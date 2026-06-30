@@ -288,6 +288,12 @@ mod tests {
         json!({"key_hash": key_hash, "allowed_models": allowed})
     }
 
+    fn apikey_payload_with_tools(key: &str, allowed: &[&str], tools: Value) -> Value {
+        let mut payload = apikey_payload(key, allowed);
+        payload["allowed_tools"] = tools;
+        payload
+    }
+
     fn auth_req(method: &str, uri: &str, body: Option<Value>) -> Request<Body> {
         let body = match body {
             Some(v) => Body::from(v.to_string()),
@@ -1045,6 +1051,74 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn apikey_crud_round_trips_allowed_tools() {
+        let state = build_state();
+
+        let app = build_router(state.clone());
+        let resp = run(
+            app,
+            auth_req(
+                "POST",
+                "/admin/v1/apikeys",
+                Some(apikey_payload_with_tools(
+                    "sk-mcp-tools",
+                    &["*"],
+                    json!(["github__create_issue"]),
+                )),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let created = body_json(resp).await;
+        let id = created["id"].as_str().unwrap().to_string();
+        assert_eq!(
+            created["value"]["allowed_tools"],
+            json!(["github__create_issue"])
+        );
+
+        let app = build_router(state.clone());
+        let resp = run(app, auth_req("GET", "/admin/v1/apikeys", None)).await;
+        let listed = body_json(resp).await;
+        assert_eq!(
+            listed[0]["value"]["allowed_tools"],
+            json!(["github__create_issue"])
+        );
+
+        let app = build_router(state.clone());
+        let resp = run(
+            app,
+            auth_req("GET", &format!("/admin/v1/apikeys/{id}"), None),
+        )
+        .await;
+        let fetched = body_json(resp).await;
+        assert_eq!(
+            fetched["value"]["allowed_tools"],
+            json!(["github__create_issue"])
+        );
+
+        let app = build_router(state.clone());
+        let resp = run(
+            app,
+            auth_req(
+                "PUT",
+                &format!("/admin/v1/apikeys/{id}"),
+                Some(apikey_payload_with_tools(
+                    "sk-mcp-tools-2",
+                    &["*"],
+                    Value::Null,
+                )),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let updated = body_json(resp).await;
+        assert!(
+            updated["value"].get("allowed_tools").is_none(),
+            "explicit null should clear allowed_tools and be omitted from the response"
+        );
     }
 
     #[tokio::test]
