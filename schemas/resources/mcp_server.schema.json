@@ -65,9 +65,9 @@
       ]
     },
     "timeout_ms": {
-      "description": "Maximum time, in milliseconds, to wait for a single upstream operation (establishing the session, listing tools, or calling a tool). When omitted, the gateway applies a built-in default.",
+      "description": "Maximum time, in milliseconds, to wait for a single upstream operation (establishing the session, listing tools, or calling a tool). Must be at least `1` when set. When omitted, the gateway applies a built-in default.",
       "format": "uint64",
-      "minimum": 0.0,
+      "minimum": 1.0,
       "type": [
         "integer",
         "null"
