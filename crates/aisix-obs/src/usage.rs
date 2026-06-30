@@ -313,6 +313,19 @@ pub struct UsageEvent {
     /// Empty when the client sent none. cp-api stores empty as NULL.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub client_user_agent: String,
+
+    // ─── MCP gateway attribution ───
+    /// Registered name of the upstream MCP server a `tools/call` was routed
+    /// to (the namespace prefix of the requested tool). Empty for non-MCP
+    /// events; cp-api stores empty as NULL. Older cp-api images that predate
+    /// this field ignore it (DP-first rollout).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub mcp_server_name: String,
+
+    /// Name of the MCP tool invoked, without the server prefix. Empty for
+    /// non-MCP events; cp-api stores empty as NULL.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub mcp_tool_name: String,
 }
 
 #[inline]
@@ -405,6 +418,7 @@ impl UsageSink {
         let bounded_protocol: &'static str = match event.inbound_protocol.as_str() {
             "openai" => "openai",
             "anthropic" => "anthropic",
+            "mcp" => "mcp",
             _ => "other",
         };
 

@@ -2875,6 +2875,8 @@ fn emit_usage_event(
         // extractor (control-char strip + cap); IP is a formatted addr.
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),
+        // MCP attribution does not apply to the chat path.
+        ..Default::default()
     };
     // Handler label "chat" matches the documented enumeration for
     // `aisix_usage_events_emitted_total` (#408). Keep `&'static str`

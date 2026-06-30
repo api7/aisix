@@ -12,6 +12,9 @@
 //! traffic are layered on in subsequent steps; this step establishes the
 //! authenticated, snapshot-sourced endpoint.
 
+use std::time::{Duration, Instant};
+
+use aisix_obs::UsageEvent;
 use axum::body::{to_bytes, Body};
 use axum::extract::{Request, State};
 use axum::http::StatusCode;
@@ -23,18 +26,27 @@ use crate::auth::AuthenticatedKey;
 use crate::state::ProxyState;
 
 /// Just enough of a JSON-RPC request to tell a tool call apart from the MCP
-/// handshake / discovery methods. Unknown fields are ignored.
+/// handshake / discovery methods, and to recover the called tool's name.
+/// Unknown fields are ignored.
 #[derive(Deserialize)]
 struct JsonRpcPeek {
     method: Option<String>,
+    params: Option<PeekParams>,
+}
+
+#[derive(Deserialize)]
+struct PeekParams {
+    /// The namespaced `<server>__<tool>` name on a `tools/call`.
+    name: Option<String>,
 }
 
 /// Serve a `/mcp` request. The [`AuthenticatedKey`] extractor enforces a valid
 /// AISIX API key (responding `401` otherwise). A `tools/call` is then subject to
 /// the same rate-limit and budget governance as an LLM request — keyed on the
 /// caller's API key — before being handled by an MCP gateway built from the
-/// current snapshot's `mcp_servers`. The `initialize` / `tools/list` handshake
-/// and discovery methods pass through ungated.
+/// current snapshot's `mcp_servers`, and a usage event is emitted into the same
+/// pipeline as LLM calls. The `initialize` / `tools/list` handshake and discovery
+/// methods pass through ungated and unmetered.
 pub async fn mcp_endpoint(
     auth: AuthenticatedKey,
     State(state): State<ProxyState>,
@@ -48,21 +60,41 @@ pub async fn mcp_endpoint(
         Err(_) => return (StatusCode::BAD_REQUEST, "invalid request body").into_response(),
     };
 
-    let is_tool_call = serde_json::from_slice::<JsonRpcPeek>(&bytes)
-        .ok()
-        .and_then(|peek| peek.method)
-        .as_deref()
-        == Some("tools/call");
+    let peek = serde_json::from_slice::<JsonRpcPeek>(&bytes).ok();
+    let is_tool_call = peek.as_ref().and_then(|p| p.method.as_deref()) == Some("tools/call");
+    // Split the namespaced tool name into (server, tool) up front, owned, so it
+    // survives the body being consumed when the request is rebuilt.
+    let (mcp_server, mcp_tool) = if is_tool_call {
+        peek.as_ref()
+            .and_then(|p| p.params.as_ref())
+            .and_then(|p| p.name.as_deref())
+            .and_then(|name| name.split_once(aisix_mcp::TOOL_NAMESPACE_SEPARATOR))
+            .map(|(server, tool)| (server.to_string(), tool.to_string()))
+            .unwrap_or_default()
+    } else {
+        (String::new(), String::new())
+    };
 
     // Reuse the LLM path's rate-limit + budget gate on the unit of work. The
     // reservation is held for the duration of the call and dropped after (no
     // tokens to commit — a tool call carries no token cost), which releases the
     // concurrency slot. On 429 / budget-exceeded this returns before any
-    // upstream is contacted.
+    // upstream is contacted — and the rejected call is still recorded.
     let _reservation = if is_tool_call {
         match crate::quota::enforce(&state, &auth, None).await {
             Ok(reservation) => Some(reservation),
-            Err(err) => return err.into_response(),
+            Err(err) => {
+                let response = err.into_response();
+                emit_tool_call_usage(
+                    &state,
+                    &auth,
+                    &mcp_server,
+                    &mcp_tool,
+                    response.status().as_u16(),
+                    Duration::ZERO,
+                );
+                return response;
+            }
         }
     } else {
         None
@@ -77,10 +109,48 @@ pub async fn mcp_endpoint(
     let request = Request::from_parts(parts, Body::from(bytes));
     // `StreamableHttpService` is a tower service that dispatches on method and
     // never fails (`Error = Infallible`); map its boxed body back to axum's.
-    match service.oneshot(request).await {
+    let started = Instant::now();
+    let response = match service.oneshot(request).await {
         Ok(response) => response.map(Body::new),
         Err(infallible) => match infallible {},
+    };
+
+    if is_tool_call {
+        emit_tool_call_usage(
+            &state,
+            &auth,
+            &mcp_server,
+            &mcp_tool,
+            response.status().as_u16(),
+            started.elapsed(),
+        );
     }
+    response
+}
+
+/// Emit a usage event for a single MCP tool call into the same sink as LLM
+/// usage. MCP calls carry no token cost yet, so token/cost fields stay zero;
+/// the event records who called which tool, the outcome, and the latency.
+fn emit_tool_call_usage(
+    state: &ProxyState,
+    auth: &AuthenticatedKey,
+    mcp_server: &str,
+    mcp_tool: &str,
+    status_code: u16,
+    latency: Duration,
+) {
+    let event = UsageEvent {
+        request_id: uuid::Uuid::new_v4().to_string(),
+        occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        api_key_id: auth.entry.id.clone(),
+        status_code,
+        latency_ms: latency.as_millis().min(u32::MAX as u128) as u32,
+        inbound_protocol: "mcp".to_string(),
+        mcp_server_name: mcp_server.to_string(),
+        mcp_tool_name: mcp_tool.to_string(),
+        ..Default::default()
+    };
+    state.usage_sink.try_emit("mcp", event);
 }
 
 #[cfg(test)]
@@ -337,6 +407,46 @@ mod tests {
         assert!(
             text.contains("serverInfo") || text.contains("protocolVersion"),
             "initialize result should carry the server info, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn emits_usage_event_for_tool_call_only() {
+        use aisix_obs::{UsageEvent, UsageSink};
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<UsageEvent>(8);
+        let handle = SnapshotHandle::new(snapshot_with_key());
+        let hub = Arc::new(aisix_gateway::Hub::new());
+        let state = ProxyState::new(handle, hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let router = build_router(state);
+
+        // A tools/call emits one usage event into the same sink as LLM calls,
+        // carrying the MCP attribution (server + tool, parsed from the
+        // namespaced name `ghost__tool`).
+        let _ = router
+            .clone()
+            .oneshot(tools_call_request())
+            .await
+            .expect("router responds");
+        let event = rx
+            .try_recv()
+            .expect("a usage event was emitted for the tool call");
+        assert_eq!(event.inbound_protocol, "mcp");
+        assert_eq!(event.mcp_server_name, "ghost");
+        assert_eq!(event.mcp_tool_name, "tool");
+        assert_eq!(event.api_key_id, "ak-1");
+        assert_eq!(event.prompt_tokens, 0, "MCP calls carry no token cost");
+
+        // The handshake does NOT emit a usage event.
+        let _ = router
+            .oneshot(initialize_request(Some(TOKEN)))
+            .await
+            .expect("router responds");
+        assert!(
+            rx.try_recv().is_err(),
+            "initialize must not emit a usage event"
         );
     }
 }
