@@ -3172,7 +3172,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
             "items": {
               "type": "string"
             },
-            "description": "MCP tools this key may call, as namespaced `<server>__<tool>` names. A wildcard entry `\"*\"` grants every tool. When omitted, the key has no MCP tool access."
+            "description": "MCP tools this key may call, as namespaced `<server>__<tool>` names. A wildcard entry `\"*\"` grants every tool. When omitted or set to `null`, the key has no MCP tool access."
           }
         },
         "additionalProperties": false
@@ -3480,7 +3480,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
             "items": {
               "type": "string"
             },
-            "description": "MCP tools this key may call, as namespaced `<server>__<tool>` names. A wildcard entry `\"*\"` grants every tool. When omitted, the key has no MCP tool access.",
+            "description": "MCP tools this key may call, as namespaced `<server>__<tool>` names. A wildcard entry `\"*\"` grants every tool. When omitted or set to `null`, the key has no MCP tool access.",
             "example": [
               "github__create_issue"
             ]

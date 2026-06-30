@@ -49,8 +49,8 @@ pub struct ApiKey {
 
     /// MCP tools this key may call, as namespaced `<server>__<tool>` names
     /// (the form the gateway exposes). A wildcard entry `"*"` grants every
-    /// tool. When omitted, the key has no MCP tool access — access is granted
-    /// explicitly, matching `allowed_models`.
+    /// tool. When omitted or set to `null`, the key has no MCP tool access —
+    /// access is granted explicitly, matching `allowed_models`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_tools: Option<Vec<String>>,
 
