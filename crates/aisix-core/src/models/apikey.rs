@@ -41,11 +41,9 @@ pub struct ApiKey {
     #[schemars(length(min = 1))]
     pub user_id: Option<String>,
 
-    /// Readable display name of the owning member (#890 req-3). Synced by
-    /// cp-api solely so the proxy can stamp a human-readable `user_name`
-    /// metric label alongside `user_id`; never used for auth or routing.
-    /// Absent on older cp-api payloads → the metric label falls back to
-    /// `"unknown"` (DP-first rollout).
+    /// Readable display name of the owning member. Used only for telemetry
+    /// labels alongside `user_id`; never used for authentication or routing.
+    /// When omitted, telemetry reports the user name as `"unknown"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_name: Option<String>,
 
