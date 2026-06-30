@@ -8,9 +8,11 @@
 //! current configuration snapshot on each request, so it always reflects the
 //! live `mcp_servers` set.
 //!
-//! Per-tool access control, guardrail / quota reuse, and usage logging over MCP
-//! traffic are layered on in subsequent steps; this step establishes the
-//! authenticated, snapshot-sourced endpoint.
+//! A `tools/call` is governed by the SAME pipeline as an LLM request, keyed on
+//! the caller's API key: per-tool access control (the key's `allowed_tools`),
+//! rate-limit + budget (`quota::enforce`), input guardrails on the tool
+//! arguments, and a usage event into the shared sink. Output-side guardrails
+//! (scanning the tool result) are a follow-up.
 
 use std::time::{Duration, Instant};
 
@@ -26,18 +28,22 @@ use crate::auth::AuthenticatedKey;
 use crate::state::ProxyState;
 
 /// Just enough of a JSON-RPC request to tell a tool call apart from the MCP
-/// handshake / discovery methods, and to recover the called tool's name.
-/// Unknown fields are ignored.
+/// handshake / discovery methods, recover the called tool's name + arguments,
+/// and echo the request id back in a synthesized error. Unknown fields ignored.
 #[derive(Deserialize)]
 struct JsonRpcPeek {
     method: Option<String>,
     params: Option<PeekParams>,
+    /// JSON-RPC request id, echoed back if the gateway synthesizes an error.
+    id: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
 struct PeekParams {
     /// The namespaced `<server>__<tool>` name on a `tools/call`.
     name: Option<String>,
+    /// The tool arguments, scanned by input guardrails.
+    arguments: Option<serde_json::Value>,
 }
 
 /// Serve a `/mcp` request. The [`AuthenticatedKey`] extractor enforces a valid
@@ -92,6 +98,7 @@ pub async fn mcp_endpoint(
                     &mcp_tool,
                     response.status().as_u16(),
                     Duration::ZERO,
+                    false,
                 );
                 return response;
             }
@@ -99,6 +106,54 @@ pub async fn mcp_endpoint(
     } else {
         None
     };
+
+    // Input guardrails: run the tool arguments through the SAME guardrail chain
+    // as LLM input. MCP has no model, so only env / api-key / team-scoped
+    // guardrails apply (an empty `model_id` matches those, never a Model-scoped
+    // one). An empty chain short-circuits, keeping the no-guardrail path cheap.
+    if is_tool_call {
+        let ctx = aisix_guardrails::RequestContext {
+            model_id: "",
+            api_key_id: &auth.entry.id,
+            team_id: auth.key().team_id.as_deref(),
+        };
+        let chain = state.guardrail_index.resolve(&ctx);
+        if !chain.is_empty() {
+            let args_text = peek
+                .as_ref()
+                .and_then(|p| p.params.as_ref())
+                .and_then(|p| p.arguments.as_ref())
+                .map(|args| args.to_string())
+                .unwrap_or_default();
+            let chat = aisix_gateway::ChatFormat::new(
+                "",
+                vec![aisix_gateway::ChatMessage::user(args_text)],
+            );
+            if let aisix_guardrails::GuardrailVerdict::Block {
+                reason,
+                guardrail_name,
+            } = aisix_guardrails::Guardrail::check_input(&chain, &chat).await
+            {
+                tracing::warn!(
+                    guardrail_hook = "input",
+                    tool = %mcp_tool,
+                    reason = %reason,
+                    "guardrail blocked MCP tool call"
+                );
+                emit_tool_call_usage(
+                    &state,
+                    &auth,
+                    &mcp_server,
+                    &mcp_tool,
+                    StatusCode::OK.as_u16(),
+                    Duration::ZERO,
+                    true,
+                );
+                let id = peek.as_ref().and_then(|p| p.id.clone());
+                return jsonrpc_guardrail_block(id, guardrail_name.as_deref());
+            }
+        }
+    }
 
     let snapshot = state.snapshot.load();
     // Scope the gateway to the tools this caller's key permits, so MCP tool
@@ -123,6 +178,7 @@ pub async fn mcp_endpoint(
             &mcp_tool,
             response.status().as_u16(),
             started.elapsed(),
+            false,
         );
     }
     response
@@ -131,6 +187,7 @@ pub async fn mcp_endpoint(
 /// Emit a usage event for a single MCP tool call into the same sink as LLM
 /// usage. MCP calls carry no token cost yet, so token/cost fields stay zero;
 /// the event records who called which tool, the outcome, and the latency.
+#[allow(clippy::too_many_arguments)]
 fn emit_tool_call_usage(
     state: &ProxyState,
     auth: &AuthenticatedKey,
@@ -138,6 +195,7 @@ fn emit_tool_call_usage(
     mcp_tool: &str,
     status_code: u16,
     latency: Duration,
+    guardrail_blocked: bool,
 ) {
     let event = UsageEvent {
         request_id: uuid::Uuid::new_v4().to_string(),
@@ -148,9 +206,32 @@ fn emit_tool_call_usage(
         inbound_protocol: "mcp".to_string(),
         mcp_server_name: mcp_server.to_string(),
         mcp_tool_name: mcp_tool.to_string(),
+        guardrail_blocked,
         ..Default::default()
     };
     state.usage_sink.try_emit("mcp", event);
+}
+
+/// Build the MCP-native response for a guardrail block: a JSON-RPC error
+/// echoing the request id, served as HTTP 200 with a JSON body (the MCP
+/// Streamable HTTP shape). Unlike the LLM path's 422, an MCP client expects a
+/// JSON-RPC envelope, so the block surfaces as a tool-call error it can handle.
+fn jsonrpc_guardrail_block(
+    id: Option<serde_json::Value>,
+    guardrail_name: Option<&str>,
+) -> Response {
+    let message = crate::error::guardrail_block_message("tool call", guardrail_name);
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id.unwrap_or(serde_json::Value::Null),
+        "error": { "code": -32600, "message": message }
+    });
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body.to_string(),
+    )
+        .into_response()
 }
 
 #[cfg(test)]
@@ -487,5 +568,76 @@ mod tests {
         assert_eq!(event.inbound_protocol, "mcp");
         assert_eq!(event.mcp_server_name, "ghost");
         assert_eq!(event.mcp_tool_name, "tool");
+    }
+
+    /// Seed a keyword input guardrail (env-scoped) that blocks the literal
+    /// `forbidden-token`, by RCU-inserting into the live snapshot handle.
+    fn seed_input_guardrail(handle: &SnapshotHandle<AisixSnapshot>) {
+        use aisix_core::models::{Guardrail, GuardrailAttachment};
+        let guardrail: Guardrail = serde_json::from_str(
+            r#"{"name":"mcp-input-guard","kind":"keyword","patterns":[{"kind":"literal","value":"forbidden-token"}]}"#,
+        )
+        .unwrap();
+        let attachment: GuardrailAttachment =
+            serde_json::from_str(r#"{"guardrail_id":"g1","scope_type":"env","priority":50}"#)
+                .unwrap();
+        handle.rcu(|snap| {
+            let new = snap.clone();
+            new.guardrails
+                .insert(ResourceEntry::new("g1", guardrail.clone(), 1));
+            new.guardrail_attachments
+                .insert(ResourceEntry::new("att-g1", attachment.clone(), 1));
+            new
+        });
+    }
+
+    fn tools_call_with_args(arguments: serde_json::Value) -> HttpRequest<Body> {
+        mcp_request(
+            "tools/call",
+            serde_json::json!({ "name": "ghost__tool", "arguments": arguments }),
+        )
+    }
+
+    #[tokio::test]
+    async fn input_guardrail_blocks_tool_call_with_forbidden_args() {
+        let handle = SnapshotHandle::new(snapshot_with_key());
+        let hub = Arc::new(aisix_gateway::Hub::new());
+        let state = ProxyState::new(handle.clone(), hub, &cfg()).without_cache();
+        let router = build_router(state);
+        seed_input_guardrail(&handle);
+
+        // Arguments carrying the forbidden token are blocked by the same
+        // guardrail chain LLM input uses — as an MCP-native JSON-RPC error
+        // (HTTP 200), before the gateway/upstream is reached.
+        let blocked = router
+            .clone()
+            .oneshot(tools_call_with_args(
+                serde_json::json!({ "q": "forbidden-token" }),
+            ))
+            .await
+            .expect("router responds");
+        assert_eq!(blocked.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(blocked.into_body(), 64 * 1024)
+            .await
+            .expect("read body");
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.contains("\"error\"") && text.contains("content policy"),
+            "expected a JSON-RPC guardrail-block error, got: {text}"
+        );
+
+        // Clean arguments are not blocked by the guardrail (the gateway may
+        // still reject for other reasons, but not with a content-policy error).
+        let clean = router
+            .oneshot(tools_call_with_args(serde_json::json!({ "q": "hello" })))
+            .await
+            .expect("router responds");
+        let clean_body = axum::body::to_bytes(clean.into_body(), 64 * 1024)
+            .await
+            .expect("read body");
+        assert!(
+            !String::from_utf8_lossy(&clean_body).contains("content policy"),
+            "clean arguments must not be guardrail-blocked"
+        );
     }
 }
