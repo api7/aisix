@@ -198,6 +198,12 @@ mod tests {
             serde_json::from_str(r#"{"key_hash":"h","allowed_models":["*"]}"#).unwrap();
         assert!(!none.can_access_tool("github__create_issue"));
 
+        // Explicit null has the same no-access behavior as omission.
+        let null: ApiKey =
+            serde_json::from_str(r#"{"key_hash":"h","allowed_models":["*"],"allowed_tools":null}"#)
+                .unwrap();
+        assert!(!null.can_access_tool("github__create_issue"));
+
         // Empty list also denies everything.
         let empty: ApiKey =
             serde_json::from_str(r#"{"key_hash":"h","allowed_models":[],"allowed_tools":[]}"#)
