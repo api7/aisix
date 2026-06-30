@@ -155,7 +155,7 @@ pub async fn mcp_endpoint(
                 Duration::ZERO,
                 true,
             );
-            return jsonrpc_guardrail_block(rpc_id, guardrail_name.as_deref());
+            return jsonrpc_guardrail_block(rpc_id, "tool call", guardrail_name.as_deref());
         }
     }
 
@@ -195,7 +195,7 @@ pub async fn mcp_endpoint(
                 latency,
                 true,
             );
-            return jsonrpc_guardrail_block(rpc_id, guardrail_name.as_deref());
+            return jsonrpc_guardrail_block(rpc_id, "tool result", guardrail_name.as_deref());
         }
         Response::from_parts(resp_parts, Body::from(resp_bytes))
     } else {
@@ -226,7 +226,27 @@ async fn output_guardrail_block(
     tool: &str,
 ) -> Option<Option<String>> {
     let value: serde_json::Value = serde_json::from_slice(response_bytes).ok()?;
-    let result_text = value.get("result")?.to_string();
+    let result = value.get("result")?;
+    // Scan the client-visible tool text — the `text`-type content blocks the
+    // result carries — not the serialized JSON envelope. This keeps MCP output
+    // and LLM output on the same representation: a keyword guardrail sees the
+    // decoded prose, so envelope field names (`content`, `type`, `text`) can't
+    // trip a false positive, and escaped characters can't hide blocked content.
+    // Fall back to the whole serialized result for non-standard shapes so
+    // nothing escapes inspection.
+    let result_text = result
+        .get("content")
+        .and_then(|c| c.as_array())
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .filter(|text| !text.is_empty())
+        .unwrap_or_else(|| result.to_string());
     let resp = aisix_gateway::ChatResponse {
         id: String::new(),
         model: String::new(),
@@ -281,13 +301,16 @@ fn emit_tool_call_usage(
 
 /// Build the MCP-native response for a guardrail block: a JSON-RPC error
 /// echoing the request id, served as HTTP 200 with a JSON body (the MCP
-/// Streamable HTTP shape). Unlike the LLM path's 422, an MCP client expects a
-/// JSON-RPC envelope, so the block surfaces as a tool-call error it can handle.
+/// Streamable HTTP shape). Both the input and output hooks funnel through here;
+/// `side` (`"tool call"` for input arguments, `"tool result"` for output)
+/// selects the caller-visible wording. Unlike the LLM path's 422, an MCP client
+/// expects a JSON-RPC envelope, so the block surfaces as an error it can handle.
 fn jsonrpc_guardrail_block(
     id: Option<serde_json::Value>,
+    side: &str,
     guardrail_name: Option<&str>,
 ) -> Response {
-    let message = crate::error::guardrail_block_message("tool call", guardrail_name);
+    let message = crate::error::guardrail_block_message(side, guardrail_name);
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "id": id.unwrap_or(serde_json::Value::Null),
@@ -390,9 +413,19 @@ mod tests {
 
     /// A JSON-RPC request to `/mcp` for `method`, authenticated with `TOKEN`.
     fn mcp_request(method: &str, params: serde_json::Value) -> HttpRequest<Body> {
+        mcp_request_with_id(serde_json::json!(1), method, params)
+    }
+
+    /// As [`mcp_request`], but with an explicit JSON-RPC `id` so a test can
+    /// assert the response echoes the request's id rather than a constant.
+    fn mcp_request_with_id(
+        id: serde_json::Value,
+        method: &str,
+        params: serde_json::Value,
+    ) -> HttpRequest<Body> {
         let body = serde_json::json!({
             "jsonrpc": "2.0",
-            "id": 1,
+            "id": id,
             "method": method,
             "params": params
         });
@@ -674,12 +707,16 @@ mod tests {
         seed_guardrail(&handle, INPUT_GUARD);
 
         // Arguments carrying the forbidden token are blocked by the same
-        // guardrail chain LLM input uses — as an MCP-native JSON-RPC error
-        // (HTTP 200), before the gateway/upstream is reached.
+        // guardrail chain LLM input uses — surfaced as an MCP-native JSON-RPC
+        // error (HTTP 200) before the gateway/upstream is reached. A distinctive
+        // request id (7) proves the handler echoes the caller's id (not a
+        // constant) through the block envelope both hooks funnel through.
         let blocked = router
             .clone()
-            .oneshot(tools_call_with_args(
-                serde_json::json!({ "q": "forbidden-token" }),
+            .oneshot(mcp_request_with_id(
+                serde_json::json!(7),
+                "tools/call",
+                serde_json::json!({ "name": "ghost__tool", "arguments": { "q": "forbidden-token" } }),
             ))
             .await
             .expect("router responds");
@@ -687,10 +724,25 @@ mod tests {
         let body = axum::body::to_bytes(blocked.into_body(), 64 * 1024)
             .await
             .expect("read body");
-        let text = String::from_utf8_lossy(&body);
+        let envelope: serde_json::Value =
+            serde_json::from_slice(&body).expect("a JSON-RPC envelope");
+        assert_eq!(envelope["jsonrpc"], "2.0");
+        assert_eq!(
+            envelope["id"],
+            serde_json::json!(7),
+            "the block must echo the request id"
+        );
+        assert_eq!(envelope["error"]["code"], -32600);
         assert!(
-            text.contains("\"error\"") && text.contains("content policy"),
-            "expected a JSON-RPC guardrail-block error, got: {text}"
+            envelope.get("result").is_none(),
+            "a guardrail block carries no result"
+        );
+        assert!(
+            envelope["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("content policy"),
+            "expected a content-policy block message, got: {envelope}"
         );
 
         // Clean arguments are not blocked by the guardrail (the gateway may
@@ -752,6 +804,80 @@ mod tests {
                 .await
                 .is_none(),
             "an error response has no tool result to scan"
+        );
+    }
+
+    #[tokio::test]
+    async fn output_guardrail_scans_decoded_text_not_envelope() {
+        use aisix_guardrails::{LiveGuardrailIndex, RequestContext};
+
+        // A guardrail matching a JSON envelope field name ("content").
+        const FIELD_NAME_GUARD: &str = r#"{"name":"field-name-guard","kind":"keyword","hook_point":"output","patterns":[{"kind":"literal","value":"content"}]}"#;
+        let handle = SnapshotHandle::new(snapshot_with_key());
+        seed_guardrail(&handle, FIELD_NAME_GUARD);
+        let chain = LiveGuardrailIndex::new(handle, None).resolve(&RequestContext {
+            model_id: "",
+            api_key_id: "ak-1",
+            team_id: None,
+        });
+
+        // The envelope literally contains "content"/"type"/"text", but we scan
+        // the decoded tool text ("hello world"), so the field name must NOT fire.
+        let clean = br#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"hello world"}]}}"#;
+        assert!(
+            output_guardrail_block(&chain, clean, "echo")
+                .await
+                .is_none(),
+            "scanning the decoded text must ignore envelope field names"
+        );
+
+        // When the decoded text itself carries the pattern the guardrail fires —
+        // proving it is active here, not simply absent.
+        let hit = br#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"this has content in it"}]}}"#;
+        assert!(
+            output_guardrail_block(&chain, hit, "echo").await.is_some(),
+            "decoded text containing the pattern must still block"
+        );
+    }
+
+    #[tokio::test]
+    async fn output_block_envelope_echoes_id_and_shape() {
+        // Both hooks funnel the block through `jsonrpc_guardrail_block`; assert
+        // the wire envelope directly so a regression that nulls the id or shifts
+        // the code/status/content-type is caught without an rmcp upstream.
+        let resp = jsonrpc_guardrail_block(
+            Some(serde_json::json!(42)),
+            "tool result",
+            Some("mcp-output-guard"),
+        );
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .expect("read body");
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("a JSON-RPC envelope");
+        assert_eq!(v["jsonrpc"], "2.0");
+        assert_eq!(
+            v["id"],
+            serde_json::json!(42),
+            "the original JSON-RPC id must be echoed, not nulled"
+        );
+        assert_eq!(v["error"]["code"], -32600);
+        assert!(
+            v.get("result").is_none(),
+            "a block envelope carries no result"
+        );
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("tool result blocked by content policy"),
+            "expected the output-side wording, got: {v}"
         );
     }
 }
