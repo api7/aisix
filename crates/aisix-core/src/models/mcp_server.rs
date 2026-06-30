@@ -46,9 +46,10 @@ pub struct McpServer {
     pub secret: Option<String>,
 
     /// Maximum time, in milliseconds, to wait for a single upstream operation
-    /// (establishing the session, listing tools, or calling a tool). When
-    /// omitted, the gateway applies a built-in default.
+    /// (establishing the session, listing tools, or calling a tool). Must be at
+    /// least `1` when set. When omitted, the gateway applies a built-in default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
     pub timeout_ms: Option<u64>,
 
     /// Whether this server is active. When `false`, its tools are not listed and

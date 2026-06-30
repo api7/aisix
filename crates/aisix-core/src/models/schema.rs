@@ -2140,4 +2140,39 @@ mod tests {
         });
         assert!(validate_provider_key(&v).is_err());
     }
+
+    // ---- mcp_server schema tests (#666 timeout_ms guard) ----
+
+    #[test]
+    fn mcp_server_minimal_passes() {
+        // `timeout_ms` is optional; omitting it must validate.
+        let v = json!({
+            "display_name": "github",
+            "url": "https://api.example.com/mcp"
+        });
+        validate_mcp_server(&v).unwrap();
+    }
+
+    #[test]
+    fn mcp_server_accepts_positive_timeout_ms() {
+        let v = json!({
+            "display_name": "github",
+            "url": "https://api.example.com/mcp",
+            "timeout_ms": 1
+        });
+        validate_mcp_server(&v).unwrap();
+    }
+
+    #[test]
+    fn mcp_server_rejects_zero_timeout_ms() {
+        // A zero deadline times out every upstream op instantly and silently
+        // drops the server from `tools/list`; reject it at the schema layer
+        // (enforced on both the Admin write-path and the etcd loader).
+        let v = json!({
+            "display_name": "github",
+            "url": "https://api.example.com/mcp",
+            "timeout_ms": 0
+        });
+        assert!(validate_mcp_server(&v).is_err());
+    }
 }
