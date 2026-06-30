@@ -189,7 +189,49 @@ pub fn provider_key_root_schema() -> Value {
 /// [`McpTransport`](crate::models::McpTransport) /
 /// [`McpAuthType`](crate::models::McpAuthType) enums.
 pub fn mcp_server_root_schema() -> Value {
-    struct_root_schema::<crate::models::McpServer>(true)
+    let mut schema = struct_root_schema::<crate::models::McpServer>(true);
+    if let Some(Value::Object(defs)) = schema.get_mut("definitions") {
+        title_single_value_enum_variants(
+            defs,
+            "McpAuthType",
+            &[("none", "No authentication"), ("bearer", "Bearer token")],
+        );
+        title_single_value_enum_variants(
+            defs,
+            "McpTransport",
+            &[("streamable_http", "Streamable HTTP")],
+        );
+    }
+    schema
+}
+
+fn title_single_value_enum_variants(
+    defs: &mut serde_json::Map<String, Value>,
+    schema_name: &str,
+    titles: &[(&str, &str)],
+) {
+    let Some(Value::Array(branches)) = defs.get_mut(schema_name).and_then(|d| d.get_mut("oneOf"))
+    else {
+        return;
+    };
+    for branch in branches.iter_mut() {
+        let Some(branch) = branch.as_object_mut() else {
+            continue;
+        };
+        let Some(value) = branch
+            .get("enum")
+            .and_then(|v| v.as_array())
+            .and_then(|values| values.first())
+            .and_then(|v| v.as_str())
+        else {
+            continue;
+        };
+        if let Some((_, title)) = titles.iter().find(|(expected, _)| *expected == value) {
+            branch
+                .entry("title".to_string())
+                .or_insert_with(|| Value::String((*title).to_string()));
+        }
+    }
 }
 
 /// Canonical JSON Schema for the `guardrail` resource, derived from the
