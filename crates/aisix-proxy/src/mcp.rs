@@ -438,6 +438,10 @@ mod tests {
         assert_eq!(event.mcp_tool_name, "tool");
         assert_eq!(event.api_key_id, "ak-1");
         assert_eq!(event.prompt_tokens, 0, "MCP calls carry no token cost");
+        assert!(
+            rx.try_recv().is_err(),
+            "exactly one usage event per tool call"
+        );
 
         // The handshake does NOT emit a usage event.
         let _ = router
@@ -448,5 +452,40 @@ mod tests {
             rx.try_recv().is_err(),
             "initialize must not emit a usage event"
         );
+    }
+
+    #[tokio::test]
+    async fn rate_limited_tool_call_still_emits_usage_event() {
+        use aisix_obs::{UsageEvent, UsageSink};
+
+        // rpm=1: the second tool call is rate-limited (429) but still recorded —
+        // the reject path emits before returning.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<UsageEvent>(8);
+        let handle = SnapshotHandle::new(snapshot_with_rate_limited_key(1));
+        let hub = Arc::new(aisix_gateway::Hub::new());
+        let state = ProxyState::new(handle, hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let router = build_router(state);
+
+        let _ = router
+            .clone()
+            .oneshot(tools_call_request())
+            .await
+            .expect("router responds");
+        let _ = rx.try_recv().expect("first (allowed) call emits");
+
+        let second = router
+            .oneshot(tools_call_request())
+            .await
+            .expect("router responds");
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+        let event = rx
+            .try_recv()
+            .expect("the rate-limited call is still recorded");
+        assert_eq!(event.status_code, 429);
+        assert_eq!(event.inbound_protocol, "mcp");
+        assert_eq!(event.mcp_server_name, "ghost");
+        assert_eq!(event.mcp_tool_name, "tool");
     }
 }
