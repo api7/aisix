@@ -170,13 +170,13 @@ mod tests {
         snapshot
     }
 
-    /// A `tools/call` request authenticated with `TOKEN`.
-    fn tools_call_request() -> HttpRequest<Body> {
+    /// A JSON-RPC request to `/mcp` for `method`, authenticated with `TOKEN`.
+    fn mcp_request(method: &str, params: serde_json::Value) -> HttpRequest<Body> {
         let body = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
-            "method": "tools/call",
-            "params": { "name": "ghost__tool", "arguments": {} }
+            "method": method,
+            "params": params
         });
         HttpRequest::post("/mcp")
             .header("host", "mcp.aisix.example.com")
@@ -185,6 +185,13 @@ mod tests {
             .header("authorization", format!("Bearer {TOKEN}"))
             .body(Body::from(body.to_string()))
             .unwrap()
+    }
+
+    fn tools_call_request() -> HttpRequest<Body> {
+        mcp_request(
+            "tools/call",
+            serde_json::json!({ "name": "ghost__tool", "arguments": {} }),
+        )
     }
 
     #[tokio::test]
@@ -217,8 +224,10 @@ mod tests {
             "second tool call should be rate-limited"
         );
 
-        // The handshake is never rate-limited, even with the key at its limit.
+        // Neither handshake nor discovery is rate-limited, even with the key at
+        // its tool-call limit — a client can always connect and enumerate.
         let handshake = router
+            .clone()
             .oneshot(initialize_request(Some(TOKEN)))
             .await
             .expect("router responds");
@@ -226,6 +235,16 @@ mod tests {
             handshake.status(),
             StatusCode::TOO_MANY_REQUESTS,
             "initialize must not be rate-limited"
+        );
+
+        let listed = router
+            .oneshot(mcp_request("tools/list", serde_json::json!({})))
+            .await
+            .expect("router responds");
+        assert_ne!(
+            listed.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "tools/list must not be rate-limited"
         );
     }
 
