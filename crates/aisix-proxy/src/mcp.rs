@@ -12,28 +12,69 @@
 //! traffic are layered on in subsequent steps; this step establishes the
 //! authenticated, snapshot-sourced endpoint.
 
-use axum::body::Body;
+use axum::body::{to_bytes, Body};
 use axum::extract::{Request, State};
-use axum::response::Response;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use serde::Deserialize;
 use tower::ServiceExt;
 
 use crate::auth::AuthenticatedKey;
 use crate::state::ProxyState;
 
+/// Just enough of a JSON-RPC request to tell a tool call apart from the MCP
+/// handshake / discovery methods. Unknown fields are ignored.
+#[derive(Deserialize)]
+struct JsonRpcPeek {
+    method: Option<String>,
+}
+
 /// Serve a `/mcp` request. The [`AuthenticatedKey`] extractor enforces a valid
-/// AISIX API key (responding `401` otherwise); the request is then handled by an
-/// MCP gateway built from the current snapshot's `mcp_servers`.
+/// AISIX API key (responding `401` otherwise). A `tools/call` is then subject to
+/// the same rate-limit and budget governance as an LLM request — keyed on the
+/// caller's API key — before being handled by an MCP gateway built from the
+/// current snapshot's `mcp_servers`. The `initialize` / `tools/list` handshake
+/// and discovery methods pass through ungated.
 pub async fn mcp_endpoint(
     auth: AuthenticatedKey,
     State(state): State<ProxyState>,
     request: Request,
 ) -> Response {
+    // Buffer the body so the JSON-RPC method can be inspected, then rebuilt for
+    // the gateway. The global body-limit layer has already capped the size.
+    let (parts, body) = request.into_parts();
+    let bytes = match to_bytes(body, state.request_body_limit_bytes).await {
+        Ok(bytes) => bytes,
+        Err(_) => return (StatusCode::BAD_REQUEST, "invalid request body").into_response(),
+    };
+
+    let is_tool_call = serde_json::from_slice::<JsonRpcPeek>(&bytes)
+        .ok()
+        .and_then(|peek| peek.method)
+        .as_deref()
+        == Some("tools/call");
+
+    // Reuse the LLM path's rate-limit + budget gate on the unit of work. The
+    // reservation is held for the duration of the call and dropped after (no
+    // tokens to commit — a tool call carries no token cost), which releases the
+    // concurrency slot. On 429 / budget-exceeded this returns before any
+    // upstream is contacted.
+    let _reservation = if is_tool_call {
+        match crate::quota::enforce(&state, &auth, None).await {
+            Ok(reservation) => Some(reservation),
+            Err(err) => return err.into_response(),
+        }
+    } else {
+        None
+    };
+
     let snapshot = state.snapshot.load();
     // Scope the gateway to the tools this caller's key permits, so MCP tool
     // access is governed by the same key object as LLM access.
     let acl = aisix_mcp::ToolAcl::from_allowed(auth.key().allowed_tools.as_deref());
     let gateway = aisix_mcp::McpGateway::from_snapshot(&snapshot).with_tool_acl(acl);
     let service = aisix_mcp::streamable_http_service(gateway);
+    let request = Request::from_parts(parts, Body::from(bytes));
     // `StreamableHttpService` is a tower service that dispatches on method and
     // never fails (`Error = Infallible`); map its boxed body back to axum's.
     match service.oneshot(request).await {
@@ -109,6 +150,83 @@ mod tests {
             builder = builder.header("authorization", format!("Bearer {token}"));
         }
         builder.body(Body::from(body.to_string())).unwrap()
+    }
+
+    /// A snapshot whose key carries an inline `rate_limit` of `rpm` requests
+    /// per minute and may call every tool.
+    fn snapshot_with_rate_limited_key(rpm: u32) -> AisixSnapshot {
+        let key_hash = ApiKey::hash_bearer(TOKEN);
+        let apikey: ApiKey = serde_json::from_value(serde_json::json!({
+            "key_hash": key_hash,
+            "allowed_models": ["*"],
+            "allowed_tools": ["*"],
+            "rate_limit": { "rpm": rpm },
+        }))
+        .expect("valid apikey");
+        let snapshot = AisixSnapshot::new();
+        snapshot
+            .apikeys
+            .insert(ResourceEntry::new("ak-1", apikey, 1));
+        snapshot
+    }
+
+    /// A `tools/call` request authenticated with `TOKEN`.
+    fn tools_call_request() -> HttpRequest<Body> {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": "ghost__tool", "arguments": {} }
+        });
+        HttpRequest::post("/mcp")
+            .header("host", "mcp.aisix.example.com")
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("authorization", format!("Bearer {TOKEN}"))
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn rate_limit_applies_to_tool_calls_but_not_handshake() {
+        // rpm=1: the key may make one tools/call per minute.
+        let router = router_with(snapshot_with_rate_limited_key(1));
+
+        // First tool call passes the rate gate (status is whatever the gateway
+        // returns — there are no upstreams — but NOT 429).
+        let first = router
+            .clone()
+            .oneshot(tools_call_request())
+            .await
+            .expect("router responds");
+        assert_ne!(
+            first.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "first tool call should pass the rate gate"
+        );
+
+        // Second tool call within the same minute is rate-limited.
+        let second = router
+            .clone()
+            .oneshot(tools_call_request())
+            .await
+            .expect("router responds");
+        assert_eq!(
+            second.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "second tool call should be rate-limited"
+        );
+
+        // The handshake is never rate-limited, even with the key at its limit.
+        let handshake = router
+            .oneshot(initialize_request(Some(TOKEN)))
+            .await
+            .expect("router responds");
+        assert_ne!(
+            handshake.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "initialize must not be rate-limited"
+        );
     }
 
     #[tokio::test]
