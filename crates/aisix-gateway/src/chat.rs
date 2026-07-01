@@ -353,6 +353,29 @@ impl UsageStats {
         }
     }
 
+    /// Build usage for a provider that reports cache tokens as counters
+    /// *separate* from `prompt_tokens` — i.e. Anthropic, where the true
+    /// input is `input_tokens + cache_creation + cache_read` rather than
+    /// a single `prompt_tokens` that already includes the cached part
+    /// (the OpenAI shape). `total_tokens` therefore folds the cache
+    /// counters in, so it stays the honest total instead of
+    /// `prompt + completion` alone (#906 / AISIX-Cloud#906). OpenAI
+    /// upstreams keep using `new()` — their cache hit is a subset of
+    /// `prompt_tokens`, so it must NOT be added again here.
+    pub fn with_cache(prompt: u32, completion: u32, cache_creation: u32, cache_read: u32) -> Self {
+        Self {
+            prompt_tokens: prompt,
+            completion_tokens: completion,
+            total_tokens: prompt
+                .saturating_add(completion)
+                .saturating_add(cache_creation)
+                .saturating_add(cache_read),
+            cache_creation_tokens: cache_creation,
+            cache_read_tokens: cache_read,
+            ..Self::default()
+        }
+    }
+
     /// Field-wise saturating sum of two usage records. Used to build an
     /// ensemble's client-facing aggregate usage — the sum of every panel
     /// member plus the judge (api7/AISIX-Cloud#804) — so a fan-out request
@@ -715,6 +738,21 @@ mod tests {
     fn usage_stats_saturates_total() {
         let u = UsageStats::new(u32::MAX, 10);
         assert_eq!(u.total_tokens, u32::MAX);
+    }
+
+    #[test]
+    fn usage_stats_with_cache_folds_cache_into_total() {
+        // #906: cache_creation / cache_read are input classes separate
+        // from prompt_tokens, so the total is prompt + completion +
+        // cache_creation + cache_read — not prompt + completion alone.
+        let u = UsageStats::with_cache(10, 4, 200, 800);
+        assert_eq!(u.prompt_tokens, 10);
+        assert_eq!(u.completion_tokens, 4);
+        assert_eq!(u.cache_creation_tokens, 200);
+        assert_eq!(u.cache_read_tokens, 800);
+        assert_eq!(u.total_tokens, 1014);
+        // No cache present degrades to the plain prompt + completion total.
+        assert_eq!(UsageStats::with_cache(10, 4, 0, 0).total_tokens, 14);
     }
 
     #[test]
