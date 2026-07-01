@@ -125,9 +125,11 @@ pub async fn image_generations(
                 elapsed,
                 &request_id,
             );
+            let snap = state.snapshot.load();
+            let metric_model = crate::usage_attr::metric_model_label(&snap, &model_name);
             state.metrics.record_request(
                 "unknown",
-                &model_name,
+                metric_model,
                 status,
                 RequestOutcome::from_status(status),
                 elapsed,

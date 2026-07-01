@@ -55,6 +55,28 @@ pub(crate) fn provider_key_metric_name(snap: &AisixSnapshot, provider_key_id: &s
     }
 }
 
+/// The `model` metric label for a request whose client-supplied `model`
+/// field never resolved to a configured model (e.g. model-not-found). See
+/// [`metric_model_label`].
+pub(crate) const UNRESOLVED_MODEL_LABEL: &str = "unresolved";
+
+/// Bound the `model` metric label to the configured set. A request's `model`
+/// field is arbitrary caller-controlled text until it resolves against the
+/// snapshot; on an error path that can fire *before* resolution (model-not-
+/// found), feeding the raw value into a Prometheus label lets a caller
+/// explode metric cardinality. Return the requested name only when it maps to
+/// a configured model (direct or virtual router — both live in `models`),
+/// else the fixed [`UNRESOLVED_MODEL_LABEL`] sentinel. This is the typed-
+/// endpoint analogue of passthrough's `PASSTHROUGH_MODEL_LABEL` guard (#451),
+/// shared here so the handler family can't drift.
+pub(crate) fn metric_model_label<'a>(snap: &AisixSnapshot, model_name: &'a str) -> &'a str {
+    if snap.models.get_by_name(model_name).is_some() {
+        model_name
+    } else {
+        UNRESOLVED_MODEL_LABEL
+    }
+}
+
 /// Stamp the five per-PK attribution fields onto an in-progress UsageEvent,
 /// sanitising the operator-controlled tag strings (control-char strip + length
 /// cap) before they hit the wire. One source of truth for the mapping so the

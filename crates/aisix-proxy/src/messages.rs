@@ -253,9 +253,11 @@ pub async fn messages(
                 &request_id,
                 &routing,
             );
+            let snap = state.snapshot.load();
+            let metric_model = crate::usage_attr::metric_model_label(&snap, &model_name);
             state.metrics.record_request(
                 "unknown",
-                &model_name,
+                metric_model,
                 status,
                 RequestOutcome::from_status(status),
                 elapsed,
@@ -267,7 +269,7 @@ pub async fn messages(
                 endpoint: "/v1/messages",
                 inbound_protocol: "anthropic",
                 provider: "unknown",
-                model: &model_name,
+                model: metric_model,
                 upstream_model: "unknown",
                 provider_key_id: "unknown",
                 provider_key_name: "unknown",
