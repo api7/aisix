@@ -236,6 +236,21 @@ impl RedisStore {
         self
     }
 
+    /// Namespace the prefix by the DP's environment id. Most bucket keys are
+    /// globally-unique CP UUIDs (api_key / policy ids), but the model inline
+    /// limit buckets on the env-local model alias (`model:<name>`), so two
+    /// environments sharing one (user-provided) Redis would otherwise merge
+    /// their `model:<alias>` counters. Scoping the prefix to `<prefix>:<env_id>`
+    /// isolates every bucket. Empty `env_id` (standalone / v2) leaves it
+    /// unchanged. The env segment sits before the `{bucket}` hash tag, so
+    /// Redis Cluster slot placement (by bucket) is unaffected.
+    pub fn with_env_namespace(mut self, env_id: &str) -> Self {
+        if !env_id.is_empty() {
+            self.prefix = format!("{}:{}", self.prefix, env_id);
+        }
+        self
+    }
+
     /// `aisix:rl:{<bucket>}` — the hash tag co-locates every key for the
     /// bucket on one Redis Cluster slot.
     fn bucket_prefix(&self, key: &str) -> String {

@@ -316,3 +316,55 @@ async fn sentinel_shared_counter_round_trips() {
         "got {err:?}"
     );
 }
+
+#[tokio::test]
+async fn env_namespace_isolates_model_alias_bucket() {
+    // The model inline rate limit buckets on the env-local alias
+    // (`model:<name>`), which is NOT a globally-unique id. Two environments
+    // sharing one Redis must keep independent counters for the same alias —
+    // `with_env_namespace` is what separates them. (The api_key / policy
+    // buckets are UUIDs and never collided; the prefix just covers them too.)
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: RATELIMIT_TEST_REDIS_URL not set");
+        return;
+    };
+    // A shared run tag keeps the test hermetic; the env-a / env-b suffixes are
+    // what must isolate the two counters.
+    let run = unique_key("modelns");
+    let env_a_ns = format!("{run}:env-a");
+    let env_b_ns = format!("{run}:env-b");
+
+    let env_a = store(&url).await.with_env_namespace(&env_a_ns);
+    let env_b = store(&url).await.with_env_namespace(&env_b_ns);
+
+    // Identical alias bucket in both environments.
+    let key = "model:gpt-4o";
+    let limits = RateLimit {
+        rpm: Some(1),
+        ..rl()
+    };
+
+    // env-a burns its single rpm slot for the alias.
+    env_a
+        .acquire(key, &limits, "a-1")
+        .await
+        .expect("env-a first allowed");
+    env_a
+        .acquire(key, &limits, "a-2")
+        .await
+        .expect_err("env-a is now at its own limit");
+
+    // env-b, identical alias bucket, is unaffected — a distinct counter.
+    env_b
+        .acquire(key, &limits, "b-1")
+        .await
+        .expect("different env must not share the model:<alias> counter");
+
+    // Control: a second handle in env-a shares the exhausted counter, proving
+    // the isolation comes from the env namespace, not the handle identity.
+    let env_a2 = store(&url).await.with_env_namespace(&env_a_ns);
+    env_a2
+        .acquire(key, &limits, "a-3")
+        .await
+        .expect_err("same env shares the counter");
+}

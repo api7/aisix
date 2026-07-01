@@ -224,6 +224,69 @@ async fn put_then_get_round_trips_against_sentinel() {
     assert_eq!(got.message.content_str(), "via-master");
 }
 
+#[tokio::test]
+async fn env_namespace_isolates_identical_fingerprints() {
+    // Two environments pointed at the same (user-provided) Redis must not
+    // share cache entries even for a byte-identical request — the key is a
+    // content-only fingerprint, so `with_env_namespace` is the only thing
+    // keeping them apart.
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: CACHE_TEST_REDIS_URL not set");
+        return;
+    };
+    // Same base prefix for both handles, so any isolation is due to the env
+    // segment alone (not a stray unique prefix).
+    let base = format!("aisix:test:{}", uuid_like());
+
+    let env_a = RedisCache::connect(&single(&url))
+        .await
+        .expect("redis connect")
+        .with_prefix(base.clone())
+        .with_env_namespace("env-a");
+    let env_b = RedisCache::connect(&single(&url))
+        .await
+        .expect("redis connect")
+        .with_prefix(base.clone())
+        .with_env_namespace("env-b");
+
+    let key = "identical-fingerprint";
+    env_a.put(key, sample("answer for A")).await.unwrap();
+
+    // env-b must NOT see env-a's entry under the identical fingerprint.
+    assert!(
+        env_b.get(key).await.unwrap().is_none(),
+        "distinct env namespaces must not share cache entries"
+    );
+    // env-a still reads its own.
+    assert_eq!(
+        env_a
+            .get(key)
+            .await
+            .unwrap()
+            .expect("hit")
+            .message
+            .content_str(),
+        "answer for A"
+    );
+
+    // Control: empty env_id leaves the prefix unchanged, so a bare handle
+    // shares the base namespace (standalone / v2 behaviour is preserved).
+    let bare = RedisCache::connect(&single(&url))
+        .await
+        .expect("redis connect")
+        .with_prefix(base.clone());
+    let bare_ns = RedisCache::connect(&single(&url))
+        .await
+        .expect("redis connect")
+        .with_prefix(base.clone())
+        .with_env_namespace("");
+    bare.put("empty-env", sample("shared")).await.unwrap();
+    assert!(
+        bare_ns.get("empty-env").await.unwrap().is_some(),
+        "empty env_id must not change the namespace"
+    );
+}
+
 /// Cheap unique-ish suffix to keep tests from clobbering each other.
 /// We don't need cryptographic uniqueness — `cargo test` runs each test
 /// file in a single process, so nanos + thread-id give plenty of spread.

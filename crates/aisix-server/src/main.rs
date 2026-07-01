@@ -400,7 +400,8 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
                 .map_err(|e| {
                     anyhow::anyhow!("redis rate-limit connect failed (ratelimit.redis): {e}")
                 })?
-                .with_conc_ttl(cfg.ratelimit.concurrency_ttl_secs);
+                .with_conc_ttl(cfg.ratelimit.concurrency_ttl_secs)
+                .with_env_namespace(&cfg.etcd.env_id);
             Limiter::with_store(Arc::new(store))
         }
         RateLimitBackend::Memory => Limiter::new(),
@@ -420,12 +421,15 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     let redis_cache: Option<Arc<dyn Cache>> = match cfg.cache.redis.as_ref() {
         Some(redis_cfg) => {
             tracing::info!(target: "aisix::cache", backend = "redis", "connecting cache backend");
-            let redis = RedisCache::connect(redis_cfg).await.map_err(|e| {
-                // Deliberately no URL in the message: redis URLs carry
-                // credentials (redis://user:pass@host) and this error
-                // lands in logs that may ship to centralized sinks.
-                anyhow::anyhow!("redis cache connect failed (cache.redis): {e}")
-            })?;
+            let redis = RedisCache::connect(redis_cfg)
+                .await
+                .map_err(|e| {
+                    // Deliberately no URL in the message: redis URLs carry
+                    // credentials (redis://user:pass@host) and this error
+                    // lands in logs that may ship to centralized sinks.
+                    anyhow::anyhow!("redis cache connect failed (cache.redis): {e}")
+                })?
+                .with_env_namespace(&cfg.etcd.env_id);
             Some(Arc::new(redis) as Arc<dyn Cache>)
         }
         None => None,

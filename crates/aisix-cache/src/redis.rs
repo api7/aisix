@@ -76,6 +76,19 @@ impl RedisCache {
         self
     }
 
+    /// Namespace the prefix by the DP's environment id. The response-cache
+    /// key is a content-only fingerprint (`CacheKey`, no caller/env in it),
+    /// so two environments pointed at the same (user-provided) Redis would
+    /// otherwise serve each other's cached answers for an identical request.
+    /// Scoping the prefix to `<prefix>:<env_id>` keeps them isolated. Empty
+    /// `env_id` (standalone / v2 — no env cert) leaves the prefix unchanged.
+    pub fn with_env_namespace(mut self, env_id: &str) -> Self {
+        if !env_id.is_empty() {
+            self.prefix = format!("{}:{}", self.prefix, env_id);
+        }
+        self
+    }
+
     fn full_key(&self, key: &str) -> String {
         format!("{}:{}", self.prefix, key)
     }
