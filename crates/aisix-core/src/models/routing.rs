@@ -6,12 +6,19 @@
 //! Failures may retry the current target and then fall back to later
 //! targets.
 //!
-//! Three strategies (spec §3):
+//! Positional strategies (spec §3) pick a *starting* target, then walk
+//! forward on failure:
 //! - `round_robin`: cycle through targets in declaration order.
 //! - `weighted`: pick a target with probability proportional to its
 //!   `weight`; falls back to round-robin when weights are missing.
 //! - `failover`: always start at the first target; only move down the
 //!   list on failure.
+//!
+//! Metric-ordered strategies rank *all* targets by a runtime signal and
+//! attempt them best-first, falling forward down the ranked order:
+//! - `least_cost`: cheapest target first, by the target model's `cost`
+//!   (combined input+output per-1K price). Targets without a `cost` rank
+//!   last. See [`RoutingStrategy::is_metric_based`].
 
 use serde::{Deserialize, Serialize};
 
@@ -28,6 +35,20 @@ pub enum RoutingStrategy {
     /// after failure.
     #[default]
     Failover,
+    /// Rank targets cheapest-first by the target model's `cost` (combined
+    /// input+output per-1K price), then fall forward. Targets without a
+    /// configured `cost` rank last.
+    LeastCost,
+}
+
+impl RoutingStrategy {
+    /// Whether the strategy ranks the full target set by a runtime metric
+    /// (rather than picking a start index and walking positionally). These
+    /// strategies are ordered after target resolution, where each target's
+    /// Model and runtime state are available.
+    pub fn is_metric_based(&self) -> bool {
+        matches!(self, RoutingStrategy::LeastCost)
+    }
 }
 
 /// One destination in a routing configuration. `model` references a direct model alias.
@@ -219,6 +240,23 @@ mod tests {
     fn missing_weight_defaults_to_one() {
         let t = RoutingTarget::new("x");
         assert_eq!(t.weight_or_default(), 1);
+    }
+
+    #[test]
+    fn parses_least_cost_strategy() {
+        let r: Routing = serde_json::from_str(
+            r#"{"strategy":"least_cost","targets":[{"model":"a"},{"model":"b"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(r.strategy, RoutingStrategy::LeastCost);
+    }
+
+    #[test]
+    fn is_metric_based_classification() {
+        assert!(RoutingStrategy::LeastCost.is_metric_based());
+        assert!(!RoutingStrategy::Failover.is_metric_based());
+        assert!(!RoutingStrategy::RoundRobin.is_metric_based());
+        assert!(!RoutingStrategy::Weighted.is_metric_based());
     }
 
     #[test]

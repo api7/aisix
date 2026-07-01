@@ -84,6 +84,13 @@
           "enum": [
             "failover"
           ]
+        },
+        {
+          "description": "Rank targets cheapest-first by the target model's `cost` (combined input+output per-1K price), then fall forward. Targets without a configured `cost` rank last.",
+          "type": "string",
+          "enum": [
+            "least_cost"
+          ]
         }
       ]
     },
