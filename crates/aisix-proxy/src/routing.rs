@@ -416,7 +416,9 @@ pub(crate) fn filter_attempt_models(
 
 /// Per-request routing inputs threaded into [`resolve_attempt_models`]: the
 /// tags that gate tag/metadata routing and the stability key for sticky
-/// (A/B / canary) weighted selection. Both come from request headers.
+/// (A/B / canary) weighted selection. Tags come from request headers; the
+/// stability key is the routing-key header when present, otherwise the
+/// caller's API key id.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct RoutingRequest<'a> {
     pub tags: &'a [String],
