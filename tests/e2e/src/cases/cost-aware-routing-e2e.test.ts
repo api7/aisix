@@ -113,14 +113,12 @@ describe("cost-aware (least_cost) routing e2e", () => {
 
     // Gate on the routing model reaching the DP snapshot (probe would be
     // fine here since both targets are healthy, but listModels avoids any
-    // per-target request skew before baselines are taken).
+    // per-target request skew before baselines are taken). listModels reads
+    // etcd directly and shouldn't fail during propagation — let a genuine
+    // admin failure surface instead of masking it as a 30s timeout.
     await waitConfigPropagation(async () => {
-      try {
-        const models = await admin!.listModels();
-        return models.some((m) => m.display_name === "cost-virtual");
-      } catch {
-        return false;
-      }
+      const models = await admin!.listModels();
+      return models.some((m) => m.display_name === "cost-virtual");
     });
 
     const cheapBaseline = cheap.receivedRequests.length;
@@ -175,12 +173,8 @@ describe("cost-aware (least_cost) routing e2e", () => {
     });
 
     await waitConfigPropagation(async () => {
-      try {
-        const models = await admin!.listModels();
-        return models.some((m) => m.display_name === "cost-ff-virtual");
-      } catch {
-        return false;
-      }
+      const models = await admin!.listModels();
+      return models.some((m) => m.display_name === "cost-ff-virtual");
     });
 
     const cheapBaseline = cheap.receivedRequests.length;
