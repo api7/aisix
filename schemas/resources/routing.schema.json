@@ -84,6 +84,20 @@
           "enum": [
             "failover"
           ]
+        },
+        {
+          "description": "Rank targets cheapest-first by the target model's `cost` (combined input+output per-1K price), then fall forward. Targets without a configured `cost` rank last.",
+          "type": "string",
+          "enum": [
+            "least_cost"
+          ]
+        },
+        {
+          "description": "Rank targets fastest-first by a moving average of recent observed upstream latency (time-to-first-token for streaming), then fall forward. Targets with no samples yet rank first so they get probed.",
+          "type": "string",
+          "enum": [
+            "least_latency"
+          ]
         }
       ]
     },
