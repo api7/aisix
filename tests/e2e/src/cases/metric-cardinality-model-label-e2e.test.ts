@@ -109,9 +109,11 @@ describe("metric label cardinality for unresolved model (#911 [27])", () => {
     }
 
     // Fire many unique unknown model names at a typed endpoint. Each fails
-    // resolution (model-not-found) and records the request metric.
+    // resolution (model-not-found) and records the request metric — assert the
+    // error status rather than swallowing it, so a regression that started
+    // resolving these (and thus recording a real model label) is caught here.
     for (let i = 0; i < BOGUS_COUNT; i++) {
-      await fetch(`${app.proxyUrl}/v1/chat/completions`, {
+      const res = await fetch(`${app.proxyUrl}/v1/chat/completions`, {
         method: "POST",
         headers: {
           authorization: `Bearer ${CALLER_PLAINTEXT}`,
@@ -121,7 +123,9 @@ describe("metric label cardinality for unresolved model (#911 [27])", () => {
           model: `${BOGUS_PREFIX}${i}`,
           messages: [{ role: "user", content: "x" }],
         }),
-      }).catch(() => {});
+      });
+      await res.text();
+      expect(res.ok).toBe(false);
     }
 
     const scrape = await fetch(`${app.metricsUrl}/metrics`).then((r) => r.text());

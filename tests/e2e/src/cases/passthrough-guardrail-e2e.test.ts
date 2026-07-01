@@ -148,6 +148,19 @@ describe("passthrough guardrail (#911 [6])", () => {
       return;
     }
 
+    // Self-synchronize on the INPUT guardrail loading (independent of the
+    // output-block test above): a forbidden-input request is blocked 422 only
+    // once the chain is live. A blocked request never reaches the upstream, so
+    // polling here doesn't perturb the hit-count assertion below.
+    await waitConfigPropagation(async () => {
+      const probe = await passthrough({
+        model: "gpt-4o-mini",
+        messages: [{ role: "user", content: `probe ${FORBIDDEN_INPUT}` }],
+      });
+      await probe.text();
+      return probe.status === 422;
+    });
+
     const hitsBefore = upstream.receivedRequests.length;
 
     const res = await passthrough({

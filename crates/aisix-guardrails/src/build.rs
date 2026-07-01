@@ -402,7 +402,13 @@ impl MandatoryGuardrail {
                     reason = %reason,
                     "mandatory guardrail could not evaluate; blocking (mandatory=true overrides fail_open)",
                 );
-                GuardrailVerdict::block(format!("mandatory guardrail unavailable: {reason}"))
+                // Carry the row name so downstream handlers can name the
+                // guardrail in the 422 envelope (#519 B.4b) — `block()` would
+                // drop it to `None` and surface an unnamed content-filter block.
+                GuardrailVerdict::Block {
+                    reason: format!("mandatory guardrail unavailable: {reason}"),
+                    guardrail_name: Some(self.row_name.clone()),
+                }
             }
             other => other,
         }
@@ -968,14 +974,24 @@ mod tests {
     async fn mandatory_upgrades_bypass_to_block() {
         let g = apply_mandatory(&row_with_mandatory(true), Arc::new(AlwaysBypass));
         let vin = g.check_input(&req("hi")).await;
-        assert!(
-            vin.is_block(),
-            "mandatory input Bypass must become Block, got {vin:?}",
+        // The block must carry the row name so the 422 envelope can name the
+        // guardrail (#519 B.4b) rather than surfacing an unnamed block.
+        assert_eq!(
+            vin,
+            GuardrailVerdict::Block {
+                reason: "mandatory guardrail unavailable: upstream_unreachable".to_string(),
+                guardrail_name: Some("remote".to_string()),
+            },
+            "mandatory input Bypass must become a named Block, got {vin:?}",
         );
         let vout = g.check_output(&resp("hi")).await;
-        assert!(
-            vout.is_block(),
-            "mandatory output Bypass must become Block, got {vout:?}",
+        assert_eq!(
+            vout,
+            GuardrailVerdict::Block {
+                reason: "mandatory guardrail unavailable: upstream_unreachable".to_string(),
+                guardrail_name: Some("remote".to_string()),
+            },
+            "mandatory output Bypass must become a named Block, got {vout:?}",
         );
     }
 

@@ -198,7 +198,6 @@ async fn dispatch(
     req: Request,
     request_id: &str,
 ) -> Result<(Response, String), ProxyError> {
-    let _reservation = crate::quota::enforce(&state, auth, None).await?;
     let snapshot = state.snapshot.load();
 
     // Find a model for this provider so we can borrow its provider_key.
@@ -336,6 +335,11 @@ async fn dispatch(
             ));
         }
     }
+
+    // Reserve the rate-limit layers AFTER the input guardrail so a content
+    // block doesn't burn an RPM slot, matching the typed endpoints. Passthrough
+    // has no resolved model, so only the api-key/team/member layers apply.
+    let _reservation = crate::quota::enforce(&state, auth, None).await?;
 
     let client = crate::http_client::client();
     let mut builder = client.request(method.clone(), &url);
