@@ -14,7 +14,9 @@
 //! 7. Call `bridge.complete(body, ctx)` → JSON response.
 //! 8. Providers that don't support completions return 501.
 
-use aisix_gateway::{BridgeContext, BridgeError, ChatMessage, ChatResponse, FinishReason, UsageStats};
+use aisix_gateway::{
+    BridgeContext, BridgeError, ChatMessage, ChatResponse, FinishReason, UsageStats,
+};
 use aisix_obs::{AccessLog, RequestOutcome, UsageEvent};
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -308,7 +310,10 @@ async fn dispatch(
                         "guardrail blocked /v1/completions response",
                     );
                     return Err(ProxyError::ContentFiltered(
-                        crate::error::guardrail_block_message("response", guardrail_name.as_deref()),
+                        crate::error::guardrail_block_message(
+                            "response",
+                            guardrail_name.as_deref(),
+                        ),
                     ));
                 }
             }

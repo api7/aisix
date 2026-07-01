@@ -454,7 +454,10 @@ async fn dispatch(
     // #911 [21]: commit the reserved layers with the actual token cost so
     // TPM/TPD is enforced for /v1/rerank like chat + embeddings. Pre-fix the
     // reservation dropped uncommitted and the token counter never moved.
-    let total_tokens = usage.as_ref().map(|u| u64::from(u.prompt_tokens)).unwrap_or(0);
+    let total_tokens = usage
+        .as_ref()
+        .map(|u| u64::from(u.prompt_tokens))
+        .unwrap_or(0);
     reservation.commit_tokens(total_tokens).await;
 
     Ok(RerankDispatchSuccess {
