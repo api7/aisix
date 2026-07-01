@@ -457,7 +457,11 @@ pub struct Guardrail {
     #[serde(default = "default_enforcement_mode")]
     pub enforcement_mode: String,
 
-    /// Whether guardrail evaluation errors should be fatal. Stored for compatibility. Current enforcement still follows `fail_open`.
+    /// Whether guardrail evaluation errors are fatal. When `true`, a remote
+    /// guardrail that can't reach its upstream blocks the request instead of
+    /// failing open — it overrides `fail_open` on the failure path (the DP
+    /// wraps the row in a MandatoryGuardrail that turns a `Bypass` into a
+    /// `Block`). Default `false` keeps the `fail_open` behaviour.
     #[serde(default)]
     pub mandatory: bool,
 
