@@ -441,10 +441,15 @@ async fn multipart_dispatch(
     }
 
     let client = crate::http_client::client();
-    let resp = client
-        .post(&url)
-        .headers(headers)
-        .multipart(form)
+    let mut req = client.post(&url).headers(headers).multipart(form);
+    // #554/#911: audio transcription/translation is non-streaming; apply the
+    // per-model E2E request timeout like the other direct-upstream paths
+    // (count_tokens/rerank/responses) so a slow/blackholed audio provider
+    // fails over and the model's timeout cooldown can engage.
+    if let Some(d) = model.request_timeout() {
+        req = req.timeout(d);
+    }
+    let resp = req
         .send()
         .await
         .map_err(|e| {
@@ -647,10 +652,16 @@ async fn speech_dispatch(
     }
 
     let client = crate::http_client::client();
-    let resp = client
+    let mut req = client
         .post(crate::dispatch::build_v1_url(&base, "/audio/speech"))
         .headers(headers)
-        .json(&body)
+        .json(&body);
+    // #554/#911: speech synthesis is non-streaming; apply the per-model E2E
+    // request timeout (same as count_tokens/rerank/responses).
+    if let Some(d) = model.request_timeout() {
+        req = req.timeout(d);
+    }
+    let resp = req
         .send()
         .await
         .map_err(|e| {

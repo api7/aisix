@@ -373,6 +373,14 @@ async fn dispatch(
         builder = builder.body(body_bytes);
     }
 
+    // #554/#911: bound the raw tunnel by the selected model's E2E request
+    // timeout, matching the first-class non-streaming paths. Without it a
+    // slow/blackholed upstream could pin a passthrough connection open
+    // indefinitely regardless of the model's configured timeout.
+    if let Some(d) = model.request_timeout() {
+        builder = builder.timeout(d);
+    }
+
     let upstream_resp = builder
         .send()
         .await
