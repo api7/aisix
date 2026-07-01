@@ -3730,7 +3730,13 @@ fn add_variant_titles(doc: &mut Value) {
         ),
         (
             "/components/schemas/RoutingStrategy/oneOf",
-            &["Round robin", "Weighted", "Failover", "Least cost"],
+            &[
+                "Round robin",
+                "Weighted",
+                "Failover",
+                "Least cost",
+                "Least latency",
+            ],
         ),
         (
             "/components/schemas/SlsContentMode/oneOf",

@@ -18,7 +18,12 @@
 //! attempt them best-first, falling forward down the ranked order:
 //! - `least_cost`: cheapest target first, by the target model's `cost`
 //!   (combined input+output per-1K price). Targets without a `cost` rank
-//!   last. See [`RoutingStrategy::is_metric_based`].
+//!   last.
+//! - `least_latency`: fastest target first, by a moving average of recent
+//!   observed upstream latency (time-to-first-token for streaming). Targets
+//!   with no latency samples yet rank first so they get probed.
+//!
+//! See [`RoutingStrategy::is_metric_based`].
 
 use serde::{Deserialize, Serialize};
 
@@ -39,6 +44,10 @@ pub enum RoutingStrategy {
     /// input+output per-1K price), then fall forward. Targets without a
     /// configured `cost` rank last.
     LeastCost,
+    /// Rank targets fastest-first by a moving average of recent observed
+    /// upstream latency (time-to-first-token for streaming), then fall
+    /// forward. Targets with no samples yet rank first so they get probed.
+    LeastLatency,
 }
 
 impl RoutingStrategy {
@@ -47,7 +56,10 @@ impl RoutingStrategy {
     /// strategies are ordered after target resolution, where each target's
     /// Model and runtime state are available.
     pub fn is_metric_based(&self) -> bool {
-        matches!(self, RoutingStrategy::LeastCost)
+        matches!(
+            self,
+            RoutingStrategy::LeastCost | RoutingStrategy::LeastLatency
+        )
     }
 }
 
@@ -243,17 +255,23 @@ mod tests {
     }
 
     #[test]
-    fn parses_least_cost_strategy() {
-        let r: Routing = serde_json::from_str(
+    fn parses_metric_strategies() {
+        let cost: Routing = serde_json::from_str(
             r#"{"strategy":"least_cost","targets":[{"model":"a"},{"model":"b"}]}"#,
         )
         .unwrap();
-        assert_eq!(r.strategy, RoutingStrategy::LeastCost);
+        assert_eq!(cost.strategy, RoutingStrategy::LeastCost);
+        let latency: Routing = serde_json::from_str(
+            r#"{"strategy":"least_latency","targets":[{"model":"a"},{"model":"b"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(latency.strategy, RoutingStrategy::LeastLatency);
     }
 
     #[test]
     fn is_metric_based_classification() {
         assert!(RoutingStrategy::LeastCost.is_metric_based());
+        assert!(RoutingStrategy::LeastLatency.is_metric_based());
         assert!(!RoutingStrategy::Failover.is_metric_based());
         assert!(!RoutingStrategy::RoundRobin.is_metric_based());
         assert!(!RoutingStrategy::Weighted.is_metric_based());

@@ -225,6 +225,10 @@ struct RuntimeEntry {
     last_checked_at: Option<SystemTime>,
     last_check_status: Option<u16>,
     status_reason: Option<String>,
+    /// Exponentially-weighted moving average of recent observed upstream
+    /// latency in milliseconds. `None` until the first sample. Drives the
+    /// `least_latency` routing strategy; independent of health/cooldown.
+    latency_ewma_ms: Option<f64>,
 }
 
 impl RuntimeEntry {
@@ -331,6 +335,12 @@ impl Entry {
 pub struct HealthTracker {
     entries: DashMap<String, Entry>,
 }
+
+/// Smoothing factor for the per-target latency EWMA. Higher = more weight on
+/// the most recent sample (faster reaction to a slowing upstream), lower =
+/// smoother. 0.3 balances reacting to a real regression against per-request
+/// jitter, roughly matching LiteLLM's last-10-samples moving average.
+const LATENCY_EWMA_ALPHA: f64 = 0.3;
 
 #[derive(Default, Debug)]
 pub struct ModelRuntimeStatusTracker {
@@ -453,6 +463,30 @@ impl ModelRuntimeStatusTracker {
                 status_reason: Some(reason),
                 ..RuntimeEntry::default()
             });
+    }
+
+    /// Fold a fresh latency sample (ms) into the target's EWMA. Called on
+    /// each successful upstream attempt; drives the `least_latency` routing
+    /// strategy. Independent of health/cooldown state.
+    pub fn record_latency(&self, model_id: &str, latency_ms: u32) {
+        let sample = f64::from(latency_ms);
+        self.entries
+            .entry(model_id.to_string())
+            .and_modify(|entry| {
+                entry.latency_ewma_ms = Some(match entry.latency_ewma_ms {
+                    Some(prev) => LATENCY_EWMA_ALPHA * sample + (1.0 - LATENCY_EWMA_ALPHA) * prev,
+                    None => sample,
+                });
+            })
+            .or_insert_with(|| RuntimeEntry {
+                latency_ewma_ms: Some(sample),
+                ..RuntimeEntry::default()
+            });
+    }
+
+    /// Current latency EWMA (ms) for `model_id`, or `None` if never sampled.
+    pub fn latency_ewma_ms(&self, model_id: &str) -> Option<f64> {
+        self.entries.get(model_id).and_then(|e| e.latency_ewma_ms)
     }
 
     pub fn status(&self, model_id: &str) -> RuntimeStatusSnapshot {

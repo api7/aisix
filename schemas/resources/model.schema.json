@@ -436,6 +436,13 @@
             "least_cost"
           ],
           "type": "string"
+        },
+        {
+          "description": "Rank targets fastest-first by a moving average of recent observed upstream latency (time-to-first-token for streaming), then fall forward. Targets with no samples yet rank first so they get probed.",
+          "enum": [
+            "least_latency"
+          ],
+          "type": "string"
         }
       ]
     },
