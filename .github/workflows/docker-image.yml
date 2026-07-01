@@ -39,6 +39,7 @@ env:
 permissions:
   contents: read
   packages: write
+  id-token: write # keyless cosign signing via GitHub OIDC
 
 concurrency:
   group: docker-image-${{ github.ref }}
@@ -108,6 +109,7 @@ jobs:
         run: echo "value=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
 
       - name: Build and push
+        id: build
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -119,6 +121,31 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: false   # keep manifest format compatible with older clients
+
+      - name: Install cosign
+        if: github.event_name != 'pull_request'
+        uses: sigstore/cosign-installer@v3
+
+      # Keyless (GitHub OIDC) signature over the pushed image digest, same
+      # scheme as api7-ee-3-gateway. Tags sharing a digest collapse to one
+      # signature; signatures land in a sibling <registry>/api7/notary repo,
+      # so `cosign verify` must set COSIGN_REPOSITORY to the same value.
+      - name: Sign images with cosign
+        if: github.event_name != 'pull_request'
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          signed=""
+          for ref in ${TAGS}; do
+            repo="${ref%:*}"
+            case " ${signed} " in *" ${repo} "*) continue ;; esac
+            signed="${signed} ${repo}"
+            registry="${repo%%/*}"
+            echo "Signing ${repo}@${DIGEST} (notary: ${registry}/api7/notary)"
+            COSIGN_REPOSITORY="${registry}/api7/notary" \
+              cosign sign --yes --recursive "${repo}@${DIGEST}"
+          done
 
       - name: Check OpenAPI publishing secrets
         id: openapi-secrets
