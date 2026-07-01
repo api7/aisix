@@ -44,6 +44,7 @@ mod http_client;
 mod images;
 mod mcp;
 mod messages;
+mod model_resolve;
 mod models;
 mod passthrough;
 mod quota;

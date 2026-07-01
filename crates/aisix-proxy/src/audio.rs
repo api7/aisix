@@ -363,9 +363,7 @@ async fn multipart_dispatch(
         .ok_or_else(|| ProxyError::InvalidRequest("`model` field missing from form".into()))?;
 
     let snapshot = state.snapshot.load();
-    let model_entry = snapshot
-        .models
-        .get_by_name(&model_name)
+    let model_entry = crate::model_resolve::resolve_model(&snapshot, &model_name)
         .ok_or_else(|| ProxyError::ModelNotFound(model_name.clone()))?;
 
     if !auth.key().can_access(&model_name) {
@@ -543,9 +541,7 @@ async fn speech_dispatch(
         .to_string();
 
     let snapshot = state.snapshot.load();
-    let model_entry = snapshot
-        .models
-        .get_by_name(&model_name)
+    let model_entry = crate::model_resolve::resolve_model(&snapshot, &model_name)
         .ok_or_else(|| ProxyError::ModelNotFound(model_name.clone()))?;
 
     if !auth.key().can_access(&model_name) {

@@ -249,9 +249,7 @@ async fn dispatch(
 ) -> Result<EmbedDispatchSuccess, ProxyError> {
     let snapshot = state.snapshot.load();
 
-    let model_entry = snapshot
-        .models
-        .get_by_name(&body.model)
+    let model_entry = crate::model_resolve::resolve_model(&snapshot, &body.model)
         .ok_or_else(|| ProxyError::ModelNotFound(body.model.clone()))?;
 
     if !auth.key().can_access(&body.model) {

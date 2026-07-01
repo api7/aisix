@@ -193,9 +193,7 @@ async fn dispatch(
         .ok_or_else(|| ProxyError::InvalidRequest("`model` field missing".into()))?
         .to_string();
 
-    let model_entry = snapshot
-        .models
-        .get_by_name(&model_name)
+    let model_entry = crate::model_resolve::resolve_model(&snapshot, &model_name)
         .ok_or_else(|| ProxyError::ModelNotFound(model_name.clone()))?;
 
     if !auth.key().can_access(&model_name) {

@@ -75,12 +75,14 @@ impl ApiKey {
 
     /// True if this key is allowed to call the given Model.
     ///
-    /// A wildcard entry `"*"` grants access to every model. An empty
-    /// `allowed_models` list denies everything (spec §3 authz rule).
+    /// Entries are matched as single-`*` globs, so `"*"` grants every model and
+    /// `"openai/*"` grants every `openai/*` name (pairing with wildcard Models);
+    /// entries without a `*` match exactly. An empty `allowed_models` list denies
+    /// everything (spec §3 authz rule).
     pub fn can_access(&self, model_name: &str) -> bool {
         self.allowed_models
             .iter()
-            .any(|n| n == "*" || n == model_name)
+            .any(|n| crate::wildcard::wildcard_matches(n, model_name))
     }
 
     /// True if this key may call the given MCP tool, named in the gateway's
@@ -96,22 +98,15 @@ impl ApiKey {
         }
     }
 
-    /// Iterate over the names of models this key may access, filtering
-    /// them against a known universe of model names. The `*` wildcard
-    /// expands to the full universe so callers don't have to special-case
-    /// it themselves.
+    /// Iterate over the names of models this key may access, filtering them
+    /// against a known universe of model names. Delegates to [`Self::can_access`]
+    /// so glob entries stay consistent with per-request authz: `*` expands to
+    /// the full universe and `openai/*` to every matching name.
     pub fn accessible_models<'a>(
         &'a self,
         all_models: impl Iterator<Item = &'a str> + 'a,
     ) -> Vec<&'a str> {
-        let has_wildcard = self.allowed_models.iter().any(|n| n == "*");
-        if has_wildcard {
-            all_models.collect()
-        } else {
-            all_models
-                .filter(|name| self.allowed_models.iter().any(|n| n.as_str() == *name))
-                .collect()
-        }
+        all_models.filter(|name| self.can_access(name)).collect()
     }
 }
 
@@ -239,6 +234,26 @@ mod tests {
             serde_json::from_str(r#"{"key_hash":"abc","allowed_models":["*"]}"#).unwrap();
         assert!(k.can_access("my-gpt4"));
         assert!(k.can_access("literally-anything"));
+    }
+
+    #[test]
+    fn glob_entry_grants_matching_names() {
+        let k: ApiKey =
+            serde_json::from_str(r#"{"key_hash":"abc","allowed_models":["openai/*"]}"#).unwrap();
+        assert!(k.can_access("openai/gpt-4o"));
+        assert!(k.can_access("openai/gpt-4o-mini"));
+        assert!(!k.can_access("anthropic/claude"));
+        assert!(!k.can_access("openai")); // prefix must be followed by the glob
+    }
+
+    #[test]
+    fn accessible_models_honors_glob_entry() {
+        let k: ApiKey =
+            serde_json::from_str(r#"{"key_hash":"abc","allowed_models":["openai/*"]}"#).unwrap();
+        let universe = ["openai/gpt-4o", "openai/o1", "anthropic/claude"];
+        let mut accessible = k.accessible_models(universe.iter().copied());
+        accessible.sort_unstable();
+        assert_eq!(accessible, vec!["openai/gpt-4o", "openai/o1"]);
     }
 
     #[test]

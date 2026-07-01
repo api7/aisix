@@ -58,12 +58,14 @@ pub async fn list_models(
 
     // Collect the names of all non-routing models (routing aliases are
     // implementation detail, not something callers PUT into requests).
+    // Wildcard aliases (`provider/*`) are patterns, not concrete ids a caller
+    // can request by name, so they're excluded too.
     // Then filter to what the authenticated key may access.
     let all_names: Vec<String> = snapshot
         .models
         .entries()
         .into_iter()
-        .filter(|e| !e.value.is_routing())
+        .filter(|e| !e.value.is_routing() && !e.value.display_name.contains('*'))
         .map(|e| e.value.display_name.clone())
         .collect();
 
@@ -286,6 +288,32 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let data = v["data"].as_array().unwrap();
         // Only gpt4, not smart-router.
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0]["id"], "gpt4");
+    }
+
+    #[tokio::test]
+    async fn wildcard_models_are_excluded_from_list() {
+        let snap = new_snap();
+        snap.models.insert(model_entry("m1", "gpt4"));
+        // A `provider/*` wildcard alias is a pattern, not a concrete id.
+        snap.models.insert(model_entry("w1", "openai/*"));
+        snap.apikeys.insert(apikey_entry("sk-caller", &["*"]));
+
+        let app = build_app(snap);
+        let req = Request::builder()
+            .method("GET")
+            .uri("/v1/models")
+            .header("authorization", "Bearer sk-caller")
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let data = v["data"].as_array().unwrap();
+        // Only the concrete gpt4, not the `openai/*` pattern.
         assert_eq!(data.len(), 1);
         assert_eq!(data[0]["id"], "gpt4");
     }

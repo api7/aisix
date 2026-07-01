@@ -21,6 +21,7 @@ pub mod error;
 pub mod models;
 pub mod resource;
 pub mod snapshot;
+pub mod wildcard;
 
 pub use config::{
     AdminConfig, CacheBackend, CacheConfig, Config, EtcdConfig, EtcdTlsConfig, ManagedConfig,

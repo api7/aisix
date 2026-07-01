@@ -786,9 +786,10 @@ async fn dispatch(
             .iter()
             .map(|e| &e.value),
     );
-    let virtual_entry = snapshot.models.get_by_name(&req.model).ok_or_else(|| {
-        DispatchFailure::new(None, None, ProxyError::ModelNotFound(req.model.clone()))
-    })?;
+    let virtual_entry =
+        crate::model_resolve::resolve_model(&snapshot, &req.model).ok_or_else(|| {
+            DispatchFailure::new(None, None, ProxyError::ModelNotFound(req.model.clone()))
+        })?;
     let model_id = virtual_entry.id.clone();
 
     // Every error from here on attaches the resolved model_id so the

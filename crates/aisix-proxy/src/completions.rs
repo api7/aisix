@@ -195,9 +195,7 @@ async fn dispatch(
 
     let snapshot = state.snapshot.load();
 
-    let model_entry = snapshot
-        .models
-        .get_by_name(model_name)
+    let model_entry = crate::model_resolve::resolve_model(&snapshot, model_name)
         .ok_or_else(|| ProxyError::ModelNotFound(model_name.to_string()))?;
 
     if !auth.key().can_access(model_name) {
