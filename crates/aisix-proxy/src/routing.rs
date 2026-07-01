@@ -162,6 +162,43 @@ impl std::fmt::Debug for RoutingRegistry {
     }
 }
 
+/// Narrow a routing model's targets to those eligible for this request's
+/// routing tags, mirroring LiteLLM's tag-based routing:
+///   * No target is tagged → tag routing isn't in use; every target eligible.
+///   * Request carries tags → targets whose tags intersect it (match-any); if
+///     none match, fall back to `"default"`-tagged targets.
+///   * Request has no tags → `"default"`-tagged targets if any, else all.
+///
+/// Returns owned clones so the caller runs the normal strategy over the
+/// surviving subset. An empty result means the request asked for a tag tier
+/// with no matching target and no default — the caller turns that into an error.
+fn eligible_targets(targets: &[RoutingTarget], request_tags: &[String]) -> Vec<RoutingTarget> {
+    if !targets.iter().any(RoutingTarget::has_tags) {
+        return targets.to_vec();
+    }
+    let defaults = || -> Vec<RoutingTarget> {
+        targets
+            .iter()
+            .filter(|t| t.is_default_target())
+            .cloned()
+            .collect()
+    };
+    if request_tags.is_empty() {
+        let d = defaults();
+        return if d.is_empty() { targets.to_vec() } else { d };
+    }
+    let matched: Vec<RoutingTarget> = targets
+        .iter()
+        .filter(|t| t.matches_request_tags(request_tags))
+        .cloned()
+        .collect();
+    if matched.is_empty() {
+        defaults()
+    } else {
+        matched
+    }
+}
+
 /// Build the target-order vector starting at `start_idx`, walking forward
 /// (wrap-around) for `limit` distinct entries.
 fn attempt_order(targets: &[RoutingTarget], start_idx: usize, limit: usize) -> Vec<String> {
@@ -355,6 +392,7 @@ pub(crate) fn resolve_attempt_models(
     virtual_name: &str,
     virtual_id: &str,
     virtual_model: &Model,
+    request_tags: &[String],
 ) -> Result<Vec<AttemptModel>, ProxyError> {
     let Some(routing) = virtual_model.routing.as_ref() else {
         return Ok(vec![AttemptModel {
@@ -362,6 +400,21 @@ pub(crate) fn resolve_attempt_models(
             model: virtual_model.clone(),
         }]);
     };
+
+    // Tag/metadata pre-filter: narrow the targets to those eligible for this
+    // request's routing tags, then let the configured strategy order whatever
+    // survives. A no-op when no target is tagged.
+    let eligible = eligible_targets(&routing.targets, request_tags);
+    if eligible.is_empty() {
+        return Err(ProxyError::InvalidRequest(format!(
+            "no routing target matches request tags {request_tags:?}"
+        )));
+    }
+    let filtered_routing = Routing {
+        targets: eligible,
+        ..routing.clone()
+    };
+    let routing = &filtered_routing;
 
     let names = routing_registry.pick_targets(virtual_name, routing);
     if names.is_empty() {
@@ -423,6 +476,67 @@ mod tests {
             retry_on_429: None,
             when_all_unavailable: None,
         }
+    }
+
+    fn tagged(model: &str, tags: &[&str]) -> RoutingTarget {
+        RoutingTarget::new(model).with_tags(tags.iter().map(|s| s.to_string()).collect())
+    }
+
+    fn model_names(targets: &[RoutingTarget]) -> Vec<&str> {
+        targets.iter().map(|t| t.model.as_str()).collect()
+    }
+
+    #[test]
+    fn eligible_no_tagged_target_returns_all() {
+        // No target is tagged → tag routing isn't in use, even with request tags.
+        let targets = vec![RoutingTarget::new("a"), RoutingTarget::new("b")];
+        assert_eq!(
+            model_names(&eligible_targets(&targets, &["x".into()])),
+            vec!["a", "b"]
+        );
+    }
+
+    #[test]
+    fn eligible_matches_any_overlapping_tag() {
+        let targets = vec![tagged("eu", &["eu"]), tagged("us", &["us"])];
+        assert_eq!(
+            model_names(&eligible_targets(&targets, &["eu".into()])),
+            vec!["eu"]
+        );
+    }
+
+    #[test]
+    fn eligible_tagged_no_match_falls_back_to_default() {
+        let targets = vec![tagged("eu", &["eu"]), tagged("fallback", &["default"])];
+        assert_eq!(
+            model_names(&eligible_targets(&targets, &["apac".into()])),
+            vec!["fallback"]
+        );
+    }
+
+    #[test]
+    fn eligible_untagged_request_prefers_default() {
+        let targets = vec![tagged("eu", &["eu"]), tagged("fallback", &["default"])];
+        assert_eq!(
+            model_names(&eligible_targets(&targets, &[])),
+            vec!["fallback"]
+        );
+    }
+
+    #[test]
+    fn eligible_untagged_request_without_default_returns_all() {
+        let targets = vec![tagged("eu", &["eu"]), tagged("us", &["us"])];
+        assert_eq!(
+            model_names(&eligible_targets(&targets, &[])),
+            vec!["eu", "us"]
+        );
+    }
+
+    #[test]
+    fn eligible_tagged_no_match_no_default_is_empty() {
+        // The caller turns an empty result into a "no target matches tags" error.
+        let targets = vec![tagged("eu", &["eu"]), tagged("us", &["us"])];
+        assert!(eligible_targets(&targets, &["apac".into()]).is_empty());
     }
 
     #[test]

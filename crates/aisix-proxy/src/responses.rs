@@ -356,6 +356,7 @@ async fn dispatch(
         &model_name,
         &model_entry.id,
         &model_entry.value,
+        &client.routing_tags,
     )?;
     let retry_on_429 = model_entry
         .value

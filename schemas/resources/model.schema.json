@@ -462,6 +462,14 @@
           "minLength": 1,
           "type": "string"
         },
+        "tags": {
+          "description": "Tags for tag/metadata-conditional routing. When a request carries routing tags, only targets whose tags intersect the request's are eligible; a target tagged `\"default\"` is the fallback used when nothing matches and for untagged requests. Absent/empty means the target opts out of tag filtering (eligible only via the default fallback once any sibling target is tagged). The configured strategy then orders whatever set survives.",
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": "array"
+        },
         "weight": {
           "description": "Target weight for `weighted` routing. Other strategies ignore this field.",
           "format": "uint32",

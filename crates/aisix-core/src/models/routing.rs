@@ -78,13 +78,27 @@ pub struct RoutingTarget {
     /// Target weight for `weighted` routing. Other strategies ignore this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub weight: Option<u32>,
+    /// Tags for tag/metadata-conditional routing. When a request carries
+    /// routing tags, only targets whose tags intersect the request's are
+    /// eligible; a target tagged `"default"` is the fallback used when nothing
+    /// matches and for untagged requests. Absent/empty means the target opts
+    /// out of tag filtering (eligible only via the default fallback once any
+    /// sibling target is tagged). The configured strategy then orders whatever
+    /// set survives.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(inner(length(min = 1)))]
+    pub tags: Option<Vec<String>>,
 }
+
+/// Reserved tag marking a target as the fallback when no tag matches.
+pub const DEFAULT_ROUTING_TAG: &str = "default";
 
 impl RoutingTarget {
     pub fn new(model: impl Into<String>) -> Self {
         Self {
             model: model.into(),
             weight: None,
+            tags: None,
         }
     }
 
@@ -93,8 +107,32 @@ impl RoutingTarget {
         self
     }
 
+    pub fn with_tags(mut self, tags: Vec<String>) -> Self {
+        self.tags = Some(tags);
+        self
+    }
+
     pub fn weight_or_default(&self) -> u32 {
         self.weight.unwrap_or(1)
+    }
+
+    /// True if this target carries at least one tag.
+    pub fn has_tags(&self) -> bool {
+        self.tags.as_ref().is_some_and(|t| !t.is_empty())
+    }
+
+    /// True if this target is the `"default"` fallback.
+    pub fn is_default_target(&self) -> bool {
+        self.tags
+            .as_ref()
+            .is_some_and(|t| t.iter().any(|tag| tag == DEFAULT_ROUTING_TAG))
+    }
+
+    /// True if any of this target's tags appears in `request_tags` (match-any).
+    pub fn matches_request_tags(&self, request_tags: &[String]) -> bool {
+        self.tags
+            .as_ref()
+            .is_some_and(|t| t.iter().any(|tag| request_tags.iter().any(|r| r == tag)))
     }
 }
 
@@ -257,6 +295,21 @@ mod tests {
     fn missing_weight_defaults_to_one() {
         let t = RoutingTarget::new("x");
         assert_eq!(t.weight_or_default(), 1);
+    }
+
+    #[test]
+    fn target_tags_parse_and_predicates() {
+        let r: Routing = serde_json::from_str(
+            r#"{"targets":[{"model":"a","tags":["eu","premium"]},{"model":"b","tags":["default"]},{"model":"c"}]}"#,
+        )
+        .unwrap();
+        assert!(r.targets[0].has_tags());
+        assert!(!r.targets[0].is_default_target());
+        assert!(r.targets[0].matches_request_tags(&["premium".into()]));
+        assert!(!r.targets[0].matches_request_tags(&["apac".into()]));
+        assert!(r.targets[1].is_default_target());
+        assert!(!r.targets[2].has_tags());
+        assert!(!r.targets[2].matches_request_tags(&["eu".into()]));
     }
 
     #[test]

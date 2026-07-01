@@ -114,12 +114,20 @@ fn parse_forwarded_token(tok: &str) -> Option<IpAddr> {
     None
 }
 
+/// Header carrying request-scoped routing tags for tag/metadata-conditional
+/// routing (comma-separated). Read out-of-band from the request headers so the
+/// tags never reach the upstream request body.
+pub const ROUTING_TAGS_HEADER: &str = "x-aisix-routing-tags";
+
 /// Per-request client attribution. Resolved once via the extractor and
 /// threaded into the usage event by each handler's emit fn.
 #[derive(Debug, Clone, Default)]
 pub struct ClientContext {
     pub source_ip: String,
     pub user_agent: String,
+    /// Routing tags from [`ROUTING_TAGS_HEADER`], used to select among a
+    /// routing model's tagged targets. Empty when the header is absent.
+    pub routing_tags: Vec<String>,
 }
 
 #[axum::async_trait]
@@ -154,11 +162,28 @@ where
             .map(|s| crate::chat::sanitize_tag(s.to_string()))
             .unwrap_or_default();
 
+        let routing_tags = parts
+            .headers
+            .get(ROUTING_TAGS_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .map(parse_routing_tags)
+            .unwrap_or_default();
+
         Ok(ClientContext {
             source_ip,
             user_agent,
+            routing_tags,
         })
     }
+}
+
+/// Split a comma-separated routing-tags header into trimmed, non-empty tags.
+fn parse_routing_tags(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 #[cfg(test)]
@@ -170,6 +195,16 @@ mod tests {
     }
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
+    }
+
+    #[test]
+    fn parse_routing_tags_splits_trims_and_drops_empties() {
+        assert_eq!(
+            parse_routing_tags("eu, premium ,,us"),
+            vec!["eu", "premium", "us"]
+        );
+        assert!(parse_routing_tags("").is_empty());
+        assert!(parse_routing_tags("  ,  ").is_empty());
     }
 
     #[test]

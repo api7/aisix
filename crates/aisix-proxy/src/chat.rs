@@ -902,6 +902,7 @@ async fn dispatch(
                 &req.model,
                 &virtual_entry.id,
                 &virtual_entry.value,
+                &client.routing_tags,
             )
             .map_err(&with_model)?;
             (attempts, None)

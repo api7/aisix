@@ -91,7 +91,7 @@ pub async fn count_tokens(
         .unwrap_or("")
         .to_string();
 
-    match dispatch(&state, &auth, &body, &request_id, &client.source_ip).await {
+    match dispatch(&state, &auth, &body, &request_id, &client).await {
         Ok((resp, provider)) => {
             let elapsed = started.elapsed();
             let status = resp.status().as_u16();
@@ -142,7 +142,7 @@ async fn dispatch(
     auth: &AuthenticatedKey,
     body: &Value,
     request_id: &str,
-    source_ip: &str,
+    client: &ClientContext,
 ) -> Result<(Response, String), ProxyError> {
     let snapshot = state.snapshot.load();
 
@@ -160,7 +160,7 @@ async fn dispatch(
     }
 
     // Client-IP allowlist gate (#557): reject before quota / upstream.
-    crate::dispatch::check_ip_access(&model_entry.value, source_ip)?;
+    crate::dispatch::check_ip_access(&model_entry.value, &client.source_ip)?;
 
     let model_rl =
         crate::quota::ModelRateLimit::from_model(&model_name, &model_entry.id, &model_entry.value);
@@ -176,6 +176,7 @@ async fn dispatch(
         &model_name,
         &model_entry.id,
         &model_entry.value,
+        &client.routing_tags,
     )?;
     let retry_on_429 = model_entry
         .value
