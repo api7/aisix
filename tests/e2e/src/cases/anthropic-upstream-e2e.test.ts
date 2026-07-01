@@ -294,3 +294,104 @@ describe("anthropic upstream e2e: tool_use-only response surfaces content:null (
     expect(completion.choices[0]?.message.content).toBeNull();
   });
 });
+
+// E2E (#906): an Anthropic upstream reports cache_creation_input_tokens /
+// cache_read_input_tokens as input classes SEPARATE from input_tokens
+// (Anthropic's total input = input + cache_creation + cache_read). The
+// OpenAI-shape `total_tokens` the caller sees must fold those in — pre-fix
+// it was input + output only, under-counting every cached request.
+const CACHE_CALLER_PLAINTEXT = "sk-an-e2e-cachetotal-caller";
+const CACHE_CALLER_KEY_HASH = createHash("sha256")
+  .update(CACHE_CALLER_PLAINTEXT)
+  .digest("hex");
+
+describe("anthropic upstream e2e: cache tokens fold into total_tokens (#906)", () => {
+  let app: SpawnedApp | undefined;
+  let upstream: OpenAiUpstream | undefined;
+  let admin: AdminClient | undefined;
+  let etcdReachable = false;
+
+  beforeAll(async () => {
+    etcdReachable = await new EtcdClient().ping();
+    if (!etcdReachable) return;
+
+    upstream = await startOpenAiUpstream({
+      nonStreamBody: {
+        id: "msg_cache_01",
+        type: "message",
+        role: "assistant",
+        content: [{ type: "text", text: "cached hello" }],
+        model: "claude-3-5-haiku-20241022",
+        stop_reason: "end_turn",
+        usage: {
+          input_tokens: 10,
+          output_tokens: 4,
+          cache_creation_input_tokens: 200,
+          cache_read_input_tokens: 800,
+        },
+      },
+    });
+    app = await spawnApp();
+    admin = new AdminClient(app.adminUrl, app.adminKey);
+
+    const pk = await admin.createProviderKey({
+      display_name: "an-e2e-cachetotal-pk",
+      provider: "anthropic",
+      adapter: "anthropic",
+      secret: "sk-ant-mock",
+      api_base: upstream.baseUrl,
+    });
+    await admin.createModel({
+      display_name: "an-e2e-cachetotal",
+      provider: "anthropic",
+      model_name: "claude-3-5-haiku-20241022",
+      provider_key_id: pk.id,
+    });
+    await admin.createApiKey({
+      key_hash: CACHE_CALLER_KEY_HASH,
+      allowed_models: ["an-e2e-cachetotal"],
+    });
+  });
+
+  afterAll(async () => {
+    await app?.exit();
+    await upstream?.close();
+  });
+
+  test("cache_creation + cache_read fold into total_tokens on the OpenAI shape", async (ctx) => {
+    if (!etcdReachable || !app || !upstream) {
+      ctx.skip();
+      return;
+    }
+
+    const client = new OpenAI({
+      apiKey: CACHE_CALLER_PLAINTEXT,
+      baseURL: `${app.proxyUrl}/v1`,
+      maxRetries: 0,
+    });
+
+    await waitConfigPropagation(async () => {
+      try {
+        const r = await client.chat.completions.create({
+          model: "an-e2e-cachetotal",
+          messages: [{ role: "user", content: "ready-probe" }],
+        });
+        return r.choices[0]?.message.role === "assistant";
+      } catch {
+        return false;
+      }
+    });
+
+    const completion = await client.chat.completions.create({
+      model: "an-e2e-cachetotal",
+      messages: [{ role: "user", content: "hi" }],
+    });
+
+    // prompt_tokens stays the non-cached input (Option A: cache is NOT
+    // folded into prompt_tokens), but total_tokens is the honest sum of
+    // every input class + completion: 10 + 4 + 200 + 800 = 1014.
+    expect(completion.usage?.prompt_tokens).toBe(10);
+    expect(completion.usage?.completion_tokens).toBe(4);
+    expect(completion.usage?.total_tokens).toBe(10 + 4 + 200 + 800);
+  });
+});

@@ -576,20 +576,18 @@ pub fn response_into_chat_response(raw: AnthropicResponse) -> ChatResponse {
 
     let usage = raw
         .usage
-        .map(|u| UsageStats {
-            prompt_tokens: u.input_tokens,
-            completion_tokens: u.output_tokens,
-            total_tokens: u.input_tokens.saturating_add(u.output_tokens),
-            cache_creation_tokens: u.cache_creation_input_tokens,
-            cache_read_tokens: u.cache_read_input_tokens,
-            // Anthropic doesn't use OpenAI's cached-prompt-tokens or
-            // reasoning-tokens taxonomy; leave at 0.
-            cached_prompt_tokens: 0,
-            reasoning_tokens: 0,
-            // DeepSeek-native passthrough fields (#542) don't apply to
-            // Anthropic upstreams.
-            prompt_cache_hit_tokens: None,
-            prompt_cache_miss_tokens: None,
+        .map(|u| {
+            // Anthropic bills cache_creation / cache_read as input classes
+            // *on top of* input_tokens, so `total_tokens` must fold them
+            // in — `input + output` alone under-counts (#906). Cache
+            // counters stay separate; Anthropic doesn't use OpenAI's
+            // cached-prompt / reasoning taxonomy (those default to 0).
+            UsageStats::with_cache(
+                u.input_tokens,
+                u.output_tokens,
+                u.cache_creation_input_tokens,
+                u.cache_read_input_tokens,
+            )
         })
         .unwrap_or_default();
 
@@ -659,6 +657,14 @@ pub struct AnthropicStreamStartMessage {
 pub struct AnthropicStreamStartUsage {
     #[serde(default)]
     pub input_tokens: Option<u32>,
+    /// Cache write / read counters ride on `message_start` alongside
+    /// `input_tokens` and are sent only there — capture them here or
+    /// they're lost for the whole stream on the cross-protocol bridge
+    /// path (#906).
+    #[serde(default)]
+    pub cache_creation_input_tokens: Option<u32>,
+    #[serde(default)]
+    pub cache_read_input_tokens: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -693,6 +699,10 @@ pub struct StreamState {
     /// emitted on the terminal `message_delta` so the final `UsageStats`
     /// carries both prompt and completion (and a correct total).
     pub input_tokens: u32,
+    /// Cache write / read counters captured from `message_start`, carried
+    /// onto the terminal usage so the bridge doesn't drop them (#906).
+    pub cache_creation_tokens: u32,
+    pub cache_read_tokens: u32,
 }
 
 impl StreamState {
@@ -706,6 +716,16 @@ impl StreamState {
                 .usage
                 .as_ref()
                 .and_then(|u| u.input_tokens)
+                .unwrap_or(0);
+            self.cache_creation_tokens = message
+                .usage
+                .as_ref()
+                .and_then(|u| u.cache_creation_input_tokens)
+                .unwrap_or(0);
+            self.cache_read_tokens = message
+                .usage
+                .as_ref()
+                .and_then(|u| u.cache_read_input_tokens)
                 .unwrap_or(0);
         }
     }
@@ -733,8 +753,14 @@ impl StreamState {
                     .as_deref()
                     .map(|r| map_stop_reason(Some(r)));
                 let usage = usage.as_ref().and_then(|u| {
-                    u.output_tokens
-                        .map(|n| UsageStats::new(self.input_tokens, n))
+                    u.output_tokens.map(|n| {
+                        UsageStats::with_cache(
+                            self.input_tokens,
+                            n,
+                            self.cache_creation_tokens,
+                            self.cache_read_tokens,
+                        )
+                    })
                 });
                 if finish.is_none() && usage.is_none() {
                     return None;
@@ -1936,6 +1962,10 @@ mod tests {
         assert_eq!(out.usage.completion_tokens, 4);
         assert_eq!(out.usage.cache_creation_tokens, 200);
         assert_eq!(out.usage.cache_read_tokens, 800);
+        // #906: cache_creation / cache_read are input classes on top of
+        // input_tokens, so the honest total folds them in — not just
+        // input + output (which would be 14 and under-count by 1000).
+        assert_eq!(out.usage.total_tokens, 10 + 4 + 200 + 800);
         // Anthropic doesn't use OpenAI's cached_prompt / reasoning
         // taxonomy — these stay 0.
         assert_eq!(out.usage.cached_prompt_tokens, 0);
@@ -2060,6 +2090,39 @@ mod tests {
         assert_eq!(usage.prompt_tokens, 37);
         assert_eq!(usage.completion_tokens, 52);
         assert_eq!(usage.total_tokens, 89);
+    }
+
+    #[test]
+    fn stream_state_carries_message_start_cache_tokens_into_final_usage() {
+        // #906: Anthropic sends cache_creation / cache_read only on
+        // message_start. The cross-protocol bridge must carry them onto
+        // the terminal usage (and fold them into the total), else an
+        // OpenAI-shape client streaming against an Anthropic upstream
+        // loses cache tokens entirely — not just from the total.
+        let mut state = StreamState::default();
+        let start: AnthropicStreamEvent = serde_json::from_str(
+            r#"{"type":"message_start","message":{"id":"m","model":"claude","type":"message","role":"assistant","content":[],"stop_reason":null,"usage":{"input_tokens":10,"output_tokens":1,"cache_creation_input_tokens":200,"cache_read_input_tokens":800}}}"#,
+        )
+        .unwrap();
+        state.update(&start);
+        assert_eq!(state.cache_creation_tokens, 200);
+        assert_eq!(state.cache_read_tokens, 800);
+
+        let end: AnthropicStreamEvent = serde_json::from_str(
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":4}}"#,
+        )
+        .unwrap();
+        let usage = state.to_chunk(&end).unwrap().usage.unwrap();
+        assert_eq!(usage.prompt_tokens, 10);
+        assert_eq!(usage.completion_tokens, 4);
+        assert_eq!(usage.cache_creation_tokens, 200);
+        assert_eq!(usage.cache_read_tokens, 800);
+        assert_eq!(usage.total_tokens, 10 + 4 + 200 + 800);
+        // Option A: cache is neither folded into prompt_tokens nor
+        // mapped onto cached_prompt_tokens — the latter would
+        // double-count cost in cp-api's pricing formula, which bills
+        // cache_read as its own term.
+        assert_eq!(usage.cached_prompt_tokens, 0);
     }
 
     // ─── parse_inbound_request ────────────────────────────────────
