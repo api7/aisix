@@ -173,11 +173,24 @@ pub struct Routing {
     /// Policy to apply when every target is unavailable because of runtime health or cooldown state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub when_all_unavailable: Option<WhenAllUnavailablePolicy>,
+    /// Sticky (deterministic) target selection for `weighted` routing — the
+    /// A/B / canary knob. When `true`, a request's target is chosen by hashing a
+    /// stability key (the `x-aisix-routing-key` header, else the caller's API
+    /// key) into the weight distribution, so the same key consistently lands on
+    /// the same target while the aggregate split still honors the weights. When
+    /// absent/`false`, `weighted` samples independently per request (the
+    /// default). Ignored by non-`weighted` strategies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sticky: Option<bool>,
 }
 
 impl Routing {
     pub fn retries_or_default(&self) -> usize {
         self.retries.unwrap_or(0) as usize
+    }
+
+    pub fn sticky_or_default(&self) -> bool {
+        self.sticky.unwrap_or(false)
     }
 
     pub fn max_fallbacks_or_default(&self) -> usize {
@@ -246,6 +259,7 @@ mod tests {
             max_fallbacks: Some(0),
             retry_on_429: None,
             when_all_unavailable: None,
+            sticky: None,
         };
         assert_eq!(r.max_fallbacks_or_default(), 0);
     }
@@ -259,6 +273,7 @@ mod tests {
             max_fallbacks: Some(99),
             retry_on_429: None,
             when_all_unavailable: None,
+            sticky: None,
         };
         assert_eq!(r.max_fallbacks_or_default(), 0);
     }
@@ -295,6 +310,17 @@ mod tests {
     fn missing_weight_defaults_to_one() {
         let t = RoutingTarget::new("x");
         assert_eq!(t.weight_or_default(), 1);
+    }
+
+    #[test]
+    fn sticky_parses_and_defaults_false() {
+        let off: Routing = serde_json::from_str(r#"{"targets":[{"model":"a"}]}"#).unwrap();
+        assert!(!off.sticky_or_default());
+        let on: Routing = serde_json::from_str(
+            r#"{"strategy":"weighted","sticky":true,"targets":[{"model":"a"},{"model":"b"}]}"#,
+        )
+        .unwrap();
+        assert!(on.sticky_or_default());
     }
 
     #[test]

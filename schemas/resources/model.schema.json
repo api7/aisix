@@ -376,6 +376,10 @@
           "description": "Whether upstream 429 participates in retries and failover.",
           "type": "boolean"
         },
+        "sticky": {
+          "description": "Sticky (deterministic) target selection for `weighted` routing — the A/B / canary knob. When `true`, a request's target is chosen by hashing a stability key (the `x-aisix-routing-key` header, else the caller's API key) into the weight distribution, so the same key consistently lands on the same target while the aggregate split still honors the weights. When absent/`false`, `weighted` samples independently per request (the default). Ignored by non-`weighted` strategies.",
+          "type": "boolean"
+        },
         "strategy": {
           "allOf": [
             {

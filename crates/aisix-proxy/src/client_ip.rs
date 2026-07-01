@@ -119,6 +119,11 @@ fn parse_forwarded_token(tok: &str) -> Option<IpAddr> {
 /// tags never reach the upstream request body.
 pub const ROUTING_TAGS_HEADER: &str = "x-aisix-routing-tags";
 
+/// Header carrying the stability key for sticky (A/B / canary) weighted
+/// routing. When present, a request consistently maps to the same weighted
+/// target; absent, the caller's API key is used as the key instead.
+pub const ROUTING_KEY_HEADER: &str = "x-aisix-routing-key";
+
 /// Per-request client attribution. Resolved once via the extractor and
 /// threaded into the usage event by each handler's emit fn.
 #[derive(Debug, Clone, Default)]
@@ -128,6 +133,9 @@ pub struct ClientContext {
     /// Routing tags from [`ROUTING_TAGS_HEADER`], used to select among a
     /// routing model's tagged targets. Empty when the header is absent.
     pub routing_tags: Vec<String>,
+    /// Stability key from [`ROUTING_KEY_HEADER`] for sticky weighted routing.
+    /// `None` when the header is absent (the caller's API key is used instead).
+    pub routing_key: Option<String>,
 }
 
 #[axum::async_trait]
@@ -169,10 +177,19 @@ where
             .map(parse_routing_tags)
             .unwrap_or_default();
 
+        let routing_key = parts
+            .headers
+            .get(ROUTING_KEY_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+
         Ok(ClientContext {
             source_ip,
             user_agent,
             routing_tags,
+            routing_key,
         })
     }
 }

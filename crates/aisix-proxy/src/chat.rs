@@ -41,7 +41,7 @@ use crate::client_ip::ClientContext;
 use crate::error::ProxyError;
 use crate::render::{render_chunk, render_response};
 use crate::request_id::new_request_id;
-use crate::routing::{is_retryable, resolve_attempt_models, AttemptModel};
+use crate::routing::{is_retryable, resolve_attempt_models, AttemptModel, RoutingRequest};
 use crate::state::ProxyState;
 
 /// Header set on every non-streaming response indicating whether the
@@ -902,7 +902,15 @@ async fn dispatch(
                 &req.model,
                 &virtual_entry.id,
                 &virtual_entry.value,
-                &client.routing_tags,
+                RoutingRequest {
+                    tags: &client.routing_tags,
+                    stability_key: Some(
+                        client
+                            .routing_key
+                            .as_deref()
+                            .unwrap_or(auth.entry.id.as_str()),
+                    ),
+                },
             )
             .map_err(&with_model)?;
             (attempts, None)

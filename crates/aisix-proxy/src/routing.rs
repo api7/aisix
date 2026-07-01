@@ -114,7 +114,12 @@ impl RoutingRegistry {
     /// initial target; subsequent elements are later fallback targets (in
     /// declaration order, wrapping if needed). Length is bounded by the
     /// initial target plus `routing.max_fallbacks_or_default()`.
-    pub fn pick_targets(&self, virtual_name: &str, routing: &Routing) -> Vec<String> {
+    pub fn pick_targets(
+        &self,
+        virtual_name: &str,
+        routing: &Routing,
+        stability_key: Option<&str>,
+    ) -> Vec<String> {
         if routing.targets.is_empty() {
             return Vec::new();
         }
@@ -126,7 +131,7 @@ impl RoutingRegistry {
         if routing.strategy.is_metric_based() {
             return routing.targets.iter().map(|t| t.model.clone()).collect();
         }
-        let start = self.starting_index(virtual_name, routing);
+        let start = self.starting_index(virtual_name, routing, stability_key);
         attempt_order(
             &routing.targets,
             start,
@@ -134,11 +139,25 @@ impl RoutingRegistry {
         )
     }
 
-    fn starting_index(&self, virtual_name: &str, routing: &Routing) -> usize {
+    fn starting_index(
+        &self,
+        virtual_name: &str,
+        routing: &Routing,
+        stability_key: Option<&str>,
+    ) -> usize {
         match routing.strategy {
             RoutingStrategy::Failover => 0,
             RoutingStrategy::RoundRobin => self.advance_cursor(virtual_name, routing.targets.len()),
-            RoutingStrategy::Weighted => weighted_pick(&routing.targets),
+            RoutingStrategy::Weighted => {
+                // Sticky (A/B / canary) routing makes the weighted pick
+                // deterministic in the request's stability key; otherwise each
+                // request samples the weight distribution independently.
+                let sticky_key = routing
+                    .sticky_or_default()
+                    .then_some(stability_key)
+                    .flatten();
+                weighted_pick(&routing.targets, sticky_key)
+            }
             // Metric-ordered strategies never reach here — `pick_targets`
             // short-circuits them before computing a start index.
             RoutingStrategy::LeastCost
@@ -231,12 +250,19 @@ fn attempt_order(targets: &[RoutingTarget], start_idx: usize, limit: usize) -> V
 /// from OS entropy on first use and is independent across calls; the
 /// distribution converges to the configured weights over a finite
 /// sample (per the spec the e2e pins).
-fn weighted_pick(targets: &[RoutingTarget]) -> usize {
+///
+/// With a `sticky_key` (A/B / canary routing) the pick is instead a
+/// deterministic function of that key, so the same key always resolves to the
+/// same target while the aggregate split still honors the weights.
+fn weighted_pick(targets: &[RoutingTarget], sticky_key: Option<&str>) -> usize {
     let total: u64 = targets.iter().map(|t| t.weight_or_default() as u64).sum();
     if total == 0 {
         return 0;
     }
-    let pick = rand::thread_rng().gen_range(0..total);
+    let pick = match sticky_key {
+        Some(key) => stable_hash(key) % total,
+        None => rand::thread_rng().gen_range(0..total),
+    };
     let mut acc: u64 = 0;
     for (i, t) in targets.iter().enumerate() {
         acc += t.weight_or_default() as u64;
@@ -245,6 +271,18 @@ fn weighted_pick(targets: &[RoutingTarget]) -> usize {
         }
     }
     targets.len() - 1
+}
+
+/// Stable 64-bit FNV-1a hash used to map a sticky-routing key into the weight
+/// distribution. Deterministic across processes and toolchains by design (the
+/// std hasher is not), so a given key always resolves to the same target.
+fn stable_hash(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a offset basis
+    for b in s.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3); // FNV-1a prime
+    }
+    h
 }
 
 /// Combined per-1K unit price used to rank `least_cost` targets. A target
@@ -376,6 +414,15 @@ pub(crate) fn filter_attempt_models(
     }
 }
 
+/// Per-request routing inputs threaded into [`resolve_attempt_models`]: the
+/// tags that gate tag/metadata routing and the stability key for sticky
+/// (A/B / canary) weighted selection. Both come from request headers.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct RoutingRequest<'a> {
+    pub tags: &'a [String],
+    pub stability_key: Option<&'a str>,
+}
+
 /// Resolve the ordered list of concrete Models a request will attempt.
 ///
 /// For a routing model (Model Group), walk `routing.targets` per the
@@ -392,7 +439,7 @@ pub(crate) fn resolve_attempt_models(
     virtual_name: &str,
     virtual_id: &str,
     virtual_model: &Model,
-    request_tags: &[String],
+    req: RoutingRequest<'_>,
 ) -> Result<Vec<AttemptModel>, ProxyError> {
     let Some(routing) = virtual_model.routing.as_ref() else {
         return Ok(vec![AttemptModel {
@@ -404,10 +451,11 @@ pub(crate) fn resolve_attempt_models(
     // Tag/metadata pre-filter: narrow the targets to those eligible for this
     // request's routing tags, then let the configured strategy order whatever
     // survives. A no-op when no target is tagged.
-    let eligible = eligible_targets(&routing.targets, request_tags);
+    let eligible = eligible_targets(&routing.targets, req.tags);
     if eligible.is_empty() {
         return Err(ProxyError::InvalidRequest(format!(
-            "no routing target matches request tags {request_tags:?}"
+            "no routing target matches request tags {:?}",
+            req.tags
         )));
     }
     let filtered_routing = Routing {
@@ -416,7 +464,7 @@ pub(crate) fn resolve_attempt_models(
     };
     let routing = &filtered_routing;
 
-    let names = routing_registry.pick_targets(virtual_name, routing);
+    let names = routing_registry.pick_targets(virtual_name, routing, req.stability_key);
     if names.is_empty() {
         return Err(ProxyError::InvalidRequest(
             "routing model has no targets".into(),
@@ -475,6 +523,7 @@ mod tests {
             max_fallbacks,
             retry_on_429: None,
             when_all_unavailable: None,
+            sticky: None,
         }
     }
 
@@ -484,6 +533,69 @@ mod tests {
 
     fn model_names(targets: &[RoutingTarget]) -> Vec<&str> {
         targets.iter().map(|t| t.model.as_str()).collect()
+    }
+
+    #[test]
+    fn stable_hash_is_deterministic() {
+        assert_eq!(stable_hash("session-abc"), stable_hash("session-abc"));
+        assert_ne!(stable_hash("a"), stable_hash("b"));
+    }
+
+    #[test]
+    fn sticky_weighted_pick_is_deterministic_per_key() {
+        let targets = vec![
+            RoutingTarget::new("a").with_weight(50),
+            RoutingTarget::new("b").with_weight(50),
+        ];
+        let first = weighted_pick(&targets, Some("session-1"));
+        for _ in 0..50 {
+            assert_eq!(weighted_pick(&targets, Some("session-1")), first);
+        }
+    }
+
+    #[test]
+    fn sticky_weighted_pick_spreads_distinct_keys() {
+        // Distinct keys shouldn't all funnel to one target.
+        let targets = vec![
+            RoutingTarget::new("a").with_weight(50),
+            RoutingTarget::new("b").with_weight(50),
+        ];
+        let mut seen = [false; 2];
+        for i in 0..200 {
+            seen[weighted_pick(&targets, Some(&format!("k{i}")))] = true;
+        }
+        assert!(seen[0] && seen[1]);
+    }
+
+    #[test]
+    fn sticky_weighted_pick_honors_extreme_weights() {
+        // A 100/0 canary split lands every key on the weighted target.
+        let targets = vec![
+            RoutingTarget::new("stable").with_weight(100),
+            RoutingTarget::new("canary").with_weight(0),
+        ];
+        for i in 0..50 {
+            assert_eq!(weighted_pick(&targets, Some(&format!("k{i}"))), 0);
+        }
+    }
+
+    #[test]
+    fn sticky_routing_pins_a_key_to_one_target() {
+        let reg = RoutingRegistry::new();
+        let mut routing = r(
+            RoutingStrategy::Weighted,
+            vec![
+                RoutingTarget::new("stable").with_weight(90),
+                RoutingTarget::new("canary").with_weight(10),
+            ],
+            Some(0), // only the chosen start target
+        );
+        routing.sticky = Some(true);
+        let first = reg.pick_targets("v", &routing, Some("user-42"));
+        assert_eq!(first.len(), 1);
+        for _ in 0..20 {
+            assert_eq!(reg.pick_targets("v", &routing, Some("user-42")), first);
+        }
     }
 
     #[test]
@@ -552,7 +664,7 @@ mod tests {
             None,
         );
         for _ in 0..5 {
-            let order = reg.pick_targets("v", &routing);
+            let order = reg.pick_targets("v", &routing, None);
             assert_eq!(order, vec!["primary", "secondary", "tertiary"]);
         }
     }
@@ -571,7 +683,7 @@ mod tests {
         );
         let mut firsts = Vec::new();
         for _ in 0..6 {
-            let order = reg.pick_targets("v", &routing);
+            let order = reg.pick_targets("v", &routing, None);
             firsts.push(order[0].clone());
         }
         // Two full cycles of a→b→c.
@@ -587,10 +699,10 @@ mod tests {
             Some(1),
         );
         // Two distinct virtual models advance independently.
-        assert_eq!(reg.pick_targets("v1", &routing)[0], "a");
-        assert_eq!(reg.pick_targets("v2", &routing)[0], "a");
-        assert_eq!(reg.pick_targets("v1", &routing)[0], "b");
-        assert_eq!(reg.pick_targets("v2", &routing)[0], "b");
+        assert_eq!(reg.pick_targets("v1", &routing, None)[0], "a");
+        assert_eq!(reg.pick_targets("v2", &routing, None)[0], "a");
+        assert_eq!(reg.pick_targets("v1", &routing, None)[0], "b");
+        assert_eq!(reg.pick_targets("v2", &routing, None)[0], "b");
     }
 
     #[test]
@@ -606,9 +718,9 @@ mod tests {
             Some(2),
         );
         // First call starts at a → a, b, c
-        assert_eq!(reg.pick_targets("v", &routing), vec!["a", "b", "c"]);
+        assert_eq!(reg.pick_targets("v", &routing, None), vec!["a", "b", "c"]);
         // Second call starts at b → b, c, a
-        assert_eq!(reg.pick_targets("v", &routing), vec!["b", "c", "a"]);
+        assert_eq!(reg.pick_targets("v", &routing, None), vec!["b", "c", "a"]);
     }
 
     #[test]
@@ -626,7 +738,7 @@ mod tests {
         // exactly two attempts, distinct targets, both targets covered.
         // (Aggregate distribution is pinned by the dedicated tests
         // below.)
-        let order = reg.pick_targets("v", &routing);
+        let order = reg.pick_targets("v", &routing, None);
         assert_eq!(order.len(), 2);
         assert!(order.iter().any(|t| t == "a"));
         assert!(order.iter().any(|t| t == "b"));
@@ -638,7 +750,7 @@ mod tests {
             RoutingTarget::new("a").with_weight(0),
             RoutingTarget::new("b").with_weight(0),
         ];
-        assert_eq!(weighted_pick(&targets), 0);
+        assert_eq!(weighted_pick(&targets, None), 0);
     }
 
     /// Aggregate-distribution property: across many trials, a 100/1
@@ -656,7 +768,9 @@ mod tests {
             RoutingTarget::new("b").with_weight(1),
         ];
         let n = 5_000;
-        let a_count = (0..n).filter(|_| weighted_pick(&targets) == 0).count();
+        let a_count = (0..n)
+            .filter(|_| weighted_pick(&targets, None) == 0)
+            .count();
         // Uniform 50/50 → ~2500. Weighted 100/1 → ~4950 in theory.
         // 95% threshold (4750) rejects both a weight-blind impl
         // (~50%) AND a half-sensitivity regression (~75% would also
@@ -681,7 +795,9 @@ mod tests {
             RoutingTarget::new("b").with_weight(100),
         ];
         let n = 5_000;
-        let b_count = (0..n).filter(|_| weighted_pick(&targets) == 1).count();
+        let b_count = (0..n)
+            .filter(|_| weighted_pick(&targets, None) == 1)
+            .count();
         assert!(
             b_count * 100 / n >= 95,
             "weight=100 target at index 1 should dominate aggregate picks; got {b_count}/{n}",
@@ -705,7 +821,9 @@ mod tests {
             RoutingTarget::new("b").with_weight(30),
         ];
         let n = 1_000;
-        let a_count = (0..n).filter(|_| weighted_pick(&targets) == 0).count();
+        let a_count = (0..n)
+            .filter(|_| weighted_pick(&targets, None) == 0)
+            .count();
         // Expected ~700; tolerance window [650, 750] (≈±3.45σ).
         assert!(
             (650..=750).contains(&a_count),
@@ -732,7 +850,7 @@ mod tests {
         let n = 2_000;
         let mut counts = [0_usize; 3];
         for _ in 0..n {
-            counts[weighted_pick(&targets)] += 1;
+            counts[weighted_pick(&targets, None)] += 1;
         }
         // Expected 1000/600/400. ±100 window catches a weight-blind
         // 2-target collapse (where the 3rd bin would be 0) AND
@@ -765,7 +883,9 @@ mod tests {
             RoutingTarget::new("c").with_weight(10),
         ];
         let n = 2_000;
-        let b_count = (0..n).filter(|_| weighted_pick(&targets) == 1).count();
+        let b_count = (0..n)
+            .filter(|_| weighted_pick(&targets, None) == 1)
+            .count();
         assert_eq!(
             b_count, 0,
             "weight=0 target must never be picked; got {b_count}/{n}",
@@ -780,7 +900,7 @@ mod tests {
             vec![RoutingTarget::new("a"), RoutingTarget::new("b")],
             Some(0),
         );
-        let order = reg.pick_targets("v", &routing);
+        let order = reg.pick_targets("v", &routing, None);
         assert_eq!(order, vec!["a"]);
     }
 
@@ -788,7 +908,7 @@ mod tests {
     fn empty_targets_yields_empty_order() {
         let reg = RoutingRegistry::new();
         let routing = r(RoutingStrategy::Failover, vec![], None);
-        assert!(reg.pick_targets("v", &routing).is_empty());
+        assert!(reg.pick_targets("v", &routing, None).is_empty());
     }
 
     #[test]
@@ -1019,7 +1139,7 @@ mod tests {
         );
         // Ranking needs resolved Models, so pick_targets hands back every
         // target untouched regardless of max_fallbacks.
-        assert_eq!(reg.pick_targets("v", &routing), vec!["a", "b", "c"]);
+        assert_eq!(reg.pick_targets("v", &routing, None), vec!["a", "b", "c"]);
     }
 
     #[test]

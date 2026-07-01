@@ -485,7 +485,15 @@ async fn dispatch(
         &model_name,
         &model_entry.id,
         &model_entry.value,
-        &client.routing_tags,
+        crate::routing::RoutingRequest {
+            tags: &client.routing_tags,
+            stability_key: Some(
+                client
+                    .routing_key
+                    .as_deref()
+                    .unwrap_or(auth.entry.id.as_str()),
+            ),
+        },
     )?;
 
     let retry_on_429 = model_entry
