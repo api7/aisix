@@ -226,7 +226,7 @@ async fn dispatch(
 
     let model_rl =
         crate::quota::ModelRateLimit::from_model(model_name, &model_entry.id, &model_entry.value);
-    let _reservation = crate::quota::enforce(state, auth, Some(&model_rl)).await?;
+    let reservation = crate::quota::enforce(state, auth, Some(&model_rl)).await?;
 
     let model = &model_entry.value;
 
@@ -270,6 +270,13 @@ async fn dispatch(
             // dall-e-3 doesn't) BEFORE moving resp_json into the
             // Response, so the success struct carries typed counters.
             let usage = extract_token_usage(&resp_json);
+            // #911 [21]: commit the actual token cost so TPM/TPD is enforced
+            // for /v1/images/generations like chat + embeddings. Pre-fix the
+            // reservation dropped uncommitted and the token counter never moved.
+            let total_tokens = usage
+                .map(|(prompt, completion)| u64::from(prompt) + u64::from(completion))
+                .unwrap_or(0);
+            reservation.commit_tokens(total_tokens).await;
             Ok(ImageDispatchSuccess {
                 response: Json(resp_json).into_response(),
                 provider: provider_label,
@@ -281,6 +288,8 @@ async fn dispatch(
             })
         }
         Err(BridgeError::Config(msg)) if msg.contains("does not support image generation") => {
+            // No upstream call → no tokens to count; release the reservation.
+            reservation.commit_tokens(0).await;
             let env = ErrorEnvelope::new(msg, "not_implemented");
             Ok(ImageDispatchSuccess {
                 response: (StatusCode::NOT_IMPLEMENTED, Json(env)).into_response(),
@@ -293,7 +302,10 @@ async fn dispatch(
                 upstream_called: false,
             })
         }
-        Err(e) => Err(ProxyError::Bridge(e)),
+        Err(e) => {
+            reservation.commit_tokens(0).await;
+            Err(ProxyError::Bridge(e))
+        }
     }
 }
 

@@ -245,7 +245,7 @@ async fn dispatch(
 
     let model_rl =
         crate::quota::ModelRateLimit::from_model(&model_name, &model_entry.id, &model_entry.value);
-    let _reservation = crate::quota::enforce(state, auth, Some(&model_rl)).await?;
+    let reservation = crate::quota::enforce(state, auth, Some(&model_rl)).await?;
 
     let model = &model_entry.value;
 
@@ -450,6 +450,12 @@ async fn dispatch(
         axum::http::header::HeaderName::from_static("x-aisix-request-id"),
         HeaderValue::from_str(request_id).unwrap_or_else(|_| HeaderValue::from_static("")),
     );
+
+    // #911 [21]: commit the reserved layers with the actual token cost so
+    // TPM/TPD is enforced for /v1/rerank like chat + embeddings. Pre-fix the
+    // reservation dropped uncommitted and the token counter never moved.
+    let total_tokens = usage.as_ref().map(|u| u64::from(u.prompt_tokens)).unwrap_or(0);
+    reservation.commit_tokens(total_tokens).await;
 
     Ok(RerankDispatchSuccess {
         response: resp,

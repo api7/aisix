@@ -346,7 +346,7 @@ async fn dispatch(
 
     let model_rl =
         crate::quota::ModelRateLimit::from_model(&model_name, &model_entry.id, &model_entry.value);
-    let _reservation = crate::quota::enforce(state, auth, Some(&model_rl)).await?;
+    let reservation = crate::quota::enforce(state, auth, Some(&model_rl)).await?;
 
     // Resolve the attempt list (routing-aware). A Model Group walks its
     // targets in order; a direct model resolves to itself (#471). OpenAI
@@ -461,6 +461,22 @@ async fn dispatch(
                         latency_ms: ms_since(attempt_started),
                     });
                     success.routing = routing;
+                    // #911 [21]: commit the reserved layers with the actual
+                    // token cost so TPM/TPD is enforced for /v1/responses like
+                    // chat + embeddings. The buffered / non-streaming paths
+                    // carry `usage` here; the verbatim streaming path reports
+                    // `usage_handled_by_stream` (its Drop guard owns end-of-
+                    // stream emission) and its post-stream token accounting is
+                    // a tracked follow-up — its reservation still releases the
+                    // concurrency slot on drop, and budget ($) already gated it.
+                    if !success.usage_handled_by_stream {
+                        let total = success
+                            .usage
+                            .as_ref()
+                            .map(|u| u64::from(u.prompt_tokens) + u64::from(u.completion_tokens))
+                            .unwrap_or(0);
+                        reservation.commit_tokens(total).await;
+                    }
                     return Ok(success);
                 }
                 Err(e) => {

@@ -243,7 +243,7 @@ async fn dispatch(
 
     let model_rl =
         crate::quota::ModelRateLimit::from_model(model_name, &model_entry.id, &model_entry.value);
-    let _reservation = crate::quota::enforce(state, auth, Some(&model_rl)).await?;
+    let reservation = crate::quota::enforce(state, auth, Some(&model_rl)).await?;
 
     let model = &model_entry.value;
     let provider = crate::dispatch::require_provider(model)?;
@@ -268,6 +268,16 @@ async fn dispatch(
             // so the success struct carries typed counters rather
             // than re-parsing JSON downstream.
             let usage = extract_completion_usage(&resp_json);
+            // #911 [21]: commit the actual token cost so TPM/TPD is enforced
+            // for /v1/completions the same way chat + embeddings enforce it.
+            // Pre-fix the reservation dropped uncommitted, so the token
+            // counter never moved and a caller could bypass token limits by
+            // routing traffic through this endpoint.
+            let total_tokens = usage
+                .as_ref()
+                .map(|u| u64::from(u.prompt_tokens) + u64::from(u.completion_tokens))
+                .unwrap_or(0);
+            reservation.commit_tokens(total_tokens).await;
             Ok(CompletionDispatchSuccess {
                 response: Json(resp_json).into_response(),
                 provider: provider_label,
@@ -277,6 +287,8 @@ async fn dispatch(
             })
         }
         Err(BridgeError::Config(msg)) if msg.contains("does not support text completions") => {
+            // No upstream call → no tokens to count; release the reservation.
+            reservation.commit_tokens(0).await;
             let env = ErrorEnvelope::new(msg, "not_implemented");
             Ok(CompletionDispatchSuccess {
                 response: (StatusCode::NOT_IMPLEMENTED, Json(env)).into_response(),
@@ -289,7 +301,10 @@ async fn dispatch(
                 usage: None,
             })
         }
-        Err(e) => Err(ProxyError::Bridge(e)),
+        Err(e) => {
+            reservation.commit_tokens(0).await;
+            Err(ProxyError::Bridge(e))
+        }
     }
 }
 

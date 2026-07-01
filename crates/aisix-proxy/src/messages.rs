@@ -467,7 +467,7 @@ async fn dispatch(
 
     let model_rl =
         crate::quota::ModelRateLimit::from_model(&model_name, &model_entry.id, &model_entry.value);
-    let _reservation = crate::quota::enforce(state, auth, Some(&model_rl)).await?;
+    let reservation = crate::quota::enforce(state, auth, Some(&model_rl)).await?;
 
     // Budget pre-check via cp-api (mirrors /v1/chat/completions).
     let budget_decision = state.budgets.check(&auth.entry.id).await;
@@ -581,6 +581,20 @@ async fn dispatch(
                         latency_ms: ms_since(attempt_started),
                     });
                     outcome.routing = routing;
+                    // #911 [21]: commit the reserved layers with the actual
+                    // token cost so TPM/TPD is enforced for /v1/messages like
+                    // chat + embeddings. The non-streaming path carries the
+                    // counts in `outcome.metrics`; the verbatim streaming path
+                    // sets `usage_handled_by_stream` (its Drop guard owns end-
+                    // of-stream emission) and its post-stream token accounting
+                    // is a tracked follow-up — its reservation still releases
+                    // the concurrency slot on drop, and budget ($) already
+                    // gated it.
+                    if !outcome.usage_handled_by_stream {
+                        let total = u64::from(outcome.metrics.prompt_tokens)
+                            + u64::from(outcome.metrics.completion_tokens);
+                        reservation.commit_tokens(total).await;
+                    }
                     return Ok(outcome);
                 }
                 Err(e) => {
