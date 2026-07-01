@@ -1080,6 +1080,10 @@ async fn dispatch(
                 Ok(upstream) => {
                     state.health.record_success(&model.display_name);
                     state.runtime_status.mark_healthy(&attempt.id);
+                    // Feed the least_latency EWMA. For streaming this is
+                    // time-to-first-response (upstream stream established) —
+                    // the routing-relevant latency signal.
+                    state.runtime_status.record_latency(&attempt.id, latency_ms);
                     stream_routing.attempts.push(AttemptRecord {
                         index: idx,
                         kind,
@@ -1706,6 +1710,11 @@ async fn dispatch(
                 Ok(resp) => {
                     state.health.record_success(&model.display_name);
                     state.runtime_status.mark_healthy(&attempt.id);
+                    // Feed the least_latency EWMA with this attempt's
+                    // round-trip latency.
+                    state
+                        .runtime_status
+                        .record_latency(&attempt.id, attempt_latency_ms);
                     chosen_provider = Some(provider.to_ascii_lowercase());
                     chosen_provider_key_id = Some(pk_entry.id.clone());
                     chosen_upstream_model =

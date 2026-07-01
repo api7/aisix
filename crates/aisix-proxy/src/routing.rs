@@ -138,7 +138,7 @@ impl RoutingRegistry {
             RoutingStrategy::Weighted => weighted_pick(&routing.targets),
             // Metric-ordered strategies never reach here — `pick_targets`
             // short-circuits them before computing a start index.
-            RoutingStrategy::LeastCost => 0,
+            RoutingStrategy::LeastCost | RoutingStrategy::LeastLatency => 0,
         }
     }
 
@@ -216,14 +216,32 @@ fn cost_key(model: &Model) -> f64 {
         .unwrap_or(f64::INFINITY)
 }
 
+/// Observed-latency key used to rank `least_latency` targets. A target with
+/// no latency samples yet sorts first (treated as −∞) so it gets probed;
+/// once it has an EWMA it ranks by that.
+fn latency_key(runtime_status: &crate::ModelRuntimeStatusTracker, id: &str) -> f64 {
+    runtime_status
+        .latency_ewma_ms(id)
+        .unwrap_or(f64::NEG_INFINITY)
+}
+
 /// Rank the resolved attempt list by the strategy's runtime metric,
 /// best-first (ascending). Stable, so equal-metric targets keep their
 /// declaration order. Only metric-based strategies reach here; positional
 /// strategies are ordered in [`RoutingRegistry::pick_targets`].
-fn order_attempts_by_metric(strategy: RoutingStrategy, attempts: &mut [AttemptModel]) {
+fn order_attempts_by_metric(
+    strategy: RoutingStrategy,
+    attempts: &mut [AttemptModel],
+    runtime_status: &crate::ModelRuntimeStatusTracker,
+) {
     match strategy {
         RoutingStrategy::LeastCost => {
             attempts.sort_by(|a, b| cost_key(&a.model).total_cmp(&cost_key(&b.model)));
+        }
+        RoutingStrategy::LeastLatency => {
+            attempts.sort_by(|a, b| {
+                latency_key(runtime_status, &a.id).total_cmp(&latency_key(runtime_status, &b.id))
+            });
         }
         RoutingStrategy::Failover | RoutingStrategy::RoundRobin | RoutingStrategy::Weighted => {}
     }
@@ -359,7 +377,7 @@ pub(crate) fn resolve_attempt_models(
     // rank it best-first here (target Models are now resolved) and cap it to
     // the same attempt budget the positional strategies apply upstream.
     if routing.strategy.is_metric_based() {
-        order_attempts_by_metric(routing.strategy, &mut resolved);
+        order_attempts_by_metric(routing.strategy, &mut resolved, runtime_status);
         resolved.truncate(routing.max_fallbacks_or_default() + 1);
     }
     match filter_attempt_models(
@@ -756,24 +774,26 @@ mod tests {
 
     #[test]
     fn least_cost_orders_cheapest_first() {
+        let t = crate::ModelRuntimeStatusTracker::new();
         let mut attempts = vec![
             am_with_cost("pricey", 10.0, 20.0), // 30 / 1K
             am_with_cost("cheap", 1.0, 2.0),    // 3 / 1K
             am_with_cost("mid", 5.0, 5.0),      // 10 / 1K
         ];
-        order_attempts_by_metric(RoutingStrategy::LeastCost, &mut attempts);
+        order_attempts_by_metric(RoutingStrategy::LeastCost, &mut attempts, &t);
         let ids: Vec<&str> = attempts.iter().map(|a| a.id.as_str()).collect();
         assert_eq!(ids, vec!["cheap", "mid", "pricey"]);
     }
 
     #[test]
     fn least_cost_ranks_missing_cost_last_and_stably() {
+        let t = crate::ModelRuntimeStatusTracker::new();
         let mut attempts = vec![
             am("no-cost-a"),                 // +∞
             am_with_cost("cheap", 1.0, 1.0), // 2 / 1K
             am("no-cost-b"),                 // +∞
         ];
-        order_attempts_by_metric(RoutingStrategy::LeastCost, &mut attempts);
+        order_attempts_by_metric(RoutingStrategy::LeastCost, &mut attempts, &t);
         let ids: Vec<&str> = attempts.iter().map(|a| a.id.as_str()).collect();
         // Priced target first; equal (missing-cost) targets keep their
         // declaration order thanks to the stable sort.
@@ -782,10 +802,47 @@ mod tests {
 
     #[test]
     fn non_metric_strategy_leaves_order_untouched() {
+        let t = crate::ModelRuntimeStatusTracker::new();
         let mut attempts = vec![am_with_cost("b", 9.0, 9.0), am_with_cost("a", 1.0, 1.0)];
-        order_attempts_by_metric(RoutingStrategy::Failover, &mut attempts);
+        order_attempts_by_metric(RoutingStrategy::Failover, &mut attempts, &t);
         let ids: Vec<&str> = attempts.iter().map(|a| a.id.as_str()).collect();
         assert_eq!(ids, vec!["b", "a"]);
+    }
+
+    // ── order_attempts_by_metric (least_latency) ──────────────────
+    #[test]
+    fn least_latency_orders_fastest_first() {
+        let t = crate::ModelRuntimeStatusTracker::new();
+        t.record_latency("slow", 900);
+        t.record_latency("fast", 50);
+        t.record_latency("mid", 300);
+        let mut attempts = vec![am("slow"), am("fast"), am("mid")];
+        order_attempts_by_metric(RoutingStrategy::LeastLatency, &mut attempts, &t);
+        let ids: Vec<&str> = attempts.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(ids, vec!["fast", "mid", "slow"]);
+    }
+
+    #[test]
+    fn least_latency_probes_unmeasured_targets_first() {
+        let t = crate::ModelRuntimeStatusTracker::new();
+        t.record_latency("measured", 100);
+        // "unseen-a"/"unseen-b" have no samples → rank first (−∞), keeping
+        // their declaration order via the stable sort.
+        let mut attempts = vec![am("measured"), am("unseen-a"), am("unseen-b")];
+        order_attempts_by_metric(RoutingStrategy::LeastLatency, &mut attempts, &t);
+        let ids: Vec<&str> = attempts.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(ids, vec!["unseen-a", "unseen-b", "measured"]);
+    }
+
+    #[test]
+    fn record_latency_ewma_tracks_recent_samples() {
+        let t = crate::ModelRuntimeStatusTracker::new();
+        assert_eq!(t.latency_ewma_ms("m"), None);
+        t.record_latency("m", 100);
+        assert_eq!(t.latency_ewma_ms("m"), Some(100.0)); // first sample seeds
+        t.record_latency("m", 200);
+        // 0.3*200 + 0.7*100 = 130
+        assert!((t.latency_ewma_ms("m").unwrap() - 130.0).abs() < 1e-9);
     }
 
     #[test]

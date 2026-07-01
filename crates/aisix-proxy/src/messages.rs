@@ -566,6 +566,9 @@ async fn dispatch(
             .await
             {
                 Ok(mut outcome) => {
+                    let latency_ms = ms_since(attempt_started);
+                    // Feed the least_latency EWMA for this target.
+                    state.runtime_status.record_latency(&target.id, latency_ms);
                     routing.attempts.push(AttemptRecord {
                         index: idx,
                         kind,
@@ -576,7 +579,7 @@ async fn dispatch(
                         success: true,
                         error_class: String::new(),
                         error_message: String::new(),
-                        latency_ms: ms_since(attempt_started),
+                        latency_ms,
                     });
                     outcome.routing = routing;
                     return Ok(outcome);
