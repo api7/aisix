@@ -1171,6 +1171,12 @@ async fn dispatch(
         // than N simultaneous streams (#450).
         let post_stream_keys = reservation.keys();
         let stream_concurrency_hold = reservation.into_stream_hold();
+        // least_busy: keep this target counted as in-flight for the stream's
+        // full lifetime. Like `stream_concurrency_hold`, the guard is moved
+        // into the on_complete closure (dropped there), so the count stays
+        // raised until the stream completes or is cancelled — the window a
+        // concurrent routing decision must see this target as loaded.
+        let in_flight_hold = state.runtime_status.begin_in_flight(&winner_target_id);
         // Capture everything the stream-completion callback needs so
         // it can fire `emit_usage_event` once the terminal SSE chunk
         // has yielded its `usage` block. Telemetry emission has to
@@ -1386,6 +1392,8 @@ async fn dispatch(
                 // CompleteOnDrop guard on both paths, so the permit is held
                 // for the stream's full lifetime and never leaked (#450).
                 drop(stream_concurrency_hold);
+                // Same lifetime for the least_busy in-flight count.
+                drop(in_flight_hold);
             },
         );
         let response =
@@ -1703,6 +1711,11 @@ async fn dispatch(
             };
 
             let attempt_started = Instant::now();
+            // least_busy: count this target as in-flight for the upstream
+            // call. The response is fully buffered, so the target is done
+            // once `bridge.chat` returns; the guard drops at the end of this
+            // attempt's scope on both the success-break and failure paths.
+            let _in_flight = state.runtime_status.begin_in_flight(&attempt.id);
             let result = bridge.chat(req, &ctx).await;
             let attempt_latency_ms =
                 attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;

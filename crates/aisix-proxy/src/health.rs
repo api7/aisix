@@ -15,7 +15,8 @@
 
 use dashmap::DashMap;
 use std::sync::atomic::AtomicBool;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use axum::http::header::{HeaderName, HeaderValue, CONTENT_TYPE};
@@ -229,6 +230,11 @@ struct RuntimeEntry {
     /// latency in milliseconds. `None` until the first sample. Drives the
     /// `least_latency` routing strategy; independent of health/cooldown.
     latency_ewma_ms: Option<f64>,
+    /// Number of requests currently in flight to this target. Held in an
+    /// `Arc` so an [`InFlightGuard`] can decrement it after the DashMap lock
+    /// is released (and for the streaming path, after the handler returns).
+    /// Drives the `least_busy` routing strategy.
+    in_flight: Arc<AtomicUsize>,
 }
 
 impl RuntimeEntry {
@@ -345,6 +351,21 @@ const LATENCY_EWMA_ALPHA: f64 = 0.3;
 #[derive(Default, Debug)]
 pub struct ModelRuntimeStatusTracker {
     entries: DashMap<String, RuntimeEntry>,
+}
+
+/// RAII guard that decrements a target's in-flight counter when dropped.
+/// Created by [`ModelRuntimeStatusTracker::begin_in_flight`] before an
+/// upstream attempt. For the streaming path the guard is moved into the
+/// stream body so the count stays raised until the stream ends or is
+/// cancelled, matching the request's true lifetime.
+pub struct InFlightGuard {
+    counter: Arc<AtomicUsize>,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl HealthTracker {
@@ -487,6 +508,28 @@ impl ModelRuntimeStatusTracker {
     /// Current latency EWMA (ms) for `model_id`, or `None` if never sampled.
     pub fn latency_ewma_ms(&self, model_id: &str) -> Option<f64> {
         self.entries.get(model_id).and_then(|e| e.latency_ewma_ms)
+    }
+
+    /// Mark one request as in flight to `model_id` and return a guard that
+    /// decrements the count when dropped. Drives the `least_busy` strategy.
+    pub fn begin_in_flight(&self, model_id: &str) -> InFlightGuard {
+        let counter = Arc::clone(
+            &self
+                .entries
+                .entry(model_id.to_string())
+                .or_default()
+                .in_flight,
+        );
+        counter.fetch_add(1, Ordering::Relaxed);
+        InFlightGuard { counter }
+    }
+
+    /// Current in-flight request count for `model_id`.
+    pub fn in_flight(&self, model_id: &str) -> usize {
+        self.entries
+            .get(model_id)
+            .map(|e| e.in_flight.load(Ordering::Relaxed))
+            .unwrap_or(0)
     }
 
     pub fn status(&self, model_id: &str) -> RuntimeStatusSnapshot {

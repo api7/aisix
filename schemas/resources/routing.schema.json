@@ -98,6 +98,13 @@
           "enum": [
             "least_latency"
           ]
+        },
+        {
+          "description": "Rank targets least-loaded-first by the number of in-flight requests currently dispatched to each target, then fall forward.",
+          "type": "string",
+          "enum": [
+            "least_busy"
+          ]
         }
       ]
     },

@@ -443,6 +443,13 @@
             "least_latency"
           ],
           "type": "string"
+        },
+        {
+          "description": "Rank targets least-loaded-first by the number of in-flight requests currently dispatched to each target, then fall forward.",
+          "enum": [
+            "least_busy"
+          ],
+          "type": "string"
         }
       ]
     },

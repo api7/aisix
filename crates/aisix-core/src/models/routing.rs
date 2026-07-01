@@ -22,6 +22,8 @@
 //! - `least_latency`: fastest target first, by a moving average of recent
 //!   observed upstream latency (time-to-first-token for streaming). Targets
 //!   with no latency samples yet rank first so they get probed.
+//! - `least_busy`: least-loaded target first, by the number of in-flight
+//!   requests currently dispatched to each target.
 //!
 //! See [`RoutingStrategy::is_metric_based`].
 
@@ -48,6 +50,9 @@ pub enum RoutingStrategy {
     /// upstream latency (time-to-first-token for streaming), then fall
     /// forward. Targets with no samples yet rank first so they get probed.
     LeastLatency,
+    /// Rank targets least-loaded-first by the number of in-flight requests
+    /// currently dispatched to each target, then fall forward.
+    LeastBusy,
 }
 
 impl RoutingStrategy {
@@ -58,7 +63,7 @@ impl RoutingStrategy {
     pub fn is_metric_based(&self) -> bool {
         matches!(
             self,
-            RoutingStrategy::LeastCost | RoutingStrategy::LeastLatency
+            RoutingStrategy::LeastCost | RoutingStrategy::LeastLatency | RoutingStrategy::LeastBusy
         )
     }
 }
@@ -266,12 +271,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(latency.strategy, RoutingStrategy::LeastLatency);
+        let busy: Routing = serde_json::from_str(
+            r#"{"strategy":"least_busy","targets":[{"model":"a"},{"model":"b"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(busy.strategy, RoutingStrategy::LeastBusy);
     }
 
     #[test]
     fn is_metric_based_classification() {
         assert!(RoutingStrategy::LeastCost.is_metric_based());
         assert!(RoutingStrategy::LeastLatency.is_metric_based());
+        assert!(RoutingStrategy::LeastBusy.is_metric_based());
         assert!(!RoutingStrategy::Failover.is_metric_based());
         assert!(!RoutingStrategy::RoundRobin.is_metric_based());
         assert!(!RoutingStrategy::Weighted.is_metric_based());

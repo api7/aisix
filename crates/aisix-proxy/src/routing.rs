@@ -21,6 +21,9 @@
 //! Models / runtime state, so `resolve_attempt_models` ranks them instead:
 //! - **least_cost**: cheapest target first, by combined input+output per-1K
 //!   price; targets without a `cost` rank last.
+//! - **least_latency**: fastest target first, by an EWMA of observed upstream
+//!   latency; targets with no samples yet rank first (probe, then exploit).
+//! - **least_busy**: least-loaded target first, by in-flight request count.
 
 use aisix_core::{
     AisixSnapshot, Model, Routing, RoutingStrategy, RoutingTarget, WhenAllUnavailablePolicy,
@@ -138,7 +141,9 @@ impl RoutingRegistry {
             RoutingStrategy::Weighted => weighted_pick(&routing.targets),
             // Metric-ordered strategies never reach here — `pick_targets`
             // short-circuits them before computing a start index.
-            RoutingStrategy::LeastCost | RoutingStrategy::LeastLatency => 0,
+            RoutingStrategy::LeastCost
+            | RoutingStrategy::LeastLatency
+            | RoutingStrategy::LeastBusy => 0,
         }
     }
 
@@ -242,6 +247,9 @@ fn order_attempts_by_metric(
             attempts.sort_by(|a, b| {
                 latency_key(runtime_status, &a.id).total_cmp(&latency_key(runtime_status, &b.id))
             });
+        }
+        RoutingStrategy::LeastBusy => {
+            attempts.sort_by_key(|a| runtime_status.in_flight(&a.id));
         }
         RoutingStrategy::Failover | RoutingStrategy::RoundRobin | RoutingStrategy::Weighted => {}
     }
@@ -843,6 +851,44 @@ mod tests {
         t.record_latency("m", 200);
         // 0.3*200 + 0.7*100 = 130
         assert!((t.latency_ewma_ms("m").unwrap() - 130.0).abs() < 1e-9);
+    }
+
+    // ── order_attempts_by_metric (least_busy) ─────────────────────
+    #[test]
+    fn least_busy_orders_least_loaded_first() {
+        let t = crate::ModelRuntimeStatusTracker::new();
+        let _b1 = t.begin_in_flight("busy");
+        let _b2 = t.begin_in_flight("busy"); // 2 in-flight
+        let _m1 = t.begin_in_flight("mid"); // 1 in-flight
+                                            // "idle" has 0 in-flight.
+        let mut attempts = vec![am("busy"), am("idle"), am("mid")];
+        order_attempts_by_metric(RoutingStrategy::LeastBusy, &mut attempts, &t);
+        let ids: Vec<&str> = attempts.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(ids, vec!["idle", "mid", "busy"]);
+    }
+
+    #[test]
+    fn least_busy_cold_start_keeps_declaration_order() {
+        let t = crate::ModelRuntimeStatusTracker::new();
+        // All idle (0 in-flight) → stable sort preserves declaration order.
+        let mut attempts = vec![am("a"), am("b"), am("c")];
+        order_attempts_by_metric(RoutingStrategy::LeastBusy, &mut attempts, &t);
+        let ids: Vec<&str> = attempts.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(ids, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn in_flight_guard_increments_then_decrements_on_drop() {
+        let t = crate::ModelRuntimeStatusTracker::new();
+        assert_eq!(t.in_flight("m"), 0);
+        let g1 = t.begin_in_flight("m");
+        assert_eq!(t.in_flight("m"), 1);
+        let g2 = t.begin_in_flight("m");
+        assert_eq!(t.in_flight("m"), 2);
+        drop(g1);
+        assert_eq!(t.in_flight("m"), 1);
+        drop(g2);
+        assert_eq!(t.in_flight("m"), 0);
     }
 
     #[test]
