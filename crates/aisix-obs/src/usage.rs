@@ -163,6 +163,15 @@ pub struct UsageEvent {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub applied_guardrails: Vec<AppliedGuardrail>,
 
+    /// Per-detector count of spans a `kind: "pii"` guardrail masked on this
+    /// request (input + output merged), e.g. `{"email": 2}`. Detector names
+    /// only — masked values are never captured (#932), so a compliance audit
+    /// sees THAT redaction happened without the event becoming a PII sink.
+    /// Empty (no redaction) is omitted from the wire; cp-api's `/dp/telemetry`
+    /// binds JSON leniently, so older CP images ignore the unknown field.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub redacted_entity_counts: std::collections::BTreeMap<String, u32>,
+
     /// Cache outcome on this request. One of:
     ///
     /// - `"hit"` — cached response served the request without a

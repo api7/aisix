@@ -48,6 +48,7 @@ mod model_resolve;
 mod models;
 mod passthrough;
 mod quota;
+mod redact;
 mod render;
 mod request_id;
 mod rerank;

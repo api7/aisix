@@ -93,7 +93,7 @@ pub async fn chat_completions(
     let started = Instant::now();
     let method = "POST";
     let path = "/v1/chat/completions";
-    let req = match body {
+    let mut req = match body {
         Ok(Json(r)) => r,
         Err(rej) => {
             use axum::extract::rejection::JsonRejection;
@@ -129,14 +129,18 @@ pub async fn chat_completions(
     // read below to attach `applied_guardrails` to the telemetry event on
     // both the success and failure (guardrail-block) paths (#379).
     let mut applied_guardrails: Vec<AppliedGuardrail> = Vec::new();
+    // Filled by `dispatch` with per-detector PII mask counts (#932), same
+    // dual-path lifecycle as `applied_guardrails`.
+    let mut redaction_counts = crate::redact::RedactionCounts::new();
     let outcome = dispatch(
         &state,
         &auth,
-        &req,
+        &mut req,
         &request_id,
         started,
         &client,
         &mut applied_guardrails,
+        &mut redaction_counts,
     )
     .await;
 
@@ -246,6 +250,7 @@ pub async fn chat_completions(
                         error_message: String::new(),
                         applied_guardrails: applied_guardrails.clone(),
                         provider_key_id: success.provider_key_id.clone(),
+                        redacted_entity_counts: redaction_counts.clone(),
                     },
                     success.cost_usd,
                     /* guardrail_blocked */ false,
@@ -472,6 +477,9 @@ pub async fn chat_completions(
                             // ultimately blocked on the output filter.
                             applied_guardrails: applied_guardrails.clone(),
                             provider_key_id: c.provider_key_id,
+                            // Input-side masking happened before the output
+                            // block — the audit trail keeps it.
+                            redacted_entity_counts: redaction_counts.clone(),
                         },
                         /* cost_usd */ 0.0,
                         guardrail_blocked,
@@ -499,6 +507,8 @@ pub async fn chat_completions(
                             // the resolved guardrail chain (empty if it failed
                             // before resolution).
                             applied_guardrails: applied_guardrails.clone(),
+                            // Input masking may have fired before the failure.
+                            redacted_entity_counts: redaction_counts.clone(),
                             ..UsageExtras::default()
                         },
                         /* cost_usd */ 0.0,
@@ -764,7 +774,10 @@ struct UpstreamCharge {
 async fn dispatch(
     state: &ProxyState,
     auth: &AuthenticatedKey,
-    req: &ChatFormat,
+    // `&mut` so mask-action PII guardrails (#932) can rewrite the request
+    // text in place before it reaches semantic routing, the cache key, or
+    // the upstream.
+    req: &mut ChatFormat,
     request_id: &str,
     started: Instant,
     client: &ClientContext,
@@ -774,6 +787,12 @@ async fn dispatch(
     // without threading a field through every `Success`/`DispatchFailure`
     // construction site. Stays empty for requests rejected before resolution.
     applied_out: &mut Vec<AppliedGuardrail>,
+    // Out-param: per-detector PII mask counts (#932), same lifecycle as
+    // `applied_out`. Input-side counts land here as soon as the request is
+    // rewritten; the non-streaming output side merges in later. Streaming
+    // output counts travel via `StreamCompletion` instead (the event is
+    // emitted at end-of-stream).
+    redactions_out: &mut crate::redact::RedactionCounts,
 ) -> Result<Success, DispatchFailure> {
     if req.messages.is_empty() {
         return Err(DispatchFailure::new(
@@ -870,6 +889,16 @@ async fn dispatch(
             bypass_reason = Some(reason);
         }
     }
+
+    // #932: mask-action PII rules rewrite the request in place AFTER the
+    // block check passes and BEFORE any downstream use — the semantic-
+    // routing embedding, the cache-key fingerprint, and the upstream
+    // dispatch all see the masked text, so the matched values never leave
+    // the gateway.
+    crate::redact::merge_counts(
+        redactions_out,
+        crate::redact::redact_chat_format(&resolved_chain, req),
+    );
 
     // Budget pre-check via cp-api. The DP no longer owns budget state;
     // cp-api returns a cached/live decision per api_key.
@@ -980,6 +1009,7 @@ async fn dispatch(
             &model_id,
             &auth.entry.id,
             client,
+            redactions_out.clone(),
         )
         .await;
     }
@@ -1236,6 +1266,10 @@ async fn dispatch(
         // Applied guardrail set (#379), owned for the move into on_complete so
         // the streamed-response telemetry event records which guardrails ran.
         let applied_guardrails_for_telem = applied_guardrails.clone();
+        // Input-side PII mask counts (#932), captured before the stream so
+        // the end-of-stream event merges them with the output-side counts
+        // accumulated in `comp.redacted_entity_counts`.
+        let input_redactions_for_telem = redactions_out.clone();
         // Downstream client attribution (#492) moved into the on_complete
         // closure so streamed responses log the same IP/UA as non-streaming.
         let client_for_telem = client.clone();
@@ -1347,6 +1381,14 @@ async fn dispatch(
                         error_message: String::new(),
                         applied_guardrails: applied_guardrails_for_telem.clone(),
                         provider_key_id: provider_key_id_for_telem.clone(),
+                        redacted_entity_counts: {
+                            let mut merged = input_redactions_for_telem.clone();
+                            crate::redact::merge_counts(
+                                &mut merged,
+                                comp.redacted_entity_counts,
+                            );
+                            merged
+                        },
                     },
                     /* cost_usd */ 0.0,
                     comp.guardrail_blocked,
@@ -1523,7 +1565,7 @@ async fn dispatch(
 
     if let (Some(cache), Some(key)) = (policy_cache.as_ref(), cache_key.as_ref()) {
         match cache.get(key).await {
-            Ok(Some(cached)) => {
+            Ok(Some(mut cached)) => {
                 reservation.commit_tokens(0).await;
                 // #448: a cache hit is client-visible output just like a
                 // fresh upstream response, so it must run output guardrails
@@ -1553,6 +1595,14 @@ async fn dispatch(
                     }
                     _ => {}
                 }
+                // #932: cache hits are client-visible output like a fresh
+                // upstream response — mask them too. Entries are stored
+                // masked (see the write below), but entries written before
+                // a rule was added/tightened must still be caught here.
+                crate::redact::merge_counts(
+                    redactions_out,
+                    crate::redact::redact_chat_response(&resolved_chain, &mut cached),
+                );
                 let prompt = cached.usage.prompt_tokens as u64;
                 let completion = cached.usage.completion_tokens as u64;
                 let total = cached.usage.total_tokens as u64;
@@ -1832,7 +1882,7 @@ async fn dispatch(
         }
     }
 
-    let Some(upstream) = upstream else {
+    let Some(mut upstream) = upstream else {
         // Bubble the most recent BridgeError through ProxyError::Bridge.
         let err = last_err.unwrap_or_else(|| {
             BridgeError::Config("routing exhausted with no targets attempted".into())
@@ -1932,6 +1982,14 @@ async fn dispatch(
             }
         }
     }
+
+    // #932: mask-action PII rules rewrite the response AFTER the block
+    // check passes and BEFORE the cache write below, so cached entries
+    // are stored masked — the matched values don't persist at rest.
+    crate::redact::merge_counts(
+        redactions_out,
+        crate::redact::redact_chat_response(&resolved_chain, &mut upstream),
+    );
 
     // Cache write is gated on the same policy as the lookup at the
     // top of dispatch — without a matching enabled cache_policy in
@@ -2044,6 +2102,11 @@ async fn dispatch_ensemble(
     model_id: &str,
     api_key_id: &str,
     client: &ClientContext,
+    // Input-side PII mask counts (#932) captured by `dispatch` before the
+    // fan-out. Ensemble telemetry is emitted per sub-call inside this
+    // function (the handler's main emit is skipped), so the counts ride
+    // the judge event — the ensemble's terminal event.
+    input_redactions: crate::redact::RedactionCounts,
 ) -> Result<Success, DispatchFailure> {
     let started = Instant::now();
     let with_model = |e: ProxyError| DispatchFailure::new(Some(model_id.to_string()), None, e);
@@ -2359,6 +2422,9 @@ async fn dispatch_ensemble(
         let applied_guardrails_for_telem = applied_guardrails.to_vec();
         let client_for_telem = client.clone();
         let bypass_for_telem = bypass_reason.clone().unwrap_or_default();
+        // Input-side PII mask counts (#932); merged with the streamed judge's
+        // output-side counts on the terminal (judge) event.
+        let input_redactions_for_telem = input_redactions.clone();
 
         // Hold concurrency for the stream's full lifetime (#450). Snapshot the
         // keys BEFORE consuming the reservation into the owned guard.
@@ -2461,6 +2527,14 @@ async fn dispatch_ensemble(
                         attempt_model: judge_attempt_model.clone(),
                         applied_guardrails: applied_guardrails_for_telem.clone(),
                         provider_key_id: judge_provider_key_id.clone(),
+                        redacted_entity_counts: {
+                            let mut merged = input_redactions_for_telem.clone();
+                            crate::redact::merge_counts(
+                                &mut merged,
+                                comp.redacted_entity_counts,
+                            );
+                            merged
+                        },
                         ..UsageExtras::default()
                     },
                     /* cost_usd */ 0.0,
@@ -2580,7 +2654,14 @@ async fn dispatch_ensemble(
     // usage to cp-api. The `emit_subcalls` closure is therefore defined
     // here and invoked from each branch of the guardrail match below —
     // never from the post-match continuation alone.
-    let emit_subcalls = |blocked: bool, bypass: &str| {
+    // Takes `outcome` as a parameter (not a capture) so the Allow branch
+    // below can mask `outcome.response` in place (#932) between the
+    // guardrail check and this emit. `redactions` lands on the judge
+    // event — the ensemble's terminal telemetry event.
+    let emit_subcalls = |outcome: &crate::ensemble::EnsembleOutcome,
+                         blocked: bool,
+                         bypass: &str,
+                         redactions: &crate::redact::RedactionCounts| {
         for (index, member) in outcome.panel.iter().enumerate() {
             emit_panel_member(member, index, blocked, bypass);
         }
@@ -2610,6 +2691,7 @@ async fn dispatch_ensemble(
                 attempt_model: outcome.judge_model.clone(),
                 applied_guardrails: applied_guardrails.to_vec(),
                 provider_key_id: judge_provider_key_id,
+                redacted_entity_counts: redactions.clone(),
                 ..UsageExtras::default()
             },
             /* cost_usd */ 0.0,
@@ -2639,7 +2721,12 @@ async fn dispatch_ensemble(
             );
             // Block is not a bypass, so the output guardrail did not mutate
             // `bypass_reason`; carry the input-only bypass (if any).
-            emit_subcalls(true, &bypass_reason.clone().unwrap_or_default());
+            emit_subcalls(
+                &outcome,
+                true,
+                &bypass_reason.clone().unwrap_or_default(),
+                &input_redactions,
+            );
             return Err(DispatchFailure::new(
                 Some(model_id.to_string()),
                 None,
@@ -2656,10 +2743,21 @@ async fn dispatch_ensemble(
             }
         }
     }
-    // Allow / Bypass continuation: emit the (non-blocked) sub-call events
-    // with the final bypass value (which an output bypass above may have
-    // set).
-    emit_subcalls(false, &bypass_reason.clone().unwrap_or_default());
+    // Allow / Bypass continuation: mask the synthesized answer (#932) —
+    // the check above ran on the original text, the client gets the masked
+    // one — then emit the (non-blocked) sub-call events with the final
+    // bypass value (which an output bypass above may have set).
+    let mut ensemble_redactions = input_redactions.clone();
+    crate::redact::merge_counts(
+        &mut ensemble_redactions,
+        crate::redact::redact_chat_response(resolved_chain, &mut outcome.response),
+    );
+    emit_subcalls(
+        &outcome,
+        false,
+        &bypass_reason.clone().unwrap_or_default(),
+        &ensemble_redactions,
+    );
 
     // The synthesized answer is the client-facing response, rendered with
     // the requested (ensemble) model name. `telemetry_handled_by_stream`
@@ -2884,6 +2982,7 @@ fn emit_usage_event(
         guardrail_blocked,
         guardrail_bypassed_reason: extras.bypass_reason,
         applied_guardrails: extras.applied_guardrails,
+        redacted_entity_counts: extras.redacted_entity_counts,
         cache_status: extras.cache_status,
         cache_hit_saved_input_tokens: extras.cache_hit_saved_input_tokens,
         cache_hit_saved_output_tokens: extras.cache_hit_saved_output_tokens,
@@ -3026,6 +3125,10 @@ struct UsageExtras {
     /// emit events land in cp-api with the tag columns NULL.
     /// See AISIX-Cloud#436 / #302 M17.
     provider_key_id: String,
+    /// Per-detector PII mask counts for this request, input + output
+    /// merged (#932). Lands on `usage_events.redacted_entity_counts`.
+    /// Detector names only, never matched values. Empty = no redaction.
+    redacted_entity_counts: crate::redact::RedactionCounts,
 }
 
 /// Emit one zero-token `UsageEvent` per FAILED attempt of a request
@@ -3211,6 +3314,10 @@ struct StreamCompletion {
     /// capture cap). Empty otherwise. Read by the on_complete telemetry
     /// closure; never reaches the CP sink.
     response_text: String,
+    /// Per-detector PII mask counts applied to the held stream at release
+    /// (#932). Merged with the input-side counts by the on_complete
+    /// telemetry closure. Detector names only, never matched values.
+    redacted_entity_counts: crate::redact::RedactionCounts,
 }
 
 /// Parameters needed to run output-guardrail evaluation at
@@ -3378,9 +3485,11 @@ where
             .map(|ctx| ctx.chain.stream_output_policy())
             .unwrap_or_default();
         let hold_back = stream_policy.holds_back();
-        // Rendered content events withheld from the wire until their
-        // window (or the whole response) scans clean. Hold-back path only.
-        let mut pending: Vec<Event> = Vec::new();
+        // Content chunks withheld from the wire until their window (or the
+        // whole response) scans clean. Hold-back path only. Held PRE-render
+        // (#932): the BufferFull release rewrites masked spans across the
+        // held chunks before they are rendered + serialised at drain time.
+        let mut pending: Vec<aisix_gateway::ChatChunk> = Vec::new();
         // Content accumulated since the last window flush (Window mode);
         // bounded to ~window_size, unlike content_buffer (whole response).
         let mut window_buf = String::new();
@@ -3403,8 +3512,25 @@ where
         // the truncated response as a successful one.
         let mut errored = false;
         let mut first_chunk_seen = false;
+        // Render + serialise one held/live chunk into an SSE Event.
+        // Serialisation of these plain structs can't realistically fail;
+        // the Err arm mirrors the pre-hold-back defensive error frame.
+        macro_rules! chunk_event {
+            ($chunk:expr) => {{
+                let rendered = render_chunk(created, $chunk, &client_facing_model);
+                match serde_json::to_string(&rendered) {
+                    Ok(json) => Event::default().data(json),
+                    Err(err) => {
+                        errored = true;
+                        Event::default()
+                            .event("error")
+                            .data(error_frame_payload("internal_error", &err.to_string()))
+                    }
+                }
+            }};
+        }
         while let Some(item) = upstream.next().await {
-            let (ev, is_error_ev) = match item {
+            let maybe_chunk = match item {
                 Ok(mut chunk) => {
                     // Record TTFT on the first chunk carrying generated
                     // output (content or tool calls). Skip role-only
@@ -3524,42 +3650,34 @@ where
                     if let Some(u) = chunk.usage.as_mut() {
                         *u = u.saturating_add(&base_usage);
                     }
-                    let rendered = render_chunk(created, chunk, &client_facing_model);
-                    match serde_json::to_string(&rendered) {
-                        Ok(json) => (Event::default().data(json), false),
-                        Err(err) => {
-                            errored = true;
-                            (
-                                Event::default()
-                                    .event("error")
-                                    .data(error_frame_payload("internal_error", &err.to_string())),
-                                true,
-                            )
-                        }
-                    }
+                    Some(chunk)
                 }
                 Err(err) => {
                     errored = true;
                     let etype = err.error_type();
-                    (
+                    yield Ok::<_, Infallible>(
                         Event::default()
                             .event("error")
                             .data(error_frame_payload(etype, &err.to_string())),
-                        true,
-                    )
+                    );
+                    None
                 }
             };
-            if is_error_ev || !hold_back || cap_released {
-                // Error frames, the EndOfStreamCheck path, and a released
-                // BufferFull cap all forward straight to the wire. On the
-                // hold-back path an error drops the held (unscanned)
-                // content via the `errored` skip at end-of-stream (fail
-                // closed).
+            let Some(chunk) = maybe_chunk else {
+                continue;
+            };
+            if !hold_back || cap_released {
+                // The EndOfStreamCheck path and a released BufferFull cap
+                // forward straight to the wire. (Error frames yielded in
+                // the Err arm above also bypass the hold; the `errored`
+                // skip at end-of-stream then drops any held unscanned
+                // content — fail closed.)
+                let ev = chunk_event!(chunk);
                 yield Ok::<_, Infallible>(ev);
             } else {
-                // Hold-back: withhold this content event until its window
-                // (or the whole response) scans clean.
-                pending.push(ev);
+                // Hold-back: withhold this chunk until its window (or the
+                // whole response) scans clean.
+                pending.push(chunk);
                 match &stream_policy {
                     aisix_guardrails::StreamOutputPolicy::Window {
                         size_chars,
@@ -3629,11 +3747,16 @@ where
                                     _ => {}
                                 }
                                 // Clean (Allow / Bypass): release
-                                // this window's events, then keep the
+                                // this window's chunks, then keep the
                                 // trailing overlap as scan context for the
-                                // next window (its events were already sent).
-                                for e in pending.drain(..) {
-                                    yield Ok::<_, Infallible>(e);
+                                // next window (its chunks were already sent).
+                                // No mask rewrite here: a redacting (PII)
+                                // guardrail always folds the chain to
+                                // BufferFull, so Window mode implies no
+                                // redactor in the chain.
+                                for chunk in pending.drain(..) {
+                                    let ev = chunk_event!(chunk);
+                                    yield Ok::<_, Infallible>(ev);
                                 }
                                 // Clamp the retained overlap to cc-1 so a
                                 // misconfigured overlap >= window can't keep
@@ -3656,9 +3779,14 @@ where
                         let buffered = content_buffer.as_ref().map_or(0, |b| b.len());
                         if buffered > *max_buffer_bytes {
                             if *on_exceeded_fail_open {
+                                // Fail-open overflow releases the held
+                                // chunks unscanned AND unmasked — the
+                                // operator opted into that trade-off via
+                                // `on_buffer_exceeded: fail_open`.
                                 cap_released = true;
-                                for e in pending.drain(..) {
-                                    yield Ok::<_, Infallible>(e);
+                                for chunk in pending.drain(..) {
+                                    let ev = chunk_event!(chunk);
+                                    yield Ok::<_, Infallible>(ev);
                                 }
                             } else {
                                 tracing::warn!(
@@ -3774,8 +3902,23 @@ where
                         }
                     };
                     if !blocked {
-                        for e in pending.drain(..) {
-                            yield Ok::<_, Infallible>(e);
+                        // #932: the whole response is held here, so mask-
+                        // action PII rules rewrite the held chunks before
+                        // anything reaches the wire (channel reassembly —
+                        // a masked span can cross chunk boundaries).
+                        if let Some(ctx) = output_guardrail.as_ref() {
+                            let counts =
+                                crate::redact::redact_chat_chunks(&ctx.chain, &mut pending);
+                            if !counts.is_empty() {
+                                crate::redact::merge_counts(
+                                    &mut guard.comp().redacted_entity_counts,
+                                    counts,
+                                );
+                            }
+                        }
+                        for chunk in pending.drain(..) {
+                            let ev = chunk_event!(chunk);
+                            yield Ok::<_, Infallible>(ev);
                         }
                     }
                 }
