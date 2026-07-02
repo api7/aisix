@@ -1653,8 +1653,7 @@ async fn cross_provider_dispatch(
 
     // #932: mask-action PII rules rewrite the bridged response AFTER the
     // block check passes, BEFORE it is rendered back as Anthropic JSON.
-    let output_redactions =
-        crate::redact::redact_chat_response(resolved_chain.as_ref(), &mut resp);
+    let output_redactions = crate::redact::redact_chat_response(resolved_chain.as_ref(), &mut resp);
 
     let metrics = AnthropicUsageMetrics {
         prompt_tokens: resp.usage.prompt_tokens,

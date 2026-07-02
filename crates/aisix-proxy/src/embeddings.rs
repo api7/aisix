@@ -172,6 +172,7 @@ pub async fn embeddings(
                     elapsed,
                     success.prompt_tokens,
                     &client,
+                    success.redactions.clone(),
                 );
             }
             success.response
@@ -229,6 +230,8 @@ struct EmbedDispatchSuccess {
     /// The `{kind, hook}` set of guardrails that governed this request (#379
     /// parity) — surfaced on the emitted UsageEvent.
     applied_guardrails: Vec<AppliedGuardrail>,
+    /// Per-detector PII mask counts (#932) applied to the input.
+    redactions: crate::redact::RedactionCounts,
     prompt_tokens: u32,
     /// `true` when the dispatch produced a real 200 from the upstream
     /// (we have authoritative usage data to attribute). `false` for the
@@ -245,7 +248,7 @@ struct EmbedDispatchSuccess {
 async fn dispatch(
     state: &ProxyState,
     auth: &AuthenticatedKey,
-    body: EmbeddingRequestBody,
+    mut body: EmbeddingRequestBody,
     request_id: &str,
     source_ip: &str,
 ) -> Result<EmbedDispatchSuccess, ProxyError> {
@@ -310,6 +313,32 @@ async fn dispatch(
         }
     }
 
+    // #932: mask-action PII rules rewrite the embeddings input in place
+    // AFTER the block check passes — the masked text is what gets embedded,
+    // so the matched values never reach the provider.
+    let mut redactions = crate::redact::RedactionCounts::new();
+    if aisix_guardrails::Guardrail::redacts_input(&resolved_chain) {
+        match &mut body.input {
+            InputField::Single(s) => {
+                if let Some(r) = aisix_guardrails::Guardrail::redact_input_text(&resolved_chain, s)
+                {
+                    *s = r.text;
+                    crate::redact::merge_counts(&mut redactions, r.counts);
+                }
+            }
+            InputField::Multi(items) => {
+                for s in items {
+                    if let Some(r) =
+                        aisix_guardrails::Guardrail::redact_input_text(&resolved_chain, s)
+                    {
+                        *s = r.text;
+                        crate::redact::merge_counts(&mut redactions, r.counts);
+                    }
+                }
+            }
+        }
+    }
+
     let model_rl =
         crate::quota::ModelRateLimit::from_model(&body.model, &model_entry.id, &model_entry.value);
     let reservation = crate::quota::enforce(state, auth, Some(&model_rl)).await?;
@@ -360,6 +389,7 @@ async fn dispatch(
                 model_id: model_entry.id.to_string(),
                 provider_key_id: pk_entry.id.to_string(),
                 applied_guardrails: applied_guardrails.clone(),
+                redactions: redactions.clone(),
                 prompt_tokens,
                 upstream_called: true,
             })
@@ -379,6 +409,7 @@ async fn dispatch(
                 model_id: model_entry.id.to_string(),
                 provider_key_id: pk_entry.id.to_string(),
                 applied_guardrails: applied_guardrails.clone(),
+                redactions: redactions.clone(),
                 prompt_tokens: 0,
                 // No upstream call happened — the handler reads this
                 // and skips UsageEvent emission. Distinguished from
@@ -459,6 +490,8 @@ fn emit_usage_event(
     elapsed: Duration,
     prompt_tokens: u32,
     client: &ClientContext,
+    // Per-detector PII mask counts (#932) applied to the input.
+    redacted_entity_counts: crate::redact::RedactionCounts,
 ) {
     // Only populate fields meaningful to /v1/embeddings; rely on
     // UsageEvent's `#[derive(Default)]` for everything else. Wire-level
@@ -498,6 +531,7 @@ fn emit_usage_event(
         status_code,
         inbound_protocol: "openai".to_string(),
         applied_guardrails: applied_guardrails.to_vec(),
+        redacted_entity_counts,
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),
         ..Default::default()

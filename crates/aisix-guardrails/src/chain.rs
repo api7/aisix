@@ -217,15 +217,23 @@ impl Guardrail for GuardrailChain {
     /// output, so stacked redacting guardrails compose. Counts merge across
     /// members.
     fn redact_input_text(&self, text: &str) -> Option<Redaction> {
-        fold_redactions(text, self.members.iter().filter_map(|m| {
-            m.guardrail.redacts_input().then_some(&m.guardrail)
-        }), true)
+        fold_redactions(
+            text,
+            self.members
+                .iter()
+                .filter_map(|m| m.guardrail.redacts_input().then_some(&m.guardrail)),
+            true,
+        )
     }
 
     fn redact_output_text(&self, text: &str) -> Option<Redaction> {
-        fold_redactions(text, self.members.iter().filter_map(|m| {
-            m.guardrail.redacts_output().then_some(&m.guardrail)
-        }), false)
+        fold_redactions(
+            text,
+            self.members
+                .iter()
+                .filter_map(|m| m.guardrail.redacts_output().then_some(&m.guardrail)),
+            false,
+        )
     }
 }
 

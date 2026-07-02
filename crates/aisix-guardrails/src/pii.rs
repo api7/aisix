@@ -137,12 +137,20 @@ fn mask_token(name: &str) -> String {
 /// contract: cp-api's validator and the dashboard's detector list carry
 /// the same set.
 pub const BUILTIN_DETECTORS: &[(&str, &str, Option<MatchValidator>)] = &[
-    ("email", r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b", None),
+    (
+        "email",
+        r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b",
+        None,
+    ),
     // Chinese mainland mobile: 1[3-9] + 9 digits, standalone digit run.
     ("china_mobile", r"\b1[3-9]\d{9}\b", None),
     // 18-char Chinese national ID (17 digits + check char), verified with
     // the ISO 7064 MOD 11-2 checksum.
-    ("china_id_card", r"\b\d{17}[0-9Xx]\b", Some(china_id_checksum)),
+    (
+        "china_id_card",
+        r"\b\d{17}[0-9Xx]\b",
+        Some(china_id_checksum),
+    ),
     // 13–19 digit PAN (bank/credit card), Luhn-verified.
     ("bank_card", r"\b\d{13,19}\b", Some(luhn_checksum)),
     ("us_ssn", r"\b\d{3}-\d{2}-\d{4}\b", None),
@@ -158,7 +166,11 @@ pub const BUILTIN_DETECTORS: &[(&str, &str, Option<MatchValidator>)] = &[
         r"\b(?:sk-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{22,}|xox[baprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{35})\b",
         None,
     ),
-    ("jwt", r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b", None),
+    (
+        "jwt",
+        r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b",
+        None,
+    ),
     (
         "private_key",
         r"(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
@@ -313,10 +325,9 @@ impl Guardrail for PiiGuardrail {
         match self.first_block_match(&combined) {
             // Reason carries the detector NAME only — never the matched
             // value (#153 + #932 no-leak criterion).
-            Some(rule) => GuardrailVerdict::block(format!(
-                "input blocked by pii detector '{}'",
-                rule.name
-            )),
+            Some(rule) => {
+                GuardrailVerdict::block(format!("input blocked by pii detector '{}'", rule.name))
+            }
             None => GuardrailVerdict::Allow,
         }
     }
@@ -327,10 +338,9 @@ impl Guardrail for PiiGuardrail {
         }
         let text = resp.guardrail_output_text();
         match self.first_block_match(&text) {
-            Some(rule) => GuardrailVerdict::block(format!(
-                "output blocked by pii detector '{}'",
-                rule.name
-            )),
+            Some(rule) => {
+                GuardrailVerdict::block(format!("output blocked by pii detector '{}'", rule.name))
+            }
             None => GuardrailVerdict::Allow,
         }
     }
@@ -389,7 +399,9 @@ mod tests {
     #[test]
     fn email_masks_span_only() {
         let g = guardrail(vec![builtin("email", PiiAction::Mask)]);
-        let r = g.redact_input_text("contact me at alice@example.com please").unwrap();
+        let r = g
+            .redact_input_text("contact me at alice@example.com please")
+            .unwrap();
         assert_eq!(r.text, "contact me at [EMAIL_REDACTED] please");
         assert_eq!(r.counts.get("email"), Some(&1));
     }
@@ -397,7 +409,9 @@ mod tests {
     #[test]
     fn china_mobile_masks_standalone_number_only() {
         let g = guardrail(vec![builtin("china_mobile", PiiAction::Mask)]);
-        let r = g.redact_input_text("我的手机号是 13800138000，请回电").unwrap();
+        let r = g
+            .redact_input_text("我的手机号是 13800138000，请回电")
+            .unwrap();
         assert_eq!(r.text, "我的手机号是 [CHINA_MOBILE_REDACTED]，请回电");
         // Embedded in a longer digit run → not a phone → untouched.
         assert!(g.redact_input_text("订单号 913800138000123").is_none());
@@ -407,10 +421,14 @@ mod tests {
     fn china_id_card_requires_checksum() {
         let g = guardrail(vec![builtin("china_id_card", PiiAction::Mask)]);
         // Valid checksum (11010519491231002X is the canonical example).
-        let r = g.redact_input_text("身份证 11010519491231002X 已登记").unwrap();
+        let r = g
+            .redact_input_text("身份证 11010519491231002X 已登记")
+            .unwrap();
         assert_eq!(r.text, "身份证 [CHINA_ID_CARD_REDACTED] 已登记");
         // Same shape, broken check digit → untouched.
-        assert!(g.redact_input_text("身份证 110105194912310021 已登记").is_none());
+        assert!(g
+            .redact_input_text("身份证 110105194912310021 已登记")
+            .is_none());
     }
 
     #[test]
@@ -433,10 +451,7 @@ mod tests {
                 "key sk-abcdefghijklmnopqrstuv and token eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.dGVzdHNpZ25hdHVyZQ",
             )
             .unwrap();
-        assert_eq!(
-            r.text,
-            "key [API_KEY_REDACTED] and token [JWT_REDACTED]"
-        );
+        assert_eq!(r.text, "key [API_KEY_REDACTED] and token [JWT_REDACTED]");
         assert_eq!(r.counts.len(), 2);
     }
 
@@ -450,13 +465,7 @@ mod tests {
 
     #[test]
     fn custom_pattern_masks_with_sanitised_token() {
-        let rule = PiiRule::new(
-            "employee id",
-            r"\bEMP-\d{6}\b",
-            PiiAction::Mask,
-            None,
-        )
-        .unwrap();
+        let rule = PiiRule::new("employee id", r"\bEMP-\d{6}\b", PiiAction::Mask, None).unwrap();
         let g = guardrail(vec![rule]);
         let r = g.redact_input_text("badge EMP-123456").unwrap();
         assert_eq!(r.text, "badge [EMPLOYEE_ID_REDACTED]");
@@ -557,9 +566,7 @@ mod tests {
     #[test]
     fn multiple_matches_count_per_detector() {
         let g = guardrail(vec![builtin("email", PiiAction::Mask)]);
-        let r = g
-            .redact_input_text("a@x.com then b@y.org")
-            .unwrap();
+        let r = g.redact_input_text("a@x.com then b@y.org").unwrap();
         assert_eq!(r.text, "[EMAIL_REDACTED] then [EMAIL_REDACTED]");
         assert_eq!(r.counts.get("email"), Some(&2));
     }
@@ -579,10 +586,7 @@ mod tests {
         let r = g
             .redact_input_text("ssn 123-45-6789 from 192.168.1.100")
             .unwrap();
-        assert_eq!(
-            r.text,
-            "ssn [US_SSN_REDACTED] from [IP_ADDRESS_REDACTED]"
-        );
+        assert_eq!(r.text, "ssn [US_SSN_REDACTED] from [IP_ADDRESS_REDACTED]");
     }
 
     #[test]

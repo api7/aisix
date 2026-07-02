@@ -194,10 +194,7 @@ fn redact_tool_call_arguments(
         return;
     };
     for tc in items {
-        if let Some(args) = tc
-            .get_mut("function")
-            .and_then(|f| f.get_mut("arguments"))
-        {
+        if let Some(args) = tc.get_mut("function").and_then(|f| f.get_mut("arguments")) {
             if let Value::String(s) = args {
                 let mut owned = std::mem::take(s);
                 redact_json_encoded(chain, dir, &mut owned, counts);
@@ -318,24 +315,22 @@ fn redact_responses_item(
 ) {
     match item.get("type").and_then(Value::as_str) {
         // An item without a `type` defaults to `message` on this API.
-        Some("message") | None => {
-            match item.get_mut("content") {
-                Some(v @ Value::String(_)) => apply_to_value_string(chain, dir, v, counts),
-                Some(Value::Array(parts)) => {
-                    for part in parts {
-                        if matches!(
-                            part.get("type").and_then(Value::as_str),
-                            Some("input_text") | Some("output_text") | Some("text")
-                        ) {
-                            if let Some(text) = part.get_mut("text") {
-                                apply_to_value_string(chain, dir, text, counts);
-                            }
+        Some("message") | None => match item.get_mut("content") {
+            Some(v @ Value::String(_)) => apply_to_value_string(chain, dir, v, counts),
+            Some(Value::Array(parts)) => {
+                for part in parts {
+                    if matches!(
+                        part.get("type").and_then(Value::as_str),
+                        Some("input_text") | Some("output_text") | Some("text")
+                    ) {
+                        if let Some(text) = part.get_mut("text") {
+                            apply_to_value_string(chain, dir, text, counts);
                         }
                     }
                 }
-                _ => {}
             }
-        }
+            _ => {}
+        },
         Some("function_call") => {
             if let Some(Value::String(args)) = item.get_mut("arguments") {
                 let mut owned = std::mem::take(args);
@@ -350,6 +345,61 @@ fn redact_responses_item(
         }
         _ => {}
     }
+}
+
+/// Mask a `/v1/responses` non-streaming RESPONSE body in place: every
+/// item in `output` (message `output_text` parts, `function_call`
+/// arguments) — the same surface the output check scans.
+pub fn redact_responses_response(chain: &dyn Guardrail, body: &mut Value) -> RedactionCounts {
+    let mut counts = RedactionCounts::new();
+    if !chain.redacts_output() {
+        return counts;
+    }
+    if let Some(Value::Array(items)) = body.get_mut("output") {
+        for item in items {
+            redact_responses_item(chain, Direction::Output, item, &mut counts);
+        }
+    }
+    counts
+}
+
+/// Mask a legacy `/v1/completions` request body in place: `prompt` as a
+/// bare string or an array of strings (token-id arrays carry no text).
+pub fn redact_completions_request(chain: &dyn Guardrail, body: &mut Value) -> RedactionCounts {
+    let mut counts = RedactionCounts::new();
+    if !chain.redacts_input() {
+        return counts;
+    }
+    match body.get_mut("prompt") {
+        Some(v @ Value::String(_)) => {
+            apply_to_value_string(chain, Direction::Input, v, &mut counts)
+        }
+        Some(Value::Array(items)) => {
+            for item in items {
+                if item.is_string() {
+                    apply_to_value_string(chain, Direction::Input, item, &mut counts);
+                }
+            }
+        }
+        _ => {}
+    }
+    counts
+}
+
+/// Mask a legacy `/v1/completions` RESPONSE body in place: `choices[].text`.
+pub fn redact_completions_response(chain: &dyn Guardrail, body: &mut Value) -> RedactionCounts {
+    let mut counts = RedactionCounts::new();
+    if !chain.redacts_output() {
+        return counts;
+    }
+    if let Some(Value::Array(choices)) = body.get_mut("choices") {
+        for choice in choices {
+            if let Some(text) = choice.get_mut("text") {
+                apply_to_value_string(chain, Direction::Output, text, &mut counts);
+            }
+        }
+    }
+    counts
 }
 
 // ─── Response side (non-streaming) ───────────────────────────────────────────
@@ -584,7 +634,11 @@ pub fn redact_anthropic_sse(
         let index = data.get("index").and_then(Value::as_u64).unwrap_or(0);
         match data.get("type").and_then(Value::as_str) {
             Some("content_block_delta") => {
-                match data.get("delta").and_then(|d| d.get("type")).and_then(Value::as_str) {
+                match data
+                    .get("delta")
+                    .and_then(|d| d.get("type"))
+                    .and_then(Value::as_str)
+                {
                     Some("text_delta") => {
                         if data
                             .get("delta")
@@ -592,7 +646,10 @@ pub fn redact_anthropic_sse(
                             .and_then(Value::as_str)
                             .is_some_and(|t| !t.is_empty())
                         {
-                            text_channels.entry(index).or_default().push((fi, Site::DeltaText));
+                            text_channels
+                                .entry(index)
+                                .or_default()
+                                .push((fi, Site::DeltaText));
                         }
                     }
                     Some("input_json_delta") => {
@@ -642,18 +699,16 @@ pub fn redact_anthropic_sse(
     fn site_slot<'v>(data: &'v mut Value, site: Site) -> Option<&'v mut Value> {
         match site {
             Site::DeltaText => data.get_mut("delta").and_then(|d| d.get_mut("text")),
-            Site::DeltaPartialJson => {
-                data.get_mut("delta").and_then(|d| d.get_mut("partial_json"))
-            }
-            Site::BlockStartText => {
-                data.get_mut("content_block").and_then(|b| b.get_mut("text"))
-            }
+            Site::DeltaPartialJson => data
+                .get_mut("delta")
+                .and_then(|d| d.get_mut("partial_json")),
+            Site::BlockStartText => data
+                .get_mut("content_block")
+                .and_then(|b| b.get_mut("text")),
         }
     }
 
-    let mut rewrite = |frames: &mut Vec<SseFrame>,
-                       sites: &[(usize, Site)],
-                       new_text: String| {
+    let mut rewrite = |frames: &mut Vec<SseFrame>, sites: &[(usize, Site)], new_text: String| {
         let mut first = true;
         for &(fi, site) in sites {
             let frame = &mut frames[fi];
@@ -694,6 +749,203 @@ pub fn redact_anthropic_sse(
     }
 
     if counts.is_empty() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(raw.len());
+    for frame in &frames {
+        out.extend_from_slice(&frame.render());
+        out.extend_from_slice(b"\n\n");
+    }
+    out.extend_from_slice(trailing);
+    Some((out, counts))
+}
+
+// ─── Responses-API SSE rewrite ───────────────────────────────────────────────
+
+/// Mask a fully-buffered Responses-API SSE byte stream (the `/v1/responses`
+/// verbatim hold-back and the cross-provider bridge release). Delta events
+/// are reassembled per channel (`output_text.delta` by item, `function_call
+/// _arguments.delta` by item), masked once, and re-emitted on the channel's
+/// first frame; the aggregate events (`*.done`, `output_item.done`,
+/// `response.completed`) carry complete texts and are masked directly —
+/// deterministic masking keeps them consistent with the delta channels.
+/// `None` = nothing matched, forward the original bytes byte-identical.
+pub fn redact_responses_sse(
+    chain: &dyn Guardrail,
+    raw: &[u8],
+) -> Option<(Vec<u8>, RedactionCounts)> {
+    if !chain.redacts_output() {
+        return None;
+    }
+    let (mut frames, trailing) = split_sse_frames(raw);
+    let mut counts = RedactionCounts::new();
+
+    // Delta channels: (event-type discriminant, channel key) → frame sites.
+    let mut text_channels: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    let mut args_channels: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+
+    fn channel_key(data: &Value) -> String {
+        // item_id is the stable discriminator; fall back to output_index +
+        // content_index for encoders that omit it.
+        match data.get("item_id").and_then(Value::as_str) {
+            Some(id) => format!(
+                "{id}/{}",
+                data.get("content_index")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+            ),
+            None => format!(
+                "{}/{}",
+                data.get("output_index")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                data.get("content_index")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+            ),
+        }
+    }
+
+    for (fi, frame) in frames.iter().enumerate() {
+        let Some(data) = frame.data.as_ref() else {
+            continue;
+        };
+        match data.get("type").and_then(Value::as_str) {
+            Some("response.output_text.delta") => {
+                if data
+                    .get("delta")
+                    .and_then(Value::as_str)
+                    .is_some_and(|t| !t.is_empty())
+                {
+                    text_channels.entry(channel_key(data)).or_default().push(fi);
+                }
+            }
+            Some("response.function_call_arguments.delta") => {
+                if data
+                    .get("delta")
+                    .and_then(Value::as_str)
+                    .is_some_and(|t| !t.is_empty())
+                {
+                    args_channels.entry(channel_key(data)).or_default().push(fi);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Rewrite the delta channels (first frame gets the full masked text).
+    let mut rewrite_channel = |frames: &mut Vec<SseFrame>, sites: &[usize], new_text: String| {
+        let mut first = true;
+        for &fi in sites {
+            let frame = &mut frames[fi];
+            if let Some(slot) = frame.data.as_mut().and_then(|d| d.get_mut("delta")) {
+                *slot = Value::String(if first {
+                    first = false;
+                    new_text.clone()
+                } else {
+                    String::new()
+                });
+                frame.dirty = true;
+            }
+        }
+    };
+    for sites in text_channels.values() {
+        let joined: String = sites
+            .iter()
+            .map(|&fi| {
+                frames[fi]
+                    .data
+                    .as_ref()
+                    .and_then(|d| d.get("delta"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+            })
+            .collect();
+        if let Some(r) = chain.redact_output_text(&joined) {
+            rewrite_channel(&mut frames, sites, r.text);
+            merge_counts(&mut counts, r.counts);
+        }
+    }
+    for sites in args_channels.values() {
+        let joined: String = sites
+            .iter()
+            .map(|&fi| {
+                frames[fi]
+                    .data
+                    .as_ref()
+                    .and_then(|d| d.get("delta"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+            })
+            .collect();
+        let mut rewritten = joined.clone();
+        let mut local = RedactionCounts::new();
+        redact_json_encoded(chain, Direction::Output, &mut rewritten, &mut local);
+        if !local.is_empty() {
+            rewrite_channel(&mut frames, sites, rewritten);
+            merge_counts(&mut counts, local);
+        }
+    }
+
+    // Aggregate events carry complete texts — mask them in place. Their
+    // counts are NOT merged into the totals: they duplicate the delta
+    // channels' matches (the audit count is per span served, not per
+    // wire occurrence). Only count them when the delta channel was absent
+    // (e.g. a `.done`-only encoder).
+    for frame in frames.iter_mut() {
+        let Some(data) = frame.data.as_mut() else {
+            continue;
+        };
+        let ty = data
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let mut local = RedactionCounts::new();
+        match ty.as_str() {
+            "response.output_text.done" => {
+                if let Some(text) = data.get_mut("text") {
+                    apply_to_value_string(chain, Direction::Output, text, &mut local);
+                }
+            }
+            "response.content_part.done" => {
+                if let Some(text) = data.get_mut("part").and_then(|p| p.get_mut("text")) {
+                    apply_to_value_string(chain, Direction::Output, text, &mut local);
+                }
+            }
+            "response.function_call_arguments.done" => {
+                if let Some(Value::String(args)) = data.get_mut("arguments") {
+                    let mut owned = std::mem::take(args);
+                    redact_json_encoded(chain, Direction::Output, &mut owned, &mut local);
+                    *args = owned;
+                }
+            }
+            "response.output_item.done" => {
+                if let Some(item) = data.get_mut("item") {
+                    redact_responses_item(chain, Direction::Output, item, &mut local);
+                }
+            }
+            "response.completed" | "response.incomplete" | "response.failed" => {
+                if let Some(Value::Array(items)) =
+                    data.get_mut("response").and_then(|r| r.get_mut("output"))
+                {
+                    for item in items {
+                        redact_responses_item(chain, Direction::Output, item, &mut local);
+                    }
+                }
+            }
+            _ => {}
+        }
+        if !local.is_empty() {
+            frame.dirty = true;
+            if counts.is_empty() {
+                merge_counts(&mut counts, local);
+            }
+        }
+    }
+
+    let any_dirty = frames.iter().any(|f| f.dirty);
+    if !any_dirty {
         return None;
     }
     let mut out = Vec::with_capacity(raw.len());
@@ -747,7 +999,10 @@ mod tests {
         }))
         .unwrap();
         let counts = redact_chat_format(chain.as_ref(), &mut req);
-        assert_eq!(req.messages[0].content.as_deref(), Some("mail [EMAIL_REDACTED]"));
+        assert_eq!(
+            req.messages[0].content.as_deref(),
+            Some("mail [EMAIL_REDACTED]")
+        );
         let blocks = req.messages[1].content_blocks.as_ref().unwrap();
         assert_eq!(
             blocks[0].get("text").unwrap().as_str().unwrap(),
@@ -805,7 +1060,10 @@ mod tests {
             usage: aisix_gateway::UsageStats::new(0, 0),
         };
         let counts = redact_chat_response(chain.as_ref(), &mut resp);
-        assert_eq!(resp.message.content.as_deref(), Some("reach me at [EMAIL_REDACTED]"));
+        assert_eq!(
+            resp.message.content.as_deref(),
+            Some("reach me at [EMAIL_REDACTED]")
+        );
         let args = resp.message.extra["tool_calls"][0]["function"]["arguments"]
             .as_str()
             .unwrap();
@@ -833,8 +1091,14 @@ mod tests {
         });
         let counts = redact_anthropic_request(chain.as_ref(), &mut body);
         assert_eq!(body["system"][0]["text"], "user email [EMAIL_REDACTED]");
-        assert_eq!(body["messages"][0]["content"], "call [CHINA_MOBILE_REDACTED]");
-        assert_eq!(body["messages"][1]["content"][0]["text"], "and [EMAIL_REDACTED]");
+        assert_eq!(
+            body["messages"][0]["content"],
+            "call [CHINA_MOBILE_REDACTED]"
+        );
+        assert_eq!(
+            body["messages"][1]["content"][0]["text"],
+            "and [EMAIL_REDACTED]"
+        );
         assert_eq!(
             body["messages"][1]["content"][1]["content"][0]["text"],
             "result [EMAIL_REDACTED]",
@@ -876,7 +1140,10 @@ mod tests {
         let counts = redact_responses_request(chain.as_ref(), &mut body);
         assert_eq!(body["instructions"], "never leak [EMAIL_REDACTED]");
         assert_eq!(body["input"][0]["content"], "call [CHINA_MOBILE_REDACTED]");
-        assert_eq!(body["input"][1]["content"][0]["text"], "mail [EMAIL_REDACTED]");
+        assert_eq!(
+            body["input"][1]["content"][0]["text"],
+            "mail [EMAIL_REDACTED]"
+        );
         assert_eq!(body["input"][2]["output"], "from [EMAIL_REDACTED]");
         assert_eq!(counts.get("email"), Some(&3));
 
@@ -915,7 +1182,10 @@ mod tests {
             .collect();
         assert_eq!(reassembled, "mail [EMAIL_REDACTED] now");
         // Full text lands on the first content chunk; the rest are empty.
-        assert_eq!(chunks[0].delta.content.as_deref(), Some("mail [EMAIL_REDACTED] now"));
+        assert_eq!(
+            chunks[0].delta.content.as_deref(),
+            Some("mail [EMAIL_REDACTED] now")
+        );
         assert_eq!(chunks[1].delta.content.as_deref(), Some(""));
     }
 
@@ -987,7 +1257,10 @@ mod tests {
         assert!(out.contains("mail [EMAIL_REDACTED] ok"), "out: {out}");
         assert!(!out.contains("a@x.com"));
         // Second delta emptied; frame structure + unrelated frames intact.
-        assert!(out.contains("{\"type\":\"text_delta\",\"text\":\"\"}") || out.contains("\"text\":\"\""));
+        assert!(
+            out.contains("{\"type\":\"text_delta\",\"text\":\"\"}")
+                || out.contains("\"text\":\"\"")
+        );
         assert!(out.contains("message_start"));
         assert!(out.contains("message_stop"));
         assert_eq!(counts.get("email"), Some(&1));
@@ -1006,6 +1279,79 @@ mod tests {
         assert!(out.contains("[EMAIL_REDACTED]"), "out: {out}");
         assert!(!out.contains("a@"), "no split original fragments: {out}");
         assert_eq!(counts.get("email"), Some(&1));
+    }
+
+    #[test]
+    fn responses_sse_masks_delta_channel_and_aggregate_events() {
+        let chain = both();
+        let raw = concat!(
+            "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"output_index\":0,\"content_index\":0,\"delta\":\"mail a@\"}\n\n",
+            "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"output_index\":0,\"content_index\":0,\"delta\":\"x.com ok\"}\n\n",
+            "event: response.output_text.done\ndata: {\"type\":\"response.output_text.done\",\"item_id\":\"msg_1\",\"text\":\"mail a@x.com ok\"}\n\n",
+            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"mail a@x.com ok\"}]}]}}\n\n",
+        );
+        let (out, counts) = redact_responses_sse(chain.as_ref(), raw.as_bytes()).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(!out.contains("a@x.com"), "original must be gone: {out}");
+        // Delta channel: full masked text on the first delta; done +
+        // completed events masked consistently.
+        assert!(
+            out.contains("\"delta\":\"mail [EMAIL_REDACTED] ok\""),
+            "out: {out}"
+        );
+        assert!(
+            out.contains("\"text\":\"mail [EMAIL_REDACTED] ok\""),
+            "out: {out}"
+        );
+        // Aggregate events don't double-count the same span.
+        assert_eq!(counts.get("email"), Some(&1));
+    }
+
+    #[test]
+    fn responses_sse_masks_function_call_args_channel() {
+        let chain = both();
+        let raw = concat!(
+            "event: response.function_call_arguments.delta\ndata: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_1\",\"delta\":\"{\\\"to\\\":\\\"a@\"}\n\n",
+            "event: response.function_call_arguments.delta\ndata: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_1\",\"delta\":\"x.com\\\"}\"}\n\n",
+            "event: response.function_call_arguments.done\ndata: {\"type\":\"response.function_call_arguments.done\",\"item_id\":\"fc_1\",\"arguments\":\"{\\\"to\\\":\\\"a@x.com\\\"}\"}\n\n",
+        );
+        let (out, counts) = redact_responses_sse(chain.as_ref(), raw.as_bytes()).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(!out.contains("a@"), "original fragments gone: {out}");
+        assert!(out.contains("[EMAIL_REDACTED]"), "out: {out}");
+        assert_eq!(counts.get("email"), Some(&1));
+    }
+
+    #[test]
+    fn responses_sse_returns_none_when_clean() {
+        let chain = both();
+        let raw = "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"m\",\"delta\":\"hello\"}\n\n";
+        assert!(redact_responses_sse(chain.as_ref(), raw.as_bytes()).is_none());
+    }
+
+    #[test]
+    fn responses_response_json_masks_output_items() {
+        let chain = both();
+        let mut body = json!({
+            "id": "resp_1",
+            "output": [
+                {"type": "message", "role": "assistant", "content": [
+                    {"type": "output_text", "text": "mail a@x.com"}
+                ]},
+                {"type": "function_call", "call_id": "c", "name": "send",
+                 "arguments": "{\"to\":\"b@y.org\"}"}
+            ]
+        });
+        let counts = redact_responses_response(chain.as_ref(), &mut body);
+        assert_eq!(
+            body["output"][0]["content"][0]["text"],
+            "mail [EMAIL_REDACTED]"
+        );
+        assert_eq!(
+            body["output"][1]["arguments"],
+            "{\"to\":\"[EMAIL_REDACTED]\"}"
+        );
+        assert_eq!(counts.get("email"), Some(&2));
     }
 
     #[test]

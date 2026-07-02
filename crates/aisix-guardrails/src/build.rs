@@ -221,9 +221,8 @@ fn build_one_inner(
                     field: "default_action",
                     value: cfg.default_action.clone(),
                 })?;
-            let mut rules: Vec<PiiRule> = Vec::with_capacity(
-                cfg.detectors.len() + cfg.custom_patterns.len(),
-            );
+            let mut rules: Vec<PiiRule> =
+                Vec::with_capacity(cfg.detectors.len() + cfg.custom_patterns.len());
             for d in &cfg.detectors {
                 let action = match d.action.as_deref() {
                     None => default_action,
@@ -232,11 +231,12 @@ fn build_one_inner(
                         value: s.to_owned(),
                     })?,
                 };
-                let rule =
-                    builtin_rule(&d.detector_type, action).ok_or_else(|| BuildError::InvalidValue {
+                let rule = builtin_rule(&d.detector_type, action).ok_or_else(|| {
+                    BuildError::InvalidValue {
                         field: "detectors[].type",
                         value: d.detector_type.clone(),
-                    })?;
+                    }
+                })?;
                 rules.push(rule);
             }
             for p in &cfg.custom_patterns {
@@ -356,10 +356,7 @@ enum BuildError {
     /// (unknown built-in detector id, unrecognised action). The row is
     /// skipped + warned rather than silently running a weaker policy.
     #[error("invalid {field} value {value:?}")]
-    InvalidValue {
-        field: &'static str,
-        value: String,
-    },
+    InvalidValue { field: &'static str, value: String },
     /// A guardrail kind whose runtime dispatch was compiled out via
     /// feature flags (e.g. a pruned build that excluded `--features bedrock`
     /// or `--features azure-content-safety`). The chain treats the row as

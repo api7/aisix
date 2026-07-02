@@ -71,6 +71,11 @@ struct ResponseDispatchSuccess {
     /// guard owns the UsageEvent emit (parsed from the terminal SSE event),
     /// so the top-level handler must NOT emit the winner event again (#808).
     usage_handled_by_stream: bool,
+    /// Per-detector PII mask counts applied to the response body (#932),
+    /// non-streaming + buffered paths. Merged with the input-side counts by
+    /// the handler before the terminal emit. Empty on the live streaming
+    /// paths — their end-of-stream closures own the output-side counts.
+    output_redactions: crate::redact::RedactionCounts,
 }
 
 /// Dispatch error carrying the per-attempt telemetry accumulated before
@@ -124,7 +129,7 @@ pub async fn responses(
     State(state): State<ProxyState>,
     auth: AuthenticatedKey,
     client: ClientContext,
-    Json(body): Json<Value>,
+    Json(mut body): Json<Value>,
 ) -> Response {
     let started = Instant::now();
     let request_id = new_request_id();
@@ -136,8 +141,24 @@ pub async fn responses(
         .unwrap_or("")
         .to_string();
 
-    match dispatch(&state, &auth, &body, &request_id, started, &client).await {
+    // Filled by `dispatch` with per-detector PII mask counts (#932); attached
+    // to the terminal usage event on both the success and failure paths.
+    let mut redaction_counts = crate::redact::RedactionCounts::new();
+    match dispatch(
+        &state,
+        &auth,
+        &mut body,
+        &request_id,
+        started,
+        &client,
+        &mut redaction_counts,
+    )
+    .await
+    {
         Ok(success) => {
+            // #932: fold the non-streaming response-side mask counts into
+            // the per-request total before the terminal emit below.
+            crate::redact::merge_counts(&mut redaction_counts, success.output_redactions.clone());
             let elapsed = started.elapsed();
             let status = success.response.status().as_u16();
             emit_access_log(
@@ -201,6 +222,7 @@ pub async fn responses(
                         &client,
                         attempt,
                         success.guardrail_blocked,
+                        redaction_counts.clone(),
                     );
                 }
             }
@@ -258,6 +280,8 @@ pub async fn responses(
                         error_class: err.kind().to_string(),
                         ..Default::default()
                     },
+                    // Input masking may have fired before the failure.
+                    redaction_counts.clone(),
                 );
             }
             err.into_response()
@@ -268,13 +292,20 @@ pub async fn responses(
 async fn dispatch(
     state: &ProxyState,
     auth: &AuthenticatedKey,
-    body: &Value,
+    // `&mut` so mask-action PII guardrails (#932) can rewrite the request
+    // text in place before it reaches the upstream.
+    body: &mut Value,
     request_id: &str,
     // Request-scoped clock + downstream client attribution, threaded so the
     // streaming path's Drop guard can stamp latency + client IP/UA on the
     // end-of-stream UsageEvent it emits (#808).
     started: Instant,
     client: &ClientContext,
+    // Out-param: per-detector PII mask counts (#932). Input-side counts land
+    // here as soon as the request is rewritten; the non-streaming output side
+    // arrives via `ResponseDispatchSuccess::output_redactions`; streaming
+    // output counts travel via the stream completion instead.
+    redactions_out: &mut crate::redact::RedactionCounts,
 ) -> Result<ResponseDispatchSuccess, ResponsesDispatchError> {
     let snapshot = state.snapshot.load();
 
@@ -340,6 +371,13 @@ async fn dispatch(
                 .into(),
             );
         }
+        // #932: mask-action PII rules rewrite the Responses body in place
+        // AFTER the block check passes — both the verbatim passthrough and
+        // the cross-provider bridge forward from this body.
+        crate::redact::merge_counts(
+            redactions_out,
+            crate::redact::redact_responses_request(resolved_chain.as_ref(), body),
+        );
     }
 
     let model_rl =
@@ -438,6 +476,7 @@ async fn dispatch(
                     client,
                     attempt,
                     &mut reservation,
+                    redactions_out.clone(),
                 )
                 .await
             } else {
@@ -455,6 +494,7 @@ async fn dispatch(
                     client,
                     attempt,
                     &mut reservation,
+                    redactions_out.clone(),
                 )
                 .await
             };
@@ -655,6 +695,10 @@ async fn responses_to_target(
     client_ctx: &ClientContext,
     attempt: AttemptInfo,
     reservation: &mut Option<aisix_ratelimit::MultiReservation>,
+    // Input-side PII mask counts (#932) for the verbatim streaming path's
+    // end-of-stream emit; the non-streaming/buffered emits happen in the
+    // handler, which already holds them.
+    input_redactions: crate::redact::RedactionCounts,
 ) -> Result<ResponseDispatchSuccess, ProxyError> {
     let mut body = body.clone();
     let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
@@ -898,6 +942,16 @@ async fn responses_to_target(
                     crate::error::guardrail_block_message("response", guardrail_name.as_deref()),
                 ));
             }
+            // #932: the whole SSE response is held here — mask the frames
+            // (channel reassembly) before anything reaches the wire.
+            let mut output_redactions = crate::redact::RedactionCounts::new();
+            let buf = match crate::redact::redact_responses_sse(chain, &buf) {
+                Some((rewritten, counts)) => {
+                    output_redactions = counts;
+                    rewritten
+                }
+                None => buf,
+            };
             // #808: the whole SSE response is buffered here, so parse its
             // terminal event for usage and let the handler emit (the body is
             // a single complete chunk now, not a live stream).
@@ -913,6 +967,7 @@ async fn responses_to_target(
                 routing: RoutingTelemetry::default(),
                 guardrail_blocked: false,
                 usage_handled_by_stream: false,
+                output_redactions,
             });
         }
 
@@ -1011,6 +1066,10 @@ async fn responses_to_target(
                 &client_c,
                 attempt,
                 /* guardrail_blocked */ false,
+                // Live-forward path: no output masking possible (an
+                // output-masking guardrail forces the buffered branch),
+                // so only the input-side counts apply.
+                input_redactions.clone(),
             );
         });
         let mut response =
@@ -1027,6 +1086,8 @@ async fn responses_to_target(
             routing: RoutingTelemetry::default(),
             guardrail_blocked: false,
             usage_handled_by_stream: true,
+            // The Drop guard's emit carries the counts.
+            output_redactions: crate::redact::RedactionCounts::new(),
         })
     } else {
         let json_body: Value = upstream_resp
@@ -1084,9 +1145,15 @@ async fn responses_to_target(
                     routing: RoutingTelemetry::default(),
                     guardrail_blocked: true,
                     usage_handled_by_stream: false,
+                    output_redactions: crate::redact::RedactionCounts::new(),
                 });
             }
         }
+
+        // #932: mask-action PII rules rewrite the response body AFTER the
+        // block check passes.
+        let mut json_body = json_body;
+        let output_redactions = crate::redact::redact_responses_response(chain, &mut json_body);
 
         Ok(ResponseDispatchSuccess {
             response: Json(json_body).into_response(),
@@ -1097,6 +1164,7 @@ async fn responses_to_target(
             routing: RoutingTelemetry::default(),
             guardrail_blocked: false,
             usage_handled_by_stream: false,
+            output_redactions,
         })
     }
 }
@@ -1122,6 +1190,9 @@ async fn responses_cross_provider_to_target(
     client_ctx: &ClientContext,
     attempt: AttemptInfo,
     reservation: &mut Option<aisix_ratelimit::MultiReservation>,
+    // Input-side PII mask counts (#932), merged into the streamed judge
+    // path's end-of-stream emit; non-streaming emits happen in the handler.
+    input_redactions: crate::redact::RedactionCounts,
 ) -> Result<ResponseDispatchSuccess, ProxyError> {
     use aisix_gateway::{Bridge, BridgeContext};
 
@@ -1289,6 +1360,13 @@ async fn responses_cross_provider_to_target(
                     &client_c,
                     attempt_c,
                     comp.guardrail_blocked,
+                    // #932: input-side counts merged with the hold-back
+                    // release's output-side counts.
+                    {
+                        let mut merged = input_redactions.clone();
+                        crate::redact::merge_counts(&mut merged, comp.redacted_entity_counts);
+                        merged
+                    },
                 );
             },
         );
@@ -1315,11 +1393,13 @@ async fn responses_cross_provider_to_target(
             routing: RoutingTelemetry::default(),
             guardrail_blocked: false,
             usage_handled_by_stream: true,
+            // The stream's end-of-stream emit carries the counts.
+            output_redactions: crate::redact::RedactionCounts::new(),
         });
     }
 
     // Non-streaming.
-    let resp = bridge.chat(&chat, &ctx).await.map_err(|err| {
+    let mut resp = bridge.chat(&chat, &ctx).await.map_err(|err| {
         if let Some((ttl, reason)) = crate::cooldown::decide_cooldown(&err, model.cooldown.as_ref())
         {
             state.runtime_status.mark_cooldown(model_id, ttl, reason);
@@ -1369,9 +1449,14 @@ async fn responses_cross_provider_to_target(
                 routing: RoutingTelemetry::default(),
                 guardrail_blocked: true,
                 usage_handled_by_stream: false,
+                output_redactions: crate::redact::RedactionCounts::new(),
             });
         }
     }
+
+    // #932: mask-action PII rules rewrite the bridged response AFTER the
+    // block check passes, BEFORE it is re-encoded as Responses JSON.
+    let output_redactions = crate::redact::redact_chat_response(chain.as_ref(), &mut resp);
 
     let created_at = chrono::Utc::now().timestamp();
     let json_body = crate::responses_bridge::chat_response_to_responses_json(
@@ -1394,6 +1479,7 @@ async fn responses_cross_provider_to_target(
         routing: RoutingTelemetry::default(),
         guardrail_blocked: false,
         usage_handled_by_stream: false,
+        output_redactions,
     })
 }
 
@@ -1758,6 +1844,9 @@ fn emit_usage_event(
     client: &ClientContext,
     attempt: AttemptInfo,
     guardrail_blocked: bool,
+    // Per-detector PII mask counts (#932), input + output merged. Detector
+    // names only, never matched values. Empty = no redaction.
+    redacted_entity_counts: crate::redact::RedactionCounts,
 ) {
     let snap = state.snapshot.load();
     let tags = provider_telemetry_tags(&snap, provider_key_id);
@@ -1791,6 +1880,7 @@ fn emit_usage_event(
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),
         guardrail_blocked,
+        redacted_entity_counts,
         ..Default::default()
     };
     state.usage_sink.try_emit("responses", event.clone());
@@ -1814,6 +1904,9 @@ fn emit_zero_token_event(
     elapsed: Duration,
     client: &ClientContext,
     attempt: AttemptInfo,
+    // Per-detector PII mask counts (#932): input masking may have fired
+    // before the failure. Empty for most failure classes.
+    redacted_entity_counts: crate::redact::RedactionCounts,
 ) {
     let snap = state.snapshot.load();
     let tags = provider_telemetry_tags(&snap, provider_key_id);
@@ -1823,6 +1916,7 @@ fn emit_zero_token_event(
         model_id: model_id.to_string(),
         api_key_id: api_key_id.to_string(),
         requested_model: requested_model.to_string(),
+        redacted_entity_counts,
         latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
         status_code,
         inbound_protocol: "openai".to_string(),
@@ -1873,6 +1967,9 @@ fn emit_failed_attempts(
             Duration::from_millis(u64::from(rec.latency_ms)),
             client,
             AttemptInfo::from_record(rec),
+            // Failed attempts carry no per-request redaction detail; the
+            // terminal event does.
+            crate::redact::RedactionCounts::new(),
         );
     }
 }

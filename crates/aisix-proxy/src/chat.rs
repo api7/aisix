@@ -1383,10 +1383,7 @@ async fn dispatch(
                         provider_key_id: provider_key_id_for_telem.clone(),
                         redacted_entity_counts: {
                             let mut merged = input_redactions_for_telem.clone();
-                            crate::redact::merge_counts(
-                                &mut merged,
-                                comp.redacted_entity_counts,
-                            );
+                            crate::redact::merge_counts(&mut merged, comp.redacted_entity_counts);
                             merged
                         },
                     },
@@ -2529,10 +2526,7 @@ async fn dispatch_ensemble(
                         provider_key_id: judge_provider_key_id.clone(),
                         redacted_entity_counts: {
                             let mut merged = input_redactions_for_telem.clone();
-                            crate::redact::merge_counts(
-                                &mut merged,
-                                comp.redacted_entity_counts,
-                            );
+                            crate::redact::merge_counts(&mut merged, comp.redacted_entity_counts);
                             merged
                         },
                         ..UsageExtras::default()

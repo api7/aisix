@@ -898,6 +898,9 @@ pub struct ResponsesStreamCompletion {
     /// the non-streaming path so the dashboard's Blocked tab + budget ledger
     /// see it.
     pub guardrail_blocked: bool,
+    /// Per-detector PII mask counts applied to the held stream at release
+    /// (#932). Merged with the input-side counts by the on_complete emit.
+    pub redacted_entity_counts: crate::redact::RedactionCounts,
 }
 
 struct CompleteOnDrop<F: FnOnce(ResponsesStreamCompletion)> {
@@ -1072,7 +1075,25 @@ pub fn build_responses_bridge_stream(
                 return;
             }
         }
-        // Passed: release the held events verbatim.
+        // Passed (#932): mask the held SSE frames (channel reassembly)
+        // before release, then hand them to the client.
+        if !held.is_empty() && aisix_guardrails::Guardrail::redacts_output(chain.as_ref()) {
+            let mut joined: Vec<u8> = Vec::with_capacity(held_bytes);
+            for b in &held {
+                joined.extend_from_slice(b);
+            }
+            if let Some((rewritten, counts)) =
+                crate::redact::redact_responses_sse(chain.as_ref(), &joined)
+            {
+                crate::redact::merge_counts(
+                    &mut guard.comp().redacted_entity_counts,
+                    counts,
+                );
+                yield Ok(bytes::Bytes::from(rewritten));
+                return;
+            }
+        }
+        // Release the held events verbatim.
         for b in held {
             yield Ok(b);
         }
