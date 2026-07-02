@@ -85,7 +85,10 @@ describe("streaming /v1/messages tool_use output guardrail (#448)", () => {
     await waitConfigPropagation(async () => (await stream().then((r) => r.text())).includes("content_filter"));
 
     const body = await stream().then((r) => r.text());
-    expect(body, "tool_use arguments are forwarded verbatim").toContain(FORBIDDEN);
+    // #932 / #466-class: keyword output guardrails carry the BufferFull
+    // hold-back policy, so the tool_use arguments are withheld until the
+    // end-of-stream scan — the matched content must NOT reach the wire.
+    expect(body, "hold-back keeps the matched arguments off the wire").not.toContain(FORBIDDEN);
     expect(body, "stream must end with a content_filter error event").toContain("content_filter");
   });
 });

@@ -96,7 +96,11 @@ describe("streaming /v1/messages output guardrail (#448)", () => {
     const res = await stream();
     expect(res.status).toBe(200); // stream starts 200; the block is in-band
     const body = await res.text();
-    expect(body, "streamed content is forwarded verbatim").toContain(FORBIDDEN);
+    // #932 / #466-class: keyword output guardrails carry the BufferFull
+    // hold-back policy, so /v1/messages streaming now withholds the whole
+    // response until it scans clean — the matched content must NOT reach
+    // the wire (pre-fix it was forwarded verbatim before the error frame).
+    expect(body, "hold-back keeps the matched content off the wire").not.toContain(FORBIDDEN);
     expect(body, "stream must end with a content_filter error event").toContain("content_filter");
   });
 });

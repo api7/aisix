@@ -19,7 +19,6 @@
 //! .redacted_entity_counts`.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
 use aisix_gateway::{ChatChunk, ChatFormat, ChatResponse};
 use aisix_guardrails::Guardrail;
@@ -708,7 +707,7 @@ pub fn redact_anthropic_sse(
         }
     }
 
-    let mut rewrite = |frames: &mut Vec<SseFrame>, sites: &[(usize, Site)], new_text: String| {
+    let rewrite = |frames: &mut Vec<SseFrame>, sites: &[(usize, Site)], new_text: String| {
         let mut first = true;
         for &(fi, site) in sites {
             let frame = &mut frames[fi];
@@ -834,7 +833,7 @@ pub fn redact_responses_sse(
     }
 
     // Rewrite the delta channels (first frame gets the full masked text).
-    let mut rewrite_channel = |frames: &mut Vec<SseFrame>, sites: &[usize], new_text: String| {
+    let rewrite_channel = |frames: &mut Vec<SseFrame>, sites: &[usize], new_text: String| {
         let mut first = true;
         for &fi in sites {
             let frame = &mut frames[fi];
@@ -961,6 +960,7 @@ pub fn redact_responses_sse(
 mod tests {
     use super::*;
     use aisix_gateway::{ChatDelta, ChatMessage};
+    use std::sync::Arc;
     use aisix_guardrails::{builtin_rule, GuardrailChain, PiiAction, PiiGuardrail};
     use serde_json::json;
 
