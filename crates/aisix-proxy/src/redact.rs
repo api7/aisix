@@ -193,7 +193,8 @@ fn redact_tool_call_arguments(
         return;
     };
     for tc in items {
-        if let Some(Value::String(s)) = tc.get_mut("function").and_then(|f| f.get_mut("arguments")) {
+        if let Some(Value::String(s)) = tc.get_mut("function").and_then(|f| f.get_mut("arguments"))
+        {
             let mut owned = std::mem::take(s);
             redact_json_encoded(chain, dir, &mut owned, counts);
             *s = owned;
