@@ -51,6 +51,9 @@ struct ImageDispatchSuccess {
     /// not-implemented path stays out of /logs (same convention as
     /// embeddings #402).
     upstream_called: bool,
+    /// Per-detector PII mask counts (#932/#696) applied to the prompt.
+    /// Attached to the emitted UsageEvent. Empty = no redaction.
+    redactions: crate::redact::RedactionCounts,
 }
 
 pub async fn image_generations(
@@ -110,6 +113,7 @@ pub async fn image_generations(
                     prompt_tokens,
                     completion_tokens,
                     &client,
+                    success.redactions.clone(),
                 );
             }
             success.response
@@ -165,14 +169,18 @@ fn images_input_to_chat(model: &str, body: &Value) -> aisix_gateway::ChatFormat 
 async fn dispatch(
     state: &ProxyState,
     auth: &AuthenticatedKey,
-    body: Value,
+    mut body: Value,
     request_id: &str,
     source_ip: &str,
 ) -> Result<ImageDispatchSuccess, ProxyError> {
+    // Owned so the #696 in-place prompt masking below can borrow `body`
+    // mutably.
     let model_name = body
         .get("model")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| ProxyError::InvalidRequest("missing `model` field".into()))?;
+        .ok_or_else(|| ProxyError::InvalidRequest("missing `model` field".into()))?
+        .to_string();
+    let model_name = model_name.as_str();
 
     let snapshot = state.snapshot.load();
 
@@ -221,6 +229,11 @@ async fn dispatch(
             ));
         }
     }
+
+    // #932/#696: mask-action PII rules rewrite the `prompt` in place AFTER
+    // the block check passes, BEFORE the body is forwarded upstream.
+    // Pre-#696 a mask-action detector was a silent no-op here.
+    let redactions = crate::redact::redact_images_request(&resolved_chain, &mut body);
 
     let model_rl =
         crate::quota::ModelRateLimit::from_model(model_name, &model_entry.id, &model_entry.value);
@@ -287,6 +300,7 @@ async fn dispatch(
                 applied_guardrails: applied_guardrails.clone(),
                 usage,
                 upstream_called: true,
+                redactions,
             })
         }
         Err(BridgeError::Config(msg)) if msg.contains("does not support image generation") => {
@@ -302,6 +316,7 @@ async fn dispatch(
                 usage: None,
                 // No upstream call happened → handler skips emit.
                 upstream_called: false,
+                redactions,
             })
         }
         Err(e) => {
@@ -362,6 +377,8 @@ fn emit_usage_event(
     prompt_tokens: u32,
     completion_tokens: u32,
     client: &ClientContext,
+    // Per-detector PII mask counts (#932/#696). Empty = no redaction.
+    redacted_entity_counts: crate::redact::RedactionCounts,
 ) {
     let snap = state.snapshot.load();
     let mut event = UsageEvent {
@@ -378,6 +395,7 @@ fn emit_usage_event(
         applied_guardrails: applied_guardrails.to_vec(),
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),
+        redacted_entity_counts,
         ..Default::default()
     };
     crate::usage_attr::apply_pk_telemetry(&mut event, &snap, provider_key_id);
@@ -1050,6 +1068,64 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "exactly one event per failed request"
+        );
+    }
+
+    fn pii_mask_guardrail() -> ResourceEntry<aisix_core::Guardrail> {
+        let json = r#"{"name":"pii","enabled":true,"hook_point":"input","kind":"pii","detectors":[{"type":"email","action":"mask"}]}"#;
+        let g: aisix_core::Guardrail = serde_json::from_str(json).unwrap();
+        ResourceEntry::new("g-pii", g, 1)
+    }
+
+    /// #696: a mask-action PII detector must rewrite the `prompt` before the
+    /// body reaches the upstream. Pre-#696 the mask action was a silent
+    /// no-op on /v1/images/generations — the raw text was forwarded. Also
+    /// pins the counts on the emitted UsageEvent.
+    #[tokio::test]
+    async fn pii_mask_rewrites_prompt_before_upstream_issue_696() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/images/generations"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "created": 1_700_000_000,
+                "data": [{"url": "https://img.example/1.png"}]
+            })))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("img"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        snap.guardrails.insert(pii_mask_guardrail());
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = build_app_with_sink(snap, tx);
+        let body = serde_json::json!({
+            "model": "img",
+            "prompt": "a portrait of a@x.com at sunset"
+        });
+        let resp = tower::ServiceExt::oneshot(app, make_req(body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let reqs = upstream.received_requests().await.unwrap();
+        let sent = String::from_utf8_lossy(&reqs[0].body).into_owned();
+        assert!(sent.contains("[EMAIL_REDACTED]"), "sent: {sent}");
+        assert!(
+            !sent.contains("a@x.com"),
+            "raw PII forwarded upstream: {sent}"
+        );
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted")
+            .expect("usage_sink sender dropped");
+        assert_eq!(
+            event.redacted_entity_counts.get("email"),
+            Some(&1),
+            "mask counts must reach the UsageEvent"
         );
     }
 

@@ -397,6 +397,98 @@ pub fn redact_completions_request(chain: &dyn Guardrail, body: &mut Value) -> Re
     counts
 }
 
+/// Mask a `/v1/rerank` request body in place: `query` plus `documents[]`
+/// (plain strings or `{"text": ...}` objects) — the same surface
+/// `check_input` scans via `rerank_input_to_chat` (#696).
+pub fn redact_rerank_request(chain: &dyn Guardrail, body: &mut Value) -> RedactionCounts {
+    let mut counts = RedactionCounts::new();
+    if !chain.redacts_input() {
+        return counts;
+    }
+    if let Some(q) = body.get_mut("query") {
+        apply_to_value_string(chain, Direction::Input, q, &mut counts);
+    }
+    if let Some(Value::Array(docs)) = body.get_mut("documents") {
+        for doc in docs {
+            match doc {
+                Value::String(_) => {
+                    apply_to_value_string(chain, Direction::Input, doc, &mut counts)
+                }
+                Value::Object(_) => {
+                    if let Some(text) = doc.get_mut("text") {
+                        apply_to_value_string(chain, Direction::Input, text, &mut counts);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    counts
+}
+
+/// Mask a `/v1/images/generations` request body in place: the `prompt`
+/// field — the same surface `check_input` scans via `images_input_to_chat`
+/// (#696).
+pub fn redact_images_request(chain: &dyn Guardrail, body: &mut Value) -> RedactionCounts {
+    let mut counts = RedactionCounts::new();
+    if !chain.redacts_input() {
+        return counts;
+    }
+    if let Some(p) = body.get_mut("prompt") {
+        apply_to_value_string(chain, Direction::Input, p, &mut counts);
+    }
+    counts
+}
+
+/// Mask a `/v1/audio/speech` request body in place: the `input` field (the
+/// text to synthesize) — the same surface `check_input` scans via
+/// `speech_input_to_chat` (#696).
+pub fn redact_speech_request(chain: &dyn Guardrail, body: &mut Value) -> RedactionCounts {
+    let mut counts = RedactionCounts::new();
+    if !chain.redacts_input() {
+        return counts;
+    }
+    if let Some(input) = body.get_mut("input") {
+        apply_to_value_string(chain, Direction::Input, input, &mut counts);
+    }
+    counts
+}
+
+/// Mask an audio transcription/translation RESPONSE in place (#696). The
+/// wire body is either JSON (`json` / `verbose_json` response_format:
+/// top-level `text` + per-segment `segments[].text`) or raw text
+/// (`text` / `srt` / `vtt` formats). Returns the rewritten bytes + counts,
+/// or `None` when nothing matched (caller keeps the original body). A
+/// non-UTF-8 body is left untouched.
+pub fn redact_transcription_response(
+    chain: &dyn Guardrail,
+    body: &[u8],
+) -> Option<(Vec<u8>, RedactionCounts)> {
+    if !chain.redacts_output() {
+        return None;
+    }
+    let mut counts = RedactionCounts::new();
+    if let Ok(mut json) = serde_json::from_slice::<Value>(body) {
+        if let Some(text) = json.get_mut("text") {
+            apply_to_value_string(chain, Direction::Output, text, &mut counts);
+        }
+        if let Some(Value::Array(segments)) = json.get_mut("segments") {
+            for seg in segments {
+                if let Some(text) = seg.get_mut("text") {
+                    apply_to_value_string(chain, Direction::Output, text, &mut counts);
+                }
+            }
+        }
+        if counts.is_empty() {
+            return None;
+        }
+        return serde_json::to_vec(&json).ok().map(|b| (b, counts));
+    }
+    let text = std::str::from_utf8(body).ok()?;
+    let r = chain.redact_output_text(text)?;
+    Some((r.text.into_bytes(), r.counts))
+}
+
 /// Mask a legacy `/v1/completions` RESPONSE body in place: `choices[].text`.
 pub fn redact_completions_response(chain: &dyn Guardrail, body: &mut Value) -> RedactionCounts {
     let mut counts = RedactionCounts::new();
@@ -1381,5 +1473,71 @@ mod tests {
         redact_json_encoded(chain.as_ref(), Direction::Output, &mut encoded, &mut counts);
         assert_eq!(encoded, "not json but has [EMAIL_REDACTED] inside");
         assert_eq!(counts.get("email"), Some(&1));
+    }
+
+    /// #696: rerank request masking covers `query` + both document shapes.
+    #[test]
+    fn rerank_request_masks_query_and_documents() {
+        let chain = both();
+        let mut body = json!({
+            "model": "m",
+            "query": "who is a@x.com",
+            "documents": ["contact b@y.org", {"text": "reach c@z.io"}, 42]
+        });
+        let counts = redact_rerank_request(chain.as_ref(), &mut body);
+        assert_eq!(body["query"], "who is [EMAIL_REDACTED]");
+        assert_eq!(body["documents"][0], "contact [EMAIL_REDACTED]");
+        assert_eq!(body["documents"][1]["text"], "reach [EMAIL_REDACTED]");
+        assert_eq!(counts.get("email"), Some(&3));
+    }
+
+    /// #696: images request masking covers `prompt`.
+    #[test]
+    fn images_request_masks_prompt() {
+        let chain = both();
+        let mut body = json!({"model": "m", "prompt": "portrait of a@x.com"});
+        let counts = redact_images_request(chain.as_ref(), &mut body);
+        assert_eq!(body["prompt"], "portrait of [EMAIL_REDACTED]");
+        assert_eq!(counts.get("email"), Some(&1));
+    }
+
+    /// #696: speech (TTS) request masking covers `input`.
+    #[test]
+    fn speech_request_masks_input() {
+        let chain = both();
+        let mut body = json!({"model": "m", "input": "read a@x.com aloud", "voice": "alloy"});
+        let counts = redact_speech_request(chain.as_ref(), &mut body);
+        assert_eq!(body["input"], "read [EMAIL_REDACTED] aloud");
+        assert_eq!(counts.get("email"), Some(&1));
+    }
+
+    /// #696: transcription response masking rewrites the JSON `text` +
+    /// `segments[].text` (verbose_json) and reports counts.
+    #[test]
+    fn transcription_response_masks_json_text_and_segments() {
+        let chain = both();
+        let body = json!({
+            "text": "mail a@x.com",
+            "segments": [{"id": 0, "text": "mail a@x.com"}]
+        });
+        let (rewritten, counts) =
+            redact_transcription_response(chain.as_ref(), &serde_json::to_vec(&body).unwrap())
+                .expect("must rewrite");
+        let v: Value = serde_json::from_slice(&rewritten).unwrap();
+        assert_eq!(v["text"], "mail [EMAIL_REDACTED]");
+        assert_eq!(v["segments"][0]["text"], "mail [EMAIL_REDACTED]");
+        assert_eq!(counts.get("email"), Some(&2));
+    }
+
+    /// #696: the raw-text response formats (`text` / `srt` / `vtt`) are
+    /// masked as plain text; a clean body returns None (kept as-is).
+    #[test]
+    fn transcription_response_masks_raw_text_formats() {
+        let chain = both();
+        let (rewritten, counts) =
+            redact_transcription_response(chain.as_ref(), b"speaker: a@x.com\n").expect("rewrite");
+        assert_eq!(rewritten, b"speaker: [EMAIL_REDACTED]\n");
+        assert_eq!(counts.get("email"), Some(&1));
+        assert!(redact_transcription_response(chain.as_ref(), b"all clean\n").is_none());
     }
 }

@@ -131,6 +131,7 @@ fn strip_redundant_version_segment<'a>(base: &str, rest: &'a str) -> &'a str {
 pub async fn passthrough(
     State(state): State<ProxyState>,
     auth: AuthenticatedKey,
+    client: crate::client_ip::ClientContext,
     Path((provider, rest)): Path<(String, String)>,
     req: Request,
 ) -> Response {
@@ -140,7 +141,17 @@ pub async fn passthrough(
     let method = req.method().clone();
     let path = format!("/passthrough/{provider}/{rest}");
 
-    match dispatch(state.clone(), &auth, &provider, &rest, req, &request_id).await {
+    match dispatch(
+        state.clone(),
+        &auth,
+        &provider,
+        &rest,
+        req,
+        &request_id,
+        &client.source_ip,
+    )
+    .await
+    {
         Ok((resp, provider_label)) => {
             let elapsed = started.elapsed();
             let status = resp.status().as_u16();
@@ -190,6 +201,7 @@ pub async fn passthrough(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn dispatch(
     state: ProxyState,
     auth: &AuthenticatedKey,
@@ -197,6 +209,7 @@ async fn dispatch(
     rest: &str,
     req: Request,
     request_id: &str,
+    source_ip: &str,
 ) -> Result<(Response, String), ProxyError> {
     let snapshot = state.snapshot.load();
 
@@ -232,6 +245,14 @@ async fn dispatch(
         })?;
 
     let model = &model_entry.value;
+
+    // Client-IP allowlist gate (#557/#697): the borrowed model's
+    // `allowed_cidrs` applies to the raw tunnel too — pre-#697 passthrough
+    // was the one surface that skipped it, so an operator's IP restriction
+    // was bypassable by lending the same credentials through here. Same
+    // borrowed-model basis as the #911 [6] guardrail resolution below.
+    crate::dispatch::check_ip_access(model, source_ip)?;
+
     let pk_entry = crate::dispatch::resolve_provider_key(&snapshot, model)?;
     let api_key = crate::dispatch::require_secret(&pk_entry.value, model)?.to_string();
 
@@ -1235,5 +1256,78 @@ mod tests {
             upstream_header_values(r, "cookie").is_empty(),
             "case-insensitive strip: cookie must be removed"
         );
+    }
+
+    /// #697: the borrowed model's `allowed_cidrs` (#557) must gate the raw
+    /// passthrough tunnel too. A client IP outside the allowlist gets 403
+    /// and the upstream is never contacted. Oneshot requests carry no
+    /// ConnectInfo → empty source IP, which fails closed against a
+    /// configured allowlist (same as the typed handlers).
+    #[tokio::test]
+    async fn ip_allowlisted_model_rejects_disallowed_client_issue_697() {
+        let upstream = MockServer::start().await;
+        Mock::given(wm_method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"data": []})))
+            .expect(0)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        let model_json = format!(
+            r#"{{"display_name":"gated","provider":"openai","model_name":"gpt-4o","provider_key_id":"{PK_ID}","allowed_cidrs":["10.0.0.0/8"]}}"#
+        );
+        let m: Model = serde_json::from_str(&model_json).unwrap();
+        snap.models.insert(ResourceEntry::new("m-1", m, 1));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let app = build_app(snap);
+        let req = Request::builder()
+            .method("GET")
+            .uri("/passthrough/openai/v1/models")
+            .header("authorization", "Bearer sk-caller")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["type"], "permission_denied");
+    }
+
+    /// #697 companion: a client IP inside the allowlist passes through.
+    /// ConnectInfo is injected the way a real listener would provide it.
+    #[tokio::test]
+    async fn ip_allowlisted_model_allows_matching_client_issue_697() {
+        let upstream = MockServer::start().await;
+        Mock::given(wm_method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"data": []})))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        let model_json = format!(
+            r#"{{"display_name":"gated","provider":"openai","model_name":"gpt-4o","provider_key_id":"{PK_ID}","allowed_cidrs":["10.0.0.0/8"]}}"#
+        );
+        let m: Model = serde_json::from_str(&model_json).unwrap();
+        snap.models.insert(ResourceEntry::new("m-1", m, 1));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let app = build_app(snap);
+        let mut req = Request::builder()
+            .method("GET")
+            .uri("/passthrough/openai/v1/models")
+            .header("authorization", "Bearer sk-caller")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        req.extensions_mut()
+            .insert(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                [10, 1, 2, 3],
+                50000,
+            ))));
+        let resp = ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 }
