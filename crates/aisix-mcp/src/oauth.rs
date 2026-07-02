@@ -30,6 +30,12 @@ const EXPIRY_SKEW: Duration = Duration::from_secs(60);
 /// only recommends it).
 const DEFAULT_TOKEN_LIFETIME: Duration = Duration::from_secs(3600);
 
+/// Cap on a reported `expires_in`. A hostile or broken identity provider can
+/// return any u64; an absurd value would overflow `Instant + Duration` and
+/// panic the connect task. Thirty days is beyond any sane token lifetime and
+/// far below the overflow horizon.
+const MAX_TOKEN_LIFETIME: Duration = Duration::from_secs(30 * 24 * 3600);
+
 /// One minted upstream access token. Never printed: the struct deliberately
 /// has no `Debug` impl, and nothing in this module logs the token value.
 struct CachedToken {
@@ -39,35 +45,54 @@ struct CachedToken {
 
 /// Process-global token cache. Guards are held only for map lookups/inserts,
 /// never across an await; concurrent misses for the same key may fetch in
-/// parallel (each minted token is valid — last insert wins).
+/// parallel (each minted token is valid — last insert wins). Entries are
+/// evicted only by 401-invalidation or key rotation, so tokens for deleted
+/// servers linger until restart — the map is bounded by the set of distinct
+/// configs ever seen (~100 bytes each), which is acceptable.
 fn cache() -> &'static RwLock<HashMap<String, CachedToken>> {
     static CACHE: OnceLock<RwLock<HashMap<String, CachedToken>>> = OnceLock::new();
     CACHE.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
 /// Shared HTTP client for token fetches, bounded per request by the same
-/// default deadline as any other upstream MCP operation.
+/// default deadline as any other upstream MCP operation. Redirects are
+/// disabled: a token endpoint never legitimately redirects, and following one
+/// would re-POST the secret-bearing form to wherever it points (307/308 keep
+/// the body; a chain may even downgrade to plain HTTP).
 fn http_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
         reqwest::Client::builder()
             .timeout(DEFAULT_UPSTREAM_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
             .build()
-            // Building a client with only a timeout set cannot fail on any
-            // supported platform; fall back to the default client if it does.
+            // Building a client with only a timeout and redirect policy set
+            // cannot fail on any supported platform; fall back to the default
+            // client if it does.
             .unwrap_or_default()
     })
 }
 
-/// Cache key: `token_url \x1f client_id \x1f sha256(client_secret)`. The
-/// secret is folded in as a digest — never in plaintext — so a rotated secret
-/// can never reuse the previous secret's token, while the key itself stays
-/// safe to hold alongside the non-secret fields.
+/// Cache key over every field that shapes the minted token: token endpoint,
+/// client identity, client secret, and the requested scopes. Two servers
+/// sharing one OAuth client but requesting different scopes must never share
+/// a token (one would be presented a token minted for the other's scopes).
+/// The secret is folded in as a digest — never in plaintext — so a rotated
+/// secret can never reuse the previous secret's token. Each component is
+/// length-prefixed so no crafted field value can shift a boundary and make
+/// two distinct configs collide.
 fn cache_key(cfg: &OAuthClientConfig) -> String {
     let secret_digest = hex::encode(Sha256::digest(cfg.client_secret.as_bytes()));
+    let joined_scopes = cfg.scopes.join(" ");
     format!(
-        "{}\x1f{}\x1f{}",
-        cfg.token_url, cfg.client_id, secret_digest
+        "{}:{}\x1f{}:{}\x1f{}\x1f{}:{}",
+        cfg.token_url.len(),
+        cfg.token_url,
+        cfg.client_id.len(),
+        cfg.client_id,
+        secret_digest,
+        joined_scopes.len(),
+        joined_scopes
     )
 }
 
@@ -185,7 +210,8 @@ async fn fetch_token(cfg: &OAuthClientConfig) -> Result<(String, Duration), McpE
     let lifetime = token
         .expires_in
         .map(Duration::from_secs)
-        .unwrap_or(DEFAULT_TOKEN_LIFETIME);
+        .unwrap_or(DEFAULT_TOKEN_LIFETIME)
+        .min(MAX_TOKEN_LIFETIME);
     Ok((token.access_token, lifetime))
 }
 
@@ -457,6 +483,72 @@ mod tests {
             .await
             .expect_err("missing access_token must fail");
         assert!(err.to_string().contains("malformed"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn same_client_different_scopes_mint_distinct_tokens() {
+        // Two servers sharing one OAuth client (same IdP, client_id, secret)
+        // but requesting different scopes must never share a cached token —
+        // one would be presented a token minted for the other's scopes.
+        let endpoint = spawn_token_endpoint(TokenEndpointBehavior::Mint {
+            expires_in: Some(3600),
+        })
+        .await;
+        let read_cfg = OAuthClientConfig {
+            scopes: vec!["read".to_string()],
+            ..config(endpoint.url())
+        };
+        let write_cfg = OAuthClientConfig {
+            scopes: vec!["write".to_string()],
+            ..config(endpoint.url())
+        };
+
+        assert_eq!(get_or_fetch(&read_cfg).await.expect("read"), "tok-1");
+        assert_eq!(get_or_fetch(&write_cfg).await.expect("write"), "tok-2");
+        assert_eq!(endpoint.hits(), 2, "different scopes must mint separately");
+        assert_eq!(
+            endpoint.request(1).get("scope").map(String::as_str),
+            Some("write")
+        );
+        // Each scope set keeps its own cached token.
+        assert_eq!(get_or_fetch(&read_cfg).await.expect("read again"), "tok-1");
+        assert_eq!(endpoint.hits(), 2);
+    }
+
+    #[tokio::test]
+    async fn absurd_expires_in_is_clamped_not_panicking() {
+        // A hostile IdP can return any u64; an unclamped
+        // `Instant::now() + Duration::from_secs(u64::MAX)` overflows and
+        // panics the connect task.
+        let endpoint = spawn_token_endpoint(TokenEndpointBehavior::Mint {
+            expires_in: Some(u64::MAX),
+        })
+        .await;
+        let cfg = config(endpoint.url());
+        assert_eq!(get_or_fetch(&cfg).await.expect("clamped mint"), "tok-1");
+        // Still cached (clamped lifetime is far above the skew).
+        assert_eq!(get_or_fetch(&cfg).await.expect("cached"), "tok-1");
+        assert_eq!(endpoint.hits(), 1);
+    }
+
+    #[tokio::test]
+    async fn token_endpoint_redirects_are_refused() {
+        // A token endpoint never legitimately redirects; following one would
+        // re-POST the secret-bearing form to wherever it points. The client
+        // must refuse and fail with the redirect status, not follow it.
+        let endpoint = spawn_token_endpoint(TokenEndpointBehavior::Static {
+            status: axum::http::StatusCode::TEMPORARY_REDIRECT,
+            body: "",
+        })
+        .await;
+        let err = get_or_fetch(&config(endpoint.url()))
+            .await
+            .expect_err("redirect must fail");
+        assert!(
+            err.to_string().contains("HTTP 307"),
+            "redirect should surface as its status: {err}"
+        );
+        assert_eq!(endpoint.hits(), 1, "the redirect must not be followed");
     }
 
     #[tokio::test]

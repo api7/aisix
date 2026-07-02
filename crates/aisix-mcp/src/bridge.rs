@@ -263,7 +263,12 @@ impl RmcpBridge {
                         crate::oauth::invalidate(cfg);
                     }
                 }
-                McpError::Connect(e.to_string())
+                // Bound + sanitize: a bare-401 shape embeds the upstream's
+                // response body in the error text, which lands in gateway
+                // logs. An upstream that reflects request headers into its
+                // error body (or emits control characters for log injection)
+                // must not get either past this point verbatim.
+                McpError::Connect(sanitize_error_message(&e.to_string()))
             })
         };
         let running = tokio::time::timeout(upstream.timeout, establish)
@@ -273,6 +278,23 @@ impl RmcpBridge {
             running,
             timeout: upstream.timeout,
         })
+    }
+}
+
+/// Bound an upstream-derived error message for logging: control characters
+/// (log-injection vectors) are stripped and the text is truncated, since a
+/// bare non-success response embeds the upstream's body verbatim.
+fn sanitize_error_message(message: &str) -> String {
+    const MAX_LEN: usize = 256;
+    let cleaned: String = message
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    if cleaned.chars().count() <= MAX_LEN {
+        cleaned
+    } else {
+        let truncated: String = cleaned.chars().take(MAX_LEN).collect();
+        format!("{truncated}…")
     }
 }
 
@@ -288,6 +310,13 @@ impl RmcpBridge {
 /// the workspace 0.12) so the types match. Post-handshake operations don't
 /// need this: [`EphemeralBridge`] reconnects per operation, so every request
 /// replays the handshake and a rejected token always surfaces on this path.
+///
+/// Known gap (availability-only): a bare 401 whose body parses as a JSON-RPC
+/// error arrives as `ClientInitializeError::JsonRpcError` — not a transport
+/// error — and is not recognized here, so a revoked token is replayed until
+/// the cache's expiry skew retires it (at most ~59 minutes at the default
+/// lifetime). Spec-conforming servers answer 401 with `WWW-Authenticate`,
+/// which IS recognized.
 fn init_error_is_unauthorized(error: &ClientInitializeError) -> bool {
     let ClientInitializeError::TransportError { error, .. } = error else {
         return false;
@@ -423,5 +452,51 @@ impl McpBridge for EphemeralBridge {
             .await?
             .call_tool(name, arguments)
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The hand-written Debug impls are the only guard between a credential
+    /// and the logs; pin them so a `#[derive(Debug)]` regression fails loudly
+    /// for every secret-bearing variant.
+    #[test]
+    fn debug_redacts_every_credential_variant() {
+        let oauth = McpAuth::OAuth2(OAuthClientConfig {
+            client_id: "cid".into(),
+            client_secret: "cs-LEAK".into(),
+            token_url: "https://idp.example.com/token".into(),
+            scopes: vec!["read".into()],
+        });
+        let rendered = format!(
+            "{oauth:?} {:?} {:?}",
+            McpAuth::ApiKey("key-LEAK".into()),
+            McpAuth::Bearer("tok-LEAK".into())
+        );
+        assert!(
+            !rendered.contains("LEAK"),
+            "credential leaked into Debug output: {rendered}"
+        );
+        // The non-secret fields stay visible for operability.
+        assert!(rendered.contains("idp.example.com"));
+        assert!(rendered.contains("cid"));
+    }
+
+    #[test]
+    fn sanitize_error_message_strips_controls_and_truncates() {
+        let injected = "HTTP 401: bad\r\n[FAKE LOG LINE] evil";
+        let cleaned = sanitize_error_message(injected);
+        assert!(
+            !cleaned.contains('\n') && !cleaned.contains('\r'),
+            "{cleaned}"
+        );
+        assert!(cleaned.starts_with("HTTP 401"));
+
+        let long = format!("HTTP 502: {}", "x".repeat(1000));
+        let truncated = sanitize_error_message(&long);
+        assert!(truncated.chars().count() <= 257, "bounded output");
+        assert!(truncated.ends_with('…'));
     }
 }
