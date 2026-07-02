@@ -17,7 +17,7 @@
 use aisix_gateway::{
     BridgeContext, BridgeError, ChatMessage, ChatResponse, FinishReason, UsageStats,
 };
-use aisix_obs::{AccessLog, RequestOutcome, UsageEvent};
+use aisix_obs::{content_capture_cap, AccessLog, CapturedContent, RequestOutcome, UsageEvent};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -62,6 +62,11 @@ struct CompletionDispatchSuccess {
     /// ledger + /logs from under-reporting spend the provider charged for
     /// — the output analog of chat.rs's UpstreamCharge / responses.rs #543.
     guardrail_blocked: bool,
+    /// Captured request/response content for content-capturing exporters
+    /// (AISIX-Cloud#947). `Some` only when an enabled exporter opted into
+    /// `content_mode = full`; threaded to `fan_out` via the handler's emit,
+    /// never to the CP sink.
+    captured_content: Option<CapturedContent>,
 }
 
 /// Subset of the OpenAI legacy /v1/completions response `usage`
@@ -135,6 +140,7 @@ pub async fn completions(
                     &client,
                     success.guardrail_blocked,
                     success.redactions.clone(),
+                    success.captured_content.as_ref(),
                 );
             }
             success.response
@@ -259,6 +265,18 @@ async fn dispatch(
     // block check passes, BEFORE the body is forwarded upstream.
     let mut redactions = crate::redact::redact_completions_request(&resolved_chain, &mut body);
 
+    // Content capture (AISIX-Cloud#947): the client-facing request body
+    // (post-redaction, so masked PII stays masked in the exported content),
+    // gated on an exporter actually wanting content.
+    let content_cap = content_capture_cap(
+        snapshot
+            .observability_exporters
+            .entries()
+            .iter()
+            .map(|e| &e.value),
+    );
+    let captured_prompt = content_cap.map(|_| serde_json::to_string(&body).unwrap_or_default());
+
     let model_rl =
         crate::quota::ModelRateLimit::from_model(model_name, &model_entry.id, &model_entry.value);
     let reservation = crate::quota::enforce(state, auth, Some(&model_rl)).await?;
@@ -345,6 +363,9 @@ async fn dispatch(
                         usage,
                         redactions,
                         guardrail_blocked: true,
+                        // Blocked responses never reached the client — no
+                        // content capture, matching the chat surface.
+                        captured_content: None,
                     });
                 }
             }
@@ -357,6 +378,18 @@ async fn dispatch(
                 crate::redact::redact_completions_response(&resolved_chain, &mut resp_json),
             );
 
+            // Content capture (AISIX-Cloud#947): the completion text from the
+            // POST-redaction body, so the exported content matches what the
+            // caller received.
+            let captured_content = match (&captured_prompt, content_cap) {
+                (Some(prompt), Some(cap)) => Some(CapturedContent::new(
+                    prompt,
+                    &completion_output_text(&resp_json),
+                    cap as usize,
+                )),
+                _ => None,
+            };
+
             Ok(CompletionDispatchSuccess {
                 response: Json(resp_json).into_response(),
                 provider: provider_label,
@@ -365,6 +398,7 @@ async fn dispatch(
                 usage,
                 redactions,
                 guardrail_blocked: false,
+                captured_content,
             })
         }
         Err(BridgeError::Config(msg)) if msg.contains("does not support text completions") => {
@@ -382,6 +416,7 @@ async fn dispatch(
                 usage: None,
                 redactions,
                 guardrail_blocked: false,
+                captured_content: None,
             })
         }
         Err(e) => {
@@ -465,6 +500,9 @@ fn emit_usage_event(
     guardrail_blocked: bool,
     // Per-detector PII mask counts (#932). Empty = no redaction.
     redacted_entity_counts: crate::redact::RedactionCounts,
+    // Captured request/response content for content-capturing exporters
+    // (AISIX-Cloud#947). Forwarded only to `fan_out`, never to the CP sink.
+    content: Option<&CapturedContent>,
 ) {
     let snap = state.snapshot.load();
     let mut event = UsageEvent {
@@ -491,7 +529,7 @@ fn emit_usage_event(
     let exporters = snap.observability_exporters.entries();
     state
         .otlp_fan_out
-        .fan_out(&event, None, exporters.iter().map(|e| &e.value));
+        .fan_out(&event, content, exporters.iter().map(|e| &e.value));
 }
 
 fn emit_access_log(

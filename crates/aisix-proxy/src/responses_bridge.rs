@@ -901,6 +901,11 @@ pub struct ResponsesStreamCompletion {
     /// Per-detector PII mask counts applied to the held stream at release
     /// (#932). Merged with the input-side counts by the on_complete emit.
     pub redacted_entity_counts: crate::redact::RedactionCounts,
+    /// Assembled assistant text for content-capturing exporters
+    /// (AISIX-Cloud#947), accumulated across chunks ONLY when an exporter
+    /// wants full content (bounded to the capture cap). Empty otherwise.
+    /// Read by the on_complete telemetry closure; never reaches the CP sink.
+    pub response_text: String,
 }
 
 struct CompleteOnDrop<F: FnOnce(ResponsesStreamCompletion)> {
@@ -938,6 +943,7 @@ impl<F: FnOnce(ResponsesStreamCompletion)> Drop for CompleteOnDrop<F> {
 /// (not raw deltas), and the buffer is capped — an output guardrail must
 /// never release content it couldn't fully buffer to scan, so an overflow
 /// fails closed. With no output guardrail the bytes forward live.
+#[allow(clippy::too_many_arguments)]
 pub fn build_responses_bridge_stream(
     upstream: ChatChunkStream,
     encoder: ResponsesSseEncoder,
@@ -945,6 +951,9 @@ pub fn build_responses_bridge_stream(
     output_guardrail: Option<Arc<aisix_guardrails::GuardrailChain>>,
     max_buffer_bytes: usize,
     model_label: String,
+    // Largest content cap any content-capturing exporter wants
+    // (AISIX-Cloud#947); `None` skips response-text accumulation entirely.
+    content_cap: Option<u32>,
     on_complete: impl FnOnce(ResponsesStreamCompletion) + Send + 'static,
 ) -> axum::body::Body {
     use futures::StreamExt;
@@ -974,6 +983,18 @@ pub fn build_responses_bridge_stream(
                         let comp = guard.comp();
                         if let Some(fr) = chunk.finish_reason.as_ref() {
                             comp.finish_reason = finish_reason_label(fr);
+                        }
+                        // Content capture (AISIX-Cloud#947): assemble the
+                        // assistant text for the observability fan-out,
+                        // bounded to the cap so a long stream can't grow the
+                        // buffer without limit. Only when an exporter wants
+                        // full content — mirrors chat.rs's stream capture.
+                        if let (Some(cap), Some(text)) =
+                            (content_cap, chunk.delta.content.as_deref())
+                        {
+                            if comp.response_text.len() < cap as usize {
+                                comp.response_text.push_str(text);
+                            }
                         }
                         if let Some(u) = chunk.usage.as_ref() {
                             comp.prompt_tokens = comp.prompt_tokens.max(u.prompt_tokens);
