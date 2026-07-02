@@ -371,6 +371,10 @@ async fn dispatch(
 
     match bridge.embed(&req, &ctx).await {
         Ok(embed_resp) => {
+            // #701: clear any cooldown/unhealthy mark now the upstream
+            // answered — same recovery signal as rerank/audio/chat.
+            state.health.record_success(&body.model);
+            state.runtime_status.mark_healthy(&model_entry.id);
             // Commit the reservation — release the concurrency permit
             // and finalise RPM. Embeddings do report prompt_tokens via
             // EmbeddingResponse.usage; thread it through so TPM works
@@ -420,6 +424,16 @@ async fn dispatch(
         }
         Err(e) => {
             reservation.commit_tokens(0).await;
+            // #701: mark the failure on the runtime status so the cooldown /
+            // circuit-breaker sees flapping upstreams reached only via this
+            // endpoint — same policy as rerank/audio/chat. `note_failure` is
+            // a no-op for non-triggering categories (e.g. Config errors).
+            let e = crate::cooldown::note_failure(
+                &state.runtime_status,
+                &model_entry.id,
+                model.cooldown.as_ref(),
+                e,
+            );
             Err(ProxyError::Bridge(e))
         }
     }
@@ -1539,6 +1553,40 @@ mod tests {
         assert_eq!(
             v["error"]["type"], "invalid_request_error",
             "envelope must be OpenAI-shape invalid_request_error — #401",
+        );
+    }
+
+    /// #701: an upstream 5xx must mark the model's runtime status (cooldown)
+    /// — /v1/embeddings previously never touched it.
+    #[tokio::test]
+    async fn upstream_5xx_marks_cooldown_issue_701() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/embeddings"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("embed-model"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let handle = SnapshotHandle::new(snap);
+        let state = crate::ProxyState::new(handle, hub, &cfg()).without_cache();
+        let app = crate::build_router(state.clone());
+
+        let body = serde_json::json!({"model": "embed-model", "input": "hi"});
+        let resp = tower::ServiceExt::oneshot(app, make_req(body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+
+        let status = state.runtime_status.status("m-1");
+        assert!(
+            status.cooldown_until.is_some(),
+            "a 500 must mark the model in cooldown, got {status:?}"
         );
     }
 }

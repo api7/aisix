@@ -426,10 +426,22 @@ async fn dispatch(
         builder = builder.timeout(d);
     }
 
+    // #701: transport/decode failures against the shared upstream mark the
+    // borrowed model's runtime status (same borrowed-model basis as the
+    // #911 [6] guardrail chain), so a dead upstream reached only via the raw
+    // tunnel still trips the cooldown. Forwarded HTTP statuses stay the
+    // caller's business — the tunnel relays them verbatim.
     let upstream_resp = builder
         .send()
         .await
-        .map_err(|e| aisix_gateway::BridgeError::Transport(e.to_string()))
+        .map_err(|e| {
+            crate::cooldown::note_failure(
+                &state.runtime_status,
+                &model_entry.id,
+                model.cooldown.as_ref(),
+                aisix_gateway::BridgeError::Transport(e.to_string()),
+            )
+        })
         .map_err(ProxyError::Bridge)?;
 
     let status = upstream_resp.status();
@@ -437,7 +449,14 @@ async fn dispatch(
     let resp_body = upstream_resp
         .bytes()
         .await
-        .map_err(|e| aisix_gateway::BridgeError::UpstreamDecode(e.to_string()))
+        .map_err(|e| {
+            crate::cooldown::note_failure(
+                &state.runtime_status,
+                &model_entry.id,
+                model.cooldown.as_ref(),
+                aisix_gateway::BridgeError::UpstreamDecode(e.to_string()),
+            )
+        })
         .map_err(ProxyError::Bridge)?;
 
     // #911 [6]: run OUTPUT guardrails on the passthrough response body — the

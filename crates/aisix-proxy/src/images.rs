@@ -264,6 +264,10 @@ async fn dispatch(
 
     match bridge.generate_image(&body, &ctx).await {
         Ok(resp_json) => {
+            // #701: clear any cooldown/unhealthy mark now the upstream
+            // answered — same recovery signal as rerank/audio/chat.
+            state.health.record_success(model_name);
+            state.runtime_status.mark_healthy(&model_entry.id);
             // Extract usage tokens (gpt-image-1 returns a `usage` block;
             // dall-e-3 doesn't) BEFORE moving resp_json into the
             // Response, so the success struct carries typed counters.
@@ -302,6 +306,16 @@ async fn dispatch(
         }
         Err(e) => {
             reservation.commit_tokens(0).await;
+            // #701: mark the failure on the runtime status so the cooldown /
+            // circuit-breaker sees flapping upstreams reached only via this
+            // endpoint — same policy as rerank/audio/chat. `note_failure` is
+            // a no-op for non-triggering categories (e.g. Config errors).
+            let e = crate::cooldown::note_failure(
+                &state.runtime_status,
+                &model_entry.id,
+                model.cooldown.as_ref(),
+                e,
+            );
             Err(ProxyError::Bridge(e))
         }
     }
@@ -1036,6 +1050,40 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "exactly one event per failed request"
+        );
+    }
+
+    /// #701: an upstream 5xx must mark the model's runtime status (cooldown)
+    /// — /v1/images/generations previously never touched it.
+    #[tokio::test]
+    async fn upstream_5xx_marks_cooldown_issue_701() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/images/generations"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("img"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let handle = SnapshotHandle::new(snap);
+        let state = crate::ProxyState::new(handle, hub, &cfg()).without_cache();
+        let app = crate::build_router(state.clone());
+
+        let body = serde_json::json!({"model": "img", "prompt": "a cat"});
+        let resp = tower::ServiceExt::oneshot(app, make_req(body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+
+        let status = state.runtime_status.status("m-1");
+        assert!(
+            status.cooldown_until.is_some(),
+            "a 500 must mark the model in cooldown, got {status:?}"
         );
     }
 }
