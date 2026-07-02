@@ -19,7 +19,7 @@
 
 use aisix_core::AppliedGuardrail;
 use aisix_gateway::{ChatMessage, ChatResponse, FinishReason, UsageStats};
-use aisix_obs::{AccessLog, RequestOutcome, UsageEvent};
+use aisix_obs::{content_capture_cap, AccessLog, CapturedContent, RequestOutcome, UsageEvent};
 use axum::body::Bytes;
 use axum::extract::{Multipart, State};
 use axum::http::{header, HeaderMap};
@@ -65,6 +65,12 @@ struct AudioDispatchSuccess {
     /// `guardrail_blocked`) doesn't under-report spend — same convention as
     /// completions #911 [23] / responses #543.
     guardrail_blocked: bool,
+    /// Captured request/response content for content-capturing exporters
+    /// (#700, LiteLLM parity: the audio bytes are represented by their
+    /// sha256, text form fields verbatim; the response is the post-redaction
+    /// transcript). `Some` only when an exporter opted into
+    /// `content_mode = full`.
+    captured_content: Option<CapturedContent>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -280,7 +286,15 @@ pub async fn speech(
         .to_string();
 
     match speech_dispatch(&state, &auth, body, &request_id, &client.source_ip).await {
-        Ok((resp, provider, model_id, provider_key_id, applied_guardrails, redactions)) => {
+        Ok((
+            resp,
+            provider,
+            model_id,
+            provider_key_id,
+            applied_guardrails,
+            redactions,
+            captured,
+        )) => {
             let elapsed = started.elapsed();
             emit_access_log(
                 "POST",
@@ -319,6 +333,7 @@ pub async fn speech(
                 &client,
                 redactions,
                 /* guardrail_blocked */ false,
+                captured.as_ref(),
             );
             resp
         }
@@ -472,6 +487,40 @@ async fn multipart_dispatch(
             }
         }
     }
+
+    // Content capture (#700, LiteLLM parity): the audio bytes are NOT
+    // captured — the file is represented by its sha256 (exactly what LiteLLM
+    // logs for transcription input); the text form fields (model, prompt,
+    // language, …) are captured verbatim, POST-redaction so a masked
+    // `prompt` field stays masked in the exported content.
+    let content_cap = content_capture_cap(
+        snapshot
+            .observability_exporters
+            .entries()
+            .iter()
+            .map(|e| &e.value),
+    );
+    let captured_prompt = content_cap.map(|_| {
+        use sha2::Digest;
+        let mut obj = serde_json::Map::new();
+        for (name, file_name, _, data) in &fields {
+            match std::str::from_utf8(data) {
+                Ok(text) if name != "file" => {
+                    obj.insert(name.clone(), Value::String(text.to_string()));
+                }
+                _ => {
+                    obj.insert(
+                        format!("{name}_sha256"),
+                        Value::String(format!("{:x}", sha2::Sha256::digest(data))),
+                    );
+                    if let Some(f) = file_name {
+                        obj.insert(format!("{name}_filename"), Value::String(f.clone()));
+                    }
+                }
+            }
+        }
+        serde_json::to_string(&Value::Object(obj)).unwrap_or_default()
+    });
 
     let model_rl =
         crate::quota::ModelRateLimit::from_model(&model_name, &model_entry.id, &model_entry.value);
@@ -657,6 +706,9 @@ async fn multipart_dispatch(
                     applied_guardrails,
                     redactions,
                     guardrail_blocked: true,
+                    // The blocked transcript never reached the client — no
+                    // content capture, matching the chat surface.
+                    captured_content: None,
                 });
             }
         }
@@ -673,6 +725,18 @@ async fn multipart_dispatch(
             None => body_bytes,
         };
 
+    // Content capture (#700): the transcript the caller sees — read from
+    // the POST-redaction body so masked PII stays masked in the exported
+    // content.
+    let captured_content = match (&captured_prompt, content_cap) {
+        (Some(prompt), Some(cap)) => Some(CapturedContent::new(
+            prompt,
+            &String::from_utf8_lossy(&body_bytes),
+            cap as usize,
+        )),
+        _ => None,
+    };
+
     let mut out = axum::response::Response::new(axum::body::Body::from(body_bytes));
     copy_response_header(&upstream_headers, &mut out, header::CONTENT_TYPE);
     Ok(AudioDispatchSuccess {
@@ -685,6 +749,7 @@ async fn multipart_dispatch(
         applied_guardrails,
         redactions,
         guardrail_blocked: false,
+        captured_content,
     })
 }
 
@@ -739,6 +804,7 @@ async fn speech_dispatch(
         String,
         Vec<AppliedGuardrail>,
         crate::redact::RedactionCounts,
+        Option<CapturedContent>,
     ),
     ProxyError,
 > {
@@ -798,6 +864,24 @@ async fn speech_dispatch(
     // AFTER the block check passes, BEFORE the body is forwarded upstream.
     // Pre-#696 a mask-action detector was a silent no-op here.
     let redactions = crate::redact::redact_speech_request(&resolved_chain, &mut body);
+
+    // Content capture (#700, LiteLLM parity): the post-redaction request
+    // body (the `input` text to synthesize) is the prompt; the binary audio
+    // response is NOT captured — LiteLLM logs no TTS response either.
+    let captured_content = content_capture_cap(
+        snapshot
+            .observability_exporters
+            .entries()
+            .iter()
+            .map(|e| &e.value),
+    )
+    .map(|cap| {
+        CapturedContent::new(
+            &serde_json::to_string(&body).unwrap_or_default(),
+            "",
+            cap as usize,
+        )
+    });
 
     let model_rl =
         crate::quota::ModelRateLimit::from_model(&model_name, &model_entry.id, &model_entry.value);
@@ -929,6 +1013,7 @@ async fn speech_dispatch(
         pk_entry.id.to_string(),
         applied_guardrails,
         redactions,
+        captured_content,
     ))
 }
 
@@ -976,6 +1061,7 @@ fn emit_audio_usage(
         client,
         success.redactions.clone(),
         success.guardrail_blocked,
+        success.captured_content.as_ref(),
     );
 }
 
@@ -1004,6 +1090,9 @@ fn emit_usage_event(
     redacted_entity_counts: crate::redact::RedactionCounts,
     // #696: transcript blocked by an output guardrail after upstream billing.
     guardrail_blocked: bool,
+    // Captured request/response content (#700). Forwarded only to `fan_out`,
+    // never to the CP sink.
+    content: Option<&CapturedContent>,
 ) {
     let snap = state.snapshot.load();
     let mut event = UsageEvent {
@@ -1032,7 +1121,7 @@ fn emit_usage_event(
     let exporters = snap.observability_exporters.entries();
     state
         .otlp_fan_out
-        .fan_out(&event, None, exporters.iter().map(|e| &e.value));
+        .fan_out(&event, content, exporters.iter().map(|e| &e.value));
 }
 
 fn copy_response_header(src: &HeaderMap, dst: &mut Response, name: header::HeaderName) {

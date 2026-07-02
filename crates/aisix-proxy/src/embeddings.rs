@@ -16,7 +16,7 @@
 
 use aisix_core::AppliedGuardrail;
 use aisix_gateway::{BridgeContext, BridgeError, ChatFormat, ChatMessage, EmbeddingRequest};
-use aisix_obs::{AccessLog, RequestOutcome, UsageEvent};
+use aisix_obs::{content_capture_cap, AccessLog, CapturedContent, RequestOutcome, UsageEvent};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -35,7 +35,7 @@ use crate::state::ProxyState;
 ///
 /// `input` may be a single string **or** an array of strings; both are
 /// handled by the `InputField` helper so callers don't need to know.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, serde::Serialize)]
 pub struct EmbeddingRequestBody {
     pub model: String,
     pub input: InputField,
@@ -47,7 +47,7 @@ pub struct EmbeddingRequestBody {
 
 /// Deserialises both `"text"` and `["text", ...]` forms of the
 /// OpenAI embeddings `input` field.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, serde::Serialize)]
 #[serde(untagged)]
 pub enum InputField {
     Single(String),
@@ -173,6 +173,7 @@ pub async fn embeddings(
                     success.prompt_tokens,
                     &client,
                     success.redactions.clone(),
+                    success.captured_content.as_ref(),
                 );
             }
             success.response
@@ -232,6 +233,11 @@ struct EmbedDispatchSuccess {
     applied_guardrails: Vec<AppliedGuardrail>,
     /// Per-detector PII mask counts (#932) applied to the input.
     redactions: crate::redact::RedactionCounts,
+    /// Captured request/response content for content-capturing exporters
+    /// (#700, LiteLLM parity: the full response JSON — vectors included —
+    /// truncated at the capture cap). `Some` only when an exporter opted
+    /// into `content_mode = full`.
+    captured_content: Option<CapturedContent>,
     prompt_tokens: u32,
     /// `true` when the dispatch produced a real 200 from the upstream
     /// (we have authoritative usage data to attribute). `false` for the
@@ -339,6 +345,19 @@ async fn dispatch(
         }
     }
 
+    // Content capture (#700): the client-facing request body
+    // (post-#932-redaction) is the prompt; the full response JSON — vectors
+    // included, matching LiteLLM's logging payload — is the response, both
+    // truncated at the largest cap an enabled exporter wants.
+    let content_cap = content_capture_cap(
+        snapshot
+            .observability_exporters
+            .entries()
+            .iter()
+            .map(|e| &e.value),
+    );
+    let captured_prompt = content_cap.map(|_| serde_json::to_string(&body).unwrap_or_default());
+
     let model_rl =
         crate::quota::ModelRateLimit::from_model(&body.model, &model_entry.id, &model_entry.value);
     let reservation = crate::quota::enforce(state, auth, Some(&model_rl)).await?;
@@ -383,6 +402,17 @@ async fn dispatch(
             // embed_resp into the JSON response — the handler needs
             // this for UsageEvent emission downstream (#226).
             let prompt_tokens = embed_resp.usage.prompt_tokens;
+            // Content capture (#700): the full response JSON, vectors
+            // included (LiteLLM parity); CapturedContent::new truncates to
+            // the cap.
+            let captured_content = match (&captured_prompt, content_cap) {
+                (Some(prompt), Some(cap)) => Some(CapturedContent::new(
+                    prompt,
+                    &serde_json::to_string(&embed_resp).unwrap_or_default(),
+                    cap as usize,
+                )),
+                _ => None,
+            };
             Ok(EmbedDispatchSuccess {
                 response: Json(embed_resp).into_response(),
                 provider: provider_label,
@@ -392,6 +422,7 @@ async fn dispatch(
                 redactions: redactions.clone(),
                 prompt_tokens,
                 upstream_called: true,
+                captured_content,
             })
         }
         Err(BridgeError::Config(msg)) if msg.contains("does not support embeddings") => {
@@ -411,6 +442,7 @@ async fn dispatch(
                 applied_guardrails: applied_guardrails.clone(),
                 redactions: redactions.clone(),
                 prompt_tokens: 0,
+                captured_content: None,
                 // No upstream call happened — the handler reads this
                 // and skips UsageEvent emission. Distinguished from
                 // `prompt_tokens == 0` so a 200 that legitimately
@@ -492,6 +524,9 @@ fn emit_usage_event(
     client: &ClientContext,
     // Per-detector PII mask counts (#932) applied to the input.
     redacted_entity_counts: crate::redact::RedactionCounts,
+    // Captured request/response content (#700). Forwarded only to `fan_out`,
+    // never to the CP sink.
+    content: Option<&CapturedContent>,
 ) {
     // Only populate fields meaningful to /v1/embeddings; rely on
     // UsageEvent's `#[derive(Default)]` for everything else. Wire-level
@@ -545,7 +580,7 @@ fn emit_usage_event(
     let exporters = snap.observability_exporters.entries();
     state
         .otlp_fan_out
-        .fan_out(&event, None, exporters.iter().map(|e| &e.value));
+        .fan_out(&event, content, exporters.iter().map(|e| &e.value));
 }
 
 #[cfg(test)]

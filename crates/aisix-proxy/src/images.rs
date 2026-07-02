@@ -12,7 +12,7 @@
 
 use aisix_core::AppliedGuardrail;
 use aisix_gateway::{BridgeContext, BridgeError};
-use aisix_obs::{AccessLog, RequestOutcome, UsageEvent};
+use aisix_obs::{content_capture_cap, AccessLog, CapturedContent, RequestOutcome, UsageEvent};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -54,6 +54,11 @@ struct ImageDispatchSuccess {
     /// Per-detector PII mask counts (#932/#696) applied to the prompt.
     /// Attached to the emitted UsageEvent. Empty = no redaction.
     redactions: crate::redact::RedactionCounts,
+    /// Captured request/response content for content-capturing exporters
+    /// (#700, LiteLLM parity: the full image response JSON — url or
+    /// b64_json — truncated at the capture cap). `Some` only when an
+    /// exporter opted into `content_mode = full`.
+    captured_content: Option<CapturedContent>,
 }
 
 pub async fn image_generations(
@@ -114,6 +119,7 @@ pub async fn image_generations(
                     completion_tokens,
                     &client,
                     success.redactions.clone(),
+                    success.captured_content.as_ref(),
                 );
             }
             success.response
@@ -235,6 +241,19 @@ async fn dispatch(
     // Pre-#696 a mask-action detector was a silent no-op here.
     let redactions = crate::redact::redact_images_request(&resolved_chain, &mut body);
 
+    // Content capture (#700): the client-facing request body
+    // (post-#932-redaction) is the prompt; the response is the image JSON
+    // (url or b64_json — LiteLLM logs it unstripped too), truncated at the
+    // cap.
+    let content_cap = content_capture_cap(
+        snapshot
+            .observability_exporters
+            .entries()
+            .iter()
+            .map(|e| &e.value),
+    );
+    let captured_prompt = content_cap.map(|_| serde_json::to_string(&body).unwrap_or_default());
+
     let model_rl =
         crate::quota::ModelRateLimit::from_model(model_name, &model_entry.id, &model_entry.value);
     let reservation = crate::quota::enforce(state, auth, Some(&model_rl)).await?;
@@ -288,6 +307,16 @@ async fn dispatch(
                 .map(|(prompt, completion)| u64::from(prompt) + u64::from(completion))
                 .unwrap_or(0);
             reservation.commit_tokens(total_tokens).await;
+            // Content capture (#700): the full response JSON (LiteLLM
+            // parity); CapturedContent::new truncates to the cap.
+            let captured_content = match (&captured_prompt, content_cap) {
+                (Some(prompt), Some(cap)) => Some(CapturedContent::new(
+                    prompt,
+                    &serde_json::to_string(&resp_json).unwrap_or_default(),
+                    cap as usize,
+                )),
+                _ => None,
+            };
             Ok(ImageDispatchSuccess {
                 response: Json(resp_json).into_response(),
                 provider: provider_label,
@@ -297,6 +326,7 @@ async fn dispatch(
                 usage,
                 upstream_called: true,
                 redactions,
+                captured_content,
             })
         }
         Err(BridgeError::Config(msg)) if msg.contains("does not support image generation") => {
@@ -313,6 +343,7 @@ async fn dispatch(
                 // No upstream call happened → handler skips emit.
                 upstream_called: false,
                 redactions,
+                captured_content: None,
             })
         }
         Err(e) => {
@@ -365,6 +396,9 @@ fn emit_usage_event(
     client: &ClientContext,
     // Per-detector PII mask counts (#932/#696). Empty = no redaction.
     redacted_entity_counts: crate::redact::RedactionCounts,
+    // Captured request/response content (#700). Forwarded only to `fan_out`,
+    // never to the CP sink.
+    content: Option<&CapturedContent>,
 ) {
     let snap = state.snapshot.load();
     let mut event = UsageEvent {
@@ -390,7 +424,7 @@ fn emit_usage_event(
     let exporters = snap.observability_exporters.entries();
     state
         .otlp_fan_out
-        .fan_out(&event, None, exporters.iter().map(|e| &e.value));
+        .fan_out(&event, content, exporters.iter().map(|e| &e.value));
 }
 
 fn emit_access_log(

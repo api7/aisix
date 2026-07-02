@@ -10,7 +10,7 @@
 //! The gateway appends `/v1/rerank`.
 
 use aisix_core::AppliedGuardrail;
-use aisix_obs::{AccessLog, RequestOutcome, UsageEvent};
+use aisix_obs::{content_capture_cap, AccessLog, CapturedContent, RequestOutcome, UsageEvent};
 use axum::extract::State;
 use axum::http::HeaderValue;
 use axum::response::{IntoResponse, Response};
@@ -47,6 +47,10 @@ struct RerankDispatchSuccess {
     /// Per-detector PII mask counts (#932/#696) applied to the request.
     /// Attached to the emitted UsageEvent. Empty = no redaction.
     redactions: crate::redact::RedactionCounts,
+    /// Captured request/response content for content-capturing exporters
+    /// (#700, LiteLLM parity: the full rerank response JSON). `Some` only
+    /// when an exporter opted into `content_mode = full`.
+    captured_content: Option<CapturedContent>,
 }
 
 /// Rerank has no completion side — only the input (query + docs)
@@ -118,6 +122,7 @@ pub async fn rerank(
                     &usage,
                     &client,
                     success.redactions.clone(),
+                    success.captured_content.as_ref(),
                 );
             }
             success.response
@@ -249,6 +254,18 @@ async fn dispatch(
     // place AFTER the block check passes, BEFORE the body is forwarded
     // upstream. Pre-#696 a mask-action detector was a silent no-op here.
     let redactions = crate::redact::redact_rerank_request(&resolved_chain, body);
+
+    // Content capture (#700): the client-facing request body
+    // (post-#932-redaction) is the prompt; the response is the upstream's
+    // rerank JSON verbatim (LiteLLM parity), both truncated at the cap.
+    let content_cap = content_capture_cap(
+        snapshot
+            .observability_exporters
+            .entries()
+            .iter()
+            .map(|e| &e.value),
+    );
+    let captured_prompt = content_cap.map(|_| serde_json::to_string(&*body).unwrap_or_default());
 
     let model_rl =
         crate::quota::ModelRateLimit::from_model(&model_name, &model_entry.id, &model_entry.value);
@@ -444,6 +461,17 @@ async fn dispatch(
         }
     };
 
+    // Content capture (#700): the relayed response bytes are the JSON the
+    // caller sees; non-UTF-8 (unexpected) degrades to lossy text.
+    let captured_content = match (&captured_prompt, content_cap) {
+        (Some(prompt), Some(cap)) => Some(CapturedContent::new(
+            prompt,
+            &String::from_utf8_lossy(&body_bytes),
+            cap as usize,
+        )),
+        _ => None,
+    };
+
     let mut resp = axum::response::Response::new(axum::body::Body::from(body_bytes));
 
     // Forward content-type from upstream.
@@ -475,6 +503,7 @@ async fn dispatch(
         applied_guardrails: applied_guardrails.clone(),
         usage,
         redactions,
+        captured_content,
     })
 }
 
@@ -537,6 +566,9 @@ fn emit_usage_event(
     client: &ClientContext,
     // Per-detector PII mask counts (#932/#696). Empty = no redaction.
     redacted_entity_counts: crate::redact::RedactionCounts,
+    // Captured request/response content (#700). Forwarded only to `fan_out`,
+    // never to the CP sink.
+    content: Option<&CapturedContent>,
 ) {
     let snap = state.snapshot.load();
     let mut event = UsageEvent {
@@ -563,7 +595,7 @@ fn emit_usage_event(
     let exporters = snap.observability_exporters.entries();
     state
         .otlp_fan_out
-        .fan_out(&event, None, exporters.iter().map(|e| &e.value));
+        .fan_out(&event, content, exporters.iter().map(|e| &e.value));
 }
 
 /// Default upstream host for the rerank-supporting providers,
