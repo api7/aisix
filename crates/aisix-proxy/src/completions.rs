@@ -14,7 +14,9 @@
 //! 7. Call `bridge.complete(body, ctx)` → JSON response.
 //! 8. Providers that don't support completions return 501.
 
-use aisix_gateway::{BridgeContext, BridgeError};
+use aisix_gateway::{
+    BridgeContext, BridgeError, ChatMessage, ChatResponse, FinishReason, UsageStats,
+};
 use aisix_obs::{AccessLog, RequestOutcome, UsageEvent};
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -50,6 +52,13 @@ struct CompletionDispatchSuccess {
     /// or on a 200 with no `usage` block (rare edge). Handler
     /// gates UsageEvent emission on this being `Some`.
     usage: Option<CompletionUsage>,
+    /// True when the response leg was blocked by an OUTPUT guardrail
+    /// AFTER the upstream billed for it (#911 [23]). The response body is
+    /// the redacted 422, but `usage` still carries the billed counts so
+    /// the UsageEvent (marked `guardrail_blocked`) keeps cp-api's budget
+    /// ledger + /logs from under-reporting spend the provider charged for
+    /// — the output analog of chat.rs's UpstreamCharge / responses.rs #543.
+    guardrail_blocked: bool,
 }
 
 /// Subset of the OpenAI legacy /v1/completions response `usage`
@@ -121,6 +130,7 @@ pub async fn completions(
                     elapsed,
                     &usage,
                     &client,
+                    success.guardrail_blocked,
                 );
             }
             success.response
@@ -136,9 +146,11 @@ pub async fn completions(
                 elapsed,
                 &request_id,
             );
+            let snap = state.snapshot.load();
+            let metric_model = crate::usage_attr::metric_model_label(&snap, &model_name);
             state.metrics.record_request(
                 "unknown",
-                &model_name,
+                metric_model,
                 status,
                 RequestOutcome::from_status(status),
                 elapsed,
@@ -239,7 +251,7 @@ async fn dispatch(
 
     let model_rl =
         crate::quota::ModelRateLimit::from_model(model_name, &model_entry.id, &model_entry.value);
-    let _reservation = crate::quota::enforce(state, auth, Some(&model_rl)).await?;
+    let reservation = crate::quota::enforce(state, auth, Some(&model_rl)).await?;
 
     let model = &model_entry.value;
     let provider = crate::dispatch::require_provider(model)?;
@@ -264,15 +276,80 @@ async fn dispatch(
             // so the success struct carries typed counters rather
             // than re-parsing JSON downstream.
             let usage = extract_completion_usage(&resp_json);
+            // #911 [21]: commit the actual token cost so TPM/TPD is enforced
+            // for /v1/completions the same way chat + embeddings enforce it.
+            // Pre-fix the reservation dropped uncommitted, so the token
+            // counter never moved and a caller could bypass token limits by
+            // routing traffic through this endpoint.
+            let total_tokens = usage
+                .as_ref()
+                .map(|u| u64::from(u.prompt_tokens) + u64::from(u.completion_tokens))
+                .unwrap_or(0);
+            reservation.commit_tokens(total_tokens).await;
+
+            // #911 [23]: /v1/completions must run OUTPUT guardrails too. The
+            // input hook above scans the prompt, but pre-fix the model's reply
+            // was returned unscanned — a content/DLP block enforced on
+            // /v1/chat/completions was bypassable by switching to this surface
+            // for the response leg. Mirror chat's output check: buffer the reply
+            // text into a synthetic ChatResponse and run the chain. The upstream
+            // already billed (tokens committed above), so a block surfaces a
+            // redacted 422 rather than the response.
+            if !resolved_chain.is_empty() {
+                let synth = ChatResponse {
+                    id: String::new(),
+                    model: model_name.to_string(),
+                    message: ChatMessage::assistant(completion_output_text(&resp_json)),
+                    finish_reason: FinishReason::Stop,
+                    usage: UsageStats::default(),
+                };
+                if let aisix_guardrails::GuardrailVerdict::Block {
+                    reason,
+                    guardrail_name,
+                } = aisix_guardrails::Guardrail::check_output(&resolved_chain, &synth).await
+                {
+                    // Per #153 the matched-pattern detail stays in ops logs only.
+                    tracing::warn!(
+                        guardrail_hook = "output",
+                        model = %model_name,
+                        reason = %reason,
+                        "guardrail blocked /v1/completions response",
+                    );
+                    // The upstream already billed for this response (tokens
+                    // committed above), so return the redacted 422 body BUT
+                    // carry the billed `usage` marked `guardrail_blocked` —
+                    // recording zero tokens here would let cp-api's ledger
+                    // under-report spend the customer was charged for. Same
+                    // output analog as responses.rs #543 / chat.rs UpstreamCharge.
+                    return Ok(CompletionDispatchSuccess {
+                        response: ProxyError::ContentFiltered(
+                            crate::error::guardrail_block_message(
+                                "response",
+                                guardrail_name.as_deref(),
+                            ),
+                        )
+                        .into_response(),
+                        provider: provider_label,
+                        model_id: model_entry.id.to_string(),
+                        provider_key_id: pk_entry.id.to_string(),
+                        usage,
+                        guardrail_blocked: true,
+                    });
+                }
+            }
+
             Ok(CompletionDispatchSuccess {
                 response: Json(resp_json).into_response(),
                 provider: provider_label,
                 model_id: model_entry.id.to_string(),
                 provider_key_id: pk_entry.id.to_string(),
                 usage,
+                guardrail_blocked: false,
             })
         }
         Err(BridgeError::Config(msg)) if msg.contains("does not support text completions") => {
+            // No upstream call → no tokens to count; release the reservation.
+            reservation.commit_tokens(0).await;
             let env = ErrorEnvelope::new(msg, "not_implemented");
             Ok(CompletionDispatchSuccess {
                 response: (StatusCode::NOT_IMPLEMENTED, Json(env)).into_response(),
@@ -283,9 +360,13 @@ async fn dispatch(
                 // gates emission on `usage.is_some()` so 501 stays
                 // out of /logs noise (same convention as #402).
                 usage: None,
+                guardrail_blocked: false,
             })
         }
-        Err(e) => Err(ProxyError::Bridge(e)),
+        Err(e) => {
+            reservation.commit_tokens(0).await;
+            Err(ProxyError::Bridge(e))
+        }
     }
 }
 
@@ -320,6 +401,23 @@ fn extract_completion_usage(body: &Value) -> Option<CompletionUsage> {
     })
 }
 
+/// Concatenate the `text` of every choice in a /v1/completions response for
+/// output-guardrail scanning (#911 [23]). Missing/non-string `text` fields are
+/// skipped; the result is the client-visible completion text the content/DLP
+/// output hook must inspect.
+fn completion_output_text(body: &Value) -> String {
+    body.get("choices")
+        .and_then(|c| c.as_array())
+        .map(|choices| {
+            choices
+                .iter()
+                .filter_map(|c| c.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
+}
+
 /// Issue #403: push one `UsageEvent` onto cp-api's telemetry sink
 /// and fan it out to per-env OTLP exporters. Mirrors the shape of
 /// `embeddings::emit_usage_event` (#402) and `responses::emit_usage_event`
@@ -343,6 +441,7 @@ fn emit_usage_event(
     elapsed: Duration,
     usage: &CompletionUsage,
     client: &ClientContext,
+    guardrail_blocked: bool,
 ) {
     let snap = state.snapshot.load();
     let mut event = UsageEvent {
@@ -358,6 +457,9 @@ fn emit_usage_event(
         inbound_protocol: "openai".to_string(),
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),
+        // #911 [23]: a billed-then-output-blocked completion surfaces on the
+        // dashboard's Blocked tab while still carrying its billed token counts.
+        guardrail_blocked,
         ..Default::default()
     };
     crate::usage_attr::apply_pk_telemetry(&mut event, &snap, provider_key_id);

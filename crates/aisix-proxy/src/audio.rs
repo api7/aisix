@@ -297,9 +297,11 @@ pub async fn speech(
                 elapsed,
                 &request_id,
             );
+            let snap = state.snapshot.load();
+            let metric_model = crate::usage_attr::metric_model_label(&snap, &model_name);
             state.metrics.record_request(
                 "unknown",
-                &model_name,
+                metric_model,
                 status,
                 RequestOutcome::from_status(status),
                 elapsed,
@@ -375,7 +377,7 @@ async fn multipart_dispatch(
 
     let model_rl =
         crate::quota::ModelRateLimit::from_model(&model_name, &model_entry.id, &model_entry.value);
-    let _reservation = crate::quota::enforce(state, auth, Some(&model_rl)).await?;
+    let reservation = crate::quota::enforce(state, auth, Some(&model_rl)).await?;
 
     let model = &model_entry.value;
     let provider = crate::dispatch::require_provider(model)?;
@@ -439,10 +441,15 @@ async fn multipart_dispatch(
     }
 
     let client = crate::http_client::client();
-    let resp = client
-        .post(&url)
-        .headers(headers)
-        .multipart(form)
+    let mut req = client.post(&url).headers(headers).multipart(form);
+    // #554/#911: audio transcription/translation is non-streaming; apply the
+    // per-model E2E request timeout like the other direct-upstream paths
+    // (count_tokens/rerank/responses) so a slow/blackholed audio provider
+    // fails over and the model's timeout cooldown can engage.
+    if let Some(d) = model.request_timeout() {
+        req = req.timeout(d);
+    }
+    let resp = req
         .send()
         .await
         .map_err(|e| {
@@ -501,6 +508,14 @@ async fn multipart_dispatch(
         .ok()
         .as_ref()
         .and_then(extract_token_usage);
+
+    // #911 [21]: commit the actual token cost so TPM/TPD is enforced for the
+    // audio transcription/translation endpoints like chat + embeddings.
+    // Pre-fix the reservation dropped uncommitted and the counter never moved.
+    let total_tokens = usage
+        .map(|(prompt, completion)| u64::from(prompt) + u64::from(completion))
+        .unwrap_or(0);
+    reservation.commit_tokens(total_tokens).await;
 
     let mut out = axum::response::Response::new(axum::body::Body::from(body_bytes));
     copy_response_header(&upstream_headers, &mut out, header::CONTENT_TYPE);
@@ -588,7 +603,7 @@ async fn speech_dispatch(
 
     let model_rl =
         crate::quota::ModelRateLimit::from_model(&model_name, &model_entry.id, &model_entry.value);
-    let _reservation = crate::quota::enforce(state, auth, Some(&model_rl)).await?;
+    let reservation = crate::quota::enforce(state, auth, Some(&model_rl)).await?;
 
     let model = &model_entry.value;
     let provider = crate::dispatch::require_provider(model)?;
@@ -643,10 +658,16 @@ async fn speech_dispatch(
     }
 
     let client = crate::http_client::client();
-    let resp = client
+    let mut req = client
         .post(crate::dispatch::build_v1_url(&base, "/audio/speech"))
         .headers(headers)
-        .json(&body)
+        .json(&body);
+    // #554/#911: speech synthesis is non-streaming; apply the per-model E2E
+    // request timeout (same as count_tokens/rerank/responses).
+    if let Some(d) = model.request_timeout() {
+        req = req.timeout(d);
+    }
+    let resp = req
         .send()
         .await
         .map_err(|e| {
@@ -694,6 +715,12 @@ async fn speech_dispatch(
             )
         })
         .map_err(ProxyError::Bridge)?;
+
+    // #911 [21]: speech synthesis (TTS) reports no token usage — it is billed
+    // per input character — so there are no tokens to add to TPM/TPD. Commit 0
+    // to release the reservation the same way the other handlers do, keeping
+    // the "every reserve is committed" invariant explicit.
+    reservation.commit_tokens(0).await;
 
     let mut out = axum::response::Response::new(axum::body::Body::from(body_bytes));
     copy_response_header(&upstream_headers, &mut out, header::CONTENT_TYPE);

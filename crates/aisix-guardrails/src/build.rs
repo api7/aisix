@@ -124,15 +124,39 @@ fn applied_for(row: &DomainGuardrail) -> AppliedGuardrail {
     }
 }
 
-/// Build the runtime guardrail for a row, applying its `enforcement_mode`.
-/// `block` (the default) returns the guardrail as-is; `monitor` wraps it in
-/// [`MonitorGuardrail`] so it observes violations without blocking. An
-/// unrecognised mode is treated as `block` (fail-safe) with a warning.
+/// Build the runtime guardrail for a row, applying its `enforcement_mode`
+/// and `mandatory` policy.
+///
+/// `enforcement_mode` `block` (the default) returns the guardrail as-is;
+/// `monitor` wraps it in [`MonitorGuardrail`] so it observes violations
+/// without blocking. `mandatory: true` wraps the result in
+/// [`MandatoryGuardrail`] so a remote guardrail that can't evaluate blocks
+/// the request instead of failing open. `mandatory` is applied outermost:
+/// a monitored guardrail still never blocks on its *content* decisions, but
+/// being unavailable is an infra failure that mandatory makes fatal.
 fn build_one(
     row: &DomainGuardrail,
     bedrock_endpoint_url: Option<&str>,
 ) -> Result<Option<Arc<dyn Guardrail>>, BuildError> {
-    Ok(build_one_inner(row, bedrock_endpoint_url)?.map(|g| apply_enforcement_mode(row, g)))
+    Ok(build_one_inner(row, bedrock_endpoint_url)?
+        .map(|g| apply_enforcement_mode(row, g))
+        .map(|g| apply_mandatory(row, g)))
+}
+
+/// Wrap `inner` in [`MandatoryGuardrail`] when `row.mandatory` is set, so a
+/// fail-open remote guardrail that couldn't reach its upstream blocks
+/// instead of bypassing. A no-op for the default (`mandatory: false`) and
+/// for guardrails that never emit `Bypass` (e.g. keyword) — so it's only
+/// ever paid for by rows that opt in.
+fn apply_mandatory(row: &DomainGuardrail, inner: Arc<dyn Guardrail>) -> Arc<dyn Guardrail> {
+    if row.mandatory {
+        Arc::new(MandatoryGuardrail {
+            row_name: row.name.clone(),
+            inner,
+        })
+    } else {
+        inner
+    }
 }
 
 /// Wrap `inner` per the row's `enforcement_mode`. See [`build_one`].
@@ -343,6 +367,74 @@ impl Guardrail for MonitorGuardrail {
 
     fn stream_output_policy(&self) -> StreamOutputPolicy {
         StreamOutputPolicy::EndOfStreamCheck
+    }
+
+    fn runs_on_output(&self) -> bool {
+        self.inner.runs_on_output()
+    }
+}
+
+/// `mandatory: true` decorator. A remote guardrail that can't reach its
+/// upstream returns `Bypass` when `fail_open` is set — the request proceeds
+/// unscanned. For a guardrail an operator marked mandatory that fail-open is
+/// the wrong call: the point of `mandatory` is that the rule MUST evaluate,
+/// so an unreachable upstream is a hard failure. This decorator upgrades a
+/// `Bypass` verdict to `Block`, overriding `fail_open` on the failure path.
+/// `Allow` and `Block` pass through unchanged, and only remote guardrails
+/// ever emit `Bypass`, so keyword rows wrapped here are behaviourally
+/// untouched.
+///
+/// Stream policy + `runs_on_output` delegate to the inner guardrail so the
+/// decorator doesn't change hold-back behaviour — it only rewrites the
+/// verdict a failed evaluation produces.
+struct MandatoryGuardrail {
+    row_name: String,
+    inner: Arc<dyn Guardrail>,
+}
+
+impl MandatoryGuardrail {
+    fn enforce(&self, hook: &'static str, verdict: GuardrailVerdict) -> GuardrailVerdict {
+        match verdict {
+            GuardrailVerdict::Bypass { reason } => {
+                tracing::warn!(
+                    guardrail_name = %self.row_name,
+                    hook,
+                    reason = %reason,
+                    "mandatory guardrail could not evaluate; blocking (mandatory=true overrides fail_open)",
+                );
+                // Carry the row name so downstream handlers can name the
+                // guardrail in the 422 envelope (#519 B.4b) — `block()` would
+                // drop it to `None` and surface an unnamed content-filter block.
+                GuardrailVerdict::Block {
+                    reason: format!("mandatory guardrail unavailable: {reason}"),
+                    guardrail_name: Some(self.row_name.clone()),
+                }
+            }
+            other => other,
+        }
+    }
+}
+
+#[async_trait]
+impl Guardrail for MandatoryGuardrail {
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    async fn check_input(&self, req: &ChatFormat) -> GuardrailVerdict {
+        self.enforce("input", self.inner.check_input(req).await)
+    }
+
+    async fn check_output(&self, resp: &ChatResponse) -> GuardrailVerdict {
+        self.enforce("output", self.inner.check_output(resp).await)
+    }
+
+    fn stream_output_policy(&self) -> StreamOutputPolicy {
+        self.inner.stream_output_policy()
     }
 
     fn runs_on_output(&self) -> bool {
@@ -830,6 +922,119 @@ mod tests {
                 .is_block(),
             "unknown mode must default to block, not silently pass through",
         );
+    }
+
+    /// A stub remote guardrail that always fails open (returns `Bypass`),
+    /// standing in for a Bedrock/Azure guardrail whose upstream is down.
+    struct AlwaysBypass;
+    #[async_trait]
+    impl Guardrail for AlwaysBypass {
+        fn name(&self) -> &'static str {
+            "always-bypass"
+        }
+        async fn check_input(&self, _req: &ChatFormat) -> GuardrailVerdict {
+            GuardrailVerdict::Bypass {
+                reason: "upstream_unreachable".into(),
+            }
+        }
+        async fn check_output(&self, _resp: &ChatResponse) -> GuardrailVerdict {
+            GuardrailVerdict::Bypass {
+                reason: "upstream_unreachable".into(),
+            }
+        }
+    }
+
+    fn row_with_mandatory(mandatory: bool) -> DomainGuardrail {
+        let mut v = serde_json::json!({
+            "name": "remote",
+            "kind": "keyword",
+            "patterns": [{ "kind": "literal", "value": "x" }],
+        });
+        if mandatory {
+            v["mandatory"] = serde_json::Value::Bool(true);
+        }
+        serde_json::from_value(v).unwrap()
+    }
+
+    fn resp(text: &str) -> ChatResponse {
+        ChatResponse {
+            id: "r".into(),
+            model: "m".into(),
+            message: ChatMessage::assistant(text),
+            finish_reason: aisix_gateway::FinishReason::Stop,
+            usage: aisix_gateway::UsageStats::new(0, 0),
+        }
+    }
+
+    /// #911 finding [26]: `mandatory: true` turns a fail-open `Bypass` into a
+    /// `Block`, so a remote guardrail marked mandatory can't be silently
+    /// skipped when its upstream is unreachable. Before the fix the field was
+    /// parsed but never enforced — a mandatory guardrail still failed open.
+    #[tokio::test]
+    async fn mandatory_upgrades_bypass_to_block() {
+        let g = apply_mandatory(&row_with_mandatory(true), Arc::new(AlwaysBypass));
+        let vin = g.check_input(&req("hi")).await;
+        // The block must carry the row name so the 422 envelope can name the
+        // guardrail (#519 B.4b) rather than surfacing an unnamed block.
+        assert_eq!(
+            vin,
+            GuardrailVerdict::Block {
+                reason: "mandatory guardrail unavailable: upstream_unreachable".to_string(),
+                guardrail_name: Some("remote".to_string()),
+            },
+            "mandatory input Bypass must become a named Block, got {vin:?}",
+        );
+        let vout = g.check_output(&resp("hi")).await;
+        assert_eq!(
+            vout,
+            GuardrailVerdict::Block {
+                reason: "mandatory guardrail unavailable: upstream_unreachable".to_string(),
+                guardrail_name: Some("remote".to_string()),
+            },
+            "mandatory output Bypass must become a named Block, got {vout:?}",
+        );
+    }
+
+    /// The default (`mandatory: false`) keeps the fail-open behaviour: a
+    /// `Bypass` stays a `Bypass`.
+    #[tokio::test]
+    async fn non_mandatory_leaves_bypass_untouched() {
+        let g = apply_mandatory(&row_with_mandatory(false), Arc::new(AlwaysBypass));
+        assert!(
+            g.check_input(&req("hi")).await.is_bypass(),
+            "non-mandatory guardrail must keep failing open",
+        );
+    }
+
+    /// Mandatory only rewrites the failure verdict — `Allow` and `Block`
+    /// pass through, so a healthy mandatory guardrail never becomes a false
+    /// block and a real block is preserved.
+    #[tokio::test]
+    async fn mandatory_passes_allow_and_block_through() {
+        struct AlwaysAllow;
+        #[async_trait]
+        impl Guardrail for AlwaysAllow {
+            fn name(&self) -> &'static str {
+                "always-allow"
+            }
+            async fn check_input(&self, _req: &ChatFormat) -> GuardrailVerdict {
+                GuardrailVerdict::Allow
+            }
+        }
+        struct AlwaysBlock;
+        #[async_trait]
+        impl Guardrail for AlwaysBlock {
+            fn name(&self) -> &'static str {
+                "always-block"
+            }
+            async fn check_input(&self, _req: &ChatFormat) -> GuardrailVerdict {
+                GuardrailVerdict::block("nope")
+            }
+        }
+        let allow = apply_mandatory(&row_with_mandatory(true), Arc::new(AlwaysAllow));
+        assert_eq!(allow.check_input(&req("hi")).await, GuardrailVerdict::Allow);
+        let block = apply_mandatory(&row_with_mandatory(true), Arc::new(AlwaysBlock));
+        assert!(block.check_input(&req("hi")).await.is_block());
     }
 
     #[tokio::test]

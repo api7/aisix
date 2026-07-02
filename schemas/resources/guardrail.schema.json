@@ -561,7 +561,7 @@
     },
     "mandatory": {
       "default": false,
-      "description": "Whether guardrail evaluation errors should be fatal. Stored for compatibility. Current enforcement still follows `fail_open`.",
+      "description": "Whether guardrail evaluation errors are fatal. When `true`, a remote guardrail that can't reach its upstream blocks the request instead of failing open — it overrides `fail_open` on the failure path (the DP wraps the row in a MandatoryGuardrail that turns a `Bypass` into a `Block`). Default `false` keeps the `fail_open` behaviour.",
       "type": "boolean"
     },
     "name": {

@@ -198,7 +198,6 @@ async fn dispatch(
     req: Request,
     request_id: &str,
 ) -> Result<(Response, String), ProxyError> {
-    let _reservation = crate::quota::enforce(&state, auth, None).await?;
     let snapshot = state.snapshot.load();
 
     // Find a model for this provider so we can borrow its provider_key.
@@ -235,6 +234,16 @@ async fn dispatch(
     let model = &model_entry.value;
     let pk_entry = crate::dispatch::resolve_provider_key(&snapshot, model)?;
     let api_key = crate::dispatch::require_secret(&pk_entry.value, model)?.to_string();
+
+    // #911 [6]: resolve the guardrail chain for the model whose credentials
+    // this passthrough borrows, so the raw tunnel is subject to the same
+    // content/DLP policy as the typed surfaces. Empty chain → no scan, no cost.
+    let guardrail_ctx = aisix_guardrails::RequestContext {
+        model_id: &model_entry.id,
+        api_key_id: &auth.entry.id,
+        team_id: auth.key().team_id.as_deref(),
+    };
+    let resolved_chain = state.guardrail_index.resolve(&guardrail_ctx);
 
     let base = match pk_entry.value.api_base.as_deref() {
         Some(b) if !b.trim().is_empty() => b.trim_end_matches('/').to_string(),
@@ -295,6 +304,42 @@ async fn dispatch(
         .map_err(|_| ProxyError::RequestTooLarge {
             limit_bytes: body_limit,
         })?;
+
+    // #911 [6]: run INPUT guardrails on the passthrough request body BEFORE it
+    // reaches the upstream. The tunnel forwards arbitrary provider endpoints
+    // verbatim, so a content/DLP block enforced on the typed surfaces was
+    // bypassable here. Following LiteLLM's passthrough default, scan the whole
+    // body as one text blob (UTF-8 lossy so binary bodies degrade to
+    // replacement chars rather than being skipped).
+    if !resolved_chain.is_empty() {
+        let chat = aisix_gateway::ChatFormat::new(
+            &model_entry.value.display_name,
+            vec![aisix_gateway::ChatMessage::user(
+                String::from_utf8_lossy(&body_bytes).into_owned(),
+            )],
+        );
+        if let aisix_guardrails::GuardrailVerdict::Block {
+            reason,
+            guardrail_name,
+        } = aisix_guardrails::Guardrail::check_input(&resolved_chain, &chat).await
+        {
+            // Per #153 the matched-pattern detail stays in ops logs only.
+            tracing::warn!(
+                guardrail_hook = "input",
+                provider = %provider_lower,
+                reason = %reason,
+                "guardrail blocked passthrough request",
+            );
+            return Err(ProxyError::ContentFiltered(
+                crate::error::guardrail_block_message("request", guardrail_name.as_deref()),
+            ));
+        }
+    }
+
+    // Reserve the rate-limit layers AFTER the input guardrail so a content
+    // block doesn't burn an RPM slot, matching the typed endpoints. Passthrough
+    // has no resolved model, so only the api-key/team/member layers apply.
+    let _reservation = crate::quota::enforce(&state, auth, None).await?;
 
     let client = crate::http_client::client();
     let mut builder = client.request(method.clone(), &url);
@@ -373,6 +418,14 @@ async fn dispatch(
         builder = builder.body(body_bytes);
     }
 
+    // #554/#911: bound the raw tunnel by the selected model's E2E request
+    // timeout, matching the first-class non-streaming paths. Without it a
+    // slow/blackholed upstream could pin a passthrough connection open
+    // indefinitely regardless of the model's configured timeout.
+    if let Some(d) = model.request_timeout() {
+        builder = builder.timeout(d);
+    }
+
     let upstream_resp = builder
         .send()
         .await
@@ -386,6 +439,37 @@ async fn dispatch(
         .await
         .map_err(|e| aisix_gateway::BridgeError::UpstreamDecode(e.to_string()))
         .map_err(ProxyError::Bridge)?;
+
+    // #911 [6]: run OUTPUT guardrails on the passthrough response body — the
+    // same whole-body text scan as the input hook, so forbidden model output
+    // can't be exfiltrated through the raw tunnel.
+    if !resolved_chain.is_empty() {
+        let synth = aisix_gateway::ChatResponse {
+            id: String::new(),
+            model: model_entry.value.display_name.clone(),
+            message: aisix_gateway::ChatMessage::assistant(
+                String::from_utf8_lossy(&resp_body).into_owned(),
+            ),
+            finish_reason: aisix_gateway::FinishReason::Stop,
+            usage: aisix_gateway::UsageStats::default(),
+        };
+        if let aisix_guardrails::GuardrailVerdict::Block {
+            reason,
+            guardrail_name,
+        } = aisix_guardrails::Guardrail::check_output(&resolved_chain, &synth).await
+        {
+            // Per #153 the matched-pattern detail stays in ops logs only.
+            tracing::warn!(
+                guardrail_hook = "output",
+                provider = %provider_lower,
+                reason = %reason,
+                "guardrail blocked passthrough response",
+            );
+            return Err(ProxyError::ContentFiltered(
+                crate::error::guardrail_block_message("response", guardrail_name.as_deref()),
+            ));
+        }
+    }
 
     let mut response = Response::builder()
         .status(status)

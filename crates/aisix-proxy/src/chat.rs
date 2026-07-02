@@ -332,7 +332,15 @@ pub async fn chat_completions(
             } = failure;
             let status = err.status().as_u16();
             let elapsed = started.elapsed();
-            record_error(&state.metrics, &err, &model_name, status, elapsed);
+            // #911 [27]: bound the `model` metric label to the configured set.
+            // A pre-resolution failure (model-not-found) carries an arbitrary
+            // caller-supplied `model_name` that must never become a Prometheus
+            // label (unbounded cardinality). The raw name still flows to the
+            // per-request access log + usage events below (bounded by request
+            // volume, not label cardinality).
+            let snap = state.snapshot.load();
+            let metric_model = crate::usage_attr::metric_model_label(&snap, &model_name);
+            record_error(&state.metrics, &err, metric_model, status, elapsed);
             // Access log: surface the upstream-billed counts when the
             // error fired AFTER the upstream call (output-content-filter
             // block). Pre-upstream errors (input filter, budget,
@@ -365,7 +373,7 @@ pub async fn chat_completions(
                 endpoint: "/v1/chat/completions",
                 inbound_protocol: "openai",
                 provider: "unknown",
-                model: &model_name,
+                model: metric_model,
                 upstream_model: "unknown",
                 provider_key_id: "unknown",
                 provider_key_name: "unknown",
