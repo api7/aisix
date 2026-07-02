@@ -3173,6 +3173,20 @@ const OPENAPI_JSON_BASE: &str = r##"{
               "type": "string"
             },
             "description": "MCP tools this key may call, as namespaced `<server>__<tool>` names. A wildcard entry `\"*\"` grants every tool. When omitted or set to `null`, the key has no MCP tool access."
+          },
+          "expires_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "RFC 3339 timestamp after which the key stops authenticating. Requests presenting an expired key are rejected with `401`. When omitted or set to `null`, the key never expires.",
+            "example": "2027-01-01T00:00:00Z"
+          },
+          "disabled": {
+            "type": "boolean",
+            "default": false,
+            "description": "Administratively disabled. A disabled key is rejected with `401` until it is enabled again; the key itself is preserved."
           }
         },
         "additionalProperties": false
@@ -3484,6 +3498,20 @@ const OPENAPI_JSON_BASE: &str = r##"{
             "example": [
               "github__create_issue"
             ]
+          },
+          "expires_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "RFC 3339 timestamp after which the key stops authenticating. Requests presenting an expired key are rejected with `401`. When omitted or set to `null`, the key never expires.",
+            "example": "2027-01-01T00:00:00Z"
+          },
+          "disabled": {
+            "type": "boolean",
+            "default": false,
+            "description": "Administratively disabled. A disabled key is rejected with `401` until it is enabled again; the key itself is preserved."
           }
         },
         "additionalProperties": false,

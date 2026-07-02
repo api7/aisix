@@ -90,6 +90,18 @@
         "null"
       ]
     },
+    "disabled": {
+      "description": "Administratively disabled. A disabled key is rejected with `401` until it is enabled again; the key itself is preserved. Treated as `false` when omitted.",
+      "type": "boolean"
+    },
+    "expires_at": {
+      "description": "RFC 3339 timestamp after which the key stops authenticating. Requests presenting an expired key are rejected with `401`. When omitted or set to `null`, the key never expires.",
+      "format": "date-time",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "key_hash": {
       "description": "SHA-256 hexadecimal hash of the plaintext bearer. The proxy hashes incoming bearer tokens before lookup.",
       "minLength": 1,

@@ -49,6 +49,17 @@ where
             .apikeys
             .get_by_name(&ApiKey::hash_bearer(&token))
             .ok_or(ProxyError::InvalidApiKey)?;
+        // Lifecycle enforcement (#933): a known key that is disabled or
+        // past its expiry deadline must be rejected here, at the single
+        // auth choke point, so every proxy surface (chat, messages,
+        // responses, embeddings, audio, passthrough, MCP, …) inherits
+        // the same 401 without per-handler checks.
+        if entry.value.disabled {
+            return Err(ProxyError::ApiKeyDisabled);
+        }
+        if entry.value.is_expired_at(chrono::Utc::now()) {
+            return Err(ProxyError::ApiKeyExpired);
+        }
         Ok(AuthenticatedKey { entry })
     }
 }

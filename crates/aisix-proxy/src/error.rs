@@ -144,6 +144,17 @@ pub enum ProxyError {
     MissingAuth,
     #[error("invalid API key")]
     InvalidApiKey,
+    /// The presented key exists but its `expires_at` deadline has
+    /// passed (#933). Deliberately caller-visible as "expired" (not a
+    /// generic invalid-key 401): the caller already holds the secret,
+    /// so naming the reason leaks nothing and tells them to request a
+    /// fresh key instead of debugging a typo.
+    #[error("API key has expired")]
+    ApiKeyExpired,
+    /// The presented key exists but was administratively disabled
+    /// (#933). Same disclosure reasoning as [`Self::ApiKeyExpired`].
+    #[error("API key has been disabled")]
+    ApiKeyDisabled,
     #[error("model {0:?} not found")]
     ModelNotFound(String),
     #[error("API key is not allowed to use model {0:?}")]
@@ -222,7 +233,10 @@ pub(crate) fn guardrail_block_message(side: &str, guardrail_name: Option<&str>) 
 impl ProxyError {
     pub fn status(&self) -> StatusCode {
         match self {
-            ProxyError::MissingAuth | ProxyError::InvalidApiKey => StatusCode::UNAUTHORIZED,
+            ProxyError::MissingAuth
+            | ProxyError::InvalidApiKey
+            | ProxyError::ApiKeyExpired
+            | ProxyError::ApiKeyDisabled => StatusCode::UNAUTHORIZED,
             ProxyError::ModelForbidden(_) => StatusCode::FORBIDDEN,
             ProxyError::ModelIpRestricted(_) => StatusCode::FORBIDDEN,
             ProxyError::ModelNotFound(_) => StatusCode::NOT_FOUND,
@@ -241,7 +255,10 @@ impl ProxyError {
 
     pub fn kind(&self) -> &'static str {
         match self {
-            ProxyError::MissingAuth | ProxyError::InvalidApiKey => "invalid_api_key",
+            ProxyError::MissingAuth
+            | ProxyError::InvalidApiKey
+            | ProxyError::ApiKeyExpired
+            | ProxyError::ApiKeyDisabled => "invalid_api_key",
             ProxyError::ModelForbidden(_) => "permission_denied",
             ProxyError::ModelIpRestricted(_) => "permission_denied",
             ProxyError::ModelNotFound(_) => "model_not_found",
@@ -310,6 +327,11 @@ impl ProxyError {
             // from the generic `permission_denied` type shared with
             // ModelForbidden (#557 AC-1).
             ProxyError::ModelIpRestricted(_) => env.with_code("ip_restricted"),
+            // Stable machine-readable codes so SDKs can branch on the
+            // lifecycle reason without parsing the message, while the
+            // `error.type` stays the family-wide `invalid_api_key`.
+            ProxyError::ApiKeyExpired => env.with_code("api_key_expired"),
+            ProxyError::ApiKeyDisabled => env.with_code("api_key_disabled"),
             _ => env,
         }
     }
