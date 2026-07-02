@@ -262,6 +262,11 @@ describe("sls content capture e2e (#700): embeddings / rerank / images / audio",
       expect(fullText).not.toContain(AUDIO_FILE_BYTES); // never the raw bytes
 
       // -- metadata_only exporter received none of the content --
+      // Wait until the LAST request's metadata (its requested_model, which
+      // both content modes carry) has landed in the meta logstore, so the
+      // negative assertions below can't pass trivially against an empty or
+      // lagging store.
+      await waitForToken(sls, META_LOGSTORE, "cc700-transcribe");
       const metaText = decodedTextFor(sls, META_LOGSTORE);
       for (const token of [
         EMBED_PROMPT_TOKEN,

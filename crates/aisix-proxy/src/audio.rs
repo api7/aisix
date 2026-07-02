@@ -503,19 +503,30 @@ async fn multipart_dispatch(
     let captured_prompt = content_cap.map(|_| {
         use sha2::Digest;
         let mut obj = serde_json::Map::new();
-        for (name, file_name, _, data) in &fields {
+        // Appends on a repeated name (multipart allows repeats and all are
+        // forwarded) so no field disappears from the export. The filename is
+        // deliberately NOT captured — it is user-controlled text that skips
+        // the redaction path; the checksum alone represents the file,
+        // matching LiteLLM.
+        let mut push = |key: String, value: String| match obj.get_mut(&key) {
+            Some(Value::String(existing)) => {
+                existing.push('\n');
+                existing.push_str(&value);
+            }
+            _ => {
+                obj.insert(key, Value::String(value));
+            }
+        };
+        for (name, _, _, data) in &fields {
             match std::str::from_utf8(data) {
                 Ok(text) if name != "file" => {
-                    obj.insert(name.clone(), Value::String(text.to_string()));
+                    push(name.clone(), text.to_string());
                 }
                 _ => {
-                    obj.insert(
+                    push(
                         format!("{name}_sha256"),
-                        Value::String(format!("{:x}", sha2::Sha256::digest(data))),
+                        format!("{:x}", sha2::Sha256::digest(data)),
                     );
-                    if let Some(f) = file_name {
-                        obj.insert(format!("{name}_filename"), Value::String(f.clone()));
-                    }
                 }
             }
         }
