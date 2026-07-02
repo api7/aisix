@@ -52,6 +52,13 @@ struct CompletionDispatchSuccess {
     /// or on a 200 with no `usage` block (rare edge). Handler
     /// gates UsageEvent emission on this being `Some`.
     usage: Option<CompletionUsage>,
+    /// True when the response leg was blocked by an OUTPUT guardrail
+    /// AFTER the upstream billed for it (#911 [23]). The response body is
+    /// the redacted 422, but `usage` still carries the billed counts so
+    /// the UsageEvent (marked `guardrail_blocked`) keeps cp-api's budget
+    /// ledger + /logs from under-reporting spend the provider charged for
+    /// — the output analog of chat.rs's UpstreamCharge / responses.rs #543.
+    guardrail_blocked: bool,
 }
 
 /// Subset of the OpenAI legacy /v1/completions response `usage`
@@ -123,6 +130,7 @@ pub async fn completions(
                     elapsed,
                     &usage,
                     &client,
+                    success.guardrail_blocked,
                 );
             }
             success.response
@@ -309,12 +317,26 @@ async fn dispatch(
                         reason = %reason,
                         "guardrail blocked /v1/completions response",
                     );
-                    return Err(ProxyError::ContentFiltered(
-                        crate::error::guardrail_block_message(
-                            "response",
-                            guardrail_name.as_deref(),
-                        ),
-                    ));
+                    // The upstream already billed for this response (tokens
+                    // committed above), so return the redacted 422 body BUT
+                    // carry the billed `usage` marked `guardrail_blocked` —
+                    // recording zero tokens here would let cp-api's ledger
+                    // under-report spend the customer was charged for. Same
+                    // output analog as responses.rs #543 / chat.rs UpstreamCharge.
+                    return Ok(CompletionDispatchSuccess {
+                        response: ProxyError::ContentFiltered(
+                            crate::error::guardrail_block_message(
+                                "response",
+                                guardrail_name.as_deref(),
+                            ),
+                        )
+                        .into_response(),
+                        provider: provider_label,
+                        model_id: model_entry.id.to_string(),
+                        provider_key_id: pk_entry.id.to_string(),
+                        usage,
+                        guardrail_blocked: true,
+                    });
                 }
             }
 
@@ -324,6 +346,7 @@ async fn dispatch(
                 model_id: model_entry.id.to_string(),
                 provider_key_id: pk_entry.id.to_string(),
                 usage,
+                guardrail_blocked: false,
             })
         }
         Err(BridgeError::Config(msg)) if msg.contains("does not support text completions") => {
@@ -339,6 +362,7 @@ async fn dispatch(
                 // gates emission on `usage.is_some()` so 501 stays
                 // out of /logs noise (same convention as #402).
                 usage: None,
+                guardrail_blocked: false,
             })
         }
         Err(e) => {
@@ -419,6 +443,7 @@ fn emit_usage_event(
     elapsed: Duration,
     usage: &CompletionUsage,
     client: &ClientContext,
+    guardrail_blocked: bool,
 ) {
     let snap = state.snapshot.load();
     let mut event = UsageEvent {
@@ -434,6 +459,9 @@ fn emit_usage_event(
         inbound_protocol: "openai".to_string(),
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),
+        // #911 [23]: a billed-then-output-blocked completion surfaces on the
+        // dashboard's Blocked tab while still carrying its billed token counts.
+        guardrail_blocked,
         ..Default::default()
     };
     crate::usage_attr::apply_pk_telemetry(&mut event, &snap, provider_key_id);

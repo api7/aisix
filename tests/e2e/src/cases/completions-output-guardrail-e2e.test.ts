@@ -136,5 +136,28 @@ describe("completions output guardrail (#911 [23])", () => {
     // #519 B.4b: the redacted message names WHICH guardrail fired (operator
     // metadata, not matched content).
     expect(String(body.error?.message)).toContain(`guardrail '${GUARDRAIL_NAME}'`);
+
+    // #911 [23] billed-then-blocked telemetry: the upstream already charged
+    // for this response, so the block must be recorded on the CHARGED path
+    // (carrying the real provider + resolved model + billed usage into the
+    // UsageEvent) rather than the zeroed error path. The observable signature
+    // is the `provider` label on the 422 request metric: the charged Ok path
+    // records the real provider ("openai"); the pre-fix bare-error path
+    // recorded "unknown" and dropped the billed usage from cp-api's ledger.
+    const scrape = await fetch(`${app.metricsUrl}/metrics`).then((r) => r.text());
+    const blocked422 = scrape
+      .split("\n")
+      .filter((l) => l.startsWith("aisix_requests_total{"))
+      .filter((l) => /status="422"/.test(l));
+    // The block went through the charged path: real provider, resolved model.
+    expect(
+      blocked422.some((l) => /provider="openai"/.test(l) && /model="cmpl-out-gr"/.test(l)),
+      `no charged-path 422 metric (provider=openai, model=cmpl-out-gr):\n${blocked422.join("\n")}`,
+    ).toBe(true);
+    // And NOT the zeroed error path (which attributes provider="unknown").
+    expect(
+      blocked422.filter((l) => /provider="unknown"/.test(l)),
+      `billed-then-blocked completion fell onto the zeroed error path:\n${blocked422.join("\n")}`,
+    ).toHaveLength(0);
   });
 });
