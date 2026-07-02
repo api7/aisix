@@ -960,9 +960,9 @@ pub fn redact_responses_sse(
 mod tests {
     use super::*;
     use aisix_gateway::{ChatDelta, ChatMessage};
-    use std::sync::Arc;
     use aisix_guardrails::{builtin_rule, GuardrailChain, PiiAction, PiiGuardrail};
     use serde_json::json;
+    use std::sync::Arc;
 
     fn mask_chain(hook: aisix_core::models::GuardrailHookPoint) -> Arc<dyn Guardrail> {
         let g = PiiGuardrail::new(
