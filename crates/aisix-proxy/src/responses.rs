@@ -344,7 +344,10 @@ async fn dispatch(
 
     let model_rl =
         crate::quota::ModelRateLimit::from_model(&model_name, &model_entry.id, &model_entry.value);
-    let reservation = crate::quota::enforce(state, auth, Some(&model_rl)).await?;
+    // `Option` so the winning streaming attempt can `take()` the reservation
+    // and carry it into the end-of-stream guard (#688); non-streaming / failed
+    // attempts leave it in place for the post-dispatch commit or a retry.
+    let mut reservation = Some(crate::quota::enforce(state, auth, Some(&model_rl)).await?);
 
     // Resolve the attempt list (routing-aware). A Model Group walks its
     // targets in order; a direct model resolves to itself (#471). OpenAI
@@ -434,6 +437,7 @@ async fn dispatch(
                     &auth.entry.id,
                     client,
                     attempt,
+                    &mut reservation,
                 )
                 .await
             } else {
@@ -450,6 +454,7 @@ async fn dispatch(
                     &auth.entry.id,
                     client,
                     attempt,
+                    &mut reservation,
                 )
                 .await
             };
@@ -474,18 +479,21 @@ async fn dispatch(
                     // #911 [21]: commit the reserved layers with the actual
                     // token cost so TPM/TPD is enforced for /v1/responses like
                     // chat + embeddings. The buffered / non-streaming paths
-                    // carry `usage` here; the verbatim streaming path reports
-                    // `usage_handled_by_stream` (its Drop guard owns end-of-
-                    // stream emission) and its post-stream token accounting is
-                    // tracked in #688 — its reservation still releases the
-                    // concurrency slot on drop, and budget ($) already gated it.
+                    // carry `usage` here and commit now; the streaming path
+                    // already `take()`-d the reservation into its end-of-stream
+                    // guard (#688), so `reservation` is `None` and this is
+                    // skipped.
                     if !success.usage_handled_by_stream {
-                        let total = success
-                            .usage
-                            .as_ref()
-                            .map(|u| u64::from(u.prompt_tokens) + u64::from(u.completion_tokens))
-                            .unwrap_or(0);
-                        reservation.commit_tokens(total).await;
+                        if let Some(r) = reservation.take() {
+                            let total = success
+                                .usage
+                                .as_ref()
+                                .map(|u| {
+                                    u64::from(u.prompt_tokens) + u64::from(u.completion_tokens)
+                                })
+                                .unwrap_or(0);
+                            r.commit_tokens(total).await;
+                        }
                     }
                     return Ok(success);
                 }
@@ -646,6 +654,7 @@ async fn responses_to_target(
     api_key_id: &str,
     client_ctx: &ClientContext,
     attempt: AttemptInfo,
+    reservation: &mut Option<aisix_ratelimit::MultiReservation>,
 ) -> Result<ResponseDispatchSuccess, ProxyError> {
     let mut body = body.clone();
     let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
@@ -969,9 +978,26 @@ async fn responses_to_target(
         let api_key_id_c = api_key_id.to_string();
         let provider_key_id_c = provider_key_id.clone();
         let client_c = client_ctx.clone();
+        // #688: carry the reservation into the end-of-stream guard — keys drive
+        // post-stream TPM/TPD accounting, the hold keeps the concurrency slot(s)
+        // until the stream ends. `take()` leaves the handler's `reservation` as
+        // `None` so it won't also `commit_tokens`.
+        let post_stream_keys = reservation.as_ref().map(|r| r.keys()).unwrap_or_default();
+        let stream_hold = reservation.take().map(|r| r.into_stream_hold());
+        let limiter_c = std::sync::Arc::clone(&state.limiter);
         let parsed_stream = build_responses_passthrough_stream(body_stream, move |usage| {
             // Streams that reach here are committed 200s — the
             // `!status.is_success()` guard above returned early on errors.
+            //
+            // #688: apply the terminal token cost to TPM/TPD and release the
+            // concurrency hold now the stream has ended (sync analog of the
+            // reservation's async `commit_tokens`, which this closure can't await).
+            let streamed_tokens =
+                u64::from(usage.prompt_tokens) + u64::from(usage.completion_tokens);
+            for key in &post_stream_keys {
+                limiter_c.add_tokens_post_stream(key, streamed_tokens);
+            }
+            drop(stream_hold);
             emit_usage_event(
                 &state_c,
                 &request_id_c,
@@ -1095,6 +1121,7 @@ async fn responses_cross_provider_to_target(
     api_key_id: &str,
     client_ctx: &ClientContext,
     attempt: AttemptInfo,
+    reservation: &mut Option<aisix_ratelimit::MultiReservation>,
 ) -> Result<ResponseDispatchSuccess, ProxyError> {
     use aisix_gateway::{Bridge, BridgeContext};
 
@@ -1211,6 +1238,13 @@ async fn responses_cross_provider_to_target(
         let provider_key_id_c = provider_key_id.clone();
         let client_c = client_ctx.clone();
         let attempt_c = attempt.clone();
+        // #688: carry the reservation into the end-of-stream guard — keys drive
+        // post-stream TPM/TPD accounting, the hold keeps the concurrency slot(s)
+        // until the stream ends. `take()` leaves the handler's `reservation` as
+        // `None` so it won't also `commit_tokens`.
+        let post_stream_keys = reservation.as_ref().map(|r| r.keys()).unwrap_or_default();
+        let stream_hold = reservation.take().map(|r| r.into_stream_hold());
+        let limiter_c = std::sync::Arc::clone(&state.limiter);
         let sse_body = crate::responses_bridge::build_responses_bridge_stream(
             upstream,
             encoder,
@@ -1219,6 +1253,16 @@ async fn responses_cross_provider_to_target(
             max_buffer_bytes,
             requested_model.to_string(),
             move |comp| {
+                // #688: apply the terminal token cost to TPM/TPD and release the
+                // concurrency hold now the stream has ended (sync analog of the
+                // reservation's async `commit_tokens`). Tokens count even on an
+                // output-guardrail block — the upstream still billed them.
+                let streamed_tokens =
+                    u64::from(comp.prompt_tokens) + u64::from(comp.completion_tokens);
+                for key in &post_stream_keys {
+                    limiter_c.add_tokens_post_stream(key, streamed_tokens);
+                }
+                drop(stream_hold);
                 let usage = ResponseUsage {
                     prompt_tokens: comp.prompt_tokens,
                     completion_tokens: comp.completion_tokens,

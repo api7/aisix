@@ -463,7 +463,10 @@ async fn dispatch(
 
     let model_rl =
         crate::quota::ModelRateLimit::from_model(&model_name, &model_entry.id, &model_entry.value);
-    let reservation = crate::quota::enforce(state, auth, Some(&model_rl)).await?;
+    // `Option` so the winning streaming attempt can `take()` the reservation
+    // and carry it into the end-of-stream guard (#688); non-streaming / failed
+    // attempts leave it in place for the post-dispatch commit or a retry.
+    let mut reservation = Some(crate::quota::enforce(state, auth, Some(&model_rl)).await?);
 
     // Budget pre-check via cp-api (mirrors /v1/chat/completions).
     let budget_decision = state.budgets.check(&auth.entry.id).await;
@@ -569,6 +572,7 @@ async fn dispatch(
                     model: target_model.clone(),
                     ..Default::default()
                 },
+                &mut reservation,
             )
             .await
             {
@@ -592,15 +596,16 @@ async fn dispatch(
                     // #911 [21]: commit the reserved layers with the actual
                     // token cost so TPM/TPD is enforced for /v1/messages like
                     // chat + embeddings. The non-streaming path carries the
-                    // counts in `outcome.metrics`; the verbatim streaming path
-                    // sets `usage_handled_by_stream` (its Drop guard owns end-
-                    // of-stream emission) and its post-stream token accounting
-                    // is tracked in #688 — its reservation still releases the
-                    // concurrency slot on drop, and budget ($) already gated it.
+                    // counts in `outcome.metrics` and commits here; the
+                    // streaming path already `take()`-d the reservation into its
+                    // end-of-stream guard (#688), so `reservation` is `None` and
+                    // this is skipped.
                     if !outcome.usage_handled_by_stream {
-                        let total = u64::from(outcome.metrics.prompt_tokens)
-                            + u64::from(outcome.metrics.completion_tokens);
-                        reservation.commit_tokens(total).await;
+                        if let Some(r) = reservation.take() {
+                            let total = u64::from(outcome.metrics.prompt_tokens)
+                                + u64::from(outcome.metrics.completion_tokens);
+                            r.commit_tokens(total).await;
+                        }
                     }
                     return Ok(outcome);
                 }
@@ -668,6 +673,10 @@ async fn dispatch_to_target(
     // whose Drop guard owns the UsageEvent emit. Non-streaming paths emit
     // from the handler and ignore it.
     attempt: AttemptInfo,
+    // #688: the streaming paths `take()` this to carry the concurrency hold +
+    // post-stream token accounting into the end-of-stream guard. Left in place
+    // on the non-streaming / error paths for the handler to commit or retry.
+    reservation: &mut Option<aisix_ratelimit::MultiReservation>,
 ) -> Result<DispatchOutcome, ProxyError> {
     let model = &target.model;
     let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
@@ -689,6 +698,7 @@ async fn dispatch_to_target(
             resolved_chain,
             client,
             attempt,
+            reservation,
         )
         .await;
     }
@@ -710,6 +720,7 @@ async fn dispatch_to_target(
         resolved_chain,
         client,
         attempt,
+        reservation,
     )
     .await
 }
@@ -736,6 +747,7 @@ async fn anthropic_passthrough_dispatch(
     resolved_chain: std::sync::Arc<aisix_guardrails::GuardrailChain>,
     client_ctx: &ClientContext,
     attempt: AttemptInfo,
+    reservation: &mut Option<aisix_ratelimit::MultiReservation>,
 ) -> Result<DispatchOutcome, ProxyError> {
     let mut body = body.clone();
     let api_key = crate::dispatch::require_secret(pk_value, model)?;
@@ -985,6 +997,14 @@ async fn anthropic_passthrough_dispatch(
         );
         let captured_prompt_c =
             content_cap.map(|_| serde_json::to_string(&body).unwrap_or_default());
+        // #688: carry the rate-limit reservation into the end-of-stream guard.
+        // The winning streaming attempt owns it now; the keys drive post-stream
+        // TPM/TPD accounting and `into_stream_hold` keeps the concurrency slot(s)
+        // until the stream ends (mirrors chat.rs). `take()` leaves the handler's
+        // `reservation` as `None`, so it won't also `commit_tokens`.
+        let post_stream_keys = reservation.as_ref().map(|r| r.keys()).unwrap_or_default();
+        let stream_hold = reservation.take().map(|r| r.into_stream_hold());
+        let limiter_c = std::sync::Arc::clone(&state.limiter);
         let parsed_stream = build_anthropic_passthrough_stream(
             body_stream,
             started,
@@ -995,6 +1015,19 @@ async fn anthropic_passthrough_dispatch(
                 // Streaming responses that got this far are 200 — the
                 // !status.is_success() guard above returned early on
                 // upstream errors.
+                //
+                // #688: apply the terminal token cost to TPM/TPD and release the
+                // concurrency hold now the stream has ended. `add_tokens_post_stream`
+                // is the sync analog of the reservation's async `commit_tokens`
+                // (this end-of-stream closure can't await); dropping the hold frees
+                // the concurrency slot(s) held for the stream's full lifetime.
+                let streamed_tokens =
+                    u64::from(usage.prompt_tokens) + u64::from(usage.completion_tokens);
+                for key in &post_stream_keys {
+                    limiter_c.add_tokens_post_stream(key, streamed_tokens);
+                }
+                drop(stream_hold);
+
                 let metrics = AnthropicUsageMetrics {
                     prompt_tokens: usage.prompt_tokens,
                     completion_tokens: usage.completion_tokens,
@@ -1274,6 +1307,7 @@ async fn cross_provider_dispatch(
     resolved_chain: std::sync::Arc<aisix_guardrails::GuardrailChain>,
     client: &ClientContext,
     attempt: AttemptInfo,
+    reservation: &mut Option<aisix_ratelimit::MultiReservation>,
 ) -> Result<DispatchOutcome, ProxyError> {
     use aisix_gateway::{Bridge, BridgeContext};
     use aisix_provider_anthropic::{
@@ -1430,6 +1464,13 @@ async fn cross_provider_dispatch(
         );
         let captured_prompt_for_telem =
             content_cap.map(|_| serde_json::to_string(body).unwrap_or_default());
+        // #688: carry the rate-limit reservation into the end-of-stream guard —
+        // keys drive post-stream TPM/TPD accounting, the hold keeps the
+        // concurrency slot(s) until the stream ends. `take()` leaves the
+        // handler's `reservation` as `None` so it won't also `commit_tokens`.
+        let post_stream_keys = reservation.as_ref().map(|r| r.keys()).unwrap_or_default();
+        let stream_hold = reservation.take().map(|r| r.into_stream_hold());
+        let limiter_for_stream = std::sync::Arc::clone(&state.limiter);
         let sse_body = build_anthropic_sse_stream(
             upstream,
             encoder,
@@ -1438,6 +1479,17 @@ async fn cross_provider_dispatch(
             model_name.to_string(),
             content_cap,
             move |comp| {
+                // #688: apply the terminal token cost to TPM/TPD and release the
+                // concurrency hold now the stream has ended (sync analog of the
+                // reservation's async `commit_tokens`, which this closure can't
+                // await).
+                let streamed_tokens =
+                    u64::from(comp.prompt_tokens) + u64::from(comp.completion_tokens);
+                for key in &post_stream_keys {
+                    limiter_for_stream.add_tokens_post_stream(key, streamed_tokens);
+                }
+                drop(stream_hold);
+
                 let metrics = AnthropicUsageMetrics {
                     prompt_tokens: comp.prompt_tokens,
                     completion_tokens: comp.completion_tokens,
