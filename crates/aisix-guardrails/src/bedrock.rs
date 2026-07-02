@@ -38,9 +38,10 @@ use async_trait::async_trait;
 use aws_credential_types::provider::SharedCredentialsProvider;
 use aws_credential_types::Credentials;
 use aws_sdk_bedrockruntime::config::{BehaviorVersion, Region};
-use aws_sdk_bedrockruntime::operation::apply_guardrail::ApplyGuardrailError;
+use aws_sdk_bedrockruntime::operation::apply_guardrail::{ApplyGuardrailError, ApplyGuardrailOutput};
 use aws_sdk_bedrockruntime::types::{
-    GuardrailAction, GuardrailContentBlock, GuardrailContentSource, GuardrailTextBlock,
+    GuardrailAction, GuardrailAssessment, GuardrailContentBlock, GuardrailContentSource,
+    GuardrailSensitiveInformationPolicyAction, GuardrailTextBlock,
 };
 use aws_sdk_bedrockruntime::Client;
 use aws_smithy_runtime_api::client::result::SdkError;
@@ -205,24 +206,23 @@ impl BedrockGuardrail {
         };
 
         match result {
-            Ok(resp) => match resp.action() {
-                GuardrailAction::GuardrailIntervened => GuardrailVerdict::block(format!(
+            Ok(resp) => match classify_response(&resp, &self.guardrail_id) {
+                BedrockOutcome::Allow => GuardrailVerdict::Allow,
+                BedrockOutcome::Block => GuardrailVerdict::block(format!(
                     "bedrock guardrail {} intervened",
                     self.guardrail_id
                 )),
-                GuardrailAction::None => GuardrailVerdict::Allow,
-                other => {
-                    // Forward-compat: an unknown enum variant from a
-                    // future SDK upgrade. Treat as no-block (the
-                    // safer interpretation since `intervened` is the
-                    // active-block signal).
-                    tracing::warn!(
-                        guardrail_id = %self.guardrail_id,
-                        action = ?other,
-                        "unknown ApplyGuardrail action; treating as Allow",
-                    );
-                    GuardrailVerdict::Allow
-                }
+                // Bedrock ANONYMIZED (masked) the content rather than
+                // blocking. The masked replacement text is in the payload.
+                // TODO(#932 bedrock follow-up): once the async rewrite
+                // channel lands, return a mask verdict and write the masked
+                // text back instead of blocking. Until then, block so the
+                // un-masked content is never released (fail-safe, and
+                // behaviour-preserving vs the pre-classify code).
+                BedrockOutcome::Mask(_) => GuardrailVerdict::block(format!(
+                    "bedrock guardrail {} anonymized content",
+                    self.guardrail_id
+                )),
             },
             Err(failure) => self.handle_failure(failure, fail_open),
         }
@@ -247,6 +247,97 @@ impl BedrockGuardrail {
             GuardrailVerdict::block(format!("bedrock unavailable ({reason})"))
         }
     }
+}
+
+/// The masking-aware interpretation of an `ApplyGuardrail` response.
+///
+/// Bedrock reports `action = GUARDRAIL_INTERVENED` for BOTH a hard block
+/// AND a PII anonymization (mask). The two are told apart by the
+/// per-policy actions inside `assessments`: a topic/content/word/
+/// contextual-grounding policy hit, or a PII/regex entity with
+/// `action = BLOCKED`, is a hard block; a PII/regex entity with
+/// `action = ANONYMIZED` (and nothing blocking) is a mask, whose
+/// replacement text Bedrock returns in `outputs[].text`. Mirrors
+/// LiteLLM's `_should_raise_guardrail_blocked_exception` (raise iff any
+/// assessment entry is BLOCKED; otherwise apply the masked output).
+#[derive(Debug, PartialEq, Eq)]
+enum BedrockOutcome {
+    /// `action = NONE` — nothing detected.
+    Allow,
+    /// A hard block: some policy blocked (topic/content/word/contextual)
+    /// or a PII/regex entity had `action = BLOCKED`.
+    Block,
+    /// Only anonymization occurred. Carries the masked replacement text
+    /// per `outputs[]` block (real Bedrock returns one).
+    Mask(Vec<String>),
+}
+
+/// Classify an `ApplyGuardrail` response into allow / block / mask.
+/// Secure by default: an intervention that is neither a recognizable
+/// block nor accompanied by masked output is treated as a block.
+fn classify_response(resp: &ApplyGuardrailOutput, guardrail_id: &str) -> BedrockOutcome {
+    match resp.action() {
+        GuardrailAction::None => BedrockOutcome::Allow,
+        GuardrailAction::GuardrailIntervened => {
+            if resp.assessments().iter().any(assessment_has_hard_block) {
+                return BedrockOutcome::Block;
+            }
+            let masked: Vec<String> = resp
+                .outputs()
+                .iter()
+                .filter_map(|o| o.text())
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect();
+            if masked.is_empty() {
+                // Intervened, no recognizable hard block, no masked
+                // output — block rather than risk releasing content whose
+                // disposition we can't read.
+                BedrockOutcome::Block
+            } else {
+                BedrockOutcome::Mask(masked)
+            }
+        }
+        other => {
+            // Forward-compat: an unknown enum variant from a future SDK
+            // upgrade. `intervened` is the active signal, so an unknown
+            // action is treated as no-intervention (Allow).
+            tracing::warn!(
+                guardrail_id = %guardrail_id,
+                action = ?other,
+                "unknown ApplyGuardrail action; treating as Allow",
+            );
+            BedrockOutcome::Allow
+        }
+    }
+}
+
+/// True if the assessment carries any BLOCKING disposition — a
+/// topic/content/word policy hit (these have no anonymize mode, so their
+/// presence is a block), a contextual-grounding filter that BLOCKED, or a
+/// PII/regex entity whose action is BLOCKED (as opposed to ANONYMIZED).
+fn assessment_has_hard_block(a: &GuardrailAssessment) -> bool {
+    let topic_blocked = a.topic_policy().is_some_and(|p| !p.topics().is_empty());
+    let content_blocked = a.content_policy().is_some_and(|p| !p.filters().is_empty());
+    let word_blocked = a.word_policy().is_some_and(|p| {
+        !p.custom_words().is_empty() || !p.managed_word_lists().is_empty()
+    });
+    let grounding_blocked = a.contextual_grounding_policy().is_some_and(|p| {
+        p.filters().iter().any(|f| {
+            *f.action()
+                == aws_sdk_bedrockruntime::types::GuardrailContextualGroundingPolicyAction::Blocked
+        })
+    });
+    let pii_blocked = a.sensitive_information_policy().is_some_and(|sip| {
+        sip.pii_entities()
+            .iter()
+            .any(|e| *e.action() == GuardrailSensitiveInformationPolicyAction::Blocked)
+            || sip
+                .regexes()
+                .iter()
+                .any(|r| *r.action() == GuardrailSensitiveInformationPolicyAction::Blocked)
+    });
+    topic_blocked || content_blocked || word_blocked || grounding_blocked || pii_blocked
 }
 
 /// Failure cause buckets that map onto `guardrail_bypassed_reason`
@@ -379,6 +470,131 @@ fn collect_input_text(req: &ChatFormat) -> String {
 mod tests {
     use super::*;
     use aisix_core::models::{BedrockAWSCredentials, BedrockConfig, BedrockLatencyMode};
+
+    // --- classify_response: block vs mask vs allow (#932 bedrock) ---------
+    mod classify {
+        use super::super::{assessment_has_hard_block, classify_response, BedrockOutcome};
+        use aws_sdk_bedrockruntime::operation::apply_guardrail::ApplyGuardrailOutput;
+        use aws_sdk_bedrockruntime::types::{
+            GuardrailAction, GuardrailAssessment, GuardrailOutputContent, GuardrailPiiEntityFilter,
+            GuardrailPiiEntityType, GuardrailSensitiveInformationPolicyAction as PiiAction,
+            GuardrailSensitiveInformationPolicyAssessment, GuardrailTopic, GuardrailTopicPolicyAction,
+            GuardrailTopicPolicyAssessment, GuardrailTopicType,
+        };
+
+        fn resp(
+            action: GuardrailAction,
+            outputs: Vec<&str>,
+            assessments: Vec<GuardrailAssessment>,
+        ) -> ApplyGuardrailOutput {
+            ApplyGuardrailOutput::builder()
+                .action(action)
+                .set_outputs(Some(
+                    outputs
+                        .into_iter()
+                        .map(|t| GuardrailOutputContent::builder().text(t).build())
+                        .collect(),
+                ))
+                .set_assessments(Some(assessments))
+                .build()
+                .expect("action/outputs/assessments all set")
+        }
+
+        fn pii(action: PiiAction) -> GuardrailAssessment {
+            let entity = GuardrailPiiEntityFilter::builder()
+                .r#match("alice@example.com")
+                .r#type(GuardrailPiiEntityType::Email)
+                .action(action)
+                .build()
+                .unwrap();
+            let sip = GuardrailSensitiveInformationPolicyAssessment::builder()
+                .pii_entities(entity)
+                .set_regexes(Some(vec![]))
+                .build()
+                .unwrap();
+            GuardrailAssessment::builder()
+                .sensitive_information_policy(sip)
+                .build()
+        }
+
+        fn topic() -> GuardrailAssessment {
+            let t = GuardrailTopic::builder()
+                .name("blocked-topic")
+                .r#type(GuardrailTopicType::Deny)
+                .action(GuardrailTopicPolicyAction::Blocked)
+                .build()
+                .unwrap();
+            let tp = GuardrailTopicPolicyAssessment::builder()
+                .topics(t)
+                .build()
+                .unwrap();
+            GuardrailAssessment::builder().topic_policy(tp).build()
+        }
+
+        #[test]
+        fn action_none_is_allow() {
+            let r = resp(GuardrailAction::None, vec![], vec![]);
+            assert_eq!(classify_response(&r, "gid"), BedrockOutcome::Allow);
+        }
+
+        #[test]
+        fn anonymized_pii_with_masked_output_is_mask() {
+            let r = resp(
+                GuardrailAction::GuardrailIntervened,
+                vec!["contact {EMAIL} about the order"],
+                vec![pii(PiiAction::Anonymized)],
+            );
+            assert_eq!(
+                classify_response(&r, "gid"),
+                BedrockOutcome::Mask(vec!["contact {EMAIL} about the order".to_owned()])
+            );
+        }
+
+        #[test]
+        fn blocked_pii_is_block() {
+            let r = resp(
+                GuardrailAction::GuardrailIntervened,
+                vec!["irrelevant"],
+                vec![pii(PiiAction::Blocked)],
+            );
+            assert_eq!(classify_response(&r, "gid"), BedrockOutcome::Block);
+        }
+
+        #[test]
+        fn topic_policy_hit_is_block_even_with_masked_output() {
+            // A hard block (topic) wins even if masked output is present.
+            let r = resp(
+                GuardrailAction::GuardrailIntervened,
+                vec!["masked text"],
+                vec![topic()],
+            );
+            assert_eq!(classify_response(&r, "gid"), BedrockOutcome::Block);
+        }
+
+        #[test]
+        fn mixed_anonymized_and_blocked_is_block() {
+            let r = resp(
+                GuardrailAction::GuardrailIntervened,
+                vec!["masked"],
+                vec![pii(PiiAction::Anonymized), pii(PiiAction::Blocked)],
+            );
+            assert_eq!(classify_response(&r, "gid"), BedrockOutcome::Block);
+        }
+
+        #[test]
+        fn intervened_without_hard_block_or_masked_output_is_block() {
+            // Secure default: an intervention we can't read as a mask blocks.
+            let r = resp(GuardrailAction::GuardrailIntervened, vec![], vec![]);
+            assert_eq!(classify_response(&r, "gid"), BedrockOutcome::Block);
+        }
+
+        #[test]
+        fn hard_block_helper_only_true_for_blocking_dispositions() {
+            assert!(!assessment_has_hard_block(&pii(PiiAction::Anonymized)));
+            assert!(assessment_has_hard_block(&pii(PiiAction::Blocked)));
+            assert!(assessment_has_hard_block(&topic()));
+        }
+    }
 
     fn cfg() -> BedrockConfig {
         BedrockConfig {
