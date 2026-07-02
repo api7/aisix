@@ -315,6 +315,59 @@ fn upstream_from_mcp_server_maps_auth_and_timeout() {
     ));
 }
 
+#[test]
+fn upstream_from_mcp_server_maps_api_key_and_oauth2() {
+    let api_key: McpServer = serde_json::from_value(serde_json::json!({
+        "display_name": "gh",
+        "url": "https://api.example.com/mcp",
+        "auth_type": "api_key",
+        "secret": "k-1"
+    }))
+    .unwrap();
+    assert!(matches!(
+        upstream_from_mcp_server(&api_key).auth,
+        McpAuth::ApiKey(ref k) if k == "k-1"
+    ));
+
+    let oauth: McpServer = serde_json::from_value(serde_json::json!({
+        "display_name": "gh2",
+        "url": "https://api.example.com/mcp",
+        "auth_type": "oauth2",
+        "secret": "cs",
+        "client_id": "cid",
+        "token_url": "https://auth.example.com/token",
+        "scopes": ["read", "write"]
+    }))
+    .unwrap();
+    match upstream_from_mcp_server(&oauth).auth {
+        McpAuth::OAuth2(cfg) => {
+            assert_eq!(cfg.client_id, "cid");
+            assert_eq!(cfg.client_secret, "cs");
+            assert_eq!(cfg.token_url, "https://auth.example.com/token");
+            assert_eq!(cfg.scopes, vec!["read".to_string(), "write".to_string()]);
+        }
+        other => panic!("expected OAuth2 auth, got {other:?}"),
+    }
+
+    // Missing oauth2 fields map to empty strings — the mapping never errors;
+    // the token fetch fails cleanly at connect time instead.
+    let incomplete: McpServer = serde_json::from_value(serde_json::json!({
+        "display_name": "gh3",
+        "url": "https://api.example.com/mcp",
+        "auth_type": "oauth2"
+    }))
+    .unwrap();
+    match upstream_from_mcp_server(&incomplete).auth {
+        McpAuth::OAuth2(cfg) => {
+            assert!(cfg.client_id.is_empty());
+            assert!(cfg.client_secret.is_empty());
+            assert!(cfg.token_url.is_empty());
+            assert!(cfg.scopes.is_empty());
+        }
+        other => panic!("expected OAuth2 auth, got {other:?}"),
+    }
+}
+
 /// Build a snapshot resource entry for an upstream at `addr`.
 fn mcp_entry(id: &str, name: &str, addr: &SocketAddr, enabled: bool) -> ResourceEntry<McpServer> {
     let server: McpServer = serde_json::from_value(serde_json::json!({
@@ -363,6 +416,72 @@ async fn from_snapshot_sources_only_enabled_upstreams() {
         .await
         .expect("call");
     assert_eq!(first_text(&result), "alpha:hi");
+}
+
+#[tokio::test]
+async fn from_snapshot_degrades_misconfigured_oauth2_upstream_gracefully() {
+    let alpha = spawn_upstream("alpha").await;
+
+    let snapshot = AisixSnapshot::new();
+    snapshot
+        .mcp_servers
+        .insert(mcp_entry("e1", "alpha", &alpha, true));
+    // An `oauth2` server missing its `token_url`: schema-valid and loadable
+    // (the flat schema stays permissive on credential coupling), but its
+    // token fetch can never succeed.
+    let broken: McpServer = serde_json::from_value(serde_json::json!({
+        "display_name": "broken",
+        "url": format!("http://{alpha}/mcp"),
+        "auth_type": "oauth2",
+        "client_id": "cid",
+        "secret": "top-secret-cs",
+        "enabled": true
+    }))
+    .unwrap();
+    snapshot
+        .mcp_servers
+        .insert(ResourceEntry::new("e2", broken, 1));
+
+    let gw_addr = spawn_gateway(McpGateway::from_snapshot(&snapshot)).await;
+    let client = ()
+        .serve(StreamableHttpClientTransport::from_uri(format!(
+            "http://{gw_addr}/mcp"
+        )))
+        .await
+        .expect("connect");
+
+    // The mis-configured upstream's tools are simply absent (its failure is
+    // logged server-side); the healthy upstream keeps serving.
+    let tools = client.list_all_tools().await.expect("list tools");
+    let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+    assert_eq!(
+        names,
+        vec!["alpha__echo"],
+        "misconfigured oauth2 upstream must be skipped, not fatal to the aggregate"
+    );
+
+    // Calling into it fails with the generic upstream-failure message — no
+    // hang, and nothing about its credentials leaks to the agent.
+    let err = client
+        .call_tool(call("broken__echo", "hi"))
+        .await
+        .expect_err("a call through the misconfigured upstream must fail");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("failed to call tool"),
+        "expected the generic upstream-failure error, got: {msg}"
+    );
+    assert!(
+        !msg.contains("top-secret-cs") && !msg.contains("oauth"),
+        "credential/config detail must not reach the agent: {msg}"
+    );
+
+    // The healthy upstream still routes.
+    let ok = client
+        .call_tool(call("alpha__echo", "hi"))
+        .await
+        .expect("healthy upstream keeps serving");
+    assert_eq!(first_text(&ok), "alpha:hi");
 }
 
 #[test]

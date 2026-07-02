@@ -102,12 +102,34 @@ fn decode(raw: &Value) -> Result<McpServer, AdminError> {
             "display_name must not contain the reserved separator `{TOOL_NAMESPACE_SEPARATOR}`"
         )));
     }
-    if matches!(server.auth_type, McpAuthType::Bearer)
-        && server.secret.as_deref().unwrap_or_default().is_empty()
-    {
-        return Err(AdminError::BadRequest(
-            "secret is required and must be non-empty when auth_type is `bearer`".to_string(),
-        ));
+    // Per-auth_type credential coupling. The JSON schema stays flat and
+    // permissive on this (see the note on the McpServer struct); the write
+    // path is where an incomplete credential set is rejected outright.
+    let has_secret = !server.secret.as_deref().unwrap_or_default().is_empty();
+    match server.auth_type {
+        McpAuthType::None => {}
+        McpAuthType::Bearer if !has_secret => {
+            return Err(AdminError::BadRequest(
+                "secret is required and must be non-empty when auth_type is `bearer`".to_string(),
+            ));
+        }
+        McpAuthType::ApiKey if !has_secret => {
+            return Err(AdminError::BadRequest(
+                "secret is required and must be non-empty when auth_type is `api_key`".to_string(),
+            ));
+        }
+        McpAuthType::OAuth2 => {
+            let has_client_id = !server.client_id.as_deref().unwrap_or_default().is_empty();
+            let has_token_url = !server.token_url.as_deref().unwrap_or_default().is_empty();
+            if !has_secret || !has_client_id || !has_token_url {
+                return Err(AdminError::BadRequest(
+                    "client_id, token_url, and secret (the OAuth client secret) are required \
+                     and must be non-empty when auth_type is `oauth2`"
+                        .to_string(),
+                ));
+            }
+        }
+        McpAuthType::Bearer | McpAuthType::ApiKey => {}
     }
     Ok(server)
 }
@@ -146,6 +168,66 @@ mod tests {
         }))
         .expect_err("bearer auth without a secret must be rejected");
         assert!(matches!(err, AdminError::BadRequest(_)));
+    }
+
+    #[test]
+    fn decode_rejects_api_key_without_secret() {
+        let err = decode(&json!({
+            "display_name": "gh",
+            "url": "https://x/mcp",
+            "auth_type": "api_key"
+        }))
+        .expect_err("api_key auth without a secret must be rejected");
+        assert!(matches!(err, AdminError::BadRequest(_)));
+    }
+
+    #[test]
+    fn decode_rejects_incomplete_oauth2() {
+        // Each of client_id / token_url / secret is individually required.
+        for missing in ["client_id", "token_url", "secret"] {
+            let mut v = json!({
+                "display_name": "gh",
+                "url": "https://x/mcp",
+                "auth_type": "oauth2",
+                "client_id": "cid",
+                "token_url": "https://auth.example.com/oauth/token",
+                "secret": "cs"
+            });
+            v.as_object_mut().unwrap().remove(missing);
+            let err = decode(&v).unwrap_err();
+            assert!(
+                matches!(err, AdminError::BadRequest(_)),
+                "oauth2 without `{missing}` must be a BadRequest"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_accepts_api_key_and_oauth2_servers() {
+        let api_key = decode(&json!({
+            "display_name": "gh",
+            "url": "https://x/mcp",
+            "auth_type": "api_key",
+            "secret": "k-1"
+        }))
+        .expect("valid api_key server should decode");
+        assert_eq!(api_key.secret.as_deref(), Some("k-1"));
+
+        let oauth2 = decode(&json!({
+            "display_name": "gh2",
+            "url": "https://x/mcp",
+            "auth_type": "oauth2",
+            "client_id": "cid",
+            "token_url": "https://auth.example.com/oauth/token",
+            "secret": "cs",
+            "scopes": ["read"]
+        }))
+        .expect("valid oauth2 server should decode");
+        assert_eq!(oauth2.client_id.as_deref(), Some("cid"));
+        assert_eq!(
+            oauth2.token_url.as_deref(),
+            Some("https://auth.example.com/oauth/token")
+        );
     }
 
     #[test]

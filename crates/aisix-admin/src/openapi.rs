@@ -1417,7 +1417,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
             }
           },
           "400": {
-            "description": "Schema validation failed, the JSON body is malformed, `display_name` contains the reserved `__` separator, or bearer auth is missing `secret`",
+            "description": "Schema validation failed, the JSON body is malformed, `display_name` contains the reserved `__` separator, or the credentials required by `auth_type` are missing (`secret` for `bearer`/`api_key`; `client_id`, `token_url`, and `secret` for `oauth2`)",
             "content": {
               "application/json": {
                 "schema": {
@@ -1575,7 +1575,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
             }
           },
           "400": {
-            "description": "Schema validation failed, the JSON body is malformed, `display_name` contains the reserved `__` separator, or bearer auth is missing `secret`",
+            "description": "Schema validation failed, the JSON body is malformed, `display_name` contains the reserved `__` separator, or the credentials required by `auth_type` are missing (`secret` for `bearer`/`api_key`; `client_id`, `token_url`, and `secret` for `oauth2`)",
             "content": {
               "application/json": {
                 "schema": {

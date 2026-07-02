@@ -183,18 +183,26 @@ pub fn provider_key_root_schema() -> Value {
 
 /// Canonical JSON Schema for the `mcp_server` resource, derived from the
 /// [`McpServer`](crate::models::McpServer) struct. Uses the nullable `Option`
-/// representation (`true`) so the optional `secret` / `timeout_ms` fields accept
-/// an explicit `null` as well as being absent, matching the resource's wire
-/// contract. The `transport` / `auth_type` closed sets come from the
+/// representation (`true`) so the optional fields (`secret`, `client_id`,
+/// `token_url`, `scopes`, `timeout_ms`) accept an explicit `null` as well as
+/// being absent, matching the resource's wire contract. The `transport` /
+/// `auth_type` closed sets come from the
 /// [`McpTransport`](crate::models::McpTransport) /
-/// [`McpAuthType`](crate::models::McpAuthType) enums.
+/// [`McpAuthType`](crate::models::McpAuthType) enums. The per-`auth_type`
+/// credential coupling is intentionally not encoded here (see the note on the
+/// struct); the schema stays permissive and write paths enforce it.
 pub fn mcp_server_root_schema() -> Value {
     let mut schema = struct_root_schema::<crate::models::McpServer>(true);
     if let Some(Value::Object(defs)) = schema.get_mut("definitions") {
         title_single_value_enum_variants(
             defs,
             "McpAuthType",
-            &[("none", "No authentication"), ("bearer", "Bearer token")],
+            &[
+                ("none", "No authentication"),
+                ("bearer", "Bearer token"),
+                ("api_key", "API key"),
+                ("oauth2", "OAuth 2.0 client credentials"),
+            ],
         );
         title_single_value_enum_variants(
             defs,
@@ -2159,6 +2167,68 @@ mod tests {
             "display_name": "github",
             "url": "https://api.example.com/mcp",
             "timeout_ms": 1
+        });
+        validate_mcp_server(&v).unwrap();
+    }
+
+    #[test]
+    fn mcp_server_accepts_api_key_auth() {
+        let v = json!({
+            "display_name": "github",
+            "url": "https://api.example.com/mcp",
+            "auth_type": "api_key",
+            "secret": "k-123"
+        });
+        validate_mcp_server(&v).unwrap();
+    }
+
+    #[test]
+    fn mcp_server_accepts_oauth2_auth_with_client_fields() {
+        let v = json!({
+            "display_name": "github",
+            "url": "https://api.example.com/mcp",
+            "auth_type": "oauth2",
+            "secret": "client-secret",
+            "client_id": "cid",
+            "token_url": "https://auth.example.com/oauth/token",
+            "scopes": ["read", "write"]
+        });
+        validate_mcp_server(&v).unwrap();
+    }
+
+    #[test]
+    fn mcp_server_rejects_unknown_auth_type_and_bad_scopes_shape() {
+        // The `auth_type` set is closed: near-misses like `oauth` must fail.
+        let v = json!({
+            "display_name": "x",
+            "url": "https://x/mcp",
+            "auth_type": "oauth"
+        });
+        assert!(validate_mcp_server(&v).is_err());
+
+        // `scopes` is an array of strings, not a single space-joined string.
+        let v = json!({
+            "display_name": "x",
+            "url": "https://x/mcp",
+            "auth_type": "oauth2",
+            "secret": "s",
+            "client_id": "cid",
+            "token_url": "https://auth/token",
+            "scopes": "read write"
+        });
+        assert!(validate_mcp_server(&v).is_err());
+    }
+
+    #[test]
+    fn mcp_server_schema_stays_permissive_on_credential_coupling() {
+        // The per-`auth_type` credential coupling (oauth2 ⇒ client_id +
+        // secret + token_url) is enforced by write paths, not this schema —
+        // an incomplete oauth2 row must still validate so the snapshot loader
+        // keeps it (the runtime degrades that server gracefully instead).
+        let v = json!({
+            "display_name": "x",
+            "url": "https://x/mcp",
+            "auth_type": "oauth2"
         });
         validate_mcp_server(&v).unwrap();
     }
