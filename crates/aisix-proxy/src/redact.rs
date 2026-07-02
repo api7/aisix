@@ -193,12 +193,10 @@ fn redact_tool_call_arguments(
         return;
     };
     for tc in items {
-        if let Some(args) = tc.get_mut("function").and_then(|f| f.get_mut("arguments")) {
-            if let Value::String(s) = args {
-                let mut owned = std::mem::take(s);
-                redact_json_encoded(chain, dir, &mut owned, counts);
-                *s = owned;
-            }
+        if let Some(Value::String(s)) = tc.get_mut("function").and_then(|f| f.get_mut("arguments")) {
+            let mut owned = std::mem::take(s);
+            redact_json_encoded(chain, dir, &mut owned, counts);
+            *s = owned;
         }
     }
 }
@@ -686,7 +684,7 @@ pub fn redact_anthropic_sse(
         }
     }
 
-    fn site_text<'v>(data: &'v Value, site: Site) -> &'v str {
+    fn site_text(data: &Value, site: Site) -> &str {
         let path = match site {
             Site::DeltaText => data.get("delta").and_then(|d| d.get("text")),
             Site::DeltaPartialJson => data.get("delta").and_then(|d| d.get("partial_json")),
@@ -695,7 +693,7 @@ pub fn redact_anthropic_sse(
         path.and_then(Value::as_str).unwrap_or("")
     }
 
-    fn site_slot<'v>(data: &'v mut Value, site: Site) -> Option<&'v mut Value> {
+    fn site_slot(data: &mut Value, site: Site) -> Option<&mut Value> {
         match site {
             Site::DeltaText => data.get_mut("delta").and_then(|d| d.get_mut("text")),
             Site::DeltaPartialJson => data

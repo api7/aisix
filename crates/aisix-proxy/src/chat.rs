@@ -771,6 +771,7 @@ struct UpstreamCharge {
     routing: RoutingTelemetry,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn dispatch(
     state: &ProxyState,
     auth: &AuthenticatedKey,

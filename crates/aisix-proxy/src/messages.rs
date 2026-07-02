@@ -397,6 +397,7 @@ fn emit_failed_attempts_anthropic(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn dispatch(
     state: &ProxyState,
     auth: &AuthenticatedKey,
