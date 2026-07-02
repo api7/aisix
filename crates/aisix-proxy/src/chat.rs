@@ -3905,6 +3905,14 @@ where
                             let counts =
                                 crate::redact::redact_chat_chunks(ctx.chain.as_ref(), &mut pending);
                             if !counts.is_empty() {
+                                // The wire chunks were masked — mask the
+                                // content-capture accumulator too, or the
+                                // exported content would carry PII the client
+                                // never saw (#932 × AISIX-Cloud#947).
+                                crate::redact::redact_captured_output(
+                                    ctx.chain.as_ref(),
+                                    &mut guard.comp().response_text,
+                                );
                                 crate::redact::merge_counts(
                                     &mut guard.comp().redacted_entity_counts,
                                     counts,

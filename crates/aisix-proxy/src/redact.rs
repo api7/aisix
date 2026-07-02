@@ -116,6 +116,19 @@ pub fn redact_value_strings(
     }
 }
 
+/// Mask-rewrite an already-assembled OUTPUT text buffer in place — the
+/// content-capture accumulator a streaming hold-back path hands to
+/// content-capturing exporters (#932 × AISIX-Cloud#947). The wire-side
+/// SSE/chunk redaction rewrites only the held bytes released to the client;
+/// the capture accumulator collects raw deltas, so without this the exported
+/// content would carry PII the client never saw. Counts are deliberately
+/// discarded — the wire-side redaction already tallied them, and tallying
+/// the same matches again would double-count.
+pub fn redact_captured_output(chain: &dyn Guardrail, text: &mut String) {
+    let mut discard = RedactionCounts::new();
+    apply_to_string(chain, Direction::Output, text, &mut discard);
+}
+
 /// Rewrite a JSON-*encoded* string (OpenAI `function.arguments`): parse,
 /// walk the string values, re-serialise — so a mask token can't corrupt
 /// the embedded document (e.g. a phone number as a JSON number value

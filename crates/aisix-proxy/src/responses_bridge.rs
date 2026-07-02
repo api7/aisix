@@ -1106,6 +1106,13 @@ pub fn build_responses_bridge_stream(
             if let Some((rewritten, counts)) =
                 crate::redact::redact_responses_sse(chain.as_ref(), &joined)
             {
+                // The wire bytes were masked — mask the content-capture
+                // accumulator too, or the exported content would carry
+                // PII the client never saw (#932 × AISIX-Cloud#947).
+                crate::redact::redact_captured_output(
+                    chain.as_ref(),
+                    &mut guard.comp().response_text,
+                );
                 crate::redact::merge_counts(
                     &mut guard.comp().redacted_entity_counts,
                     counts,

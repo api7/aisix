@@ -1883,6 +1883,13 @@ fn build_anthropic_sse_stream(
                 let counts =
                     crate::redact::redact_chat_chunks(chain.as_ref(), &mut held_chunks);
                 if !counts.is_empty() {
+                    // The wire chunks were masked — mask the content-capture
+                    // accumulator too, or the exported content would carry
+                    // PII the client never saw (#932 × AISIX-Cloud#947).
+                    crate::redact::redact_captured_output(
+                        chain.as_ref(),
+                        &mut guard.comp().response_text,
+                    );
                     crate::redact::merge_counts(
                         &mut guard.comp().redacted_entity_counts,
                         counts,
@@ -2617,6 +2624,15 @@ where
                 .and_then(|c| crate::redact::redact_anthropic_sse(c.as_ref(), &held))
             {
                 Some((rewritten, counts)) => {
+                    // The wire bytes were masked — mask the content-capture
+                    // accumulator too, or the exported content would carry
+                    // PII the client never saw (#932 × AISIX-Cloud#947).
+                    if let Some(c) = output_guardrail.as_ref() {
+                        crate::redact::redact_captured_output(
+                            c.as_ref(),
+                            &mut guard.usage().response_text,
+                        );
+                    }
                     crate::redact::merge_counts(
                         &mut guard.usage().redacted_entity_counts,
                         counts,
