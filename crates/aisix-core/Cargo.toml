@@ -17,7 +17,10 @@ thiserror.workspace = true
 anyhow.workspace = true
 config.workspace = true
 jsonschema.workspace = true
-schemars.workspace = true
+schemars = { workspace = true, features = ["chrono"] }
+# ApiKey::expires_at parses RFC 3339 timestamps for key-expiry
+# enforcement in the proxy auth path (#933).
+chrono.workspace = true
 once_cell.workspace = true
 # ApiKey::hash_bearer (prd-09a §9A.7B.4) is the canonical SHA-256 the
 # proxy uses to compare an incoming Authorization: Bearer <plaintext>

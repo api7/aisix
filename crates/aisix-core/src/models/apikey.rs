@@ -9,6 +9,7 @@
 //! looks up by the hash. Net security win: no plaintext API key
 //! ever sits in the DB or KV.
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::rate_limit::RateLimit;
@@ -54,6 +55,17 @@ pub struct ApiKey {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_tools: Option<Vec<String>>,
 
+    /// RFC 3339 timestamp after which the key stops authenticating.
+    /// Requests presenting an expired key are rejected with `401`.
+    /// When omitted or set to `null`, the key never expires.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
+
+    /// Administratively disabled. A disabled key is rejected with `401`
+    /// until it is enabled again; the key itself is preserved.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub disabled: bool,
+
     /// etcd-key uuid. Filled by the loader and never included in the JSON payload.
     #[serde(skip)]
     pub(crate) runtime_id: String,
@@ -71,6 +83,12 @@ impl ApiKey {
         let mut h = Sha256::new();
         h.update(plaintext.as_bytes());
         hex::encode(h.finalize())
+    }
+
+    /// True if the key's `expires_at` deadline has passed at `now`.
+    /// Keys without a deadline never expire.
+    pub fn is_expired_at(&self, now: DateTime<Utc>) -> bool {
+        self.expires_at.is_some_and(|deadline| deadline <= now)
     }
 
     /// True if this key is allowed to call the given Model.
@@ -180,6 +198,8 @@ mod tests {
             user_id: None,
             user_name: None,
             allowed_tools: None,
+            expires_at: None,
+            disabled: false,
             runtime_id: String::new(),
         };
         assert!(!k.can_access("my-gpt4"));
@@ -321,5 +341,62 @@ mod tests {
         assert!(k.team_id.is_none());
         assert!(k.user_id.is_none());
         assert!(k.user_name.is_none());
+    }
+
+    #[test]
+    fn absent_lifecycle_fields_mean_active_forever() {
+        // Every pre-existing key payload lacks `expires_at`/`disabled`;
+        // they must keep authenticating unchanged.
+        let k = sample();
+        assert!(k.expires_at.is_none());
+        assert!(!k.disabled);
+        assert!(!k.is_expired_at(chrono::Utc::now()));
+    }
+
+    #[test]
+    fn explicit_null_expires_at_means_never_expires() {
+        let k: ApiKey =
+            serde_json::from_str(r#"{"key_hash":"h","allowed_models":[],"expires_at":null}"#)
+                .unwrap();
+        assert!(k.expires_at.is_none());
+        assert!(!k.is_expired_at(chrono::Utc::now()));
+    }
+
+    #[test]
+    fn is_expired_at_honors_deadline() {
+        let k: ApiKey = serde_json::from_str(
+            r#"{"key_hash":"h","allowed_models":[],"expires_at":"2030-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        let before = "2029-12-31T23:59:59Z".parse().unwrap();
+        let at = "2030-01-01T00:00:00Z".parse().unwrap();
+        let after = "2030-01-01T00:00:01Z".parse().unwrap();
+        assert!(!k.is_expired_at(before));
+        // The deadline itself is exclusive: a key is valid strictly
+        // before `expires_at`, expired from that instant on.
+        assert!(k.is_expired_at(at));
+        assert!(k.is_expired_at(after));
+    }
+
+    #[test]
+    fn rejects_malformed_expires_at() {
+        // A non-RFC3339 string must fail deserialization so the loader
+        // rejects the row (fail closed) instead of silently treating
+        // the key as never-expiring.
+        let r: Result<ApiKey, _> =
+            serde_json::from_str(r#"{"key_hash":"h","allowed_models":[],"expires_at":"tomorrow"}"#);
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn disabled_roundtrips_and_defaults_false() {
+        let k: ApiKey =
+            serde_json::from_str(r#"{"key_hash":"h","allowed_models":[],"disabled":true}"#)
+                .unwrap();
+        assert!(k.disabled);
+        // `disabled: false` is the default and stays off the wire.
+        let v = serde_json::to_value(sample()).unwrap();
+        assert!(v.get("disabled").is_none());
+        assert!(v.get("expires_at").is_none());
     }
 }
