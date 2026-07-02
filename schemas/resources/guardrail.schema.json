@@ -148,6 +148,51 @@
           "type": "object"
         }
       ]
+    },
+    "PiiCustomPattern": {
+      "additionalProperties": false,
+      "description": "One operator-supplied regex detector for `kind: \"pii\"`.",
+      "properties": {
+        "action": {
+          "description": "Per-pattern action override: `mask` or `block`. Falls back to the guardrail's `default_action` when omitted.",
+          "type": "string"
+        },
+        "name": {
+          "description": "Detector name surfaced in the mask token (`[<NAME>_REDACTED]`), telemetry counts, and block reasons. Never the matched value.",
+          "maxLength": 64,
+          "minLength": 1,
+          "type": "string"
+        },
+        "regex": {
+          "description": "Regular expression the DP compiles at chain build. Invalid patterns are logged and the row is skipped (same contract as keyword rules).",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "regex"
+      ],
+      "type": "object"
+    },
+    "PiiDetectorConfig": {
+      "additionalProperties": false,
+      "description": "One built-in detector selection for `kind: \"pii\"`. The `type` names a detector compiled into the DP (`aisix-guardrails::pii::BUILTIN_DETECTORS`); `action` optionally overrides the guardrail-level `default_action` for this detector only.",
+      "properties": {
+        "action": {
+          "description": "Per-detector action override: `mask` or `block`. Falls back to the guardrail's `default_action` when omitted.",
+          "type": "string"
+        },
+        "type": {
+          "description": "Built-in detector id: `email`, `china_mobile`, `china_id_card`, `bank_card`, `us_ssn`, `ip_address`, `api_key`, `jwt`, `private_key`.",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
     }
   },
   "description": "Content policy evaluated before or after upstream calls.",
@@ -520,6 +565,54 @@
         "access_key_secret",
         "kind",
         "region"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "In-process sensitive-data detection + redaction (#932): built-in detectors + custom regex, per-detector `mask`/`block` actions, on input and/or output, including streaming output. Always available.",
+      "properties": {
+        "custom_patterns": {
+          "default": [],
+          "description": "Operator-supplied regex detectors, evaluated after the built-ins.",
+          "items": {
+            "$ref": "#/definitions/PiiCustomPattern"
+          },
+          "type": "array"
+        },
+        "default_action": {
+          "default": "mask",
+          "description": "Action for detectors that don't set their own: `mask` (default) or `block`.",
+          "type": "string"
+        },
+        "detectors": {
+          "default": [],
+          "description": "Built-in detectors to enable. Unknown detector ids are rejected at build time (row skipped + warn), so a typo can't silently disarm the policy.",
+          "items": {
+            "$ref": "#/definitions/PiiDetectorConfig"
+          },
+          "type": "array"
+        },
+        "kind": {
+          "enum": [
+            "pii"
+          ],
+          "type": "string"
+        },
+        "max_buffer_bytes": {
+          "default": 262144,
+          "description": "Max bytes buffered for a streamed response before `on_buffer_exceeded` applies.",
+          "format": "uint64",
+          "minimum": 1.0,
+          "type": "integer"
+        },
+        "on_buffer_exceeded": {
+          "default": "fail_closed",
+          "description": "Buffer-overflow policy. Use `fail_open` to release output unscanned (and unmasked) when the buffer cap is hit; the default `fail_closed` blocks the response instead.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind"
       ],
       "type": "object"
     }

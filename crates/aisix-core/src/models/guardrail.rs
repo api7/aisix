@@ -325,6 +325,87 @@ fn default_aliyun_risk_level_threshold() -> String {
     "high".to_owned()
 }
 
+/// One built-in detector selection for `kind: "pii"`. The `type` names a
+/// detector compiled into the DP (`aisix-guardrails::pii::BUILTIN_DETECTORS`);
+/// `action` optionally overrides the guardrail-level `default_action` for
+/// this detector only.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PiiDetectorConfig {
+    /// Built-in detector id: `email`, `china_mobile`, `china_id_card`,
+    /// `bank_card`, `us_ssn`, `ip_address`, `api_key`, `jwt`, `private_key`.
+    #[serde(rename = "type")]
+    #[schemars(length(min = 1))]
+    pub detector_type: String,
+    /// Per-detector action override: `mask` or `block`. Falls back to the
+    /// guardrail's `default_action` when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+}
+
+/// One operator-supplied regex detector for `kind: "pii"`.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PiiCustomPattern {
+    /// Detector name surfaced in the mask token (`[<NAME>_REDACTED]`),
+    /// telemetry counts, and block reasons. Never the matched value.
+    #[schemars(length(min = 1, max = 64))]
+    pub name: String,
+    /// Regular expression the DP compiles at chain build. Invalid patterns
+    /// are logged and the row is skipped (same contract as keyword rules).
+    #[schemars(length(min = 1))]
+    pub regex: String,
+    /// Per-pattern action override: `mask` or `block`. Falls back to the
+    /// guardrail's `default_action` when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+}
+
+/// Config block for `kind: "pii"`. In-process sensitive-data detection and
+/// redaction (#932): built-in detectors + custom regex patterns, each with a
+/// `mask` (redact-and-continue) or `block` action, applied to request and/or
+/// response text per the row's `hook_point`.
+///
+/// `mask` rewrites each matched span to `[<DETECTOR>_REDACTED]` and lets the
+/// request/response continue; `block` rejects with the standard 422
+/// content-filter envelope. Matched values never appear in logs, telemetry,
+/// or error envelopes — only detector names and match counts do.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PiiConfig {
+    /// Built-in detectors to enable. Unknown detector ids are rejected at
+    /// build time (row skipped + warn), so a typo can't silently disarm
+    /// the policy.
+    #[serde(default)]
+    pub detectors: Vec<PiiDetectorConfig>,
+    /// Operator-supplied regex detectors, evaluated after the built-ins.
+    #[serde(default)]
+    pub custom_patterns: Vec<PiiCustomPattern>,
+    /// Action for detectors that don't set their own: `mask` (default) or
+    /// `block`.
+    #[serde(default = "default_pii_action")]
+    pub default_action: String,
+
+    // --- streaming-output controls (consumed by aisix-proxy) ---
+    // Masking a streamed response requires the whole response to be held
+    // back (the mask spans chunk boundaries), so kind=pii always uses the
+    // buffer_full policy on the output hook. These knobs mirror the ACS/
+    // Aliyun buffer_full parameters.
+    /// Max bytes buffered for a streamed response before `on_buffer_exceeded` applies.
+    #[serde(default = "default_acs_max_buffer_bytes")]
+    #[schemars(range(min = 1))]
+    pub max_buffer_bytes: u64,
+    /// Buffer-overflow policy. Use `fail_open` to release output unscanned
+    /// (and unmasked) when the buffer cap is hit; the default `fail_closed`
+    /// blocks the response instead.
+    #[serde(default = "default_acs_on_buffer_exceeded")]
+    pub on_buffer_exceeded: String,
+}
+
+fn default_pii_action() -> String {
+    "mask".to_owned()
+}
+
 fn default_aliyun_window_size() -> u32 {
     2_000
 }
@@ -380,6 +461,10 @@ pub enum GuardrailKind {
     /// `TextModerationPlus` action on `green-cip.<region>.aliyuncs.com`, on
     /// input and/or output, including streaming output.
     AliyunTextModeration(AliyunTextModerationConfig),
+    /// In-process sensitive-data detection + redaction (#932): built-in
+    /// detectors + custom regex, per-detector `mask`/`block` actions, on
+    /// input and/or output, including streaming output. Always available.
+    Pii(PiiConfig),
 }
 
 impl GuardrailKind {
@@ -394,6 +479,7 @@ impl GuardrailKind {
                 "azure_content_safety_text_moderation"
             }
             GuardrailKind::AliyunTextModeration(_) => "aliyun_text_moderation",
+            GuardrailKind::Pii(_) => "pii",
         }
     }
 }
@@ -900,6 +986,61 @@ mod tests {
                 assert_eq!(c.window_overlap_size, 0, "explicit 0 overlap must survive");
             }
             _ => panic!("expected AliyunTextModeration variant"),
+        }
+    }
+
+    #[test]
+    fn pii_kind_parses_with_defaults() {
+        // cp-api omits unset fields (omitempty); the DP must apply the
+        // documented defaults so a minimal row still works.
+        let v = json!({
+            "name": "mask-pii",
+            "kind": "pii",
+            "detectors": [
+                { "type": "email" },
+                { "type": "china_id_card", "action": "block" }
+            ]
+        });
+        let g: Guardrail = serde_json::from_value(v).unwrap();
+        match g.config {
+            GuardrailKind::Pii(ref c) => {
+                assert_eq!(c.detectors.len(), 2);
+                assert_eq!(c.detectors[0].detector_type, "email");
+                assert_eq!(c.detectors[0].action, None);
+                assert_eq!(c.detectors[1].action.as_deref(), Some("block"));
+                assert!(c.custom_patterns.is_empty());
+                assert_eq!(c.default_action, "mask");
+                assert_eq!(c.max_buffer_bytes, 262_144);
+                assert_eq!(c.on_buffer_exceeded, "fail_closed");
+            }
+            _ => panic!("expected Pii variant"),
+        }
+    }
+
+    #[test]
+    fn pii_kind_round_trips_custom_patterns_and_overrides() {
+        let v = json!({
+            "name": "mask-pii",
+            "kind": "pii",
+            "default_action": "block",
+            "custom_patterns": [
+                { "name": "employee_id", "regex": "\\bEMP-\\d{6}\\b", "action": "mask" }
+            ],
+            "max_buffer_bytes": 1024,
+            "on_buffer_exceeded": "fail_open"
+        });
+        let g: Guardrail = serde_json::from_value(v).unwrap();
+        match g.config {
+            GuardrailKind::Pii(ref c) => {
+                assert!(c.detectors.is_empty());
+                assert_eq!(c.custom_patterns.len(), 1);
+                assert_eq!(c.custom_patterns[0].name, "employee_id");
+                assert_eq!(c.custom_patterns[0].action.as_deref(), Some("mask"));
+                assert_eq!(c.default_action, "block");
+                assert_eq!(c.max_buffer_bytes, 1024);
+                assert_eq!(c.on_buffer_exceeded, "fail_open");
+            }
+            _ => panic!("expected Pii variant"),
         }
     }
 

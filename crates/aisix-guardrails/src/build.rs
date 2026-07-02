@@ -24,7 +24,8 @@ use async_trait::async_trait;
 
 use crate::index::{GuardrailIndex, RequestContext, ScopeKind};
 use crate::keyword::{KeywordBlocklist, KeywordRule};
-use crate::{Guardrail, GuardrailChain, GuardrailVerdict, StreamOutputPolicy};
+use crate::pii::{builtin_rule, PiiAction, PiiGuardrail, PiiRule};
+use crate::{Guardrail, GuardrailChain, GuardrailVerdict, Redaction, StreamOutputPolicy};
 
 /// A snapshot table's guardrail entries in deterministic chain order:
 /// `created_at` ascending (RFC3339 strings in a fixed offset compare
@@ -211,6 +212,58 @@ fn build_one_inner(
             };
             Ok(Some(Arc::new(blocklist)))
         }
+        GuardrailKind::Pii(cfg) => {
+            if cfg.detectors.is_empty() && cfg.custom_patterns.is_empty() {
+                return Ok(None);
+            }
+            let default_action =
+                PiiAction::parse(&cfg.default_action).ok_or_else(|| BuildError::InvalidValue {
+                    field: "default_action",
+                    value: cfg.default_action.clone(),
+                })?;
+            let mut rules: Vec<PiiRule> = Vec::with_capacity(
+                cfg.detectors.len() + cfg.custom_patterns.len(),
+            );
+            for d in &cfg.detectors {
+                let action = match d.action.as_deref() {
+                    None => default_action,
+                    Some(s) => PiiAction::parse(s).ok_or_else(|| BuildError::InvalidValue {
+                        field: "detectors[].action",
+                        value: s.to_owned(),
+                    })?,
+                };
+                let rule =
+                    builtin_rule(&d.detector_type, action).ok_or_else(|| BuildError::InvalidValue {
+                        field: "detectors[].type",
+                        value: d.detector_type.clone(),
+                    })?;
+                rules.push(rule);
+            }
+            for p in &cfg.custom_patterns {
+                let action = match p.action.as_deref() {
+                    None => default_action,
+                    Some(s) => PiiAction::parse(s).ok_or_else(|| BuildError::InvalidValue {
+                        field: "custom_patterns[].action",
+                        value: s.to_owned(),
+                    })?,
+                };
+                let rule = PiiRule::new(p.name.clone(), &p.regex, action, None).map_err(|e| {
+                    BuildError::InvalidRegex {
+                        pattern: p.regex.clone(),
+                        source: e,
+                    }
+                })?;
+                rules.push(rule);
+            }
+            let on_exceeded_fail_open = cfg.on_buffer_exceeded == "fail_open";
+            let g = PiiGuardrail::new(
+                rules,
+                row.hook_point,
+                usize::try_from(cfg.max_buffer_bytes).unwrap_or(usize::MAX),
+                on_exceeded_fail_open,
+            );
+            Ok(Some(Arc::new(g)))
+        }
         #[cfg(feature = "bedrock")]
         GuardrailKind::Bedrock(cfg) => {
             // Phase 2: build the AWS-SDK-backed dispatcher. cp-api
@@ -299,6 +352,14 @@ enum BuildError {
         pattern: String,
         source: regex::Error,
     },
+    /// An enum-ish config field carrying a value the DP doesn't know
+    /// (unknown built-in detector id, unrecognised action). The row is
+    /// skipped + warned rather than silently running a weaker policy.
+    #[error("invalid {field} value {value:?}")]
+    InvalidValue {
+        field: &'static str,
+        value: String,
+    },
     /// A guardrail kind whose runtime dispatch was compiled out via
     /// feature flags (e.g. a pruned build that excluded `--features bedrock`
     /// or `--features azure-content-safety`). The chain treats the row as
@@ -331,6 +392,19 @@ struct MonitorGuardrail {
 }
 
 impl MonitorGuardrail {
+    /// Log the mask counts a monitor-mode redacting guardrail WOULD have
+    /// applied. Counts carry detector names only, never matched values.
+    fn observe_redaction(&self, hook: &'static str, r: Option<Redaction>) {
+        if let Some(r) = r {
+            tracing::info!(
+                guardrail_name = %self.row_name,
+                hook,
+                counts = ?r.counts,
+                "guardrail in monitor mode observed maskable spans; not redacting (enforcement_mode=monitor)",
+            );
+        }
+    }
+
     fn observe(&self, hook: &'static str, verdict: GuardrailVerdict) -> GuardrailVerdict {
         match verdict {
             GuardrailVerdict::Block { reason, .. } => {
@@ -371,6 +445,28 @@ impl Guardrail for MonitorGuardrail {
 
     fn runs_on_output(&self) -> bool {
         self.inner.runs_on_output()
+    }
+
+    // Monitor mode observes without modifying: redaction is suppressed the
+    // same way Block verdicts are downgraded. The would-be mask counts are
+    // logged so operators can stage a redaction rule and audit its impact
+    // before enforcing it.
+    fn redacts_input(&self) -> bool {
+        false
+    }
+
+    fn redacts_output(&self) -> bool {
+        false
+    }
+
+    fn redact_input_text(&self, text: &str) -> Option<Redaction> {
+        self.observe_redaction("input", self.inner.redact_input_text(text));
+        None
+    }
+
+    fn redact_output_text(&self, text: &str) -> Option<Redaction> {
+        self.observe_redaction("output", self.inner.redact_output_text(text));
+        None
     }
 }
 
@@ -439,6 +535,24 @@ impl Guardrail for MandatoryGuardrail {
 
     fn runs_on_output(&self) -> bool {
         self.inner.runs_on_output()
+    }
+
+    // Mandatory only rewrites the failure (Bypass) verdict; redaction
+    // passes straight through to the inner guardrail.
+    fn redacts_input(&self) -> bool {
+        self.inner.redacts_input()
+    }
+
+    fn redacts_output(&self) -> bool {
+        self.inner.redacts_output()
+    }
+
+    fn redact_input_text(&self, text: &str) -> Option<Redaction> {
+        self.inner.redact_input_text(text)
+    }
+
+    fn redact_output_text(&self, text: &str) -> Option<Redaction> {
+        self.inner.redact_output_text(text)
     }
 }
 
@@ -537,6 +651,22 @@ impl Guardrail for LiveGuardrailChain {
 
     fn runs_on_output(&self) -> bool {
         self.current().runs_on_output()
+    }
+
+    fn redacts_input(&self) -> bool {
+        self.current().redacts_input()
+    }
+
+    fn redacts_output(&self) -> bool {
+        self.current().redacts_output()
+    }
+
+    fn redact_input_text(&self, text: &str) -> Option<Redaction> {
+        self.current().redact_input_text(text)
+    }
+
+    fn redact_output_text(&self, text: &str) -> Option<Redaction> {
+        self.current().redact_output_text(text)
     }
 }
 
