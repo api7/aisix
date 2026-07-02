@@ -17,6 +17,22 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+# Upstream OAuth 2.0 client-credentials token minting (`crate::oauth`) plus
+# header types for the `api_key` transport headers.
+http.workspace = true
+reqwest.workspace = true
+# rmcp 1.8.0 builds its transport on the reqwest 0.13 line (the workspace is
+# on 0.12) and does not re-export it. This renamed dep exists ONLY to name
+# `StreamableHttpError<reqwest::Error>` when downcasting a connect failure to
+# detect an upstream 401 — it resolves to the same crate version rmcp links,
+# so the downcast sees the identical type. Kept `default-features = false`:
+# only the `Error` type is used, never a client. The 401-invalidation
+# integration test fails loudly if these ever stop unifying.
+rmcp-reqwest = { package = "reqwest", version = "0.13", default-features = false }
+# Token-cache keying: the client secret is folded into the cache key as a
+# SHA-256 digest so a rotated secret never reuses the previous secret's token.
+sha2.workspace = true
+hex.workspace = true
 
 # Official MCP Rust SDK. Pinned exactly: rmcp is <16 months old and still
 # ships breaking changes on a roughly-monthly cadence, so we hold a fixed
