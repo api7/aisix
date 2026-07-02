@@ -897,7 +897,7 @@ async fn dispatch(
     // the gateway.
     crate::redact::merge_counts(
         redactions_out,
-        crate::redact::redact_chat_format(&resolved_chain, req),
+        crate::redact::redact_chat_format(resolved_chain.as_ref(), req),
     );
 
     // Budget pre-check via cp-api. The DP no longer owns budget state;
@@ -1601,7 +1601,7 @@ async fn dispatch(
                 // a rule was added/tightened must still be caught here.
                 crate::redact::merge_counts(
                     redactions_out,
-                    crate::redact::redact_chat_response(&resolved_chain, &mut cached),
+                    crate::redact::redact_chat_response(resolved_chain.as_ref(), &mut cached),
                 );
                 let prompt = cached.usage.prompt_tokens as u64;
                 let completion = cached.usage.completion_tokens as u64;
@@ -1988,7 +1988,7 @@ async fn dispatch(
     // are stored masked — the matched values don't persist at rest.
     crate::redact::merge_counts(
         redactions_out,
-        crate::redact::redact_chat_response(&resolved_chain, &mut upstream),
+        crate::redact::redact_chat_response(resolved_chain.as_ref(), &mut upstream),
     );
 
     // Cache write is gated on the same policy as the lookup at the
@@ -2750,7 +2750,7 @@ async fn dispatch_ensemble(
     let mut ensemble_redactions = input_redactions.clone();
     crate::redact::merge_counts(
         &mut ensemble_redactions,
-        crate::redact::redact_chat_response(resolved_chain, &mut outcome.response),
+        crate::redact::redact_chat_response(resolved_chain.as_ref(), &mut outcome.response),
     );
     emit_subcalls(
         &outcome,
@@ -3908,7 +3908,7 @@ where
                         // a masked span can cross chunk boundaries).
                         if let Some(ctx) = output_guardrail.as_ref() {
                             let counts =
-                                crate::redact::redact_chat_chunks(&ctx.chain, &mut pending);
+                                crate::redact::redact_chat_chunks(ctx.chain.as_ref(), &mut pending);
                             if !counts.is_empty() {
                                 crate::redact::merge_counts(
                                     &mut guard.comp().redacted_entity_counts,
