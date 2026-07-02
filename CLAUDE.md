@@ -88,6 +88,19 @@ After every `gh pr create` or force-push, spawn a fresh `general-purpose` Agent 
 
 Output HIGH/MEDIUM/LOW per finding with **concrete suggested code**, not vague "consider". **Merge gate:** every HIGH and MEDIUM is either fixed in code or explicitly justified in the PR (e.g. "feature gap, filed as #N, agreed not to block"); silent merge is not enough. For findings that surface gateway/product-behavior gaps, file separate issues and link them. Self-review misses the author's blind spots — an independent agent catches them.
 
+## A Config Knob Isn't Shipped Until the Control Plane Exposes It
+
+**A user-configurable data-plane feature is NOT delivered when the Rust side works — it's delivered when a user can reach it through the control plane. DP-only is a half-feature nobody can turn on.**
+
+This repo reads its config from etcd, but users never write etcd directly — the **control plane** (`api7/AISIX-Cloud`, a separate repo) is the only writer. That CP is **not a passthrough**: it validates every resource against a **closed** OpenAPI schema (`control-plane/openapi/cp-admin.yaml`) and its validator **rejects any field or enum value the spec doesn't list, before it is ever written to etcd**. So the moment you add a new config surface here — a new `RoutingStrategy` variant, a new per-target field, a new resource knob, a header-driven behavior a user is expected to configure on a resource — a DP that happily reads it from etcd is still **unreachable**, because the CP will never let that value through and no UI offers it.
+
+- **Treat any DP PR that adds or extends a user-facing config surface as automatically implying a paired CP PR.** The DP change is not "done" on its own; it's one half of a cross-plane feature. Before calling a routing/resource/config feature complete, confirm the CP can accept and persist the new shape.
+- **"Done" for such a feature spans four CP layers**, none optional: (1) the `cp-admin.yaml` schema (new enum value / field) **and its regenerated Go bindings**; (2) the Go typed model + request validation + etcd projection under `internal/cpapi/resources/`; (3) the dashboard form field(s) under `dashboard/` **plus `messages/en.json` + `zh.json` i18n**; (4) paired tests — CP↔DP Go integration in `e2e/cases/` and Playwright for the UI.
+- **If you can only do the DP half in this PR, say so and file/track the CP issue in the same breath** — never let the umbrella task close on DP-only work. A merged DP PR with no CP counterpart is a latent gap, not a shipped feature.
+- Pure internal DP mechanics (a new algorithm with no user-set config, an observability metric, an internal refactor) don't need CP work — this rule is specifically about **user-configurable** surfaces a customer must be able to set.
+
+(Lesson from AISIX-Cloud#873 routing: `least_cost` / `least_latency` / `least_busy`, per-target `tags`, and `sticky` canary all shipped DP-only across #681/#682/#684/#686/#687 while `cp-admin.yaml` still pinned the closed `[round_robin, weighted, failover]` enum and the dashboard had no fields — so none of it was actually usable until the matching CP integration landed. The meta-repo `AGENTS.md` carries the same rule for cross-plane agents.)
+
 ## Documentation Lives in api7/docs
 
 **User-facing documentation is maintained in the `api7/docs` repository (published to <https://docs.api7.ai/ai-gateway/>), not in this repo.**
