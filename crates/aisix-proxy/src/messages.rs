@@ -590,9 +590,8 @@ async fn dispatch(
                     // counts in `outcome.metrics`; the verbatim streaming path
                     // sets `usage_handled_by_stream` (its Drop guard owns end-
                     // of-stream emission) and its post-stream token accounting
-                    // is a tracked follow-up — its reservation still releases
-                    // the concurrency slot on drop, and budget ($) already
-                    // gated it.
+                    // is tracked in #688 — its reservation still releases the
+                    // concurrency slot on drop, and budget ($) already gated it.
                     if !outcome.usage_handled_by_stream {
                         let total = u64::from(outcome.metrics.prompt_tokens)
                             + u64::from(outcome.metrics.completion_tokens);

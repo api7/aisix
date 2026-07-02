@@ -470,7 +470,7 @@ async fn dispatch(
                     // carry `usage` here; the verbatim streaming path reports
                     // `usage_handled_by_stream` (its Drop guard owns end-of-
                     // stream emission) and its post-stream token accounting is
-                    // a tracked follow-up — its reservation still releases the
+                    // tracked in #688 — its reservation still releases the
                     // concurrency slot on drop, and budget ($) already gated it.
                     if !success.usage_handled_by_stream {
                         let total = success
