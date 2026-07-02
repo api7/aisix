@@ -427,16 +427,18 @@ async fn multipart_dispatch(
     let applied_guardrails = resolved_chain.applied().to_vec();
     let mut redactions = crate::redact::RedactionCounts::new();
     if !resolved_chain.is_empty() {
-        let prompt_text = fields
+        // EVERY `prompt` field: multipart allows repeated names and the form
+        // is rebuilt with all of them, so all are scanned — an empty first
+        // field must not skip a later one.
+        let prompt_messages: Vec<ChatMessage> = fields
             .iter()
-            .find(|(name, ..)| name == "prompt")
-            .and_then(|(.., data)| std::str::from_utf8(data).ok())
-            .unwrap_or("");
-        if !prompt_text.is_empty() {
-            let chat = aisix_gateway::ChatFormat::new(
-                &model_name,
-                vec![ChatMessage::user(prompt_text.to_string())],
-            );
+            .filter(|(name, ..)| name == "prompt")
+            .filter_map(|(.., data)| std::str::from_utf8(data).ok())
+            .filter(|s| !s.is_empty())
+            .map(|s| ChatMessage::user(s.to_string()))
+            .collect();
+        if !prompt_messages.is_empty() {
+            let chat = aisix_gateway::ChatFormat::new(&model_name, prompt_messages);
             if let aisix_guardrails::GuardrailVerdict::Block {
                 reason,
                 guardrail_name,
@@ -453,18 +455,18 @@ async fn multipart_dispatch(
                     crate::error::guardrail_block_message("request", guardrail_name.as_deref()),
                 ));
             }
-            if aisix_guardrails::Guardrail::redacts_input(&resolved_chain) {
-                for (name, _, _, data) in fields.iter_mut() {
-                    if name != "prompt" {
-                        continue;
-                    }
-                    if let Ok(text) = std::str::from_utf8(data) {
-                        if let Some(r) =
-                            aisix_guardrails::Guardrail::redact_input_text(&resolved_chain, text)
-                        {
-                            *data = Bytes::from(r.text.into_bytes());
-                            crate::redact::merge_counts(&mut redactions, r.counts);
-                        }
+        }
+        if aisix_guardrails::Guardrail::redacts_input(&resolved_chain) {
+            for (name, _, _, data) in fields.iter_mut() {
+                if name != "prompt" {
+                    continue;
+                }
+                if let Ok(text) = std::str::from_utf8(data) {
+                    if let Some(r) =
+                        aisix_guardrails::Guardrail::redact_input_text(&resolved_chain, text)
+                    {
+                        *data = Bytes::from(r.text.into_bytes());
+                        crate::redact::merge_counts(&mut redactions, r.counts);
                     }
                 }
             }
@@ -687,15 +689,24 @@ async fn multipart_dispatch(
 }
 
 /// The caller-visible transcript text for output-guardrail scanning (#696):
-/// the JSON `text` field (`json` / `verbose_json` response formats) or the
-/// raw body for the plain-text formats (`text` / `srt` / `vtt`).
+/// the JSON `text` field plus `segments[].text` (`json` / `verbose_json`
+/// response formats — segments are scanned too so a response carrying text
+/// only in segments can't bypass the check), or the raw body for the
+/// plain-text formats (`text` / `srt` / `vtt`).
 fn transcription_output_text(body: &[u8]) -> String {
     if let Ok(json) = serde_json::from_slice::<Value>(body) {
-        return json
-            .get("text")
-            .and_then(|t| t.as_str())
-            .unwrap_or_default()
-            .to_string();
+        let mut parts: Vec<&str> = Vec::new();
+        if let Some(t) = json.get("text").and_then(|t| t.as_str()) {
+            parts.push(t);
+        }
+        if let Some(segments) = json.get("segments").and_then(|s| s.as_array()) {
+            parts.extend(
+                segments
+                    .iter()
+                    .filter_map(|s| s.get("text").and_then(|t| t.as_str())),
+            );
+        }
+        return parts.join("\n");
     }
     String::from_utf8_lossy(body).into_owned()
 }
