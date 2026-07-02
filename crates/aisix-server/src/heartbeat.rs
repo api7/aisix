@@ -641,6 +641,7 @@ mod tests {
             body["supported_guardrail_kinds"],
             serde_json::json!([
                 "keyword",
+                "pii",
                 "azure_content_safety",
                 "azure_content_safety_text_moderation",
                 "aliyun_text_moderation",

@@ -3707,6 +3707,7 @@ fn add_variant_titles(doc: &mut Value) {
                 "Azure AI Content Safety Prompt Shield",
                 "Azure AI Content Safety Text Moderation",
                 "Aliyun Text Moderation",
+                "PII Detection & Redaction",
             ],
         ),
         (
@@ -3830,6 +3831,10 @@ fn add_missing_property_descriptions(doc: &mut Value) {
         (
             "/components/schemas/Guardrail/oneOf/4/properties/kind",
             "Guardrail provider type. Use `aliyun_text_moderation` for Aliyun text moderation.",
+        ),
+        (
+            "/components/schemas/Guardrail/oneOf/5/properties/kind",
+            "Guardrail provider type. Use `pii` for in-process sensitive-data detection and redaction.",
         ),
         (
             "/components/schemas/KeywordPattern/oneOf/0/properties/kind",

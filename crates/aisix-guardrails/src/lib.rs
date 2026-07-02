@@ -26,6 +26,7 @@ mod build;
 mod chain;
 mod index;
 mod keyword;
+mod pii;
 #[cfg(feature = "azure-content-safety")]
 mod prompt_shield;
 #[cfg(feature = "azure-content-safety")]
@@ -72,6 +73,7 @@ pub(crate) fn message_scan_text(m: &ChatMessage) -> String {
 pub fn supported_kinds() -> &'static [&'static str] {
     &[
         "keyword",
+        "pii",
         #[cfg(feature = "azure-content-safety")]
         "azure_content_safety",
         #[cfg(feature = "azure-content-safety")]
@@ -93,6 +95,7 @@ pub use build::{
 pub use chain::GuardrailChain;
 pub use index::{GuardrailIndex, RequestContext};
 pub use keyword::{KeywordBlocklist, KeywordRule};
+pub use pii::{builtin_rule, PiiAction, PiiGuardrail, PiiRule, BUILTIN_DETECTORS};
 #[cfg(feature = "azure-content-safety")]
 pub use prompt_shield::PromptShieldGuardrail;
 #[cfg(feature = "azure-content-safety")]
@@ -251,6 +254,31 @@ impl StreamOutputPolicy {
 /// Matches the Azure text-moderation buffer-mode default.
 pub const DEFAULT_STREAM_OUTPUT_BUFFER_BYTES: usize = 262_144;
 
+/// One text-channel redaction outcome from
+/// [`Guardrail::redact_input_text`] / [`Guardrail::redact_output_text`]:
+/// the rewritten text plus per-detector match counts. Counts carry detector
+/// NAMES only — the matched values are gone by construction, so this type
+/// is safe to log and to attach to telemetry (#932 no-leak criterion).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Redaction {
+    pub text: String,
+    /// detector name → number of masked spans.
+    pub counts: std::collections::BTreeMap<String, u32>,
+}
+
+impl Redaction {
+    /// Fold `other`'s counts into `self` (used by chains and by callers
+    /// merging per-field redactions into one per-request summary).
+    pub fn merge_counts(
+        into: &mut std::collections::BTreeMap<String, u32>,
+        other: &std::collections::BTreeMap<String, u32>,
+    ) {
+        for (k, v) in other {
+            *into.entry(k.clone()).or_insert(0) += v;
+        }
+    }
+}
+
 /// Pluggable content-policy hook. Production wires `Arc<dyn Guardrail>`
 /// in `ProxyState`; tests construct in-memory chains directly.
 #[async_trait]
@@ -299,6 +327,38 @@ pub trait Guardrail: Send + Sync + 'static {
     /// to gate on their hook.
     fn runs_on_output(&self) -> bool {
         true
+    }
+
+    // --- redaction (#932) -------------------------------------------------
+    //
+    // Redaction is a separate, synchronous, text→text capability rather
+    // than a mutation inside `check_input`/`check_output`: the check hooks
+    // scan ONE concatenated blob per request, while redaction must be
+    // applied per text FIELD (each message, each tool-call argument, each
+    // streamed channel) so the caller controls which wire fields are
+    // rewritten and structure is preserved. Callers run the check first
+    // (Block wins over Mask), then apply the redactor to each field.
+
+    /// `true` when this guardrail can rewrite REQUEST text. Cheap probe so
+    /// call sites skip walking the body when nothing would change.
+    fn redacts_input(&self) -> bool {
+        false
+    }
+
+    /// `true` when this guardrail can rewrite RESPONSE text.
+    fn redacts_output(&self) -> bool {
+        false
+    }
+
+    /// Rewrite one request-side text field, masking sensitive spans.
+    /// `None` = no capability or no matches (caller keeps the original).
+    fn redact_input_text(&self, _text: &str) -> Option<Redaction> {
+        None
+    }
+
+    /// Rewrite one response-side text field, masking sensitive spans.
+    fn redact_output_text(&self, _text: &str) -> Option<Redaction> {
+        None
     }
 }
 
@@ -386,6 +446,7 @@ mod tests {
             supported_kinds(),
             &[
                 "keyword",
+                "pii",
                 "azure_content_safety",
                 "azure_content_safety_text_moderation",
                 "aliyun_text_moderation",
@@ -400,6 +461,10 @@ mod tests {
                 "keyword" => serde_json::json!({
                     "kind": "keyword",
                     "patterns": [{"kind": "literal", "value": "x"}],
+                }),
+                "pii" => serde_json::json!({
+                    "kind": "pii",
+                    "detectors": [{"type": "email"}],
                 }),
                 "azure_content_safety" => serde_json::json!({
                     "kind": "azure_content_safety",

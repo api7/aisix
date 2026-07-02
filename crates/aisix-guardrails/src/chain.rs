@@ -13,7 +13,7 @@ use aisix_core::AppliedGuardrail;
 use aisix_gateway::{ChatFormat, ChatResponse};
 use async_trait::async_trait;
 
-use crate::{Guardrail, GuardrailVerdict, StreamOutputPolicy};
+use crate::{Guardrail, GuardrailVerdict, Redaction, StreamOutputPolicy};
 
 /// One chain member: the runtime guardrail plus the operator-facing name
 /// of the row it was built from. The name is what `Block` verdicts are
@@ -204,6 +204,66 @@ impl Guardrail for GuardrailChain {
             None => GuardrailVerdict::Allow,
         }
     }
+
+    fn redacts_input(&self) -> bool {
+        self.members.iter().any(|m| m.guardrail.redacts_input())
+    }
+
+    fn redacts_output(&self) -> bool {
+        self.members.iter().any(|m| m.guardrail.redacts_output())
+    }
+
+    /// Members apply in chain order, each rewriting the previous member's
+    /// output, so stacked redacting guardrails compose. Counts merge across
+    /// members.
+    fn redact_input_text(&self, text: &str) -> Option<Redaction> {
+        fold_redactions(
+            text,
+            self.members
+                .iter()
+                .filter_map(|m| m.guardrail.redacts_input().then_some(&m.guardrail)),
+            true,
+        )
+    }
+
+    fn redact_output_text(&self, text: &str) -> Option<Redaction> {
+        fold_redactions(
+            text,
+            self.members
+                .iter()
+                .filter_map(|m| m.guardrail.redacts_output().then_some(&m.guardrail)),
+            false,
+        )
+    }
+}
+
+/// Fold `text` through each member's redactor, merging counts. `None`
+/// when no member changed anything.
+fn fold_redactions<'a>(
+    text: &str,
+    members: impl Iterator<Item = &'a Arc<dyn Guardrail>>,
+    input: bool,
+) -> Option<Redaction> {
+    let mut current: Option<Redaction> = None;
+    for g in members {
+        let src = current.as_ref().map_or(text, |r| r.text.as_str());
+        let next = if input {
+            g.redact_input_text(src)
+        } else {
+            g.redact_output_text(src)
+        };
+        if let Some(r) = next {
+            current = Some(match current.take() {
+                None => r,
+                Some(mut acc) => {
+                    acc.text = r.text;
+                    Redaction::merge_counts(&mut acc.counts, &r.counts);
+                    acc
+                }
+            });
+        }
+    }
+    current
 }
 
 #[cfg(test)]

@@ -52,6 +52,9 @@ struct CompletionDispatchSuccess {
     /// or on a 200 with no `usage` block (rare edge). Handler
     /// gates UsageEvent emission on this being `Some`.
     usage: Option<CompletionUsage>,
+    /// Per-detector PII mask counts (#932), input + output merged.
+    /// Attached to the emitted UsageEvent. Empty = no redaction.
+    redactions: crate::redact::RedactionCounts,
     /// True when the response leg was blocked by an OUTPUT guardrail
     /// AFTER the upstream billed for it (#911 [23]). The response body is
     /// the redacted 422, but `usage` still carries the billed counts so
@@ -131,6 +134,7 @@ pub async fn completions(
                     &usage,
                     &client,
                     success.guardrail_blocked,
+                    success.redactions.clone(),
                 );
             }
             success.response
@@ -196,14 +200,16 @@ fn completions_input_to_chat(model: &str, body: &Value) -> aisix_gateway::ChatFo
 async fn dispatch(
     state: &ProxyState,
     auth: &AuthenticatedKey,
-    body: Value,
+    mut body: Value,
     request_id: &str,
     source_ip: &str,
 ) -> Result<CompletionDispatchSuccess, ProxyError> {
     let model_name = body
         .get("model")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| ProxyError::InvalidRequest("missing `model` field".into()))?;
+        .ok_or_else(|| ProxyError::InvalidRequest("missing `model` field".into()))?
+        .to_string();
+    let model_name = model_name.as_str();
 
     let snapshot = state.snapshot.load();
 
@@ -248,6 +254,10 @@ async fn dispatch(
             ));
         }
     }
+
+    // #932: mask-action PII rules rewrite the prompt in place AFTER the
+    // block check passes, BEFORE the body is forwarded upstream.
+    let mut redactions = crate::redact::redact_completions_request(&resolved_chain, &mut body);
 
     let model_rl =
         crate::quota::ModelRateLimit::from_model(model_name, &model_entry.id, &model_entry.value);
@@ -333,10 +343,19 @@ async fn dispatch(
                         model_id: model_entry.id.to_string(),
                         provider_key_id: pk_entry.id.to_string(),
                         usage,
+                        redactions,
                         guardrail_blocked: true,
                     });
                 }
             }
+
+            // #932: mask-action PII rules rewrite the reply text AFTER the
+            // block check passes.
+            let mut resp_json = resp_json;
+            crate::redact::merge_counts(
+                &mut redactions,
+                crate::redact::redact_completions_response(&resolved_chain, &mut resp_json),
+            );
 
             Ok(CompletionDispatchSuccess {
                 response: Json(resp_json).into_response(),
@@ -344,6 +363,7 @@ async fn dispatch(
                 model_id: model_entry.id.to_string(),
                 provider_key_id: pk_entry.id.to_string(),
                 usage,
+                redactions,
                 guardrail_blocked: false,
             })
         }
@@ -360,6 +380,7 @@ async fn dispatch(
                 // gates emission on `usage.is_some()` so 501 stays
                 // out of /logs noise (same convention as #402).
                 usage: None,
+                redactions,
                 guardrail_blocked: false,
             })
         }
@@ -442,6 +463,8 @@ fn emit_usage_event(
     usage: &CompletionUsage,
     client: &ClientContext,
     guardrail_blocked: bool,
+    // Per-detector PII mask counts (#932). Empty = no redaction.
+    redacted_entity_counts: crate::redact::RedactionCounts,
 ) {
     let snap = state.snapshot.load();
     let mut event = UsageEvent {
@@ -460,6 +483,7 @@ fn emit_usage_event(
         // #911 [23]: a billed-then-output-blocked completion surfaces on the
         // dashboard's Blocked tab while still carrying its billed token counts.
         guardrail_blocked,
+        redacted_entity_counts,
         ..Default::default()
     };
     crate::usage_attr::apply_pk_telemetry(&mut event, &snap, provider_key_id);

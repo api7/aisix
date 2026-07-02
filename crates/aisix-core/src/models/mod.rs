@@ -39,7 +39,8 @@ pub use guardrail::{
     AliyunTextModerationConfig, AppliedGuardrail, AzureContentSafetyConfig,
     AzureContentSafetyTextModerationConfig, BedrockAWSCredentials, BedrockConfig,
     BedrockLatencyMode, Guardrail, GuardrailAttachment, GuardrailHookPoint, GuardrailKind,
-    GuardrailScopeType, KeywordConfig, KeywordPattern,
+    GuardrailScopeType, KeywordConfig, KeywordPattern, PiiConfig, PiiCustomPattern,
+    PiiDetectorConfig,
 };
 pub use mcp_server::{McpAuthType, McpServer, McpTransport};
 pub use model::{
