@@ -16,11 +16,20 @@ fn etcd_url() -> Option<String> {
 }
 
 fn unique_prefix() -> String {
+    // The timestamp alone is NOT unique: tests in this binary run
+    // concurrently, and a coarse CI clock can hand two of them the same
+    // nanosecond reading — their watches then share one prefix and each
+    // sees the other's events (observed as a flake: the single-put test
+    // received the batch test's `/batch/0`). A per-process counter
+    // disambiguates tests within the binary; the pid covers concurrent
+    // binaries against the same etcd.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or_default();
-    format!("/aisix-etcd-it/{nanos:x}")
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("/aisix-etcd-it/{nanos:x}-{}-{seq}", std::process::id())
 }
 
 /// The core regression test for issue #237: after `watch()` returns,
