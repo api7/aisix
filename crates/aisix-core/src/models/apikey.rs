@@ -86,9 +86,11 @@ impl ApiKey {
     }
 
     /// True if the key's `expires_at` deadline has passed at `now`.
-    /// Keys without a deadline never expire.
+    /// Keys without a deadline never expire. The comparison is strict
+    /// (`<`): the key is still valid at the deadline instant itself,
+    /// matching the established gateway-ecosystem semantics.
     pub fn is_expired_at(&self, now: DateTime<Utc>) -> bool {
-        self.expires_at.is_some_and(|deadline| deadline <= now)
+        self.expires_at.is_some_and(|deadline| deadline < now)
     }
 
     /// True if this key is allowed to call the given Model.
@@ -372,17 +374,21 @@ mod tests {
         let at = "2030-01-01T00:00:00Z".parse().unwrap();
         let after = "2030-01-01T00:00:01Z".parse().unwrap();
         assert!(!k.is_expired_at(before));
-        // The deadline itself is exclusive: a key is valid strictly
-        // before `expires_at`, expired from that instant on.
-        assert!(k.is_expired_at(at));
+        // Strict comparison: still valid at the deadline instant,
+        // expired strictly after it (ecosystem-aligned boundary).
+        assert!(!k.is_expired_at(at));
         assert!(k.is_expired_at(after));
     }
 
     #[test]
     fn rejects_malformed_expires_at() {
         // A non-RFC3339 string must fail deserialization so the loader
-        // rejects the row (fail closed) instead of silently treating
-        // the key as never-expiring.
+        // rejects the row instead of silently treating the key as
+        // never-expiring. Note the rejection is fail-closed on full
+        // loads/resyncs (the key is absent from the snapshot); on the
+        // incremental watch path a rejected UPDATE keeps the previous
+        // version serving until the next resync (pre-existing
+        // supervisor behavior shared by every resource kind).
         let r: Result<ApiKey, _> =
             serde_json::from_str(r#"{"key_hash":"h","allowed_models":[],"expires_at":"tomorrow"}"#);
         assert!(r.is_err());

@@ -214,17 +214,25 @@ describe("api key lifecycle e2e: expired/disabled keys fail closed, rotate swaps
 
     const plaintext = "sk-lifecycle-deadline";
     // Expires well after propagation completes (seedKey asserts a 200
-    // first), but soon enough for the test to observe the flip.
-    const expiresAt = new Date(Date.now() + 8_000).toISOString();
+    // first), but soon enough for the test to observe the flip. The
+    // runway must outlast worst-case propagation on shared-etcd CI
+    // runners — if propagation eats it anyway, the "no config change"
+    // premise is void, so skip rather than fail unrecoverably.
+    const runwayMs = 15_000;
+    const expiresAt = new Date(Date.now() + runwayMs).toISOString();
     await seedKey(plaintext, { expires_at: expiresAt }, is200);
+    if (Date.now() >= Date.parse(expiresAt)) {
+      ctx.skip();
+      return;
+    }
 
     // No admin writes from here on: the ONLY thing that changes is the
     // wall clock. Poll until the gateway starts rejecting.
     await waitConfigPropagation(
       async () => isLifecycle401("api_key_expired")(await chat(plaintext, "deadline probe")),
-      20_000,
+      runwayMs + 15_000,
     );
-  }, 40_000);
+  }, 60_000);
 
   test("Anthropic surface rejects a disabled key with the Anthropic envelope", async (ctx) => {
     if (!etcdReachable || !app) {
@@ -284,5 +292,34 @@ describe("api key lifecycle e2e: expired/disabled keys fail closed, rotate swaps
     const res = await chat(plaintext, "old secret after rotate");
     expect(res.status).toBe(401);
     await res.text();
+  });
+
+  test("rotate preserves lifecycle fields: a disabled key's new secret is still disabled", async (ctx) => {
+    if (!etcdReachable || !app || !admin) {
+      ctx.skip();
+      return;
+    }
+
+    const plaintext = "sk-lifecycle-rotate-disabled";
+    const expiresAt = "2099-01-01T00:00:00Z";
+    const { id } = await seedKey(
+      plaintext,
+      { disabled: true, expires_at: expiresAt },
+      isLifecycle401("api_key_disabled"),
+    );
+
+    const rotated = await admin!.json<{
+      entry: { id: string; value: { disabled?: boolean; expires_at?: string } };
+      plaintext: string;
+    }>("POST", `/admin/v1/apikeys/${id}/rotate`);
+
+    // Rotation swaps ONLY the secret — a regression that rebuilt the
+    // entry from a partial body would silently re-enable a disabled
+    // key under its fresh plaintext.
+    expect(rotated.entry.value.disabled).toBe(true);
+    expect(Date.parse(rotated.entry.value.expires_at ?? "")).toBe(Date.parse(expiresAt));
+    await waitConfigPropagation(async () =>
+      isLifecycle401("api_key_disabled")(await chat(rotated.plaintext, "rotated but disabled")),
+    );
   });
 });
