@@ -44,6 +44,9 @@ struct RerankDispatchSuccess {
     /// or a wire shape this gateway doesn't yet support). Handler
     /// gates UsageEvent emission on this being `Some`.
     usage: Option<RerankUsage>,
+    /// Per-detector PII mask counts (#932/#696) applied to the request.
+    /// Attached to the emitted UsageEvent. Empty = no redaction.
+    redactions: crate::redact::RedactionCounts,
 }
 
 /// Rerank has no completion side — only the input (query + docs)
@@ -114,6 +117,7 @@ pub async fn rerank(
                     elapsed,
                     &usage,
                     &client,
+                    success.redactions.clone(),
                 );
             }
             success.response
@@ -240,6 +244,11 @@ async fn dispatch(
             ));
         }
     }
+
+    // #932/#696: mask-action PII rules rewrite `query` + `documents[]` in
+    // place AFTER the block check passes, BEFORE the body is forwarded
+    // upstream. Pre-#696 a mask-action detector was a silent no-op here.
+    let redactions = crate::redact::redact_rerank_request(&resolved_chain, body);
 
     let model_rl =
         crate::quota::ModelRateLimit::from_model(&model_name, &model_entry.id, &model_entry.value);
@@ -465,6 +474,7 @@ async fn dispatch(
         provider_key_id: pk_entry.id.to_string(),
         applied_guardrails: applied_guardrails.clone(),
         usage,
+        redactions,
     })
 }
 
@@ -525,6 +535,8 @@ fn emit_usage_event(
     elapsed: Duration,
     usage: &RerankUsage,
     client: &ClientContext,
+    // Per-detector PII mask counts (#932/#696). Empty = no redaction.
+    redacted_entity_counts: crate::redact::RedactionCounts,
 ) {
     let snap = state.snapshot.load();
     let mut event = UsageEvent {
@@ -540,6 +552,7 @@ fn emit_usage_event(
         applied_guardrails: applied_guardrails.to_vec(),
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),
+        redacted_entity_counts,
         ..Default::default()
     };
     // Per-PK attribution tags (provider_kind / provider_featured /
@@ -1631,5 +1644,69 @@ mod tests {
         // The mock only matches when both the injected body field and header
         // are present — a 200 proves the PK request overrides were applied.
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    fn pii_mask_guardrail() -> ResourceEntry<aisix_core::Guardrail> {
+        let json = r#"{"name":"pii","enabled":true,"hook_point":"input","kind":"pii","detectors":[{"type":"email","action":"mask"}]}"#;
+        let g: aisix_core::Guardrail = serde_json::from_str(json).unwrap();
+        ResourceEntry::new("g-pii", g, 1)
+    }
+
+    /// #696: a mask-action PII detector must rewrite `query` + `documents[]`
+    /// (plain strings AND `{text}` objects) before the body reaches the
+    /// upstream. Pre-#696 the mask action was a silent no-op on /v1/rerank —
+    /// the raw text was forwarded. Also pins the counts on the UsageEvent.
+    #[tokio::test]
+    async fn pii_mask_rewrites_query_and_documents_before_upstream_issue_696() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/rerank"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "results": [],
+                "usage": {"total_tokens": 3}
+            })))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(openai_model("rr"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        snap.guardrails.insert(pii_mask_guardrail());
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        let handle = SnapshotHandle::new(snap);
+        let state = crate::ProxyState::new(handle, hub, &cfg())
+            .without_cache()
+            .with_usage_sink(aisix_obs::UsageSink::new(tx));
+        let app = crate::build_router(state);
+
+        let body = serde_json::json!({
+            "model": "rr",
+            "query": "who is a@x.com",
+            "documents": ["contact b@y.org now", {"text": "reach c@z.io"}]
+        });
+        let resp = tower::ServiceExt::oneshot(app, make_req(body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let reqs = upstream.received_requests().await.unwrap();
+        let sent = String::from_utf8_lossy(&reqs[0].body).into_owned();
+        assert!(sent.contains("[EMAIL_REDACTED]"), "sent: {sent}");
+        for raw in ["a@x.com", "b@y.org", "c@z.io"] {
+            assert!(!sent.contains(raw), "raw PII forwarded upstream: {sent}");
+        }
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted")
+            .expect("usage_sink sender dropped");
+        assert_eq!(
+            event.redacted_entity_counts.get("email"),
+            Some(&3),
+            "mask counts must reach the UsageEvent"
+        );
     }
 }
