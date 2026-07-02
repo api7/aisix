@@ -91,7 +91,7 @@
       ]
     },
     "disabled": {
-      "description": "Administratively disabled. A disabled key is rejected with `401` until it is enabled again; the key itself is preserved.",
+      "description": "Administratively disabled. A disabled key is rejected with `401` until it is enabled again; the key itself is preserved. Treated as `false` when omitted.",
       "type": "boolean"
     },
     "expires_at": {

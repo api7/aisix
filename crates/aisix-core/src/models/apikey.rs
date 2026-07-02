@@ -62,7 +62,8 @@ pub struct ApiKey {
     pub expires_at: Option<DateTime<Utc>>,
 
     /// Administratively disabled. A disabled key is rejected with `401`
-    /// until it is enabled again; the key itself is preserved.
+    /// until it is enabled again; the key itself is preserved. Treated
+    /// as `false` when omitted.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub disabled: bool,
 
