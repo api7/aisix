@@ -34,7 +34,8 @@ pub use error::{
 pub use models::{
     validate_apikey, validate_cache_policy, validate_guardrail, validate_mcp_server,
     validate_model, validate_observability_exporter, validate_provider_key,
-    validate_rate_limit_policy, Adapter, AisixSnapshot, ApiKey, AppliedGuardrail, CachePolicy,
+    validate_rate_limit_policy, A2aAgent, A2aAuthType, A2aProtocolVersion, Adapter, AisixSnapshot,
+    ApiKey, AppliedGuardrail, CachePolicy,
     CooldownConfig, ExporterKind, Guardrail, GuardrailHookPoint, GuardrailKind, KeywordConfig,
     KeywordPattern, McpAuthType, McpServer, McpTransport, Model, ObservabilityExporter,
     ParamConstraints, PolicyScope, PolicyWindow, ProviderKey, RateLimit, RateLimitPolicy,

@@ -32,6 +32,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "aisix-a2a"
+version = "0.1.0"
+dependencies = [
+ "aisix-core",
+ "async-trait",
+ "axum",
+ "http 1.4.0",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "aisix-admin"
 version = "0.1.0"
 dependencies = [

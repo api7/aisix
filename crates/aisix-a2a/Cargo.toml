@@ -1,0 +1,28 @@
+[package]
+name = "aisix-a2a"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "aisix: A2A (Agent-to-Agent) gateway — upstream JSON-RPC client behind the A2aBridge trait"
+
+[dependencies]
+aisix-core = { path = "../aisix-core" }
+tokio.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+http.workspace = true
+# A2A has no official Rust SDK (the reference SDKs are Python/JS/Java/Go/.NET),
+# so the JSON-RPC 2.0 + agent-card plumbing is hand-rolled directly on the
+# workspace HTTP client rather than pulled from an SDK.
+reqwest.workspace = true
+
+[dev-dependencies]
+aisix-core = { path = "../aisix-core" }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+axum.workspace = true
