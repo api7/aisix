@@ -172,8 +172,14 @@ describe("least-busy routing via passthrough endpoints e2e", () => {
     const fastBase = fast.receivedRequests.length;
 
     // Occupy A (both idle → declaration order) and do NOT await it.
+    // Wait until the slow upstream has actually RECEIVED it — the
+    // in-flight guard is acquired before the upstream send, so
+    // arrival implies the count is raised (a fixed sleep can race on
+    // slow CI).
     const inflight = postMessages("msg-busy-virtual", "occupy-a");
-    await new Promise((r) => setTimeout(r, 200));
+    await waitConfigPropagation(
+      async () => slow.receivedRequests.length - slowBase >= 1,
+    );
 
     // A has 1 in-flight, B has 0 → least_busy must divert to B. Before
     // the fix /v1/messages never raised the count, so this landed on A.
@@ -223,8 +229,11 @@ describe("least-busy routing via passthrough endpoints e2e", () => {
     const slowBase = slow.receivedRequests.length;
     const fastBase = fast.receivedRequests.length;
 
+    // Same deterministic gate as the messages test above.
     const inflight = postResponses("resp-busy-virtual", "occupy-a");
-    await new Promise((r) => setTimeout(r, 200));
+    await waitConfigPropagation(
+      async () => slow.receivedRequests.length - slowBase >= 1,
+    );
 
     const diverted = await postResponses("resp-busy-virtual", "divert-to-b");
     expect(diverted.status).toBe(200);
