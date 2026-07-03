@@ -328,6 +328,7 @@ dependencies = [
 name = "aisix-proxy"
 version = "0.1.0"
 dependencies = [
+ "aisix-a2a",
  "aisix-cache",
  "aisix-core",
  "aisix-gateway",

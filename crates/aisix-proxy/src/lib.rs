@@ -24,6 +24,7 @@
 #![forbid(unsafe_code)]
 #![deny(rust_2018_idioms)]
 
+mod a2a;
 mod attempt;
 mod audio;
 mod auth;
@@ -112,6 +113,15 @@ pub fn build_router(state: ProxyState) -> Router {
         // enforced inside the handler via the `AuthenticatedKey` extractor.
         .route("/mcp", any(mcp::mcp_endpoint))
         .route("/mcp/", any(mcp::mcp_endpoint))
+        // Downstream-facing A2A gateway. One route per registered agent; the
+        // agent's card (with the service URL rewritten to the gateway) is served
+        // at the RFC 8615 well-known path under it. Authentication (AISIX API
+        // key) is enforced inside the handlers via `AuthenticatedKey`.
+        .route("/a2a/:agent", post(a2a::a2a_endpoint))
+        .route(
+            "/a2a/:agent/.well-known/agent-card.json",
+            get(a2a::a2a_agent_card),
+        )
         // Wire the configured cap into axum's request-body extractor
         // chain (`Json<T>` defers to `Bytes` which honors this layer).
         // Without this, axum 0.7's `DefaultBodyLimit` falls back to
@@ -186,6 +196,7 @@ fn normalize_endpoint_label(path: &str) -> &'static str {
         "/v1/audio/translations" => "/v1/audio/translations",
         "/v1/audio/speech" => "/v1/audio/speech",
         "/mcp" | "/mcp/" => "/mcp",
+        _ if path.starts_with("/a2a/") => "/a2a",
         _ if path.starts_with("/passthrough/") => "/passthrough/:provider/*rest",
         _ => "other",
     }
@@ -196,6 +207,8 @@ fn inbound_protocol_for_endpoint(endpoint: &str) -> &'static str {
         "anthropic"
     } else if endpoint == "/mcp" {
         "mcp"
+    } else if endpoint == "/a2a" {
+        "a2a"
     } else {
         "openai"
     }
