@@ -875,6 +875,12 @@ async fn anthropic_passthrough_dispatch(
         }
     }
     let send_started = Instant::now();
+    // least_busy: count this target as in-flight for the upstream call
+    // (mirrors chat.rs). Non-streaming / error paths drop the guard at
+    // function return; the streaming branch moves it into the
+    // end-of-stream closure next to `stream_hold`, so the count stays
+    // raised for the stream's full lifetime.
+    let in_flight = state.runtime_status.begin_in_flight(model_id);
     // Streaming bounds the connect by the stream deadline (reqwest's
     // request-level timeout can't be used — it would cap the whole stream);
     // non-streaming relies on the request-level timeout set above.
@@ -1063,6 +1069,9 @@ async fn anthropic_passthrough_dispatch(
                     limiter_c.add_tokens_post_stream(key, streamed_tokens);
                 }
                 drop(stream_hold);
+                // least_busy: stream over — this target is no longer
+                // in-flight.
+                drop(in_flight);
 
                 let metrics = AnthropicUsageMetrics {
                     prompt_tokens: usage.prompt_tokens,
@@ -1416,6 +1425,13 @@ async fn cross_provider_dispatch(
     let provider_key_id = model.provider_key_id.as_deref().unwrap_or("unknown");
     let upstream_model = model.upstream_model().unwrap_or("unknown").to_string();
 
+    // least_busy: count this target as in-flight for the upstream call
+    // (mirrors chat.rs). Non-streaming / error paths drop the guard at
+    // function return; the streaming branch moves it into the
+    // end-of-stream closure next to `stream_hold`, so the count stays
+    // raised for the stream's full lifetime.
+    let in_flight = state.runtime_status.begin_in_flight(model_id);
+
     if is_stream {
         let upstream = bridge.chat_stream(&chat, &ctx).await.map_err(|err| {
             if let Some((ttl, reason)) =
@@ -1534,6 +1550,9 @@ async fn cross_provider_dispatch(
                     limiter_for_stream.add_tokens_post_stream(key, streamed_tokens);
                 }
                 drop(stream_hold);
+                // least_busy: stream over — this target is no longer
+                // in-flight.
+                drop(in_flight);
 
                 let metrics = AnthropicUsageMetrics {
                     prompt_tokens: comp.prompt_tokens,

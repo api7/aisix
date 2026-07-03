@@ -799,6 +799,12 @@ async fn responses_to_target(
         }
     }
     let send_started = Instant::now();
+    // least_busy: count this target as in-flight for the upstream call
+    // (mirrors chat.rs). Non-streaming / error paths drop the guard at
+    // function return; the streaming branch moves it into the
+    // end-of-stream closure next to `stream_hold`, so the count stays
+    // raised for the stream's full lifetime.
+    let in_flight = state.runtime_status.begin_in_flight(model_id);
     // Streaming bounds the connect by the stream deadline (reqwest's
     // request-level timeout can't be used — it would cap the whole stream);
     // non-streaming relies on the request-level timeout set above.
@@ -1086,6 +1092,9 @@ async fn responses_to_target(
                     limiter_c.add_tokens_post_stream(key, streamed_tokens);
                 }
                 drop(stream_hold);
+                // least_busy: stream over — this target is no longer
+                // in-flight.
+                drop(in_flight);
                 // Content capture (AISIX-Cloud#947): prompt captured up front,
                 // output text assembled by the stream wrapper (empty when no
                 // exporter wants content).
@@ -1302,6 +1311,13 @@ async fn responses_cross_provider_to_target(
     }
     let provider_label = provider.to_ascii_lowercase();
 
+    // least_busy: count this target as in-flight for the upstream call
+    // (mirrors chat.rs). Non-streaming / error paths drop the guard at
+    // function return; the streaming branch moves it into the
+    // end-of-stream closure next to `stream_hold`, so the count stays
+    // raised for the stream's full lifetime.
+    let in_flight = state.runtime_status.begin_in_flight(model_id);
+
     if is_stream {
         let upstream = bridge.chat_stream(&chat, &ctx).await.map_err(|err| {
             if let Some((ttl, reason)) =
@@ -1409,6 +1425,9 @@ async fn responses_cross_provider_to_target(
                     limiter_c.add_tokens_post_stream(key, streamed_tokens);
                 }
                 drop(stream_hold);
+                // least_busy: stream over — this target is no longer
+                // in-flight.
+                drop(in_flight);
                 let usage = ResponseUsage {
                     prompt_tokens: comp.prompt_tokens,
                     completion_tokens: comp.completion_tokens,
