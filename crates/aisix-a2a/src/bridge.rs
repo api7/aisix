@@ -20,10 +20,12 @@
 //!   body shape are the caller's concern, not this layer's.
 //!   <https://a2a-protocol.org/latest/topics/life-of-a-task/>
 
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use aisix_core::{A2aAgent, A2aAuthType};
 use async_trait::async_trait;
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 
 use crate::error::A2aError;
@@ -39,6 +41,61 @@ const API_KEY_HEADER: &str = "x-api-key";
 
 /// Standard RFC 8615 well-known path for an A2A agent card.
 const AGENT_CARD_PATH: &str = "/.well-known/agent-card.json";
+
+/// Hard cap on an upstream response body the gateway will buffer. A registered
+/// agent is semi-trusted, but a compromised or misbehaving one must not be able
+/// to OOM the gateway with a multi-gigabyte (or unbounded streaming) response.
+/// Generous for a JSON-RPC task result; a per-agent override can be added later.
+const MAX_UPSTREAM_BODY_BYTES: usize = 16 * 1024 * 1024;
+
+/// The shared outbound HTTP client. Built once (a `reqwest::Client` is a
+/// connection-pool handle — cloning is cheap and shares the pool) so every
+/// upstream call reuses connections instead of standing up a fresh pool + TLS
+/// handshake per request.
+///
+/// Redirects are refused: the data plane runs inside the customer's VPC, and a
+/// compromised or MITM'd upstream returning `302 Location: http://169.254.169.254/…`
+/// (or a loopback address) would otherwise turn the gateway into an SSRF pivot.
+/// A legitimate A2A agent does not redirect its JSON-RPC endpoint or card. This
+/// mirrors the MCP OAuth client, which refuses redirects for the same reason.
+fn shared_client() -> reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("reqwest client (redirect-disabled) builds")
+        })
+        .clone()
+}
+
+/// Read an upstream response body, refusing anything larger than
+/// [`MAX_UPSTREAM_BODY_BYTES`]. An honestly-declared oversized `Content-Length`
+/// is rejected up front; a lying or absent length (including a never-ending
+/// stream) is caught as chunks accumulate, so the buffer can never exceed the
+/// cap regardless of what the upstream claims.
+async fn read_capped(resp: reqwest::Response) -> Result<Vec<u8>, A2aError> {
+    if let Some(len) = resp.content_length() {
+        if len > MAX_UPSTREAM_BODY_BYTES as u64 {
+            return Err(A2aError::Request(format!(
+                "upstream response too large: {len} bytes"
+            )));
+        }
+    }
+    let mut stream = resp.bytes_stream();
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| A2aError::Request(e.to_string()))?;
+        if buf.len() + chunk.len() > MAX_UPSTREAM_BODY_BYTES {
+            return Err(A2aError::Request(
+                "upstream response exceeded size cap".to_string(),
+            ));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
 
 /// How the gateway authenticates to an upstream A2A agent. The credential is
 /// held here on the gateway side and is never exposed to the calling client —
@@ -159,11 +216,13 @@ pub struct HttpBridge {
 }
 
 impl HttpBridge {
-    /// Build a bridge for one upstream agent.
+    /// Build a bridge for one upstream agent. Reuses the shared, redirect-free
+    /// HTTP client (see [`shared_client`]); the per-agent timeout is applied
+    /// per-request, so a shared client does not lose the per-agent deadline.
     pub fn new(upstream: A2aUpstream) -> Self {
         Self {
             upstream,
-            client: reqwest::Client::new(),
+            client: shared_client(),
         }
     }
 
@@ -202,8 +261,8 @@ impl A2aBridge for HttpBridge {
                 resp.status().as_u16()
             )));
         }
-        resp.json::<AgentCard>()
-            .await
+        let bytes = read_capped(resp).await?;
+        serde_json::from_slice::<AgentCard>(&bytes)
             .map_err(|e| A2aError::Request(format!("malformed agent card: {e}")))
     }
 
@@ -219,13 +278,15 @@ impl A2aBridge for HttpBridge {
             .await
             .map_err(|e| A2aError::Connect(e.to_string()))?;
         if !resp.status().is_success() {
+            // Surface the upstream STATUS only — never proxy the upstream error
+            // body verbatim to the caller, which could leak upstream internals.
             return Err(A2aError::Request(format!(
                 "upstream returned HTTP {}",
                 resp.status().as_u16()
             )));
         }
-        resp.json::<serde_json::Value>()
-            .await
+        let bytes = read_capped(resp).await?;
+        serde_json::from_slice::<serde_json::Value>(&bytes)
             .map_err(|e| A2aError::Request(format!("malformed JSON-RPC response: {e}")))
     }
 }

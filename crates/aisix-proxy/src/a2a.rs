@@ -359,4 +359,164 @@ mod tests {
     fn gateway_base_is_none_without_host() {
         assert_eq!(gateway_base(&HeaderMap::new()), None);
     }
+
+    // ---- endpoint integration tests: drive the real router via oneshot ----
+    use crate::build_router;
+    use aisix_core::{A2aAgent, AisixSnapshot, ApiKey, ProxyConfig, ResourceEntry, SnapshotHandle};
+    use axum::body::Body;
+    use axum::http::Request as HttpRequest;
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    const TOKEN: &str = "sk-a2a-endpoint-test";
+
+    fn proxy_cfg() -> ProxyConfig {
+        ProxyConfig {
+            addr: "127.0.0.1:0".into(),
+            request_body_limit_bytes: 1_048_576,
+            real_ip: Default::default(),
+            tls: None,
+        }
+    }
+
+    /// Snapshot with one API key (granting `allowed_agents`, or none when
+    /// `allowed_agents` is `null`) and one `invoice` agent at `agent_url`.
+    fn snapshot_with(
+        agent_url: &str,
+        enabled: bool,
+        allowed_agents: serde_json::Value,
+    ) -> AisixSnapshot {
+        let mut key = serde_json::json!({
+            "key_hash": ApiKey::hash_bearer(TOKEN),
+            "allowed_models": ["*"],
+        });
+        if !allowed_agents.is_null() {
+            key["allowed_agents"] = allowed_agents;
+        }
+        let apikey: ApiKey = serde_json::from_value(key).expect("valid apikey");
+        let agent: A2aAgent = serde_json::from_value(serde_json::json!({
+            "display_name": "invoice",
+            "url": agent_url,
+            "enabled": enabled,
+        }))
+        .expect("valid a2a agent");
+
+        let snap = AisixSnapshot::new();
+        snap.apikeys.insert(ResourceEntry::new("ak-1", apikey, 1));
+        snap.a2a_agents.insert(ResourceEntry::new("ag-1", agent, 1));
+        snap
+    }
+
+    fn router_with(snap: AisixSnapshot) -> axum::Router {
+        let handle = SnapshotHandle::new(snap);
+        let hub = Arc::new(aisix_gateway::Hub::new());
+        build_router(ProxyState::new(handle, hub, &proxy_cfg()).without_cache())
+    }
+
+    fn a2a_post(agent: &str, auth: bool) -> HttpRequest<Body> {
+        let body = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "message/send"});
+        let mut b = HttpRequest::post(format!("/a2a/{agent}"))
+            .header("host", "a2a.aisix.example.com")
+            .header("content-type", "application/json");
+        if auth {
+            b = b.header("authorization", format!("Bearer {TOKEN}"));
+        }
+        b.body(Body::from(body.to_string())).unwrap()
+    }
+
+    #[tokio::test]
+    async fn endpoint_denies_key_without_allowed_agents_403() {
+        // Unreachable upstream on purpose: the ACL must reject BEFORE any
+        // upstream call is made.
+        let app = router_with(snapshot_with(
+            "http://127.0.0.1:1/a2a",
+            true,
+            serde_json::Value::Null,
+        ));
+        let resp = app.oneshot(a2a_post("invoice", true)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn endpoint_disabled_agent_is_404() {
+        let app = router_with(snapshot_with(
+            "http://127.0.0.1:1/a2a",
+            false,
+            serde_json::json!(["*"]),
+        ));
+        let resp = app.oneshot(a2a_post("invoice", true)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn endpoint_unknown_agent_is_404() {
+        let app = router_with(snapshot_with(
+            "http://127.0.0.1:1/a2a",
+            true,
+            serde_json::json!(["*"]),
+        ));
+        let resp = app.oneshot(a2a_post("does-not-exist", true)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn endpoint_missing_key_is_401() {
+        let app = router_with(snapshot_with(
+            "http://127.0.0.1:1/a2a",
+            true,
+            serde_json::json!(["*"]),
+        ));
+        let resp = app.oneshot(a2a_post("invoice", false)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// A stub upstream that serves an agent card advertising an internal URL.
+    async fn spawn_card_stub() -> std::net::SocketAddr {
+        let app = axum::Router::new().route(
+            "/.well-known/agent-card.json",
+            axum::routing::get(|| async {
+                axum::Json(serde_json::json!({
+                    "name": "Invoice Agent",
+                    "url": "https://upstream.internal/a2a",
+                    "version": "2.1.0",
+                    "skills": [{"id": "extract"}]
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service())
+                .await
+                .unwrap();
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn endpoint_rewrites_agent_card_url_to_gateway() {
+        let addr = spawn_card_stub().await;
+        let app = router_with(snapshot_with(
+            &format!("http://{addr}/a2a"),
+            true,
+            serde_json::json!(["*"]),
+        ));
+        let req = HttpRequest::get("/a2a/invoice/.well-known/agent-card.json")
+            .header("host", "a2a.aisix.example.com")
+            .header("authorization", format!("Bearer {TOKEN}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1_048_576)
+            .await
+            .unwrap();
+        let card: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        // The advertised service URL is rewritten to the gateway; the caller's
+        // Host is reflected and every other card field is preserved.
+        assert_eq!(card["url"], "https://a2a.aisix.example.com/a2a/invoice");
+        assert_eq!(card["name"], "Invoice Agent");
+        assert_eq!(card["version"], "2.1.0");
+        assert_eq!(card["skills"][0]["id"], "extract");
+    }
 }

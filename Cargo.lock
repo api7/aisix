@@ -38,6 +38,7 @@ dependencies = [
  "aisix-core",
  "async-trait",
  "axum",
+ "futures",
  "http 1.4.0",
  "reqwest 0.12.28",
  "serde",
