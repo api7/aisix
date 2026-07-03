@@ -65,8 +65,41 @@ const SHUTDOWN_GRACE_MS = 3_000;
  * on the proxy, `/admin/v1/health` on the admin listener, and the scrape
  * path on the metrics listener to respond 200. `exit()` issues SIGTERM
  * and waits up to 3s, escalating to SIGKILL.
+ *
+ * A startup that dies to a port collision (an external process bound one
+ * of the picked ports in the pick→bind window; see `ports.ts`) is retried
+ * with fresh ports rather than failing the test.
  */
 export async function spawnApp(overrides: AppOverrides = {}): Promise<SpawnedApp> {
+  const MAX_ATTEMPTS = 3;
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await spawnAppOnce(overrides);
+    } catch (err) {
+      if (attempt < MAX_ATTEMPTS && isAddrInUseStartupFailure(err)) {
+        console.warn(
+          `spawnApp: aisix died to a port collision (attempt ${attempt}/${MAX_ATTEMPTS}), retrying with fresh ports`,
+        );
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
+/**
+ * True when the spawn failure is `aisix` exiting at startup because one
+ * of its listeners hit AddrInUse — the only failure class `spawnApp`
+ * retries (anything else is a real bug the test must surface).
+ */
+export function isAddrInUseStartupFailure(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  // Matches both the OS error text ("Address already in use (os error
+  // 98)") and Rust's ErrorKind rendering ("AddrInUse").
+  return msg.includes("exited early") && /addr(?:ess)?\s*(?:already\s*)?in\s*use/i.test(msg);
+}
+
+async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
   const etcd = new EtcdClient();
   if (!(await etcd.ping())) {
     throw new Error(
@@ -178,11 +211,17 @@ export async function spawnApp(overrides: AppOverrides = {}): Promise<SpawnedApp
     ]);
   } catch (err) {
     const detail = exitErr ?? "still running";
-    const stderr = stderrBuf.slice(-2000);
+    // Keep the head too — a startup error (anyhow's `Error: …` line)
+    // prints before its backtrace, and a tail-only excerpt used to cut
+    // exactly the line that says what went wrong.
+    const stderr =
+      stderrBuf.length <= 3000
+        ? stderrBuf
+        : `${stderrBuf.slice(0, 1500)}\n  […]\n${stderrBuf.slice(-1500)}`;
     await terminate(child);
     await cleanup(etcd, etcdPrefix, dir);
     throw new Error(
-      `${(err as Error).message}\n  binary state: ${detail}\n  stderr tail:\n${stderr}`,
+      `${(err as Error).message}\n  binary state: ${detail}\n  stderr:\n${stderr}`,
     );
   }
 
