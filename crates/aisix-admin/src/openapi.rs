@@ -3172,7 +3172,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
             "items": {
               "type": "string"
             },
-            "description": "MCP tools this key may call, as namespaced `<server>__<tool>` names. A wildcard entry `\"*\"` grants every tool. When omitted or set to `null`, the key has no MCP tool access."
+            "description": "MCP tools this key may call, as namespaced `<server>__<tool>` names (the form the gateway exposes). Entries are matched as single-`*` globs, mirroring `allowed_models`: `\"*\"` grants every tool and `\"<server>__*\"` grants every tool on one server (e.g. `\"github__*\"`); an entry without a `*` matches one tool exactly. When omitted or set to `null`, the key has no MCP tool access — access is granted explicitly."
           },
           "expires_at": {
             "type": [
@@ -3494,7 +3494,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
             "items": {
               "type": "string"
             },
-            "description": "MCP tools this key may call, as namespaced `<server>__<tool>` names. A wildcard entry `\"*\"` grants every tool. When omitted or set to `null`, the key has no MCP tool access.",
+            "description": "MCP tools this key may call, as namespaced `<server>__<tool>` names (the form the gateway exposes). Entries are matched as single-`*` globs, mirroring `allowed_models`: `\"*\"` grants every tool and `\"<server>__*\"` grants every tool on one server (e.g. `\"github__*\"`); an entry without a `*` matches one tool exactly. When omitted or set to `null`, the key has no MCP tool access — access is granted explicitly.",
             "example": [
               "github__create_issue"
             ]
@@ -4232,6 +4232,10 @@ mod tests {
             request_allowed_tools.contains("omitted or set to `null`"),
             "self-hosted API key request schema must document null tool-access behavior"
         );
+        assert!(
+            request_allowed_tools.contains("<server>__*"),
+            "self-hosted API key request schema must document the per-server wildcard"
+        );
         let public = &parsed["components"]["schemas"]["PublicApiKey"];
         assert!(
             public["properties"].get("allowed_tools").is_some(),
@@ -4243,6 +4247,10 @@ mod tests {
         assert!(
             public_allowed_tools.contains("omitted or set to `null`"),
             "API key response schema must document null tool-access behavior"
+        );
+        assert!(
+            public_allowed_tools.contains("<server>__*"),
+            "API key response schema must document the per-server wildcard"
         );
         assert!(request["properties"].get("team_id").is_none());
         assert!(request["properties"].get("user_id").is_none());

@@ -117,6 +117,10 @@ impl ApiKey {
     /// permits `github__create_issue`); entries without a `*` match exactly.
     /// A key with no `allowed_tools` (or an empty list) may call no MCP tools —
     /// access is granted explicitly, matching [`ApiKey::can_access`].
+    ///
+    /// Currently exercised only by tests: the live MCP enforcement path builds
+    /// an `aisix_mcp::ToolAcl` from `allowed_tools` and uses the identical
+    /// matcher, so this method is kept in lockstep as the documented mirror.
     pub fn can_access_tool(&self, tool: &str) -> bool {
         match &self.allowed_tools {
             None => false,
@@ -260,6 +264,18 @@ mod tests {
         // and a server whose name merely shares the prefix, are both denied.
         assert!(!per_server.can_access_tool("slack__post_message"));
         assert!(!per_server.can_access_tool("githubenterprise__create_issue"));
+
+        // The glob is a single `*` anywhere, not only trailing (same as
+        // `allowed_models`): `"*__readonly"` is a genuine any-server grant of
+        // a same-named tool. Pinned so the breadth stays intentional.
+        let any_server: ApiKey = serde_json::from_str(
+            r#"{"key_hash":"h","allowed_models":[],"allowed_tools":["*__readonly"]}"#,
+        )
+        .unwrap();
+        assert!(any_server.can_access_tool("github__readonly"));
+        assert!(any_server.can_access_tool("slack__readonly"));
+        // The suffix still anchors — a longer tool name doesn't match.
+        assert!(!any_server.can_access_tool("github__readonly_admin"));
     }
 
     #[test]
