@@ -73,7 +73,22 @@ RUN apt-get update \
     && mkdir -p /etc/aisix/tls /var/lib/aisix \
     && chown -R aisix:aisix /etc/aisix /var/lib/aisix
 
-COPY --from=builder /usr/local/bin/aisix /usr/local/bin/aisix
+# Install the binary and grant CAP_NET_BIND_SERVICE as a file
+# capability so the non-root user can bind privileged ports (e.g.
+# listening on :80/:443 with Kubernetes hostNetwork). Install + setcap
+# happen in one RUN (bind-mount, no COPY) so the binary isn't
+# duplicated across layers by the xattr change. Caveat: with the
+# effective bit set, exec fails outright if NET_BIND_SERVICE is
+# missing from the container's bounding set — it is in the default
+# Docker/containerd cap set, but `capabilities: {drop: [ALL]}` pod
+# specs must add NET_BIND_SERVICE back.
+RUN --mount=type=bind,from=builder,source=/usr/local/bin/aisix,target=/mnt/aisix \
+    apt-get update \
+    && apt-get install -y --no-install-recommends libcap2-bin \
+    && install -m 0755 /mnt/aisix /usr/local/bin/aisix \
+    && setcap 'cap_net_bind_service=+ep' /usr/local/bin/aisix \
+    && apt-get purge -y --auto-remove libcap2-bin \
+    && rm -rf /var/lib/apt/lists/*
 
 # Bake the managed-mode bootstrap config so aisix.cloud tenants can
 # `docker run` without mounting anything — env vars carry the per-DP
