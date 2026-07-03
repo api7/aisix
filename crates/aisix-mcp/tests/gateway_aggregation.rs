@@ -499,6 +499,12 @@ fn tool_acl_from_allowed_semantics() {
         ToolAcl::from_allowed(Some(&["a__b".to_string()])),
         ToolAcl::Allow(_)
     ));
+    // A per-server wildcard is a scoped Allow, not AllowAll — only a bare
+    // `"*"` opens everything.
+    assert!(matches!(
+        ToolAcl::from_allowed(Some(&["github__*".to_string()])),
+        ToolAcl::Allow(_)
+    ));
 }
 
 #[tokio::test]
@@ -548,6 +554,52 @@ async fn tool_acl_filters_list_and_rejects_calls() {
         !msg.contains("permitted") && !msg.contains("forbidden") && !msg.contains("exists"),
         "rejection must not reveal existence/permission detail, got: {msg}"
     );
+}
+
+#[tokio::test]
+async fn tool_acl_per_server_wildcard_scopes_to_one_server() {
+    // A `<server>__*` grant exposes every tool on that server and nothing
+    // from any other — the granularity an operator gets without a live tool
+    // list. Two real upstreams; the key is scoped to alpha only.
+    let gateway = McpGateway::new([
+        ("alpha".to_string(), bridge_to("alpha").await),
+        ("beta".to_string(), bridge_to("beta").await),
+    ])
+    .with_tool_acl(ToolAcl::from_allowed(Some(&["alpha__*".to_string()])));
+    let gw_addr = spawn_gateway(gateway).await;
+    let client = ()
+        .serve(StreamableHttpClientTransport::from_uri(format!(
+            "http://{gw_addr}/mcp"
+        )))
+        .await
+        .expect("connect");
+
+    // Every alpha tool is exposed; nothing from beta.
+    let tools = client.list_all_tools().await.expect("list tools");
+    let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+    assert!(
+        names.iter().all(|n| n.starts_with("alpha__")),
+        "per-server wildcard must expose only alpha's tools, got: {names:?}"
+    );
+    assert!(
+        names.contains(&"alpha__echo"),
+        "alpha's tool should be visible, got: {names:?}"
+    );
+    assert!(
+        !names.iter().any(|n| n.starts_with("beta__")),
+        "beta's tools must stay hidden, got: {names:?}"
+    );
+
+    // alpha is callable; beta is rejected by the same ACL (defense-in-depth).
+    let allowed = client
+        .call_tool(call("alpha__echo", "hi"))
+        .await
+        .expect("permitted call");
+    assert_eq!(first_text(&allowed), "alpha:hi");
+    client
+        .call_tool(call("beta__echo", "hi"))
+        .await
+        .expect_err("a tool outside the granted server must be rejected");
 }
 
 /// Build a `tools/call` for `name` with a single `text` argument.

@@ -81,7 +81,7 @@
       "type": "array"
     },
     "allowed_tools": {
-      "description": "MCP tools this key may call, as namespaced `<server>__<tool>` names (the form the gateway exposes). A wildcard entry `\"*\"` grants every tool. When omitted or set to `null`, the key has no MCP tool access — access is granted explicitly, matching `allowed_models`.",
+      "description": "MCP tools this key may call, as namespaced `<server>__<tool>` names (the form the gateway exposes). Entries are matched as single-`*` globs, mirroring `allowed_models`: `\"*\"` grants every tool and `\"<server>__*\"` grants every tool on one server (e.g. `\"github__*\"`); an entry without a `*` matches one tool exactly. When omitted or set to `null`, the key has no MCP tool access — access is granted explicitly.",
       "items": {
         "type": "string"
       },

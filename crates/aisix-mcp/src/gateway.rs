@@ -65,7 +65,8 @@ pub enum ToolAcl {
 impl ToolAcl {
     /// Build an ACL from an API key's `allowed_tools` list: `None` or an empty
     /// list grants no tools; a list containing `"*"` grants all; otherwise the
-    /// exact namespaced set. Mirrors `ApiKey::can_access_tool`.
+    /// listed patterns. Entries are matched as single-`*` globs (see
+    /// [`ToolAcl::permits`]), mirroring `ApiKey::can_access_tool`.
     pub fn from_allowed(allowed: Option<&[String]>) -> Self {
         match allowed {
             Some(list) if list.iter().any(|t| t == "*") => Self::AllowAll,
@@ -74,10 +75,16 @@ impl ToolAcl {
         }
     }
 
+    /// Whether `namespaced_tool` is permitted. Patterns are single-`*` globs:
+    /// `"<server>__*"` grants every tool on that server, a pattern without a
+    /// `*` matches exactly. (A bare `"*"` is folded into [`Self::AllowAll`] at
+    /// construction.) Uses the same matcher as `ApiKey::can_access_tool`.
     fn permits(&self, namespaced_tool: &str) -> bool {
         match self {
             Self::AllowAll => true,
-            Self::Allow(set) => set.contains(namespaced_tool),
+            Self::Allow(patterns) => patterns
+                .iter()
+                .any(|p| aisix_core::wildcard::wildcard_matches(p, namespaced_tool)),
         }
     }
 }
