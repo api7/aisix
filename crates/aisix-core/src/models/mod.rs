@@ -15,6 +15,7 @@
 //! Standalone deployments do per-key rate-limiting via
 //! `ApiKey::rate_limit`.
 
+pub mod a2a_agent;
 pub mod apikey;
 pub mod cache_policy;
 pub mod embedding;
@@ -31,6 +32,7 @@ pub mod schema;
 pub mod semantic;
 pub mod snapshot;
 
+pub use a2a_agent::{A2aAgent, A2aAuthType, A2aProtocolVersion};
 pub use apikey::ApiKey;
 pub use cache_policy::{AppliesTo, CacheBackend, CachePolicy};
 pub use embedding::EmbeddingConfig;
