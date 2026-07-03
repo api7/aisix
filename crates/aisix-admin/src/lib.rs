@@ -34,6 +34,7 @@
 #![forbid(unsafe_code)]
 #![deny(rust_2018_idioms)]
 
+mod a2a_agents_handlers;
 mod apikeys_handlers;
 mod auth;
 mod cache_policies_handlers;
@@ -130,6 +131,17 @@ pub fn build_router(state: AdminState) -> Router {
             get(mcp_servers_handlers::get_mcp_server)
                 .put(mcp_servers_handlers::update_mcp_server)
                 .delete(mcp_servers_handlers::delete_mcp_server),
+        )
+        .route(
+            "/admin/v1/a2a_agents",
+            get(a2a_agents_handlers::list_a2a_agents)
+                .post(a2a_agents_handlers::create_a2a_agent),
+        )
+        .route(
+            "/admin/v1/a2a_agents/:id",
+            get(a2a_agents_handlers::get_a2a_agent)
+                .put(a2a_agents_handlers::update_a2a_agent)
+                .delete(a2a_agents_handlers::delete_a2a_agent),
         )
         .route(
             "/admin/v1/guardrails",
