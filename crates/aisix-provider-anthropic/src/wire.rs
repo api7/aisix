@@ -448,6 +448,80 @@ pub fn translate_anthropic_tool_choice_to_openai(
     }
 }
 
+/// Rewrite `extra` (as filled by [`parse_inbound_request`], i.e. raw
+/// Anthropic `/v1/messages` top-level fields) into the OpenAI chat shape
+/// that non-Anthropic bridges expect. Whitelist-translate what maps
+/// cleanly; drop everything else — Anthropic-only fields flattened onto
+/// an OpenAI-compatible upstream request are rejected as unknown
+/// parameters, e.g. 400 "Unknown parameter: 'context_management'"
+/// (AISIX-Cloud#953). Mirrors the `/v1/responses` bridge's
+/// whitelist-and-drop policy (#825) in the opposite direction.
+///
+/// Translations (matching LiteLLM's Anthropic→OpenAI adapter):
+///   tools / tool_choice   → OpenAI shapes (existing helpers)
+///   stop_sequences        → stop
+///   metadata.user_id      → user
+///   thinking              → reasoning_effort
+pub fn translate_extras_to_openai_shape(extra: &mut serde_json::Map<String, serde_json::Value>) {
+    let anthropic = std::mem::take(extra);
+    for (key, value) in anthropic {
+        match key.as_str() {
+            "tools" => {
+                if let Some(translated) = translate_anthropic_tools_to_openai(value) {
+                    extra.insert("tools".to_string(), translated);
+                }
+            }
+            "tool_choice" => {
+                if let Some(translated) = translate_anthropic_tool_choice_to_openai(value) {
+                    extra.insert("tool_choice".to_string(), translated);
+                }
+            }
+            "stop_sequences" => {
+                extra.insert("stop".to_string(), value);
+            }
+            "metadata" => {
+                if let Some(user_id) = value.get("user_id").and_then(|v| v.as_str()) {
+                    extra.insert("user".to_string(), user_id.into());
+                }
+            }
+            "thinking" => {
+                if let Some(effort) = reasoning_effort_from_thinking(&value) {
+                    extra.insert("reasoning_effort".to_string(), effort.into());
+                }
+            }
+            _ => {
+                tracing::debug!(
+                    field = %key,
+                    "dropping Anthropic-only request field on cross-provider dispatch"
+                );
+            }
+        }
+    }
+}
+
+/// Bucket Anthropic `thinking` into an OpenAI `reasoning_effort` label.
+/// Thresholds match LiteLLM's `reasoning_effort_from_thinking_budget`
+/// (budget_tokens ≥ 4096 → high, ≥ 2048 → medium, ≥ 1024 → low, below →
+/// minimal; `adaptive` → medium; `disabled`/unrecognised → None).
+fn reasoning_effort_from_thinking(thinking: &serde_json::Value) -> Option<&'static str> {
+    match thinking.get("type").and_then(|t| t.as_str())? {
+        "enabled" => {
+            let budget = thinking
+                .get("budget_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            Some(match budget {
+                b if b >= 4096 => "high",
+                b if b >= 2048 => "medium",
+                b if b >= 1024 => "low",
+                _ => "minimal",
+            })
+        }
+        "adaptive" => Some("medium"),
+        _ => None,
+    }
+}
+
 /// Non-streaming response shape from `/v1/messages`.
 #[derive(Debug, Deserialize)]
 pub struct AnthropicResponse {
@@ -2242,6 +2316,97 @@ mod tests {
             parse_inbound_request(&body).unwrap_err(),
             AnthropicInboundError::MissingModel,
         ));
+    }
+
+    // ─── translate_extras_to_openai_shape (AISIX-Cloud#953) ───────
+
+    #[test]
+    fn extras_shape_drops_anthropic_only_fields() {
+        let mut extra = serde_json::json!({
+            "context_management": {"edits": [{"type": "clear_tool_uses_20250919"}]},
+            "top_k": 40,
+            "mcp_servers": [{"type": "url", "url": "https://example.com/mcp"}],
+            "container": "container_abc",
+            "service_tier": "standard_only",
+            "betas": ["context-management-2025-06-27"],
+            "anthropic_version": "2023-06-01",
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        translate_extras_to_openai_shape(&mut extra);
+        assert!(extra.is_empty(), "expected all dropped, got: {extra:?}");
+    }
+
+    #[test]
+    fn extras_shape_translates_mappable_fields() {
+        let mut extra = serde_json::json!({
+            "stop_sequences": ["\n\nHuman:"],
+            "metadata": {"user_id": "user-123"},
+            "tools": [{"name": "get_time", "input_schema": {"type": "object"}}],
+            "tool_choice": {"type": "any"},
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        translate_extras_to_openai_shape(&mut extra);
+
+        assert_eq!(extra.get("stop"), Some(&serde_json::json!(["\n\nHuman:"])));
+        assert!(!extra.contains_key("stop_sequences"));
+        assert_eq!(extra.get("user"), Some(&serde_json::json!("user-123")));
+        assert!(!extra.contains_key("metadata"));
+        assert_eq!(
+            extra.get("tools").unwrap()[0]["function"]["name"],
+            serde_json::json!("get_time")
+        );
+        assert_eq!(
+            extra.get("tool_choice"),
+            Some(&serde_json::json!("required"))
+        );
+    }
+
+    #[test]
+    fn extras_shape_metadata_without_user_id_is_dropped() {
+        let mut extra = serde_json::json!({"metadata": {"foo": "bar"}})
+            .as_object()
+            .unwrap()
+            .clone();
+        translate_extras_to_openai_shape(&mut extra);
+        assert!(extra.is_empty());
+    }
+
+    #[test]
+    fn extras_shape_thinking_buckets_to_reasoning_effort() {
+        for (thinking, expected) in [
+            (
+                serde_json::json!({"type": "enabled", "budget_tokens": 8000}),
+                Some("high"),
+            ),
+            (
+                serde_json::json!({"type": "enabled", "budget_tokens": 2048}),
+                Some("medium"),
+            ),
+            (
+                serde_json::json!({"type": "enabled", "budget_tokens": 1024}),
+                Some("low"),
+            ),
+            (
+                serde_json::json!({"type": "enabled", "budget_tokens": 100}),
+                Some("minimal"),
+            ),
+            (serde_json::json!({"type": "adaptive"}), Some("medium")),
+            (serde_json::json!({"type": "disabled"}), None),
+        ] {
+            let mut extra = serde_json::Map::new();
+            extra.insert("thinking".to_string(), thinking.clone());
+            translate_extras_to_openai_shape(&mut extra);
+            assert_eq!(
+                extra.get("reasoning_effort").and_then(|v| v.as_str()),
+                expected,
+                "thinking = {thinking}"
+            );
+            assert!(!extra.contains_key("thinking"));
+        }
     }
 
     // ─── chat_response_into_anthropic_json ────────────────────────

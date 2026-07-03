@@ -1363,8 +1363,7 @@ async fn cross_provider_dispatch(
 ) -> Result<DispatchOutcome, ProxyError> {
     use aisix_gateway::{Bridge, BridgeContext};
     use aisix_provider_anthropic::{
-        chat_response_into_anthropic_json, parse_inbound_request,
-        translate_anthropic_tool_choice_to_openai, translate_anthropic_tools_to_openai,
+        chat_response_into_anthropic_json, parse_inbound_request, translate_extras_to_openai_shape,
         AnthropicSseEncoder,
     };
     use std::sync::Arc;
@@ -1389,19 +1388,13 @@ async fn cross_provider_dispatch(
     // through `ctx.model.upstream_model()` exactly like chat.rs does.
     chat.model = model_name.to_string();
 
-    // Translate Anthropic-shape tools/tool_choice in `extra` to
-    // OpenAI shape so the non-Anthropic bridge receives the format
-    // it expects. Without this, tools are silently dropped (#236).
-    if let Some(tools) = chat.extra.remove("tools") {
-        if let Some(translated) = translate_anthropic_tools_to_openai(tools) {
-            chat.extra.insert("tools".to_string(), translated);
-        }
-    }
-    if let Some(tc) = chat.extra.remove("tool_choice") {
-        if let Some(translated) = translate_anthropic_tool_choice_to_openai(tc) {
-            chat.extra.insert("tool_choice".to_string(), translated);
-        }
-    }
+    // Rewrite Anthropic-shaped extras into the OpenAI chat shape the
+    // non-Anthropic bridges expect: tools/tool_choice (#236),
+    // stop_sequences/metadata/thinking are translated; Anthropic-only
+    // fields (context_management, top_k, mcp_servers, …) are dropped —
+    // flattened onto an OpenAI-compatible upstream they 400 as unknown
+    // parameters (AISIX-Cloud#953).
+    translate_extras_to_openai_shape(&mut chat.extra);
 
     let is_stream = chat.is_streaming();
     let model_arc = Arc::new(model.clone());

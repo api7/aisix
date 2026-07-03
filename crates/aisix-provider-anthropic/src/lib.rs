@@ -31,5 +31,6 @@ pub use bridge::{AnthropicBridge, ANTHROPIC_DEFAULT_BASE, ANTHROPIC_VERSION};
 pub use wire::{
     chat_response_into_anthropic_json, parse_inbound_request,
     translate_anthropic_tool_choice_to_openai, translate_anthropic_tools_to_openai,
-    AnthropicInboundError, AnthropicSseEncoder, AnthropicSseEvent,
+    translate_extras_to_openai_shape, AnthropicInboundError, AnthropicSseEncoder,
+    AnthropicSseEvent,
 };
