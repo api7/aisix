@@ -31,6 +31,7 @@ pub struct Schemas {
     pub observability_exporter: Validator,
     pub rate_limit_policy: Validator,
     pub mcp_server: Validator,
+    pub a2a_agent: Validator,
 }
 
 pub static SCHEMAS: Lazy<Arc<Schemas>> = Lazy::new(|| Arc::new(Schemas::compile()));
@@ -65,6 +66,9 @@ impl Schemas {
             mcp_server: jsonschema::options()
                 .build(&mcp_server_root_schema())
                 .expect("mcp_server schema is well-formed"),
+            a2a_agent: jsonschema::options()
+                .build(&a2a_agent_root_schema())
+                .expect("a2a_agent schema is well-formed"),
         }
     }
 }
@@ -123,6 +127,10 @@ pub fn validate_guardrail_attachment(value: &Value) -> Result<(), SchemaError> {
 
 pub fn validate_mcp_server(value: &Value) -> Result<(), SchemaError> {
     validate(&SCHEMAS.mcp_server, value)
+}
+
+pub fn validate_a2a_agent(value: &Value) -> Result<(), SchemaError> {
+    validate(&SCHEMAS.a2a_agent, value)
 }
 
 /// Build a resource's canonical JSON Schema from its struct via `schemars`,
@@ -208,6 +216,28 @@ pub fn mcp_server_root_schema() -> Value {
             defs,
             "McpTransport",
             &[("streamable_http", "Streamable HTTP")],
+        );
+    }
+    schema
+}
+
+pub fn a2a_agent_root_schema() -> Value {
+    let mut schema = struct_root_schema::<crate::models::A2aAgent>(true);
+    if let Some(Value::Object(defs)) = schema.get_mut("definitions") {
+        title_single_value_enum_variants(
+            defs,
+            "A2aAuthType",
+            &[
+                ("none", "No authentication"),
+                ("bearer", "Bearer token"),
+                ("api_key", "API key"),
+                ("oauth2", "OAuth 2.0 client credentials"),
+            ],
+        );
+        title_single_value_enum_variants(
+            defs,
+            "A2aProtocolVersion",
+            &[("1.0", "A2A 1.0"), ("0.3", "A2A 0.3")],
         );
     }
     schema

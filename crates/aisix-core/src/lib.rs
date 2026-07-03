@@ -32,16 +32,15 @@ pub use error::{
     AdminError, AdminErrorEnvelope, BootstrapError, ProxyError, ProxyErrorEnvelope, RateLimitScope,
 };
 pub use models::{
-    validate_apikey, validate_cache_policy, validate_guardrail, validate_mcp_server,
-    validate_model, validate_observability_exporter, validate_provider_key,
+    validate_a2a_agent, validate_apikey, validate_cache_policy, validate_guardrail,
+    validate_mcp_server, validate_model, validate_observability_exporter, validate_provider_key,
     validate_rate_limit_policy, A2aAgent, A2aAuthType, A2aProtocolVersion, Adapter, AisixSnapshot,
-    ApiKey, AppliedGuardrail, CachePolicy,
-    CooldownConfig, ExporterKind, Guardrail, GuardrailHookPoint, GuardrailKind, KeywordConfig,
-    KeywordPattern, McpAuthType, McpServer, McpTransport, Model, ObservabilityExporter,
-    ParamConstraints, PolicyScope, PolicyWindow, ProviderKey, RateLimit, RateLimitPolicy,
-    RequestOverrides, ResponseOverrides, Routing, RoutingStrategy, RoutingTarget, SchemaError,
-    StreamDoneMarker, TelemetryKind, TelemetryTags, WhenAllUnavailablePolicy,
-    DEFAULT_COOLDOWN_TRIGGER_STATUSES,
+    ApiKey, AppliedGuardrail, CachePolicy, CooldownConfig, ExporterKind, Guardrail,
+    GuardrailHookPoint, GuardrailKind, KeywordConfig, KeywordPattern, McpAuthType, McpServer,
+    McpTransport, Model, ObservabilityExporter, ParamConstraints, PolicyScope, PolicyWindow,
+    ProviderKey, RateLimit, RateLimitPolicy, RequestOverrides, ResponseOverrides, Routing,
+    RoutingStrategy, RoutingTarget, SchemaError, StreamDoneMarker, TelemetryKind, TelemetryTags,
+    WhenAllUnavailablePolicy, DEFAULT_COOLDOWN_TRIGGER_STATUSES,
 };
 pub use resource::{Resource, ResourceEntry};
 pub use snapshot::{ResourceTable, SnapshotHandle};

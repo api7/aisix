@@ -60,9 +60,10 @@ pub use rate_limit::RateLimit;
 pub use rate_limit_policy::{PolicyScope, PolicyWindow, RateLimitPolicy};
 pub use routing::{Routing, RoutingStrategy, RoutingTarget, WhenAllUnavailablePolicy};
 pub use schema::{
-    validate_apikey, validate_cache_policy, validate_guardrail, validate_guardrail_attachment,
-    validate_mcp_server, validate_model, validate_observability_exporter, validate_provider_key,
-    validate_rate_limit_policy, SchemaError,
+    validate_a2a_agent, validate_apikey, validate_cache_policy, validate_guardrail,
+    validate_guardrail_attachment, validate_mcp_server, validate_model,
+    validate_observability_exporter, validate_provider_key, validate_rate_limit_policy,
+    SchemaError,
 };
 pub use semantic::{
     Aggregation, DistanceMetric, EmbeddingFailureMode, OnEmbeddingFailure, Semantic, SemanticMatch,

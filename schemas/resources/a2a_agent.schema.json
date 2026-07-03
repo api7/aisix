@@ -1,0 +1,145 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "additionalProperties": false,
+  "definitions": {
+    "A2aAuthType": {
+      "description": "How the gateway authenticates to an upstream A2A agent.",
+      "oneOf": [
+        {
+          "description": "No authentication; the agent is reached as-is.",
+          "enum": [
+            "none"
+          ],
+          "title": "No authentication",
+          "type": "string"
+        },
+        {
+          "description": "Bearer token authentication. The token is supplied in `secret` and sent as `Authorization: Bearer <secret>`.",
+          "enum": [
+            "bearer"
+          ],
+          "title": "Bearer token",
+          "type": "string"
+        },
+        {
+          "description": "API key authentication. The key is supplied in `secret` and sent as an `x-api-key: <secret>` header on every upstream request.",
+          "enum": [
+            "api_key"
+          ],
+          "title": "API key",
+          "type": "string"
+        },
+        {
+          "description": "OAuth 2.0 client credentials grant. The gateway exchanges `client_id`, the client secret in `secret`, and the optional `scopes` at `token_url` for an access token, and sends it as `Authorization: Bearer <access_token>` on every upstream request. Access tokens are cached until shortly before their reported expiry.",
+          "enum": [
+            "oauth2"
+          ],
+          "title": "OAuth 2.0 client credentials",
+          "type": "string"
+        }
+      ]
+    },
+    "A2aProtocolVersion": {
+      "description": "The A2A wire-format version pinned for an upstream agent.",
+      "oneOf": [
+        {
+          "description": "A2A 1.0 wire format (protobuf-JSON envelopes, PascalCase methods).",
+          "enum": [
+            "1.0"
+          ],
+          "title": "A2A 1.0",
+          "type": "string"
+        },
+        {
+          "description": "A2A 0.3 wire format (`kind`-discriminated JSON-RPC objects).",
+          "enum": [
+            "0.3"
+          ],
+          "title": "A2A 0.3",
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "properties": {
+    "auth_type": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/A2aAuthType"
+        }
+      ],
+      "default": "none",
+      "description": "How the gateway authenticates to the upstream agent. The credential is held by the gateway and is never forwarded from or exposed to the calling client."
+    },
+    "client_id": {
+      "description": "OAuth client identifier used for the OAuth 2.0 client credentials grant. Required when `auth_type` is `oauth2`; ignored otherwise.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "display_name": {
+      "description": "Operator-facing label, unique within the gateway. It is the path segment under which the agent is exposed to callers as `/a2a/<display_name>`, so it must be a single non-empty URL path segment.",
+      "minLength": 1,
+      "type": "string"
+    },
+    "enabled": {
+      "default": true,
+      "description": "Whether this agent is active. When `false`, it is not served and cannot be reached.",
+      "type": "boolean"
+    },
+    "protocol_version": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/A2aProtocolVersion"
+        }
+      ],
+      "default": "1.0",
+      "description": "The A2A wire-format version the gateway pins for this agent. Pinned explicitly rather than inferred from client signals, so the served agent card and the accepted requests stay consistent."
+    },
+    "scopes": {
+      "description": "OAuth scopes to request. Joined with spaces into the `scope` parameter of the token request. Only used when `auth_type` is `oauth2`.",
+      "items": {
+        "type": "string"
+      },
+      "type": [
+        "array",
+        "null"
+      ]
+    },
+    "secret": {
+      "description": "Authentication credential for the upstream agent. Its meaning follows `auth_type`: the bearer token when `auth_type` is `bearer` (sent as `Authorization: Bearer <secret>`), the API key when `auth_type` is `api_key` (sent as `x-api-key: <secret>`), or the OAuth client secret when `auth_type` is `oauth2`. Leave unset when `auth_type` is `none`.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "timeout_ms": {
+      "description": "Maximum time, in milliseconds, to wait for a single upstream operation (fetching the agent card or invoking the agent). Must be at least `1` when set. When omitted, the gateway applies a built-in default.",
+      "format": "uint64",
+      "minimum": 1.0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "token_url": {
+      "description": "OAuth token endpoint URL where the gateway exchanges the client credentials for an access token, such as `https://auth.example.com/oauth/token`. Required when `auth_type` is `oauth2`; ignored otherwise.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "url": {
+      "description": "The upstream agent's base URL, reached over HTTP with the A2A protocol (JSON-RPC 2.0), such as `https://agents.example.com/a2a`. The agent card is discovered relative to this URL.",
+      "minLength": 1,
+      "type": "string"
+    }
+  },
+  "required": [
+    "display_name",
+    "url"
+  ],
+  "title": "A2aAgent",
+  "type": "object"
+}
