@@ -2308,20 +2308,40 @@ fn update_anthropic_usage(
             }
         }
         Some("message_delta") => {
-            if let Some(v) = json.get("usage").and_then(|u| u.get("output_tokens")) {
-                if let Some(t) = v.as_u64() {
-                    acc.completion_tokens = acc.completion_tokens.max(t as u32);
-                } else {
-                    // PR #436 audit LOW-1: a `usage` object present but
-                    // with a non-numeric `output_tokens` leaves
-                    // completion_tokens at the message_start floor
-                    // (often 1) — a silent under-count. Surface it so a
-                    // wire-shape drift is visible to operators.
-                    tracing::debug!(
-                        output_tokens = %v,
-                        "anthropic stream: message_delta usage.output_tokens \
-                         is non-numeric; completion_tokens left at floor"
-                    );
+            if let Some(usage) = json.get("usage") {
+                if let Some(v) = usage.get("output_tokens") {
+                    if let Some(t) = v.as_u64() {
+                        acc.completion_tokens = acc.completion_tokens.max(t as u32);
+                    } else {
+                        // PR #436 audit LOW-1: a `usage` object present but
+                        // with a non-numeric `output_tokens` leaves
+                        // completion_tokens at the message_start floor
+                        // (often 1) — a silent under-count. Surface it so a
+                        // wire-shape drift is visible to operators.
+                        tracing::debug!(
+                            output_tokens = %v,
+                            "anthropic stream: message_delta usage.output_tokens \
+                             is non-numeric; completion_tokens left at floor"
+                        );
+                    }
+                }
+                // AISIX-Cloud#952: newer Anthropic wire (and some relays)
+                // report cumulative input/cache counts on message_delta —
+                // for some backends that is the ONLY place they appear
+                // (message_start ships no usable usage), which recorded
+                // prompt_tokens=0. Harvest them here too, max-wins with
+                // the message_start values (LiteLLM reads both frames).
+                if let Some(t) = usage.get("input_tokens").and_then(Value::as_u64) {
+                    acc.prompt_tokens = acc.prompt_tokens.max(t as u32);
+                }
+                if let Some(t) = usage
+                    .get("cache_creation_input_tokens")
+                    .and_then(Value::as_u64)
+                {
+                    acc.cache_creation_tokens = acc.cache_creation_tokens.max(t as u32);
+                }
+                if let Some(t) = usage.get("cache_read_input_tokens").and_then(Value::as_u64) {
+                    acc.cache_read_tokens = acc.cache_read_tokens.max(t as u32);
                 }
             }
             if let Some(sr) = json
@@ -3882,6 +3902,71 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
             "streaming /v1/messages telemetry must record TTFT",
         );
         assert!(rx.try_recv().is_err(), "usage event should be emitted once");
+    }
+
+    /// AISIX-Cloud#952: relay backends that ship NO usage on
+    /// `message_start` (id/model present) and report cumulative
+    /// input/cache counts only on the terminal `message_delta`. Pre-fix
+    /// the emitted UsageEvent carried prompt_tokens=0 (stored as NULL by
+    /// cp-api, shown as 0 in the dashboard).
+    #[tokio::test]
+    async fn anthropic_passthrough_streaming_harvests_input_tokens_from_message_delta() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        let sse = "\
+event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"gen_01REPRO952\",\"role\":\"assistant\",\"content\":[],\"model\":\"mco-5\",\"stop_reason\":null}}\n\n\
+event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n\
+event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":11504,\"cache_creation_input_tokens\":4,\"cache_read_input_tokens\":9,\"output_tokens\":136}}\n\n\
+event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&upstream)
+            .await;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let snap = new_snap_anthropic(&upstream.uri());
+        snap.models.insert(anthropic_model("my-claude"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+        let handle = SnapshotHandle::new(snap);
+        let state = crate::ProxyState::new(handle, hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let app = crate::build_router(state);
+
+        let body = serde_json::json!({
+            "model": "my-claude",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 200,
+            "stream": true,
+        });
+        let resp = app.oneshot(make_req(body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        to_bytes(resp.into_body(), 65536).await.unwrap();
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("streaming /v1/messages must emit a UsageEvent")
+            .expect("usage event sender dropped");
+        assert_eq!(
+            event.prompt_tokens, 11504,
+            "input_tokens reported only on message_delta must be harvested (#952)",
+        );
+        assert_eq!(event.completion_tokens, 136);
+        assert_eq!(event.cache_creation_tokens, 4);
+        assert_eq!(event.cache_read_tokens, 9);
+        assert_eq!(event.provider_request_id, "gen_01REPRO952");
+        assert_eq!(event.provider_model_version, "mco-5");
     }
 
     /// Issue #245: the SSE frame parser must reassemble events that

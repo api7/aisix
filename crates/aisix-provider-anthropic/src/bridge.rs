@@ -645,6 +645,53 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert_eq!(chunks[2].usage.as_ref().unwrap().completion_tokens, 5);
     }
 
+    /// AISIX-Cloud#952: some relay backends omit usage from
+    /// `message_start` and report input/cache counts only on the
+    /// terminal `message_delta`. The bridge must harvest them there
+    /// (pre-fix the final usage carried prompt_tokens=0).
+    #[tokio::test]
+    async fn streaming_harvests_input_tokens_from_message_delta() {
+        let server = MockServer::start().await;
+        let sse = "\
+event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"gen_952\",\"model\":\"claude-sonnet-4-5\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"stop_reason\":null}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":37,\"cache_creation_input_tokens\":4,\"cache_read_input_tokens\":9,\"output_tokens\":5}}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n";
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&server)
+            .await;
+
+        let bridge = AnthropicBridge::new();
+        let ctx = sample_ctx(&server.uri());
+        let mut stream = bridge.chat_stream(&req(), &ctx).await.unwrap();
+
+        let mut chunks = Vec::new();
+        while let Some(item) = stream.next().await {
+            chunks.push(item.unwrap());
+        }
+        let usage = chunks
+            .last()
+            .and_then(|c| c.usage.as_ref())
+            .expect("finish chunk must carry usage");
+        assert_eq!(
+            usage.prompt_tokens, 37,
+            "input_tokens reported only on message_delta must be harvested (#952)",
+        );
+        assert_eq!(usage.completion_tokens, 5);
+        assert_eq!(usage.cache_creation_tokens, 4);
+        assert_eq!(usage.cache_read_tokens, 9);
+    }
+
     #[tokio::test]
     async fn streaming_upstream_error_surfaces_before_stream_start() {
         let server = MockServer::start().await;

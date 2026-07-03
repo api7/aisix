@@ -760,6 +760,17 @@ pub struct AnthropicStreamMessageDelta {
 pub struct AnthropicStreamUsage {
     #[serde(default)]
     pub output_tokens: Option<u32>,
+    /// Cumulative input/cache counts on the terminal `message_delta` —
+    /// newer Anthropic wire sends them there too, and for some relay
+    /// backends it is the ONLY frame that carries them (AISIX-Cloud#952:
+    /// `message_start` shipped no usable usage, so prompt tokens
+    /// recorded as 0).
+    #[serde(default)]
+    pub input_tokens: Option<u32>,
+    #[serde(default)]
+    pub cache_creation_input_tokens: Option<u32>,
+    #[serde(default)]
+    pub cache_read_input_tokens: Option<u32>,
 }
 
 /// Rolling state the Bridge carries across a stream so chunks can be
@@ -781,26 +792,46 @@ pub struct StreamState {
 
 impl StreamState {
     pub fn update(&mut self, event: &AnthropicStreamEvent) {
-        if let AnthropicStreamEvent::MessageStart { message } = event {
-            self.id = message.id.clone();
-            self.model = message.model.clone();
-            // Reset on every message_start so a later message_start without
-            // usage can't leave a stale prompt-token count from a prior one.
-            self.input_tokens = message
-                .usage
-                .as_ref()
-                .and_then(|u| u.input_tokens)
-                .unwrap_or(0);
-            self.cache_creation_tokens = message
-                .usage
-                .as_ref()
-                .and_then(|u| u.cache_creation_input_tokens)
-                .unwrap_or(0);
-            self.cache_read_tokens = message
-                .usage
-                .as_ref()
-                .and_then(|u| u.cache_read_input_tokens)
-                .unwrap_or(0);
+        match event {
+            AnthropicStreamEvent::MessageStart { message } => {
+                self.id = message.id.clone();
+                self.model = message.model.clone();
+                // Reset on every message_start so a later message_start without
+                // usage can't leave a stale prompt-token count from a prior one.
+                self.input_tokens = message
+                    .usage
+                    .as_ref()
+                    .and_then(|u| u.input_tokens)
+                    .unwrap_or(0);
+                self.cache_creation_tokens = message
+                    .usage
+                    .as_ref()
+                    .and_then(|u| u.cache_creation_input_tokens)
+                    .unwrap_or(0);
+                self.cache_read_tokens = message
+                    .usage
+                    .as_ref()
+                    .and_then(|u| u.cache_read_input_tokens)
+                    .unwrap_or(0);
+            }
+            // AISIX-Cloud#952: harvest cumulative input/cache counts from
+            // the terminal message_delta too (max-wins) — some backends
+            // report them only there. Runs before to_chunk() for the same
+            // event, so the emitted UsageStats picks these up.
+            AnthropicStreamEvent::MessageDelta {
+                usage: Some(usage), ..
+            } => {
+                if let Some(t) = usage.input_tokens {
+                    self.input_tokens = self.input_tokens.max(t);
+                }
+                if let Some(t) = usage.cache_creation_input_tokens {
+                    self.cache_creation_tokens = self.cache_creation_tokens.max(t);
+                }
+                if let Some(t) = usage.cache_read_input_tokens {
+                    self.cache_read_tokens = self.cache_read_tokens.max(t);
+                }
+            }
+            _ => {}
         }
     }
 
