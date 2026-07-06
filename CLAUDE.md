@@ -90,7 +90,7 @@ Output HIGH/MEDIUM/LOW per finding with **concrete suggested code**, not vague "
 
 ## Handler Families Stay in Lockstep — Fix the Whole Class
 
-**The client-facing endpoint handlers come in families that share dispatch, auth, routing, telemetry, and guardrail logic — `/v1/chat/completions`, `/v1/messages` (+`count_tokens`), `/v1/responses`, plus embeddings/rerank/audio/images. A bug or feature landed on one almost always applies to the others, and a gap on the unfixed siblings is SILENT: nothing errors, the behavior just quietly degrades.**
+**The client-facing endpoint handlers come in families that share dispatch, auth, routing, telemetry, and guardrail logic — `/v1/chat/completions`, `/v1/messages` (+`count_tokens`), `/v1/responses`, plus embeddings/rerank/audio/images and the jobs surface (files/batches/fine-tuning). A bug or feature landed on one almost always applies to the others, and a gap on the unfixed siblings is SILENT: nothing errors, the behavior just quietly degrades.**
 
 - When you touch a per-request mechanism (a runtime metric, a limit, an auth check, a usage emission, header threading), grep the offending call/pattern across the whole crate and wire **every** sibling path in the same PR — both streaming and non-streaming branches — or state explicitly in the PR which sibling is deferred and why, and file the follow-up issue immediately.
 - "Documented follow-up" without an issue is how gaps rot: it lives in one PR description and no one ever comes back.

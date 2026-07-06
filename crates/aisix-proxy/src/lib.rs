@@ -43,6 +43,7 @@ mod error_translate;
 pub mod health;
 mod http_client;
 mod images;
+mod jobs;
 mod mcp;
 mod messages;
 mod model_resolve;
@@ -109,6 +110,32 @@ pub fn build_router(state: ProxyState) -> Router {
         // OpenAI Realtime WebSocket relay (#721). Auth/ACL/quota are
         // enforced pre-upgrade inside the handler.
         .route("/v1/realtime", get(realtime::realtime))
+        // Files / Batches / Fine-tuning jobs surface (#720). Provider
+        // routing rides the gateway-encoded resource ids; see jobs.rs.
+        .route(
+            "/v1/files",
+            post(jobs::create_file).get(jobs::list_files),
+        )
+        .route(
+            "/v1/files/:id",
+            get(jobs::get_file).delete(jobs::delete_file),
+        )
+        .route("/v1/files/:id/content", get(jobs::file_content))
+        .route(
+            "/v1/batches",
+            post(jobs::create_batch).get(jobs::list_batches),
+        )
+        .route("/v1/batches/:id", get(jobs::get_batch))
+        .route("/v1/batches/:id/cancel", post(jobs::cancel_batch))
+        .route(
+            "/v1/fine_tuning/jobs",
+            post(jobs::create_ft_job).get(jobs::list_ft_jobs),
+        )
+        .route("/v1/fine_tuning/jobs/:id", get(jobs::get_ft_job))
+        .route(
+            "/v1/fine_tuning/jobs/:id/cancel",
+            post(jobs::cancel_ft_job),
+        )
         .route(
             "/passthrough/:provider/*rest",
             any(passthrough::passthrough),
@@ -201,6 +228,12 @@ fn normalize_endpoint_label(path: &str) -> &'static str {
         "/v1/audio/speech" => "/v1/audio/speech",
         "/mcp" | "/mcp/" => "/mcp",
         "/v1/realtime" => "/v1/realtime",
+        "/v1/files" => "/v1/files",
+        "/v1/batches" => "/v1/batches",
+        "/v1/fine_tuning/jobs" => "/v1/fine_tuning/jobs",
+        _ if path.starts_with("/v1/files/") => "/v1/files/:id",
+        _ if path.starts_with("/v1/batches/") => "/v1/batches/:id",
+        _ if path.starts_with("/v1/fine_tuning/jobs/") => "/v1/fine_tuning/jobs/:id",
         _ if path.starts_with("/a2a/") => "/a2a",
         _ if path.starts_with("/passthrough/") => "/passthrough/:provider/*rest",
         _ => "other",

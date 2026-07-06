@@ -143,6 +143,11 @@ pub struct ProxyState {
     /// Wired from the watch supervisor in aisix-server; `None` here means
     /// no freshness signal, so readiness gates on shutdown only (#591).
     pub config_apply_age: Option<Arc<dyn Fn() -> Option<std::time::Duration> + Send + Sync>>,
+    /// Batch ids whose completed output has already been attributed to
+    /// UsageEvents by THIS process (#720). Process-local dedup only — the
+    /// deterministic `request_id = "batch-<id>"` on the emitted events is
+    /// what keeps cross-restart re-emission idempotent on the cp-api side.
+    pub billed_batches: Arc<dashmap::DashSet<String>>,
 }
 
 impl ProxyState {
@@ -166,6 +171,7 @@ impl ProxyState {
             otlp_fan_out: OtlpHttpFanOut::new(),
             request_body_limit_bytes: cfg.request_body_limit_bytes,
             real_ip: Arc::new(ResolvedRealIp::from_config(&cfg.real_ip)),
+            billed_batches: Arc::new(dashmap::DashSet::new()),
         }
     }
 
@@ -196,6 +202,7 @@ impl ProxyState {
             otlp_fan_out: OtlpHttpFanOut::new(),
             request_body_limit_bytes: cfg.request_body_limit_bytes,
             real_ip: Arc::new(ResolvedRealIp::from_config(&cfg.real_ip)),
+            billed_batches: Arc::new(dashmap::DashSet::new()),
         }
     }
 
@@ -229,6 +236,7 @@ impl ProxyState {
             otlp_fan_out: OtlpHttpFanOut::new(),
             request_body_limit_bytes: cfg.request_body_limit_bytes,
             real_ip: Arc::new(ResolvedRealIp::from_config(&cfg.real_ip)),
+            billed_batches: Arc::new(dashmap::DashSet::new()),
         }
     }
 
