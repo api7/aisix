@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { WebSocket } from "undici";
 import { WebSocketServer, type WebSocket as WsSocket } from "ws";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
@@ -121,8 +122,9 @@ describe("realtime e2e: /v1/realtime WebSocket relay (#721)", () => {
     }
 
     const wsUrl = `${app.proxyUrl.replace("http://", "ws://")}/v1/realtime?model=realtime-e2e-model`;
-    // Node's NATIVE WebSocket (undici) — cannot set headers, exactly the
-    // browser constraint the subprotocol flow exists for.
+    // undici's browser-style WebSocket — cannot set headers, exactly the
+    // browser constraint the subprotocol flow exists for (Node 20 CI has
+    // no global WebSocket, so import it from undici explicitly).
     const ws = new WebSocket(wsUrl, [
       "realtime",
       `openai-insecure-api-key.${CALLER_PLAINTEXT}`,
