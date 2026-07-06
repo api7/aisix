@@ -55,6 +55,182 @@ fn redact_str(
     }
 }
 
+// ─── Remote segment moderation (kind=bedrock mask write-back) ────────────────
+//
+// A Bedrock guardrail whose PII action is ANONYMIZE returns the masked
+// replacement text from the SAME `ApplyGuardrail` call that yields the
+// verdict — an async, whole-request rewrite that can't implement the sync
+// per-field redact contract above. The bridge works in three walker
+// passes over one wire body, all using the SAME wire-shape walker so slot
+// enumeration order is identical by construction:
+//
+//   1. collect: a probe guardrail records every text slot the walker
+//      offers (rewriting nothing);
+//   2. one remote call: the chain's segment fold sends the slots as one
+//      content block each and returns verdict + positionally-aligned
+//      masked texts;
+//   3. apply: a second probe guardrail replaces slot i with masked[i].
+//
+// Call sites pair this with `check_*_non_segment` so a segment-moderating
+// member is consulted exactly once per hook. Families without a wire
+// walker (embeddings, rerank, images, audio, passthrough, MCP) keep the
+// plain `check_*` path, where an ANONYMIZE disposition still maps to
+// Block — there is no write-back channel, and releasing the un-masked
+// content would defeat the operator's policy.
+
+/// Marker count key [`SegmentApplier`] attaches to each rewritten slot.
+/// Several walkers discard a rewrite whose counts are empty (their
+/// "did anything change" gate); the marker makes those gates fire. It is
+/// never surfaced: [`moderate_body`] discards the apply-walk's returned
+/// counts and reports the provider's entity counts instead.
+const SEGMENT_APPLY_MARKER: &str = "__segment_apply__";
+
+/// Pass-1 probe: records every text slot the walker offers. Never
+/// rewrites, so the body is bit-identical after the collect walk.
+#[derive(Default)]
+struct SegmentCollector {
+    texts: std::sync::Mutex<Vec<String>>,
+}
+
+impl SegmentCollector {
+    fn take(&self) -> Vec<String> {
+        std::mem::take(&mut self.texts.lock().expect("collector poisoned"))
+    }
+
+    fn record(&self, text: &str) -> Option<aisix_guardrails::Redaction> {
+        self.texts
+            .lock()
+            .expect("collector poisoned")
+            .push(text.to_owned());
+        None
+    }
+}
+
+impl Guardrail for SegmentCollector {
+    fn name(&self) -> &'static str {
+        "segment-collector"
+    }
+    fn redacts_input(&self) -> bool {
+        true
+    }
+    fn redacts_output(&self) -> bool {
+        true
+    }
+    fn redact_input_text(&self, text: &str) -> Option<aisix_guardrails::Redaction> {
+        self.record(text)
+    }
+    fn redact_output_text(&self, text: &str) -> Option<aisix_guardrails::Redaction> {
+        self.record(text)
+    }
+}
+
+/// Pass-3 probe: replaces the i-th offered slot with `masked[i]`.
+/// Positional by construction — the walker offers slots in the same
+/// order the collector recorded them (same walker, same body state).
+struct SegmentApplier {
+    state: std::sync::Mutex<ApplierState>,
+}
+
+struct ApplierState {
+    masked: Vec<String>,
+    cursor: usize,
+}
+
+impl SegmentApplier {
+    fn new(masked: Vec<String>) -> Self {
+        Self {
+            state: std::sync::Mutex::new(ApplierState { masked, cursor: 0 }),
+        }
+    }
+
+    fn apply(&self, original: &str) -> Option<aisix_guardrails::Redaction> {
+        let mut st = self.state.lock().expect("applier poisoned");
+        let i = st.cursor;
+        st.cursor += 1;
+        match st.masked.get(i) {
+            Some(m) if m != original => Some(aisix_guardrails::Redaction {
+                text: m.clone(),
+                counts: std::iter::once((SEGMENT_APPLY_MARKER.to_owned(), 1)).collect(),
+            }),
+            _ => None,
+        }
+    }
+
+    /// Warn when the apply walk offered a different slot count than the
+    /// mask carries — the extra/missing slots kept their originals (the
+    /// per-slot `get` above never misassigns), this is diagnostics only.
+    fn warn_if_misaligned(&self) {
+        let st = self.state.lock().expect("applier poisoned");
+        if st.cursor != st.masked.len() {
+            tracing::warn!(
+                offered = st.cursor,
+                masked = st.masked.len(),
+                "segment apply walk drifted from collect walk; \
+                 unmatched slots kept their original text",
+            );
+        }
+    }
+}
+
+impl Guardrail for SegmentApplier {
+    fn name(&self) -> &'static str {
+        "segment-applier"
+    }
+    fn redacts_input(&self) -> bool {
+        true
+    }
+    fn redacts_output(&self) -> bool {
+        true
+    }
+    fn redact_input_text(&self, text: &str) -> Option<aisix_guardrails::Redaction> {
+        self.apply(text)
+    }
+    fn redact_output_text(&self, text: &str) -> Option<aisix_guardrails::Redaction> {
+        self.apply(text)
+    }
+}
+
+/// Complete one hook's moderation over a wire body: fold the already-run
+/// `check_*_non_segment` verdict with the remote segment pass. The
+/// segment pass is skipped when the check already blocked (the request
+/// is dead — don't burn a provider call) or when the chain has no
+/// segment-moderating member (zero overhead for non-Bedrock chains).
+/// Masked replacements are written back through `walk`; the provider's
+/// entity counts merge into `counts_out` (they feed
+/// `redacted_entity_counts`, names only — #932 no-leak).
+pub async fn moderate_body(
+    chain: &dyn Guardrail,
+    dir: Direction,
+    non_segment_verdict: aisix_guardrails::GuardrailVerdict,
+    counts_out: &mut RedactionCounts,
+    mut walk: impl FnMut(&dyn Guardrail) -> RedactionCounts,
+) -> aisix_guardrails::GuardrailVerdict {
+    if non_segment_verdict.is_block() || !chain.moderates_segments() {
+        return non_segment_verdict;
+    }
+    let collector = SegmentCollector::default();
+    walk(&collector);
+    let texts = collector.take();
+    if texts.is_empty() {
+        return non_segment_verdict;
+    }
+    let outcome = match dir {
+        Direction::Input => chain.moderate_input_segments(&texts).await,
+        Direction::Output => chain.moderate_output_segments(&texts).await,
+    };
+    if !outcome.verdict.is_block() {
+        if let Some(masked) = outcome.masked {
+            let applier = SegmentApplier::new(masked);
+            // Marker counts are plumbing (see SEGMENT_APPLY_MARKER) —
+            // discard them; the provider counts below are the real ones.
+            let _ = walk(&applier);
+            applier.warn_if_misaligned();
+            merge_counts(counts_out, outcome.counts);
+        }
+    }
+    non_segment_verdict.merged_with(outcome.verdict)
+}
+
 /// Rewrite one owned text field in place. No-op (and no allocation) when
 /// nothing matches.
 fn apply_to_string(
@@ -861,6 +1037,76 @@ pub fn redact_anthropic_sse(
     }
     out.extend_from_slice(trailing);
     Some((out, counts))
+}
+
+/// The concatenated TEXT-channel content of a buffered Anthropic-native
+/// SSE stream (per content-block `index` order, `content_block_start`
+/// head text included). Used to rebuild the content-capture accumulator
+/// after a segment (provider-side) mask rewrote the held bytes — the
+/// sync redactor can't reproduce a provider mask (#932 × AISIX-Cloud#947).
+pub fn anthropic_sse_text(raw: &[u8]) -> String {
+    let (frames, _) = split_sse_frames(raw);
+    let mut channels: BTreeMap<u64, String> = BTreeMap::new();
+    for frame in &frames {
+        let Some(data) = frame.data.as_ref() else {
+            continue;
+        };
+        let index = data.get("index").and_then(Value::as_u64).unwrap_or(0);
+        let text = match data.get("type").and_then(Value::as_str) {
+            Some("content_block_delta") => data
+                .get("delta")
+                .filter(|d| d.get("type").and_then(Value::as_str) == Some("text_delta"))
+                .and_then(|d| d.get("text"))
+                .and_then(Value::as_str),
+            Some("content_block_start") => data
+                .get("content_block")
+                .and_then(|b| b.get("text"))
+                .and_then(Value::as_str),
+            _ => None,
+        };
+        if let Some(t) = text {
+            channels.entry(index).or_default().push_str(t);
+        }
+    }
+    channels.into_values().collect()
+}
+
+/// The concatenated `output_text` delta content of a buffered
+/// `/v1/responses` SSE stream (channel order). Same capture-rebuild role
+/// as [`anthropic_sse_text`].
+pub fn responses_sse_text(raw: &[u8]) -> String {
+    let (frames, _) = split_sse_frames(raw);
+    let mut channels: BTreeMap<String, String> = BTreeMap::new();
+    for frame in &frames {
+        let Some(data) = frame.data.as_ref() else {
+            continue;
+        };
+        if data.get("type").and_then(Value::as_str) != Some("response.output_text.delta") {
+            continue;
+        }
+        let Some(t) = data.get("delta").and_then(Value::as_str) else {
+            continue;
+        };
+        let key = match data.get("item_id").and_then(Value::as_str) {
+            Some(id) => format!(
+                "{id}/{}",
+                data.get("content_index")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+            ),
+            None => format!(
+                "{}/{}",
+                data.get("output_index")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                data.get("content_index")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+            ),
+        };
+        channels.entry(key).or_default().push_str(t);
+    }
+    channels.into_values().collect()
 }
 
 // ─── Responses-API SSE rewrite ───────────────────────────────────────────────

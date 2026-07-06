@@ -13,7 +13,7 @@ use aisix_core::AppliedGuardrail;
 use aisix_gateway::{ChatFormat, ChatResponse};
 use async_trait::async_trait;
 
-use crate::{Guardrail, GuardrailVerdict, Redaction, StreamOutputPolicy};
+use crate::{Guardrail, GuardrailVerdict, Redaction, SegmentsOutcome, StreamOutputPolicy};
 
 /// One chain member: the runtime guardrail plus the operator-facing name
 /// of the row it was built from. The name is what `Block` verdicts are
@@ -205,6 +205,73 @@ impl Guardrail for GuardrailChain {
         }
     }
 
+    fn moderates_segments(&self) -> bool {
+        self.members
+            .iter()
+            .any(|m| m.guardrail.moderates_segments())
+    }
+
+    /// Fold over segment-moderating members only. A Block short-circuits
+    /// (attributed like the check folds); masked texts COMPOSE — each
+    /// member moderates the previous member's masked output, mirroring
+    /// `fold_redactions`; the first Bypass reason sticks. Counts merge.
+    async fn moderate_input_segments(&self, texts: &[String]) -> SegmentsOutcome {
+        fold_segments(&self.members, texts, true).await
+    }
+
+    async fn moderate_output_segments(&self, texts: &[String]) -> SegmentsOutcome {
+        fold_segments(&self.members, texts, false).await
+    }
+
+    /// The check fold minus segment-moderating members — the pass those
+    /// members are consulted through is `moderate_*_segments`, run by the
+    /// same call sites. Recurses via the member's own
+    /// `check_input_non_segment` so a nested chain filters its own members
+    /// rather than being skipped wholesale.
+    async fn check_input_non_segment(&self, req: &ChatFormat) -> GuardrailVerdict {
+        let mut bypass: Option<String> = None;
+        for m in &self.members {
+            match m.guardrail.check_input_non_segment(req).await {
+                GuardrailVerdict::Allow => continue,
+                GuardrailVerdict::Block {
+                    reason,
+                    guardrail_name,
+                } => return attribute_block(&m.name, reason, guardrail_name),
+                GuardrailVerdict::Bypass { reason } => {
+                    if bypass.is_none() {
+                        bypass = Some(reason);
+                    }
+                }
+            }
+        }
+        match bypass {
+            Some(reason) => GuardrailVerdict::Bypass { reason },
+            None => GuardrailVerdict::Allow,
+        }
+    }
+
+    async fn check_output_non_segment(&self, resp: &ChatResponse) -> GuardrailVerdict {
+        let mut bypass: Option<String> = None;
+        for m in &self.members {
+            match m.guardrail.check_output_non_segment(resp).await {
+                GuardrailVerdict::Allow => continue,
+                GuardrailVerdict::Block {
+                    reason,
+                    guardrail_name,
+                } => return attribute_block(&m.name, reason, guardrail_name),
+                GuardrailVerdict::Bypass { reason } => {
+                    if bypass.is_none() {
+                        bypass = Some(reason);
+                    }
+                }
+            }
+        }
+        match bypass {
+            Some(reason) => GuardrailVerdict::Bypass { reason },
+            None => GuardrailVerdict::Allow,
+        }
+    }
+
     fn redacts_input(&self) -> bool {
         self.members.iter().any(|m| m.guardrail.redacts_input())
     }
@@ -234,6 +301,68 @@ impl Guardrail for GuardrailChain {
                 .filter_map(|m| m.guardrail.redacts_output().then_some(&m.guardrail)),
             false,
         )
+    }
+}
+
+/// Fold the texts through each segment-moderating member. Mirrors the
+/// check folds (first Block short-circuits with attribution, first Bypass
+/// reason sticks) plus mask composition: each member moderates the
+/// previous member's masked output. Counts merge across members.
+async fn fold_segments(members: &[ChainMember], texts: &[String], input: bool) -> SegmentsOutcome {
+    let mut masked: Option<Vec<String>> = None;
+    let mut counts = std::collections::BTreeMap::new();
+    let mut bypass: Option<String> = None;
+    for m in members {
+        if !m.guardrail.moderates_segments() {
+            continue;
+        }
+        let src: &[String] = masked.as_deref().unwrap_or(texts);
+        let outcome = if input {
+            m.guardrail.moderate_input_segments(src).await
+        } else {
+            m.guardrail.moderate_output_segments(src).await
+        };
+        match outcome.verdict {
+            GuardrailVerdict::Allow => {}
+            GuardrailVerdict::Block {
+                reason,
+                guardrail_name,
+            } => {
+                return SegmentsOutcome::from_verdict(attribute_block(
+                    &m.name,
+                    reason,
+                    guardrail_name,
+                ))
+            }
+            GuardrailVerdict::Bypass { reason } => {
+                if bypass.is_none() {
+                    bypass = Some(reason);
+                }
+            }
+        }
+        if let Some(new_masked) = outcome.masked {
+            // Implementations uphold alignment with THEIR input; refuse a
+            // drifted length here so a broken member can't desync slots.
+            if new_masked.len() == src.len() {
+                masked = Some(new_masked);
+            } else {
+                tracing::warn!(
+                    member = %m.name,
+                    expected = src.len(),
+                    got = new_masked.len(),
+                    "segment moderation returned misaligned mask; keeping originals",
+                );
+            }
+        }
+        Redaction::merge_counts(&mut counts, &outcome.counts);
+    }
+    SegmentsOutcome {
+        verdict: match bypass {
+            Some(reason) => GuardrailVerdict::Bypass { reason },
+            None => GuardrailVerdict::Allow,
+        },
+        masked,
+        counts,
     }
 }
 
@@ -520,6 +649,149 @@ mod tests {
         let empty = GuardrailChain::new(vec![]);
         assert!(!empty.runs_on_output());
         assert!(!empty.stream_output_policy().holds_back());
+    }
+
+    // --- segment moderation folds (#932 bedrock follow-up) ---------------
+
+    /// A stub segment moderator: uppercases every slot and reports a
+    /// fixed count key, or blocks/bypasses on demand.
+    struct StubSegments {
+        verdict: GuardrailVerdict,
+        mask: bool,
+    }
+    #[async_trait]
+    impl Guardrail for StubSegments {
+        fn name(&self) -> &'static str {
+            "stub-segments"
+        }
+        fn moderates_segments(&self) -> bool {
+            true
+        }
+        async fn check_input(&self, _req: &ChatFormat) -> GuardrailVerdict {
+            panic!("segment member must not be consulted via check_input_non_segment");
+        }
+        async fn moderate_input_segments(&self, texts: &[String]) -> crate::SegmentsOutcome {
+            let mut counts = std::collections::BTreeMap::new();
+            counts.insert("STUB".to_owned(), texts.len() as u32);
+            crate::SegmentsOutcome {
+                verdict: self.verdict.clone(),
+                masked: self
+                    .mask
+                    .then(|| texts.iter().map(|t| t.to_uppercase()).collect()),
+                counts,
+            }
+        }
+    }
+
+    /// The non-segment check fold skips segment members (they're consulted
+    /// via the segment pass) while normal members still run — the panic in
+    /// the stub's `check_input` proves the skip.
+    #[tokio::test]
+    async fn check_input_non_segment_skips_segment_members_but_not_others() {
+        let chain = GuardrailChain::new(vec![
+            Arc::new(StubSegments {
+                verdict: GuardrailVerdict::Allow,
+                mask: false,
+            }),
+            Arc::new(KeywordBlocklist::new(vec![KeywordRule::literal("AKIA")])),
+        ]);
+        // Keyword member still blocks...
+        assert!(chain
+            .check_input_non_segment(&req("here is AKIAEXAMPLE"))
+            .await
+            .is_block());
+        // ...and a clean request is Allow (the stub's check_input would
+        // have panicked if consulted).
+        assert_eq!(
+            chain.check_input_non_segment(&req("clean")).await,
+            GuardrailVerdict::Allow,
+        );
+        // The FULL fold still consults every member (unconverted call
+        // sites keep blob-mode coverage) — the stub panics to prove it
+        // WOULD be consulted there; assert via catch_unwind-free route:
+        // moderates_segments visibility.
+        assert!(chain.moderates_segments());
+    }
+
+    /// Segment masks compose across members in chain order, counts merge,
+    /// and a Block short-circuits with attribution.
+    #[tokio::test]
+    async fn segment_fold_composes_masks_and_attributes_blocks() {
+        // Two maskers: uppercase then uppercase again (idempotent — the
+        // composition is observable via counts merging to 2 members).
+        let chain = GuardrailChain::new_with_applied(
+            vec![
+                (
+                    "mask-a".to_owned(),
+                    Arc::new(StubSegments {
+                        verdict: GuardrailVerdict::Allow,
+                        mask: true,
+                    }) as Arc<dyn Guardrail>,
+                ),
+                (
+                    "mask-b".to_owned(),
+                    Arc::new(StubSegments {
+                        verdict: GuardrailVerdict::Allow,
+                        mask: true,
+                    }),
+                ),
+            ],
+            Vec::new(),
+        );
+        let texts = vec!["hello".to_owned(), "world".to_owned()];
+        let out = chain.moderate_input_segments(&texts).await;
+        assert_eq!(out.verdict, GuardrailVerdict::Allow);
+        assert_eq!(
+            out.masked,
+            Some(vec!["HELLO".to_owned(), "WORLD".to_owned()]),
+        );
+        assert_eq!(out.counts.get("STUB"), Some(&4), "2 members × 2 slots");
+
+        // Block short-circuits and is attributed to the firing member.
+        let blocking = GuardrailChain::new_with_applied(
+            vec![(
+                "seg-blocker".to_owned(),
+                Arc::new(StubSegments {
+                    verdict: GuardrailVerdict::block("pii blocked"),
+                    mask: false,
+                }) as Arc<dyn Guardrail>,
+            )],
+            Vec::new(),
+        );
+        match blocking.moderate_input_segments(&texts).await.verdict {
+            GuardrailVerdict::Block { guardrail_name, .. } => {
+                assert_eq!(guardrail_name.as_deref(), Some("seg-blocker"))
+            }
+            other => panic!("expected Block, got {other:?}"),
+        }
+    }
+
+    /// A member returning a mask whose length drifted from ITS input is
+    /// refused (originals kept) — the chain-level alignment guard.
+    #[tokio::test]
+    async fn segment_fold_refuses_misaligned_member_mask() {
+        struct Drifting;
+        #[async_trait]
+        impl Guardrail for Drifting {
+            fn name(&self) -> &'static str {
+                "drifting"
+            }
+            fn moderates_segments(&self) -> bool {
+                true
+            }
+            async fn moderate_input_segments(&self, _texts: &[String]) -> crate::SegmentsOutcome {
+                crate::SegmentsOutcome {
+                    verdict: GuardrailVerdict::Allow,
+                    masked: Some(vec!["only-one".to_owned()]),
+                    counts: std::collections::BTreeMap::new(),
+                }
+            }
+        }
+        let chain = GuardrailChain::new(vec![Arc::new(Drifting)]);
+        let texts = vec!["a".to_owned(), "b".to_owned()];
+        let out = chain.moderate_input_segments(&texts).await;
+        assert_eq!(out.masked, None, "drifted mask must be refused");
+        assert_eq!(out.verdict, GuardrailVerdict::Allow);
     }
 
     #[test]

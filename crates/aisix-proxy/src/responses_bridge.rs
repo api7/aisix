@@ -1082,9 +1082,52 @@ pub fn build_responses_bridge_stream(
                 finish_reason: FinishReason::Stop,
                 usage: UsageStats::new(0, 0),
             };
-            if let aisix_guardrails::GuardrailVerdict::Block { reason, guardrail_name } =
-                aisix_guardrails::Guardrail::check_output(chain.as_ref(), &synth).await
-            {
+            let verdict =
+                aisix_guardrails::Guardrail::check_output_non_segment(chain.as_ref(), &synth)
+                    .await;
+            // Segment pass over the held SSE frames: one Bedrock call; an
+            // ANONYMIZE disposition rewrites the held bytes (#932 bedrock
+            // follow-up).
+            let mut seg_counts = crate::redact::RedactionCounts::new();
+            let mut joined: Vec<u8> = Vec::with_capacity(held_bytes);
+            for b in &held {
+                joined.extend_from_slice(b);
+            }
+            let mut seg_rewrote = false;
+            let verdict = crate::redact::moderate_body(
+                chain.as_ref(),
+                crate::redact::Direction::Output,
+                verdict,
+                &mut seg_counts,
+                |g| match crate::redact::redact_responses_sse(g, &joined) {
+                    Some((rewritten, counts)) => {
+                        joined = rewritten;
+                        seg_rewrote = true;
+                        counts
+                    }
+                    None => crate::redact::RedactionCounts::new(),
+                },
+            )
+            .await;
+            if !seg_counts.is_empty() {
+                // Bedrock masked the held bytes — rebuild the content-
+                // capture accumulator from the masked text channels,
+                // keeping the original soft cap (#932 × AISIX-Cloud#947).
+                if let Some(cap) = content_cap {
+                    let mut rebuilt = crate::redact::responses_sse_text(&joined);
+                    let mut cut = (cap as usize).min(rebuilt.len());
+                    while cut < rebuilt.len() && !rebuilt.is_char_boundary(cut) {
+                        cut += 1;
+                    }
+                    rebuilt.truncate(cut);
+                    guard.comp().response_text = rebuilt;
+                }
+                crate::redact::merge_counts(
+                    &mut guard.comp().redacted_entity_counts,
+                    seg_counts,
+                );
+            }
+            if let aisix_guardrails::GuardrailVerdict::Block { reason, guardrail_name } = verdict {
                 tracing::warn!(
                     guardrail_hook = "output",
                     model = %model_label,
@@ -1094,6 +1137,9 @@ pub fn build_responses_bridge_stream(
                 guard.comp().guardrail_blocked = true;
                 yield Ok(bytes::Bytes::from(guardrail_error_frame(guardrail_name.as_deref())));
                 return;
+            }
+            if seg_rewrote {
+                held = vec![bytes::Bytes::from(joined)];
             }
         }
         // Passed (#932): mask the held SSE frames (channel reassembly)

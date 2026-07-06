@@ -863,7 +863,19 @@ async fn dispatch(
     // + fail_open=true) doesn't short-circuit; the reason is stashed
     // and attached to the telemetry event when the request finishes.
     let mut bypass_reason: Option<String> = None;
-    match resolved_chain.check_input(req).await {
+    // Split moderation: local/blob members check first (on the original
+    // text), then the segment pass runs the Bedrock call and writes
+    // ANONYMIZE masks back into `req` (#932 bedrock follow-up).
+    let input_verdict = resolved_chain.check_input_non_segment(req).await;
+    let input_verdict = crate::redact::moderate_body(
+        resolved_chain.as_ref(),
+        crate::redact::Direction::Input,
+        input_verdict,
+        redactions_out,
+        |g| crate::redact::redact_chat_format(g, req),
+    )
+    .await;
+    match input_verdict {
         GuardrailVerdict::Allow => {}
         GuardrailVerdict::Block {
             reason,
@@ -1568,7 +1580,16 @@ async fn dispatch(
                 // #448: a cache hit is client-visible output just like a
                 // fresh upstream response, so it must run output guardrails
                 // before being returned — not bypass them.
-                match resolved_chain.check_output(&cached).await {
+                let cached_verdict = resolved_chain.check_output_non_segment(&cached).await;
+                let cached_verdict = crate::redact::moderate_body(
+                    resolved_chain.as_ref(),
+                    crate::redact::Direction::Output,
+                    cached_verdict,
+                    redactions_out,
+                    |g| crate::redact::redact_chat_response(g, &mut cached),
+                )
+                .await;
+                match cached_verdict {
                     GuardrailVerdict::Block {
                         reason,
                         guardrail_name,
@@ -1913,7 +1934,16 @@ async fn dispatch(
     // ingesting telemetry; the DP just records 0.0 on the wire.
     let cost_usd = 0.0;
 
-    match resolved_chain.check_output(&upstream).await {
+    let output_verdict = resolved_chain.check_output_non_segment(&upstream).await;
+    let output_verdict = crate::redact::moderate_body(
+        resolved_chain.as_ref(),
+        crate::redact::Direction::Output,
+        output_verdict,
+        redactions_out,
+        |g| crate::redact::redact_chat_response(g, &mut upstream),
+    )
+    .await;
+    match output_verdict {
         GuardrailVerdict::Allow => {}
         GuardrailVerdict::Block {
             reason,
@@ -2702,7 +2732,19 @@ async fn dispatch_ensemble(
     // bills the full panel + judge): on a block we therefore pass
     // `charge: None` rather than a judge-only `UpstreamCharge`, which
     // would double-count the judge AND still miss the panel.
-    match resolved_chain.check_output(&outcome.response).await {
+    let mut ensemble_redactions = input_redactions.clone();
+    let ensemble_verdict = resolved_chain
+        .check_output_non_segment(&outcome.response)
+        .await;
+    let ensemble_verdict = crate::redact::moderate_body(
+        resolved_chain.as_ref(),
+        crate::redact::Direction::Output,
+        ensemble_verdict,
+        &mut ensemble_redactions,
+        |g| crate::redact::redact_chat_response(g, &mut outcome.response),
+    )
+    .await;
+    match ensemble_verdict {
         GuardrailVerdict::Allow => {}
         GuardrailVerdict::Block {
             reason,
@@ -2742,7 +2784,6 @@ async fn dispatch_ensemble(
     // the check above ran on the original text, the client gets the masked
     // one — then emit the (non-blocked) sub-call events with the final
     // bypass value (which an output bypass above may have set).
-    let mut ensemble_redactions = input_redactions.clone();
     crate::redact::merge_counts(
         &mut ensemble_redactions,
         crate::redact::redact_chat_response(resolved_chain.as_ref(), &mut outcome.response),
@@ -3865,7 +3906,40 @@ where
                                 ),
                             }
                         };
-                        match ctx.chain.check_output(&synthesized).await {
+                        let verdict = ctx.chain.check_output_non_segment(&synthesized).await;
+                        let mut seg_counts = crate::redact::RedactionCounts::new();
+                        let verdict = crate::redact::moderate_body(
+                            ctx.chain.as_ref(),
+                            crate::redact::Direction::Output,
+                            verdict,
+                            &mut seg_counts,
+                            |g| crate::redact::redact_chat_chunks(g, &mut pending),
+                        )
+                        .await;
+                        if !seg_counts.is_empty() {
+                            // Bedrock masked the held chunks — rebuild the
+                            // content-capture accumulator from the masked
+                            // content channel (the sync redactor below can't
+                            // reproduce a provider-side mask), keeping the
+                            // original soft cap (#932 × AISIX-Cloud#947).
+                            if let Some(cap) = content_cap {
+                                let mut rebuilt = String::new();
+                                for c in pending.iter() {
+                                    if rebuilt.len() >= cap as usize {
+                                        break;
+                                    }
+                                    if let Some(t) = c.delta.content.as_deref() {
+                                        rebuilt.push_str(t);
+                                    }
+                                }
+                                guard.comp().response_text = rebuilt;
+                            }
+                            crate::redact::merge_counts(
+                                &mut guard.comp().redacted_entity_counts,
+                                seg_counts,
+                            );
+                        }
+                        match verdict {
                             aisix_guardrails::GuardrailVerdict::Block { reason, guardrail_name } => {
                                 tracing::warn!(
                                     guardrail_hook = "output",

@@ -241,12 +241,26 @@ async fn dispatch(
         team_id: auth.key().team_id.as_deref(),
     };
     let resolved_chain = state.guardrail_index.resolve(&guardrail_ctx);
+    let mut input_seg_counts = crate::redact::RedactionCounts::new();
     if !resolved_chain.is_empty() {
         let chat = completions_input_to_chat(model_name, &body);
+        let verdict =
+            aisix_guardrails::Guardrail::check_input_non_segment(&resolved_chain, &chat).await;
+        // Segment pass: one Bedrock call over the prompt slots; an
+        // ANONYMIZE disposition writes the masked text back into the body
+        // (#932 bedrock follow-up).
+        let verdict = crate::redact::moderate_body(
+            &resolved_chain,
+            crate::redact::Direction::Input,
+            verdict,
+            &mut input_seg_counts,
+            |g| crate::redact::redact_completions_request(g, &mut body),
+        )
+        .await;
         if let aisix_guardrails::GuardrailVerdict::Block {
             reason,
             guardrail_name,
-        } = aisix_guardrails::Guardrail::check_input(&resolved_chain, &chat).await
+        } = verdict
         {
             // Per #153 the matched-pattern detail stays in ops logs only.
             tracing::warn!(
@@ -264,6 +278,7 @@ async fn dispatch(
     // #932: mask-action PII rules rewrite the prompt in place AFTER the
     // block check passes, BEFORE the body is forwarded upstream.
     let mut redactions = crate::redact::redact_completions_request(&resolved_chain, &mut body);
+    crate::redact::merge_counts(&mut redactions, input_seg_counts);
 
     // Content capture (AISIX-Cloud#947): the client-facing request body
     // (post-redaction, so masked PII stays masked in the exported content),
@@ -327,6 +342,7 @@ async fn dispatch(
             // text into a synthetic ChatResponse and run the chain. The upstream
             // already billed (tokens committed above), so a block surfaces a
             // redacted 422 rather than the response.
+            let mut resp_json = resp_json;
             if !resolved_chain.is_empty() {
                 let synth = ChatResponse {
                     id: String::new(),
@@ -335,10 +351,21 @@ async fn dispatch(
                     finish_reason: FinishReason::Stop,
                     usage: UsageStats::default(),
                 };
+                let verdict =
+                    aisix_guardrails::Guardrail::check_output_non_segment(&resolved_chain, &synth)
+                        .await;
+                let verdict = crate::redact::moderate_body(
+                    &resolved_chain,
+                    crate::redact::Direction::Output,
+                    verdict,
+                    &mut redactions,
+                    |g| crate::redact::redact_completions_response(g, &mut resp_json),
+                )
+                .await;
                 if let aisix_guardrails::GuardrailVerdict::Block {
                     reason,
                     guardrail_name,
-                } = aisix_guardrails::Guardrail::check_output(&resolved_chain, &synth).await
+                } = verdict
                 {
                     // Per #153 the matched-pattern detail stays in ops logs only.
                     tracing::warn!(
@@ -376,7 +403,6 @@ async fn dispatch(
 
             // #932: mask-action PII rules rewrite the reply text AFTER the
             // block check passes.
-            let mut resp_json = resp_json;
             crate::redact::merge_counts(
                 &mut redactions,
                 crate::redact::redact_completions_response(&resolved_chain, &mut resp_json),

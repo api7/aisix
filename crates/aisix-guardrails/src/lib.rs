@@ -159,6 +159,20 @@ impl GuardrailVerdict {
             _ => None,
         }
     }
+
+    /// Fold the verdicts of two split moderation passes over the same
+    /// content (the non-segment check + the segment pass) into one:
+    /// Block wins (`self` first), then Bypass (`self`'s reason first),
+    /// else Allow.
+    pub fn merged_with(self, other: GuardrailVerdict) -> GuardrailVerdict {
+        match (self, other) {
+            (b @ GuardrailVerdict::Block { .. }, _) => b,
+            (_, b @ GuardrailVerdict::Block { .. }) => b,
+            (by @ GuardrailVerdict::Bypass { .. }, _) => by,
+            (_, by @ GuardrailVerdict::Bypass { .. }) => by,
+            _ => GuardrailVerdict::Allow,
+        }
+    }
 }
 
 /// How a guardrail wants STREAMED output moderated. The proxy's SSE
@@ -279,6 +293,46 @@ impl Redaction {
     }
 }
 
+/// Outcome of [`Guardrail::moderate_input_segments`] /
+/// [`Guardrail::moderate_output_segments`] — remote moderation of a
+/// request's text segments in ONE provider call (kind=bedrock).
+///
+/// `masked`, when present, is positionally aligned with the input
+/// `texts` slice: `masked[i]` replaces `texts[i]`. Implementations MUST
+/// uphold that alignment or return `masked: None` (the caller then keeps
+/// the originals — the LiteLLM `_merge_masked_texts` defensive fallback:
+/// never misapply masked content to the wrong slot).
+///
+/// `counts` mirrors [`Redaction::counts`]: entity NAMES only (e.g. a
+/// Bedrock PII entity type like `EMAIL`), never matched values, so it is
+/// safe for logs and telemetry (#153 / #932 no-leak criterion).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SegmentsOutcome {
+    pub verdict: GuardrailVerdict,
+    pub masked: Option<Vec<String>>,
+    pub counts: std::collections::BTreeMap<String, u32>,
+}
+
+impl SegmentsOutcome {
+    /// Plain Allow: nothing detected, nothing rewritten.
+    pub fn allow() -> Self {
+        Self {
+            verdict: GuardrailVerdict::Allow,
+            masked: None,
+            counts: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// Wrap a bare verdict (Block/Bypass paths carry no mask or counts).
+    pub fn from_verdict(verdict: GuardrailVerdict) -> Self {
+        Self {
+            verdict,
+            masked: None,
+            counts: std::collections::BTreeMap::new(),
+        }
+    }
+}
+
 /// Pluggable content-policy hook. Production wires `Arc<dyn Guardrail>`
 /// in `ProxyState`; tests construct in-memory chains directly.
 #[async_trait]
@@ -359,6 +413,61 @@ pub trait Guardrail: Send + Sync + 'static {
     /// Rewrite one response-side text field, masking sensitive spans.
     fn redact_output_text(&self, _text: &str) -> Option<Redaction> {
         None
+    }
+
+    // --- remote segment moderation (#932 bedrock follow-up) ---------------
+    //
+    // A remote-API guardrail that can MASK (Bedrock PII anonymize) can't
+    // implement the sync per-field redact contract above — the mask comes
+    // back from the provider call itself. Instead the proxy hands such a
+    // guardrail ALL of a request's text segments at once (in wire-walker
+    // order), gets verdict + positionally-aligned masked replacements from
+    // ONE provider call, and writes them back per wire shape. Call sites
+    // that run this pass pair it with `check_*_non_segment` so the
+    // guardrail is consulted exactly once per hook.
+
+    /// `true` when this guardrail moderates via the segment hooks below.
+    /// Such a member is skipped by `check_input_non_segment` /
+    /// `check_output_non_segment` (the segment pass covers it).
+    fn moderates_segments(&self) -> bool {
+        false
+    }
+
+    /// Moderate the request's text segments in one remote call. Only
+    /// meaningful when [`Self::moderates_segments`] is `true`; the default
+    /// allows so a caller that runs the pass unconditionally is safe.
+    async fn moderate_input_segments(&self, _texts: &[String]) -> SegmentsOutcome {
+        SegmentsOutcome::allow()
+    }
+
+    /// Moderate the response's text segments in one remote call.
+    async fn moderate_output_segments(&self, _texts: &[String]) -> SegmentsOutcome {
+        SegmentsOutcome::allow()
+    }
+
+    /// `check_input` minus segment-moderating members — used by call
+    /// sites that ALSO run [`Self::moderate_input_segments`], so a
+    /// segment member isn't consulted twice (and billed twice). For a
+    /// leaf guardrail this is all-or-nothing: a segment moderator
+    /// answers via the segment pass (Allow here), anything else answers
+    /// via its normal check. [`GuardrailChain`] overrides with a
+    /// member-filtered fold.
+    async fn check_input_non_segment(&self, req: &ChatFormat) -> GuardrailVerdict {
+        if self.moderates_segments() {
+            GuardrailVerdict::Allow
+        } else {
+            self.check_input(req).await
+        }
+    }
+
+    /// `check_output` minus segment-moderating members (see
+    /// [`Self::check_input_non_segment`]).
+    async fn check_output_non_segment(&self, resp: &ChatResponse) -> GuardrailVerdict {
+        if self.moderates_segments() {
+            GuardrailVerdict::Allow
+        } else {
+            self.check_output(resp).await
+        }
     }
 }
 

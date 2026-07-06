@@ -459,10 +459,26 @@ async fn dispatch(
     *applied_out = resolved_chain.applied().to_vec();
     if !resolved_chain.is_empty() {
         if let Ok(chat) = aisix_provider_anthropic::parse_inbound_request(body) {
+            let verdict = aisix_guardrails::Guardrail::check_input_non_segment(
+                resolved_chain.as_ref(),
+                &chat,
+            )
+            .await;
+            // Segment pass: one Bedrock call over the body's text slots;
+            // an ANONYMIZE disposition writes the masked text back into
+            // the Anthropic-native body (#932 bedrock follow-up).
+            let verdict = crate::redact::moderate_body(
+                resolved_chain.as_ref(),
+                crate::redact::Direction::Input,
+                verdict,
+                redactions_out,
+                |g| crate::redact::redact_anthropic_request(g, body),
+            )
+            .await;
             if let aisix_guardrails::GuardrailVerdict::Block {
                 reason,
                 guardrail_name,
-            } = aisix_guardrails::Guardrail::check_input(resolved_chain.as_ref(), &chat).await
+            } = verdict
             {
                 tracing::warn!(
                     guardrail_hook = "input",
@@ -1168,7 +1184,7 @@ async fn anthropic_passthrough_dispatch(
         // failures cool down the target — a body the bridge can't
         // parse is a real upstream problem worth taking out of
         // rotation, not a caller bug.
-        let json_body: Value = upstream_resp
+        let mut json_body: Value = upstream_resp
             .json()
             .await
             .map_err(|e| {
@@ -1187,6 +1203,7 @@ async fn anthropic_passthrough_dispatch(
         // The body is forwarded verbatim, so extract its text (content
         // blocks + the raw content array, which covers tool_use args) into
         // a synthetic ChatResponse for inspection before returning it.
+        let mut output_seg_counts = crate::redact::RedactionCounts::new();
         if !resolved_chain.is_empty() {
             if let Some(content) = json_body.get("content").and_then(|v| v.as_array()) {
                 let mut out_text = String::new();
@@ -1210,11 +1227,23 @@ async fn anthropic_passthrough_dispatch(
                     finish_reason: aisix_gateway::FinishReason::Stop,
                     usage: aisix_gateway::UsageStats::new(0, 0),
                 };
+                let verdict = aisix_guardrails::Guardrail::check_output_non_segment(
+                    resolved_chain.as_ref(),
+                    &synth,
+                )
+                .await;
+                let verdict = crate::redact::moderate_body(
+                    resolved_chain.as_ref(),
+                    crate::redact::Direction::Output,
+                    verdict,
+                    &mut output_seg_counts,
+                    |g| crate::redact::redact_anthropic_response(g, &mut json_body),
+                )
+                .await;
                 if let aisix_guardrails::GuardrailVerdict::Block {
                     reason,
                     guardrail_name,
-                } =
-                    aisix_guardrails::Guardrail::check_output(resolved_chain.as_ref(), &synth).await
+                } = verdict
                 {
                     tracing::warn!(
                         guardrail_hook = "output",
@@ -1233,7 +1262,6 @@ async fn anthropic_passthrough_dispatch(
         }
 
         // Restore the gateway-facing model name so callers see what they asked for.
-        let mut json_body = json_body;
         if let Some(m) = json_body.get_mut("model") {
             // If the upstream echoes the model name, rewrite to the gateway name.
             if m.as_str().map(|s| s == upstream_model).unwrap_or(false) {
@@ -1243,8 +1271,9 @@ async fn anthropic_passthrough_dispatch(
 
         // #932: mask-action PII rules rewrite the passthrough response body
         // (text blocks + tool_use input) AFTER the block check passes.
-        let output_redactions =
+        let mut output_redactions =
             crate::redact::redact_anthropic_response(resolved_chain.as_ref(), &mut json_body);
+        crate::redact::merge_counts(&mut output_redactions, output_seg_counts);
 
         // Capture the prompt (the outbound request body) + assembled assistant
         // text for content-capturing exporters (gated). Built here, before
@@ -1646,11 +1675,23 @@ async fn cross_provider_dispatch(
     // #448 (#22): run output guardrails on the cross-provider response
     // before rendering it back as Anthropic JSON — the response is
     // client-visible output just like /v1/chat/completions.
+    let mut output_seg_counts = crate::redact::RedactionCounts::new();
     if !resolved_chain.is_empty() {
+        let verdict =
+            aisix_guardrails::Guardrail::check_output_non_segment(resolved_chain.as_ref(), &resp)
+                .await;
+        let verdict = crate::redact::moderate_body(
+            resolved_chain.as_ref(),
+            crate::redact::Direction::Output,
+            verdict,
+            &mut output_seg_counts,
+            |g| crate::redact::redact_chat_response(g, &mut resp),
+        )
+        .await;
         if let aisix_guardrails::GuardrailVerdict::Block {
             reason,
             guardrail_name,
-        } = aisix_guardrails::Guardrail::check_output(resolved_chain.as_ref(), &resp).await
+        } = verdict
         {
             tracing::warn!(
                 guardrail_hook = "output",
@@ -1666,7 +1707,9 @@ async fn cross_provider_dispatch(
 
     // #932: mask-action PII rules rewrite the bridged response AFTER the
     // block check passes, BEFORE it is rendered back as Anthropic JSON.
-    let output_redactions = crate::redact::redact_chat_response(resolved_chain.as_ref(), &mut resp);
+    let mut output_redactions =
+        crate::redact::redact_chat_response(resolved_chain.as_ref(), &mut resp);
+    crate::redact::merge_counts(&mut output_redactions, output_seg_counts);
 
     let metrics = AnthropicUsageMetrics {
         prompt_tokens: resp.usage.prompt_tokens,
@@ -1868,10 +1911,45 @@ fn build_anthropic_sse_stream(
                     finish_reason: aisix_gateway::FinishReason::Stop,
                     usage: aisix_gateway::UsageStats::new(0, 0),
                 };
+                let verdict =
+                    aisix_guardrails::Guardrail::check_output_non_segment(chain.as_ref(), &synth)
+                        .await;
+                let mut seg_counts = crate::redact::RedactionCounts::new();
+                let verdict = crate::redact::moderate_body(
+                    chain.as_ref(),
+                    crate::redact::Direction::Output,
+                    verdict,
+                    &mut seg_counts,
+                    |g| crate::redact::redact_chat_chunks(g, &mut held_chunks),
+                )
+                .await;
+                if !seg_counts.is_empty() {
+                    // Bedrock masked the held chunks — rebuild the content-
+                    // capture accumulator from the masked content channel
+                    // (the sync redactor below can't reproduce a provider-
+                    // side mask), keeping the original soft cap
+                    // (#932 × AISIX-Cloud#947).
+                    if let Some(cap) = content_cap {
+                        let mut rebuilt = String::new();
+                        for c in held_chunks.iter() {
+                            if rebuilt.len() >= cap as usize {
+                                break;
+                            }
+                            if let Some(t) = c.delta.content.as_deref() {
+                                rebuilt.push_str(t);
+                            }
+                        }
+                        guard.comp().response_text = rebuilt;
+                    }
+                    crate::redact::merge_counts(
+                        &mut guard.comp().redacted_entity_counts,
+                        seg_counts,
+                    );
+                }
                 if let aisix_guardrails::GuardrailVerdict::Block {
                     reason,
                     guardrail_name,
-                } = aisix_guardrails::Guardrail::check_output(chain.as_ref(), &synth).await
+                } = verdict
                 {
                     tracing::warn!(
                         guardrail_hook = "output",
@@ -2631,10 +2709,51 @@ where
                     finish_reason: aisix_gateway::FinishReason::Stop,
                     usage: aisix_gateway::UsageStats::new(0, 0),
                 };
+                let verdict =
+                    aisix_guardrails::Guardrail::check_output_non_segment(chain.as_ref(), &synth)
+                        .await;
+                // Segment pass over the held SSE bytes. Only meaningful in
+                // hold-back mode (`held` is empty otherwise — and a chain
+                // with a segment member always folds to BufferFull, so a
+                // live-forward stream never carries one).
+                let mut seg_counts = crate::redact::RedactionCounts::new();
+                let verdict = crate::redact::moderate_body(
+                    chain.as_ref(),
+                    crate::redact::Direction::Output,
+                    verdict,
+                    &mut seg_counts,
+                    |g| match crate::redact::redact_anthropic_sse(g, &held) {
+                        Some((rewritten, counts)) => {
+                            held = rewritten;
+                            counts
+                        }
+                        None => crate::redact::RedactionCounts::new(),
+                    },
+                )
+                .await;
+                if !seg_counts.is_empty() {
+                    // Bedrock masked the held bytes — rebuild the content-
+                    // capture accumulator from the masked text channels
+                    // (the sync redactor can't reproduce a provider-side
+                    // mask) (#932 × AISIX-Cloud#947).
+                    if let Some(cap) = content_cap {
+                        let mut rebuilt = crate::redact::anthropic_sse_text(&held);
+                        let mut cut = (cap as usize).min(rebuilt.len());
+                        while cut < rebuilt.len() && !rebuilt.is_char_boundary(cut) {
+                            cut += 1;
+                        }
+                        rebuilt.truncate(cut);
+                        guard.usage().response_text = rebuilt;
+                    }
+                    crate::redact::merge_counts(
+                        &mut guard.usage().redacted_entity_counts,
+                        seg_counts,
+                    );
+                }
                 if let aisix_guardrails::GuardrailVerdict::Block {
                     reason,
                     guardrail_name,
-                } = aisix_guardrails::Guardrail::check_output(chain.as_ref(), &synth).await
+                } = verdict
                 {
                     tracing::warn!(
                         guardrail_hook = "output",
