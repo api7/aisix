@@ -897,8 +897,17 @@ impl StreamState {
 // is handled by `split_system` + `build_request` for the
 // Anthropic-upstream case above.
 //
-// Trimmed to the MVP fields aisix supports today (text content blocks;
-// tool_use, image, and thinking blocks land in a follow-up PR).
+// Content-block coverage (#722, matching LiteLLM's
+// `LiteLLMAnthropicMessagesAdapter.translate_anthropic_messages_to_openai`):
+// `text`, `image` (base64 + url), `document` (→ image_url data URL, the
+// LiteLLM mapping), assistant `tool_use` (→ OpenAI `tool_calls`), and
+// `tool_result` (→ a `role:"tool"` message; string / single-text /
+// multi-block content forms). `thinking` / `redacted_thinking` history
+// blocks are dropped: the OpenAI chat wire cannot replay another
+// vendor's signed reasoning blocks — LiteLLM's OpenAI provider
+// transform discards them the same way (the top-level `thinking`
+// config key still maps to `reasoning_effort`, see
+// `translate_extras_to_openai_shape`).
 
 #[derive(Debug, thiserror::Error)]
 pub enum AnthropicInboundError {
@@ -912,7 +921,7 @@ pub enum AnthropicInboundError {
     MessageMissingRole { idx: usize },
     #[error("messages[{idx}] role {role:?} is not 'user', 'assistant' or 'system'")]
     UnsupportedRole { idx: usize, role: String },
-    #[error("messages[{idx}].content must be a string or an array of text blocks")]
+    #[error("messages[{idx}].content must be a string or an array of content blocks")]
     UnsupportedContent { idx: usize },
     #[error("`system` field must be a string or an array of text blocks")]
     UnsupportedSystem,
@@ -920,10 +929,12 @@ pub enum AnthropicInboundError {
 
 /// Parse an Anthropic `POST /v1/messages` JSON body into the gateway's
 /// internal [`ChatFormat`]. The `system` field is folded into a leading
-/// system message; content blocks are concatenated text-only (non-text
-/// blocks are skipped). Unrecognized top-level keys (`metadata`,
-/// `tools`, `tool_choice`, etc.) flow into `ChatFormat::extra` so a
-/// future tools-aware bridge can read them.
+/// system message. Message content blocks translate to their OpenAI
+/// equivalents (see the module comment above for the per-block map);
+/// a user message whose blocks include `tool_result`s expands into the
+/// preceding `role:"tool"` messages OpenAI expects. Unrecognized
+/// top-level keys (`metadata`, `tools`, `tool_choice`, etc.) flow into
+/// `ChatFormat::extra` for `translate_extras_to_openai_shape`.
 pub fn parse_inbound_request(
     body: &serde_json::Value,
 ) -> Result<ChatFormat, AnthropicInboundError> {
@@ -971,28 +982,28 @@ pub fn parse_inbound_request(
             .and_then(Value::as_str)
             .ok_or(AnthropicInboundError::MessageMissingRole { idx })?;
 
-        let content = match m.get("content") {
-            Some(Value::String(s)) => s.clone(),
-            Some(Value::Array(blocks)) => {
-                let mut parts = Vec::new();
-                for block in blocks {
-                    if let Some(text) = block.get("text").and_then(Value::as_str) {
-                        parts.push(text);
-                    }
-                }
-                parts.join("")
+        match (role, m.get("content")) {
+            ("user", Some(Value::String(s))) => messages.push(ChatMessage::user(s.clone())),
+            ("assistant", Some(Value::String(s))) => {
+                messages.push(ChatMessage::assistant(s.clone()))
             }
-            _ => return Err(AnthropicInboundError::UnsupportedContent { idx }),
-        };
-
-        match role {
-            "user" => messages.push(ChatMessage::user(content)),
-            "assistant" => messages.push(ChatMessage::assistant(content)),
             // Not in the Anthropic spec, but Claude Code/cc-switch send it
             // (#597). Keep it as a system message so OpenAI-compatible
             // upstreams receive it natively instead of a 400 here.
-            "system" => messages.push(ChatMessage::system(content)),
-            other => {
+            ("system", Some(Value::String(s))) => messages.push(ChatMessage::system(s.clone())),
+            ("user", Some(Value::Array(blocks))) => {
+                translate_user_blocks(blocks, &mut messages);
+            }
+            ("assistant", Some(Value::Array(blocks))) => {
+                messages.push(translate_assistant_blocks(blocks));
+            }
+            ("system", Some(Value::Array(blocks))) => {
+                messages.push(ChatMessage::system(concat_text_blocks(blocks)));
+            }
+            ("user" | "assistant" | "system", _) => {
+                return Err(AnthropicInboundError::UnsupportedContent { idx })
+            }
+            (other, _) => {
                 return Err(AnthropicInboundError::UnsupportedRole {
                     idx,
                     role: other.to_string(),
@@ -1029,6 +1040,247 @@ pub fn parse_inbound_request(
     }
 
     Ok(chat)
+}
+
+/// OpenAI function-name length cap; LiteLLM truncates the same way
+/// (`truncate_tool_name`).
+const OPENAI_TOOL_NAME_MAX: usize = 64;
+
+fn truncate_tool_name(name: &str) -> &str {
+    match name.char_indices().nth(OPENAI_TOOL_NAME_MAX) {
+        Some((byte_idx, _)) => &name[..byte_idx],
+        None => name,
+    }
+}
+
+fn concat_text_blocks(blocks: &[serde_json::Value]) -> String {
+    let mut out = String::new();
+    for block in blocks {
+        if let Some(text) = block.get("text").and_then(serde_json::Value::as_str) {
+            out.push_str(text);
+        }
+    }
+    out
+}
+
+/// Translate one Anthropic `image` or `document` block into the OpenAI
+/// `image_url` content part. Base64 sources become `data:` URLs; URL
+/// sources pass through. Documents map to `image_url` as well — the
+/// LiteLLM `_translate_anthropic_image_to_openai` behavior.
+fn openai_media_part_from_anthropic(block: &serde_json::Value) -> Option<serde_json::Value> {
+    let source = block.get("source")?;
+    let url = match source.get("type").and_then(serde_json::Value::as_str) {
+        Some("base64") => {
+            let media_type = source
+                .get("media_type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("application/octet-stream");
+            let data = source.get("data").and_then(serde_json::Value::as_str)?;
+            format!("data:{media_type};base64,{data}")
+        }
+        Some("url") => source
+            .get("url")
+            .and_then(serde_json::Value::as_str)?
+            .to_string(),
+        _ => return None,
+    };
+    Some(serde_json::json!({"type": "image_url", "image_url": {"url": url}}))
+}
+
+/// Translate one Anthropic assistant `tool_use` block into an OpenAI
+/// `tool_calls[]` entry (`arguments` is the JSON-*encoded* input).
+fn tool_call_from_tool_use(block: &serde_json::Value) -> Option<serde_json::Value> {
+    let id = block.get("id").and_then(serde_json::Value::as_str)?;
+    let name = block.get("name").and_then(serde_json::Value::as_str)?;
+    let input = block
+        .get("input")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    Some(serde_json::json!({
+        "id": id,
+        "type": "function",
+        "function": {
+            "name": truncate_tool_name(name),
+            "arguments": input.to_string(),
+        }
+    }))
+}
+
+/// Translate one Anthropic `tool_result` block into the OpenAI
+/// `role:"tool"` message. Content forms (LiteLLM parity): absent → "",
+/// string → string, single-text array → collapsed string, multi-block
+/// array → combined text+image content parts on ONE tool message.
+fn tool_message_from_tool_result(block: &serde_json::Value) -> ChatMessage {
+    use serde_json::Value;
+    let tool_use_id = block
+        .get("tool_use_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+
+    let (content, content_blocks) = match block.get("content") {
+        Some(Value::String(s)) => (Some(s.clone()), None),
+        Some(Value::Array(items)) => {
+            let mut parts = Vec::new();
+            let mut text = String::new();
+            let mut non_text = false;
+            for item in items {
+                match item.get("type").and_then(Value::as_str) {
+                    Some("text") => {
+                        if let Some(t) = item.get("text").and_then(Value::as_str) {
+                            text.push_str(t);
+                            parts.push(serde_json::json!({"type": "text", "text": t}));
+                        }
+                    }
+                    Some("image") => {
+                        if let Some(p) = openai_media_part_from_anthropic(item) {
+                            parts.push(p);
+                            non_text = true;
+                        }
+                    }
+                    other => {
+                        tracing::debug!(
+                            block_type = ?other,
+                            "dropping unsupported tool_result item on cross-provider dispatch",
+                        );
+                    }
+                }
+            }
+            if non_text {
+                (Some(text), Some(parts))
+            } else {
+                // All-text (or empty) collapses to a plain string.
+                (Some(text), None)
+            }
+        }
+        _ => (Some(String::new()), None),
+    };
+
+    ChatMessage {
+        role: Role::Tool,
+        content,
+        content_blocks,
+        name: None,
+        tool_call_id: (!tool_use_id.is_empty()).then_some(tool_use_id),
+        extra: serde_json::Map::new(),
+    }
+}
+
+/// Expand one Anthropic user message's content blocks. `tool_result`
+/// blocks become individual `role:"tool"` messages emitted BEFORE the
+/// user turn (OpenAI requires tool messages to directly follow the
+/// assistant `tool_calls` turn); the remaining text/image/document
+/// blocks form the user message itself.
+fn translate_user_blocks(blocks: &[serde_json::Value], out: &mut Vec<ChatMessage>) {
+    use serde_json::Value;
+    let mut tool_messages: Vec<ChatMessage> = Vec::new();
+    let mut parts: Vec<Value> = Vec::new();
+    let mut text = String::new();
+    let mut non_text = false;
+
+    for block in blocks {
+        match block.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                if let Some(t) = block.get("text").and_then(Value::as_str) {
+                    text.push_str(t);
+                    parts.push(serde_json::json!({"type": "text", "text": t}));
+                }
+            }
+            Some("image") | Some("document") => {
+                if let Some(p) = openai_media_part_from_anthropic(block) {
+                    parts.push(p);
+                    non_text = true;
+                } else {
+                    tracing::debug!(
+                        "dropping image/document block with unsupported source on \
+                         cross-provider dispatch",
+                    );
+                }
+            }
+            Some("tool_result") => tool_messages.push(tool_message_from_tool_result(block)),
+            other => {
+                tracing::debug!(
+                    block_type = ?other,
+                    "dropping unsupported Anthropic content block on cross-provider dispatch",
+                );
+            }
+        }
+    }
+
+    let had_tool_messages = !tool_messages.is_empty();
+    out.append(&mut tool_messages);
+
+    if !parts.is_empty() {
+        let mut msg = ChatMessage::user(text);
+        if non_text {
+            // Mixed/multimodal content rides the raw OpenAI parts array;
+            // `content` keeps the concatenated text for guardrail scans
+            // and non-block bridges.
+            msg.content_blocks = Some(parts);
+        }
+        out.push(msg);
+    } else if !had_tool_messages {
+        // Preserve the pre-#722 behavior for a message whose blocks all
+        // fell through: an empty user turn (rather than dropping the
+        // message and shifting the conversation structure).
+        out.push(ChatMessage::user(String::new()));
+    }
+}
+
+/// Collapse one Anthropic assistant message's content blocks into a
+/// ChatMessage: text concatenates, `tool_use` becomes OpenAI
+/// `tool_calls`, thinking blocks drop (non-replayable on the OpenAI
+/// wire — see the module comment).
+fn translate_assistant_blocks(blocks: &[serde_json::Value]) -> ChatMessage {
+    use serde_json::Value;
+    let mut text = String::new();
+    let mut tool_calls: Vec<Value> = Vec::new();
+
+    for block in blocks {
+        match block.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                if let Some(t) = block.get("text").and_then(Value::as_str) {
+                    text.push_str(t);
+                }
+            }
+            Some("tool_use") => {
+                if let Some(tc) = tool_call_from_tool_use(block) {
+                    tool_calls.push(tc);
+                } else {
+                    tracing::debug!(
+                        "dropping malformed tool_use block (missing id/name) on \
+                         cross-provider dispatch",
+                    );
+                }
+            }
+            Some("thinking") | Some("redacted_thinking") => {
+                tracing::debug!(
+                    "dropping thinking block on cross-provider dispatch (not replayable \
+                     on the OpenAI wire)",
+                );
+            }
+            other => {
+                tracing::debug!(
+                    block_type = ?other,
+                    "dropping unsupported Anthropic content block on cross-provider dispatch",
+                );
+            }
+        }
+    }
+
+    let mut msg = ChatMessage::assistant(text);
+    if !tool_calls.is_empty() {
+        if msg.content.as_deref() == Some("") {
+            // OpenAI's canonical history shape for a pure tool-call turn
+            // is `content: null`.
+            msg.content = None;
+        }
+        msg.extra.insert(
+            "tool_calls".to_string(),
+            serde_json::Value::Array(tool_calls),
+        );
+    }
+    msg
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -2290,8 +2542,13 @@ mod tests {
             }],
         });
         let chat = parse_inbound_request(&body).unwrap();
-        // Image block silently skipped; text concatenates.
+        // Text still concatenates into `content` (guardrail scans read it)…
         assert_eq!(chat.messages[0].content_str(), "hello world");
+        // …and since #722 the image block is preserved as an OpenAI
+        // `image_url` part instead of being silently dropped.
+        let blocks = chat.messages[0].content_blocks.as_ref().unwrap();
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[1]["type"], "image_url");
     }
 
     #[test]
@@ -2836,5 +3093,199 @@ mod tests {
             kinds,
             vec!["content_block_stop", "message_delta", "message_stop"]
         );
+    }
+    // ─── #722: cross-provider content-block translation ─────────────
+
+    #[test]
+    fn inbound_image_base64_becomes_data_url_image_part() {
+        let body = serde_json::json!({
+            "model": "claude",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "what is this?"},
+                    {"type": "image", "source": {
+                        "type": "base64", "media_type": "image/png", "data": "aGk="
+                    }},
+                ],
+            }],
+        });
+        let chat = parse_inbound_request(&body).unwrap();
+        assert_eq!(chat.messages.len(), 1);
+        let blocks = chat.messages[0].content_blocks.as_ref().unwrap();
+        assert_eq!(
+            blocks[0],
+            serde_json::json!({"type": "text", "text": "what is this?"})
+        );
+        assert_eq!(
+            blocks[1],
+            serde_json::json!({"type": "image_url", "image_url": {"url": "data:image/png;base64,aGk="}})
+        );
+        assert_eq!(chat.messages[0].content_str(), "what is this?");
+    }
+
+    #[test]
+    fn inbound_image_url_and_document_become_image_parts() {
+        let body = serde_json::json!({
+            "model": "claude",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {"type": "url", "url": "https://x.example/cat.png"}},
+                    {"type": "document", "source": {
+                        "type": "base64", "media_type": "application/pdf", "data": "cGRm"
+                    }},
+                ],
+            }],
+        });
+        let chat = parse_inbound_request(&body).unwrap();
+        let blocks = chat.messages[0].content_blocks.as_ref().unwrap();
+        assert_eq!(blocks[0]["image_url"]["url"], "https://x.example/cat.png");
+        assert_eq!(
+            blocks[1]["image_url"]["url"],
+            "data:application/pdf;base64,cGRm"
+        );
+    }
+
+    #[test]
+    fn inbound_assistant_tool_use_becomes_openai_tool_calls() {
+        let body = serde_json::json!({
+            "model": "claude",
+            "messages": [
+                {"role": "user", "content": "weather in SF?"},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "checking"},
+                    {"type": "tool_use", "id": "toolu_1", "name": "get_weather",
+                     "input": {"city": "SF"}},
+                ]},
+            ],
+        });
+        let chat = parse_inbound_request(&body).unwrap();
+        let assistant = &chat.messages[1];
+        assert_eq!(assistant.content_str(), "checking");
+        let calls = assistant
+            .extra
+            .get("tool_calls")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["id"], "toolu_1");
+        assert_eq!(calls[0]["type"], "function");
+        assert_eq!(calls[0]["function"]["name"], "get_weather");
+        let args: serde_json::Value =
+            serde_json::from_str(calls[0]["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(args, serde_json::json!({"city": "SF"}));
+    }
+
+    #[test]
+    fn inbound_pure_tool_use_turn_has_null_content() {
+        let body = serde_json::json!({
+            "model": "claude",
+            "messages": [{"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_1", "name": "f", "input": {}},
+            ]}],
+        });
+        let chat = parse_inbound_request(&body).unwrap();
+        // OpenAI's canonical pure-tool-call history turn is content: null.
+        assert_eq!(chat.messages[0].content, None);
+        assert!(chat.messages[0].extra.contains_key("tool_calls"));
+    }
+
+    #[test]
+    fn inbound_tool_name_truncates_to_openai_64_char_cap() {
+        let long = "x".repeat(80);
+        let body = serde_json::json!({
+            "model": "claude",
+            "messages": [{"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": long, "input": {}},
+            ]}],
+        });
+        let chat = parse_inbound_request(&body).unwrap();
+        let calls = chat.messages[0].extra["tool_calls"].as_array().unwrap();
+        assert_eq!(calls[0]["function"]["name"].as_str().unwrap().len(), 64);
+    }
+
+    #[test]
+    fn inbound_tool_result_becomes_tool_message_before_user_turn() {
+        let body = serde_json::json!({
+            "model": "claude",
+            "messages": [
+                {"role": "user", "content": "weather?"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {}},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "and now?"},
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": "sunny, 21C"},
+                ]},
+            ],
+        });
+        let chat = parse_inbound_request(&body).unwrap();
+        // user, assistant(tool_calls), TOOL, user — the tool answer must
+        // directly follow the assistant tool_calls turn.
+        assert_eq!(chat.messages.len(), 4);
+        assert_eq!(chat.messages[2].role, Role::Tool);
+        assert_eq!(chat.messages[2].tool_call_id.as_deref(), Some("toolu_1"));
+        assert_eq!(chat.messages[2].content_str(), "sunny, 21C");
+        assert_eq!(chat.messages[3].role, Role::User);
+        assert_eq!(chat.messages[3].content_str(), "and now?");
+    }
+
+    #[test]
+    fn inbound_tool_result_single_text_block_collapses_to_string() {
+        let body = serde_json::json!({
+            "model": "claude",
+            "messages": [{"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1",
+                 "content": [{"type": "text", "text": "42"}]},
+            ]}],
+        });
+        let chat = parse_inbound_request(&body).unwrap();
+        assert_eq!(chat.messages.len(), 1);
+        assert_eq!(chat.messages[0].role, Role::Tool);
+        assert_eq!(chat.messages[0].content_str(), "42");
+        assert!(chat.messages[0].content_blocks.is_none());
+    }
+
+    #[test]
+    fn inbound_tool_result_with_image_keeps_combined_parts() {
+        let body = serde_json::json!({
+            "model": "claude",
+            "messages": [{"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": [
+                    {"type": "text", "text": "screenshot:"},
+                    {"type": "image", "source": {
+                        "type": "base64", "media_type": "image/png", "data": "aWc="
+                    }},
+                ]},
+            ]}],
+        });
+        let chat = parse_inbound_request(&body).unwrap();
+        let tool_msg = &chat.messages[0];
+        assert_eq!(tool_msg.role, Role::Tool);
+        let parts = tool_msg.content_blocks.as_ref().unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[1]["type"], "image_url");
+    }
+
+    #[test]
+    fn inbound_thinking_blocks_drop_but_text_and_tools_survive() {
+        let body = serde_json::json!({
+            "model": "claude",
+            "messages": [{"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "secret chain", "signature": "sig"},
+                {"type": "redacted_thinking", "data": "opaque"},
+                {"type": "text", "text": "answer"},
+            ]}],
+        });
+        let chat = parse_inbound_request(&body).unwrap();
+        assert_eq!(chat.messages[0].content_str(), "answer");
+        assert!(!chat.messages[0].extra.contains_key("tool_calls"));
+        // The thinking text must not leak into the translated content.
+        assert!(!serde_json::to_string(&chat.messages[0])
+            .unwrap()
+            .contains("secret chain"));
     }
 }

@@ -77,11 +77,11 @@ pub struct ChatMessage {
     /// Raw content-block array when the caller sent
     /// `content: [{type, ...}, ...]`. `None` for the bare-string and
     /// `null` content shapes. Bridges that support content blocks
-    /// (the OpenAI-compat bridge) forward this verbatim to upstream;
-    /// bridges that don't (Anthropic / Gemini cross-provider
-    /// translation today) consult only `content` (concatenated text) and
-    /// silently skip the non-text blocks on the inbound parse, so a
-    /// cross-provider request drops images/audio.
+    /// (the OpenAI-compat bridge) forward this verbatim to upstream.
+    /// The Anthropic /v1/messages inbound parse translates its own
+    /// block types INTO this OpenAI-shaped array (#722); bridges that
+    /// don't understand blocks consult only `content` (concatenated
+    /// text).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_blocks: Option<Vec<Value>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

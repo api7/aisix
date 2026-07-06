@@ -16,8 +16,10 @@
 //!   stream as Anthropic JSON or Anthropic SSE events
 //!   (`message_start` / `content_block_*` / `message_delta` /
 //!   `message_stop`). The translation helpers live in
-//!   `aisix-provider-anthropic::wire`. Scoped to text content blocks
-//!   today (tool_use / thinking / image blocks land in a follow-up).
+//!   `aisix-provider-anthropic::wire`. Content blocks translate per the
+//!   LiteLLM map (#722): text / image / document / tool_use /
+//!   tool_result; thinking history blocks drop (non-replayable on the
+//!   OpenAI wire).
 //!
 //! Both paths share the same auth, model lookup, allowed_models check,
 //! access-log emission, metrics labels, and health tracker hooks.
