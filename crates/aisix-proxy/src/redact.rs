@@ -1076,7 +1076,9 @@ pub fn anthropic_sse_text(raw: &[u8]) -> String {
 /// as [`anthropic_sse_text`].
 pub fn responses_sse_text(raw: &[u8]) -> String {
     let (frames, _) = split_sse_frames(raw);
-    let mut channels: BTreeMap<String, String> = BTreeMap::new();
+    // First-seen channel order (NOT key order): the rebuilt capture must
+    // read in the order the client saw the channels emitted.
+    let mut channels: Vec<(String, String)> = Vec::new();
     for frame in &frames {
         let Some(data) = frame.data.as_ref() else {
             continue;
@@ -1104,9 +1106,12 @@ pub fn responses_sse_text(raw: &[u8]) -> String {
                     .unwrap_or(0)
             ),
         };
-        channels.entry(key).or_default().push_str(t);
+        match channels.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, buf)) => buf.push_str(t),
+            None => channels.push((key, t.to_owned())),
+        }
     }
-    channels.into_values().collect()
+    channels.into_iter().map(|(_, text)| text).collect()
 }
 
 // ─── Responses-API SSE rewrite ───────────────────────────────────────────────
@@ -2027,5 +2032,21 @@ mod tests {
             "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"i1\",\"content_index\":0,\"delta\":\"bar\"}\n\n",
         );
         assert_eq!(responses_sse_text(raw.as_bytes()), "foo bar");
+    }
+
+    /// Channels concatenate in first-seen (emission) order, not item-id
+    /// lexicographic order — the rebuilt capture must read like the
+    /// stream the client saw.
+    #[test]
+    fn responses_sse_text_preserves_emission_order() {
+        let raw = concat!(
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"zzz\",\"content_index\":0,\"delta\":\"first \"}\n\n",
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"aaa\",\"content_index\":0,\"delta\":\"second\"}\n\n",
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"zzz\",\"content_index\":0,\"delta\":\"more\"}\n\n",
+        );
+        assert_eq!(responses_sse_text(raw.as_bytes()), "first moresecond");
     }
 }

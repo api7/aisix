@@ -392,15 +392,34 @@ fn anonymized_counts(resp: &ApplyGuardrailOutput) -> std::collections::BTreeMap<
 }
 
 /// True if the assessment carries any BLOCKING disposition — a
-/// topic/content/word policy hit (these have no anonymize mode, so their
-/// presence is a block), a contextual-grounding filter that BLOCKED, or a
-/// PII/regex entity whose action is BLOCKED (as opposed to ANONYMIZED).
+/// topic/content/word/contextual-grounding entry whose `action` is
+/// BLOCKED, or a PII/regex entity whose action is BLOCKED (as opposed to
+/// ANONYMIZED). Every policy family also has a detect-only mode
+/// (`action = NONE`): entries are returned for observability but nothing
+/// was suppressed, so their mere presence must NOT be read as a block —
+/// mirrors LiteLLM's per-entry BLOCKED check.
 fn assessment_has_hard_block(a: &GuardrailAssessment) -> bool {
-    let topic_blocked = a.topic_policy().is_some_and(|p| !p.topics().is_empty());
-    let content_blocked = a.content_policy().is_some_and(|p| !p.filters().is_empty());
-    let word_blocked = a
-        .word_policy()
-        .is_some_and(|p| !p.custom_words().is_empty() || !p.managed_word_lists().is_empty());
+    use aws_sdk_bedrockruntime::types::{
+        GuardrailContentPolicyAction, GuardrailTopicPolicyAction, GuardrailWordPolicyAction,
+    };
+    let topic_blocked = a.topic_policy().is_some_and(|p| {
+        p.topics()
+            .iter()
+            .any(|t| *t.action() == GuardrailTopicPolicyAction::Blocked)
+    });
+    let content_blocked = a.content_policy().is_some_and(|p| {
+        p.filters()
+            .iter()
+            .any(|f| *f.action() == GuardrailContentPolicyAction::Blocked)
+    });
+    let word_blocked = a.word_policy().is_some_and(|p| {
+        p.custom_words()
+            .iter()
+            .any(|w| *w.action() == GuardrailWordPolicyAction::Blocked)
+            || p.managed_word_lists()
+                .iter()
+                .any(|w| *w.action() == GuardrailWordPolicyAction::Blocked)
+    });
     let grounding_blocked = a.contextual_grounding_policy().is_some_and(|p| {
         p.filters().iter().any(|f| {
             *f.action()
@@ -632,11 +651,11 @@ mod tests {
                 .build()
         }
 
-        fn topic() -> GuardrailAssessment {
+        fn topic_with(action: GuardrailTopicPolicyAction) -> GuardrailAssessment {
             let t = GuardrailTopic::builder()
                 .name("blocked-topic")
                 .r#type(GuardrailTopicType::Deny)
-                .action(GuardrailTopicPolicyAction::Blocked)
+                .action(action)
                 .build()
                 .unwrap();
             let tp = GuardrailTopicPolicyAssessment::builder()
@@ -644,6 +663,10 @@ mod tests {
                 .build()
                 .unwrap();
             GuardrailAssessment::builder().topic_policy(tp).build()
+        }
+
+        fn topic() -> GuardrailAssessment {
+            topic_with(GuardrailTopicPolicyAction::Blocked)
         }
 
         #[test]
@@ -708,6 +731,30 @@ mod tests {
             assert!(!assessment_has_hard_block(&pii(PiiAction::Anonymized)));
             assert!(assessment_has_hard_block(&pii(PiiAction::Blocked)));
             assert!(assessment_has_hard_block(&topic()));
+            // Detect-only (`action=NONE`) entries are observability
+            // metadata, not a block.
+            assert!(!assessment_has_hard_block(&topic_with(
+                GuardrailTopicPolicyAction::None
+            )));
+        }
+
+        /// A detect-mode (`action=NONE`) topic entry alongside an
+        /// ANONYMIZED PII entity must classify as Mask — the topic
+        /// policy observed but did not suppress anything.
+        #[test]
+        fn detect_only_topic_does_not_turn_mask_into_block() {
+            let r = resp(
+                GuardrailAction::GuardrailIntervened,
+                vec!["contact {EMAIL}"],
+                vec![
+                    topic_with(GuardrailTopicPolicyAction::None),
+                    pii(PiiAction::Anonymized),
+                ],
+            );
+            assert_eq!(
+                classify_response(&r, "gid"),
+                BedrockOutcome::Mask(vec!["contact {EMAIL}".to_owned()])
+            );
         }
 
         /// Positional integrity: an empty `outputs[]` entry is preserved,

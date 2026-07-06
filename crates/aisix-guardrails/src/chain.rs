@@ -343,8 +343,12 @@ async fn fold_segments(members: &[ChainMember], texts: &[String], input: bool) -
         if let Some(new_masked) = outcome.masked {
             // Implementations uphold alignment with THEIR input; refuse a
             // drifted length here so a broken member can't desync slots.
+            // Counts merge ONLY with an accepted mask — they describe
+            // APPLIED anonymization (`redacted_entity_counts`), so a
+            // refused mask must not inflate them.
             if new_masked.len() == src.len() {
                 masked = Some(new_masked);
+                Redaction::merge_counts(&mut counts, &outcome.counts);
             } else {
                 tracing::warn!(
                     member = %m.name,
@@ -354,7 +358,6 @@ async fn fold_segments(members: &[ChainMember], texts: &[String], input: bool) -
                 );
             }
         }
-        Redaction::merge_counts(&mut counts, &outcome.counts);
     }
     SegmentsOutcome {
         verdict: match bypass {
@@ -780,10 +783,12 @@ mod tests {
                 true
             }
             async fn moderate_input_segments(&self, _texts: &[String]) -> crate::SegmentsOutcome {
+                let mut counts = std::collections::BTreeMap::new();
+                counts.insert("EMAIL".to_owned(), 3);
                 crate::SegmentsOutcome {
                     verdict: GuardrailVerdict::Allow,
                     masked: Some(vec!["only-one".to_owned()]),
-                    counts: std::collections::BTreeMap::new(),
+                    counts,
                 }
             }
         }
@@ -791,6 +796,11 @@ mod tests {
         let texts = vec!["a".to_owned(), "b".to_owned()];
         let out = chain.moderate_input_segments(&texts).await;
         assert_eq!(out.masked, None, "drifted mask must be refused");
+        assert!(
+            out.counts.is_empty(),
+            "a refused mask's counts describe anonymization that was NOT \
+             applied — they must not reach redacted_entity_counts",
+        );
         assert_eq!(out.verdict, GuardrailVerdict::Allow);
     }
 
