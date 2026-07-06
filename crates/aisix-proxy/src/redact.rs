@@ -1786,4 +1786,246 @@ mod tests {
         assert_eq!(counts.get("email"), Some(&1));
         assert!(redact_transcription_response(chain.as_ref(), b"all clean\n").is_none());
     }
+
+    // ── remote segment moderation (#932 bedrock follow-up) ──────────────
+
+    use aisix_guardrails::{GuardrailVerdict, SegmentsOutcome};
+
+    /// Stub of a Bedrock-style segment moderator: masks slot i to
+    /// `"<M{i}:UPPER(text)>"` — index-stamped so a positional mix-up is
+    /// unmissable — and reports a fixed entity count. `verdict` lets the
+    /// block/bypass paths be exercised; `panic_if_called` pins the
+    /// skip-when-already-blocked contract.
+    struct StubSegments {
+        verdict: GuardrailVerdict,
+        mask: bool,
+        panic_if_called: bool,
+    }
+
+    impl StubSegments {
+        fn masker() -> Self {
+            Self {
+                verdict: GuardrailVerdict::Allow,
+                mask: true,
+                panic_if_called: false,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Guardrail for StubSegments {
+        fn name(&self) -> &'static str {
+            "stub-segments"
+        }
+        fn moderates_segments(&self) -> bool {
+            true
+        }
+        async fn moderate_input_segments(&self, texts: &[String]) -> SegmentsOutcome {
+            self.moderate(texts)
+        }
+        async fn moderate_output_segments(&self, texts: &[String]) -> SegmentsOutcome {
+            self.moderate(texts)
+        }
+    }
+
+    impl StubSegments {
+        fn moderate(&self, texts: &[String]) -> SegmentsOutcome {
+            if self.panic_if_called {
+                panic!("segment moderator must not be called on this path");
+            }
+            let mut counts = RedactionCounts::new();
+            counts.insert("EMAIL".to_owned(), 1);
+            SegmentsOutcome {
+                verdict: self.verdict.clone(),
+                masked: self.mask.then(|| {
+                    texts
+                        .iter()
+                        .enumerate()
+                        .map(|(i, t)| format!("<M{i}:{}>", t.to_uppercase()))
+                        .collect()
+                }),
+                counts,
+            }
+        }
+    }
+
+    fn seg_chain(stub: StubSegments) -> GuardrailChain {
+        GuardrailChain::new(vec![Arc::new(stub)])
+    }
+
+    /// The collect→call→apply round trip over the chat walker: every slot
+    /// kind (flat content, text block, tool-call JSON argument) gets its
+    /// OWN positionally-matched mask, and the provider counts — not the
+    /// applier's plumbing marker — land in `counts_out`.
+    #[tokio::test]
+    async fn moderate_body_masks_chat_slots_positionally() {
+        let chain = seg_chain(StubSegments::masker());
+        let mut req: ChatFormat = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "first slot"},
+                {"role": "user", "content": "", "content_blocks": [
+                    {"type": "text", "text": "second slot"}
+                ]},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"index": 0, "function": {"name": "send", "arguments": "{\"to\":\"third slot\"}"}}
+                ]}
+            ]
+        }))
+        .unwrap();
+        let mut counts = RedactionCounts::new();
+        let verdict = moderate_body(
+            &chain,
+            Direction::Input,
+            GuardrailVerdict::Allow,
+            &mut counts,
+            |g| redact_chat_format(g, &mut req),
+        )
+        .await;
+        assert_eq!(verdict, GuardrailVerdict::Allow);
+        assert_eq!(
+            req.messages[0].content.as_deref(),
+            Some("<M0:FIRST SLOT>"),
+            "flat content = slot 0",
+        );
+        assert_eq!(
+            req.messages[1].content_blocks.as_ref().unwrap()[0]["text"],
+            "<M1:SECOND SLOT>",
+            "text block = slot 1",
+        );
+        assert_eq!(
+            req.messages[2].extra["tool_calls"][0]["function"]["arguments"]
+                .as_str()
+                .unwrap(),
+            "{\"to\":\"<M2:THIRD SLOT>\"}",
+            "tool-arg inner string = slot 2 (marker counts must fire the \
+             json-encoded rewrite gate)",
+        );
+        assert_eq!(counts.get("EMAIL"), Some(&1), "provider counts merged");
+        assert!(
+            !counts.keys().any(|k| k.starts_with("__")),
+            "the applier's plumbing marker must never leak into telemetry counts",
+        );
+    }
+
+    /// A Block from the segment pass leaves the body untouched (no mask
+    /// write-back on a dead request) and propagates the verdict.
+    #[tokio::test]
+    async fn moderate_body_block_leaves_body_untouched() {
+        let chain = seg_chain(StubSegments {
+            verdict: GuardrailVerdict::block("pii blocked"),
+            mask: true,
+            panic_if_called: false,
+        });
+        let mut req: ChatFormat = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "original"}]
+        }))
+        .unwrap();
+        let mut counts = RedactionCounts::new();
+        let verdict = moderate_body(
+            &chain,
+            Direction::Input,
+            GuardrailVerdict::Allow,
+            &mut counts,
+            |g| redact_chat_format(g, &mut req),
+        )
+        .await;
+        assert!(verdict.is_block());
+        assert_eq!(req.messages[0].content.as_deref(), Some("original"));
+        assert!(counts.is_empty(), "no counts on a blocked request");
+    }
+
+    /// An already-blocked prior verdict skips the remote call entirely
+    /// (the request is dead — don't burn a provider call), and a chain
+    /// with no segment member is a no-op.
+    #[tokio::test]
+    async fn moderate_body_skips_remote_when_blocked_or_absent() {
+        let chain = seg_chain(StubSegments {
+            verdict: GuardrailVerdict::Allow,
+            mask: false,
+            panic_if_called: true,
+        });
+        let mut req: ChatFormat = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "x"}]
+        }))
+        .unwrap();
+        let mut counts = RedactionCounts::new();
+        let verdict = moderate_body(
+            &chain,
+            Direction::Input,
+            GuardrailVerdict::block("already blocked"),
+            &mut counts,
+            |g| redact_chat_format(g, &mut req),
+        )
+        .await;
+        assert!(verdict.is_block(), "prior Block passes through");
+
+        // A sync-only (non-segment) chain never enters the pass.
+        let sync_only = both();
+        let verdict = moderate_body(
+            sync_only.as_ref(),
+            Direction::Input,
+            GuardrailVerdict::Allow,
+            &mut counts,
+            |_| panic!("walk must not run when no segment member exists"),
+        )
+        .await;
+        assert_eq!(verdict, GuardrailVerdict::Allow);
+    }
+
+    /// The round trip through the Anthropic SSE walker: the masked
+    /// channel text lands on the channel's first frame (later frames
+    /// empty) even though the applier only returns marker counts — the
+    /// gate that discards count-less SSE rewrites must fire on them.
+    #[tokio::test]
+    async fn moderate_body_masks_anthropic_sse_channels() {
+        let chain = seg_chain(StubSegments::masker());
+        let mut held: Vec<u8> = concat!(
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello \"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"world\"}}\n\n",
+        )
+        .as_bytes()
+        .to_vec();
+        let mut counts = RedactionCounts::new();
+        let verdict = moderate_body(
+            &chain,
+            Direction::Output,
+            GuardrailVerdict::Allow,
+            &mut counts,
+            |g| match redact_anthropic_sse(g, &held) {
+                Some((rewritten, c)) => {
+                    held = rewritten;
+                    c
+                }
+                None => RedactionCounts::new(),
+            },
+        )
+        .await;
+        assert_eq!(verdict, GuardrailVerdict::Allow);
+        let out = String::from_utf8(held.clone()).unwrap();
+        assert!(
+            out.contains("<M0:HELLO WORLD>"),
+            "channel text masked as one positional slot: {out}",
+        );
+        assert_eq!(counts.get("EMAIL"), Some(&1));
+        // The capture-rebuild helper reads the masked channel back.
+        assert_eq!(anthropic_sse_text(&held), "<M0:HELLO WORLD>");
+    }
+
+    /// `responses_sse_text` assembles `output_text` deltas per channel —
+    /// the capture-rebuild source after a segment mask.
+    #[test]
+    fn responses_sse_text_assembles_channels() {
+        let raw = concat!(
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"i1\",\"content_index\":0,\"delta\":\"foo \"}\n\n",
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"i1\",\"content_index\":0,\"delta\":\"bar\"}\n\n",
+        );
+        assert_eq!(responses_sse_text(raw.as_bytes()), "foo bar");
+    }
 }
