@@ -152,6 +152,7 @@ async fn dispatch(
                     response.status().as_u16(),
                     Duration::ZERO,
                     false,
+                    Vec::new(),
                 );
                 return response;
             }
@@ -179,6 +180,7 @@ async fn dispatch(
         .filter(|chain| !chain.is_empty());
 
     // Input guardrails: scan the tool arguments.
+    let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
     if let Some(chain) = &guardrail_chain {
         let args_text = peek
             .as_ref()
@@ -188,10 +190,12 @@ async fn dispatch(
             .unwrap_or_default();
         let chat =
             aisix_gateway::ChatFormat::new("", vec![aisix_gateway::ChatMessage::user(args_text)]);
+        let (verdict, hits) = aisix_guardrails::Guardrail::check_input_observed(chain, &chat).await;
+        monitor_hits.extend(hits);
         if let aisix_guardrails::GuardrailVerdict::Block {
             reason,
             guardrail_name,
-        } = aisix_guardrails::Guardrail::check_input(chain, &chat).await
+        } = verdict
         {
             tracing::warn!(
                 guardrail_hook = "input",
@@ -208,6 +212,7 @@ async fn dispatch(
                 StatusCode::OK.as_u16(),
                 Duration::ZERO,
                 true,
+                monitor_hits,
             );
             return jsonrpc_guardrail_block(rpc_id, "tool call", guardrail_name.as_deref());
         }
@@ -239,7 +244,9 @@ async fn dispatch(
                 return (StatusCode::BAD_GATEWAY, "invalid upstream response").into_response()
             }
         };
-        if let Some(guardrail_name) = output_guardrail_block(chain, &resp_bytes, &mcp_tool).await {
+        if let Some(guardrail_name) =
+            output_guardrail_block(chain, &resp_bytes, &mcp_tool, &mut monitor_hits).await
+        {
             emit_tool_call_usage(
                 state,
                 &auth,
@@ -249,6 +256,7 @@ async fn dispatch(
                 StatusCode::OK.as_u16(),
                 latency,
                 true,
+                monitor_hits,
             );
             return jsonrpc_guardrail_block(rpc_id, "tool result", guardrail_name.as_deref());
         }
@@ -267,6 +275,7 @@ async fn dispatch(
             response.status().as_u16(),
             latency,
             false,
+            monitor_hits,
         );
     }
     response
@@ -282,6 +291,7 @@ async fn output_guardrail_block(
     chain: &aisix_guardrails::GuardrailChain,
     response_bytes: &[u8],
     tool: &str,
+    monitor_hits: &mut Vec<aisix_core::GuardrailMonitorHit>,
 ) -> Option<Option<String>> {
     // Fail closed on an unparseable body. The `/mcp` gateway is configured
     // `json_response = true`, so a `tools/call` returns a single
@@ -321,7 +331,9 @@ async fn output_guardrail_block(
         finish_reason: aisix_gateway::FinishReason::Stop,
         usage: aisix_gateway::UsageStats::new(0, 0),
     };
-    match aisix_guardrails::Guardrail::check_output(chain, &resp).await {
+    let (verdict, hits) = aisix_guardrails::Guardrail::check_output_observed(chain, &resp).await;
+    monitor_hits.extend(hits);
+    match verdict {
         aisix_guardrails::GuardrailVerdict::Block {
             reason,
             guardrail_name,
@@ -351,6 +363,7 @@ fn emit_tool_call_usage(
     status_code: u16,
     latency: Duration,
     guardrail_blocked: bool,
+    guardrail_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
 ) {
     let event = UsageEvent {
         request_id: request_id.to_string(),
@@ -362,6 +375,7 @@ fn emit_tool_call_usage(
         mcp_server_name: mcp_server.to_string(),
         mcp_tool_name: mcp_tool.to_string(),
         guardrail_blocked,
+        guardrail_monitor_hits,
         ..Default::default()
     };
     state.usage_sink.try_emit("mcp", event.clone());
@@ -858,7 +872,7 @@ mod tests {
         // A tool result whose content carries the forbidden token is blocked.
         let blocked = br#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"forbidden-token here"}]}}"#;
         assert!(
-            output_guardrail_block(&chain, blocked, "echo")
+            output_guardrail_block(&chain, blocked, "echo", &mut Vec::new())
                 .await
                 .is_some(),
             "a result containing the forbidden token must be blocked"
@@ -868,7 +882,7 @@ mod tests {
         let clean =
             br#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"all good"}]}}"#;
         assert!(
-            output_guardrail_block(&chain, clean, "echo")
+            output_guardrail_block(&chain, clean, "echo", &mut Vec::new())
                 .await
                 .is_none(),
             "a clean result must not be blocked"
@@ -877,7 +891,7 @@ mod tests {
         // An error response (no `result`) has nothing to scan.
         let errored = br#"{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"x"}}"#;
         assert!(
-            output_guardrail_block(&chain, errored, "echo")
+            output_guardrail_block(&chain, errored, "echo", &mut Vec::new())
                 .await
                 .is_none(),
             "an error response has no tool result to scan"
@@ -887,7 +901,7 @@ mod tests {
         // regression) fails closed — block, never pass an unscanned result.
         let sse_body = b"event: message\ndata: {\"jsonrpc\":\"2.0\",\"result\":{}}\n\n";
         assert!(
-            output_guardrail_block(&chain, sse_body, "echo")
+            output_guardrail_block(&chain, sse_body, "echo", &mut Vec::new())
                 .await
                 .is_some(),
             "an unparseable response body must fail closed (block)"
@@ -912,7 +926,7 @@ mod tests {
         // the decoded tool text ("hello world"), so the field name must NOT fire.
         let clean = br#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"hello world"}]}}"#;
         assert!(
-            output_guardrail_block(&chain, clean, "echo")
+            output_guardrail_block(&chain, clean, "echo", &mut Vec::new())
                 .await
                 .is_none(),
             "scanning the decoded text must ignore envelope field names"
@@ -922,7 +936,9 @@ mod tests {
         // proving it is active here, not simply absent.
         let hit = br#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"this has content in it"}]}}"#;
         assert!(
-            output_guardrail_block(&chain, hit, "echo").await.is_some(),
+            output_guardrail_block(&chain, hit, "echo", &mut Vec::new())
+                .await
+                .is_some(),
             "decoded text containing the pattern must still block"
         );
     }

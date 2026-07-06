@@ -317,6 +317,7 @@ impl PresidioGuardrail {
             verdict: GuardrailVerdict::Allow,
             masked: Some(masked),
             counts,
+            monitor_hits: Vec::new(),
         }
     }
 

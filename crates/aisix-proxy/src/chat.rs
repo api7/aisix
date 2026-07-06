@@ -132,6 +132,9 @@ pub async fn chat_completions(
     // Filled by `dispatch` with per-detector PII mask counts (#932), same
     // dual-path lifecycle as `applied_guardrails`.
     let mut redaction_counts = crate::redact::RedactionCounts::new();
+    // Filled by `dispatch` with monitor-mode guardrail observations
+    // (AISIX-Cloud#562), same dual-path lifecycle as `applied_guardrails`.
+    let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
     let outcome = dispatch(
         &state,
         &auth,
@@ -141,6 +144,7 @@ pub async fn chat_completions(
         &client,
         &mut applied_guardrails,
         &mut redaction_counts,
+        &mut monitor_hits,
     )
     .await;
 
@@ -251,6 +255,7 @@ pub async fn chat_completions(
                         applied_guardrails: applied_guardrails.clone(),
                         provider_key_id: success.provider_key_id.clone(),
                         redacted_entity_counts: redaction_counts.clone(),
+                        guardrail_monitor_hits: monitor_hits.clone(),
                     },
                     success.cost_usd,
                     /* guardrail_blocked */ false,
@@ -480,6 +485,7 @@ pub async fn chat_completions(
                             // Input-side masking happened before the output
                             // block — the audit trail keeps it.
                             redacted_entity_counts: redaction_counts.clone(),
+                            guardrail_monitor_hits: monitor_hits.clone(),
                         },
                         /* cost_usd */ 0.0,
                         guardrail_blocked,
@@ -509,6 +515,7 @@ pub async fn chat_completions(
                             applied_guardrails: applied_guardrails.clone(),
                             // Input masking may have fired before the failure.
                             redacted_entity_counts: redaction_counts.clone(),
+                            guardrail_monitor_hits: monitor_hits.clone(),
                             ..UsageExtras::default()
                         },
                         /* cost_usd */ 0.0,
@@ -794,6 +801,9 @@ async fn dispatch(
     // output counts travel via `StreamCompletion` instead (the event is
     // emitted at end-of-stream).
     redactions_out: &mut crate::redact::RedactionCounts,
+    // Out-param: monitor-mode guardrail observations (AISIX-Cloud#562),
+    // same lifecycle as `redactions_out`.
+    monitor_hits_out: &mut Vec<aisix_core::GuardrailMonitorHit>,
 ) -> Result<Success, DispatchFailure> {
     if req.messages.is_empty() {
         return Err(DispatchFailure::new(
@@ -866,12 +876,14 @@ async fn dispatch(
     // Split moderation: local/blob members check first (on the original
     // text), then the segment pass runs the Bedrock call and writes
     // ANONYMIZE masks back into `req` (#932 bedrock follow-up).
-    let input_verdict = resolved_chain.check_input_non_segment(req).await;
+    let (input_verdict, hits) = resolved_chain.check_input_non_segment_observed(req).await;
+    monitor_hits_out.extend(hits);
     let input_verdict = crate::redact::moderate_body(
         resolved_chain.as_ref(),
         crate::redact::Direction::Input,
         input_verdict,
         redactions_out,
+        monitor_hits_out,
         |g| crate::redact::redact_chat_format(g, req),
     )
     .await;
@@ -1023,6 +1035,7 @@ async fn dispatch(
             &auth.entry.id,
             client,
             redactions_out.clone(),
+            monitor_hits_out.clone(),
         )
         .await;
     }
@@ -1283,6 +1296,9 @@ async fn dispatch(
         // the end-of-stream event merges them with the output-side counts
         // accumulated in `comp.redacted_entity_counts`.
         let input_redactions_for_telem = redactions_out.clone();
+        // Input-side monitor hits (AISIX-Cloud#562), merged with the
+        // output-side hits accumulated in `comp.monitor_hits`.
+        let input_monitor_hits_for_telem = monitor_hits_out.clone();
         // Downstream client attribution (#492) moved into the on_complete
         // closure so streamed responses log the same IP/UA as non-streaming.
         let client_for_telem = client.clone();
@@ -1397,6 +1413,11 @@ async fn dispatch(
                         redacted_entity_counts: {
                             let mut merged = input_redactions_for_telem.clone();
                             crate::redact::merge_counts(&mut merged, comp.redacted_entity_counts);
+                            merged
+                        },
+                        guardrail_monitor_hits: {
+                            let mut merged = input_monitor_hits_for_telem.clone();
+                            merged.extend(comp.monitor_hits);
                             merged
                         },
                     },
@@ -1580,12 +1601,16 @@ async fn dispatch(
                 // #448: a cache hit is client-visible output just like a
                 // fresh upstream response, so it must run output guardrails
                 // before being returned — not bypass them.
-                let cached_verdict = resolved_chain.check_output_non_segment(&cached).await;
+                let (cached_verdict, hits) = resolved_chain
+                    .check_output_non_segment_observed(&cached)
+                    .await;
+                monitor_hits_out.extend(hits);
                 let cached_verdict = crate::redact::moderate_body(
                     resolved_chain.as_ref(),
                     crate::redact::Direction::Output,
                     cached_verdict,
                     redactions_out,
+                    monitor_hits_out,
                     |g| crate::redact::redact_chat_response(g, &mut cached),
                 )
                 .await;
@@ -1934,12 +1959,16 @@ async fn dispatch(
     // ingesting telemetry; the DP just records 0.0 on the wire.
     let cost_usd = 0.0;
 
-    let output_verdict = resolved_chain.check_output_non_segment(&upstream).await;
+    let (output_verdict, hits) = resolved_chain
+        .check_output_non_segment_observed(&upstream)
+        .await;
+    monitor_hits_out.extend(hits);
     let output_verdict = crate::redact::moderate_body(
         resolved_chain.as_ref(),
         crate::redact::Direction::Output,
         output_verdict,
         redactions_out,
+        monitor_hits_out,
         |g| crate::redact::redact_chat_response(g, &mut upstream),
     )
     .await;
@@ -2135,6 +2164,9 @@ async fn dispatch_ensemble(
     // function (the handler's main emit is skipped), so the counts ride
     // the judge event — the ensemble's terminal event.
     input_redactions: crate::redact::RedactionCounts,
+    // Input-side monitor hits (AISIX-Cloud#562), same lifecycle as
+    // `input_redactions`.
+    input_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
 ) -> Result<Success, DispatchFailure> {
     let started = Instant::now();
     let with_model = |e: ProxyError| DispatchFailure::new(Some(model_id.to_string()), None, e);
@@ -2453,6 +2485,8 @@ async fn dispatch_ensemble(
         // Input-side PII mask counts (#932); merged with the streamed judge's
         // output-side counts on the terminal (judge) event.
         let input_redactions_for_telem = input_redactions.clone();
+        // Input-side monitor hits (AISIX-Cloud#562), merged the same way.
+        let input_monitor_hits_for_telem = input_monitor_hits.clone();
 
         // Hold concurrency for the stream's full lifetime (#450). Snapshot the
         // keys BEFORE consuming the reservation into the owned guard.
@@ -2558,6 +2592,11 @@ async fn dispatch_ensemble(
                         redacted_entity_counts: {
                             let mut merged = input_redactions_for_telem.clone();
                             crate::redact::merge_counts(&mut merged, comp.redacted_entity_counts);
+                            merged
+                        },
+                        guardrail_monitor_hits: {
+                            let mut merged = input_monitor_hits_for_telem.clone();
+                            merged.extend(comp.monitor_hits);
                             merged
                         },
                         ..UsageExtras::default()
@@ -2686,7 +2725,8 @@ async fn dispatch_ensemble(
     let emit_subcalls = |outcome: &crate::ensemble::EnsembleOutcome,
                          blocked: bool,
                          bypass: &str,
-                         redactions: &crate::redact::RedactionCounts| {
+                         redactions: &crate::redact::RedactionCounts,
+                         hits: &[aisix_core::GuardrailMonitorHit]| {
         for (index, member) in outcome.panel.iter().enumerate() {
             emit_panel_member(member, index, blocked, bypass);
         }
@@ -2717,6 +2757,7 @@ async fn dispatch_ensemble(
                 applied_guardrails: applied_guardrails.to_vec(),
                 provider_key_id: judge_provider_key_id,
                 redacted_entity_counts: redactions.clone(),
+                guardrail_monitor_hits: hits.to_vec(),
                 ..UsageExtras::default()
             },
             /* cost_usd */ 0.0,
@@ -2733,14 +2774,17 @@ async fn dispatch_ensemble(
     // `charge: None` rather than a judge-only `UpstreamCharge`, which
     // would double-count the judge AND still miss the panel.
     let mut ensemble_redactions = input_redactions.clone();
-    let ensemble_verdict = resolved_chain
-        .check_output_non_segment(&outcome.response)
+    let mut ensemble_monitor_hits = input_monitor_hits.clone();
+    let (ensemble_verdict, hits) = resolved_chain
+        .check_output_non_segment_observed(&outcome.response)
         .await;
+    ensemble_monitor_hits.extend(hits);
     let ensemble_verdict = crate::redact::moderate_body(
         resolved_chain.as_ref(),
         crate::redact::Direction::Output,
         ensemble_verdict,
         &mut ensemble_redactions,
+        &mut ensemble_monitor_hits,
         |g| crate::redact::redact_chat_response(g, &mut outcome.response),
     )
     .await;
@@ -2763,6 +2807,7 @@ async fn dispatch_ensemble(
                 true,
                 &bypass_reason.clone().unwrap_or_default(),
                 &input_redactions,
+                &ensemble_monitor_hits,
             );
             return Err(DispatchFailure::new(
                 Some(model_id.to_string()),
@@ -2793,6 +2838,7 @@ async fn dispatch_ensemble(
         false,
         &bypass_reason.clone().unwrap_or_default(),
         &ensemble_redactions,
+        &ensemble_monitor_hits,
     );
 
     // The synthesized answer is the client-facing response, rendered with
@@ -3019,6 +3065,7 @@ fn emit_usage_event(
         guardrail_bypassed_reason: extras.bypass_reason,
         applied_guardrails: extras.applied_guardrails,
         redacted_entity_counts: extras.redacted_entity_counts,
+        guardrail_monitor_hits: extras.guardrail_monitor_hits,
         cache_status: extras.cache_status,
         cache_hit_saved_input_tokens: extras.cache_hit_saved_input_tokens,
         cache_hit_saved_output_tokens: extras.cache_hit_saved_output_tokens,
@@ -3165,6 +3212,10 @@ struct UsageExtras {
     /// merged (#932). Lands on `usage_events.redacted_entity_counts`.
     /// Detector names only, never matched values. Empty = no redaction.
     redacted_entity_counts: crate::redact::RedactionCounts,
+    /// Monitor-mode guardrail observations for this request, input +
+    /// output merged (AISIX-Cloud#562). Lands on
+    /// `usage_events.guardrail_monitor_hits`. Empty = no monitor hit.
+    guardrail_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
 }
 
 /// Emit one zero-token `UsageEvent` per FAILED attempt of a request
@@ -3354,6 +3405,10 @@ struct StreamCompletion {
     /// (#932). Merged with the input-side counts by the on_complete
     /// telemetry closure. Detector names only, never matched values.
     redacted_entity_counts: crate::redact::RedactionCounts,
+    /// Monitor-mode guardrail observations made by the end-of-stream
+    /// output checks (AISIX-Cloud#562). Merged with the input-side hits
+    /// by the on_complete telemetry closure.
+    monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
 }
 
 /// Parameters needed to run output-guardrail evaluation at
@@ -3751,7 +3806,10 @@ where
                                         ),
                                     }
                                 };
-                                match ctx.chain.check_output(&synthesized).await {
+                                let (verdict, hits) =
+                                    ctx.chain.check_output_observed(&synthesized).await;
+                                guard.comp().monitor_hits.extend(hits);
+                                match verdict {
                                     aisix_guardrails::GuardrailVerdict::Block { reason, guardrail_name } => {
                                         tracing::warn!(
                                             guardrail_hook = "output",
@@ -3906,16 +3964,23 @@ where
                                 ),
                             }
                         };
-                        let verdict = ctx.chain.check_output_non_segment(&synthesized).await;
+                        let (verdict, hits) = ctx
+                            .chain
+                            .check_output_non_segment_observed(&synthesized)
+                            .await;
+                        guard.comp().monitor_hits.extend(hits);
                         let mut seg_counts = crate::redact::RedactionCounts::new();
+                        let mut seg_hits = Vec::new();
                         let verdict = crate::redact::moderate_body(
                             ctx.chain.as_ref(),
                             crate::redact::Direction::Output,
                             verdict,
                             &mut seg_counts,
+                            &mut seg_hits,
                             |g| crate::redact::redact_chat_chunks(g, &mut pending),
                         )
                         .await;
+                        guard.comp().monitor_hits.extend(seg_hits);
                         if !seg_counts.is_empty() {
                             // Bedrock masked the held chunks — rebuild the
                             // content-capture accumulator from the masked
@@ -4021,7 +4086,9 @@ where
                         guard.comp().completion_tokens,
                     ),
                 };
-                match ctx.chain.check_output(&synthesized).await {
+                let (verdict, hits) = ctx.chain.check_output_observed(&synthesized).await;
+                guard.comp().monitor_hits.extend(hits);
+                match verdict {
                     aisix_guardrails::GuardrailVerdict::Block { reason, guardrail_name } => {
                         // Mirror the non-streaming path's #153
                         // redaction contract: the wire-level message

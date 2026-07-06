@@ -203,6 +203,7 @@ pub async fn moderate_body(
     dir: Direction,
     non_segment_verdict: aisix_guardrails::GuardrailVerdict,
     counts_out: &mut RedactionCounts,
+    monitor_hits_out: &mut Vec<aisix_core::models::GuardrailMonitorHit>,
     mut walk: impl FnMut(&dyn Guardrail) -> RedactionCounts,
 ) -> aisix_guardrails::GuardrailVerdict {
     if non_segment_verdict.is_block() || !chain.moderates_segments() {
@@ -214,10 +215,11 @@ pub async fn moderate_body(
     if texts.is_empty() {
         return non_segment_verdict;
     }
-    let outcome = match dir {
+    let mut outcome = match dir {
         Direction::Input => chain.moderate_input_segments(&texts).await,
         Direction::Output => chain.moderate_output_segments(&texts).await,
     };
+    monitor_hits_out.append(&mut outcome.monitor_hits);
     if !outcome.verdict.is_block() {
         if let Some(masked) = outcome.masked {
             let applier = SegmentApplier::new(masked);
@@ -1850,6 +1852,7 @@ mod tests {
                         .collect()
                 }),
                 counts,
+                monitor_hits: Vec::new(),
             }
         }
     }
@@ -1884,6 +1887,7 @@ mod tests {
             Direction::Input,
             GuardrailVerdict::Allow,
             &mut counts,
+            &mut Vec::new(),
             |g| redact_chat_format(g, &mut req),
         )
         .await;
@@ -1933,6 +1937,7 @@ mod tests {
             Direction::Input,
             GuardrailVerdict::Allow,
             &mut counts,
+            &mut Vec::new(),
             |g| redact_chat_format(g, &mut req),
         )
         .await;
@@ -1962,6 +1967,7 @@ mod tests {
             Direction::Input,
             GuardrailVerdict::block("already blocked"),
             &mut counts,
+            &mut Vec::new(),
             |g| redact_chat_format(g, &mut req),
         )
         .await;
@@ -1974,6 +1980,7 @@ mod tests {
             Direction::Input,
             GuardrailVerdict::Allow,
             &mut counts,
+            &mut Vec::new(),
             |_| panic!("walk must not run when no segment member exists"),
         )
         .await;
@@ -2001,6 +2008,7 @@ mod tests {
             Direction::Output,
             GuardrailVerdict::Allow,
             &mut counts,
+            &mut Vec::new(),
             |g| match redact_anthropic_sse(g, &held) {
                 Some((rewritten, c)) => {
                     held = rewritten;

@@ -54,6 +54,8 @@ struct ImageDispatchSuccess {
     /// Per-detector PII mask counts (#932/#696) applied to the prompt.
     /// Attached to the emitted UsageEvent. Empty = no redaction.
     redactions: crate::redact::RedactionCounts,
+    /// Monitor-mode guardrail observations (AISIX-Cloud#562).
+    monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
     /// Captured request/response content for content-capturing exporters
     /// (#700, LiteLLM parity: the full image response JSON — url or
     /// b64_json — truncated at the capture cap). `Some` only when an
@@ -119,6 +121,7 @@ pub async fn image_generations(
                     completion_tokens,
                     &client,
                     success.redactions.clone(),
+                    success.monitor_hits.clone(),
                     success.captured_content.as_ref(),
                 );
             }
@@ -216,12 +219,16 @@ async fn dispatch(
     // UsageEvent surfaces them in Logs, like chat / messages. Empty when no
     // guardrail is attached.
     let applied_guardrails = resolved_chain.applied().to_vec();
+    let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
     if !resolved_chain.is_empty() {
         let chat = images_input_to_chat(model_name, &body);
+        let (verdict, hits) =
+            aisix_guardrails::Guardrail::check_input_observed(&resolved_chain, &chat).await;
+        monitor_hits.extend(hits);
         if let aisix_guardrails::GuardrailVerdict::Block {
             reason,
             guardrail_name,
-        } = aisix_guardrails::Guardrail::check_input(&resolved_chain, &chat).await
+        } = verdict
         {
             // Per #153 the matched-pattern detail stays in ops logs only.
             tracing::warn!(
@@ -330,6 +337,7 @@ async fn dispatch(
                 usage,
                 upstream_called: true,
                 redactions,
+                monitor_hits: monitor_hits.clone(),
                 captured_content,
             })
         }
@@ -347,6 +355,7 @@ async fn dispatch(
                 // No upstream call happened → handler skips emit.
                 upstream_called: false,
                 redactions,
+                monitor_hits: monitor_hits.clone(),
                 captured_content: None,
             })
         }
@@ -410,6 +419,8 @@ fn emit_usage_event(
     client: &ClientContext,
     // Per-detector PII mask counts (#932/#696). Empty = no redaction.
     redacted_entity_counts: crate::redact::RedactionCounts,
+    // Monitor-mode guardrail observations (AISIX-Cloud#562).
+    guardrail_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
     // Captured request/response content (#700). Forwarded only to `fan_out`,
     // never to the CP sink.
     content: Option<&CapturedContent>,
@@ -430,6 +441,7 @@ fn emit_usage_event(
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),
         redacted_entity_counts,
+        guardrail_monitor_hits,
         ..Default::default()
     };
     crate::usage_attr::apply_pk_telemetry(&mut event, &snap, provider_key_id);

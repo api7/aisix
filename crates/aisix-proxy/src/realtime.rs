@@ -422,6 +422,7 @@ async fn run_session(
     let (mut up_tx, mut up_rx) = upstream.split();
 
     let mut usage = SessionUsage::default();
+    let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
     let mut close_status: u16 = 200;
     // Operator-configured stream idle deadline (stream_timeout on the
     // Model). Absent → no idle cap; realtime sessions are long-lived by
@@ -461,6 +462,7 @@ async fn run_session(
                             &model_entry.value.display_name,
                             &text,
                             true,
+                            &mut monitor_hits,
                         )
                         .await
                         {
@@ -503,6 +505,7 @@ async fn run_session(
                             &model_entry.value.display_name,
                             &text,
                             false,
+                            &mut monitor_hits,
                         )
                         .await
                         {
@@ -595,6 +598,7 @@ async fn run_session(
         inbound_protocol: "realtime".to_string(),
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),
+        guardrail_monitor_hits: monitor_hits,
         ..Default::default()
     };
     crate::usage_attr::apply_pk_telemetry(&mut event, &snap, &pk_id);
@@ -617,13 +621,14 @@ async fn guardrail_block_event(
     model_name: &str,
     text: &str,
     input_side: bool,
+    monitor_hits: &mut Vec<aisix_core::GuardrailMonitorHit>,
 ) -> Option<String> {
-    let verdict = if input_side {
+    let (verdict, hits) = if input_side {
         let chat = aisix_gateway::ChatFormat::new(
             model_name,
             vec![aisix_gateway::ChatMessage::user(text.to_string())],
         );
-        aisix_guardrails::Guardrail::check_input(chain, &chat).await
+        aisix_guardrails::Guardrail::check_input_observed(chain, &chat).await
     } else {
         let synth = aisix_gateway::ChatResponse {
             id: String::new(),
@@ -632,8 +637,9 @@ async fn guardrail_block_event(
             finish_reason: aisix_gateway::FinishReason::Stop,
             usage: aisix_gateway::UsageStats::default(),
         };
-        aisix_guardrails::Guardrail::check_output(chain, &synth).await
+        aisix_guardrails::Guardrail::check_output_observed(chain, &synth).await
     };
+    monitor_hits.extend(hits);
     if let aisix_guardrails::GuardrailVerdict::Block {
         reason,
         guardrail_name,

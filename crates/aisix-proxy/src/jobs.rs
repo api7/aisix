@@ -400,6 +400,7 @@ async fn scan_input_blob(
     auth: &AuthenticatedKey,
     target: &JobTarget,
     blob: &[u8],
+    monitor_hits: &mut Vec<aisix_core::GuardrailMonitorHit>,
 ) -> Result<(), ProxyError> {
     let ctx = aisix_guardrails::RequestContext {
         model_id: &target.model_entry.id,
@@ -416,10 +417,12 @@ async fn scan_input_blob(
             String::from_utf8_lossy(blob).into_owned(),
         )],
     );
+    let (verdict, hits) = aisix_guardrails::Guardrail::check_input_observed(&chain, &chat).await;
+    monitor_hits.extend(hits);
     if let aisix_guardrails::GuardrailVerdict::Block {
         reason,
         guardrail_name,
-    } = aisix_guardrails::Guardrail::check_input(&chain, &chat).await
+    } = verdict
     {
         tracing::warn!(
             guardrail_hook = "input",
@@ -440,6 +443,7 @@ async fn scan_output_blob(
     auth: &AuthenticatedKey,
     target: &JobTarget,
     blob: &[u8],
+    monitor_hits: &mut Vec<aisix_core::GuardrailMonitorHit>,
 ) -> Result<(), ProxyError> {
     let ctx = aisix_guardrails::RequestContext {
         model_id: &target.model_entry.id,
@@ -457,10 +461,12 @@ async fn scan_output_blob(
         finish_reason: aisix_gateway::FinishReason::Stop,
         usage: aisix_gateway::UsageStats::default(),
     };
+    let (verdict, hits) = aisix_guardrails::Guardrail::check_output_observed(&chain, &synth).await;
+    monitor_hits.extend(hits);
     if let aisix_guardrails::GuardrailVerdict::Block {
         reason,
         guardrail_name,
-    } = aisix_guardrails::Guardrail::check_output(&chain, &synth).await
+    } = verdict
     {
         tracing::warn!(
             guardrail_hook = "output",
@@ -526,6 +532,7 @@ fn emit_job_usage_event(
     status_code: u16,
     elapsed: Duration,
     client: &ClientContext,
+    guardrail_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
 ) {
     let snap = state.snapshot.load();
     let mut event = UsageEvent {
@@ -539,6 +546,7 @@ fn emit_job_usage_event(
         inbound_protocol: "openai".to_string(),
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),
+        guardrail_monitor_hits,
         ..Default::default()
     };
     crate::usage_attr::apply_pk_telemetry(&mut event, &snap, &target.pk_entry.id);
@@ -590,6 +598,7 @@ fn finish(
     started: Instant,
     request_id: String,
     result: Result<(Response, JobTarget), ProxyError>,
+    monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
 ) -> Response {
     let elapsed = started.elapsed();
     match result {
@@ -620,6 +629,7 @@ fn finish(
                 status,
                 elapsed,
                 client,
+                monitor_hits,
             );
             if let Ok(hv) = HeaderValue::from_str(&request_id) {
                 resp.headers_mut().insert("x-aisix-request-id", hv);
@@ -711,6 +721,7 @@ pub(crate) async fn create_file(
 ) -> Response {
     let started = Instant::now();
     let request_id = new_request_id();
+    let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
 
     let result = async {
         // Re-build the outbound multipart form, extracting the gateway-only
@@ -766,7 +777,7 @@ pub(crate) async fn create_file(
 
         // Batch/fine-tune input files carry end-user content — scan them
         // like any other inbound payload.
-        scan_input_blob(&state, &auth, &target, &file_bytes).await?;
+        scan_input_blob(&state, &auth, &target, &file_bytes, &mut monitor_hits).await?;
         let _reservation = crate::quota::enforce(
             &state,
             &auth,
@@ -788,7 +799,7 @@ pub(crate) async fn create_file(
             &request_id,
         )
         .await?;
-        scan_output_blob(&state, &auth, &target, &bytes).await?;
+        scan_output_blob(&state, &auth, &target, &bytes, &mut monitor_hits).await?;
         let model = target.display_name().to_string();
         Ok((
             json_response(status, &resp_headers, bytes, Some(&model)),
@@ -807,6 +818,7 @@ pub(crate) async fn create_file(
         started,
         request_id,
         result,
+        monitor_hits,
     )
 }
 
@@ -941,6 +953,7 @@ pub(crate) async fn create_batch(
 ) -> Response {
     let started = Instant::now();
     let request_id = new_request_id();
+    let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
 
     let result = async {
         let mut req_json: Value = serde_json::from_slice(&body)
@@ -981,7 +994,7 @@ pub(crate) async fn create_batch(
         }
         let out_body = Bytes::from(serde_json::to_vec(&req_json).unwrap_or_default());
 
-        scan_input_blob(&state, &auth, &target, &out_body).await?;
+        scan_input_blob(&state, &auth, &target, &out_body, &mut monitor_hits).await?;
         let _reservation = crate::quota::enforce(
             &state,
             &auth,
@@ -1003,7 +1016,7 @@ pub(crate) async fn create_batch(
             &request_id,
         )
         .await?;
-        scan_output_blob(&state, &auth, &target, &bytes).await?;
+        scan_output_blob(&state, &auth, &target, &bytes, &mut monitor_hits).await?;
         let model = target.display_name().to_string();
         Ok((
             json_response(status, &resp_headers, bytes, Some(&model)),
@@ -1022,6 +1035,7 @@ pub(crate) async fn create_batch(
         started,
         request_id,
         result,
+        monitor_hits,
     )
 }
 
@@ -1036,6 +1050,7 @@ pub(crate) async fn get_batch(
     let started = Instant::now();
     let request_id = new_request_id();
     let (raw, embedded) = routed_model_hint(&id, &params, &headers);
+    let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
 
     let result = async {
         require_safe_upstream_id(&raw)?;
@@ -1062,7 +1077,7 @@ pub(crate) async fn get_batch(
             &request_id,
         )
         .await?;
-        scan_output_blob(&state, &auth, &target, &bytes).await?;
+        scan_output_blob(&state, &auth, &target, &bytes, &mut monitor_hits).await?;
 
         // Batch cost attribution (#720): first observation of a completed
         // batch downloads the output JSONL and emits real token usage.
@@ -1090,6 +1105,7 @@ pub(crate) async fn get_batch(
         started,
         request_id,
         result,
+        monitor_hits,
     )
 }
 
@@ -1164,6 +1180,7 @@ pub(crate) async fn create_ft_job(
 ) -> Response {
     let started = Instant::now();
     let request_id = new_request_id();
+    let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
 
     let result = async {
         let mut req_json: Value = serde_json::from_slice(&body)
@@ -1201,7 +1218,7 @@ pub(crate) async fn create_ft_job(
         }
         let out_body = Bytes::from(serde_json::to_vec(&req_json).unwrap_or_default());
 
-        scan_input_blob(&state, &auth, &target, &out_body).await?;
+        scan_input_blob(&state, &auth, &target, &out_body, &mut monitor_hits).await?;
         let _reservation = crate::quota::enforce(
             &state,
             &auth,
@@ -1223,7 +1240,7 @@ pub(crate) async fn create_ft_job(
             &request_id,
         )
         .await?;
-        scan_output_blob(&state, &auth, &target, &bytes).await?;
+        scan_output_blob(&state, &auth, &target, &bytes, &mut monitor_hits).await?;
         let model = target.display_name().to_string();
         Ok((
             json_response(status, &resp_headers, bytes, Some(&model)),
@@ -1242,6 +1259,7 @@ pub(crate) async fn create_ft_job(
         started,
         request_id,
         result,
+        monitor_hits,
     )
 }
 
@@ -1365,6 +1383,7 @@ async fn forward_simple(
     let method = spec.method.clone();
     let log_path = spec.log_path.clone();
     let label = spec.label;
+    let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
 
     let result = async {
         let embedded = match &spec.id {
@@ -1378,7 +1397,7 @@ async fn forward_simple(
         let target = resolve_target(&state, &auth, wanted.as_deref(), &client.source_ip)?;
 
         if let Some(body) = &spec.body {
-            scan_input_blob(&state, &auth, &target, body).await?;
+            scan_input_blob(&state, &auth, &target, body, &mut monitor_hits).await?;
         }
         let _reservation = crate::quota::enforce(
             &state,
@@ -1399,7 +1418,7 @@ async fn forward_simple(
         };
         let (status, resp_headers, bytes) =
             send_upstream(&state, &target, spec.method, &url, body, &request_id).await?;
-        scan_output_blob(&state, &auth, &target, &bytes).await?;
+        scan_output_blob(&state, &auth, &target, &bytes, &mut monitor_hits).await?;
 
         let resp = if spec.relay_raw_body {
             let mut resp = Response::builder()
@@ -1419,7 +1438,16 @@ async fn forward_simple(
     .await;
 
     finish(
-        &state, label, method, log_path, &auth, &client, started, request_id, result,
+        &state,
+        label,
+        method,
+        log_path,
+        &auth,
+        &client,
+        started,
+        request_id,
+        result,
+        monitor_hits,
     )
 }
 

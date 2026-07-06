@@ -55,6 +55,9 @@ struct CompletionDispatchSuccess {
     /// Per-detector PII mask counts (#932), input + output merged.
     /// Attached to the emitted UsageEvent. Empty = no redaction.
     redactions: crate::redact::RedactionCounts,
+    /// Monitor-mode guardrail observations (AISIX-Cloud#562), input +
+    /// output merged. Attached to the emitted UsageEvent.
+    monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
     /// True when the response leg was blocked by an OUTPUT guardrail
     /// AFTER the upstream billed for it (#911 [23]). The response body is
     /// the redacted 422, but `usage` still carries the billed counts so
@@ -140,6 +143,7 @@ pub async fn completions(
                     &client,
                     success.guardrail_blocked,
                     success.redactions.clone(),
+                    success.monitor_hits.clone(),
                     success.captured_content.as_ref(),
                 );
             }
@@ -242,10 +246,13 @@ async fn dispatch(
     };
     let resolved_chain = state.guardrail_index.resolve(&guardrail_ctx);
     let mut input_seg_counts = crate::redact::RedactionCounts::new();
+    let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
     if !resolved_chain.is_empty() {
         let chat = completions_input_to_chat(model_name, &body);
-        let verdict =
-            aisix_guardrails::Guardrail::check_input_non_segment(&resolved_chain, &chat).await;
+        let (verdict, hits) =
+            aisix_guardrails::Guardrail::check_input_non_segment_observed(&resolved_chain, &chat)
+                .await;
+        monitor_hits.extend(hits);
         // Segment pass: one Bedrock call over the prompt slots; an
         // ANONYMIZE disposition writes the masked text back into the body
         // (#932 bedrock follow-up).
@@ -254,6 +261,7 @@ async fn dispatch(
             crate::redact::Direction::Input,
             verdict,
             &mut input_seg_counts,
+            &mut monitor_hits,
             |g| crate::redact::redact_completions_request(g, &mut body),
         )
         .await;
@@ -351,14 +359,19 @@ async fn dispatch(
                     finish_reason: FinishReason::Stop,
                     usage: UsageStats::default(),
                 };
-                let verdict =
-                    aisix_guardrails::Guardrail::check_output_non_segment(&resolved_chain, &synth)
-                        .await;
+                let (verdict, hits) =
+                    aisix_guardrails::Guardrail::check_output_non_segment_observed(
+                        &resolved_chain,
+                        &synth,
+                    )
+                    .await;
+                monitor_hits.extend(hits);
                 let verdict = crate::redact::moderate_body(
                     &resolved_chain,
                     crate::redact::Direction::Output,
                     verdict,
                     &mut redactions,
+                    &mut monitor_hits,
                     |g| crate::redact::redact_completions_response(g, &mut resp_json),
                 )
                 .await;
@@ -393,6 +406,7 @@ async fn dispatch(
                         provider_key_id: pk_entry.id.to_string(),
                         usage,
                         redactions,
+                        monitor_hits,
                         guardrail_blocked: true,
                         // Blocked responses never reached the client — no
                         // content capture, matching the chat surface.
@@ -427,6 +441,7 @@ async fn dispatch(
                 provider_key_id: pk_entry.id.to_string(),
                 usage,
                 redactions,
+                monitor_hits,
                 guardrail_blocked: false,
                 captured_content,
             })
@@ -445,6 +460,7 @@ async fn dispatch(
                 // out of /logs noise (same convention as #402).
                 usage: None,
                 redactions,
+                monitor_hits,
                 guardrail_blocked: false,
                 captured_content: None,
             })
@@ -540,6 +556,8 @@ fn emit_usage_event(
     guardrail_blocked: bool,
     // Per-detector PII mask counts (#932). Empty = no redaction.
     redacted_entity_counts: crate::redact::RedactionCounts,
+    // Monitor-mode guardrail observations (AISIX-Cloud#562).
+    guardrail_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
     // Captured request/response content for content-capturing exporters
     // (AISIX-Cloud#947). Forwarded only to `fan_out`, never to the CP sink.
     content: Option<&CapturedContent>,
@@ -562,6 +580,7 @@ fn emit_usage_event(
         // dashboard's Blocked tab while still carrying its billed token counts.
         guardrail_blocked,
         redacted_entity_counts,
+        guardrail_monitor_hits,
         ..Default::default()
     };
     crate::usage_attr::apply_pk_telemetry(&mut event, &snap, provider_key_id);

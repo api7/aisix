@@ -38,6 +38,7 @@ mod prompt_shield;
 #[cfg(feature = "azure-content-safety")]
 mod text_moderation;
 
+use aisix_core::models::GuardrailMonitorHit;
 use aisix_gateway::{ChatFormat, ChatMessage, ChatResponse};
 use async_trait::async_trait;
 
@@ -329,6 +330,10 @@ pub struct SegmentsOutcome {
     pub verdict: GuardrailVerdict,
     pub masked: Option<Vec<String>>,
     pub counts: std::collections::BTreeMap<String, u32>,
+    /// Monitor-mode observations made during this pass (what an
+    /// `enforcement_mode: monitor` member WOULD have done). Callers merge
+    /// them into the request's `guardrail_monitor_hits` telemetry.
+    pub monitor_hits: Vec<GuardrailMonitorHit>,
 }
 
 impl SegmentsOutcome {
@@ -338,6 +343,7 @@ impl SegmentsOutcome {
             verdict: GuardrailVerdict::Allow,
             masked: None,
             counts: std::collections::BTreeMap::new(),
+            monitor_hits: Vec::new(),
         }
     }
 
@@ -347,6 +353,7 @@ impl SegmentsOutcome {
             verdict,
             masked: None,
             counts: std::collections::BTreeMap::new(),
+            monitor_hits: Vec::new(),
         }
     }
 }
@@ -485,6 +492,56 @@ pub trait Guardrail: Send + Sync + 'static {
             GuardrailVerdict::Allow
         } else {
             self.check_output(resp).await
+        }
+    }
+
+    // --- monitor-hit observation (AISIX-Cloud#562) -------------------------
+    //
+    // `enforcement_mode: monitor` downgrades Blocks and suppresses masks,
+    // which erases the observation from the plain check return value. The
+    // `*_observed` variants return the verdict PLUS the monitor hits made
+    // during the check, so call sites can attach them to the request's
+    // telemetry. Defaults delegate to the plain checks with no hits — only
+    // the monitor decorator and the chain override these, so concrete
+    // guardrail kinds never need to.
+
+    /// [`Self::check_input`] plus any monitor-mode observations.
+    async fn check_input_observed(
+        &self,
+        req: &ChatFormat,
+    ) -> (GuardrailVerdict, Vec<GuardrailMonitorHit>) {
+        (self.check_input(req).await, Vec::new())
+    }
+
+    /// [`Self::check_output`] plus any monitor-mode observations.
+    async fn check_output_observed(
+        &self,
+        resp: &ChatResponse,
+    ) -> (GuardrailVerdict, Vec<GuardrailMonitorHit>) {
+        (self.check_output(resp).await, Vec::new())
+    }
+
+    /// [`Self::check_input_non_segment`] plus any monitor-mode observations.
+    async fn check_input_non_segment_observed(
+        &self,
+        req: &ChatFormat,
+    ) -> (GuardrailVerdict, Vec<GuardrailMonitorHit>) {
+        if self.moderates_segments() {
+            (GuardrailVerdict::Allow, Vec::new())
+        } else {
+            self.check_input_observed(req).await
+        }
+    }
+
+    /// [`Self::check_output_non_segment`] plus any monitor-mode observations.
+    async fn check_output_non_segment_observed(
+        &self,
+        resp: &ChatResponse,
+    ) -> (GuardrailVerdict, Vec<GuardrailMonitorHit>) {
+        if self.moderates_segments() {
+            (GuardrailVerdict::Allow, Vec::new())
+        } else {
+            self.check_output_observed(resp).await
         }
     }
 }

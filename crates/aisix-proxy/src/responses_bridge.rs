@@ -901,6 +901,10 @@ pub struct ResponsesStreamCompletion {
     /// Per-detector PII mask counts applied to the held stream at release
     /// (#932). Merged with the input-side counts by the on_complete emit.
     pub redacted_entity_counts: crate::redact::RedactionCounts,
+    /// Monitor-mode guardrail observations made by the end-of-stream output
+    /// check (AISIX-Cloud#562). Merged with the input-side hits by the
+    /// on_complete emit.
+    pub monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
     /// Assembled assistant text for content-capturing exporters
     /// (AISIX-Cloud#947), accumulated across chunks ONLY when an exporter
     /// wants full content (bounded to the capture cap). Empty otherwise.
@@ -1082,13 +1086,18 @@ pub fn build_responses_bridge_stream(
                 finish_reason: FinishReason::Stop,
                 usage: UsageStats::new(0, 0),
             };
-            let verdict =
-                aisix_guardrails::Guardrail::check_output_non_segment(chain.as_ref(), &synth)
-                    .await;
+            let (verdict, hits) =
+                aisix_guardrails::Guardrail::check_output_non_segment_observed(
+                    chain.as_ref(),
+                    &synth,
+                )
+                .await;
+            guard.comp().monitor_hits.extend(hits);
             // Segment pass over the held SSE frames: one Bedrock call; an
             // ANONYMIZE disposition rewrites the held bytes (#932 bedrock
             // follow-up).
             let mut seg_counts = crate::redact::RedactionCounts::new();
+            let mut seg_hits = Vec::new();
             let mut joined: Vec<u8> = Vec::with_capacity(held_bytes);
             for b in &held {
                 joined.extend_from_slice(b);
@@ -1099,6 +1108,7 @@ pub fn build_responses_bridge_stream(
                 crate::redact::Direction::Output,
                 verdict,
                 &mut seg_counts,
+                &mut seg_hits,
                 |g| match crate::redact::redact_responses_sse(g, &joined) {
                     Some((rewritten, counts)) => {
                         joined = rewritten;
@@ -1109,6 +1119,7 @@ pub fn build_responses_bridge_stream(
                 },
             )
             .await;
+            guard.comp().monitor_hits.extend(seg_hits);
             if !seg_counts.is_empty() {
                 // Bedrock masked the held bytes — rebuild the content-
                 // capture accumulator from the masked text channels,

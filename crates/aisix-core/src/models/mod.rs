@@ -41,8 +41,9 @@ pub use guardrail::{
     AliyunTextModerationConfig, AppliedGuardrail, AzureContentSafetyConfig,
     AzureContentSafetyTextModerationConfig, BedrockAWSCredentials, BedrockConfig,
     BedrockLatencyMode, Guardrail, GuardrailAttachment, GuardrailHookPoint, GuardrailKind,
-    GuardrailScopeType, KeywordConfig, KeywordPattern, LakeraConfig, OpenaiModerationConfig,
-    PiiConfig, PiiCustomPattern, PiiDetectorConfig, PresidioConfig, PresidioEntityConfig,
+    GuardrailMonitorHit, GuardrailScopeType, KeywordConfig, KeywordPattern, LakeraConfig,
+    OpenaiModerationConfig, PiiConfig, PiiCustomPattern, PiiDetectorConfig, PresidioConfig,
+    PresidioEntityConfig,
 };
 pub use mcp_server::{McpAuthType, McpServer, McpTransport};
 pub use model::{

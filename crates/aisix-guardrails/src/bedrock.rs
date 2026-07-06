@@ -262,6 +262,7 @@ impl BedrockGuardrail {
                             verdict: GuardrailVerdict::Allow,
                             masked: Some(outputs),
                             counts: anonymized_counts(&resp),
+                            monitor_hits: Vec::new(),
                         }
                     } else {
                         tracing::warn!(

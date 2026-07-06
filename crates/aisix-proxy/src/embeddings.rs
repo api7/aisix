@@ -173,6 +173,7 @@ pub async fn embeddings(
                     success.prompt_tokens,
                     &client,
                     success.redactions.clone(),
+                    success.monitor_hits.clone(),
                     success.captured_content.as_ref(),
                 );
             }
@@ -233,6 +234,8 @@ struct EmbedDispatchSuccess {
     applied_guardrails: Vec<AppliedGuardrail>,
     /// Per-detector PII mask counts (#932) applied to the input.
     redactions: crate::redact::RedactionCounts,
+    /// Monitor-mode guardrail observations (AISIX-Cloud#562).
+    monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
     /// Captured request/response content for content-capturing exporters
     /// (#700, LiteLLM parity: the full response JSON — vectors included —
     /// truncated at the capture cap). `Some` only when an exporter opted
@@ -298,12 +301,16 @@ async fn dispatch(
     // UsageEvent surfaces them in Logs, like chat / messages. Empty when no
     // guardrail is attached.
     let applied_guardrails = resolved_chain.applied().to_vec();
+    let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
     if !resolved_chain.is_empty() {
         let chat = embeddings_input_to_chat(&body.model, &body.input);
+        let (verdict, hits) =
+            aisix_guardrails::Guardrail::check_input_observed(&resolved_chain, &chat).await;
+        monitor_hits.extend(hits);
         if let aisix_guardrails::GuardrailVerdict::Block {
             reason,
             guardrail_name,
-        } = aisix_guardrails::Guardrail::check_input(&resolved_chain, &chat).await
+        } = verdict
         {
             // Per #153 keep the matched-pattern detail in ops logs only; the
             // wire envelope names only the guardrail that fired (#519 B.4b).
@@ -424,6 +431,7 @@ async fn dispatch(
                 provider_key_id: pk_entry.id.to_string(),
                 applied_guardrails: applied_guardrails.clone(),
                 redactions: redactions.clone(),
+                monitor_hits: monitor_hits.clone(),
                 prompt_tokens,
                 upstream_called: true,
                 captured_content,
@@ -445,6 +453,7 @@ async fn dispatch(
                 provider_key_id: pk_entry.id.to_string(),
                 applied_guardrails: applied_guardrails.clone(),
                 redactions: redactions.clone(),
+                monitor_hits: monitor_hits.clone(),
                 prompt_tokens: 0,
                 captured_content: None,
                 // No upstream call happened — the handler reads this
@@ -538,6 +547,8 @@ fn emit_usage_event(
     client: &ClientContext,
     // Per-detector PII mask counts (#932) applied to the input.
     redacted_entity_counts: crate::redact::RedactionCounts,
+    // Monitor-mode guardrail observations (AISIX-Cloud#562).
+    guardrail_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
     // Captured request/response content (#700). Forwarded only to `fan_out`,
     // never to the CP sink.
     content: Option<&CapturedContent>,
@@ -581,6 +592,7 @@ fn emit_usage_event(
         inbound_protocol: "openai".to_string(),
         applied_guardrails: applied_guardrails.to_vec(),
         redacted_entity_counts,
+        guardrail_monitor_hits,
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),
         ..Default::default()

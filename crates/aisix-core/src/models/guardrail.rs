@@ -734,6 +734,33 @@ pub struct AppliedGuardrail {
     pub hook: String,
 }
 
+/// One monitor-mode observation: what an `enforcement_mode: monitor`
+/// guardrail WOULD have done to this request had it been enforcing
+/// (AISIX-Cloud#562). Carried on the telemetry UsageEvent so operators can
+/// stage a policy, watch its hit rate in the dashboard, and only then flip
+/// it to `block`.
+///
+/// `reason` and `counts` carry detector/entity/category NAMES only — never
+/// matched content (#153 no-leak criterion).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuardrailMonitorHit {
+    /// The configured (row) name of the monitor-mode guardrail that fired.
+    pub guardrail_name: String,
+    /// Which side observed the hit: `input` or `output`.
+    pub hook: String,
+    /// `would_block` (a Block verdict was downgraded) or `would_mask`
+    /// (maskable spans were observed but not rewritten).
+    pub action: String,
+    /// The suppressed Block's operator-facing reason (`would_block` only;
+    /// empty for `would_mask`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reason: String,
+    /// detector/entity name → span count the guardrail would have masked
+    /// (`would_mask` only; empty for `would_block`).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub counts: std::collections::BTreeMap<String, u32>,
+}
+
 /// Content policy evaluated before or after upstream calls.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
 pub struct Guardrail {

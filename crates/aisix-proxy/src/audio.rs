@@ -59,6 +59,9 @@ struct AudioDispatchSuccess {
     /// field (input side) + the transcript (output side), merged. Attached
     /// to the emitted UsageEvent. Empty = no redaction.
     redactions: crate::redact::RedactionCounts,
+    /// Monitor-mode guardrail observations (AISIX-Cloud#562), input +
+    /// output merged.
+    monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
     /// #696: set when an OUTPUT guardrail blocked the transcript AFTER the
     /// upstream billed for it. The response body is the redacted 422, but
     /// `usage` keeps the billed counts so the UsageEvent (marked
@@ -293,6 +296,7 @@ pub async fn speech(
             provider_key_id,
             applied_guardrails,
             redactions,
+            monitor_hits,
             captured,
         )) => {
             let elapsed = started.elapsed();
@@ -332,6 +336,7 @@ pub async fn speech(
                 0,
                 &client,
                 redactions,
+                monitor_hits,
                 /* guardrail_blocked */ false,
                 captured.as_ref(),
             );
@@ -441,6 +446,7 @@ async fn multipart_dispatch(
     let resolved_chain = state.guardrail_index.resolve(&guardrail_ctx);
     let applied_guardrails = resolved_chain.applied().to_vec();
     let mut redactions = crate::redact::RedactionCounts::new();
+    let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
     if !resolved_chain.is_empty() {
         // EVERY `prompt` field: multipart allows repeated names and the form
         // is rebuilt with all of them, so all are scanned — an empty first
@@ -454,10 +460,13 @@ async fn multipart_dispatch(
             .collect();
         if !prompt_messages.is_empty() {
             let chat = aisix_gateway::ChatFormat::new(&model_name, prompt_messages);
+            let (verdict, hits) =
+                aisix_guardrails::Guardrail::check_input_observed(&resolved_chain, &chat).await;
+            monitor_hits.extend(hits);
             if let aisix_guardrails::GuardrailVerdict::Block {
                 reason,
                 guardrail_name,
-            } = aisix_guardrails::Guardrail::check_input(&resolved_chain, &chat).await
+            } = verdict
             {
                 // Per #153 the matched-pattern detail stays in ops logs only.
                 tracing::warn!(
@@ -691,10 +700,13 @@ async fn multipart_dispatch(
                 finish_reason: FinishReason::Stop,
                 usage: UsageStats::default(),
             };
+            let (verdict, hits) =
+                aisix_guardrails::Guardrail::check_output_observed(&resolved_chain, &synth).await;
+            monitor_hits.extend(hits);
             if let aisix_guardrails::GuardrailVerdict::Block {
                 reason,
                 guardrail_name,
-            } = aisix_guardrails::Guardrail::check_output(&resolved_chain, &synth).await
+            } = verdict
             {
                 // Per #153 the matched-pattern detail stays in ops logs only.
                 tracing::warn!(
@@ -716,6 +728,7 @@ async fn multipart_dispatch(
                     usage,
                     applied_guardrails,
                     redactions,
+                    monitor_hits: monitor_hits.clone(),
                     guardrail_blocked: true,
                     // The blocked transcript never reached the client — no
                     // content capture, matching the chat surface.
@@ -759,6 +772,7 @@ async fn multipart_dispatch(
         usage,
         applied_guardrails,
         redactions,
+        monitor_hits,
         guardrail_blocked: false,
         captured_content,
     })
@@ -815,6 +829,7 @@ async fn speech_dispatch(
         String,
         Vec<AppliedGuardrail>,
         crate::redact::RedactionCounts,
+        Vec<aisix_core::GuardrailMonitorHit>,
         Option<CapturedContent>,
     ),
     ProxyError,
@@ -851,12 +866,16 @@ async fn speech_dispatch(
     // Record which guardrails govern this request (#379 parity) for the emitted
     // UsageEvent. Empty when none attached.
     let applied_guardrails = resolved_chain.applied().to_vec();
+    let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
     if !resolved_chain.is_empty() {
         let chat = speech_input_to_chat(&model_name, &body);
+        let (verdict, hits) =
+            aisix_guardrails::Guardrail::check_input_observed(&resolved_chain, &chat).await;
+        monitor_hits.extend(hits);
         if let aisix_guardrails::GuardrailVerdict::Block {
             reason,
             guardrail_name,
-        } = aisix_guardrails::Guardrail::check_input(&resolved_chain, &chat).await
+        } = verdict
         {
             // Per #153 the matched-pattern detail stays in ops logs only.
             tracing::warn!(
@@ -1024,6 +1043,7 @@ async fn speech_dispatch(
         pk_entry.id.to_string(),
         applied_guardrails,
         redactions,
+        monitor_hits,
         captured_content,
     ))
 }
@@ -1071,6 +1091,7 @@ fn emit_audio_usage(
         completion_tokens,
         client,
         success.redactions.clone(),
+        success.monitor_hits.clone(),
         success.guardrail_blocked,
         success.captured_content.as_ref(),
     );
@@ -1099,6 +1120,8 @@ fn emit_usage_event(
     client: &ClientContext,
     // Per-detector PII mask counts (#932/#696). Empty = no redaction.
     redacted_entity_counts: crate::redact::RedactionCounts,
+    // Monitor-mode guardrail observations (AISIX-Cloud#562).
+    guardrail_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
     // #696: transcript blocked by an output guardrail after upstream billing.
     guardrail_blocked: bool,
     // Captured request/response content (#700). Forwarded only to `fan_out`,
@@ -1121,6 +1144,7 @@ fn emit_usage_event(
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),
         redacted_entity_counts,
+        guardrail_monitor_hits,
         guardrail_blocked,
         ..Default::default()
     };

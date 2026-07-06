@@ -254,6 +254,7 @@ impl LakeraGuardrail {
                         verdict: GuardrailVerdict::Allow,
                         masked: Some(masked),
                         counts,
+                        monitor_hits: Vec::new(),
                     }
                 }
             },

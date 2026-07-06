@@ -27,7 +27,7 @@
 //! batch contract (5s interval / 100-event ceiling) lives in the worker
 //! (aisix-server), not here.
 
-use aisix_core::AppliedGuardrail;
+use aisix_core::{AppliedGuardrail, GuardrailMonitorHit};
 use serde::Serialize;
 
 /// One usage event. Emitted at end-of-request (success / upstream error /
@@ -171,6 +171,18 @@ pub struct UsageEvent {
     /// binds JSON leniently, so older CP images ignore the unknown field.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub redacted_entity_counts: std::collections::BTreeMap<String, u32>,
+
+    /// What each `enforcement_mode: monitor` guardrail WOULD have done to
+    /// this request (AISIX-Cloud#562): one entry per suppressed Block
+    /// (`would_block`, with the operator-facing reason) or suppressed mask
+    /// (`would_mask`, with per-detector counts). Names only — never matched
+    /// content (#153). Lets operators stage a policy and audit its hit rate
+    /// in the dashboard before flipping it to `block`. Empty (no
+    /// monitor-mode guardrail fired) is omitted from the wire; cp-api's
+    /// `/dp/telemetry` binds JSON leniently, so older CP images ignore the
+    /// unknown field.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub guardrail_monitor_hits: Vec<GuardrailMonitorHit>,
 
     /// Cache outcome on this request. One of:
     ///

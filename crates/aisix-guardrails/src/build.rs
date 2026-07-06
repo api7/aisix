@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 
 use aisix_core::models::{
     AisixSnapshot, AppliedGuardrail, Guardrail as DomainGuardrail, GuardrailAttachment,
-    GuardrailHookPoint, GuardrailKind, GuardrailScopeType, KeywordPattern,
+    GuardrailHookPoint, GuardrailKind, GuardrailMonitorHit, GuardrailScopeType, KeywordPattern,
 };
 use aisix_core::snapshot::ResourceTable;
 use aisix_core::SnapshotHandle;
@@ -25,7 +25,9 @@ use async_trait::async_trait;
 use crate::index::{GuardrailIndex, RequestContext, ScopeKind};
 use crate::keyword::{KeywordBlocklist, KeywordRule};
 use crate::pii::{builtin_rule, PiiAction, PiiGuardrail, PiiRule};
-use crate::{Guardrail, GuardrailChain, GuardrailVerdict, Redaction, StreamOutputPolicy};
+use crate::{
+    Guardrail, GuardrailChain, GuardrailVerdict, Redaction, SegmentsOutcome, StreamOutputPolicy,
+};
 
 /// A snapshot table's guardrail entries in deterministic chain order:
 /// `created_at` ascending (RFC3339 strings in a fixed offset compare
@@ -498,6 +500,92 @@ impl MonitorGuardrail {
             other => other,
         }
     }
+
+    /// `would_block` telemetry hit for a downgraded Block (AISIX-Cloud#562).
+    fn would_block_hit(&self, hook: &'static str, reason: &str) -> GuardrailMonitorHit {
+        GuardrailMonitorHit {
+            guardrail_name: self.row_name.clone(),
+            hook: hook.to_owned(),
+            action: "would_block".to_owned(),
+            reason: reason.to_owned(),
+            counts: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// `would_mask` telemetry hit for suppressed mask counts.
+    fn would_mask_hit(
+        &self,
+        hook: &'static str,
+        counts: std::collections::BTreeMap<String, u32>,
+    ) -> GuardrailMonitorHit {
+        GuardrailMonitorHit {
+            guardrail_name: self.row_name.clone(),
+            hook: hook.to_owned(),
+            action: "would_mask".to_owned(),
+            reason: String::new(),
+            counts,
+        }
+    }
+
+    /// Downgrade a verdict, recording a `would_block` hit alongside the
+    /// existing ops-log line.
+    fn observe_hit(
+        &self,
+        hook: &'static str,
+        verdict: GuardrailVerdict,
+        hits: &mut Vec<GuardrailMonitorHit>,
+    ) -> GuardrailVerdict {
+        if let GuardrailVerdict::Block { ref reason, .. } = verdict {
+            hits.push(self.would_block_hit(hook, reason));
+        }
+        self.observe(hook, verdict)
+    }
+
+    /// Observe a segment outcome (AISIX-Cloud#562): a Block downgrades to
+    /// Allow with a `would_block` hit; an inner mask is suppressed (never
+    /// written back) with a `would_mask` hit carrying the provider's
+    /// entity counts. Bypass passes through — monitor mode doesn't change
+    /// availability semantics.
+    fn observe_segments(&self, hook: &'static str, outcome: SegmentsOutcome) -> SegmentsOutcome {
+        let mut hits = outcome.monitor_hits;
+        if outcome.masked.is_some() {
+            tracing::info!(
+                guardrail_name = %self.row_name,
+                hook,
+                counts = ?outcome.counts,
+                "guardrail in monitor mode observed maskable spans; not redacting (enforcement_mode=monitor)",
+            );
+            hits.push(self.would_mask_hit(hook, outcome.counts));
+        }
+        let verdict = self.observe_hit(hook, outcome.verdict, &mut hits);
+        SegmentsOutcome {
+            verdict,
+            masked: None,
+            counts: std::collections::BTreeMap::new(),
+            monitor_hits: hits,
+        }
+    }
+
+    /// Probe the inner SYNC redactor (kind=pii) with the hook's scan text
+    /// and record what it would have masked. Redaction stays suppressed —
+    /// this only recovers the counts for telemetry. Segment moderators
+    /// (bedrock/lakera/presidio) report through the segment pass instead.
+    fn probe_redaction(
+        &self,
+        hook: &'static str,
+        redacts: bool,
+        redact: impl FnOnce() -> Option<Redaction>,
+        hits: &mut Vec<GuardrailMonitorHit>,
+    ) {
+        if !redacts {
+            return;
+        }
+        let r = redact();
+        if let Some(ref red) = r {
+            hits.push(self.would_mask_hit(hook, red.counts.clone()));
+        }
+        self.observe_redaction(hook, r);
+    }
 }
 
 #[async_trait]
@@ -516,6 +604,63 @@ impl Guardrail for MonitorGuardrail {
 
     async fn check_output(&self, resp: &ChatResponse) -> GuardrailVerdict {
         self.observe("output", self.inner.check_output(resp).await)
+    }
+
+    async fn check_input_observed(
+        &self,
+        req: &ChatFormat,
+    ) -> (GuardrailVerdict, Vec<GuardrailMonitorHit>) {
+        let mut hits = Vec::new();
+        let verdict = self.observe_hit("input", self.inner.check_input(req).await, &mut hits);
+        // Recover the would-mask counts the suppressed sync redactor
+        // (kind=pii) would have produced, from the same text its
+        // check_input scans.
+        let text: String = req
+            .messages
+            .iter()
+            .map(crate::message_scan_text)
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.probe_redaction(
+            "input",
+            self.inner.redacts_input() && !text.is_empty(),
+            || self.inner.redact_input_text(&text),
+            &mut hits,
+        );
+        (verdict, hits)
+    }
+
+    async fn check_output_observed(
+        &self,
+        resp: &ChatResponse,
+    ) -> (GuardrailVerdict, Vec<GuardrailMonitorHit>) {
+        let mut hits = Vec::new();
+        let verdict = self.observe_hit("output", self.inner.check_output(resp).await, &mut hits);
+        let text = resp.guardrail_output_text();
+        self.probe_redaction(
+            "output",
+            self.inner.redacts_output() && !text.is_empty(),
+            || self.inner.redact_output_text(&text),
+            &mut hits,
+        );
+        (verdict, hits)
+    }
+
+    /// Delegate so a monitored segment moderator (bedrock/lakera/presidio)
+    /// is consulted through the segment pass — ONE provider call whose
+    /// verdict AND mask are observed with full fidelity — instead of the
+    /// blob path, where a maskable outcome degrades to a would-block.
+    fn moderates_segments(&self) -> bool {
+        self.inner.moderates_segments()
+    }
+
+    async fn moderate_input_segments(&self, texts: &[String]) -> SegmentsOutcome {
+        self.observe_segments("input", self.inner.moderate_input_segments(texts).await)
+    }
+
+    async fn moderate_output_segments(&self, texts: &[String]) -> SegmentsOutcome {
+        self.observe_segments("output", self.inner.moderate_output_segments(texts).await)
     }
 
     fn stream_output_policy(&self) -> StreamOutputPolicy {
@@ -1078,6 +1223,131 @@ mod tests {
             usage: aisix_gateway::UsageStats::new(0, 0),
         };
         assert!(!chain.check_output(&resp).await.is_block());
+    }
+
+    /// AISIX-Cloud#562: the observed check surfaces what monitor mode
+    /// suppressed — a downgraded Block becomes a `would_block` hit and a
+    /// suppressed pii mask becomes a `would_mask` hit with the detector
+    /// counts. Verdicts stay downgraded; names only, never values.
+    #[tokio::test]
+    async fn monitor_mode_observed_check_reports_hits() {
+        let table: ResourceTable<DomainGuardrail> = ResourceTable::default();
+        table.insert(entry(
+            "watch-pii",
+            "g-1",
+            parse(
+                r#"{
+                    "name": "watch-pii",
+                    "enforcement_mode": "monitor",
+                    "kind": "pii",
+                    "detectors": [
+                        { "type": "email", "action": "mask" },
+                        { "type": "us_ssn", "action": "block" }
+                    ]
+                }"#,
+            ),
+        ));
+        let chain = build_chain_from_snapshot(&table, None);
+
+        // mask-action detector match → would_mask hit with counts.
+        let (v, hits) = chain
+            .check_input_observed(&req("mail alice@example.com ok"))
+            .await;
+        assert_eq!(v, GuardrailVerdict::Allow);
+        assert_eq!(hits.len(), 1, "hits: {hits:?}");
+        assert_eq!(hits[0].guardrail_name, "watch-pii");
+        assert_eq!(hits[0].hook, "input");
+        assert_eq!(hits[0].action, "would_mask");
+        assert_eq!(hits[0].counts.get("email"), Some(&1));
+        assert!(
+            !format!("{hits:?}").contains("alice@example.com"),
+            "matched value must never ride a hit",
+        );
+
+        // block-action detector match → would_block hit carrying the reason.
+        let (v, hits) = chain.check_input_observed(&req("ssn 123-45-6789")).await;
+        assert_eq!(v, GuardrailVerdict::Allow);
+        assert_eq!(hits.len(), 1, "hits: {hits:?}");
+        assert_eq!(hits[0].action, "would_block");
+        assert!(
+            hits[0].reason.contains("us_ssn"),
+            "reason: {}",
+            hits[0].reason
+        );
+        assert!(!hits[0].reason.contains("123-45-6789"));
+
+        // clean input → no hits.
+        let (v, hits) = chain.check_input_observed(&req("all fine")).await;
+        assert_eq!(v, GuardrailVerdict::Allow);
+        assert!(hits.is_empty(), "hits: {hits:?}");
+    }
+
+    /// An ENFORCING (block-mode) guardrail must not produce monitor hits —
+    /// its Block is real and already carried by the verdict.
+    #[tokio::test]
+    async fn enforcing_guardrail_produces_no_monitor_hits() {
+        let table: ResourceTable<DomainGuardrail> = ResourceTable::default();
+        table.insert(entry(
+            "hard-block",
+            "g-1",
+            parse(
+                r#"{
+                    "name": "hard-block",
+                    "kind": "keyword",
+                    "patterns": [{ "kind": "literal", "value": "AKIA" }]
+                }"#,
+            ),
+        ));
+        let chain = build_chain_from_snapshot(&table, None);
+        let (v, hits) = chain
+            .check_input_observed(&req("here is AKIAEXAMPLE"))
+            .await;
+        assert!(v.is_block());
+        assert!(hits.is_empty(), "hits: {hits:?}");
+    }
+
+    /// A monitor-mode hit made BEFORE an enforcing peer blocks must survive
+    /// the short-circuit — the chain collects hits as it folds.
+    #[tokio::test]
+    async fn monitor_hit_survives_enforcing_peer_block() {
+        let table: ResourceTable<DomainGuardrail> = ResourceTable::default();
+        table.insert(entry(
+            "watch-first",
+            "g-1",
+            parse(
+                r#"{
+                    "name": "watch-first",
+                    "enforcement_mode": "monitor",
+                    "kind": "keyword",
+                    "created_at": "2024-01-01T00:00:00Z",
+                    "patterns": [{ "kind": "literal", "value": "AKIA" }]
+                }"#,
+            ),
+        ));
+        table.insert(entry(
+            "block-second",
+            "g-2",
+            parse(
+                r#"{
+                    "name": "block-second",
+                    "kind": "keyword",
+                    "created_at": "2024-01-02T00:00:00Z",
+                    "patterns": [{ "kind": "literal", "value": "AKIA" }]
+                }"#,
+            ),
+        ));
+        let chain = build_chain_from_snapshot(&table, None);
+        let (v, hits) = chain
+            .check_input_observed(&req("here is AKIAEXAMPLE"))
+            .await;
+        assert!(v.is_block(), "enforcing peer still blocks");
+        assert_eq!(
+            hits.len(),
+            1,
+            "monitor hit collected before the block: {hits:?}"
+        );
+        assert_eq!(hits[0].guardrail_name, "watch-first");
+        assert_eq!(hits[0].action, "would_block");
     }
 
     /// A monitor-mode guardrail must not force streamed output to hold back —

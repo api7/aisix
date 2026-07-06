@@ -13,6 +13,8 @@ use aisix_core::AppliedGuardrail;
 use aisix_gateway::{ChatFormat, ChatResponse};
 use async_trait::async_trait;
 
+use aisix_core::models::GuardrailMonitorHit;
+
 use crate::{Guardrail, GuardrailVerdict, Redaction, SegmentsOutcome, StreamOutputPolicy};
 
 /// One chain member: the runtime guardrail plus the operator-facing name
@@ -205,6 +207,126 @@ impl Guardrail for GuardrailChain {
         }
     }
 
+    // Observed folds (AISIX-Cloud#562): same short-circuit semantics as the
+    // plain folds, but every member's monitor-mode observations are
+    // collected — including the ones made before an enforcing member
+    // blocks, so a monitored rule's hit isn't erased by a peer's Block.
+    async fn check_input_observed(
+        &self,
+        req: &ChatFormat,
+    ) -> (GuardrailVerdict, Vec<GuardrailMonitorHit>) {
+        let mut bypass: Option<String> = None;
+        let mut hits: Vec<GuardrailMonitorHit> = Vec::new();
+        for m in &self.members {
+            let (verdict, member_hits) = m.guardrail.check_input_observed(req).await;
+            hits.extend(member_hits);
+            match verdict {
+                GuardrailVerdict::Allow => continue,
+                GuardrailVerdict::Block {
+                    reason,
+                    guardrail_name,
+                } => return (attribute_block(&m.name, reason, guardrail_name), hits),
+                GuardrailVerdict::Bypass { reason } => {
+                    if bypass.is_none() {
+                        bypass = Some(reason);
+                    }
+                }
+            }
+        }
+        let verdict = match bypass {
+            Some(reason) => GuardrailVerdict::Bypass { reason },
+            None => GuardrailVerdict::Allow,
+        };
+        (verdict, hits)
+    }
+
+    async fn check_output_observed(
+        &self,
+        resp: &ChatResponse,
+    ) -> (GuardrailVerdict, Vec<GuardrailMonitorHit>) {
+        let mut bypass: Option<String> = None;
+        let mut hits: Vec<GuardrailMonitorHit> = Vec::new();
+        for m in &self.members {
+            let (verdict, member_hits) = m.guardrail.check_output_observed(resp).await;
+            hits.extend(member_hits);
+            match verdict {
+                GuardrailVerdict::Allow => continue,
+                GuardrailVerdict::Block {
+                    reason,
+                    guardrail_name,
+                } => return (attribute_block(&m.name, reason, guardrail_name), hits),
+                GuardrailVerdict::Bypass { reason } => {
+                    if bypass.is_none() {
+                        bypass = Some(reason);
+                    }
+                }
+            }
+        }
+        let verdict = match bypass {
+            Some(reason) => GuardrailVerdict::Bypass { reason },
+            None => GuardrailVerdict::Allow,
+        };
+        (verdict, hits)
+    }
+
+    async fn check_input_non_segment_observed(
+        &self,
+        req: &ChatFormat,
+    ) -> (GuardrailVerdict, Vec<GuardrailMonitorHit>) {
+        let mut bypass: Option<String> = None;
+        let mut hits: Vec<GuardrailMonitorHit> = Vec::new();
+        for m in &self.members {
+            let (verdict, member_hits) = m.guardrail.check_input_non_segment_observed(req).await;
+            hits.extend(member_hits);
+            match verdict {
+                GuardrailVerdict::Allow => continue,
+                GuardrailVerdict::Block {
+                    reason,
+                    guardrail_name,
+                } => return (attribute_block(&m.name, reason, guardrail_name), hits),
+                GuardrailVerdict::Bypass { reason } => {
+                    if bypass.is_none() {
+                        bypass = Some(reason);
+                    }
+                }
+            }
+        }
+        let verdict = match bypass {
+            Some(reason) => GuardrailVerdict::Bypass { reason },
+            None => GuardrailVerdict::Allow,
+        };
+        (verdict, hits)
+    }
+
+    async fn check_output_non_segment_observed(
+        &self,
+        resp: &ChatResponse,
+    ) -> (GuardrailVerdict, Vec<GuardrailMonitorHit>) {
+        let mut bypass: Option<String> = None;
+        let mut hits: Vec<GuardrailMonitorHit> = Vec::new();
+        for m in &self.members {
+            let (verdict, member_hits) = m.guardrail.check_output_non_segment_observed(resp).await;
+            hits.extend(member_hits);
+            match verdict {
+                GuardrailVerdict::Allow => continue,
+                GuardrailVerdict::Block {
+                    reason,
+                    guardrail_name,
+                } => return (attribute_block(&m.name, reason, guardrail_name), hits),
+                GuardrailVerdict::Bypass { reason } => {
+                    if bypass.is_none() {
+                        bypass = Some(reason);
+                    }
+                }
+            }
+        }
+        let verdict = match bypass {
+            Some(reason) => GuardrailVerdict::Bypass { reason },
+            None => GuardrailVerdict::Allow,
+        };
+        (verdict, hits)
+    }
+
     fn moderates_segments(&self) -> bool {
         self.members
             .iter()
@@ -312,27 +434,30 @@ async fn fold_segments(members: &[ChainMember], texts: &[String], input: bool) -
     let mut masked: Option<Vec<String>> = None;
     let mut counts = std::collections::BTreeMap::new();
     let mut bypass: Option<String> = None;
+    let mut monitor_hits: Vec<GuardrailMonitorHit> = Vec::new();
     for m in members {
         if !m.guardrail.moderates_segments() {
             continue;
         }
         let src: &[String] = masked.as_deref().unwrap_or(texts);
-        let outcome = if input {
+        let mut outcome = if input {
             m.guardrail.moderate_input_segments(src).await
         } else {
             m.guardrail.moderate_output_segments(src).await
         };
+        monitor_hits.append(&mut outcome.monitor_hits);
         match outcome.verdict {
             GuardrailVerdict::Allow => {}
             GuardrailVerdict::Block {
                 reason,
                 guardrail_name,
             } => {
-                return SegmentsOutcome::from_verdict(attribute_block(
-                    &m.name,
-                    reason,
-                    guardrail_name,
-                ))
+                return SegmentsOutcome {
+                    verdict: attribute_block(&m.name, reason, guardrail_name),
+                    masked: None,
+                    counts: std::collections::BTreeMap::new(),
+                    monitor_hits,
+                }
             }
             GuardrailVerdict::Bypass { reason } => {
                 if bypass.is_none() {
@@ -366,6 +491,7 @@ async fn fold_segments(members: &[ChainMember], texts: &[String], input: bool) -
         },
         masked,
         counts,
+        monitor_hits,
     }
 }
 
@@ -682,6 +808,7 @@ mod tests {
                     .mask
                     .then(|| texts.iter().map(|t| t.to_uppercase()).collect()),
                 counts,
+                monitor_hits: Vec::new(),
             }
         }
     }
@@ -789,6 +916,7 @@ mod tests {
                     verdict: GuardrailVerdict::Allow,
                     masked: Some(vec!["only-one".to_owned()]),
                     counts,
+                    monitor_hits: Vec::new(),
                 }
             }
         }

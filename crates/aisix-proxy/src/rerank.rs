@@ -47,6 +47,8 @@ struct RerankDispatchSuccess {
     /// Per-detector PII mask counts (#932/#696) applied to the request.
     /// Attached to the emitted UsageEvent. Empty = no redaction.
     redactions: crate::redact::RedactionCounts,
+    /// Monitor-mode guardrail observations (AISIX-Cloud#562).
+    monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
     /// Captured request/response content for content-capturing exporters
     /// (#700, LiteLLM parity: the full rerank response JSON). `Some` only
     /// when an exporter opted into `content_mode = full`.
@@ -122,6 +124,7 @@ pub async fn rerank(
                     &usage,
                     &client,
                     success.redactions.clone(),
+                    success.monitor_hits.clone(),
                     success.captured_content.as_ref(),
                 );
             }
@@ -230,12 +233,16 @@ async fn dispatch(
     // UsageEvent surfaces them in Logs, like chat / messages. Empty when no
     // guardrail is attached.
     let applied_guardrails = resolved_chain.applied().to_vec();
+    let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
     if !resolved_chain.is_empty() {
         let chat = rerank_input_to_chat(&model_name, &*body);
+        let (verdict, hits) =
+            aisix_guardrails::Guardrail::check_input_observed(&resolved_chain, &chat).await;
+        monitor_hits.extend(hits);
         if let aisix_guardrails::GuardrailVerdict::Block {
             reason,
             guardrail_name,
-        } = aisix_guardrails::Guardrail::check_input(&resolved_chain, &chat).await
+        } = verdict
         {
             // Per #153 the matched-pattern detail stays in ops logs only.
             tracing::warn!(
@@ -503,6 +510,7 @@ async fn dispatch(
         applied_guardrails: applied_guardrails.clone(),
         usage,
         redactions,
+        monitor_hits,
         captured_content,
     })
 }
@@ -566,6 +574,8 @@ fn emit_usage_event(
     client: &ClientContext,
     // Per-detector PII mask counts (#932/#696). Empty = no redaction.
     redacted_entity_counts: crate::redact::RedactionCounts,
+    // Monitor-mode guardrail observations (AISIX-Cloud#562).
+    guardrail_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
     // Captured request/response content (#700). Forwarded only to `fan_out`,
     // never to the CP sink.
     content: Option<&CapturedContent>,
@@ -585,6 +595,7 @@ fn emit_usage_event(
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),
         redacted_entity_counts,
+        guardrail_monitor_hits,
         ..Default::default()
     };
     // Per-PK attribution tags (provider_kind / provider_featured /

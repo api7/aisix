@@ -123,6 +123,9 @@ pub async fn messages(
     // dual-path lifecycle as `applied_guardrails`. Streaming output counts
     // travel via the stream builders' end-of-stream emit instead.
     let mut redaction_counts = crate::redact::RedactionCounts::new();
+    // Filled by `dispatch` with monitor-mode guardrail observations
+    // (AISIX-Cloud#562), same lifecycle as `redaction_counts`.
+    let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
     // #890 req-1: capture the client's streaming intent before dispatch
     // (which mutates the body).
     let stream_requested = body
@@ -138,6 +141,7 @@ pub async fn messages(
         &client,
         &mut applied_guardrails,
         &mut redaction_counts,
+        &mut monitor_hits,
     )
     .await
     {
@@ -151,10 +155,12 @@ pub async fn messages(
             routing,
             captured_content,
             output_redactions,
+            output_monitor_hits,
         }) => {
             // #932: fold the non-streaming response-side mask counts into
             // the per-request total before the terminal emit below.
             crate::redact::merge_counts(&mut redaction_counts, output_redactions);
+            monitor_hits.extend(output_monitor_hits);
             let elapsed = started.elapsed();
             let status = response.status().as_u16();
             emit_access_log(
@@ -246,6 +252,7 @@ pub async fn messages(
                     attempt,
                     applied_guardrails.clone(),
                     redaction_counts.clone(),
+                    monitor_hits.clone(),
                     captured_content,
                 );
             }
@@ -339,6 +346,7 @@ pub async fn messages(
                     applied_guardrails.clone(),
                     // Input masking may have fired before the failure.
                     redaction_counts.clone(),
+                    monitor_hits.clone(),
                     /* content */ None,
                 );
             }
@@ -394,6 +402,7 @@ fn emit_failed_attempts_anthropic(
             // Failed attempts carry no per-request redaction detail; the
             // terminal (winner / pre-dispatch) event does.
             crate::redact::RedactionCounts::new(),
+            Vec::new(),
             /* content */ None,
         );
     }
@@ -417,6 +426,9 @@ async fn dispatch(
     // `applied_out`. Streaming output counts travel via the stream
     // builders' own end-of-stream emit instead.
     redactions_out: &mut crate::redact::RedactionCounts,
+    // Out-param: monitor-mode guardrail observations (AISIX-Cloud#562),
+    // same lifecycle as `redactions_out`.
+    monitor_hits_out: &mut Vec<aisix_core::GuardrailMonitorHit>,
 ) -> Result<DispatchOutcome, MessagesDispatchError> {
     let snapshot = state.snapshot.load();
 
@@ -461,11 +473,12 @@ async fn dispatch(
     *applied_out = resolved_chain.applied().to_vec();
     if !resolved_chain.is_empty() {
         if let Ok(chat) = aisix_provider_anthropic::parse_inbound_request(body) {
-            let verdict = aisix_guardrails::Guardrail::check_input_non_segment(
+            let (verdict, hits) = aisix_guardrails::Guardrail::check_input_non_segment_observed(
                 resolved_chain.as_ref(),
                 &chat,
             )
             .await;
+            monitor_hits_out.extend(hits);
             // Segment pass: one Bedrock call over the body's text slots;
             // an ANONYMIZE disposition writes the masked text back into
             // the Anthropic-native body (#932 bedrock follow-up).
@@ -474,6 +487,7 @@ async fn dispatch(
                 crate::redact::Direction::Input,
                 verdict,
                 redactions_out,
+                monitor_hits_out,
                 |g| crate::redact::redact_anthropic_request(g, body),
             )
             .await;
@@ -620,6 +634,7 @@ async fn dispatch(
                 },
                 &mut reservation,
                 redactions_out.clone(),
+                monitor_hits_out.clone(),
             )
             .await
             {
@@ -728,6 +743,9 @@ async fn dispatch_to_target(
     // into their end-of-stream telemetry emit (the non-streaming emit
     // happens in `messages()`, which already holds them).
     input_redactions: crate::redact::RedactionCounts,
+    // Input-side monitor hits (AISIX-Cloud#562), same lifecycle as
+    // `input_redactions`.
+    input_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
 ) -> Result<DispatchOutcome, ProxyError> {
     let model = &target.model;
     let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
@@ -751,6 +769,7 @@ async fn dispatch_to_target(
             attempt,
             reservation,
             input_redactions,
+            input_monitor_hits,
         )
         .await;
     }
@@ -774,6 +793,7 @@ async fn dispatch_to_target(
         attempt,
         reservation,
         input_redactions,
+        input_monitor_hits,
     )
     .await
 }
@@ -802,6 +822,7 @@ async fn anthropic_passthrough_dispatch(
     attempt: AttemptInfo,
     reservation: &mut Option<aisix_ratelimit::MultiReservation>,
     input_redactions: crate::redact::RedactionCounts,
+    input_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
 ) -> Result<DispatchOutcome, ProxyError> {
     let mut body = body.clone();
     let api_key = crate::dispatch::require_secret(pk_value, model)?;
@@ -1126,6 +1147,11 @@ async fn anthropic_passthrough_dispatch(
                         crate::redact::merge_counts(&mut merged, usage.redacted_entity_counts);
                         merged
                     },
+                    {
+                        let mut merged = input_monitor_hits.clone();
+                        merged.extend(usage.monitor_hits);
+                        merged
+                    },
                     // Prompt captured up front; response assembled by the frame
                     // parser into `usage.response_text`. Both gated on the cap.
                     match (&captured_prompt_c, content_cap) {
@@ -1180,6 +1206,7 @@ async fn anthropic_passthrough_dispatch(
             captured_content: None,
             // Streaming: the end-of-stream closure owns the counts.
             output_redactions: crate::redact::RedactionCounts::new(),
+            output_monitor_hits: Vec::new(),
         })
     } else {
         // Non-streaming: deserialise and re-serialise as JSON. Decode
@@ -1206,6 +1233,7 @@ async fn anthropic_passthrough_dispatch(
         // blocks + the raw content array, which covers tool_use args) into
         // a synthetic ChatResponse for inspection before returning it.
         let mut output_seg_counts = crate::redact::RedactionCounts::new();
+        let mut output_monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
         if !resolved_chain.is_empty() {
             if let Some(content) = json_body.get("content").and_then(|v| v.as_array()) {
                 let mut out_text = String::new();
@@ -1229,16 +1257,19 @@ async fn anthropic_passthrough_dispatch(
                     finish_reason: aisix_gateway::FinishReason::Stop,
                     usage: aisix_gateway::UsageStats::new(0, 0),
                 };
-                let verdict = aisix_guardrails::Guardrail::check_output_non_segment(
-                    resolved_chain.as_ref(),
-                    &synth,
-                )
-                .await;
+                let (verdict, hits) =
+                    aisix_guardrails::Guardrail::check_output_non_segment_observed(
+                        resolved_chain.as_ref(),
+                        &synth,
+                    )
+                    .await;
+                output_monitor_hits.extend(hits);
                 let verdict = crate::redact::moderate_body(
                     resolved_chain.as_ref(),
                     crate::redact::Direction::Output,
                     verdict,
                     &mut output_seg_counts,
+                    &mut output_monitor_hits,
                     |g| crate::redact::redact_anthropic_response(g, &mut json_body),
                 )
                 .await;
@@ -1308,6 +1339,7 @@ async fn anthropic_passthrough_dispatch(
             routing: RoutingTelemetry::default(),
             captured_content,
             output_redactions,
+            output_monitor_hits,
         })
     }
 }
@@ -1400,6 +1432,7 @@ async fn cross_provider_dispatch(
     attempt: AttemptInfo,
     reservation: &mut Option<aisix_ratelimit::MultiReservation>,
     input_redactions: crate::redact::RedactionCounts,
+    input_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
 ) -> Result<DispatchOutcome, ProxyError> {
     use aisix_gateway::{Bridge, BridgeContext};
     use aisix_provider_anthropic::{
@@ -1620,6 +1653,11 @@ async fn cross_provider_dispatch(
                         crate::redact::merge_counts(&mut merged, comp.redacted_entity_counts);
                         merged
                     },
+                    {
+                        let mut merged = input_monitor_hits.clone();
+                        merged.extend(comp.monitor_hits);
+                        merged
+                    },
                     // Prompt captured up front, response assembled across the
                     // stream into `comp.response_text`; both gated on the cap.
                     match (&captured_prompt_for_telem, content_cap) {
@@ -1660,6 +1698,7 @@ async fn cross_provider_dispatch(
             captured_content: None,
             // Streaming: the end-of-stream closure owns the counts.
             output_redactions: crate::redact::RedactionCounts::new(),
+            output_monitor_hits: Vec::new(),
         });
     }
 
@@ -1678,15 +1717,20 @@ async fn cross_provider_dispatch(
     // before rendering it back as Anthropic JSON — the response is
     // client-visible output just like /v1/chat/completions.
     let mut output_seg_counts = crate::redact::RedactionCounts::new();
+    let mut output_monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
     if !resolved_chain.is_empty() {
-        let verdict =
-            aisix_guardrails::Guardrail::check_output_non_segment(resolved_chain.as_ref(), &resp)
-                .await;
+        let (verdict, hits) = aisix_guardrails::Guardrail::check_output_non_segment_observed(
+            resolved_chain.as_ref(),
+            &resp,
+        )
+        .await;
+        output_monitor_hits.extend(hits);
         let verdict = crate::redact::moderate_body(
             resolved_chain.as_ref(),
             crate::redact::Direction::Output,
             verdict,
             &mut output_seg_counts,
+            &mut output_monitor_hits,
             |g| crate::redact::redact_chat_response(g, &mut resp),
         )
         .await;
@@ -1753,6 +1797,7 @@ async fn cross_provider_dispatch(
         routing: RoutingTelemetry::default(),
         captured_content,
         output_redactions,
+        output_monitor_hits,
     })
 }
 
@@ -1913,18 +1958,25 @@ fn build_anthropic_sse_stream(
                     finish_reason: aisix_gateway::FinishReason::Stop,
                     usage: aisix_gateway::UsageStats::new(0, 0),
                 };
-                let verdict =
-                    aisix_guardrails::Guardrail::check_output_non_segment(chain.as_ref(), &synth)
-                        .await;
+                let (verdict, hits) =
+                    aisix_guardrails::Guardrail::check_output_non_segment_observed(
+                        chain.as_ref(),
+                        &synth,
+                    )
+                    .await;
+                guard.comp().monitor_hits.extend(hits);
                 let mut seg_counts = crate::redact::RedactionCounts::new();
+                let mut seg_hits = Vec::new();
                 let verdict = crate::redact::moderate_body(
                     chain.as_ref(),
                     crate::redact::Direction::Output,
                     verdict,
                     &mut seg_counts,
+                    &mut seg_hits,
                     |g| crate::redact::redact_chat_chunks(g, &mut held_chunks),
                 )
                 .await;
+                guard.comp().monitor_hits.extend(seg_hits);
                 if !seg_counts.is_empty() {
                     // Bedrock masked the held chunks — rebuild the content-
                     // capture accumulator from the masked content channel
@@ -2052,6 +2104,10 @@ struct AnthropicStreamCompletion {
     /// Per-detector PII mask counts applied to the held stream at release
     /// (#932). Merged with the input-side counts by the on_complete emit.
     redacted_entity_counts: crate::redact::RedactionCounts,
+    /// Monitor-mode guardrail observations made by the end-of-stream output
+    /// check (AISIX-Cloud#562). Merged with the input-side hits by the
+    /// on_complete emit.
+    monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
 }
 
 struct CompleteAnthropicStreamOnDrop<F: FnOnce(AnthropicStreamCompletion)> {
@@ -2100,6 +2156,9 @@ struct DispatchOutcome {
     /// before the terminal emit. Empty on the streaming paths — their
     /// end-of-stream closures own the output-side counts.
     output_redactions: crate::redact::RedactionCounts,
+    /// Monitor-mode guardrail observations on the response side
+    /// (AISIX-Cloud#562), same lifecycle as `output_redactions`.
+    output_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
 }
 
 /// Dispatch error carrying the per-attempt telemetry accumulated before
@@ -2177,6 +2236,9 @@ fn emit_anthropic_usage_event(
     // Per-detector PII mask counts (#932), input + output merged. Detector
     // names only, never matched values. Empty = no redaction.
     redacted_entity_counts: crate::redact::RedactionCounts,
+    // Monitor-mode guardrail observations (AISIX-Cloud#562), input +
+    // output merged.
+    guardrail_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
     content: Option<CapturedContent>,
 ) {
     // Per-PK telemetry attribution (#302 M17 / AISIX-Cloud#436).
@@ -2229,6 +2291,7 @@ fn emit_anthropic_usage_event(
         client_user_agent: client.user_agent.clone(),
         applied_guardrails,
         redacted_entity_counts,
+        guardrail_monitor_hits,
         ..Default::default()
     };
     // Handler label "messages" — Anthropic /v1/messages inbound
@@ -2331,6 +2394,10 @@ struct AnthropicStreamUsage {
     /// Per-detector PII mask counts applied to the held stream at release
     /// (#932). Merged with the input-side counts by the on_complete emit.
     redacted_entity_counts: crate::redact::RedactionCounts,
+    /// Monitor-mode guardrail observations made by the end-of-stream output
+    /// check (AISIX-Cloud#562). Merged with the input-side hits by the
+    /// on_complete emit.
+    monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
 }
 
 /// Update the accumulator from one parsed SSE `data:` JSON object.
@@ -2711,19 +2778,25 @@ where
                     finish_reason: aisix_gateway::FinishReason::Stop,
                     usage: aisix_gateway::UsageStats::new(0, 0),
                 };
-                let verdict =
-                    aisix_guardrails::Guardrail::check_output_non_segment(chain.as_ref(), &synth)
-                        .await;
+                let (verdict, hits) =
+                    aisix_guardrails::Guardrail::check_output_non_segment_observed(
+                        chain.as_ref(),
+                        &synth,
+                    )
+                    .await;
+                guard.usage().monitor_hits.extend(hits);
                 // Segment pass over the held SSE bytes. Only meaningful in
                 // hold-back mode (`held` is empty otherwise — and a chain
                 // with a segment member always folds to BufferFull, so a
                 // live-forward stream never carries one).
                 let mut seg_counts = crate::redact::RedactionCounts::new();
+                let mut seg_hits = Vec::new();
                 let verdict = crate::redact::moderate_body(
                     chain.as_ref(),
                     crate::redact::Direction::Output,
                     verdict,
                     &mut seg_counts,
+                    &mut seg_hits,
                     |g| match crate::redact::redact_anthropic_sse(g, &held) {
                         Some((rewritten, counts)) => {
                             held = rewritten;
@@ -2733,6 +2806,7 @@ where
                     },
                 )
                 .await;
+                guard.usage().monitor_hits.extend(seg_hits);
                 if !seg_counts.is_empty() {
                     // Bedrock masked the held bytes — rebuild the content-
                     // capture accumulator from the masked text channels

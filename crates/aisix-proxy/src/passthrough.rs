@@ -141,6 +141,7 @@ pub async fn passthrough(
     let method = req.method().clone();
     let path = format!("/passthrough/{provider}/{rest}");
 
+    let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
     match dispatch(
         state.clone(),
         &auth,
@@ -149,6 +150,7 @@ pub async fn passthrough(
         req,
         &request_id,
         &client.source_ip,
+        &mut monitor_hits,
     )
     .await
     {
@@ -187,6 +189,7 @@ pub async fn passthrough(
                 status,
                 elapsed,
                 &client,
+                monitor_hits,
             );
             resp
         }
@@ -237,6 +240,7 @@ async fn dispatch(
     req: Request,
     request_id: &str,
     source_ip: &str,
+    monitor_hits_out: &mut Vec<aisix_core::GuardrailMonitorHit>,
 ) -> Result<(Response, String, String), ProxyError> {
     let snapshot = state.snapshot.load();
 
@@ -366,10 +370,13 @@ async fn dispatch(
                 String::from_utf8_lossy(&body_bytes).into_owned(),
             )],
         );
+        let (verdict, hits) =
+            aisix_guardrails::Guardrail::check_input_observed(&resolved_chain, &chat).await;
+        monitor_hits_out.extend(hits);
         if let aisix_guardrails::GuardrailVerdict::Block {
             reason,
             guardrail_name,
-        } = aisix_guardrails::Guardrail::check_input(&resolved_chain, &chat).await
+        } = verdict
         {
             // Per #153 the matched-pattern detail stays in ops logs only.
             tracing::warn!(
@@ -520,10 +527,13 @@ async fn dispatch(
             finish_reason: aisix_gateway::FinishReason::Stop,
             usage: aisix_gateway::UsageStats::default(),
         };
+        let (verdict, hits) =
+            aisix_guardrails::Guardrail::check_output_observed(&resolved_chain, &synth).await;
+        monitor_hits_out.extend(hits);
         if let aisix_guardrails::GuardrailVerdict::Block {
             reason,
             guardrail_name,
-        } = aisix_guardrails::Guardrail::check_output(&resolved_chain, &synth).await
+        } = verdict
         {
             // Per #153 the matched-pattern detail stays in ops logs only.
             tracing::warn!(
@@ -562,6 +572,7 @@ async fn dispatch(
 /// who lent which provider's credentials (per-PK attribution tags), the
 /// relayed status, and the latency. `inbound_protocol = "passthrough"`
 /// distinguishes these rows from typed-endpoint traffic in /logs.
+#[allow(clippy::too_many_arguments)]
 fn emit_usage_event(
     state: &ProxyState,
     request_id: &str,
@@ -570,6 +581,7 @@ fn emit_usage_event(
     status_code: u16,
     elapsed: Duration,
     client: &crate::client_ip::ClientContext,
+    guardrail_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
 ) {
     let snap = state.snapshot.load();
     let mut event = aisix_obs::UsageEvent {
@@ -581,6 +593,7 @@ fn emit_usage_event(
         inbound_protocol: "passthrough".to_string(),
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),
+        guardrail_monitor_hits,
         ..Default::default()
     };
     crate::usage_attr::apply_pk_telemetry(&mut event, &snap, provider_key_id);
