@@ -114,6 +114,9 @@ jobs:
         with:
           context: .
           push: ${{ github.event_name != 'pull_request' }}
+          # PR builds aren't pushed; load them into the local daemon so
+          # the smoke test below can run the image.
+          load: ${{ github.event_name == 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
@@ -121,6 +124,45 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: false   # keep manifest format compatible with older clients
+
+      # The image contract customers rely on for hostNetwork/:80
+      # deployments: the default non-root user (uid 10001) must be able
+      # to bind privileged ports via the CAP_NET_BIND_SERVICE file
+      # capability set in the Dockerfile. Runs the container on the host
+      # network with the proxy on :80 — without the file capability the
+      # bind fails and /livez never answers.
+      - name: Smoke test — non-root binds :80
+        if: github.event_name == 'pull_request'
+        run: |
+          set -eux
+          IMAGE="$(printf '%s\n' "${{ steps.meta.outputs.tags }}" | head -n1)"
+          docker run -d --name smoke-etcd -p 2379:2379 quay.io/coreos/etcd:v3.5.18 \
+            etcd --listen-client-urls=http://0.0.0.0:2379 \
+                 --advertise-client-urls=http://127.0.0.1:2379
+          cat > /tmp/smoke.yaml <<'EOF'
+          etcd:
+            endpoints: ["http://127.0.0.1:2379"]
+          proxy:
+            addr: "0.0.0.0:80"
+          admin:
+            addr: "127.0.0.1:3001"
+            admin_keys: ["smoke-only"]
+          observability:
+            service_name: "aisix-smoke"
+            log_level: "info"
+            metrics:
+              prometheus:
+                enabled: false
+          EOF
+          docker run -d --name smoke-aisix --network host \
+            -v /tmp/smoke.yaml:/etc/aisix/config.yaml:ro "$IMAGE"
+          ok=""
+          for _ in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:80/livez > /dev/null; then ok=1; break; fi
+            sleep 1
+          done
+          docker logs smoke-aisix
+          test -n "$ok"
 
       - name: Install cosign
         if: github.event_name != 'pull_request'

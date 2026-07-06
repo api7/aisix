@@ -4,6 +4,7 @@
 //! coherent rebuild (compaction, initial load) and atomically swaps it into
 //! a [`SnapshotHandle<AisixSnapshot>`]. The data plane only sees the handle.
 
+use super::a2a_agent::A2aAgent;
 use super::apikey::ApiKey;
 use super::cache_policy::CachePolicy;
 use super::guardrail::{Guardrail, GuardrailAttachment};
@@ -39,6 +40,10 @@ pub struct AisixSnapshot {
     /// MCP gateway endpoint aggregates each enabled server's tools and routes
     /// tool calls back to the owning server.
     pub mcp_servers: ResourceTable<McpServer>,
+    /// Registered upstream A2A agents: `/aisix/<env>/a2a_agents/<uuid>`. The
+    /// A2A gateway endpoint fronts each enabled agent, forwarding JSON-RPC
+    /// requests to it and serving its card with URLs rewritten to the gateway.
+    pub a2a_agents: ResourceTable<A2aAgent>,
 }
 
 impl AisixSnapshot {
@@ -58,6 +63,7 @@ impl AisixSnapshot {
             + self.observability_exporters.len()
             + self.rate_limit_policies.len()
             + self.mcp_servers.len()
+            + self.a2a_agents.len()
     }
 }
 

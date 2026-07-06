@@ -13,7 +13,7 @@
 //! 400 with an explanatory message.
 
 use aisix_gateway::{ChatFormat, ChatMessage, ChatResponse, FinishReason, UsageStats};
-use aisix_obs::{AccessLog, RequestOutcome, UsageEvent};
+use aisix_obs::{content_capture_cap, AccessLog, CapturedContent, RequestOutcome, UsageEvent};
 use axum::extract::State;
 use axum::http::{HeaderName, HeaderValue};
 use axum::response::{IntoResponse, Response};
@@ -71,6 +71,12 @@ struct ResponseDispatchSuccess {
     /// guard owns the UsageEvent emit (parsed from the terminal SSE event),
     /// so the top-level handler must NOT emit the winner event again (#808).
     usage_handled_by_stream: bool,
+    /// Captured request/response content for content-capturing exporters
+    /// (AISIX-Cloud#947). `Some` only when an enabled exporter opted into
+    /// `content_mode = full`; threaded to `fan_out` via the handler's emit,
+    /// never to the CP sink. `None` on the streaming paths, whose
+    /// end-of-stream emit owns the capture.
+    captured_content: Option<CapturedContent>,
     /// Per-detector PII mask counts applied to the response body (#932),
     /// non-streaming + buffered paths. Merged with the input-side counts by
     /// the handler before the terminal emit. Empty on the live streaming
@@ -223,6 +229,7 @@ pub async fn responses(
                         attempt,
                         success.guardrail_blocked,
                         redaction_counts.clone(),
+                        success.captured_content.as_ref(),
                     );
                 }
             }
@@ -700,6 +707,18 @@ async fn responses_to_target(
     // handler, which already holds them.
     input_redactions: crate::redact::RedactionCounts,
 ) -> Result<ResponseDispatchSuccess, ProxyError> {
+    // Largest content cap any enabled content-capturing exporter wants, or
+    // `None` when none do (AISIX-Cloud#947). The captured prompt is the
+    // client-facing request body (post-#932-redaction), taken BEFORE the
+    // upstream model rewrite below so the log shows what the caller sent.
+    let content_cap = content_capture_cap(
+        snapshot
+            .observability_exporters
+            .entries()
+            .iter()
+            .map(|e| &e.value),
+    );
+    let captured_prompt = content_cap.map(|_| serde_json::to_string(body).unwrap_or_default());
     let mut body = body.clone();
     let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
     // Resolved PK id for per-PK telemetry attribution on the emitted
@@ -780,6 +799,12 @@ async fn responses_to_target(
         }
     }
     let send_started = Instant::now();
+    // least_busy: count this target as in-flight for the upstream call
+    // (mirrors chat.rs). Non-streaming / error paths drop the guard at
+    // function return; the streaming branch moves it into the
+    // end-of-stream closure next to `stream_hold`, so the count stays
+    // raised for the stream's full lifetime.
+    let in_flight = state.runtime_status.begin_in_flight(model_id);
     // Streaming bounds the connect by the stream deadline (reqwest's
     // request-level timeout can't be used — it would cap the whole stream);
     // non-streaming relies on the request-level timeout set above.
@@ -956,6 +981,17 @@ async fn responses_to_target(
             // terminal event for usage and let the handler emit (the body is
             // a single complete chunk now, not a live stream).
             let usage = responses_sse_usage(&buf);
+            // Content capture (AISIX-Cloud#947): the assembled output text,
+            // read from the POST-redaction buffer so masked PII stays masked
+            // in the exported content.
+            let captured_content = match (&captured_prompt, content_cap) {
+                (Some(prompt), Some(cap)) => Some(CapturedContent::new(
+                    prompt,
+                    &responses_sse_output_text(&buf),
+                    cap as usize,
+                )),
+                _ => None,
+            };
             let mut response = axum::response::Response::new(axum::body::Body::from(buf));
             apply_passthrough_headers(&mut response, &headers, request_id);
             return Ok(ResponseDispatchSuccess {
@@ -968,6 +1004,7 @@ async fn responses_to_target(
                 guardrail_blocked: false,
                 usage_handled_by_stream: false,
                 output_redactions,
+                captured_content,
             });
         }
 
@@ -1040,38 +1077,53 @@ async fn responses_to_target(
         let post_stream_keys = reservation.as_ref().map(|r| r.keys()).unwrap_or_default();
         let stream_hold = reservation.take().map(|r| r.into_stream_hold());
         let limiter_c = std::sync::Arc::clone(&state.limiter);
-        let parsed_stream = build_responses_passthrough_stream(body_stream, move |usage| {
-            // Streams that reach here are committed 200s — the
-            // `!status.is_success()` guard above returned early on errors.
-            //
-            // #688: apply the terminal token cost to TPM/TPD and release the
-            // concurrency hold now the stream has ended (sync analog of the
-            // reservation's async `commit_tokens`, which this closure can't await).
-            let streamed_tokens =
-                u64::from(usage.prompt_tokens) + u64::from(usage.completion_tokens);
-            for key in &post_stream_keys {
-                limiter_c.add_tokens_post_stream(key, streamed_tokens);
-            }
-            drop(stream_hold);
-            emit_usage_event(
-                &state_c,
-                &request_id_c,
-                &model_id_c,
-                &requested_model_c,
-                &api_key_id_c,
-                &provider_key_id_c,
-                200,
-                started.elapsed(),
-                &usage,
-                &client_c,
-                attempt,
-                /* guardrail_blocked */ false,
-                // Live-forward path: no output masking possible (an
-                // output-masking guardrail forces the buffered branch),
-                // so only the input-side counts apply.
-                input_redactions.clone(),
-            );
-        });
+        let captured_prompt_c = captured_prompt.clone();
+        let parsed_stream =
+            build_responses_passthrough_stream(body_stream, content_cap, move |usage, out_text| {
+                // Streams that reach here are committed 200s — the
+                // `!status.is_success()` guard above returned early on errors.
+                //
+                // #688: apply the terminal token cost to TPM/TPD and release the
+                // concurrency hold now the stream has ended (sync analog of the
+                // reservation's async `commit_tokens`, which this closure can't await).
+                let streamed_tokens =
+                    u64::from(usage.prompt_tokens) + u64::from(usage.completion_tokens);
+                for key in &post_stream_keys {
+                    limiter_c.add_tokens_post_stream(key, streamed_tokens);
+                }
+                drop(stream_hold);
+                // least_busy: stream over — this target is no longer
+                // in-flight.
+                drop(in_flight);
+                // Content capture (AISIX-Cloud#947): prompt captured up front,
+                // output text assembled by the stream wrapper (empty when no
+                // exporter wants content).
+                let captured_content = match (&captured_prompt_c, content_cap) {
+                    (Some(prompt), Some(cap)) => {
+                        Some(CapturedContent::new(prompt, &out_text, cap as usize))
+                    }
+                    _ => None,
+                };
+                emit_usage_event(
+                    &state_c,
+                    &request_id_c,
+                    &model_id_c,
+                    &requested_model_c,
+                    &api_key_id_c,
+                    &provider_key_id_c,
+                    200,
+                    started.elapsed(),
+                    &usage,
+                    &client_c,
+                    attempt,
+                    /* guardrail_blocked */ false,
+                    // Live-forward path: no output masking possible (an
+                    // output-masking guardrail forces the buffered branch),
+                    // so only the input-side counts apply.
+                    input_redactions.clone(),
+                    captured_content.as_ref(),
+                );
+            });
         let mut response =
             axum::response::Response::new(axum::body::Body::from_stream(Box::pin(parsed_stream)));
         apply_passthrough_headers(&mut response, &headers, request_id);
@@ -1088,6 +1140,8 @@ async fn responses_to_target(
             usage_handled_by_stream: true,
             // The Drop guard's emit carries the counts.
             output_redactions: crate::redact::RedactionCounts::new(),
+            // The Drop guard's emit carries the captured content too.
+            captured_content: None,
         })
     } else {
         let json_body: Value = upstream_resp
@@ -1146,6 +1200,9 @@ async fn responses_to_target(
                     guardrail_blocked: true,
                     usage_handled_by_stream: false,
                     output_redactions: crate::redact::RedactionCounts::new(),
+                    // Blocked responses never reached the client — no content
+                    // capture, matching the chat surface.
+                    captured_content: None,
                 });
             }
         }
@@ -1154,6 +1211,18 @@ async fn responses_to_target(
         // block check passes.
         let mut json_body = json_body;
         let output_redactions = crate::redact::redact_responses_response(chain, &mut json_body);
+
+        // Content capture (AISIX-Cloud#947): the assistant's assembled output
+        // text, read from the POST-redaction body so masked PII stays masked
+        // in the exported content.
+        let captured_content = match (&captured_prompt, content_cap) {
+            (Some(prompt), Some(cap)) => Some(CapturedContent::new(
+                prompt,
+                &responses_output_text(&json_body),
+                cap as usize,
+            )),
+            _ => None,
+        };
 
         Ok(ResponseDispatchSuccess {
             response: Json(json_body).into_response(),
@@ -1165,6 +1234,7 @@ async fn responses_to_target(
             guardrail_blocked: false,
             usage_handled_by_stream: false,
             output_redactions,
+            captured_content,
         })
     }
 }
@@ -1195,6 +1265,18 @@ async fn responses_cross_provider_to_target(
     input_redactions: crate::redact::RedactionCounts,
 ) -> Result<ResponseDispatchSuccess, ProxyError> {
     use aisix_gateway::{Bridge, BridgeContext};
+
+    // Content capture (AISIX-Cloud#947), same contract as the verbatim
+    // target: prompt = the client-facing Responses request body
+    // (post-#932-redaction), gated on an exporter actually wanting content.
+    let content_cap = content_capture_cap(
+        snapshot
+            .observability_exporters
+            .entries()
+            .iter()
+            .map(|e| &e.value),
+    );
+    let captured_prompt = content_cap.map(|_| serde_json::to_string(body).unwrap_or_default());
 
     let provider = model
         .provider
@@ -1228,6 +1310,13 @@ async fn responses_cross_provider_to_target(
         ctx = ctx.with_deadline(d);
     }
     let provider_label = provider.to_ascii_lowercase();
+
+    // least_busy: count this target as in-flight for the upstream call
+    // (mirrors chat.rs). Non-streaming / error paths drop the guard at
+    // function return; the streaming branch moves it into the
+    // end-of-stream closure next to `stream_hold`, so the count stays
+    // raised for the stream's full lifetime.
+    let in_flight = state.runtime_status.begin_in_flight(model_id);
 
     if is_stream {
         let upstream = bridge.chat_stream(&chat, &ctx).await.map_err(|err| {
@@ -1316,6 +1405,7 @@ async fn responses_cross_provider_to_target(
         let post_stream_keys = reservation.as_ref().map(|r| r.keys()).unwrap_or_default();
         let stream_hold = reservation.take().map(|r| r.into_stream_hold());
         let limiter_c = std::sync::Arc::clone(&state.limiter);
+        let captured_prompt_c = captured_prompt.clone();
         let sse_body = crate::responses_bridge::build_responses_bridge_stream(
             upstream,
             encoder,
@@ -1323,6 +1413,7 @@ async fn responses_cross_provider_to_target(
             output_guardrail,
             max_buffer_bytes,
             requested_model.to_string(),
+            content_cap,
             move |comp| {
                 // #688: apply the terminal token cost to TPM/TPD and release the
                 // concurrency hold now the stream has ended (sync analog of the
@@ -1334,6 +1425,9 @@ async fn responses_cross_provider_to_target(
                     limiter_c.add_tokens_post_stream(key, streamed_tokens);
                 }
                 drop(stream_hold);
+                // least_busy: stream over — this target is no longer
+                // in-flight.
+                drop(in_flight);
                 let usage = ResponseUsage {
                     prompt_tokens: comp.prompt_tokens,
                     completion_tokens: comp.completion_tokens,
@@ -1347,6 +1441,16 @@ async fn responses_cross_provider_to_target(
                 // recorded as a 422 marked guardrail_blocked, matching the
                 // non-streaming path so the Blocked tab + ledger see it.
                 let status = if comp.guardrail_blocked { 422 } else { 200 };
+                // Content capture (AISIX-Cloud#947): prompt captured up front,
+                // response assembled across the bridged stream into
+                // `comp.response_text` (empty when no exporter wants content
+                // or when the response was blocked before release).
+                let captured_content = match (&captured_prompt_c, content_cap) {
+                    (Some(prompt), Some(cap)) if !comp.guardrail_blocked => Some(
+                        CapturedContent::new(prompt, &comp.response_text, cap as usize),
+                    ),
+                    _ => None,
+                };
                 emit_usage_event(
                     &state_c,
                     &request_id_c,
@@ -1367,6 +1471,7 @@ async fn responses_cross_provider_to_target(
                         crate::redact::merge_counts(&mut merged, comp.redacted_entity_counts);
                         merged
                     },
+                    captured_content.as_ref(),
                 );
             },
         );
@@ -1395,6 +1500,8 @@ async fn responses_cross_provider_to_target(
             usage_handled_by_stream: true,
             // The stream's end-of-stream emit carries the counts.
             output_redactions: crate::redact::RedactionCounts::new(),
+            // The stream's end-of-stream emit carries the captured content.
+            captured_content: None,
         });
     }
 
@@ -1450,6 +1557,9 @@ async fn responses_cross_provider_to_target(
                 guardrail_blocked: true,
                 usage_handled_by_stream: false,
                 output_redactions: crate::redact::RedactionCounts::new(),
+                // Blocked responses never reached the client — no content
+                // capture, matching the chat surface.
+                captured_content: None,
             });
         }
     }
@@ -1464,6 +1574,17 @@ async fn responses_cross_provider_to_target(
         requested_model,
         created_at,
     );
+    // Content capture (AISIX-Cloud#947): the client-visible Responses JSON
+    // (post-redaction) is the source, so the exported text matches what the
+    // caller received.
+    let captured_content = match (&captured_prompt, content_cap) {
+        (Some(prompt), Some(cap)) => Some(CapturedContent::new(
+            prompt,
+            &responses_output_text(&json_body),
+            cap as usize,
+        )),
+        _ => None,
+    };
     let mut response = Json(json_body).into_response();
     if let Ok(hv) = HeaderValue::from_str(request_id) {
         response
@@ -1480,6 +1601,7 @@ async fn responses_cross_provider_to_target(
         guardrail_blocked: false,
         usage_handled_by_stream: false,
         output_redactions,
+        captured_content,
     })
 }
 
@@ -1570,11 +1692,16 @@ fn responses_sse_usage(bytes: &[u8]) -> Option<ResponseUsage> {
 }
 
 /// Drain every complete SSE frame from `buf`, updating `acc` with the latest
-/// terminal-event usage (#808). A frame ends at the first blank line; an
-/// incomplete trailing frame is left in `buf` for the next chunk. Reuses the
-/// shared SSE framing helpers from the `/v1/messages` passthrough so the two
-/// surfaces parse identically.
-fn drain_responses_sse_frames(buf: &mut Vec<u8>, acc: &mut Option<ResponseUsage>) {
+/// terminal-event usage (#808) and feeding each parsed event to the optional
+/// content capture (AISIX-Cloud#947). A frame ends at the first blank line;
+/// an incomplete trailing frame is left in `buf` for the next chunk. Reuses
+/// the shared SSE framing helpers from the `/v1/messages` passthrough so the
+/// two surfaces parse identically.
+fn drain_responses_sse_frames(
+    buf: &mut Vec<u8>,
+    acc: &mut Option<ResponseUsage>,
+    mut capture: Option<&mut SseTextCapture>,
+) {
     while let Some(end) = crate::messages::find_frame_end(buf) {
         let frame: Vec<u8> = buf.drain(..end).collect();
         if let Some(data) = crate::messages::extract_sse_data_line(&frame) {
@@ -1585,8 +1712,66 @@ fn drain_responses_sse_frames(buf: &mut Vec<u8>, acc: &mut Option<ResponseUsage>
                 if let Some(u) = parse_responses_terminal_usage(&json) {
                     *acc = Some(u);
                 }
+                if let Some(c) = capture.as_deref_mut() {
+                    c.observe(&json);
+                }
             }
         }
+    }
+}
+
+/// Streamed output-text accumulator for content-capturing exporters
+/// (AISIX-Cloud#947). Mirrors `responses_sse_output_text`'s precedence: a
+/// terminal `response.*` event's full output (incl. tool-call items) wins;
+/// concatenated `*.delta` text is the fallback for streams that abort before
+/// a terminal object. Delta accumulation is bounded to the capture cap so a
+/// long stream can't grow the buffer without limit.
+struct SseTextCapture {
+    cap: usize,
+    deltas: String,
+    terminal: Option<String>,
+}
+
+impl SseTextCapture {
+    fn new(cap: usize) -> Self {
+        Self {
+            cap,
+            deltas: String::new(),
+            terminal: None,
+        }
+    }
+
+    /// Feed one parsed SSE event's JSON.
+    fn observe(&mut self, json: &Value) {
+        match json.get("type").and_then(|t| t.as_str()) {
+            Some("response.completed" | "response.incomplete" | "response.failed") => {
+                if let Some(resp) = json.get("response") {
+                    let full = responses_output_text(resp);
+                    if !full.is_empty() {
+                        self.terminal = Some(full);
+                    }
+                }
+            }
+            Some(
+                "response.output_text.delta"
+                | "response.function_call_arguments.delta"
+                | "response.mcp_call_arguments.delta"
+                | "response.custom_tool_call_input.delta",
+            ) => {
+                if let Some(d) = json.get("delta").and_then(|d| d.as_str()) {
+                    if self.deltas.len() < self.cap {
+                        self.deltas.push_str(d);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The captured output text: terminal full output when seen, else the
+    /// accumulated deltas. `CapturedContent::new` re-truncates to the cap.
+    fn into_text(self) -> String {
+        self.terminal.unwrap_or(self.deltas)
     }
 }
 
@@ -1596,43 +1781,55 @@ fn drain_responses_sse_frames(buf: &mut Vec<u8>, acc: &mut Option<ResponseUsage>
 /// point), mirroring the `/v1/messages` and chat.rs CompleteOnDrop pattern.
 /// `None` means no terminal usage was seen (e.g. an abort before completion);
 /// the emit then records a zero-token 200 so the request still appears in the
-/// dashboard Logs.
-struct ResponsesUsageGuard<F: FnOnce(ResponseUsage)> {
-    slot: Option<(F, Option<ResponseUsage>)>,
+/// dashboard Logs. The second callback argument is the captured output text
+/// (AISIX-Cloud#947) — empty when no exporter wants content.
+struct ResponsesUsageGuard<F: FnOnce(ResponseUsage, String)> {
+    slot: Option<(F, Option<ResponseUsage>, Option<SseTextCapture>)>,
 }
 
-impl<F: FnOnce(ResponseUsage)> ResponsesUsageGuard<F> {
-    fn usage(&mut self) -> &mut Option<ResponseUsage> {
-        &mut self
+impl<F: FnOnce(ResponseUsage, String)> ResponsesUsageGuard<F> {
+    fn parts(&mut self) -> (&mut Option<ResponseUsage>, Option<&mut SseTextCapture>) {
+        let slot = self
             .slot
             .as_mut()
-            .expect("ResponsesUsageGuard accessed after take")
-            .1
+            .expect("ResponsesUsageGuard accessed after take");
+        (&mut slot.1, slot.2.as_mut())
     }
 }
 
-impl<F: FnOnce(ResponseUsage)> Drop for ResponsesUsageGuard<F> {
+impl<F: FnOnce(ResponseUsage, String)> Drop for ResponsesUsageGuard<F> {
     fn drop(&mut self) {
-        if let Some((f, usage)) = self.slot.take() {
-            f(usage.unwrap_or_default());
+        if let Some((f, usage, capture)) = self.slot.take() {
+            f(
+                usage.unwrap_or_default(),
+                capture.map(SseTextCapture::into_text).unwrap_or_default(),
+            );
         }
     }
 }
 
 /// Wrap a Responses-API upstream byte stream so the terminal event's usage is
 /// parsed in-flight and `on_complete` fires once at end-of-stream (or
-/// client-disconnect) with the accumulated counts (#808). Bytes forward
-/// verbatim — the client sees the exact upstream SSE wire shape.
+/// client-disconnect) with the accumulated counts (#808) plus the captured
+/// output text (AISIX-Cloud#947, empty when `content_cap` is `None`). Bytes
+/// forward verbatim — the client sees the exact upstream SSE wire shape.
 fn build_responses_passthrough_stream<S, F>(
     upstream: S,
+    content_cap: Option<u32>,
     on_complete: F,
 ) -> impl futures::Stream<Item = reqwest::Result<bytes::Bytes>>
 where
     S: futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send + 'static,
-    F: FnOnce(ResponseUsage) + Send + 'static,
+    F: FnOnce(ResponseUsage, String) + Send + 'static,
 {
     async_stream::stream! {
-        let mut guard = ResponsesUsageGuard { slot: Some((on_complete, None)) };
+        let mut guard = ResponsesUsageGuard {
+            slot: Some((
+                on_complete,
+                None,
+                content_cap.map(|cap| SseTextCapture::new(cap as usize)),
+            )),
+        };
         futures::pin_mut!(upstream);
         let mut buf: Vec<u8> = Vec::new();
         while let Some(item) = upstream.next().await {
@@ -1640,7 +1837,8 @@ where
                 // Side-channel parse: copy into the frame buffer (the original
                 // `bytes` is yielded unchanged below) and drain complete frames.
                 buf.extend_from_slice(bytes);
-                drain_responses_sse_frames(&mut buf, guard.usage());
+                let (usage_acc, capture) = guard.parts();
+                drain_responses_sse_frames(&mut buf, usage_acc, capture);
                 // Bound the frame buffer: the happy path drains complete frames
                 // above so `buf` only holds a partial trailing frame. A
                 // non-conformant upstream streaming bytes without a blank-line
@@ -1847,6 +2045,9 @@ fn emit_usage_event(
     // Per-detector PII mask counts (#932), input + output merged. Detector
     // names only, never matched values. Empty = no redaction.
     redacted_entity_counts: crate::redact::RedactionCounts,
+    // Captured request/response content for content-capturing exporters
+    // (AISIX-Cloud#947). Forwarded only to `fan_out`, never to the CP sink.
+    content: Option<&CapturedContent>,
 ) {
     let snap = state.snapshot.load();
     let tags = provider_telemetry_tags(&snap, provider_key_id);
@@ -1887,7 +2088,7 @@ fn emit_usage_event(
     let exporters = snap.observability_exporters.entries();
     state
         .otlp_fan_out
-        .fan_out(&event, None, exporters.iter().map(|e| &e.value));
+        .fan_out(&event, content, exporters.iter().map(|e| &e.value));
 }
 
 /// Emit a zero-token `UsageEvent` for a failed / pre-dispatch attempt
@@ -3887,5 +4088,61 @@ data: [DONE]\n\n";
             event.completion_tokens, 0,
             "missing output_tokens must default to 0, not drop the event"
         );
+    }
+
+    /// AISIX-Cloud#947: the streamed content capture prefers the terminal
+    /// `response.completed` event's full output over accumulated deltas —
+    /// the terminal object is authoritative (includes tool-call items the
+    /// deltas may have missed).
+    #[test]
+    fn sse_text_capture_prefers_terminal_full_output() {
+        let mut cap = super::SseTextCapture::new(1024);
+        cap.observe(&serde_json::json!({
+            "type": "response.output_text.delta",
+            "delta": "partial "
+        }));
+        cap.observe(&serde_json::json!({
+            "type": "response.completed",
+            "response": {
+                "output": [
+                    {"type": "message", "content": [{"type": "output_text", "text": "the full text"}]}
+                ]
+            }
+        }));
+        assert_eq!(cap.into_text(), "the full text");
+    }
+
+    /// AISIX-Cloud#947: a stream that aborts before any terminal event falls
+    /// back to the concatenated deltas — including tool-call argument deltas,
+    /// which stream via their own event type.
+    #[test]
+    fn sse_text_capture_falls_back_to_deltas_on_abort() {
+        let mut cap = super::SseTextCapture::new(1024);
+        cap.observe(&serde_json::json!({
+            "type": "response.output_text.delta",
+            "delta": "hello "
+        }));
+        cap.observe(&serde_json::json!({
+            "type": "response.function_call_arguments.delta",
+            "delta": "{\"city\":\"SF\"}"
+        }));
+        assert_eq!(cap.into_text(), "hello {\"city\":\"SF\"}");
+    }
+
+    /// AISIX-Cloud#947: delta accumulation is bounded to the capture cap so
+    /// a long stream can't grow the buffer without limit.
+    #[test]
+    fn sse_text_capture_bounds_delta_accumulation() {
+        let mut cap = super::SseTextCapture::new(10);
+        for _ in 0..100 {
+            cap.observe(&serde_json::json!({
+                "type": "response.output_text.delta",
+                "delta": "0123456789"
+            }));
+        }
+        let text = cap.into_text();
+        // One push may land after the buffer crosses the cap; the point is
+        // the accumulation stops near the cap instead of growing 100x.
+        assert!(text.len() <= 20, "delta buffer must stay near the cap");
     }
 }

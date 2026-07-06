@@ -379,6 +379,9 @@ impl<P: ConfigProvider> Supervisor<P> {
             for e in tiny.mcp_servers.entries() {
                 new.mcp_servers.insert(clone_entry(&e));
             }
+            for e in tiny.a2a_agents.entries() {
+                new.a2a_agents.insert(clone_entry(&e));
+            }
             new
         });
         self.remove_rejection_for_key(&entry.key);
@@ -434,6 +437,7 @@ impl<P: ConfigProvider> Supervisor<P> {
             }
             "rate_limit_policies" => snap.rate_limit_policies.get_by_id(parsed.id).is_some(),
             "mcp_servers" => snap.mcp_servers.get_by_id(parsed.id).is_some(),
+            "a2a_agents" => snap.a2a_agents.get_by_id(parsed.id).is_some(),
             _ => false,
         };
         let removed_rejection = self.remove_rejection_for_key(key_str);
@@ -481,6 +485,9 @@ impl<P: ConfigProvider> Supervisor<P> {
                 }
                 "mcp_servers" => {
                     new.mcp_servers.remove(parsed.id);
+                }
+                "a2a_agents" => {
+                    new.a2a_agents.remove(parsed.id);
                 }
                 _ => {}
             }
@@ -717,6 +724,9 @@ fn clone_snapshot(src: &AisixSnapshot) -> AisixSnapshot {
     }
     for e in src.mcp_servers.entries() {
         out.mcp_servers.insert(clone_entry(&e));
+    }
+    for e in src.a2a_agents.entries() {
+        out.a2a_agents.insert(clone_entry(&e));
     }
     out
 }

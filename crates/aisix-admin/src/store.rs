@@ -8,7 +8,7 @@
 
 use aisix_core::resource::ResourceEntry;
 use aisix_core::{
-    ApiKey, CachePolicy, Guardrail, McpServer, Model, ObservabilityExporter, ProviderKey,
+    A2aAgent, ApiKey, CachePolicy, Guardrail, McpServer, Model, ObservabilityExporter, ProviderKey,
 };
 use dashmap::DashMap;
 use std::sync::Arc;
@@ -75,6 +75,11 @@ pub trait ConfigStore: Send + Sync + 'static {
     ) -> Result<Option<ResourceEntry<McpServer>>, StoreError>;
     async fn list_mcp_servers(&self) -> Result<Vec<ResourceEntry<McpServer>>, StoreError>;
     async fn delete_mcp_server(&self, id: &str) -> Result<bool, StoreError>;
+
+    async fn put_a2a_agent(&self, entry: ResourceEntry<A2aAgent>) -> Result<(), StoreError>;
+    async fn get_a2a_agent(&self, id: &str) -> Result<Option<ResourceEntry<A2aAgent>>, StoreError>;
+    async fn list_a2a_agents(&self) -> Result<Vec<ResourceEntry<A2aAgent>>, StoreError>;
+    async fn delete_a2a_agent(&self, id: &str) -> Result<bool, StoreError>;
 }
 
 /// In-memory store. Thread-safe via DashMap; mainly used by tests, but
@@ -88,6 +93,7 @@ pub struct InMemoryStore {
     cache_policies: DashMap<String, ResourceEntry<CachePolicy>>,
     observability_exporters: DashMap<String, ResourceEntry<ObservabilityExporter>>,
     mcp_servers: DashMap<String, ResourceEntry<McpServer>>,
+    a2a_agents: DashMap<String, ResourceEntry<A2aAgent>>,
 }
 
 impl InMemoryStore {
@@ -239,6 +245,23 @@ impl ConfigStore for InMemoryStore {
 
     async fn delete_mcp_server(&self, id: &str) -> Result<bool, StoreError> {
         Ok(self.mcp_servers.remove(id).is_some())
+    }
+
+    async fn put_a2a_agent(&self, entry: ResourceEntry<A2aAgent>) -> Result<(), StoreError> {
+        self.a2a_agents.insert(entry.id.clone(), entry);
+        Ok(())
+    }
+
+    async fn get_a2a_agent(&self, id: &str) -> Result<Option<ResourceEntry<A2aAgent>>, StoreError> {
+        Ok(self.a2a_agents.get(id).map(|r| r.clone()))
+    }
+
+    async fn list_a2a_agents(&self) -> Result<Vec<ResourceEntry<A2aAgent>>, StoreError> {
+        Ok(self.a2a_agents.iter().map(|r| r.clone()).collect())
+    }
+
+    async fn delete_a2a_agent(&self, id: &str) -> Result<bool, StoreError> {
+        Ok(self.a2a_agents.remove(id).is_some())
     }
 }
 

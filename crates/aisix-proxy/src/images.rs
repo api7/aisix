@@ -12,7 +12,7 @@
 
 use aisix_core::AppliedGuardrail;
 use aisix_gateway::{BridgeContext, BridgeError};
-use aisix_obs::{AccessLog, RequestOutcome, UsageEvent};
+use aisix_obs::{content_capture_cap, AccessLog, CapturedContent, RequestOutcome, UsageEvent};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -51,6 +51,14 @@ struct ImageDispatchSuccess {
     /// not-implemented path stays out of /logs (same convention as
     /// embeddings #402).
     upstream_called: bool,
+    /// Per-detector PII mask counts (#932/#696) applied to the prompt.
+    /// Attached to the emitted UsageEvent. Empty = no redaction.
+    redactions: crate::redact::RedactionCounts,
+    /// Captured request/response content for content-capturing exporters
+    /// (#700, LiteLLM parity: the full image response JSON — url or
+    /// b64_json — truncated at the capture cap). `Some` only when an
+    /// exporter opted into `content_mode = full`.
+    captured_content: Option<CapturedContent>,
 }
 
 pub async fn image_generations(
@@ -110,6 +118,8 @@ pub async fn image_generations(
                     prompt_tokens,
                     completion_tokens,
                     &client,
+                    success.redactions.clone(),
+                    success.captured_content.as_ref(),
                 );
             }
             success.response
@@ -165,14 +175,18 @@ fn images_input_to_chat(model: &str, body: &Value) -> aisix_gateway::ChatFormat 
 async fn dispatch(
     state: &ProxyState,
     auth: &AuthenticatedKey,
-    body: Value,
+    mut body: Value,
     request_id: &str,
     source_ip: &str,
 ) -> Result<ImageDispatchSuccess, ProxyError> {
+    // Owned so the #696 in-place prompt masking below can borrow `body`
+    // mutably.
     let model_name = body
         .get("model")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| ProxyError::InvalidRequest("missing `model` field".into()))?;
+        .ok_or_else(|| ProxyError::InvalidRequest("missing `model` field".into()))?
+        .to_string();
+    let model_name = model_name.as_str();
 
     let snapshot = state.snapshot.load();
 
@@ -222,6 +236,24 @@ async fn dispatch(
         }
     }
 
+    // #932/#696: mask-action PII rules rewrite the `prompt` in place AFTER
+    // the block check passes, BEFORE the body is forwarded upstream.
+    // Pre-#696 a mask-action detector was a silent no-op here.
+    let redactions = crate::redact::redact_images_request(&resolved_chain, &mut body);
+
+    // Content capture (#700): the client-facing request body
+    // (post-#932-redaction) is the prompt; the response is the image JSON
+    // (url or b64_json — LiteLLM logs it unstripped too), truncated at the
+    // cap.
+    let content_cap = content_capture_cap(
+        snapshot
+            .observability_exporters
+            .entries()
+            .iter()
+            .map(|e| &e.value),
+    );
+    let captured_prompt = content_cap.map(|_| serde_json::to_string(&body).unwrap_or_default());
+
     let model_rl =
         crate::quota::ModelRateLimit::from_model(model_name, &model_entry.id, &model_entry.value);
     let reservation = crate::quota::enforce(state, auth, Some(&model_rl)).await?;
@@ -264,6 +296,10 @@ async fn dispatch(
 
     match bridge.generate_image(&body, &ctx).await {
         Ok(resp_json) => {
+            // #701: clear any cooldown/unhealthy mark now the upstream
+            // answered — same recovery signal as rerank/audio/chat.
+            state.health.record_success(model_name);
+            state.runtime_status.mark_healthy(&model_entry.id);
             // Extract usage tokens (gpt-image-1 returns a `usage` block;
             // dall-e-3 doesn't) BEFORE moving resp_json into the
             // Response, so the success struct carries typed counters.
@@ -275,6 +311,16 @@ async fn dispatch(
                 .map(|(prompt, completion)| u64::from(prompt) + u64::from(completion))
                 .unwrap_or(0);
             reservation.commit_tokens(total_tokens).await;
+            // Content capture (#700): the full response JSON (LiteLLM
+            // parity); CapturedContent::new truncates to the cap.
+            let captured_content = match (&captured_prompt, content_cap) {
+                (Some(prompt), Some(cap)) => Some(CapturedContent::new(
+                    prompt,
+                    &serde_json::to_string(&resp_json).unwrap_or_default(),
+                    cap as usize,
+                )),
+                _ => None,
+            };
             Ok(ImageDispatchSuccess {
                 response: Json(resp_json).into_response(),
                 provider: provider_label,
@@ -283,6 +329,8 @@ async fn dispatch(
                 applied_guardrails: applied_guardrails.clone(),
                 usage,
                 upstream_called: true,
+                redactions,
+                captured_content,
             })
         }
         Err(BridgeError::Config(msg)) if msg.contains("does not support image generation") => {
@@ -298,10 +346,22 @@ async fn dispatch(
                 usage: None,
                 // No upstream call happened → handler skips emit.
                 upstream_called: false,
+                redactions,
+                captured_content: None,
             })
         }
         Err(e) => {
             reservation.commit_tokens(0).await;
+            // #701: mark the failure on the runtime status so the cooldown /
+            // circuit-breaker sees flapping upstreams reached only via this
+            // endpoint — same policy as rerank/audio/chat. `note_failure` is
+            // a no-op for non-triggering categories (e.g. Config errors).
+            let e = crate::cooldown::note_failure(
+                &state.runtime_status,
+                &model_entry.id,
+                model.cooldown.as_ref(),
+                e,
+            );
             Err(ProxyError::Bridge(e))
         }
     }
@@ -348,6 +408,11 @@ fn emit_usage_event(
     prompt_tokens: u32,
     completion_tokens: u32,
     client: &ClientContext,
+    // Per-detector PII mask counts (#932/#696). Empty = no redaction.
+    redacted_entity_counts: crate::redact::RedactionCounts,
+    // Captured request/response content (#700). Forwarded only to `fan_out`,
+    // never to the CP sink.
+    content: Option<&CapturedContent>,
 ) {
     let snap = state.snapshot.load();
     let mut event = UsageEvent {
@@ -364,6 +429,7 @@ fn emit_usage_event(
         applied_guardrails: applied_guardrails.to_vec(),
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),
+        redacted_entity_counts,
         ..Default::default()
     };
     crate::usage_attr::apply_pk_telemetry(&mut event, &snap, provider_key_id);
@@ -372,7 +438,7 @@ fn emit_usage_event(
     let exporters = snap.observability_exporters.entries();
     state
         .otlp_fan_out
-        .fan_out(&event, None, exporters.iter().map(|e| &e.value));
+        .fan_out(&event, content, exporters.iter().map(|e| &e.value));
 }
 
 fn emit_access_log(
@@ -1036,6 +1102,98 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "exactly one event per failed request"
+        );
+    }
+
+    fn pii_mask_guardrail() -> ResourceEntry<aisix_core::Guardrail> {
+        let json = r#"{"name":"pii","enabled":true,"hook_point":"input","kind":"pii","detectors":[{"type":"email","action":"mask"}]}"#;
+        let g: aisix_core::Guardrail = serde_json::from_str(json).unwrap();
+        ResourceEntry::new("g-pii", g, 1)
+    }
+
+    /// #696: a mask-action PII detector must rewrite the `prompt` before the
+    /// body reaches the upstream. Pre-#696 the mask action was a silent
+    /// no-op on /v1/images/generations — the raw text was forwarded. Also
+    /// pins the counts on the emitted UsageEvent.
+    #[tokio::test]
+    async fn pii_mask_rewrites_prompt_before_upstream_issue_696() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/images/generations"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "created": 1_700_000_000,
+                "data": [{"url": "https://img.example/1.png"}]
+            })))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("img"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        snap.guardrails.insert(pii_mask_guardrail());
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = build_app_with_sink(snap, tx);
+        let body = serde_json::json!({
+            "model": "img",
+            "prompt": "a portrait of a@x.com at sunset"
+        });
+        let resp = tower::ServiceExt::oneshot(app, make_req(body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let reqs = upstream.received_requests().await.unwrap();
+        let sent = String::from_utf8_lossy(&reqs[0].body).into_owned();
+        assert!(sent.contains("[EMAIL_REDACTED]"), "sent: {sent}");
+        assert!(
+            !sent.contains("a@x.com"),
+            "raw PII forwarded upstream: {sent}"
+        );
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted")
+            .expect("usage_sink sender dropped");
+        assert_eq!(
+            event.redacted_entity_counts.get("email"),
+            Some(&1),
+            "mask counts must reach the UsageEvent"
+        );
+    }
+
+    /// #701: an upstream 5xx must mark the model's runtime status (cooldown)
+    /// — /v1/images/generations previously never touched it.
+    #[tokio::test]
+    async fn upstream_5xx_marks_cooldown_issue_701() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/images/generations"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("img"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let handle = SnapshotHandle::new(snap);
+        let state = crate::ProxyState::new(handle, hub, &cfg()).without_cache();
+        let app = crate::build_router(state.clone());
+
+        let body = serde_json::json!({"model": "img", "prompt": "a cat"});
+        let resp = tower::ServiceExt::oneshot(app, make_req(body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+
+        let status = state.runtime_status.status("m-1");
+        assert!(
+            status.cooldown_until.is_some(),
+            "a 500 must mark the model in cooldown, got {status:?}"
         );
     }
 }

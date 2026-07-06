@@ -16,7 +16,7 @@
 
 use std::time::{Duration, Instant};
 
-use aisix_obs::UsageEvent;
+use aisix_obs::{AccessLog, RequestOutcome, UsageEvent};
 use axum::body::{to_bytes, Body};
 use axum::extract::{Request, State};
 use axum::http::StatusCode;
@@ -25,7 +25,13 @@ use serde::Deserialize;
 use tower::ServiceExt;
 
 use crate::auth::AuthenticatedKey;
+use crate::request_id::new_request_id;
 use crate::state::ProxyState;
+
+/// Bounded `model` metric label for /mcp requests — MCP has no resolved
+/// model, and the tool name is caller-controlled (unbounded Prometheus
+/// cardinality, same rule as passthrough's #451 sentinel).
+const MCP_MODEL_LABEL: &str = "mcp";
 
 /// Just enough of a JSON-RPC request to tell a tool call apart from the MCP
 /// handshake / discovery methods, recover the called tool's name + arguments,
@@ -58,6 +64,52 @@ pub async fn mcp_endpoint(
     State(state): State<ProxyState>,
     request: Request,
 ) -> Response {
+    // #698: /mcp emits the same access log + request metrics as every other
+    // handler — pre-fix the endpoint was invisible in both. One wrapper
+    // around `dispatch` covers every early-return path (quota, guardrail
+    // blocks, gateway errors) with the actual response status.
+    let started = Instant::now();
+    let request_id = new_request_id();
+    let api_key_id = auth.entry.id.clone();
+    let method = request.method().clone();
+
+    let response = dispatch(auth, &state, request, &request_id).await;
+
+    let elapsed = started.elapsed();
+    let status = response.status().as_u16();
+    AccessLog {
+        method: method.as_str(),
+        path: "/mcp",
+        status,
+        latency: elapsed,
+        provider: Some("mcp"),
+        model: None,
+        api_key_id: Some(&api_key_id),
+        prompt_tokens: None,
+        completion_tokens: None,
+        total_tokens: None,
+        request_id: &request_id,
+        served_by_model: None,
+        routing_attempt_count: None,
+        routing_fallback_count: None,
+    }
+    .emit();
+    state.metrics.record_request(
+        "mcp",
+        MCP_MODEL_LABEL,
+        status,
+        RequestOutcome::from_status(status),
+        elapsed,
+    );
+    response
+}
+
+async fn dispatch(
+    auth: AuthenticatedKey,
+    state: &ProxyState,
+    request: Request,
+    request_id: &str,
+) -> Response {
     // Buffer the body so the JSON-RPC method can be inspected, then rebuilt for
     // the gateway. The global body-limit layer has already capped the size.
     let (parts, body) = request.into_parts();
@@ -87,13 +139,14 @@ pub async fn mcp_endpoint(
     // concurrency slot. On 429 / budget-exceeded this returns before any
     // upstream is contacted — and the rejected call is still recorded.
     let _reservation = if is_tool_call {
-        match crate::quota::enforce(&state, &auth, None).await {
+        match crate::quota::enforce(state, &auth, None).await {
             Ok(reservation) => Some(reservation),
             Err(err) => {
                 let response = err.into_response();
                 emit_tool_call_usage(
-                    &state,
+                    state,
                     &auth,
+                    request_id,
                     &mcp_server,
                     &mcp_tool,
                     response.status().as_u16(),
@@ -147,8 +200,9 @@ pub async fn mcp_endpoint(
                 "guardrail blocked MCP tool call"
             );
             emit_tool_call_usage(
-                &state,
+                state,
                 &auth,
+                request_id,
                 &mcp_server,
                 &mcp_tool,
                 StatusCode::OK.as_u16(),
@@ -187,8 +241,9 @@ pub async fn mcp_endpoint(
         };
         if let Some(guardrail_name) = output_guardrail_block(chain, &resp_bytes, &mcp_tool).await {
             emit_tool_call_usage(
-                &state,
+                state,
                 &auth,
+                request_id,
                 &mcp_server,
                 &mcp_tool,
                 StatusCode::OK.as_u16(),
@@ -204,8 +259,9 @@ pub async fn mcp_endpoint(
 
     if is_tool_call {
         emit_tool_call_usage(
-            &state,
+            state,
             &auth,
+            request_id,
             &mcp_server,
             &mcp_tool,
             response.status().as_u16(),
@@ -289,6 +345,7 @@ async fn output_guardrail_block(
 fn emit_tool_call_usage(
     state: &ProxyState,
     auth: &AuthenticatedKey,
+    request_id: &str,
     mcp_server: &str,
     mcp_tool: &str,
     status_code: u16,
@@ -296,7 +353,7 @@ fn emit_tool_call_usage(
     guardrail_blocked: bool,
 ) {
     let event = UsageEvent {
-        request_id: uuid::Uuid::new_v4().to_string(),
+        request_id: request_id.to_string(),
         occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         api_key_id: auth.entry.id.clone(),
         status_code,
@@ -307,7 +364,16 @@ fn emit_tool_call_usage(
         guardrail_blocked,
         ..Default::default()
     };
-    state.usage_sink.try_emit("mcp", event);
+    state.usage_sink.try_emit("mcp", event.clone());
+    // #698: fan the event out to the per-env OTLP/SLS/Datadog exporters like
+    // every other emitter — pre-fix MCP usage reached only the CP sink, so
+    // exporters never saw /mcp traffic. No content capture (tool args/results
+    // are a separate surface from prompt/response).
+    let snap = state.snapshot.load();
+    let exporters = snap.observability_exporters.entries();
+    state
+        .otlp_fan_out
+        .fan_out(&event, None, exporters.iter().map(|e| &e.value));
 }
 
 /// Build the MCP-native response for a guardrail block: a JSON-RPC error
@@ -900,5 +966,60 @@ mod tests {
                 .contains("tool result blocked by content policy"),
             "expected the output-side wording, got: {v}"
         );
+    }
+
+    /// #698: a tool-call usage event must reach the per-env observability
+    /// exporters via the OTLP fan-out — pre-fix MCP usage was emitted only
+    /// into the CP sink, so exporters never saw /mcp traffic. Uses the ghost
+    /// server (no upstream needed): the gateway's error reply still records
+    /// the call.
+    #[tokio::test]
+    async fn tool_call_usage_fans_out_to_exporters_issue_698() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let collector = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&collector)
+            .await;
+
+        let snapshot = snapshot_with_key();
+        let exporter: aisix_core::ObservabilityExporter =
+            serde_json::from_value(serde_json::json!({
+                "name": "mcp-exp",
+                "enabled": true,
+                "kind": "otlp_http",
+                "endpoint": format!("{}/v1/traces", collector.uri()),
+                "headers": {}
+            }))
+            .expect("valid exporter");
+        snapshot
+            .observability_exporters
+            .insert(ResourceEntry::new("exp-1", exporter, 1));
+
+        let handle = SnapshotHandle::new(snapshot);
+        let hub = Arc::new(aisix_gateway::Hub::new());
+        let router = build_router(ProxyState::new(handle, hub, &cfg()).without_cache());
+
+        let resp = router
+            .oneshot(tools_call_request())
+            .await
+            .expect("router responds");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // The fan-out POST runs in a detached task — poll for it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            let received = collector.received_requests().await.unwrap_or_default();
+            if !received.is_empty() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the tool-call usage event never reached the OTLP exporter"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
     }
 }

@@ -88,6 +88,17 @@ After every `gh pr create` or force-push, spawn a fresh `general-purpose` Agent 
 
 Output HIGH/MEDIUM/LOW per finding with **concrete suggested code**, not vague "consider". **Merge gate:** every HIGH and MEDIUM is either fixed in code or explicitly justified in the PR (e.g. "feature gap, filed as #N, agreed not to block"); silent merge is not enough. For findings that surface gateway/product-behavior gaps, file separate issues and link them. Self-review misses the author's blind spots — an independent agent catches them.
 
+## Handler Families Stay in Lockstep — Fix the Whole Class
+
+**The client-facing endpoint handlers come in families that share dispatch, auth, routing, telemetry, and guardrail logic — `/v1/chat/completions`, `/v1/messages` (+`count_tokens`), `/v1/responses`, plus embeddings/rerank/audio/images. A bug or feature landed on one almost always applies to the others, and a gap on the unfixed siblings is SILENT: nothing errors, the behavior just quietly degrades.**
+
+- When you touch a per-request mechanism (a runtime metric, a limit, an auth check, a usage emission, header threading), grep the offending call/pattern across the whole crate and wire **every** sibling path in the same PR — both streaming and non-streaming branches — or state explicitly in the PR which sibling is deferred and why, and file the follow-up issue immediately.
+- "Documented follow-up" without an issue is how gaps rot: it lives in one PR description and no one ever comes back.
+- Test coverage must include each wired endpoint, not just chat: an e2e that only drives `/v1/chat/completions` will stay green forever while Anthropic-SDK (`/v1/messages`) and Codex (`/v1/responses`) traffic silently misbehaves.
+- Prefer hoisting the shared logic into one chokepoint (e.g. `resolve_attempt_models`) so the family can't drift again.
+
+(Two recurrences of the same lesson: #471 — a Model-Group dispatch fix landed only on `/v1/messages` while `/v1/responses` and `count_tokens` had the identical gap; then #715 — `least_busy`'s in-flight counter shipped fed by chat.rs only (#684 left messages/responses as an un-filed "follow-up"), so the strategy silently degraded to declaration order for Claude Code / Codex traffic until #716. The EWMA for `least_latency` (#682) wired all three endpoints at once and never had this problem — that's the standard.)
+
 ## A Config Knob Isn't Shipped Until the Control Plane Exposes It
 
 **A user-configurable data-plane feature is NOT delivered when the Rust side works — it's delivered when a user can reach it through the control plane. DP-only is a half-feature nobody can turn on.**

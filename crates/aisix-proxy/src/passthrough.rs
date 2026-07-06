@@ -131,6 +131,7 @@ fn strip_redundant_version_segment<'a>(base: &str, rest: &'a str) -> &'a str {
 pub async fn passthrough(
     State(state): State<ProxyState>,
     auth: AuthenticatedKey,
+    client: crate::client_ip::ClientContext,
     Path((provider, rest)): Path<(String, String)>,
     req: Request,
 ) -> Response {
@@ -140,8 +141,18 @@ pub async fn passthrough(
     let method = req.method().clone();
     let path = format!("/passthrough/{provider}/{rest}");
 
-    match dispatch(state.clone(), &auth, &provider, &rest, req, &request_id).await {
-        Ok((resp, provider_label)) => {
+    match dispatch(
+        state.clone(),
+        &auth,
+        &provider,
+        &rest,
+        req,
+        &request_id,
+        &client.source_ip,
+    )
+    .await
+    {
+        Ok((resp, provider_label, provider_key_id)) => {
             let elapsed = started.elapsed();
             let status = resp.status().as_u16();
             emit_access_log(
@@ -164,6 +175,19 @@ pub async fn passthrough(
                 RequestOutcome::from_status(status),
                 elapsed,
             );
+            // #699: record the passthrough call in the UsageEvent stream —
+            // pre-fix it never appeared in /logs, the budget ledger or the
+            // exporters. The raw tunnel parses nothing, so tokens stay zero;
+            // the upstream's status is relayed verbatim and recorded as-is.
+            emit_usage_event(
+                &state,
+                &request_id,
+                &api_key_id,
+                &provider_key_id,
+                status,
+                elapsed,
+                &client,
+            );
             resp
         }
         Err(err) => {
@@ -185,11 +209,26 @@ pub async fn passthrough(
                 RequestOutcome::from_status(status),
                 elapsed,
             );
+            // #699 / #655 parity: surface the failed request in Logs with a
+            // zero-token event (status + error class). No resolved model on
+            // the error path -> empty requested_model, like audio's multipart
+            // error path.
+            crate::usage_attr::emit_error_usage_event(
+                &state,
+                "passthrough",
+                &request_id,
+                "",
+                &api_key_id,
+                status,
+                err.kind(),
+                &client,
+            );
             err.into_response()
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn dispatch(
     state: ProxyState,
     auth: &AuthenticatedKey,
@@ -197,7 +236,8 @@ async fn dispatch(
     rest: &str,
     req: Request,
     request_id: &str,
-) -> Result<(Response, String), ProxyError> {
+    source_ip: &str,
+) -> Result<(Response, String, String), ProxyError> {
     let snapshot = state.snapshot.load();
 
     // Find a model for this provider so we can borrow its provider_key.
@@ -232,6 +272,14 @@ async fn dispatch(
         })?;
 
     let model = &model_entry.value;
+
+    // Client-IP allowlist gate (#557/#697): the borrowed model's
+    // `allowed_cidrs` applies to the raw tunnel too — pre-#697 passthrough
+    // was the one surface that skipped it, so an operator's IP restriction
+    // was bypassable by lending the same credentials through here. Same
+    // borrowed-model basis as the #911 [6] guardrail resolution below.
+    crate::dispatch::check_ip_access(model, source_ip)?;
+
     let pk_entry = crate::dispatch::resolve_provider_key(&snapshot, model)?;
     let api_key = crate::dispatch::require_secret(&pk_entry.value, model)?.to_string();
 
@@ -426,10 +474,22 @@ async fn dispatch(
         builder = builder.timeout(d);
     }
 
+    // #701: transport/decode failures against the shared upstream mark the
+    // borrowed model's runtime status (same borrowed-model basis as the
+    // #911 [6] guardrail chain), so a dead upstream reached only via the raw
+    // tunnel still trips the cooldown. Forwarded HTTP statuses stay the
+    // caller's business — the tunnel relays them verbatim.
     let upstream_resp = builder
         .send()
         .await
-        .map_err(|e| aisix_gateway::BridgeError::Transport(e.to_string()))
+        .map_err(|e| {
+            crate::cooldown::note_failure(
+                &state.runtime_status,
+                &model_entry.id,
+                model.cooldown.as_ref(),
+                aisix_gateway::BridgeError::Transport(e.to_string()),
+            )
+        })
         .map_err(ProxyError::Bridge)?;
 
     let status = upstream_resp.status();
@@ -437,7 +497,14 @@ async fn dispatch(
     let resp_body = upstream_resp
         .bytes()
         .await
-        .map_err(|e| aisix_gateway::BridgeError::UpstreamDecode(e.to_string()))
+        .map_err(|e| {
+            crate::cooldown::note_failure(
+                &state.runtime_status,
+                &model_entry.id,
+                model.cooldown.as_ref(),
+                aisix_gateway::BridgeError::UpstreamDecode(e.to_string()),
+            )
+        })
         .map_err(ProxyError::Bridge)?;
 
     // #911 [6]: run OUTPUT guardrails on the passthrough response body — the
@@ -486,7 +553,42 @@ async fn dispatch(
         );
     }
 
-    Ok((response, provider_lower))
+    Ok((response, provider_lower, pk_entry.id.to_string()))
+}
+
+/// #699: push one zero-token `UsageEvent` per passthrough request onto the
+/// CP sink and the exporter fan-out. The raw tunnel parses neither request
+/// nor response, so there are no tokens or model fields — the event records
+/// who lent which provider's credentials (per-PK attribution tags), the
+/// relayed status, and the latency. `inbound_protocol = "passthrough"`
+/// distinguishes these rows from typed-endpoint traffic in /logs.
+fn emit_usage_event(
+    state: &ProxyState,
+    request_id: &str,
+    api_key_id: &str,
+    provider_key_id: &str,
+    status_code: u16,
+    elapsed: Duration,
+    client: &crate::client_ip::ClientContext,
+) {
+    let snap = state.snapshot.load();
+    let mut event = aisix_obs::UsageEvent {
+        request_id: request_id.to_string(),
+        occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        api_key_id: api_key_id.to_string(),
+        status_code,
+        latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
+        inbound_protocol: "passthrough".to_string(),
+        client_source_ip: client.source_ip.clone(),
+        client_user_agent: client.user_agent.clone(),
+        ..Default::default()
+    };
+    crate::usage_attr::apply_pk_telemetry(&mut event, &snap, provider_key_id);
+    state.usage_sink.try_emit("passthrough", event.clone());
+    let exporters = snap.observability_exporters.entries();
+    state
+        .otlp_fan_out
+        .fan_out(&event, None, exporters.iter().map(|e| &e.value));
 }
 
 /// Copy response headers that are safe to relay to the downstream caller.
@@ -1215,6 +1317,175 @@ mod tests {
         assert!(
             upstream_header_values(r, "cookie").is_empty(),
             "case-insensitive strip: cookie must be removed"
+        );
+    }
+
+    /// #697: the borrowed model's `allowed_cidrs` (#557) must gate the raw
+    /// passthrough tunnel too. A client IP outside the allowlist gets 403
+    /// and the upstream is never contacted. Oneshot requests carry no
+    /// ConnectInfo → empty source IP, which fails closed against a
+    /// configured allowlist (same as the typed handlers).
+    #[tokio::test]
+    async fn ip_allowlisted_model_rejects_disallowed_client_issue_697() {
+        let upstream = MockServer::start().await;
+        Mock::given(wm_method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"data": []})))
+            .expect(0)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        let model_json = format!(
+            r#"{{"display_name":"gated","provider":"openai","model_name":"gpt-4o","provider_key_id":"{PK_ID}","allowed_cidrs":["10.0.0.0/8"]}}"#
+        );
+        let m: Model = serde_json::from_str(&model_json).unwrap();
+        snap.models.insert(ResourceEntry::new("m-1", m, 1));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let app = build_app(snap);
+        let req = Request::builder()
+            .method("GET")
+            .uri("/passthrough/openai/v1/models")
+            .header("authorization", "Bearer sk-caller")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["type"], "permission_denied");
+    }
+
+    /// #697 companion: a client IP inside the allowlist passes through.
+    /// ConnectInfo is injected the way a real listener would provide it.
+    #[tokio::test]
+    async fn ip_allowlisted_model_allows_matching_client_issue_697() {
+        let upstream = MockServer::start().await;
+        Mock::given(wm_method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"data": []})))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        let model_json = format!(
+            r#"{{"display_name":"gated","provider":"openai","model_name":"gpt-4o","provider_key_id":"{PK_ID}","allowed_cidrs":["10.0.0.0/8"]}}"#
+        );
+        let m: Model = serde_json::from_str(&model_json).unwrap();
+        snap.models.insert(ResourceEntry::new("m-1", m, 1));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let app = build_app(snap);
+        let mut req = Request::builder()
+            .method("GET")
+            .uri("/passthrough/openai/v1/models")
+            .header("authorization", "Bearer sk-caller")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        req.extensions_mut()
+            .insert(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                [10, 1, 2, 3],
+                50000,
+            ))));
+        let resp = ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// #699: a passthrough request must land in the UsageEvent stream —
+    /// zero tokens (nothing is parsed), the relayed upstream status, the
+    /// caller's api_key and the lent ProviderKey's attribution tags.
+    #[tokio::test]
+    async fn emits_usage_event_on_success_issue_699() {
+        use aisix_obs::{UsageEvent, UsageSink};
+
+        let upstream = MockServer::start().await;
+        Mock::given(wm_method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"data": []})))
+            .mount(&upstream)
+            .await;
+
+        let snap = AisixSnapshot::new();
+        let pk_json = format!(
+            r#"{{"display_name":"openai-up","secret":"sk-test","api_base":"{}","provider":"openai","adapter":"openai","telemetry_tags":{{"kind":"catalog","featured":true,"branded_provider":"openai","pk_label":"prod-pt-key"}}}}"#,
+            upstream.uri()
+        );
+        let pk: aisix_core::ProviderKey = serde_json::from_str(&pk_json).unwrap();
+        snap.provider_keys.insert(ResourceEntry::new(PK_ID, pk, 1));
+        snap.models.insert(openai_model("gpt"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<UsageEvent>(8);
+        let hub = Arc::new(Hub::new());
+        let handle = SnapshotHandle::new(snap);
+        let state = crate::ProxyState::new(handle, hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let app = crate::build_router(state);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/passthrough/openai/v1/models")
+            .header("authorization", "Bearer sk-caller")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("a passthrough request must emit a UsageEvent")
+            .expect("usage_sink sender dropped");
+        assert_eq!(event.inbound_protocol, "passthrough");
+        assert_eq!(event.status_code, 200);
+        assert_eq!(event.api_key_id, "k-1");
+        assert_eq!(event.prompt_tokens, 0, "the raw tunnel parses no tokens");
+        assert_eq!(event.pk_label, "prod-pt-key", "PK attribution must apply");
+        assert!(
+            rx.try_recv().is_err(),
+            "exactly one event per passthrough request"
+        );
+    }
+
+    /// #699 / #655 parity: a failed passthrough dispatch (no model for the
+    /// provider -> 404) emits one zero-token error event instead of being
+    /// dropped.
+    #[tokio::test]
+    async fn failed_dispatch_emits_zero_token_error_event_issue_699() {
+        use aisix_obs::{UsageEvent, UsageSink};
+
+        let snap = new_snap("http://unused");
+        snap.models.insert(openai_model("gpt"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<UsageEvent>(8);
+        let hub = Arc::new(Hub::new());
+        let handle = SnapshotHandle::new(snap);
+        let state = crate::ProxyState::new(handle, hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let app = crate::build_router(state);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/passthrough/nonexistent/v1/models")
+            .header("authorization", "Bearer sk-caller")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("a failed passthrough must emit a zero-token UsageEvent")
+            .expect("usage_sink sender dropped");
+        assert_eq!(event.status_code, 404);
+        assert_eq!(event.api_key_id, "k-1");
+        assert!(
+            !event.error_class.is_empty(),
+            "error_class must classify the failure"
         );
     }
 }

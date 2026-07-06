@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/aisix-a2a",
     "crates/aisix-core",
     "crates/aisix-etcd",
     "crates/aisix-gateway",

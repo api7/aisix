@@ -335,6 +335,18 @@ pub struct UsageEvent {
     /// non-MCP events; cp-api stores empty as NULL.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub mcp_tool_name: String,
+
+    // ─── A2A gateway attribution ───
+    /// Registered name of the upstream A2A agent a request was routed to.
+    /// Empty for non-A2A events; cp-api stores empty as NULL. Older cp-api
+    /// images that predate this field ignore it (DP-first rollout).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub a2a_agent_name: String,
+
+    /// The JSON-RPC method invoked on the A2A agent (such as `message/send`).
+    /// Empty for non-A2A events; cp-api stores empty as NULL.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub a2a_method: String,
 }
 
 #[inline]
