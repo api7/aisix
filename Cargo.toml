@@ -33,6 +33,7 @@ authors = ["moonming"]
 # Runtime
 tokio = { version = "1.41", features = ["full"] }
 futures = "0.3"
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 async-trait = "0.1"
 
 # HTTP server

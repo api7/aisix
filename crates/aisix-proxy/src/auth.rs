@@ -38,30 +38,41 @@ where
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
         let token = extract_bearer(parts)?;
         let proxy_state = ProxyState::from_ref(state);
-        let snapshot = proxy_state.snapshot.load();
-        // Self-hosted CP (prd-09a §9A.7B.4): the snapshot stores
-        // SHA-256 hashes of the plaintext bearer, never the plaintext
-        // itself. Hash the incoming token via the canonical helper
-        // and look up by the hex digest. cp-api hashes with the same
-        // function before persistence, so the two sides agree byte
-        // for byte.
-        let entry = snapshot
-            .apikeys
-            .get_by_name(&ApiKey::hash_bearer(&token))
-            .ok_or(ProxyError::InvalidApiKey)?;
-        // Lifecycle enforcement (#933): a known key that is disabled or
-        // past its expiry deadline must be rejected here, at the single
-        // auth choke point, so every proxy surface (chat, messages,
-        // responses, embeddings, audio, passthrough, MCP, …) inherits
-        // the same 401 without per-handler checks.
-        if entry.value.disabled {
-            return Err(ProxyError::ApiKeyDisabled);
-        }
-        if entry.value.is_expired_at(chrono::Utc::now()) {
-            return Err(ProxyError::ApiKeyExpired);
-        }
-        Ok(AuthenticatedKey { entry })
+        authenticate_token(&proxy_state, &token)
     }
+}
+
+/// Look a plaintext bearer up in the snapshot and enforce key lifecycle.
+/// The single auth choke point behind the [`AuthenticatedKey`] extractor;
+/// also called directly by surfaces whose credentials arrive outside the
+/// standard headers (WebSocket subprotocol auth on `/v1/realtime`).
+pub(crate) fn authenticate_token(
+    state: &ProxyState,
+    token: &str,
+) -> Result<AuthenticatedKey, ProxyError> {
+    let snapshot = state.snapshot.load();
+    // Self-hosted CP (prd-09a §9A.7B.4): the snapshot stores
+    // SHA-256 hashes of the plaintext bearer, never the plaintext
+    // itself. Hash the incoming token via the canonical helper
+    // and look up by the hex digest. cp-api hashes with the same
+    // function before persistence, so the two sides agree byte
+    // for byte.
+    let entry = snapshot
+        .apikeys
+        .get_by_name(&ApiKey::hash_bearer(token))
+        .ok_or(ProxyError::InvalidApiKey)?;
+    // Lifecycle enforcement (#933): a known key that is disabled or
+    // past its expiry deadline must be rejected here, at the single
+    // auth choke point, so every proxy surface (chat, messages,
+    // responses, embeddings, audio, passthrough, MCP, …) inherits
+    // the same 401 without per-handler checks.
+    if entry.value.disabled {
+        return Err(ProxyError::ApiKeyDisabled);
+    }
+    if entry.value.is_expired_at(chrono::Utc::now()) {
+        return Err(ProxyError::ApiKeyExpired);
+    }
+    Ok(AuthenticatedKey { entry })
 }
 
 fn extract_bearer(parts: &Parts) -> Result<String, ProxyError> {

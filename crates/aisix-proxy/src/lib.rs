@@ -50,6 +50,7 @@ mod model_resolve;
 mod models;
 mod passthrough;
 mod quota;
+mod realtime;
 mod redact;
 mod render;
 mod request_id;
@@ -106,6 +107,9 @@ pub fn build_router(state: ProxyState) -> Router {
         .route("/v1/audio/transcriptions", post(audio::transcriptions))
         .route("/v1/audio/translations", post(audio::translations))
         .route("/v1/audio/speech", post(audio::speech))
+        // OpenAI Realtime WebSocket relay (#721). Auth/ACL/quota are
+        // enforced pre-upgrade inside the handler.
+        .route("/v1/realtime", get(realtime::realtime))
         // Files / Batches / Fine-tuning jobs surface (#720). Provider
         // routing rides the gateway-encoded resource ids; see jobs.rs.
         .route(
@@ -223,6 +227,7 @@ fn normalize_endpoint_label(path: &str) -> &'static str {
         "/v1/audio/translations" => "/v1/audio/translations",
         "/v1/audio/speech" => "/v1/audio/speech",
         "/mcp" | "/mcp/" => "/mcp",
+        "/v1/realtime" => "/v1/realtime",
         "/v1/files" => "/v1/files",
         "/v1/batches" => "/v1/batches",
         "/v1/fine_tuning/jobs" => "/v1/fine_tuning/jobs",
@@ -242,6 +247,8 @@ fn inbound_protocol_for_endpoint(endpoint: &str) -> &'static str {
         "mcp"
     } else if endpoint == "/a2a" {
         "a2a"
+    } else if endpoint == "/v1/realtime" {
+        "realtime"
     } else {
         "openai"
     }
