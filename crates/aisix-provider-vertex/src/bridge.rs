@@ -25,7 +25,8 @@
 use aisix_gateway::{
     sse::{SseDecoder, SseEvent},
     Bridge, BridgeContext, BridgeError, ChatChunk, ChatChunkStream, ChatDelta, ChatFormat,
-    ChatMessage, ChatResponse, FinishReason, Role, UsageStats,
+    ChatMessage, ChatResponse, EmbeddingObject, EmbeddingRequest, EmbeddingResponse,
+    EmbeddingUsage, EmbeddingVector, FinishReason, Role, UsageStats,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -644,6 +645,121 @@ impl Bridge for VertexBridge {
             }
         }
     }
+
+    /// Native Vertex embeddings (#723): google-publisher `:predict`
+    /// with the text-embedding `instances` shape — LiteLLM
+    /// `VertexEmbedding` (`vertex_embeddings/embedding_handler.py`)
+    /// parity. Every embedding model on this adapter is a
+    /// google-publisher surface (the Claude / MaaS publishers expose
+    /// no embeddings), so there is no publisher dispatch here.
+    async fn embed(
+        &self,
+        req: &EmbeddingRequest,
+        ctx: &BridgeContext,
+    ) -> Result<EmbeddingResponse, BridgeError> {
+        let upstream_id = upstream_model(ctx)?;
+        let creds = VertexSecret::parse(&ctx.provider_key.secret)?;
+        validate_url_token("project", &creds.project)?;
+        validate_url_token("region", &creds.region)?;
+        validate_url_token("upstream_id", upstream_id)?;
+
+        let base = self.resolve_api_base(&creds.region, ctx.provider_key.api_base.as_deref())?;
+        let url = format!(
+            "{base}/v1/projects/{project}/locations/{region}/publishers/google/models/{model}:predict",
+            project = creds.project,
+            region = creds.region,
+            model = upstream_id,
+        );
+
+        let instances: Vec<serde_json::Value> = req
+            .input
+            .iter()
+            .map(|text| serde_json::json!({"content": text}))
+            .collect();
+        let mut body = serde_json::json!({"instances": instances});
+        if let Some(dims) = req.dimensions {
+            body["parameters"] = serde_json::json!({"outputDimensionality": dims});
+        }
+        apply_body_overrides(&mut body, ctx);
+
+        let access_token = creds.resolve_access_token(&self.token_minter).await?;
+        let headers = build_request_headers(
+            &access_token,
+            &ctx.request_id,
+            ctx.provider_key.request.as_ref(),
+        )?;
+        let client = self.client.clone();
+        let started = Instant::now();
+        let model_echo = req.model.clone();
+
+        with_deadline(ctx.deadline, started, async move {
+            let resp = client
+                .post(&url)
+                .headers(headers)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| BridgeError::Transport(e.to_string()))?;
+            let status = resp.status();
+            if !status.is_success() {
+                return Err(map_http_error(status, resp).await);
+            }
+            let parsed: VertexPredictEmbeddingsResponse = resp
+                .json()
+                .await
+                .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?;
+
+            let mut data = Vec::with_capacity(parsed.predictions.len());
+            let mut prompt_tokens: u64 = 0;
+            for (i, p) in parsed.predictions.into_iter().enumerate() {
+                if let Some(stats) = &p.embeddings.statistics {
+                    prompt_tokens += stats.token_count;
+                }
+                data.push(EmbeddingObject {
+                    index: i as u32,
+                    object: "embedding".to_string(),
+                    embedding: EmbeddingVector::Float(p.embeddings.values),
+                });
+            }
+            let tokens = prompt_tokens.min(u32::MAX as u64) as u32;
+            Ok(EmbeddingResponse {
+                object: "list".to_string(),
+                model: model_echo,
+                data,
+                usage: EmbeddingUsage {
+                    prompt_tokens: tokens,
+                    total_tokens: tokens,
+                },
+            })
+        })
+        .await
+    }
+}
+
+/// `:predict` response for text-embedding models, per
+/// <https://cloud.google.com/vertex-ai/generative-ai/docs/embeddings/get-text-embeddings>.
+#[derive(Debug, Deserialize)]
+struct VertexPredictEmbeddingsResponse {
+    #[serde(default)]
+    predictions: Vec<VertexEmbeddingPrediction>,
+}
+
+#[derive(Debug, Deserialize)]
+struct VertexEmbeddingPrediction {
+    embeddings: VertexEmbeddingsPayload,
+}
+
+#[derive(Debug, Deserialize)]
+struct VertexEmbeddingsPayload {
+    values: Vec<f32>,
+    #[serde(default)]
+    statistics: Option<VertexEmbeddingStatistics>,
+}
+
+#[derive(Debug, Deserialize)]
+struct VertexEmbeddingStatistics {
+    #[serde(default)]
+    token_count: u64,
 }
 
 impl VertexBridge {
@@ -4803,5 +4919,109 @@ mod tests {
             Some("abc"),
             "response.content_list_to_string must flatten array content to a string on the outbound body; got {body}",
         );
+    }
+
+    // ─── #723: native embeddings via :predict ─────────────────────────
+
+    #[tokio::test]
+    async fn embed_dispatches_predict_and_sums_usage() {
+        use wiremock::matchers::{method as wm_method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(wm_method("POST"))
+            .and(wm_path(
+                "/v1/projects/my-proj/locations/us-central1/publishers/google/models/text-embedding-005:predict",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "predictions": [
+                    {"embeddings": {"values": [0.1, 0.2], "statistics": {"token_count": 3}}},
+                    {"embeddings": {"values": [0.3, 0.4], "statistics": {"token_count": 2}}}
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let bridge = VertexBridge::new().with_api_base_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("text-embedding-005"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let req = EmbeddingRequest {
+            model: "customer-facing-name".into(),
+            input: vec!["hello".into(), "world".into()],
+            input_was_single: false,
+            encoding_format: None,
+            dimensions: None,
+        };
+        let resp = bridge.embed(&req, &ctx).await.expect("embed dispatch");
+        assert_eq!(resp.object, "list");
+        assert_eq!(resp.model, "customer-facing-name");
+        assert_eq!(resp.data.len(), 2);
+        assert_eq!(resp.data[0].index, 0);
+        match &resp.data[0].embedding {
+            EmbeddingVector::Float(v) => assert_eq!(v, &vec![0.1, 0.2]),
+            other => panic!("expected float vector, got {other:?}"),
+        }
+        assert_eq!(
+            resp.usage.prompt_tokens, 5,
+            "token_count sums across predictions"
+        );
+
+        // Upstream body: one instance per input, in order, plus the
+        // OAuth bearer from the PK secret.
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(received.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
+        assert_eq!(
+            body["instances"],
+            serde_json::json!([{"content": "hello"}, {"content": "world"}])
+        );
+        assert!(
+            body.get("parameters").is_none(),
+            "no dims -> no parameters key"
+        );
+        assert_eq!(
+            received[0]
+                .headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok()),
+            Some("Bearer ya29.test")
+        );
+    }
+
+    #[tokio::test]
+    async fn embed_forwards_output_dimensionality() {
+        use wiremock::matchers::method as wm_method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(wm_method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "predictions": [
+                    {"embeddings": {"values": [0.5], "statistics": {"token_count": 1}}}
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let bridge = VertexBridge::new().with_api_base_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("gemini-embedding-001"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let req = EmbeddingRequest {
+            model: "customer-facing-name".into(),
+            input: vec!["hello".into()],
+            input_was_single: true,
+            encoding_format: None,
+            dimensions: Some(256),
+        };
+        bridge.embed(&req, &ctx).await.expect("embed dispatch");
+        let received = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
+        assert_eq!(body["parameters"]["outputDimensionality"], 256);
     }
 }

@@ -18,7 +18,8 @@
 
 use aisix_gateway::{
     Bridge, BridgeContext, BridgeError, ChatChunk, ChatChunkStream, ChatDelta, ChatFormat,
-    ChatMessage, ChatResponse, FinishReason, Role, UsageStats,
+    ChatMessage, ChatResponse, EmbeddingObject, EmbeddingRequest, EmbeddingResponse,
+    EmbeddingUsage, EmbeddingVector, FinishReason, Role, UsageStats,
 };
 use async_trait::async_trait;
 use aws_credential_types::provider::SharedCredentialsProvider;
@@ -661,6 +662,117 @@ impl Bridge for BedrockBridge {
         let _ = publisher;
         self.chat_converse_stream(req, ctx, upstream_id).await
     }
+
+    /// Native Bedrock embeddings (#723), LiteLLM `litellm/llms/bedrock/embed/`
+    /// parity: `amazon.titan-embed-*` (Titan G1/V2 — the model embeds ONE
+    /// text per InvokeModel, so batch inputs loop; LiteLLM iterates the
+    /// same way) and `cohere.embed-*` (whole batch in one call). Other
+    /// publishers expose no embedding models on Bedrock.
+    async fn embed(
+        &self,
+        req: &EmbeddingRequest,
+        ctx: &BridgeContext,
+    ) -> Result<EmbeddingResponse, BridgeError> {
+        let upstream_id = upstream_model(ctx)?;
+        validate_model_id_chars(upstream_id)?;
+        let client = self.build_client_from_ctx(ctx)?;
+        let started = Instant::now();
+        let deadline = ctx.deadline;
+
+        let mut data = Vec::with_capacity(req.input.len());
+        let mut prompt_tokens: u64 = 0;
+
+        let base_id = strip_region_prefix(upstream_id);
+        if base_id.starts_with("amazon.titan-embed") {
+            for (i, text) in req.input.iter().enumerate() {
+                let mut body = serde_json::json!({"inputText": text});
+                // `dimensions` is a Titan V2 knob; G1 rejects unknown keys.
+                if let Some(dims) = req.dimensions {
+                    if base_id.contains("v2") {
+                        body["dimensions"] = dims.into();
+                    }
+                }
+                let body_bytes = serde_json::to_vec(&body)
+                    .map_err(|e| BridgeError::Config(format!("serialize Titan embed body: {e}")))?;
+                let resp = client
+                    .invoke_model()
+                    .model_id(upstream_id)
+                    .content_type("application/json")
+                    .accept("application/json")
+                    .body(Blob::new(body_bytes))
+                    .send()
+                    .await
+                    .map_err(|e| map_sdk_error(e, started, deadline))?;
+                let parsed: TitanEmbedResponse = serde_json::from_slice(resp.body().as_ref())
+                    .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?;
+                prompt_tokens += parsed.input_text_token_count;
+                data.push(EmbeddingObject {
+                    index: i as u32,
+                    object: "embedding".to_string(),
+                    embedding: EmbeddingVector::Float(parsed.embedding),
+                });
+            }
+        } else if base_id.starts_with("cohere.embed") {
+            let body = serde_json::json!({
+                "texts": req.input,
+                // LiteLLM's default when the caller gives no input_type.
+                "input_type": "search_document",
+            });
+            let body_bytes = serde_json::to_vec(&body)
+                .map_err(|e| BridgeError::Config(format!("serialize Cohere embed body: {e}")))?;
+            let resp = client
+                .invoke_model()
+                .model_id(upstream_id)
+                .content_type("application/json")
+                .accept("application/json")
+                .body(Blob::new(body_bytes))
+                .send()
+                .await
+                .map_err(|e| map_sdk_error(e, started, deadline))?;
+            let parsed: CohereEmbedResponse = serde_json::from_slice(resp.body().as_ref())
+                .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?;
+            for (i, values) in parsed.embeddings.into_iter().enumerate() {
+                data.push(EmbeddingObject {
+                    index: i as u32,
+                    object: "embedding".to_string(),
+                    embedding: EmbeddingVector::Float(values),
+                });
+            }
+            // Cohere-on-Bedrock returns no token statistics; usage stays 0
+            // (LiteLLM surfaces the same absence).
+        } else {
+            return Err(BridgeError::Config(format!(
+                "bedrock embeddings support amazon.titan-embed-* and cohere.embed-* \
+                 model ids; got {upstream_id:?}"
+            )));
+        }
+
+        let tokens = prompt_tokens.min(u32::MAX as u64) as u32;
+        Ok(EmbeddingResponse {
+            object: "list".to_string(),
+            model: req.model.clone(),
+            data,
+            usage: EmbeddingUsage {
+                prompt_tokens: tokens,
+                total_tokens: tokens,
+            },
+        })
+    }
+}
+
+/// Titan embed response per the Amazon Titan Embeddings docs
+/// (`embedding` + `inputTextTokenCount`).
+#[derive(Debug, Deserialize)]
+struct TitanEmbedResponse {
+    embedding: Vec<f32>,
+    #[serde(rename = "inputTextTokenCount", default)]
+    input_text_token_count: u64,
+}
+
+/// Cohere-on-Bedrock embed response (`embeddings` = one vector per text).
+#[derive(Debug, Deserialize)]
+struct CohereEmbedResponse {
+    embeddings: Vec<Vec<f32>>,
 }
 
 impl BedrockBridge {
@@ -4002,5 +4114,163 @@ mod tests {
             Some(1.0),
             "stream-path Converse temperature must be clamped to temperature_max; body={body}",
         );
+    }
+
+    // ─── #723: native embeddings via InvokeModel ──────────────────────
+
+    #[tokio::test]
+    async fn titan_embed_loops_one_invoke_per_input() {
+        use wiremock::matchers::{method as wm_method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(wm_method("POST"))
+            .and(wm_path("/model/amazon.titan-embed-text-v1/invoke"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "embedding": [0.25, 0.5],
+                "inputTextTokenCount": 4
+            })))
+            .mount(&server)
+            .await;
+
+        let bridge = BedrockBridge::new().with_endpoint_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("amazon.titan-embed-text-v1"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let req = EmbeddingRequest {
+            model: "customer-facing-name".into(),
+            input: vec!["a".into(), "b".into()],
+            input_was_single: false,
+            encoding_format: None,
+            dimensions: None,
+        };
+        let resp = bridge.embed(&req, &ctx).await.expect("titan embed");
+        assert_eq!(resp.data.len(), 2);
+        assert_eq!(resp.data[1].index, 1);
+        assert_eq!(resp.usage.prompt_tokens, 8, "4 tokens per input, summed");
+
+        // Titan embeds ONE text per call -> two upstream invokes, in order.
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(received.len(), 2);
+        let first: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
+        assert_eq!(first, serde_json::json!({"inputText": "a"}));
+        // SigV4 signing ran (SDK path) — the Authorization header carries
+        // the AWS algorithm marker.
+        assert!(received[0]
+            .headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .contains("AWS4-HMAC-SHA256"));
+    }
+
+    #[tokio::test]
+    async fn titan_v2_embed_forwards_dimensions_but_g1_does_not() {
+        use wiremock::matchers::method as wm_method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(wm_method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "embedding": [0.1],
+                "inputTextTokenCount": 1
+            })))
+            .mount(&server)
+            .await;
+
+        let bridge = BedrockBridge::new().with_endpoint_override(server.uri());
+        let req = EmbeddingRequest {
+            model: "customer-facing-name".into(),
+            input: vec!["a".into()],
+            input_was_single: true,
+            encoding_format: None,
+            dimensions: Some(512),
+        };
+
+        // V2: dimensions forwards.
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("amazon.titan-embed-text-v2:0"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        bridge.embed(&req, &ctx).await.expect("v2 embed");
+        // G1: dimensions must be omitted (Titan G1 rejects unknown keys).
+        let ctx = BridgeContext::new(
+            "req-2",
+            sample_model_with("amazon.titan-embed-text-v1"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        bridge.embed(&req, &ctx).await.expect("g1 embed");
+
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(received.len(), 2);
+        let v2_body: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
+        assert_eq!(v2_body["dimensions"], 512);
+        let g1_body: serde_json::Value = serde_json::from_slice(&received[1].body).unwrap();
+        assert!(g1_body.get("dimensions").is_none());
+    }
+
+    #[tokio::test]
+    async fn cohere_embed_sends_whole_batch_in_one_call() {
+        use wiremock::matchers::{method as wm_method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(wm_method("POST"))
+            .and(wm_path("/model/cohere.embed-english-v3/invoke"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "embeddings": [[0.1, 0.2], [0.3, 0.4]]
+            })))
+            .mount(&server)
+            .await;
+
+        let bridge = BedrockBridge::new().with_endpoint_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("cohere.embed-english-v3"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let req = EmbeddingRequest {
+            model: "customer-facing-name".into(),
+            input: vec!["a".into(), "b".into()],
+            input_was_single: false,
+            encoding_format: None,
+            dimensions: None,
+        };
+        let resp = bridge.embed(&req, &ctx).await.expect("cohere embed");
+        assert_eq!(resp.data.len(), 2);
+
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(received.len(), 1, "cohere batches in a single call");
+        let body: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
+        assert_eq!(body["texts"], serde_json::json!(["a", "b"]));
+        assert_eq!(body["input_type"], "search_document");
+    }
+
+    #[tokio::test]
+    async fn embed_rejects_non_embedding_publishers() {
+        let bridge = BedrockBridge::new();
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("anthropic.claude-3-5-sonnet-20241022-v2:0"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let req = EmbeddingRequest {
+            model: "customer-facing-name".into(),
+            input: vec!["a".into()],
+            input_was_single: true,
+            encoding_format: None,
+            dimensions: None,
+        };
+        let err = bridge.embed(&req, &ctx).await.unwrap_err();
+        match err {
+            BridgeError::Config(msg) => {
+                assert!(msg.contains("amazon.titan-embed-"));
+                assert!(msg.contains("cohere.embed-"));
+            }
+            other => panic!("expected Config error, got {other:?}"),
+        }
     }
 }
