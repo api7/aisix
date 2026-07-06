@@ -42,6 +42,7 @@ interface PresidioMock {
     text: string;
     language: string;
     entities: string[] | undefined;
+    scoreThreshold: number | undefined;
   }>;
   anonymizeRequests: Array<{
     text: string;
@@ -74,6 +75,7 @@ async function startPresidioMock(): Promise<PresidioMock> {
           text,
           language: (body.language as string) ?? "",
           entities: body.entities as string[] | undefined,
+          scoreThreshold: body.score_threshold as number | undefined,
         });
         if (text.includes(ERROR_MARKER)) {
           res.statusCode = 503;
@@ -143,7 +145,10 @@ async function startPresidioMock(): Promise<PresidioMock> {
     });
   });
   const port = await pickFreePort();
-  await new Promise<void>((resolve) => server.listen(port, "127.0.0.1", resolve));
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(port, "127.0.0.1", resolve);
+  });
   return {
     baseUrl: `http://127.0.0.1:${port}`,
     analyzeRequests,
@@ -276,21 +281,27 @@ describe("presidio guardrail e2e: block, input/output redaction, operators", () 
       maxRetries: 0,
     });
 
-  test("redact: request PII anonymized before the upstream, response PII before the caller", async (ctx) => {
-    if (!etcdReachable || !app || !upstream || !presidio) {
-      ctx.skip();
-      return;
-    }
-
-    // Propagation probe: once the guardrail is live, the (email-bearing)
-    // mock reply comes back anonymized.
-    await waitConfigPropagation(async () => {
+  // Poll until the replace-operator guardrail is live (the email-bearing
+  // mock reply comes back anonymized), so every test stands alone (no
+  // hidden dependency on execution order). Once propagated, the first
+  // poll returns immediately. The hash-operator test establishes its own
+  // baseline with a full PUT + its own propagation probe.
+  const ensureGuardrailLive = () =>
+    waitConfigPropagation(async () => {
       const r = await client().chat.completions.create({
         model: "presidio-e2e",
         messages: [{ role: "user", content: "probe" }],
       });
       return (r.choices[0]?.message?.content ?? "").includes("<EMAIL_ADDRESS>");
     });
+
+  test("redact: request PII anonymized before the upstream, response PII before the caller", async (ctx) => {
+    if (!etcdReachable || !app || !upstream || !presidio) {
+      ctx.skip();
+      return;
+    }
+
+    await ensureGuardrailLive();
 
     const res = await client().chat.completions.create({
       model: "presidio-e2e",
@@ -313,10 +324,12 @@ describe("presidio guardrail e2e: block, input/output redaction, operators", () 
     expect(lastReq!.body).toContain("about the order");
     expect(lastReq!.body).not.toContain(EMAIL);
 
-    // The analyzer was consulted with the configured language + entities.
+    // The analyzer was consulted with the configured language, entities,
+    // and confidence floor.
     const analyzed = presidio.analyzeRequests.at(-1);
     expect(analyzed?.language).toBe("en");
     expect(analyzed?.entities).toEqual(["EMAIL_ADDRESS", "US_SSN"]);
+    expect(analyzed?.scoreThreshold).toBe(0.5);
   });
 
   test("block: a block-action entity rejects with 422 content_filter, value not echoed", async (ctx) => {
@@ -324,6 +337,7 @@ describe("presidio guardrail e2e: block, input/output redaction, operators", () 
       ctx.skip();
       return;
     }
+    await ensureGuardrailLive();
     const upstreamBefore = upstream.receivedRequests.length;
     let caught: unknown;
     try {
@@ -348,6 +362,7 @@ describe("presidio guardrail e2e: block, input/output redaction, operators", () 
       ctx.skip();
       return;
     }
+    await ensureGuardrailLive();
     const stream = await client().chat.completions.create({
       model: "presidio-stream-e2e",
       messages: [{ role: "user", content: "stream me the contact" }],
@@ -366,6 +381,7 @@ describe("presidio guardrail e2e: block, input/output redaction, operators", () 
       ctx.skip();
       return;
     }
+    await ensureGuardrailLive();
     const before = upstream.receivedRequests.length;
     const res = await client().chat.completions.create({
       model: "presidio-e2e",

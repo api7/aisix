@@ -107,7 +107,10 @@ async function startLakeraMock(): Promise<LakeraMock> {
     });
   });
   const port = await pickFreePort();
-  await new Promise<void>((resolve) => server.listen(port, "127.0.0.1", resolve));
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(port, "127.0.0.1", resolve);
+  });
   return {
     baseUrl: `http://127.0.0.1:${port}`,
     requests,
@@ -196,15 +199,11 @@ describe("lakera guardrail e2e: injection blocks, PII-only masks, 5xx fail-open"
       maxRetries: 0,
     });
 
-  test("injection phrase → 422 content_filter, upstream never called", async (ctx) => {
-    if (!etcdReachable || !app || !upstream || !lakera) {
-      ctx.skip();
-      return;
-    }
-
-    // Gate on the guardrail being live: poll with an injection prompt
-    // until it 422s.
-    await waitConfigPropagation(async () => {
+  // Poll with an injection probe until the guardrail is live, so every
+  // test stands alone (no hidden dependency on execution order). Once
+  // propagated, the first poll returns immediately.
+  const ensureGuardrailLive = () =>
+    waitConfigPropagation(async () => {
       try {
         await client().chat.completions.create({
           model: "lakera-e2e",
@@ -215,6 +214,14 @@ describe("lakera guardrail e2e: injection blocks, PII-only masks, 5xx fail-open"
         return e instanceof APIError && e.status === 422;
       }
     });
+
+  test("injection phrase → 422 content_filter, upstream never called", async (ctx) => {
+    if (!etcdReachable || !app || !upstream || !lakera) {
+      ctx.skip();
+      return;
+    }
+
+    await ensureGuardrailLive();
 
     const upstreamBefore = upstream.receivedRequests.length;
     let caught: unknown;
@@ -247,6 +254,7 @@ describe("lakera guardrail e2e: injection blocks, PII-only masks, 5xx fail-open"
       ctx.skip();
       return;
     }
+    await ensureGuardrailLive();
     const before = upstream.receivedRequests.length;
     const res = await client().chat.completions.create({
       model: "lakera-e2e",
@@ -261,6 +269,7 @@ describe("lakera guardrail e2e: injection blocks, PII-only masks, 5xx fail-open"
       ctx.skip();
       return;
     }
+    await ensureGuardrailLive();
     const res = await client().chat.completions.create({
       model: "lakera-e2e",
       messages: [
@@ -282,6 +291,7 @@ describe("lakera guardrail e2e: injection blocks, PII-only masks, 5xx fail-open"
       ctx.skip();
       return;
     }
+    await ensureGuardrailLive();
     const before = upstream.receivedRequests.length;
     const res = await client().chat.completions.create({
       model: "lakera-e2e",

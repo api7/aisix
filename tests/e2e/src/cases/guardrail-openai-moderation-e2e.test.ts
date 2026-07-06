@@ -85,7 +85,10 @@ async function startModerationMock(): Promise<ModerationMock> {
     });
   });
   const port = await pickFreePort();
-  await new Promise<void>((resolve) => server.listen(port, "127.0.0.1", resolve));
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(port, "127.0.0.1", resolve);
+  });
   return {
     baseUrl: `http://127.0.0.1:${port}`,
     requests,
@@ -195,13 +198,12 @@ describe("openai moderation guardrail e2e: flagged blocks, monitor allows, thres
     return caught;
   };
 
-  test("flagged content → 422 content_filter, upstream never called", async (ctx) => {
-    if (!etcdReachable || !app || !upstream || !moderation) {
-      ctx.skip();
-      return;
-    }
-
-    await waitConfigPropagation(async () => {
+  // Poll with a flagged probe until the block-mode guardrail is live, so
+  // each block-mode test stands alone (no hidden dependency on execution
+  // order). The monitor/threshold tests establish their own baseline with
+  // a full PUT + their own propagation probe instead.
+  const ensureGuardrailLive = () =>
+    waitConfigPropagation(async () => {
       try {
         await client().chat.completions.create({
           model: "moderation-e2e",
@@ -212,6 +214,14 @@ describe("openai moderation guardrail e2e: flagged blocks, monitor allows, thres
         return e instanceof APIError && e.status === 422;
       }
     });
+
+  test("flagged content → 422 content_filter, upstream never called", async (ctx) => {
+    if (!etcdReachable || !app || !upstream || !moderation) {
+      ctx.skip();
+      return;
+    }
+
+    await ensureGuardrailLive();
 
     const upstreamBefore = upstream.receivedRequests.length;
     const err = await expect422(`please describe ${RISKY_MARKER} violence`);
@@ -230,6 +240,7 @@ describe("openai moderation guardrail e2e: flagged blocks, monitor allows, thres
       ctx.skip();
       return;
     }
+    await ensureGuardrailLive();
     const before = upstream.receivedRequests.length;
     const res = await client().chat.completions.create({
       model: "moderation-e2e",
@@ -244,6 +255,7 @@ describe("openai moderation guardrail e2e: flagged blocks, monitor allows, thres
       ctx.skip();
       return;
     }
+    await ensureGuardrailLive();
     const before = upstream.receivedRequests.length;
     const res = await client().chat.completions.create({
       model: "moderation-e2e",

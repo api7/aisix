@@ -456,9 +456,9 @@ pub struct BedrockConfig {
 /// the offsets Lakera returns and lets the request continue (LiteLLM
 /// `lakera_ai_v2` behavior).
 ///
-/// The CP (cp-api) decrypts the envelope-encrypted `api_key` at kine-
-/// projection time so the DP always holds plaintext in memory. The key
-/// is never logged.
+/// The `api_key` is stored encrypted and decrypted only when the
+/// configuration is applied; the plaintext is held in memory only and is
+/// never logged.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct LakeraConfig {
@@ -508,9 +508,9 @@ pub struct LakeraConfig {
 /// result is flagged. Detection-only — it never rewrites content.
 /// Monitor-before-enforce comes from the row's `enforcement_mode`.
 ///
-/// The CP (cp-api) decrypts the envelope-encrypted `api_key` at kine-
-/// projection time so the DP always holds plaintext in memory. The key
-/// is never logged.
+/// The `api_key` is stored encrypted and decrypted only when the
+/// configuration is applied; the plaintext is held in memory only and is
+/// never logged.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct OpenaiModerationConfig {

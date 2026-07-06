@@ -363,6 +363,17 @@ fn build_one_inner(
             // #52: HTTP-based /moderations dispatcher. cp-api already
             // decrypted the api_key at projection time; the config carries
             // plaintext. Endpoint is per-row (default api.openai.com/v1).
+            // Moderation scores are 0..=1; a threshold outside that range
+            // can never (or always) fire, so reject the row rather than
+            // silently running a policy the operator didn't intend.
+            for (category, threshold) in &cfg.category_thresholds {
+                if !(0.0..=1.0).contains(threshold) {
+                    return Err(BuildError::InvalidValue {
+                        field: "category_thresholds",
+                        value: format!("{category}={threshold}"),
+                    });
+                }
+            }
             let g = crate::openai_moderation::OpenaiModerationGuardrail::new(
                 row.name.clone(),
                 cfg,
@@ -1309,6 +1320,29 @@ mod tests {
         assert_eq!(chain.len(), 1);
         let v = chain.check_input(&req("ok")).await;
         assert!(v.is_block());
+    }
+
+    /// #52: an openai_moderation row with a category threshold outside
+    /// 0..=1 is rejected at build time (moderation scores are 0..=1, so
+    /// such a threshold can never — or always — fire).
+    #[cfg(feature = "openai-moderation")]
+    #[tokio::test]
+    async fn openai_moderation_out_of_range_threshold_skips_row() {
+        let table: ResourceTable<DomainGuardrail> = ResourceTable::default();
+        table.insert(entry(
+            "bad-threshold",
+            "g-1",
+            parse(
+                r#"{
+                    "name": "bad-threshold",
+                    "kind": "openai_moderation",
+                    "api_key": "sk-x",
+                    "category_thresholds": { "violence": 1.5 }
+                }"#,
+            ),
+        ));
+        let chain = build_chain_from_snapshot(&table, None);
+        assert_eq!(chain.len(), 0, "out-of-range threshold row must be skipped");
     }
 
     /// Phase 2 contract: kind=bedrock rows materialise into the
