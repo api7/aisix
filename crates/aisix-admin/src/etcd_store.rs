@@ -20,7 +20,7 @@
 
 use aisix_core::resource::ResourceEntry;
 use aisix_core::{
-    ApiKey, CachePolicy, Guardrail, McpServer, Model, ObservabilityExporter, ProviderKey,
+    A2aAgent, ApiKey, CachePolicy, Guardrail, McpServer, Model, ObservabilityExporter, ProviderKey,
 };
 use etcd_client::{Client, DeleteOptions, GetOptions};
 use serde::de::DeserializeOwned;
@@ -38,6 +38,7 @@ pub const GUARDRAILS_SUBKEY: &str = "guardrails";
 pub const CACHE_POLICIES_SUBKEY: &str = "cache_policies";
 pub const OBSERVABILITY_EXPORTERS_SUBKEY: &str = "observability_exporters";
 pub const MCP_SERVERS_SUBKEY: &str = "mcp_servers";
+pub const A2A_AGENTS_SUBKEY: &str = "a2a_agents";
 
 pub struct EtcdConfigStore {
     client: Mutex<Client>,
@@ -364,6 +365,32 @@ impl ConfigStore for EtcdConfigStore {
 
     async fn delete_mcp_server(&self, id: &str) -> Result<bool, StoreError> {
         self.delete_one(&self.key_for(MCP_SERVERS_SUBKEY, id)).await
+    }
+
+    async fn put_a2a_agent(&self, entry: ResourceEntry<A2aAgent>) -> Result<(), StoreError> {
+        let key = self.key_for(A2A_AGENTS_SUBKEY, &entry.id);
+        self.put_json(&key, &entry.value).await
+    }
+
+    async fn get_a2a_agent(&self, id: &str) -> Result<Option<ResourceEntry<A2aAgent>>, StoreError> {
+        let key = self.key_for(A2A_AGENTS_SUBKEY, id);
+        Ok(self
+            .get_one::<A2aAgent>(&key)
+            .await?
+            .map(|(v, rev)| ResourceEntry::new(id, v, rev)))
+    }
+
+    async fn list_a2a_agents(&self) -> Result<Vec<ResourceEntry<A2aAgent>>, StoreError> {
+        Ok(self
+            .list_range::<A2aAgent>(A2A_AGENTS_SUBKEY)
+            .await?
+            .into_iter()
+            .map(|(id, v, rev)| ResourceEntry::new(id, v, rev))
+            .collect())
+    }
+
+    async fn delete_a2a_agent(&self, id: &str) -> Result<bool, StoreError> {
+        self.delete_one(&self.key_for(A2A_AGENTS_SUBKEY, id)).await
     }
 }
 

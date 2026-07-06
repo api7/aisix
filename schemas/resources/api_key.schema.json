@@ -73,6 +73,16 @@
     }
   },
   "properties": {
+    "allowed_agents": {
+      "description": "A2A agents this key may reach, named by their registered names. Entries are matched as single-`*` globs, mirroring `allowed_tools`: `\"*\"` grants every agent and an entry without a `*` matches one agent exactly. When omitted or set to `null`, the key has no A2A agent access — access is granted explicitly.",
+      "items": {
+        "type": "string"
+      },
+      "type": [
+        "array",
+        "null"
+      ]
+    },
     "allowed_models": {
       "description": "Model identifiers this key may use. An empty array denies access to every model.",
       "items": {

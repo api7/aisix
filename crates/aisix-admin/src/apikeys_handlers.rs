@@ -36,6 +36,10 @@ struct StandaloneApiKeyBody {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     allowed_tools: Option<Vec<String>>,
+    /// A2A agents this key may reach (by registered name, or `"*"`).
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    allowed_agents: Option<Vec<String>>,
     /// RFC 3339 timestamp after which the key stops authenticating.
     /// Omitted or `null` means the key never expires.
     #[serde(default)]
@@ -57,6 +61,8 @@ pub struct PublicApiKey {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allowed_tools: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_agents: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub disabled: bool,
@@ -69,6 +75,7 @@ impl From<ApiKey> for PublicApiKey {
             allowed_models: value.allowed_models,
             rate_limit: value.rate_limit,
             allowed_tools: value.allowed_tools,
+            allowed_agents: value.allowed_agents,
             expires_at: value.expires_at,
             disabled: value.disabled,
         }

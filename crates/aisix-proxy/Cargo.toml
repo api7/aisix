@@ -9,6 +9,7 @@ authors.workspace = true
 description = "aisix: /v1/* proxy router (OpenAI-compatible) + middleware + hooks"
 
 [dependencies]
+aisix-a2a = { path = "../aisix-a2a" }
 aisix-core = { path = "../aisix-core" }
 aisix-gateway = { path = "../aisix-gateway" }
 # Mounts the downstream-facing `/mcp` MCP gateway endpoint (mcp.rs): the
