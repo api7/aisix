@@ -35,6 +35,14 @@
 //!     guardrail (`TextModerationPlus` on `green-cip.<region>.aliyuncs.com`).
 //!     Risk-level moderation on input (`llm_query_moderation`) and output
 //!     (`llm_response_moderation`). #603.
+//!   * `pii` — in-process sensitive-data detection + redaction
+//!     (built-in detectors + custom regex, `mask`/`block`). #932.
+//!   * `lakera` — calls Lakera Guard `/v2/guard`; injection/jailbreak
+//!     blocks, PII-only detections mask via returned offsets. #52.
+//!   * `openai_moderation` — calls the OpenAI Moderation API;
+//!     detection-only block. #52.
+//!   * `presidio` — self-hosted Presidio analyze→anonymize; per-entity
+//!     `mask`/`block` + selectable anonymize operator. #52.
 //!
 //! See `aisix-guardrails/src/keyword.rs` for the runtime semantics
 //! the snapshot is parsed into.
@@ -440,9 +448,212 @@ pub struct BedrockConfig {
     pub output_fail_open: bool,
 }
 
+/// Config block for `kind: "lakera"` (#52). Calls Lakera Guard
+/// (`POST {endpoint}/v2/guard`) with the conversation text and translates
+/// the screening result into a verdict: `flagged` with any non-PII
+/// detector (prompt injection, jailbreak, moderated content) blocks;
+/// `flagged` with ONLY `pii/*` detectors masks the detected spans using
+/// the offsets Lakera returns and lets the request continue (LiteLLM
+/// `lakera_ai_v2` behavior).
+///
+/// The CP (cp-api) decrypts the envelope-encrypted `api_key` at kine-
+/// projection time so the DP always holds plaintext in memory. The key
+/// is never logged.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LakeraConfig {
+    /// Lakera API key sent as a `Authorization: Bearer` header. Decrypted
+    /// before projection. Plaintext is held in memory only and is not logged.
+    #[schemars(length(min = 1))]
+    pub api_key: String,
+    /// Endpoint override, e.g. a regional or self-hosted Lakera deployment.
+    /// The data plane appends `/v2/guard`. Defaults to `https://api.lakera.ai`.
+    #[serde(default)]
+    #[schemars(length(min = 1))]
+    pub endpoint: Option<String>,
+    /// Lakera project whose policy applies (`project-...`). Omitted → the
+    /// account's default policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
+    pub project_id: Option<String>,
+    /// HTTP call timeout in milliseconds. `fail_open` and `output_fail_open`
+    /// govern the verdict when it elapses. A value of `0` triggers the timeout
+    /// immediately.
+    #[serde(default = "default_acs_timeout_ms")]
+    #[schemars(range(max = 4_294_967_295u32))]
+    pub timeout_ms: u32,
+    /// Fail-open policy for the output hook. When disabled (the default), a
+    /// Lakera outage blocks model output instead of releasing unscanned content.
+    /// The input hook continues to use the top-level `fail_open` policy.
+    #[serde(default)]
+    pub output_fail_open: bool,
+
+    // --- streaming-output controls (consumed by aisix-proxy) ---
+    // Masking a streamed response requires the whole response held back
+    // (a masked span can cross any chunk boundary), so kind=lakera always
+    // uses the buffer_full policy on the output hook, like kind=pii.
+    /// Max bytes buffered for a streamed response before `on_buffer_exceeded` applies.
+    #[serde(default = "default_acs_max_buffer_bytes")]
+    #[schemars(range(min = 1))]
+    pub max_buffer_bytes: u64,
+    /// Buffer-overflow policy. Use `fail_open` to release output unscanned
+    /// when the buffer cap is hit; the default `fail_closed` blocks the
+    /// response instead.
+    #[serde(default = "default_acs_on_buffer_exceeded")]
+    pub on_buffer_exceeded: String,
+}
+
+/// Config block for `kind: "openai_moderation"` (#52). Calls the OpenAI
+/// Moderation API (`POST {endpoint}/moderations`, free) and blocks when the
+/// result is flagged. Detection-only — it never rewrites content.
+/// Monitor-before-enforce comes from the row's `enforcement_mode`.
+///
+/// The CP (cp-api) decrypts the envelope-encrypted `api_key` at kine-
+/// projection time so the DP always holds plaintext in memory. The key
+/// is never logged.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct OpenaiModerationConfig {
+    /// OpenAI API key sent as a `Authorization: Bearer` header. Decrypted
+    /// before projection. Plaintext is held in memory only and is not logged.
+    #[schemars(length(min = 1))]
+    pub api_key: String,
+    /// Endpoint override (an Azure OpenAI deployment or a mock). The data
+    /// plane appends `/moderations`. Defaults to `https://api.openai.com/v1`.
+    #[serde(default)]
+    #[schemars(length(min = 1))]
+    pub endpoint: Option<String>,
+    /// Moderation model. `omni-moderation-latest` (default) or
+    /// `text-moderation-latest`.
+    #[serde(default = "default_openai_moderation_model")]
+    #[schemars(length(min = 1))]
+    pub model: String,
+    /// Per-category score thresholds, e.g. `{"violence": 0.5}`. When set,
+    /// only the listed categories are enforced and a category blocks when
+    /// its score reaches the threshold. When empty (the default), the API's
+    /// own `flagged` boolean decides — the LiteLLM `openai_moderation`
+    /// baseline behavior.
+    #[serde(default)]
+    pub category_thresholds: std::collections::BTreeMap<String, f64>,
+    /// HTTP call timeout in milliseconds. `fail_open` and `output_fail_open`
+    /// govern the verdict when it elapses. A value of `0` triggers the timeout
+    /// immediately.
+    #[serde(default = "default_acs_timeout_ms")]
+    #[schemars(range(max = 4_294_967_295u32))]
+    pub timeout_ms: u32,
+    /// Fail-open policy for the output hook. When disabled (the default), an
+    /// OpenAI outage blocks model output instead of releasing unscanned content.
+    /// The input hook continues to use the top-level `fail_open` policy.
+    #[serde(default)]
+    pub output_fail_open: bool,
+}
+
+fn default_openai_moderation_model() -> String {
+    "omni-moderation-latest".to_owned()
+}
+
+/// One entity selection for `kind: "presidio"`. The `type` names a Presidio
+/// entity (`EMAIL_ADDRESS`, `PHONE_NUMBER`, `PERSON`, `CREDIT_CARD`, …);
+/// `action` optionally overrides the guardrail-level `default_action` for
+/// this entity only — the same per-detector shape as `kind: "pii"`.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PresidioEntityConfig {
+    /// Presidio entity type, e.g. `EMAIL_ADDRESS`, `PERSON`, `US_SSN`.
+    #[serde(rename = "type")]
+    #[schemars(length(min = 1))]
+    pub entity_type: String,
+    /// Per-entity action override: `mask` or `block`. Falls back to the
+    /// guardrail's `default_action` when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+}
+
+/// Config block for `kind: "presidio"` (#52). Self-hosted Microsoft
+/// Presidio PII detection + anonymization: `POST {analyzer_url}/analyze`
+/// finds entities; when the effective action is `mask`,
+/// `POST {anonymizer_url}/anonymize` rewrites the text and the request/
+/// response continues; `block` rejects with the standard 422
+/// content-filter envelope.
+///
+/// vs. the built-in `kind: "pii"`: Presidio adds NER/ML entities a regex
+/// cannot express (`PERSON`, `LOCATION`, `NRP`, …), a self-hosted
+/// compliance posture, and selectable anonymize operators (`replace`,
+/// `mask`, `hash`, `redact`). No vendor secret — both URLs point at
+/// customer-run containers.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PresidioConfig {
+    /// Presidio analyzer base URL, e.g. `http://presidio-analyzer:3000`.
+    /// The data plane appends `/analyze`.
+    #[schemars(length(min = 1))]
+    pub analyzer_url: String,
+    /// Presidio anonymizer base URL, e.g. `http://presidio-anonymizer:3000`.
+    /// The data plane appends `/anonymize`. Only called when a detected
+    /// entity's effective action is `mask`.
+    #[schemars(length(min = 1))]
+    pub anonymizer_url: String,
+    /// Entities to detect. Empty (the default) analyzes with Presidio's
+    /// full recognizer set and applies `default_action` to every hit.
+    #[serde(default)]
+    pub entities: Vec<PresidioEntityConfig>,
+    /// Action for entities that don't set their own: `mask` (default) or
+    /// `block`.
+    #[serde(default = "default_pii_action")]
+    pub default_action: String,
+    /// Anonymize operator applied to masked entities: `replace` (default —
+    /// Presidio substitutes `<ENTITY_TYPE>`), `mask` (asterisks), `hash`
+    /// (SHA-256 hex), or `redact` (span removed).
+    #[serde(default = "default_presidio_operator")]
+    pub operator: String,
+    /// Analyzer language code.
+    #[serde(default = "default_presidio_language")]
+    #[schemars(length(min = 1))]
+    pub language: String,
+    /// Minimum analyzer confidence for a hit to count. Omitted → every
+    /// result the analyzer returns counts (Presidio's own per-recognizer
+    /// defaults apply).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 0.0, max = 1.0))]
+    pub score_threshold: Option<f64>,
+    /// HTTP call timeout in milliseconds, applied per analyzer/anonymizer
+    /// call. `fail_open` and `output_fail_open` govern the verdict when it
+    /// elapses. A value of `0` triggers the timeout immediately.
+    #[serde(default = "default_acs_timeout_ms")]
+    #[schemars(range(max = 4_294_967_295u32))]
+    pub timeout_ms: u32,
+    /// Fail-open policy for the output hook. When disabled (the default), a
+    /// Presidio outage blocks model output instead of releasing unscanned content.
+    /// The input hook continues to use the top-level `fail_open` policy.
+    #[serde(default)]
+    pub output_fail_open: bool,
+
+    // --- streaming-output controls (consumed by aisix-proxy) ---
+    // Masking a streamed response requires the whole response held back,
+    // so kind=presidio always uses the buffer_full policy on the output
+    // hook, like kind=pii.
+    /// Max bytes buffered for a streamed response before `on_buffer_exceeded` applies.
+    #[serde(default = "default_acs_max_buffer_bytes")]
+    #[schemars(range(min = 1))]
+    pub max_buffer_bytes: u64,
+    /// Buffer-overflow policy. Use `fail_open` to release output unscanned
+    /// (and unmasked) when the buffer cap is hit; the default `fail_closed`
+    /// blocks the response instead.
+    #[serde(default = "default_acs_on_buffer_exceeded")]
+    pub on_buffer_exceeded: String,
+}
+
+fn default_presidio_operator() -> String {
+    "replace".to_owned()
+}
+
+fn default_presidio_language() -> String {
+    "en".to_owned()
+}
+
 /// Provider discriminator. The kind drives which `*_config` block is
 /// expected. Serde's `tag = "kind"` keeps us honest at parse time.
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum GuardrailKind {
     /// In-process literal/regex blocklist. Always available.
@@ -465,6 +676,20 @@ pub enum GuardrailKind {
     /// detectors + custom regex, per-detector `mask`/`block` actions, on
     /// input and/or output, including streaming output. Always available.
     Pii(PiiConfig),
+    /// Lakera Guard screening via `POST /v2/guard` (#52): prompt-injection /
+    /// jailbreak / content detection blocks; PII-only detections mask via
+    /// the returned offsets, on input and/or output, including streaming
+    /// output.
+    Lakera(LakeraConfig),
+    /// OpenAI Moderation API (#52): category content moderation via
+    /// `POST /moderations`, detection-only (block, never rewrite), on input
+    /// and/or output, including streaming output.
+    OpenaiModeration(OpenaiModerationConfig),
+    /// Self-hosted Microsoft Presidio PII detection + anonymization (#52):
+    /// analyzer entities with per-entity `mask`/`block` actions and a
+    /// selectable anonymize operator, on input and/or output, including
+    /// streaming output.
+    Presidio(PresidioConfig),
 }
 
 impl GuardrailKind {
@@ -480,6 +705,9 @@ impl GuardrailKind {
             }
             GuardrailKind::AliyunTextModeration(_) => "aliyun_text_moderation",
             GuardrailKind::Pii(_) => "pii",
+            GuardrailKind::Lakera(_) => "lakera",
+            GuardrailKind::OpenaiModeration(_) => "openai_moderation",
+            GuardrailKind::Presidio(_) => "presidio",
         }
     }
 }
@@ -507,7 +735,7 @@ pub struct AppliedGuardrail {
 }
 
 /// Content policy evaluated before or after upstream calls.
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
 pub struct Guardrail {
     /// Operator-facing name that surfaces in metric labels and error reasons.
     #[schemars(length(min = 1))]

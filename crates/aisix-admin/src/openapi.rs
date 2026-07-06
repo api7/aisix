@@ -4083,6 +4083,9 @@ fn add_variant_titles(doc: &mut Value) {
                 "Azure AI Content Safety Text Moderation",
                 "Aliyun Text Moderation",
                 "PII Detection & Redaction",
+                "Lakera Guard",
+                "OpenAI Moderation",
+                "Microsoft Presidio",
             ],
         ),
         (
@@ -4210,6 +4213,18 @@ fn add_missing_property_descriptions(doc: &mut Value) {
         (
             "/components/schemas/Guardrail/oneOf/5/properties/kind",
             "Guardrail provider type. Use `pii` for in-process sensitive-data detection and redaction.",
+        ),
+        (
+            "/components/schemas/Guardrail/oneOf/6/properties/kind",
+            "Guardrail provider type. Use `lakera` for Lakera Guard screening.",
+        ),
+        (
+            "/components/schemas/Guardrail/oneOf/7/properties/kind",
+            "Guardrail provider type. Use `openai_moderation` for the OpenAI Moderation API.",
+        ),
+        (
+            "/components/schemas/Guardrail/oneOf/8/properties/kind",
+            "Guardrail provider type. Use `presidio` for self-hosted Microsoft Presidio PII detection and anonymization.",
         ),
         (
             "/components/schemas/KeywordPattern/oneOf/0/properties/kind",

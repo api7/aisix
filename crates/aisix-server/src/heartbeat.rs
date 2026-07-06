@@ -646,6 +646,9 @@ mod tests {
                 "azure_content_safety_text_moderation",
                 "aliyun_text_moderation",
                 "bedrock",
+                "lakera",
+                "openai_moderation",
+                "presidio",
             ]),
         );
 

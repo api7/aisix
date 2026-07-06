@@ -26,7 +26,13 @@ mod build;
 mod chain;
 mod index;
 mod keyword;
+#[cfg(feature = "lakera")]
+mod lakera;
+#[cfg(feature = "openai-moderation")]
+mod openai_moderation;
 mod pii;
+#[cfg(feature = "presidio")]
+mod presidio;
 #[cfg(feature = "azure-content-safety")]
 mod prompt_shield;
 #[cfg(feature = "azure-content-safety")]
@@ -82,6 +88,12 @@ pub fn supported_kinds() -> &'static [&'static str] {
         "aliyun_text_moderation",
         #[cfg(feature = "bedrock")]
         "bedrock",
+        #[cfg(feature = "lakera")]
+        "lakera",
+        #[cfg(feature = "openai-moderation")]
+        "openai_moderation",
+        #[cfg(feature = "presidio")]
+        "presidio",
     ]
 }
 
@@ -95,7 +107,13 @@ pub use build::{
 pub use chain::GuardrailChain;
 pub use index::{GuardrailIndex, RequestContext};
 pub use keyword::{KeywordBlocklist, KeywordRule};
+#[cfg(feature = "lakera")]
+pub use lakera::LakeraGuardrail;
+#[cfg(feature = "openai-moderation")]
+pub use openai_moderation::OpenaiModerationGuardrail;
 pub use pii::{builtin_rule, PiiAction, PiiGuardrail, PiiRule, BUILTIN_DETECTORS};
+#[cfg(feature = "presidio")]
+pub use presidio::PresidioGuardrail;
 #[cfg(feature = "azure-content-safety")]
 pub use prompt_shield::PromptShieldGuardrail;
 #[cfg(feature = "azure-content-safety")]
@@ -547,7 +565,10 @@ mod tests {
     #[cfg(all(
         feature = "bedrock",
         feature = "azure-content-safety",
-        feature = "aliyun-text-moderation"
+        feature = "aliyun-text-moderation",
+        feature = "lakera",
+        feature = "openai-moderation",
+        feature = "presidio"
     ))]
     #[test]
     fn supported_kinds_matches_kind_str_under_default_features() {
@@ -560,6 +581,9 @@ mod tests {
                 "azure_content_safety_text_moderation",
                 "aliyun_text_moderation",
                 "bedrock",
+                "lakera",
+                "openai_moderation",
+                "presidio",
             ],
         );
         for kind in supported_kinds() {
@@ -598,6 +622,19 @@ mod tests {
                     "region": "us-east-1",
                     "aws_credentials": {"kind": "static", "access_key_id": "ak", "secret_access_key": "sk"},
                     "latency_mode": {"kind": "serial"},
+                }),
+                "lakera" => serde_json::json!({
+                    "kind": "lakera",
+                    "api_key": "lk",
+                }),
+                "openai_moderation" => serde_json::json!({
+                    "kind": "openai_moderation",
+                    "api_key": "sk",
+                }),
+                "presidio" => serde_json::json!({
+                    "kind": "presidio",
+                    "analyzer_url": "http://analyzer:3000",
+                    "anonymizer_url": "http://anonymizer:3000",
                 }),
                 other => panic!("no parse fixture for kind {other:?}"),
             };

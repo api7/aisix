@@ -193,6 +193,25 @@
         "type"
       ],
       "type": "object"
+    },
+    "PresidioEntityConfig": {
+      "additionalProperties": false,
+      "description": "One entity selection for `kind: \"presidio\"`. The `type` names a Presidio entity (`EMAIL_ADDRESS`, `PHONE_NUMBER`, `PERSON`, `CREDIT_CARD`, …); `action` optionally overrides the guardrail-level `default_action` for this entity only — the same per-detector shape as `kind: \"pii\"`.",
+      "properties": {
+        "action": {
+          "description": "Per-entity action override: `mask` or `block`. Falls back to the guardrail's `default_action` when omitted.",
+          "type": "string"
+        },
+        "type": {
+          "description": "Presidio entity type, e.g. `EMAIL_ADDRESS`, `PERSON`, `US_SSN`.",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
     }
   },
   "description": "Content policy evaluated before or after upstream calls.",
@@ -612,6 +631,201 @@
         }
       },
       "required": [
+        "kind"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "Lakera Guard screening via `POST /v2/guard` (#52): prompt-injection / jailbreak / content detection blocks; PII-only detections mask via the returned offsets, on input and/or output, including streaming output.",
+      "properties": {
+        "api_key": {
+          "description": "Lakera API key sent as a `Authorization: Bearer` header. Decrypted before projection. Plaintext is held in memory only and is not logged.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "endpoint": {
+          "default": null,
+          "description": "Endpoint override, e.g. a regional or self-hosted Lakera deployment. The data plane appends `/v2/guard`. Defaults to `https://api.lakera.ai`.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "lakera"
+          ],
+          "type": "string"
+        },
+        "max_buffer_bytes": {
+          "default": 262144,
+          "description": "Max bytes buffered for a streamed response before `on_buffer_exceeded` applies.",
+          "format": "uint64",
+          "minimum": 1.0,
+          "type": "integer"
+        },
+        "on_buffer_exceeded": {
+          "default": "fail_closed",
+          "description": "Buffer-overflow policy. Use `fail_open` to release output unscanned when the buffer cap is hit; the default `fail_closed` blocks the response instead.",
+          "type": "string"
+        },
+        "output_fail_open": {
+          "default": false,
+          "description": "Fail-open policy for the output hook. When disabled (the default), a Lakera outage blocks model output instead of releasing unscanned content. The input hook continues to use the top-level `fail_open` policy.",
+          "type": "boolean"
+        },
+        "project_id": {
+          "description": "Lakera project whose policy applies (`project-...`). Omitted → the account's default policy.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "timeout_ms": {
+          "default": 5000,
+          "description": "HTTP call timeout in milliseconds. `fail_open` and `output_fail_open` govern the verdict when it elapses. A value of `0` triggers the timeout immediately.",
+          "format": "uint32",
+          "maximum": 4294967295.0,
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "api_key",
+        "kind"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "OpenAI Moderation API (#52): category content moderation via `POST /moderations`, detection-only (block, never rewrite), on input and/or output, including streaming output.",
+      "properties": {
+        "api_key": {
+          "description": "OpenAI API key sent as a `Authorization: Bearer` header. Decrypted before projection. Plaintext is held in memory only and is not logged.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "category_thresholds": {
+          "additionalProperties": {
+            "format": "double",
+            "type": "number"
+          },
+          "default": {},
+          "description": "Per-category score thresholds, e.g. `{\"violence\": 0.5}`. When set, only the listed categories are enforced and a category blocks when its score reaches the threshold. When empty (the default), the API's own `flagged` boolean decides — the LiteLLM `openai_moderation` baseline behavior.",
+          "type": "object"
+        },
+        "endpoint": {
+          "default": null,
+          "description": "Endpoint override (an Azure OpenAI deployment or a mock). The data plane appends `/moderations`. Defaults to `https://api.openai.com/v1`.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "openai_moderation"
+          ],
+          "type": "string"
+        },
+        "model": {
+          "default": "omni-moderation-latest",
+          "description": "Moderation model. `omni-moderation-latest` (default) or `text-moderation-latest`.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "output_fail_open": {
+          "default": false,
+          "description": "Fail-open policy for the output hook. When disabled (the default), an OpenAI outage blocks model output instead of releasing unscanned content. The input hook continues to use the top-level `fail_open` policy.",
+          "type": "boolean"
+        },
+        "timeout_ms": {
+          "default": 5000,
+          "description": "HTTP call timeout in milliseconds. `fail_open` and `output_fail_open` govern the verdict when it elapses. A value of `0` triggers the timeout immediately.",
+          "format": "uint32",
+          "maximum": 4294967295.0,
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "api_key",
+        "kind"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "Self-hosted Microsoft Presidio PII detection + anonymization (#52): analyzer entities with per-entity `mask`/`block` actions and a selectable anonymize operator, on input and/or output, including streaming output.",
+      "properties": {
+        "analyzer_url": {
+          "description": "Presidio analyzer base URL, e.g. `http://presidio-analyzer:3000`. The data plane appends `/analyze`.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "anonymizer_url": {
+          "description": "Presidio anonymizer base URL, e.g. `http://presidio-anonymizer:3000`. The data plane appends `/anonymize`. Only called when a detected entity's effective action is `mask`.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "default_action": {
+          "default": "mask",
+          "description": "Action for entities that don't set their own: `mask` (default) or `block`.",
+          "type": "string"
+        },
+        "entities": {
+          "default": [],
+          "description": "Entities to detect. Empty (the default) analyzes with Presidio's full recognizer set and applies `default_action` to every hit.",
+          "items": {
+            "$ref": "#/definitions/PresidioEntityConfig"
+          },
+          "type": "array"
+        },
+        "kind": {
+          "enum": [
+            "presidio"
+          ],
+          "type": "string"
+        },
+        "language": {
+          "default": "en",
+          "description": "Analyzer language code.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "max_buffer_bytes": {
+          "default": 262144,
+          "description": "Max bytes buffered for a streamed response before `on_buffer_exceeded` applies.",
+          "format": "uint64",
+          "minimum": 1.0,
+          "type": "integer"
+        },
+        "on_buffer_exceeded": {
+          "default": "fail_closed",
+          "description": "Buffer-overflow policy. Use `fail_open` to release output unscanned (and unmasked) when the buffer cap is hit; the default `fail_closed` blocks the response instead.",
+          "type": "string"
+        },
+        "operator": {
+          "default": "replace",
+          "description": "Anonymize operator applied to masked entities: `replace` (default — Presidio substitutes `<ENTITY_TYPE>`), `mask` (asterisks), `hash` (SHA-256 hex), or `redact` (span removed).",
+          "type": "string"
+        },
+        "output_fail_open": {
+          "default": false,
+          "description": "Fail-open policy for the output hook. When disabled (the default), a Presidio outage blocks model output instead of releasing unscanned content. The input hook continues to use the top-level `fail_open` policy.",
+          "type": "boolean"
+        },
+        "score_threshold": {
+          "description": "Minimum analyzer confidence for a hit to count. Omitted → every result the analyzer returns counts (Presidio's own per-recognizer defaults apply).",
+          "format": "double",
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "type": "number"
+        },
+        "timeout_ms": {
+          "default": 5000,
+          "description": "HTTP call timeout in milliseconds, applied per analyzer/anonymizer call. `fail_open` and `output_fail_open` govern the verdict when it elapses. A value of `0` triggers the timeout immediately.",
+          "format": "uint32",
+          "maximum": 4294967295.0,
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "analyzer_url",
+        "anonymizer_url",
         "kind"
       ],
       "type": "object"

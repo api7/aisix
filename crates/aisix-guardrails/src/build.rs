@@ -342,6 +342,77 @@ fn build_one_inner(
         GuardrailKind::AliyunTextModeration(_) => {
             Err(BuildError::FeatureDisabled("aliyun-text-moderation"))
         }
+        #[cfg(feature = "lakera")]
+        GuardrailKind::Lakera(cfg) => {
+            // #52: HTTP-based /v2/guard dispatcher. cp-api already decrypted
+            // the api_key at projection time; the config carries plaintext.
+            // Endpoint is per-row (default api.lakera.ai, overridable for
+            // regional/self-hosted deployments and tests).
+            let g = crate::lakera::LakeraGuardrail::new(
+                row.name.clone(),
+                cfg,
+                row.hook_point,
+                row.fail_open,
+            );
+            Ok(Some(Arc::new(g)))
+        }
+        #[cfg(not(feature = "lakera"))]
+        GuardrailKind::Lakera(_) => Err(BuildError::FeatureDisabled("lakera")),
+        #[cfg(feature = "openai-moderation")]
+        GuardrailKind::OpenaiModeration(cfg) => {
+            // #52: HTTP-based /moderations dispatcher. cp-api already
+            // decrypted the api_key at projection time; the config carries
+            // plaintext. Endpoint is per-row (default api.openai.com/v1).
+            let g = crate::openai_moderation::OpenaiModerationGuardrail::new(
+                row.name.clone(),
+                cfg,
+                row.hook_point,
+                row.fail_open,
+            );
+            Ok(Some(Arc::new(g)))
+        }
+        #[cfg(not(feature = "openai-moderation"))]
+        GuardrailKind::OpenaiModeration(_) => Err(BuildError::FeatureDisabled("openai-moderation")),
+        #[cfg(feature = "presidio")]
+        GuardrailKind::Presidio(cfg) => {
+            // #52: analyze→anonymize dispatcher against customer-run
+            // Presidio containers (no vendor secret). The enum-ish fields
+            // (`default_action`, per-entity actions, `operator`) are
+            // resolved here so a typo can't silently weaken the policy.
+            let default_action =
+                PiiAction::parse(&cfg.default_action).ok_or_else(|| BuildError::InvalidValue {
+                    field: "default_action",
+                    value: cfg.default_action.clone(),
+                })?;
+            let mut entity_actions = std::collections::BTreeMap::new();
+            for e in &cfg.entities {
+                if let Some(s) = e.action.as_deref() {
+                    let action = PiiAction::parse(s).ok_or_else(|| BuildError::InvalidValue {
+                        field: "entities[].action",
+                        value: s.to_owned(),
+                    })?;
+                    entity_actions.insert(e.entity_type.to_uppercase(), action);
+                }
+            }
+            let anonymizers = crate::presidio::operator_config(&cfg.operator).ok_or_else(|| {
+                BuildError::InvalidValue {
+                    field: "operator",
+                    value: cfg.operator.clone(),
+                }
+            })?;
+            let g = crate::presidio::PresidioGuardrail::new(
+                row.name.clone(),
+                cfg,
+                row.hook_point,
+                row.fail_open,
+                default_action,
+                entity_actions,
+                anonymizers,
+            );
+            Ok(Some(Arc::new(g)))
+        }
+        #[cfg(not(feature = "presidio"))]
+        GuardrailKind::Presidio(_) => Err(BuildError::FeatureDisabled("presidio")),
     }
 }
 

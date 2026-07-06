@@ -45,7 +45,14 @@ chrono = { workspace = true, optional = true }
 uuid = { workspace = true, optional = true }
 
 [features]
-default = ["bedrock", "azure-content-safety", "aliyun-text-moderation"]
+default = [
+    "bedrock",
+    "azure-content-safety",
+    "aliyun-text-moderation",
+    "lakera",
+    "openai-moderation",
+    "presidio",
+]
 bedrock = [
     "dep:aws-config",
     "dep:aws-sdk-bedrockruntime",
@@ -62,6 +69,11 @@ aliyun-text-moderation = [
     "dep:chrono",
     "dep:uuid",
 ]
+# kind=lakera / kind=openai_moderation / kind=presidio guardrails (#52).
+# Plain HTTP dispatchers over the shared reqwest client.
+lakera = ["dep:reqwest"]
+openai-moderation = ["dep:reqwest"]
+presidio = ["dep:reqwest"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }
