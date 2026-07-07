@@ -26,7 +26,7 @@ use std::sync::OnceLock;
 
 use axum::http::header;
 use axum::response::{Html, IntoResponse, Response};
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 
 /// Paths + OpenAPI-specific wrapper schemas (`ModelEntry`,
 /// `ApiKeyEntry`, `ModelStatusView`, `AdminError`, etc.). Resource
@@ -4084,10 +4084,20 @@ pub(crate) fn merged_openapi() -> &'static str {
         add_variant_titles(&mut doc);
         add_missing_property_descriptions(&mut doc);
         add_schema_defaults(&mut doc);
+        add_schema_examples(&mut doc);
         wrap_ref_siblings_for_redoc(&mut doc);
 
         serde_json::to_string(&doc).expect("merged OpenAPI must serialise")
     })
+}
+
+fn add_schema_examples(doc: &mut Value) {
+    doc["components"]["schemas"]["A2aAgent"]["example"] = json!({
+        "display_name": "invoice-processor",
+        "url": "https://agents.example.com/invoice",
+        "protocol_version": "0.3",
+        "auth_type": "none"
+    });
 }
 
 /// ReDoc uses `title` for `oneOf` tab labels. Schemars does not title generated
