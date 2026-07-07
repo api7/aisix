@@ -79,8 +79,8 @@ pub struct A2aAgent {
     pub scopes: Option<Vec<String>>,
 
     /// Maximum time, in milliseconds, to wait for a single upstream operation,
-    /// including fetching the agent card or invoking the agent. Must be at
-    /// least `1` when set. When omitted, AISIX applies a built-in default.
+    /// including fetching the agent card or invoking the agent. When omitted,
+    /// AISIX applies a built-in default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1))]
     pub timeout_ms: Option<u64>,
