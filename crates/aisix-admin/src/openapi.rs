@@ -26,7 +26,7 @@ use std::sync::OnceLock;
 
 use axum::http::header;
 use axum::response::{Html, IntoResponse, Response};
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 
 /// Paths + OpenAPI-specific wrapper schemas (`ModelEntry`,
 /// `ApiKeyEntry`, `ModelStatusView`, `AdminError`, etc.). Resource
@@ -1756,6 +1756,12 @@ const OPENAPI_JSON_BASE: &str = r##"{
             "application/json": {
               "schema": {
                 "$ref": "#/components/schemas/A2aAgent"
+              },
+              "example": {
+                "display_name": "invoice-processor",
+                "url": "https://agents.example.com/invoice",
+                "protocol_version": "0.3",
+                "auth_type": "none"
               }
             }
           },
@@ -1768,12 +1774,23 @@ const OPENAPI_JSON_BASE: &str = r##"{
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/A2aAgentEntry"
+                },
+                "example": {
+                  "id": "1d95ac57-7f27-46a4-b5a3-55d3c3ad0a12",
+                  "value": {
+                    "display_name": "invoice-processor",
+                    "url": "https://agents.example.com/invoice",
+                    "protocol_version": "0.3",
+                    "auth_type": "none",
+                    "enabled": true
+                  },
+                  "revision": 1
                 }
               }
             }
           },
           "400": {
-            "description": "Schema validation failed, the JSON body is malformed, `display_name` contains a `/` (it is the agent's URL path segment), or the credentials required by `auth_type` are missing (`secret` for `bearer`/`api_key`; `client_id`, `token_url`, and `secret` for `oauth2`)",
+            "description": "Invalid request body, `display_name` contains `/`, or the selected `auth_type` is missing required credentials.",
             "content": {
               "application/json": {
                 "schema": {
@@ -1931,7 +1948,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
             }
           },
           "400": {
-            "description": "Schema validation failed, the JSON body is malformed, `display_name` contains a `/` (it is the agent's URL path segment), or the credentials required by `auth_type` are missing (`secret` for `bearer`/`api_key`; `client_id`, `token_url`, and `secret` for `oauth2`)",
+            "description": "Invalid request body, `display_name` contains `/`, or the selected `auth_type` is missing required credentials.",
             "content": {
               "application/json": {
                 "schema": {
@@ -3653,7 +3670,18 @@ const OPENAPI_JSON_BASE: &str = r##"{
             "example": 1845
           }
         },
-        "description": "Stored Admin API resource entry."
+        "description": "Stored Admin API resource entry.",
+        "example": {
+          "id": "1d95ac57-7f27-46a4-b5a3-55d3c3ad0a12",
+          "value": {
+            "display_name": "invoice-processor",
+            "url": "https://agents.example.com/invoice",
+            "protocol_version": "0.3",
+            "auth_type": "none",
+            "enabled": true
+          },
+          "revision": 1
+        }
       },
       "GuardrailEntry": {
         "type": "object",
@@ -4056,10 +4084,34 @@ pub(crate) fn merged_openapi() -> &'static str {
         add_variant_titles(&mut doc);
         add_missing_property_descriptions(&mut doc);
         add_schema_defaults(&mut doc);
+        add_schema_examples(&mut doc);
         wrap_ref_siblings_for_redoc(&mut doc);
 
         serde_json::to_string(&doc).expect("merged OpenAPI must serialise")
     })
+}
+
+fn add_schema_examples(doc: &mut Value) {
+    doc["components"]["schemas"]["A2aAgent"]["example"] = json!({
+        "display_name": "invoice-processor",
+        "url": "https://agents.example.com/invoice",
+        "protocol_version": "0.3",
+        "auth_type": "none"
+    });
+    doc["components"]["schemas"]["A2aAgentEntry"]["example"] = json!({
+        "id": "1d95ac57-7f27-46a4-b5a3-55d3c3ad0a12",
+        "value": {
+            "display_name": "invoice-processor",
+            "url": "https://agents.example.com/invoice",
+            "protocol_version": "0.3",
+            "auth_type": "none",
+            "enabled": true
+        },
+        "revision": 1
+    });
+    if let Some(obj) = doc["components"]["schemas"]["McpServerEntry"].as_object_mut() {
+        obj.remove("example");
+    }
 }
 
 /// ReDoc uses `title` for `oneOf` tab labels. Schemars does not title generated

@@ -28,15 +28,15 @@ pub struct A2aAgent {
     #[schemars(length(min = 1))]
     pub display_name: String,
 
-    /// The upstream agent's base URL, reached over HTTP with the A2A protocol
-    /// (JSON-RPC 2.0), such as `https://agents.example.com/a2a`. The agent card
-    /// is discovered relative to this URL.
+    /// The upstream agent's base URL, such as `https://agents.example.com/a2a`.
+    /// AISIX reaches this URL over HTTP with the A2A JSON-RPC 2.0 protocol and
+    /// discovers the agent card relative to it.
     #[schemars(length(min = 1))]
     pub url: String,
 
-    /// The A2A wire-format version the gateway pins for this agent. Pinned
-    /// explicitly rather than inferred from client signals, so the served agent
-    /// card and the accepted requests stay consistent.
+    /// The A2A wire-format version AISIX uses for this agent. AISIX pins the
+    /// version explicitly so the served agent card and accepted requests stay
+    /// consistent.
     #[serde(default)]
     pub protocol_version: A2aProtocolVersion,
 
@@ -46,11 +46,11 @@ pub struct A2aAgent {
     #[serde(default)]
     pub auth_type: A2aAuthType,
 
-    /// Authentication credential for the upstream agent. Its meaning follows
-    /// `auth_type`: the bearer token when `auth_type` is `bearer` (sent as
-    /// `Authorization: Bearer <secret>`), the API key when `auth_type` is
-    /// `api_key` (sent as `x-api-key: <secret>`), or the OAuth client secret
-    /// when `auth_type` is `oauth2`. Leave unset when `auth_type` is `none`.
+    /// Credential AISIX uses to authenticate to the upstream agent. For
+    /// `bearer`, AISIX sends it as `Authorization: Bearer <secret>`; for
+    /// `api_key`, AISIX sends it as `x-api-key: <secret>`. For `oauth2`, it is
+    /// stored as the client secret for forward compatibility, but the runtime
+    /// does not yet mint upstream A2A access tokens. Leave unset for `none`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret: Option<String>,
 
@@ -60,28 +60,26 @@ pub struct A2aAgent {
     // resource into a oneOf. The control plane enforces the coupling strictly
     // at write time, this gateway's own Admin API re-checks it on write, and
     // the runtime degrades gracefully when a snapshot-loaded agent is
-    // mis-configured: its credential exchange fails and the agent becomes
-    // unavailable, logged like any other upstream failure.
-    /// OAuth client identifier used for the OAuth 2.0 client credentials grant.
-    /// Required when `auth_type` is `oauth2`; ignored otherwise.
+    // misconfigured.
+    /// OAuth client identifier stored for future OAuth 2.0 client credentials
+    /// support. Required when `auth_type` is `oauth2`; ignored otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_id: Option<String>,
 
-    /// OAuth token endpoint URL where the gateway exchanges the client
-    /// credentials for an access token, such as
-    /// `https://auth.example.com/oauth/token`. Required when `auth_type` is
-    /// `oauth2`; ignored otherwise.
+    /// OAuth token endpoint URL stored for future OAuth 2.0 client credentials
+    /// support, such as `https://auth.example.com/oauth/token`. Required when
+    /// `auth_type` is `oauth2`; ignored otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_url: Option<String>,
 
-    /// OAuth scopes to request. Joined with spaces into the `scope` parameter of
-    /// the token request. Only used when `auth_type` is `oauth2`.
+    /// OAuth scopes stored for future OAuth 2.0 client credentials support.
+    /// Only used when `auth_type` is `oauth2`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scopes: Option<Vec<String>>,
 
-    /// Maximum time, in milliseconds, to wait for a single upstream operation
-    /// (fetching the agent card or invoking the agent). Must be at least `1`
-    /// when set. When omitted, the gateway applies a built-in default.
+    /// Maximum time, in milliseconds, to wait for a single upstream operation,
+    /// including fetching the agent card or invoking the agent. When omitted,
+    /// AISIX applies a built-in default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1))]
     pub timeout_ms: Option<u64>,
@@ -105,11 +103,11 @@ fn default_enabled() -> bool {
     Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
 )]
 pub enum A2aProtocolVersion {
-    /// A2A 1.0 wire format (protobuf-JSON envelopes, PascalCase methods).
+    /// A2A 1.0 wire format with protobuf-JSON envelopes and PascalCase methods.
     #[default]
     #[serde(rename = "1.0")]
     V1_0,
-    /// A2A 0.3 wire format (`kind`-discriminated JSON-RPC objects).
+    /// A2A 0.3 wire format with `kind`-discriminated JSON-RPC objects.
     #[serde(rename = "0.3")]
     V0_3,
 }
@@ -129,11 +127,9 @@ pub enum A2aAuthType {
     /// API key authentication. The key is supplied in `secret` and sent as an
     /// `x-api-key: <secret>` header on every upstream request.
     ApiKey,
-    /// OAuth 2.0 client credentials grant. The gateway exchanges `client_id`,
-    /// the client secret in `secret`, and the optional `scopes` at `token_url`
-    /// for an access token, and sends it as `Authorization: Bearer
-    /// <access_token>` on every upstream request. Access tokens are cached
-    /// until shortly before their reported expiry.
+    /// OAuth 2.0 client credentials grant. Accepted on the resource for forward
+    /// compatibility, but the runtime does not yet mint tokens for upstream A2A
+    /// agents.
     #[serde(rename = "oauth2")]
     OAuth2,
 }
