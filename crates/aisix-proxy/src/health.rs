@@ -458,25 +458,30 @@ impl ModelRuntimeStatusTracker {
         let entered_cooldown = entry.cooldown_until.is_none_or(|u| u <= now);
         entry.cooldown_until = Some(until);
         entry.status_reason = Some(reason);
-        drop(entry);
+        // Hold the DashMap entry guard across the emit so concurrent
+        // cooldown/recovery on the same model can't publish the gauge out of
+        // order (which would leave it stale until the next transition). The
+        // emit only reads `snapshot` and writes `metrics` — it never re-locks
+        // `entries` — so holding the guard here is deadlock-free.
         if entered_cooldown {
             self.emit_deployment_state(model_id, DeploymentState::Down, true);
         }
     }
 
     pub fn mark_healthy(&self, model_id: &str) {
-        let mut recovered = false;
         if let Some(mut entry) = self.entries.get_mut(model_id) {
-            recovered =
+            let recovered =
                 entry.unhealthy || entry.cooldown_until.is_some_and(|u| u > SystemTime::now());
             entry.unhealthy = false;
             entry.cooldown_until = None;
             entry.status_reason = None;
-        }
-        // Only flip the gauge back to Healthy on an actual recovery, so
-        // already-healthy targets don't churn the metric on every success.
-        if recovered {
-            self.emit_deployment_state(model_id, DeploymentState::Healthy, false);
+            // Only flip the gauge back to Healthy on an actual recovery, so
+            // already-healthy targets don't churn the metric on every success.
+            // Emitted under the guard (see mark_cooldown) to serialize
+            // same-model transitions.
+            if recovered {
+                self.emit_deployment_state(model_id, DeploymentState::Healthy, false);
+            }
         }
     }
 
