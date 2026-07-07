@@ -48,8 +48,9 @@ pub struct A2aAgent {
 
     /// Credential AISIX uses to authenticate to the upstream agent. For
     /// `bearer`, AISIX sends it as `Authorization: Bearer <secret>`; for
-    /// `api_key`, AISIX sends it as `x-api-key: <secret>`; for `oauth2`, it is
-    /// the client secret. Leave unset for `none`.
+    /// `api_key`, AISIX sends it as `x-api-key: <secret>`. For `oauth2`, it is
+    /// stored as the client secret for forward compatibility, but the runtime
+    /// does not yet mint upstream A2A access tokens. Leave unset for `none`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret: Option<String>,
 
@@ -59,22 +60,20 @@ pub struct A2aAgent {
     // resource into a oneOf. The control plane enforces the coupling strictly
     // at write time, this gateway's own Admin API re-checks it on write, and
     // the runtime degrades gracefully when a snapshot-loaded agent is
-    // mis-configured: its credential exchange fails and the agent becomes
-    // unavailable, logged like any other upstream failure.
-    /// OAuth client identifier used for the OAuth 2.0 client credentials grant.
-    /// Required when `auth_type` is `oauth2`; ignored otherwise.
+    // misconfigured.
+    /// OAuth client identifier stored for future OAuth 2.0 client credentials
+    /// support. Required when `auth_type` is `oauth2`; ignored otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_id: Option<String>,
 
-    /// OAuth token endpoint URL where the gateway exchanges the client
-    /// credentials for an access token, such as
-    /// `https://auth.example.com/oauth/token`. Required when `auth_type` is
-    /// `oauth2`; ignored otherwise.
+    /// OAuth token endpoint URL stored for future OAuth 2.0 client credentials
+    /// support, such as `https://auth.example.com/oauth/token`. Required when
+    /// `auth_type` is `oauth2`; ignored otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_url: Option<String>,
 
-    /// OAuth scopes to request. Joined with spaces into the `scope` parameter of
-    /// the token request. Only used when `auth_type` is `oauth2`.
+    /// OAuth scopes stored for future OAuth 2.0 client credentials support.
+    /// Only used when `auth_type` is `oauth2`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scopes: Option<Vec<String>>,
 

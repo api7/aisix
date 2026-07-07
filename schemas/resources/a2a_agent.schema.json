@@ -72,7 +72,7 @@
       "description": "How the gateway authenticates to the upstream agent. The credential is held by the gateway and is never forwarded from or exposed to the calling client."
     },
     "client_id": {
-      "description": "OAuth client identifier used for the OAuth 2.0 client credentials grant. Required when `auth_type` is `oauth2`; ignored otherwise.",
+      "description": "OAuth client identifier stored for future OAuth 2.0 client credentials support. Required when `auth_type` is `oauth2`; ignored otherwise.",
       "type": [
         "string",
         "null"
@@ -98,7 +98,7 @@
       "description": "The A2A wire-format version AISIX uses for this agent. AISIX pins the version explicitly so the served agent card and accepted requests stay consistent."
     },
     "scopes": {
-      "description": "OAuth scopes to request. Joined with spaces into the `scope` parameter of the token request. Only used when `auth_type` is `oauth2`.",
+      "description": "OAuth scopes stored for future OAuth 2.0 client credentials support. Only used when `auth_type` is `oauth2`.",
       "items": {
         "type": "string"
       },
@@ -108,7 +108,7 @@
       ]
     },
     "secret": {
-      "description": "Credential AISIX uses to authenticate to the upstream agent. For `bearer`, AISIX sends it as `Authorization: Bearer <secret>`; for `api_key`, AISIX sends it as `x-api-key: <secret>`; for `oauth2`, it is the client secret. Leave unset for `none`.",
+      "description": "Credential AISIX uses to authenticate to the upstream agent. For `bearer`, AISIX sends it as `Authorization: Bearer <secret>`; for `api_key`, AISIX sends it as `x-api-key: <secret>`. For `oauth2`, it is stored as the client secret for forward compatibility, but the runtime does not yet mint upstream A2A access tokens. Leave unset for `none`.",
       "type": [
         "string",
         "null"
@@ -124,7 +124,7 @@
       ]
     },
     "token_url": {
-      "description": "OAuth token endpoint URL where the gateway exchanges the client credentials for an access token, such as `https://auth.example.com/oauth/token`. Required when `auth_type` is `oauth2`; ignored otherwise.",
+      "description": "OAuth token endpoint URL stored for future OAuth 2.0 client credentials support, such as `https://auth.example.com/oauth/token`. Required when `auth_type` is `oauth2`; ignored otherwise.",
       "type": [
         "string",
         "null"
