@@ -39,8 +39,9 @@
 //! Management calls emit zero-token UsageEvents (parity with
 //! `/passthrough`, #699). When a **batch retrieve** first observes
 //! `status == "completed"`, the gateway downloads the output JSONL once
-//! (per-process dedup + deterministic `request_id = "batch-<id>"` so
-//! cp-api can idempotently upsert), aggregates per-line `usage`, and
+//! (per-process dedup + a deterministic UUIDv5 `request_id` derived
+//! from the batch identity — the telemetry contract requires a UUID),
+//! aggregates per-line `usage`, and
 //! emits real token counts grouped by the provider-billed model —
 //! LiteLLM's `_handle_completed_batch` equivalent
 //! (`litellm/batches/batch_utils.py`).
@@ -1453,10 +1454,27 @@ async fn forward_simple(
 
 // ─────────────────── batch completion attribution ───────────────────
 
+/// Deterministic UUIDv5 request_id for a batch attribution event.
+///
+/// The `/dp/telemetry` contract requires `request_id` to be a UUID
+/// (cp-api rejects the event otherwise — and with it the whole flush),
+/// while attribution needs a *stable* id per (batch, model-slice) so
+/// re-emission after a DP restart + re-retrieve doesn't mint a new
+/// identity. UUIDv5 over the batch identity gives both.
+fn batch_attribution_request_id(raw_batch_id: &str, idx: usize, multi: bool) -> String {
+    let name = if multi {
+        format!("aisix:batch:{raw_batch_id}:{idx}")
+    } else {
+        format!("aisix:batch:{raw_batch_id}")
+    };
+    uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, name.as_bytes()).to_string()
+}
+
 /// First-completed-observation hook: dedup via the process-local billed
 /// set, then attribute usage in a detached task. The deterministic
-/// `request_id = "batch-<raw_id>[-<n>]"` keeps repeated emission (DP
-/// restart + re-retrieve) idempotent on the cp-api side.
+/// UUIDv5 `request_id` (see [`batch_attribution_request_id`]) keeps
+/// repeated emission (DP restart + re-retrieve) stable per
+/// (batch, model-slice) on the cp-api side.
 fn maybe_attribute_batch(
     state: &ProxyState,
     auth: &AuthenticatedKey,
@@ -1615,11 +1633,7 @@ async fn attribute_batch_usage(
     let snap = state.snapshot.load();
     let multi = per_model.len() > 1;
     for (idx, (provider_model, agg)) in per_model.iter().enumerate() {
-        let request_id = if multi {
-            format!("batch-{raw_batch_id}-{idx}")
-        } else {
-            format!("batch-{raw_batch_id}")
-        };
+        let request_id = batch_attribution_request_id(raw_batch_id, idx, multi);
         let mut event = UsageEvent {
             request_id,
             occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
@@ -1742,6 +1756,19 @@ mod tests {
     }
 
     // ---- id codec ----
+
+    #[test]
+    fn batch_attribution_request_id_is_a_stable_uuid() {
+        let single = batch_attribution_request_id("batch_1", 0, false);
+        uuid::Uuid::parse_str(&single).expect("must be a UUID");
+        assert_eq!(single, batch_attribution_request_id("batch_1", 0, false));
+        // Multi-model slices and different batches get distinct ids.
+        let s0 = batch_attribution_request_id("batch_1", 0, true);
+        let s1 = batch_attribution_request_id("batch_1", 1, true);
+        assert_ne!(s0, s1);
+        assert_ne!(single, s0);
+        assert_ne!(single, batch_attribution_request_id("batch_2", 0, false));
+    }
 
     #[test]
     fn routed_id_roundtrip() {
@@ -2055,7 +2082,15 @@ mod tests {
         }
         assert_eq!(mgmt, 1);
         let agg = agg.expect("aggregated batch event must be emitted");
-        assert_eq!(agg.request_id, "batch-batch_1");
+        // The telemetry contract requires a UUID request_id (a non-UUID
+        // event 400s the whole flush on cp-api, dropping co-flushed
+        // events), and the id must stay deterministic for re-emission.
+        uuid::Uuid::parse_str(&agg.request_id)
+            .expect("batch attribution request_id must be a UUID");
+        assert_eq!(
+            agg.request_id,
+            batch_attribution_request_id("batch_1", 0, false)
+        );
         assert_eq!(agg.prompt_tokens, 17);
         assert_eq!(agg.completion_tokens, 8);
         assert_eq!(agg.cached_prompt_tokens, 2);
