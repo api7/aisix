@@ -36,12 +36,20 @@ RUN apt-get update \
 WORKDIR /src
 
 # Short git sha stamped into the binary (heartbeat `version` =
-# `<crate-version>+sha-<BUILD_SHA>`) so a running DP can be matched to
+# `<version>+sha-<BUILD_SHA>`) so a running DP can be matched to
 # its image tag. CI passes the same short sha that tags the image;
 # plain `docker build` (no arg) produces a binary that reports the bare
 # crate version.
 ARG BUILD_SHA=
 ENV AISIX_BUILD_SHA=$BUILD_SHA
+
+# Release version stamped into the binary. CI derives this from the
+# release tag (v0.4.0 → 0.4.0), so `aisix --version`, the `Server`
+# response header, and the heartbeat dp_version always self-report the
+# tagged version — no manual Cargo.toml bump at release time. Empty
+# (non-release / local build) falls back to the workspace crate version.
+ARG BUILD_VERSION=
+ENV AISIX_BUILD_VERSION=$BUILD_VERSION
 
 # BuildKit cache mounts carry `~/.cargo/registry` + `target/` across
 # builds, so changes to source files still reuse compiled dependencies.

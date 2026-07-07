@@ -38,15 +38,16 @@ use serde::Serialize;
 use tokio::sync::watch;
 
 /// Build identity reported to cp-api (heartbeat `version` field + HTTP
-/// User-Agent). CI stamps `AISIX_BUILD_SHA` — the same short git sha
-/// that tags the container image — at compile time, so the wire carries
-/// `0.1.0+sha-103d3ec` and an operator can match a DP node directly to
-/// its `ghcr.io/...:sha-103d3ec` image. Local builds (no stamp) report
-/// the bare crate version. cp-api persists this into
+/// User-Agent). The base version is [`aisix_core::BUILD_VERSION`] —
+/// release builds are stamped from the git tag, local builds fall back
+/// to the crate version. CI additionally stamps `AISIX_BUILD_SHA` — the
+/// same short git sha that tags the container image — so the wire
+/// carries `0.4.0+sha-103d3ec` and an operator can match a DP node
+/// directly to its image. cp-api persists this into
 /// `dpmgr_nodes.dp_version`, replacing the `"pending"` placeholder it
 /// wrote at install-command time.
 pub static BUILD_VERSION: LazyLock<String> = LazyLock::new(|| {
-    format_build_version(env!("CARGO_PKG_VERSION"), option_env!("AISIX_BUILD_SHA"))
+    format_build_version(aisix_core::BUILD_VERSION, option_env!("AISIX_BUILD_SHA"))
 });
 
 fn format_build_version(pkg_version: &str, build_sha: Option<&str>) -> String {

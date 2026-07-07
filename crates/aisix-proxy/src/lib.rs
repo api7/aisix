@@ -81,9 +81,13 @@ use tower_http::set_header::SetResponseHeaderLayer;
 
 /// Product token emitted in the `Server` response header. Format follows
 /// RFC 9110 §10.2.4 (`product/version`) and matches the convention used
-/// by adjacent gateways (APISIX, nginx, kong). Version is the workspace
-/// crate version, baked in at compile time.
-const SERVER_HEADER_VALUE: &str = concat!("AISIX/", env!("CARGO_PKG_VERSION"));
+/// by adjacent gateways (APISIX, nginx, kong). Version is
+/// [`aisix_core::BUILD_VERSION`]: CI-stamped from the release tag, crate
+/// version for local builds.
+static SERVER_HEADER_VALUE: std::sync::LazyLock<HeaderValue> = std::sync::LazyLock::new(|| {
+    HeaderValue::from_str(&format!("AISIX/{}", aisix_core::BUILD_VERSION))
+        .expect("build version must be a valid ASCII header value")
+});
 
 /// Build the proxy router. Mounts `/livez` plus the
 /// OpenAI-compatible proxy surface.
@@ -180,7 +184,7 @@ pub fn build_router(state: ProxyState) -> Router {
         // identity.
         .layer(SetResponseHeaderLayer::overriding(
             header::SERVER,
-            HeaderValue::from_static(SERVER_HEADER_VALUE),
+            SERVER_HEADER_VALUE.clone(),
         ))
         .with_state(state)
 }
