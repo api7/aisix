@@ -3645,18 +3645,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
             "example": 1845
           }
         },
-        "description": "Stored Admin API resource entry.",
-        "example": {
-          "id": "1d95ac57-7f27-46a4-b5a3-55d3c3ad0a12",
-          "value": {
-            "display_name": "invoice-processor",
-            "url": "https://agents.example.com/invoice",
-            "protocol_version": "0.3",
-            "auth_type": "none",
-            "enabled": true
-          },
-          "revision": 1
-        }
+        "description": "Stored Admin API resource entry."
       },
       "A2aAgentEntry": {
         "type": "object",
@@ -3681,7 +3670,18 @@ const OPENAPI_JSON_BASE: &str = r##"{
             "example": 1845
           }
         },
-        "description": "Stored Admin API resource entry."
+        "description": "Stored Admin API resource entry.",
+        "example": {
+          "id": "1d95ac57-7f27-46a4-b5a3-55d3c3ad0a12",
+          "value": {
+            "display_name": "invoice-processor",
+            "url": "https://agents.example.com/invoice",
+            "protocol_version": "0.3",
+            "auth_type": "none",
+            "enabled": true
+          },
+          "revision": 1
+        }
       },
       "GuardrailEntry": {
         "type": "object",
@@ -4098,6 +4098,20 @@ fn add_schema_examples(doc: &mut Value) {
         "protocol_version": "0.3",
         "auth_type": "none"
     });
+    doc["components"]["schemas"]["A2aAgentEntry"]["example"] = json!({
+        "id": "1d95ac57-7f27-46a4-b5a3-55d3c3ad0a12",
+        "value": {
+            "display_name": "invoice-processor",
+            "url": "https://agents.example.com/invoice",
+            "protocol_version": "0.3",
+            "auth_type": "none",
+            "enabled": true
+        },
+        "revision": 1
+    });
+    if let Some(obj) = doc["components"]["schemas"]["McpServerEntry"].as_object_mut() {
+        obj.remove("example");
+    }
 }
 
 /// ReDoc uses `title` for `oneOf` tab labels. Schemars does not title generated
