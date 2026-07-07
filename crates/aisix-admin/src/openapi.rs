@@ -1774,6 +1774,17 @@ const OPENAPI_JSON_BASE: &str = r##"{
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/A2aAgentEntry"
+                },
+                "example": {
+                  "id": "1d95ac57-7f27-46a4-b5a3-55d3c3ad0a12",
+                  "value": {
+                    "display_name": "invoice-processor",
+                    "url": "https://agents.example.com/invoice",
+                    "protocol_version": "0.3",
+                    "auth_type": "none",
+                    "enabled": true
+                  },
+                  "revision": 1
                 }
               }
             }
@@ -3634,7 +3645,18 @@ const OPENAPI_JSON_BASE: &str = r##"{
             "example": 1845
           }
         },
-        "description": "Stored Admin API resource entry."
+        "description": "Stored Admin API resource entry.",
+        "example": {
+          "id": "1d95ac57-7f27-46a4-b5a3-55d3c3ad0a12",
+          "value": {
+            "display_name": "invoice-processor",
+            "url": "https://agents.example.com/invoice",
+            "protocol_version": "0.3",
+            "auth_type": "none",
+            "enabled": true
+          },
+          "revision": 1
+        }
       },
       "A2aAgentEntry": {
         "type": "object",

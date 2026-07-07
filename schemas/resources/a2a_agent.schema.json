@@ -61,6 +61,12 @@
       ]
     }
   },
+  "example": {
+    "display_name": "invoice-processor",
+    "url": "https://agents.example.com/invoice",
+    "protocol_version": "0.3",
+    "auth_type": "none"
+  },
   "properties": {
     "auth_type": {
       "allOf": [
