@@ -61,8 +61,8 @@ pub struct ApiKey {
     /// A2A agents this key may reach, named by their registered names. Entries
     /// are matched as single-`*` globs, mirroring `allowed_tools`: `"*"` grants
     /// every agent and an entry without a `*` matches one agent exactly. When
-    /// omitted or set to `null`, the key has no A2A agent access — access is
-    /// granted explicitly.
+    /// omitted, set to `null`, or set to an empty list, the key has no A2A
+    /// agent access — access is granted explicitly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_agents: Option<Vec<String>>,
 

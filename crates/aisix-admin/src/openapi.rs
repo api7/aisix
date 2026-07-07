@@ -3545,7 +3545,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
             "items": {
               "type": "string"
             },
-            "description": "A2A agents this key may reach, named by their registered names. Entries are matched as single-`*` globs: `\"*\"` grants every agent and an entry without a `*` matches one agent exactly. When omitted or set to `null`, the key has no A2A agent access — access is granted explicitly."
+            "description": "A2A agents this key may reach, named by their registered names. Entries are matched as single-`*` globs: `\"*\"` grants every agent and an entry without a `*` matches one agent exactly. When omitted, set to `null`, or set to an empty list, the key has no A2A agent access — access is granted explicitly."
           },
           "expires_at": {
             "type": [
@@ -3916,7 +3916,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
             "items": {
               "type": "string"
             },
-            "description": "A2A agents this key may reach, named by their registered names. Entries are matched as single-`*` globs: `\"*\"` grants every agent and an entry without a `*` matches one agent exactly. When omitted or set to `null`, the key has no A2A agent access — access is granted explicitly.",
+            "description": "A2A agents this key may reach, named by their registered names. Entries are matched as single-`*` globs: `\"*\"` grants every agent and an entry without a `*` matches one agent exactly. When omitted, set to `null`, or set to an empty list, the key has no A2A agent access — access is granted explicitly.",
             "example": [
               "invoice-processor"
             ]
@@ -4719,8 +4719,8 @@ mod tests {
             .as_str()
             .unwrap();
         assert!(
-            request_allowed_agents.contains("omitted or set to `null`"),
-            "self-hosted API key request schema must document null agent-access behavior"
+            request_allowed_agents.contains("omitted, set to `null`, or set to an empty list"),
+            "self-hosted API key request schema must document no-access agent-list behavior"
         );
         assert!(
             request_allowed_agents.contains("grants every agent"),
@@ -4750,8 +4750,8 @@ mod tests {
             .as_str()
             .unwrap();
         assert!(
-            public_allowed_agents.contains("omitted or set to `null`"),
-            "API key response schema must document null agent-access behavior"
+            public_allowed_agents.contains("omitted, set to `null`, or set to an empty list"),
+            "API key response schema must document no-access agent-list behavior"
         );
         assert!(
             public_allowed_agents.contains("grants every agent"),
