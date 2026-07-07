@@ -31,7 +31,6 @@ use crate::auth::AuthenticatedKey;
 use crate::chat::sanitize_tag;
 use crate::client_ip::ClientContext;
 use crate::error::ProxyError;
-use crate::request_id::new_request_id;
 use crate::state::ProxyState;
 use crate::usage_attr::{provider_telemetry_tags, total_tokens_with_cache};
 
@@ -141,7 +140,7 @@ pub async fn responses(
     Json(mut body): Json<Value>,
 ) -> Response {
     let started = Instant::now();
-    let request_id = new_request_id();
+    let request_id = client.request_id.clone();
     let api_key_id = auth.entry.id.clone();
 
     let model_name = body

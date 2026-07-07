@@ -65,7 +65,6 @@ use serde_json::Value;
 use crate::auth::AuthenticatedKey;
 use crate::client_ip::ClientContext;
 use crate::error::ProxyError;
-use crate::request_id::new_request_id;
 use crate::state::ProxyState;
 
 /// Marker prefix for gateway-minted routed ids.
@@ -657,6 +656,7 @@ fn finish(
             crate::usage_attr::emit_error_usage_event(
                 state,
                 label,
+                "openai",
                 &request_id,
                 "",
                 &auth.entry.id,
@@ -720,7 +720,7 @@ pub(crate) async fn create_file(
     mut multipart: Multipart,
 ) -> Response {
     let started = Instant::now();
-    let request_id = new_request_id();
+    let request_id = client.request_id.clone();
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
 
     let result = async {
@@ -952,7 +952,7 @@ pub(crate) async fn create_batch(
     body: Bytes,
 ) -> Response {
     let started = Instant::now();
-    let request_id = new_request_id();
+    let request_id = client.request_id.clone();
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
 
     let result = async {
@@ -1048,7 +1048,7 @@ pub(crate) async fn get_batch(
     headers: HeaderMap,
 ) -> Response {
     let started = Instant::now();
-    let request_id = new_request_id();
+    let request_id = client.request_id.clone();
     let (raw, embedded) = routed_model_hint(&id, &params, &headers);
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
 
@@ -1179,7 +1179,7 @@ pub(crate) async fn create_ft_job(
     body: Bytes,
 ) -> Response {
     let started = Instant::now();
-    let request_id = new_request_id();
+    let request_id = client.request_id.clone();
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
 
     let result = async {
@@ -1379,7 +1379,7 @@ async fn forward_simple(
     spec: FwdSpec,
 ) -> Response {
     let started = Instant::now();
-    let request_id = new_request_id();
+    let request_id = client.request_id.clone();
     let method = spec.method.clone();
     let log_path = spec.log_path.clone();
     let label = spec.label;

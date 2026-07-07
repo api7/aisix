@@ -32,7 +32,6 @@ use std::time::{Duration, Instant};
 
 use crate::auth::AuthenticatedKey;
 use crate::error::ProxyError;
-use crate::request_id::new_request_id;
 use crate::state::ProxyState;
 
 /// Bounded `model` metric label for passthrough requests. The wildcard
@@ -136,7 +135,7 @@ pub async fn passthrough(
     req: Request,
 ) -> Response {
     let started = Instant::now();
-    let request_id = new_request_id();
+    let request_id = client.request_id.clone();
     let api_key_id = auth.entry.id.clone();
     let method = req.method().clone();
     let path = format!("/passthrough/{provider}/{rest}");
@@ -218,6 +217,7 @@ pub async fn passthrough(
             // error path.
             crate::usage_attr::emit_error_usage_event(
                 &state,
+                "passthrough",
                 "passthrough",
                 &request_id,
                 "",
@@ -1499,6 +1499,11 @@ mod tests {
         assert!(
             !event.error_class.is_empty(),
             "error_class must classify the failure"
+        );
+        assert_eq!(
+            event.inbound_protocol, "passthrough",
+            "error event must carry the same inbound_protocol as the success path \
+             so Logs protocol filtering sees both"
         );
     }
 }

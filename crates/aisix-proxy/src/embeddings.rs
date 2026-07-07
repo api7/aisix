@@ -28,7 +28,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::auth::AuthenticatedKey;
 use crate::client_ip::ClientContext;
 use crate::error::{ErrorEnvelope, ProxyError};
-use crate::request_id::new_request_id;
 use crate::state::ProxyState;
 
 /// The request body accepted by `POST /v1/embeddings`.
@@ -95,7 +94,7 @@ pub async fn embeddings(
     body: Result<Json<EmbeddingRequestBody>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     let started = Instant::now();
-    let request_id = new_request_id();
+    let request_id = client.request_id.clone();
     let api_key_id = auth.entry.id.clone();
     let body = match body {
         Ok(Json(b)) => b,
@@ -204,6 +203,7 @@ pub async fn embeddings(
             crate::usage_attr::emit_error_usage_event(
                 &state,
                 "embeddings",
+                "openai",
                 &request_id,
                 &model_name,
                 &api_key_id,

@@ -52,7 +52,6 @@ use crate::auth::AuthenticatedKey;
 use crate::client_ip::ClientContext;
 use crate::error::ProxyError;
 use crate::messages::ANTHROPIC_VERSION;
-use crate::request_id::new_request_id;
 use crate::state::ProxyState;
 
 pub async fn count_tokens(
@@ -82,7 +81,7 @@ pub async fn count_tokens(
     };
 
     let started = Instant::now();
-    let request_id = new_request_id();
+    let request_id = client.request_id.clone();
     let api_key_id = auth.entry.id.clone();
 
     let model_name = body

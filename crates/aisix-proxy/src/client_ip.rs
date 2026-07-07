@@ -136,6 +136,12 @@ pub struct ClientContext {
     /// Stability key from [`ROUTING_KEY_HEADER`] for sticky weighted routing.
     /// `None` when the header is absent (the caller's API key is used instead).
     pub routing_key: Option<String>,
+    /// Per-request correlation id, resolved from the [`RequestId`] the
+    /// `ensure_request_id` middleware stamped into the request extensions.
+    /// Handlers use it for both the usage event and the response header, so
+    /// the two always match. Falls back to a fresh id when the middleware
+    /// isn't in the chain (e.g. a handler unit test with a bare router).
+    pub request_id: String,
 }
 
 #[axum::async_trait]
@@ -185,11 +191,18 @@ where
             .filter(|s| !s.is_empty())
             .map(str::to_owned);
 
+        let request_id = parts
+            .extensions
+            .get::<crate::request_id::RequestId>()
+            .map(|r| r.0.clone())
+            .unwrap_or_else(crate::request_id::new_request_id);
+
         Ok(ClientContext {
             source_ip,
             user_agent,
             routing_tags,
             routing_key,
+            request_id,
         })
     }
 }

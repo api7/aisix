@@ -182,6 +182,12 @@ pub fn build_router(state: ProxyState) -> Router {
             header::SERVER,
             HeaderValue::from_static(SERVER_HEADER_VALUE),
         ))
+        // Outermost: mint the request id into the request extensions
+        // before any handler/extractor runs, and stamp it onto every
+        // response (including the short-circuited 4xx from the layers
+        // above) so the whole proxy family carries `x-aisix-request-id`
+        // and it equals the telemetry request_id. See request_id.rs.
+        .layer(middleware::from_fn(request_id::ensure_request_id))
         .with_state(state)
 }
 

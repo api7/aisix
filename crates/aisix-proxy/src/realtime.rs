@@ -56,7 +56,6 @@ use tokio_tungstenite::tungstenite::Message as TgMessage;
 use crate::auth::AuthenticatedKey;
 use crate::client_ip::ClientContext;
 use crate::error::ProxyError;
-use crate::request_id::new_request_id;
 use crate::state::ProxyState;
 
 /// Azure Realtime GA api-version (see the jobs surface twin constant).
@@ -72,7 +71,7 @@ pub(crate) async fn realtime(
     client: ClientContext,
     ws: WebSocketUpgrade,
 ) -> Response {
-    let request_id = new_request_id();
+    let request_id = client.request_id.clone();
     let started = Instant::now();
 
     match prepare(&state, &params, &headers, &client).await {
@@ -89,6 +88,7 @@ pub(crate) async fn realtime(
             emit_access_log(&Method::GET, status, started.elapsed(), &request_id, None);
             crate::usage_attr::emit_error_usage_event(
                 &state,
+                "realtime",
                 "realtime",
                 &request_id,
                 params.get("model").map(String::as_str).unwrap_or(""),
@@ -408,6 +408,7 @@ async fn run_session(
             );
             crate::usage_attr::emit_error_usage_event(
                 &state,
+                "realtime",
                 "realtime",
                 &request_id,
                 &requested_model,
@@ -928,7 +929,7 @@ mod tests {
     #[tokio::test]
     async fn missing_model_param_rejects_with_400() {
         let snap = snapshot("http://127.0.0.1:9/v1", "openai", "openai");
-        let (addr, _rx) = serve(snap).await;
+        let (addr, mut rx) = serve(snap).await;
 
         let mut req = format!("ws://{addr}/v1/realtime")
             .into_client_request()
@@ -939,6 +940,18 @@ mod tests {
             .await
             .expect_err("handshake must fail without ?model=");
         assert!(err.to_string().contains("400"), "got: {err}");
+
+        // The failure surfaces in Logs under the SAME protocol tag as a
+        // successful realtime session, so protocol filtering catches both.
+        let ev = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("a failed realtime handshake must emit an error UsageEvent")
+            .expect("sink closed");
+        assert_eq!(ev.status_code, 400);
+        assert_eq!(
+            ev.inbound_protocol, "realtime",
+            "error event must carry the realtime protocol tag, not \"openai\""
+        );
     }
 
     #[tokio::test]

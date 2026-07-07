@@ -21,7 +21,6 @@ use std::time::{Duration, Instant};
 use crate::auth::AuthenticatedKey;
 use crate::client_ip::ClientContext;
 use crate::error::ProxyError;
-use crate::request_id::new_request_id;
 use crate::state::ProxyState;
 
 /// Per-request payload from a successful dispatch — carries the
@@ -76,7 +75,7 @@ pub async fn rerank(
     Json(mut body): Json<Value>,
 ) -> Response {
     let started = Instant::now();
-    let request_id = new_request_id();
+    let request_id = client.request_id.clone();
     let api_key_id = auth.entry.id.clone();
 
     let model_name = body
@@ -155,6 +154,7 @@ pub async fn rerank(
             crate::usage_attr::emit_error_usage_event(
                 &state,
                 "rerank",
+                "openai",
                 &request_id,
                 &model_name,
                 &api_key_id,

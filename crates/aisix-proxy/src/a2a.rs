@@ -57,7 +57,11 @@ pub async fn a2a_endpoint(
     request: Request,
 ) -> Response {
     let started = Instant::now();
-    let request_id = new_request_id();
+    let request_id = request
+        .extensions()
+        .get::<crate::request_id::RequestId>()
+        .map(|r| r.0.clone())
+        .unwrap_or_else(new_request_id);
     let api_key_id = auth.entry.id.clone();
     let http_method = request.method().clone();
 
