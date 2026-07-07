@@ -1756,6 +1756,12 @@ const OPENAPI_JSON_BASE: &str = r##"{
             "application/json": {
               "schema": {
                 "$ref": "#/components/schemas/A2aAgent"
+              },
+              "example": {
+                "display_name": "invoice-processor",
+                "url": "https://agents.example.com/invoice",
+                "protocol_version": "0.3",
+                "auth_type": "none"
               }
             }
           },

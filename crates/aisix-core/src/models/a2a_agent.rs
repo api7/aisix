@@ -28,15 +28,15 @@ pub struct A2aAgent {
     #[schemars(length(min = 1))]
     pub display_name: String,
 
-    /// The upstream agent's base URL, reached over HTTP with the A2A protocol
-    /// (JSON-RPC 2.0), such as `https://agents.example.com/a2a`. The agent card
-    /// is discovered relative to this URL.
+    /// The upstream agent's base URL, such as `https://agents.example.com/a2a`.
+    /// AISIX reaches this URL over HTTP with the A2A JSON-RPC 2.0 protocol and
+    /// discovers the agent card relative to it.
     #[schemars(length(min = 1))]
     pub url: String,
 
-    /// The A2A wire-format version the gateway pins for this agent. Pinned
-    /// explicitly rather than inferred from client signals, so the served agent
-    /// card and the accepted requests stay consistent.
+    /// The A2A wire-format version AISIX uses for this agent. AISIX pins the
+    /// version explicitly so the served agent card and accepted requests stay
+    /// consistent.
     #[serde(default)]
     pub protocol_version: A2aProtocolVersion,
 
@@ -46,11 +46,10 @@ pub struct A2aAgent {
     #[serde(default)]
     pub auth_type: A2aAuthType,
 
-    /// Authentication credential for the upstream agent. Its meaning follows
-    /// `auth_type`: the bearer token when `auth_type` is `bearer` (sent as
-    /// `Authorization: Bearer <secret>`), the API key when `auth_type` is
-    /// `api_key` (sent as `x-api-key: <secret>`), or the OAuth client secret
-    /// when `auth_type` is `oauth2`. Leave unset when `auth_type` is `none`.
+    /// Credential AISIX uses to authenticate to the upstream agent. For
+    /// `bearer`, AISIX sends it as `Authorization: Bearer <secret>`; for
+    /// `api_key`, AISIX sends it as `x-api-key: <secret>`; for `oauth2`, it is
+    /// the client secret. Leave unset for `none`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret: Option<String>,
 
@@ -79,9 +78,9 @@ pub struct A2aAgent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scopes: Option<Vec<String>>,
 
-    /// Maximum time, in milliseconds, to wait for a single upstream operation
-    /// (fetching the agent card or invoking the agent). Must be at least `1`
-    /// when set. When omitted, the gateway applies a built-in default.
+    /// Maximum time, in milliseconds, to wait for a single upstream operation,
+    /// including fetching the agent card or invoking the agent. Must be at
+    /// least `1` when set. When omitted, AISIX applies a built-in default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1))]
     pub timeout_ms: Option<u64>,
@@ -105,11 +104,11 @@ fn default_enabled() -> bool {
     Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
 )]
 pub enum A2aProtocolVersion {
-    /// A2A 1.0 wire format (protobuf-JSON envelopes, PascalCase methods).
+    /// A2A 1.0 wire format with protobuf-JSON envelopes and PascalCase methods.
     #[default]
     #[serde(rename = "1.0")]
     V1_0,
-    /// A2A 0.3 wire format (`kind`-discriminated JSON-RPC objects).
+    /// A2A 0.3 wire format with `kind`-discriminated JSON-RPC objects.
     #[serde(rename = "0.3")]
     V0_3,
 }

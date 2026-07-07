@@ -43,7 +43,7 @@
       "description": "The A2A wire-format version pinned for an upstream agent.",
       "oneOf": [
         {
-          "description": "A2A 1.0 wire format (protobuf-JSON envelopes, PascalCase methods).",
+          "description": "A2A 1.0 wire format with protobuf-JSON envelopes and PascalCase methods.",
           "enum": [
             "1.0"
           ],
@@ -51,7 +51,7 @@
           "type": "string"
         },
         {
-          "description": "A2A 0.3 wire format (`kind`-discriminated JSON-RPC objects).",
+          "description": "A2A 0.3 wire format with `kind`-discriminated JSON-RPC objects.",
           "enum": [
             "0.3"
           ],
@@ -95,7 +95,7 @@
         }
       ],
       "default": "1.0",
-      "description": "The A2A wire-format version the gateway pins for this agent. Pinned explicitly rather than inferred from client signals, so the served agent card and the accepted requests stay consistent."
+      "description": "The A2A wire-format version AISIX uses for this agent. AISIX pins the version explicitly so the served agent card and accepted requests stay consistent."
     },
     "scopes": {
       "description": "OAuth scopes to request. Joined with spaces into the `scope` parameter of the token request. Only used when `auth_type` is `oauth2`.",
@@ -108,14 +108,14 @@
       ]
     },
     "secret": {
-      "description": "Authentication credential for the upstream agent. Its meaning follows `auth_type`: the bearer token when `auth_type` is `bearer` (sent as `Authorization: Bearer <secret>`), the API key when `auth_type` is `api_key` (sent as `x-api-key: <secret>`), or the OAuth client secret when `auth_type` is `oauth2`. Leave unset when `auth_type` is `none`.",
+      "description": "Credential AISIX uses to authenticate to the upstream agent. For `bearer`, AISIX sends it as `Authorization: Bearer <secret>`; for `api_key`, AISIX sends it as `x-api-key: <secret>`; for `oauth2`, it is the client secret. Leave unset for `none`.",
       "type": [
         "string",
         "null"
       ]
     },
     "timeout_ms": {
-      "description": "Maximum time, in milliseconds, to wait for a single upstream operation (fetching the agent card or invoking the agent). Must be at least `1` when set. When omitted, the gateway applies a built-in default.",
+      "description": "Maximum time, in milliseconds, to wait for a single upstream operation, including fetching the agent card or invoking the agent. Must be at least `1` when set. When omitted, AISIX applies a built-in default.",
       "format": "uint64",
       "minimum": 1.0,
       "type": [
@@ -131,7 +131,7 @@
       ]
     },
     "url": {
-      "description": "The upstream agent's base URL, reached over HTTP with the A2A protocol (JSON-RPC 2.0), such as `https://agents.example.com/a2a`. The agent card is discovered relative to this URL.",
+      "description": "The upstream agent's base URL, such as `https://agents.example.com/a2a`. AISIX reaches this URL over HTTP with the A2A JSON-RPC 2.0 protocol and discovers the agent card relative to it.",
       "minLength": 1,
       "type": "string"
     }
