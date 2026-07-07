@@ -129,11 +129,9 @@ pub enum A2aAuthType {
     /// API key authentication. The key is supplied in `secret` and sent as an
     /// `x-api-key: <secret>` header on every upstream request.
     ApiKey,
-    /// OAuth 2.0 client credentials grant. The gateway exchanges `client_id`,
-    /// the client secret in `secret`, and the optional `scopes` at `token_url`
-    /// for an access token, and sends it as `Authorization: Bearer
-    /// <access_token>` on every upstream request. Access tokens are cached
-    /// until shortly before their reported expiry.
+    /// OAuth 2.0 client credentials grant. Accepted on the resource for forward
+    /// compatibility, but the runtime does not yet mint tokens for upstream A2A
+    /// agents.
     #[serde(rename = "oauth2")]
     OAuth2,
 }
