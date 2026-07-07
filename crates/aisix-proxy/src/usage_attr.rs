@@ -55,6 +55,27 @@ pub(crate) fn provider_key_metric_name(snap: &AisixSnapshot, provider_key_id: &s
     }
 }
 
+/// Total token cost of a request as committed against TPM/TPD rate limits
+/// (and reported as the prometheus usage total): prompt + completion +
+/// Anthropic cache creation/read. Anthropic reports cache tokens as counters
+/// SEPARATE from `input_tokens`, so a prompt+completion sum silently
+/// undercounts cached traffic — the OpenAI bridge already folds them into
+/// `total_tokens` (#679) and the CP display total includes them (#906); this
+/// keeps the native `/v1/messages` and `/v1/responses` commits consistent
+/// (AISIX-Cloud#995). OpenAI's `cached_tokens` is a subset of
+/// `prompt_tokens` and is deliberately NOT an input here.
+pub(crate) fn total_tokens_with_cache(
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    cache_creation_tokens: u32,
+    cache_read_tokens: u32,
+) -> u64 {
+    u64::from(prompt_tokens)
+        + u64::from(completion_tokens)
+        + u64::from(cache_creation_tokens)
+        + u64::from(cache_read_tokens)
+}
+
 /// The `model` metric label for a request whose client-supplied `model`
 /// field never resolved to a configured model (e.g. model-not-found). See
 /// [`metric_model_label`].

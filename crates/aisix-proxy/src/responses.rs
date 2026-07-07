@@ -33,7 +33,7 @@ use crate::client_ip::ClientContext;
 use crate::error::ProxyError;
 use crate::request_id::new_request_id;
 use crate::state::ProxyState;
-use crate::usage_attr::provider_telemetry_tags;
+use crate::usage_attr::{provider_telemetry_tags, total_tokens_with_cache};
 
 /// Per-request payload from a successful dispatch — carries the
 /// response + provider label + the bits of usage data needed for
@@ -570,7 +570,12 @@ async fn dispatch(
                                 .usage
                                 .as_ref()
                                 .map(|u| {
-                                    u64::from(u.prompt_tokens) + u64::from(u.completion_tokens)
+                                    total_tokens_with_cache(
+                                        u.prompt_tokens,
+                                        u.completion_tokens,
+                                        u.cache_creation_tokens,
+                                        u.cache_read_tokens,
+                                    )
                                 })
                                 .unwrap_or(0);
                             r.commit_tokens(total).await;
@@ -1145,8 +1150,12 @@ async fn responses_to_target(
                 // #688: apply the terminal token cost to TPM/TPD and release the
                 // concurrency hold now the stream has ended (sync analog of the
                 // reservation's async `commit_tokens`, which this closure can't await).
-                let streamed_tokens =
-                    u64::from(usage.prompt_tokens) + u64::from(usage.completion_tokens);
+                let streamed_tokens = total_tokens_with_cache(
+                    usage.prompt_tokens,
+                    usage.completion_tokens,
+                    usage.cache_creation_tokens,
+                    usage.cache_read_tokens,
+                );
                 for key in &post_stream_keys {
                     limiter_c.add_tokens_post_stream(key, streamed_tokens);
                 }
@@ -1501,8 +1510,12 @@ async fn responses_cross_provider_to_target(
                 // concurrency hold now the stream has ended (sync analog of the
                 // reservation's async `commit_tokens`). Tokens count even on an
                 // output-guardrail block — the upstream still billed them.
-                let streamed_tokens =
-                    u64::from(comp.prompt_tokens) + u64::from(comp.completion_tokens);
+                let streamed_tokens = total_tokens_with_cache(
+                    comp.prompt_tokens,
+                    comp.completion_tokens,
+                    comp.cache_creation_tokens,
+                    comp.cache_read_tokens,
+                );
                 for key in &post_stream_keys {
                     limiter_c.add_tokens_post_stream(key, streamed_tokens);
                 }

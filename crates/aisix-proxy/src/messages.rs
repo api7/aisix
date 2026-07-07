@@ -63,6 +63,7 @@ use crate::client_ip::ClientContext;
 use crate::error::ProxyError;
 use crate::request_id::new_request_id;
 use crate::state::ProxyState;
+use crate::usage_attr::total_tokens_with_cache;
 
 /// Anthropic API version header value injected on every forwarded request.
 /// Shared with the `/v1/messages/count_tokens` handler so both Anthropic
@@ -664,8 +665,12 @@ async fn dispatch(
                     // this is skipped.
                     if !outcome.usage_handled_by_stream {
                         if let Some(r) = reservation.take() {
-                            let total = u64::from(outcome.metrics.prompt_tokens)
-                                + u64::from(outcome.metrics.completion_tokens);
+                            let total = total_tokens_with_cache(
+                                outcome.metrics.prompt_tokens,
+                                outcome.metrics.completion_tokens,
+                                outcome.metrics.cache_creation_tokens,
+                                outcome.metrics.cache_read_tokens,
+                            );
                             r.commit_tokens(total).await;
                         }
                     }
@@ -1102,8 +1107,12 @@ async fn anthropic_passthrough_dispatch(
                 // is the sync analog of the reservation's async `commit_tokens`
                 // (this end-of-stream closure can't await); dropping the hold frees
                 // the concurrency slot(s) held for the stream's full lifetime.
-                let streamed_tokens =
-                    u64::from(usage.prompt_tokens) + u64::from(usage.completion_tokens);
+                let streamed_tokens = total_tokens_with_cache(
+                    usage.prompt_tokens,
+                    usage.completion_tokens,
+                    usage.cache_creation_tokens,
+                    usage.cache_read_tokens,
+                );
                 for key in &post_stream_keys {
                     limiter_c.add_tokens_post_stream(key, streamed_tokens);
                 }
@@ -1608,8 +1617,12 @@ async fn cross_provider_dispatch(
                 // concurrency hold now the stream has ended (sync analog of the
                 // reservation's async `commit_tokens`, which this closure can't
                 // await).
-                let streamed_tokens =
-                    u64::from(comp.prompt_tokens) + u64::from(comp.completion_tokens);
+                let streamed_tokens = total_tokens_with_cache(
+                    comp.prompt_tokens,
+                    comp.completion_tokens,
+                    comp.cache_creation_tokens,
+                    comp.cache_read_tokens,
+                );
                 for key in &post_stream_keys {
                     limiter_for_stream.add_tokens_post_stream(key, streamed_tokens);
                 }
@@ -2318,9 +2331,13 @@ fn emit_anthropic_usage_event(
         LlmUsage {
             input_tokens: metrics.prompt_tokens,
             output_tokens: metrics.completion_tokens,
-            total_tokens: metrics
-                .prompt_tokens
-                .saturating_add(metrics.completion_tokens),
+            total_tokens: total_tokens_with_cache(
+                metrics.prompt_tokens,
+                metrics.completion_tokens,
+                metrics.cache_creation_tokens,
+                metrics.cache_read_tokens,
+            )
+            .min(u64::from(u32::MAX)) as u32,
             spend_usd: 0.0,
         },
     );
