@@ -3537,6 +3537,16 @@ const OPENAPI_JSON_BASE: &str = r##"{
             },
             "description": "MCP tools this key may call, as namespaced `<server>__<tool>` names (the form the gateway exposes). Entries are matched as single-`*` globs, mirroring `allowed_models`: `\"*\"` grants every tool and `\"<server>__*\"` grants every tool on one server (e.g. `\"github__*\"`); an entry without a `*` matches one tool exactly. When omitted or set to `null`, the key has no MCP tool access — access is granted explicitly."
           },
+          "allowed_agents": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "A2A agents this key may reach, named by their registered names. Entries are matched as single-`*` globs: `\"*\"` grants every agent and an entry without a `*` matches one agent exactly. When omitted or set to `null`, the key has no A2A agent access — access is granted explicitly."
+          },
           "expires_at": {
             "type": [
               "string",
@@ -3898,6 +3908,19 @@ const OPENAPI_JSON_BASE: &str = r##"{
               "github__create_issue"
             ]
           },
+          "allowed_agents": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "A2A agents this key may reach, named by their registered names. Entries are matched as single-`*` globs: `\"*\"` grants every agent and an entry without a `*` matches one agent exactly. When omitted or set to `null`, the key has no A2A agent access — access is granted explicitly.",
+            "example": [
+              "invoice-processor"
+            ]
+          },
           "expires_at": {
             "type": [
               "string",
@@ -3947,6 +3970,10 @@ const OPENAPI_JSON_BASE: &str = r##"{
     {
       "name": "MCP Servers",
       "description": "Upstream MCP servers exposed through the gateway MCP endpoint."
+    },
+    {
+      "name": "A2A Agents",
+      "description": "Upstream A2A agents exposed through the gateway Agent Gateway endpoint."
     },
     {
       "name": "Guardrails",
@@ -4684,6 +4711,21 @@ mod tests {
             request_allowed_tools.contains("<server>__*"),
             "self-hosted API key request schema must document the per-server wildcard"
         );
+        assert!(
+            request["properties"].get("allowed_agents").is_some(),
+            "self-hosted API key requests must document A2A agent access"
+        );
+        let request_allowed_agents = request["properties"]["allowed_agents"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(
+            request_allowed_agents.contains("omitted or set to `null`"),
+            "self-hosted API key request schema must document null agent-access behavior"
+        );
+        assert!(
+            request_allowed_agents.contains("grants every agent"),
+            "self-hosted API key request schema must document wildcard agent access"
+        );
         let public = &parsed["components"]["schemas"]["PublicApiKey"];
         assert!(
             public["properties"].get("allowed_tools").is_some(),
@@ -4699,6 +4741,21 @@ mod tests {
         assert!(
             public_allowed_tools.contains("<server>__*"),
             "API key response schema must document the per-server wildcard"
+        );
+        assert!(
+            public["properties"].get("allowed_agents").is_some(),
+            "API key responses must document A2A agent access"
+        );
+        let public_allowed_agents = public["properties"]["allowed_agents"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(
+            public_allowed_agents.contains("omitted or set to `null`"),
+            "API key response schema must document null agent-access behavior"
+        );
+        assert!(
+            public_allowed_agents.contains("grants every agent"),
+            "API key response schema must document wildcard agent access"
         );
         assert!(request["properties"].get("team_id").is_none());
         assert!(request["properties"].get("user_id").is_none());
