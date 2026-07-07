@@ -1790,7 +1790,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
             }
           },
           "400": {
-            "description": "Schema validation failed, the JSON body is malformed, `display_name` contains a `/` (it is the agent's URL path segment), or the credentials required by `auth_type` are missing (`secret` for `bearer`/`api_key`; `client_id`, `token_url`, and `secret` for `oauth2`)",
+            "description": "Invalid request body, `display_name` contains `/`, or the selected `auth_type` is missing required credentials.",
             "content": {
               "application/json": {
                 "schema": {
@@ -1948,7 +1948,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
             }
           },
           "400": {
-            "description": "Schema validation failed, the JSON body is malformed, `display_name` contains a `/` (it is the agent's URL path segment), or the credentials required by `auth_type` are missing (`secret` for `bearer`/`api_key`; `client_id`, `token_url`, and `secret` for `oauth2`)",
+            "description": "Invalid request body, `display_name` contains `/`, or the selected `auth_type` is missing required credentials.",
             "content": {
               "application/json": {
                 "schema": {
