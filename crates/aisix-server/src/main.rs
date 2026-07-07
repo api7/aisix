@@ -42,7 +42,7 @@ use etcd_client::{Certificate, ConnectOptions, Identity, TlsOptions};
 use tokio::sync::watch;
 
 #[derive(Debug, Parser)]
-#[command(name = "aisix", version, about = "aisix AI Gateway")]
+#[command(name = "aisix", version = aisix_core::BUILD_VERSION, about = "aisix AI Gateway")]
 struct Cli {
     /// Path to the bootstrap config file (YAML / TOML / JSON).
     #[arg(short, long, env = "AISIX_CONFIG")]

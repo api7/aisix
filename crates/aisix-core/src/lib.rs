@@ -21,6 +21,7 @@ pub mod error;
 pub mod models;
 pub mod resource;
 pub mod snapshot;
+pub mod version;
 pub mod wildcard;
 
 pub use config::{
@@ -44,3 +45,4 @@ pub use models::{
 };
 pub use resource::{Resource, ResourceEntry};
 pub use snapshot::{ResourceTable, SnapshotHandle};
+pub use version::BUILD_VERSION;

@@ -108,6 +108,19 @@ jobs:
         # metadata-action's `type=sha,format=short` puts in the tag.
         run: echo "value=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
 
+      # Release version stamped into the binary so the shipped image
+      # self-reports the tagged version (Server header, --version,
+      # heartbeat dp_version) with no manual Cargo.toml bump. Empty on
+      # non-tag builds → binary falls back to the crate version.
+      - name: Compute release version from tag
+        id: relver
+        run: |
+          v=""
+          case "$GITHUB_REF" in
+            refs/tags/v*) v="${GITHUB_REF_NAME#v}" ;;
+          esac
+          echo "value=$v" >> "$GITHUB_OUTPUT"
+
       - name: Build and push
         id: build
         uses: docker/build-push-action@v7
@@ -121,9 +134,24 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             BUILD_SHA=${{ steps.shortsha.outputs.value }}
+            BUILD_VERSION=${{ steps.relver.outputs.value }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: false   # keep manifest format compatible with older clients
+
+      # Fail the release if the published image does not self-report the
+      # tagged version — the guard that keeps `Server: AISIX/<ver>` /
+      # `aisix --version` / dashboard dp_version from ever regressing to
+      # a stale crate version again (QA v0.3.0 finding: 0.3.0 image
+      # reported 0.1.0).
+      - name: Verify self-reported version matches the release tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -eux
+          VER="${GITHUB_REF_NAME#v}"
+          IMG="${REGISTRY}/${IMAGE_NAME}@${{ steps.build.outputs.digest }}"
+          docker run --rm --entrypoint /usr/local/bin/aisix "$IMG" --version | tee /tmp/aisix-version
+          grep -qx "aisix ${VER}" /tmp/aisix-version
 
       # The image contract customers rely on for hostNetwork/:80
       # deployments: the default non-root user (uid 10001) must be able

@@ -33,7 +33,7 @@ dependencies = [
 
 [[package]]
 name = "aisix-a2a"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "aisix-core",
  "async-trait",
@@ -50,7 +50,7 @@ dependencies = [
 
 [[package]]
 name = "aisix-admin"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "aisix-core",
  "aisix-etcd",
@@ -77,7 +77,7 @@ dependencies = [
 
 [[package]]
 name = "aisix-cache"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "aisix-core",
  "aisix-gateway",
@@ -92,7 +92,7 @@ dependencies = [
 
 [[package]]
 name = "aisix-core"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -113,7 +113,7 @@ dependencies = [
 
 [[package]]
 name = "aisix-etcd"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "aisix-core",
  "async-trait",
@@ -130,7 +130,7 @@ dependencies = [
 
 [[package]]
 name = "aisix-gateway"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "aisix-core",
  "async-trait",
@@ -147,7 +147,7 @@ dependencies = [
 
 [[package]]
 name = "aisix-guardrails"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "aisix-core",
  "aisix-gateway",
@@ -174,7 +174,7 @@ dependencies = [
 
 [[package]]
 name = "aisix-mcp"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "aisix-core",
  "async-trait",
@@ -195,7 +195,7 @@ dependencies = [
 
 [[package]]
 name = "aisix-obs"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "aisix-core",
  "aliyun-log-sdk-protobuf",
@@ -225,7 +225,7 @@ dependencies = [
 
 [[package]]
 name = "aisix-provider-anthropic"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "aisix-core",
  "aisix-gateway",
@@ -244,7 +244,7 @@ dependencies = [
 
 [[package]]
 name = "aisix-provider-azure-openai"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "aisix-core",
  "aisix-gateway",
@@ -264,7 +264,7 @@ dependencies = [
 
 [[package]]
 name = "aisix-provider-bedrock"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "aisix-core",
  "aisix-gateway",
@@ -287,7 +287,7 @@ dependencies = [
 
 [[package]]
 name = "aisix-provider-openai"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "aisix-core",
  "aisix-gateway",
@@ -306,7 +306,7 @@ dependencies = [
 
 [[package]]
 name = "aisix-provider-vertex"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "aisix-core",
  "aisix-gateway",
@@ -327,7 +327,7 @@ dependencies = [
 
 [[package]]
 name = "aisix-proxy"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "aisix-a2a",
  "aisix-cache",
@@ -366,7 +366,7 @@ dependencies = [
 
 [[package]]
 name = "aisix-ratelimit"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "aisix-core",
  "aisix-redis",
@@ -382,7 +382,7 @@ dependencies = [
 
 [[package]]
 name = "aisix-redis"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "aisix-core",
  "redis",
@@ -392,7 +392,7 @@ dependencies = [
 
 [[package]]
 name = "aisix-server"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "aisix-admin",
  "aisix-cache",
