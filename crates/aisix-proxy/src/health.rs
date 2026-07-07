@@ -19,6 +19,9 @@ use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use aisix_core::snapshot::SnapshotHandle;
+use aisix_core::AisixSnapshot;
+use aisix_obs::{DeploymentLabels, DeploymentState, Metrics};
 use axum::http::header::{HeaderName, HeaderValue, CONTENT_TYPE};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -351,6 +354,19 @@ const LATENCY_EWMA_ALPHA: f64 = 0.3;
 #[derive(Default, Debug)]
 pub struct ModelRuntimeStatusTracker {
     entries: DashMap<String, RuntimeEntry>,
+    /// Optional metrics sink. Wired only by the production
+    /// [`crate::state::ProxyState::with_components`] bootstrap so cooldown
+    /// transitions surface on the Prometheus scrape
+    /// (`aisix_deployment_state` / `aisix_deployment_cooled_down_total`);
+    /// `None` in tests and the lightweight constructors, where the tracker
+    /// stays a pure state machine.
+    metrics: Option<Arc<Metrics>>,
+    /// Optional snapshot handle, used purely to resolve a cooled target's
+    /// id into rich deployment labels (provider / upstream_model /
+    /// provider_key_id) at emit time — a rare, O(1) `get_by_id` lookup
+    /// only on a cooldown transition. `None` falls back to model-id-only
+    /// labels.
+    snapshot: Option<SnapshotHandle<AisixSnapshot>>,
 }
 
 /// RAII guard that decrements a target's in-flight counter when dropped.
@@ -414,29 +430,99 @@ impl ModelRuntimeStatusTracker {
         Self::default()
     }
 
+    /// Production constructor: wires the metrics sink and snapshot handle
+    /// so cooldown transitions emit `aisix_deployment_state` /
+    /// `aisix_deployment_cooled_down_total`. Used by
+    /// [`crate::state::ProxyState::with_components`]; the plain [`new`]
+    /// (and `Default`) stay metrics-free for tests.
+    pub fn with_observability(
+        metrics: Arc<Metrics>,
+        snapshot: SnapshotHandle<AisixSnapshot>,
+    ) -> Self {
+        Self {
+            entries: DashMap::new(),
+            metrics: Some(metrics),
+            snapshot: Some(snapshot),
+        }
+    }
+
     pub fn mark_cooldown(&self, model_id: &str, ttl: Duration, reason: impl Into<String>) {
         let now = SystemTime::now();
         let until = now + ttl;
         let reason = reason.into();
-        self.entries
-            .entry(model_id.to_string())
-            .and_modify(|entry| {
-                entry.cooldown_until = Some(until);
-                entry.status_reason = Some(reason.clone());
-            })
-            .or_insert_with(|| RuntimeEntry {
-                cooldown_until: Some(until),
-                status_reason: Some(reason),
-                ..RuntimeEntry::default()
-            });
+        let mut entry = self.entries.entry(model_id.to_string()).or_default();
+        // A fresh cooldown = the target was not already cooling (never
+        // cooled, or a previous cooldown has since expired). Only that
+        // transition is counted, so a burst of failures re-marking an
+        // already-cooled target doesn't inflate the counter.
+        let entered_cooldown = entry.cooldown_until.is_none_or(|u| u <= now);
+        entry.cooldown_until = Some(until);
+        entry.status_reason = Some(reason);
+        drop(entry);
+        if entered_cooldown {
+            self.emit_deployment_state(model_id, DeploymentState::Down, true);
+        }
     }
 
     pub fn mark_healthy(&self, model_id: &str) {
+        let mut recovered = false;
         if let Some(mut entry) = self.entries.get_mut(model_id) {
+            recovered =
+                entry.unhealthy || entry.cooldown_until.is_some_and(|u| u > SystemTime::now());
             entry.unhealthy = false;
             entry.cooldown_until = None;
             entry.status_reason = None;
         }
+        // Only flip the gauge back to Healthy on an actual recovery, so
+        // already-healthy targets don't churn the metric on every success.
+        if recovered {
+            self.emit_deployment_state(model_id, DeploymentState::Healthy, false);
+        }
+    }
+
+    /// Emit the deployment gauge (and, on a fresh cooldown, the cooldown
+    /// counter) for `model_id`. No-op unless a metrics sink is wired.
+    /// Rich labels (provider / upstream_model / provider_key_id) are
+    /// resolved from the snapshot by id; a missing snapshot or unknown id
+    /// falls back to a model-id-only label set.
+    fn emit_deployment_state(&self, model_id: &str, state: DeploymentState, count_cooldown: bool) {
+        let Some(metrics) = self.metrics.as_ref() else {
+            return;
+        };
+        let (provider, model, upstream_model, provider_key_id) = self
+            .snapshot
+            .as_ref()
+            .and_then(|handle| {
+                let snap = handle.load();
+                let entry = snap.models.get_by_id(model_id)?;
+                let m = &entry.value;
+                Some((
+                    m.provider.clone().unwrap_or_else(|| "unknown".to_string()),
+                    m.display_name.clone(),
+                    m.upstream_model().unwrap_or("unknown").to_string(),
+                    m.provider_key_id
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_string()),
+                ))
+            })
+            .unwrap_or_else(|| {
+                (
+                    "unknown".to_string(),
+                    model_id.to_string(),
+                    "unknown".to_string(),
+                    "unknown".to_string(),
+                )
+            });
+        let labels = DeploymentLabels {
+            provider: &provider,
+            model: &model,
+            upstream_model: &upstream_model,
+            provider_key_id: &provider_key_id,
+        };
+        if count_cooldown {
+            metrics.record_deployment_cooldown(labels);
+        }
+        metrics.set_deployment_state(labels, state);
     }
 
     pub fn clear_unhealthy(&self, model_id: &str) {
@@ -713,6 +799,70 @@ mod tests {
         assert_eq!(unhealthy.last_check_status, Some(500));
         t.mark_healthy("m-1");
         assert_eq!(t.status("m-1").status, RuntimeStatus::Healthy);
+    }
+
+    #[test]
+    fn cooldown_transition_emits_deployment_metrics_once() {
+        use aisix_core::{Model, ResourceEntry};
+
+        // A snapshot with one direct model lets the tracker resolve rich
+        // labels (provider / upstream_model / provider_key_id) for the
+        // cooled target id instead of falling back to model-id-only.
+        let model: Model = serde_json::from_value(serde_json::json!({
+            "display_name": "cooldown-metrics-model",
+            "provider": "openai",
+            "model_name": "gpt-4o-mini",
+            "provider_key_id": "pk-cooldown",
+        }))
+        .unwrap();
+        let snapshot = AisixSnapshot::new();
+        snapshot
+            .models
+            .insert(ResourceEntry::new("m-cool", model, 1));
+
+        let metrics = Arc::new(Metrics::new(false));
+        let tracker = ModelRuntimeStatusTracker::with_observability(
+            metrics.clone(),
+            SnapshotHandle::new(snapshot),
+        );
+
+        // First mark = a fresh transition (counter++, gauge → Down). The
+        // second mark re-cools an already-cooled target and must NOT
+        // double-count.
+        tracker.mark_cooldown("m-cool", Duration::from_secs(30), "upstream_server_error");
+        tracker.mark_cooldown("m-cool", Duration::from_secs(30), "upstream_server_error");
+
+        let scrape = metrics.render();
+        assert!(
+            scrape.contains("aisix_deployment_cooled_down_total"),
+            "cooldown counter missing from scrape:\n{scrape}"
+        );
+        // Labels came from the snapshot, not the model-id-only fallback.
+        assert!(
+            scrape.contains("provider=\"openai\"")
+                && scrape.contains("upstream_model=\"gpt-4o-mini\"")
+                && scrape.contains("provider_key_id=\"pk-cooldown\""),
+            "expected resolved deployment labels in scrape:\n{scrape}"
+        );
+        let cooled = scrape
+            .lines()
+            .find(|l| l.starts_with("aisix_deployment_cooled_down_total{"))
+            .expect("cooldown counter line");
+        let count: f64 = cooled.rsplit(' ').next().unwrap().parse().unwrap();
+        assert_eq!(count, 1.0, "cooldown counted once per transition: {cooled}");
+
+        // Recovery flips the gauge back to Healthy(0).
+        tracker.mark_healthy("m-cool");
+        let scrape = metrics.render();
+        let state = scrape
+            .lines()
+            .find(|l| l.starts_with("aisix_deployment_state{"))
+            .expect("deployment state gauge line");
+        let value: f64 = state.rsplit(' ').next().unwrap().parse().unwrap();
+        assert_eq!(
+            value, 0.0,
+            "state gauge is Healthy(0) after recovery: {state}"
+        );
     }
 
     #[test]

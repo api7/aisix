@@ -711,3 +711,156 @@ describe("filter contract (H3 escape hatch) — try_anyway sends to known-bad", 
     expect(downUpstream.receivedRequests.length - baseline).toBe(1);
   });
 });
+
+describe("cooldown observability — a cooldown transition emits aisix_deployment_* metrics", () => {
+  let app: SpawnedApp | undefined;
+  let admin: AdminClient | undefined;
+  let etcdReachable = false;
+  let failUpstream: OpenAiUpstream | undefined;
+  let stableUpstream: OpenAiUpstream | undefined;
+  let failModelID = "";
+
+  beforeAll(async () => {
+    etcdReachable = await new EtcdClient().ping();
+    if (!etcdReachable) return;
+
+    // 500 is a default cooldown trigger status → the failing target
+    // cools down; the router then falls over to the stable target.
+    failUpstream = await startOpenAiUpstream({
+      status: 500,
+      errorBody: { error: { message: "boom", type: "server_error" } },
+    });
+    stableUpstream = await startOpenAiUpstream({
+      nonStreamBody: {
+        id: "cmpl-metrics-stable",
+        object: "chat.completion",
+        created: Math.floor(Date.now() / 1000),
+        model: "gpt-4o-mini",
+        choices: [
+          {
+            index: 0,
+            message: { role: "assistant", content: "metrics stable fallback" },
+            finish_reason: "stop",
+          },
+        ],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      },
+    });
+
+    app = await spawnApp();
+    admin = new AdminClient(app.adminUrl, app.adminKey);
+
+    const failPk = await admin.createProviderKey({
+      display_name: "cd-metrics-fail-pk",
+      secret: "sk-mock",
+      api_base: `${failUpstream.baseUrl}/v1`,
+    });
+    const stablePk = await admin.createProviderKey({
+      display_name: "cd-metrics-stable-pk",
+      secret: "sk-mock",
+      api_base: `${stableUpstream.baseUrl}/v1`,
+    });
+
+    failModelID = (
+      await admin.createModel({
+        display_name: "cd-metrics-500-model",
+        provider: "openai",
+        model_name: "gpt-4o-mini",
+        provider_key_id: failPk.id,
+      })
+    ).id;
+    await admin.createModel({
+      display_name: "cd-metrics-stable-model",
+      provider: "openai",
+      model_name: "gpt-4o-mini",
+      provider_key_id: stablePk.id,
+    });
+    await admin.createModel({
+      display_name: "cd-metrics-router",
+      routing: {
+        strategy: "failover",
+        targets: [
+          { model: "cd-metrics-500-model" },
+          { model: "cd-metrics-stable-model" },
+        ],
+        max_fallbacks: 1,
+      },
+    });
+    await admin.createApiKey({
+      key_hash: CALLER_KEY_HASH,
+      allowed_models: ["cd-metrics-router", "cd-metrics-stable-model"],
+    });
+  });
+
+  afterAll(async () => {
+    await app?.exit();
+    await failUpstream?.close();
+    await stableUpstream?.close();
+  });
+
+  test("the deployment cooldown counter and state gauge appear on the scrape with the cooled target's labels", async (ctx) => {
+    if (!etcdReachable || !app || !admin || !failUpstream || !stableUpstream) {
+      ctx.skip();
+      return;
+    }
+
+    const client = new OpenAI({
+      apiKey: CALLER_PLAINTEXT,
+      baseURL: `${app.proxyUrl}/v1`,
+      maxRetries: 0,
+    });
+
+    await waitConfigPropagation(async () => {
+      try {
+        const probe = await client.chat.completions.create({
+          model: "cd-metrics-stable-model",
+          messages: [{ role: "user", content: "ready-metrics-stable" }],
+        });
+        return probe.choices[0]?.message.content === "metrics stable fallback";
+      } catch {
+        return false;
+      }
+    });
+
+    // Trip the 500 target: it cools down (and the router fails over to
+    // the stable target, so the caller still gets a 200).
+    const res = await client.chat.completions.create({
+      model: "cd-metrics-router",
+      messages: [{ role: "user", content: "trip cooldown for metrics" }],
+    });
+    expect(res.choices[0]?.message.content).toBe("metrics stable fallback");
+
+    // Confirm the cooldown actually landed before scraping.
+    const statuses = await admin.listModelStatuses();
+    expect(statuses.find((r) => r.id === failModelID)?.status).toBe("cooldown");
+
+    const scrape = await fetch(`${app.metricsUrl}/metrics`);
+    expect(scrape.status).toBe(200);
+    const text = await scrape.text();
+
+    // The cooldown counter is emitted for the cooled target, labelled by
+    // its resolved deployment identity (not model-id-only "unknown").
+    const cooledLine = text
+      .split("\n")
+      .find(
+        (l) =>
+          l.startsWith("aisix_deployment_cooled_down_total{") &&
+          l.includes('model="cd-metrics-500-model"'),
+      );
+    expect(cooledLine, `cooldown counter missing:\n${text}`).toBeTruthy();
+    expect(cooledLine).toContain('provider="openai"');
+    expect(cooledLine).toContain('upstream_model="gpt-4o-mini"');
+    expect(Number(cooledLine!.trim().split(/\s+/).pop())).toBeGreaterThanOrEqual(1);
+
+    // The state gauge reflects the cooled target as out-of-rotation (Down=2).
+    const stateLine = text
+      .split("\n")
+      .find(
+        (l) =>
+          l.startsWith("aisix_deployment_state{") &&
+          l.includes('model="cd-metrics-500-model"'),
+      );
+    expect(stateLine, `deployment state gauge missing:\n${text}`).toBeTruthy();
+    expect(Number(stateLine!.trim().split(/\s+/).pop())).toBe(2);
+  });
+});

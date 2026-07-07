@@ -218,6 +218,14 @@ impl ProxyState {
         cfg: &ProxyConfig,
     ) -> Self {
         let guardrail_index = LiveGuardrailIndex::new(snapshot.clone(), None);
+        // The bootstrap constructor is the one place the tracker gets a
+        // metrics sink + snapshot handle, so cooldown transitions emit
+        // `aisix_deployment_*`. Clone both before they are moved into the
+        // struct below.
+        let runtime_status = Arc::new(ModelRuntimeStatusTracker::with_observability(
+            metrics.clone(),
+            snapshot.clone(),
+        ));
         Self {
             snapshot,
             hub,
@@ -231,7 +239,7 @@ impl ProxyState {
             health: Arc::new(HealthTracker::new()),
             livez: Arc::new(LivezState::new()),
             config_apply_age: None,
-            runtime_status: Arc::new(ModelRuntimeStatusTracker::new()),
+            runtime_status,
             usage_sink: UsageSink::disabled(),
             otlp_fan_out: OtlpHttpFanOut::new(),
             request_body_limit_bytes: cfg.request_body_limit_bytes,
