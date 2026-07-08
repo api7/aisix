@@ -34,15 +34,15 @@
 //!   * `aliyun_text_moderation` — calls Aliyun's content-safety
 //!     guardrail (`TextModerationPlus` on `green-cip.<region>.aliyuncs.com`).
 //!     Risk-level moderation on input (`llm_query_moderation`) and output
-//!     (`llm_response_moderation`). #603.
+//!     (`llm_response_moderation`).
 //!   * `pii` — in-process sensitive-data detection + redaction
-//!     (built-in detectors + custom regex, `mask`/`block`). #932.
+//!     (built-in detectors + custom regex, `mask`/`block`).
 //!   * `lakera` — calls Lakera Guard `/v2/guard`; injection/jailbreak
-//!     blocks, PII-only detections mask via returned offsets. #52.
+//!     blocks, PII-only detections mask via returned offsets.
 //!   * `openai_moderation` — calls the OpenAI Moderation API;
-//!     detection-only block. #52.
+//!     detection-only block.
 //!   * `presidio` — self-hosted Presidio analyze→anonymize; per-entity
-//!     `mask`/`block` + selectable anonymize operator. #52.
+//!     `mask`/`block` + selectable anonymize operator.
 //!
 //! See `aisix-guardrails/src/keyword.rs` for the runtime semantics
 //! the snapshot is parsed into.
@@ -339,8 +339,7 @@ fn default_aliyun_risk_level_threshold() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PiiDetectorConfig {
-    /// Built-in detector id: `email`, `china_mobile`, `china_id_card`,
-    /// `bank_card`, `us_ssn`, `ip_address`, `api_key`, `jwt`, `private_key`.
+    /// Built-in detector to enable for this PII guardrail entry.
     #[serde(rename = "type")]
     #[schemars(length(min = 1))]
     pub detector_type: String,
@@ -368,10 +367,11 @@ pub struct PiiCustomPattern {
     pub action: Option<String>,
 }
 
-/// Config block for `kind: "pii"`. In-process sensitive-data detection and
-/// redaction (#932): built-in detectors + custom regex patterns, each with a
-/// `mask` (redact-and-continue) or `block` action, applied to request and/or
-/// response text per the row's `hook_point`.
+/// Config block for `kind: "pii"`. Built-in sensitive-data detection and
+/// redaction. AISIX evaluates built-in detectors and custom regex patterns
+/// inside the gateway. Each detector can mask the matched span and let traffic
+/// continue, or block the request or response according to the row's
+/// `hook_point`.
 ///
 /// `mask` rewrites each matched span to `[<DETECTOR>_REDACTED]` and lets the
 /// request/response continue; `block` rejects with the standard 422
@@ -447,13 +447,11 @@ pub struct BedrockConfig {
     pub output_fail_open: bool,
 }
 
-/// Config block for `kind: "lakera"` (#52). Calls Lakera Guard
-/// (`POST {endpoint}/v2/guard`) with the conversation text and translates
-/// the screening result into a verdict: `flagged` with any non-PII
-/// detector (prompt injection, jailbreak, moderated content) blocks;
-/// `flagged` with ONLY `pii/*` detectors masks the detected spans using
-/// the offsets Lakera returns and lets the request continue (LiteLLM
-/// `lakera_ai_v2` behavior).
+/// Config block for `kind: "lakera"`. Calls Lakera Guard
+/// (`POST {endpoint}/v2/guard`) with conversation text and translates the
+/// screening result into a verdict. Prompt-injection, jailbreak, and content
+/// detections block traffic. Detections that involve only PII mask the detected
+/// spans using the offsets Lakera returns and let traffic continue.
 ///
 /// The `api_key` is stored encrypted and decrypted only when the
 /// configuration is applied; the plaintext is held in memory only and is
@@ -502,10 +500,11 @@ pub struct LakeraConfig {
     pub on_buffer_exceeded: String,
 }
 
-/// Config block for `kind: "openai_moderation"` (#52). Calls the OpenAI
-/// Moderation API (`POST {endpoint}/moderations`, free) and blocks when the
-/// result is flagged. Detection-only — it never rewrites content.
-/// Monitor-before-enforce comes from the row's `enforcement_mode`.
+/// Config block for `kind: "openai_moderation"`. Calls the OpenAI Moderation
+/// API (`POST {endpoint}/moderations`) and blocks when the provider flags
+/// content or when configured category thresholds are reached. This guardrail
+/// is detection-only and never rewrites content. Monitor-before-enforce comes
+/// from the row's `enforcement_mode`.
 ///
 /// The `api_key` is stored encrypted and decrypted only when the
 /// configuration is applied; the plaintext is held in memory only and is
@@ -567,12 +566,10 @@ pub struct PresidioEntityConfig {
     pub action: Option<String>,
 }
 
-/// Config block for `kind: "presidio"` (#52). Self-hosted Microsoft
-/// Presidio PII detection + anonymization: `POST {analyzer_url}/analyze`
-/// finds entities; when the effective action is `mask`,
-/// `POST {anonymizer_url}/anonymize` rewrites the text and the request/
-/// response continues; `block` rejects with the standard 422
-/// content-filter envelope.
+/// Config block for `kind: "presidio"`. Calls a self-hosted Microsoft
+/// Presidio analyzer to find PII entities and, when the effective action is
+/// `mask`, calls the anonymizer to rewrite text before traffic continues.
+/// `block` rejects with the standard 422 content-filter envelope.
 ///
 /// vs. the built-in `kind: "pii"`: Presidio adds NER/ML entities a regex
 /// cannot express (`PERSON`, `LOCATION`, `NRP`, …), a self-hosted
@@ -670,23 +667,25 @@ pub enum GuardrailKind {
     /// `TextModerationPlus` action on `green-cip.<region>.aliyuncs.com`, on
     /// input and/or output, including streaming output.
     AliyunTextModeration(AliyunTextModerationConfig),
-    /// In-process sensitive-data detection + redaction (#932): built-in
-    /// detectors + custom regex, per-detector `mask`/`block` actions, on
-    /// input and/or output, including streaming output. Always available.
+    /// Built-in sensitive-data detection and redaction inside AISIX. Built-in
+    /// detectors and custom regex patterns can mask matched spans or block
+    /// traffic on input, output, or both, including buffered streaming output.
+    /// Always available and does not call an external service.
     Pii(PiiConfig),
-    /// Lakera Guard screening via `POST /v2/guard` (#52): prompt-injection /
-    /// jailbreak / content detection blocks; PII-only detections mask via
-    /// the returned offsets, on input and/or output, including streaming
-    /// output.
+    /// Lakera Guard screening via `POST /v2/guard`. Prompt-injection,
+    /// jailbreak, and content-policy detections block traffic. Detections
+    /// that involve only PII mask spans using the returned offsets. Applies
+    /// on input, output, or both, including buffered streaming output.
     Lakera(LakeraConfig),
-    /// OpenAI Moderation API (#52): category content moderation via
-    /// `POST /moderations`, detection-only (block, never rewrite), on input
-    /// and/or output, including streaming output.
+    /// OpenAI Moderation API category screening via `POST /moderations`.
+    /// Flagged content or configured category thresholds block traffic. This
+    /// guardrail is detection-only and never rewrites content. Applies on
+    /// input, output, or both, including buffered streaming output.
     OpenaiModeration(OpenaiModerationConfig),
-    /// Self-hosted Microsoft Presidio PII detection + anonymization (#52):
-    /// analyzer entities with per-entity `mask`/`block` actions and a
-    /// selectable anonymize operator, on input and/or output, including
-    /// streaming output.
+    /// Self-hosted Microsoft Presidio PII detection and anonymization.
+    /// Analyzer entities can mask or block per entity, and masked entities
+    /// use the selected anonymize operator. Applies on input, output, or both,
+    /// including buffered streaming output.
     Presidio(PresidioConfig),
 }
 

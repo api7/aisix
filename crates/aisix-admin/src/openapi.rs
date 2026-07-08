@@ -4161,7 +4161,7 @@ fn add_variant_titles(doc: &mut Value) {
                 "Azure AI Content Safety Prompt Shield",
                 "Azure AI Content Safety Text Moderation",
                 "Aliyun Text Moderation",
-                "PII Detection & Redaction",
+                "PII Detection and Redaction",
                 "Lakera Guard",
                 "OpenAI Moderation",
                 "Microsoft Presidio",

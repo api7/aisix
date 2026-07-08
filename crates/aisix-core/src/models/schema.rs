@@ -286,7 +286,7 @@ fn title_single_value_enum_variants(
 ///    schema enforced via `enum`. They stay `String` on the struct (their
 ///    values flow through `aisix-guardrails` as strings; converting them to
 ///    Rust enums would churn that crate's processing), so the closed set is
-///    injected here into the relevant kind branch.
+///    injected here into the relevant property.
 /// 3. `created_at` republishes its `date-time` format (annotation-only).
 pub fn guardrail_root_schema() -> Value {
     let mut schema = struct_root_schema::<crate::models::Guardrail>(false);
@@ -310,6 +310,41 @@ pub fn guardrail_root_schema() -> Value {
                 }
             }
         }
+
+        set_definition_property_enum(
+            defs,
+            "PiiDetectorConfig",
+            "type",
+            json!([
+                "email",
+                "china_mobile",
+                "china_id_card",
+                "bank_card",
+                "us_ssn",
+                "ip_address",
+                "api_key",
+                "jwt",
+                "private_key"
+            ]),
+        );
+        set_definition_property_enum(
+            defs,
+            "PiiDetectorConfig",
+            "action",
+            json!(["mask", "block"]),
+        );
+        set_definition_property_enum(defs, "PiiCustomPattern", "action", json!(["mask", "block"]));
+        set_definition_property_enum(
+            defs,
+            "PresidioEntityConfig",
+            "action",
+            json!(["mask", "block"]),
+        );
+    }
+
+    if let Some(Value::Object(properties)) = obj.get_mut("properties") {
+        set_enum(properties, "enforcement_mode", json!(["block", "monitor"]));
+        set_enum(properties, "direction", json!(["input", "output", "both"]));
     }
 
     if let Some(Value::Array(branches)) = obj.get_mut("oneOf") {
@@ -350,6 +385,18 @@ pub fn guardrail_root_schema() -> Value {
                     );
                     set_property_enum(b, "on_buffer_exceeded", json!(["fail_closed", "fail_open"]));
                 }
+                Some("pii") => {
+                    set_property_enum(b, "default_action", json!(["mask", "block"]));
+                    set_property_enum(b, "on_buffer_exceeded", json!(["fail_closed", "fail_open"]));
+                }
+                Some("lakera") => {
+                    set_property_enum(b, "on_buffer_exceeded", json!(["fail_closed", "fail_open"]));
+                }
+                Some("presidio") => {
+                    set_property_enum(b, "default_action", json!(["mask", "block"]));
+                    set_property_enum(b, "operator", json!(["replace", "mask", "hash", "redact"]));
+                    set_property_enum(b, "on_buffer_exceeded", json!(["fail_closed", "fail_open"]));
+                }
                 _ => {}
             }
         }
@@ -369,11 +416,27 @@ pub fn guardrail_root_schema() -> Value {
 /// Set a closed `enum` on a oneOf branch's property (for stringly-typed fields
 /// whose closed set lives only in the schema, not the Rust type).
 fn set_property_enum(branch: &mut serde_json::Map<String, Value>, field: &str, values: Value) {
-    if let Some(prop) = branch
-        .get_mut("properties")
-        .and_then(|p| p.get_mut(field))
-        .and_then(Value::as_object_mut)
+    if let Some(Value::Object(properties)) = branch.get_mut("properties") {
+        set_enum(properties, field, values);
+    }
+}
+
+fn set_definition_property_enum(
+    defs: &mut serde_json::Map<String, Value>,
+    definition: &str,
+    field: &str,
+    values: Value,
+) {
+    if let Some(Value::Object(properties)) = defs
+        .get_mut(definition)
+        .and_then(|d| d.get_mut("properties"))
     {
+        set_enum(properties, field, values);
+    }
+}
+
+fn set_enum(properties: &mut serde_json::Map<String, Value>, field: &str, values: Value) {
+    if let Some(prop) = properties.get_mut(field).and_then(Value::as_object_mut) {
         prop.insert("enum".to_string(), values);
     }
 }
@@ -1507,6 +1570,71 @@ mod tests {
             "risk_level_threshold": "none"
         });
         assert!(validate_guardrail(&v).is_err());
+    }
+
+    #[test]
+    fn guardrail_rejects_invalid_string_enums() {
+        let cases = [
+            json!({
+                "name": "g",
+                "kind": "keyword",
+                "patterns": [],
+                "enforcement_mode": "audit"
+            }),
+            json!({
+                "name": "g",
+                "kind": "keyword",
+                "patterns": [],
+                "direction": "sideways"
+            }),
+            json!({
+                "name": "g",
+                "kind": "pii",
+                "detectors": [{ "type": "email", "action": "redact" }]
+            }),
+            json!({
+                "name": "g",
+                "kind": "pii",
+                "default_action": "redact",
+                "detectors": [{ "type": "email" }]
+            }),
+            json!({
+                "name": "g",
+                "kind": "pii",
+                "detectors": [{ "type": "driver_license" }]
+            }),
+            json!({
+                "name": "g",
+                "kind": "pii",
+                "detectors": [{ "type": "email" }],
+                "on_buffer_exceeded": "drop"
+            }),
+            json!({
+                "name": "g",
+                "kind": "presidio",
+                "analyzer_url": "http://presidio-analyzer:3000",
+                "anonymizer_url": "http://presidio-anonymizer:3000",
+                "operator": "tokenize"
+            }),
+        ];
+
+        for value in cases {
+            assert!(
+                validate_guardrail(&value).is_err(),
+                "guardrail schema accepted invalid enum value: {value}",
+            );
+        }
+    }
+
+    #[test]
+    fn guardrail_openai_moderation_model_stays_open() {
+        let v = json!({
+            "name": "openai-mod",
+            "kind": "openai_moderation",
+            "api_key": "plaintext-key",
+            "model": "future-moderation-model"
+        });
+        validate_guardrail(&v).unwrap();
     }
 
     // ---- observability_exporter schema tests ----

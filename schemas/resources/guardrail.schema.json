@@ -155,6 +155,10 @@
       "properties": {
         "action": {
           "description": "Per-pattern action override: `mask` or `block`. Falls back to the guardrail's `default_action` when omitted.",
+          "enum": [
+            "mask",
+            "block"
+          ],
           "type": "string"
         },
         "name": {
@@ -181,10 +185,25 @@
       "properties": {
         "action": {
           "description": "Per-detector action override: `mask` or `block`. Falls back to the guardrail's `default_action` when omitted.",
+          "enum": [
+            "mask",
+            "block"
+          ],
           "type": "string"
         },
         "type": {
-          "description": "Built-in detector id: `email`, `china_mobile`, `china_id_card`, `bank_card`, `us_ssn`, `ip_address`, `api_key`, `jwt`, `private_key`.",
+          "description": "Built-in detector to enable for this PII guardrail entry.",
+          "enum": [
+            "email",
+            "china_mobile",
+            "china_id_card",
+            "bank_card",
+            "us_ssn",
+            "ip_address",
+            "api_key",
+            "jwt",
+            "private_key"
+          ],
           "minLength": 1,
           "type": "string"
         }
@@ -200,6 +219,10 @@
       "properties": {
         "action": {
           "description": "Per-entity action override: `mask` or `block`. Falls back to the guardrail's `default_action` when omitted.",
+          "enum": [
+            "mask",
+            "block"
+          ],
           "type": "string"
         },
         "type": {
@@ -588,7 +611,7 @@
       "type": "object"
     },
     {
-      "description": "In-process sensitive-data detection + redaction (#932): built-in detectors + custom regex, per-detector `mask`/`block` actions, on input and/or output, including streaming output. Always available.",
+      "description": "Built-in sensitive-data detection and redaction inside AISIX. Built-in detectors and custom regex patterns can mask matched spans or block traffic on input, output, or both, including buffered streaming output. Always available and does not call an external service.",
       "properties": {
         "custom_patterns": {
           "default": [],
@@ -601,6 +624,10 @@
         "default_action": {
           "default": "mask",
           "description": "Action for detectors that don't set their own: `mask` (default) or `block`.",
+          "enum": [
+            "mask",
+            "block"
+          ],
           "type": "string"
         },
         "detectors": {
@@ -627,6 +654,10 @@
         "on_buffer_exceeded": {
           "default": "fail_closed",
           "description": "Buffer-overflow policy. Use `fail_open` to release output unscanned (and unmasked) when the buffer cap is hit; the default `fail_closed` blocks the response instead.",
+          "enum": [
+            "fail_closed",
+            "fail_open"
+          ],
           "type": "string"
         }
       },
@@ -636,7 +667,7 @@
       "type": "object"
     },
     {
-      "description": "Lakera Guard screening via `POST /v2/guard` (#52): prompt-injection / jailbreak / content detection blocks; PII-only detections mask via the returned offsets, on input and/or output, including streaming output.",
+      "description": "Lakera Guard screening via `POST /v2/guard`. Prompt-injection, jailbreak, and content-policy detections block traffic. Detections that involve only PII mask spans using the returned offsets. Applies on input, output, or both, including buffered streaming output.",
       "properties": {
         "api_key": {
           "description": "Lakera API key sent as a `Authorization: Bearer` header. Decrypted before projection. Plaintext is held in memory only and is not logged.",
@@ -665,6 +696,10 @@
         "on_buffer_exceeded": {
           "default": "fail_closed",
           "description": "Buffer-overflow policy. Use `fail_open` to release output unscanned when the buffer cap is hit; the default `fail_closed` blocks the response instead.",
+          "enum": [
+            "fail_closed",
+            "fail_open"
+          ],
           "type": "string"
         },
         "output_fail_open": {
@@ -693,7 +728,7 @@
       "type": "object"
     },
     {
-      "description": "OpenAI Moderation API (#52): category content moderation via `POST /moderations`, detection-only (block, never rewrite), on input and/or output, including streaming output.",
+      "description": "OpenAI Moderation API category screening via `POST /moderations`. Flagged content or configured category thresholds block traffic. This guardrail is detection-only and never rewrites content. Applies on input, output, or both, including buffered streaming output.",
       "properties": {
         "api_key": {
           "description": "OpenAI API key sent as a `Authorization: Bearer` header. Decrypted before projection. Plaintext is held in memory only and is not logged.",
@@ -748,7 +783,7 @@
       "type": "object"
     },
     {
-      "description": "Self-hosted Microsoft Presidio PII detection + anonymization (#52): analyzer entities with per-entity `mask`/`block` actions and a selectable anonymize operator, on input and/or output, including streaming output.",
+      "description": "Self-hosted Microsoft Presidio PII detection and anonymization. Analyzer entities can mask or block per entity, and masked entities use the selected anonymize operator. Applies on input, output, or both, including buffered streaming output.",
       "properties": {
         "analyzer_url": {
           "description": "Presidio analyzer base URL, e.g. `http://presidio-analyzer:3000`. The data plane appends `/analyze`.",
@@ -763,6 +798,10 @@
         "default_action": {
           "default": "mask",
           "description": "Action for entities that don't set their own: `mask` (default) or `block`.",
+          "enum": [
+            "mask",
+            "block"
+          ],
           "type": "string"
         },
         "entities": {
@@ -795,11 +834,21 @@
         "on_buffer_exceeded": {
           "default": "fail_closed",
           "description": "Buffer-overflow policy. Use `fail_open` to release output unscanned (and unmasked) when the buffer cap is hit; the default `fail_closed` blocks the response instead.",
+          "enum": [
+            "fail_closed",
+            "fail_open"
+          ],
           "type": "string"
         },
         "operator": {
           "default": "replace",
           "description": "Anonymize operator applied to masked entities: `replace` (default — Presidio substitutes `<ENTITY_TYPE>`), `mask` (asterisks), `hash` (SHA-256 hex), or `redact` (span removed).",
+          "enum": [
+            "replace",
+            "mask",
+            "hash",
+            "redact"
+          ],
           "type": "string"
         },
         "output_fail_open": {
@@ -840,6 +889,11 @@
     "direction": {
       "default": "both",
       "description": "Attachment direction hint: `input`, `output`, or `both`. Guardrail execution still follows `hook_point`.",
+      "enum": [
+        "input",
+        "output",
+        "both"
+      ],
       "type": "string"
     },
     "enabled": {
@@ -850,6 +904,10 @@
     "enforcement_mode": {
       "default": "block",
       "description": "How AISIX handles matching content. `block` enforces the guardrail. `monitor` records what would have happened without blocking or redacting the caller-visible response.",
+      "enum": [
+        "block",
+        "monitor"
+      ],
       "type": "string"
     },
     "fail_open": {
