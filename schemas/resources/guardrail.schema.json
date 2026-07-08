@@ -434,10 +434,6 @@
         "on_buffer_exceeded": {
           "default": "fail_closed",
           "description": "Buffer-overflow policy for streamed output when the buffer cap is hit.",
-          "enum": [
-            "fail_closed",
-            "fail_open"
-          ],
           "type": "string"
         },
         "output_fail_open": {
@@ -558,10 +554,6 @@
         "on_buffer_exceeded": {
           "default": "fail_closed",
           "description": "Buffer-overflow policy for streamed output when the buffer cap is hit.",
-          "enum": [
-            "fail_closed",
-            "fail_open"
-          ],
           "type": "string"
         },
         "output_fail_open": {
@@ -670,10 +662,6 @@
         "on_buffer_exceeded": {
           "default": "fail_closed",
           "description": "Buffer-overflow policy for streamed output when the buffer cap is hit.",
-          "enum": [
-            "fail_closed",
-            "fail_open"
-          ],
           "type": "string"
         }
       },
@@ -713,10 +701,6 @@
         "on_buffer_exceeded": {
           "default": "fail_closed",
           "description": "Buffer-overflow policy for streamed output when the buffer cap is hit.",
-          "enum": [
-            "fail_closed",
-            "fail_open"
-          ],
           "type": "string"
         },
         "output_fail_open": {
@@ -854,10 +838,6 @@
         "on_buffer_exceeded": {
           "default": "fail_closed",
           "description": "Buffer-overflow policy for streamed output when the buffer cap is hit.",
-          "enum": [
-            "fail_closed",
-            "fail_open"
-          ],
           "type": "string"
         },
         "operator": {
@@ -909,11 +889,6 @@
     "direction": {
       "default": "both",
       "description": "Attachment direction hint. Guardrail execution still follows `hook_point`.",
-      "enum": [
-        "input",
-        "output",
-        "both"
-      ],
       "type": "string"
     },
     "enabled": {

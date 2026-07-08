@@ -393,10 +393,6 @@ pub fn guardrail_root_schema() -> Value {
         );
     }
 
-    if let Some(Value::Object(properties)) = obj.get_mut("properties") {
-        set_enum(properties, "direction", json!(["input", "output", "both"]));
-    }
-
     if let Some(Value::Array(branches)) = obj.get_mut("oneOf") {
         for branch in branches.iter_mut() {
             let Some(b) = branch.as_object_mut() else {
@@ -425,7 +421,6 @@ pub fn guardrail_root_schema() -> Value {
                         "stream_processing_mode",
                         json!(["window", "buffer_full"]),
                     );
-                    set_property_enum(b, "on_buffer_exceeded", json!(["fail_closed", "fail_open"]));
                     set_property_items_enum(
                         b,
                         "categories",
@@ -454,14 +449,9 @@ pub fn guardrail_root_schema() -> Value {
                         "stream_processing_mode",
                         json!(["window", "buffer_full"]),
                     );
-                    set_property_enum(b, "on_buffer_exceeded", json!(["fail_closed", "fail_open"]));
                 }
                 "pii" => {
                     set_property_enum(b, "default_action", json!(["mask", "block"]));
-                    set_property_enum(b, "on_buffer_exceeded", json!(["fail_closed", "fail_open"]));
-                }
-                "lakera" => {
-                    set_property_enum(b, "on_buffer_exceeded", json!(["fail_closed", "fail_open"]));
                 }
                 "openai_moderation" => {
                     set_property_additional_properties_description(
@@ -473,7 +463,6 @@ pub fn guardrail_root_schema() -> Value {
                 "presidio" => {
                     set_property_enum(b, "default_action", json!(["mask", "block"]));
                     set_property_enum(b, "operator", json!(["replace", "mask", "hash", "redact"]));
-                    set_property_enum(b, "on_buffer_exceeded", json!(["fail_closed", "fail_open"]));
                 }
                 _ => {}
             }
@@ -1746,12 +1735,6 @@ mod tests {
         let cases = [
             json!({
                 "name": "g",
-                "kind": "keyword",
-                "patterns": [],
-                "direction": "sideways"
-            }),
-            json!({
-                "name": "g",
                 "kind": "azure_content_safety_text_moderation",
                 "endpoint": "https://example.cognitiveservices.azure.com",
                 "api_key": "key",
@@ -1805,18 +1788,6 @@ mod tests {
             }),
             json!({
                 "name": "g",
-                "kind": "pii",
-                "detectors": [{ "type": "email" }],
-                "on_buffer_exceeded": "drop"
-            }),
-            json!({
-                "name": "g",
-                "kind": "lakera",
-                "api_key": "key",
-                "on_buffer_exceeded": "drop"
-            }),
-            json!({
-                "name": "g",
                 "kind": "presidio",
                 "analyzer_url": "http://presidio-analyzer:3000",
                 "anonymizer_url": "http://presidio-anonymizer:3000",
@@ -1828,13 +1799,6 @@ mod tests {
                 "analyzer_url": "http://presidio-analyzer:3000",
                 "anonymizer_url": "http://presidio-anonymizer:3000",
                 "entities": [{ "type": "EMAIL_ADDRESS", "action": "redact" }]
-            }),
-            json!({
-                "name": "g",
-                "kind": "presidio",
-                "analyzer_url": "http://presidio-analyzer:3000",
-                "anonymizer_url": "http://presidio-anonymizer:3000",
-                "on_buffer_exceeded": "drop"
             }),
             json!({
                 "name": "g",
@@ -1854,14 +1818,54 @@ mod tests {
     }
 
     #[test]
-    fn guardrail_enforcement_mode_stays_schema_open_for_fail_safe_fallback() {
-        let v = json!({
-            "name": "g",
-            "kind": "keyword",
-            "patterns": [],
-            "enforcement_mode": "audit"
-        });
-        validate_guardrail(&v).unwrap();
+    fn guardrail_fail_safe_fields_stay_schema_open() {
+        let cases = [
+            json!({
+                "name": "g",
+                "kind": "keyword",
+                "patterns": [],
+                "enforcement_mode": "audit",
+                "direction": "sideways"
+            }),
+            json!({
+                "name": "g",
+                "kind": "azure_content_safety_text_moderation",
+                "endpoint": "https://example.cognitiveservices.azure.com",
+                "api_key": "key",
+                "on_buffer_exceeded": "drop"
+            }),
+            json!({
+                "name": "g",
+                "kind": "aliyun_text_moderation",
+                "region": "cn-shanghai",
+                "access_key_id": "id",
+                "access_key_secret": "s",
+                "on_buffer_exceeded": "drop"
+            }),
+            json!({
+                "name": "g",
+                "kind": "pii",
+                "detectors": [{ "type": "email" }],
+                "on_buffer_exceeded": "drop"
+            }),
+            json!({
+                "name": "g",
+                "kind": "lakera",
+                "api_key": "key",
+                "on_buffer_exceeded": "drop"
+            }),
+            json!({
+                "name": "g",
+                "kind": "presidio",
+                "analyzer_url": "http://presidio-analyzer:3000",
+                "anonymizer_url": "http://presidio-anonymizer:3000",
+                "on_buffer_exceeded": "drop"
+            }),
+        ];
+
+        for value in cases {
+            validate_guardrail(&value).unwrap();
+        }
     }
 
     #[test]
