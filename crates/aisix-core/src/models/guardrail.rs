@@ -333,10 +333,9 @@ fn default_aliyun_risk_level_threshold() -> String {
     "high".to_owned()
 }
 
-/// One built-in detector selection for `kind: "pii"`. The `type` names a
-/// detector compiled into the DP (`aisix-guardrails::pii::BUILTIN_DETECTORS`);
-/// `action` optionally overrides the guardrail-level `default_action` for
-/// this detector only.
+/// One built-in detector selection for `kind: "pii"`. The `type` names the
+/// detector to enable; `action` optionally overrides the guardrail-level
+/// `default_action` for this detector only.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PiiDetectorConfig {
@@ -359,8 +358,8 @@ pub struct PiiCustomPattern {
     /// telemetry counts, and block reasons. Never the matched value.
     #[schemars(length(min = 1, max = 64))]
     pub name: String,
-    /// Regular expression the DP compiles at chain build. Invalid patterns
-    /// are logged and the row is skipped (same contract as keyword rules).
+    /// Regular expression AISIX compiles when building the guardrail chain.
+    /// An invalid pattern makes AISIX log and skip the guardrail.
     #[schemars(length(min = 1))]
     pub regex: String,
     /// Per-pattern action override: `mask` or `block`. Falls back to the
@@ -381,8 +380,8 @@ pub struct PiiCustomPattern {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PiiConfig {
-    /// Built-in detectors to enable. Unknown detector ids are rejected at
-    /// build time (row skipped + warn), so a typo can't silently disarm
+    /// Built-in detectors to enable. Unknown detector ids are rejected when
+    /// AISIX builds the guardrail chain, so a typo cannot silently disable
     /// the policy.
     #[serde(default)]
     pub detectors: Vec<PiiDetectorConfig>,
@@ -518,8 +517,8 @@ pub struct OpenaiModerationConfig {
     /// before projection. Plaintext is held in memory only and is not logged.
     #[schemars(length(min = 1))]
     pub api_key: String,
-    /// Endpoint override (an Azure OpenAI deployment or a mock). The data
-    /// plane appends `/moderations`. Defaults to `https://api.openai.com/v1`.
+    /// Endpoint override, such as an Azure OpenAI deployment. AISIX appends
+    /// `/moderations`. Defaults to `https://api.openai.com/v1`.
     #[serde(default)]
     #[schemars(length(min = 1))]
     pub endpoint: Option<String>,
@@ -530,9 +529,8 @@ pub struct OpenaiModerationConfig {
     pub model: String,
     /// Per-category score thresholds, e.g. `{"violence": 0.5}`. When set,
     /// only the listed categories are enforced and a category blocks when
-    /// its score reaches the threshold. When empty (the default), the API's
-    /// own `flagged` boolean decides — the LiteLLM `openai_moderation`
-    /// baseline behavior.
+    /// its score reaches the threshold. When empty (the default), the
+    /// provider's `flagged` decision determines whether to block.
     #[serde(default)]
     pub category_thresholds: std::collections::BTreeMap<String, f64>,
     /// HTTP call timeout in milliseconds. `fail_open` and `output_fail_open`
@@ -790,23 +788,21 @@ pub struct Guardrail {
     #[serde(flatten)]
     pub config: GuardrailKind,
 
-    // --- P0c additive fields (outer-struct level; no deny_unknown_fields) ---
-    //
-    // cp-api's marshalGuardrailKV will start emitting these once the P0c
-    // CP PR lands. Until then, old kine rows omit them and the defaults apply.
-    /// How the data plane behaves when this guardrail fires. `monitor` is stored for compatibility but not yet enforced.
+    /// How AISIX handles matching content. `block` enforces the guardrail.
+    /// `monitor` records what would have happened without blocking or
+    /// redacting the caller-visible response.
     #[serde(default = "default_enforcement_mode")]
     pub enforcement_mode: String,
 
     /// Whether guardrail evaluation errors are fatal. When `true`, a remote
-    /// guardrail that can't reach its upstream blocks the request instead of
-    /// failing open — it overrides `fail_open` on the failure path (the DP
-    /// wraps the row in a MandatoryGuardrail that turns a `Bypass` into a
-    /// `Block`). Default `false` keeps the `fail_open` behaviour.
+    /// guardrail that cannot reach its upstream blocks the request instead of
+    /// failing open, overriding `fail_open` on the failure path. The default
+    /// `false` keeps the `fail_open` behavior.
     #[serde(default)]
     pub mandatory: bool,
 
-    /// Attachment direction hint: `input`, `output`, or `both`. Stored for compatibility. Current hook selection still follows `hook_point`.
+    /// Attachment direction hint: `input`, `output`, or `both`. Guardrail
+    /// execution still follows `hook_point`.
     #[serde(default = "default_direction")]
     pub direction: String,
 
@@ -854,9 +850,9 @@ impl Resource for Guardrail {
 
 /// Which dimension of the request a guardrail attachment is scoped to.
 ///
-/// `Env` applies to every request in the environment (the pre-P0c behaviour).
-/// The narrower scopes let operators attach a guardrail to just the models,
-/// API keys, or teams that need it.
+/// `Env` applies to every request in the environment. The narrower scopes let
+/// operators attach a guardrail to only the models, API keys, or teams that
+/// need it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum GuardrailScopeType {
@@ -866,14 +862,10 @@ pub enum GuardrailScopeType {
     Team,
 }
 
-/// One attachment row — written by cp-api to `/aisix/<env>/guardrail_attachments/<uuid>`.
-///
-/// The DP loads these alongside the guardrail definitions and builds a
-/// `GuardrailIndex` that resolves the applicable chain per request via
-/// `scope_type` + `scope_id` matching.
-///
-/// `deny_unknown_fields` is intentionally NOT set: cp-api includes `env_id`
-/// in the payload (for its own idempotency checks) which the DP doesn't need.
+/// Guardrail attachment that scopes one guardrail to an environment, model,
+/// caller API key, or team. AISIX loads attachments with the guardrail
+/// definitions and uses `scope_type` plus `scope_id` to decide which
+/// guardrails apply to each request.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 pub struct GuardrailAttachment {
     /// UUID of the guardrail definition this attachment points to.
@@ -892,8 +884,7 @@ pub struct GuardrailAttachment {
     /// and duplicates are dropped.
     pub priority: i32,
 
-    /// When `false`, `GuardrailIndex::resolve` skips this attachment
-    /// entirely (same as the row not existing).
+    /// When `false`, AISIX ignores this attachment.
     #[serde(default = "default_enabled")]
     pub enabled: bool,
 

@@ -164,7 +164,7 @@
           "type": "string"
         },
         "regex": {
-          "description": "Regular expression the DP compiles at chain build. Invalid patterns are logged and the row is skipped (same contract as keyword rules).",
+          "description": "Regular expression AISIX compiles when building the guardrail chain. An invalid pattern makes AISIX log and skip the guardrail.",
           "minLength": 1,
           "type": "string"
         }
@@ -177,7 +177,7 @@
     },
     "PiiDetectorConfig": {
       "additionalProperties": false,
-      "description": "One built-in detector selection for `kind: \"pii\"`. The `type` names a detector compiled into the DP (`aisix-guardrails::pii::BUILTIN_DETECTORS`); `action` optionally overrides the guardrail-level `default_action` for this detector only.",
+      "description": "One built-in detector selection for `kind: \"pii\"`. The `type` names the detector to enable; `action` optionally overrides the guardrail-level `default_action` for this detector only.",
       "properties": {
         "action": {
           "description": "Per-detector action override: `mask` or `block`. Falls back to the guardrail's `default_action` when omitted.",
@@ -605,7 +605,7 @@
         },
         "detectors": {
           "default": [],
-          "description": "Built-in detectors to enable. Unknown detector ids are rejected at build time (row skipped + warn), so a typo can't silently disarm the policy.",
+          "description": "Built-in detectors to enable. Unknown detector ids are rejected when AISIX builds the guardrail chain, so a typo cannot silently disable the policy.",
           "items": {
             "$ref": "#/definitions/PiiDetectorConfig"
           },
@@ -706,12 +706,12 @@
             "type": "number"
           },
           "default": {},
-          "description": "Per-category score thresholds, e.g. `{\"violence\": 0.5}`. When set, only the listed categories are enforced and a category blocks when its score reaches the threshold. When empty (the default), the API's own `flagged` boolean decides — the LiteLLM `openai_moderation` baseline behavior.",
+          "description": "Per-category score thresholds, e.g. `{\"violence\": 0.5}`. When set, only the listed categories are enforced and a category blocks when its score reaches the threshold. When empty (the default), the provider's `flagged` decision determines whether to block.",
           "type": "object"
         },
         "endpoint": {
           "default": null,
-          "description": "Endpoint override (an Azure OpenAI deployment or a mock). The data plane appends `/moderations`. Defaults to `https://api.openai.com/v1`.",
+          "description": "Endpoint override, such as an Azure OpenAI deployment. AISIX appends `/moderations`. Defaults to `https://api.openai.com/v1`.",
           "minLength": 1,
           "type": "string"
         },
@@ -839,7 +839,7 @@
     },
     "direction": {
       "default": "both",
-      "description": "Attachment direction hint: `input`, `output`, or `both`. Stored for compatibility. Current hook selection still follows `hook_point`.",
+      "description": "Attachment direction hint: `input`, `output`, or `both`. Guardrail execution still follows `hook_point`.",
       "type": "string"
     },
     "enabled": {
@@ -849,7 +849,7 @@
     },
     "enforcement_mode": {
       "default": "block",
-      "description": "How the data plane behaves when this guardrail fires. `monitor` is stored for compatibility but not yet enforced.",
+      "description": "How AISIX handles matching content. `block` enforces the guardrail. `monitor` records what would have happened without blocking or redacting the caller-visible response.",
       "type": "string"
     },
     "fail_open": {
@@ -868,7 +868,7 @@
     },
     "mandatory": {
       "default": false,
-      "description": "Whether guardrail evaluation errors are fatal. When `true`, a remote guardrail that can't reach its upstream blocks the request instead of failing open — it overrides `fail_open` on the failure path (the DP wraps the row in a MandatoryGuardrail that turns a `Bypass` into a `Block`). Default `false` keeps the `fail_open` behaviour.",
+      "description": "Whether guardrail evaluation errors are fatal. When `true`, a remote guardrail that cannot reach its upstream blocks the request instead of failing open, overriding `fail_open` on the failure path. The default `false` keeps the `fail_open` behavior.",
       "type": "boolean"
     },
     "name": {

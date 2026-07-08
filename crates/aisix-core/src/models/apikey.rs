@@ -52,9 +52,9 @@ pub struct ApiKey {
     /// (the form the gateway exposes). Entries are matched as single-`*`
     /// globs, mirroring `allowed_models`: `"*"` grants every tool and
     /// `"<server>__*"` grants every tool on one server (e.g. `"github__*"`);
-    /// an entry without a `*` matches one tool exactly. When omitted or set
-    /// to `null`, the key has no MCP tool access — access is granted
-    /// explicitly.
+    /// an entry without a `*` matches one tool exactly. When omitted, set to
+    /// `null`, or set to an empty list, the key has no MCP tool access —
+    /// access is granted explicitly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_tools: Option<Vec<String>>,
 

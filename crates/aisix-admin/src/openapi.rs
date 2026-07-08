@@ -3391,7 +3391,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
           },
           "kind": {
             "$ref": "#/components/schemas/ModelKind",
-            "description": "Whether the row describes a direct upstream model or a routing model."
+            "description": "Whether the entry describes a direct upstream model or a routing model."
           },
           "status": {
             "$ref": "#/components/schemas/RuntimeStatus",
@@ -3535,7 +3535,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
             "items": {
               "type": "string"
             },
-            "description": "MCP tools this key may call, as namespaced `<server>__<tool>` names (the form the gateway exposes). Entries are matched as single-`*` globs, mirroring `allowed_models`: `\"*\"` grants every tool and `\"<server>__*\"` grants every tool on one server (e.g. `\"github__*\"`); an entry without a `*` matches one tool exactly. When omitted or set to `null`, the key has no MCP tool access — access is granted explicitly."
+            "description": "MCP tools this key may call, as namespaced `<server>__<tool>` names (the form the gateway exposes). Entries are matched as single-`*` globs, mirroring `allowed_models`: `\"*\"` grants every tool and `\"<server>__*\"` grants every tool on one server (e.g. `\"github__*\"`); an entry without a `*` matches one tool exactly. When omitted, set to `null`, or set to an empty list, the key has no MCP tool access — access is granted explicitly."
           },
           "allowed_agents": {
             "type": [
@@ -3903,7 +3903,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
             "items": {
               "type": "string"
             },
-            "description": "MCP tools this key may call, as namespaced `<server>__<tool>` names (the form the gateway exposes). Entries are matched as single-`*` globs, mirroring `allowed_models`: `\"*\"` grants every tool and `\"<server>__*\"` grants every tool on one server (e.g. `\"github__*\"`); an entry without a `*` matches one tool exactly. When omitted or set to `null`, the key has no MCP tool access — access is granted explicitly.",
+            "description": "MCP tools this key may call, as namespaced `<server>__<tool>` names (the form the gateway exposes). Entries are matched as single-`*` globs, mirroring `allowed_models`: `\"*\"` grants every tool and `\"<server>__*\"` grants every tool on one server (e.g. `\"github__*\"`); an entry without a `*` matches one tool exactly. When omitted, set to `null`, or set to an empty list, the key has no MCP tool access — access is granted explicitly.",
             "example": [
               "github__create_issue"
             ]
@@ -4704,8 +4704,8 @@ mod tests {
             .as_str()
             .unwrap();
         assert!(
-            request_allowed_tools.contains("omitted or set to `null`"),
-            "self-hosted API key request schema must document null tool-access behavior"
+            request_allowed_tools.contains("omitted, set to `null`, or set to an empty list"),
+            "self-hosted API key request schema must document no-access tool-list behavior"
         );
         assert!(
             request_allowed_tools.contains("<server>__*"),
@@ -4735,8 +4735,8 @@ mod tests {
             .as_str()
             .unwrap();
         assert!(
-            public_allowed_tools.contains("omitted or set to `null`"),
-            "API key response schema must document null tool-access behavior"
+            public_allowed_tools.contains("omitted, set to `null`, or set to an empty list"),
+            "API key response schema must document no-access tool-list behavior"
         );
         assert!(
             public_allowed_tools.contains("<server>__*"),

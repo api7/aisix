@@ -27,8 +27,8 @@ pub struct PanelMember {
     /// Sampling seed for this panel member.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed: Option<u64>,
-    /// Reserved for the future voting/quorum strategy. Ignored by the v1
-    /// synthesis path.
+    /// Reserved for a future voting/quorum strategy. AISIX currently ignores
+    /// this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub weight: Option<u32>,
 }
