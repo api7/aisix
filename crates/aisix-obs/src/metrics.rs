@@ -346,13 +346,22 @@ impl Metrics {
     /// dedicated [`M_LLM_TOKENS_BY_CLIENT_TOTAL`] series. `client_type` is a
     /// `&'static str` from [`client_type_from_user_agent`] so cardinality is
     /// bounded; zero dims are skipped to keep the series sparse.
+    ///
+    /// `total_tokens` is the caller's canonical cache-inclusive total
+    /// (`input + output + Anthropic cache_creation/cache_read`), emitted under
+    /// `token_type="total"` (AISIX-Cloud#1002). It is passed in — not derived
+    /// from `input + output` — because Anthropic reports cache tokens as
+    /// counters SEPARATE from `input_tokens`, so a prompt+completion sum
+    /// undercounts cached traffic (same reason as [`total_tokens_with_cache`]
+    /// and the `aisix_llm_total_tokens_total` fix in #679).
     pub fn record_llm_tokens_by_client(
         &self,
         client_type: &'static str,
         input_tokens: u64,
         output_tokens: u64,
+        total_tokens: u64,
     ) {
-        if input_tokens == 0 && output_tokens == 0 {
+        if input_tokens == 0 && output_tokens == 0 && total_tokens == 0 {
             return;
         }
         metrics::with_local_recorder(&self.inner.recorder, || {
@@ -371,6 +380,14 @@ impl Metrics {
                     "token_type" => "output",
                 )
                 .increment(output_tokens);
+            }
+            if total_tokens > 0 {
+                metrics::counter!(
+                    M_LLM_TOKENS_BY_CLIENT_TOTAL,
+                    "client_type" => client_type,
+                    "token_type" => "total",
+                )
+                .increment(total_tokens);
             }
         });
     }
@@ -1076,16 +1093,26 @@ mod tests {
     #[test]
     fn tokens_by_client_records_bounded_client_type() {
         let m = Metrics::new(false);
-        m.record_llm_tokens_by_client("openai-python", 100, 40);
-        m.record_llm_tokens_by_client("openai-python", 10, 0);
-        // Zero/zero is a no-op (keeps the series sparse).
-        m.record_llm_tokens_by_client("curl", 0, 0);
+        // The caller's canonical total is cache-inclusive, so it can exceed
+        // input+output: 155 = 100 + 40 + 15 cache tokens (#1002).
+        m.record_llm_tokens_by_client("openai-python", 100, 40, 155);
+        m.record_llm_tokens_by_client("openai-python", 10, 0, 10);
+        // All-zero is a no-op (keeps the series sparse).
+        m.record_llm_tokens_by_client("curl", 0, 0, 0);
         let rendered = m.render();
         assert!(rendered.contains(M_LLM_TOKENS_BY_CLIENT_TOTAL));
         assert!(rendered.contains("client_type=\"openai-python\""));
         assert!(rendered.contains("token_type=\"input\""));
         assert!(rendered.contains("token_type=\"output\""));
-        // The zero/zero curl call recorded nothing.
+        assert!(rendered.contains("token_type=\"total\""));
+        // input=110, output=40, total=165 — the total series counts the 15
+        // cache tokens the input series omits (165 > 110 + 40).
+        assert!(rendered
+            .lines()
+            .any(|l| l.starts_with("aisix_llm_tokens_by_client_total{")
+                && l.contains("token_type=\"total\"")
+                && l.trim_end().ends_with(" 165")));
+        // The all-zero curl call recorded nothing.
         assert!(!rendered.contains("client_type=\"curl\""));
     }
 

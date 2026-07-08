@@ -1456,10 +1456,14 @@ async fn dispatch(
                     },
                 );
                 // #890 req-4: streaming token volume by inbound client type.
+                // #1002: comp.total_tokens is the cache-inclusive total (an
+                // Anthropic upstream bridged to an OpenAI-shape client folds
+                // cache tokens into total_tokens per #679).
                 metrics_for_stream.record_llm_tokens_by_client(
                     client_type_for_metrics,
                     u64::from(comp.prompt_tokens),
                     u64::from(comp.completion_tokens),
+                    comp.total_tokens,
                 );
                 metrics_for_stream.record_time_to_first_token(
                     UsageLabels {
@@ -2971,11 +2975,13 @@ fn record_success(
     );
     // #890 req-4: token volume by inbound client type (non-streaming path;
     // streaming tokens arrive in the SSE on_complete and are recorded there).
-    // No-op when both counts are zero (e.g. the streaming branch here).
+    // No-op when all counts are zero (e.g. the streaming branch here).
+    // #1002: s.total_tokens is the cache-inclusive canonical total.
     metrics.record_llm_tokens_by_client(
         client_type,
         s.prompt_tokens.unwrap_or(0),
         s.completion_tokens.unwrap_or(0),
+        s.total_tokens.unwrap_or(0),
     );
 }
 

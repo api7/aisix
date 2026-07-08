@@ -2313,6 +2313,16 @@ fn emit_anthropic_usage_event(
     state
         .otlp_fan_out
         .fan_out(&event, content.as_ref(), exporters.iter().map(|e| &e.value));
+    // Cache-inclusive canonical total: Anthropic reports cache tokens as
+    // counters separate from prompt_tokens, so prompt+completion undercounts
+    // cached traffic (#995/#906). Shared by the LLM-usage total metric and the
+    // by-client total (#1002) so the two can't drift.
+    let total_tokens_all = total_tokens_with_cache(
+        metrics.prompt_tokens,
+        metrics.completion_tokens,
+        metrics.cache_creation_tokens,
+        metrics.cache_read_tokens,
+    );
     state.metrics.record_llm_usage(
         UsageLabels {
             endpoint: "/v1/messages",
@@ -2330,22 +2340,18 @@ fn emit_anthropic_usage_event(
         LlmUsage {
             input_tokens: metrics.prompt_tokens,
             output_tokens: metrics.completion_tokens,
-            total_tokens: total_tokens_with_cache(
-                metrics.prompt_tokens,
-                metrics.completion_tokens,
-                metrics.cache_creation_tokens,
-                metrics.cache_read_tokens,
-            )
-            .min(u64::from(u32::MAX)) as u32,
+            total_tokens: total_tokens_all.min(u64::from(u32::MAX)) as u32,
             spend_usd: 0.0,
         },
     );
     // #890 req-4: token volume by inbound client type (covers streaming and
     // non-streaming — every /v1/messages usage event flows through here).
+    // #1002: total_tokens_all folds in the Anthropic cache counters.
     state.metrics.record_llm_tokens_by_client(
         aisix_obs::client_type_from_user_agent(&client.user_agent),
         u64::from(metrics.prompt_tokens),
         u64::from(metrics.completion_tokens),
+        total_tokens_all,
     );
     if metrics.ttft_ms > 0 {
         state.metrics.record_time_to_first_token(
