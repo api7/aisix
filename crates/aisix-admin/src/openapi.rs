@@ -4161,7 +4161,7 @@ fn add_variant_titles(doc: &mut Value) {
                 "Azure AI Content Safety Prompt Shield",
                 "Azure AI Content Safety Text Moderation",
                 "Aliyun Text Moderation",
-                "PII Detection & Redaction",
+                "PII Detection and Redaction",
                 "Lakera Guard",
                 "OpenAI Moderation",
                 "Microsoft Presidio",
@@ -4259,59 +4259,59 @@ fn add_missing_property_descriptions(doc: &mut Value) {
     for (pointer, description) in [
         (
             "/components/schemas/BedrockAWSCredentials/oneOf/0/properties/kind",
-            "Credential mode. Use `static` for explicitly configured AWS access keys.",
+            "Credential mode for explicitly configured AWS access keys.",
         ),
         (
             "/components/schemas/BedrockLatencyMode/oneOf/0/properties/kind",
-            "Latency mode. Use `serial` to wait for the Bedrock guardrail response.",
+            "Latency mode that waits for the Bedrock guardrail response.",
         ),
         (
             "/components/schemas/BedrockLatencyMode/oneOf/1/properties/kind",
-            "Latency mode. Use `timed` to stop waiting after `timeout_ms`.",
+            "Latency mode that stops waiting after `timeout_ms`.",
         ),
         (
             "/components/schemas/Guardrail/oneOf/0/properties/kind",
-            "Guardrail provider type. Use `keyword` for literal and regular expression matching.",
+            "Guardrail provider type for literal and regular expression matching.",
         ),
         (
             "/components/schemas/Guardrail/oneOf/1/properties/kind",
-            "Guardrail provider type. Use `bedrock` for Amazon Bedrock Guardrails.",
+            "Guardrail provider type for Amazon Bedrock Guardrails.",
         ),
         (
             "/components/schemas/Guardrail/oneOf/2/properties/kind",
-            "Guardrail provider type. Use `azure_content_safety` for Azure Prompt Shield.",
+            "Guardrail provider type for Azure Prompt Shield.",
         ),
         (
             "/components/schemas/Guardrail/oneOf/3/properties/kind",
-            "Guardrail provider type. Use `azure_content_safety_text_moderation` for Azure text moderation.",
+            "Guardrail provider type for Azure text moderation.",
         ),
         (
             "/components/schemas/Guardrail/oneOf/4/properties/kind",
-            "Guardrail provider type. Use `aliyun_text_moderation` for Aliyun text moderation.",
+            "Guardrail provider type for Aliyun text moderation.",
         ),
         (
             "/components/schemas/Guardrail/oneOf/5/properties/kind",
-            "Guardrail provider type. Use `pii` for in-process sensitive-data detection and redaction.",
+            "Guardrail provider type for in-process sensitive-data detection and redaction.",
         ),
         (
             "/components/schemas/Guardrail/oneOf/6/properties/kind",
-            "Guardrail provider type. Use `lakera` for Lakera Guard screening.",
+            "Guardrail provider type for Lakera Guard screening.",
         ),
         (
             "/components/schemas/Guardrail/oneOf/7/properties/kind",
-            "Guardrail provider type. Use `openai_moderation` for the OpenAI Moderation API.",
+            "Guardrail provider type for the OpenAI Moderation API.",
         ),
         (
             "/components/schemas/Guardrail/oneOf/8/properties/kind",
-            "Guardrail provider type. Use `presidio` for self-hosted Microsoft Presidio PII detection and anonymization.",
+            "Guardrail provider type for self-hosted Microsoft Presidio PII detection and anonymization.",
         ),
         (
             "/components/schemas/KeywordPattern/oneOf/0/properties/kind",
-            "Pattern type. Use `literal` to match the value as plain text.",
+            "Pattern type for matching the value as plain text.",
         ),
         (
             "/components/schemas/KeywordPattern/oneOf/1/properties/kind",
-            "Pattern type. Use `regex` to match the value as a regular expression.",
+            "Pattern type for matching the value as a regular expression.",
         ),
         (
             "/components/schemas/KeywordPattern/oneOf/0/properties/value",
