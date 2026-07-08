@@ -100,7 +100,7 @@
       ]
     },
     "OnEmbeddingFailure": {
-      "description": "What the router does when the embedding call errors or times out.\n\nWire shape mirrors the proposal: the bare string `\"default\"` / `\"fail\"`, or an object `{ \"target\": \"<direct alias>\" }` to fall back to a specific safe model. Replicates the spirit of [`WhenAllUnavailablePolicy`](super::WhenAllUnavailablePolicy) with the added explicit-target option.",
+      "description": "What the router does when the embedding call errors or times out. Use `\"default\"` to route to the router's default model, `\"fail\"` to reject the request with `503`, or `{ \"target\": \"<direct alias>\" }` to route to a specific fallback model.",
       "anyOf": [
         {
           "description": "`\"default\"` or `\"fail\"`.",
@@ -179,7 +179,7 @@
           "minLength": 1
         },
         "examples": {
-          "description": "Example utterances that define this route. The DP embeds each at apply time and caches the vector; a request is matched against these. At least one is required (description does not participate in matching).",
+          "description": "Example utterances that define this route. AISIX embeds each example when applying the configuration and caches the vector. A request is matched against these examples. At least one example is required.",
           "type": "array",
           "items": {
             "type": "string",
@@ -198,7 +198,7 @@
           "minLength": 1
         },
         "threshold": {
-          "description": "Per-route similarity threshold. A request matches this route only when its aggregated score is `>=` this value. When omitted, the router-level [`SemanticMatch::threshold`] applies.",
+          "description": "Per-route similarity threshold. A request matches this route only when its aggregated score is `>=` this value. When omitted, the router-level threshold applies.",
           "type": [
             "number",
             "null"

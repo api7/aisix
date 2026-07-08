@@ -63,15 +63,14 @@ pub struct SemanticRoute {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(min = 1))]
     pub description: Option<String>,
-    /// Example utterances that define this route. The DP embeds each at
-    /// apply time and caches the vector; a request is matched against
-    /// these. At least one is required (description does not participate
-    /// in matching).
+    /// Example utterances that define this route. AISIX embeds each example
+    /// when applying the configuration and caches the vector. A request is
+    /// matched against these examples. At least one example is required.
     #[schemars(length(min = 1), inner(length(min = 1)))]
     pub examples: Vec<String>,
     /// Per-route similarity threshold. A request matches this route only
     /// when its aggregated score is `>=` this value. When omitted, the
-    /// router-level [`SemanticMatch::threshold`] applies.
+    /// router-level threshold applies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 0.0, max = 1.0))]
     pub threshold: Option<f32>,
@@ -107,13 +106,10 @@ pub enum EmbeddingFailureMode {
     Fail,
 }
 
-/// What the router does when the embedding call errors or times out.
-///
-/// Wire shape mirrors the proposal: the bare string `"default"` / `"fail"`,
-/// or an object `{ "target": "<direct alias>" }` to fall back to a specific
-/// safe model. Replicates the spirit of
-/// [`WhenAllUnavailablePolicy`](super::WhenAllUnavailablePolicy) with the added
-/// explicit-target option.
+/// What the router does when the embedding call errors or times out. Use
+/// `"default"` to route to the router's default model, `"fail"` to reject the
+/// request with `503`, or `{ "target": "<direct alias>" }` to route to a
+/// specific fallback model.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(untagged)]
 pub enum OnEmbeddingFailure {

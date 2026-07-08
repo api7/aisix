@@ -98,7 +98,7 @@
           "minimum": 0.0
         },
         "weight": {
-          "description": "Reserved for the future voting/quorum strategy. Ignored by the v1 synthesis path.",
+          "description": "Reserved for a future voting/quorum strategy. AISIX currently ignores this field.",
           "type": [
             "integer",
             "null"
