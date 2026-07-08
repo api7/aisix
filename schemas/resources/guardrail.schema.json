@@ -164,7 +164,7 @@
           "type": "string"
         },
         "regex": {
-          "description": "Regular expression AISIX compiles when building the guardrail chain. Invalid patterns are logged and skipped.",
+          "description": "Regular expression AISIX compiles when building the guardrail chain. An invalid pattern makes AISIX log and skip the guardrail.",
           "minLength": 1,
           "type": "string"
         }

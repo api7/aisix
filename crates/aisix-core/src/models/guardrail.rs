@@ -359,7 +359,7 @@ pub struct PiiCustomPattern {
     #[schemars(length(min = 1, max = 64))]
     pub name: String,
     /// Regular expression AISIX compiles when building the guardrail chain.
-    /// Invalid patterns are logged and skipped.
+    /// An invalid pattern makes AISIX log and skip the guardrail.
     #[schemars(length(min = 1))]
     pub regex: String,
     /// Per-pattern action override: `mask` or `block`. Falls back to the
