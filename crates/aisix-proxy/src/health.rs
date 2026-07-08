@@ -238,9 +238,29 @@ struct RuntimeEntry {
     /// is released (and for the streaming path, after the handler returns).
     /// Drives the `least_busy` routing strategy.
     in_flight: Arc<AtomicUsize>,
+    /// Last value published to the `aisix_deployment_state` gauge for this
+    /// target, so [`ModelRuntimeStatusTracker::sync_deployment_state`] can
+    /// skip a write when nothing changed. `None` = never published.
+    emitted_state: Option<DeploymentState>,
 }
 
 impl RuntimeEntry {
+    /// Serving state as the router sees it: a target that is cooling down,
+    /// or that its background check has marked unhealthy, is out of
+    /// rotation ([`ModelRuntimeStatusTracker::should_skip_for_routing`]).
+    ///
+    /// The gauge is derived from this — never from "did we just observe a
+    /// transition". A cooldown lapses on its own with nothing calling back
+    /// into the tracker, so an edge-triggered gauge misses the recovery and
+    /// pins the target at Down forever.
+    fn deployment_state(&self, now: SystemTime) -> DeploymentState {
+        if self.unhealthy || self.cooldown_until.is_some_and(|until| until > now) {
+            DeploymentState::Down
+        } else {
+            DeploymentState::Healthy
+        }
+    }
+
     fn snapshot(&self, now: SystemTime, stale_after: Option<Duration>) -> RuntimeStatusSnapshot {
         let cooldown_until = self.cooldown_until.filter(|until| *until > now);
         let unhealthy = self.unhealthy && !self.is_stale(now, stale_after);
@@ -464,33 +484,63 @@ impl ModelRuntimeStatusTracker {
         // emit only reads `snapshot` and writes `metrics` — it never re-locks
         // `entries` — so holding the guard here is deadlock-free.
         if entered_cooldown {
-            self.emit_deployment_state(model_id, DeploymentState::Down, true);
+            self.record_cooldown(model_id);
         }
+        self.sync_deployment_state(model_id, &mut entry, now);
     }
 
     pub fn mark_healthy(&self, model_id: &str) {
         if let Some(mut entry) = self.entries.get_mut(model_id) {
-            let recovered =
-                entry.unhealthy || entry.cooldown_until.is_some_and(|u| u > SystemTime::now());
             entry.unhealthy = false;
             entry.cooldown_until = None;
             entry.status_reason = None;
-            // Only flip the gauge back to Healthy on an actual recovery, so
-            // already-healthy targets don't churn the metric on every success.
-            // Emitted under the guard (see mark_cooldown) to serialize
-            // same-model transitions.
-            if recovered {
-                self.emit_deployment_state(model_id, DeploymentState::Healthy, false);
-            }
+            self.sync_deployment_state(model_id, &mut entry, SystemTime::now());
         }
     }
 
-    /// Emit the deployment gauge (and, on a fresh cooldown, the cooldown
-    /// counter) for `model_id`. No-op unless a metrics sink is wired.
-    /// Rich labels (provider / upstream_model / provider_key_id) are
-    /// resolved from the snapshot by id; a missing snapshot or unknown id
-    /// falls back to a model-id-only label set.
-    fn emit_deployment_state(&self, model_id: &str, state: DeploymentState, count_cooldown: bool) {
+    /// Publish `aisix_deployment_state` for `model_id` when the entry's
+    /// serving state differs from what the gauge currently shows. Called
+    /// after every mutation of `unhealthy` / `cooldown_until` — including
+    /// the ones that merely *observe* a lapsed cooldown — so the gauge can
+    /// never disagree with [`RuntimeEntry::deployment_state`]. The dedupe
+    /// keeps already-healthy targets from writing the gauge on every
+    /// successful request.
+    ///
+    /// Emitted while the caller still holds the DashMap entry guard, so
+    /// concurrent cooldown/recovery on the same model can't publish out of
+    /// order (see `mark_cooldown`).
+    fn sync_deployment_state(&self, model_id: &str, entry: &mut RuntimeEntry, now: SystemTime) {
+        let state = entry.deployment_state(now);
+        if entry.emitted_state == Some(state) {
+            return;
+        }
+        entry.emitted_state = Some(state);
+        self.emit_deployment_state(model_id, state);
+    }
+
+    /// Bump `aisix_deployment_cooled_down_total` for `model_id`.
+    fn record_cooldown(&self, model_id: &str) {
+        self.with_deployment_labels(model_id, |metrics, labels| {
+            metrics.record_deployment_cooldown(labels);
+        });
+    }
+
+    /// Set the `aisix_deployment_state` gauge for `model_id`.
+    fn emit_deployment_state(&self, model_id: &str, state: DeploymentState) {
+        self.with_deployment_labels(model_id, |metrics, labels| {
+            metrics.set_deployment_state(labels, state);
+        });
+    }
+
+    /// Resolve `model_id`'s deployment labels and hand them to `f`. No-op
+    /// unless a metrics sink is wired. Rich labels (provider /
+    /// upstream_model / provider_key_id) come from the snapshot by id; a
+    /// missing snapshot or unknown id falls back to a model-id-only set.
+    fn with_deployment_labels(
+        &self,
+        model_id: &str,
+        f: impl FnOnce(&Metrics, DeploymentLabels<'_>),
+    ) {
         let Some(metrics) = self.metrics.as_ref() else {
             return;
         };
@@ -518,16 +568,15 @@ impl ModelRuntimeStatusTracker {
                     "unknown".to_string(),
                 )
             });
-        let labels = DeploymentLabels {
-            provider: &provider,
-            model: &model,
-            upstream_model: &upstream_model,
-            provider_key_id: &provider_key_id,
-        };
-        if count_cooldown {
-            metrics.record_deployment_cooldown(labels);
-        }
-        metrics.set_deployment_state(labels, state);
+        f(
+            metrics,
+            DeploymentLabels {
+                provider: &provider,
+                model: &model,
+                upstream_model: &upstream_model,
+                provider_key_id: &provider_key_id,
+            },
+        );
     }
 
     pub fn clear_unhealthy(&self, model_id: &str) {
@@ -536,13 +585,15 @@ impl ModelRuntimeStatusTracker {
             if entry.status_reason.as_deref() == Some("background_check_failed") {
                 entry.status_reason = None;
             }
+            self.sync_deployment_state(model_id, &mut entry, SystemTime::now());
         }
     }
 
     pub fn mark_unhealthy(&self, model_id: &str, status: Option<u16>, reason: impl Into<String>) {
         let now = SystemTime::now();
         let reason = reason.into();
-        self.entries
+        let mut entry = self
+            .entries
             .entry(model_id.to_string())
             .and_modify(|entry| {
                 entry.unhealthy = true;
@@ -557,6 +608,7 @@ impl ModelRuntimeStatusTracker {
                 status_reason: Some(reason),
                 ..RuntimeEntry::default()
             });
+        self.sync_deployment_state(model_id, &mut entry, now);
     }
 
     pub fn record_ignored_check(&self, model_id: &str, status: u16, reason: impl Into<String>) {
@@ -858,16 +910,100 @@ mod tests {
 
         // Recovery flips the gauge back to Healthy(0).
         tracker.mark_healthy("m-cool");
-        let scrape = metrics.render();
-        let state = scrape
+        assert_eq!(
+            deployment_state_gauge(&metrics),
+            Some(0.0),
+            "state gauge is Healthy(0) after recovery"
+        );
+    }
+
+    /// A cooldown that lapses on its own is the *ordinary* recovery: the
+    /// router filters cooled targets out of rotation, so nothing calls back
+    /// into the tracker while the TTL runs down, and the first success
+    /// arrives only after it has already expired. The old edge-triggered
+    /// gauge could not see a transition at that point and left the target
+    /// pinned at Down(2) forever.
+    #[test]
+    fn gauge_returns_to_healthy_after_a_cooldown_expires_naturally() {
+        let metrics = Arc::new(Metrics::new(false));
+        let tracker = ModelRuntimeStatusTracker::with_observability(
+            metrics.clone(),
+            SnapshotHandle::new(AisixSnapshot::new()),
+        );
+
+        tracker.mark_cooldown(
+            "m-expiry",
+            Duration::from_millis(5),
+            "upstream_server_error",
+        );
+        assert_eq!(deployment_state_gauge(&metrics), Some(2.0), "cooled → Down");
+
+        thread::sleep(Duration::from_millis(15));
+        assert_eq!(
+            tracker.status("m-expiry").status,
+            RuntimeStatus::Healthy,
+            "the cooldown has lapsed, so the target is back in rotation"
+        );
+
+        tracker.mark_healthy("m-expiry");
+        assert_eq!(
+            deployment_state_gauge(&metrics),
+            Some(0.0),
+            "gauge follows the target back into rotation"
+        );
+    }
+
+    /// A background check failure takes the target out of rotation exactly
+    /// like a cooldown does (`should_skip_for_routing` → Unhealthy), so the
+    /// gauge has to say Down — and come back on the next passing check.
+    #[test]
+    fn gauge_tracks_background_check_failures_and_recovery() {
+        let metrics = Arc::new(Metrics::new(false));
+        let tracker = ModelRuntimeStatusTracker::with_observability(
+            metrics.clone(),
+            SnapshotHandle::new(AisixSnapshot::new()),
+        );
+
+        tracker.mark_unhealthy("m-bg", Some(503), "background_check_failed");
+        assert_eq!(deployment_state_gauge(&metrics), Some(2.0));
+
+        tracker.clear_unhealthy("m-bg");
+        assert_eq!(deployment_state_gauge(&metrics), Some(0.0));
+    }
+
+    /// The gauge is level-triggered but not chatty: a target that is already
+    /// healthy must not re-publish on every successful request, and the
+    /// cooldown counter must not move when nothing entered cooldown.
+    #[test]
+    fn repeated_success_neither_churns_the_gauge_nor_the_cooldown_counter() {
+        let metrics = Arc::new(Metrics::new(false));
+        let tracker = ModelRuntimeStatusTracker::with_observability(
+            metrics.clone(),
+            SnapshotHandle::new(AisixSnapshot::new()),
+        );
+
+        // begin_in_flight is what creates the entry on the request path.
+        drop(tracker.begin_in_flight("m-ok"));
+        tracker.mark_healthy("m-ok");
+        tracker.mark_healthy("m-ok");
+        tracker.mark_healthy("m-ok");
+
+        assert_eq!(deployment_state_gauge(&metrics), Some(0.0));
+        assert!(
+            !metrics
+                .render()
+                .contains("aisix_deployment_cooled_down_total"),
+            "a never-cooled target must not emit the cooldown counter"
+        );
+    }
+
+    /// Value of the single `aisix_deployment_state` series in the scrape.
+    fn deployment_state_gauge(metrics: &Metrics) -> Option<f64> {
+        metrics
+            .render()
             .lines()
             .find(|l| l.starts_with("aisix_deployment_state{"))
-            .expect("deployment state gauge line");
-        let value: f64 = state.rsplit(' ').next().unwrap().parse().unwrap();
-        assert_eq!(
-            value, 0.0,
-            "state gauge is Healthy(0) after recovery: {state}"
-        );
+            .and_then(|l| l.rsplit(' ').next()?.parse().ok())
     }
 
     #[test]

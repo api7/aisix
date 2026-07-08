@@ -864,3 +864,203 @@ describe("cooldown observability — a cooldown transition emits aisix_deploymen
     expect(Number(stateLine!.trim().split(/\s+/).pop())).toBe(2);
   });
 });
+
+/** Value of the `aisix_deployment_state` series carrying `model="<model>"`. */
+async function scrapeDeploymentState(
+  metricsUrl: string,
+  model: string,
+): Promise<number | undefined> {
+  const text = await (await fetch(`${metricsUrl}/metrics`)).text();
+  const line = text
+    .split("\n")
+    .find(
+      (l) =>
+        l.startsWith("aisix_deployment_state{") &&
+        l.includes(`model="${model}"`),
+    );
+  return line ? Number(line.trim().split(/\s+/).pop()) : undefined;
+}
+
+describe("cooldown observability — the state gauge follows a target back into rotation", () => {
+  let app: SpawnedApp | undefined;
+  let admin: AdminClient | undefined;
+  let etcdReachable = false;
+  let flakyUpstream: OpenAiUpstream | undefined;
+  let stableUpstream: OpenAiUpstream | undefined;
+  let flakyModelID = "";
+
+  const RECOVERED_REPLY = "recovered after cooldown";
+
+  beforeAll(async () => {
+    etcdReachable = await new EtcdClient().ping();
+    if (!etcdReachable) return;
+
+    // First request 500s (trips the cooldown); every later request
+    // succeeds, so the target is genuinely healthy again once the TTL
+    // lapses. `scriptedResponses` runs before the static opts.
+    flakyUpstream = await startOpenAiUpstream({
+      scriptedResponses: [
+        {
+          status: 500,
+          errorBody: { error: { message: "boom", type: "server_error" } },
+        },
+      ],
+      nonStreamBody: {
+        id: "cmpl-recovered",
+        object: "chat.completion",
+        created: Math.floor(Date.now() / 1000),
+        model: "gpt-4o-mini",
+        choices: [
+          {
+            index: 0,
+            message: { role: "assistant", content: RECOVERED_REPLY },
+            finish_reason: "stop",
+          },
+        ],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      },
+    });
+    stableUpstream = await startOpenAiUpstream({
+      nonStreamBody: {
+        id: "cmpl-recover-stable",
+        object: "chat.completion",
+        created: Math.floor(Date.now() / 1000),
+        model: "gpt-4o-mini",
+        choices: [
+          {
+            index: 0,
+            message: { role: "assistant", content: "recover stable fallback" },
+            finish_reason: "stop",
+          },
+        ],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      },
+    });
+
+    app = await spawnApp();
+    admin = new AdminClient(app.adminUrl, app.adminKey);
+
+    const flakyPk = await admin.createProviderKey({
+      display_name: "cd-recover-flaky-pk",
+      secret: "sk-mock",
+      api_base: `${flakyUpstream.baseUrl}/v1`,
+    });
+    const stablePk = await admin.createProviderKey({
+      display_name: "cd-recover-stable-pk",
+      secret: "sk-mock",
+      api_base: `${stableUpstream.baseUrl}/v1`,
+    });
+
+    flakyModelID = (
+      await admin.createModel({
+        display_name: "cd-recover-flaky-model",
+        provider: "openai",
+        model_name: "gpt-4o-mini",
+        provider_key_id: flakyPk.id,
+        // A 1s TTL keeps the test honest: it must observe the cooldown
+        // lapsing on its own, which is what the router does in production.
+        cooldown: { default_seconds: 1 },
+      })
+    ).id;
+    await admin.createModel({
+      display_name: "cd-recover-stable-model",
+      provider: "openai",
+      model_name: "gpt-4o-mini",
+      provider_key_id: stablePk.id,
+    });
+    await admin.createModel({
+      display_name: "cd-recover-router",
+      routing: {
+        strategy: "failover",
+        targets: [
+          { model: "cd-recover-flaky-model" },
+          { model: "cd-recover-stable-model" },
+        ],
+        max_fallbacks: 1,
+      },
+    });
+    await admin.createApiKey({
+      key_hash: CALLER_KEY_HASH,
+      allowed_models: [
+        "cd-recover-router",
+        "cd-recover-flaky-model",
+        "cd-recover-stable-model",
+      ],
+    });
+  });
+
+  afterAll(async () => {
+    await app?.exit();
+    await flakyUpstream?.close();
+    await stableUpstream?.close();
+  });
+
+  // The router filters cooled targets out of rotation, so nothing touches
+  // the tracker while the TTL runs down — the cooldown simply lapses. An
+  // edge-triggered gauge has no transition to observe when the next success
+  // finally arrives and pins the target at Down(2) for the rest of the
+  // process's life. The gauge must instead follow the target's actual
+  // serving state.
+  test("after the cooldown lapses on its own, the next success drives the gauge back to Healthy(0)", async (ctx) => {
+    if (!etcdReachable || !app || !admin || !flakyUpstream || !stableUpstream) {
+      ctx.skip();
+      return;
+    }
+
+    const client = new OpenAI({
+      apiKey: CALLER_PLAINTEXT,
+      baseURL: `${app.proxyUrl}/v1`,
+      maxRetries: 0,
+    });
+
+    await waitConfigPropagation(async () => {
+      try {
+        const probe = await client.chat.completions.create({
+          model: "cd-recover-stable-model",
+          messages: [{ role: "user", content: "ready-recover-stable" }],
+        });
+        return probe.choices[0]?.message.content === "recover stable fallback";
+      } catch {
+        return false;
+      }
+    });
+
+    // Trip the cooldown on the flaky target (router falls over → caller 200).
+    const tripped = await client.chat.completions.create({
+      model: "cd-recover-router",
+      messages: [{ role: "user", content: "trip the cooldown" }],
+    });
+    expect(tripped.choices[0]?.message.content).toBe("recover stable fallback");
+
+    expect(
+      (await admin.listModelStatuses()).find((r) => r.id === flakyModelID)
+        ?.status,
+    ).toBe("cooldown");
+    expect(
+      await scrapeDeploymentState(app.metricsUrl, "cd-recover-flaky-model"),
+    ).toBe(2);
+
+    // Let the 1s TTL lapse. Nothing calls back into the tracker here — that
+    // is the whole point.
+    await expect
+      .poll(
+        async () =>
+          (await admin!.listModelStatuses()).find((r) => r.id === flakyModelID)
+            ?.status,
+        { timeout: 10_000, interval: 200 },
+      )
+      .toBe("healthy");
+
+    // The target is back in rotation and serving. The gauge must agree.
+    const recovered = await client.chat.completions.create({
+      model: "cd-recover-router",
+      messages: [{ role: "user", content: "after the cooldown lapsed" }],
+    });
+    expect(recovered.choices[0]?.message.content).toBe(RECOVERED_REPLY);
+
+    expect(
+      await scrapeDeploymentState(app.metricsUrl, "cd-recover-flaky-model"),
+      "the recovered target must not stay pinned at Down(2)",
+    ).toBe(0);
+  });
+});
