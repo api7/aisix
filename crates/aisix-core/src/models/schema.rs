@@ -287,7 +287,9 @@ fn title_single_value_enum_variants(
 ///    values flow through `aisix-guardrails` as strings; converting them to
 ///    Rust enums would churn that crate's processing), so the closed set is
 ///    injected here into the relevant property.
-/// 3. `created_at` republishes its `date-time` format (annotation-only).
+/// 3. `schemars` leaves discriminator tag fields and collection item schemas
+///    without descriptions, so the public schema fills those gaps.
+/// 4. `created_at` republishes its `date-time` format (annotation-only).
 pub fn guardrail_root_schema() -> Value {
     let mut schema = struct_root_schema::<crate::models::Guardrail>(false);
     let obj = schema
@@ -340,10 +342,58 @@ pub fn guardrail_root_schema() -> Value {
             "action",
             json!(["mask", "block"]),
         );
+        set_definition_variant_property_description(
+            defs,
+            "BedrockAWSCredentials",
+            "static",
+            "kind",
+            "Credential mode for explicitly configured AWS access keys.",
+        );
+        set_definition_variant_property_description(
+            defs,
+            "BedrockLatencyMode",
+            "serial",
+            "kind",
+            "Latency mode that waits for the Bedrock guardrail response.",
+        );
+        set_definition_variant_property_description(
+            defs,
+            "BedrockLatencyMode",
+            "timed",
+            "kind",
+            "Latency mode that stops waiting after `timeout_ms`.",
+        );
+        set_definition_variant_property_description(
+            defs,
+            "KeywordPattern",
+            "literal",
+            "kind",
+            "Pattern type for matching the value as plain text.",
+        );
+        set_definition_variant_property_description(
+            defs,
+            "KeywordPattern",
+            "regex",
+            "kind",
+            "Pattern type for matching the value as a regular expression.",
+        );
+        set_definition_variant_property_description(
+            defs,
+            "KeywordPattern",
+            "literal",
+            "value",
+            "Literal string to match.",
+        );
+        set_definition_variant_property_description(
+            defs,
+            "KeywordPattern",
+            "regex",
+            "value",
+            "Regular expression pattern to match.",
+        );
     }
 
     if let Some(Value::Object(properties)) = obj.get_mut("properties") {
-        set_enum(properties, "enforcement_mode", json!(["block", "monitor"]));
         set_enum(properties, "direction", json!(["input", "output", "both"]));
     }
 
@@ -352,8 +402,14 @@ pub fn guardrail_root_schema() -> Value {
             let Some(b) = branch.as_object_mut() else {
                 continue;
             };
-            match branch_kind(b) {
-                Some("azure_content_safety_text_moderation") => {
+            let Some(kind) = branch_kind(b).map(str::to_owned) else {
+                continue;
+            };
+            if let Some(description) = guardrail_kind_description(&kind) {
+                set_property_description(b, "kind", description);
+            }
+            match kind.as_str() {
+                "azure_content_safety_text_moderation" => {
                     set_property_enum(
                         b,
                         "output_type",
@@ -375,8 +431,23 @@ pub fn guardrail_root_schema() -> Value {
                         "categories",
                         json!(["Hate", "Sexual", "SelfHarm", "Violence"]),
                     );
+                    set_property_items_description(
+                        b,
+                        "categories",
+                        "Azure content category to analyze.",
+                    );
+                    set_property_items_description(
+                        b,
+                        "blocklist_names",
+                        "Azure blocklist name to match against.",
+                    );
+                    set_property_additional_properties_description(
+                        b,
+                        "severity_threshold_by_category",
+                        "Severity threshold for the category key.",
+                    );
                 }
-                Some("aliyun_text_moderation") => {
+                "aliyun_text_moderation" => {
                     set_property_enum(b, "risk_level_threshold", json!(["low", "medium", "high"]));
                     set_property_enum(
                         b,
@@ -385,14 +456,21 @@ pub fn guardrail_root_schema() -> Value {
                     );
                     set_property_enum(b, "on_buffer_exceeded", json!(["fail_closed", "fail_open"]));
                 }
-                Some("pii") => {
+                "pii" => {
                     set_property_enum(b, "default_action", json!(["mask", "block"]));
                     set_property_enum(b, "on_buffer_exceeded", json!(["fail_closed", "fail_open"]));
                 }
-                Some("lakera") => {
+                "lakera" => {
                     set_property_enum(b, "on_buffer_exceeded", json!(["fail_closed", "fail_open"]));
                 }
-                Some("presidio") => {
+                "openai_moderation" => {
+                    set_property_additional_properties_description(
+                        b,
+                        "category_thresholds",
+                        "Score threshold for the category key.",
+                    );
+                }
+                "presidio" => {
                     set_property_enum(b, "default_action", json!(["mask", "block"]));
                     set_property_enum(b, "operator", json!(["replace", "mask", "hash", "redact"]));
                     set_property_enum(b, "on_buffer_exceeded", json!(["fail_closed", "fail_open"]));
@@ -435,9 +513,66 @@ fn set_definition_property_enum(
     }
 }
 
+fn set_definition_variant_property_description(
+    defs: &mut serde_json::Map<String, Value>,
+    definition: &str,
+    variant_kind: &str,
+    field: &str,
+    description: &str,
+) {
+    let Some(Value::Array(branches)) = defs.get_mut(definition).and_then(|d| d.get_mut("oneOf"))
+    else {
+        return;
+    };
+    for branch in branches {
+        let Some(branch) = branch.as_object_mut() else {
+            continue;
+        };
+        if branch_kind(branch) == Some(variant_kind) {
+            set_property_description(branch, field, description);
+        }
+    }
+}
+
+fn guardrail_kind_description(kind: &str) -> Option<&'static str> {
+    match kind {
+        "keyword" => Some("Guardrail provider type for literal and regular expression matching."),
+        "bedrock" => Some("Guardrail provider type for Amazon Bedrock Guardrails."),
+        "azure_content_safety" => Some("Guardrail provider type for Azure Prompt Shield."),
+        "azure_content_safety_text_moderation" => {
+            Some("Guardrail provider type for Azure text moderation.")
+        }
+        "aliyun_text_moderation" => Some("Guardrail provider type for Aliyun text moderation."),
+        "pii" => {
+            Some("Guardrail provider type for in-process sensitive-data detection and redaction.")
+        }
+        "lakera" => Some("Guardrail provider type for Lakera Guard screening."),
+        "openai_moderation" => Some("Guardrail provider type for the OpenAI Moderation API."),
+        "presidio" => {
+            Some("Guardrail provider type for self-hosted Microsoft Presidio PII detection and anonymization.")
+        }
+        _ => None,
+    }
+}
+
 fn set_enum(properties: &mut serde_json::Map<String, Value>, field: &str, values: Value) {
     if let Some(prop) = properties.get_mut(field).and_then(Value::as_object_mut) {
         prop.insert("enum".to_string(), values);
+    }
+}
+
+fn set_property_description(
+    branch: &mut serde_json::Map<String, Value>,
+    field: &str,
+    description: &str,
+) {
+    if let Some(prop) = branch
+        .get_mut("properties")
+        .and_then(|p| p.get_mut(field))
+        .and_then(Value::as_object_mut)
+    {
+        prop.entry("description".to_string())
+            .or_insert_with(|| Value::String(description.to_string()));
     }
 }
 
@@ -454,6 +589,40 @@ fn set_property_items_enum(
         .and_then(Value::as_object_mut)
     {
         items.insert("enum".to_string(), values);
+    }
+}
+
+fn set_property_items_description(
+    branch: &mut serde_json::Map<String, Value>,
+    field: &str,
+    description: &str,
+) {
+    if let Some(items) = branch
+        .get_mut("properties")
+        .and_then(|p| p.get_mut(field))
+        .and_then(|f| f.get_mut("items"))
+        .and_then(Value::as_object_mut)
+    {
+        items
+            .entry("description".to_string())
+            .or_insert_with(|| Value::String(description.to_string()));
+    }
+}
+
+fn set_property_additional_properties_description(
+    branch: &mut serde_json::Map<String, Value>,
+    field: &str,
+    description: &str,
+) {
+    if let Some(additional_properties) = branch
+        .get_mut("properties")
+        .and_then(|p| p.get_mut(field))
+        .and_then(|f| f.get_mut("additionalProperties"))
+        .and_then(Value::as_object_mut)
+    {
+        additional_properties
+            .entry("description".to_string())
+            .or_insert_with(|| Value::String(description.to_string()));
     }
 }
 
@@ -1579,18 +1748,49 @@ mod tests {
                 "name": "g",
                 "kind": "keyword",
                 "patterns": [],
-                "enforcement_mode": "audit"
+                "direction": "sideways"
             }),
             json!({
                 "name": "g",
-                "kind": "keyword",
-                "patterns": [],
-                "direction": "sideways"
+                "kind": "azure_content_safety_text_moderation",
+                "endpoint": "https://example.cognitiveservices.azure.com",
+                "api_key": "key",
+                "output_type": "TwoSeverityLevels"
+            }),
+            json!({
+                "name": "g",
+                "kind": "azure_content_safety_text_moderation",
+                "endpoint": "https://example.cognitiveservices.azure.com",
+                "api_key": "key",
+                "categories": ["Hate", "Spam"]
+            }),
+            json!({
+                "name": "g",
+                "kind": "azure_content_safety_text_moderation",
+                "endpoint": "https://example.cognitiveservices.azure.com",
+                "api_key": "key",
+                "text_source": "assistant_only"
+            }),
+            json!({
+                "name": "g",
+                "kind": "azure_content_safety_text_moderation",
+                "endpoint": "https://example.cognitiveservices.azure.com",
+                "api_key": "key",
+                "stream_processing_mode": "chunked"
             }),
             json!({
                 "name": "g",
                 "kind": "pii",
                 "detectors": [{ "type": "email", "action": "redact" }]
+            }),
+            json!({
+                "name": "g",
+                "kind": "pii",
+                "custom_patterns": [{
+                    "name": "employee_id",
+                    "regex": "\\bEMP-\\d+\\b",
+                    "action": "redact"
+                }]
             }),
             json!({
                 "name": "g",
@@ -1611,6 +1811,33 @@ mod tests {
             }),
             json!({
                 "name": "g",
+                "kind": "lakera",
+                "api_key": "key",
+                "on_buffer_exceeded": "drop"
+            }),
+            json!({
+                "name": "g",
+                "kind": "presidio",
+                "analyzer_url": "http://presidio-analyzer:3000",
+                "anonymizer_url": "http://presidio-anonymizer:3000",
+                "default_action": "redact"
+            }),
+            json!({
+                "name": "g",
+                "kind": "presidio",
+                "analyzer_url": "http://presidio-analyzer:3000",
+                "anonymizer_url": "http://presidio-anonymizer:3000",
+                "entities": [{ "type": "EMAIL_ADDRESS", "action": "redact" }]
+            }),
+            json!({
+                "name": "g",
+                "kind": "presidio",
+                "analyzer_url": "http://presidio-analyzer:3000",
+                "anonymizer_url": "http://presidio-anonymizer:3000",
+                "on_buffer_exceeded": "drop"
+            }),
+            json!({
+                "name": "g",
                 "kind": "presidio",
                 "analyzer_url": "http://presidio-analyzer:3000",
                 "anonymizer_url": "http://presidio-anonymizer:3000",
@@ -1624,6 +1851,17 @@ mod tests {
                 "guardrail schema accepted invalid enum value: {value}",
             );
         }
+    }
+
+    #[test]
+    fn guardrail_enforcement_mode_stays_schema_open_for_fail_safe_fallback() {
+        let v = json!({
+            "name": "g",
+            "kind": "keyword",
+            "patterns": [],
+            "enforcement_mode": "audit"
+        });
+        validate_guardrail(&v).unwrap();
     }
 
     #[test]

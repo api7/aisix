@@ -101,7 +101,9 @@ pub enum BedrockAWSCredentials {
     },
 }
 
-/// Per-guardrail latency policy for `kind: "bedrock"`. `serial` waits for the guardrail response. `timed` aborts at `timeout_ms` and applies `fail_open`.
+/// Per-guardrail latency policy for `kind: "bedrock"`. Serial mode waits
+/// for the guardrail response; timed mode aborts at `timeout_ms` and applies
+/// `fail_open`.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum BedrockLatencyMode {
@@ -175,7 +177,9 @@ pub struct AzureContentSafetyTextModerationConfig {
     pub timeout_ms: u32,
 
     // --- moderation parameters ---
-    /// Severity scale. Use `FourSeverityLevels` for 0, 2, 4, and 6, or `EightSeverityLevels` for 0 through 7.
+    /// Severity scale used for Azure category scores. The four-level scale
+    /// returns even severities; the eight-level scale returns every integer
+    /// severity.
     #[serde(default = "default_acs_output_type")]
     pub output_type: String,
     /// Categories to analyze.
@@ -194,13 +198,14 @@ pub struct AzureContentSafetyTextModerationConfig {
     /// Forwarded to Azure's `haltOnBlocklistHit`.
     #[serde(default)]
     pub halt_on_blocklist_hit: bool,
-    /// Input-hook text selection. Use `concatenate_all_content` to include all message content. Ignored on the output hook.
+    /// Input-hook text selection. The default scans user messages only; the
+    /// alternate mode includes all message content. Ignored on the output hook.
     #[serde(default = "default_acs_text_source")]
     pub text_source: String,
 
     // --- streaming-output controls (consumed by aisix-proxy build_sse_stream) ---
-    /// `window` for sliding-window incremental release or `buffer_full`
-    /// for whole-response hold-back.
+    /// Streaming output moderation mode: sliding-window incremental release
+    /// or whole-response hold-back.
     #[serde(default = "default_acs_stream_processing_mode")]
     pub stream_processing_mode: String,
     /// Sliding-window size in characters for window mode.
@@ -214,7 +219,7 @@ pub struct AzureContentSafetyTextModerationConfig {
     #[serde(default = "default_acs_max_buffer_bytes")]
     #[schemars(range(min = 1))]
     pub max_buffer_bytes: u64,
-    /// Buffer-overflow policy. Use `fail_open` to allow output when the buffer cap is hit.
+    /// Buffer-overflow policy for streamed output when the buffer cap is hit.
     #[serde(default = "default_acs_on_buffer_exceeded")]
     pub on_buffer_exceeded: String,
     /// Fail-open policy for the output hook. When disabled, an Azure outage does not release unscanned model output.
@@ -295,7 +300,8 @@ pub struct AliyunTextModerationConfig {
     /// in memory only and is not logged. Used to sign the request.
     #[schemars(length(min = 1))]
     pub access_key_secret: String,
-    /// Minimum risk level that triggers a block: `low`, `medium`, or `high`. A returned level at or above this blocks.
+    /// Minimum risk level that triggers a block. A returned level at or above
+    /// this threshold blocks.
     #[serde(default = "default_aliyun_risk_level_threshold")]
     pub risk_level_threshold: String,
     /// HTTP call timeout in milliseconds. `fail_open` and `output_fail_open`
@@ -309,8 +315,8 @@ pub struct AliyunTextModerationConfig {
     pub output_fail_open: bool,
 
     // --- streaming-output controls (consumed by aisix-proxy build_sse_stream) ---
-    /// `window` for sliding-window incremental release or `buffer_full`
-    /// for whole-response hold-back.
+    /// Streaming output moderation mode: sliding-window incremental release
+    /// or whole-response hold-back.
     #[serde(default = "default_acs_stream_processing_mode")]
     pub stream_processing_mode: String,
     /// Sliding-window size in characters when window mode is used. Aliyun limits each `llm_response_moderation` call to 2,000 characters.
@@ -324,7 +330,7 @@ pub struct AliyunTextModerationConfig {
     #[serde(default = "default_acs_max_buffer_bytes")]
     #[schemars(range(min = 1))]
     pub max_buffer_bytes: u64,
-    /// Buffer-overflow policy. Use `fail_open` to allow output when the buffer cap is hit.
+    /// Buffer-overflow policy for streamed output when the buffer cap is hit.
     #[serde(default = "default_acs_on_buffer_exceeded")]
     pub on_buffer_exceeded: String,
 }
@@ -343,8 +349,8 @@ pub struct PiiDetectorConfig {
     #[serde(rename = "type")]
     #[schemars(length(min = 1))]
     pub detector_type: String,
-    /// Per-detector action override: `mask` or `block`. Falls back to the
-    /// guardrail's `default_action` when omitted.
+    /// Per-detector action override. Falls back to the guardrail's
+    /// `default_action` when omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action: Option<String>,
 }
@@ -361,8 +367,8 @@ pub struct PiiCustomPattern {
     /// An invalid pattern makes AISIX log and skip the guardrail.
     #[schemars(length(min = 1))]
     pub regex: String,
-    /// Per-pattern action override: `mask` or `block`. Falls back to the
-    /// guardrail's `default_action` when omitted.
+    /// Per-pattern action override. Falls back to the guardrail's
+    /// `default_action` when omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action: Option<String>,
 }
@@ -380,16 +386,14 @@ pub struct PiiCustomPattern {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PiiConfig {
-    /// Built-in detectors to enable. Unknown detector ids are rejected when
-    /// AISIX builds the guardrail chain, so a typo cannot silently disable
-    /// the policy.
+    /// Built-in detectors to enable. The resource schema rejects unknown
+    /// detector ids, so a typo cannot silently disable the policy.
     #[serde(default)]
     pub detectors: Vec<PiiDetectorConfig>,
     /// Operator-supplied regex detectors, evaluated after the built-ins.
     #[serde(default)]
     pub custom_patterns: Vec<PiiCustomPattern>,
-    /// Action for detectors that don't set their own: `mask` (default) or
-    /// `block`.
+    /// Action for detectors that do not set their own override.
     #[serde(default = "default_pii_action")]
     pub default_action: String,
 
@@ -402,9 +406,7 @@ pub struct PiiConfig {
     #[serde(default = "default_acs_max_buffer_bytes")]
     #[schemars(range(min = 1))]
     pub max_buffer_bytes: u64,
-    /// Buffer-overflow policy. Use `fail_open` to release output unscanned
-    /// (and unmasked) when the buffer cap is hit; the default `fail_closed`
-    /// blocks the response instead.
+    /// Buffer-overflow policy for streamed output when the buffer cap is hit.
     #[serde(default = "default_acs_on_buffer_exceeded")]
     pub on_buffer_exceeded: String,
 }
@@ -438,7 +440,7 @@ pub struct BedrockConfig {
     pub region: String,
     /// IAM credentials for Bedrock requests.
     pub aws_credentials: BedrockAWSCredentials,
-    /// Bedrock guardrail latency policy. Use `timed` with `timeout_ms` to cap wait time.
+    /// Bedrock guardrail latency policy. Timed mode caps wait time with `timeout_ms`.
     pub latency_mode: BedrockLatencyMode,
     /// Fail-open policy for the output hook. When disabled (the default), a
     /// Bedrock outage blocks model output instead of releasing unscanned content.
@@ -493,9 +495,7 @@ pub struct LakeraConfig {
     #[serde(default = "default_acs_max_buffer_bytes")]
     #[schemars(range(min = 1))]
     pub max_buffer_bytes: u64,
-    /// Buffer-overflow policy. Use `fail_open` to release output unscanned
-    /// when the buffer cap is hit; the default `fail_closed` blocks the
-    /// response instead.
+    /// Buffer-overflow policy for streamed output when the buffer cap is hit.
     #[serde(default = "default_acs_on_buffer_exceeded")]
     pub on_buffer_exceeded: String,
 }
@@ -521,8 +521,9 @@ pub struct OpenaiModerationConfig {
     #[serde(default)]
     #[schemars(length(min = 1))]
     pub endpoint: Option<String>,
-    /// Moderation model. `omni-moderation-latest` (default) or
-    /// `text-moderation-latest`.
+    /// Moderation model sent to the provider. The default is
+    /// `omni-moderation-latest`; provider model names are not restricted by
+    /// AISIX.
     #[serde(default = "default_openai_moderation_model")]
     #[schemars(length(min = 1))]
     pub model: String,
@@ -560,8 +561,8 @@ pub struct PresidioEntityConfig {
     #[serde(rename = "type")]
     #[schemars(length(min = 1))]
     pub entity_type: String,
-    /// Per-entity action override: `mask` or `block`. Falls back to the
-    /// guardrail's `default_action` when omitted.
+    /// Per-entity action override. Falls back to the guardrail's
+    /// `default_action` when omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action: Option<String>,
 }
@@ -573,9 +574,8 @@ pub struct PresidioEntityConfig {
 ///
 /// vs. the built-in `kind: "pii"`: Presidio adds NER/ML entities a regex
 /// cannot express (`PERSON`, `LOCATION`, `NRP`, …), a self-hosted
-/// compliance posture, and selectable anonymize operators (`replace`,
-/// `mask`, `hash`, `redact`). No vendor secret — both URLs point at
-/// customer-run containers.
+/// compliance posture, and selectable anonymize operators. No vendor secret:
+/// both URLs point at customer-run containers.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct PresidioConfig {
@@ -592,13 +592,10 @@ pub struct PresidioConfig {
     /// full recognizer set and applies `default_action` to every hit.
     #[serde(default)]
     pub entities: Vec<PresidioEntityConfig>,
-    /// Action for entities that don't set their own: `mask` (default) or
-    /// `block`.
+    /// Action for entities that do not set their own override.
     #[serde(default = "default_pii_action")]
     pub default_action: String,
-    /// Anonymize operator applied to masked entities: `replace` (default —
-    /// Presidio substitutes `<ENTITY_TYPE>`), `mask` (asterisks), `hash`
-    /// (SHA-256 hex), or `redact` (span removed).
+    /// Anonymize operator applied to masked entities.
     #[serde(default = "default_presidio_operator")]
     pub operator: String,
     /// Analyzer language code.
@@ -631,9 +628,7 @@ pub struct PresidioConfig {
     #[serde(default = "default_acs_max_buffer_bytes")]
     #[schemars(range(min = 1))]
     pub max_buffer_bytes: u64,
-    /// Buffer-overflow policy. Use `fail_open` to release output unscanned
-    /// (and unmasked) when the buffer cap is hit; the default `fail_closed`
-    /// blocks the response instead.
+    /// Buffer-overflow policy for streamed output when the buffer cap is hit.
     #[serde(default = "default_acs_on_buffer_exceeded")]
     pub on_buffer_exceeded: String,
 }
@@ -787,9 +782,9 @@ pub struct Guardrail {
     #[serde(flatten)]
     pub config: GuardrailKind,
 
-    /// How AISIX handles matching content. `block` enforces the guardrail.
-    /// `monitor` records what would have happened without blocking or
-    /// redacting the caller-visible response.
+    /// How AISIX handles matching content. Enforcing mode applies the
+    /// guardrail verdict; monitor mode records what would have happened
+    /// without blocking or redacting the caller-visible response.
     #[serde(default = "default_enforcement_mode")]
     pub enforcement_mode: String,
 
@@ -800,8 +795,8 @@ pub struct Guardrail {
     #[serde(default)]
     pub mandatory: bool,
 
-    /// Attachment direction hint: `input`, `output`, or `both`. Guardrail
-    /// execution still follows `hook_point`.
+    /// Attachment direction hint. Guardrail execution still follows
+    /// `hook_point`.
     #[serde(default = "default_direction")]
     pub direction: String,
 

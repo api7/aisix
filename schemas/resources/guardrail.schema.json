@@ -13,6 +13,7 @@
               "type": "string"
             },
             "kind": {
+              "description": "Credential mode for explicitly configured AWS access keys.",
               "enum": [
                 "static"
               ],
@@ -34,12 +35,13 @@
       ]
     },
     "BedrockLatencyMode": {
-      "description": "Per-guardrail latency policy for `kind: \"bedrock\"`. `serial` waits for the guardrail response. `timed` aborts at `timeout_ms` and applies `fail_open`.",
+      "description": "Per-guardrail latency policy for `kind: \"bedrock\"`. Serial mode waits for the guardrail response; timed mode aborts at `timeout_ms` and applies `fail_open`.",
       "oneOf": [
         {
           "additionalProperties": false,
           "properties": {
             "kind": {
+              "description": "Latency mode that waits for the Bedrock guardrail response.",
               "enum": [
                 "serial"
               ],
@@ -55,6 +57,7 @@
           "additionalProperties": false,
           "properties": {
             "kind": {
+              "description": "Latency mode that stops waiting after `timeout_ms`.",
               "enum": [
                 "timed"
               ],
@@ -110,12 +113,14 @@
           "description": "Literal string to match.",
           "properties": {
             "kind": {
+              "description": "Pattern type for matching the value as plain text.",
               "enum": [
                 "literal"
               ],
               "type": "string"
             },
             "value": {
+              "description": "Literal string to match.",
               "minLength": 1,
               "type": "string"
             }
@@ -131,12 +136,14 @@
           "description": "Regular expression pattern to match.",
           "properties": {
             "kind": {
+              "description": "Pattern type for matching the value as a regular expression.",
               "enum": [
                 "regex"
               ],
               "type": "string"
             },
             "value": {
+              "description": "Regular expression pattern to match.",
               "minLength": 1,
               "type": "string"
             }
@@ -154,7 +161,7 @@
       "description": "One operator-supplied regex detector for `kind: \"pii\"`.",
       "properties": {
         "action": {
-          "description": "Per-pattern action override: `mask` or `block`. Falls back to the guardrail's `default_action` when omitted.",
+          "description": "Per-pattern action override. Falls back to the guardrail's `default_action` when omitted.",
           "enum": [
             "mask",
             "block"
@@ -184,7 +191,7 @@
       "description": "One built-in detector selection for `kind: \"pii\"`. The `type` names the detector to enable; `action` optionally overrides the guardrail-level `default_action` for this detector only.",
       "properties": {
         "action": {
-          "description": "Per-detector action override: `mask` or `block`. Falls back to the guardrail's `default_action` when omitted.",
+          "description": "Per-detector action override. Falls back to the guardrail's `default_action` when omitted.",
           "enum": [
             "mask",
             "block"
@@ -218,7 +225,7 @@
       "description": "One entity selection for `kind: \"presidio\"`. The `type` names a Presidio entity (`EMAIL_ADDRESS`, `PHONE_NUMBER`, `PERSON`, `CREDIT_CARD`, …); `action` optionally overrides the guardrail-level `default_action` for this entity only — the same per-detector shape as `kind: \"pii\"`.",
       "properties": {
         "action": {
-          "description": "Per-entity action override: `mask` or `block`. Falls back to the guardrail's `default_action` when omitted.",
+          "description": "Per-entity action override. Falls back to the guardrail's `default_action` when omitted.",
           "enum": [
             "mask",
             "block"
@@ -243,6 +250,7 @@
       "description": "In-process literal/regex blocklist. Always available.",
       "properties": {
         "kind": {
+          "description": "Guardrail provider type for literal and regular expression matching.",
           "enum": [
             "keyword"
           ],
@@ -286,6 +294,7 @@
           "type": "string"
         },
         "kind": {
+          "description": "Guardrail provider type for Amazon Bedrock Guardrails.",
           "enum": [
             "bedrock"
           ],
@@ -297,7 +306,7 @@
               "$ref": "#/definitions/BedrockLatencyMode"
             }
           ],
-          "description": "Bedrock guardrail latency policy. Use `timed` with `timeout_ms` to cap wait time."
+          "description": "Bedrock guardrail latency policy. Timed mode caps wait time with `timeout_ms`."
         },
         "output_fail_open": {
           "default": false,
@@ -334,6 +343,7 @@
           "type": "string"
         },
         "kind": {
+          "description": "Guardrail provider type for Azure Prompt Shield.",
           "enum": [
             "azure_content_safety"
           ],
@@ -372,6 +382,7 @@
           "default": [],
           "description": "Azure CS blocklist names to match against.",
           "items": {
+            "description": "Azure blocklist name to match against.",
             "type": "string"
           },
           "type": "array"
@@ -385,6 +396,7 @@
           ],
           "description": "Categories to analyze.",
           "items": {
+            "description": "Azure content category to analyze.",
             "enum": [
               "Hate",
               "Sexual",
@@ -406,6 +418,7 @@
           "type": "boolean"
         },
         "kind": {
+          "description": "Guardrail provider type for Azure text moderation.",
           "enum": [
             "azure_content_safety_text_moderation"
           ],
@@ -420,7 +433,7 @@
         },
         "on_buffer_exceeded": {
           "default": "fail_closed",
-          "description": "Buffer-overflow policy. Use `fail_open` to allow output when the buffer cap is hit.",
+          "description": "Buffer-overflow policy for streamed output when the buffer cap is hit.",
           "enum": [
             "fail_closed",
             "fail_open"
@@ -434,7 +447,7 @@
         },
         "output_type": {
           "default": "FourSeverityLevels",
-          "description": "Severity scale. Use `FourSeverityLevels` for 0, 2, 4, and 6, or `EightSeverityLevels` for 0 through 7.",
+          "description": "Severity scale used for Azure category scores. The four-level scale returns even severities; the eight-level scale returns every integer severity.",
           "enum": [
             "FourSeverityLevels",
             "EightSeverityLevels"
@@ -451,6 +464,7 @@
         },
         "severity_threshold_by_category": {
           "additionalProperties": {
+            "description": "Severity threshold for the category key.",
             "format": "uint8",
             "minimum": 0.0,
             "type": "integer"
@@ -461,7 +475,7 @@
         },
         "stream_processing_mode": {
           "default": "window",
-          "description": "`window` for sliding-window incremental release or `buffer_full` for whole-response hold-back.",
+          "description": "Streaming output moderation mode: sliding-window incremental release or whole-response hold-back.",
           "enum": [
             "window",
             "buffer_full"
@@ -470,7 +484,7 @@
         },
         "text_source": {
           "default": "concatenate_user_content",
-          "description": "Input-hook text selection. Use `concatenate_all_content` to include all message content. Ignored on the output hook.",
+          "description": "Input-hook text selection. The default scans user messages only; the alternate mode includes all message content. Ignored on the output hook.",
           "enum": [
             "concatenate_user_content",
             "concatenate_all_content"
@@ -528,6 +542,7 @@
           "type": "string"
         },
         "kind": {
+          "description": "Guardrail provider type for Aliyun text moderation.",
           "enum": [
             "aliyun_text_moderation"
           ],
@@ -542,7 +557,7 @@
         },
         "on_buffer_exceeded": {
           "default": "fail_closed",
-          "description": "Buffer-overflow policy. Use `fail_open` to allow output when the buffer cap is hit.",
+          "description": "Buffer-overflow policy for streamed output when the buffer cap is hit.",
           "enum": [
             "fail_closed",
             "fail_open"
@@ -561,7 +576,7 @@
         },
         "risk_level_threshold": {
           "default": "high",
-          "description": "Minimum risk level that triggers a block: `low`, `medium`, or `high`. A returned level at or above this blocks.",
+          "description": "Minimum risk level that triggers a block. A returned level at or above this threshold blocks.",
           "enum": [
             "low",
             "medium",
@@ -571,7 +586,7 @@
         },
         "stream_processing_mode": {
           "default": "window",
-          "description": "`window` for sliding-window incremental release or `buffer_full` for whole-response hold-back.",
+          "description": "Streaming output moderation mode: sliding-window incremental release or whole-response hold-back.",
           "enum": [
             "window",
             "buffer_full"
@@ -623,7 +638,7 @@
         },
         "default_action": {
           "default": "mask",
-          "description": "Action for detectors that don't set their own: `mask` (default) or `block`.",
+          "description": "Action for detectors that do not set their own override.",
           "enum": [
             "mask",
             "block"
@@ -632,13 +647,14 @@
         },
         "detectors": {
           "default": [],
-          "description": "Built-in detectors to enable. Unknown detector ids are rejected when AISIX builds the guardrail chain, so a typo cannot silently disable the policy.",
+          "description": "Built-in detectors to enable. The resource schema rejects unknown detector ids, so a typo cannot silently disable the policy.",
           "items": {
             "$ref": "#/definitions/PiiDetectorConfig"
           },
           "type": "array"
         },
         "kind": {
+          "description": "Guardrail provider type for in-process sensitive-data detection and redaction.",
           "enum": [
             "pii"
           ],
@@ -653,7 +669,7 @@
         },
         "on_buffer_exceeded": {
           "default": "fail_closed",
-          "description": "Buffer-overflow policy. Use `fail_open` to release output unscanned (and unmasked) when the buffer cap is hit; the default `fail_closed` blocks the response instead.",
+          "description": "Buffer-overflow policy for streamed output when the buffer cap is hit.",
           "enum": [
             "fail_closed",
             "fail_open"
@@ -681,6 +697,7 @@
           "type": "string"
         },
         "kind": {
+          "description": "Guardrail provider type for Lakera Guard screening.",
           "enum": [
             "lakera"
           ],
@@ -695,7 +712,7 @@
         },
         "on_buffer_exceeded": {
           "default": "fail_closed",
-          "description": "Buffer-overflow policy. Use `fail_open` to release output unscanned when the buffer cap is hit; the default `fail_closed` blocks the response instead.",
+          "description": "Buffer-overflow policy for streamed output when the buffer cap is hit.",
           "enum": [
             "fail_closed",
             "fail_open"
@@ -737,6 +754,7 @@
         },
         "category_thresholds": {
           "additionalProperties": {
+            "description": "Score threshold for the category key.",
             "format": "double",
             "type": "number"
           },
@@ -751,6 +769,7 @@
           "type": "string"
         },
         "kind": {
+          "description": "Guardrail provider type for the OpenAI Moderation API.",
           "enum": [
             "openai_moderation"
           ],
@@ -758,7 +777,7 @@
         },
         "model": {
           "default": "omni-moderation-latest",
-          "description": "Moderation model. `omni-moderation-latest` (default) or `text-moderation-latest`.",
+          "description": "Moderation model sent to the provider. The default is `omni-moderation-latest`; provider model names are not restricted by AISIX.",
           "minLength": 1,
           "type": "string"
         },
@@ -797,7 +816,7 @@
         },
         "default_action": {
           "default": "mask",
-          "description": "Action for entities that don't set their own: `mask` (default) or `block`.",
+          "description": "Action for entities that do not set their own override.",
           "enum": [
             "mask",
             "block"
@@ -813,6 +832,7 @@
           "type": "array"
         },
         "kind": {
+          "description": "Guardrail provider type for self-hosted Microsoft Presidio PII detection and anonymization.",
           "enum": [
             "presidio"
           ],
@@ -833,7 +853,7 @@
         },
         "on_buffer_exceeded": {
           "default": "fail_closed",
-          "description": "Buffer-overflow policy. Use `fail_open` to release output unscanned (and unmasked) when the buffer cap is hit; the default `fail_closed` blocks the response instead.",
+          "description": "Buffer-overflow policy for streamed output when the buffer cap is hit.",
           "enum": [
             "fail_closed",
             "fail_open"
@@ -842,7 +862,7 @@
         },
         "operator": {
           "default": "replace",
-          "description": "Anonymize operator applied to masked entities: `replace` (default — Presidio substitutes `<ENTITY_TYPE>`), `mask` (asterisks), `hash` (SHA-256 hex), or `redact` (span removed).",
+          "description": "Anonymize operator applied to masked entities.",
           "enum": [
             "replace",
             "mask",
@@ -888,7 +908,7 @@
     },
     "direction": {
       "default": "both",
-      "description": "Attachment direction hint: `input`, `output`, or `both`. Guardrail execution still follows `hook_point`.",
+      "description": "Attachment direction hint. Guardrail execution still follows `hook_point`.",
       "enum": [
         "input",
         "output",
@@ -903,11 +923,7 @@
     },
     "enforcement_mode": {
       "default": "block",
-      "description": "How AISIX handles matching content. `block` enforces the guardrail. `monitor` records what would have happened without blocking or redacting the caller-visible response.",
-      "enum": [
-        "block",
-        "monitor"
-      ],
+      "description": "How AISIX handles matching content. Enforcing mode applies the guardrail verdict; monitor mode records what would have happened without blocking or redacting the caller-visible response.",
       "type": "string"
     },
     "fail_open": {
