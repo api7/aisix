@@ -18,7 +18,7 @@ static binary with low per-request overhead. Self-host for free, forever.
 
 [**Start free**](https://api7.ai/ai-gateway?utm_source=github&utm_medium=readme&utm_campaign=ai-gateway) ·
 [**Documentation**](https://docs.api7.ai/ai-gateway/) ·
-[**Quickstart**](https://docs.api7.ai/ai-gateway/quickstart/) ·
+[**Quickstart**](https://docs.api7.ai/ai-gateway/getting-started/self-hosted-quickstart) ·
 [**AISIX Cloud**](https://api7.ai/ai-gateway?utm_source=github&utm_medium=readme&utm_campaign=cloud) ·
 [**Roadmap**](ROADMAP.md)
 
@@ -50,14 +50,14 @@ for a managed control plane with team governance, budgets, audit, and a dashboar
 
 AISIX is etcd-backed, so the fastest local run is Docker Compose (gateway + etcd). Grab the
 ready-to-run `docker-compose.yml` and example `config.yaml` from the
-[self-hosted quickstart](https://docs.api7.ai/ai-gateway/quickstart/), then:
+[self-hosted quickstart](https://docs.api7.ai/ai-gateway/getting-started/self-hosted-quickstart), then:
 
 ```bash
 docker compose up          # proxy → :3000, admin API → :3001
 ```
 
 Configure a model and an API key through the admin API on `:3001`
-([quickstart](https://docs.api7.ai/ai-gateway/quickstart/)),
+([quickstart](https://docs.api7.ai/ai-gateway/getting-started/self-hosted-quickstart)),
 then call the gateway exactly like OpenAI:
 
 ```bash
@@ -95,7 +95,7 @@ Covered by 90+ E2E tests.
 - **Semantic routing** — one virtual model that dispatches by the *meaning* of each
   request: it embeds the prompt, scores it against per-route example utterances, and routes
   to the best match (or a default). See the
-  [semantic routing docs](https://docs.api7.ai/ai-gateway/routing-and-resilience/semantic-routing).
+  [semantic routing docs](https://docs.api7.ai/ai-gateway/routing/semantic-routing).
 - **Rate limiting & concurrency** — RPM/RPD + TPM/TPD + concurrency caps, AND-combined
   across `ApiKey`, `Model`, and policy scopes (`api_key` / `model` / `team` / `member`).
 - **Guardrails** — content-policy enforcement on input and output: keyword/regex
@@ -126,7 +126,7 @@ OpenAI-shaped.
 
 Plus specialized handling for vendor quirks (e.g. DeepSeek reasoning content) and dedicated
 **rerank / embeddings** vendors (Cohere, Jina). Details in
-[adapter protocol families](https://docs.api7.ai/ai-gateway/reference/adapters). More providers on the
+[adapter protocol families](https://docs.api7.ai/ai-gateway/providers/adapters). More providers on the
 [roadmap](ROADMAP.md).
 
 ## ☁️ Self-hosted vs AISIX Cloud
