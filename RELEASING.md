@@ -17,7 +17,8 @@ Pushing the tag triggers two workflows:
   `ghcr.io/api7/aisix:X.Y.Z` (plus `:X.Y`, `:X`, `:latest`, `:sha-<short>`),
   mirrors the release tag to `docker.io/api7/aisix` for private/offline
   deployments, signs the images with cosign, and stamps the version into the
-  binary so a running gateway self-reports `X.Y.Z+sha-<short>`.
+  binary so a running gateway self-reports `X.Y.Z` (`--version`, `Server`
+  header) and `X.Y.Z+sha-<short>` in its managed-mode heartbeat.
 - **`release-draft.yml`** creates a **draft** GitHub Release for the tag with
   auto-generated notes as a starting skeleton.
 
@@ -42,7 +43,7 @@ Edit the draft before publishing. House style (see the
   docker pull ghcr.io/api7/aisix:X.Y.Z
   ```
 
-  `**Full changelog**: https://github.com/api7/aisix/compare/vX.Y.(Z-1)...vX.Y.Z`
+  `**Full changelog**: https://github.com/api7/aisix/compare/<previous release tag>...vX.Y.Z`
 
 ## 3. Publish
 

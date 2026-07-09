@@ -30,10 +30,12 @@ cargo run -p aisix-server --bin aisix -- --config config.yaml
 ```
 
 CI enforces `fmt`, `clippy -D warnings`, unit tests with a coverage gate, the
-E2E suite, and two generated-artifact checks: resource JSON schemas
-(`schemas/`) and the Admin API OpenAPI document must be regenerated when the
-resource structs change — CI fails on drift, and the failing job's log shows
-the regeneration command.
+E2E suite, and two generated-artifact checks: the resource JSON Schemas in
+`schemas/` must be regenerated (`cargo run -p aisix-core --bin dump-schema`)
+and committed when the resource structs change — CI fails on drift — and the
+Admin API OpenAPI document (generated at build time, not committed) must
+still build and pass its structural checks
+(`cargo run -p aisix-admin --bin dump-openapi`).
 
 ## Making changes
 

@@ -33,7 +33,9 @@ jobs:
             echo "release for $TAG already exists — nothing to do"
             exit 0
           fi
-          gh release create "$TAG" -R "$REPO" \
+          # Pre-release tags (v0.4.0-rc.1) get the prerelease flag.
+          case "$TAG" in *-*) PRE=--prerelease ;; *) PRE= ;; esac
+          gh release create "$TAG" -R "$REPO" $PRE \
             --draft \
             --generate-notes \
             --title "$TAG"
