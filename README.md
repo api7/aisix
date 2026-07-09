@@ -234,6 +234,7 @@ cargo run -p aisix-server --bin aisix -- --config config.yaml
 
 - **Discord** — [discord.gg/dUmRZ7Rvf](https://discord.gg/dUmRZ7Rvf)
 - **Issues & discussions** — [github.com/api7/aisix/issues](https://github.com/api7/aisix/issues)
+- **Contributing** — [CONTRIBUTING.md](CONTRIBUTING.md)
 - **Website** — [api7.ai/ai-gateway](https://api7.ai/ai-gateway?utm_source=github&utm_medium=readme)
 
 If AISIX is useful to you, a ⭐ helps other engineers find it.

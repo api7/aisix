@@ -1,0 +1,39 @@
+name: release-draft
+
+# Create a draft GitHub Release with auto-generated notes whenever a
+# release tag (vX.Y.Z) is pushed — the skeleton a maintainer polishes into
+# curated notes before publishing (see RELEASING.md). Draft releases do
+# not notify watchers, so nothing goes out until a human publishes.
+#
+# No-op if a release for the tag already exists (e.g. created manually).
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-draft-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  draft:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Create draft release with generated notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          if gh release view "$TAG" -R "$REPO" >/dev/null 2>&1; then
+            echo "release for $TAG already exists — nothing to do"
+            exit 0
+          fi
+          gh release create "$TAG" -R "$REPO" \
+            --draft \
+            --generate-notes \
+            --title "$TAG"
