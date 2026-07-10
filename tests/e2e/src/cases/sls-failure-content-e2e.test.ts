@@ -45,6 +45,11 @@ const GUARDRAIL_SENTINEL = `${FORBIDDEN_WORD} plus context 4b9f0a`;
 const FORBIDDEN_MODEL_SENTINEL = "forbidden-model-prompt-9e3a1b";
 const MESSAGES_SENTINEL = "messages-fail-prompt-5d8c4f";
 const RESPONSES_SENTINEL = "responses-fail-prompt-2a6e9d";
+const GROUP_SENTINEL = "group-all-failed-prompt-8f2b6c";
+const RECOVER_SENTINEL = "group-recovered-prompt-3c7d1a";
+const EMAIL = "dana@example.com";
+const CN_ID = "11010519491231002X"; // valid ISO 7064 MOD 11-2 check digit
+const MASKED_BLOCK_SENTINEL = "masked-block-prompt-6a4e8b";
 
 // --- Minimal SLS LogGroup protobuf reader (see sink/sls.rs encoder) -----
 // LogGroup { Logs = 1 (message) { Time = 1 (varint), Contents = 2 (message)
@@ -242,6 +247,9 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: failPk.id,
+      // Keep the failing target in rotation across tests — a cooldown
+      // would silently shrink the routing groups below to one target.
+      cooldown: { enabled: false },
     });
     // A model the caller is NOT allowed to use (403 case).
     await admin.createModel({
@@ -250,10 +258,46 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
       model_name: "gpt-4o-mini",
       provider_key_id: okPk.id,
     });
+    // Second hard-failing target so a routing group can fail on BOTH
+    // targets (content must ride the LAST attempt only).
+    await admin.createModel({
+      display_name: "failure-content-fail-b",
+      provider: "openai",
+      model_name: "gpt-4o-mini",
+      provider_key_id: failPk.id,
+      cooldown: { enabled: false },
+    });
+    await admin.createModel({
+      display_name: "failure-content-group",
+      routing: {
+        strategy: "failover",
+        targets: [
+          { model: "failure-content-fail" },
+          { model: "failure-content-fail-b" },
+        ],
+      },
+    });
+    // Fail-then-recover group: the failed attempt must stay content-less
+    // while the winner's success event carries the prompt.
+    await admin.createModel({
+      display_name: "failure-content-recover",
+      routing: {
+        strategy: "failover",
+        targets: [
+          { model: "failure-content-fail" },
+          { model: "failure-content-ok" },
+        ],
+      },
+    });
 
     await admin.createApiKey({
       key_hash: CALLER_KEY_HASH,
-      allowed_models: ["failure-content-ok", "failure-content-fail"],
+      allowed_models: [
+        "failure-content-ok",
+        "failure-content-fail",
+        "failure-content-group",
+        "failure-content-recover",
+      ],
     });
 
     // Input-side keyword guardrail (block mode) for the 422 case.
@@ -264,13 +308,33 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
       kind: "keyword",
       patterns: [{ kind: "literal", value: FORBIDDEN_WORD }],
     });
+    // PII guardrail: email masks, china_id_card blocks. A blocked request
+    // carrying BOTH must capture the post-mask body (the email placeholder,
+    // never the raw address).
+    await admin.json("POST", "/admin/v1/guardrails", {
+      name: "failure-content-pii",
+      enabled: true,
+      hook_point: "input",
+      kind: "pii",
+      detectors: [
+        { type: "email", action: "mask" },
+        { type: "china_id_card", action: "block" },
+      ],
+    });
 
-    // Gate: benign chat succeeds AND the guardrail is live (risky 422).
+    // Gate: benign chat succeeds, both guardrails are live (each blocks),
+    // and the routing groups resolved.
     await waitConfigPropagation(async () => {
       const ok = await chat("failure-content-ok", "a plain benign question");
       if (ok.status !== 200) return false;
       const blocked = await chat("failure-content-ok", `probe ${FORBIDDEN_WORD}`);
-      return blocked.status === 422;
+      if (blocked.status !== 422) return false;
+      const pii = await chat("failure-content-ok", `probe id ${CN_ID}`);
+      if (pii.status !== 422) return false;
+      const grp = await chat("failure-content-group", "group probe");
+      if (grp.status === 404) return false;
+      const rec = await chat("failure-content-recover", "recover probe");
+      return rec.status === 200;
     });
   });
 
@@ -413,6 +477,102 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
     expect(Number(log.get("status_code"))).toBeGreaterThanOrEqual(400);
   });
 
+  test("blocked request carrying maskable PII captures the POST-mask body", async (ctx) => {
+    if (!etcdReachable || !app || !sls) {
+      ctx.skip();
+      return;
+    }
+    // The china_id_card detector blocks; the email detector masks. The
+    // captured prompt must show what the success path would have sent —
+    // the masked email — never the raw address.
+    const res = await chat(
+      "failure-content-ok",
+      `${MASKED_BLOCK_SENTINEL} write to ${EMAIL} about id ${CN_ID}`,
+    );
+    expect(res.status).toBe(422);
+
+    const log = await waitForLog(
+      sls,
+      (l) => (l.get("prompt") ?? "").includes(MASKED_BLOCK_SENTINEL),
+      "pii-blocked record with prompt",
+    );
+    expect(log.get("guardrail_blocked")).toBe("true");
+    const prompt = log.get("prompt")!;
+    expect(prompt).toContain("[EMAIL_REDACTED]");
+    expect(prompt).not.toContain(EMAIL);
+    // And the raw address never reaches the logstore in any record.
+    for (const l of logsFor(sls, FULL_LOGSTORE)) {
+      for (const v of l.values()) {
+        expect(v).not.toContain(EMAIL);
+      }
+    }
+  });
+
+  test("all targets failed: exactly one record carries the prompt, on the last attempt", async (ctx) => {
+    if (!etcdReachable || !app || !sls) {
+      ctx.skip();
+      return;
+    }
+    const res = await chat("failure-content-group", GROUP_SENTINEL);
+    expect(res.status).toBeGreaterThanOrEqual(400);
+
+    const withPrompt = await waitForLog(
+      sls,
+      (l) => (l.get("prompt") ?? "").includes(GROUP_SENTINEL),
+      "all-targets-failed record with prompt",
+    );
+    const requestId = withPrompt.get("request_id")!;
+    expect(requestId).toBeTruthy();
+
+    // Both attempts produced a record…
+    const requestLogs = logsFor(sls, FULL_LOGSTORE).filter(
+      (l) => l.get("request_id") === requestId,
+    );
+    expect(requestLogs.length).toBeGreaterThanOrEqual(2);
+    // …but exactly ONE carries the prompt, and it is the LAST attempt
+    // (the failure the caller actually saw), not the first.
+    const promptBearers = requestLogs.filter((l) =>
+      (l.get("prompt") ?? "").includes(GROUP_SENTINEL),
+    );
+    expect(promptBearers.length).toBe(1);
+    const maxAttempt = Math.max(
+      ...requestLogs.map((l) => Number(l.get("attempt_index") ?? "0")),
+    );
+    expect(Number(promptBearers[0]!.get("attempt_index"))).toBe(maxAttempt);
+    expect(maxAttempt).toBeGreaterThanOrEqual(1);
+  });
+
+  test("fallback recovers: failed attempt stays content-less, the success record carries the prompt", async (ctx) => {
+    if (!etcdReachable || !app || !sls) {
+      ctx.skip();
+      return;
+    }
+    const res = await chat("failure-content-recover", RECOVER_SENTINEL);
+    expect(res.status).toBe(200);
+
+    const successLog = await waitForLog(
+      sls,
+      (l) =>
+        (l.get("prompt") ?? "").includes(RECOVER_SENTINEL) &&
+        l.get("status_code") === "200",
+      "recovered request's success record with prompt",
+    );
+    const requestId = successLog.get("request_id")!;
+    // The failed first attempt is recorded — without the prompt.
+    const deadline = Date.now() + 10_000;
+    let failedAttempt: Map<string, string> | undefined;
+    while (Date.now() < deadline && !failedAttempt) {
+      failedAttempt = logsFor(sls, FULL_LOGSTORE).find(
+        (l) =>
+          l.get("request_id") === requestId &&
+          Number(l.get("status_code") ?? "0") >= 400,
+      );
+      if (!failedAttempt) await new Promise((r) => setTimeout(r, 100));
+    }
+    expect(failedAttempt, "failed attempt record").toBeDefined();
+    expect(failedAttempt!.get("prompt")).toBeUndefined();
+  });
+
   test("metadata_only exporter never receives any failed-request prompt", async (ctx) => {
     if (!etcdReachable || !app || !sls) {
       ctx.skip();
@@ -420,6 +580,17 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
     }
     // Runs last: every sentinel above has already been sent and captured
     // into the FULL logstore. None may appear in the metadata logstore.
+    // Vacuous-pass guard: the meta pipeline must have delivered the failed
+    // requests before we assert what its records lack.
+    const failedMeta = () =>
+      logsFor(sls!, META_LOGSTORE).filter(
+        (l) => Number(l.get("status_code") ?? "0") >= 400,
+      );
+    const deadline = Date.now() + 10_000;
+    while (failedMeta().length < 4 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    expect(failedMeta().length).toBeGreaterThanOrEqual(4);
     const metaText = logsFor(sls, META_LOGSTORE)
       .flatMap((l) => [...l.values()])
       .join(" ");

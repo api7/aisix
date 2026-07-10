@@ -424,7 +424,9 @@ pub async fn chat_completions(
             // AISIX-Cloud#1013: failed requests carry the (post-mask)
             // request body so a 4xx/5xx can be triaged from the log alone.
             // Same opt-in gate and cap as the success path; 401/403 stay
-            // body-less — the body adds nothing to an authorization
+            // body-less (a 401 here is upstream-auth passthrough — caller
+            // 401s are rejected by the auth extractor before any event
+            // exists) — the body adds nothing to an authorization
             // failure and callers probing keys shouldn't get their
             // payloads archived.
             let mut failure_content = if status == 401 || status == 403 {
@@ -934,6 +936,17 @@ async fn dispatch(
             // carries only the firing guardrail's name (#519 B.4b) so
             // callers can't enumerate the blocklist by inspecting
             // error responses.
+            // AISIX-Cloud#1013: the blocked request's body is captured
+            // into full-content exporters, so run the mask-action rewrite
+            // BEFORE returning — otherwise the capture would export the
+            // pre-mask text the success path would have masked. (Remote
+            // segment masks — moderate_body's Bedrock pass — are still
+            // skipped: the request is dead, don't burn a provider call;
+            // those entities were never locally detected.)
+            crate::redact::merge_counts(
+                redactions_out,
+                crate::redact::redact_chat_format(resolved_chain.as_ref(), req),
+            );
             tracing::warn!(
                 guardrail_hook = "input",
                 model = %req.model,

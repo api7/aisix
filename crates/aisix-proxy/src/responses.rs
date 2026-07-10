@@ -270,7 +270,9 @@ pub async fn responses(
             // AISIX-Cloud#1013: failed requests carry the (post-mask)
             // request body so a 4xx/5xx can be triaged from the log alone.
             // Same opt-in gate and cap as the success path; 401/403 stay
-            // body-less (the body adds nothing to an authorization failure).
+            // body-less (a 401 here is upstream-auth passthrough — caller
+            // 401s are rejected by the auth extractor before any event
+            // exists) (the body adds nothing to an authorization failure).
             let mut failure_content = if status == 401 || status == 403 {
                 None
             } else {
@@ -428,6 +430,12 @@ async fn dispatch(
             // wire envelope names only the guardrail that fired (#519 B.4b)
             // so callers can't enumerate the blocklist by probing error
             // responses.
+            // AISIX-Cloud#1013: mask before returning so the failure
+            // content capture exports post-mask text (see chat.rs).
+            crate::redact::merge_counts(
+                redactions_out,
+                crate::redact::redact_responses_request(resolved_chain.as_ref(), body),
+            );
             tracing::warn!(
                 guardrail_hook = "input",
                 model = %model_name,
@@ -1319,9 +1327,14 @@ async fn responses_to_target(
                     output_redactions: crate::redact::RedactionCounts::new(),
                     // Hits observed by the blocking check still count.
                     output_monitor_hits,
-                    // Blocked responses never reached the client — no content
-                    // capture, matching the chat surface.
-                    captured_content: None,
+                    // AISIX-Cloud#1013: the billed-then-blocked event carries
+                    // the (post-mask) prompt; the blocked output itself stays
+                    // out of the log — blocking it and then archiving it would
+                    // defeat the block.
+                    captured_content: match (&captured_prompt, content_cap) {
+                        (Some(p), Some(cap)) => Some(CapturedContent::new(p, "", cap as usize)),
+                        _ => None,
+                    },
                 });
             }
         }
@@ -1707,9 +1720,14 @@ async fn responses_cross_provider_to_target(
                 output_redactions: crate::redact::RedactionCounts::new(),
                 // Hits observed by the blocking check still count.
                 output_monitor_hits,
-                // Blocked responses never reached the client — no content
-                // capture, matching the chat surface.
-                captured_content: None,
+                // AISIX-Cloud#1013: the billed-then-blocked event carries
+                // the (post-mask) prompt; the blocked output itself stays
+                // out of the log — blocking it and then archiving it would
+                // defeat the block.
+                captured_content: match (&captured_prompt, content_cap) {
+                    (Some(p), Some(cap)) => Some(CapturedContent::new(p, "", cap as usize)),
+                    _ => None,
+                },
             });
         }
     }
