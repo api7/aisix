@@ -193,6 +193,12 @@ async fn dispatch(
         .as_ref()
         .map(|r| r.retry_on_429_or_default())
         .unwrap_or(false);
+    let fallback_statuses: &[u16] = model_entry
+        .value
+        .routing
+        .as_ref()
+        .map(|r| r.fallback_on_statuses_or_default())
+        .unwrap_or(&[]);
 
     let mut last_err: Option<ProxyError> = None;
     let mut any_anthropic = false;
@@ -218,7 +224,7 @@ async fn dispatch(
             Err(e) => {
                 let retryable = matches!(
                     &e,
-                    ProxyError::Bridge(be) if crate::routing::is_retryable(be, retry_on_429)
+                    ProxyError::Bridge(be) if crate::routing::is_retryable(be, retry_on_429, fallback_statuses)
                 );
                 last_err = Some(e);
                 if !retryable {

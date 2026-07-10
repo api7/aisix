@@ -623,6 +623,12 @@ async fn dispatch(
         .as_ref()
         .map(|r| r.retry_on_429_or_default())
         .unwrap_or(false);
+    let fallback_statuses: &[u16] = model_entry
+        .value
+        .routing
+        .as_ref()
+        .map(|r| r.fallback_on_statuses_or_default())
+        .unwrap_or(&[]);
     // Routing target names only matter on the telemetry for a real Model
     // Group; a direct model leaves `attempt_model` empty (its `model_id`
     // already identifies it), matching chat.rs.
@@ -734,7 +740,7 @@ async fn dispatch(
                 Err(e) => {
                     let retryable = matches!(
                         &e,
-                        ProxyError::Bridge(be) if crate::routing::is_retryable(be, retry_on_429)
+                        ProxyError::Bridge(be) if crate::routing::is_retryable(be, retry_on_429, fallback_statuses)
                     );
                     let (error_class, error_message) = attempt_error_from_proxy(&e);
                     routing.attempts.push(AttemptRecord {

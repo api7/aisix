@@ -170,6 +170,10 @@ pub struct Routing {
     /// Whether upstream 429 participates in retries and failover.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_on_429: Option<bool>,
+    /// Additional upstream HTTP status codes that participate in retries and failover. By default a non-429 4xx response is treated as a caller error and returned as-is; providers that use 4xx codes for transient conditions (model overload, queue full, quota exhaustion) can be listed here, for example `[408, 409]`. 5xx codes are already retryable, so listing them changes nothing. Authentication (`401`/`403`) and validation (`400`) codes should only be listed when the provider is known to use them for transient failures.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(inner(range(min = 400, max = 599)))]
+    pub fallback_on_statuses: Option<Vec<u16>>,
     /// Policy to apply when every target is unavailable because of runtime health or cooldown state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub when_all_unavailable: Option<WhenAllUnavailablePolicy>,
@@ -203,6 +207,12 @@ impl Routing {
 
     pub fn retry_on_429_or_default(&self) -> bool {
         self.retry_on_429.unwrap_or(false)
+    }
+
+    /// Configured status codes that opt into retry/failover; empty when
+    /// unset (the default behavior).
+    pub fn fallback_on_statuses_or_default(&self) -> &[u16] {
+        self.fallback_on_statuses.as_deref().unwrap_or(&[])
     }
 
     pub fn when_all_unavailable_or_default(&self) -> WhenAllUnavailablePolicy {
@@ -258,6 +268,7 @@ mod tests {
             retries: Some(0),
             max_fallbacks: Some(0),
             retry_on_429: None,
+            fallback_on_statuses: None,
             when_all_unavailable: None,
             sticky: None,
         };
@@ -272,6 +283,7 @@ mod tests {
             retries: None,
             max_fallbacks: Some(99),
             retry_on_429: None,
+            fallback_on_statuses: None,
             when_all_unavailable: None,
             sticky: None,
         };

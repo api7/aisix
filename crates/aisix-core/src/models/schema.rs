@@ -1434,6 +1434,29 @@ mod tests {
     }
 
     #[test]
+    fn routing_fallback_on_statuses_range_is_enforced() {
+        // AISIX-Cloud#1012: entries outside 400-599 are rejected by the
+        // same committed-schema validation the admin API and etcd watch
+        // paths share; an in-range list passes.
+        let bad = json!({
+            "display_name": "router-fos",
+            "routing": {
+                "targets": [{"model": "x"}],
+                "fallback_on_statuses": [300]
+            }
+        });
+        assert!(validate_model(&bad).is_err());
+        let good = json!({
+            "display_name": "router-fos",
+            "routing": {
+                "targets": [{"model": "x"}],
+                "fallback_on_statuses": [408, 422]
+            }
+        });
+        validate_model(&good).unwrap();
+    }
+
+    #[test]
     fn cooldown_rejects_invalid_status_code() {
         let v = json!({
             "display_name": "x",
