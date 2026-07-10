@@ -191,8 +191,10 @@ describe("guardrail e2e: monitor mode never blocks, even on provider failure (#1
       });
       return { ok: true };
     } catch (e) {
-      if (e instanceof APIError && typeof e.status === "number") {
-        return { status: e.status };
+      if (e instanceof APIError) {
+        // status is undefined for connection-class errors; report a
+        // sentinel so gates keep polling instead of failing the test.
+        return { status: typeof e.status === "number" ? e.status : 0 };
       }
       throw e;
     }
@@ -257,7 +259,10 @@ describe("guardrail e2e: monitor mode never blocks, even on provider failure (#1
     expect(broken.requests).toBeGreaterThan(brokenBefore);
   });
 
-  test("monitor mode: flagged content is observed but not blocked", async (ctx) => {
+  // The "observed" half (the would_block monitor hit) is pinned at the
+  // unit layer — build.rs monitor_mode tests + guardrail-monitor-telemetry
+  // e2e; this case pins the traffic half for a remote provider.
+  test("monitor mode: flagged content is not blocked", async (ctx) => {
     if (!etcdReachable || !app || !upstream || !flagAll) {
       ctx.skip();
       return;
