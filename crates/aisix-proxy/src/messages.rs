@@ -220,6 +220,9 @@ pub async fn messages(
                 &client,
                 &applied_guardrails,
                 &routing,
+                // The winner's success event carries the content.
+                /* content_for_last */
+                None,
             );
             if !usage_handled_by_stream {
                 // Winning-attempt classification (#655). Direct models have
@@ -301,6 +304,36 @@ pub async fn messages(
             };
             state.metrics.record_proxy_request(fail_labels, elapsed);
             state.metrics.record_llm_request(fail_labels, elapsed);
+            // AISIX-Cloud#1013: failed requests carry the (post-mask)
+            // request body so a 4xx/5xx can be triaged from the log alone.
+            // Same opt-in gate and cap as the success path; 401/403 stay
+            // body-less (a 401 here is upstream-auth passthrough — caller
+            // 401s are rejected by the auth extractor before any event
+            // exists) (the body adds nothing to an authorization failure).
+            let mut failure_content = if status == 401 || status == 403 {
+                None
+            } else {
+                content_capture_cap(
+                    snap.observability_exporters
+                        .entries()
+                        .iter()
+                        .map(|e| &e.value),
+                )
+                .map(|cap| {
+                    CapturedContent::new(
+                        &serde_json::to_string(&body).unwrap_or_default(),
+                        "",
+                        cap as usize,
+                    )
+                })
+            };
+            // When every target failed there is no terminal event below —
+            // the content rides the last failed attempt instead.
+            let content_for_last = if !routing.attempts.is_empty() {
+                failure_content.take()
+            } else {
+                None
+            };
             // Per #655: emit one zero-token UsageEvent per FAILED attempt so
             // the dashboard's Logs tab surfaces each failed upstream try.
             emit_failed_attempts_anthropic(
@@ -316,6 +349,7 @@ pub async fn messages(
                 &client,
                 &applied_guardrails,
                 &routing,
+                content_for_last,
             );
             // Pre-dispatch failure (model-not-found, auth, budget, guardrail
             // block before any upstream attempt) records no attempts — emit a
@@ -347,7 +381,7 @@ pub async fn messages(
                     // Input masking may have fired before the failure.
                     redaction_counts.clone(),
                     monitor_hits.clone(),
-                    /* content */ None,
+                    failure_content.take(),
                 );
             }
             // /v1/messages must return Anthropic-shape error envelope
@@ -377,8 +411,24 @@ fn emit_failed_attempts_anthropic(
     client: &ClientContext,
     applied_guardrails: &[AppliedGuardrail],
     routing: &RoutingTelemetry,
+    // AISIX-Cloud#1013: when every target failed there is no terminal
+    // event, so the captured request body rides the LAST failed attempt —
+    // the one whose status the caller saw. Other attempts (and the
+    // success-path caller) stay content-less.
+    mut content_for_last: Option<CapturedContent>,
 ) {
-    for rec in routing.attempts.iter().filter(|a| !a.success) {
+    let last_failed = routing.attempts.iter().rposition(|a| !a.success);
+    for (i, rec) in routing
+        .attempts
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| !a.success)
+    {
+        let content = if Some(i) == last_failed {
+            content_for_last.take()
+        } else {
+            None
+        };
         emit_anthropic_usage_event(
             state,
             request_id,
@@ -403,7 +453,7 @@ fn emit_failed_attempts_anthropic(
             // terminal (winner / pre-dispatch) event does.
             crate::redact::RedactionCounts::new(),
             Vec::new(),
-            /* content */ None,
+            content,
         );
     }
 }
@@ -496,6 +546,12 @@ async fn dispatch(
                 guardrail_name,
             } = verdict
             {
+                // AISIX-Cloud#1013: mask before returning so the failure
+                // content capture exports post-mask text (see chat.rs).
+                crate::redact::merge_counts(
+                    redactions_out,
+                    crate::redact::redact_anthropic_request(resolved_chain.as_ref(), body),
+                );
                 tracing::warn!(
                     guardrail_hook = "input",
                     model = %model_name,

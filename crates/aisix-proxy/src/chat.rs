@@ -200,6 +200,9 @@ pub async fn chat_completions(
                 &client,
                 &applied_guardrails,
                 &success.routing,
+                // The winner's success event carries the content.
+                /* content_for_last */
+                None,
             );
             // The streaming path wires the WINNER's telemetry into the SSE
             // stream's on_complete callback (it has to wait for the
@@ -418,6 +421,38 @@ pub async fn chat_completions(
             // (guardrail) sets `guardrail_blocked` for the Blocked tab.
             let guardrail_blocked = matches!(err, ProxyError::ContentFiltered(_));
             let model_id_str = resolved_model_id.as_deref().unwrap_or("");
+            // AISIX-Cloud#1013: failed requests carry the (post-mask)
+            // request body so a 4xx/5xx can be triaged from the log alone.
+            // Same opt-in gate and cap as the success path; 401/403 stay
+            // body-less (a 401 here is upstream-auth passthrough — caller
+            // 401s are rejected by the auth extractor before any event
+            // exists) — the body adds nothing to an authorization
+            // failure and callers probing keys shouldn't get their
+            // payloads archived.
+            let mut failure_content = if status == 401 || status == 403 {
+                None
+            } else {
+                content_capture_cap(
+                    snap.observability_exporters
+                        .entries()
+                        .iter()
+                        .map(|e| &e.value),
+                )
+                .map(|cap| {
+                    CapturedContent::new(
+                        &serde_json::to_string(&req).unwrap_or_default(),
+                        "",
+                        cap as usize,
+                    )
+                })
+            };
+            // When every target failed there is no terminal event below —
+            // the content rides the last failed attempt instead.
+            let content_for_last = if charge.is_none() && !routing.attempts.is_empty() {
+                failure_content.take()
+            } else {
+                None
+            };
             // Per #655: emit one zero-token event for each FAILED attempt.
             // `applied_guardrails` (resolved by `dispatch`) is recorded on
             // every attempt so an input-blocked / failed request still
@@ -430,6 +465,7 @@ pub async fn chat_completions(
                 &client,
                 &applied_guardrails,
                 &routing,
+                content_for_last,
             );
             // Terminal event:
             //  - output-blocked (charge present): the WINNING attempt was
@@ -489,7 +525,7 @@ pub async fn chat_completions(
                         /* cost_usd */ 0.0,
                         guardrail_blocked,
                         &client,
-                        /* content */ None,
+                        failure_content.take(),
                     );
                 }
                 None if routing.attempts.is_empty() => {
@@ -520,11 +556,12 @@ pub async fn chat_completions(
                         /* cost_usd */ 0.0,
                         guardrail_blocked,
                         &client,
-                        /* content */ None,
+                        failure_content.take(),
                     );
                 }
                 None => {
-                    // All attempts failed; each was emitted above.
+                    // All attempts failed; each was emitted above (the last
+                    // one carrying the captured request body).
                 }
             }
             err.into_response()
@@ -899,6 +936,17 @@ async fn dispatch(
             // carries only the firing guardrail's name (#519 B.4b) so
             // callers can't enumerate the blocklist by inspecting
             // error responses.
+            // AISIX-Cloud#1013: the blocked request's body is captured
+            // into full-content exporters, so run the mask-action rewrite
+            // BEFORE returning — otherwise the capture would export the
+            // pre-mask text the success path would have masked. (Remote
+            // segment masks — moderate_body's Bedrock pass — are still
+            // skipped: the request is dead, don't burn a provider call;
+            // those entities were never locally detected.)
+            crate::redact::merge_counts(
+                redactions_out,
+                crate::redact::redact_chat_format(resolved_chain.as_ref(), req),
+            );
             tracing::warn!(
                 guardrail_hook = "input",
                 model = %req.model,
@@ -3229,6 +3277,7 @@ struct UsageExtras {
 /// (direct-model success / pre-dispatch error). Each event shares the
 /// request's `request_id` (the trace key) and carries this attempt's
 /// status / error / latency.
+#[allow(clippy::too_many_arguments)]
 fn emit_failed_attempts(
     state: &ProxyState,
     request_id: &str,
@@ -3237,8 +3286,25 @@ fn emit_failed_attempts(
     client: &ClientContext,
     applied_guardrails: &[AppliedGuardrail],
     routing: &RoutingTelemetry,
+    // AISIX-Cloud#1013: when every target failed there is no terminal
+    // event, so the captured request body rides the LAST failed attempt —
+    // the one whose status the caller saw. Other attempts (and the
+    // success-path caller) stay content-less to avoid duplicating a large
+    // prompt across N events.
+    mut content_for_last: Option<CapturedContent>,
 ) {
-    for rec in routing.attempts.iter().filter(|a| !a.success) {
+    let last_failed = routing.attempts.iter().rposition(|a| !a.success);
+    for (i, rec) in routing
+        .attempts
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| !a.success)
+    {
+        let content = if Some(i) == last_failed {
+            content_for_last.take()
+        } else {
+            None
+        };
         emit_usage_event(
             state,
             request_id,
@@ -3264,7 +3330,7 @@ fn emit_failed_attempts(
             /* cost_usd */ 0.0,
             /* guardrail_blocked */ false,
             client,
-            /* content */ None,
+            content,
         );
     }
 }
