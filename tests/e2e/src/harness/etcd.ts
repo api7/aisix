@@ -65,6 +65,24 @@ export class EtcdClient {
     }
   }
 
+  /** Read one key's value (etcd v3 `/v3/kv/range`); undefined when absent. */
+  async get(key: string): Promise<string | undefined> {
+    const res = await harnessRequest(`${this.endpoint}/v3/kv/range`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ key: Buffer.from(key, "utf8").toString("base64") }),
+    });
+    if (res.statusCode >= 300) {
+      const body = await res.body.text();
+      throw new Error(`etcd range failed (${res.statusCode}): ${body}`);
+    }
+    const parsed = JSON.parse(await res.body.text()) as {
+      kvs?: Array<{ value: string }>;
+    };
+    const v = parsed.kvs?.[0]?.value;
+    return v === undefined ? undefined : Buffer.from(v, "base64").toString("utf8");
+  }
+
   /** Delete every key under `prefix` (range delete in etcd v3 semantics). */
   async deletePrefix(prefix: string): Promise<void> {
     const key = Buffer.from(prefix, "utf8").toString("base64");
