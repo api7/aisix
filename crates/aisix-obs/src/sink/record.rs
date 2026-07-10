@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use serde::Serialize;
 
+use super::truncate::truncate_content;
 use crate::usage::UsageEvent;
 
 /// Current canonical event schema version, emitted on every [`SinkRecord`]
@@ -33,30 +34,19 @@ pub struct SinkContent {
 
 impl SinkContent {
     /// Build captured content, truncating `prompt` and `response` to at most
-    /// `max_bytes` each (on a UTF-8 char boundary so the result stays valid).
-    /// `truncated` is set when either field was cut.
+    /// `max_bytes` each. Oversized valid JSON is reduced structurally so it
+    /// stays valid JSON; other text is cut on a UTF-8 char boundary (see
+    /// [`super::truncate::truncate_content`]). `truncated` is set when
+    /// either field was cut.
     pub fn capture(prompt: &str, response: &str, max_bytes: usize) -> Self {
-        let (prompt, p_cut) = truncate_on_char_boundary(prompt, max_bytes);
-        let (response, r_cut) = truncate_on_char_boundary(response, max_bytes);
+        let (prompt, p_cut) = truncate_content(prompt, max_bytes);
+        let (response, r_cut) = truncate_content(response, max_bytes);
         Self {
-            prompt: prompt.to_owned(),
-            response: response.to_owned(),
+            prompt: prompt.into_owned(),
+            response: response.into_owned(),
             truncated: p_cut || r_cut,
         }
     }
-}
-
-/// Truncate `s` to at most `max_bytes`, backing up to the previous UTF-8 char
-/// boundary so the slice stays valid. Returns the slice and whether it was cut.
-fn truncate_on_char_boundary(s: &str, max_bytes: usize) -> (&str, bool) {
-    if s.len() <= max_bytes {
-        return (s, false);
-    }
-    let mut end = max_bytes;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    (&s[..end], true)
 }
 
 /// Raw captured request/response content, handed from a request handler to the
@@ -77,16 +67,17 @@ pub struct CapturedContent {
 }
 
 impl CapturedContent {
-    /// Capture `prompt` and `response`, truncating each to `max_bytes` (on a
-    /// UTF-8 char boundary) to bound the held buffer at the largest cap any
-    /// content-capturing exporter requested. `truncated` is set if either was
-    /// cut here; a per-exporter `SinkContent` ORs in its own (smaller) cap.
+    /// Capture `prompt` and `response`, truncating each to `max_bytes`
+    /// (structure-preserving for JSON, UTF-8-boundary cut otherwise) to
+    /// bound the held buffer at the largest cap any content-capturing
+    /// exporter requested. `truncated` is set if either was cut here; a
+    /// per-exporter `SinkContent` ORs in its own (smaller) cap.
     pub fn new(prompt: &str, response: &str, max_bytes: usize) -> Self {
-        let (prompt, p_cut) = truncate_on_char_boundary(prompt, max_bytes);
-        let (response, r_cut) = truncate_on_char_boundary(response, max_bytes);
+        let (prompt, p_cut) = truncate_content(prompt, max_bytes);
+        let (response, r_cut) = truncate_content(response, max_bytes);
         Self {
-            prompt: prompt.to_owned(),
-            response: response.to_owned(),
+            prompt: prompt.into_owned(),
+            response: response.into_owned(),
             truncated: p_cut || r_cut,
         }
     }

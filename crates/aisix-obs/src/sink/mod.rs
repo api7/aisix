@@ -19,6 +19,7 @@ mod object_store;
 mod pipeline;
 mod record;
 mod sls;
+mod truncate;
 
 pub use capabilities::{
     BatchUnit, ChannelKey, IdempotencyMarker, IdempotencyScheme, OrderingScope, SinkCapabilities,
