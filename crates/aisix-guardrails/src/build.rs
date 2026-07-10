@@ -1516,6 +1516,69 @@ mod tests {
         assert!(block.check_input(&req("hi")).await.is_block());
     }
 
+    fn aliyun_row_against(endpoint: &str, extra: &str) -> DomainGuardrail {
+        parse(&format!(
+            r#"{{
+                "name": "aliyun-monitor",
+                "kind": "aliyun_text_moderation",
+                "region": "cn-shanghai",
+                "endpoint": "{endpoint}",
+                "access_key_id": "ak",
+                "access_key_secret": "sk"{extra}
+            }}"#,
+        ))
+    }
+
+    /// AISIX-Cloud#1010: `enforcement_mode: "monitor"` must never block —
+    /// including when the remote provider call itself FAILS, not just when
+    /// content is flagged. With `fail_open: false` a provider 5xx surfaces
+    /// as a `Block` from the inner guardrail; the monitor wrapper must
+    /// downgrade it. Composed through `build_one` so the decorator
+    /// ordering itself is what's pinned.
+    #[tokio::test]
+    async fn monitor_downgrades_provider_failure_block() {
+        use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let row = aliyun_row_against(
+            &server.uri(),
+            r#", "enforcement_mode": "monitor", "fail_open": false"#,
+        );
+        let g = build_one(&row, None).unwrap().unwrap();
+        assert_eq!(
+            g.check_input(&req("hello")).await,
+            GuardrailVerdict::Allow,
+            "monitor mode must downgrade a fail-closed provider-failure Block",
+        );
+    }
+
+    /// The documented exception to the above: `mandatory: true` is applied
+    /// OUTSIDE the monitor wrapper (`build_one`), so provider
+    /// unavailability stays fatal even in monitor mode — the fail-open
+    /// `Bypass` passes through the monitor wrapper untouched and is then
+    /// upgraded to a named `Block`.
+    #[tokio::test]
+    async fn mandatory_keeps_unavailability_fatal_in_monitor_mode() {
+        use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let row = aliyun_row_against(
+            &server.uri(),
+            r#", "enforcement_mode": "monitor", "mandatory": true"#,
+        );
+        let g = build_one(&row, None).unwrap().unwrap();
+        assert!(
+            g.check_input(&req("hello")).await.is_block(),
+            "mandatory must keep provider unavailability fatal in monitor mode",
+        );
+    }
+
     #[tokio::test]
     async fn disabled_row_is_dropped() {
         let table: ResourceTable<DomainGuardrail> = ResourceTable::default();
