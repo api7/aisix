@@ -216,6 +216,22 @@ pub async fn responses(
             // `response.completed` event. `usage_handled_by_stream` guards
             // against a double-emit; `usage` is `None` on that path.
             if !success.usage_handled_by_stream {
+                // SLO e2e histogram (AISIX-Cloud#1011): recorded even when
+                // the upstream response carried no parseable usage block —
+                // latency observation must not depend on token accounting.
+                state.metrics.record_request_e2e_latency(
+                    LatencyLabels {
+                        endpoint: "/v1/responses",
+                        model: &model_name,
+                        provider: &success.provider,
+                        status,
+                        streaming: body
+                            .get("stream")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false),
+                    },
+                    elapsed,
+                );
                 if let Some(usage) = success.usage {
                     // Winning-attempt classification (#655). Direct models
                     // have no recorded attempt → AttemptInfo defaults.
@@ -233,7 +249,6 @@ pub async fn responses(
                         &success.provider_key_id,
                         status,
                         elapsed,
-                        /* streaming */ false,
                         &usage,
                         &client,
                         attempt,
@@ -1148,6 +1163,7 @@ async fn responses_to_target(
         let requested_model_c = requested_model.to_string();
         let api_key_id_c = api_key_id.to_string();
         let provider_key_id_c = provider_key_id.clone();
+        let provider_c = provider_label.clone();
         let client_c = client_ctx.clone();
         // #688: carry the reservation into the end-of-stream guard — keys drive
         // post-stream TPM/TPD accounting, the hold keeps the concurrency slot(s)
@@ -1187,6 +1203,17 @@ async fn responses_to_target(
                     }
                     _ => None,
                 };
+                // SLO e2e histogram: full stream duration (verbatim path).
+                state_c.metrics.record_request_e2e_latency(
+                    LatencyLabels {
+                        endpoint: "/v1/responses",
+                        model: &requested_model_c,
+                        provider: &provider_c,
+                        status: 200,
+                        streaming: true,
+                    },
+                    started.elapsed(),
+                );
                 emit_usage_event(
                     &state_c,
                     &request_id_c,
@@ -1196,7 +1223,6 @@ async fn responses_to_target(
                     &provider_key_id_c,
                     200,
                     started.elapsed(),
-                    /* streaming */ true,
                     &usage,
                     &client_c,
                     attempt,
@@ -1503,6 +1529,7 @@ async fn responses_cross_provider_to_target(
         let requested_model_c = requested_model.to_string();
         let api_key_id_c = api_key_id.to_string();
         let provider_key_id_c = provider_key_id.clone();
+        let provider_c = provider_label.clone();
         let client_c = client_ctx.clone();
         let attempt_c = attempt.clone();
         // #688: carry the reservation into the end-of-stream guard — keys drive
@@ -1562,6 +1589,18 @@ async fn responses_cross_provider_to_target(
                     ),
                     _ => None,
                 };
+                // SLO e2e histogram: full stream duration (bridge path).
+                // Blocked streams keep this guard's 422 status.
+                state_c.metrics.record_request_e2e_latency(
+                    LatencyLabels {
+                        endpoint: "/v1/responses",
+                        model: &requested_model_c,
+                        provider: &provider_c,
+                        status,
+                        streaming: true,
+                    },
+                    started.elapsed(),
+                );
                 emit_usage_event(
                     &state_c,
                     &request_id_c,
@@ -1571,7 +1610,6 @@ async fn responses_cross_provider_to_target(
                     &provider_key_id_c,
                     status,
                     started.elapsed(),
-                    /* streaming */ true,
                     &usage,
                     &client_c,
                     attempt_c,
@@ -2175,10 +2213,6 @@ fn emit_usage_event(
     provider_key_id: &str,
     status_code: u16,
     elapsed: Duration,
-    // SLO e2e histogram dimension (AISIX-Cloud#1011): callers pass true
-    // from the two stream-completion sites (where `elapsed` is the full
-    // stream duration), false from the non-streaming terminal emit.
-    streaming: bool,
     usage: &ResponseUsage,
     client: &ClientContext,
     attempt: AttemptInfo,
@@ -2195,18 +2229,6 @@ fn emit_usage_event(
 ) {
     let snap = state.snapshot.load();
     let tags = provider_telemetry_tags(&snap, provider_key_id);
-    // This function runs exactly once per successful request (attempts go
-    // through emit_zero_token_event), so it is the e2e observation point.
-    state.metrics.record_request_e2e_latency(
-        LatencyLabels {
-            endpoint: "/v1/responses",
-            model: requested_model,
-            provider: tags.kind.map(|k| k.as_str()).unwrap_or("unknown"),
-            status: status_code,
-            streaming,
-        },
-        elapsed,
-    );
     let event = UsageEvent {
         request_id: request_id.to_string(),
         occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),

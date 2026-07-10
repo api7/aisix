@@ -19,8 +19,10 @@ import {
 // re-aggregated; they stay untouched.
 //
 // Drives a real `aisix` + etcd + mock upstream through non-streaming,
-// streaming, and failing requests on /v1/chat/completions and
-// /v1/messages, then scrapes the dedicated metrics listener.
+// streaming, and failing chat requests plus a /v1/messages request, then
+// scrapes the dedicated metrics listener. Exactly-once accounting is
+// pinned via _count (a double-observation or dropped-observation
+// regression shifts the count off 1).
 
 const CALLER_PLAINTEXT = "sk-latency-histo-caller";
 const CALLER_KEY_HASH = createHash("sha256").update(CALLER_PLAINTEXT).digest("hex");
@@ -157,6 +159,19 @@ describe("latency histograms e2e: bucketed TTFT + e2e latency (#1011)", () => {
     );
   }
 
+  /** Sum of `series`_count across label combinations matching `labels`. */
+  function countOf(body: string, series: string, labels: Record<string, string>): number {
+    return body
+      .split("\n")
+      .filter(
+        (l) =>
+          l.startsWith(`${series}_count{`) &&
+          Object.entries(labels).every(([k, v]) => l.includes(`${k}="${v}"`)),
+      )
+      .map((l) => parseInt(l.split("}").at(-1)!.trim(), 10))
+      .reduce((a, b) => a + b, 0);
+  }
+
   test("non-streaming, streaming and failed requests land in le-bucketed series", async (ctx) => {
     if (!etcdReachable || !app) {
       ctx.skip();
@@ -165,6 +180,22 @@ describe("latency histograms e2e: bucketed TTFT + e2e latency (#1011)", () => {
     expect((await chat("histo-model", false)).status).toBe(200);
     expect((await chat("histo-stream-model", true)).status).toBe(200);
     expect((await chat("histo-fail-model", false)).status).toBeGreaterThanOrEqual(500);
+    // One /v1/messages request so the anthropic-protocol wiring is covered.
+    const msg = await fetch(`${app!.proxyUrl}/v1/messages`, {
+      method: "POST",
+      headers: {
+        "x-api-key": CALLER_PLAINTEXT,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "histo-model",
+        max_tokens: 16,
+        messages: [{ role: "user", content: "hello" }],
+      }),
+    });
+    await msg.text();
+    expect(msg.status).toBe(200);
 
     // Streaming observation happens at stream completion; poll the scrape.
     let body = "";
@@ -209,6 +240,20 @@ describe("latency histograms e2e: bucketed TTFT + e2e latency (#1011)", () => {
       model: "histo-stream-model",
     });
     expect(ttft.length, "TTFT buckets").toBeGreaterThan(0);
+
+    const messagesSeries = bucketLines(body, E2E_SERIES, {
+      endpoint: "/v1/messages",
+      model: "histo-model",
+    });
+    expect(messagesSeries.length, "/v1/messages buckets").toBeGreaterThan(0);
+
+    // Exactly-once accounting: this suite sent exactly ONE streaming chat
+    // to histo-stream-model — a double observation (e.g. handler-return
+    // AND stream-completion both recording) or a dropped one shifts this
+    // off 1. Same for its single TTFT.
+    expect(countOf(body, E2E_SERIES, { model: "histo-stream-model" })).toBe(1);
+    expect(countOf(body, TTFT_SERIES, { model: "histo-stream-model" })).toBe(1);
+    expect(countOf(body, E2E_SERIES, { model: "histo-fail-model" })).toBe(1);
 
     // histogram_quantile() needs _sum/_count too.
     expect(body).toContain(`${E2E_SERIES}_sum`);

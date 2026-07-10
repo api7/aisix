@@ -108,6 +108,9 @@ pub const M_OTLP_FANOUT_FAILURES_TOTAL: &str = "aisix_otlp_fanout_failures_total
 /// non-streaming requests and failures, at stream completion for
 /// committed streams (full stream duration, matching the usage event's
 /// `latency_ms` — NOT the time-to-first-byte the summary series record).
+/// A stream the client cancels mid-flight still observes once, with the
+/// committed status (2xx) and the duration up to the abort — the same
+/// client-perceived semantics as the usage event.
 pub const M_REQUEST_E2E_LATENCY_SECONDS: &str = "aisix_request_e2e_latency_seconds";
 /// Time-to-first-token for streaming requests, same label set as
 /// [`M_REQUEST_E2E_LATENCY_SECONDS`] (with `streaming="true"` always).

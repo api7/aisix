@@ -2639,6 +2639,31 @@ async fn dispatch_ensemble(
                     &client_for_telem,
                     /* content */ None,
                 );
+                // SLO histograms (AISIX-Cloud#1011): the handler's
+                // record_success is stream-gated, so the ensemble stream
+                // records its e2e/TTFT here like the plain streaming path.
+                state_for_telem.metrics.record_request_e2e_latency(
+                    LatencyLabels {
+                        endpoint: "/v1/chat/completions",
+                        model: &client_model_for_telem,
+                        // Matches the legacy series: no single provider
+                        // governs an ensemble response.
+                        provider: "ensemble",
+                        status: 200,
+                        streaming: true,
+                    },
+                    started.elapsed(),
+                );
+                state_for_telem.metrics.record_request_ttft(
+                    LatencyLabels {
+                        endpoint: "/v1/chat/completions",
+                        model: &client_model_for_telem,
+                        provider: "ensemble",
+                        status: 200,
+                        streaming: true,
+                    },
+                    Duration::from_millis(u64::from(comp.ttft_ms)),
+                );
                 // Release the concurrency permit(s) now the stream is done
                 // (or was cancelled) — on_complete fires on both paths (#450).
                 drop(stream_concurrency_hold);
