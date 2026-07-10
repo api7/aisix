@@ -39,12 +39,34 @@ const LADDER: &[(usize, usize, usize)] = &[
 /// Truncate `s` to at most `max_bytes`. Oversized valid JSON is reduced
 /// structurally (stays valid JSON); anything else falls back to a
 /// UTF-8-boundary byte cut. Returns the content and whether it was cut.
+///
+/// Worst-case cost (only when the content exceeds the cap AND a
+/// full-content exporter is enabled): one parse, one stats pass, and up
+/// to |LADDER| build+serialize rounds over the tree. Structurally
+/// irreducible payloads (no long strings, no long arrays) skip every
+/// rung and pay parse + one compact serialize before the byte-cut
+/// fallback.
 pub(crate) fn truncate_content(s: &str, max_bytes: usize) -> (Cow<'_, str>, bool) {
     if s.len() <= max_bytes {
         return (Cow::Borrowed(s), false);
     }
     if let Ok(root) = serde_json::from_str::<Value>(s) {
+        // Whitespace-heavy (pretty-printed) input may already fit once
+        // compacted, with nothing dropped; this is also the baseline the
+        // rung skip below compares against.
+        if let Ok(compact) = serde_json::to_string(&root) {
+            if compact.len() <= max_bytes {
+                return (Cow::Owned(compact), true);
+            }
+        }
+        let (mut max_str, mut max_arr) = (0usize, 0usize);
+        measure(&root, &mut max_str, &mut max_arr);
         for &(string_cap, head, tail) in LADDER {
+            // A rung that caps no string and samples no array reproduces
+            // the compact serialization — already known not to fit.
+            if string_cap >= max_str && head + tail + 1 >= max_arr {
+                continue;
+            }
             let reduced = shrink(&root, string_cap, head, tail);
             if let Ok(out) = serde_json::to_string(&reduced) {
                 if out.len() <= max_bytes {
@@ -55,6 +77,27 @@ pub(crate) fn truncate_content(s: &str, max_bytes: usize) -> (Cow<'_, str>, bool
     }
     let (cut, _) = truncate_on_char_boundary(s, max_bytes);
     (Cow::Borrowed(cut), true)
+}
+
+/// One pass over the tree: the largest string (bytes) and largest array
+/// (element count) anywhere — used to skip ladder rungs that cannot
+/// change anything.
+fn measure(v: &Value, max_str: &mut usize, max_arr: &mut usize) {
+    match v {
+        Value::String(s) => *max_str = (*max_str).max(s.len()),
+        Value::Array(items) => {
+            *max_arr = (*max_arr).max(items.len());
+            for i in items {
+                measure(i, max_str, max_arr);
+            }
+        }
+        Value::Object(map) => {
+            for val in map.values() {
+                measure(val, max_str, max_arr);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Truncate `s` to at most `max_bytes`, backing up to the previous UTF-8 char
@@ -84,9 +127,18 @@ fn shrink(v: &Value, string_cap: usize, head: usize, tail: usize) -> Value {
                         .iter()
                         .map(|i| shrink(i, string_cap, head, tail)),
                 );
+                // A dropped element that is itself a placeholder from an
+                // earlier (larger-cap) truncation pass stands for
+                // `omitted_items` originals, not 1 — fold its count in so
+                // the accounting survives two-stage capture→exporter
+                // truncation.
+                let omitted: u64 = items[head..items.len() - tail]
+                    .iter()
+                    .map(|i| placeholder_omitted(i).unwrap_or(1))
+                    .sum();
                 out.push(serde_json::json!({
                     "_aisix_truncated": true,
-                    "omitted_items": items.len() - head - tail,
+                    "omitted_items": omitted,
                 }));
                 out.extend(
                     items[items.len() - tail..]
@@ -112,6 +164,13 @@ fn shrink(v: &Value, string_cap: usize, head: usize, tail: usize) -> Value {
     }
 }
 
+/// `Some(count)` when `v` is an array-sampling placeholder produced by
+/// [`shrink`]; the count it stands for (1 if the field is malformed).
+fn placeholder_omitted(v: &Value) -> Option<u64> {
+    (v.get("_aisix_truncated") == Some(&Value::Bool(true)))
+        .then(|| v.get("omitted_items").and_then(|n| n.as_u64()).unwrap_or(1))
+}
+
 /// Cap one string value. Base64 data URIs carry no information a log
 /// reader can use, so they collapse to a placeholder (detection is exact
 /// — bare base64 is left alone rather than guessed at); text keeps a
@@ -124,7 +183,13 @@ fn shrink_string(s: &str, cap: usize) -> String {
         return format!("[aisix: base64 data uri omitted, {} bytes]", s.len());
     }
     let (prefix, _) = truncate_on_char_boundary(s, cap);
-    format!("{prefix}...[aisix: truncated, {} bytes total]", s.len())
+    let marked = format!("{prefix}...[aisix: truncated, {} bytes total]", s.len());
+    // A string barely over the cap can come out LONGER with the marker
+    // appended; keeping the original is then strictly better.
+    if marked.len() >= s.len() {
+        return s.to_owned();
+    }
+    marked
 }
 
 /// True for `data:<mime>;base64,...` payloads (inline images/audio).
@@ -311,7 +376,9 @@ mod tests {
         // Handler-side capture runs at the largest exporter cap; each
         // exporter then re-truncates to its own smaller cap. The second
         // pass sees the first pass's (valid JSON) output and must keep it
-        // valid JSON.
+        // valid JSON — AND keep the omitted-items accounting true to the
+        // ORIGINAL element count (a dropped stage-1 placeholder folds its
+        // count into the stage-2 placeholder instead of counting as 1).
         let messages: Vec<Value> = (0..300)
             .map(|i| json!({"role": "user", "content": format!("msg {i} {}", "y".repeat(100))}))
             .collect();
@@ -321,6 +388,21 @@ mod tests {
         let (second, cut) = truncate_content(&first, 2048);
         assert!(cut);
         let v = assert_valid_json_within(&second, 2048);
-        assert!(v["messages"].as_array().unwrap().len() >= 3);
+
+        let arr = v["messages"].as_array().unwrap();
+        assert!(arr.len() >= 3);
+        let (mut kept, mut omitted) = (0u64, 0u64);
+        for item in arr {
+            match placeholder_omitted(item) {
+                Some(n) => omitted += n,
+                None => kept += 1,
+            }
+        }
+        assert_eq!(
+            kept + omitted,
+            300,
+            "kept + omitted must account for every original element \
+             across both truncation stages (got kept={kept}, omitted={omitted})",
+        );
     }
 }
