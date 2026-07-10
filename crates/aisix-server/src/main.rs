@@ -406,7 +406,10 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
         }
         RateLimitBackend::Memory => Limiter::new(),
     });
-    let metrics = Arc::new(Metrics::new(true));
+    // env_id is resolved by now (managed provisioning / sidecar restore
+    // above); it becomes the constant `env_id` label on the SLO latency
+    // histograms. Standalone DPs leave it empty → "unknown".
+    let metrics = Arc::new(Metrics::new_with_env_id(&cfg.etcd.env_id));
     // Cache backends (#519 B.8). The memory cache is always built
     // (in-process, cheap); the redis cache is built iff `cache.redis`
     // is configured. Which instance serves a request is selected by

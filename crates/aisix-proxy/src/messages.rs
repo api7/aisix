@@ -37,8 +37,8 @@
 
 use aisix_core::AppliedGuardrail;
 use aisix_obs::{
-    content_capture_cap, AccessLog, CapturedContent, LlmUsage, RequestLabels, RequestOutcome,
-    UsageEvent, UsageLabels,
+    content_capture_cap, AccessLog, CapturedContent, LatencyLabels, LlmUsage, RequestLabels,
+    RequestOutcome, UsageEvent, UsageLabels,
 };
 use axum::extract::State;
 use axum::http::{HeaderName, HeaderValue};
@@ -204,6 +204,20 @@ pub async fn messages(
             };
             state.metrics.record_proxy_request(labels, elapsed);
             state.metrics.record_llm_request(labels, elapsed);
+            // SLO e2e histogram (AISIX-Cloud#1011): non-streaming only —
+            // a stream records its full duration at completion instead.
+            if !stream_requested {
+                state.metrics.record_request_e2e_latency(
+                    LatencyLabels {
+                        endpoint: "/v1/messages",
+                        model: &model_name,
+                        provider: &provider_label,
+                        status,
+                        streaming: false,
+                    },
+                    elapsed,
+                );
+            }
             // Per #655: one zero-token UsageEvent per failed attempt that
             // preceded the winner (non-streaming failover). No-op for a
             // first-try success and for the single-attempt streaming path.
@@ -301,6 +315,16 @@ pub async fn messages(
             };
             state.metrics.record_proxy_request(fail_labels, elapsed);
             state.metrics.record_llm_request(fail_labels, elapsed);
+            state.metrics.record_request_e2e_latency(
+                LatencyLabels {
+                    endpoint: "/v1/messages",
+                    model: metric_model,
+                    provider: "unknown",
+                    status,
+                    streaming: stream_requested,
+                },
+                elapsed,
+            );
             // Per #655: emit one zero-token UsageEvent per FAILED attempt so
             // the dashboard's Logs tab surfaces each failed upstream try.
             emit_failed_attempts_anthropic(
@@ -1130,6 +1154,16 @@ async fn anthropic_passthrough_dispatch(
                     finish_reason: usage.finish_reason,
                     ttft_ms: usage.ttft_ms,
                 };
+                state_c.metrics.record_request_e2e_latency(
+                    LatencyLabels {
+                        endpoint: "/v1/messages",
+                        model: &model_name_c,
+                        provider: &provider_c,
+                        status: 200,
+                        streaming: true,
+                    },
+                    started.elapsed(),
+                );
                 emit_anthropic_usage_event(
                     &state_c,
                     &request_id_c,
@@ -1640,6 +1674,16 @@ async fn cross_provider_dispatch(
                     finish_reason: comp.finish_reason,
                     ttft_ms: comp.ttft_ms,
                 };
+                state_for_telem.metrics.record_request_e2e_latency(
+                    LatencyLabels {
+                        endpoint: "/v1/messages",
+                        model: &model_for_telem,
+                        provider: &provider_for_telem,
+                        status: 200,
+                        streaming: true,
+                    },
+                    started_for_telem.elapsed(),
+                );
                 emit_anthropic_usage_event(
                     &state_for_telem,
                     &request_id_for_telem,
@@ -2354,6 +2398,16 @@ fn emit_anthropic_usage_event(
         total_tokens_all,
     );
     if metrics.ttft_ms > 0 {
+        state.metrics.record_request_ttft(
+            LatencyLabels {
+                endpoint: "/v1/messages",
+                model,
+                provider,
+                status: status_code,
+                streaming: true,
+            },
+            Duration::from_millis(u64::from(metrics.ttft_ms)),
+        );
         state.metrics.record_time_to_first_token(
             UsageLabels {
                 endpoint: "/v1/messages",

@@ -13,7 +13,9 @@
 //! 400 with an explanatory message.
 
 use aisix_gateway::{ChatFormat, ChatMessage, ChatResponse, FinishReason, UsageStats};
-use aisix_obs::{content_capture_cap, AccessLog, CapturedContent, RequestOutcome, UsageEvent};
+use aisix_obs::{
+    content_capture_cap, AccessLog, CapturedContent, LatencyLabels, RequestOutcome, UsageEvent,
+};
 use axum::extract::State;
 use axum::http::{HeaderName, HeaderValue};
 use axum::response::{IntoResponse, Response};
@@ -231,6 +233,7 @@ pub async fn responses(
                         &success.provider_key_id,
                         status,
                         elapsed,
+                        /* streaming */ false,
                         &usage,
                         &client,
                         attempt,
@@ -262,6 +265,19 @@ pub async fn responses(
                 metric_model,
                 status,
                 RequestOutcome::from_status(status),
+                elapsed,
+            );
+            state.metrics.record_request_e2e_latency(
+                LatencyLabels {
+                    endpoint: "/v1/responses",
+                    model: metric_model,
+                    provider: "unknown",
+                    status,
+                    streaming: body
+                        .get("stream")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
+                },
                 elapsed,
             );
             // Per #655: emit one zero-token UsageEvent per FAILED attempt so
@@ -1180,6 +1196,7 @@ async fn responses_to_target(
                     &provider_key_id_c,
                     200,
                     started.elapsed(),
+                    /* streaming */ true,
                     &usage,
                     &client_c,
                     attempt,
@@ -1554,6 +1571,7 @@ async fn responses_cross_provider_to_target(
                     &provider_key_id_c,
                     status,
                     started.elapsed(),
+                    /* streaming */ true,
                     &usage,
                     &client_c,
                     attempt_c,
@@ -2157,6 +2175,10 @@ fn emit_usage_event(
     provider_key_id: &str,
     status_code: u16,
     elapsed: Duration,
+    // SLO e2e histogram dimension (AISIX-Cloud#1011): callers pass true
+    // from the two stream-completion sites (where `elapsed` is the full
+    // stream duration), false from the non-streaming terminal emit.
+    streaming: bool,
     usage: &ResponseUsage,
     client: &ClientContext,
     attempt: AttemptInfo,
@@ -2173,6 +2195,18 @@ fn emit_usage_event(
 ) {
     let snap = state.snapshot.load();
     let tags = provider_telemetry_tags(&snap, provider_key_id);
+    // This function runs exactly once per successful request (attempts go
+    // through emit_zero_token_event), so it is the e2e observation point.
+    state.metrics.record_request_e2e_latency(
+        LatencyLabels {
+            endpoint: "/v1/responses",
+            model: requested_model,
+            provider: tags.kind.map(|k| k.as_str()).unwrap_or("unknown"),
+            status: status_code,
+            streaming,
+        },
+        elapsed,
+    );
     let event = UsageEvent {
         request_id: request_id.to_string(),
         occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),

@@ -20,7 +20,9 @@
 //! `metrics-exporter-prometheus`'s text renderer; no global recorder is
 //! installed, so tests can spin up isolated instances per case.
 
-use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle, PrometheusRecorder};
+use metrics_exporter_prometheus::{
+    Matcher, PrometheusBuilder, PrometheusHandle, PrometheusRecorder,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -93,6 +95,31 @@ pub const M_GUARDRAIL_BYPASSES_TOTAL: &str = "aisix_guardrail_bypasses_total";
 pub const M_USAGE_EVENT_EMITS_TOTAL: &str = "aisix_usage_events_emitted_total";
 pub const M_OTLP_FANOUT_DROPS_TOTAL: &str = "aisix_otlp_fanout_drops_total";
 pub const M_OTLP_FANOUT_FAILURES_TOTAL: &str = "aisix_otlp_fanout_failures_total";
+/// AISIX-Cloud#1011: SLO-grade latency distributions as REAL bucketed
+/// histograms (`_bucket{le=…}`), aggregatable across DP instances with
+/// `histogram_quantile()`. Every other `histogram!` series in this file
+/// renders as a summary (no buckets configured) whose quantiles cannot
+/// be re-aggregated — these two get explicit buckets in [`Metrics::new`]
+/// and a DEDICATED low-cardinality label set ([`LatencyLabels`]) so the
+/// per-key/per-user dimensions never multiply the bucket count.
+///
+/// `aisix_request_e2e_latency_seconds` observes the client-perceived
+/// end-to-end latency once per request: at handler return for
+/// non-streaming requests and failures, at stream completion for
+/// committed streams (full stream duration, matching the usage event's
+/// `latency_ms` — NOT the time-to-first-byte the summary series record).
+pub const M_REQUEST_E2E_LATENCY_SECONDS: &str = "aisix_request_e2e_latency_seconds";
+/// Time-to-first-token for streaming requests, same label set as
+/// [`M_REQUEST_E2E_LATENCY_SECONDS`] (with `streaming="true"` always).
+pub const M_REQUEST_TTFT_SECONDS: &str = "aisix_request_ttft_seconds";
+
+/// Bucket edges for the two SLO histograms, spanning LLM latency ranges:
+/// sub-100ms cache hits / TTFT through multi-minute long generations.
+/// 14 edges → 15 `_bucket` series per label combination; keep
+/// [`LatencyLabels`] lean before adding edges.
+pub const LATENCY_HISTOGRAM_BUCKETS: &[f64] = &[
+    0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0,
+];
 
 /// Holds an isolated `PrometheusRecorder` plus its render handle.
 /// `metrics::*` macros talk to whatever recorder is in scope; we use
@@ -107,6 +134,10 @@ struct MetricsInner {
     recorder: PrometheusRecorder,
     handle: PrometheusHandle,
     proxy_in_flight: Mutex<HashMap<(String, String), i64>>,
+    /// Constant `env_id` label for the SLO latency histograms — one DP
+    /// process serves exactly one environment. `"unknown"` when the DP
+    /// runs standalone (no control plane).
+    env_id: String,
 }
 
 impl std::fmt::Debug for Metrics {
@@ -120,13 +151,40 @@ impl Metrics {
     /// use but currently has no effect — every Metrics instance runs
     /// with a local recorder so parallel tests don't collide.
     pub fn new(_install_global: bool) -> Self {
-        let recorder = PrometheusBuilder::new().build_recorder();
+        Self::new_with_env_id("unknown")
+    }
+
+    /// Like [`Metrics::new`], stamping `env_id` onto the SLO latency
+    /// histograms. Empty ids (standalone DP) collapse to `"unknown"`,
+    /// matching the missing-dimension convention used elsewhere.
+    pub fn new_with_env_id(env_id: &str) -> Self {
+        // Buckets ONLY for the two SLO histograms: with `metrics-exporter-
+        // prometheus`, a distribution without configured buckets renders as
+        // a summary — which is what every legacy `histogram!` series here
+        // intentionally stays as.
+        let recorder = PrometheusBuilder::new()
+            .set_buckets_for_metric(
+                Matcher::Full(M_REQUEST_E2E_LATENCY_SECONDS.to_string()),
+                LATENCY_HISTOGRAM_BUCKETS,
+            )
+            .expect("static bucket list is non-empty")
+            .set_buckets_for_metric(
+                Matcher::Full(M_REQUEST_TTFT_SECONDS.to_string()),
+                LATENCY_HISTOGRAM_BUCKETS,
+            )
+            .expect("static bucket list is non-empty")
+            .build_recorder();
         let handle = recorder.handle();
         Self {
             inner: Arc::new(MetricsInner {
                 recorder,
                 handle,
                 proxy_in_flight: Mutex::new(HashMap::new()),
+                env_id: if env_id.is_empty() {
+                    "unknown".to_string()
+                } else {
+                    env_id.to_string()
+                },
             }),
         }
     }
@@ -543,6 +601,72 @@ impl Metrics {
             metrics::counter!(M_OTLP_FANOUT_FAILURES_TOTAL, "exporter" => exporter.to_string())
                 .increment(1);
         });
+    }
+
+    /// Observe one request's client-perceived end-to-end latency on
+    /// [`M_REQUEST_E2E_LATENCY_SECONDS`]. Call exactly once per request:
+    /// at handler return for non-streaming requests and failures, at
+    /// stream completion for committed streams.
+    pub fn record_request_e2e_latency(&self, labels: LatencyLabels<'_>, elapsed: Duration) {
+        metrics::with_local_recorder(&self.inner.recorder, || {
+            metrics::histogram!(
+                M_REQUEST_E2E_LATENCY_SECONDS,
+                "env_id" => self.inner.env_id.clone(),
+                "endpoint" => labels.endpoint.to_string(),
+                "model" => non_empty_or_unknown(labels.model),
+                "provider" => non_empty_or_unknown(labels.provider),
+                "status_class" => status_bucket(labels.status),
+                "streaming" => bool_str(labels.streaming),
+            )
+            .record(elapsed.as_secs_f64());
+        });
+    }
+
+    /// Observe a streaming request's time-to-first-token on
+    /// [`M_REQUEST_TTFT_SECONDS`]. Zero durations are skipped (TTFT was
+    /// never measured — e.g. the stream died before the first token).
+    pub fn record_request_ttft(&self, labels: LatencyLabels<'_>, ttft: Duration) {
+        if ttft.is_zero() {
+            return;
+        }
+        metrics::with_local_recorder(&self.inner.recorder, || {
+            metrics::histogram!(
+                M_REQUEST_TTFT_SECONDS,
+                "env_id" => self.inner.env_id.clone(),
+                "endpoint" => labels.endpoint.to_string(),
+                "model" => non_empty_or_unknown(labels.model),
+                "provider" => non_empty_or_unknown(labels.provider),
+                "status_class" => status_bucket(labels.status),
+                "streaming" => bool_str(labels.streaming),
+            )
+            .record(ttft.as_secs_f64());
+        });
+    }
+}
+
+/// Labels for the SLO latency histograms (AISIX-Cloud#1011). Deliberately
+/// low-cardinality: bounded endpoint set, configured model/provider names,
+/// bucketed status — never per-key / per-user dimensions, which would
+/// multiply every bucket edge.
+#[derive(Clone, Copy)]
+pub struct LatencyLabels<'a> {
+    /// Route template, e.g. `/v1/chat/completions`. Bounded set.
+    pub endpoint: &'a str,
+    /// Gateway-level model name (the dashboard alias the caller requested).
+    pub model: &'a str,
+    /// Provider kind (`openai`, `anthropic`, …); `unknown` pre-resolution.
+    pub provider: &'a str,
+    /// Raw HTTP status; bucketed to `2xx`/`4xx`/… at record time.
+    pub status: u16,
+    pub streaming: bool,
+}
+
+/// Missing dimensions default to `"unknown"`, never an empty label value.
+fn non_empty_or_unknown(v: &str) -> String {
+    if v.is_empty() {
+        "unknown".to_string()
+    } else {
+        v.to_string()
     }
 }
 
@@ -1168,6 +1292,128 @@ mod tests {
             rendered.contains(" 0"),
             "expected gauge to return to zero:\n{rendered}"
         );
+    }
+
+    /// AISIX-Cloud#1011: the two SLO series must render as REAL bucketed
+    /// histograms (`_bucket{le=…}` + `_sum`/`_count`) — the property that
+    /// makes `histogram_quantile()` and cross-instance aggregation work.
+    /// Every other `histogram!` series stays a summary (no buckets), so a
+    /// bucket-config regression is invisible without this pin.
+    #[test]
+    fn slo_latency_series_render_as_bucketed_histograms() {
+        let m = Metrics::new_with_env_id("env-42");
+        let labels = LatencyLabels {
+            endpoint: "/v1/chat/completions",
+            model: "gpt-4o",
+            provider: "openai",
+            status: 200,
+            streaming: false,
+        };
+        m.record_request_e2e_latency(labels, Duration::from_millis(1500));
+        m.record_request_ttft(
+            LatencyLabels {
+                streaming: true,
+                ..labels
+            },
+            Duration::from_millis(80),
+        );
+        let out = m.render();
+
+        // Real histogram exposition: le-bucketed series + sum/count.
+        assert!(
+            out.contains("aisix_request_e2e_latency_seconds_bucket"),
+            "e2e series must expose _bucket lines:\n{out}"
+        );
+        assert!(out.contains("aisix_request_e2e_latency_seconds_sum"));
+        assert!(out.contains("aisix_request_e2e_latency_seconds_count"));
+        assert!(out.contains("aisix_request_ttft_seconds_bucket"));
+        assert!(
+            out.contains("le=\"2.5\""),
+            "configured bucket edges present"
+        );
+
+        // The label contract: constant env_id, bucketed status, bounded
+        // dims — and none of the per-key/per-user dimensions.
+        assert!(out.contains("env_id=\"env-42\""));
+        assert!(out.contains("status_class=\"2xx\""));
+        assert!(out.contains("streaming=\"false\""));
+        assert!(out.contains("streaming=\"true\""));
+        for high_card in ["api_key_id", "user_id", "team_id", "provider_key_id"] {
+            for line in out.lines().filter(|l| l.contains("aisix_request_")) {
+                assert!(
+                    !line.contains(high_card),
+                    "SLO histogram must not carry {high_card}: {line}"
+                );
+            }
+        }
+    }
+
+    /// A 1.5s observation lands in the 2.5 bucket but not the 1.0 bucket —
+    /// pins that the configured edges actually apply (a default-bucket
+    /// fallback would place them differently or render a summary).
+    #[test]
+    fn slo_latency_observation_lands_in_the_right_bucket() {
+        let m = Metrics::new_with_env_id("");
+        m.record_request_e2e_latency(
+            LatencyLabels {
+                endpoint: "/v1/messages",
+                model: "m",
+                provider: "anthropic",
+                status: 502,
+                streaming: false,
+            },
+            Duration::from_millis(1500),
+        );
+        let out = m.render();
+        let bucket_val = |le: &str| -> u64 {
+            out.lines()
+                .find(|l| {
+                    l.starts_with("aisix_request_e2e_latency_seconds_bucket")
+                        && l.contains(&format!("le=\"{le}\""))
+                })
+                .and_then(|l| l.rsplit(' ').next())
+                .and_then(|v| v.parse().ok())
+                .unwrap_or_else(|| panic!("no bucket le={le} in:\n{out}"))
+        };
+        assert_eq!(bucket_val("1"), 0, "1.5s must not land in le=1");
+        assert_eq!(bucket_val("2.5"), 1, "1.5s must land in le=2.5");
+        // Empty env_id collapses to the missing-dimension convention.
+        assert!(out.contains("env_id=\"unknown\""));
+        assert!(out.contains("status_class=\"5xx\""));
+    }
+
+    /// Zero TTFT (never measured) is skipped, and the legacy duration
+    /// series keep their summary exposition — no `_bucket` lines appear
+    /// for them even after the SLO buckets are configured.
+    #[test]
+    fn slo_ttft_skips_zero_and_legacy_series_stay_summaries() {
+        let m = Metrics::new_with_env_id("e");
+        let labels = LatencyLabels {
+            endpoint: "/v1/chat/completions",
+            model: "m",
+            provider: "openai",
+            status: 200,
+            streaming: true,
+        };
+        m.record_request_ttft(labels, Duration::ZERO);
+        assert!(
+            !m.render().contains("aisix_request_ttft_seconds"),
+            "zero TTFT must not be observed"
+        );
+
+        m.record_request(
+            "openai",
+            "m",
+            200,
+            RequestOutcome::Success,
+            Duration::from_millis(100),
+        );
+        let out = m.render();
+        assert!(
+            !out.contains("aisix_request_duration_seconds_bucket"),
+            "legacy duration series must stay a summary (quantiles), got:\n{out}"
+        );
+        assert!(out.contains("aisix_request_duration_seconds"));
     }
 
     /// Issue #408 audit MEDIUM-2: pin every boundary of
