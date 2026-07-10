@@ -47,9 +47,18 @@ const FALLBACK_ALL_UNHEALTHY_RETRY_AFTER: Duration = Duration::from_secs(30);
 /// as retryable. Non-429 4xx is the caller's mistake — retrying won't
 /// help and may amplify damage. Everything else (5xx, timeout,
 /// transport, decode, config, stream abort) gets the retry/failover path.
-pub fn is_retryable(err: &BridgeError, retry_on_429: bool) -> bool {
+///
+/// `fallback_on_statuses` (AISIX-Cloud#1012) is the routing model's
+/// explicit opt-in list for providers that use 4xx codes for transient
+/// conditions (overload, queue full, quota): a status in the list is
+/// retryable regardless of the default classification. Empty by default,
+/// which preserves the historical behavior exactly.
+pub fn is_retryable(err: &BridgeError, retry_on_429: bool, fallback_on_statuses: &[u16]) -> bool {
     match err {
         BridgeError::UpstreamStatus { status, .. } => {
+            if fallback_on_statuses.contains(status) {
+                return true;
+            }
             if *status == 429 {
                 return retry_on_429;
             }
@@ -524,6 +533,7 @@ mod tests {
             retries: None,
             max_fallbacks,
             retry_on_429: None,
+            fallback_on_statuses: None,
             when_all_unavailable: None,
             sticky: None,
         }
@@ -917,32 +927,98 @@ mod tests {
     fn is_retryable_distinguishes_4xx_from_other_failures() {
         assert!(!is_retryable(
             &BridgeError::upstream_status(400, "bad request"),
-            false
+            false,
+            &[]
         ));
         assert!(!is_retryable(
             &BridgeError::upstream_status(429, "rate limited"),
-            false
+            false,
+            &[]
         ));
         assert!(is_retryable(
             &BridgeError::upstream_status(429, "rate limited"),
-            true
+            true,
+            &[]
         ));
         assert!(is_retryable(
             &BridgeError::upstream_status(502, "bad gateway"),
-            false
+            false,
+            &[]
         ));
-        assert!(is_retryable(&BridgeError::Timeout { elapsed_ms: 1 }, false));
-        assert!(is_retryable(&BridgeError::Transport("conn".into()), false));
+        assert!(is_retryable(
+            &BridgeError::Timeout { elapsed_ms: 1 },
+            false,
+            &[]
+        ));
+        assert!(is_retryable(
+            &BridgeError::Transport("conn".into()),
+            false,
+            &[]
+        ));
         assert!(is_retryable(
             &BridgeError::UpstreamDecode("x".into()),
-            false
+            false,
+            &[]
         ));
-        assert!(is_retryable(&BridgeError::Config("bad key".into()), false));
-        assert!(is_retryable(&BridgeError::StreamAborted, false));
+        assert!(is_retryable(
+            &BridgeError::Config("bad key".into()),
+            false,
+            &[]
+        ));
+        assert!(is_retryable(&BridgeError::StreamAborted, false, &[]));
         // #367: customer-fixable config is a 4xx — not retryable.
         assert!(!is_retryable(
             &BridgeError::InvalidUpstreamConfig("no api_base".into()),
-            false
+            false,
+            &[]
+        ));
+    }
+
+    /// AISIX-Cloud#1012: `fallback_on_statuses` opts specific upstream
+    /// status codes into retry/failover. The list is additive — codes not
+    /// listed keep the default classification — and it never resurrects
+    /// non-status failures (customer-fixable config stays terminal).
+    #[test]
+    fn fallback_on_statuses_opts_specific_codes_into_retry() {
+        // A listed 4xx becomes retryable.
+        assert!(is_retryable(
+            &BridgeError::upstream_status(408, "request timeout"),
+            false,
+            &[408, 409]
+        ));
+        assert!(is_retryable(
+            &BridgeError::upstream_status(409, "conflict"),
+            false,
+            &[408, 409]
+        ));
+        // Codes NOT in the list keep the default: terminal.
+        assert!(!is_retryable(
+            &BridgeError::upstream_status(422, "unprocessable"),
+            false,
+            &[408, 409]
+        ));
+        assert!(!is_retryable(
+            &BridgeError::upstream_status(400, "bad request"),
+            false,
+            &[408, 409]
+        ));
+        // 429 in the list works without retry_on_429.
+        assert!(is_retryable(
+            &BridgeError::upstream_status(429, "rate limited"),
+            false,
+            &[429]
+        ));
+        // 5xx stays retryable whether or not listed.
+        assert!(is_retryable(
+            &BridgeError::upstream_status(503, "unavailable"),
+            false,
+            &[408]
+        ));
+        // The list is status-scoped: it never affects non-status errors.
+        assert!(!is_retryable(
+            &BridgeError::InvalidUpstreamConfig("no api_base".into()),
+            false,
+            &[400, 401, 403]
         ));
     }
 
