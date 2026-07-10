@@ -199,6 +199,9 @@ pub async fn responses(
                 &api_key_id,
                 &client,
                 &success.routing,
+                // The winner's success event carries the content.
+                /* content_for_last */
+                None,
             );
             // Issue #404: emit UsageEvent so cp-api's budget ledger
             // and customer-facing /logs analytics see /v1/responses
@@ -264,6 +267,34 @@ pub async fn responses(
                 RequestOutcome::from_status(status),
                 elapsed,
             );
+            // AISIX-Cloud#1013: failed requests carry the (post-mask)
+            // request body so a 4xx/5xx can be triaged from the log alone.
+            // Same opt-in gate and cap as the success path; 401/403 stay
+            // body-less (the body adds nothing to an authorization failure).
+            let mut failure_content = if status == 401 || status == 403 {
+                None
+            } else {
+                content_capture_cap(
+                    snap.observability_exporters
+                        .entries()
+                        .iter()
+                        .map(|e| &e.value),
+                )
+                .map(|cap| {
+                    CapturedContent::new(
+                        &serde_json::to_string(&body).unwrap_or_default(),
+                        "",
+                        cap as usize,
+                    )
+                })
+            };
+            // When every target failed there is no terminal event below —
+            // the content rides the last failed attempt instead.
+            let content_for_last = if !routing.attempts.is_empty() {
+                failure_content.take()
+            } else {
+                None
+            };
             // Per #655: emit one zero-token UsageEvent per FAILED attempt so
             // the dashboard's Logs tab surfaces each failed upstream try.
             emit_failed_attempts(
@@ -273,6 +304,7 @@ pub async fn responses(
                 &api_key_id,
                 &client,
                 &routing,
+                content_for_last,
             );
             // Pre-dispatch failure (model-not-found, auth, budget) records no
             // attempts — emit a single terminal event carrying the failure
@@ -298,6 +330,7 @@ pub async fn responses(
                     // Input masking may have fired before the failure.
                     redaction_counts.clone(),
                     monitor_hits.clone(),
+                    failure_content.take(),
                 );
             }
             err.into_response()
@@ -2234,6 +2267,9 @@ fn emit_zero_token_event(
     // Monitor-mode guardrail observations (AISIX-Cloud#562) that fired
     // before the failure.
     guardrail_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
+    // AISIX-Cloud#1013: captured (post-mask) request body for failed
+    // requests. Forwarded only to `fan_out`, never to the CP sink.
+    content: Option<CapturedContent>,
 ) {
     let snap = state.snapshot.load();
     let tags = provider_telemetry_tags(&snap, provider_key_id);
@@ -2264,15 +2300,14 @@ fn emit_zero_token_event(
     };
     state.usage_sink.try_emit("responses", event.clone());
     let exporters = snap.observability_exporters.entries();
-    state.otlp_fan_out.fan_out(
-        &event,
-        /* content */ None,
-        exporters.iter().map(|e| &e.value),
-    );
+    state
+        .otlp_fan_out
+        .fan_out(&event, content.as_ref(), exporters.iter().map(|e| &e.value));
 }
 
 /// Emit one zero-token `UsageEvent` per FAILED attempt of a `/v1/responses`
 /// request (#655). The winner / terminal event is emitted separately.
+#[allow(clippy::too_many_arguments)]
 fn emit_failed_attempts(
     state: &ProxyState,
     request_id: &str,
@@ -2280,8 +2315,24 @@ fn emit_failed_attempts(
     api_key_id: &str,
     client: &ClientContext,
     routing: &RoutingTelemetry,
+    // AISIX-Cloud#1013: when every target failed there is no terminal
+    // event, so the captured request body rides the LAST failed attempt —
+    // the one whose status the caller saw. Other attempts (and the
+    // success-path caller) stay content-less.
+    mut content_for_last: Option<CapturedContent>,
 ) {
-    for rec in routing.attempts.iter().filter(|a| !a.success) {
+    let last_failed = routing.attempts.iter().rposition(|a| !a.success);
+    for (i, rec) in routing
+        .attempts
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| !a.success)
+    {
+        let content = if Some(i) == last_failed {
+            content_for_last.take()
+        } else {
+            None
+        };
         emit_zero_token_event(
             state,
             request_id,
@@ -2299,6 +2350,7 @@ fn emit_failed_attempts(
             // terminal event does.
             crate::redact::RedactionCounts::new(),
             Vec::new(),
+            content,
         );
     }
 }
