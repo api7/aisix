@@ -1104,12 +1104,12 @@ async fn dispatch(
             .as_ref()
             .map(|r| r.retry_on_429_or_default())
             .unwrap_or(false);
-        let fallback_statuses: Vec<u16> = virtual_entry
+        let fallback_statuses: &[u16] = virtual_entry
             .value
             .routing
             .as_ref()
-            .map(|r| r.fallback_on_statuses_or_default().to_vec())
-            .unwrap_or_default();
+            .map(|r| r.fallback_on_statuses_or_default())
+            .unwrap_or(&[]);
         let is_routing_request =
             virtual_entry.value.routing.is_some() || virtual_entry.value.is_semantic();
         let mut stream_routing = RoutingTelemetry::default();
@@ -1247,7 +1247,7 @@ async fn dispatch(
                         error_message: attempt_error_message(&err),
                         latency_ms,
                     });
-                    let retryable = is_retryable(&err, retry_on_429, &fallback_statuses);
+                    let retryable = is_retryable(&err, retry_on_429, fallback_statuses);
                     tracing::warn!(
                         target_model = %model.display_name,
                         error = %err,
@@ -1825,12 +1825,12 @@ async fn dispatch(
         .as_ref()
         .map(|routing| routing.retry_on_429_or_default())
         .unwrap_or(false);
-    let fallback_statuses: Vec<u16> = virtual_entry
+    let fallback_statuses: &[u16] = virtual_entry
         .value
         .routing
         .as_ref()
-        .map(|routing| routing.fallback_on_statuses_or_default().to_vec())
-        .unwrap_or_default();
+        .map(|routing| routing.fallback_on_statuses_or_default())
+        .unwrap_or(&[]);
     let is_routing_request =
         virtual_entry.value.routing.is_some() || virtual_entry.value.is_semantic();
     let mut routing = RoutingTelemetry::default();
@@ -1936,7 +1936,7 @@ async fn dispatch(
                         error_message: attempt_error_message(&err),
                         latency_ms: attempt_latency_ms,
                     });
-                    let retryable = is_retryable(&err, retry_on_429, &fallback_statuses);
+                    let retryable = is_retryable(&err, retry_on_429, fallback_statuses);
                     tracing::warn!(
                         target_model = %model.display_name,
                         target_attempt = attempt_idx + 1,
@@ -1983,7 +1983,7 @@ async fn dispatch(
             break;
         }
         if let Some(err) = last_err.as_ref() {
-            if !is_retryable(err, retry_on_429, &fallback_statuses) {
+            if !is_retryable(err, retry_on_429, fallback_statuses) {
                 break;
             }
         }

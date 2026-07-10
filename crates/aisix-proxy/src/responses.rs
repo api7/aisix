@@ -494,12 +494,12 @@ async fn dispatch(
         .as_ref()
         .map(|r| r.retry_on_429_or_default())
         .unwrap_or(false);
-    let fallback_statuses: Vec<u16> = model_entry
+    let fallback_statuses: &[u16] = model_entry
         .value
         .routing
         .as_ref()
-        .map(|r| r.fallback_on_statuses_or_default().to_vec())
-        .unwrap_or_default();
+        .map(|r| r.fallback_on_statuses_or_default())
+        .unwrap_or(&[]);
     let is_routing_request = model_entry.value.routing.is_some();
     let mut routing = RoutingTelemetry::default();
     // `routing.retries` — same-target retries (with backoff) before failing
@@ -632,7 +632,7 @@ async fn dispatch(
                 Err(e) => {
                     let retryable = matches!(
                         &e,
-                        ProxyError::Bridge(be) if crate::routing::is_retryable(be, retry_on_429, &fallback_statuses)
+                        ProxyError::Bridge(be) if crate::routing::is_retryable(be, retry_on_429, fallback_statuses)
                     );
                     let (error_class, error_message) = attempt_error_from_proxy(&e);
                     routing.attempts.push(AttemptRecord {
