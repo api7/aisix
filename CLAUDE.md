@@ -112,6 +112,15 @@ This repo reads its config from etcd, but users never write etcd directly — th
 
 (Lesson from AISIX-Cloud#873 routing: `least_cost` / `least_latency` / `least_busy`, per-target `tags`, and `sticky` canary all shipped DP-only across #681/#682/#684/#686/#687 while `cp-admin.yaml` still pinned the closed `[round_robin, weighted, failover]` enum and the dashboard had no fields — so none of it was actually usable until the matching CP integration landed. The meta-repo `AGENTS.md` carries the same rule for cross-plane agents.)
 
+## The Resource Model Is Canonical in cp-admin.yaml
+
+**When this repo and the control plane disagree about a resource field's name, enum values, or nesting, the control plane's spec (`AISIX-Cloud: openapi/cp-admin.yaml`) wins by definition — this repo converges to it.**
+
+- Adding or renaming a user-facing resource field starts by defining its name and shape in `cp-admin.yaml` (in the paired CP PR — see the config-knob rule above); the Rust model then implements exactly that name. The naming decision happens once, in the spec — never independently here.
+- Renames converge with `#[serde(alias = "…")]` so stored documents and existing callers keep loading through the deprecation window; never hard-rename in one step. Regenerate `schemas/resources/` afterwards (`cargo run -p aisix-core --bin dump-schema`).
+- Exactly four divergence axes are registered as intentional and allowed: reference style (names here vs UUIDs in the CP), tenancy scoping (flat here vs org/environment there), credential custody (`key_hash` in documents here vs server-generated plaintext-once there), and CP-derived fields (`cost`, `telemetry_tags`). Anything else that diverges from cp-admin.yaml is drift — expect the cross-plane contract check to fail it.
+- Why the CP spec and not this repo's schemas: the CP is spec-first behind a closed validator (its spec already is the authoritative field shape on that side), the spec renders into the customer-facing API reference, and this repo's schemas are generated from the implementation — a schema that follows the implementation cannot lead it. Naming lag and breaking renames have cost real incidents (#644, #657).
+
 ## Documentation Lives in api7/docs
 
 **User-facing documentation is maintained in the `api7/docs` repository (published to <https://docs.api7.ai/ai-gateway/>), not in this repo.**
