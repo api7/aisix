@@ -100,10 +100,6 @@ async fn read_capped(resp: reqwest::Response) -> Result<Vec<u8>, A2aError> {
 /// How the gateway authenticates to an upstream A2A agent. The credential is
 /// held here on the gateway side and is never exposed to the calling client —
 /// the client presents only its AISIX key.
-///
-/// The `oauth2` upstream auth type is accepted on the [`A2aAgent`] resource for
-/// forward compatibility but is not yet implemented in this runtime;
-/// [`upstream_from_a2a_agent`] rejects it with [`A2aError::Unsupported`].
 #[derive(Clone)]
 pub enum A2aAuth {
     /// No upstream auth — the agent is reachable as-is.
@@ -154,30 +150,22 @@ impl std::fmt::Debug for A2aUpstream {
 }
 
 /// Build an [`A2aUpstream`] from a registered [`A2aAgent`] resource.
-///
-/// Returns [`A2aError::Unsupported`] for the `oauth2` auth type, which this
-/// runtime does not implement yet.
-pub fn upstream_from_a2a_agent(agent: &A2aAgent) -> Result<A2aUpstream, A2aError> {
+pub fn upstream_from_a2a_agent(agent: &A2aAgent) -> A2aUpstream {
     let secret = agent.secret.clone().unwrap_or_default();
     let auth = match agent.auth_type {
         A2aAuthType::None => A2aAuth::None,
         A2aAuthType::Bearer => A2aAuth::Bearer(secret),
         A2aAuthType::ApiKey => A2aAuth::ApiKey(secret),
-        A2aAuthType::OAuth2 => {
-            return Err(A2aError::Unsupported(
-                "oauth2 upstream auth is not yet implemented".to_string(),
-            ))
-        }
     };
     let timeout = agent
         .timeout_ms
         .map(Duration::from_millis)
         .unwrap_or(DEFAULT_UPSTREAM_TIMEOUT);
-    Ok(A2aUpstream {
+    A2aUpstream {
         url: agent.url.clone(),
         auth,
         timeout,
-    })
+    }
 }
 
 /// An upstream agent's card, as fetched from its well-known URI.
@@ -306,24 +294,15 @@ mod tests {
     fn upstream_maps_none_bearer_api_key() {
         let mut none = agent("none");
         none.secret = None;
+        assert!(matches!(upstream_from_a2a_agent(&none).auth, A2aAuth::None));
         assert!(matches!(
-            upstream_from_a2a_agent(&none).unwrap().auth,
-            A2aAuth::None
-        ));
-        assert!(matches!(
-            upstream_from_a2a_agent(&agent("bearer")).unwrap().auth,
+            upstream_from_a2a_agent(&agent("bearer")).auth,
             A2aAuth::Bearer(_)
         ));
         assert!(matches!(
-            upstream_from_a2a_agent(&agent("api_key")).unwrap().auth,
+            upstream_from_a2a_agent(&agent("api_key")).auth,
             A2aAuth::ApiKey(_)
         ));
-    }
-
-    #[test]
-    fn upstream_rejects_oauth2_as_unsupported() {
-        let err = upstream_from_a2a_agent(&agent("oauth2")).unwrap_err();
-        assert!(matches!(err, A2aError::Unsupported(_)));
     }
 
     #[test]
@@ -331,11 +310,11 @@ mod tests {
         let mut a = agent("none");
         a.timeout_ms = Some(1234);
         assert_eq!(
-            upstream_from_a2a_agent(&a).unwrap().timeout,
+            upstream_from_a2a_agent(&a).timeout,
             Duration::from_millis(1234)
         );
         assert_eq!(
-            upstream_from_a2a_agent(&agent("none")).unwrap().timeout,
+            upstream_from_a2a_agent(&agent("none")).timeout,
             DEFAULT_UPSTREAM_TIMEOUT
         );
     }

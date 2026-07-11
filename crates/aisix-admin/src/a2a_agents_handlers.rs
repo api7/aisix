@@ -117,17 +117,6 @@ fn decode(raw: &Value) -> Result<A2aAgent, AdminError> {
                 "secret is required and must be non-empty when auth_type is `api_key`".to_string(),
             ));
         }
-        A2aAuthType::OAuth2 => {
-            let has_client_id = !agent.client_id.as_deref().unwrap_or_default().is_empty();
-            let has_token_url = !agent.token_url.as_deref().unwrap_or_default().is_empty();
-            if !has_secret || !has_client_id || !has_token_url {
-                return Err(AdminError::BadRequest(
-                    "client_id, token_url, and secret (the OAuth client secret) are required \
-                     and must be non-empty when auth_type is `oauth2`"
-                        .to_string(),
-                ));
-            }
-        }
         A2aAuthType::Bearer | A2aAuthType::ApiKey => {}
     }
     Ok(agent)
@@ -170,23 +159,18 @@ mod tests {
     }
 
     #[test]
-    fn decode_rejects_incomplete_oauth2() {
-        for missing in ["client_id", "token_url", "secret"] {
-            let mut v = json!({
-                "display_name": "agent",
-                "url": "https://x/a2a",
-                "auth_type": "oauth2",
-                "client_id": "cid",
-                "token_url": "https://auth.example.com/oauth/token",
-                "secret": "cs"
-            });
-            v.as_object_mut().unwrap().remove(missing);
-            let err = decode(&v).unwrap_err();
-            assert!(
-                matches!(err, AdminError::BadRequest(_)),
-                "oauth2 without `{missing}` must be a BadRequest"
-            );
-        }
+    fn decode_rejects_oauth2_auth_type_as_schema_error() {
+        // `oauth2` is not part of the a2a_agent resource model — `auth_type`
+        // allows only `none` / `bearer` / `api_key` — so a payload carrying it
+        // fails schema validation with a 400 before reaching the store.
+        let err = decode(&json!({
+            "display_name": "agent",
+            "url": "https://x/a2a",
+            "auth_type": "oauth2",
+            "secret": "cs"
+        }))
+        .expect_err("oauth2 auth_type must be rejected by schema validation");
+        assert_eq!(err.status(), axum::http::StatusCode::BAD_REQUEST);
     }
 
     #[test]

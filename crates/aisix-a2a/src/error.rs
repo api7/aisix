@@ -19,9 +19,4 @@ pub enum A2aError {
     /// status on the JSON-RPC call, or a malformed response body.
     #[error("upstream A2A request failed: {0}")]
     Request(String),
-
-    /// The configured upstream authentication method is not yet supported by
-    /// this data-plane runtime.
-    #[error("unsupported A2A upstream auth: {0}")]
-    Unsupported(String),
 }

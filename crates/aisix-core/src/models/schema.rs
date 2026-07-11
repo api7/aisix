@@ -231,7 +231,6 @@ pub fn a2a_agent_root_schema() -> Value {
                 ("none", "No authentication"),
                 ("bearer", "Bearer token"),
                 ("api_key", "API key"),
-                ("oauth2", "OAuth 2.0 client credentials"),
             ],
         );
         title_single_value_enum_variants(

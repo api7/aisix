@@ -48,35 +48,17 @@ pub struct A2aAgent {
 
     /// Credential AISIX uses to authenticate to the upstream agent. For
     /// `bearer`, AISIX sends it as `Authorization: Bearer <secret>`; for
-    /// `api_key`, AISIX sends it as `x-api-key: <secret>`. For `oauth2`, it is
-    /// stored as the client secret for forward compatibility, but the runtime
-    /// does not yet mint upstream A2A access tokens. Leave unset for `none`.
+    /// `api_key`, AISIX sends it as `x-api-key: <secret>`. Leave unset for
+    /// `none`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret: Option<String>,
 
-    // Cross-field coupling (`oauth2` requires `client_id` + `secret` +
-    // `token_url`; `bearer`/`api_key` require `secret`) is deliberately NOT
-    // expressed in this flat schema — that would force restructuring the
-    // resource into a oneOf. The control plane enforces the coupling strictly
-    // at write time, this gateway's own Admin API re-checks it on write, and
-    // the runtime degrades gracefully when a snapshot-loaded agent is
-    // misconfigured.
-    /// OAuth client identifier stored for future OAuth 2.0 client credentials
-    /// support. Required when `auth_type` is `oauth2`; ignored otherwise.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub client_id: Option<String>,
-
-    /// OAuth token endpoint URL stored for future OAuth 2.0 client credentials
-    /// support, such as `https://auth.example.com/oauth/token`. Required when
-    /// `auth_type` is `oauth2`; ignored otherwise.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub token_url: Option<String>,
-
-    /// OAuth scopes stored for future OAuth 2.0 client credentials support.
-    /// Only used when `auth_type` is `oauth2`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub scopes: Option<Vec<String>>,
-
+    // Cross-field coupling (`bearer`/`api_key` require `secret`) is
+    // deliberately NOT expressed in this flat schema — that would force
+    // restructuring the resource into a oneOf. The control plane enforces the
+    // coupling strictly at write time, this gateway's own Admin API re-checks
+    // it on write, and the runtime degrades gracefully when a snapshot-loaded
+    // agent is misconfigured.
     /// Maximum time, in milliseconds, to wait for a single upstream operation,
     /// including fetching the agent card or invoking the agent. When omitted,
     /// AISIX applies a built-in default.
@@ -127,11 +109,6 @@ pub enum A2aAuthType {
     /// API key authentication. The key is supplied in `secret` and sent as an
     /// `x-api-key: <secret>` header on every upstream request.
     ApiKey,
-    /// OAuth 2.0 client credentials grant. Accepted on the resource for forward
-    /// compatibility, but the runtime does not yet mint tokens for upstream A2A
-    /// agents.
-    #[serde(rename = "oauth2")]
-    OAuth2,
 }
 
 impl Resource for A2aAgent {
@@ -164,9 +141,6 @@ mod tests {
         assert_eq!(a.protocol_version, A2aProtocolVersion::V1_0);
         assert_eq!(a.auth_type, A2aAuthType::None);
         assert!(a.secret.is_none());
-        assert!(a.client_id.is_none());
-        assert!(a.token_url.is_none());
-        assert!(a.scopes.is_none());
         assert!(a.timeout_ms.is_none());
         assert!(a.enabled);
     }
@@ -185,19 +159,26 @@ mod tests {
     }
 
     #[test]
-    fn deserialises_with_oauth2_auth() {
-        let a: A2aAgent = serde_json::from_str(
-            r#"{"display_name":"a","url":"https://x/a2a","auth_type":"oauth2","secret":"cs-1","client_id":"cid","token_url":"https://auth/x/token","scopes":["read","write"]}"#,
+    fn rejects_oauth2_auth_type_and_oauth_fields() {
+        // `auth_type` accepts only `none` / `bearer` / `api_key` — the same
+        // closed set as the control plane's a2a_agent resource.
+        assert!(serde_json::from_str::<A2aAgent>(
+            r#"{"display_name":"a","url":"https://x/a2a","auth_type":"oauth2","secret":"cs-1"}"#,
         )
-        .unwrap();
-        assert_eq!(a.auth_type, A2aAuthType::OAuth2);
-        assert_eq!(a.secret.as_deref(), Some("cs-1"));
-        assert_eq!(a.client_id.as_deref(), Some("cid"));
-        assert_eq!(a.token_url.as_deref(), Some("https://auth/x/token"));
-        assert_eq!(
-            a.scopes.as_deref(),
-            Some(&["read".to_string(), "write".to_string()][..])
-        );
+        .is_err());
+        // The OAuth-specific fields were removed with the `oauth2` arm, so a
+        // document carrying one is rejected as an unknown field.
+        for field in [
+            r#""client_id":"cid""#,
+            r#""token_url":"https://auth/x/token""#,
+            r#""scopes":["read","write"]"#,
+        ] {
+            let doc = format!(r#"{{"display_name":"a","url":"https://x/a2a",{field}}}"#);
+            assert!(
+                serde_json::from_str::<A2aAgent>(&doc).is_err(),
+                "field must be rejected as unknown: {doc}"
+            );
+        }
     }
 
     #[test]
@@ -210,14 +191,18 @@ mod tests {
     }
 
     #[test]
-    fn oauth2_round_trips_and_omits_unset_optionals() {
+    fn api_key_round_trips_and_omits_unset_optionals() {
         let original: A2aAgent = serde_json::from_str(
-            r#"{"display_name":"a","url":"https://x/a2a","auth_type":"oauth2","secret":"cs","client_id":"cid","token_url":"https://auth/token"}"#,
+            r#"{"display_name":"a","url":"https://x/a2a","auth_type":"api_key","secret":"k-1"}"#,
         )
         .unwrap();
         let s = serde_json::to_string(&original).unwrap();
-        assert!(s.contains(r#""auth_type":"oauth2""#), "got: {s}");
-        assert!(!s.contains("scopes"), "unset scopes must be omitted: {s}");
+        // The tag serialises as `api_key` (not a PascalCased `ApiKey`).
+        assert!(s.contains(r#""auth_type":"api_key""#), "got: {s}");
+        assert!(
+            !s.contains("timeout_ms"),
+            "unset timeout_ms must be omitted: {s}"
+        );
         let back: A2aAgent = serde_json::from_str(&s).unwrap();
         assert_eq!(original, back);
     }
@@ -259,9 +244,6 @@ mod tests {
             protocol_version: A2aProtocolVersion::V1_0,
             auth_type: A2aAuthType::None,
             secret: None,
-            client_id: None,
-            token_url: None,
-            scopes: None,
             timeout_ms: None,
             enabled: true,
             runtime_id: String::new(),

@@ -121,23 +121,7 @@ async fn dispatch(
             .into_response();
     }
 
-    let upstream = match upstream_from_a2a_agent(&entry.value) {
-        Ok(upstream) => upstream,
-        // Currently only oauth2 upstream auth, which the runtime does not
-        // implement yet — surface it as "not implemented".
-        Err(err) => {
-            emit_a2a_usage(
-                state,
-                &auth,
-                request_id,
-                agent,
-                "",
-                StatusCode::NOT_IMPLEMENTED.as_u16(),
-                Duration::ZERO,
-            );
-            return (StatusCode::NOT_IMPLEMENTED, err.to_string()).into_response();
-        }
-    };
+    let upstream = upstream_from_a2a_agent(&entry.value);
 
     let (_parts, body) = request.into_parts();
     let bytes = match to_bytes(body, state.request_body_limit_bytes).await {
@@ -231,10 +215,7 @@ pub async fn a2a_agent_card(
         )
             .into_response();
     }
-    let upstream = match upstream_from_a2a_agent(&entry.value) {
-        Ok(upstream) => upstream,
-        Err(err) => return (StatusCode::NOT_IMPLEMENTED, err.to_string()).into_response(),
-    };
+    let upstream = upstream_from_a2a_agent(&entry.value);
 
     let bridge = HttpBridge::new(upstream);
     let mut card = match bridge.fetch_agent_card().await {
@@ -267,12 +248,11 @@ fn gateway_base(headers: &HeaderMap) -> Option<String> {
     Some(format!("{scheme}://{host}"))
 }
 
-/// Map a bridge error to the client-visible HTTP status: an upstream that could
-/// not be reached is a bad gateway; a not-yet-supported config is not
-/// implemented; anything else from the call is a bad gateway too.
+/// Map a bridge error to the client-visible HTTP status: whether the upstream
+/// could not be reached or the call itself failed, the gateway surfaces it as
+/// a bad gateway.
 fn a2a_error_status(err: &A2aError) -> StatusCode {
     match err {
-        A2aError::Unsupported(_) => StatusCode::NOT_IMPLEMENTED,
         A2aError::Connect(_) | A2aError::Request(_) => StatusCode::BAD_GATEWAY,
     }
 }
@@ -329,11 +309,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn error_status_maps_unsupported_to_501_and_transport_to_502() {
-        assert_eq!(
-            a2a_error_status(&A2aError::Unsupported("oauth2".into())),
-            StatusCode::NOT_IMPLEMENTED
-        );
+    fn error_status_maps_transport_errors_to_502() {
         assert_eq!(
             a2a_error_status(&A2aError::Connect("dns".into())),
             StatusCode::BAD_GATEWAY
