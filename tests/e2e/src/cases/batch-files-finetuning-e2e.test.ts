@@ -3,9 +3,10 @@ import { createServer, type Server } from "node:http";
 import OpenAI, { toFile } from "openai";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   spawnApp,
+  waitConfigPropagation,
   type SpawnedApp,
 } from "../harness/index.js";
 
@@ -171,33 +172,46 @@ async function startJobsUpstream(): Promise<JobsUpstream> {
 
 describe("jobs e2e: /v1/files + /v1/batches + /v1/fine_tuning/jobs (#720)", () => {
   let app: SpawnedApp | undefined;
-  let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let upstream: JobsUpstream | undefined;
   let etcdReachable = false;
   let client: OpenAI;
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    seed = new SeedClient(etcd, app.etcdPrefix);
     upstream = await startJobsUpstream();
 
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["*"],
     });
-    const pk = await admin.createProviderKey({
+    const pk = await seed.createProviderKey({
       display_name: "jobs-e2e-pk",
       secret: "sk-upstream-jobs",
       api_base: `${upstream.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "jobs-e2e-model",
       provider: "openai",
       model_name: "gpt-4o",
       provider_key_id: pk.id,
+    });
+
+    // Gate on the DP snapshot, not the store: /v1/models only lists the
+    // model once the snapshot has it, and only authenticates once the
+    // caller key has propagated too. Touches no upstream.
+    await waitConfigPropagation(async () => {
+      const res = await fetch(`${app!.proxyUrl}/v1/models`, {
+        headers: { authorization: `Bearer ${CALLER_PLAINTEXT}` },
+      });
+      if (res.status !== 200) return false;
+      const body = (await res.json()) as { data?: Array<{ id?: string }> };
+      return (body.data ?? []).some((m) => m.id === "jobs-e2e-model");
     });
 
     client = new OpenAI({
@@ -212,7 +226,7 @@ describe("jobs e2e: /v1/files + /v1/batches + /v1/fine_tuning/jobs (#720)", () =
   });
 
   test("full batch lifecycle through the OpenAI SDK: upload → create → retrieve → content → cancel", async (ctx) => {
-    if (!etcdReachable || !app || !admin || !upstream) {
+    if (!etcdReachable || !app || !seed || !upstream) {
       ctx.skip();
       return;
     }
@@ -287,7 +301,7 @@ describe("jobs e2e: /v1/files + /v1/batches + /v1/fine_tuning/jobs (#720)", () =
   });
 
   test("fine-tuning: encoded training_file routes the job, provider base model forwards verbatim", async (ctx) => {
-    if (!etcdReachable || !app || !admin || !upstream) {
+    if (!etcdReachable || !app || !seed || !upstream) {
       ctx.skip();
       return;
     }

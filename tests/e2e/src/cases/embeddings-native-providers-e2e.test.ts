@@ -3,9 +3,10 @@ import { createServer, type Server } from "node:http";
 import OpenAI from "openai";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   spawnApp,
+  waitConfigPropagation,
   type SpawnedApp,
 } from "../harness/index.js";
 
@@ -74,18 +75,19 @@ async function startJsonUpstream(
 
 describe("native-provider embeddings e2e (#723)", () => {
   let app: SpawnedApp | undefined;
-  let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let etcdReachable = false;
   const upstreams: RecordingUpstream[] = [];
   let client: OpenAI;
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
-    await admin.createApiKey({
+    seed = new SeedClient(etcd, app.etcdPrefix);
+    await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["*"],
     });
@@ -101,7 +103,7 @@ describe("native-provider embeddings e2e (#723)", () => {
   });
 
   test("vertex/gemini model embeds via :predict with OAuth bearer + summed usage", async (ctx) => {
-    if (!etcdReachable || !app || !admin) {
+    if (!etcdReachable || !app || !seed) {
       ctx.skip();
       return;
     }
@@ -114,7 +116,7 @@ describe("native-provider embeddings e2e (#723)", () => {
     }));
     upstreams.push(upstream);
 
-    const pk = await admin.createProviderKey({
+    const pk = await seed.createProviderKey({
       display_name: "vertex-embed-pk",
       provider: "google",
       adapter: "vertex",
@@ -125,11 +127,23 @@ describe("native-provider embeddings e2e (#723)", () => {
       }),
       api_base: upstream.baseUrl,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "vertex-embed-model",
       provider: "google",
       model_name: "text-embedding-005",
       provider_key_id: pk.id,
+    });
+
+    // Gate on the DP snapshot via /v1/models — authenticates only once the
+    // caller key has propagated, lists the model only once the snapshot has
+    // it, and touches no upstream.
+    await waitConfigPropagation(async () => {
+      const res = await fetch(`${app!.proxyUrl}/v1/models`, {
+        headers: { authorization: `Bearer ${CALLER_PLAINTEXT}` },
+      });
+      if (res.status !== 200) return false;
+      const body = (await res.json()) as { data?: Array<{ id?: string }> };
+      return (body.data ?? []).some((m) => m.id === "vertex-embed-model");
     });
 
     const resp = await client.embeddings.create({
@@ -151,7 +165,7 @@ describe("native-provider embeddings e2e (#723)", () => {
   });
 
   test("bedrock titan model embeds via one SigV4 InvokeModel per input", async (ctx) => {
-    if (!etcdReachable || !app || !admin) {
+    if (!etcdReachable || !app || !seed) {
       ctx.skip();
       return;
     }
@@ -163,7 +177,7 @@ describe("native-provider embeddings e2e (#723)", () => {
     });
     upstreams.push(upstream);
 
-    const pk = await admin.createProviderKey({
+    const pk = await seed.createProviderKey({
       display_name: "bedrock-embed-pk",
       provider: "bedrock",
       adapter: "bedrock",
@@ -174,11 +188,21 @@ describe("native-provider embeddings e2e (#723)", () => {
       }),
       api_base: upstream.baseUrl,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "bedrock-embed-model",
       provider: "bedrock",
       model_name: "amazon.titan-embed-text-v1",
       provider_key_id: pk.id,
+    });
+
+    // Same DP-snapshot gate as the vertex case above.
+    await waitConfigPropagation(async () => {
+      const res = await fetch(`${app!.proxyUrl}/v1/models`, {
+        headers: { authorization: `Bearer ${CALLER_PLAINTEXT}` },
+      });
+      if (res.status !== 200) return false;
+      const body = (await res.json()) as { data?: Array<{ id?: string }> };
+      return (body.data ?? []).some((m) => m.id === "bedrock-embed-model");
     });
 
     const resp = await client.embeddings.create({

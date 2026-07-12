@@ -2,8 +2,8 @@ import { createHash } from "node:crypto";
 import OpenAI from "openai";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   ProxyClient,
   spawnApp,
   startOpenAiUpstream,
@@ -51,17 +51,18 @@ const CALLER_KEY_HASH = createHash("sha256")
 
 describe("streaming edges e2e: client abort mid-stream", () => {
   let app: SpawnedApp | undefined;
-  let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let etcdReachable = false;
   const upstreams: OpenAiUpstream[] = [];
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
-    await admin.createApiKey({
+    seed = new SeedClient(etcd, app.etcdPrefix);
+    await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["*"],
     });
@@ -73,7 +74,7 @@ describe("streaming edges e2e: client abort mid-stream", () => {
   });
 
   test("client aborts mid-stream: gateway stays healthy, subsequent request succeeds", async (ctx) => {
-    if (!etcdReachable || !app || !admin) {
+    if (!etcdReachable || !app || !seed) {
       ctx.skip();
       return;
     }
@@ -94,12 +95,12 @@ describe("streaming edges e2e: client abort mid-stream", () => {
     });
     upstreams.push(upstream);
 
-    const pk = await admin.createProviderKey({
+    const pk = await seed.createProviderKey({
       display_name: "stream-abort-pk",
       secret: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "stream-abort",
       provider: "openai",
       model_name: "gpt-4o-mini",
@@ -184,7 +185,7 @@ describe("streaming edges e2e: client abort mid-stream", () => {
   });
 
   test("upstream disconnects mid-stream: partial chunks reach caller, iterator throws, no [DONE]", async (ctx) => {
-    if (!etcdReachable || !app || !admin) {
+    if (!etcdReachable || !app || !seed) {
       ctx.skip();
       return;
     }
@@ -214,12 +215,12 @@ describe("streaming edges e2e: client abort mid-stream", () => {
     });
     upstreams.push(upstream);
 
-    const pk = await admin.createProviderKey({
+    const pk = await seed.createProviderKey({
       display_name: "stream-disc-pk",
       secret: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "stream-disc",
       provider: "openai",
       model_name: "gpt-4o-mini",

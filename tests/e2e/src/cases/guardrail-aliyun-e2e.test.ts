@@ -3,8 +3,8 @@ import { createHash } from "node:crypto";
 import OpenAI, { APIError } from "openai";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   pickFreePort,
   spawnApp,
   startOpenAiUpstream,
@@ -106,11 +106,12 @@ describe("aliyun guardrail e2e: TextModerationPlus blocks risky input/output", (
   let riskyOutputUpstream: OpenAiUpstream | undefined;
   let streamUpstream: OpenAiUpstream | undefined;
   let aliyun: AliyunMock | undefined;
-  let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let etcdReachable = false;
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     aliyun = await startAliyunMock();
@@ -164,45 +165,45 @@ describe("aliyun guardrail e2e: TextModerationPlus blocks risky input/output", (
     });
 
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    seed = new SeedClient(etcd, app.etcdPrefix);
 
-    const benignPk = await admin.createProviderKey({
+    const benignPk = await seed.createProviderKey({
       display_name: "aliyun-e2e-pk",
       secret: "sk-mock",
       api_base: `${benignUpstream.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "aliyun-e2e",
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: benignPk.id,
     });
 
-    const riskyOutPk = await admin.createProviderKey({
+    const riskyOutPk = await seed.createProviderKey({
       display_name: "aliyun-out-e2e-pk",
       secret: "sk-mock",
       api_base: `${riskyOutputUpstream.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "aliyun-out-e2e",
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: riskyOutPk.id,
     });
 
-    const streamPk = await admin.createProviderKey({
+    const streamPk = await seed.createProviderKey({
       display_name: "aliyun-stream-e2e-pk",
       secret: "sk-mock",
       api_base: `${streamUpstream.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "aliyun-stream-e2e",
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: streamPk.id,
     });
 
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["aliyun-e2e", "aliyun-out-e2e", "aliyun-stream-e2e"],
     });
@@ -210,7 +211,7 @@ describe("aliyun guardrail e2e: TextModerationPlus blocks risky input/output", (
     // One env-wide guardrail covering input + output. Small window so the
     // streaming case triggers a windowed output call (and reuses the
     // stream's sessionId across windows). `endpoint` points at the mock.
-    await admin.json("POST", "/admin/v1/guardrails", {
+    await seed.createGuardrail({
       name: "aliyun-e2e-guard",
       enabled: true,
       hook_point: "both",

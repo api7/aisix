@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
@@ -39,11 +39,12 @@ const CALLER_KEY_HASH = createHash("sha256")
 describe("images generations e2e: /v1/images/generations verbatim forward + model translation", () => {
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
-  let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let etcdReachable = false;
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     upstream = await startOpenAiUpstream({
@@ -60,20 +61,20 @@ describe("images generations e2e: /v1/images/generations verbatim forward + mode
       },
     });
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    seed = new SeedClient(etcd, app.etcdPrefix);
 
-    const pk = await admin.createProviderKey({
+    const pk = await seed.createProviderKey({
       display_name: "img-pk",
       secret: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "img-e2e",
       provider: "openai",
       model_name: "gpt-image-1",
       provider_key_id: pk.id,
     });
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["img-e2e"],
     });
@@ -175,7 +176,7 @@ describe("images generations e2e: /v1/images/generations verbatim forward + mode
   });
 
   test("non-OpenAI provider returns 400 invalid_request_error, upstream untouched (#212 / docs §4.9)", async (ctx) => {
-    if (!etcdReachable || !app || !admin || !upstream) {
+    if (!etcdReachable || !app || !seed || !upstream) {
       ctx.skip();
       return;
     }
@@ -187,19 +188,19 @@ describe("images generations e2e: /v1/images/generations verbatim forward + mode
     // API; Gemini's image generation uses a different URL + body
     // shape; DeepSeek doesn't expose image generation). #212 covers
     // the e2e gap on this contract.
-    const nonOaPk = await admin.createProviderKey({
+    const nonOaPk = await seed.createProviderKey({
       display_name: "img-anthropic-pk",
       secret: "sk-ant-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "img-anthropic",
       provider: "anthropic",
       model_name: "claude-3-5-haiku-20241022",
       provider_key_id: nonOaPk.id,
     });
     const nonOaCaller = `${CALLER_PLAINTEXT}-non-oa`;
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: createHash("sha256").update(nonOaCaller).digest("hex"),
       allowed_models: ["img-anthropic"],
     });

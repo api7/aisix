@@ -2,8 +2,8 @@ import { createHash } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   pickFreePort,
   spawnApp,
   startOpenAiUpstream,
@@ -84,19 +84,19 @@ async function startOtlpReceiver(): Promise<OtlpReceiver> {
   };
 }
 
-async function seedRouting(admin: AdminClient, upstream: OpenAiUpstream) {
-  const pk = await admin.createProviderKey({
+async function seedRouting(seed: SeedClient, upstream: OpenAiUpstream) {
+  const pk = await seed.createProviderKey({
     display_name: "client-source-pk",
     secret: PROVIDER_SECRET,
     api_base: `${upstream.baseUrl}/v1`,
   });
-  await admin.createModel({
+  await seed.createModel({
     display_name: "client-source-model",
     provider: "openai",
     model_name: "gpt-4o-mini",
     provider_key_id: pk.id,
   });
-  await admin.createApiKey({
+  await seed.createApiKey({
     key_hash: CALLER_KEY_HASH,
     allowed_models: ["client-source-model"],
   });
@@ -161,14 +161,14 @@ describe("usage client source e2e (#492): source IP + User-Agent on usage events
         realIp: { trusted_proxies: ["127.0.0.1/32", "10.0.0.0/8"], recursive: true },
       });
       apps.push(app);
-      const admin = new AdminClient(app.adminUrl, app.adminKey);
-      await admin.createObservabilityExporter({
+      const seed = new SeedClient(new EtcdClient(), app.etcdPrefix);
+      await seed.createObservabilityExporter({
         name: "mock-otlp",
         enabled: true,
         kind: "otlp_http",
         endpoint: otlp.url,
       });
-      await seedRouting(admin, upstream);
+      await seedRouting(seed, upstream);
 
       await waitConfigPropagation(async () => {
         try {
@@ -208,14 +208,14 @@ describe("usage client source e2e (#492): source IP + User-Agent on usage events
       }
       const app = await spawnApp(); // no real_ip → trust nothing
       apps.push(app);
-      const admin = new AdminClient(app.adminUrl, app.adminKey);
-      await admin.createObservabilityExporter({
+      const seed = new SeedClient(new EtcdClient(), app.etcdPrefix);
+      await seed.createObservabilityExporter({
         name: "mock-otlp-2",
         enabled: true,
         kind: "otlp_http",
         endpoint: otlp.url,
       });
-      await seedRouting(admin, upstream);
+      await seedRouting(seed, upstream);
 
       const marker = "aisix-e2e-peer-probe/9.9";
       await waitConfigPropagation(async () => {

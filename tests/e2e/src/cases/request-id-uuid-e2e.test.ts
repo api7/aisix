@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
@@ -21,14 +21,15 @@ const UUID_RE =
 
 describe("request id e2e: gateway-generated request IDs are UUIDs", () => {
   let app: SpawnedApp | undefined;
-  let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let chatUpstream: OpenAiUpstream | undefined;
   let embeddingsUpstream: OpenAiUpstream | undefined;
   let messagesUpstream: OpenAiUpstream | undefined;
   let etcdReachable = false;
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     chatUpstream = await startOpenAiUpstream();
@@ -53,45 +54,45 @@ describe("request id e2e: gateway-generated request IDs are UUIDs", () => {
     });
 
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    seed = new SeedClient(etcd, app.etcdPrefix);
 
-    const chatPk = await admin.createProviderKey({
+    const chatPk = await seed.createProviderKey({
       display_name: "request-id-chat-pk",
       secret: "sk-mock",
       api_base: `${chatUpstream.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "request-id-chat",
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: chatPk.id,
     });
 
-    const embeddingsPk = await admin.createProviderKey({
+    const embeddingsPk = await seed.createProviderKey({
       display_name: "request-id-embeddings-pk",
       secret: "sk-mock",
       api_base: `${embeddingsUpstream.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "request-id-embeddings",
       provider: "openai",
       model_name: "text-embedding-3-small",
       provider_key_id: embeddingsPk.id,
     });
 
-    const messagesPk = await admin.createProviderKey({
+    const messagesPk = await seed.createProviderKey({
       display_name: "request-id-messages-pk",
       secret: "sk-ant-mock",
       api_base: messagesUpstream.baseUrl,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "request-id-messages",
       provider: "anthropic",
       model_name: "claude-3-5-haiku-20241022",
       provider_key_id: messagesPk.id,
     });
 
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["*"],
     });

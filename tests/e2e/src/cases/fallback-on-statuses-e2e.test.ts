@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
@@ -35,7 +35,8 @@ describe("fallback_on_statuses e2e: opt-in 4xx failover (#1012)", () => {
   let etcdReachable = false;
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     // "Overloaded" provider: answers every call with 422 (the shape some
@@ -67,38 +68,38 @@ describe("fallback_on_statuses e2e: opt-in 4xx failover (#1012)", () => {
     });
 
     app = await spawnApp();
-    const admin = new AdminClient(app.adminUrl, app.adminKey);
+    const seed = new SeedClient(etcd, app.etcdPrefix);
 
-    const overloadedPk = await admin.createProviderKey({
+    const overloadedPk = await seed.createProviderKey({
       display_name: "fos-overloaded-pk",
       secret: "sk-mock",
       api_base: `${overloaded.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "fos-overloaded",
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: overloadedPk.id,
       cooldown: { enabled: false },
     });
-    const badPk = await admin.createProviderKey({
+    const badPk = await seed.createProviderKey({
       display_name: "fos-bad-pk",
       secret: "sk-mock",
       api_base: `${badRequest.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "fos-bad",
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: badPk.id,
       cooldown: { enabled: false },
     });
-    const healthyPk = await admin.createProviderKey({
+    const healthyPk = await seed.createProviderKey({
       display_name: "fos-healthy-pk",
       secret: "sk-mock",
       api_base: `${healthy.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "fos-healthy",
       provider: "openai",
       model_name: "gpt-4o-mini",
@@ -106,14 +107,14 @@ describe("fallback_on_statuses e2e: opt-in 4xx failover (#1012)", () => {
     });
 
     // Same two targets, with and without the opt-in.
-    await admin.createModel({
+    await seed.createModel({
       display_name: "fos-default-group",
       routing: {
         strategy: "failover",
         targets: [{ model: "fos-overloaded" }, { model: "fos-healthy" }],
       },
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "fos-configured-group",
       routing: {
         strategy: "failover",
@@ -123,7 +124,7 @@ describe("fallback_on_statuses e2e: opt-in 4xx failover (#1012)", () => {
     });
     // Configured group whose FIRST target 400s — 400 is not in the list,
     // so it must still relay.
-    await admin.createModel({
+    await seed.createModel({
       display_name: "fos-unlisted-group",
       routing: {
         strategy: "failover",
@@ -132,7 +133,7 @@ describe("fallback_on_statuses e2e: opt-in 4xx failover (#1012)", () => {
       },
     });
 
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: [
         "fos-default-group",

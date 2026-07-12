@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   lz4DecompressBlock,
   spawnApp,
   startMockSls,
@@ -170,7 +170,8 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
   let etcdReachable = false;
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     sls = await startMockSls();
@@ -203,9 +204,9 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
         [`SLS_CRED_${CREDENTIAL_REF.toUpperCase()}_AK_SECRET`]: MOCK_AK_SECRET,
       },
     });
-    const admin = new AdminClient(app.adminUrl, app.adminKey);
+    const seed = new SeedClient(etcd, app.etcdPrefix);
 
-    await admin.createObservabilityExporter({
+    await seed.createObservabilityExporter({
       name: "sls-failure-full",
       enabled: true,
       kind: "aliyun_sls",
@@ -215,7 +216,7 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
       credential_ref: CREDENTIAL_REF,
       content_mode: "full",
     });
-    await admin.createObservabilityExporter({
+    await seed.createObservabilityExporter({
       name: "sls-failure-meta",
       enabled: true,
       kind: "aliyun_sls",
@@ -226,23 +227,23 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
       content_mode: "metadata_only",
     });
 
-    const okPk = await admin.createProviderKey({
+    const okPk = await seed.createProviderKey({
       display_name: "failure-content-ok-pk",
       secret: "sk-mock",
       api_base: `${okUpstream.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "failure-content-ok",
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: okPk.id,
     });
-    const failPk = await admin.createProviderKey({
+    const failPk = await seed.createProviderKey({
       display_name: "failure-content-fail-pk",
       secret: "sk-mock",
       api_base: `${failUpstream.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "failure-content-fail",
       provider: "openai",
       model_name: "gpt-4o-mini",
@@ -252,7 +253,7 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
       cooldown: { enabled: false },
     });
     // A model the caller is NOT allowed to use (403 case).
-    await admin.createModel({
+    await seed.createModel({
       display_name: "failure-content-offlimits",
       provider: "openai",
       model_name: "gpt-4o-mini",
@@ -260,14 +261,14 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
     });
     // Second hard-failing target so a routing group can fail on BOTH
     // targets (content must ride the LAST attempt only).
-    await admin.createModel({
+    await seed.createModel({
       display_name: "failure-content-fail-b",
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: failPk.id,
       cooldown: { enabled: false },
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "failure-content-group",
       routing: {
         strategy: "failover",
@@ -279,7 +280,7 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
     });
     // Fail-then-recover group: the failed attempt must stay content-less
     // while the winner's success event carries the prompt.
-    await admin.createModel({
+    await seed.createModel({
       display_name: "failure-content-recover",
       routing: {
         strategy: "failover",
@@ -290,7 +291,7 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
       },
     });
 
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: [
         "failure-content-ok",
@@ -301,7 +302,7 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
     });
 
     // Input-side keyword guardrail (block mode) for the 422 case.
-    await admin.json("POST", "/admin/v1/guardrails", {
+    await seed.createGuardrail({
       name: "failure-content-guard",
       enabled: true,
       hook_point: "input",
@@ -311,7 +312,7 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
     // PII guardrail: email masks, china_id_card blocks. A blocked request
     // carrying BOTH must capture the post-mask body (the email placeholder,
     // never the raw address).
-    await admin.json("POST", "/admin/v1/guardrails", {
+    await seed.createGuardrail({
       name: "failure-content-pii",
       enabled: true,
       hook_point: "input",

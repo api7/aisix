@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
@@ -49,11 +49,12 @@ const OPENAI_401_BODY = {
 describe("upstream 401 error.code preserved across Content-Type (#543)", () => {
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
-  let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let etcdReachable = false;
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     // Upstream returns the canonical OpenAI 401 JSON body but labels it
@@ -64,20 +65,20 @@ describe("upstream 401 error.code preserved across Content-Type (#543)", () => {
       errorContentType: "text/plain",
     });
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    seed = new SeedClient(etcd, app.etcdPrefix);
 
-    const pk = await admin.createProviderKey({
+    const pk = await seed.createProviderKey({
       display_name: "err401-pk",
       secret: "sk-mock-bad",
       api_base: `${upstream.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "err401-gpt",
       provider: "openai",
       model_name: "gpt-4o",
       provider_key_id: pk.id,
     });
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["err401-gpt"],
     });
@@ -94,23 +95,21 @@ describe("upstream 401 error.code preserved across Content-Type (#543)", () => {
       return;
     }
 
-    // Propagation probe: the model must be live (any non-5xx-from-DP
-    // response means config propagated; the upstream always 401s).
+    // Propagation probe via /v1/models: a bare "chat returns 401" gate
+    // would also match the gateway's own unknown-key 401 while the caller
+    // key is still propagating — which carries no upstream error.code and
+    // is exactly what this case must NOT confuse with the upstream's 401.
     await waitConfigPropagation(async () => {
       try {
-        const r = await fetch(`${app!.proxyUrl}/v1/chat/completions`, {
-          method: "POST",
-          headers: {
-            "content-type": "application/json",
-            authorization: `Bearer ${CALLER_PLAINTEXT}`,
-          },
-          body: JSON.stringify({
-            model: "err401-gpt",
-            messages: [{ role: "user", content: "probe" }],
-          }),
+        const models = await fetch(`${app!.proxyUrl}/v1/models`, {
+          headers: { authorization: `Bearer ${CALLER_PLAINTEXT}` },
         });
-        // 401 propagated correctly is what we want; 404 = model not yet live.
-        return r.status === 401;
+        if (models.status !== 200) return false;
+        const ids =
+          ((await models.json()) as { data?: Array<{ id?: string }> }).data?.map(
+            (m) => m.id,
+          ) ?? [];
+        return ids.includes("err401-gpt");
       } catch {
         return false;
       }

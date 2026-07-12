@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
@@ -41,33 +41,34 @@ const UNKNOWN_PLAINTEXT = "sk-auth-baseline-unregistered";
 describe("auth baseline e2e: missing/malformed/unknown bearer all fail closed", () => {
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
-  let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let etcdReachable = false;
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     upstream = await startOpenAiUpstream();
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    seed = new SeedClient(etcd, app.etcdPrefix);
 
     // A single Model + ProviderKey + ApiKey configured. The valid
     // ApiKey is what makes the negative cases meaningful: failing
     // auth must happen even though a valid key exists; failing auth
     // must NOT degrade to "any-key-works".
-    const pk = await admin.createProviderKey({
+    const pk = await seed.createProviderKey({
       display_name: "auth-baseline-pk",
       secret: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "auth-baseline",
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: pk.id,
     });
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: VALID_KEY_HASH,
       allowed_models: ["auth-baseline"],
     });

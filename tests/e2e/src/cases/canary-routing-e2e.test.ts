@@ -2,8 +2,8 @@ import { createHash } from "node:crypto";
 import OpenAI from "openai";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
@@ -35,17 +35,18 @@ function okBody(content: string) {
 
 describe("sticky (A/B / canary) weighted routing e2e", () => {
   let app: SpawnedApp | undefined;
-  let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let etcdReachable = false;
   const upstreams: OpenAiUpstream[] = [];
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
-    await admin.createApiKey({
+    seed = new SeedClient(etcd, app.etcdPrefix);
+    await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["*"],
     });
@@ -60,13 +61,13 @@ describe("sticky (A/B / canary) weighted routing e2e", () => {
     displayName: string,
     upstream: OpenAiUpstream,
   ): Promise<void> {
-    if (!admin) throw new Error("admin client not initialized");
-    const providerKey = await admin.createProviderKey({
+    if (!seed) throw new Error("seed client not initialized");
+    const providerKey = await seed.createProviderKey({
       display_name: `${displayName}-pk`,
       secret: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: displayName,
       provider: "openai",
       model_name: "gpt-4o-mini",
@@ -91,7 +92,7 @@ describe("sticky (A/B / canary) weighted routing e2e", () => {
   }
 
   test("pins a stability key to one target while splitting across keys", async (ctx) => {
-    if (!etcdReachable || !app || !admin) {
+    if (!etcdReachable || !app || !seed) {
       ctx.skip();
       return;
     }
@@ -99,9 +100,10 @@ describe("sticky (A/B / canary) weighted routing e2e", () => {
     const stable = await startOpenAiUpstream({ nonStreamBody: okBody("stable-served") });
     const canary = await startOpenAiUpstream({ nonStreamBody: okBody("canary-served") });
     upstreams.push(stable, canary);
-    await createOpenAiModel("canary-stable", stable);
-    await createOpenAiModel("canary-new", canary);
-    await admin.createModel({
+    // Router BEFORE its targets: watch events apply in revision order, so
+    // once /v1/models lists both targets the router is in the snapshot too
+    // (virtual models don't appear in /v1/models themselves).
+    await seed.createModel({
       display_name: "canary-router",
       routing: {
         strategy: "weighted",
@@ -112,10 +114,20 @@ describe("sticky (A/B / canary) weighted routing e2e", () => {
         ],
       },
     });
+    await createOpenAiModel("canary-stable", stable);
+    await createOpenAiModel("canary-new", canary);
 
+    // Gate on the DP snapshot via /v1/models — authenticates only once the
+    // caller key has propagated, lists the targets only once the snapshot
+    // has them, and dispatches to no target (which would skew the
+    // per-target counts below).
     await waitConfigPropagation(async () => {
-      const models = await admin!.listModels();
-      return models.some((m) => m.display_name === "canary-router");
+      const res = await fetch(`${app!.proxyUrl}/v1/models`, {
+        headers: { authorization: `Bearer ${CALLER_PLAINTEXT}` },
+      });
+      if (res.status !== 200) return false;
+      const ids = ((await res.json()) as { data?: Array<{ id?: string }> }).data?.map((m) => m.id) ?? [];
+      return ids.includes("canary-stable") && ids.includes("canary-new");
     });
 
     // Same key → same target on every request (sticky).

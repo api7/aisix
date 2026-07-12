@@ -4,6 +4,7 @@ import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   AdminClient,
   EtcdClient,
+  SeedClient,
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
@@ -19,12 +20,14 @@ const CALLER_KEY_HASH = createHash("sha256")
 describe("retry_on_429 vs background ignore e2e", () => {
   let app: SpawnedApp | undefined;
   let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let etcdReachable = false;
   let rateLimitedUpstream: OpenAiUpstream | undefined;
   let fallbackUpstream: OpenAiUpstream | undefined;
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     rateLimitedUpstream = await startOpenAiUpstream({
@@ -62,19 +65,20 @@ describe("retry_on_429 vs background ignore e2e", () => {
 
     app = await spawnApp();
     admin = new AdminClient(app.adminUrl, app.adminKey);
+    seed = new SeedClient(etcd, app.etcdPrefix);
 
-    const primaryPk = await admin.createProviderKey({
+    const primaryPk = await seed.createProviderKey({
       display_name: "retry-429-primary-pk",
       secret: "sk-mock",
       api_base: `${rateLimitedUpstream.baseUrl}/v1`,
     });
-    const fallbackPk = await admin.createProviderKey({
+    const fallbackPk = await seed.createProviderKey({
       display_name: "retry-429-fallback-pk",
       secret: "sk-mock",
       api_base: `${fallbackUpstream.baseUrl}/v1`,
     });
 
-    await admin.createModel({
+    await seed.createModel({
       display_name: "retry-429-primary",
       provider: "openai",
       model_name: "gpt-4o-mini",
@@ -89,13 +93,13 @@ describe("retry_on_429 vs background ignore e2e", () => {
         stale_after_seconds: 90,
       },
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "retry-429-fallback",
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: fallbackPk.id,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "retry-429-router",
       routing: {
         strategy: "failover",
@@ -108,7 +112,7 @@ describe("retry_on_429 vs background ignore e2e", () => {
         retry_on_429: true,
       },
     });
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["retry-429-router", "retry-429-fallback"],
     });

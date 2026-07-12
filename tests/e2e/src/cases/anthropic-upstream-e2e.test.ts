@@ -2,8 +2,8 @@ import { createHash } from "node:crypto";
 import OpenAI from "openai";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
@@ -40,11 +40,12 @@ const CALLER_KEY_HASH = createHash("sha256")
 describe("anthropic upstream e2e: OpenAI in, Anthropic out, OpenAI back to caller", () => {
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
-  let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let etcdReachable = false;
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     upstream = await startOpenAiUpstream({
@@ -59,26 +60,26 @@ describe("anthropic upstream e2e: OpenAI in, Anthropic out, OpenAI back to calle
       },
     });
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    seed = new SeedClient(etcd, app.etcdPrefix);
 
     // The Anthropic bridge appends `/v1/messages` to the api_base, so
     // we point it at the bare host (no `/v1` suffix) — the OpenAI
     // bridge convention is the opposite (host + `/v1`), and getting
     // these mixed up was the lesson from the unit-level matrix tests.
-    const pk = await admin.createProviderKey({
+    const pk = await seed.createProviderKey({
       display_name: "an-e2e-pk",
       provider: "anthropic",
       adapter: "anthropic",
       secret: "sk-ant-mock",
       api_base: upstream.baseUrl,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "an-e2e",
       provider: "anthropic",
       model_name: "claude-3-5-haiku-20241022",
       provider_key_id: pk.id,
     });
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["an-e2e"],
     });
@@ -203,11 +204,12 @@ const TOOL_CALLER_KEY_HASH = createHash("sha256")
 describe("anthropic upstream e2e: tool_use-only response surfaces content:null (#395)", () => {
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
-  let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let etcdReachable = false;
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     upstream = await startOpenAiUpstream({
@@ -230,22 +232,22 @@ describe("anthropic upstream e2e: tool_use-only response surfaces content:null (
       },
     });
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    seed = new SeedClient(etcd, app.etcdPrefix);
 
-    const pk = await admin.createProviderKey({
+    const pk = await seed.createProviderKey({
       display_name: "an-e2e-toolnull-pk",
       provider: "anthropic",
       adapter: "anthropic",
       secret: "sk-ant-mock",
       api_base: upstream.baseUrl,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "an-e2e-toolnull",
       provider: "anthropic",
       model_name: "claude-3-5-haiku-20241022",
       provider_key_id: pk.id,
     });
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: TOOL_CALLER_KEY_HASH,
       allowed_models: ["an-e2e-toolnull"],
     });
@@ -308,11 +310,12 @@ const CACHE_CALLER_KEY_HASH = createHash("sha256")
 describe("anthropic upstream e2e: cache tokens fold into total_tokens (#906)", () => {
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
-  let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let etcdReachable = false;
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     upstream = await startOpenAiUpstream({
@@ -332,22 +335,22 @@ describe("anthropic upstream e2e: cache tokens fold into total_tokens (#906)", (
       },
     });
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    seed = new SeedClient(etcd, app.etcdPrefix);
 
-    const pk = await admin.createProviderKey({
+    const pk = await seed.createProviderKey({
       display_name: "an-e2e-cachetotal-pk",
       provider: "anthropic",
       adapter: "anthropic",
       secret: "sk-ant-mock",
       api_base: upstream.baseUrl,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "an-e2e-cachetotal",
       provider: "anthropic",
       model_name: "claude-3-5-haiku-20241022",
       provider_key_id: pk.id,
     });
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: CACHE_CALLER_KEY_HASH,
       allowed_models: ["an-e2e-cachetotal"],
     });

@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   lz4DecompressBlock,
   spawnApp,
   startMockSls,
@@ -140,7 +140,8 @@ describe("sls e2e: oversized captured content is truncated structurally (#1014)"
   let etcdReachable = false;
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     sls = await startMockSls();
@@ -167,9 +168,9 @@ describe("sls e2e: oversized captured content is truncated structurally (#1014)"
         [`SLS_CRED_${CREDENTIAL_REF.toUpperCase()}_AK_SECRET`]: MOCK_AK_SECRET,
       },
     });
-    const admin = new AdminClient(app.adminUrl, app.adminKey);
+    const seed = new SeedClient(etcd, app.etcdPrefix);
 
-    await admin.createObservabilityExporter({
+    await seed.createObservabilityExporter({
       name: "sls-structured-trunc",
       enabled: true,
       kind: "aliyun_sls",
@@ -181,18 +182,18 @@ describe("sls e2e: oversized captured content is truncated structurally (#1014)"
       content_max_bytes: CONTENT_MAX_BYTES,
     });
 
-    const pk = await admin.createProviderKey({
+    const pk = await seed.createProviderKey({
       display_name: "sls-trunc-pk",
       secret: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "sls-trunc-model",
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: pk.id,
     });
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["sls-trunc-model"],
     });

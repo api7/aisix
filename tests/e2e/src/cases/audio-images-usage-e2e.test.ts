@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import { beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
@@ -55,19 +55,19 @@ describe("audio + images UsageEvent emission (#406/#407)", () => {
     });
     const app: SpawnedApp = await spawnApp();
     try {
-      const admin = new AdminClient(app.adminUrl, app.adminKey);
-      const pk = await admin.createProviderKey({
+      const seed = new SeedClient(new EtcdClient(), app.etcdPrefix);
+      const pk = await seed.createProviderKey({
         display_name: "img-usage-pk",
         secret: "sk-mock",
         api_base: `${upstream.baseUrl}/v1`,
       });
-      await admin.createModel({
+      await seed.createModel({
         display_name: "img-usage",
         provider: "openai",
         model_name: "gpt-image-1",
         provider_key_id: pk.id,
       });
-      await admin.createApiKey({
+      await seed.createApiKey({
         key_hash: CALLER_KEY_HASH,
         allowed_models: ["img-usage"],
       });
@@ -114,19 +114,19 @@ describe("audio + images UsageEvent emission (#406/#407)", () => {
     });
     const app: SpawnedApp = await spawnApp();
     try {
-      const admin = new AdminClient(app.adminUrl, app.adminKey);
-      const pk = await admin.createProviderKey({
+      const seed = new SeedClient(new EtcdClient(), app.etcdPrefix);
+      const pk = await seed.createProviderKey({
         display_name: "audio-usage-pk",
         secret: "sk-mock",
         api_base: `${upstream.baseUrl}/v1`,
       });
-      await admin.createModel({
+      await seed.createModel({
         display_name: "audio-usage",
         provider: "openai",
         model_name: "gpt-4o-transcribe",
         provider_key_id: pk.id,
       });
-      await admin.createApiKey({
+      await seed.createApiKey({
         key_hash: CALLER_KEY_HASH,
         allowed_models: ["audio-usage"],
       });

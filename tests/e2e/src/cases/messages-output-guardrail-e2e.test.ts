@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
@@ -23,30 +23,31 @@ const HASH = createHash("sha256").update(CALLER).digest("hex");
 describe("/v1/messages output guardrail (#448)", () => {
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
-  let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let etcdReachable = false;
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
     upstream = await startOpenAiUpstream();
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
-    const pk = await admin.createProviderKey({
+    seed = new SeedClient(etcd, app.etcdPrefix);
+    const pk = await seed.createProviderKey({
       display_name: "msgout-gr-pk",
       secret: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     // OpenAI-provider model → /v1/messages takes the cross-provider path
     // (Anthropic protocol translated to the OpenAI bridge).
-    await admin.createModel({
+    await seed.createModel({
       display_name: "msgout-gr",
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: pk.id,
     });
-    await admin.createApiKey({ key_hash: HASH, allowed_models: ["msgout-gr"] });
-    await admin.json("POST", "/admin/v1/guardrails", {
+    await seed.createApiKey({ key_hash: HASH, allowed_models: ["msgout-gr"] });
+    await seed.createGuardrail({
       name: "msgout-gr-output-keyword",
       enabled: true,
       hook_point: "output",

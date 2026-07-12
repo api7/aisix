@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
@@ -48,36 +48,36 @@ const POST_EXPIRY_WAIT_MS = (TTL_SECONDS + 2) * 1000;
 describe("cache TTL eviction e2e: entry expires after ttl_seconds", () => {
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
-  let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let etcdReachable = false;
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     upstream = await startOpenAiUpstream();
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    seed = new SeedClient(etcd, app.etcdPrefix);
 
-    const pk = await admin.createProviderKey({
+    const pk = await seed.createProviderKey({
       display_name: "cache-ttl-pk",
       secret: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "cache-ttl-model",
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: pk.id,
     });
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["cache-ttl-model"],
     });
     // CachePolicy with a short TTL so the test can wait it out
-    // synchronously instead of mocking the clock. CachePolicy is not
-    // exposed on the typed AdminClient yet — use the JSON helper.
-    await admin.json("POST", "/admin/v1/cache_policies", {
+    // synchronously instead of mocking the clock.
+    await seed.createCachePolicy({
       name: "cache-ttl-policy",
       enabled: true,
       applies_to: "all",

@@ -4,6 +4,7 @@ import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   AdminClient,
   EtcdClient,
+  SeedClient,
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
@@ -19,6 +20,7 @@ const CALLER_KEY_HASH = createHash("sha256")
 describe("runtime status e2e", () => {
   let app: SpawnedApp | undefined;
   let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let etcdReachable = false;
   let flakyUpstream: OpenAiUpstream | undefined;
   let stableUpstream: OpenAiUpstream | undefined;
@@ -27,7 +29,8 @@ describe("runtime status e2e", () => {
   let routerModelID = "";
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     flakyUpstream = await startOpenAiUpstream({
@@ -73,32 +76,33 @@ describe("runtime status e2e", () => {
 
     app = await spawnApp();
     admin = new AdminClient(app.adminUrl, app.adminKey);
+    seed = new SeedClient(etcd, app.etcdPrefix);
 
-    const flakyPk = await admin.createProviderKey({
+    const flakyPk = await seed.createProviderKey({
       display_name: "runtime-flaky-pk",
       secret: "sk-mock",
       api_base: `${flakyUpstream.baseUrl}/v1`,
     });
-    const stablePk = await admin.createProviderKey({
+    const stablePk = await seed.createProviderKey({
       display_name: "runtime-stable-pk",
       secret: "sk-mock",
       api_base: `${stableUpstream.baseUrl}/v1`,
     });
-    const flakyModel = await admin.createModel({
+    const flakyModel = await seed.createModel({
       display_name: "runtime-flaky",
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: flakyPk.id,
     });
     flakyModelID = flakyModel.id;
-    const stableModel = await admin.createModel({
+    const stableModel = await seed.createModel({
       display_name: "runtime-stable",
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: stablePk.id,
     });
     stableModelID = stableModel.id;
-    const routerModel = await admin.createModel({
+    const routerModel = await seed.createModel({
       display_name: "runtime-router",
       routing: {
         strategy: "failover",
@@ -108,7 +112,7 @@ describe("runtime status e2e", () => {
       },
     });
     routerModelID = routerModel.id;
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["runtime-router", "runtime-stable", "runtime-flaky"],
     });

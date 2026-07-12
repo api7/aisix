@@ -2,8 +2,8 @@ import { createHash } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
@@ -134,18 +134,19 @@ function chatUpstreamReplying(content: string): Promise<OpenAiUpstream> {
 
 describe("semantic routing e2e", () => {
   let app: SpawnedApp | undefined;
-  let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let etcdReachable = false;
   const upstreams: OpenAiUpstream[] = [];
   const embedMocks: EmbeddingMock[] = [];
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
-    await admin.createApiKey({
+    seed = new SeedClient(etcd, app.etcdPrefix);
+    await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["*"],
     });
@@ -161,7 +162,7 @@ describe("semantic routing e2e", () => {
     await createEmbeddingModel("bge-mock", embed);
     await createDirectModel("legal-model", legal);
     await createDirectModel("default-model", fallback);
-    await admin.createModel({
+    await seed.createModel({
       display_name: "prod-chat",
       semantic: {
         embedding_model: "bge-mock",
@@ -198,13 +199,13 @@ describe("semantic routing e2e", () => {
     displayName: string,
     upstream: OpenAiUpstream,
   ): Promise<void> {
-    if (!admin) throw new Error("admin not ready");
-    const pk = await admin.createProviderKey({
+    if (!seed) throw new Error("seed not ready");
+    const pk = await seed.createProviderKey({
       display_name: `${displayName}-pk`,
       secret: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: displayName,
       provider: "openai",
       model_name: "gpt-4o-mini",
@@ -216,13 +217,13 @@ describe("semantic routing e2e", () => {
     displayName: string,
     mock: EmbeddingMock,
   ): Promise<void> {
-    if (!admin) throw new Error("admin not ready");
-    const pk = await admin.createProviderKey({
+    if (!seed) throw new Error("seed not ready");
+    const pk = await seed.createProviderKey({
       display_name: `${displayName}-pk`,
       secret: "sk-mock",
       api_base: `${mock.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: displayName,
       provider: "openai",
       model_name: "embed-mock",
@@ -268,7 +269,7 @@ describe("semantic routing e2e", () => {
   }
 
   test("routes a matching prompt to its route target and sets x-aisix-route", async (ctx) => {
-    if (!etcdReachable || !app || !admin) {
+    if (!etcdReachable || !app || !seed) {
       ctx.skip();
       return;
     }
@@ -282,7 +283,7 @@ describe("semantic routing e2e", () => {
   });
 
   test("falls through to default when no route clears its threshold (no x-aisix-route)", async (ctx) => {
-    if (!etcdReachable || !app || !admin) {
+    if (!etcdReachable || !app || !seed) {
       ctx.skip();
       return;
     }
@@ -296,7 +297,7 @@ describe("semantic routing e2e", () => {
   });
 
   test("on_embedding_failure: default routes to the default model when embedding errors", async (ctx) => {
-    if (!etcdReachable || !app || !admin) {
+    if (!etcdReachable || !app || !seed) {
       ctx.skip();
       return;
     }
@@ -307,7 +308,7 @@ describe("semantic routing e2e", () => {
 
     await createEmbeddingModel("broken-embed", brokenEmbed);
     await createDirectModel("safe-default-model", fallback);
-    await admin.createModel({
+    await seed.createModel({
       display_name: "degrading-router",
       semantic: {
         embedding_model: "broken-embed",
@@ -342,7 +343,7 @@ describe("semantic routing e2e", () => {
   });
 
   test("on_embedding_failure: fail returns 503 when embedding errors", async (ctx) => {
-    if (!etcdReachable || !app || !admin) {
+    if (!etcdReachable || !app || !seed) {
       ctx.skip();
       return;
     }
@@ -353,7 +354,7 @@ describe("semantic routing e2e", () => {
 
     await createEmbeddingModel("broken-embed-2", brokenEmbed);
     await createDirectModel("unreached-model", target);
-    await admin.createModel({
+    await seed.createModel({
       display_name: "strict-router",
       semantic: {
         embedding_model: "broken-embed-2",

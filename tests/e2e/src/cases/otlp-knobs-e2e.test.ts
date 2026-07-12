@@ -2,8 +2,8 @@ import { createHash } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   pickFreePort,
   spawnApp,
   startOpenAiUpstream,
@@ -76,19 +76,19 @@ async function startOtlpReceiver(): Promise<OtlpReceiver> {
   };
 }
 
-async function seedRouting(admin: AdminClient, upstream: OpenAiUpstream) {
-  const pk = await admin.createProviderKey({
+async function seedRouting(seed: SeedClient, upstream: OpenAiUpstream) {
+  const pk = await seed.createProviderKey({
     display_name: "otlp-knobs-pk",
     secret: PROVIDER_SECRET,
     api_base: `${upstream.baseUrl}/v1`,
   });
-  await admin.createModel({
+  await seed.createModel({
     display_name: "otlp-knobs-model",
     provider: "openai",
     model_name: "gpt-4o-mini",
     provider_key_id: pk.id,
   });
-  await admin.createApiKey({
+  await seed.createApiKey({
     key_hash: CALLER_KEY_HASH,
     allowed_models: ["otlp-knobs-model"],
   });
@@ -155,14 +155,14 @@ describe("otlp exporter knobs e2e (#519 B.2): sample_rate + content capture", ()
       receivers.push(otlp);
       const app = await spawnApp();
       apps.push(app);
-      const admin = new AdminClient(app.adminUrl, app.adminKey);
-      await admin.createObservabilityExporter({
+      const seed = new SeedClient(new EtcdClient(), app.etcdPrefix);
+      await seed.createObservabilityExporter({
         name: "otlp-defaults",
         enabled: true,
         kind: "otlp_http",
         endpoint: otlp.url,
       });
-      await seedRouting(admin, upstream);
+      await seedRouting(seed, upstream);
       await waitConfigPropagation(async () => {
         try {
           const r = await chat(app, "default-probe");
@@ -191,8 +191,8 @@ describe("otlp exporter knobs e2e (#519 B.2): sample_rate + content capture", ()
       receivers.push(otlp);
       const app = await spawnApp();
       apps.push(app);
-      const admin = new AdminClient(app.adminUrl, app.adminKey);
-      await admin.createObservabilityExporter({
+      const seed = new SeedClient(new EtcdClient(), app.etcdPrefix);
+      await seed.createObservabilityExporter({
         name: "otlp-full",
         enabled: true,
         kind: "otlp_http",
@@ -203,7 +203,7 @@ describe("otlp exporter knobs e2e (#519 B.2): sample_rate + content capture", ()
         // must leave room for the probe to stay visible untruncated.
         content_max_bytes: 200,
       });
-      await seedRouting(admin, upstream);
+      await seedRouting(seed, upstream);
       await waitConfigPropagation(async () => {
         try {
           const r = await chat(app, "content-probe");
@@ -250,22 +250,22 @@ describe("otlp exporter knobs e2e (#519 B.2): sample_rate + content capture", ()
       receivers.push(otlpZero, otlpAll);
       const app = await spawnApp();
       apps.push(app);
-      const admin = new AdminClient(app.adminUrl, app.adminKey);
-      await admin.createObservabilityExporter({
+      const seed = new SeedClient(new EtcdClient(), app.etcdPrefix);
+      await seed.createObservabilityExporter({
         name: "otlp-sample-zero",
         enabled: true,
         kind: "otlp_http",
         endpoint: otlpZero.url,
         sample_rate: 0,
       });
-      await admin.createObservabilityExporter({
+      await seed.createObservabilityExporter({
         name: "otlp-sample-all",
         enabled: true,
         kind: "otlp_http",
         endpoint: otlpAll.url,
         sample_rate: 1.0,
       });
-      await seedRouting(admin, upstream);
+      await seedRouting(seed, upstream);
       await waitConfigPropagation(async () => {
         try {
           const r = await chat(app, "sampling-probe");

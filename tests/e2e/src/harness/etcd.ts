@@ -83,6 +83,23 @@ export class EtcdClient {
     return v === undefined ? undefined : Buffer.from(v, "base64").toString("utf8");
   }
 
+  /**
+   * Delete exactly one key (etcd v3 `/v3/kv/deleterange`). With
+   * `range_end` omitted the DeleteRange request applies to only `key`
+   * — the single-key form of the same RPC `deletePrefix` uses.
+   */
+  async delete(key: string): Promise<void> {
+    const res = await harnessRequest(`${this.endpoint}/v3/kv/deleterange`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ key: Buffer.from(key, "utf8").toString("base64") }),
+    });
+    if (res.statusCode >= 300) {
+      const body = await res.body.text();
+      throw new Error(`etcd deleterange failed (${res.statusCode}): ${body}`);
+    }
+  }
+
   /** Delete every key under `prefix` (range delete in etcd v3 semantics). */
   async deletePrefix(prefix: string): Promise<void> {
     const key = Buffer.from(prefix, "utf8").toString("base64");

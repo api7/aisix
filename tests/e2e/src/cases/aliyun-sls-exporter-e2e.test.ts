@@ -2,8 +2,8 @@ import { createHash } from "node:crypto";
 import { createServer, type IncomingMessage, type Server } from "node:http";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   pickFreePort,
   spawnApp,
   startOpenAiUpstream,
@@ -89,19 +89,19 @@ async function startMockSls(): Promise<MockSls> {
   };
 }
 
-async function seedRouting(admin: AdminClient, upstream: OpenAiUpstream) {
-  const pk = await admin.createProviderKey({
+async function seedRouting(seed: SeedClient, upstream: OpenAiUpstream) {
+  const pk = await seed.createProviderKey({
     display_name: "sls-exporter-pk",
     secret: PROVIDER_SECRET,
     api_base: `${upstream.baseUrl}/v1`,
   });
-  await admin.createModel({
+  await seed.createModel({
     display_name: "sls-exporter-model",
     provider: "openai",
     model_name: "gpt-4o-mini",
     provider_key_id: pk.id,
   });
-  await admin.createApiKey({
+  await seed.createApiKey({
     key_hash: CALLER_KEY_HASH,
     allowed_models: ["sls-exporter-model"],
   });
@@ -176,8 +176,8 @@ describe("aliyun_sls exporter e2e (#687): DP delivers a signed PutLogs to SLS", 
         },
       });
       apps.push(app);
-      const admin = new AdminClient(app.adminUrl, app.adminKey);
-      await admin.createObservabilityExporter({
+      const seed = new SeedClient(new EtcdClient(), app.etcdPrefix);
+      await seed.createObservabilityExporter({
         name: "mock-sls",
         enabled: true,
         kind: "aliyun_sls",
@@ -186,7 +186,7 @@ describe("aliyun_sls exporter e2e (#687): DP delivers a signed PutLogs to SLS", 
         logstore: SLS_LOGSTORE,
         credential_ref: CREDENTIAL_REF,
       });
-      await seedRouting(admin, upstream);
+      await seedRouting(seed, upstream);
 
       await waitConfigPropagation(async () => {
         try {

@@ -2,8 +2,8 @@ import { createHash } from "node:crypto";
 import OpenAI from "openai";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
@@ -67,23 +67,24 @@ const CASES: ReadonlyArray<MatrixCase> = [
 
 describe("cross-provider matrix: OpenAI-compat upstreams", () => {
   let app: SpawnedApp | undefined;
-  let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let etcdReachable = false;
   // Each test creates its own upstream mock (per provider × streaming
   // variant). Track them so `afterAll` can close every one.
   const upstreams: OpenAiUpstream[] = [];
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    seed = new SeedClient(etcd, app.etcdPrefix);
 
     // Wildcard `allowed_models: ["*"]` lets the same caller key reach
     // every model the per-test setup creates, without re-creating the
     // ApiKey per case.
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["*"],
     });
@@ -96,7 +97,7 @@ describe("cross-provider matrix: OpenAI-compat upstreams", () => {
 
   for (const tc of CASES) {
     test(`${tc.provider} upstream — non-streaming`, async (ctx) => {
-      if (!etcdReachable || !app || !admin) {
+      if (!etcdReachable || !app || !seed) {
         ctx.skip();
         return;
       }
@@ -126,7 +127,7 @@ describe("cross-provider matrix: OpenAI-compat upstreams", () => {
       });
       upstreams.push(upstream);
 
-      const pk = await admin.createProviderKey({
+      const pk = await seed.createProviderKey({
         display_name: `${tc.displayPrefix}-pk-non-stream`,
         secret: "sk-mock",
         api_base: `${upstream.baseUrl}/v1`,
@@ -141,7 +142,7 @@ describe("cross-provider matrix: OpenAI-compat upstreams", () => {
         adapter: "openai",
       });
       const modelName = `${tc.displayPrefix}-non-stream`;
-      await admin.createModel({
+      await seed.createModel({
         display_name: modelName,
         provider: tc.provider,
         model_name: tc.upstreamModelId,
@@ -211,7 +212,7 @@ describe("cross-provider matrix: OpenAI-compat upstreams", () => {
     });
 
     test(`${tc.provider} upstream — streaming`, async (ctx) => {
-      if (!etcdReachable || !app || !admin) {
+      if (!etcdReachable || !app || !seed) {
         ctx.skip();
         return;
       }
@@ -228,7 +229,7 @@ describe("cross-provider matrix: OpenAI-compat upstreams", () => {
       const upstream = await startOpenAiUpstream({ streamEvents: sseEvents });
       upstreams.push(upstream);
 
-      const pk = await admin.createProviderKey({
+      const pk = await seed.createProviderKey({
         display_name: `${tc.displayPrefix}-pk-stream`,
         secret: "sk-mock",
         api_base: `${upstream.baseUrl}/v1`,
@@ -238,7 +239,7 @@ describe("cross-provider matrix: OpenAI-compat upstreams", () => {
         adapter: "openai",
       });
       const modelName = `${tc.displayPrefix}-stream`;
-      await admin.createModel({
+      await seed.createModel({
         display_name: modelName,
         provider: tc.provider,
         model_name: tc.upstreamModelId,

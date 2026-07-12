@@ -3,8 +3,8 @@ import { createHash } from "node:crypto";
 import OpenAI, { APIError } from "openai";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   pickFreePort,
   spawnApp,
   startOpenAiUpstream,
@@ -104,12 +104,13 @@ describe("openai moderation guardrail e2e: flagged blocks, monitor allows, thres
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
   let moderation: ModerationMock | undefined;
-  let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let guardrailId: string | undefined;
   let etcdReachable = false;
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     moderation = await startModerationMock();
@@ -132,39 +133,35 @@ describe("openai moderation guardrail e2e: flagged blocks, monitor allows, thres
     });
 
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    seed = new SeedClient(etcd, app.etcdPrefix);
 
-    const pk = await admin.createProviderKey({
+    const pk = await seed.createProviderKey({
       display_name: "moderation-e2e-pk",
       secret: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "moderation-e2e",
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: pk.id,
     });
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: hash(CALLER),
       allowed_models: ["moderation-e2e"],
     });
 
     // One env-wide guardrail on the input hook, block mode. fail_open=true
     // so the 5xx case exercises the bypass path.
-    const created = await admin!.json<{ id: string }>(
-      "POST",
-      "/admin/v1/guardrails",
-      {
-        name: "moderation-e2e-guard",
-        enabled: true,
-        hook_point: "input",
-        fail_open: true,
-        kind: "openai_moderation",
-        api_key: "sk-moderation-key",
-        endpoint: moderation.baseUrl,
-      },
-    );
+    const created = await seed!.createGuardrail({
+      name: "moderation-e2e-guard",
+      enabled: true,
+      hook_point: "input",
+      fail_open: true,
+      kind: "openai_moderation",
+      api_key: "sk-moderation-key",
+      endpoint: moderation.baseUrl,
+    });
     guardrailId = created.id;
   });
 
@@ -266,11 +263,11 @@ describe("openai moderation guardrail e2e: flagged blocks, monitor allows, thres
   });
 
   test("enforcement_mode=monitor → flagged content passes through", async (ctx) => {
-    if (!etcdReachable || !app || !upstream || !admin || !guardrailId) {
+    if (!etcdReachable || !app || !upstream || !seed || !guardrailId) {
       ctx.skip();
       return;
     }
-    await admin.json("PUT", `/admin/v1/guardrails/${guardrailId}`, {
+    await seed.update("guardrails", guardrailId, {
       name: "moderation-e2e-guard",
       enabled: true,
       hook_point: "input",
@@ -296,13 +293,13 @@ describe("openai moderation guardrail e2e: flagged blocks, monitor allows, thres
   });
 
   test("category threshold mode enforces the configured category only", async (ctx) => {
-    if (!etcdReachable || !app || !upstream || !admin || !guardrailId) {
+    if (!etcdReachable || !app || !upstream || !seed || !guardrailId) {
       ctx.skip();
       return;
     }
     // violence>=0.3 blocks even though the mock does NOT set flagged for
     // MILD_MARKER (score 0.4) — the threshold overrides the API boolean.
-    await admin.json("PUT", `/admin/v1/guardrails/${guardrailId}`, {
+    await seed.update("guardrails", guardrailId, {
       name: "moderation-e2e-guard",
       enabled: true,
       hook_point: "input",

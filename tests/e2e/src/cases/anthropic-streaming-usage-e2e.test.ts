@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
@@ -84,11 +84,12 @@ const STREAM_EVENTS = [
 describe("anthropic /v1/messages streaming usage telemetry (#245)", () => {
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
-  let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let etcdReachable = false;
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     // Path-agnostic mock: the DP forwards /v1/messages to
@@ -100,22 +101,22 @@ describe("anthropic /v1/messages streaming usage telemetry (#245)", () => {
       eventDelayMs: 2,
     });
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    seed = new SeedClient(etcd, app.etcdPrefix);
 
     // Anthropic-provider model → exercises the byte-passthrough
     // streaming branch (the one #245 fixes), not the translated path.
-    const pk = await admin.createProviderKey({
+    const pk = await seed.createProviderKey({
       display_name: "anth-stream-usage-pk",
       secret: "sk-anth-mock",
       api_base: upstream.baseUrl,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "anth-stream-usage",
       provider: "anthropic",
       model_name: "claude-3-5-haiku-20241022",
       provider_key_id: pk.id,
     });
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["anth-stream-usage"],
     });

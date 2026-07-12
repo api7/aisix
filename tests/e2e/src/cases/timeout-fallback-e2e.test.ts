@@ -2,8 +2,8 @@ import { createHash } from "node:crypto";
 import OpenAI, { APIError } from "openai";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
@@ -75,7 +75,7 @@ function streamFor(content: string): string[] {
 
 describe("timeout fallback e2e (#554)", () => {
   let app: SpawnedApp | undefined;
-  let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let etcdReachable = false;
 
   // Non-streaming upstreams.
@@ -89,7 +89,8 @@ describe("timeout fallback e2e (#554)", () => {
   let stBackup: OpenAiUpstream | undefined;
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     nsSlow = await startOpenAiUpstream({
@@ -116,11 +117,11 @@ describe("timeout fallback e2e (#554)", () => {
     });
 
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    seed = new SeedClient(etcd, app.etcdPrefix);
 
     const pk = async (name: string, u: OpenAiUpstream) =>
       (
-        await admin!.createProviderKey({
+        await seed!.createProviderKey({
           display_name: name,
           secret: "sk-mock",
           api_base: `${u.baseUrl}/v1`,
@@ -138,7 +139,7 @@ describe("timeout fallback e2e (#554)", () => {
     // Direct targets. Cooldown is disabled on the slow/stall primaries so a
     // timeout doesn't take them out of rotation between probe and test call
     // (mirrors fallback-e2e).
-    await admin.createModel({
+    await seed.createModel({
       display_name: "t-m-ns-slow",
       provider: "openai",
       model_name: "gpt-4o-mini",
@@ -146,20 +147,20 @@ describe("timeout fallback e2e (#554)", () => {
       timeout: TIMEOUT_MS,
       cooldown: { enabled: false },
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "t-m-ns-fast",
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: nsFastPk,
       timeout: GENEROUS_MS,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "t-m-ns-backup",
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: nsBackupPk,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "t-m-st-slow",
       provider: "openai",
       model_name: "gpt-4o-mini",
@@ -167,14 +168,14 @@ describe("timeout fallback e2e (#554)", () => {
       stream_timeout: TIMEOUT_MS,
       cooldown: { enabled: false },
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "t-m-st-fast",
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: stFastPk,
       stream_timeout: GENEROUS_MS,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "t-m-st-stall",
       provider: "openai",
       model_name: "gpt-4o-mini",
@@ -182,7 +183,7 @@ describe("timeout fallback e2e (#554)", () => {
       stream_timeout: TIMEOUT_MS,
       cooldown: { enabled: false },
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "t-m-st-backup",
       provider: "openai",
       model_name: "gpt-4o-mini",
@@ -190,7 +191,7 @@ describe("timeout fallback e2e (#554)", () => {
     });
 
     const router = async (name: string, targets: string[]) =>
-      admin!.createModel({
+      seed!.createModel({
         display_name: name,
         routing: { strategy: "failover", targets: targets.map((model) => ({ model })) },
       });
@@ -200,7 +201,7 @@ describe("timeout fallback e2e (#554)", () => {
     await router("t-r-st-fast", ["t-m-st-fast", "t-m-st-backup"]);
     await router("t-r-st-stall", ["t-m-st-stall", "t-m-st-backup"]);
 
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: [
         "t-r-ns-timeout",

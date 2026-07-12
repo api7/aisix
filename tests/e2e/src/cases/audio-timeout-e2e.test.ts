@@ -2,8 +2,8 @@ import { createHash } from "node:crypto";
 import OpenAI from "openai";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
@@ -45,13 +45,14 @@ function chatReply(content: string): unknown {
 
 describe("audio request timeout (#911 [22])", () => {
   let app: SpawnedApp | undefined;
-  let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let slow: OpenAiUpstream | undefined;
   let fast: OpenAiUpstream | undefined;
   let etcdReachable = false;
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     // Slow upstream (delays status + headers) behind the audio model, and a
@@ -63,24 +64,24 @@ describe("audio request timeout (#911 [22])", () => {
     fast = await startOpenAiUpstream({ nonStreamBody: chatReply("ready") });
 
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    seed = new SeedClient(etcd, app.etcdPrefix);
 
     const slowPk = (
-      await admin.createProviderKey({
+      await seed.createProviderKey({
         display_name: "audio-slow-pk",
         secret: "sk-mock",
         api_base: `${slow.baseUrl}/v1`,
       })
     ).id;
     const fastPk = (
-      await admin.createProviderKey({
+      await seed.createProviderKey({
         display_name: "audio-gate-pk",
         secret: "sk-mock",
         api_base: `${fast.baseUrl}/v1`,
       })
     ).id;
 
-    await admin.createModel({
+    await seed.createModel({
       display_name: "audio-slow",
       provider: "openai",
       model_name: "whisper-1",
@@ -90,14 +91,14 @@ describe("audio request timeout (#911 [22])", () => {
       // between the propagation probe and the test call.
       cooldown: { enabled: false },
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "gate-fast",
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: fastPk,
     });
 
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["audio-slow", "gate-fast"],
     });

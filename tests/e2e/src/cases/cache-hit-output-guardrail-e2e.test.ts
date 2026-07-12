@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
@@ -27,28 +27,29 @@ const CACHED_PROMPT = "cache-and-guard-me";
 describe("cache hit runs output guardrails (#448)", () => {
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
-  let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let etcdReachable = false;
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
     upstream = await startOpenAiUpstream();
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
-    const pk = await admin.createProviderKey({
+    seed = new SeedClient(etcd, app.etcdPrefix);
+    const pk = await seed.createProviderKey({
       display_name: "cache-gr-pk",
       secret: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "cache-gr",
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: pk.id,
     });
-    await admin.createApiKey({ key_hash: HASH, allowed_models: ["cache-gr"] });
-    await admin.json("POST", "/admin/v1/cache_policies", {
+    await seed.createApiKey({ key_hash: HASH, allowed_models: ["cache-gr"] });
+    await seed.createCachePolicy({
       name: "cache-gr-policy",
       enabled: true,
       applies_to: "all",
@@ -82,7 +83,7 @@ describe("cache hit runs output guardrails (#448)", () => {
     expect(first.headers.get("x-aisix-cache")).toBe("miss");
 
     // 2) Attach an output guardrail blocking the canned reply text.
-    await admin!.json("POST", "/admin/v1/guardrails", {
+    await seed!.createGuardrail({
       name: "cache-gr-output-keyword",
       enabled: true,
       hook_point: "output",

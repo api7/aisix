@@ -2,8 +2,8 @@ import { createHash } from "node:crypto";
 import OpenAI from "openai";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
@@ -43,20 +43,21 @@ function chatReply(content: string): unknown {
 
 describe("metric label cardinality for unresolved model (#911 [27])", () => {
   let app: SpawnedApp | undefined;
-  let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let upstream: OpenAiUpstream | undefined;
   let etcdReachable = false;
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     upstream = await startOpenAiUpstream({ nonStreamBody: chatReply("ready") });
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    seed = new SeedClient(etcd, app.etcdPrefix);
 
     const pk = (
-      await admin.createProviderKey({
+      await seed.createProviderKey({
         display_name: "card-pk",
         secret: "sk-mock",
         api_base: `${upstream.baseUrl}/v1`,
@@ -64,7 +65,7 @@ describe("metric label cardinality for unresolved model (#911 [27])", () => {
     ).id;
 
     // One real model, used only to gate on config propagation.
-    await admin.createModel({
+    await seed.createModel({
       display_name: "card-gate",
       provider: "openai",
       model_name: "gpt-4o-mini",
@@ -74,7 +75,7 @@ describe("metric label cardinality for unresolved model (#911 [27])", () => {
     // Wildcard so ANY model name passes the allowed_models authz check and
     // reaches model resolution — where the unknown names fail (model-not-
     // found) and hit the metric-recording error path under test.
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["*"],
     });

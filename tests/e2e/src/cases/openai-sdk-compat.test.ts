@@ -52,6 +52,7 @@ describe("openai SDK compat: drive gateway through real client", () => {
     });
 
     app = await spawnApp();
+    // Deliberately seeds via the Admin API: deprecation-window coverage.
     admin = new AdminClient(app.adminUrl, app.adminKey);
 
     // Two ProviderKeys → two Models — keeps `receivedRequests` on each

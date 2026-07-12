@@ -3,8 +3,8 @@ import { createHash } from "node:crypto";
 import OpenAI, { APIError } from "openai";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   pickFreePort,
   spawnApp,
   startOpenAiUpstream,
@@ -166,7 +166,7 @@ describe("presidio guardrail e2e: block, input/output redaction, operators", () 
   let upstream: OpenAiUpstream | undefined;
   let streamUpstream: OpenAiUpstream | undefined;
   let presidio: PresidioMock | undefined;
-  let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let guardrailId: string | undefined;
   let etcdReachable = false;
 
@@ -189,7 +189,8 @@ describe("presidio guardrail e2e: block, input/output redaction, operators", () 
   });
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     presidio = await startPresidioMock();
@@ -230,40 +231,36 @@ describe("presidio guardrail e2e: block, input/output redaction, operators", () 
     });
 
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    seed = new SeedClient(etcd, app.etcdPrefix);
 
-    const pk = await admin.createProviderKey({
+    const pk = await seed.createProviderKey({
       display_name: "presidio-e2e-pk",
       secret: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "presidio-e2e",
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: pk.id,
     });
-    const streamPk = await admin.createProviderKey({
+    const streamPk = await seed.createProviderKey({
       display_name: "presidio-stream-e2e-pk",
       secret: "sk-mock",
       api_base: `${streamUpstream.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "presidio-stream-e2e",
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: streamPk.id,
     });
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: hash(CALLER),
       allowed_models: ["presidio-e2e", "presidio-stream-e2e"],
     });
 
-    const created = await admin.json<{ id: string }>(
-      "POST",
-      "/admin/v1/guardrails",
-      guardrailBody("replace"),
-    );
+    const created = await seed.createGuardrail(guardrailBody("replace"));
     guardrailId = created.id;
   });
 
@@ -288,11 +285,15 @@ describe("presidio guardrail e2e: block, input/output redaction, operators", () 
   // baseline with a full PUT + its own propagation probe.
   const ensureGuardrailLive = () =>
     waitConfigPropagation(async () => {
-      const r = await client().chat.completions.create({
-        model: "presidio-e2e",
-        messages: [{ role: "user", content: "probe" }],
-      });
-      return (r.choices[0]?.message?.content ?? "").includes("<EMAIL_ADDRESS>");
+      try {
+        const r = await client().chat.completions.create({
+          model: "presidio-e2e",
+          messages: [{ role: "user", content: "probe" }],
+        });
+        return (r.choices[0]?.message?.content ?? "").includes("<EMAIL_ADDRESS>");
+      } catch {
+        return false; // caller key / model still propagating
+      }
     });
 
   test("redact: request PII anonymized before the upstream, response PII before the caller", async (ctx) => {
@@ -392,15 +393,11 @@ describe("presidio guardrail e2e: block, input/output redaction, operators", () 
   });
 
   test("hash operator: anonymizer is driven with hash config and its output is honored", async (ctx) => {
-    if (!etcdReachable || !app || !upstream || !admin || !guardrailId || !presidio) {
+    if (!etcdReachable || !app || !upstream || !seed || !guardrailId || !presidio) {
       ctx.skip();
       return;
     }
-    await admin.json(
-      "PUT",
-      `/admin/v1/guardrails/${guardrailId}`,
-      guardrailBody("hash"),
-    );
+    await seed.update("guardrails", guardrailId, guardrailBody("hash"));
 
     // Propagation probe: the anonymized reply flips from <EMAIL_ADDRESS>
     // to the mock's fixed hash output.

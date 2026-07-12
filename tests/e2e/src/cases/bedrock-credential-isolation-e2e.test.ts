@@ -2,8 +2,8 @@ import { createHash } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   pickFreePort,
   spawnApp,
   startOpenAiUpstream,
@@ -117,19 +117,19 @@ function bedrockGuardrail(
   };
 }
 
-async function seedRouting(admin: AdminClient, upstream: OpenAiUpstream) {
-  const pk = await admin.createProviderKey({
+async function seedRouting(seed: SeedClient, upstream: OpenAiUpstream) {
+  const pk = await seed.createProviderKey({
     display_name: "bedrock-iso-pk",
     secret: PROVIDER_SECRET,
     api_base: `${upstream.baseUrl}/v1`,
   });
-  await admin.createModel({
+  await seed.createModel({
     display_name: "bedrock-iso-model",
     provider: "openai",
     model_name: "gpt-4o-mini",
     provider_key_id: pk.id,
   });
-  await admin.createApiKey({
+  await seed.createApiKey({
     key_hash: CALLER_KEY_HASH,
     allowed_models: ["bedrock-iso-model"],
   });
@@ -157,11 +157,12 @@ describe("bedrock guardrail credential isolation (#519 UV.3)", () => {
   let upstream: OpenAiUpstream | undefined;
   let bedrock: MockBedrock | undefined;
   let app: SpawnedApp | undefined;
-  let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let guardrailAId: string | undefined;
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
     upstream = await startOpenAiUpstream();
     bedrock = await startMockBedrock();
@@ -176,13 +177,13 @@ describe("bedrock guardrail credential isolation (#519 UV.3)", () => {
         AWS_REGION: "us-west-2",
       },
     });
-    admin = new AdminClient(app.adminUrl, app.adminKey);
-    await seedRouting(admin, upstream);
-    const created = (await admin.json("POST", "/admin/v1/guardrails", {
+    seed = new SeedClient(etcd, app.etcdPrefix);
+    await seedRouting(seed, upstream);
+    const created = (await seed.createGuardrail({
       ...bedrockGuardrail("gr-bedrock-a", GUARD_A, KEY_A),
     })) as { id: string };
     guardrailAId = created.id;
-    await admin.json("POST", "/admin/v1/guardrails", {
+    await seed.createGuardrail({
       ...bedrockGuardrail("gr-bedrock-b", GUARD_B, KEY_B),
     });
 
@@ -242,9 +243,9 @@ describe("bedrock guardrail credential isolation (#519 UV.3)", () => {
         ctx.skip();
         return;
       }
-      await admin!.json(
-        "PUT",
-        `/admin/v1/guardrails/${guardrailAId}`,
+      await seed!.update(
+        "guardrails",
+        guardrailAId,
         bedrockGuardrail("gr-bedrock-a", GUARD_A, KEY_A2),
       );
 

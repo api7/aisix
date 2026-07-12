@@ -4,6 +4,7 @@ import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   AdminClient,
   EtcdClient,
+  SeedClient,
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
@@ -19,13 +20,15 @@ const CALLER_KEY_HASH = createHash("sha256")
 describe("runtime mixed filtering e2e", () => {
   let app: SpawnedApp | undefined;
   let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let etcdReachable = false;
   let unhealthyUpstream: OpenAiUpstream | undefined;
   let cooldownUpstream: OpenAiUpstream | undefined;
   let healthyUpstream: OpenAiUpstream | undefined;
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     unhealthyUpstream = await startOpenAiUpstream({
@@ -75,24 +78,25 @@ describe("runtime mixed filtering e2e", () => {
 
     app = await spawnApp();
     admin = new AdminClient(app.adminUrl, app.adminKey);
+    seed = new SeedClient(etcd, app.etcdPrefix);
 
-    const unhealthyPk = await admin.createProviderKey({
+    const unhealthyPk = await seed.createProviderKey({
       display_name: "mixed-unhealthy-pk",
       secret: "sk-mock",
       api_base: `${unhealthyUpstream.baseUrl}/v1`,
     });
-    const cooldownPk = await admin.createProviderKey({
+    const cooldownPk = await seed.createProviderKey({
       display_name: "mixed-cooldown-pk",
       secret: "sk-mock",
       api_base: `${cooldownUpstream.baseUrl}/v1`,
     });
-    const healthyPk = await admin.createProviderKey({
+    const healthyPk = await seed.createProviderKey({
       display_name: "mixed-healthy-pk",
       secret: "sk-mock",
       api_base: `${healthyUpstream.baseUrl}/v1`,
     });
 
-    await admin.createModel({
+    await seed.createModel({
       display_name: "mixed-unhealthy",
       provider: "openai",
       model_name: "gpt-4o-mini",
@@ -107,20 +111,20 @@ describe("runtime mixed filtering e2e", () => {
         stale_after_seconds: 90,
       },
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "mixed-cooldown",
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: cooldownPk.id,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "mixed-healthy",
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: healthyPk.id,
     });
 
-    await admin.createModel({
+    await seed.createModel({
       display_name: "mixed-router",
       routing: {
         strategy: "failover",
@@ -133,7 +137,7 @@ describe("runtime mixed filtering e2e", () => {
       },
     });
 
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["mixed-router", "mixed-cooldown", "mixed-healthy"],
     });

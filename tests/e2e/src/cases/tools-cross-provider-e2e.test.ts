@@ -2,8 +2,8 @@ import { createHash } from "node:crypto";
 import OpenAI from "openai";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
@@ -57,11 +57,12 @@ const CALLER_KEY_HASH = createHash("sha256")
 describe("tools cross-provider e2e: OpenAI tools → Anthropic upstream tool_use → OpenAI tool_calls back", () => {
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
-  let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let etcdReachable = false;
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     // Mock Anthropic upstream returns a Messages-shape response
@@ -87,24 +88,24 @@ describe("tools cross-provider e2e: OpenAI tools → Anthropic upstream tool_use
       },
     });
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    seed = new SeedClient(etcd, app.etcdPrefix);
 
     // Anthropic api_base = bare host; bridge composes /v1/messages
     // (mirrors anthropic-upstream-e2e convention).
-    const pk = await admin.createProviderKey({
+    const pk = await seed.createProviderKey({
       display_name: "tools-xprov-pk",
       provider: "anthropic",
       adapter: "anthropic",
       secret: "sk-ant-mock",
       api_base: upstream.baseUrl,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "tools-xprov",
       provider: "anthropic",
       model_name: "claude-3-5-sonnet-20241022",
       provider_key_id: pk.id,
     });
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["tools-xprov"],
     });

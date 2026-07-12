@@ -2,8 +2,8 @@ import { createHash, randomUUID } from "node:crypto";
 import { connect } from "node:net";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   ProxyClient,
   spawnApp,
   startOpenAiUpstream,
@@ -79,22 +79,22 @@ function chatRequest(proxyUrl: string, model: string): Promise<Response> {
   });
 }
 
-/** Seed one model + an RPM=1 ApiKey via this app's admin API. The peer
- *  replica picks the same config up over the shared etcd watch. */
-async function seed(app: SpawnedApp, upstreamBase: string, model: string) {
-  const admin = new AdminClient(app.adminUrl, app.adminKey);
-  const pk = await admin.createProviderKey({
+/** Seed one model + an RPM=1 ApiKey into the SHARED config namespace —
+ *  both replicas pick it up over the same etcd watch. */
+async function seed(etcdRoot: string, upstreamBase: string, model: string) {
+  const seed = new SeedClient(new EtcdClient(), etcdRoot);
+  const pk = await seed.createProviderKey({
     display_name: `${model}-pk`,
     secret: "sk-mock",
     api_base: `${upstreamBase}/v1`,
   });
-  await admin.createModel({
+  await seed.createModel({
     display_name: model,
     provider: "openai",
     model_name: "gpt-4o-mini",
     provider_key_id: pk.id,
   });
-  await admin.createApiKey({
+  await seed.createApiKey({
     key_hash: CALLER_KEY_HASH,
     allowed_models: [model],
     rate_limit: { rpm: 1 },
@@ -132,7 +132,7 @@ describe("rate limit is shared across replicas with backend=redis (#798)", () =>
     };
     appA = await spawnApp({ extra });
     appB = await spawnApp({ extra });
-    await seed(appA, upstream.baseUrl, model);
+    await seed(prefix, upstream.baseUrl, model);
     await waitModelLive(appA.proxyUrl, model);
     await waitModelLive(appB.proxyUrl, model);
   });
@@ -175,7 +175,8 @@ describe("rate limit is NOT shared with backend=memory (per-replica, the #798 bu
   const model = "rl-cluster-mem";
 
   beforeAll(async () => {
-    etcdReady = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReady = await etcd.ping();
     if (!etcdReady) return;
 
     upstream = await startOpenAiUpstream();
@@ -184,7 +185,7 @@ describe("rate limit is NOT shared with backend=memory (per-replica, the #798 bu
     const extra = { etcd: sharedEtcd(prefix) };
     appA = await spawnApp({ extra });
     appB = await spawnApp({ extra });
-    await seed(appA, upstream.baseUrl, model);
+    await seed(prefix, upstream.baseUrl, model);
     await waitModelLive(appA.proxyUrl, model);
     await waitModelLive(appB.proxyUrl, model);
   });

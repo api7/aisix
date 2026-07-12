@@ -2,8 +2,8 @@ import { createHash } from "node:crypto";
 import OpenAI, { APIError } from "openai";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
@@ -38,11 +38,12 @@ describe("output guardrail e2e: model-emitted forbidden text is blocked before r
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
   let streamUpstream: OpenAiUpstream | undefined;
-  let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let etcdReachable = false;
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     // Mock upstream emits an OpenAI-shape completion that CONTAINS
@@ -70,26 +71,26 @@ describe("output guardrail e2e: model-emitted forbidden text is blocked before r
     });
 
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    seed = new SeedClient(etcd, app.etcdPrefix);
 
-    const pk = await admin.createProviderKey({
+    const pk = await seed.createProviderKey({
       display_name: "gr-out-e2e-pk",
       secret: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "gr-out-e2e",
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: pk.id,
     });
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["gr-out-e2e"],
     });
     // Output guardrail: runs against the assistant's response after
     // the upstream call returns, before relay to the caller.
-    await admin.json("POST", "/admin/v1/guardrails", {
+    await seed.createGuardrail({
       name: "gr-out-e2e-keyword",
       enabled: true,
       hook_point: "output",
@@ -114,19 +115,19 @@ describe("output guardrail e2e: model-emitted forbidden text is blocked before r
       ],
       eventDelayMs: 50,
     });
-    const streamPk = await admin.createProviderKey({
+    const streamPk = await seed.createProviderKey({
       display_name: "gr-out-stream-e2e-pk",
       secret: "sk-mock",
       api_base: `${streamUpstream.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "gr-out-stream-e2e",
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: streamPk.id,
     });
     // Add the streaming Model alias to the existing caller's allow-list.
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: createHash("sha256")
         .update(`${CALLER_PLAINTEXT}-stream`)
         .digest("hex"),
@@ -324,7 +325,7 @@ describe("output guardrail e2e: model-emitted forbidden text is blocked before r
   });
 
   test("streaming Allow path: clean content streams to caller with [DONE], no error event (#204 audit M3)", async (ctx) => {
-    if (!etcdReachable || !app || !admin) {
+    if (!etcdReachable || !app || !seed) {
       ctx.skip();
       return;
     }
@@ -347,19 +348,19 @@ describe("output guardrail e2e: model-emitted forbidden text is blocked before r
       ],
       eventDelayMs: 50,
     });
-    const cleanPk = await admin.createProviderKey({
+    const cleanPk = await seed.createProviderKey({
       display_name: "gr-out-stream-clean-pk",
       secret: "sk-mock",
       api_base: `${cleanUpstream.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "gr-out-stream-clean-e2e",
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: cleanPk.id,
     });
     const cleanCallerPlaintext = `${CALLER_PLAINTEXT}-stream-clean`;
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: createHash("sha256")
         .update(cleanCallerPlaintext)
         .digest("hex"),

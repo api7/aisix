@@ -2,8 +2,8 @@ import { createHash } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   pickFreePort,
   spawnApp,
   startOpenAiUpstream,
@@ -166,7 +166,8 @@ describe("/v1/responses cross-provider → Anthropic (#825)", () => {
   let etcdReachable = false;
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     nsUpstream = await startOpenAiUpstream({ nonStreamBody: ANTHROPIC_NONSTREAM });
@@ -175,9 +176,9 @@ describe("/v1/responses cross-provider → Anthropic (#825)", () => {
       eventDelayMs: 2,
     });
     app = await spawnApp();
-    const admin = new AdminClient(app.adminUrl, app.adminKey);
+    const seed = new SeedClient(etcd, app.etcdPrefix);
     otlp = await startOtlpReceiver();
-    await admin.createObservabilityExporter({
+    await seed.createObservabilityExporter({
       name: "issue825-otlp",
       enabled: true,
       kind: "otlp_http",
@@ -186,33 +187,33 @@ describe("/v1/responses cross-provider → Anthropic (#825)", () => {
 
     // Two Anthropic-backed models, one per mock (non-streaming vs streaming);
     // api_base is the bare host — the bridge composes `/v1/messages`.
-    const nsPk = await admin.createProviderKey({
+    const nsPk = await seed.createProviderKey({
       display_name: "issue825-ns-pk",
       provider: "anthropic",
       adapter: "anthropic",
       secret: "sk-ant-mock",
       api_base: nsUpstream.baseUrl,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "opus-4.7",
       provider: "anthropic",
       model_name: "claude-3-haiku-20240307",
       provider_key_id: nsPk.id,
     });
-    const streamPk = await admin.createProviderKey({
+    const streamPk = await seed.createProviderKey({
       display_name: "issue825-stream-pk",
       provider: "anthropic",
       adapter: "anthropic",
       secret: "sk-ant-mock",
       api_base: streamUpstream.baseUrl,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "opus-4.7-stream",
       provider: "anthropic",
       model_name: "claude-3-haiku-20240307",
       provider_key_id: streamPk.id,
     });
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["opus-4.7", "opus-4.7-stream"],
     });

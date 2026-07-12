@@ -2,8 +2,8 @@ import { createHash } from "node:crypto";
 import OpenAI, { APIError } from "openai";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
@@ -143,17 +143,18 @@ const CASES: ReadonlyArray<ProviderCase> = [
 
 describe("error envelope normalization e2e: provider-native 4xx → OpenAI-shape envelope", () => {
   let app: SpawnedApp | undefined;
-  let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let etcdReachable = false;
   const upstreams: OpenAiUpstream[] = [];
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
-    await admin.createApiKey({
+    seed = new SeedClient(etcd, app.etcdPrefix);
+    await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["*"],
     });
@@ -166,7 +167,7 @@ describe("error envelope normalization e2e: provider-native 4xx → OpenAI-shape
 
   for (const tc of CASES) {
     test(`${tc.provider} upstream 400 → caller sees OpenAI-shape error envelope with preserved status + reason`, async (ctx) => {
-      if (!etcdReachable || !app || !admin) {
+      if (!etcdReachable || !app || !seed) {
         ctx.skip();
         return;
       }
@@ -182,7 +183,7 @@ describe("error envelope normalization e2e: provider-native 4xx → OpenAI-shape
       });
       upstreams.push(upstream);
 
-      const pk = await admin.createProviderKey({
+      const pk = await seed.createProviderKey({
         display_name: `${tc.displayName}-pk`,
         secret: "sk-mock",
         api_base: `${upstream.baseUrl}${tc.apiBaseSuffix}`,
@@ -194,7 +195,7 @@ describe("error envelope normalization e2e: provider-native 4xx → OpenAI-shape
         provider: tc.provider,
         adapter: tc.adapter,
       });
-      await admin.createModel({
+      await seed.createModel({
         display_name: tc.displayName,
         provider: tc.provider,
         model_name: tc.upstreamModelId,

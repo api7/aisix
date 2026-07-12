@@ -265,4 +265,88 @@ describe("seed-vs-admin characterization: direct etcd writes ≡ Admin API write
       normalize(find(exporters, adminExporter.id, "admin exporter").value, ["name"]),
     );
   });
+
+  // Declared last on purpose: it mutates then removes seed-created
+  // resources the earlier tests rely on.
+  test("seed update rewrites the stored document; seed delete revokes it", async (ctx) => {
+    if (!etcdReachable || !admin || !app || !upstream || !seed) {
+      ctx.skip();
+      return;
+    }
+
+    // -- update: overwrite the seeded model's document with a new
+    // upstream model_name. Admin GET reads etcd directly, so the store
+    // must reflect the write immediately; the proxy snapshot follows
+    // after propagation.
+    const updated = { ...seedModel.value, model_name: "gpt-4o-mini-updated" };
+    await seed.update("models", seedModel.id, updated);
+
+    const models = await admin.json<Entry[]>("GET", "/admin/v1/models");
+    expect(models.find((m) => m.id === seedModel.id)?.value.model_name).toBe(
+      "gpt-4o-mini-updated",
+    );
+
+    const seedCaller = new OpenAI({
+      apiKey: SEED_CALLER,
+      baseURL: `${app.proxyUrl}/v1`,
+      maxRetries: 0,
+    });
+    // Propagated when a chat through the alias forwards the NEW
+    // model_name to the upstream — the strongest observable effect of
+    // the update (a 200 alone would pass on the stale snapshot too).
+    await waitConfigPropagation(async () => {
+      try {
+        const r = await seedCaller.chat.completions.create({
+          model: "char-seed-model",
+          messages: [{ role: "user", content: "update-probe" }],
+        });
+        if (r.choices[0]?.message.role !== "assistant") return false;
+        const last = upstream!.receivedRequests.at(-1);
+        return (
+          last !== undefined &&
+          (JSON.parse(last.body) as { model?: string }).model ===
+            "gpt-4o-mini-updated"
+        );
+      } catch {
+        return false;
+      }
+    });
+
+    // -- delete: remove the seeded caller key. The store no longer
+    // returns it, and after propagation its bearer stops
+    // authenticating (fail-closed), while the admin-created caller is
+    // untouched.
+    await seed.delete("api_keys", seedKey.id);
+    expect(
+      await etcdClient!.get(`${app.etcdPrefix}/api_keys/${seedKey.id}`),
+    ).toBeUndefined();
+
+    await waitConfigPropagation(async () => {
+      try {
+        await seedCaller.chat.completions.create({
+          model: "char-seed-model",
+          messages: [{ role: "user", content: "revoked-probe" }],
+        });
+        return false; // still authenticating — not propagated yet
+      } catch (err) {
+        return (
+          err instanceof APIError && (err.status === 401 || err.status === 403)
+        );
+      }
+    });
+
+    // Control probe: the delete revoked only that key — the
+    // admin-created caller still serves (rules out "gateway fell over"
+    // as the reason the seed caller went dark).
+    const adminCaller = new OpenAI({
+      apiKey: ADMIN_CALLER,
+      baseURL: `${app.proxyUrl}/v1`,
+      maxRetries: 0,
+    });
+    const control = await adminCaller.chat.completions.create({
+      model: "char-admin-model",
+      messages: [{ role: "user", content: "control-probe" }],
+    });
+    expect(control.choices[0]?.message.role).toBe("assistant");
+  });
 });

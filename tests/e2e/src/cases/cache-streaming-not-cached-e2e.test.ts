@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
@@ -60,11 +60,12 @@ const SSE_EVENTS = [
 describe("cache streaming bypass e2e: streaming responses are never cached", () => {
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
-  let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let etcdReachable = false;
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     // Mock dispatches by config: when streamEvents is configured,
@@ -82,33 +83,33 @@ describe("cache streaming bypass e2e: streaming responses are never cached", () 
       nonStreamMock;
 
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    seed = new SeedClient(etcd, app.etcdPrefix);
 
-    const pkStream = await admin.createProviderKey({
+    const pkStream = await seed.createProviderKey({
       display_name: "stream-nocache-stream-pk",
       secret: "sk-mock",
       api_base: `${streamMock.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "stream-nocache-stream-model",
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: pkStream.id,
     });
 
-    const pkNon = await admin.createProviderKey({
+    const pkNon = await seed.createProviderKey({
       display_name: "stream-nocache-non-pk",
       secret: "sk-mock",
       api_base: `${nonStreamMock.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "stream-nocache-non-model",
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: pkNon.id,
     });
 
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: [
         "stream-nocache-stream-model",
@@ -118,7 +119,7 @@ describe("cache streaming bypass e2e: streaming responses are never cached", () 
     // Single enabled policy applies to all — both Models are in
     // its scope. The streaming Model should bypass it anyway; the
     // non-streaming Model uses it normally.
-    await admin.json("POST", "/admin/v1/cache_policies", {
+    await seed.createCachePolicy({
       name: "stream-nocache-policy",
       enabled: true,
       applies_to: "all",

@@ -4,6 +4,7 @@ import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   AdminClient,
   EtcdClient,
+  SeedClient,
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
@@ -66,11 +67,13 @@ describe("provider_key rotation: zero in-flight disruption (#196 L3 / #271)", ()
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
   let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let pkId = "";
   let etcdReachable = false;
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     upstream = await startOpenAiUpstream({
@@ -88,20 +91,21 @@ describe("provider_key rotation: zero in-flight disruption (#196 L3 / #271)", ()
 
     app = await spawnApp();
     admin = new AdminClient(app.adminUrl, app.adminKey);
+    seed = new SeedClient(etcd, app.etcdPrefix);
 
-    const pk = await admin.createProviderKey({
+    const pk = await seed.createProviderKey({
       display_name: "pkrot-pk",
       secret: "sk-mock-v1",
       api_base: `${upstream.baseUrl}/v1`,
     });
     pkId = pk.id;
-    await admin.createModel({
+    await seed.createModel({
       display_name: "rot-model",
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: pk.id,
     });
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["rot-model"],
     });
@@ -159,7 +163,7 @@ describe("provider_key rotation: zero in-flight disruption (#196 L3 / #271)", ()
         if (i === ROTATE_AT && !rotated) {
           rotated = true;
           // Rotate the credential in place: same id + api_base, new secret.
-          await admin!.json("PUT", `/admin/v1/provider_keys/${pkId}`, {
+          await seed!.update("provider_keys", pkId, {
             provider: "openai",
             adapter: "openai",
             display_name: "pkrot-pk",
