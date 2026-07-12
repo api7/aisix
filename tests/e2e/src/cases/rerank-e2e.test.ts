@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
@@ -56,11 +56,12 @@ const CALLER_KEY_HASH = createHash("sha256")
 describe("rerank e2e: /v1/rerank verbatim forward + model translation", () => {
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
-  let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let etcdReachable = false;
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     // Mock upstream returns a canned Cohere-shape rerank response
@@ -81,20 +82,20 @@ describe("rerank e2e: /v1/rerank verbatim forward + model translation", () => {
       },
     });
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    seed = new SeedClient(etcd, app.etcdPrefix);
 
-    const pk = await admin.createProviderKey({
+    const pk = await seed.createProviderKey({
       display_name: "rerank-pk",
       secret: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "rerank-e2e",
       provider: "openai",
       model_name: "rerank-english-v3.0",
       provider_key_id: pk.id,
     });
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["rerank-e2e"],
     });
@@ -206,7 +207,7 @@ describe("rerank e2e: /v1/rerank verbatim forward + model translation", () => {
   });
 
   test("Cohere provider: gateway dispatches with Bearer auth + rewritten model (#213 Phase 1)", async (ctx) => {
-    if (!etcdReachable || !app || !admin || !upstream) {
+    if (!etcdReachable || !app || !seed || !upstream) {
       ctx.skip();
       return;
     }
@@ -218,7 +219,7 @@ describe("rerank e2e: /v1/rerank verbatim forward + model translation", () => {
     // Bearer <key>` auth, so the gateway forwards verbatim with the
     // `model` field rewritten — no transform required.
     const cohereSecret = "sk-cohere-mock-e2e";
-    const coherePk = await admin.createProviderKey({
+    const coherePk = await seed.createProviderKey({
       display_name: "rerank-cohere-pk",
       secret: cohereSecret,
       // Operator can also set this to `https://api.cohere.com`; the
@@ -226,14 +227,14 @@ describe("rerank e2e: /v1/rerank verbatim forward + model translation", () => {
       // form.
       api_base: `${upstream.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "rerank-cohere",
       provider: "cohere",
       model_name: "rerank-english-v3.0",
       provider_key_id: coherePk.id,
     });
     const cohereCallerPlaintext = `${CALLER_PLAINTEXT}-cohere`;
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: createHash("sha256")
         .update(cohereCallerPlaintext)
         .digest("hex"),
@@ -330,7 +331,7 @@ describe("rerank e2e: /v1/rerank verbatim forward + model translation", () => {
   });
 
   test("Jina provider: gateway dispatches with Bearer auth + rewritten model (#213 Phase 2)", async (ctx) => {
-    if (!etcdReachable || !app || !admin || !upstream) {
+    if (!etcdReachable || !app || !seed || !upstream) {
       ctx.skip();
       return;
     }
@@ -343,19 +344,19 @@ describe("rerank e2e: /v1/rerank verbatim forward + model translation", () => {
     // OpenAI-compat. The gateway forwards verbatim with only the
     // `model` field rewritten.
     const jinaSecret = "jina_mock_secret_e2e";
-    const jinaPk = await admin.createProviderKey({
+    const jinaPk = await seed.createProviderKey({
       display_name: "rerank-jina-pk",
       secret: jinaSecret,
       api_base: `${upstream.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "rerank-jina",
       provider: "jina",
       model_name: "jina-reranker-v2-base-multilingual",
       provider_key_id: jinaPk.id,
     });
     const jinaCallerPlaintext = `${CALLER_PLAINTEXT}-jina`;
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: createHash("sha256")
         .update(jinaCallerPlaintext)
         .digest("hex"),
@@ -441,7 +442,7 @@ describe("rerank e2e: /v1/rerank verbatim forward + model translation", () => {
   });
 
   test("non-OpenAI provider returns 400 invalid_request_error, upstream untouched (#212 / docs §4.7)", async (ctx) => {
-    if (!etcdReachable || !app || !admin || !upstream) {
+    if (!etcdReachable || !app || !seed || !upstream) {
       ctx.skip();
       return;
     }
@@ -452,19 +453,19 @@ describe("rerank e2e: /v1/rerank verbatim forward + model translation", () => {
     // and the upstream returned 404 (Anthropic / DeepSeek have no
     // rerank API; Gemini's OpenAI-compat surface doesn't expose
     // /v1/rerank). #212 covers the e2e gap on this contract.
-    const nonOaPk = await admin.createProviderKey({
+    const nonOaPk = await seed.createProviderKey({
       display_name: "rerank-anthropic-pk",
       secret: "sk-ant-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "rerank-anthropic",
       provider: "anthropic",
       model_name: "claude-3-5-haiku-20241022",
       provider_key_id: nonOaPk.id,
     });
     const nonOaCaller = `${CALLER_PLAINTEXT}-non-oa`;
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: createHash("sha256").update(nonOaCaller).digest("hex"),
       allowed_models: ["rerank-anthropic"],
     });

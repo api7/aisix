@@ -54,6 +54,43 @@ export class SeedClient {
     return this.put("observability_exporters", exporter);
   }
 
+  async createGuardrail(
+    guardrail: Record<string, unknown>,
+  ): Promise<{ id: string; value: Record<string, unknown> }> {
+    return this.put("guardrails", guardrail);
+  }
+
+  async createCachePolicy(
+    policy: Record<string, unknown>,
+  ): Promise<{ id: string; value: Record<string, unknown> }> {
+    return this.put("cache_policies", policy);
+  }
+
+  async createRateLimitPolicy(
+    policy: Record<string, unknown>,
+  ): Promise<{ id: string; value: Record<string, unknown> }> {
+    return this.put("rate_limit_policies", policy);
+  }
+
+  /**
+   * Overwrite the document at `<prefix>/<kind>/<id>` — the seed-side
+   * equivalent of an Admin API PUT. Propagation is asynchronous; probe
+   * it with the case's `waitConfigPropagation` condition as with
+   * creates.
+   */
+  async update(
+    kind: string,
+    id: string,
+    value: Record<string, unknown>,
+  ): Promise<void> {
+    await this.etcd.put(`${this.prefix}/${kind}/${id}`, JSON.stringify(value));
+  }
+
+  /** Remove `<prefix>/<kind>/<id>` so the loader drops the resource. */
+  async delete(kind: string, id: string): Promise<void> {
+    await this.etcd.delete(`${this.prefix}/${kind}/${id}`);
+  }
+
   private async put(
     kind: string,
     value: Record<string, unknown>,

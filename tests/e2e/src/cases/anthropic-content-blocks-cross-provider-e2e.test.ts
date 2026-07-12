@@ -1,10 +1,11 @@
 import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   spawnApp,
   startOpenAiUpstream,
+  waitConfigPropagation,
   type OpenAiUpstream,
   type SpawnedApp,
 } from "../harness/index.js";
@@ -33,17 +34,18 @@ const CALLER_KEY_HASH = createHash("sha256")
 
 describe("anthropic content blocks → OpenAI upstream (#722)", () => {
   let app: SpawnedApp | undefined;
-  let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let etcdReachable = false;
   const upstreams: OpenAiUpstream[] = [];
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
-    await admin.createApiKey({
+    seed = new SeedClient(etcd, app.etcdPrefix);
+    await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["*"],
     });
@@ -71,22 +73,33 @@ describe("anthropic content blocks → OpenAI upstream (#722)", () => {
       },
     });
     upstreams.push(upstream);
-    const pk = await admin!.createProviderKey({
+    const pk = await seed!.createProviderKey({
       display_name: `${name}-pk`,
       secret: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
-    await admin!.createModel({
+    await seed!.createModel({
       display_name: name,
       provider: "openai",
       model_name: "gpt-4o",
       provider_key_id: pk.id,
     });
+    // Gate on the DP snapshot, not the store: /v1/models only lists the
+    // model once the snapshot has it, and only authenticates once the
+    // caller key has propagated too. Touches no upstream.
+    await waitConfigPropagation(async () => {
+      const res = await fetch(`${app!.proxyUrl}/v1/models`, {
+        headers: { authorization: `Bearer ${CALLER_PLAINTEXT}` },
+      });
+      if (res.status !== 200) return false;
+      const body = (await res.json()) as { data?: Array<{ id?: string }> };
+      return (body.data ?? []).some((m) => m.id === name);
+    });
     return upstream;
   }
 
   test("multi-turn tool loop history reaches the OpenAI upstream intact", async (ctx) => {
-    if (!etcdReachable || !app || !admin) {
+    if (!etcdReachable || !app || !seed) {
       ctx.skip();
       return;
     }
@@ -182,7 +195,7 @@ describe("anthropic content blocks → OpenAI upstream (#722)", () => {
   });
 
   test("vision: base64 image block reaches the upstream as an image_url data URL", async (ctx) => {
-    if (!etcdReachable || !app || !admin) {
+    if (!etcdReachable || !app || !seed) {
       ctx.skip();
       return;
     }

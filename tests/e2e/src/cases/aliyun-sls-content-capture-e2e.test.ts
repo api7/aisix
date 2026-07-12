@@ -1,9 +1,9 @@
 import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   decodedTextFor,
   EtcdClient,
+  SeedClient,
   spawnApp,
   startMockSls,
   startOpenAiUpstream,
@@ -49,45 +49,45 @@ const ANTHROPIC_PROMPT_TOKEN = "anthropic-prompt-tok-5d1f9c";
 const ANTHROPIC_RESPONSE_TOKEN = "anthropic-response-tok-a4e823";
 
 async function seedRouting(
-  admin: AdminClient,
+  seed: SeedClient,
   upstream: OpenAiUpstream,
   streamUpstream: OpenAiUpstream,
   messagesUpstream: OpenAiUpstream,
 ) {
-  const pk = await admin.createProviderKey({
+  const pk = await seed.createProviderKey({
     display_name: "content-capture-pk",
     secret: PROVIDER_SECRET,
     api_base: `${upstream.baseUrl}/v1`,
   });
-  await admin.createModel({
+  await seed.createModel({
     display_name: "content-capture-model",
     provider: "openai",
     model_name: "gpt-4o-mini",
     provider_key_id: pk.id,
   });
-  const streamPk = await admin.createProviderKey({
+  const streamPk = await seed.createProviderKey({
     display_name: "content-capture-stream-pk",
     secret: PROVIDER_SECRET,
     api_base: `${streamUpstream.baseUrl}/v1`,
   });
-  await admin.createModel({
+  await seed.createModel({
     display_name: "content-capture-stream-model",
     provider: "openai",
     model_name: "gpt-4o-mini",
     provider_key_id: streamPk.id,
   });
-  const msgPk = await admin.createProviderKey({
+  const msgPk = await seed.createProviderKey({
     display_name: "content-capture-messages-pk",
     secret: PROVIDER_SECRET,
     api_base: `${messagesUpstream.baseUrl}/v1`,
   });
-  await admin.createModel({
+  await seed.createModel({
     display_name: "content-capture-messages-model",
     provider: "openai",
     model_name: "gpt-4o-mini",
     provider_key_id: msgPk.id,
   });
-  await admin.createApiKey({
+  await seed.createApiKey({
     key_hash: CALLER_KEY_HASH,
     allowed_models: [
       "content-capture-model",
@@ -251,8 +251,8 @@ describe("aliyun_sls content capture e2e (#687): full vs metadata_only", () => {
         },
       });
       apps.push(app);
-      const admin = new AdminClient(app.adminUrl, app.adminKey);
-      await admin.createObservabilityExporter({
+      const seed = new SeedClient(new EtcdClient(), app.etcdPrefix);
+      await seed.createObservabilityExporter({
         name: "sls-full",
         enabled: true,
         kind: "aliyun_sls",
@@ -262,7 +262,7 @@ describe("aliyun_sls content capture e2e (#687): full vs metadata_only", () => {
         credential_ref: CREDENTIAL_REF,
         content_mode: "full",
       });
-      await admin.createObservabilityExporter({
+      await seed.createObservabilityExporter({
         name: "sls-meta",
         enabled: true,
         kind: "aliyun_sls",
@@ -272,7 +272,7 @@ describe("aliyun_sls content capture e2e (#687): full vs metadata_only", () => {
         credential_ref: CREDENTIAL_REF,
         content_mode: "metadata_only",
       });
-      await seedRouting(admin, upstream, streamUpstream, messagesUpstream);
+      await seedRouting(seed, upstream, streamUpstream, messagesUpstream);
 
       await waitConfigPropagation(async () => {
         try {

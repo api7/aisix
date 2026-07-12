@@ -2,8 +2,8 @@ import { createHash } from "node:crypto";
 import OpenAI from "openai";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
@@ -73,17 +73,18 @@ type MessagesResult = {
 
 describe("model group via passthrough endpoints e2e (#471)", () => {
   let app: SpawnedApp | undefined;
-  let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let etcdReachable = false;
   const upstreams: OpenAiUpstream[] = [];
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
-    await admin.createApiKey({
+    seed = new SeedClient(etcd, app.etcdPrefix);
+    await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["*"],
     });
@@ -98,14 +99,14 @@ describe("model group via passthrough endpoints e2e (#471)", () => {
     displayName: string,
     upstream: OpenAiUpstream,
   ): Promise<void> {
-    if (!admin) throw new Error("admin client not initialized");
-    const pk = await admin.createProviderKey({
+    if (!seed) throw new Error("seed client not initialized");
+    const pk = await seed.createProviderKey({
       display_name: `${displayName}-pk`,
       secret: "sk-openai-mock",
       // OpenAI bridge convention: host + /v1.
       api_base: `${upstream.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: displayName,
       provider: "openai",
       model_name: "gpt-4o-mini",
@@ -117,8 +118,8 @@ describe("model group via passthrough endpoints e2e (#471)", () => {
     displayName: string,
     upstream: OpenAiUpstream,
   ): Promise<void> {
-    if (!admin) throw new Error("admin client not initialized");
-    const pk = await admin.createProviderKey({
+    if (!seed) throw new Error("seed client not initialized");
+    const pk = await seed.createProviderKey({
       display_name: `${displayName}-pk`,
       provider: "anthropic",
       adapter: "anthropic",
@@ -126,7 +127,7 @@ describe("model group via passthrough endpoints e2e (#471)", () => {
       // Anthropic bridge appends /v1/messages, so point at the bare host.
       api_base: upstream.baseUrl,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: displayName,
       provider: "anthropic",
       model_name: "claude-3-5-haiku-20241022",
@@ -203,19 +204,25 @@ describe("model group via passthrough endpoints e2e (#471)", () => {
 
   async function waitUntilGroupRoutable(virtual: string): Promise<void> {
     // Gate on the virtual record reaching the DP snapshot without
-    // sending traffic through it, so failover hit-counts below start clean.
+    // sending traffic through it, so failover hit-counts below start
+    // clean: seed a throwaway canary key AFTER the group document —
+    // watch events apply in revision order, so once the canary bearer
+    // authenticates against /v1/models the group is in the snapshot too.
+    const canary = `sk-canary-${virtual}-${Date.now()}`;
+    await seed!.createApiKey({
+      key_hash: createHash("sha256").update(canary).digest("hex"),
+      allowed_models: ["*"],
+    });
     await waitConfigPropagation(async () => {
-      try {
-        const models = await admin!.listModels();
-        return models.some((m) => m.display_name === virtual);
-      } catch {
-        return false;
-      }
+      const res = await fetch(`${app!.proxyUrl}/v1/models`, {
+        headers: { authorization: `Bearer ${canary}` },
+      });
+      return res.status === 200;
     });
   }
 
   test("Anthropic target in a group is reachable via /v1/messages", async (ctx) => {
-    if (!etcdReachable || !app || !admin) {
+    if (!etcdReachable || !app || !seed) {
       ctx.skip();
       return;
     }
@@ -232,7 +239,7 @@ describe("model group via passthrough endpoints e2e (#471)", () => {
     await createOpenAiModel("mg-an-openai", openai);
     await waitUntilModelResponds("mg-an-anthropic");
     await waitUntilModelResponds("mg-an-openai");
-    await admin.createModel({
+    await seed.createModel({
       display_name: "mg-anthropic-first",
       routing: {
         strategy: "failover",
@@ -257,7 +264,7 @@ describe("model group via passthrough endpoints e2e (#471)", () => {
   });
 
   test("OpenAI target in a group is reachable via /v1/messages (cross-provider)", async (ctx) => {
-    if (!etcdReachable || !app || !admin) {
+    if (!etcdReachable || !app || !seed) {
       ctx.skip();
       return;
     }
@@ -269,7 +276,7 @@ describe("model group via passthrough endpoints e2e (#471)", () => {
 
     await createOpenAiModel("mg-op-openai", openai);
     await waitUntilModelResponds("mg-op-openai");
-    await admin.createModel({
+    await seed.createModel({
       display_name: "mg-openai-first",
       routing: {
         strategy: "failover",
@@ -291,7 +298,7 @@ describe("model group via passthrough endpoints e2e (#471)", () => {
   });
 
   test("cross-protocol failover: OpenAI target down falls over to Anthropic target", async (ctx) => {
-    if (!etcdReachable || !app || !admin) {
+    if (!etcdReachable || !app || !seed) {
       ctx.skip();
       return;
     }
@@ -311,7 +318,7 @@ describe("model group via passthrough endpoints e2e (#471)", () => {
     // left unprobed so its cooldown doesn't exclude it from the attempt
     // list before the measured call below.
     await waitUntilModelResponds("mg-fo-anthropic");
-    await admin.createModel({
+    await seed.createModel({
       display_name: "mg-failover",
       routing: {
         strategy: "failover",
@@ -339,7 +346,7 @@ describe("model group via passthrough endpoints e2e (#471)", () => {
   });
 
   test("Anthropic group is reachable via /v1/messages/count_tokens", async (ctx) => {
-    if (!etcdReachable || !app || !admin) {
+    if (!etcdReachable || !app || !seed) {
       ctx.skip();
       return;
     }
@@ -350,7 +357,7 @@ describe("model group via passthrough endpoints e2e (#471)", () => {
     upstreams.push(anthropic);
 
     await createAnthropicModel("mg-ct-anthropic", anthropic);
-    await admin.createModel({
+    await seed.createModel({
       display_name: "mg-count-tokens",
       routing: {
         strategy: "failover",
@@ -372,7 +379,7 @@ describe("model group via passthrough endpoints e2e (#471)", () => {
   });
 
   test("OpenAI group is reachable via /v1/responses", async (ctx) => {
-    if (!etcdReachable || !app || !admin) {
+    if (!etcdReachable || !app || !seed) {
       ctx.skip();
       return;
     }
@@ -397,7 +404,7 @@ describe("model group via passthrough endpoints e2e (#471)", () => {
     upstreams.push(openai);
 
     await createOpenAiModel("mg-resp-openai", openai);
-    await admin.createModel({
+    await seed.createModel({
       display_name: "mg-responses",
       routing: {
         strategy: "failover",

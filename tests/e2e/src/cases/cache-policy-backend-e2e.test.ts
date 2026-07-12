@@ -2,8 +2,8 @@ import { createHash, randomUUID } from "node:crypto";
 import { connect } from "node:net";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
@@ -53,7 +53,6 @@ async function redisPing(url: string): Promise<boolean> {
 
 interface SeededApp {
   app: SpawnedApp;
-  admin: AdminClient;
 }
 
 /**
@@ -75,38 +74,38 @@ async function seedApp(
   modelAlias: string,
   canaryAlias: string,
 ): Promise<SeededApp> {
-  const admin = new AdminClient(app.adminUrl, app.adminKey);
-  const pk = await admin.createProviderKey({
+  const seed = new SeedClient(new EtcdClient(), app.etcdPrefix);
+  const pk = await seed.createProviderKey({
     display_name: `${modelAlias}-pk`,
     secret: "sk-mock",
     api_base: `${upstreamBase}/v1`,
   });
   for (const alias of [modelAlias, canaryAlias]) {
-    await admin.createModel({
+    await seed.createModel({
       display_name: alias,
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: pk.id,
     });
   }
-  await admin.createApiKey({
+  await seed.createApiKey({
     key_hash: CALLER_KEY_HASH,
     allowed_models: [modelAlias, canaryAlias],
   });
   // Order matters: redis policy FIRST, canary memory policy SECOND.
-  await admin.json("POST", "/admin/v1/cache_policies", {
+  await seed.createCachePolicy({
     name: `${modelAlias}-redis-policy`,
     enabled: true,
     backend: "redis",
     applies_to: `model:${modelAlias}`,
   });
-  await admin.json("POST", "/admin/v1/cache_policies", {
+  await seed.createCachePolicy({
     name: `${canaryAlias}-canary-policy`,
     enabled: true,
     backend: "memory",
     applies_to: `model:${canaryAlias}`,
   });
-  return { app, admin };
+  return { app };
 }
 
 function chatRequest(
@@ -150,7 +149,8 @@ describe("cache policy backend=redis on a memory-only DP disables caching", () =
   let etcdReachable = false;
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     upstream = await startOpenAiUpstream();

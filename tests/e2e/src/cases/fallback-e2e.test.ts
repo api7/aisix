@@ -2,8 +2,8 @@ import { createHash } from "node:crypto";
 import OpenAI from "openai";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
@@ -30,11 +30,12 @@ describe("fallback e2e: virtual routing fails over from 5xx to next target", () 
   let app: SpawnedApp | undefined;
   let badUpstream: OpenAiUpstream | undefined;
   let goodUpstream: OpenAiUpstream | undefined;
-  let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let etcdReachable = false;
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     badUpstream = await startOpenAiUpstream({
@@ -59,19 +60,19 @@ describe("fallback e2e: virtual routing fails over from 5xx to next target", () 
     });
 
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    seed = new SeedClient(etcd, app.etcdPrefix);
 
-    const badPk = await admin.createProviderKey({
+    const badPk = await seed.createProviderKey({
       display_name: "fb-bad-pk",
       secret: "sk-mock",
       api_base: `${badUpstream.baseUrl}/v1`,
     });
-    const goodPk = await admin.createProviderKey({
+    const goodPk = await seed.createProviderKey({
       display_name: "fb-good-pk",
       secret: "sk-mock",
       api_base: `${goodUpstream.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "fb-bad",
       provider: "openai",
       model_name: "gpt-4o-mini",
@@ -84,7 +85,7 @@ describe("fallback e2e: virtual routing fails over from 5xx to next target", () 
       // so the test exercises only its target behavior.
       cooldown: { enabled: false },
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "fb-good",
       provider: "openai",
       model_name: "gpt-4o-mini",
@@ -95,7 +96,7 @@ describe("fallback e2e: virtual routing fails over from 5xx to next target", () 
     // provider/model_name/provider_key_id) or carries those three
     // (direct upstream — no routing). `failover` is the default
     // strategy; making it explicit keeps the test self-documenting.
-    await admin.createModel({
+    await seed.createModel({
       display_name: "fb-virtual",
       routing: {
         strategy: "failover",
@@ -106,7 +107,7 @@ describe("fallback e2e: virtual routing fails over from 5xx to next target", () 
     // hit a single-target Model directly, instead of probing through
     // `fb-virtual` (which fires the bad→good fallback on every retry
     // and risks off-by-one when an iteration partially succeeds).
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["fb-virtual", "fb-good"],
     });

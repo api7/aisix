@@ -2,8 +2,8 @@ import { createHash, randomUUID } from "node:crypto";
 import OpenAI, { APIError } from "openai";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
@@ -38,7 +38,7 @@ describe("pii guardrail e2e: mask + block on request and response", () => {
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
   let streamUpstream: OpenAiUpstream | undefined;
-  let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let etcd: EtcdClient | undefined;
   let etcdReachable = false;
 
@@ -84,43 +84,43 @@ describe("pii guardrail e2e: mask + block on request and response", () => {
     });
 
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    seed = new SeedClient(etcd, app.etcdPrefix);
 
-    const pk = await admin.createProviderKey({
+    const pk = await seed.createProviderKey({
       display_name: "pii-e2e-pk",
       secret: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "pii-e2e",
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: pk.id,
     });
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: hash(CALLER),
       allowed_models: ["pii-e2e"],
     });
 
-    const streamPk = await admin.createProviderKey({
+    const streamPk = await seed.createProviderKey({
       display_name: "pii-stream-e2e-pk",
       secret: "sk-mock",
       api_base: `${streamUpstream.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "pii-stream-e2e",
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: streamPk.id,
     });
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: hash(`${CALLER}-stream`),
       allowed_models: ["pii-stream-e2e"],
     });
 
     // One env-wide pii guardrail: email masks (redact-and-continue),
     // china_id_card blocks (reject).
-    await admin.json("POST", "/admin/v1/guardrails", {
+    await seed.createGuardrail({
       name: "pii-e2e-guard",
       enabled: true,
       hook_point: "both",
@@ -154,11 +154,15 @@ describe("pii guardrail e2e: mask + block on request and response", () => {
     // Propagation probe: once the guardrail is live, the (email-bearing)
     // mock reply comes back masked.
     await waitConfigPropagation(async () => {
-      const r = await client().chat.completions.create({
-        model: "pii-e2e",
-        messages: [{ role: "user", content: "probe" }],
-      });
-      return (r.choices[0]?.message?.content ?? "").includes("[EMAIL_REDACTED]");
+      try {
+        const r = await client().chat.completions.create({
+          model: "pii-e2e",
+          messages: [{ role: "user", content: "probe" }],
+        });
+        return (r.choices[0]?.message?.content ?? "").includes("[EMAIL_REDACTED]");
+      } catch {
+        return false; // caller key / model still propagating
+      }
     });
 
     const res = await client().chat.completions.create({
@@ -302,24 +306,24 @@ describe("pii guardrail e2e: mask + block on request and response", () => {
       },
     });
     const monApp = await spawnApp();
-    const monAdmin = new AdminClient(monApp.adminUrl, monApp.adminKey);
-    const monPk = await monAdmin.createProviderKey({
+    const monSeed = new SeedClient(new EtcdClient(), monApp.etcdPrefix);
+    const monPk = await monSeed.createProviderKey({
       display_name: "pii-mon-pk",
       secret: "sk-mock",
       api_base: `${monUpstream.baseUrl}/v1`,
     });
-    await monAdmin.createModel({
+    await monSeed.createModel({
       display_name: "pii-mon-e2e",
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: monPk.id,
     });
     const monCaller = `${CALLER}-mon`;
-    await monAdmin.createApiKey({
+    await monSeed.createApiKey({
       key_hash: hash(monCaller),
       allowed_models: ["pii-mon-e2e"],
     });
-    await monAdmin.json("POST", "/admin/v1/guardrails", {
+    await monSeed.createGuardrail({
       name: "pii-mon-guard",
       enabled: true,
       hook_point: "both",
@@ -360,7 +364,7 @@ describe("pii guardrail e2e: mask + block on request and response", () => {
   });
 
   test("/v1/messages passthrough: request masked before the Anthropic upstream", async (ctx) => {
-    if (!etcdReachable || !app || !admin) {
+    if (!etcdReachable || !app || !seed) {
       ctx.skip();
       return;
     }
@@ -392,21 +396,21 @@ describe("pii guardrail e2e: mask + block on request and response", () => {
     await new Promise<void>((resolve) => anthUpstream.listen(0, resolve));
     const anthPort = (anthUpstream.address() as { port: number }).port;
 
-    const anthPk = await admin.createProviderKey({
+    const anthPk = await seed.createProviderKey({
       display_name: "pii-anth-pk",
       secret: "sk-ant-mock",
       api_base: `http://127.0.0.1:${anthPort}`,
       provider: "anthropic",
       adapter: "anthropic",
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "pii-anth-e2e",
       provider: "anthropic",
       model_name: "claude-3-5-haiku-20241022",
       provider_key_id: anthPk.id,
     });
     const anthCaller = `${CALLER}-anth`;
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: hash(anthCaller),
       allowed_models: ["pii-anth-e2e"],
     });

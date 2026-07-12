@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
@@ -48,34 +48,35 @@ const SHARED_PROMPT = "cache-edges-shared-prompt";
 describe("cache edges: model in fingerprint + enabled:false bypass", () => {
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
-  let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let etcdReachable = false;
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     upstream = await startOpenAiUpstream();
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    seed = new SeedClient(etcd, app.etcdPrefix);
 
     // Two distinct Models pointing at the SAME mock upstream — only
     // the gateway-side `display_name` differs (and the upstream
     // `model_name` value the proxy rewrites to). If the cache
     // fingerprint correctly includes the model identifier, requests
     // against the two Models must be cached independently.
-    const pk = await admin.createProviderKey({
+    const pk = await seed.createProviderKey({
       display_name: "cache-edges-pk",
       secret: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "cache-edges-A",
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: pk.id,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "cache-edges-B",
       provider: "openai",
       model_name: "gpt-4o",
@@ -83,13 +84,13 @@ describe("cache edges: model in fingerprint + enabled:false bypass", () => {
     });
     // A third Model used only for the "policy disabled" probe so it
     // doesn't share the cache scope with A/B above.
-    await admin.createModel({
+    await seed.createModel({
       display_name: "cache-edges-disabled",
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: pk.id,
     });
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: [
         "cache-edges-A",
@@ -103,17 +104,17 @@ describe("cache edges: model in fingerprint + enabled:false bypass", () => {
     // enabled policies must NOT use `applies_to:"all"` — if they
     // did, the third Model would also match an enabled rule and
     // test (2) would observe caching despite the disabled policy.
-    await admin.json("POST", "/admin/v1/cache_policies", {
+    await seed.createCachePolicy({
       name: "cache-edges-policy-a",
       enabled: true,
       applies_to: "model:cache-edges-A",
     });
-    await admin.json("POST", "/admin/v1/cache_policies", {
+    await seed.createCachePolicy({
       name: "cache-edges-policy-b",
       enabled: true,
       applies_to: "model:cache-edges-B",
     });
-    await admin.json("POST", "/admin/v1/cache_policies", {
+    await seed.createCachePolicy({
       name: "cache-edges-disabled-policy",
       enabled: false,
       applies_to: "model:cache-edges-disabled",

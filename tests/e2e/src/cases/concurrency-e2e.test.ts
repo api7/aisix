@@ -2,8 +2,8 @@ import { createHash } from "node:crypto";
 import OpenAI, { APIError } from "openai";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   ProxyClient,
   spawnApp,
   startOpenAiUpstream,
@@ -60,16 +60,17 @@ const CALLER_C_KEY_HASH = createHash("sha256")
 
 describe("concurrency e2e: rate-limit isolation across callers", () => {
   let app: SpawnedApp | undefined;
-  let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let etcdReachable = false;
   const upstreams: OpenAiUpstream[] = [];
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    seed = new SeedClient(etcd, app.etcdPrefix);
   });
 
   afterAll(async () => {
@@ -78,7 +79,7 @@ describe("concurrency e2e: rate-limit isolation across callers", () => {
   });
 
   test("inter-caller rate-limit isolation: caller A's RPM exhaustion does NOT affect caller B", async (ctx) => {
-    if (!etcdReachable || !app || !admin) {
+    if (!etcdReachable || !app || !seed) {
       ctx.skip();
       return;
     }
@@ -86,12 +87,12 @@ describe("concurrency e2e: rate-limit isolation across callers", () => {
     const upstream = await startOpenAiUpstream();
     upstreams.push(upstream);
 
-    const pk = await admin.createProviderKey({
+    const pk = await seed.createProviderKey({
       display_name: "conc-iso-pk",
       secret: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "conc-iso",
       provider: "openai",
       model_name: "gpt-4o-mini",
@@ -99,12 +100,12 @@ describe("concurrency e2e: rate-limit isolation across callers", () => {
     });
     // Both callers have RPM=1; the cap is per-ApiKey, so caller
     // A burning their slot must NOT consume caller B's slot.
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: CALLER_A_KEY_HASH,
       allowed_models: ["conc-iso"],
       rate_limit: { rpm: 1 },
     });
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: CALLER_B_KEY_HASH,
       allowed_models: ["conc-iso"],
       rate_limit: { rpm: 1 },
@@ -209,7 +210,7 @@ describe("concurrency e2e: rate-limit isolation across callers", () => {
     // A and B are both currently rate-limited. This is the
     // load-bearing isolation assertion: a fresh caller's quota is
     // genuinely independent of other callers'.
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: CALLER_C_KEY_HASH,
       allowed_models: ["conc-iso"],
       rate_limit: { rpm: 1 },

@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   ProxyClient,
   spawnApp,
   startOpenAiUpstream,
@@ -76,33 +76,34 @@ function seriesValue(text: string, tokenType: string): number | undefined {
 describe("aisix_llm_tokens_by_client_total token_type=total is cache-inclusive (AISIX-Cloud#1002)", () => {
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
-  let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let etcdReachable = false;
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     upstream = await startOpenAiUpstream({
       nonStreamBody: anthropicMessageBody(USAGE),
     });
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    seed = new SeedClient(etcd, app.etcdPrefix);
 
-    const pk = await admin.createProviderKey({
+    const pk = await seed.createProviderKey({
       display_name: `${MODEL}-pk`,
       provider: "anthropic",
       adapter: "anthropic",
       secret: "sk-ant-mock",
       api_base: upstream.baseUrl,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: MODEL,
       provider: "anthropic",
       model_name: "claude-3-5-haiku-20241022",
       provider_key_id: pk.id,
     });
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: hash(CALLER),
       allowed_models: [MODEL],
     });

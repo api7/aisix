@@ -2,8 +2,8 @@ import { createHash } from "node:crypto";
 import OpenAI from "openai";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
@@ -64,11 +64,12 @@ const UPSTREAM_JSON_REPLY = JSON.stringify({
 describe("json mode e2e: response_format passthrough on /v1/chat/completions", () => {
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
-  let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let etcdReachable = false;
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     upstream = await startOpenAiUpstream({
@@ -91,20 +92,20 @@ describe("json mode e2e: response_format passthrough on /v1/chat/completions", (
       },
     });
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    seed = new SeedClient(etcd, app.etcdPrefix);
 
-    const pk = await admin.createProviderKey({
+    const pk = await seed.createProviderKey({
       display_name: "jsonmode-pk",
       secret: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "jsonmode-e2e",
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: pk.id,
     });
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["jsonmode-e2e"],
     });

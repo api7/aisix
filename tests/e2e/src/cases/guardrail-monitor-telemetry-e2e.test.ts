@@ -1,9 +1,9 @@
 import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   decodedTextFor,
   EtcdClient,
+  SeedClient,
   spawnApp,
   startMockSls,
   startOpenAiUpstream,
@@ -46,7 +46,8 @@ describe("guardrail monitor-hit telemetry: would_block/would_mask on usage event
   let etcdReachable = false;
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     sls = await startMockSls();
@@ -73,9 +74,9 @@ describe("guardrail monitor-hit telemetry: would_block/would_mask on usage event
         [`SLS_CRED_${CREDENTIAL_REF.toUpperCase()}_AK_SECRET`]: "mock-secret",
       },
     });
-    const admin = new AdminClient(app.adminUrl, app.adminKey);
+    const seed = new SeedClient(etcd, app.etcdPrefix);
 
-    await admin.createObservabilityExporter({
+    await seed.createObservabilityExporter({
       name: "sls-monitor-telemetry",
       enabled: true,
       kind: "aliyun_sls",
@@ -86,23 +87,23 @@ describe("guardrail monitor-hit telemetry: would_block/would_mask on usage event
       content_mode: "metadata_only",
     });
 
-    const pk = await admin.createProviderKey({
+    const pk = await seed.createProviderKey({
       display_name: "monitor-telemetry-pk",
       secret: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "monitor-telemetry-model",
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: pk.id,
     });
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["monitor-telemetry-model"],
     });
 
-    await admin.json("POST", "/admin/v1/guardrails", {
+    await seed.createGuardrail({
       name: GUARD_NAME,
       enabled: true,
       hook_point: "input",
@@ -147,6 +148,7 @@ describe("guardrail monitor-hit telemetry: would_block/would_mask on usage event
     // exported event carries a monitor hit.
     await waitConfigPropagation(async () => {
       const res = await chat(`probe mail ${EMAIL} ok`);
+      if (res.status === 401) return false; // caller key still propagating
       expect(res.status).toBe(200);
       return decodedTextFor(sls!, META_LOGSTORE).includes("guardrail_monitor_hits");
     });

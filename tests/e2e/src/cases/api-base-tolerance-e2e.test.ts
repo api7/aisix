@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
@@ -44,22 +44,23 @@ const ANTHROPIC_CALLER_KEY_HASH = createHash("sha256")
 
 describe("api_base tolerance e2e: endpoint suffix is stripped before dispatch", () => {
   let app: SpawnedApp | undefined;
-  let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let etcdReachable = false;
   const upstreams: OpenAiUpstream[] = [];
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    seed = new SeedClient(etcd, app.etcdPrefix);
 
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: OPENAI_CALLER_KEY_HASH,
       allowed_models: ["openai-suffix-tolerance"],
     });
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: ANTHROPIC_CALLER_KEY_HASH,
       allowed_models: ["anthropic-suffix-tolerance"],
     });
@@ -71,7 +72,7 @@ describe("api_base tolerance e2e: endpoint suffix is stripped before dispatch", 
   });
 
   test("OpenAI bridge strips a `/chat/completions` suffix from api_base", async (ctx) => {
-    if (!etcdReachable || !app || !admin) {
+    if (!etcdReachable || !app || !seed) {
       ctx.skip();
       return;
     }
@@ -102,12 +103,12 @@ describe("api_base tolerance e2e: endpoint suffix is stripped before dispatch", 
     // suffix stripping, the bridge would dispatch to
     //   `${baseUrl}/chat/completions/chat/completions`
     // and `upstream.receivedRequests[*].path` would echo that.
-    const pk = await admin.createProviderKey({
+    const pk = await seed.createProviderKey({
       display_name: "openai-suffix-tolerance-pk",
       secret: "sk-mock",
       api_base: `${upstream.baseUrl}/chat/completions`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "openai-suffix-tolerance",
       provider: "openai",
       model_name: "gpt-4o-mini",
@@ -159,7 +160,7 @@ describe("api_base tolerance e2e: endpoint suffix is stripped before dispatch", 
   });
 
   test("Anthropic bridge strips a `/v1/messages` suffix from api_base", async (ctx) => {
-    if (!etcdReachable || !app || !admin) {
+    if (!etcdReachable || !app || !seed) {
       ctx.skip();
       return;
     }
@@ -180,14 +181,14 @@ describe("api_base tolerance e2e: endpoint suffix is stripped before dispatch", 
     // Operator pastes the full Anthropic upstream URL. Without the
     // strip, the bridge would dispatch to
     //   `${baseUrl}/v1/messages/v1/messages`.
-    const pk = await admin.createProviderKey({
+    const pk = await seed.createProviderKey({
       display_name: "anthropic-suffix-tolerance-pk",
       provider: "anthropic",
       adapter: "anthropic",
       secret: "sk-ant-mock",
       api_base: `${upstream.baseUrl}/v1/messages`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "anthropic-suffix-tolerance",
       provider: "anthropic",
       model_name: "claude-3-5-haiku-20241022",

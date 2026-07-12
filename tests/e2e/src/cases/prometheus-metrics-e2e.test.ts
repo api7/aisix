@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   ProxyClient,
   spawnApp,
   startOpenAiUpstream,
@@ -19,20 +19,21 @@ const CALLER_KEY_HASH = createHash("sha256")
 describe("prometheus metrics e2e", () => {
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
-  let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let etcdReachable = false;
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     upstream = await startOpenAiUpstream({
       nonStreamBody: responseBody(),
     });
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    seed = new SeedClient(etcd, app.etcdPrefix);
 
-    await configureOpenAi(admin, upstream, "prometheus-gpt");
+    await configureOpenAi(seed, upstream, "prometheus-gpt");
   });
 
   afterAll(async () => {
@@ -93,8 +94,8 @@ describe("prometheus metrics e2e", () => {
     });
     const customApp = await spawnApp({ prometheusPath: "/custom-metrics" });
     try {
-      const customAdmin = new AdminClient(customApp.adminUrl, customApp.adminKey);
-      await configureOpenAi(customAdmin, customUpstream, "prometheus-custom-gpt");
+      const customSeed = new SeedClient(new EtcdClient(), customApp.etcdPrefix);
+      await configureOpenAi(customSeed, customUpstream, "prometheus-custom-gpt");
       const proxy = new ProxyClient(customApp.proxyUrl, CALLER_PLAINTEXT);
       await waitConfigPropagation(async () => {
         const probe = await proxy.chat({
@@ -281,22 +282,22 @@ function parseUsageEmittedCount(
 }
 
 async function configureOpenAi(
-  admin: AdminClient,
+  seed: SeedClient,
   upstream: OpenAiUpstream,
   modelName: string,
 ) {
-  const pk = await admin.createProviderKey({
+  const pk = await seed.createProviderKey({
     display_name: `${modelName}-pk`,
     secret: "sk-mock",
     api_base: `${upstream.baseUrl}/v1`,
   });
-  await admin.createModel({
+  await seed.createModel({
     display_name: modelName,
     provider: "openai",
     model_name: "gpt-4o-mini",
     provider_key_id: pk.id,
   });
-  await admin.createApiKey({
+  await seed.createApiKey({
     key_hash: CALLER_KEY_HASH,
     allowed_models: [modelName],
   });

@@ -2,8 +2,8 @@ import { createHash } from "node:crypto";
 import OpenAI from "openai";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
@@ -36,20 +36,21 @@ const CALLER_KEY_HASH = createHash("sha256")
 
 describe("cache scenarios e2e: different prompt → miss", () => {
   let app: SpawnedApp | undefined;
-  let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let etcdReachable = false;
   // Each test owns its own upstream + Model so request-count assertions
   // are isolated across cases.
   const upstreams: OpenAiUpstream[] = [];
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    seed = new SeedClient(etcd, app.etcdPrefix);
 
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["*"],
     });
@@ -61,7 +62,7 @@ describe("cache scenarios e2e: different prompt → miss", () => {
   });
 
   test("different prompt → MISS (cache fingerprint reflects the request)", async (ctx) => {
-    if (!etcdReachable || !app || !admin) {
+    if (!etcdReachable || !app || !seed) {
       ctx.skip();
       return;
     }
@@ -69,18 +70,18 @@ describe("cache scenarios e2e: different prompt → miss", () => {
     const upstream = await startOpenAiUpstream();
     upstreams.push(upstream);
 
-    const pk = await admin.createProviderKey({
+    const pk = await seed.createProviderKey({
       display_name: "cache-diff-pk",
       secret: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "cache-diff",
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: pk.id,
     });
-    await admin.json("POST", "/admin/v1/cache_policies", {
+    await seed.createCachePolicy({
       name: "cache-diff-policy",
       enabled: true,
       applies_to: "all",

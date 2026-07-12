@@ -2,8 +2,8 @@ import { createHash } from "node:crypto";
 import OpenAI, { APIError } from "openai";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
@@ -41,36 +41,37 @@ function guardrailBody(enforcementMode: "block" | "monitor") {
 describe("guardrail e2e: enforcement_mode monitor observes without blocking", () => {
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
-  let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let etcdReachable = false;
   let guardrailId: string | undefined;
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     upstream = await startOpenAiUpstream();
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    seed = new SeedClient(etcd, app.etcdPrefix);
 
-    const pk = await admin.createProviderKey({
+    const pk = await seed.createProviderKey({
       display_name: "gr-monitor-pk",
       secret: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "gr-monitor-e2e",
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: pk.id,
     });
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["gr-monitor-e2e"],
     });
     // Start in BLOCK mode so we can prove the rule is loaded + active
     // before flipping it to monitor.
-    const g = await admin.json("POST", "/admin/v1/guardrails", guardrailBody("block"));
+    const g = await seed.createGuardrail(guardrailBody("block"));
     guardrailId = g.id as string;
   });
 
@@ -80,7 +81,7 @@ describe("guardrail e2e: enforcement_mode monitor observes without blocking", ()
   });
 
   test("block mode 422s; flipping to monitor lets the same request reach upstream", async (ctx) => {
-    if (!etcdReachable || !app || !upstream || !admin || !guardrailId) {
+    if (!etcdReachable || !app || !upstream || !seed || !guardrailId) {
       ctx.skip();
       return;
     }
@@ -105,7 +106,7 @@ describe("guardrail e2e: enforcement_mode monitor observes without blocking", ()
     });
 
     // 2. Flip the SAME rule to monitor mode (full-resource PUT).
-    await admin.json("PUT", `/admin/v1/guardrails/${guardrailId}`, guardrailBody("monitor"));
+    await seed.update("guardrails", guardrailId, guardrailBody("monitor"));
 
     // 3. Wait until monitor takes effect: the forbidden word no longer 422s.
     await waitConfigPropagation(async () => {

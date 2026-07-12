@@ -4,6 +4,7 @@ import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   AdminClient,
   EtcdClient,
+  SeedClient,
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
@@ -39,13 +40,15 @@ const CALLER_KEY_HASH = createHash("sha256")
 describe("cooldown contract (H1) — 401 cools down despite being non-retryable", () => {
   let app: SpawnedApp | undefined;
   let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let etcdReachable = false;
   let authFailUpstream: OpenAiUpstream | undefined;
   let stableUpstream: OpenAiUpstream | undefined;
   let authFailModelID = "";
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     authFailUpstream = await startOpenAiUpstream({
@@ -73,33 +76,34 @@ describe("cooldown contract (H1) — 401 cools down despite being non-retryable"
 
     app = await spawnApp();
     admin = new AdminClient(app.adminUrl, app.adminKey);
+    seed = new SeedClient(etcd, app.etcdPrefix);
 
-    const failPk = await admin.createProviderKey({
+    const failPk = await seed.createProviderKey({
       display_name: "h1-401-pk",
       secret: "sk-mock",
       api_base: `${authFailUpstream.baseUrl}/v1`,
     });
-    const stablePk = await admin.createProviderKey({
+    const stablePk = await seed.createProviderKey({
       display_name: "h1-stable-pk",
       secret: "sk-mock",
       api_base: `${stableUpstream.baseUrl}/v1`,
     });
 
     authFailModelID = (
-      await admin.createModel({
+      await seed.createModel({
         display_name: "h1-401-model",
         provider: "openai",
         model_name: "gpt-4o-mini",
         provider_key_id: failPk.id,
       })
     ).id;
-    await admin.createModel({
+    await seed.createModel({
       display_name: "h1-stable-model",
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: stablePk.id,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "h1-router",
       routing: {
         strategy: "failover",
@@ -107,7 +111,7 @@ describe("cooldown contract (H1) — 401 cools down despite being non-retryable"
         max_fallbacks: 1,
       },
     });
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["h1-router", "h1-stable-model"],
     });
@@ -187,13 +191,15 @@ describe("cooldown contract (H1) — 401 cools down despite being non-retryable"
 describe("cooldown contract (M1) — 429 cools down even when retry_on_429=false", () => {
   let app: SpawnedApp | undefined;
   let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let etcdReachable = false;
   let rateLimitedUpstream: OpenAiUpstream | undefined;
   let stableUpstream: OpenAiUpstream | undefined;
   let rateLimitedModelID = "";
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     rateLimitedUpstream = await startOpenAiUpstream({
@@ -221,27 +227,28 @@ describe("cooldown contract (M1) — 429 cools down even when retry_on_429=false
 
     app = await spawnApp();
     admin = new AdminClient(app.adminUrl, app.adminKey);
+    seed = new SeedClient(etcd, app.etcdPrefix);
 
-    const rateLimitedPk = await admin.createProviderKey({
+    const rateLimitedPk = await seed.createProviderKey({
       display_name: "m1-429-pk",
       secret: "sk-mock",
       api_base: `${rateLimitedUpstream.baseUrl}/v1`,
     });
-    const stablePk = await admin.createProviderKey({
+    const stablePk = await seed.createProviderKey({
       display_name: "m1-stable-pk",
       secret: "sk-mock",
       api_base: `${stableUpstream.baseUrl}/v1`,
     });
 
     rateLimitedModelID = (
-      await admin.createModel({
+      await seed.createModel({
         display_name: "m1-429-model",
         provider: "openai",
         model_name: "gpt-4o-mini",
         provider_key_id: rateLimitedPk.id,
       })
     ).id;
-    await admin.createModel({
+    await seed.createModel({
       display_name: "m1-stable-model",
       provider: "openai",
       model_name: "gpt-4o-mini",
@@ -251,7 +258,7 @@ describe("cooldown contract (M1) — 429 cools down even when retry_on_429=false
     // behavior would NOT cooldown a 429 in this configuration; the
     // M1 fix decouples cooldown from retry so the 429 must still
     // mark the target for backoff.
-    await admin.createModel({
+    await seed.createModel({
       display_name: "m1-router",
       routing: {
         strategy: "failover",
@@ -259,7 +266,7 @@ describe("cooldown contract (M1) — 429 cools down even when retry_on_429=false
         max_fallbacks: 1,
       },
     });
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["m1-router", "m1-stable-model"],
     });
@@ -335,13 +342,15 @@ describe("cooldown contract (M1) — 429 cools down even when retry_on_429=false
 describe("cooldown contract (H2) — Retry-After header from upstream drives TTL", () => {
   let app: SpawnedApp | undefined;
   let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let etcdReachable = false;
   let upstream: OpenAiUpstream | undefined;
   let stableUpstream: OpenAiUpstream | undefined;
   let rateLimitedModelID = "";
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     upstream = await startOpenAiUpstream({
@@ -371,33 +380,34 @@ describe("cooldown contract (H2) — Retry-After header from upstream drives TTL
 
     app = await spawnApp();
     admin = new AdminClient(app.adminUrl, app.adminKey);
+    seed = new SeedClient(etcd, app.etcdPrefix);
 
-    const upstreamPk = await admin.createProviderKey({
+    const upstreamPk = await seed.createProviderKey({
       display_name: "h2-upstream-pk",
       secret: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
-    const stablePk = await admin.createProviderKey({
+    const stablePk = await seed.createProviderKey({
       display_name: "h2-stable-pk",
       secret: "sk-mock",
       api_base: `${stableUpstream.baseUrl}/v1`,
     });
 
     rateLimitedModelID = (
-      await admin.createModel({
+      await seed.createModel({
         display_name: "h2-429-with-retry-after",
         provider: "openai",
         model_name: "gpt-4o-mini",
         provider_key_id: upstreamPk.id,
       })
     ).id;
-    await admin.createModel({
+    await seed.createModel({
       display_name: "h2-stable-model",
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: stablePk.id,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "h2-router",
       routing: {
         strategy: "failover",
@@ -408,7 +418,7 @@ describe("cooldown contract (H2) — Retry-After header from upstream drives TTL
         max_fallbacks: 1,
       },
     });
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["h2-router", "h2-stable-model"],
     });
@@ -487,12 +497,14 @@ describe("cooldown contract (H2) — Retry-After header from upstream drives TTL
 describe("filter contract (H3) — all candidates unhealthy returns 503", () => {
   let app: SpawnedApp | undefined;
   let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let etcdReachable = false;
   let downAUpstream: OpenAiUpstream | undefined;
   let downBUpstream: OpenAiUpstream | undefined;
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     downAUpstream = await startOpenAiUpstream({
@@ -506,19 +518,20 @@ describe("filter contract (H3) — all candidates unhealthy returns 503", () => 
 
     app = await spawnApp();
     admin = new AdminClient(app.adminUrl, app.adminKey);
+    seed = new SeedClient(etcd, app.etcdPrefix);
 
-    const aPk = await admin.createProviderKey({
+    const aPk = await seed.createProviderKey({
       display_name: "h3-down-a-pk",
       secret: "sk-mock",
       api_base: `${downAUpstream.baseUrl}/v1`,
     });
-    const bPk = await admin.createProviderKey({
+    const bPk = await seed.createProviderKey({
       display_name: "h3-down-b-pk",
       secret: "sk-mock",
       api_base: `${downBUpstream.baseUrl}/v1`,
     });
 
-    await admin.createModel({
+    await seed.createModel({
       display_name: "h3-down-a",
       provider: "openai",
       model_name: "gpt-4o-mini",
@@ -533,7 +546,7 @@ describe("filter contract (H3) — all candidates unhealthy returns 503", () => 
         stale_after_seconds: 120,
       },
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "h3-down-b",
       provider: "openai",
       model_name: "gpt-4o-mini",
@@ -550,7 +563,7 @@ describe("filter contract (H3) — all candidates unhealthy returns 503", () => 
     });
     // Default when_all_unavailable policy is "fail" — explicit here for
     // clarity even though it's the default.
-    await admin.createModel({
+    await seed.createModel({
       display_name: "h3-router-fail",
       routing: {
         strategy: "failover",
@@ -559,7 +572,7 @@ describe("filter contract (H3) — all candidates unhealthy returns 503", () => 
         when_all_unavailable: "fail",
       },
     });
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["h3-router-fail"],
     });
@@ -619,11 +632,13 @@ describe("filter contract (H3) — all candidates unhealthy returns 503", () => 
 describe("filter contract (H3 escape hatch) — try_anyway sends to known-bad", () => {
   let app: SpawnedApp | undefined;
   let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let etcdReachable = false;
   let downUpstream: OpenAiUpstream | undefined;
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     downUpstream = await startOpenAiUpstream({
@@ -633,14 +648,15 @@ describe("filter contract (H3 escape hatch) — try_anyway sends to known-bad", 
 
     app = await spawnApp();
     admin = new AdminClient(app.adminUrl, app.adminKey);
+    seed = new SeedClient(etcd, app.etcdPrefix);
 
-    const pk = await admin.createProviderKey({
+    const pk = await seed.createProviderKey({
       display_name: "h3-escape-pk",
       secret: "sk-mock",
       api_base: `${downUpstream.baseUrl}/v1`,
     });
 
-    await admin.createModel({
+    await seed.createModel({
       display_name: "h3-escape-down",
       provider: "openai",
       model_name: "gpt-4o-mini",
@@ -655,7 +671,7 @@ describe("filter contract (H3 escape hatch) — try_anyway sends to known-bad", 
         stale_after_seconds: 120,
       },
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "h3-router-escape",
       routing: {
         strategy: "failover",
@@ -664,7 +680,7 @@ describe("filter contract (H3 escape hatch) — try_anyway sends to known-bad", 
         when_all_unavailable: "try_anyway",
       },
     });
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["h3-router-escape"],
     });
@@ -715,13 +731,15 @@ describe("filter contract (H3 escape hatch) — try_anyway sends to known-bad", 
 describe("cooldown observability — a cooldown transition emits aisix_deployment_* metrics", () => {
   let app: SpawnedApp | undefined;
   let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let etcdReachable = false;
   let failUpstream: OpenAiUpstream | undefined;
   let stableUpstream: OpenAiUpstream | undefined;
   let failModelID = "";
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     // 500 is a default cooldown trigger status → the failing target
@@ -749,33 +767,34 @@ describe("cooldown observability — a cooldown transition emits aisix_deploymen
 
     app = await spawnApp();
     admin = new AdminClient(app.adminUrl, app.adminKey);
+    seed = new SeedClient(etcd, app.etcdPrefix);
 
-    const failPk = await admin.createProviderKey({
+    const failPk = await seed.createProviderKey({
       display_name: "cd-metrics-fail-pk",
       secret: "sk-mock",
       api_base: `${failUpstream.baseUrl}/v1`,
     });
-    const stablePk = await admin.createProviderKey({
+    const stablePk = await seed.createProviderKey({
       display_name: "cd-metrics-stable-pk",
       secret: "sk-mock",
       api_base: `${stableUpstream.baseUrl}/v1`,
     });
 
     failModelID = (
-      await admin.createModel({
+      await seed.createModel({
         display_name: "cd-metrics-500-model",
         provider: "openai",
         model_name: "gpt-4o-mini",
         provider_key_id: failPk.id,
       })
     ).id;
-    await admin.createModel({
+    await seed.createModel({
       display_name: "cd-metrics-stable-model",
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: stablePk.id,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "cd-metrics-router",
       routing: {
         strategy: "failover",
@@ -786,7 +805,7 @@ describe("cooldown observability — a cooldown transition emits aisix_deploymen
         max_fallbacks: 1,
       },
     });
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["cd-metrics-router", "cd-metrics-stable-model"],
     });
@@ -884,6 +903,7 @@ async function scrapeDeploymentState(
 describe("cooldown observability — the state gauge follows a target back into rotation", () => {
   let app: SpawnedApp | undefined;
   let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let etcdReachable = false;
   let flakyUpstream: OpenAiUpstream | undefined;
   let stableUpstream: OpenAiUpstream | undefined;
@@ -892,7 +912,8 @@ describe("cooldown observability — the state gauge follows a target back into 
   const RECOVERED_REPLY = "recovered after cooldown";
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     // First request 500s (trips the cooldown); every later request
@@ -939,20 +960,21 @@ describe("cooldown observability — the state gauge follows a target back into 
 
     app = await spawnApp();
     admin = new AdminClient(app.adminUrl, app.adminKey);
+    seed = new SeedClient(etcd, app.etcdPrefix);
 
-    const flakyPk = await admin.createProviderKey({
+    const flakyPk = await seed.createProviderKey({
       display_name: "cd-recover-flaky-pk",
       secret: "sk-mock",
       api_base: `${flakyUpstream.baseUrl}/v1`,
     });
-    const stablePk = await admin.createProviderKey({
+    const stablePk = await seed.createProviderKey({
       display_name: "cd-recover-stable-pk",
       secret: "sk-mock",
       api_base: `${stableUpstream.baseUrl}/v1`,
     });
 
     flakyModelID = (
-      await admin.createModel({
+      await seed.createModel({
         display_name: "cd-recover-flaky-model",
         provider: "openai",
         model_name: "gpt-4o-mini",
@@ -962,13 +984,13 @@ describe("cooldown observability — the state gauge follows a target back into 
         cooldown: { default_seconds: 1 },
       })
     ).id;
-    await admin.createModel({
+    await seed.createModel({
       display_name: "cd-recover-stable-model",
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: stablePk.id,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "cd-recover-router",
       routing: {
         strategy: "failover",
@@ -979,7 +1001,7 @@ describe("cooldown observability — the state gauge follows a target back into 
         max_fallbacks: 1,
       },
     });
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: [
         "cd-recover-router",

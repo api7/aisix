@@ -2,8 +2,8 @@ import { createHash } from "node:crypto";
 import OpenAI from "openai";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
@@ -16,7 +16,7 @@ import {
 //
 // The sibling weighted-routing-distribution-e2e pins that the INITIAL
 // weights are honored. The gap this closes: after the model is live
-// and serving, an operator PATCHes the weights via the admin API, and
+// and serving, an operator rewrites the weights on the stored model, and
 // the change must propagate through the etcd watch and the weighted
 // scheduler must REBUILD — a scheduler that cached its weight wheel on
 // first dispatch and never rebuilt on config update would keep serving
@@ -25,14 +25,13 @@ import {
 // Design is deterministic (no statistics): weight 0 = excluded (see
 // routing-strategies-e2e "weighted picks the positive-weight target").
 //   - Start [wr-edit-a: 100, wr-edit-b: 0]  → every dispatch hits A.
-//   - PATCH to [wr-edit-a: 0, wr-edit-b: 100] → every dispatch hits B.
+//   - Edit to [wr-edit-a: 0, wr-edit-b: 100] → every dispatch hits B.
 // The propagation signal is unambiguous: a probe through the virtual
 // model returning "served by B" is IMPOSSIBLE under the old [100,0]
 // config, so it proves the edit is live before we count.
 //
 // Reference: OpenAI Chat Completions shape the caller sees
-// (https://platform.openai.com/docs/api-reference/chat); admin model
-// update is PUT /admin/v1/models/:id (docs api-admin.md).
+// (https://platform.openai.com/docs/api-reference/chat).
 
 const CALLER_PLAINTEXT = "sk-wre-e2e-caller";
 const CALLER_KEY_HASH = createHash("sha256")
@@ -58,12 +57,13 @@ describe("weighted routing live-edit: changing weights shifts real traffic (#196
   let app: SpawnedApp | undefined;
   let upstreamA: OpenAiUpstream | undefined;
   let upstreamB: OpenAiUpstream | undefined;
-  let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let virtualId = "";
   let etcdReachable = false;
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     upstreamA = await startOpenAiUpstream({
@@ -74,25 +74,25 @@ describe("weighted routing live-edit: changing weights shifts real traffic (#196
     });
 
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    seed = new SeedClient(etcd, app.etcdPrefix);
 
-    const pkA = await admin.createProviderKey({
+    const pkA = await seed.createProviderKey({
       display_name: "wre-a-pk",
       secret: "sk-mock",
       api_base: `${upstreamA.baseUrl}/v1`,
     });
-    const pkB = await admin.createProviderKey({
+    const pkB = await seed.createProviderKey({
       display_name: "wre-b-pk",
       secret: "sk-mock",
       api_base: `${upstreamB.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "wr-edit-a",
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: pkA.id,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "wr-edit-b",
       provider: "openai",
       model_name: "gpt-4o-mini",
@@ -100,7 +100,7 @@ describe("weighted routing live-edit: changing weights shifts real traffic (#196
     });
     // Virtual model: weighted, ALL traffic to A initially (B excluded
     // via weight 0). Capture the generated id so we can PUT it below.
-    const virtual = await admin.createModel({
+    const virtual = await seed.createModel({
       display_name: "wr-edit-virtual",
       routing: {
         strategy: "weighted",
@@ -112,7 +112,7 @@ describe("weighted routing live-edit: changing weights shifts real traffic (#196
     });
     virtualId = (virtual as { id: string }).id;
 
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["wr-edit-virtual", "wr-edit-a", "wr-edit-b"],
     });
@@ -125,7 +125,7 @@ describe("weighted routing live-edit: changing weights shifts real traffic (#196
   });
 
   test("editing weights [100,0] → [0,100] flips the served upstream", async (ctx) => {
-    if (!etcdReachable || !app || !upstreamA || !upstreamB || !admin || !virtualId) {
+    if (!etcdReachable || !app || !upstreamA || !upstreamB || !seed || !virtualId) {
       ctx.skip();
       return;
     }
@@ -183,8 +183,8 @@ describe("weighted routing live-edit: changing weights shifts real traffic (#196
     expect(upstreamA.receivedRequests.length - aBase1).toBe(BATCH);
     expect(upstreamB.receivedRequests.length - bBase1).toBe(0);
 
-    // --- Edit: invert the weights to [0,100] via PUT /admin/v1/models/:id. ---
-    await admin.json("PUT", `/admin/v1/models/${virtualId}`, {
+    // --- Edit: invert the weights to [0,100] by rewriting the document. ---
+    await seed.update("models", virtualId, {
       display_name: "wr-edit-virtual",
       routing: {
         strategy: "weighted",

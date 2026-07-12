@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
@@ -105,11 +105,12 @@ describe("anthropic→openai streaming usage (#790)", () => {
   let app: SpawnedApp | undefined;
   let upstreamUsage: OpenAiUpstream | undefined;
   let upstreamNoUsage: OpenAiUpstream | undefined;
-  let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let etcdReachable = false;
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     upstreamUsage = await startOpenAiUpstream({
@@ -121,33 +122,33 @@ describe("anthropic→openai streaming usage (#790)", () => {
       eventDelayMs: 2,
     });
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    seed = new SeedClient(etcd, app.etcdPrefix);
 
-    const pkUsage = await admin.createProviderKey({
+    const pkUsage = await seed.createProviderKey({
       display_name: "issue790-pk",
       secret: "sk-openai-mock",
       api_base: `${upstreamUsage.baseUrl}/v1`,
     });
-    const pkNoUsage = await admin.createProviderKey({
+    const pkNoUsage = await seed.createProviderKey({
       display_name: "issue790-pk-nousage",
       secret: "sk-openai-mock",
       api_base: `${upstreamNoUsage.baseUrl}/v1`,
     });
     // Mirrors the customer config from #790: alias gpt-5.5 → upstream
     // model mog-6 on an OpenAI-protocol provider.
-    await admin.createModel({
+    await seed.createModel({
       display_name: "gpt-5.5",
       provider: "openai",
       model_name: "mog-6",
       provider_key_id: pkUsage.id,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "gpt-5.5-nousage",
       provider: "openai",
       model_name: "mog-6",
       provider_key_id: pkNoUsage.id,
     });
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["gpt-5.5", "gpt-5.5-nousage"],
     });

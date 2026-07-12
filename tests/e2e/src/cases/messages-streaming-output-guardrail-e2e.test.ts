@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
@@ -35,28 +35,29 @@ const STREAM_EVENTS = [
 describe("streaming /v1/messages output guardrail (#448)", () => {
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
-  let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let etcdReachable = false;
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
     upstream = await startOpenAiUpstream({ streamEvents: STREAM_EVENTS, eventDelayMs: 2 });
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
-    const pk = await admin.createProviderKey({
+    seed = new SeedClient(etcd, app.etcdPrefix);
+    const pk = await seed.createProviderKey({
       display_name: "msgstream-gr-pk",
       secret: "sk-anth-mock",
       api_base: upstream.baseUrl,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "msgstream-gr",
       provider: "anthropic",
       model_name: "claude-3-5-haiku-20241022",
       provider_key_id: pk.id,
     });
-    await admin.createApiKey({ key_hash: HASH, allowed_models: ["msgstream-gr"] });
-    await admin.json("POST", "/admin/v1/guardrails", {
+    await seed.createApiKey({ key_hash: HASH, allowed_models: ["msgstream-gr"] });
+    await seed.createGuardrail({
       name: "msgstream-gr-output-keyword",
       enabled: true,
       hook_point: "output",

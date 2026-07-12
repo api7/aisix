@@ -2,8 +2,8 @@ import { createHash } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   pickFreePort,
   spawnApp,
   startOpenAiUpstream,
@@ -102,23 +102,24 @@ async function waitForAttempts(
 describe("per-attempt telemetry e2e (#655): one UsageEvent per upstream attempt", () => {
   let etcdReachable = false;
   let app: SpawnedApp | undefined;
-  let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let otlp: OtlpReceiver | undefined;
   const upstreams: OpenAiUpstream[] = [];
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    seed = new SeedClient(etcd, app.etcdPrefix);
     otlp = await startOtlpReceiver();
-    await admin.createObservabilityExporter({
+    await seed.createObservabilityExporter({
       name: "per-attempt-otlp",
       enabled: true,
       kind: "otlp_http",
       endpoint: otlp.url,
     });
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["*"],
     });
@@ -134,13 +135,13 @@ describe("per-attempt telemetry e2e (#655): one UsageEvent per upstream attempt"
     displayName: string,
     upstream: OpenAiUpstream,
   ): Promise<void> {
-    if (!admin) throw new Error("admin client not initialized");
-    const providerKey = await admin.createProviderKey({
+    if (!seed) throw new Error("seed client not initialized");
+    const providerKey = await seed.createProviderKey({
       display_name: `${displayName}-pk`,
       secret: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: displayName,
       provider: "openai",
       model_name: "gpt-4o-mini",
@@ -149,7 +150,7 @@ describe("per-attempt telemetry e2e (#655): one UsageEvent per upstream attempt"
   }
 
   test("a failover request emits a failed initial + successful fallback attempt sharing request_id", async (ctx) => {
-    if (!etcdReachable || !app || !admin || !otlp) {
+    if (!etcdReachable || !app || !seed || !otlp) {
       ctx.skip();
       return;
     }
@@ -178,7 +179,7 @@ describe("per-attempt telemetry e2e (#655): one UsageEvent per upstream attempt"
 
     await createOpenAiModel("attempt-primary", primary);
     await createOpenAiModel("attempt-secondary", secondary);
-    await admin.createModel({
+    await seed.createModel({
       display_name: "attempt-virtual",
       routing: {
         strategy: "failover",
@@ -188,17 +189,22 @@ describe("per-attempt telemetry e2e (#655): one UsageEvent per upstream attempt"
       },
     });
 
-    // Gate on admin-snapshot presence rather than probing the virtual —
+    // Gate on DP-snapshot presence rather than probing the virtual —
     // probing would warm the primary's cooldown (every retryable upstream
     // failure cools the failing direct target) and the measured request
-    // would then skip the primary entirely.
+    // would then skip the primary entirely. A throwaway canary key seeded
+    // AFTER the virtual authenticates only once the snapshot has caught
+    // up past it (watch events apply in revision order).
+    const canary = `sk-canary-attempt-${Date.now()}`;
+    await seed.createApiKey({
+      key_hash: createHash("sha256").update(canary).digest("hex"),
+      allowed_models: ["*"],
+    });
     await waitConfigPropagation(async () => {
-      try {
-        const models = await admin!.listModels();
-        return models.some((m) => m.display_name === "attempt-virtual");
-      } catch {
-        return false;
-      }
+      const res = await fetch(`${app!.proxyUrl}/v1/models`, {
+        headers: { authorization: `Bearer ${canary}` },
+      });
+      return res.status === 200;
     });
 
     const res = await fetch(`${app.proxyUrl}/v1/chat/completions`, {

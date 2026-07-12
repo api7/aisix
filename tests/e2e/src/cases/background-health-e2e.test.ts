@@ -4,6 +4,7 @@ import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   AdminClient,
   EtcdClient,
+  SeedClient,
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
@@ -19,6 +20,7 @@ const CALLER_KEY_HASH = createHash("sha256")
 describe("background health e2e", () => {
   let app: SpawnedApp | undefined;
   let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let etcdReachable = false;
   let unhealthyUpstream: OpenAiUpstream | undefined;
   let ignoredUpstream: OpenAiUpstream | undefined;
@@ -28,7 +30,8 @@ describe("background health e2e", () => {
   let stableModelID = "";
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     unhealthyUpstream = await startOpenAiUpstream({
@@ -58,25 +61,26 @@ describe("background health e2e", () => {
 
     app = await spawnApp();
     admin = new AdminClient(app.adminUrl, app.adminKey);
+    seed = new SeedClient(etcd, app.etcdPrefix);
 
-    const unhealthyPk = await admin.createProviderKey({
+    const unhealthyPk = await seed.createProviderKey({
       display_name: "bg-unhealthy-pk",
       secret: "sk-mock",
       api_base: `${unhealthyUpstream.baseUrl}/v1`,
     });
-    const ignoredPk = await admin.createProviderKey({
+    const ignoredPk = await seed.createProviderKey({
       display_name: "bg-ignored-pk",
       secret: "sk-mock",
       api_base: `${ignoredUpstream.baseUrl}/v1`,
     });
-    const stablePk = await admin.createProviderKey({
+    const stablePk = await seed.createProviderKey({
       display_name: "bg-stable-pk",
       secret: "sk-mock",
       api_base: `${stableUpstream.baseUrl}/v1`,
     });
 
     unhealthyModelID = (
-      await admin.createModel({
+      await seed.createModel({
         display_name: "bg-unhealthy",
         provider: "openai",
         model_name: "gpt-4o-mini",
@@ -94,7 +98,7 @@ describe("background health e2e", () => {
     ).id;
 
     ignoredModelID = (
-      await admin.createModel({
+      await seed.createModel({
         display_name: "bg-ignored",
         provider: "openai",
         model_name: "gpt-4o-mini",
@@ -112,7 +116,7 @@ describe("background health e2e", () => {
     ).id;
 
     stableModelID = (
-      await admin.createModel({
+      await seed.createModel({
         display_name: "bg-stable",
         provider: "openai",
         model_name: "gpt-4o-mini",
@@ -120,7 +124,7 @@ describe("background health e2e", () => {
       })
     ).id;
 
-    await admin.createModel({
+    await seed.createModel({
       display_name: "bg-router",
       routing: {
         strategy: "failover",
@@ -132,7 +136,7 @@ describe("background health e2e", () => {
       },
     });
 
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["bg-router", "bg-stable"],
     });
@@ -211,17 +215,17 @@ describe("background health e2e", () => {
   });
 
   test("active background checks keep unhealthy state fresh even with a short stale window", async (ctx) => {
-    if (!etcdReachable || !app || !admin || !unhealthyUpstream) {
+    if (!etcdReachable || !app || !admin || !seed || !unhealthyUpstream) {
       ctx.skip();
       return;
     }
 
-    const shortStalePk = await admin.createProviderKey({
+    const shortStalePk = await seed.createProviderKey({
       display_name: "bg-stale-short-pk",
       secret: "sk-mock",
       api_base: `${unhealthyUpstream.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "bg-stale-short",
       provider: "openai",
       model_name: "gpt-4o-mini",

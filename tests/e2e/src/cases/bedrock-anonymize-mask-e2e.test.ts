@@ -2,8 +2,8 @@ import { createHash } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   pickFreePort,
   spawnApp,
   startOpenAiUpstream,
@@ -139,10 +139,11 @@ describe("bedrock guardrail ANONYMIZE write-back (#932 follow-up)", () => {
   let streamUpstream: OpenAiUpstream | undefined;
   let bedrock: MockBedrock | undefined;
   let app: SpawnedApp | undefined;
-  let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     // Non-streaming upstream: the canned reply CONTAINS an email so the
@@ -183,41 +184,41 @@ describe("bedrock guardrail ANONYMIZE write-back (#932 follow-up)", () => {
 
     bedrock = await startMockBedrock();
     app = await spawnApp({ extra: { bedrock_endpoint_url: bedrock.url } });
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    seed = new SeedClient(etcd, app.etcdPrefix);
 
-    const pk = await admin.createProviderKey({
+    const pk = await seed.createProviderKey({
       display_name: "bmask-pk",
       secret: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "bmask-e2e",
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: pk.id,
     });
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: hash(CALLER),
       allowed_models: ["bmask-e2e"],
     });
 
-    const streamPk = await admin.createProviderKey({
+    const streamPk = await seed.createProviderKey({
       display_name: "bmask-stream-pk",
       secret: "sk-mock",
       api_base: `${streamUpstream.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "bmask-stream-e2e",
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: streamPk.id,
     });
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: hash(STREAM_CALLER),
       allowed_models: ["bmask-stream-e2e"],
     });
 
-    await admin.json("POST", "/admin/v1/guardrails", {
+    await seed.createGuardrail({
       name: "gr-bedrock-mask",
       enabled: true,
       hook_point: "both",

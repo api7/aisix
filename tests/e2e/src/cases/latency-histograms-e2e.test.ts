@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
@@ -38,7 +38,8 @@ describe("latency histograms e2e: bucketed TTFT + e2e latency (#1011)", () => {
   let etcdReachable = false;
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     upstream = await startOpenAiUpstream({
@@ -74,42 +75,42 @@ describe("latency histograms e2e: bucketed TTFT + e2e latency (#1011)", () => {
     });
 
     app = await spawnApp();
-    const admin = new AdminClient(app.adminUrl, app.adminKey);
+    const seed = new SeedClient(etcd, app.etcdPrefix);
 
-    const pk = await admin.createProviderKey({
+    const pk = await seed.createProviderKey({
       display_name: "histo-pk",
       secret: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "histo-model",
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: pk.id,
     });
-    const streamPk = await admin.createProviderKey({
+    const streamPk = await seed.createProviderKey({
       display_name: "histo-stream-pk",
       secret: "sk-mock",
       api_base: `${streamUpstream.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "histo-stream-model",
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: streamPk.id,
     });
-    const failPk = await admin.createProviderKey({
+    const failPk = await seed.createProviderKey({
       display_name: "histo-fail-pk",
       secret: "sk-mock",
       api_base: `${failUpstream.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "histo-fail-model",
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: failPk.id,
     });
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["histo-model", "histo-stream-model", "histo-fail-model"],
     });

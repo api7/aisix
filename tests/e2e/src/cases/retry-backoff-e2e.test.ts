@@ -2,8 +2,8 @@ import { createHash } from "node:crypto";
 import OpenAI, { APIError } from "openai";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
@@ -34,11 +34,12 @@ const MIN_EXPECTED_MS = 600;
 describe("retry backoff e2e: same-target retries wait before re-hitting upstream", () => {
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
-  let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let etcdReachable = false;
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     // Every request to this upstream returns a retryable 503.
@@ -47,14 +48,14 @@ describe("retry backoff e2e: same-target retries wait before re-hitting upstream
       errorBody: { error: { message: "always down", type: "server_error" } },
     });
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    seed = new SeedClient(etcd, app.etcdPrefix);
 
-    const pk = await admin.createProviderKey({
+    const pk = await seed.createProviderKey({
       display_name: "retry-backoff-pk",
       secret: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "retry-backoff-target",
       provider: "openai",
       model_name: "gpt-4o-mini",
@@ -62,7 +63,7 @@ describe("retry backoff e2e: same-target retries wait before re-hitting upstream
     });
     // Single-target router with retries=2: the same target is attempted
     // three times, so the two inter-retry backoffs are the only delay.
-    await admin.createModel({
+    await seed.createModel({
       display_name: "retry-backoff-router",
       routing: {
         strategy: "failover",
@@ -70,7 +71,7 @@ describe("retry backoff e2e: same-target retries wait before re-hitting upstream
         retries: 2,
       },
     });
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["retry-backoff-router"],
     });

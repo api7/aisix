@@ -2,8 +2,8 @@ import { createHash } from "node:crypto";
 import OpenAI from "openai";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
@@ -18,17 +18,18 @@ const CALLER_KEY_HASH = createHash("sha256")
 
 describe("routing strategies and retry behavior e2e", () => {
   let app: SpawnedApp | undefined;
-  let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let etcdReachable = false;
   const upstreams: OpenAiUpstream[] = [];
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
-    await admin.createApiKey({
+    seed = new SeedClient(etcd, app.etcdPrefix);
+    await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["*"],
     });
@@ -44,13 +45,13 @@ describe("routing strategies and retry behavior e2e", () => {
     upstream: OpenAiUpstream,
     extra: Record<string, unknown> = {},
   ): Promise<void> {
-    if (!admin) throw new Error("admin client not initialized");
-    const providerKey = await admin.createProviderKey({
+    if (!seed) throw new Error("seed client not initialized");
+    const providerKey = await seed.createProviderKey({
       display_name: `${displayName}-pk`,
       secret: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: displayName,
       provider: "openai",
       model_name: "gpt-4o-mini",
@@ -81,8 +82,28 @@ describe("routing strategies and retry behavior e2e", () => {
     });
   }
 
+
+  // Seed a throwaway canary key AFTER the resources under test — watch
+  // events apply in revision order, so once this bearer authenticates
+  // against /v1/models everything written before it is in the snapshot
+  // too. Probing the routed models directly would warm cooldowns and
+  // skew the per-target hit counts the assertions rely on.
+  async function waitSeedApplied(label: string): Promise<void> {
+    const canary = `sk-canary-${label}-${Date.now()}`;
+    await seed!.createApiKey({
+      key_hash: createHash("sha256").update(canary).digest("hex"),
+      allowed_models: ["*"],
+    });
+    await waitConfigPropagation(async () => {
+      const res = await fetch(`${app!.proxyUrl}/v1/models`, {
+        headers: { authorization: `Bearer ${canary}` },
+      });
+      return res.status === 200;
+    });
+  }
+
   test("failover retries the current target before moving to the next target", async (ctx) => {
-    if (!etcdReachable || !app || !admin) {
+    if (!etcdReachable || !app || !seed) {
       ctx.skip();
       return;
     }
@@ -117,7 +138,7 @@ describe("routing strategies and retry behavior e2e", () => {
     });
     await createOpenAiModel("routing-retry-secondary", secondary);
     await waitUntilModelResponds("routing-retry-secondary", "after retries");
-    await admin.createModel({
+    await seed.createModel({
       display_name: "routing-retry-virtual",
       routing: {
         strategy: "failover",
@@ -170,7 +191,7 @@ describe("routing strategies and retry behavior e2e", () => {
   });
 
   test("retry_on_429 lets 429 participate in retry and failover", async (ctx) => {
-    if (!etcdReachable || !app || !admin) {
+    if (!etcdReachable || !app || !seed) {
       ctx.skip();
       return;
     }
@@ -200,7 +221,7 @@ describe("routing strategies and retry behavior e2e", () => {
     await createOpenAiModel("routing-429-primary", primary);
     await createOpenAiModel("routing-429-secondary", secondary);
     await waitUntilModelResponds("routing-429-secondary", "429 fallback worked");
-    await admin.createModel({
+    await seed.createModel({
       display_name: "routing-429-virtual",
       routing: {
         strategy: "failover",
@@ -220,18 +241,11 @@ describe("routing strategies and retry behavior e2e", () => {
       maxRetries: 0,
     });
 
-    // Gate on admin-snapshot presence rather than probing the
+    // Gate on DP-snapshot presence rather than probing the
     // virtual — probe would warm the primary's 429 cooldown and
     // zero out per-target counts (post-PR #268: 429 cools down
     // regardless of retry_on_429).
-    await waitConfigPropagation(async () => {
-      try {
-        const models = await admin!.listModels();
-        return models.some((m) => m.display_name === "routing-429-virtual");
-      } catch {
-        return false;
-      }
-    });
+    await waitSeedApplied("routing-429");
 
     const primaryBaseline = primary.receivedRequests.length;
     const secondaryBaseline = secondary.receivedRequests.length;
@@ -247,7 +261,7 @@ describe("routing strategies and retry behavior e2e", () => {
   });
 
   test("round_robin rotates the starting target between requests", async (ctx) => {
-    if (!etcdReachable || !app || !admin) {
+    if (!etcdReachable || !app || !seed) {
       ctx.skip();
       return;
     }
@@ -290,7 +304,7 @@ describe("routing strategies and retry behavior e2e", () => {
     await createOpenAiModel("routing-rr-b", second);
     await waitUntilModelResponds("routing-rr-a", "rr-a");
     await waitUntilModelResponds("routing-rr-b", "rr-b");
-    await admin.createModel({
+    await seed.createModel({
       display_name: "routing-rr-virtual",
       routing: {
         strategy: "round_robin",
@@ -337,7 +351,7 @@ describe("routing strategies and retry behavior e2e", () => {
   });
 
   test("weighted picks the positive-weight target first and falls forward from there", async (ctx) => {
-    if (!etcdReachable || !app || !admin) {
+    if (!etcdReachable || !app || !seed) {
       ctx.skip();
       return;
     }
@@ -385,7 +399,7 @@ describe("routing strategies and retry behavior e2e", () => {
     await createOpenAiModel("routing-weighted-fallback", forwardFallback);
     await waitUntilModelResponds("routing-weighted-before", "should-not-run");
     await waitUntilModelResponds("routing-weighted-fallback", "weighted fallback worked");
-    await admin.createModel({
+    await seed.createModel({
       display_name: "routing-weighted-virtual",
       routing: {
         strategy: "weighted",
@@ -404,19 +418,12 @@ describe("routing strategies and retry behavior e2e", () => {
       maxRetries: 0,
     });
 
-    // Gate on admin-snapshot presence rather than probing the
+    // Gate on DP-snapshot presence rather than probing the
     // virtual — probe would warm the weighted primary's 502 cooldown
     // and skew per-target hit counts. Both direct models' readiness
     // was already established above; this confirms the routing record
     // has reached the DP snapshot.
-    await waitConfigPropagation(async () => {
-      try {
-        const models = await admin!.listModels();
-        return models.some((m) => m.display_name === "routing-weighted-virtual");
-      } catch {
-        return false;
-      }
-    });
+    await waitSeedApplied("routing-weighted");
 
     const beforeBaseline = zeroWeightBefore.receivedRequests.length;
     const primaryBaseline = weightedPrimary.receivedRequests.length;

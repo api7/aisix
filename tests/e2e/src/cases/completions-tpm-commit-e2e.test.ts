@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   ProxyClient,
   spawnApp,
   startOpenAiUpstream,
@@ -39,23 +39,24 @@ const COMPLETION_BODY = {
 describe("completions TPM commit (#911 [21])", () => {
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
-  let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let etcdReachable = false;
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     upstream = await startOpenAiUpstream({ nonStreamBody: COMPLETION_BODY });
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    seed = new SeedClient(etcd, app.etcdPrefix);
 
-    const pk = await admin.createProviderKey({
+    const pk = await seed.createProviderKey({
       display_name: "tpm-commit-pk",
       secret: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "tpm-commit",
       provider: "openai",
       model_name: "gpt-3.5-turbo-instruct",
@@ -63,7 +64,7 @@ describe("completions TPM commit (#911 [21])", () => {
     });
     // TPM=10 on the caller's key. The first /v1/completions call commits 16
     // tokens (> 10), so the second must be rejected on the token counter.
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["tpm-commit"],
       rate_limit: { tpm: TPM },

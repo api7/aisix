@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   ProxyClient,
   spawnApp,
   startOpenAiUpstream,
@@ -101,24 +101,25 @@ describe("streaming TPM commit (#688)", () => {
   let app: SpawnedApp | undefined;
   let upstreamMsg: OpenAiUpstream | undefined;
   let upstreamResp: OpenAiUpstream | undefined;
-  let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let etcdReachable = false;
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     upstreamMsg = await startOpenAiUpstream({ streamEvents: MSG_STREAM, eventDelayMs: 2 });
     upstreamResp = await startOpenAiUpstream({ streamEvents: RESP_STREAM, eventDelayMs: 2 });
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    seed = new SeedClient(etcd, app.etcdPrefix);
 
-    const pkMsg = await admin.createProviderKey({
+    const pkMsg = await seed.createProviderKey({
       display_name: "688-msg-pk",
       secret: "sk-mock",
       api_base: `${upstreamMsg.baseUrl}/v1`,
     });
-    const pkResp = await admin.createProviderKey({
+    const pkResp = await seed.createProviderKey({
       display_name: "688-resp-pk",
       secret: "sk-mock",
       api_base: `${upstreamResp.baseUrl}/v1`,
@@ -126,25 +127,25 @@ describe("streaming TPM commit (#688)", () => {
     // Both models are OpenAI-protocol: /v1/messages bridges to it
     // (cross_provider_dispatch), /v1/responses forwards verbatim
     // (responses_to_target).
-    await admin.createModel({
+    await seed.createModel({
       display_name: "msg-tpm",
       provider: "openai",
       model_name: "up-688",
       provider_key_id: pkMsg.id,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "resp-tpm",
       provider: "openai",
       model_name: "up-688",
       provider_key_id: pkResp.id,
     });
     // Separate caller keys so each endpoint's TPM counter is independent.
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: hash(MSG_CALLER),
       allowed_models: ["msg-tpm"],
       rate_limit: { tpm: TPM },
     });
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: hash(RESP_CALLER),
       allowed_models: ["resp-tpm"],
       rate_limit: { tpm: TPM },

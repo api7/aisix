@@ -1,8 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   ProxyClient,
   spawnApp,
   startOpenAiUpstream,
@@ -34,11 +34,12 @@ describe("metrics dimensions #890 e2e", () => {
   let nonStreamUpstream: OpenAiUpstream | undefined;
   let streamUpstream: OpenAiUpstream | undefined;
   let errorUpstream: OpenAiUpstream | undefined;
-  let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let etcdReachable = false;
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     nonStreamUpstream = await startOpenAiUpstream({ nonStreamBody: responseBody() });
@@ -54,38 +55,38 @@ describe("metrics dimensions #890 e2e", () => {
     });
 
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    seed = new SeedClient(etcd, app.etcdPrefix);
 
-    const nsPk = await admin.createProviderKey({
+    const nsPk = await seed.createProviderKey({
       display_name: PK_NAME,
       secret: "sk-mock",
       api_base: `${nonStreamUpstream.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: NONSTREAM_MODEL,
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: nsPk.id,
     });
 
-    const stPk = await admin.createProviderKey({
+    const stPk = await seed.createProviderKey({
       display_name: `${PK_NAME}-stream`,
       secret: "sk-mock",
       api_base: `${streamUpstream.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: STREAM_MODEL,
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: stPk.id,
     });
 
-    const errPk = await admin.createProviderKey({
+    const errPk = await seed.createProviderKey({
       display_name: `${PK_NAME}-error`,
       secret: "sk-mock",
       api_base: `${errorUpstream.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: ERROR_MODEL,
       provider: "openai",
       model_name: "gpt-4o-mini",

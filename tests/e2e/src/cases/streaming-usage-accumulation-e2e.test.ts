@@ -2,8 +2,8 @@ import { createHash } from "node:crypto";
 import OpenAI from "openai";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
@@ -78,11 +78,12 @@ describe("streaming usage accumulation e2e: stream final usage == non-stream usa
   let app: SpawnedApp | undefined;
   let nonStreamUpstream: OpenAiUpstream | undefined;
   let streamUpstream: OpenAiUpstream | undefined;
-  let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let etcdReachable = false;
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     nonStreamUpstream = await startOpenAiUpstream({
@@ -93,35 +94,35 @@ describe("streaming usage accumulation e2e: stream final usage == non-stream usa
     });
 
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    seed = new SeedClient(etcd, app.etcdPrefix);
 
     // Two ProviderKeys → two Models so receivedRequests counts on
     // each mock are unambiguous, and so the streaming and non-
     // streaming calls cannot accidentally cross-pollinate request
     // bodies in the assertion below.
-    const pkNon = await admin.createProviderKey({
+    const pkNon = await seed.createProviderKey({
       display_name: "stream-usage-non-pk",
       secret: "sk-mock",
       api_base: `${nonStreamUpstream.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "stream-usage-non",
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: pkNon.id,
     });
-    const pkStream = await admin.createProviderKey({
+    const pkStream = await seed.createProviderKey({
       display_name: "stream-usage-stream-pk",
       secret: "sk-mock",
       api_base: `${streamUpstream.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "stream-usage-stream",
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: pkStream.id,
     });
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["stream-usage-non", "stream-usage-stream"],
     });

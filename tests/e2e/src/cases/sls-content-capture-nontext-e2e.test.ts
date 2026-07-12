@@ -1,9 +1,9 @@
 import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   decodedTextFor,
   EtcdClient,
+  SeedClient,
   spawnApp,
   startMockSls,
   startOpenAiUpstream,
@@ -130,8 +130,8 @@ describe("sls content capture e2e (#700): embeddings / rerank / images / audio",
         },
       });
       apps.push(app);
-      const admin = new AdminClient(app.adminUrl, app.adminKey);
-      await admin.createObservabilityExporter({
+      const seedClient = new SeedClient(new EtcdClient(), app.etcdPrefix);
+      await seedClient.createObservabilityExporter({
         name: "sls-full-nontext",
         enabled: true,
         kind: "aliyun_sls",
@@ -141,7 +141,7 @@ describe("sls content capture e2e (#700): embeddings / rerank / images / audio",
         credential_ref: CREDENTIAL_REF,
         content_mode: "full",
       });
-      await admin.createObservabilityExporter({
+      await seedClient.createObservabilityExporter({
         name: "sls-meta-nontext",
         enabled: true,
         kind: "aliyun_sls",
@@ -152,12 +152,12 @@ describe("sls content capture e2e (#700): embeddings / rerank / images / audio",
         content_mode: "metadata_only",
       });
       const seed = async (name: string, modelName: string, upstream: OpenAiUpstream) => {
-        const pk = await admin.createProviderKey({
+        const pk = await seedClient.createProviderKey({
           display_name: `${name}-pk`,
           secret: PROVIDER_SECRET,
           api_base: `${upstream.baseUrl}/v1`,
         });
-        await admin.createModel({
+        await seedClient.createModel({
           display_name: name,
           provider: "openai",
           model_name: modelName,
@@ -169,7 +169,7 @@ describe("sls content capture e2e (#700): embeddings / rerank / images / audio",
       await seed("cc700-images", "dall-e-3", imagesUpstream);
       await seed("cc700-speech", "tts-1", speechUpstream);
       await seed("cc700-transcribe", "whisper-1", transcribeUpstream);
-      await admin.createApiKey({
+      await seedClient.createApiKey({
         key_hash: CALLER_KEY_HASH,
         allowed_models: [
           "cc700-embed",

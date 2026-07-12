@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
@@ -63,11 +63,12 @@ describe("usage cache-counter passthrough on /v1/chat/completions (#542)", () =>
   let app: SpawnedApp | undefined;
   let openaiUpstream: OpenAiUpstream | undefined;
   let deepseekUpstream: OpenAiUpstream | undefined;
-  let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let etcdReachable = false;
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     // OpenAI-shape upstream: cache hit nested under prompt_tokens_details.
@@ -110,41 +111,41 @@ describe("usage cache-counter passthrough on /v1/chat/completions (#542)", () =>
     });
 
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    seed = new SeedClient(etcd, app.etcdPrefix);
 
     // Post-#302 Phase A: cp-api writes `provider` + `adapter` on every
     // PK row; the snapshot's two-tier dispatch needs both. DeepSeek
     // dispatches through the OpenAI-compat family bridge (`adapter:
     // "openai"`) — the same bridge whose usage parser this PR fixes.
-    const oaiPk = await admin.createProviderKey({
+    const oaiPk = await seed.createProviderKey({
       display_name: "cache-oai-pk",
       secret: "sk-mock",
       api_base: `${openaiUpstream.baseUrl}/v1`,
       provider: "openai",
       adapter: "openai",
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "cache-oai",
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: oaiPk.id,
     });
 
-    const dsPk = await admin.createProviderKey({
+    const dsPk = await seed.createProviderKey({
       display_name: "cache-ds-pk",
       secret: "sk-mock",
       api_base: `${deepseekUpstream.baseUrl}/v1`,
       provider: "deepseek",
       adapter: "openai",
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "cache-ds",
       provider: "deepseek",
       model_name: "deepseek-chat",
       provider_key_id: dsPk.id,
     });
 
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["cache-oai", "cache-ds"],
     });
@@ -232,21 +233,21 @@ describe("usage cache-counter passthrough on /v1/chat/completions (#542)", () =>
     });
     const plainApp = await spawnApp();
     try {
-      const plainAdmin = new AdminClient(plainApp.adminUrl, plainApp.adminKey);
-      const pk = await plainAdmin.createProviderKey({
+      const plainSeed = new SeedClient(new EtcdClient(), plainApp.etcdPrefix);
+      const pk = await plainSeed.createProviderKey({
         display_name: "cache-plain-pk",
         secret: "sk-mock",
         api_base: `${plainUpstream.baseUrl}/v1`,
         provider: "openai",
         adapter: "openai",
       });
-      await plainAdmin.createModel({
+      await plainSeed.createModel({
         display_name: "cache-plain",
         provider: "openai",
         model_name: "gpt-4o-mini",
         provider_key_id: pk.id,
       });
-      await plainAdmin.createApiKey({
+      await plainSeed.createApiKey({
         key_hash: CALLER_KEY_HASH,
         allowed_models: ["cache-plain"],
       });
@@ -318,21 +319,21 @@ describe("usage cache-counter passthrough on /v1/chat/completions (#542)", () =>
     });
     const streamApp = await spawnApp();
     try {
-      const streamAdmin = new AdminClient(streamApp.adminUrl, streamApp.adminKey);
-      const pk = await streamAdmin.createProviderKey({
+      const streamSeed = new SeedClient(new EtcdClient(), streamApp.etcdPrefix);
+      const pk = await streamSeed.createProviderKey({
         display_name: "cache-ds-stream-pk",
         secret: "sk-mock",
         api_base: `${streamUpstream.baseUrl}/v1`,
         provider: "deepseek",
         adapter: "openai",
       });
-      await streamAdmin.createModel({
+      await streamSeed.createModel({
         display_name: "cache-ds-stream",
         provider: "deepseek",
         model_name: "deepseek-chat",
         provider_key_id: pk.id,
       });
-      await streamAdmin.createApiKey({
+      await streamSeed.createApiKey({
         key_hash: CALLER_KEY_HASH,
         allowed_models: ["cache-ds-stream"],
       });

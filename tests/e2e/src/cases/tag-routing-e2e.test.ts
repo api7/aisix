@@ -2,8 +2,8 @@ import { createHash } from "node:crypto";
 import OpenAI from "openai";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
@@ -35,17 +35,18 @@ function okBody(content: string) {
 
 describe("tag/metadata conditional routing e2e", () => {
   let app: SpawnedApp | undefined;
-  let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let etcdReachable = false;
   const upstreams: OpenAiUpstream[] = [];
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
-    await admin.createApiKey({
+    seed = new SeedClient(etcd, app.etcdPrefix);
+    await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["*"],
     });
@@ -60,13 +61,13 @@ describe("tag/metadata conditional routing e2e", () => {
     displayName: string,
     upstream: OpenAiUpstream,
   ): Promise<void> {
-    if (!admin) throw new Error("admin client not initialized");
-    const providerKey = await admin.createProviderKey({
+    if (!seed) throw new Error("seed client not initialized");
+    const providerKey = await seed.createProviderKey({
       display_name: `${displayName}-pk`,
       secret: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: displayName,
       provider: "openai",
       model_name: "gpt-4o-mini",
@@ -91,8 +92,28 @@ describe("tag/metadata conditional routing e2e", () => {
     return completion.choices[0]?.message.content ?? null;
   }
 
+
+  // Seed a throwaway canary key AFTER the resources under test — watch
+  // events apply in revision order, so once this bearer authenticates
+  // against /v1/models everything written before it is in the snapshot
+  // too. Probing the routed models directly would warm cooldowns and
+  // skew the per-target hit counts the assertions rely on.
+  async function waitSeedApplied(label: string): Promise<void> {
+    const canary = `sk-canary-${label}-${Date.now()}`;
+    await seed!.createApiKey({
+      key_hash: createHash("sha256").update(canary).digest("hex"),
+      allowed_models: ["*"],
+    });
+    await waitConfigPropagation(async () => {
+      const res = await fetch(`${app!.proxyUrl}/v1/models`, {
+        headers: { authorization: `Bearer ${canary}` },
+      });
+      return res.status === 200;
+    });
+  }
+
   test("selects the tagged target, defaulting when unmatched or untagged", async (ctx) => {
-    if (!etcdReachable || !app || !admin) {
+    if (!etcdReachable || !app || !seed) {
       ctx.skip();
       return;
     }
@@ -106,7 +127,7 @@ describe("tag/metadata conditional routing e2e", () => {
     await createOpenAiModel("tag-default", def);
     // failover keeps target selection deterministic: whatever the tag filter
     // leaves, the first survivor is attempted.
-    await admin.createModel({
+    await seed.createModel({
       display_name: "tag-router",
       routing: {
         strategy: "failover",
@@ -118,10 +139,7 @@ describe("tag/metadata conditional routing e2e", () => {
       },
     });
 
-    await waitConfigPropagation(async () => {
-      const models = await admin!.listModels();
-      return models.some((m) => m.display_name === "tag-router");
-    });
+    await waitSeedApplied("tag-router");
 
     // Matching tags route to their target.
     expect(await askWithTags("eu")).toBe("eu-served");

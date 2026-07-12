@@ -2,8 +2,8 @@ import { createHash } from "node:crypto";
 import OpenAI from "openai";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
@@ -47,21 +47,22 @@ function sentModel(upstream: OpenAiUpstream): string {
 
 describe("wildcard (provider/*) model routing e2e", () => {
   let app: SpawnedApp | undefined;
-  let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let etcdReachable = false;
   const upstreams: OpenAiUpstream[] = [];
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
-    await admin.createApiKey({
+    seed = new SeedClient(etcd, app.etcdPrefix);
+    await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["*"],
     });
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: SCOPED_KEY_HASH,
       allowed_models: ["vendor-a/*"],
     });
@@ -79,13 +80,13 @@ describe("wildcard (provider/*) model routing e2e", () => {
     modelName: string,
     upstream: OpenAiUpstream,
   ): Promise<void> {
-    if (!admin) throw new Error("admin client not initialized");
-    const providerKey = await admin.createProviderKey({
+    if (!seed) throw new Error("seed client not initialized");
+    const providerKey = await seed.createProviderKey({
       display_name: `${displayName.replace(/[^a-z0-9]/gi, "-")}-pk`,
       secret: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: displayName,
       provider: "openai",
       model_name: modelName,
@@ -101,8 +102,28 @@ describe("wildcard (provider/*) model routing e2e", () => {
     });
   }
 
+
+  // Seed a throwaway canary key AFTER the resources under test — watch
+  // events apply in revision order, so once this bearer authenticates
+  // against /v1/models everything written before it is in the snapshot
+  // too. Probing the routed models directly would warm cooldowns and
+  // skew the per-target hit counts the assertions rely on.
+  async function waitSeedApplied(label: string): Promise<void> {
+    const canary = `sk-canary-${label}-${Date.now()}`;
+    await seed!.createApiKey({
+      key_hash: createHash("sha256").update(canary).digest("hex"),
+      allowed_models: ["*"],
+    });
+    await waitConfigPropagation(async () => {
+      const res = await fetch(`${app!.proxyUrl}/v1/models`, {
+        headers: { authorization: `Bearer ${canary}` },
+      });
+      return res.status === 200;
+    });
+  }
+
   test("resolves provider/* and sends the captured model upstream", async (ctx) => {
-    if (!etcdReachable || !app || !admin) {
+    if (!etcdReachable || !app || !seed) {
       ctx.skip();
       return;
     }
@@ -111,10 +132,7 @@ describe("wildcard (provider/*) model routing e2e", () => {
     upstreams.push(up);
     await createDirectModel("openai/*", "*", up);
 
-    await waitConfigPropagation(async () => {
-      const models = await admin!.listModels();
-      return models.some((m) => m.display_name === "openai/*");
-    });
+    await waitSeedApplied("wild-openai");
 
     const baseline = up.receivedRequests.length;
     const completion = await client().chat.completions.create({
@@ -129,7 +147,7 @@ describe("wildcard (provider/*) model routing e2e", () => {
   });
 
   test("an exact model name wins over a matching wildcard", async (ctx) => {
-    if (!etcdReachable || !app || !admin) {
+    if (!etcdReachable || !app || !seed) {
       ctx.skip();
       return;
     }
@@ -140,13 +158,7 @@ describe("wildcard (provider/*) model routing e2e", () => {
     await createDirectModel("azure/*", "*", wild);
     await createDirectModel("azure/gpt-4o", "gpt-4o-2024-08-06", exact);
 
-    await waitConfigPropagation(async () => {
-      const models = await admin!.listModels();
-      return (
-        models.some((m) => m.display_name === "azure/*") &&
-        models.some((m) => m.display_name === "azure/gpt-4o")
-      );
-    });
+    await waitSeedApplied("wild-azure");
 
     // Exact name → the concrete model, not the wildcard.
     const exactBaseline = exact.receivedRequests.length;
@@ -171,7 +183,7 @@ describe("wildcard (provider/*) model routing e2e", () => {
   });
 
   test("wildcard allowed_models scopes access to matching names", async (ctx) => {
-    if (!etcdReachable || !app || !admin) {
+    if (!etcdReachable || !app || !seed) {
       ctx.skip();
       return;
     }
@@ -184,13 +196,7 @@ describe("wildcard (provider/*) model routing e2e", () => {
     // rejection is authz (403), not not-found (404).
     await createDirectModel("vendor-b/thing", "thing", denied);
 
-    await waitConfigPropagation(async () => {
-      const models = await admin!.listModels();
-      return (
-        models.some((m) => m.display_name === "vendor-a/*") &&
-        models.some((m) => m.display_name === "vendor-b/thing")
-      );
-    });
+    await waitSeedApplied("wild-scoped");
 
     // In-scope wildcard name → allowed.
     const deniedBaseline = denied.receivedRequests.length;

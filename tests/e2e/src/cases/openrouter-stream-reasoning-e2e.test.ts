@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
@@ -47,11 +47,12 @@ function chunk(delta: Record<string, unknown>, finish: string | null = null) {
 describe("openrouter delta.reasoning normalization on streaming /v1/chat/completions (#502)", () => {
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
-  let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let etcdReachable = false;
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     // OpenRouter-style streaming: reasoning text arrives on `delta.reasoning`,
@@ -68,23 +69,23 @@ describe("openrouter delta.reasoning normalization on streaming /v1/chat/complet
     });
 
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    seed = new SeedClient(etcd, app.etcdPrefix);
 
     // OpenRouter dispatches through the OpenAI-compat family bridge.
-    const pk = await admin.createProviderKey({
+    const pk = await seed.createProviderKey({
       display_name: "or-stream-reasoning-pk",
       secret: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
       provider: "openrouter",
       adapter: "openai",
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "or-reasoner",
       provider: "openrouter",
       model_name: "some-reasoner",
       provider_key_id: pk.id,
     });
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["or-reasoner"],
     });

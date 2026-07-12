@@ -2,8 +2,8 @@ import { createHash } from "node:crypto";
 import OpenAI, { APIError } from "openai";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
@@ -37,22 +37,23 @@ const CALLER_KEY_HASH = createHash("sha256")
 
 describe("fallback edge cases e2e", () => {
   let app: SpawnedApp | undefined;
-  let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let etcdReachable = false;
   // Each test sets up its own pair/triple of mock upstreams so the
   // request-count assertions stay isolated across cases.
   const upstreams: OpenAiUpstream[] = [];
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    seed = new SeedClient(etcd, app.etcdPrefix);
 
     // Wildcard ApiKey lets the same caller reach every per-test
     // virtual model without re-issuing keys.
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["*"],
     });
@@ -64,7 +65,7 @@ describe("fallback edge cases e2e", () => {
   });
 
   test("non-retryable 4xx (400) does NOT trigger fallback — caller sees the 4xx", async (ctx) => {
-    if (!etcdReachable || !app || !admin) {
+    if (!etcdReachable || !app || !seed) {
       ctx.skip();
       return;
     }
@@ -104,29 +105,29 @@ describe("fallback edge cases e2e", () => {
     });
     upstreams.push(badRequestUpstream, goodUpstream);
 
-    const badPk = await admin.createProviderKey({
+    const badPk = await seed.createProviderKey({
       display_name: "fb-edges-400-pk",
       secret: "sk-mock",
       api_base: `${badRequestUpstream.baseUrl}/v1`,
     });
-    const goodPk = await admin.createProviderKey({
+    const goodPk = await seed.createProviderKey({
       display_name: "fb-edges-400-good-pk",
       secret: "sk-mock",
       api_base: `${goodUpstream.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "fb-edges-400-bad",
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: badPk.id,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "fb-edges-400-good",
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: goodPk.id,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "fb-edges-400-virtual",
       routing: {
         strategy: "failover",
@@ -213,7 +214,7 @@ describe("fallback edge cases e2e", () => {
   });
 
   test("all targets fail → caller sees a clean error envelope, not hang", async (ctx) => {
-    if (!etcdReachable || !app || !admin) {
+    if (!etcdReachable || !app || !seed) {
       ctx.skip();
       return;
     }
@@ -232,29 +233,29 @@ describe("fallback edge cases e2e", () => {
     });
     upstreams.push(bad1, bad2);
 
-    const pk1 = await admin.createProviderKey({
+    const pk1 = await seed.createProviderKey({
       display_name: "fb-edges-allfail-1-pk",
       secret: "sk-mock",
       api_base: `${bad1.baseUrl}/v1`,
     });
-    const pk2 = await admin.createProviderKey({
+    const pk2 = await seed.createProviderKey({
       display_name: "fb-edges-allfail-2-pk",
       secret: "sk-mock",
       api_base: `${bad2.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "fb-edges-allfail-1",
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: pk1.id,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "fb-edges-allfail-2",
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: pk2.id,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "fb-edges-allfail-virtual",
       routing: {
         strategy: "failover",

@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
@@ -64,17 +64,18 @@ const CALLER_KEY_HASH = createHash("sha256")
 
 describe("passthrough e2e: /passthrough/{provider}/*rest verbatim forwarding with auth injection + double-/v1 dedup", () => {
   let app: SpawnedApp | undefined;
-  let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let etcdReachable = false;
   const upstreams: OpenAiUpstream[] = [];
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
-    await admin.createApiKey({
+    seed = new SeedClient(etcd, app.etcdPrefix);
+    await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["*"],
     });
@@ -86,7 +87,7 @@ describe("passthrough e2e: /passthrough/{provider}/*rest verbatim forwarding wit
   });
 
   test("OpenAI passthrough: gateway dedups doubled /v1, forwards verbatim, injects Bearer auth", async (ctx) => {
-    if (!etcdReachable || !app || !admin) {
+    if (!etcdReachable || !app || !seed) {
       ctx.skip();
       return;
     }
@@ -113,14 +114,14 @@ describe("passthrough e2e: /passthrough/{provider}/*rest verbatim forwarding wit
 
     // Configure exactly per docs/api-admin.md §4.3 example:
     // `api_base: "https://api.openai.com/v1"` (with /v1).
-    const pk = await admin.createProviderKey({
+    const pk = await seed.createProviderKey({
       display_name: "pt-openai-pk",
       secret: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     // The Model's provider field is what the passthrough route
     // matches on (per docs §4.10 "first Model with that prefix").
-    await admin.createModel({
+    await seed.createModel({
       display_name: "pt-openai-model",
       provider: "openai",
       model_name: "gpt-4o-mini",
@@ -215,7 +216,7 @@ describe("passthrough e2e: /passthrough/{provider}/*rest verbatim forwarding wit
   });
 
   test("Anthropic passthrough: gateway uses x-api-key + anthropic-version, NOT Bearer", async (ctx) => {
-    if (!etcdReachable || !app || !admin) {
+    if (!etcdReachable || !app || !seed) {
       ctx.skip();
       return;
     }
@@ -238,12 +239,12 @@ describe("passthrough e2e: /passthrough/{provider}/*rest verbatim forwarding wit
     // Anthropic api_base is the bare host; bridge composes the
     // rest of the path. For passthrough, the gateway appends
     // `/*rest` directly, so we pass the bare host.
-    const pk = await admin.createProviderKey({
+    const pk = await seed.createProviderKey({
       display_name: "pt-anthropic-pk",
       secret: "sk-ant-mock",
       api_base: upstream.baseUrl,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "pt-anthropic-model",
       provider: "anthropic",
       model_name: "claude-3-5-haiku-20241022",

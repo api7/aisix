@@ -1,9 +1,9 @@
 import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   decodedTextFor,
   EtcdClient,
+  SeedClient,
   spawnApp,
   startMockSls,
   startOpenAiUpstream,
@@ -115,8 +115,8 @@ describe("sls content capture e2e: streaming capture is post-mask (#932 × AISIX
         },
       });
       apps.push(app);
-      const admin = new AdminClient(app.adminUrl, app.adminKey);
-      await admin.createObservabilityExporter({
+      const seed = new SeedClient(new EtcdClient(), app.etcdPrefix);
+      await seed.createObservabilityExporter({
         name: "sls-full-masked",
         enabled: true,
         kind: "aliyun_sls",
@@ -126,7 +126,7 @@ describe("sls content capture e2e: streaming capture is post-mask (#932 × AISIX
         credential_ref: CREDENTIAL_REF,
         content_mode: "full",
       });
-      await admin.createObservabilityExporter({
+      await seed.createObservabilityExporter({
         name: "sls-meta-masked",
         enabled: true,
         kind: "aliyun_sls",
@@ -136,38 +136,38 @@ describe("sls content capture e2e: streaming capture is post-mask (#932 × AISIX
         credential_ref: CREDENTIAL_REF,
         content_mode: "metadata_only",
       });
-      const chatPk = await admin.createProviderKey({
+      const chatPk = await seed.createProviderKey({
         display_name: "masked-chat-pk",
         secret: PROVIDER_SECRET,
         api_base: `${chatUpstream.baseUrl}/v1`,
       });
-      await admin.createModel({
+      await seed.createModel({
         display_name: "masked-chat-model",
         provider: "openai",
         model_name: "gpt-4o-mini",
         provider_key_id: chatPk.id,
       });
-      const bridgePk = await admin.createProviderKey({
+      const bridgePk = await seed.createProviderKey({
         display_name: "masked-bridge-pk",
         secret: PROVIDER_SECRET,
         api_base: `${bridgeUpstream.baseUrl}/v1`,
         provider: "deepseek",
         adapter: "openai",
       });
-      await admin.createModel({
+      await seed.createModel({
         display_name: "masked-bridge-model",
         provider: "deepseek",
         model_name: "gpt-4o-mini",
         provider_key_id: bridgePk.id,
       });
-      await admin.createApiKey({
+      await seed.createApiKey({
         key_hash: CALLER_KEY_HASH,
         allowed_models: ["masked-chat-model", "masked-bridge-model"],
       });
       // Env-wide output-hook PII guardrail: email → mask. Its presence also
       // forces the streaming hold-back (BufferFull) path — the path where
       // the capture/wire divergence lived.
-      await admin.json("POST", "/admin/v1/guardrails", {
+      await seed.createGuardrail({
         name: "masked-capture-guard",
         enabled: true,
         hook_point: "output",

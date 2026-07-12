@@ -2,8 +2,8 @@ import { createHash } from "node:crypto";
 import OpenAI, { APIError } from "openai";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   ProxyClient,
   spawnApp,
   startOpenAiUpstream,
@@ -30,23 +30,24 @@ const CALLER_KEY_HASH = createHash("sha256")
 describe("rate limit e2e: RPM=1 second call gets 429", () => {
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
-  let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let etcdReachable = false;
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     upstream = await startOpenAiUpstream();
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    seed = new SeedClient(etcd, app.etcdPrefix);
 
-    const pk = await admin.createProviderKey({
+    const pk = await seed.createProviderKey({
       display_name: "rl-e2e-pk",
       secret: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "rl-e2e",
       provider: "openai",
       model_name: "gpt-4o-mini",
@@ -55,7 +56,7 @@ describe("rate limit e2e: RPM=1 second call gets 429", () => {
     // Rate limit is per-ApiKey here (matching the unit-level
     // `seed_snapshot_with_limits` pattern). RPM=1 means the first
     // call inside a 60s window succeeds; the second is rejected.
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["rl-e2e"],
       rate_limit: { rpm: 1 },

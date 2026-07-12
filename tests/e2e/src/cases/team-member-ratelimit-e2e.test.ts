@@ -2,8 +2,8 @@ import { createHash } from "node:crypto";
 import OpenAI, { APIError } from "openai";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   ProxyClient,
   spawnApp,
   startOpenAiUpstream,
@@ -39,13 +39,13 @@ describe("rate limit e2e: team_member per-member default buckets", () => {
   let etcdReachable = false;
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     upstream = await startOpenAiUpstream();
     app = await spawnApp();
-    const admin = new AdminClient(app.adminUrl, app.adminKey);
-    const etcd = new EtcdClient();
+    const seed = new SeedClient(etcd, app.etcdPrefix);
 
     // Seed the policy FIRST (lower etcd revision) so that once the
     // probe sees the model (created below, higher revision) the policy
@@ -61,12 +61,12 @@ describe("rate limit e2e: team_member per-member default buckets", () => {
       }),
     );
 
-    const pk = await admin.createProviderKey({
+    const pk = await seed.createProviderKey({
       display_name: "tm-e2e-pk",
       secret: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "tm-e2e",
       provider: "openai",
       model_name: "gpt-4o-mini",

@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
@@ -34,11 +34,12 @@ const OUTPUT_GUARDRAIL = "pt-gr-output-keyword";
 describe("passthrough guardrail (#911 [6])", () => {
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
-  let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let etcdReachable = false;
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     // Upstream reply carries the forbidden OUTPUT word; the caller's request
@@ -61,31 +62,31 @@ describe("passthrough guardrail (#911 [6])", () => {
     });
 
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    seed = new SeedClient(etcd, app.etcdPrefix);
 
-    const pk = await admin.createProviderKey({
+    const pk = await seed.createProviderKey({
       display_name: "pt-gr-pk",
       secret: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "pt-gr",
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: pk.id,
     });
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["pt-gr"],
     });
-    await admin.json("POST", "/admin/v1/guardrails", {
+    await seed.createGuardrail({
       name: INPUT_GUARDRAIL,
       enabled: true,
       hook_point: "input",
       kind: "keyword",
       patterns: [{ kind: "literal", value: FORBIDDEN_INPUT }],
     });
-    await admin.json("POST", "/admin/v1/guardrails", {
+    await seed.createGuardrail({
       name: OUTPUT_GUARDRAIL,
       enabled: true,
       hook_point: "output",

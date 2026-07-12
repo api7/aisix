@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
@@ -30,11 +30,12 @@ const GUARDRAIL_NAME = "cmpl-out-gr-keyword";
 describe("completions output guardrail (#911 [23])", () => {
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
-  let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let etcdReachable = false;
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     // Legacy /v1/completions response shape, carrying the forbidden word in
@@ -59,26 +60,26 @@ describe("completions output guardrail (#911 [23])", () => {
     });
 
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    seed = new SeedClient(etcd, app.etcdPrefix);
 
-    const pk = await admin.createProviderKey({
+    const pk = await seed.createProviderKey({
       display_name: "cmpl-out-gr-pk",
       secret: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "cmpl-out-gr",
       provider: "openai",
       model_name: "gpt-3.5-turbo-instruct",
       provider_key_id: pk.id,
     });
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["cmpl-out-gr"],
     });
     // Output keyword guardrail (env-wide) — runs against the completion text
     // after the upstream call returns, before relay to the caller.
-    await admin.json("POST", "/admin/v1/guardrails", {
+    await seed.createGuardrail({
       name: GUARDRAIL_NAME,
       enabled: true,
       hook_point: "output",

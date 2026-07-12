@@ -2,8 +2,8 @@ import { createHash, randomUUID } from "node:crypto";
 import OpenAI, { APIError } from "openai";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
@@ -42,7 +42,7 @@ const UNSCOPED_MODEL = "unscoped-model";
 describe("guardrail e2e: model-scope attachment runs only for the scoped model (#850)", () => {
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
-  let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let etcd: EtcdClient | undefined;
   let etcdReachable = false;
 
@@ -53,43 +53,39 @@ describe("guardrail e2e: model-scope attachment runs only for the scoped model (
 
     upstream = await startOpenAiUpstream();
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    seed = new SeedClient(etcd, app.etcdPrefix);
 
-    const pk = await admin.createProviderKey({
+    const pk = await seed.createProviderKey({
       display_name: "gr-modelscope-pk",
       secret: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
-    const scoped = await admin.createModel({
+    const scoped = await seed.createModel({
       display_name: SCOPED_MODEL,
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: pk.id,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: UNSCOPED_MODEL,
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: pk.id,
     });
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: [SCOPED_MODEL, UNSCOPED_MODEL],
     });
 
     // Keyword blocklist guardrail. `hook_point: "input"` → a match
     // short-circuits with 422 before dispatch.
-    const guardrail = await admin.json<{ id: string }>(
-      "POST",
-      "/admin/v1/guardrails",
-      {
-        name: "gr-modelscope-keyword",
-        enabled: true,
-        hook_point: "input",
-        kind: "keyword",
-        patterns: [{ kind: "literal", value: FORBIDDEN_WORD }],
-      },
-    );
+    const guardrail = await seed.createGuardrail({
+      name: "gr-modelscope-keyword",
+      enabled: true,
+      hook_point: "input",
+      kind: "keyword",
+      patterns: [{ kind: "literal", value: FORBIDDEN_WORD }],
+    });
 
     // Attach the guardrail to the SCOPED model only. Wire shape mirrors
     // cp-api's `marshalGuardrailAttachmentKV` (P0c): snake_case fields,

@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   ProxyClient,
   spawnApp,
   startOpenAiUpstream,
@@ -109,11 +109,12 @@ describe("anthropic cache tokens count toward TPM (AISIX-Cloud#995)", () => {
   let upstreamMsg: OpenAiUpstream | undefined;
   let upstreamMsgStream: OpenAiUpstream | undefined;
   let upstreamResp: OpenAiUpstream | undefined;
-  let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let etcdReachable = false;
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     upstreamMsg = await startOpenAiUpstream({
@@ -127,7 +128,7 @@ describe("anthropic cache tokens count toward TPM (AISIX-Cloud#995)", () => {
       nonStreamBody: anthropicMessageBody(NONSTREAM_USAGE),
     });
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    seed = new SeedClient(etcd, app.etcdPrefix);
 
     // The Anthropic adapter appends `/v1/messages` to the api_base, so the
     // provider key points at the bare mock host.
@@ -136,21 +137,21 @@ describe("anthropic cache tokens count toward TPM (AISIX-Cloud#995)", () => {
       upstream: OpenAiUpstream,
       caller: string,
     ) => {
-      const pk = await admin!.createProviderKey({
+      const pk = await seed!.createProviderKey({
         display_name: `${name}-pk`,
         provider: "anthropic",
         adapter: "anthropic",
         secret: "sk-ant-mock",
         api_base: upstream.baseUrl,
       });
-      await admin!.createModel({
+      await seed!.createModel({
         display_name: name,
         provider: "anthropic",
         model_name: "claude-3-5-haiku-20241022",
         provider_key_id: pk.id,
       });
       // Separate caller keys so each scenario's TPM counter is independent.
-      await admin!.createApiKey({
+      await seed!.createApiKey({
         key_hash: hash(caller),
         allowed_models: [name],
         rate_limit: { tpm: TPM },

@@ -232,6 +232,7 @@ describe("datadog exporter e2e (#688): DP delivers a gzip JSON intake to Datadog
         },
       });
       apps.push(app);
+      // Deliberately seeds via the Admin API: deprecation-window coverage.
       const admin = new AdminClient(app.adminUrl, app.adminKey);
       await admin.createObservabilityExporter({
         name: "mock-datadog",

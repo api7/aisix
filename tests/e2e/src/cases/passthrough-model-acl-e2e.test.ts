@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
@@ -28,17 +28,18 @@ describe("passthrough model ACL (#449)", () => {
   let etcdReachable = false;
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
     upstream = await startOpenAiUpstream({});
     app = await spawnApp();
-    const admin = new AdminClient(app.adminUrl, app.adminKey);
-    const pk = await admin.createProviderKey({
+    const seed = new SeedClient(etcd, app.etcdPrefix);
+    const pk = await seed.createProviderKey({
       display_name: "pt-acl-pk",
       secret: "sk-openai-mock",
       api_base: upstream.baseUrl,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "pt-acl-model",
       provider: "openai",
       model_name: "gpt-x",
@@ -46,8 +47,8 @@ describe("passthrough model ACL (#449)", () => {
     });
     // ALLOWED key may use the openai model; DENIED key may only use an
     // unrelated model name (no openai model in its ACL).
-    await admin.createApiKey({ key_hash: sha(ALLOWED), allowed_models: ["pt-acl-model"] });
-    await admin.createApiKey({ key_hash: sha(DENIED), allowed_models: ["unrelated-model"] });
+    await seed.createApiKey({ key_hash: sha(ALLOWED), allowed_models: ["pt-acl-model"] });
+    await seed.createApiKey({ key_hash: sha(DENIED), allowed_models: ["unrelated-model"] });
   });
 
   afterAll(async () => {

@@ -2,8 +2,8 @@ import { createHash } from "node:crypto";
 import OpenAI from "openai";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
@@ -60,11 +60,12 @@ describe("weighted routing distribution e2e: 70/30 split lands inside [55,85] / 
   let app: SpawnedApp | undefined;
   let upstreamA: OpenAiUpstream | undefined;
   let upstreamB: OpenAiUpstream | undefined;
-  let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let etcdReachable = false;
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     upstreamA = await startOpenAiUpstream({
@@ -101,28 +102,28 @@ describe("weighted routing distribution e2e: 70/30 split lands inside [55,85] / 
     });
 
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    seed = new SeedClient(etcd, app.etcdPrefix);
 
     // Two distinct ProviderKeys so each Model points at its own
     // upstream — necessary for receivedRequests counts to be
     // attributable per side.
-    const pkA = await admin.createProviderKey({
+    const pkA = await seed.createProviderKey({
       display_name: "wr-a-pk",
       secret: "sk-mock",
       api_base: `${upstreamA.baseUrl}/v1`,
     });
-    const pkB = await admin.createProviderKey({
+    const pkB = await seed.createProviderKey({
       display_name: "wr-b-pk",
       secret: "sk-mock",
       api_base: `${upstreamB.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "wr-a",
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: pkA.id,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "wr-b",
       provider: "openai",
       model_name: "gpt-4o-mini",
@@ -131,7 +132,7 @@ describe("weighted routing distribution e2e: 70/30 split lands inside [55,85] / 
     // Virtual Model: routing-only, weighted strategy. Per the schema
     // enum the gateway publishes (round_robin / weighted / failover),
     // `weighted` should honour each target's `weight` integer.
-    await admin.createModel({
+    await seed.createModel({
       display_name: "wr-virtual",
       routing: {
         strategy: "weighted",
@@ -143,7 +144,7 @@ describe("weighted routing distribution e2e: 70/30 split lands inside [55,85] / 
     });
     // Caller is allowed all three Models so the readiness probes can
     // hit the leaves directly without firing the weighted dispatcher.
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["wr-virtual", "wr-a", "wr-b"],
     });

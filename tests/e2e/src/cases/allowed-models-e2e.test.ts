@@ -2,8 +2,8 @@ import { createHash } from "node:crypto";
 import OpenAI, { APIError } from "openai";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
@@ -30,32 +30,33 @@ const CALLER_KEY_HASH = createHash("sha256")
 describe("allowed_models e2e: 403 on disallowed model, upstream untouched", () => {
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
-  let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let etcdReachable = false;
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     upstream = await startOpenAiUpstream();
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    seed = new SeedClient(etcd, app.etcdPrefix);
 
     // Single ProviderKey + two Models. They share the upstream so
     // upstream.receivedRequests is a single source of truth — if the
     // forbidden call leaks through, it will register here.
-    const pk = await admin.createProviderKey({
+    const pk = await seed.createProviderKey({
       display_name: "am-e2e-pk",
       secret: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "am-allowed",
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: pk.id,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "am-forbidden",
       provider: "openai",
       model_name: "gpt-4o-mini",
@@ -64,7 +65,7 @@ describe("allowed_models e2e: 403 on disallowed model, upstream untouched", () =
     // Caller permitted ONLY for am-allowed. am-forbidden exists in
     // the snapshot — the 403 must come from authz, not from "model
     // not found".
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["am-allowed"],
     });

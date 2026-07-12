@@ -2,8 +2,8 @@ import { createHash } from "node:crypto";
 import OpenAI, { APIError } from "openai";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   ProxyClient,
   spawnApp,
   startOpenAiUpstream,
@@ -28,33 +28,34 @@ const CALLER_KEY_HASH = createHash("sha256")
 describe("invalid upstream config maps to 400 e2e", () => {
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
-  let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let etcdReachable = false;
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     upstream = await startOpenAiUpstream();
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    seed = new SeedClient(etcd, app.etcdPrefix);
 
     // openrouter resolves via the openai adapter family. With no
     // api_base the family bridge refuses to fall back to
     // api.openai.com — a customer-fixable misconfig. (No api_base set.)
-    const pk = await admin.createProviderKey({
+    const pk = await seed.createProviderKey({
       display_name: "invalid-config-pk",
       provider: "openrouter",
       adapter: "openai",
       secret: "sk-mock",
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "invalid-config-model",
       provider: "openrouter",
       model_name: "gpt-4o-mini",
       provider_key_id: pk.id,
     });
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["invalid-config-model"],
     });

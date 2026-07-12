@@ -3,8 +3,8 @@ import { createHash } from "node:crypto";
 import OpenAI, { APIError } from "openai";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   pickFreePort,
   spawnApp,
   startOpenAiUpstream,
@@ -126,11 +126,12 @@ describe("lakera guardrail e2e: injection blocks, PII-only masks, 5xx fail-open"
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
   let lakera: LakeraMock | undefined;
-  let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let etcdReachable = false;
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     lakera = await startLakeraMock();
@@ -153,20 +154,20 @@ describe("lakera guardrail e2e: injection blocks, PII-only masks, 5xx fail-open"
     });
 
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    seed = new SeedClient(etcd, app.etcdPrefix);
 
-    const pk = await admin.createProviderKey({
+    const pk = await seed.createProviderKey({
       display_name: "lakera-e2e-pk",
       secret: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "lakera-e2e",
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: pk.id,
     });
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: hash(CALLER),
       allowed_models: ["lakera-e2e"],
     });
@@ -174,7 +175,7 @@ describe("lakera guardrail e2e: injection blocks, PII-only masks, 5xx fail-open"
     // One env-wide guardrail on the input hook. fail_open=true so the
     // 5xx case exercises the bypass path (fail-closed is pinned by the
     // dispatcher's wiremock unit tests).
-    await admin.json("POST", "/admin/v1/guardrails", {
+    await seed.createGuardrail({
       name: "lakera-e2e-guard",
       enabled: true,
       hook_point: "input",

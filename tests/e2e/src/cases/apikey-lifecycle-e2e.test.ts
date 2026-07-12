@@ -3,6 +3,7 @@ import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   AdminClient,
   EtcdClient,
+  SeedClient,
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
@@ -44,22 +45,25 @@ describe("api key lifecycle e2e: expired/disabled keys fail closed, rotate swaps
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
   let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let etcdReachable = false;
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     upstream = await startOpenAiUpstream();
     app = await spawnApp();
     admin = new AdminClient(app.adminUrl, app.adminKey);
+    seed = new SeedClient(etcd, app.etcdPrefix);
 
-    const pk = await admin.createProviderKey({
+    const pk = await seed.createProviderKey({
       display_name: "apikey-lifecycle-pk",
       secret: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: MODEL,
       provider: "openai",
       model_name: "gpt-4o-mini",
@@ -95,7 +99,7 @@ describe("api key lifecycle e2e: expired/disabled keys fail closed, rotate swaps
     extra: Record<string, unknown>,
     propagated: (res: Response) => Promise<boolean>,
   ): Promise<{ id: string }> {
-    const created = await admin!.createApiKey({
+    const created = await seed!.createApiKey({
       key_hash: sha256(plaintext),
       allowed_models: [MODEL],
       ...extra,
@@ -177,7 +181,7 @@ describe("api key lifecycle e2e: expired/disabled keys fail closed, rotate swaps
   });
 
   test("disable then re-enable an in-use key without re-issuing it", async (ctx) => {
-    if (!etcdReachable || !app || !admin) {
+    if (!etcdReachable || !app || !seed) {
       ctx.skip();
       return;
     }
@@ -188,7 +192,7 @@ describe("api key lifecycle e2e: expired/disabled keys fail closed, rotate swaps
 
     // Disable: same key_hash, flipped flag — the credential the
     // caller holds is unchanged, only its status moves.
-    await admin.json("PUT", `/admin/v1/apikeys/${id}`, {
+    await seed.update("api_keys", id, {
       key_hash: keyHash,
       allowed_models: [MODEL],
       disabled: true,
@@ -199,7 +203,7 @@ describe("api key lifecycle e2e: expired/disabled keys fail closed, rotate swaps
 
     // Re-enable: the original plaintext works again — proving disable
     // is reversible and did not rotate or delete the credential.
-    await admin.json("PUT", `/admin/v1/apikeys/${id}`, {
+    await seed.update("api_keys", id, {
       key_hash: keyHash,
       allowed_models: [MODEL],
     });

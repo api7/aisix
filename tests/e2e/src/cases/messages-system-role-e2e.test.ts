@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
@@ -25,11 +25,12 @@ const CALLER_KEY_HASH = createHash("sha256")
 describe("anthropic /v1/messages with system role in messages[] (#597)", () => {
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
-  let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let etcdReachable = false;
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     upstream = await startOpenAiUpstream({
@@ -49,22 +50,22 @@ describe("anthropic /v1/messages with system role in messages[] (#597)", () => {
       },
     });
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    seed = new SeedClient(etcd, app.etcdPrefix);
 
-    const pk = await admin.createProviderKey({
+    const pk = await seed.createProviderKey({
       display_name: "issue597-pk",
       secret: "sk-deepseek-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     // Mirrors the customer setup from #597: Claude CLI talking to a
     // DeepSeek/OpenAI-protocol model through the Anthropic endpoint.
-    await admin.createModel({
+    await seed.createModel({
       display_name: "issue597-model",
       provider: "deepseek",
       model_name: "deepseek-chat",
       provider_key_id: pk.id,
     });
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["issue597-model"],
     });

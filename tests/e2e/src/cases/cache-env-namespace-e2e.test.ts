@@ -2,8 +2,8 @@ import { createHash, randomUUID } from "node:crypto";
 import { connect } from "node:net";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   ProxyClient,
   spawnApp,
   startOpenAiUpstream,
@@ -105,25 +105,27 @@ function chatRequest(proxyUrl: string): Promise<Response> {
 }
 
 /** Seed one model (→ this env's own upstream), a permissive ApiKey, and a
- *  redis-backed `applies_to:all` cache policy via this app's admin API. */
-async function seed(app: SpawnedApp, upstreamBase: string) {
-  const admin = new AdminClient(app.adminUrl, app.adminKey);
-  const pk = await admin.createProviderKey({
+ *  redis-backed `applies_to:all` cache policy, written to this env's own
+ *  etcd scope (`<prefix>/<env_id>` — the root the DP reads when `env_id`
+ *  is set). */
+async function seed(etcdRoot: string, upstreamBase: string) {
+  const seed = new SeedClient(new EtcdClient(), etcdRoot);
+  const pk = await seed.createProviderKey({
     display_name: `${MODEL}-pk`,
     secret: "sk-mock",
     api_base: `${upstreamBase}/v1`,
   });
-  await admin.createModel({
+  await seed.createModel({
     display_name: MODEL,
     provider: "openai",
     model_name: "gpt-4o-mini",
     provider_key_id: pk.id,
   });
-  await admin.createApiKey({
+  await seed.createApiKey({
     key_hash: CALLER_KEY_HASH,
     allowed_models: [MODEL],
   });
-  await admin.json("POST", "/admin/v1/cache_policies", {
+  await seed.createCachePolicy({
     name: `${MODEL}-redis-policy`,
     enabled: true,
     backend: "redis",
@@ -170,8 +172,8 @@ describe("response cache is isolated per env on a shared Redis (#788 P1-1)", () 
     appA = await spawnApp({ extra: { etcd: envEtcd(prefix, envA), cache } });
     appB = await spawnApp({ extra: { etcd: envEtcd(prefix, envB), cache } });
 
-    await seed(appA, upstreamA.baseUrl);
-    await seed(appB, upstreamB.baseUrl);
+    await seed(`${prefix}/${envA}`, upstreamA.baseUrl);
+    await seed(`${prefix}/${envB}`, upstreamB.baseUrl);
     await waitModelLive(appA.proxyUrl);
     await waitModelLive(appB.proxyUrl);
   });

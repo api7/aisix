@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
@@ -40,11 +40,12 @@ const FINAL_ANSWER = "The answer is 42.";
 describe("deepseek reasoning_content passthrough on /v1/chat/completions (#466)", () => {
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
-  let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let etcdReachable = false;
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     // DeepSeek-reasoner non-streaming response: message carries both
@@ -71,23 +72,23 @@ describe("deepseek reasoning_content passthrough on /v1/chat/completions (#466)"
     });
 
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    seed = new SeedClient(etcd, app.etcdPrefix);
 
     // DeepSeek dispatches through the OpenAI-compat family bridge.
-    const pk = await admin.createProviderKey({
+    const pk = await seed.createProviderKey({
       display_name: "ds-reasoning-pk",
       secret: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
       provider: "deepseek",
       adapter: "openai",
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "ds-reasoner",
       provider: "deepseek",
       model_name: "deepseek-reasoner",
       provider_key_id: pk.id,
     });
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["ds-reasoner"],
     });

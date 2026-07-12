@@ -2,8 +2,8 @@ import { createHash } from "node:crypto";
 import OpenAI from "openai";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
@@ -60,17 +60,18 @@ const VEC_FOO = [0.01, 0.02, 0.03, 0.04, 0.05];
 
 describe("embeddings e2e: /v1/embeddings dispatch + response passthrough", () => {
   let app: SpawnedApp | undefined;
-  let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let etcdReachable = false;
   const upstreams: OpenAiUpstream[] = [];
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
-    await admin.createApiKey({
+    seed = new SeedClient(etcd, app.etcdPrefix);
+    await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["*"],
     });
@@ -82,7 +83,7 @@ describe("embeddings e2e: /v1/embeddings dispatch + response passthrough", () =>
   });
 
   test("array input: N embeddings returned in the SAME ORDER as input array", async (ctx) => {
-    if (!etcdReachable || !app || !admin) {
+    if (!etcdReachable || !app || !seed) {
       ctx.skip();
       return;
     }
@@ -107,12 +108,12 @@ describe("embeddings e2e: /v1/embeddings dispatch + response passthrough", () =>
     });
     upstreams.push(upstream);
 
-    const pk = await admin.createProviderKey({
+    const pk = await seed.createProviderKey({
       display_name: "emb-array-pk",
       secret: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "emb-array",
       provider: "openai",
       model_name: "text-embedding-3-small",
@@ -184,7 +185,7 @@ describe("embeddings e2e: /v1/embeddings dispatch + response passthrough", () =>
   });
 
   test("single-string input reaches upstream as a string (#162: docs §4.4 'both pass through')", async (ctx) => {
-    if (!etcdReachable || !app || !admin) {
+    if (!etcdReachable || !app || !seed) {
       ctx.skip();
       return;
     }
@@ -199,12 +200,12 @@ describe("embeddings e2e: /v1/embeddings dispatch + response passthrough", () =>
     });
     upstreams.push(upstream);
 
-    const pk = await admin.createProviderKey({
+    const pk = await seed.createProviderKey({
       display_name: "emb-single-pk",
       secret: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "emb-single",
       provider: "openai",
       model_name: "text-embedding-3-small",

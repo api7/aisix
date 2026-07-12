@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
@@ -58,7 +58,8 @@ describe("model IP restriction e2e (#557): allowed_cidrs gate before upstream", 
   let etcdReachable = false;
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     upstream = await startOpenAiUpstream();
@@ -68,15 +69,15 @@ describe("model IP restriction e2e (#557): allowed_cidrs gate before upstream", 
     app = await spawnApp({
       realIp: { trusted_proxies: ["127.0.0.1/32"], recursive: true },
     });
-    const admin = new AdminClient(app.adminUrl, app.adminKey);
+    const seed = new SeedClient(etcd, app.etcdPrefix);
 
-    const pk = await admin.createProviderKey({
+    const pk = await seed.createProviderKey({
       display_name: "model-ip-pk",
       secret: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     // Restricted model: only the 10.0.0.0/8 range may call it.
-    await admin.createModel({
+    await seed.createModel({
       display_name: RESTRICTED_MODEL,
       provider: "openai",
       model_name: "gpt-4o-mini",
@@ -84,13 +85,13 @@ describe("model IP restriction e2e (#557): allowed_cidrs gate before upstream", 
       allowed_cidrs: ["10.0.0.0/8"],
     });
     // Open model: no restriction, same upstream.
-    await admin.createModel({
+    await seed.createModel({
       display_name: OPEN_MODEL,
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: pk.id,
     });
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: [RESTRICTED_MODEL, OPEN_MODEL],
     });

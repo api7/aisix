@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
@@ -23,28 +23,29 @@ const FORBIDDEN = "forbiddenmsgword";
 describe("/v1/messages input guardrail (#448)", () => {
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
-  let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let etcdReachable = false;
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
     upstream = await startOpenAiUpstream();
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
-    const pk = await admin.createProviderKey({
+    seed = new SeedClient(etcd, app.etcdPrefix);
+    const pk = await seed.createProviderKey({
       display_name: "msg-gr-pk",
       secret: "sk-anth-mock",
       api_base: upstream.baseUrl,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "msg-gr",
       provider: "anthropic",
       model_name: "claude-3-5-haiku-20241022",
       provider_key_id: pk.id,
     });
-    await admin.createApiKey({ key_hash: HASH, allowed_models: ["msg-gr"] });
-    await admin.json("POST", "/admin/v1/guardrails", {
+    await seed.createApiKey({ key_hash: HASH, allowed_models: ["msg-gr"] });
+    await seed.createGuardrail({
       name: "msg-gr-input-keyword",
       enabled: true,
       hook_point: "input",
@@ -74,8 +75,14 @@ describe("/v1/messages input guardrail (#448)", () => {
       ctx.skip();
       return;
     }
-    // Gate on guardrail propagation: the forbidden prompt must be rejected.
-    await waitConfigPropagation(async () => (await messages(`probe ${FORBIDDEN}`)).status >= 400);
+    // Gate on guardrail propagation. A bare ">= 400 on forbidden" would
+    // also match the transitional 401 while the caller key itself is
+    // still propagating — require a benign prompt to pass first, so the
+    // rejection can only come from the guardrail.
+    await waitConfigPropagation(async () => {
+      if ((await messages("propagation probe")).status >= 400) return false;
+      return (await messages(`probe ${FORBIDDEN}`)).status >= 400;
+    });
 
     const hitsBefore = upstream.receivedRequests.length;
     const blocked = await messages(`please do ${FORBIDDEN} now`);

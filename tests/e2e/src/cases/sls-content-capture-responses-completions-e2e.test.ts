@@ -1,9 +1,9 @@
 import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   decodedTextFor,
   EtcdClient,
+  SeedClient,
   spawnApp,
   startMockSls,
   startOpenAiUpstream,
@@ -135,7 +135,8 @@ describe("sls content capture e2e (AISIX-Cloud#947): /v1/responses + /v1/complet
   const apps: SpawnedApp[] = [];
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
     responsesUpstream = await startOpenAiUpstream({
       nonStreamBody: responsesBody(`sure, ${RESP_RESPONSE_TOKEN} noted`),
@@ -212,8 +213,8 @@ describe("sls content capture e2e (AISIX-Cloud#947): /v1/responses + /v1/complet
         },
       });
       apps.push(app);
-      const admin = new AdminClient(app.adminUrl, app.adminKey);
-      await admin.createObservabilityExporter({
+      const seed = new SeedClient(new EtcdClient(), app.etcdPrefix);
+      await seed.createObservabilityExporter({
         name: "sls-full-947",
         enabled: true,
         kind: "aliyun_sls",
@@ -223,7 +224,7 @@ describe("sls content capture e2e (AISIX-Cloud#947): /v1/responses + /v1/complet
         credential_ref: CREDENTIAL_REF,
         content_mode: "full",
       });
-      await admin.createObservabilityExporter({
+      await seed.createObservabilityExporter({
         name: "sls-meta-947",
         enabled: true,
         kind: "aliyun_sls",
@@ -235,14 +236,14 @@ describe("sls content capture e2e (AISIX-Cloud#947): /v1/responses + /v1/complet
       });
 
       const seedModel = async (name: string, provider: string, upstream: OpenAiUpstream) => {
-        const pk = await admin.createProviderKey({
+        const pk = await seed.createProviderKey({
           display_name: `${name}-pk`,
           secret: PROVIDER_SECRET,
           api_base: `${upstream.baseUrl}/v1`,
           provider,
           adapter: "openai",
         });
-        await admin.createModel({
+        await seed.createModel({
           display_name: name,
           provider,
           model_name: "gpt-4o-mini",
@@ -254,7 +255,7 @@ describe("sls content capture e2e (AISIX-Cloud#947): /v1/responses + /v1/complet
       await seedModel("cc947-bridge", "deepseek", bridgeUpstream);
       await seedModel("cc947-bridge-stream", "deepseek", bridgeStreamUpstream);
       await seedModel("cc947-completions", "openai", completionsUpstream);
-      await admin.createApiKey({
+      await seed.createApiKey({
         key_hash: CALLER_KEY_HASH,
         allowed_models: [
           "cc947-responses",

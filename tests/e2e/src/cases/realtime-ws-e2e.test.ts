@@ -3,9 +3,10 @@ import { WebSocket } from "undici";
 import { WebSocketServer, type WebSocket as WsSocket } from "ws";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   spawnApp,
+  waitConfigPropagation,
   type SpawnedApp,
 } from "../harness/index.js";
 
@@ -81,32 +82,45 @@ async function startRealtimeUpstream(): Promise<RealtimeUpstream> {
 
 describe("realtime e2e: /v1/realtime WebSocket relay (#721)", () => {
   let app: SpawnedApp | undefined;
-  let admin: AdminClient | undefined;
+  let seed: SeedClient | undefined;
   let upstream: RealtimeUpstream | undefined;
   let etcdReachable = false;
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    seed = new SeedClient(etcd, app.etcdPrefix);
     upstream = await startRealtimeUpstream();
 
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["*"],
     });
-    const pk = await admin.createProviderKey({
+    const pk = await seed.createProviderKey({
       display_name: "realtime-e2e-pk",
       secret: "sk-upstream-realtime",
       api_base: `http://127.0.0.1:${upstream.port}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "realtime-e2e-model",
       provider: "openai",
       model_name: "gpt-realtime-mock",
       provider_key_id: pk.id,
+    });
+
+    // Gate on the DP snapshot via /v1/models — the WS upgrade below
+    // authenticates against the same snapshot, and a handshake fired
+    // before the caller key propagates is rejected outright.
+    await waitConfigPropagation(async () => {
+      const res = await fetch(`${app!.proxyUrl}/v1/models`, {
+        headers: { authorization: `Bearer ${CALLER_PLAINTEXT}` },
+      });
+      if (res.status !== 200) return false;
+      const body = (await res.json()) as { data?: Array<{ id?: string }> };
+      return (body.data ?? []).some((m) => m.id === "realtime-e2e-model");
     });
   });
 
