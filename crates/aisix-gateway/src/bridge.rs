@@ -581,7 +581,7 @@ mod tests {
         // #367 follow-up: auth-material problems (empty/invalid secret,
         // unparseable credential JSON) are a 401 authentication_error,
         // not a 400 — they're a distinct class from request/routing shape.
-        let e = BridgeError::InvalidUpstreamCredentials("provider_key.secret is empty".into());
+        let e = BridgeError::InvalidUpstreamCredentials("provider_key.api_key is empty".into());
         assert_eq!(e.http_status(), 401);
         assert_eq!(e.error_type(), "authentication_error");
     }

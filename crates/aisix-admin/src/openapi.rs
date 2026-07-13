@@ -574,7 +574,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
         ]
       }
     },
-    "/admin/v1/apikeys": {
+    "/admin/v1/api_keys": {
       "get": {
         "summary": "List Caller API Keys",
         "responses": {
@@ -713,7 +713,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
         ]
       }
     },
-    "/admin/v1/apikeys/{id}": {
+    "/admin/v1/api_keys/{id}": {
       "parameters": [
         {
           "name": "id",
@@ -930,7 +930,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
         "description": "Delete a caller API key by ID."
       }
     },
-    "/admin/v1/apikeys/{id}/rotate": {
+    "/admin/v1/api_keys/{id}/rotate": {
       "parameters": [
         {
           "name": "id",
@@ -1417,7 +1417,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
             }
           },
           "400": {
-            "description": "Schema validation failed, the JSON body is malformed, `display_name` contains the reserved `__` separator, or the credentials required by `auth_type` are missing (`secret` for `bearer`/`api_key`; `client_id`, `token_url`, and `secret` for `oauth2`)",
+            "description": "Schema validation failed, the JSON body is malformed, `name` contains the reserved `__` separator, or the credentials required by `auth_type` are missing (`secret` for `bearer`/`api_key`; `client_id`, `token_url`, and `secret` for `oauth2`)",
             "content": {
               "application/json": {
                 "schema": {
@@ -1442,7 +1442,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
             }
           },
           "409": {
-            "description": "Duplicate display_name",
+            "description": "Duplicate name",
             "content": {
               "application/json": {
                 "schema": {
@@ -1485,7 +1485,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
         "tags": [
           "MCP Servers"
         ],
-        "description": "Create an upstream MCP server resource. The gateway validates the payload, rejects duplicate `display_name` values, and returns the stored resource entry."
+        "description": "Create an upstream MCP server resource. The gateway validates the payload, rejects duplicate `name` values, and returns the stored resource entry."
       }
     },
     "/admin/v1/mcp_servers/{id}": {
@@ -1575,7 +1575,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
             }
           },
           "400": {
-            "description": "Schema validation failed, the JSON body is malformed, `display_name` contains the reserved `__` separator, or the credentials required by `auth_type` are missing (`secret` for `bearer`/`api_key`; `client_id`, `token_url`, and `secret` for `oauth2`)",
+            "description": "Schema validation failed, the JSON body is malformed, `name` contains the reserved `__` separator, or the credentials required by `auth_type` are missing (`secret` for `bearer`/`api_key`; `client_id`, `token_url`, and `secret` for `oauth2`)",
             "content": {
               "application/json": {
                 "schema": {
@@ -1610,7 +1610,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
             }
           },
           "409": {
-            "description": "Duplicate display_name",
+            "description": "Duplicate name",
             "content": {
               "application/json": {
                 "schema": {
@@ -1653,7 +1653,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
         "tags": [
           "MCP Servers"
         ],
-        "description": "Update an upstream MCP server resource by ID. The gateway validates the payload, rejects duplicate `display_name` values, preserves the resource ID, and increments the revision."
+        "description": "Update an upstream MCP server resource by ID. The gateway validates the payload, rejects duplicate `name` values, preserves the resource ID, and increments the revision."
       },
       "delete": {
         "summary": "Delete MCP Server by ID",
@@ -1758,7 +1758,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
                 "$ref": "#/components/schemas/A2aAgent"
               },
               "example": {
-                "display_name": "invoice-processor",
+                "name": "invoice-processor",
                 "url": "https://agents.example.com/invoice",
                 "protocol_version": "0.3",
                 "auth_type": "none"
@@ -1778,7 +1778,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
                 "example": {
                   "id": "1d95ac57-7f27-46a4-b5a3-55d3c3ad0a12",
                   "value": {
-                    "display_name": "invoice-processor",
+                    "name": "invoice-processor",
                     "url": "https://agents.example.com/invoice",
                     "protocol_version": "0.3",
                     "auth_type": "none",
@@ -1790,7 +1790,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
             }
           },
           "400": {
-            "description": "Invalid request body, `display_name` contains `/`, or the selected `auth_type` is missing required credentials.",
+            "description": "Invalid request body, `name` contains `/`, or the selected `auth_type` is missing required credentials.",
             "content": {
               "application/json": {
                 "schema": {
@@ -1815,7 +1815,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
             }
           },
           "409": {
-            "description": "Duplicate display_name",
+            "description": "Duplicate name",
             "content": {
               "application/json": {
                 "schema": {
@@ -1858,7 +1858,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
         "tags": [
           "A2A Agents"
         ],
-        "description": "Create an upstream A2A agent resource. The gateway validates the payload, rejects duplicate `display_name` values, and returns the stored resource entry."
+        "description": "Create an upstream A2A agent resource. The gateway validates the payload, rejects duplicate `name` values, and returns the stored resource entry."
       }
     },
     "/admin/v1/a2a_agents/{id}": {
@@ -1948,7 +1948,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
             }
           },
           "400": {
-            "description": "Invalid request body, `display_name` contains `/`, or the selected `auth_type` is missing required credentials.",
+            "description": "Invalid request body, `name` contains `/`, or the selected `auth_type` is missing required credentials.",
             "content": {
               "application/json": {
                 "schema": {
@@ -2016,7 +2016,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
         "tags": [
           "A2A Agents"
         ],
-        "description": "Update an upstream A2A agent resource by ID. The gateway validates the payload, rejects duplicate `display_name` values, preserves the resource ID, and increments the revision."
+        "description": "Update an upstream A2A agent resource by ID. The gateway validates the payload, rejects duplicate `name` values, preserves the resource ID, and increments the revision."
       },
       "delete": {
         "summary": "Delete A2A Agent by ID",
@@ -3684,7 +3684,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
         "example": {
           "id": "1d95ac57-7f27-46a4-b5a3-55d3c3ad0a12",
           "value": {
-            "display_name": "invoice-processor",
+            "name": "invoice-processor",
             "url": "https://agents.example.com/invoice",
             "protocol_version": "0.3",
             "auth_type": "none",
@@ -4112,15 +4112,66 @@ pub(crate) fn merged_openapi() -> &'static str {
         add_missing_property_descriptions(&mut doc);
         add_schema_defaults(&mut doc);
         add_schema_examples(&mut doc);
+        document_former_apikeys_paths(&mut doc);
         wrap_ref_siblings_for_redoc(&mut doc);
 
         serde_json::to_string(&doc).expect("merged OpenAPI must serialise")
     })
 }
 
+/// The caller API key operations are served at both the canonical
+/// `/admin/v1/api_keys` paths and the former `/admin/v1/apikeys` spelling
+/// (same handlers — see `build_router`). The base document describes the
+/// canonical paths; mirror each one onto the former path so the published
+/// reference matches the router exactly, without a second hand-maintained
+/// copy that could drift.
+fn document_former_apikeys_paths(doc: &mut Value) {
+    const PATH_PAIRS: &[(&str, &str)] = &[
+        ("/admin/v1/api_keys", "/admin/v1/apikeys"),
+        ("/admin/v1/api_keys/{id}", "/admin/v1/apikeys/{id}"),
+        (
+            "/admin/v1/api_keys/{id}/rotate",
+            "/admin/v1/apikeys/{id}/rotate",
+        ),
+    ];
+    for (canonical, former) in PATH_PAIRS {
+        let mut item = doc["paths"][*canonical].clone();
+        assert!(
+            item.is_object(),
+            "canonical path {canonical} must be documented"
+        );
+        if let Some(ops) = item.as_object_mut() {
+            for (method, op) in ops.iter_mut() {
+                if !matches!(method.as_str(), "get" | "post" | "put" | "delete") {
+                    continue;
+                }
+                let Some(op) = op.as_object_mut() else {
+                    continue;
+                };
+                if let Some(Value::String(summary)) = op.get_mut("summary") {
+                    summary.push_str(" (alternate path)");
+                }
+                let note = format!(
+                    "Alternate spelling of `{canonical}`. \
+                     Requests and responses are identical on both paths."
+                );
+                match op.get_mut("description") {
+                    Some(Value::String(description)) => {
+                        *description = format!("{note} {description}");
+                    }
+                    _ => {
+                        op.insert("description".to_string(), Value::String(note));
+                    }
+                }
+            }
+        }
+        doc["paths"][*former] = item;
+    }
+}
+
 fn add_schema_examples(doc: &mut Value) {
     doc["components"]["schemas"]["A2aAgent"]["example"] = json!({
-        "display_name": "invoice-processor",
+        "name": "invoice-processor",
         "url": "https://agents.example.com/invoice",
         "protocol_version": "0.3",
         "auth_type": "none"
@@ -4128,7 +4179,7 @@ fn add_schema_examples(doc: &mut Value) {
     doc["components"]["schemas"]["A2aAgentEntry"]["example"] = json!({
         "id": "1d95ac57-7f27-46a4-b5a3-55d3c3ad0a12",
         "value": {
-            "display_name": "invoice-processor",
+            "name": "invoice-processor",
             "url": "https://agents.example.com/invoice",
             "protocol_version": "0.3",
             "auth_type": "none",
@@ -4566,6 +4617,9 @@ mod tests {
             "/admin/v1/models",
             "/admin/v1/models/{id}",
             "/admin/v1/models/status",
+            "/admin/v1/api_keys",
+            "/admin/v1/api_keys/{id}",
+            "/admin/v1/api_keys/{id}/rotate",
             "/admin/v1/apikeys",
             "/admin/v1/apikeys/{id}",
             "/admin/v1/apikeys/{id}/rotate",
@@ -4652,6 +4706,9 @@ mod tests {
             "/admin/v1/models",
             "/admin/v1/models/{id}",
             "/admin/v1/models/status",
+            "/admin/v1/api_keys",
+            "/admin/v1/api_keys/{id}",
+            "/admin/v1/api_keys/{id}/rotate",
             "/admin/v1/apikeys",
             "/admin/v1/apikeys/{id}",
             "/admin/v1/apikeys/{id}/rotate",
@@ -4682,6 +4739,8 @@ mod tests {
         let parsed: serde_json::Value =
             serde_json::from_str(merged_openapi()).expect("merged_openapi must parse");
         for (path, method) in [
+            ("/admin/v1/api_keys", "post"),
+            ("/admin/v1/api_keys/{id}", "put"),
             ("/admin/v1/apikeys", "post"),
             ("/admin/v1/apikeys/{id}", "put"),
         ] {

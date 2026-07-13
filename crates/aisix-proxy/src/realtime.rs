@@ -150,7 +150,7 @@ async fn prepare(
     crate::dispatch::check_ip_access(model, &client.source_ip)?;
 
     let pk_entry = crate::dispatch::resolve_provider_key(&snapshot, model)?;
-    let secret = crate::dispatch::require_secret(&pk_entry.value, model)?.to_string();
+    let secret = crate::dispatch::require_api_key(&pk_entry.value, model)?.to_string();
     let upstream_model = crate::dispatch::require_upstream_model(model)?.to_string();
 
     let upstream_request = match pk_entry.value.adapter {

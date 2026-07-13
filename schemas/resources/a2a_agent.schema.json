@@ -1,6 +1,20 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "additionalProperties": false,
+  "anyOf": [
+    {
+      "required": [
+        "name"
+      ],
+      "title": "name"
+    },
+    {
+      "required": [
+        "display_name"
+      ],
+      "title": "display_name"
+    }
+  ],
   "definitions": {
     "A2aAuthType": {
       "description": "How the gateway authenticates to an upstream A2A agent.",
@@ -64,7 +78,7 @@
       "description": "How the gateway authenticates to the upstream agent. The credential is held by the gateway and is never forwarded from or exposed to the calling client."
     },
     "display_name": {
-      "description": "Operator-facing label, unique within the gateway. It is the path segment under which the agent is exposed to callers as `/a2a/<display_name>`, so it must be a single non-empty URL path segment.",
+      "description": "Accepted as an alternative spelling of `name`. Provide the label under exactly one of the two names.",
       "minLength": 1,
       "type": "string"
     },
@@ -72,6 +86,11 @@
       "default": true,
       "description": "Whether this agent is active. When `false`, it is not served and cannot be reached.",
       "type": "boolean"
+    },
+    "name": {
+      "description": "Operator-facing label, unique within the gateway. It is the path segment under which the agent is exposed to callers as `/a2a/<name>`, so it must be a single non-empty URL path segment.",
+      "minLength": 1,
+      "type": "string"
     },
     "protocol_version": {
       "allOf": [
@@ -105,7 +124,6 @@
     }
   },
   "required": [
-    "display_name",
     "url"
   ],
   "title": "A2aAgent",

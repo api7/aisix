@@ -1,6 +1,20 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "additionalProperties": false,
+  "anyOf": [
+    {
+      "required": [
+        "name"
+      ],
+      "title": "name"
+    },
+    {
+      "required": [
+        "display_name"
+      ],
+      "title": "display_name"
+    }
+  ],
   "definitions": {
     "McpAuthType": {
       "description": "How the gateway authenticates to an upstream MCP server.",
@@ -71,7 +85,7 @@
       ]
     },
     "display_name": {
-      "description": "Operator-facing label, unique within the gateway. It is used as the namespace prefix for this server's tools, which are exposed to clients as `<display_name>__<tool>`, so it must not contain the reserved separator `__`.",
+      "description": "Accepted as an alternative spelling of `name`. Provide the label under exactly one of the two names.",
       "minLength": 1,
       "type": "string"
     },
@@ -79,6 +93,11 @@
       "default": true,
       "description": "Whether this server is active. When `false`, its tools are not listed and cannot be called.",
       "type": "boolean"
+    },
+    "name": {
+      "description": "Operator-facing label, unique within the gateway. It is used as the namespace prefix for this server's tools, which are exposed to clients as `<name>__<tool>`, so it must not contain the reserved separator `__`.",
+      "minLength": 1,
+      "type": "string"
     },
     "scopes": {
       "description": "OAuth scopes to request. Joined with spaces into the `scope` parameter of the token request. Only used when `auth_type` is `oauth2`.",
@@ -129,7 +148,6 @@
     }
   },
   "required": [
-    "display_name",
     "url"
   ],
   "title": "McpServer",

@@ -87,7 +87,13 @@ pub fn validate(validator: &Validator, value: &Value) -> Result<(), SchemaError>
     if let Some(err) = errors.next() {
         return Err(SchemaError {
             path: err.instance_path.to_string(),
-            message: err.to_string(),
+            // Mask instance values in the message. Validation errors flow
+            // into logs, the rejection buffer surfaced upstream, and admin
+            // 400 bodies — and resource documents carry credentials. The
+            // renamed-field `anyOf` (see `accept_renamed_field`) sits at
+            // the document root, so its unmasked message would echo the
+            // whole stored document, credentials included.
+            message: err.masked().to_string(),
         });
     }
     Ok(())
@@ -185,8 +191,73 @@ pub fn apikey_root_schema() -> Value {
 /// `Option` representation (`true`): `TelemetryTags` carries fields cp-api
 /// sends as explicit `null` (`branded_provider`/`pk_label`/`byo_label`), and
 /// keeping all optionals nullable matches the resource's wire contract.
+/// The credential is accepted under both its canonical name `api_key` and
+/// its former name `secret` (see [`accept_renamed_field`]).
 pub fn provider_key_root_schema() -> Value {
-    struct_root_schema::<crate::models::ProviderKey>(true)
+    let mut schema = struct_root_schema::<crate::models::ProviderKey>(true);
+    accept_renamed_field(
+        &mut schema,
+        "api_key",
+        "secret",
+        "Accepted as an alternative spelling of `api_key`. \
+         Provide the credential under exactly one of the two names.",
+    );
+    schema
+}
+
+/// Mirror a struct field's `#[serde(alias = "…")]` in the generated schema.
+///
+/// `schemars` does not emit serde aliases, so a naively generated schema
+/// would list only the canonical name and — with `additionalProperties:
+/// false` — reject every stored document that still uses the former one at
+/// the snapshot loader's schema gate. This transform makes the generated
+/// schema accept both spellings:
+///
+/// - the former name is declared as a property with the same shape as the
+///   canonical one (so `minLength` and type constraints keep applying);
+/// - the canonical name is removed from `required` and requiredness becomes
+///   a top-level `anyOf` of the two single-field `required` forms — at
+///   least one spelling must be present;
+/// - `additionalProperties: false` stays intact, so unknown fields are
+///   still rejected.
+///
+/// A document carrying **both** spellings passes this schema and is then
+/// rejected by serde's duplicate-field check at deserialize (both names map
+/// to the same field), so the ambiguity never loads.
+fn accept_renamed_field(schema: &mut Value, canonical: &str, former: &str, note: &str) {
+    let obj = schema
+        .as_object_mut()
+        .expect("resource root schema is a JSON object");
+    assert!(
+        !obj.contains_key("anyOf"),
+        "top-level anyOf already in use; compose the rename acceptance with allOf instead"
+    );
+
+    let properties = obj
+        .get_mut("properties")
+        .and_then(Value::as_object_mut)
+        .expect("resource root schema has properties");
+    let mut former_schema = properties
+        .get(canonical)
+        .unwrap_or_else(|| panic!("schema property `{canonical}` exists"))
+        .clone();
+    if let Some(former_obj) = former_schema.as_object_mut() {
+        former_obj.insert("description".to_string(), Value::String(note.to_string()));
+    }
+    properties.insert(former.to_string(), former_schema);
+
+    if let Some(Value::Array(required)) = obj.get_mut("required") {
+        required.retain(|v| v.as_str() != Some(canonical));
+    }
+    // The branch titles label the two spellings in rendered references
+    // (reference UIs use `title` for `anyOf` tab labels).
+    obj.insert(
+        "anyOf".to_string(),
+        json!([
+            { "title": canonical, "required": [canonical] },
+            { "title": former, "required": [former] },
+        ]),
+    );
 }
 
 /// Canonical JSON Schema for the `mcp_server` resource, derived from the
@@ -198,9 +269,18 @@ pub fn provider_key_root_schema() -> Value {
 /// [`McpTransport`](crate::models::McpTransport) /
 /// [`McpAuthType`](crate::models::McpAuthType) enums. The per-`auth_type`
 /// credential coupling is intentionally not encoded here (see the note on the
-/// struct); the schema stays permissive and write paths enforce it.
+/// struct); the schema stays permissive and write paths enforce it. The label
+/// is accepted under both its canonical name `name` and its former name
+/// `display_name` (see [`accept_renamed_field`]).
 pub fn mcp_server_root_schema() -> Value {
     let mut schema = struct_root_schema::<crate::models::McpServer>(true);
+    accept_renamed_field(
+        &mut schema,
+        "name",
+        "display_name",
+        "Accepted as an alternative spelling of `name`. \
+         Provide the label under exactly one of the two names.",
+    );
     if let Some(Value::Object(defs)) = schema.get_mut("definitions") {
         title_single_value_enum_variants(
             defs,
@@ -221,8 +301,19 @@ pub fn mcp_server_root_schema() -> Value {
     schema
 }
 
+/// Canonical JSON Schema for the `a2a_agent` resource, derived from the
+/// [`A2aAgent`](crate::models::A2aAgent) struct. The label is accepted under
+/// both its canonical name `name` and its former name `display_name` (see
+/// [`accept_renamed_field`]).
 pub fn a2a_agent_root_schema() -> Value {
     let mut schema = struct_root_schema::<crate::models::A2aAgent>(true);
+    accept_renamed_field(
+        &mut schema,
+        "name",
+        "display_name",
+        "Accepted as an alternative spelling of `name`. \
+         Provide the label under exactly one of the two names.",
+    );
     if let Some(Value::Object(defs)) = schema.get_mut("definitions") {
         title_single_value_enum_variants(
             defs,
@@ -2569,6 +2660,93 @@ mod tests {
             }
         });
         assert!(validate_provider_key(&v).is_err());
+    }
+
+    // ---- renamed-field dual acceptance ----
+    //
+    // provider_key `secret`→`api_key` and mcp_server / a2a_agent
+    // `display_name`→`name`: the generated schema must accept both
+    // spellings (stored documents and current control-plane writes still
+    // carry the former names), require at least one, and keep rejecting
+    // unknown fields. A document carrying both spellings passes the
+    // schema and is rejected by serde's duplicate-field check — that
+    // split is pinned by the loader tests in `aisix-etcd`.
+
+    #[test]
+    fn provider_key_accepts_both_credential_spellings() {
+        validate_provider_key(&json!({"display_name": "x", "api_key": "sk-x"})).unwrap();
+        validate_provider_key(&json!({"display_name": "x", "secret": "sk-x"})).unwrap();
+    }
+
+    #[test]
+    fn provider_key_requires_at_least_one_credential_spelling() {
+        assert!(validate_provider_key(&json!({"display_name": "x"})).is_err());
+    }
+
+    #[test]
+    fn provider_key_former_spelling_keeps_field_constraints() {
+        // The former property clones the canonical one, so `minLength: 1`
+        // keeps applying under either name.
+        assert!(validate_provider_key(&json!({"display_name": "x", "api_key": ""})).is_err());
+        assert!(validate_provider_key(&json!({"display_name": "x", "secret": ""})).is_err());
+    }
+
+    #[test]
+    fn provider_key_schema_passes_document_with_both_spellings() {
+        // Schema-layer half of the both-spellings corner: `anyOf` admits
+        // the document; the serde layer rejects it as a duplicate field.
+        validate_provider_key(&json!({"display_name": "x", "api_key": "a", "secret": "b"}))
+            .unwrap();
+    }
+
+    #[test]
+    fn mcp_server_accepts_both_label_spellings() {
+        validate_mcp_server(&json!({"name": "github", "url": "https://x/mcp"})).unwrap();
+        validate_mcp_server(&json!({"display_name": "github", "url": "https://x/mcp"})).unwrap();
+        assert!(validate_mcp_server(&json!({"url": "https://x/mcp"})).is_err());
+    }
+
+    #[test]
+    fn a2a_agent_accepts_both_label_spellings() {
+        validate_a2a_agent(&json!({"name": "invoice", "url": "https://x/a2a"})).unwrap();
+        validate_a2a_agent(&json!({"display_name": "invoice", "url": "https://x/a2a"})).unwrap();
+        assert!(validate_a2a_agent(&json!({"url": "https://x/a2a"})).is_err());
+    }
+
+    #[test]
+    fn schema_error_for_missing_name_does_not_echo_the_document() {
+        // The renamed-field `anyOf` sits at the document root, and an
+        // unmasked anyOf failure message interpolates the entire failing
+        // instance — which for these resources can carry a live upstream
+        // credential. `validate` masks instance values, so a name-less
+        // document's error must not echo its `secret`.
+        let err = validate_mcp_server(&json!({
+            "url": "https://x/mcp",
+            "auth_type": "bearer",
+            "secret": "tok-sensitive"
+        }))
+        .expect_err("name-less document must fail");
+        assert!(
+            !err.to_string().contains("tok-sensitive"),
+            "validation error must not echo credential values; got: {err}"
+        );
+    }
+
+    #[test]
+    fn renamed_field_acceptance_keeps_unknown_fields_rejected() {
+        // The dual-name transform must not loosen `additionalProperties`.
+        assert!(
+            validate_provider_key(&json!({"display_name": "x", "api_key": "k", "rogue": 1}))
+                .is_err()
+        );
+        assert!(validate_mcp_server(
+            &json!({"name": "github", "url": "https://x/mcp", "rogue": 1})
+        )
+        .is_err());
+        assert!(validate_a2a_agent(
+            &json!({"name": "invoice", "url": "https://x/a2a", "rogue": 1})
+        )
+        .is_err());
     }
 
     // ---- mcp_server schema tests (#666 timeout_ms guard) ----

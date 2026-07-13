@@ -1,9 +1,9 @@
 //! CRUD handlers for `/admin/v1/mcp_servers`.
 //!
 //! Same shape as the ProviderKeys handlers: validate against the JSON schema,
-//! reject duplicate display_names (409), generate a uuid v4 on POST, bump
-//! revision on PUT. Additionally rejects a display_name containing the reserved
-//! tool-namespace separator `__`, since the name prefixes the server's tools.
+//! reject duplicate names (409), generate a uuid v4 on POST, bump revision on
+//! PUT. Additionally rejects a name containing the reserved tool-namespace
+//! separator `__`, since the name prefixes the server's tools.
 
 use aisix_core::models::validate_mcp_server;
 use aisix_core::resource::ResourceEntry;
@@ -20,8 +20,7 @@ use crate::state::AdminState;
 const STARTING_REVISION: i64 = 1;
 
 /// Reserved separator between a server's name and a tool name in the gateway's
-/// aggregated namespace (`<display_name>__<tool>`). A server name must not
-/// contain it.
+/// aggregated namespace (`<name>__<tool>`). A server name must not contain it.
 const TOOL_NAMESPACE_SEPARATOR: &str = "__";
 
 pub async fn list_mcp_servers(
@@ -52,7 +51,7 @@ pub async fn create_mcp_server(
 ) -> Result<Json<ResourceEntry<McpServer>>, AdminError> {
     let mcp_server = decode(&raw)?;
     let all = state.store.list_mcp_servers().await?;
-    assert_unique_display_name(&all, &mcp_server.display_name, None)?;
+    assert_unique_name(&all, &mcp_server.name, None)?;
 
     let id = Uuid::new_v4().to_string();
     let entry = ResourceEntry::new(&id, mcp_server, STARTING_REVISION);
@@ -74,7 +73,7 @@ pub async fn update_mcp_server(
     let mcp_server = decode(&raw)?;
 
     let all = state.store.list_mcp_servers().await?;
-    assert_unique_display_name(&all, &mcp_server.display_name, Some(&id))?;
+    assert_unique_name(&all, &mcp_server.name, Some(&id))?;
 
     let entry = ResourceEntry::new(&id, mcp_server, existing.revision + 1);
     state.store.put_mcp_server(entry.clone()).await?;
@@ -97,9 +96,9 @@ fn decode(raw: &Value) -> Result<McpServer, AdminError> {
     validate_mcp_server(raw)?;
     let server: McpServer = serde_json::from_value(raw.clone())
         .map_err(|e| AdminError::BadRequest(format!("malformed McpServer payload: {e}")))?;
-    if server.display_name.contains(TOOL_NAMESPACE_SEPARATOR) {
+    if server.name.contains(TOOL_NAMESPACE_SEPARATOR) {
         return Err(AdminError::BadRequest(format!(
-            "display_name must not contain the reserved separator `{TOOL_NAMESPACE_SEPARATOR}`"
+            "name must not contain the reserved separator `{TOOL_NAMESPACE_SEPARATOR}`"
         )));
     }
     // Per-auth_type credential coupling. The JSON schema stays flat and
@@ -134,14 +133,14 @@ fn decode(raw: &Value) -> Result<McpServer, AdminError> {
     Ok(server)
 }
 
-fn assert_unique_display_name(
+fn assert_unique_name(
     existing: &[ResourceEntry<McpServer>],
-    display_name: &str,
+    name: &str,
     self_id: Option<&str>,
 ) -> Result<(), AdminError> {
     for e in existing {
-        if e.value.display_name == display_name && self_id.is_none_or(|sid| sid != e.id) {
-            return Err(AdminError::Conflict(display_name.to_string()));
+        if e.value.name == name && self_id.is_none_or(|sid| sid != e.id) {
+            return Err(AdminError::Conflict(name.to_string()));
         }
     }
     Ok(())
@@ -153,9 +152,9 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn decode_rejects_separator_in_display_name() {
+    fn decode_rejects_separator_in_name() {
         let err = decode(&json!({"display_name": "a__b", "url": "https://x/mcp"}))
-            .expect_err("`__` in display_name must be rejected");
+            .expect_err("`__` in the server name must be rejected");
         assert!(matches!(err, AdminError::BadRequest(_)));
     }
 
@@ -239,7 +238,7 @@ mod tests {
             "secret": "tok"
         }))
         .expect("valid server should decode");
-        assert_eq!(server.display_name, "github");
+        assert_eq!(server.name, "github");
         assert_eq!(server.secret.as_deref(), Some("tok"));
     }
 }

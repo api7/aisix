@@ -282,10 +282,13 @@ describe("api key lifecycle e2e: expired/disabled keys fail closed, rotate swaps
     const plaintext = "sk-lifecycle-rotate";
     const { id } = await seedKey(plaintext, {}, is200);
 
+    // Rotate through the canonical `api_keys` route; the disabled-key
+    // rotation below keeps the former `apikeys` spelling so both stay
+    // exercised end-to-end.
     const rotated = await admin.json<{
       entry: { id: string };
       plaintext: string;
-    }>("POST", `/admin/v1/apikeys/${id}/rotate`);
+    }>("POST", `/admin/v1/api_keys/${id}/rotate`);
     expect(rotated.entry.id).toBe(id);
     expect(rotated.plaintext).not.toBe(plaintext);
 

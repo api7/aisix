@@ -2,11 +2,11 @@
 //!
 //! Registers an upstream Model Context Protocol (MCP) server so the gateway can
 //! front it: its tools are aggregated into the gateway's own MCP endpoint under
-//! the namespace `<display_name>__<tool>`, and tool calls are routed back to it.
+//! the namespace `<name>__<tool>`, and tool calls are routed back to it.
 //! The upstream credential is held by the gateway and is never exposed to the
 //! calling client.
 //!
-//! etcd path: `{prefix}/mcp_servers/{uuid}`. Secondary index on `display_name`.
+//! etcd path: `{prefix}/mcp_servers/{uuid}`. Secondary index on `name`.
 
 use serde::{Deserialize, Serialize};
 
@@ -17,10 +17,14 @@ use crate::resource::Resource;
 pub struct McpServer {
     /// Operator-facing label, unique within the gateway. It is used as the
     /// namespace prefix for this server's tools, which are exposed to clients as
-    /// `<display_name>__<tool>`, so it must not contain the reserved separator
-    /// `__`.
+    /// `<name>__<tool>`, so it must not contain the reserved separator `__`.
+    // `display_name` is the field's former name; stored documents and
+    // callers that still use it keep deserializing (schema-side acceptance
+    // lives in `schema::mcp_server_root_schema`). Re-serialization always
+    // emits `name`.
+    #[serde(alias = "display_name")]
     #[schemars(length(min = 1))]
-    pub display_name: String,
+    pub name: String,
 
     /// The upstream server's MCP endpoint URL, reached over the Streamable HTTP
     /// transport, such as `https://api.example.com/mcp`.
@@ -134,7 +138,7 @@ impl Resource for McpServer {
     }
 
     fn name(&self) -> &str {
-        &self.display_name
+        &self.name
     }
 
     fn kind() -> &'static str {
@@ -152,7 +156,7 @@ mod tests {
             r#"{"display_name":"github","url":"https://api.example.com/mcp"}"#,
         )
         .unwrap();
-        assert_eq!(s.display_name, "github");
+        assert_eq!(s.name, "github");
         assert_eq!(s.url, "https://api.example.com/mcp");
         // Defaults.
         assert_eq!(s.transport, McpTransport::StreamableHttp);
@@ -225,6 +229,42 @@ mod tests {
         assert!(r.is_err());
     }
 
+    // ---- `display_name` → `name` rename ----
+
+    #[test]
+    fn accepts_canonical_name_spelling() {
+        let s: McpServer =
+            serde_json::from_str(r#"{"name":"github","url":"https://x/mcp"}"#).unwrap();
+        assert_eq!(s.name, "github");
+    }
+
+    #[test]
+    fn serialises_label_under_name_only() {
+        // Emission contract: re-serialization uses the canonical `name`,
+        // never the former `display_name` spelling (the fixtures above
+        // keep exercising the deserialize-side alias).
+        let s: McpServer =
+            serde_json::from_str(r#"{"display_name":"github","url":"https://x/mcp"}"#).unwrap();
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains(r#""name":"github""#), "got: {json}");
+        assert!(!json.contains("display_name"), "got: {json}");
+    }
+
+    #[test]
+    fn rejects_document_carrying_both_spellings() {
+        // serde maps the alias onto the same field, so a document that
+        // carries both spellings is a duplicate-field error — the
+        // ambiguity is rejected instead of one value silently winning.
+        let r: Result<McpServer, _> = serde_json::from_str(
+            r#"{"name":"github","display_name":"github-old","url":"https://x/mcp"}"#,
+        );
+        let err = r.expect_err("both spellings in one document must be rejected");
+        assert!(
+            err.to_string().contains("duplicate field"),
+            "expected a duplicate-field error, got: {err}"
+        );
+    }
+
     #[test]
     fn rejects_unknown_transport_and_auth_type() {
         assert!(serde_json::from_str::<McpServer>(
@@ -238,7 +278,7 @@ mod tests {
     }
 
     #[test]
-    fn resource_trait_routes_through_display_name() {
+    fn resource_trait_routes_through_name() {
         let mut s: McpServer =
             serde_json::from_str(r#"{"display_name":"github","url":"https://x/mcp"}"#).unwrap();
         s.runtime_id = "uuid-mcp-1".into();
@@ -250,7 +290,7 @@ mod tests {
     #[test]
     fn round_trip_omits_default_optionals() {
         let original = McpServer {
-            display_name: "github".into(),
+            name: "github".into(),
             url: "https://x/mcp".into(),
             transport: McpTransport::StreamableHttp,
             auth_type: McpAuthType::None,

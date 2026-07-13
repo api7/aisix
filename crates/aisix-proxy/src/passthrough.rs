@@ -285,7 +285,7 @@ async fn dispatch(
     crate::dispatch::check_ip_access(model, source_ip)?;
 
     let pk_entry = crate::dispatch::resolve_provider_key(&snapshot, model)?;
-    let api_key = crate::dispatch::require_secret(&pk_entry.value, model)?.to_string();
+    let api_key = crate::dispatch::require_api_key(&pk_entry.value, model)?.to_string();
 
     // #911 [6]: resolve the guardrail chain for the model whose credentials
     // this passthrough borrows, so the raw tunnel is subject to the same

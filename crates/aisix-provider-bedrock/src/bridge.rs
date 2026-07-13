@@ -9,7 +9,7 @@
 //! publishers + streaming surface clear `not yet implemented` errors
 //! referencing D7.x follow-ups — see crate-level docs.
 //!
-//! Credentials: `ProviderKey.secret` is a JSON-encoded
+//! Credentials: `ProviderKey.api_key` is a JSON-encoded
 //! `{access_key_id, secret_access_key, session_token?, region}`
 //! struct. The bridge parses it per request (cheap — strings only)
 //! and constructs a per-call SDK client. `ProviderKey.api_base` (if
@@ -279,7 +279,7 @@ fn strip_region_prefix(model_id: &str) -> &str {
     }
 }
 
-/// Schema for `ProviderKey.secret` on a Bedrock provider key.
+/// Schema for `ProviderKey.api_key` on a Bedrock provider key.
 ///
 /// Convention: AWS credentials are JSON-encoded into the `secret`
 /// field. The cp-api side delivers them already-decrypted (mTLS-only
@@ -310,7 +310,7 @@ impl BedrockSecret {
     fn parse(secret: &str) -> Result<Self, BridgeError> {
         if secret.trim().is_empty() {
             return Err(BridgeError::InvalidUpstreamCredentials(
-                "bedrock provider_key.secret is empty — \
+                "bedrock provider_key.api_key is empty — \
                  expected JSON {access_key_id, secret_access_key, region, session_token?}"
                     .into(),
             ));
@@ -322,7 +322,7 @@ impl BedrockSecret {
             // in the JSON). Generic shape hint is enough for the
             // operator who controls the registration.
             BridgeError::InvalidUpstreamCredentials(
-                "bedrock provider_key.secret must be valid JSON: \
+                "bedrock provider_key.api_key must be valid JSON: \
                  {access_key_id, secret_access_key, region, session_token?}"
                     .into(),
             )
@@ -339,7 +339,7 @@ fn build_client(
 ) -> Result<BedrockClient, BridgeError> {
     if creds.region.trim().is_empty() {
         return Err(BridgeError::InvalidUpstreamConfig(
-            "bedrock provider_key.secret.region is empty — \
+            "bedrock provider_key.api_key.region is empty — \
              AWS Bedrock dispatch is region-keyed and requires e.g. \"us-west-2\""
                 .into(),
         ));
@@ -840,7 +840,7 @@ impl BedrockBridge {
         // Parse credentials per-request to keep the bridge stateless —
         // credential rotation lands as soon as the PK snapshot
         // refreshes, no client cache invalidation needed.
-        let creds = BedrockSecret::parse(&ctx.provider_key.secret)?;
+        let creds = BedrockSecret::parse(&ctx.provider_key.api_key)?;
         let endpoint_url = {
             #[cfg(test)]
             {
@@ -1925,8 +1925,8 @@ mod tests {
         match err {
             BridgeError::InvalidUpstreamCredentials(msg) => {
                 assert!(
-                    msg.contains("secret is empty"),
-                    "must mention empty secret; got {msg}"
+                    msg.contains("api_key is empty"),
+                    "must mention the empty api_key; got {msg}"
                 );
                 assert!(
                     msg.contains("access_key_id"),
@@ -2074,7 +2074,7 @@ mod tests {
         assert_eq!(err.http_status(), 401);
         match err {
             BridgeError::InvalidUpstreamCredentials(msg) => {
-                assert!(msg.contains("secret is empty"));
+                assert!(msg.contains("api_key is empty"));
             }
             other => panic!("expected InvalidUpstreamCredentials error, got {other:?}"),
         }

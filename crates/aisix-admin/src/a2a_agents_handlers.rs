@@ -1,11 +1,11 @@
 //! CRUD handlers for `/admin/v1/a2a_agents`.
 //!
 //! Same shape as the McpServers handlers: validate against the JSON schema,
-//! reject duplicate display_names (409), generate a uuid v4 on POST, bump
-//! revision on PUT. The display_name is the path segment under which the agent
-//! is exposed (`/a2a/<display_name>`), so it must be a single URL path segment
-//! (no `/`). The per-auth_type credential coupling is enforced here too, since
-//! the flat schema stays permissive on it.
+//! reject duplicate names (409), generate a uuid v4 on POST, bump revision on
+//! PUT. The name is the path segment under which the agent is exposed
+//! (`/a2a/<name>`), so it must be a single URL path segment (no `/`). The
+//! per-auth_type credential coupling is enforced here too, since the flat
+//! schema stays permissive on it.
 
 use aisix_core::models::validate_a2a_agent;
 use aisix_core::resource::ResourceEntry;
@@ -49,7 +49,7 @@ pub async fn create_a2a_agent(
 ) -> Result<Json<ResourceEntry<A2aAgent>>, AdminError> {
     let agent = decode(&raw)?;
     let all = state.store.list_a2a_agents().await?;
-    assert_unique_display_name(&all, &agent.display_name, None)?;
+    assert_unique_name(&all, &agent.name, None)?;
 
     let id = Uuid::new_v4().to_string();
     let entry = ResourceEntry::new(&id, agent, STARTING_REVISION);
@@ -71,7 +71,7 @@ pub async fn update_a2a_agent(
     let agent = decode(&raw)?;
 
     let all = state.store.list_a2a_agents().await?;
-    assert_unique_display_name(&all, &agent.display_name, Some(&id))?;
+    assert_unique_name(&all, &agent.name, Some(&id))?;
 
     let entry = ResourceEntry::new(&id, agent, existing.revision + 1);
     state.store.put_a2a_agent(entry.clone()).await?;
@@ -94,11 +94,11 @@ fn decode(raw: &Value) -> Result<A2aAgent, AdminError> {
     validate_a2a_agent(raw)?;
     let agent: A2aAgent = serde_json::from_value(raw.clone())
         .map_err(|e| AdminError::BadRequest(format!("malformed A2aAgent payload: {e}")))?;
-    // The display_name is the path segment in `/a2a/<display_name>`, so it must
-    // be a single URL path segment.
-    if agent.display_name.contains('/') {
+    // The name is the path segment in `/a2a/<name>`, so it must be a single
+    // URL path segment.
+    if agent.name.contains('/') {
         return Err(AdminError::BadRequest(
-            "display_name must not contain `/` — it is the agent's URL path segment".to_string(),
+            "name must not contain `/` — it is the agent's URL path segment".to_string(),
         ));
     }
     // Per-auth_type credential coupling. The JSON schema stays flat and
@@ -122,14 +122,14 @@ fn decode(raw: &Value) -> Result<A2aAgent, AdminError> {
     Ok(agent)
 }
 
-fn assert_unique_display_name(
+fn assert_unique_name(
     existing: &[ResourceEntry<A2aAgent>],
-    display_name: &str,
+    name: &str,
     self_id: Option<&str>,
 ) -> Result<(), AdminError> {
     for e in existing {
-        if e.value.display_name == display_name && self_id.is_none_or(|sid| sid != e.id) {
-            return Err(AdminError::Conflict(display_name.to_string()));
+        if e.value.name == name && self_id.is_none_or(|sid| sid != e.id) {
+            return Err(AdminError::Conflict(name.to_string()));
         }
     }
     Ok(())
@@ -141,9 +141,9 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn decode_rejects_slash_in_display_name() {
+    fn decode_rejects_slash_in_name() {
         let err = decode(&json!({"display_name": "a/b", "url": "https://x/a2a"}))
-            .expect_err("`/` in display_name must be rejected");
+            .expect_err("`/` in the agent name must be rejected");
         assert!(matches!(err, AdminError::BadRequest(_)));
     }
 
@@ -183,7 +183,7 @@ mod tests {
             "secret": "tok"
         }))
         .expect("valid agent should decode");
-        assert_eq!(agent.display_name, "invoice-processor");
+        assert_eq!(agent.name, "invoice-processor");
         assert_eq!(agent.secret.as_deref(), Some("tok"));
     }
 }

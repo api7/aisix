@@ -552,7 +552,7 @@ async fn multipart_dispatch(
     let provider = crate::dispatch::require_provider(model)?;
     let upstream_model = crate::dispatch::require_upstream_model(model)?.to_string();
     let pk_entry = crate::dispatch::resolve_provider_key(&snapshot, model)?;
-    let api_key = crate::dispatch::require_secret(&pk_entry.value, model)?;
+    let api_key = crate::dispatch::require_api_key(&pk_entry.value, model)?;
 
     let base = crate::dispatch::resolve_base_url(&pk_entry.value)?;
     // build_v1_url owns the /v1 prefix; callers pass the suffix
@@ -923,7 +923,7 @@ async fn speech_dispatch(
     let provider = crate::dispatch::require_provider(model)?;
     let upstream_model = crate::dispatch::require_upstream_model(model)?.to_string();
     let pk_entry = crate::dispatch::resolve_provider_key(&snapshot, model)?;
-    let api_key = crate::dispatch::require_secret(&pk_entry.value, model)?;
+    let api_key = crate::dispatch::require_api_key(&pk_entry.value, model)?;
 
     let base = crate::dispatch::resolve_base_url(&pk_entry.value)?;
     let provider_label = provider.to_ascii_lowercase();

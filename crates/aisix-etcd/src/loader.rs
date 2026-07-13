@@ -549,6 +549,100 @@ mod tests {
         assert_eq!(stats.schema_rejected, 1);
     }
 
+    // ---- renamed-field dual acceptance ----
+    //
+    // provider_key `secret`→`api_key` and mcp_server / a2a_agent
+    // `display_name`→`name`: documents written under the former names
+    // (existing etcd data, current control-plane writes) and documents
+    // written under the canonical names must BOTH pass this loader's
+    // schema gate and serde parse. A regression here silently drops
+    // resources from the snapshot in managed mode.
+
+    #[test]
+    fn provider_key_accepts_both_credential_spellings() {
+        let entries = vec![
+            raw(
+                "/aisix/provider_keys/pk-former",
+                br#"{"display_name":"pk-former","secret":"sk-x"}"#,
+                1,
+            ),
+            raw(
+                "/aisix/provider_keys/pk-canonical",
+                br#"{"display_name":"pk-canonical","api_key":"sk-x"}"#,
+                2,
+            ),
+        ];
+        let (snap, stats) = build_snapshot("/aisix", &entries);
+        assert_eq!(stats.accepted, 2, "rejections: {:?}", stats.rejections);
+        assert_eq!(snap.provider_keys.len(), 2);
+        // Both spellings land on the same typed field.
+        for id in ["pk-former", "pk-canonical"] {
+            let entry = snap.provider_keys.get_by_id(id).unwrap();
+            assert_eq!(entry.value.api_key, "sk-x");
+        }
+    }
+
+    #[test]
+    fn provider_key_with_both_spellings_is_rejected_as_parse_failure() {
+        // The schema's `anyOf` admits a document carrying both spellings;
+        // serde then rejects it as a duplicate field (both names map to
+        // the same field), so the ambiguous row is skipped — not loaded
+        // with one value silently winning — and the batch continues.
+        let entries = vec![
+            raw(
+                "/aisix/provider_keys/pk-ambiguous",
+                br#"{"display_name":"pk-a","api_key":"sk-new","secret":"sk-old"}"#,
+                1,
+            ),
+            raw(
+                "/aisix/provider_keys/pk-good",
+                br#"{"display_name":"pk-good","api_key":"sk-x"}"#,
+                2,
+            ),
+        ];
+        let (snap, stats) = build_snapshot("/aisix", &entries);
+        assert_eq!(stats.schema_rejected, 0);
+        assert_eq!(stats.parse_rejected, 1);
+        assert_eq!(stats.accepted, 1);
+        assert_eq!(stats.rejections.len(), 1);
+        assert_eq!(stats.rejections[0].kind, RejectionKind::ParseFailed);
+        assert!(snap.provider_keys.get_by_id("pk-good").is_some());
+        assert!(snap.provider_keys.get_by_id("pk-ambiguous").is_none());
+    }
+
+    #[test]
+    fn mcp_server_and_a2a_agent_accept_both_label_spellings() {
+        let entries = vec![
+            raw(
+                "/aisix/mcp_servers/mcp-former",
+                br#"{"display_name":"gh-former","url":"https://x/mcp"}"#,
+                1,
+            ),
+            raw(
+                "/aisix/mcp_servers/mcp-canonical",
+                br#"{"name":"gh-canonical","url":"https://x/mcp"}"#,
+                2,
+            ),
+            raw(
+                "/aisix/a2a_agents/a2a-former",
+                br#"{"display_name":"agent-former","url":"https://x/a2a"}"#,
+                3,
+            ),
+            raw(
+                "/aisix/a2a_agents/a2a-canonical",
+                br#"{"name":"agent-canonical","url":"https://x/a2a"}"#,
+                4,
+            ),
+        ];
+        let (snap, stats) = build_snapshot("/aisix", &entries);
+        assert_eq!(stats.accepted, 4, "rejections: {:?}", stats.rejections);
+        // The name index is fed by the renamed field for both spellings.
+        assert!(snap.mcp_servers.get_by_name("gh-former").is_some());
+        assert!(snap.mcp_servers.get_by_name("gh-canonical").is_some());
+        assert!(snap.a2a_agents.get_by_name("agent-former").is_some());
+        assert!(snap.a2a_agents.get_by_name("agent-canonical").is_some());
+    }
+
     #[test]
     fn one_bad_entry_does_not_abort_the_batch() {
         let entries = vec![

@@ -2,7 +2,7 @@
 //!
 //! A ProviderKey lets operators store an upstream provider's API key
 //! (OpenAI, Anthropic, Gemini, DeepSeek, …) once and have many Models
-//! reference it by id (`provider_key_id`). Rotating the secret then
+//! reference it by id (`provider_key_id`). Rotating the key then
 //! becomes a single PUT against the ProviderKey rather than rewriting
 //! every Model that uses it.
 //!
@@ -38,8 +38,13 @@ pub struct ProviderKey {
     /// Upstream provider's API key. The data plane receives plaintext so it
     /// can authenticate to the upstream provider. Protect the configuration
     /// store and transport accordingly.
+    // `secret` is the field's former name; stored documents and callers
+    // that still use it keep deserializing (schema-side acceptance lives
+    // in `schema::provider_key_root_schema`). Re-serialization always
+    // emits `api_key`.
+    #[serde(alias = "secret")]
     #[schemars(length(min = 1))]
-    pub secret: String,
+    pub api_key: String,
 
     /// Override base URL for the upstream provider. Required for custom or OpenAI-compatible providers that should not use a built-in vendor endpoint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -283,7 +288,7 @@ mod tests {
             serde_json::from_str(r#"{"display_name":"openai-prod","secret":"sk-prod-xxxx"}"#)
                 .unwrap();
         assert_eq!(p.display_name, "openai-prod");
-        assert_eq!(p.secret, "sk-prod-xxxx");
+        assert_eq!(p.api_key, "sk-prod-xxxx");
         assert!(p.api_base.is_none());
     }
 
@@ -301,6 +306,53 @@ mod tests {
         let r: Result<ProviderKey, _> =
             serde_json::from_str(r#"{"display_name":"x","secret":"k","extra":1}"#);
         assert!(r.is_err());
+    }
+
+    // ---- `secret` → `api_key` rename ----
+
+    #[test]
+    fn accepts_canonical_api_key_spelling() {
+        let p: ProviderKey =
+            serde_json::from_str(r#"{"display_name":"openai-prod","api_key":"sk-prod-xxxx"}"#)
+                .unwrap();
+        assert_eq!(p.api_key, "sk-prod-xxxx");
+    }
+
+    #[test]
+    fn legacy_secret_spelling_still_deserialises() {
+        // Stored documents written before the rename spell the field
+        // `secret`; the serde alias must keep loading them. (Most other
+        // fixtures in this module double as coverage for this, but pin
+        // it explicitly so the intent survives fixture migrations.)
+        let p: ProviderKey =
+            serde_json::from_str(r#"{"display_name":"openai-prod","secret":"sk-legacy"}"#).unwrap();
+        assert_eq!(p.api_key, "sk-legacy");
+    }
+
+    #[test]
+    fn serialises_credential_under_api_key_only() {
+        // Emission contract: re-serialization (admin GET responses,
+        // admin-written documents) uses the canonical name, never the
+        // former spelling.
+        let p: ProviderKey =
+            serde_json::from_str(r#"{"display_name":"x","secret":"sk-x"}"#).unwrap();
+        let s = serde_json::to_string(&p).unwrap();
+        assert!(s.contains(r#""api_key":"sk-x""#), "got: {s}");
+        assert!(!s.contains(r#""secret""#), "got: {s}");
+    }
+
+    #[test]
+    fn rejects_document_carrying_both_spellings() {
+        // serde maps the alias onto the same field, so a document that
+        // carries both spellings is a duplicate-field error — the
+        // ambiguity is rejected instead of one value silently winning.
+        let r: Result<ProviderKey, _> =
+            serde_json::from_str(r#"{"display_name":"x","api_key":"sk-new","secret":"sk-old"}"#);
+        let err = r.expect_err("both spellings in one document must be rejected");
+        assert!(
+            err.to_string().contains("duplicate field"),
+            "expected a duplicate-field error, got: {err}"
+        );
     }
 
     #[test]
@@ -415,7 +467,7 @@ mod tests {
         // struct.
         let original = ProviderKey {
             display_name: "openai-prod".into(),
-            secret: "sk-x".into(),
+            api_key: "sk-x".into(),
             api_base: None,
             provider: String::new(),
             adapter: None,
