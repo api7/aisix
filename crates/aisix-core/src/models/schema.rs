@@ -87,7 +87,13 @@ pub fn validate(validator: &Validator, value: &Value) -> Result<(), SchemaError>
     if let Some(err) = errors.next() {
         return Err(SchemaError {
             path: err.instance_path.to_string(),
-            message: err.to_string(),
+            // Mask instance values in the message. Validation errors flow
+            // into logs, the rejection buffer surfaced upstream, and admin
+            // 400 bodies — and resource documents carry credentials. The
+            // renamed-field `anyOf` (see `accept_renamed_field`) sits at
+            // the document root, so its unmasked message would echo the
+            // whole stored document, credentials included.
+            message: err.masked().to_string(),
         });
     }
     Ok(())
@@ -2705,6 +2711,25 @@ mod tests {
         validate_a2a_agent(&json!({"name": "invoice", "url": "https://x/a2a"})).unwrap();
         validate_a2a_agent(&json!({"display_name": "invoice", "url": "https://x/a2a"})).unwrap();
         assert!(validate_a2a_agent(&json!({"url": "https://x/a2a"})).is_err());
+    }
+
+    #[test]
+    fn schema_error_for_missing_name_does_not_echo_the_document() {
+        // The renamed-field `anyOf` sits at the document root, and an
+        // unmasked anyOf failure message interpolates the entire failing
+        // instance — which for these resources can carry a live upstream
+        // credential. `validate` masks instance values, so a name-less
+        // document's error must not echo its `secret`.
+        let err = validate_mcp_server(&json!({
+            "url": "https://x/mcp",
+            "auth_type": "bearer",
+            "secret": "tok-sensitive"
+        }))
+        .expect_err("name-less document must fail");
+        assert!(
+            !err.to_string().contains("tok-sensitive"),
+            "validation error must not echo credential values; got: {err}"
+        );
     }
 
     #[test]
