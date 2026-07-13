@@ -1088,6 +1088,24 @@ pub fn build_responses_bridge_stream(
         // chat surface's EndOfStreamCheck behavior.
         let (text, tool_calls) = encoder.assembled_assistant_message();
         if !text.is_empty() || !tool_calls.is_empty() {
+            // Live mode releases oversized streams (that's the point of
+            // AISIX-Cloud#1010), so the assembled text is unbounded here —
+            // cap the scan input like the verbatim path's EosOutputScan
+            // does, keeping the observation provider calls bounded. Held
+            // (buffering) text is already capped by the hold-back budget.
+            let text = if buffering {
+                text
+            } else {
+                let mut text = text;
+                let mut end = text
+                    .len()
+                    .min(aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES);
+                while end > 0 && !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                text.truncate(end);
+                text
+            };
             // Live mode has no held frames for the segment pass to walk —
             // offer the flattened text as one segment so monitor-mode
             // segment moderators still record their observations.
@@ -1144,7 +1162,11 @@ pub fn build_responses_bridge_stream(
             )
             .await;
             guard.comp().monitor_hits.extend(seg_hits);
-            if !seg_counts.is_empty() {
+            // `buffering` gate: only the hold-back walk can actually rewrite
+            // wire bytes — the live walk is read-only, so a masked outcome
+            // there (unreachable today) must not clobber the capture with a
+            // rebuild from the empty `joined`.
+            if buffering && !seg_counts.is_empty() {
                 // Bedrock masked the held bytes — rebuild the content-
                 // capture accumulator from the masked text channels,
                 // keeping the original soft cap (#932 × AISIX-Cloud#947).

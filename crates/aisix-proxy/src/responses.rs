@@ -2037,6 +2037,14 @@ impl SseTextCapture {
     fn into_text(self) -> String {
         self.terminal.unwrap_or(self.deltas)
     }
+
+    /// [`Self::into_text`] without consuming — the end-of-stream scan reads
+    /// the text while the completion guard stays armed (a client disconnect
+    /// mid-scan must still fire the guard's Drop emit with the captured
+    /// text), so it clones instead of taking.
+    fn text(&self) -> String {
+        self.terminal.clone().unwrap_or_else(|| self.deltas.clone())
+    }
 }
 
 /// Drop guard that fires `on_complete` exactly once with the usage parsed from
@@ -2161,9 +2169,11 @@ where
 {
     // The scan reads the same assembled output text the capture produces, so
     // an attached scan forces the accumulator on even when no exporter wants
-    // content — capped at the scan bound in that case. `CapturedContent::new`
-    // re-truncates to the exporter cap, so a larger scan cap never leaks
-    // extra bytes into the export.
+    // content. The cap bounds delta accumulation; a terminal event's full
+    // output text is instead bounded by MAX_SSE_FRAME_BUF_BYTES (an oversized
+    // frame never parses) and re-truncated by both consumers —
+    // `CapturedContent::new` at the exporter cap and `EosOutputScan::observe`
+    // at the scan bound — so neither sees beyond its own limit.
     let capture_cap = match (content_cap, eos_scan.is_some()) {
         (Some(cap), true) => {
             Some((cap as usize).max(aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES))
@@ -2208,15 +2218,27 @@ where
             yield item;
         }
         // Clean end-of-stream: run the monitor observation (needs async, so
-        // it can't live in the Drop guard) and complete explicitly. A client
-        // disconnect never reaches here — the guard's Drop fires instead.
+        // it can't live in the Drop guard), then complete explicitly. The
+        // scan awaits a remote guardrail provider, and SDK clients routinely
+        // close the connection right after the terminal frame — dropping
+        // this generator at that await. The guard therefore MUST stay armed
+        // across the scan: its Drop then still emits the usage event (with
+        // the captured text, without hits — same as any disconnect). Taking
+        // the slot before the await would silently lose the event for a
+        // fully-delivered stream.
+        let hits = match eos_scan {
+            Some(scan) => {
+                let text = guard.parts().1.map(|c| c.text()).unwrap_or_default();
+                scan.observe(&text).await
+            }
+            None => Vec::new(),
+        };
         if let Some((f, usage, capture)) = guard.slot.take() {
-            let text = capture.map(SseTextCapture::into_text).unwrap_or_default();
-            let hits = match eos_scan {
-                Some(scan) => scan.observe(&text).await,
-                None => Vec::new(),
-            };
-            f(usage.unwrap_or_default(), text, hits);
+            f(
+                usage.unwrap_or_default(),
+                capture.map(SseTextCapture::into_text).unwrap_or_default(),
+                hits,
+            );
         }
     }
 }
@@ -3495,6 +3517,110 @@ mod tests {
             "the end-of-stream scan must record the would-block observation, got {:?}",
             event.guardrail_monitor_hits,
         );
+    }
+
+    /// AISIX-Cloud#1010 audit H1: the end-of-stream observation awaits a
+    /// remote guardrail provider, and SDK clients close the connection right
+    /// after the terminal frame — the generator is dropped at that await.
+    /// The completion guard must stay armed across the scan so the Drop
+    /// still emits the usage event: a fully-delivered 200 stream must never
+    /// lose its billing/logs record to a disconnect during the observation.
+    #[tokio::test]
+    async fn monitor_scan_disconnect_still_emits_usage_event() {
+        use aisix_obs::UsageSink;
+        use futures::StreamExt;
+        let upstream = MockServer::start().await;
+        let sse = "event: response.output_text.delta\n\
+                   data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello there\"}\n\n\
+                   event: response.completed\n\
+                   data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"hello there\"}]}],\"usage\":{\"input_tokens\":5,\"output_tokens\":3}}}\n\n\
+                   data: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        // Remote moderation backend that never answers within the test —
+        // parks the end-of-stream scan so the disconnect lands mid-await.
+        let acs = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/contentsafety/text:analyze"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_secs(30))
+                    .set_body_json(serde_json::json!({
+                        "categoriesAnalysis": [],
+                        "blocklistsMatch": []
+                    })),
+            )
+            .mount(&acs)
+            .await;
+
+        let snap = new_snap_openai(&upstream.uri());
+        snap.models.insert(openai_model("gpt-4o-resp"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        let textmod_json = format!(
+            r#"{{"name":"textmod-mon","enabled":true,"kind":"azure_content_safety_text_moderation","hook_point":"output","enforcement_mode":"monitor","endpoint":"{}","api_key":"k"}}"#,
+            acs.uri()
+        );
+        let g: aisix_core::Guardrail = serde_json::from_str(&textmod_json).unwrap();
+        snap.guardrails
+            .insert(ResourceEntry::new("g-textmod-mon", g, 1));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let handle = SnapshotHandle::new(snap);
+        let state = crate::ProxyState::new(handle, hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let app = crate::build_router(state);
+
+        let resp = app
+            .oneshot(make_req(
+                serde_json::json!({"model":"gpt-4o-resp","input":"hi","stream":true}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Read frames until the terminal [DONE] is on the wire, then poll
+        // once more so the generator advances past the loop and parks on the
+        // remote-scan await — and drop the body there, like an SDK client
+        // closing after the terminal frame.
+        let mut body_stream = resp.into_body().into_data_stream();
+        let mut wire = Vec::new();
+        while !String::from_utf8_lossy(&wire).contains("[DONE]") {
+            let chunk =
+                tokio::time::timeout(std::time::Duration::from_millis(2000), body_stream.next())
+                    .await
+                    .expect("stream must deliver the terminal frame promptly")
+                    .expect("stream ended before [DONE]")
+                    .expect("stream errored");
+            wire.extend_from_slice(chunk.as_ref());
+        }
+        let parked =
+            tokio::time::timeout(std::time::Duration::from_millis(300), body_stream.next()).await;
+        assert!(
+            parked.is_err(),
+            "generator should be parked on the remote scan await",
+        );
+        drop(body_stream);
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(1000), rx.recv())
+            .await
+            .expect("disconnect during the EOS scan must still emit the usage event")
+            .expect("usage_sink sender dropped");
+        assert_eq!(event.status_code, 200);
+        assert!(!event.guardrail_blocked);
+        assert_eq!(event.prompt_tokens, 5);
+        assert_eq!(event.completion_tokens, 3);
     }
 
     /// AISIX-Cloud#1010, cross-provider bridge path: a monitor-mode output
