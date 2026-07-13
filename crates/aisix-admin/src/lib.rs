@@ -221,6 +221,12 @@ pub fn build_router(state: AdminState) -> Router {
 /// Reject mutating `/admin/v1/*` requests with a 409 when resources are
 /// managed by the resources file. GET/HEAD/OPTIONS — the read surface —
 /// and non-resource endpoints (playground, livez, openapi) pass through.
+///
+/// Auth still wins: this layer runs before the per-handler [`AdminAuth`]
+/// extractor, so it only short-circuits for requests carrying a valid
+/// admin key. Unauthenticated writes fall through to the handler and get
+/// its `401` — the 409 body names the resources-file path, which is not
+/// for unauthenticated eyes.
 async fn file_managed_write_guard(
     axum::extract::State(state): axum::extract::State<AdminState>,
     req: axum::extract::Request,
@@ -232,8 +238,10 @@ async fn file_managed_write_guard(
     let is_read = matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS);
     if !is_read && req.uri().path().starts_with("/admin/v1/") {
         if let Some(path) = state.file_managed_path.as_deref() {
-            return AdminError::FileManaged(FileManagedStore::read_only_message(path))
-                .into_response();
+            if auth::is_admin_authorized(req.headers(), &state.admin_keys) {
+                return AdminError::FileManaged(FileManagedStore::read_only_message(path))
+                    .into_response();
+            }
         }
     }
     next.run(req).await
@@ -1732,6 +1740,41 @@ mod tests {
             .unwrap();
         let resp = run(app, req).await;
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn file_managed_mode_unauthenticated_writes_still_get_401_without_path_leak() {
+        // Auth ordering: the write guard must not answer an
+        // unauthenticated caller — the 409 body names the resources
+        // file path, which only authenticated admins may see.
+        let app = build_router(build_file_managed_state());
+        let req = Request::builder()
+            .method("POST")
+            .uri("/admin/v1/models")
+            .header("content-type", "application/json")
+            .body(Body::from(model_payload("x").to_string()))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let v = body_json(resp).await;
+        assert!(
+            !v["error_msg"]
+                .as_str()
+                .unwrap()
+                .contains("/etc/aisix/resources.yaml"),
+            "401 body must not leak the resources file path: {v}",
+        );
+
+        // Wrong key is equally unauthorized.
+        let app = build_router(build_file_managed_state());
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/admin/v1/models/m-file-1")
+            .header("authorization", "Bearer wrong-key")
+            .body(Body::empty())
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

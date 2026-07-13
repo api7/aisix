@@ -179,6 +179,18 @@ describe("file resource source: smoke + admin write-guard", () => {
       headers: auth,
     });
     expect(rotateRes.status).toBe(409);
+
+    // Auth ordering: an UNAUTHENTICATED write still gets 401, and the
+    // 401 body must not leak the resources-file path (that detail is
+    // only for authenticated admins).
+    const unauthed = await fetch(`${app.adminUrl}/admin/v1/models`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ display_name: "nope" }),
+    });
+    expect(unauthed.status).toBe(401);
+    const unauthedBody = (await unauthed.json()) as { error_msg: string };
+    expect(unauthedBody.error_msg).not.toContain(app.resourcesPath!);
   });
 });
 

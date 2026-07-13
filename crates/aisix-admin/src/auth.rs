@@ -29,18 +29,27 @@ where
     type Rejection = AdminError;
 
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
-        let token = extract_bearer(parts)?;
         let admin_state = AdminState::from_ref(state);
-        let is_authorized = admin_state.admin_keys.iter().any(|k| k == &token);
-        if !is_authorized {
+        if !is_admin_authorized(&parts.headers, &admin_state.admin_keys) {
             return Err(AdminError::Unauthorized);
         }
         Ok(AdminAuth)
     }
 }
 
-fn extract_bearer(parts: &Parts) -> Result<String, AdminError> {
-    if let Some(auth) = parts.headers.get(axum::http::header::AUTHORIZATION) {
+/// Header-level admin-key check shared by the extractor above and by
+/// router-layer middleware (which runs *before* per-handler extractors
+/// and therefore cannot use `AdminAuth` directly). True iff the request
+/// carries a valid admin key.
+pub(crate) fn is_admin_authorized(headers: &axum::http::HeaderMap, admin_keys: &[String]) -> bool {
+    match extract_bearer(headers) {
+        Ok(token) => admin_keys.iter().any(|k| k == &token),
+        Err(_) => false,
+    }
+}
+
+fn extract_bearer(headers: &axum::http::HeaderMap) -> Result<String, AdminError> {
+    if let Some(auth) = headers.get(axum::http::header::AUTHORIZATION) {
         let s = auth.to_str().map_err(|_| AdminError::Unauthorized)?;
         if let Some(rest) = s.strip_prefix("Bearer ") {
             let rest = rest.trim();
@@ -51,7 +60,7 @@ fn extract_bearer(parts: &Parts) -> Result<String, AdminError> {
         }
         return Err(AdminError::Unauthorized);
     }
-    if let Some(raw) = parts.headers.get("x-api-key") {
+    if let Some(raw) = headers.get("x-api-key") {
         let s = raw.to_str().map_err(|_| AdminError::Unauthorized)?;
         let s = s.trim();
         if s.is_empty() {
@@ -80,20 +89,26 @@ mod tests {
             axum::http::header::AUTHORIZATION,
             HeaderValue::from_static("Bearer admin-secret"),
         );
-        assert_eq!(extract_bearer(&parts_with(h)).unwrap(), "admin-secret");
+        assert_eq!(
+            extract_bearer(&parts_with(h).headers).unwrap(),
+            "admin-secret"
+        );
     }
 
     #[test]
     fn extract_bearer_accepts_x_api_key_fallback() {
         let mut h = HeaderMap::new();
         h.insert("x-api-key", HeaderValue::from_static("admin-secret"));
-        assert_eq!(extract_bearer(&parts_with(h)).unwrap(), "admin-secret");
+        assert_eq!(
+            extract_bearer(&parts_with(h).headers).unwrap(),
+            "admin-secret"
+        );
     }
 
     #[test]
     fn extract_bearer_rejects_missing_and_wrong_scheme() {
         assert!(matches!(
-            extract_bearer(&parts_with(HeaderMap::new())),
+            extract_bearer(&parts_with(HeaderMap::new()).headers),
             Err(AdminError::Unauthorized)
         ));
 
@@ -103,8 +118,27 @@ mod tests {
             HeaderValue::from_static("Basic Zm9v"),
         );
         assert!(matches!(
-            extract_bearer(&parts_with(h)),
+            extract_bearer(&parts_with(h).headers),
             Err(AdminError::Unauthorized)
         ));
+    }
+
+    #[test]
+    fn is_admin_authorized_checks_key_membership() {
+        let keys = vec!["admin-secret".to_string()];
+        let mut h = HeaderMap::new();
+        h.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer admin-secret"),
+        );
+        assert!(is_admin_authorized(&h, &keys));
+
+        let mut wrong = HeaderMap::new();
+        wrong.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer nope"),
+        );
+        assert!(!is_admin_authorized(&wrong, &keys));
+        assert!(!is_admin_authorized(&HeaderMap::new(), &keys));
     }
 }
