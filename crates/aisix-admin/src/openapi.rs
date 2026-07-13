@@ -1982,6 +1982,16 @@ const OPENAPI_JSON_BASE: &str = r##"{
               }
             }
           },
+          "409": {
+            "description": "Duplicate name",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
           "413": {
             "description": "JSON request body exceeds the admin body-size limit",
             "content": {
