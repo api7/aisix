@@ -939,20 +939,26 @@ impl<F: FnOnce(ResponsesStreamCompletion)> Drop for CompleteOnDrop<F> {
 /// callback fires from a Drop guard (so it runs on normal end and on client
 /// disconnect).
 ///
-/// When `output_guardrail` is `Some`, the encoded SSE is **held back** and
-/// released only after the assembled assistant output passes the scan —
-/// mirroring the verbatim `/v1/responses` path's secure BufferFull default
-/// (#719), so a configured output block can't be bypassed by streaming a
-/// non-OpenAI model. The scan reads the fully-reassembled text + tool calls
-/// (not raw deltas), and the buffer is capped — an output guardrail must
-/// never release content it couldn't fully buffer to scan, so an overflow
-/// fails closed. With no output guardrail the bytes forward live.
+/// When `output_guardrail` is `Some` and `hold_back` is true (the chain's
+/// resolved streaming policy holds back — any block-capable output chain),
+/// the encoded SSE is **held back** and released only after the assembled
+/// assistant output passes the scan — mirroring the verbatim `/v1/responses`
+/// path's secure BufferFull default (#719), so a configured output block
+/// can't be bypassed by streaming a non-OpenAI model. The scan reads the
+/// fully-reassembled text + tool calls (not raw deltas), and the buffer is
+/// capped — an output guardrail must never release content it couldn't fully
+/// buffer to scan, so an overflow fails closed. When `hold_back` is false
+/// (EndOfStreamCheck — a monitor-only chain, which can never block), the
+/// bytes forward live and the same end-of-stream scan runs for observation
+/// only (AISIX-Cloud#1010). With no output guardrail the bytes forward live
+/// unscanned.
 #[allow(clippy::too_many_arguments)]
 pub fn build_responses_bridge_stream(
     upstream: ChatChunkStream,
     encoder: ResponsesSseEncoder,
     started: Instant,
     output_guardrail: Option<Arc<aisix_guardrails::GuardrailChain>>,
+    hold_back: bool,
     max_buffer_bytes: usize,
     model_label: String,
     // Largest content cap any content-capturing exporter wants
@@ -967,7 +973,7 @@ pub fn build_responses_bridge_stream(
         let mut guard = CompleteOnDrop { slot: Some((on_complete, ResponsesStreamCompletion::default())) };
         let mut upstream = upstream;
         let mut first_chunk_seen = false;
-        let buffering = output_guardrail.is_some();
+        let buffering = output_guardrail.is_some() && hold_back;
         // Held SSE events when an output guardrail is attached; empty (and
         // unused) on the live-forward path.
         let mut held: Vec<bytes::Bytes> = Vec::new();
@@ -1053,11 +1059,12 @@ pub fn build_responses_bridge_stream(
             }
         }
 
-        // Live-forward path: nothing held, nothing to scan.
+        // No output-hook guardrail: nothing to scan.
         let Some(chain) = output_guardrail.as_ref() else { return; };
 
-        // Buffer overflow: an output guardrail must not release content it
-        // couldn't fully buffer to scan — fail closed (#719).
+        // Buffer overflow (hold-back mode only): an output guardrail must
+        // not release content it couldn't fully buffer to scan — fail
+        // closed (#719).
         if overflowed {
             tracing::warn!(
                 guardrail_hook = "output",
@@ -1072,9 +1079,19 @@ pub fn build_responses_bridge_stream(
 
         // End-of-stream output guardrail (#719): scan the fully-reassembled
         // assistant output (canonical tool calls, so a literal split across
-        // argument deltas can't slip through), then release or block.
+        // argument deltas can't slip through), then release or block. On the
+        // live-forward path (EndOfStreamCheck — monitor-only chain,
+        // AISIX-Cloud#1010) the same scan runs for observation: the bytes are
+        // already on the wire, so a Block (unreachable for monitor members;
+        // `mandatory` unavailability is the one composition that can still
+        // produce it) is signalled with a trailing error frame, mirroring the
+        // chat surface's EndOfStreamCheck behavior.
         let (text, tool_calls) = encoder.assembled_assistant_message();
         if !text.is_empty() || !tool_calls.is_empty() {
+            // Live mode has no held frames for the segment pass to walk —
+            // offer the flattened text as one segment so monitor-mode
+            // segment moderators still record their observations.
+            let live_seg_text = (!buffering).then(|| text.clone());
             let mut message = aisix_gateway::ChatMessage::assistant(text);
             if !tool_calls.is_empty() {
                 message.extra.insert("tool_calls".to_string(), Value::Array(tool_calls));
@@ -1109,13 +1126,20 @@ pub fn build_responses_bridge_stream(
                 verdict,
                 &mut seg_counts,
                 &mut seg_hits,
-                |g| match crate::redact::redact_responses_sse(g, &joined) {
-                    Some((rewritten, counts)) => {
-                        joined = rewritten;
-                        seg_rewrote = true;
-                        counts
+                |g| match live_seg_text.as_deref() {
+                    // Live-forward: observation only — nothing to rewrite.
+                    Some(t) => {
+                        let _ = g.redact_output_text(t);
+                        crate::redact::RedactionCounts::new()
                     }
-                    None => crate::redact::RedactionCounts::new(),
+                    None => match crate::redact::redact_responses_sse(g, &joined) {
+                        Some((rewritten, counts)) => {
+                            joined = rewritten;
+                            seg_rewrote = true;
+                            counts
+                        }
+                        None => crate::redact::RedactionCounts::new(),
+                    },
                 },
             )
             .await;

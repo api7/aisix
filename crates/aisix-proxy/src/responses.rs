@@ -585,7 +585,7 @@ async fn dispatch(
                     &target.model,
                     &target.id,
                     request_id,
-                    resolved_chain.as_ref(),
+                    resolved_chain.clone(),
                     started,
                     &model_name,
                     &auth.entry.id,
@@ -808,7 +808,9 @@ async fn responses_to_target(
     model: &aisix_core::Model,
     model_id: &str,
     request_id: &str,
-    chain: &aisix_guardrails::GuardrailChain,
+    // Arc so the live-forward streaming path can carry the chain into its
+    // end-of-stream observation (AISIX-Cloud#1010).
+    chain: Arc<aisix_guardrails::GuardrailChain>,
     // #808: end-of-stream UsageEvent context for the verbatim streaming
     // path's Drop guard. Unused by the non-streaming / buffered paths,
     // which emit from the handler.
@@ -826,6 +828,8 @@ async fn responses_to_target(
     // `input_redactions`.
     input_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
 ) -> Result<ResponseDispatchSuccess, ProxyError> {
+    let chain_arc = chain;
+    let chain = chain_arc.as_ref();
     // Largest content cap any enabled content-capturing exporter wants, or
     // `None` when none do (AISIX-Cloud#947). The captured prompt is the
     // client-facing request body (post-#932-redaction), taken BEFORE the
@@ -971,15 +975,21 @@ async fn responses_to_target(
     if is_stream {
         let headers = upstream_resp.headers().clone();
 
-        // #719: when an output-hook guardrail is attached, the streaming
-        // response can't be forwarded token-by-token — a blocked phrase
-        // would already be on the wire before it scans clean, the same
-        // surface-switch bypass via `stream:true`. Mirror the chat
-        // surface's secure default (BufferFull): hold the whole SSE
+        // #719: when an output-hook guardrail with a hold-back streaming
+        // policy (Window/BufferFull — any block-capable output chain) is
+        // attached, the streaming response can't be forwarded token-by-token
+        // — a blocked phrase would already be on the wire before it scans
+        // clean, the same surface-switch bypass via `stream:true`. Mirror the
+        // chat surface's secure default (BufferFull): hold the whole SSE
         // response, scan the assistant output text, then release the bytes
-        // verbatim or block with 422. Requests with no output-hook
-        // guardrail keep the zero-copy verbatim passthrough below.
-        if aisix_guardrails::Guardrail::runs_on_output(chain) {
+        // verbatim or block with 422. A monitor-only chain resolves to
+        // EndOfStreamCheck — it can never block, so it must never hold the
+        // stream back nor fail closed on the buffer cap (AISIX-Cloud#1010);
+        // it takes the live-forward path below, which scans at end-of-stream
+        // for observation. Requests with no output-hook guardrail keep the
+        // zero-copy verbatim passthrough.
+        let output_policy = aisix_guardrails::Guardrail::stream_output_policy(chain);
+        if aisix_guardrails::Guardrail::runs_on_output(chain) && output_policy.holds_back() {
             // Hold the whole SSE response back to scan it, but cap the
             // buffer so a huge (or malicious) upstream response can't OOM the
             // gateway. Mirror the chat surface's secure BufferFull default
@@ -987,7 +997,7 @@ async fn responses_to_target(
             // response exceeds the cap — an output-hook guardrail must never
             // release content it couldn't fully buffer to scan. The cap is
             // taken from the chain's resolved streaming policy.
-            let max_buffer_bytes = match aisix_guardrails::Guardrail::stream_output_policy(chain) {
+            let max_buffer_bytes = match output_policy {
                 aisix_guardrails::StreamOutputPolicy::BufferFull {
                     max_buffer_bytes, ..
                 } => max_buffer_bytes,
@@ -1220,8 +1230,19 @@ async fn responses_to_target(
         let stream_hold = reservation.take().map(|r| r.into_stream_hold());
         let limiter_c = std::sync::Arc::clone(&state.limiter);
         let captured_prompt_c = captured_prompt.clone();
-        let parsed_stream =
-            build_responses_passthrough_stream(body_stream, content_cap, move |usage, out_text| {
+        // AISIX-Cloud#1010: a monitor-only output chain (EndOfStreamCheck —
+        // the only way an output-hook chain reaches this live-forward branch)
+        // still gets its end-of-stream scan, so would-block / would-mask
+        // observations reach telemetry. `None` without an output hook.
+        let eos_scan = aisix_guardrails::Guardrail::runs_on_output(chain).then(|| EosOutputScan {
+            chain: Arc::clone(&chain_arc),
+            upstream_model: upstream_model.clone(),
+        });
+        let parsed_stream = build_responses_passthrough_stream(
+            body_stream,
+            content_cap,
+            eos_scan,
+            move |usage, out_text, output_hits| {
                 // Streams that reach here are committed 200s — the
                 // `!status.is_success()` guard above returned early on errors.
                 //
@@ -1261,6 +1282,13 @@ async fn responses_to_target(
                     },
                     started.elapsed(),
                 );
+                // Live-forward path: no output masking possible (a masking
+                // guardrail holds back → buffered branch; a monitor-mode one
+                // suppresses its masks), so only the input-side counts apply.
+                // The end-of-stream scan's monitor observations ride along
+                // with the input-side hits (AISIX-Cloud#1010).
+                let mut monitor_hits = input_monitor_hits.clone();
+                monitor_hits.extend(output_hits);
                 emit_usage_event(
                     &state_c,
                     &request_id_c,
@@ -1274,14 +1302,12 @@ async fn responses_to_target(
                     &client_c,
                     attempt,
                     /* guardrail_blocked */ false,
-                    // Live-forward path: no output masking possible (an
-                    // output-masking guardrail forces the buffered branch),
-                    // so only the input-side counts apply.
                     input_redactions.clone(),
-                    input_monitor_hits.clone(),
+                    monitor_hits,
                     captured_content.as_ref(),
                 );
-            });
+            },
+        );
         let mut response =
             axum::response::Response::new(axum::body::Body::from_stream(Box::pin(parsed_stream)));
         apply_passthrough_headers(&mut response, &headers, request_id);
@@ -1560,20 +1586,25 @@ async fn responses_cross_provider_to_target(
             requested_model,
             created_at,
         );
-        // Only an output-hook guardrail needs the streamed response text. When
-        // attached, the bridge buffers the SSE and scans before releasing it
-        // (#719 secure default); cap the buffer the same way the verbatim path
-        // does so a huge response can't OOM the gateway.
+        // Only an output-hook guardrail needs the streamed response text.
+        // When attached with a hold-back policy (Window/BufferFull — any
+        // block-capable chain), the bridge buffers the SSE and scans before
+        // releasing it (#719 secure default); cap the buffer the same way the
+        // verbatim path does so a huge response can't OOM the gateway. A
+        // monitor-only chain resolves to EndOfStreamCheck — it can never
+        // block, so the bridge forwards live and scans at end-of-stream for
+        // observation only (AISIX-Cloud#1010).
         let output_guardrail = (!chain.is_empty()
             && aisix_guardrails::Guardrail::runs_on_output(chain.as_ref()))
         .then(|| chain.clone());
-        let max_buffer_bytes =
-            match aisix_guardrails::Guardrail::stream_output_policy(chain.as_ref()) {
-                aisix_guardrails::StreamOutputPolicy::BufferFull {
-                    max_buffer_bytes, ..
-                } => max_buffer_bytes,
-                _ => aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES,
-            };
+        let output_policy = aisix_guardrails::Guardrail::stream_output_policy(chain.as_ref());
+        let hold_back = output_policy.holds_back();
+        let max_buffer_bytes = match output_policy {
+            aisix_guardrails::StreamOutputPolicy::BufferFull {
+                max_buffer_bytes, ..
+            } => max_buffer_bytes,
+            _ => aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES,
+        };
 
         let state_c = state.clone();
         let request_id_c = request_id.to_string();
@@ -1597,6 +1628,7 @@ async fn responses_cross_provider_to_target(
             encoder,
             started,
             output_guardrail,
+            hold_back,
             max_buffer_bytes,
             requested_model.to_string(),
             content_cap,
@@ -2014,12 +2046,17 @@ impl SseTextCapture {
 /// `None` means no terminal usage was seen (e.g. an abort before completion);
 /// the emit then records a zero-token 200 so the request still appears in the
 /// dashboard Logs. The second callback argument is the captured output text
-/// (AISIX-Cloud#947) — empty when no exporter wants content.
-struct ResponsesUsageGuard<F: FnOnce(ResponseUsage, String)> {
+/// (AISIX-Cloud#947) — empty when no exporter wants content. The third is the
+/// end-of-stream scan's monitor observations (AISIX-Cloud#1010) — the Drop
+/// (disconnect) path passes none: the response never completed, so there is
+/// nothing final to observe, matching the chat surface's disconnect behavior.
+struct ResponsesUsageGuard<F: FnOnce(ResponseUsage, String, Vec<aisix_core::GuardrailMonitorHit>)> {
     slot: Option<(F, Option<ResponseUsage>, Option<SseTextCapture>)>,
 }
 
-impl<F: FnOnce(ResponseUsage, String)> ResponsesUsageGuard<F> {
+impl<F: FnOnce(ResponseUsage, String, Vec<aisix_core::GuardrailMonitorHit>)>
+    ResponsesUsageGuard<F>
+{
     fn parts(&mut self) -> (&mut Option<ResponseUsage>, Option<&mut SseTextCapture>) {
         let slot = self
             .slot
@@ -2029,37 +2066,118 @@ impl<F: FnOnce(ResponseUsage, String)> ResponsesUsageGuard<F> {
     }
 }
 
-impl<F: FnOnce(ResponseUsage, String)> Drop for ResponsesUsageGuard<F> {
+impl<F: FnOnce(ResponseUsage, String, Vec<aisix_core::GuardrailMonitorHit>)> Drop
+    for ResponsesUsageGuard<F>
+{
     fn drop(&mut self) {
         if let Some((f, usage, capture)) = self.slot.take() {
             f(
                 usage.unwrap_or_default(),
                 capture.map(SseTextCapture::into_text).unwrap_or_default(),
+                Vec::new(),
             );
         }
+    }
+}
+
+/// End-of-stream output observation for the live-forward verbatim path
+/// (AISIX-Cloud#1010). Reachable only when the output-hook chain's resolved
+/// streaming policy is `EndOfStreamCheck` — today that is exactly the
+/// monitor-only chains, which can never block. Runs the same two-phase scan
+/// as the buffered branch (blob check + segment pass) so would-block /
+/// would-mask hits reach telemetry; the bytes are already on the wire, so a
+/// `Block` verdict (unreachable for monitor members) is logged, not enforced.
+struct EosOutputScan {
+    chain: Arc<aisix_guardrails::GuardrailChain>,
+    upstream_model: String,
+}
+
+impl EosOutputScan {
+    async fn observe(self, text: &str) -> Vec<aisix_core::GuardrailMonitorHit> {
+        // Bound the provider calls the same way the buffered branch's byte
+        // cap does — scan at most the cap's worth of text.
+        let mut end = text
+            .len()
+            .min(aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES);
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        let scan_text = &text[..end];
+        if scan_text.is_empty() {
+            return Vec::new();
+        }
+        let synth = synth_chat_response(&self.upstream_model, scan_text.to_string());
+        let (verdict, mut hits) = aisix_guardrails::Guardrail::check_output_non_segment_observed(
+            self.chain.as_ref(),
+            &synth,
+        )
+        .await;
+        // Segment pass (bedrock/lakera/presidio members): offer the flattened
+        // text as one segment so monitor-mode segment moderators record their
+        // observations too. Masks are suppressed in monitor mode, and nothing
+        // could be rewritten anyway — the counts are discarded.
+        let mut seg_counts = crate::redact::RedactionCounts::new();
+        let verdict = crate::redact::moderate_body(
+            self.chain.as_ref(),
+            crate::redact::Direction::Output,
+            verdict,
+            &mut seg_counts,
+            &mut hits,
+            |g| {
+                let _ = g.redact_output_text(scan_text);
+                crate::redact::RedactionCounts::new()
+            },
+        )
+        .await;
+        if let aisix_guardrails::GuardrailVerdict::Block { reason, .. } = verdict {
+            tracing::warn!(
+                guardrail_hook = "output",
+                model = %self.upstream_model,
+                reason = %reason,
+                "output guardrail returned a block after live forward; \
+                 response already sent (EndOfStreamCheck policy)",
+            );
+        }
+        hits
     }
 }
 
 /// Wrap a Responses-API upstream byte stream so the terminal event's usage is
 /// parsed in-flight and `on_complete` fires once at end-of-stream (or
 /// client-disconnect) with the accumulated counts (#808) plus the captured
-/// output text (AISIX-Cloud#947, empty when `content_cap` is `None`). Bytes
-/// forward verbatim — the client sees the exact upstream SSE wire shape.
+/// output text (AISIX-Cloud#947, empty when `content_cap` is `None`) and the
+/// end-of-stream scan's monitor hits (AISIX-Cloud#1010, empty without
+/// `eos_scan`). Bytes forward verbatim — the client sees the exact upstream
+/// SSE wire shape.
 fn build_responses_passthrough_stream<S, F>(
     upstream: S,
     content_cap: Option<u32>,
+    eos_scan: Option<EosOutputScan>,
     on_complete: F,
 ) -> impl futures::Stream<Item = reqwest::Result<bytes::Bytes>>
 where
     S: futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send + 'static,
-    F: FnOnce(ResponseUsage, String) + Send + 'static,
+    F: FnOnce(ResponseUsage, String, Vec<aisix_core::GuardrailMonitorHit>) + Send + 'static,
 {
+    // The scan reads the same assembled output text the capture produces, so
+    // an attached scan forces the accumulator on even when no exporter wants
+    // content — capped at the scan bound in that case. `CapturedContent::new`
+    // re-truncates to the exporter cap, so a larger scan cap never leaks
+    // extra bytes into the export.
+    let capture_cap = match (content_cap, eos_scan.is_some()) {
+        (Some(cap), true) => {
+            Some((cap as usize).max(aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES))
+        }
+        (Some(cap), false) => Some(cap as usize),
+        (None, true) => Some(aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES),
+        (None, false) => None,
+    };
     async_stream::stream! {
         let mut guard = ResponsesUsageGuard {
             slot: Some((
                 on_complete,
                 None,
-                content_cap.map(|cap| SseTextCapture::new(cap as usize)),
+                capture_cap.map(SseTextCapture::new),
             )),
         };
         futures::pin_mut!(upstream);
@@ -2089,7 +2207,17 @@ where
             // Forward the original item verbatim (Ok bytes OR a mid-stream Err).
             yield item;
         }
-        // guard drops here → on_complete fires.
+        // Clean end-of-stream: run the monitor observation (needs async, so
+        // it can't live in the Drop guard) and complete explicitly. A client
+        // disconnect never reaches here — the guard's Drop fires instead.
+        if let Some((f, usage, capture)) = guard.slot.take() {
+            let text = capture.map(SseTextCapture::into_text).unwrap_or_default();
+            let hits = match eos_scan {
+                Some(scan) => scan.observe(&text).await,
+                None => Vec::new(),
+            };
+            f(usage.unwrap_or_default(), text, hits);
+        }
     }
 }
 
@@ -3238,6 +3366,197 @@ mod tests {
         let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["error"]["type"], "content_filter");
+    }
+
+    /// `keyword_output_guardrail` with `enforcement_mode: monitor` — the
+    /// chain resolves to `EndOfStreamCheck` (never holds back, never blocks).
+    fn keyword_output_guardrail_monitor(literal: &str) -> ResourceEntry<aisix_core::Guardrail> {
+        let json = format!(
+            r#"{{"name":"test-out-mon","enabled":true,"hook_point":"output","fail_open":false,"enforcement_mode":"monitor","kind":"keyword","patterns":[{{"kind":"literal","value":"{literal}"}}]}}"#
+        );
+        let g: aisix_core::Guardrail = serde_json::from_str(&json).unwrap();
+        ResourceEntry::new("g-out-mon-1", g, 1)
+    }
+
+    /// AISIX-Cloud#1010: a MONITOR-mode output guardrail must never make a
+    /// streaming /v1/responses request fail closed. Same oversized stream as
+    /// the fail-closed test above, but the chain resolves to EndOfStreamCheck
+    /// — the bytes forward live and the client gets the full 200 SSE, not a
+    /// 422. Pre-fix, any output-hook guardrail (monitor included) forced the
+    /// hold-back branch and a >256 KiB response was rejected with
+    /// `content_filter` — a monitor rule "blocking", which it must never do.
+    #[tokio::test]
+    async fn monitor_output_guardrail_oversized_stream_released() {
+        let upstream = MockServer::start().await;
+        let big = "x".repeat(300_000);
+        let sse =
+            format!("data: {{\"type\":\"response.output_text.delta\",\"delta\":\"{big}\"}}\n\ndata: [DONE]\n\n");
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_openai(&upstream.uri());
+        snap.models.insert(openai_model("gpt-4o-resp"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        snap.guardrails
+            .insert(keyword_output_guardrail_monitor("BLOCKME"));
+        let app = build_app(snap);
+
+        let resp = app
+            .oneshot(make_req(
+                serde_json::json!({"model":"gpt-4o-resp","input":"hi","stream":true}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a monitor-only chain must never fail a stream closed on the buffer cap",
+        );
+        let bytes = to_bytes(resp.into_body(), 4 * 1024 * 1024).await.unwrap();
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(
+            body.len() >= 300_000 && body.contains("[DONE]"),
+            "the full SSE must be released, got {} bytes",
+            body.len(),
+        );
+    }
+
+    /// AISIX-Cloud#1010 companion: on the live-forward monitor path the
+    /// end-of-stream scan still runs — a violating stream is delivered
+    /// verbatim (200, content included) and the emitted usage event carries
+    /// the `would_block` observation instead of `guardrail_blocked`.
+    #[tokio::test]
+    async fn monitor_output_guardrail_streams_live_and_records_would_block() {
+        use aisix_obs::UsageSink;
+        let upstream = MockServer::start().await;
+        let sse = "event: response.output_text.delta\n\
+                   data: {\"type\":\"response.output_text.delta\",\"delta\":\"sure: BLOCKME\"}\n\n\
+                   event: response.completed\n\
+                   data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"sure: BLOCKME\"}]}],\"usage\":{\"input_tokens\":5,\"output_tokens\":3}}}\n\n\
+                   data: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_openai(&upstream.uri());
+        snap.models.insert(openai_model("gpt-4o-resp"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        snap.guardrails
+            .insert(keyword_output_guardrail_monitor("BLOCKME"));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let handle = SnapshotHandle::new(snap);
+        let state = crate::ProxyState::new(handle, hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let app = crate::build_router(state);
+
+        let resp = app
+            .oneshot(make_req(
+                serde_json::json!({"model":"gpt-4o-resp","input":"hi","stream":true}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&bytes).contains("BLOCKME"),
+            "monitor mode must deliver the stream verbatim",
+        );
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(1000), rx.recv())
+            .await
+            .expect("usage event must be emitted")
+            .expect("usage_sink sender dropped");
+        assert!(!event.guardrail_blocked);
+        assert_eq!(event.status_code, 200);
+        assert!(
+            event
+                .guardrail_monitor_hits
+                .iter()
+                .any(|h| h.hook == "output" && h.action == "would_block"),
+            "the end-of-stream scan must record the would-block observation, got {:?}",
+            event.guardrail_monitor_hits,
+        );
+    }
+
+    /// AISIX-Cloud#1010, cross-provider bridge path: a monitor-mode output
+    /// guardrail must not hold back or fail the bridged stream on the buffer
+    /// cap either. An oversized bridged response is released in full with no
+    /// `content_filter` error frame, and the usage event stays an unblocked
+    /// 200.
+    #[tokio::test]
+    async fn monitor_output_guardrail_oversized_cross_provider_stream_released() {
+        use aisix_obs::UsageSink;
+        let upstream = MockServer::start().await;
+        let big = serde_json::to_string(&"y".repeat(300_000)).unwrap();
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(anthropic_text_sse(&big)),
+            )
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_anthropic_at(&upstream.uri());
+        snap.models.insert(anthropic_model("claude-resp"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        snap.guardrails
+            .insert(keyword_output_guardrail_monitor("BLOCKME"));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+        let handle = SnapshotHandle::new(snap);
+        let state = crate::ProxyState::new(handle, hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let app = crate::build_router(state);
+
+        let resp = app
+            .oneshot(make_req(
+                serde_json::json!({"model":"claude-resp","input":"hi","stream":true}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 8 * 1024 * 1024).await.unwrap();
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(
+            body.contains(&"y".repeat(1000)),
+            "the bridged stream must be released, not withheld",
+        );
+        assert!(
+            !body.contains("content_filter"),
+            "no fail-closed error frame on a monitor-only chain",
+        );
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(1000), rx.recv())
+            .await
+            .expect("usage event must be emitted")
+            .expect("usage_sink sender dropped");
+        assert!(!event.guardrail_blocked);
+        assert_eq!(event.status_code, 200);
     }
 
     /// #546: output tool-call arguments must be scanned. A blocked literal in
