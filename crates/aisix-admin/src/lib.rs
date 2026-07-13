@@ -12,8 +12,9 @@
 //! Admin-key protected routes:
 //! - `GET|POST            /admin/v1/models`
 //! - `GET|PUT|DELETE      /admin/v1/models/:id`
-//! - `GET|POST            /admin/v1/apikeys`
-//! - `GET|PUT|DELETE      /admin/v1/apikeys/:id`
+//! - `GET|POST            /admin/v1/api_keys` (also served at the former
+//!   `/admin/v1/apikeys` spelling, same handlers)
+//! - `GET|PUT|DELETE      /admin/v1/api_keys/:id`
 //! - `GET|POST            /admin/v1/provider_keys`
 //! - `GET|PUT|DELETE      /admin/v1/provider_keys/:id`
 //! - `GET|POST            /admin/v1/guardrails`
@@ -95,6 +96,23 @@ pub fn build_router(state: AdminState) -> Router {
         .route(
             "/admin/v1/models/status",
             get(models_status_handler::get_models_status),
+        )
+        // Caller API keys are served at the canonical `api_keys` path —
+        // the resource's configuration key — and at the former `apikeys`
+        // spelling. Same handlers; existing callers keep working.
+        .route(
+            "/admin/v1/api_keys",
+            get(apikeys_handlers::list_apikeys).post(apikeys_handlers::create_apikey),
+        )
+        .route(
+            "/admin/v1/api_keys/:id",
+            get(apikeys_handlers::get_apikey)
+                .put(apikeys_handlers::update_apikey)
+                .delete(apikeys_handlers::delete_apikey),
+        )
+        .route(
+            "/admin/v1/api_keys/:id/rotate",
+            post(apikeys_handlers::rotate_apikey),
         )
         .route(
             "/admin/v1/apikeys",
@@ -855,6 +873,66 @@ mod tests {
         let resp = run(
             app,
             auth_req("POST", "/admin/v1/apikeys/nonexistent/rotate", None),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // Caller API keys are served at both the canonical `/admin/v1/api_keys`
+    // path and the former `/admin/v1/apikeys` spelling — same handlers,
+    // same store. Pin that a resource written through one path is fully
+    // addressable through the other.
+    #[tokio::test]
+    async fn api_keys_canonical_and_former_paths_share_the_same_resources() {
+        let state = build_state();
+
+        // Create through the canonical path.
+        let app = build_router(state.clone());
+        let resp = run(
+            app,
+            auth_req(
+                "POST",
+                "/admin/v1/api_keys",
+                Some(apikey_payload("sk-canonical", &["my-model"])),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let created = body_json(resp).await;
+        let id = created["id"].as_str().unwrap().to_string();
+
+        // Read it back through the former spelling.
+        let app = build_router(state.clone());
+        let resp = run(
+            app,
+            auth_req("GET", &format!("/admin/v1/apikeys/{id}"), None),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Rotate through the canonical spelling.
+        let app = build_router(state.clone());
+        let resp = run(
+            app,
+            auth_req("POST", &format!("/admin/v1/api_keys/{id}/rotate"), None),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let rotated = body_json(resp).await;
+        assert_eq!(rotated["entry"]["revision"], 2);
+
+        // Delete through the former spelling; the canonical GET 404s.
+        let app = build_router(state.clone());
+        let resp = run(
+            app,
+            auth_req("DELETE", &format!("/admin/v1/apikeys/{id}"), None),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let app = build_router(state);
+        let resp = run(
+            app,
+            auth_req("GET", &format!("/admin/v1/api_keys/{id}"), None),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);

@@ -239,7 +239,7 @@ pub(crate) fn resolve_target(
             model.display_name, pk_entry.value.provider
         ))
     })?;
-    let secret = crate::dispatch::require_secret(&pk_entry.value, model)?.to_string();
+    let secret = crate::dispatch::require_api_key(&pk_entry.value, model)?.to_string();
 
     Ok(JobTarget {
         model_entry,

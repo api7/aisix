@@ -199,10 +199,10 @@ fn normalize_canonical_openai(base: &str) -> String {
 }
 
 fn api_key(ctx: &BridgeContext) -> Result<&str, BridgeError> {
-    let k = &ctx.provider_key.secret;
+    let k = &ctx.provider_key.api_key;
     if k.is_empty() {
         return Err(BridgeError::InvalidUpstreamCredentials(
-            "provider_key.secret is empty".into(),
+            "provider_key.api_key is empty".into(),
         ));
     }
     // Reject a secret that can't be a valid Authorization header value
@@ -211,7 +211,7 @@ fn api_key(ctx: &BridgeContext) -> Result<&str, BridgeError> {
     // build_request_headers, so validating here covers them all (#367).
     if HeaderValue::from_str(k).is_err() {
         return Err(BridgeError::InvalidUpstreamCredentials(
-            "provider_key.secret contains invalid header characters".into(),
+            "provider_key.api_key contains invalid header characters".into(),
         ));
     }
     Ok(k.as_str())
@@ -1113,7 +1113,7 @@ mod tests {
         // upstream with a bare bearer (#367 follow-up).
         let mut pk: ProviderKey =
             serde_json::from_str(r#"{"display_name":"empty","secret":"placeholder"}"#).unwrap();
-        pk.secret.clear();
+        pk.api_key.clear();
 
         let bridge = OpenAiBridge::new();
         let ctx = BridgeContext::new("req-1", sample_model(), Arc::new(pk));

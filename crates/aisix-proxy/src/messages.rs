@@ -915,7 +915,7 @@ async fn anthropic_passthrough_dispatch(
     input_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
 ) -> Result<DispatchOutcome, ProxyError> {
     let mut body = body.clone();
-    let api_key = crate::dispatch::require_secret(pk_value, model)?;
+    let api_key = crate::dispatch::require_api_key(pk_value, model)?;
 
     let upstream_model = crate::dispatch::require_upstream_model(model)?.to_string();
 

@@ -2,8 +2,8 @@
 //!
 //! Registers an upstream agent that speaks the A2A protocol (HTTP + JSON-RPC
 //! 2.0) so the gateway can front it: callers reach it through the gateway's own
-//! `/a2a/<display_name>` endpoint, its agent card is served (with URLs rewritten
-//! to the gateway) at `/a2a/<display_name>/.well-known/agent.json`, and
+//! `/a2a/<name>` endpoint, its agent card is served (with URLs rewritten
+//! to the gateway) at `/a2a/<name>/.well-known/agent.json`, and
 //! `message/send` / `message/stream` are routed through the same auth / ACL /
 //! guardrail / quota pipeline as LLM and MCP traffic. The upstream credential is
 //! held by the gateway and is never exposed to the calling client.
@@ -13,7 +13,7 @@
 //! Engine) and gateway-composed virtual agents are later additions and are not
 //! part of this entity yet.
 //!
-//! etcd path: `{prefix}/a2a_agents/{uuid}`. Secondary index on `display_name`.
+//! etcd path: `{prefix}/a2a_agents/{uuid}`. Secondary index on `name`.
 
 use serde::{Deserialize, Serialize};
 
@@ -23,10 +23,15 @@ use crate::resource::Resource;
 #[serde(deny_unknown_fields)]
 pub struct A2aAgent {
     /// Operator-facing label, unique within the gateway. It is the path segment
-    /// under which the agent is exposed to callers as `/a2a/<display_name>`, so
-    /// it must be a single non-empty URL path segment.
+    /// under which the agent is exposed to callers as `/a2a/<name>`, so it must
+    /// be a single non-empty URL path segment.
+    // `display_name` is the field's former name; stored documents and
+    // callers that still use it keep deserializing (schema-side acceptance
+    // lives in `schema::a2a_agent_root_schema`). Re-serialization always
+    // emits `name`.
+    #[serde(alias = "display_name")]
     #[schemars(length(min = 1))]
-    pub display_name: String,
+    pub name: String,
 
     /// The upstream agent's base URL, such as `https://agents.example.com/a2a`.
     /// AISIX reaches this URL over HTTP with the A2A JSON-RPC 2.0 protocol and
@@ -117,7 +122,7 @@ impl Resource for A2aAgent {
     }
 
     fn name(&self) -> &str {
-        &self.display_name
+        &self.name
     }
 
     fn kind() -> &'static str {
@@ -135,7 +140,7 @@ mod tests {
             r#"{"display_name":"invoice-processor","url":"https://agents.example.com/a2a"}"#,
         )
         .unwrap();
-        assert_eq!(a.display_name, "invoice-processor");
+        assert_eq!(a.name, "invoice-processor");
         assert_eq!(a.url, "https://agents.example.com/a2a");
         // Defaults.
         assert_eq!(a.protocol_version, A2aProtocolVersion::V1_0);
@@ -214,6 +219,42 @@ mod tests {
         assert!(r.is_err());
     }
 
+    // ---- `display_name` → `name` rename ----
+
+    #[test]
+    fn accepts_canonical_name_spelling() {
+        let a: A2aAgent =
+            serde_json::from_str(r#"{"name":"invoice","url":"https://x/a2a"}"#).unwrap();
+        assert_eq!(a.name, "invoice");
+    }
+
+    #[test]
+    fn serialises_label_under_name_only() {
+        // Emission contract: re-serialization uses the canonical `name`,
+        // never the former `display_name` spelling (the fixtures above
+        // keep exercising the deserialize-side alias).
+        let a: A2aAgent =
+            serde_json::from_str(r#"{"display_name":"invoice","url":"https://x/a2a"}"#).unwrap();
+        let json = serde_json::to_string(&a).unwrap();
+        assert!(json.contains(r#""name":"invoice""#), "got: {json}");
+        assert!(!json.contains("display_name"), "got: {json}");
+    }
+
+    #[test]
+    fn rejects_document_carrying_both_spellings() {
+        // serde maps the alias onto the same field, so a document that
+        // carries both spellings is a duplicate-field error — the
+        // ambiguity is rejected instead of one value silently winning.
+        let r: Result<A2aAgent, _> = serde_json::from_str(
+            r#"{"name":"invoice","display_name":"invoice-old","url":"https://x/a2a"}"#,
+        );
+        let err = r.expect_err("both spellings in one document must be rejected");
+        assert!(
+            err.to_string().contains("duplicate field"),
+            "expected a duplicate-field error, got: {err}"
+        );
+    }
+
     #[test]
     fn rejects_unknown_protocol_version_and_auth_type() {
         assert!(serde_json::from_str::<A2aAgent>(
@@ -227,7 +268,7 @@ mod tests {
     }
 
     #[test]
-    fn resource_trait_routes_through_display_name() {
+    fn resource_trait_routes_through_name() {
         let mut a: A2aAgent =
             serde_json::from_str(r#"{"display_name":"invoice","url":"https://x/a2a"}"#).unwrap();
         a.runtime_id = "uuid-a2a-1".into();
@@ -239,7 +280,7 @@ mod tests {
     #[test]
     fn round_trip_omits_default_optionals() {
         let original = A2aAgent {
-            display_name: "invoice".into(),
+            name: "invoice".into(),
             url: "https://x/a2a".into(),
             protocol_version: A2aProtocolVersion::V1_0,
             auth_type: A2aAuthType::None,

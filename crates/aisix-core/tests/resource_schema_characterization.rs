@@ -273,13 +273,22 @@ fn rate_limit_policy_corpus() {
 
 #[test]
 fn provider_key_corpus() {
+    // Corpus fixtures deliberately keep the credential's former `secret`
+    // spelling — they double as acceptance proof for stored documents
+    // written before the field's rename to `api_key`. The canonical
+    // spelling is pinned by the dedicated cases below.
     check(
         validate_provider_key,
         &[
             (
-                "minimal",
+                "minimal (former `secret` spelling)",
                 true,
                 json!({"display_name": "openai-prod", "secret": "sk-x"}),
+            ),
+            (
+                "minimal (canonical `api_key` spelling)",
+                true,
+                json!({"display_name": "openai-prod", "api_key": "sk-x"}),
             ),
             (
                 "with api_base + provider",
@@ -287,7 +296,16 @@ fn provider_key_corpus() {
                 json!({"display_name": "p", "secret": "sk-x", "api_base": "https://api.openai.com/v1", "provider": "deepseek"}),
             ),
             ("missing display_name", false, json!({"secret": "sk-x"})),
-            ("missing secret", false, json!({"display_name": "x"})),
+            (
+                "credential absent under both spellings",
+                false,
+                json!({"display_name": "x"}),
+            ),
+            (
+                "both credential spellings (schema layer admits; serde rejects the duplicate)",
+                true,
+                json!({"display_name": "x", "api_key": "a", "secret": "b"}),
+            ),
             (
                 "unknown top-level field",
                 false,
@@ -297,6 +315,11 @@ fn provider_key_corpus() {
                 "empty display_name",
                 false,
                 json!({"display_name": "", "secret": "k"}),
+            ),
+            (
+                "empty api_key",
+                false,
+                json!({"display_name": "x", "api_key": ""}),
             ),
             (
                 "empty secret",

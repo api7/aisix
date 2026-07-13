@@ -1,6 +1,20 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "additionalProperties": false,
+  "anyOf": [
+    {
+      "required": [
+        "api_key"
+      ],
+      "title": "api_key"
+    },
+    {
+      "required": [
+        "secret"
+      ],
+      "title": "secret"
+    }
+  ],
   "definitions": {
     "Adapter": {
       "description": "Upstream API protocol family used for provider dispatch.",
@@ -208,6 +222,11 @@
         "null"
       ]
     },
+    "api_key": {
+      "description": "Upstream provider's API key. The data plane receives plaintext so it can authenticate to the upstream provider. Protect the configuration store and transport accordingly.",
+      "minLength": 1,
+      "type": "string"
+    },
     "display_name": {
       "description": "Operator-facing label, unique within the gateway. Surfaces in the Admin API list view and in dashboard UIs that wrap this resource.",
       "minLength": 1,
@@ -241,7 +260,7 @@
       "description": "Per-key response-shape overrides applied by provider bridges that support response transformation."
     },
     "secret": {
-      "description": "Upstream provider's API key. The data plane receives plaintext so it can authenticate to the upstream provider. Protect the configuration store and transport accordingly.",
+      "description": "Accepted as an alternative spelling of `api_key`. Provide the credential under exactly one of the two names.",
       "minLength": 1,
       "type": "string"
     },
@@ -271,8 +290,7 @@
     }
   },
   "required": [
-    "display_name",
-    "secret"
+    "display_name"
   ],
   "title": "ProviderKey",
   "type": "object"

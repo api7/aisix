@@ -53,8 +53,8 @@ describe("seed-vs-admin characterization: direct etcd writes ≡ Admin API write
   let etcdClient: EtcdClient | undefined;
   let etcdReachable = false;
 
-  let adminPk: Entry, seedPk: Entry;
-  let adminModel: Entry, seedModel: Entry;
+  let adminPk: Entry, seedPk: Entry, seedPkCanonical: Entry;
+  let adminModel: Entry, seedModel: Entry, seedModelCanonical: Entry;
   let adminKey: Entry, seedKey: Entry;
   let adminExporter: Entry, seedExporter: Entry;
 
@@ -82,6 +82,14 @@ describe("seed-vs-admin characterization: direct etcd writes ≡ Admin API write
       secret: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
+    // The same logical provider_key seeded under the credential's
+    // canonical `api_key` spelling — the field-spelling differential
+    // below pins that both spellings load and serve identically.
+    seedPkCanonical = await seed.createProviderKey({
+      display_name: "char-seed-pk-canonical",
+      api_key: "sk-mock",
+      api_base: `${upstream.baseUrl}/v1`,
+    });
 
     adminModel = await admin.createModel({
       display_name: "char-admin-model",
@@ -95,6 +103,12 @@ describe("seed-vs-admin characterization: direct etcd writes ≡ Admin API write
       model_name: "gpt-4o-mini",
       provider_key_id: seedPk.id,
     });
+    seedModelCanonical = await seed.createModel({
+      display_name: "char-seed-model-canonical",
+      provider: "openai",
+      model_name: "gpt-4o-mini",
+      provider_key_id: seedPkCanonical.id,
+    });
 
     // Carry optional fields too so the projection comparison below has
     // non-empty residue after the varied fields are stripped.
@@ -106,7 +120,7 @@ describe("seed-vs-admin characterization: direct etcd writes ≡ Admin API write
     });
     seedKey = await seed.createApiKey({
       key_hash: sha256(SEED_CALLER),
-      allowed_models: ["char-seed-model"],
+      allowed_models: ["char-seed-model", "char-seed-model-canonical"],
       rate_limit: { rpm: 1000 },
       expires_at: "2030-01-01T00:00:00Z",
     });
@@ -263,6 +277,72 @@ describe("seed-vs-admin characterization: direct etcd writes ≡ Admin API write
       normalize(find(exporters, seedExporter.id, "seed exporter").value, ["name"]),
     ).toEqual(
       normalize(find(exporters, adminExporter.id, "admin exporter").value, ["name"]),
+    );
+  });
+
+  // Field-spelling differential for the provider_key credential rename
+  // (`secret` → `api_key`): the same logical provider_key seeded once
+  // under each spelling must load and serve identically, and the Admin
+  // API must emit the canonical `api_key` name for both — whichever
+  // front door wrote the document and whichever spelling it used.
+  test("provider_key credential loads under either spelling; admin GET emits api_key for both", async (ctx) => {
+    if (!etcdReachable || !admin || !app || !upstream) {
+      ctx.skip();
+      return;
+    }
+
+    const seedClient = new OpenAI({
+      apiKey: SEED_CALLER,
+      baseURL: `${app.proxyUrl}/v1`,
+      maxRetries: 0,
+    });
+
+    // Serve-behavior differential: a 200 through each model proves the
+    // provider_key behind it — one stored with `secret`, one with
+    // `api_key` — loaded, resolved, and authenticated upstream. Doubles
+    // as this test's own propagation gate for the canonical-spelling
+    // resources (the earlier gate only probed the legacy-spelling pair).
+    await waitConfigPropagation(async () => {
+      try {
+        const [legacy, canonical] = await Promise.all(
+          ["char-seed-model", "char-seed-model-canonical"].map((model) =>
+            seedClient.chat.completions.create({
+              model,
+              messages: [{ role: "user", content: "spelling-probe" }],
+            }),
+          ),
+        );
+        return (
+          legacy.choices[0]?.message.role === "assistant" &&
+          canonical.choices[0]?.message.role === "assistant"
+        );
+      } catch {
+        return false;
+      }
+    });
+
+    // Emission differential: admin GET deserializes the stored document
+    // and re-serializes — the credential must come back as `api_key`
+    // (never `secret`) for all three write paths: admin+`secret`,
+    // seed+`secret`, seed+`api_key`.
+    const pks = await admin.json<Entry[]>("GET", "/admin/v1/provider_keys");
+    for (const [label, id] of [
+      ["admin-created (secret spelling)", adminPk.id],
+      ["seeded (secret spelling)", seedPk.id],
+      ["seeded (api_key spelling)", seedPkCanonical.id],
+    ] as const) {
+      const entry = pks.find((e) => e.id === id);
+      if (!entry) throw new Error(`${label} provider_key (${id}) missing from admin GET`);
+      expect(entry.value.api_key, `${label}: api_key`).toBe("sk-mock");
+      expect(entry.value.secret, `${label}: former spelling must not be emitted`).toBeUndefined();
+    }
+
+    // Document differential: modulo the identity field, the two seeded
+    // documents read back identical — the spelling leaves no residue.
+    const bySeed = pks.find((e) => e.id === seedPk.id)!;
+    const byCanonical = pks.find((e) => e.id === seedPkCanonical.id)!;
+    expect(normalize(byCanonical.value, ["display_name"])).toEqual(
+      normalize(bySeed.value, ["display_name"]),
     );
   });
 

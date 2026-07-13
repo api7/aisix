@@ -52,7 +52,7 @@ pub struct AzureOpenAiBridge {
     /// traffic in metrics.
     name: &'static str,
     /// In-process AAD token cache + minter. Used only when the
-    /// inbound `ProviderKey.secret` parses to the AAD branch; the
+    /// inbound `ProviderKey.api_key` parses to the AAD branch; the
     /// api-key branch bypasses this entirely. `Arc` so the bridge
     /// remains cheaply clonable for callers that share it across
     /// Hub registrations.
@@ -128,7 +128,7 @@ impl AzureOpenAiBridge {
     /// surface as `Err` here so `chat()` / `chat_stream()` short-
     /// circuit BEFORE attempting the upstream Azure OpenAI call.
     async fn resolve_auth(&self, ctx: &BridgeContext) -> Result<AzureAuth, BridgeError> {
-        match AzureSecret::parse(&ctx.provider_key.secret)? {
+        match AzureSecret::parse(&ctx.provider_key.api_key)? {
             AzureSecret::ApiKey(key) => Ok(AzureAuth {
                 api_key: Some(key),
                 bearer_token: None,
@@ -288,7 +288,7 @@ impl AzureUpstreamRef {
                 // api-key / AAD path for auth, never URL-embedded.
                 return Err(BridgeError::InvalidUpstreamConfig(format!(
                     "azure api_base {base:?} must not embed userinfo (@); use the \
-                     api-key / AAD credentials in `provider_key.secret` instead"
+                     api-key / AAD credentials in `provider_key.api_key` instead"
                 )));
             }
             if base.contains('?') {
@@ -383,7 +383,7 @@ pub(crate) enum AzureSecret {
 }
 
 impl AzureSecret {
-    /// Parse the inbound `ProviderKey.secret` into either the api-key
+    /// Parse the inbound `ProviderKey.api_key` into either the api-key
     /// or AAD branch.
     ///
     /// **Audit-aware:** error messages MUST NOT echo raw secret
@@ -395,14 +395,14 @@ impl AzureSecret {
         let trimmed = secret.trim();
         if trimmed.is_empty() {
             return Err(BridgeError::InvalidUpstreamCredentials(
-                "provider_key.secret is empty".into(),
+                "provider_key.api_key is empty".into(),
             ));
         }
         if trimmed.starts_with('{') {
             let creds: crate::aad_token_mint::AadCredentials = serde_json::from_str(trimmed)
                 .map_err(|_e| {
                     BridgeError::InvalidUpstreamCredentials(
-                        "azure provider_key.secret looks JSON-shaped but failed to parse \
+                        "azure provider_key.api_key looks JSON-shaped but failed to parse \
                          as AAD client_credentials \
                          {tenant_id, client_id, client_secret}"
                             .into(),
@@ -1360,7 +1360,7 @@ mod tests {
     #[tokio::test]
     async fn chat_with_empty_secret_errors_before_dispatch() {
         let bridge = AzureOpenAiBridge::new();
-        // Build a PK whose secret is empty.
+        // Build a PK whose api_key is empty.
         let pk: Arc<ProviderKey> = Arc::new(
             serde_json::from_str(
                 r#"{"display_name": "azure-prod", "secret": "", "api_base": "https://acme-west.openai.azure.com"}"#,
@@ -1373,7 +1373,7 @@ mod tests {
         assert_eq!(err.http_status(), 401);
         match err {
             BridgeError::InvalidUpstreamCredentials(msg) => {
-                assert!(msg.contains("secret is empty"), "got {msg}");
+                assert!(msg.contains("api_key is empty"), "got {msg}");
             }
             other => panic!("expected InvalidUpstreamCredentials error, got {other:?}"),
         }

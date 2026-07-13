@@ -843,7 +843,7 @@ async fn responses_to_target(
     // Resolved PK id for per-PK telemetry attribution on the emitted
     // UsageEvent (AISIX-Cloud#867).
     let provider_key_id = pk_entry.id.clone();
-    let api_key = crate::dispatch::require_secret(&pk_entry.value, model)?.to_string();
+    let api_key = crate::dispatch::require_api_key(&pk_entry.value, model)?.to_string();
     let upstream_model = crate::dispatch::require_upstream_model(model)?.to_string();
 
     // Rewrite model field to upstream name.

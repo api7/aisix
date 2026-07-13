@@ -321,7 +321,7 @@ async fn dispatch(
     }
 
     let pk_entry = crate::dispatch::resolve_provider_key(&snapshot, model)?;
-    let api_key = crate::dispatch::require_secret(&pk_entry.value, model)?.to_string();
+    let api_key = crate::dispatch::require_api_key(&pk_entry.value, model)?.to_string();
     let upstream_model = crate::dispatch::require_upstream_model(model)?.to_string();
 
     // Rewrite model field.

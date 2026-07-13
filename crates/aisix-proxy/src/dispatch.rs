@@ -246,20 +246,20 @@ pub(crate) fn build_v1_url(base: &str, path: &str) -> String {
     }
 }
 
-/// The upstream API key — `provider_key.secret`. Empty string is
+/// The upstream API key — `provider_key.api_key`. Empty string is
 /// treated as a config error (ProviderKey rows shouldn't be empty,
 /// but a hand-edited kine row could surface one).
-pub(crate) fn require_secret<'a>(
+pub(crate) fn require_api_key<'a>(
     provider_key: &'a ProviderKey,
     model: &Model,
 ) -> Result<&'a str, ProxyError> {
-    if provider_key.secret.is_empty() {
+    if provider_key.api_key.is_empty() {
         return Err(ProxyError::InvalidRequest(format!(
-            "model {:?} provider_key has empty secret",
+            "model {:?} provider_key has empty api_key",
             model.display_name
         )));
     }
-    Ok(provider_key.secret.as_str())
+    Ok(provider_key.api_key.as_str())
 }
 
 #[cfg(test)]

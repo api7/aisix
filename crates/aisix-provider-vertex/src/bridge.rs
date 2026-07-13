@@ -13,7 +13,7 @@
 //! an OpenAI-compatible body (model in BOTH the URL and the body). All
 //! five Vertex publisher rails are now wired.
 //!
-//! Credentials: `ProviderKey.secret` is a JSON-encoded
+//! Credentials: `ProviderKey.api_key` is a JSON-encoded
 //! `{access_token, project, region}` struct. The `access_token` is
 //! a pre-minted GCP OAuth2 bearer (operator-managed refresh; D5.1
 //! follow-up adds in-process JWT-signing).
@@ -325,7 +325,7 @@ impl VertexPublisher {
     }
 }
 
-/// `ProviderKey.secret` schema for a Vertex provider key.
+/// `ProviderKey.api_key` schema for a Vertex provider key.
 ///
 /// Convention: GCP credentials are JSON-encoded into the `secret`
 /// field. The operator chooses ONE of two credential modes:
@@ -373,7 +373,7 @@ impl VertexSecret {
     fn parse(secret: &str) -> Result<Self, BridgeError> {
         if secret.trim().is_empty() {
             return Err(BridgeError::InvalidUpstreamCredentials(
-                "vertex provider_key.secret is empty — \
+                "vertex provider_key.api_key is empty — \
                  expected JSON with project, region, and either access_token \
                  or service_account_json"
                     .into(),
@@ -381,7 +381,7 @@ impl VertexSecret {
         }
         let parsed: VertexSecret = serde_json::from_str(secret).map_err(|_e| {
             BridgeError::InvalidUpstreamCredentials(
-                "vertex provider_key.secret must be valid JSON: \
+                "vertex provider_key.api_key must be valid JSON: \
                  {project, region, and either access_token or service_account_json}"
                     .into(),
             )
@@ -392,7 +392,7 @@ impl VertexSecret {
         // generic "neither set".
         if parsed.access_token.as_deref().is_some_and(str::is_empty) {
             return Err(BridgeError::InvalidUpstreamCredentials(
-                "vertex provider_key.secret.access_token is empty".into(),
+                "vertex provider_key.api_key.access_token is empty".into(),
             ));
         }
         let has_token = parsed
@@ -402,14 +402,14 @@ impl VertexSecret {
         let has_sa = parsed.service_account_json.is_some();
         if has_token && has_sa {
             return Err(BridgeError::InvalidUpstreamCredentials(
-                "vertex provider_key.secret must set exactly one of access_token \
+                "vertex provider_key.api_key must set exactly one of access_token \
                  or service_account_json (both were provided)"
                     .into(),
             ));
         }
         if !has_token && !has_sa {
             return Err(BridgeError::InvalidUpstreamCredentials(
-                "vertex provider_key.secret must set either access_token or \
+                "vertex provider_key.api_key must set either access_token or \
                  service_account_json (neither was provided)"
                     .into(),
             ));
@@ -658,7 +658,7 @@ impl Bridge for VertexBridge {
         ctx: &BridgeContext,
     ) -> Result<EmbeddingResponse, BridgeError> {
         let upstream_id = upstream_model(ctx)?;
-        let creds = VertexSecret::parse(&ctx.provider_key.secret)?;
+        let creds = VertexSecret::parse(&ctx.provider_key.api_key)?;
         validate_url_token("project", &creds.project)?;
         validate_url_token("region", &creds.region)?;
         validate_url_token("upstream_id", upstream_id)?;
@@ -772,7 +772,7 @@ impl VertexBridge {
         ctx: &BridgeContext,
         upstream_id: &str,
     ) -> Result<ChatResponse, BridgeError> {
-        let creds = VertexSecret::parse(&ctx.provider_key.secret)?;
+        let creds = VertexSecret::parse(&ctx.provider_key.api_key)?;
         // Validate all URL-path tokens to keep operator-supplied
         // strings from injecting path segments / query params.
         validate_url_token("project", &creds.project)?;
@@ -871,7 +871,7 @@ impl VertexBridge {
         ctx: &BridgeContext,
         upstream_id: &str,
     ) -> Result<ChatResponse, BridgeError> {
-        let creds = VertexSecret::parse(&ctx.provider_key.secret)?;
+        let creds = VertexSecret::parse(&ctx.provider_key.api_key)?;
         validate_url_token("project", &creds.project)?;
         validate_url_token("region", &creds.region)?;
         validate_url_token("upstream_id", upstream_id)?;
@@ -959,7 +959,7 @@ impl VertexBridge {
         ctx: &BridgeContext,
         upstream_id: &str,
     ) -> Result<ChatChunkStream, BridgeError> {
-        let creds = VertexSecret::parse(&ctx.provider_key.secret)?;
+        let creds = VertexSecret::parse(&ctx.provider_key.api_key)?;
         validate_url_token("project", &creds.project)?;
         validate_url_token("region", &creds.region)?;
         validate_url_token("upstream_id", upstream_id)?;
@@ -1088,7 +1088,7 @@ impl VertexBridge {
         ctx: &BridgeContext,
         upstream_id: &str,
     ) -> Result<ChatResponse, BridgeError> {
-        let creds = VertexSecret::parse(&ctx.provider_key.secret)?;
+        let creds = VertexSecret::parse(&ctx.provider_key.api_key)?;
         // Only project + region are URL-path tokens; the model id rides
         // in the body and may legitimately contain `/` (e.g.
         // `meta/llama-3.3-70b-instruct-maas`), so it is NOT validated as
@@ -1148,7 +1148,7 @@ impl VertexBridge {
         ctx: &BridgeContext,
         upstream_id: &str,
     ) -> Result<ChatChunkStream, BridgeError> {
-        let creds = VertexSecret::parse(&ctx.provider_key.secret)?;
+        let creds = VertexSecret::parse(&ctx.provider_key.api_key)?;
         validate_url_token("project", &creds.project)?;
         validate_url_token("region", &creds.region)?;
 
@@ -1270,7 +1270,7 @@ impl VertexBridge {
         upstream_id: &str,
         publisher: VertexPublisher,
     ) -> Result<ChatResponse, BridgeError> {
-        let creds = VertexSecret::parse(&ctx.provider_key.secret)?;
+        let creds = VertexSecret::parse(&ctx.provider_key.api_key)?;
         validate_url_token("project", &creds.project)?;
         validate_url_token("region", &creds.region)?;
         // The model id is a URL path segment here (Mistral / AI21 ids are
@@ -1343,7 +1343,7 @@ impl VertexBridge {
         upstream_id: &str,
         publisher: VertexPublisher,
     ) -> Result<ChatChunkStream, BridgeError> {
-        let creds = VertexSecret::parse(&ctx.provider_key.secret)?;
+        let creds = VertexSecret::parse(&ctx.provider_key.api_key)?;
         validate_url_token("project", &creds.project)?;
         validate_url_token("region", &creds.region)?;
         validate_url_token("upstream_id", upstream_id)?;
@@ -1457,7 +1457,7 @@ impl VertexBridge {
         ctx: &BridgeContext,
         upstream_id: &str,
     ) -> Result<ChatChunkStream, BridgeError> {
-        let creds = VertexSecret::parse(&ctx.provider_key.secret)?;
+        let creds = VertexSecret::parse(&ctx.provider_key.api_key)?;
         validate_url_token("project", &creds.project)?;
         validate_url_token("region", &creds.region)?;
         validate_url_token("upstream_id", upstream_id)?;
@@ -1686,7 +1686,7 @@ fn build_request_headers(
 ) -> Result<HeaderMap, BridgeError> {
     if access_token.is_empty() {
         return Err(BridgeError::Config(
-            "vertex provider_key.secret.access_token is empty".into(),
+            "vertex provider_key.api_key.access_token is empty".into(),
         ));
     }
     let mut headers = HeaderMap::new();
@@ -2330,7 +2330,7 @@ mod tests {
         let err = VertexSecret::parse("").unwrap_err();
         match err {
             BridgeError::InvalidUpstreamCredentials(msg) => {
-                assert!(msg.contains("secret is empty"));
+                assert!(msg.contains("api_key is empty"));
             }
             other => panic!("expected InvalidUpstreamCredentials, got {other:?}"),
         }

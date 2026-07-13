@@ -146,10 +146,10 @@ fn resolve_base(ctx: &BridgeContext) -> Result<String, BridgeError> {
 }
 
 fn api_key(ctx: &BridgeContext) -> Result<&str, BridgeError> {
-    let k = &ctx.provider_key.secret;
+    let k = &ctx.provider_key.api_key;
     if k.is_empty() {
         return Err(BridgeError::InvalidUpstreamCredentials(
-            "provider_key.secret is empty".into(),
+            "provider_key.api_key is empty".into(),
         ));
     }
     // Reject a secret that can't be a valid `x-api-key` header value
@@ -158,7 +158,7 @@ fn api_key(ctx: &BridgeContext) -> Result<&str, BridgeError> {
     // later with an opaque builder error (#367).
     if header::HeaderValue::from_str(k).is_err() {
         return Err(BridgeError::InvalidUpstreamCredentials(
-            "provider_key.secret contains invalid header characters".into(),
+            "provider_key.api_key contains invalid header characters".into(),
         ));
     }
     Ok(k.as_str())
@@ -545,7 +545,7 @@ mod tests {
     async fn missing_api_key_is_a_credentials_error() {
         let mut pk: ProviderKey =
             serde_json::from_str(r#"{"display_name":"empty","secret":"placeholder"}"#).unwrap();
-        pk.secret.clear();
+        pk.api_key.clear();
 
         let bridge = AnthropicBridge::new();
         let ctx = BridgeContext::new("req-1", sample_model(), Arc::new(pk));

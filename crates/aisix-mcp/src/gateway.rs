@@ -146,7 +146,7 @@ impl McpGateway {
     /// Build a gateway whose upstreams are the **enabled** `mcp_servers` in the
     /// snapshot, each reached through an [`EphemeralBridge`] (connect per
     /// request). Disabled servers are skipped. Registration order follows the
-    /// snapshot's iteration order; duplicate display_names are deduped (first
+    /// snapshot's iteration order; duplicate names are deduped (first
     /// wins) by [`McpGateway::new`], though the Admin API already enforces
     /// uniqueness.
     pub fn from_snapshot(snapshot: &AisixSnapshot) -> Self {
@@ -158,7 +158,7 @@ impl McpGateway {
             .map(|entry| {
                 let upstream = upstream_from_mcp_server(&entry.value);
                 let bridge: Arc<dyn McpBridge> = Arc::new(EphemeralBridge::new(upstream));
-                (entry.value.display_name.clone(), bridge)
+                (entry.value.name.clone(), bridge)
             });
         McpGateway::new(upstreams)
     }

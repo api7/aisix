@@ -5,7 +5,7 @@
 //! ## Status (issue #302 Phase F)
 //!
 //! - [x] D6.1 — `api-key` header auth (resource-key scheme;
-//!   `provider_key.secret` is a verbatim string)
+//!   `provider_key.api_key` is a verbatim string)
 //! - [x] D6.2 — Azure URL pattern:
 //!   `https://<resource>.openai.azure.com/openai/deployments/<deployment>/chat/completions?api-version=<version>`
 //! - [x] D6.3 — Deployment-keyed dispatch from `Model.model_name`
@@ -18,7 +18,7 @@
 //!   (no `deny_unknown_fields`), so the extension passes through
 //!   without breaking decoding.
 //! - [x] D6.6 — AAD (Entra ID) Bearer auth as a second auth scheme.
-//!   `provider_key.secret` autodetects between the resource-key path
+//!   `provider_key.api_key` autodetects between the resource-key path
 //!   (verbatim string) and the AAD client_credentials path (JSON
 //!   `{tenant_id, client_id, client_secret}`) by checking the leading
 //!   character. The AAD path mints + caches tokens in-process via the

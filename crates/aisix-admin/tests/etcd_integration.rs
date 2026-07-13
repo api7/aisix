@@ -212,7 +212,7 @@ async fn mcp_servers_round_trip_through_real_etcd() {
         state,
         "/admin/v1/mcp_servers",
         json!({
-            "display_name": "github-it",
+            "name": "github-it",
             "url": "https://api.example.com/mcp",
             "auth_type": "bearer",
             "secret": "tok-it"
