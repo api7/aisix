@@ -13,7 +13,7 @@
 //! 10. On SIGINT/SIGTERM: cancel supervisor, stop accepting, join
 
 use std::error::Error as StdError;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 mod cert_bundle;
@@ -21,10 +21,13 @@ mod heartbeat;
 mod managed_bundle;
 mod telemetry;
 
-use aisix_admin::{AdminState, ConfigStore, EtcdConfigStore};
+use aisix_admin::{AdminState, ConfigStore, EtcdConfigStore, FileManagedStore};
 use aisix_cache::{Cache, MemoryCache, RedisCache};
 use aisix_core::models::Adapter;
-use aisix_core::{CacheBackend, Config, EtcdConfig, EtcdTlsConfig, RateLimitBackend};
+use aisix_core::snapshot::SnapshotHandle;
+use aisix_core::{
+    AisixSnapshot, CacheBackend, Config, EtcdConfig, EtcdTlsConfig, RateLimitBackend,
+};
 use aisix_etcd::{EtcdConfigProvider, SnapshotCache, Supervisor};
 use aisix_gateway::Hub;
 use aisix_obs::{init_tracing, install_otlp_tracer, Metrics};
@@ -42,11 +45,33 @@ use etcd_client::{Certificate, ConnectOptions, Identity, TlsOptions};
 use tokio::sync::watch;
 
 #[derive(Debug, Parser)]
-#[command(name = "aisix", version = aisix_core::BUILD_VERSION, about = "aisix AI Gateway")]
+#[command(
+    name = "aisix",
+    version = aisix_core::BUILD_VERSION,
+    about = "aisix AI Gateway",
+    subcommand_negates_reqs = true
+)]
 struct Cli {
     /// Path to the bootstrap config file (YAML / TOML / JSON).
-    #[arg(short, long, env = "AISIX_CONFIG")]
-    config: PathBuf,
+    #[arg(short, long, env = "AISIX_CONFIG", required = true)]
+    config: Option<PathBuf>,
+
+    #[command(subcommand)]
+    command: Option<CliCommand>,
+}
+
+#[derive(Debug, clap::Subcommand)]
+enum CliCommand {
+    /// Validate a resources file (the `resources_file` source) without
+    /// booting any listener: the identical read → interpolate → desugar
+    /// → validate pipeline runs and the process exits 0 on success or
+    /// non-zero with the full aggregated error report. `${VAR}`
+    /// references resolve against this process's environment.
+    Validate {
+        /// Path to the resources file to validate.
+        #[arg(long)]
+        resources: PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -65,8 +90,18 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
+    // Subcommands run without loading the bootstrap config or booting
+    // any listener.
+    if let Some(CliCommand::Validate { resources }) = cli.command {
+        return run_validate(&resources);
+    }
+
+    let config_path = cli
+        .config
+        .expect("clap enforces --config unless a subcommand is given");
+
     // Steps 1-2: config.
-    let cfg = Config::load_from_path(Some(&cli.config))
+    let cfg = Config::load_from_path(Some(&config_path))
         .map_err(|e| anyhow::anyhow!("config load failed: {e}"))?;
 
     // Step 3: tracing + optional OTLP export.
@@ -75,6 +110,98 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("otlp init failed: {e}"))?;
 
     run(cfg).await
+}
+
+/// `aisix validate --resources <file>`: run the identical file-source
+/// pipeline (read → interpolate → desugar → canonical schema validation
+/// → typed decode → cross-reference checks) that boot and SIGHUP reload
+/// use, without booting any listener. Exit 0 on success; on failure the
+/// aggregated error report (every problem, with kind / entry / field
+/// context) goes to stderr and the process exits non-zero.
+fn run_validate(resources: &Path) -> anyhow::Result<()> {
+    match aisix_core::filesource::load_resources_file(resources, 1) {
+        Ok(snapshot) => {
+            println!(
+                "OK: {} loaded {} resource(s)",
+                resources.display(),
+                snapshot.total_entries(),
+            );
+            Ok(())
+        }
+        Err(report) => {
+            eprintln!("{report}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// SIGHUP → re-run the whole file-source pipeline against the same
+/// resources file. Success swaps the snapshot atomically (the same
+/// [`SnapshotHandle::store`] the etcd watch supervisor uses), stamping
+/// entries with the next generation as their revision; failure keeps
+/// serving the previous snapshot and logs the aggregated error report
+/// at WARN. There is deliberately no file watcher — reloads are
+/// explicit.
+async fn file_reload_loop(
+    path: PathBuf,
+    handle: SnapshotHandle<AisixSnapshot>,
+    mut cancel: watch::Receiver<bool>,
+) {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut hup = match signal(SignalKind::hangup()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(error = %e, "cannot install SIGHUP handler; resources file reload disabled");
+                return;
+            }
+        };
+        // The boot load stamped revision 1; each successful reload
+        // bumps the generation so snapshot consumers observe a change.
+        let mut generation: i64 = 1;
+        loop {
+            tokio::select! {
+                _ = hup.recv() => {
+                    match aisix_core::filesource::load_resources_file(&path, generation + 1) {
+                        Ok(snapshot) => {
+                            generation += 1;
+                            let resources = snapshot.total_entries();
+                            handle.store(snapshot);
+                            tracing::info!(
+                                file = %path.display(),
+                                resources,
+                                generation,
+                                "resources file reloaded",
+                            );
+                        }
+                        Err(report) => {
+                            tracing::warn!(
+                                file = %path.display(),
+                                "resources file reload failed — keeping the previous snapshot:\n{report}",
+                            );
+                        }
+                    }
+                }
+                changed = cancel.changed() => {
+                    if changed.is_err() || *cancel.borrow() {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // No SIGHUP on this platform: the boot-time load stays in
+        // effect until restart.
+        let _ = (path, handle);
+        loop {
+            if cancel.changed().await.is_err() || *cancel.borrow() {
+                break;
+            }
+        }
+    }
 }
 
 /// Which managed-mode mTLS bootstrap path to take, given whether a
@@ -265,73 +392,100 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
         None
     };
 
-    // Steps 4-6: etcd + supervisor.
-    //
-    // Before handing endpoints to tonic, probe each one via the
-    // stdlib resolver. tonic's HTTP connector collapses any DNS
-    // failure into an opaque "dns error" Status (see
-    // hyper-util/src/client/legacy/connect/http.rs) — even after the
-    // cause-chain logging in aisix-etcd, the deepest cause we see is
-    // still whatever getaddrinfo returned. The probe either logs the
-    // resolved addresses (DNS works; the failure is higher in the
-    // tonic / TLS stack) or logs the raw io::Error (DNS actually
-    // fails). Both outcomes narrow triage substantially.
-    probe_etcd_dns(&cfg.etcd.endpoints).await;
-
-    // Same extra trust root reused by the etcd connect options.
-    let connect_options =
-        build_etcd_connect_options_with_extra_ca(&cfg.etcd, extra_ca_pem.as_deref())?;
-    // effective_prefix() is `<prefix>/<env_id>` in v3 managed mode
-    // (env_id populated from the register response above), bare
-    // `<prefix>` in self-hosted dev where env_id is empty.
-    let etcd_prefix = cfg.etcd.effective_prefix();
-    let provider = Arc::new(
-        EtcdConfigProvider::connect(
-            &cfg.etcd.endpoints,
-            etcd_prefix.clone(),
-            connect_options.clone(),
-        )
-        .await
-        .map_err(|e| anyhow::anyhow!("etcd connect failed: {e}"))?,
-    );
-    // Separate client for the admin write path — only needed when the
-    // admin surface is bound. We could share a single underlying
-    // connection via `Client::clone()` but keeping two is cleaner:
-    // writes and the watch stream don't contend on the same mutex.
-    // In managed mode this client is simply skipped.
-    let admin_client = if cfg.managed.is_managed() {
-        None
-    } else {
-        Some(
-            etcd_client::Client::connect(&cfg.etcd.endpoints, connect_options.clone())
-                .await
-                .map_err(|e| anyhow::anyhow!("etcd admin client connect failed: {e}"))?,
-        )
-    };
-    // Snapshot cache: in managed mode persist to disk (default
-    // /var/lib/aisix/config_cache.json) so the DP can serve traffic
-    // from the last-known config across CP outages and restarts.
-    // Disabled outside managed mode and when the operator clears the
-    // path explicitly.
-    let snapshot_cache = if cfg.managed.is_managed() && !cfg.managed.snapshot_cache_path.is_empty()
-    {
-        SnapshotCache::new(&cfg.managed.snapshot_cache_path)
-    } else {
-        SnapshotCache::disabled()
-    };
-    let supervisor = Arc::new(Supervisor::with_cache(
-        provider,
-        etcd_prefix.clone(),
-        snapshot_cache,
-    ));
-    // Seed the snapshot from disk before the etcd cycle starts so the
-    // proxy is ready to serve from cached config the moment the watch
-    // task takes its first iteration.
-    supervisor.restore_from_cache();
-    let snapshot_handle = supervisor.handle();
-
     let (cancel_tx, cancel_rx) = watch::channel(false);
-    let watch_task = tokio::spawn(supervisor.clone().run(cancel_rx.clone()));
+
+    // Steps 4-6: the resource source — either the standalone resources
+    // file (`resources_file` in config) or etcd + watch supervisor.
+    // Config validation already guaranteed exactly one is selected.
+    let file_source_path = cfg.resources_file.clone().map(PathBuf::from);
+    let (snapshot_handle, supervisor, watch_task, admin_client) =
+        if let Some(path) = &file_source_path {
+            // FILE MODE: load once at boot, fail fast with the aggregated
+            // error report on any problem. SIGHUP re-runs the identical
+            // pipeline; a failed reload keeps the last-good snapshot.
+            let snapshot = aisix_core::filesource::load_resources_file(path, 1)
+                .map_err(|report| anyhow::anyhow!("{report}"))?;
+            tracing::info!(
+                file = %path.display(),
+                resources = snapshot.total_entries(),
+                "resources loaded from file",
+            );
+            let handle = SnapshotHandle::new(snapshot);
+            let reload_task = tokio::spawn(file_reload_loop(
+                path.clone(),
+                handle.clone(),
+                cancel_rx.clone(),
+            ));
+            (handle, None, reload_task, None)
+        } else {
+            // ETCD MODE (unchanged behavior).
+            //
+            // Before handing endpoints to tonic, probe each one via the
+            // stdlib resolver. tonic's HTTP connector collapses any DNS
+            // failure into an opaque "dns error" Status (see
+            // hyper-util/src/client/legacy/connect/http.rs) — even after the
+            // cause-chain logging in aisix-etcd, the deepest cause we see is
+            // still whatever getaddrinfo returned. The probe either logs the
+            // resolved addresses (DNS works; the failure is higher in the
+            // tonic / TLS stack) or logs the raw io::Error (DNS actually
+            // fails). Both outcomes narrow triage substantially.
+            probe_etcd_dns(&cfg.etcd.endpoints).await;
+
+            // Same extra trust root reused by the etcd connect options.
+            let connect_options =
+                build_etcd_connect_options_with_extra_ca(&cfg.etcd, extra_ca_pem.as_deref())?;
+            // effective_prefix() is `<prefix>/<env_id>` in v3 managed mode
+            // (env_id populated from the register response above), bare
+            // `<prefix>` in self-hosted dev where env_id is empty.
+            let etcd_prefix = cfg.etcd.effective_prefix();
+            let provider = Arc::new(
+                EtcdConfigProvider::connect(
+                    &cfg.etcd.endpoints,
+                    etcd_prefix.clone(),
+                    connect_options.clone(),
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("etcd connect failed: {e}"))?,
+            );
+            // Separate client for the admin write path — only needed when the
+            // admin surface is bound. We could share a single underlying
+            // connection via `Client::clone()` but keeping two is cleaner:
+            // writes and the watch stream don't contend on the same mutex.
+            // In managed mode this client is simply skipped.
+            let admin_client = if cfg.managed.is_managed() {
+                None
+            } else {
+                Some((
+                    etcd_client::Client::connect(&cfg.etcd.endpoints, connect_options.clone())
+                        .await
+                        .map_err(|e| anyhow::anyhow!("etcd admin client connect failed: {e}"))?,
+                    etcd_prefix.clone(),
+                ))
+            };
+            // Snapshot cache: in managed mode persist to disk (default
+            // /var/lib/aisix/config_cache.json) so the DP can serve traffic
+            // from the last-known config across CP outages and restarts.
+            // Disabled outside managed mode and when the operator clears the
+            // path explicitly.
+            let snapshot_cache =
+                if cfg.managed.is_managed() && !cfg.managed.snapshot_cache_path.is_empty() {
+                    SnapshotCache::new(&cfg.managed.snapshot_cache_path)
+                } else {
+                    SnapshotCache::disabled()
+                };
+            let supervisor = Arc::new(Supervisor::with_cache(
+                provider,
+                etcd_prefix,
+                snapshot_cache,
+            ));
+            // Seed the snapshot from disk before the etcd cycle starts so the
+            // proxy is ready to serve from cached config the moment the watch
+            // task takes its first iteration.
+            supervisor.restore_from_cache();
+            let handle = supervisor.handle();
+            let watch_task = tokio::spawn(supervisor.clone().run(cancel_rx.clone()));
+            (handle, Some(supervisor), watch_task, admin_client)
+        };
     // Spawn heartbeat worker if we have a config for it. The
     // JoinHandle is awaited after graceful shutdown below so the
     // final in-flight beat drains cleanly.
@@ -482,7 +636,13 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     //     up with a kine write (#519 B.3)
     //   - supported_guardrail_kinds + exporter_health (#519 B.6 / D.2)
     let heartbeat_task = heartbeat_cfg.map(|mut h| {
-        let supervisor_for_heartbeat = Arc::clone(&supervisor);
+        // Heartbeat only exists in managed mode, which config
+        // validation pins to the etcd source — the supervisor is
+        // always present here.
+        let supervisor = supervisor
+            .as_ref()
+            .expect("managed mode implies the etcd resource source (validated at boot)");
+        let supervisor_for_heartbeat = Arc::clone(supervisor);
         h = h.with_rejection_fetcher(Arc::new(move || {
             supervisor_for_heartbeat.recent_rejections()
         }));
@@ -503,10 +663,18 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     let background_cancel_rx = cancel_rx.clone();
     // Wire the config-freshness probe so the proxy's /readyz reflects etcd
     // watch staleness (and pre-first-apply startup), not just shutdown (#591).
-    let readyz_watch_status = supervisor.watch_status();
-    proxy_state = proxy_state.with_config_apply_age(Arc::new(move || {
-        readyz_watch_status.snapshot().last_apply_age
-    }));
+    proxy_state = match supervisor.as_ref() {
+        Some(supervisor) => {
+            let readyz_watch_status = supervisor.watch_status();
+            proxy_state.with_config_apply_age(Arc::new(move || {
+                readyz_watch_status.snapshot().last_apply_age
+            }))
+        }
+        // File mode: the snapshot is applied synchronously at boot /
+        // SIGHUP and there is no watch stream to go stale — report the
+        // config as always freshly applied.
+        None => proxy_state.with_config_apply_age(Arc::new(|| Some(std::time::Duration::ZERO))),
+    };
     let proxy_router = aisix_proxy::build_router(proxy_state);
 
     let background_check_task = tokio::spawn(async move {
@@ -539,10 +707,21 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     // In managed mode (`cfg.managed.enabled = true`) the DP reads
     // configuration exclusively from etcd; exposing admin writes or
     // the Playground would bypass the aisix.cloud control plane.
-    let admin_serve_handle = if let Some(admin_client) = admin_client {
-        let admin_store: Arc<dyn ConfigStore> =
-            Arc::new(EtcdConfigStore::new(admin_client, etcd_prefix.clone()));
-        let admin_state = AdminState::new(snapshot_handle.clone(), admin_store, &cfg.admin)
+    //
+    // Which store backs the admin surface depends on the resource
+    // source: etcd standalone gets the writable etcd store; file mode
+    // gets a read-only view of the file-loaded snapshot (writes return
+    // 409 pointing at the file).
+    let admin_store: Option<Arc<dyn ConfigStore>> = match (admin_client, &file_source_path) {
+        (Some((client, prefix)), _) => Some(Arc::new(EtcdConfigStore::new(client, prefix))),
+        (None, Some(path)) if !cfg.managed.is_managed() => Some(Arc::new(FileManagedStore::new(
+            snapshot_handle.clone(),
+            path.display().to_string(),
+        ))),
+        _ => None,
+    };
+    let admin_serve_handle = if let Some(admin_store) = admin_store {
+        let mut admin_state = AdminState::new(snapshot_handle.clone(), admin_store, &cfg.admin)
             // Share the health tracker so /admin/v1/health reflects live
             // per-model upstream failure counts.
             .with_health_tracker(health_tracker)
@@ -550,14 +729,21 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
             // Share runtime status so /admin/v1/models/status exposes
             // direct-model cooldown/background-health state.
             .with_runtime_status_tracker(runtime_status_tracker)
+            // Share the proxy router so the playground endpoint can forward
+            // requests in-process without an extra network hop.
+            .with_proxy_router(proxy_router.clone());
+        if let Some(supervisor) = supervisor.as_ref() {
             // Share the supervisor's freshness state so /admin/v1/health
             // exposes etcd watch staleness — without this, a wedged
             // watch lets the gateway serve stale config indefinitely
             // while reporting healthy. See issue #114.
-            .with_watch_status(supervisor.watch_status())
-            // Share the proxy router so the playground endpoint can forward
-            // requests in-process without an extra network hop.
-            .with_proxy_router(proxy_router.clone());
+            admin_state = admin_state.with_watch_status(supervisor.watch_status());
+        }
+        if let Some(path) = &file_source_path {
+            // Arm the router-level write guard: every mutating
+            // /admin/v1/* request answers 409 naming the file.
+            admin_state = admin_state.with_file_managed_path(path.display().to_string());
+        }
         let admin_router = aisix_admin::build_router(admin_state);
 
         let admin_addr: std::net::SocketAddr = cfg.admin.addr.parse()?;
@@ -1104,7 +1290,46 @@ mod tests {
         let a = Cli::try_parse_from(["aisix", "-c", "/tmp/x.yaml"]).unwrap();
         let b = Cli::try_parse_from(["aisix", "--config", "/tmp/x.yaml"]).unwrap();
         assert_eq!(a.config, b.config);
-        assert_eq!(a.config, PathBuf::from("/tmp/x.yaml"));
+        assert_eq!(a.config, Some(PathBuf::from("/tmp/x.yaml")));
+        assert!(a.command.is_none());
+    }
+
+    #[test]
+    fn cli_validate_subcommand_does_not_require_config() {
+        // `aisix validate --resources f` runs without --config …
+        let cli = Cli::try_parse_from(["aisix", "validate", "--resources", "/tmp/r.yaml"]).unwrap();
+        assert!(cli.config.is_none());
+        match cli.command {
+            Some(CliCommand::Validate { resources }) => {
+                assert_eq!(resources, PathBuf::from("/tmp/r.yaml"));
+            }
+            other => panic!("expected Validate subcommand, got {other:?}"),
+        }
+        // … and --resources itself is mandatory for the subcommand.
+        assert!(Cli::try_parse_from(["aisix", "validate"]).is_err());
+    }
+
+    #[test]
+    fn run_validate_accepts_a_valid_resources_file() {
+        use std::io::Write as _;
+        let mut f = tempfile::Builder::new().suffix(".yaml").tempfile().unwrap();
+        f.write_all(
+            br#"
+_format_version: "1"
+provider_keys:
+  - display_name: pk
+    api_key: sk-test
+models:
+  - display_name: m1
+    provider: openai
+    model_name: gpt-4o
+    provider_key: pk
+"#,
+        )
+        .unwrap();
+        // Success path returns Ok; the failure path exits the process,
+        // which is covered end-to-end by the e2e fail-fast case.
+        run_validate(f.path()).unwrap();
     }
 
     #[test]

@@ -36,6 +36,15 @@ export interface AppOverrides {
    * AccessKey deliberately never travels on the config path.
    */
   extraEnv?: Record<string, string>;
+  /**
+   * FILE MODE: contents of a standalone `resources.yaml`. When set, the
+   * generated config carries `resources_file` (pointing at this content
+   * written into the tmp dir) and NO `etcd` section — the gateway loads
+   * every resource from the file and etcd is never contacted (no ping,
+   * no prefix cleanup). Rewrite the file at `SpawnedApp.resourcesPath`
+   * and send SIGHUP to exercise reloads.
+   */
+  resourcesFile?: string;
 }
 
 export interface SpawnedApp {
@@ -49,6 +58,17 @@ export interface SpawnedApp {
    * there in that case).
    */
   metricsUrl: string;
+  /**
+   * FILE MODE only: absolute path of the resources.yaml the gateway
+   * loads. Rewrite it and `signal("SIGHUP")` to trigger a reload.
+   */
+  resourcesPath?: string;
+  /**
+   * Combined stdout+stderr captured so far. Lets tests wait
+   * deterministically on log lines (e.g. the reload-failed WARN)
+   * instead of sleeping.
+   */
+  output(): string;
   signal(signal: NodeJS.Signals): void;
   exit(): Promise<void>;
 }
@@ -100,8 +120,11 @@ export function isAddrInUseStartupFailure(err: unknown): boolean {
 }
 
 async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
+  const fileMode = overrides.resourcesFile !== undefined;
   const etcd = new EtcdClient();
-  if (!(await etcd.ping())) {
+  // FILE MODE never contacts etcd — skip the availability gate so the
+  // file source stays exercisable even without the shared etcd.
+  if (!fileMode && !(await etcd.ping())) {
     throw new Error(
       `etcd not reachable at ${process.env.AISIX_E2E_ETCD ?? "http://127.0.0.1:2379"} ` +
         "(set AISIX_E2E_ETCD or run `docker run --rm -p 2379:2379 quay.io/coreos/etcd:v3.5.15`)",
@@ -113,13 +136,25 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
   const adminKey = overrides.adminKey ?? `admin-${randomUUID()}`;
   const etcdPrefix = `/aisix-e2e-${randomUUID()}`;
 
+  const dir = await mkdtemp(join(tmpdir(), "aisix-e2e-"));
+  let resourcesPath: string | undefined;
+  if (fileMode) {
+    resourcesPath = join(dir, "resources.yaml");
+    await writeFile(resourcesPath, overrides.resourcesFile!, "utf8");
+  }
+
   const cfg = {
-    etcd: {
-      endpoints: [process.env.AISIX_E2E_ETCD ?? "http://127.0.0.1:2379"],
-      prefix: etcdPrefix,
-      dial_timeout_ms: 5000,
-      request_timeout_ms: 5000,
-    },
+    // Exactly one resource source: the standalone file, or etcd.
+    ...(fileMode
+      ? { resources_file: resourcesPath }
+      : {
+          etcd: {
+            endpoints: [process.env.AISIX_E2E_ETCD ?? "http://127.0.0.1:2379"],
+            prefix: etcdPrefix,
+            dial_timeout_ms: 5000,
+            request_timeout_ms: 5000,
+          },
+        }),
     proxy: {
       addr: `127.0.0.1:${proxyPort}`,
       request_body_limit_bytes: 10485760,
@@ -144,7 +179,6 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
     ...(overrides.extra ?? {}),
   };
 
-  const dir = await mkdtemp(join(tmpdir(), "aisix-e2e-"));
   const cfgPath = join(dir, "config.yaml");
   await writeFile(cfgPath, yamlStringify(cfg), "utf8");
 
@@ -183,10 +217,16 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
     stderrBuf += c.toString("utf8");
   });
   let exitErr: string | undefined;
-  child.once("exit", (code, signal) => {
-    if (code !== 0 && code !== null) {
-      exitErr = `aisix exited early with code=${code} signal=${signal}`;
-    }
+  // Reject the readiness wait the moment the binary exits non-zero, so
+  // an intentional boot failure (e.g. a malformed resources file)
+  // surfaces immediately instead of after the full readiness timeout.
+  const exitedEarly = new Promise<never>((_, reject) => {
+    child.once("exit", (code, signal) => {
+      if (code !== 0 && code !== null) {
+        exitErr = `aisix exited early with code=${code} signal=${signal}`;
+        reject(new Error(exitErr));
+      }
+    });
   });
 
   const proxyUrl = `http://127.0.0.1:${proxyPort}`;
@@ -194,20 +234,23 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
   const metricsUrl = `http://127.0.0.1:${metricsPort}`;
 
   try {
-    await Promise.all([
-      waitForReady(`${proxyUrl}/livez`, READY_TIMEOUT_MS),
-      waitForReady(`${adminUrl}/admin/v1/health`, READY_TIMEOUT_MS, adminKey),
-      // Gate on the dedicated metrics listener too, so scrapes in the test
-      // never race the listener coming up. Skipped when prometheus is
-      // disabled — nothing binds the metrics port then.
-      ...(prometheusEnabled
-        ? [
-            waitForReady(
-              `${metricsUrl}${overrides.prometheusPath ?? "/metrics"}`,
-              READY_TIMEOUT_MS,
-            ),
-          ]
-        : []),
+    await Promise.race([
+      Promise.all([
+        waitForReady(`${proxyUrl}/livez`, READY_TIMEOUT_MS),
+        waitForReady(`${adminUrl}/admin/v1/health`, READY_TIMEOUT_MS, adminKey),
+        // Gate on the dedicated metrics listener too, so scrapes in the test
+        // never race the listener coming up. Skipped when prometheus is
+        // disabled — nothing binds the metrics port then.
+        ...(prometheusEnabled
+          ? [
+              waitForReady(
+                `${metricsUrl}${overrides.prometheusPath ?? "/metrics"}`,
+                READY_TIMEOUT_MS,
+              ),
+            ]
+          : []),
+      ]),
+      exitedEarly,
     ]);
   } catch (err) {
     const detail = exitErr ?? "still running";
@@ -219,7 +262,7 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
         ? stderrBuf
         : `${stderrBuf.slice(0, 1500)}\n  […]\n${stderrBuf.slice(-1500)}`;
     await terminate(child);
-    await cleanup(etcd, etcdPrefix, dir);
+    await cleanup(fileMode ? undefined : etcd, etcdPrefix, dir);
     throw new Error(
       `${(err as Error).message}\n  binary state: ${detail}\n  stderr:\n${stderr}`,
     );
@@ -231,12 +274,16 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
     adminKey,
     etcdPrefix,
     metricsUrl,
+    resourcesPath,
+    output() {
+      return stderrBuf;
+    },
     signal(signal: NodeJS.Signals) {
       if (child.exitCode === null) child.kill(signal);
     },
     async exit() {
       await terminate(child);
-      await cleanup(etcd, etcdPrefix, dir);
+      await cleanup(fileMode ? undefined : etcd, etcdPrefix, dir);
     },
   };
 }
@@ -281,10 +328,15 @@ async function terminate(child: ChildProcess): Promise<void> {
   }
 }
 
-async function cleanup(etcd: EtcdClient, prefix: string, dir: string): Promise<void> {
-  // Best-effort — never throw from cleanup.
+async function cleanup(
+  etcd: EtcdClient | undefined,
+  prefix: string,
+  dir: string,
+): Promise<void> {
+  // Best-effort — never throw from cleanup. `etcd` is undefined in file
+  // mode, where no prefix was ever written.
   await Promise.allSettled([
-    etcd.deletePrefix(prefix),
+    ...(etcd ? [etcd.deletePrefix(prefix)] : []),
     rm(dir, { recursive: true, force: true }),
   ]);
 }

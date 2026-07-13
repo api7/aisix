@@ -78,6 +78,10 @@ etcd-client = { version = "0.14", features = ["tls"] }
 # Config
 config = { version = "0.14", default-features = false, features = ["yaml", "toml", "json"] }
 clap = { version = "4.5", features = ["derive", "env"] }
+# Standalone resources-file source (aisix-core::filesource). Same YAML
+# parser the `config` dependency already pulls in, so this adds no new
+# parser to the dependency tree.
+yaml-rust2 = "0.8"
 
 # Time / IDs
 chrono = { version = "0.4", features = ["serde"] }

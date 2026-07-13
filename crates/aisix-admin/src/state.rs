@@ -42,6 +42,11 @@ pub struct AdminState {
     /// goes through the full proxy middleware stack (auth, rate-limit, bridge)
     /// without an additional network hop.
     pub proxy_router: Option<Router>,
+    /// When set, resources are managed by the resources file at this
+    /// path: every mutating `/admin/v1/*` request is rejected with a
+    /// 409 by the router-level guard in `build_router`, while reads
+    /// keep serving from the snapshot.
+    pub file_managed_path: Option<Arc<str>>,
 }
 
 impl AdminState {
@@ -59,7 +64,15 @@ impl AdminState {
             watch_status: None,
             livez_state: Arc::new(LivezState::new()),
             proxy_router: None,
+            file_managed_path: None,
         }
+    }
+
+    /// Mark the resource surface as file-managed. `path` is surfaced in
+    /// the 409 body so operators know which file to edit.
+    pub fn with_file_managed_path(mut self, path: impl Into<Arc<str>>) -> Self {
+        self.file_managed_path = Some(path.into());
+        self
     }
 
     /// Attach the watch supervisor's freshness status. When set, the

@@ -18,6 +18,7 @@
 
 pub mod config;
 pub mod error;
+pub mod filesource;
 pub mod models;
 pub mod resource;
 pub mod snapshot;

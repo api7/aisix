@@ -41,6 +41,7 @@ mod auth;
 mod cache_policies_handlers;
 mod error;
 pub mod etcd_store;
+pub mod file_store;
 mod guardrails_handlers;
 mod health_handler;
 mod mcp_servers_handlers;
@@ -56,6 +57,7 @@ pub mod store;
 pub use auth::AdminAuth;
 pub use error::{AdminError, ErrorBody};
 pub use etcd_store::EtcdConfigStore;
+pub use file_store::FileManagedStore;
 pub use state::AdminState;
 pub use store::{ConfigStore, InMemoryStore, StoreError};
 
@@ -202,9 +204,39 @@ pub fn build_router(state: AdminState) -> Router {
         .route(
             "/playground/chat/completions",
             post(playground_handler::playground_chat_completions),
-        );
+        )
+        // File-managed write guard: one chokepoint covering every
+        // resource write endpoint (POST/PUT/DELETE, including rotate)
+        // so file mode can't drift as routes are added. Reads and the
+        // playground pass through untouched. No-op when the gateway is
+        // etcd-backed (`file_managed_path` unset).
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            file_managed_write_guard,
+        ));
 
     router.with_state(state)
+}
+
+/// Reject mutating `/admin/v1/*` requests with a 409 when resources are
+/// managed by the resources file. GET/HEAD/OPTIONS — the read surface —
+/// and non-resource endpoints (playground, livez, openapi) pass through.
+async fn file_managed_write_guard(
+    axum::extract::State(state): axum::extract::State<AdminState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    use axum::http::Method;
+    use axum::response::IntoResponse;
+
+    let is_read = matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS);
+    if !is_read && req.uri().path().starts_with("/admin/v1/") {
+        if let Some(path) = state.file_managed_path.as_deref() {
+            return AdminError::FileManaged(FileManagedStore::read_only_message(path))
+                .into_response();
+        }
+    }
+    next.run(req).await
 }
 
 /// Build the router for the **dedicated** Prometheus metrics listener —
@@ -1602,6 +1634,116 @@ mod tests {
         let routing = rows.iter().find(|row| row["id"] == "routing-1").unwrap();
         assert_eq!(routing["kind"], "routing");
         assert_eq!(routing["status"], "not_applicable");
+    }
+
+    // ──────────────────── File-managed mode ────────────────────
+
+    /// AdminState wired the way `aisix-server` wires file mode: the
+    /// store reads from the snapshot, and `file_managed_path` arms the
+    /// router-level write guard.
+    fn build_file_managed_state() -> AdminState {
+        let snapshot = AisixSnapshot::new();
+        let model: aisix_core::Model = serde_json::from_value(model_payload("file-model")).unwrap();
+        snapshot
+            .models
+            .insert(aisix_core::ResourceEntry::new("m-file-1", model, 1));
+        let handle = SnapshotHandle::new(snapshot);
+        let store: Arc<dyn ConfigStore> = Arc::new(FileManagedStore::new(
+            handle.clone(),
+            "/etc/aisix/resources.yaml",
+        ));
+        AdminState::new(handle, store, &cfg()).with_file_managed_path("/etc/aisix/resources.yaml")
+    }
+
+    #[tokio::test]
+    async fn file_managed_mode_rejects_every_resource_write_with_409() {
+        let state = build_file_managed_state();
+        let writes: Vec<(&str, String, Option<Value>)> = vec![
+            (
+                "POST",
+                "/admin/v1/models".into(),
+                Some(model_payload("new")),
+            ),
+            (
+                "PUT",
+                "/admin/v1/models/m-file-1".into(),
+                Some(model_payload("file-model")),
+            ),
+            ("DELETE", "/admin/v1/models/m-file-1".into(), None),
+            (
+                "POST",
+                "/admin/v1/api_keys".into(),
+                Some(apikey_payload("sk-x", &["*"])),
+            ),
+            ("POST", "/admin/v1/api_keys/some-id/rotate".into(), None),
+            (
+                "POST",
+                "/admin/v1/guardrails".into(),
+                Some(guardrail_payload("g")),
+            ),
+        ];
+        for (method, uri, body) in writes {
+            let app = build_router(state.clone());
+            let resp = run(app, auth_req(method, &uri, body)).await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::CONFLICT,
+                "{method} {uri} must be refused in file mode",
+            );
+            let v = body_json(resp).await;
+            let msg = v["error_msg"].as_str().unwrap();
+            assert!(msg.contains("file-managed"), "{method} {uri}: {msg}");
+            assert!(
+                msg.contains("/etc/aisix/resources.yaml"),
+                "message must name the file: {msg}",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn file_managed_mode_serves_reads_from_the_snapshot() {
+        let state = build_file_managed_state();
+
+        // List reflects the file-loaded snapshot.
+        let app = build_router(state.clone());
+        let resp = run(app, auth_req("GET", "/admin/v1/models", None)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v.as_array().unwrap().len(), 1);
+        assert_eq!(v[0]["value"]["display_name"], "file-model");
+
+        // Get-by-id too.
+        let app = build_router(state.clone());
+        let resp = run(app, auth_req("GET", "/admin/v1/models/m-file-1", None)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Non-resource surfaces stay untouched: health + models/status +
+        // openapi keep responding.
+        let app = build_router(state.clone());
+        let resp = run(app, auth_req("GET", "/admin/v1/health", None)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let app = build_router(state.clone());
+        let resp = run(app, auth_req("GET", "/admin/v1/models/status", None)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let app = build_router(state);
+        let req = Request::builder()
+            .uri("/admin/openapi.json")
+            .body(Body::empty())
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn write_guard_is_inert_when_not_file_managed() {
+        // Same router build path, no file_managed_path → writes work.
+        let app = build_router(build_state());
+        let resp = run(
+            app,
+            auth_req("POST", "/admin/v1/models", Some(model_payload("ok"))),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]

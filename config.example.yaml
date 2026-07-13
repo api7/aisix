@@ -21,6 +21,16 @@ etcd:
   #   # Defaults to the hostname portion of endpoints[0].
   #   # domain_name: "etcd.aisix.cloud"
 
+# Standalone file-based resource source — the alternative to etcd for a
+# single-container gateway. When set, every resource (provider keys,
+# models, API keys, guardrails, MCP servers, A2A agents, cache policies,
+# observability exporters, rate-limit policies) is loaded from this one
+# YAML file at boot and re-read on SIGHUP; the `etcd` section above must
+# then be removed (the two sources are mutually exclusive), and the
+# admin listener serves the resource endpoints read-only. Validate a
+# file without booting via `aisix validate --resources <file>`.
+# resources_file: "/etc/aisix/resources.yaml"
+
 proxy:
   addr: "0.0.0.0:3000"
   request_body_limit_bytes: 10485760   # 10 MiB

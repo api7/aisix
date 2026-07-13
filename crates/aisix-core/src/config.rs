@@ -32,7 +32,19 @@ use crate::error::BootstrapError;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    /// Dynamic-resource source A: etcd. Required unless `resources_file`
+    /// selects the file source below; the two are mutually exclusive.
+    #[serde(default)]
     pub etcd: EtcdConfig,
+    /// Dynamic-resource source B: a standalone resources file
+    /// (`resources.yaml`). When set, the gateway loads every resource
+    /// (provider keys, models, API keys, …) from this file at boot and
+    /// re-reads it on SIGHUP; the `etcd` section must be absent or left
+    /// unconfigured, and the admin listener serves the resource surface
+    /// read-only. Mutually exclusive with configured `etcd.endpoints`
+    /// and with `managed.enabled`.
+    #[serde(default)]
+    pub resources_file: Option<String>,
     pub proxy: ProxyConfig,
     /// Admin surface. Defaulted so managed-mode configs can omit this
     /// block entirely; the default values are NOT bound at runtime —
@@ -284,6 +296,25 @@ impl ManagedConfig {
     }
     const fn default_heartbeat_interval_secs() -> u64 {
         15
+    }
+}
+
+/// Default is the "unconfigured" shape (no endpoints) so a
+/// `resources_file` deployment can omit the `etcd` section entirely.
+/// [`Config::validate`] still rejects empty endpoints whenever the file
+/// source is not selected, so etcd-mode behavior is unchanged.
+impl Default for EtcdConfig {
+    fn default() -> Self {
+        Self {
+            endpoints: Vec::new(),
+            prefix: Self::default_prefix(),
+            env_id: String::new(),
+            user: None,
+            password_env: None,
+            dial_timeout_ms: Self::default_dial_timeout(),
+            request_timeout_ms: Self::default_request_timeout(),
+            tls: None,
+        }
     }
 }
 
@@ -746,9 +777,34 @@ impl Config {
     }
 
     fn validate(&self) -> Result<(), BootstrapError> {
-        if self.etcd.endpoints.is_empty() {
+        if let Some(path) = self.resources_file.as_deref() {
+            // File source selected: exactly one resource source may be
+            // active. A configured etcd endpoint list alongside the file
+            // is ambiguous — fail loudly instead of silently ignoring one.
+            if path.trim().is_empty() {
+                return Err(BootstrapError::Config(
+                    "resources_file must not be empty when set".into(),
+                ));
+            }
+            if !self.etcd.endpoints.is_empty() {
+                return Err(BootstrapError::Config(
+                    "config sets both etcd.endpoints and resources_file — the etcd \
+                     source and the file source are mutually exclusive; remove one"
+                        .into(),
+                ));
+            }
+            if self.managed.is_managed() {
+                return Err(BootstrapError::Config(
+                    "resources_file cannot be combined with managed.enabled = true \
+                     (managed mode reads resources from the control plane)"
+                        .into(),
+                ));
+            }
+        } else if self.etcd.endpoints.is_empty() {
             return Err(BootstrapError::Config(
-                "etcd.endpoints must contain at least one endpoint".into(),
+                "etcd.endpoints must contain at least one endpoint \
+                 (or set resources_file to load resources from a file)"
+                    .into(),
             ));
         }
         // In managed mode the admin listener is not bound, so requiring
@@ -932,6 +988,103 @@ admin:
             format!("{err}").contains("trusted_proxies"),
             "error should name the bad field: {err}"
         );
+    }
+
+    #[test]
+    fn resources_file_makes_etcd_section_optional() {
+        let f = write_yaml(
+            r#"
+resources_file: "/etc/aisix/resources.yaml"
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+"#,
+        );
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert_eq!(
+            cfg.resources_file.as_deref(),
+            Some("/etc/aisix/resources.yaml")
+        );
+        assert!(cfg.etcd.endpoints.is_empty());
+        // Untouched etcd defaults still materialize for downstream code.
+        assert_eq!(cfg.etcd.prefix, "/aisix");
+    }
+
+    #[test]
+    fn resources_file_conflicts_with_configured_etcd_endpoints() {
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+resources_file: "/etc/aisix/resources.yaml"
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+"#,
+        );
+        let err = Config::load_from_path(Some(f.path())).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("mutually exclusive"), "unexpected: {msg}");
+        assert!(msg.contains("resources_file"), "unexpected: {msg}");
+    }
+
+    #[test]
+    fn resources_file_conflicts_with_managed_mode() {
+        let f = write_yaml(
+            r#"
+resources_file: "/etc/aisix/resources.yaml"
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+managed:
+  enabled: true
+"#,
+        );
+        let err = Config::load_from_path(Some(f.path())).unwrap_err();
+        assert!(err.to_string().contains("managed"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn resources_file_rejects_empty_path() {
+        let f = write_yaml(
+            r#"
+resources_file: ""
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+"#,
+        );
+        let err = Config::load_from_path(Some(f.path())).unwrap_err();
+        assert!(
+            err.to_string().contains("resources_file"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn resources_file_mode_still_requires_admin_keys() {
+        // The admin listener stays bound (read-only resource surface) in
+        // file mode, so the standalone auth invariant holds.
+        let f = write_yaml(
+            r#"
+resources_file: "/etc/aisix/resources.yaml"
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: []
+"#,
+        );
+        let err = Config::load_from_path(Some(f.path())).unwrap_err();
+        assert!(err.to_string().contains("admin.admin_keys"));
     }
 
     #[test]

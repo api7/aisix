@@ -17,6 +17,10 @@ use std::sync::Arc;
 pub enum StoreError {
     #[error("store backend failure: {0}")]
     Backend(String),
+    /// The store is read-only because resources come from a declarative
+    /// source (the resources file). Maps to a 409 at the HTTP surface.
+    #[error("{0}")]
+    ReadOnly(String),
 }
 
 // `async_trait` macro is what makes `dyn ConfigStore` trait objects
