@@ -1,5 +1,9 @@
+import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { writeFile } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { promisify } from "node:util";
 import OpenAI, { APIError } from "openai";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
@@ -28,6 +32,8 @@ import {
 // start with `AISIX_` — the binary's config loader treats that prefix as
 // config overrides (same reason the harness strips them).
 
+const execFileP = promisify(execFile);
+
 const CALLER_PLAINTEXT = "sk-file-e2e-caller";
 const CALLER_KEY_HASH = createHash("sha256").update(CALLER_PLAINTEXT).digest("hex");
 const CALLER_KEY_ENV = "FILE_E2E_CALLER_KEY";
@@ -53,6 +59,12 @@ api_keys:
   - display_name: file-caller
     key_env: ${CALLER_KEY_ENV}
     allowed_models: ["file-allowed"]
+guardrails:
+  - name: file-no-secrets
+    kind: keyword
+    patterns:
+      - kind: literal
+        value: file-mode-forbidden-phrase
 `;
 }
 
@@ -192,6 +204,31 @@ describe("file resource source: smoke + admin write-guard", () => {
     const unauthedBody = (await unauthed.json()) as { error_msg: string };
     expect(unauthedBody.error_msg).not.toContain(app.resourcesPath!);
   });
+
+  test("file-defined guardrail fires on matching input", async () => {
+    if (!app || !upstream) throw new Error("setup failed");
+    // The file format has no attachment collection, so file-defined
+    // guardrails apply env-globally. Pin that they actually fire — the
+    // runtime executes them through the zero-attachment fallback in the
+    // guardrail index, and this test is the regression trap for that
+    // dependency.
+    const proxy = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
+    const hitsBefore = upstream.receivedRequests.length;
+    const blocked = await proxy.chat({
+      model: "file-allowed",
+      messages: [{ role: "user", content: "contains file-mode-forbidden-phrase here" }],
+    });
+    expect(blocked.status).toBe(422);
+    // Blocked before dispatch: the upstream never sees the request.
+    expect(upstream.receivedRequests.length).toBe(hitsBefore);
+
+    // Clean input still passes end-to-end.
+    const clean = await proxy.chat({
+      model: "file-allowed",
+      messages: [{ role: "user", content: "clean input" }],
+    });
+    expect(clean.status).toBe(200);
+  });
 });
 
 describe("file resource source: differential vs etcd mode", () => {
@@ -203,7 +240,15 @@ describe("file resource source: differential vs etcd mode", () => {
   beforeAll(async () => {
     const etcd = new EtcdClient();
     etcdReachable = await etcd.ping();
-    if (!etcdReachable) return;
+    if (!etcdReachable) {
+      // Local runs may skip quietly; on CI the differential pin is the
+      // point of this file — a silent skip would let the equivalence
+      // contract rot invisibly.
+      if (process.env.CI) {
+        throw new Error("differential case requires etcd on CI (AISIX_E2E_ETCD)");
+      }
+      return;
+    }
 
     upstream = await startOpenAiUpstream();
 
@@ -472,4 +517,48 @@ not_a_collection: []
     expect(msg).toContain('unknown provider key "ghost-pk"');
     expect(msg).toContain('unknown model "nope"');
   }, 30_000);
+});
+
+describe("file resource source: validate subcommand", () => {
+  const BIN_PATH =
+    process.env.AISIX_BIN ?? join(process.cwd(), "..", "..", "target", "debug", "aisix");
+
+  test("valid file exits 0; invalid file exits 1 with the aggregated report on stderr", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "aisix-validate-e2e-"));
+    try {
+      const good = join(dir, "good.yaml");
+      await writeFile(
+        good,
+        [
+          '_format_version: "1"',
+          "provider_keys:",
+          "  - display_name: pk",
+          "    api_key: sk-x",
+          "models:",
+          "  - display_name: m1",
+          "    provider: openai",
+          "    model_name: gpt-4o",
+          "    provider_key: pk",
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+      const ok = await execFileP(BIN_PATH, ["validate", "--resources", good]);
+      expect(ok.stdout).toContain("OK:");
+
+      const bad = join(dir, "bad.yaml");
+      await writeFile(bad, "models: []\n", "utf8");
+      let failure: (Error & { code?: number; stderr?: string }) | undefined;
+      try {
+        await execFileP(BIN_PATH, ["validate", "--resources", bad]);
+      } catch (e) {
+        failure = e as Error & { code?: number; stderr?: string };
+      }
+      if (!failure) throw new Error("expected `aisix validate` to exit non-zero");
+      expect(failure.code).toBe(1);
+      expect(String(failure.stderr)).toContain("missing mandatory _format_version");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
 });

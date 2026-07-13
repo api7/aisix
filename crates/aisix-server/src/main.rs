@@ -163,7 +163,27 @@ async fn file_reload_loop(
         loop {
             tokio::select! {
                 _ = hup.recv() => {
-                    match aisix_core::filesource::load_resources_file(&path, generation + 1) {
+                    // File IO + the full parse/validate pipeline are
+                    // synchronous — run them off the async workers so a
+                    // large file can't stall in-flight requests.
+                    let load_path = path.clone();
+                    let next_generation = generation + 1;
+                    let loaded = tokio::task::spawn_blocking(move || {
+                        aisix_core::filesource::load_resources_file(&load_path, next_generation)
+                    })
+                    .await;
+                    let loaded = match loaded {
+                        Ok(result) => result,
+                        Err(join_err) => {
+                            tracing::warn!(
+                                file = %path.display(),
+                                error = %join_err,
+                                "resources file reload task failed — keeping the previous snapshot",
+                            );
+                            continue;
+                        }
+                    };
+                    match loaded {
                         Ok(snapshot) => {
                             generation += 1;
                             let resources = snapshot.total_entries();

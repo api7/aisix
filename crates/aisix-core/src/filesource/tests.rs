@@ -433,6 +433,89 @@ models:
 }
 
 #[test]
+fn duplicate_key_hash_across_api_keys_is_a_load_error_without_hash_leak() {
+    // The runtime credential index is keyed by key_hash — a duplicate
+    // plaintext would silently last-wins at auth time, so it must fail
+    // the load like the duplicate-identity rule does. One entry uses
+    // key_env, the other key_hash, resolving to the same credential.
+    let plain = "sk-shared-plaintext";
+    let hash = crate::models::ApiKey::hash_bearer(plain);
+    let contents = format!(
+        r#"
+_format_version: "1"
+api_keys:
+  - display_name: first
+    key_env: SHARED_KEY
+    allowed_models: ["*"]
+  - display_name: second
+    key_hash: {hash}
+    allowed_models: ["*"]
+"#
+    );
+    let env = env_of(&[("SHARED_KEY", plain)]);
+    let errs = errors_of(load(&contents, &env));
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    assert!(errs[0].contains("duplicate api key credential"), "{errs:?}");
+    // The error names both entries…
+    assert!(errs[0].contains("api_keys[0]"), "{errs:?}");
+    assert!(errs[0].contains("api_keys[1]"), "{errs:?}");
+    // …and never echoes the credential in either form.
+    assert!(!errs[0].contains(plain), "plaintext leaked: {errs:?}");
+    assert!(!errs[0].contains(&hash), "hash leaked: {errs:?}");
+}
+
+#[test]
+fn explicit_provider_key_id_must_match_a_file_defined_key() {
+    // In file mode every provider-key id is derived from its name, so a
+    // pasted foreign UUID is guaranteed dangling — reject it at load.
+    let contents = r#"
+_format_version: "1"
+provider_keys:
+  - display_name: pk
+    api_key: sk-1
+models:
+  - display_name: m1
+    provider: openai
+    model_name: x
+    provider_key_id: 11111111-1111-1111-1111-111111111111
+"#;
+    let errs = errors_of(load(contents, &env_of(&[])));
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    assert!(errs[0].contains("provider_key_id"), "{errs:?}");
+    assert!(
+        errs[0].contains("`provider_key`"),
+        "should point at the name sugar: {errs:?}"
+    );
+
+    // The correctly-derived id (what the sugar would produce) passes —
+    // determinism means a generated file can carry explicit ids.
+    let derived = derive_id("provider_keys", "pk");
+    let contents = format!(
+        r#"
+_format_version: "1"
+provider_keys:
+  - display_name: pk
+    api_key: sk-1
+models:
+  - display_name: m1
+    provider: openai
+    model_name: x
+    provider_key_id: {derived}
+"#
+    );
+    let snap = load(&contents, &env_of(&[])).expect("derived id must be accepted");
+    assert_eq!(
+        snap.models
+            .get_by_name("m1")
+            .unwrap()
+            .value
+            .provider_key_id
+            .as_deref(),
+        Some(derived.as_str()),
+    );
+}
+
+#[test]
 fn absent_collections_load_as_empty_and_null_sections_are_tolerated() {
     let contents = "_format_version: \"1\"\nmodels:\n";
     let snap = load(contents, &env_of(&[])).unwrap();

@@ -1003,6 +1003,14 @@ pub fn build_index_from_snapshot(
     // (tracked in https://github.com/api7/ai-gateway/issues/417).
     // After removal, a guardrail with zero attachment rows is a silent no-op —
     // operators must explicitly attach it to a scope.
+    //
+    // NOTE: the standalone resources-file source (aisix-core::filesource)
+    // deliberately writes NO attachment rows — its v1 format has no
+    // attachment collection, so file-defined guardrails are env-global
+    // through exactly this fallback. Do not remove this block without
+    // giving the file format a scoping surface (or synthesizing env-scope
+    // attachments in the file loader). The file-resource-source e2e pins
+    // that a file-defined guardrail fires.
     // Same deterministic created_at-ascending order as the chain-build
     // path: these implicit entries all share priority 0 + env scope, so
     // without a pre-sort their relative order — and which Block fires

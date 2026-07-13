@@ -17,7 +17,9 @@
 //!
 //! Errors are collected across the whole file — every load problem is
 //! reported together with kind / entry / field context, instead of
-//! failing on the first one.
+//! failing on the first one. (Within a single entry, interpolation /
+//! shape problems report the first offending field; aggregation is
+//! per-entry and across entries.)
 //!
 //! File format v1 (`_format_version: "1"`, mandatory):
 //! - nine top-level collection keys, each a sequence of maps, named by
@@ -456,6 +458,49 @@ pub fn load_from_str(
                 &semantic.on_embedding_failure
             {
                 check_model_ref(scope, "semantic on_embedding_failure target", target);
+            }
+        }
+    }
+
+    // The runtime credential index is keyed by key_hash, so two api_keys
+    // entries with distinct display_names but the same plaintext would
+    // silently last-wins at auth time (the Admin API rejects exactly
+    // this on create). Enforce credential uniqueness like the identity
+    // uniqueness above. The message names entries, never hashes.
+    let mut seen_hashes: BTreeMap<&str, &str> = BTreeMap::new();
+    for (_, scope, key) in &apikeys {
+        if let Some(first) = seen_hashes.insert(key.key_hash.as_str(), scope.as_str()) {
+            errors.push(LoadError {
+                scope: scope.clone(),
+                message: format!(
+                    "duplicate api key credential: this entry's key resolves to the \
+                     same key_hash as {first} — every api key must have a distinct \
+                     plaintext"
+                ),
+            });
+        }
+    }
+
+    // An explicit `provider_key_id` must also resolve: in file mode every
+    // provider-key id is derived from its name, so any other value is
+    // guaranteed dangling and would only surface per-request.
+    let pk_ids: std::collections::BTreeSet<&str> = identity_maps
+        .get("provider_keys")
+        .unwrap_or(&empty)
+        .values()
+        .map(String::as_str)
+        .collect();
+    for (_, scope, model) in &models {
+        if let Some(pk_id) = model.provider_key_id.as_deref() {
+            if !pk_ids.contains(pk_id) {
+                errors.push(LoadError {
+                    scope: scope.clone(),
+                    message: format!(
+                        "provider_key_id {pk_id:?} does not match any provider key \
+                         defined in this file — reference it by name with \
+                         `provider_key` instead"
+                    ),
+                });
             }
         }
     }
