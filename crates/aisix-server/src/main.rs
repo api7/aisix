@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 mod cert_bundle;
+mod export;
 mod heartbeat;
 mod managed_bundle;
 mod telemetry;
@@ -73,6 +74,30 @@ enum CliCommand {
         #[arg(long)]
         resources: PathBuf,
     },
+    /// Export the resources currently stored in etcd as a `resources.yaml`
+    /// the file source (`resources_file`) can load back — the migration /
+    /// backup path for a standalone deployment moving from the Admin API
+    /// plus etcd to the declarative file. References are resugared to
+    /// names, ids are dropped (the file derives them), and live
+    /// credentials are replaced with `${VAR}` placeholders unless
+    /// `--reveal-secrets` is given.
+    Export {
+        /// etcd endpoints to read from (comma-separated or repeated).
+        #[arg(long, value_delimiter = ',', required = true)]
+        etcd: Vec<String>,
+        /// Key prefix the resources are stored under. Defaults to the same
+        /// canonical prefix the gateway reads from (`etcd.prefix`).
+        #[arg(long, default_value_t = EtcdConfig::default().prefix)]
+        prefix: String,
+        /// Emit real stored credential values inline instead of `${VAR}`
+        /// placeholders. UNSAFE — the output then contains live secrets;
+        /// intended only for air-gapped, same-host migration.
+        #[arg(long)]
+        reveal_secrets: bool,
+        /// Write the resources file here instead of stdout.
+        #[arg(short = 'o', long)]
+        output: Option<PathBuf>,
+    },
 }
 
 #[tokio::main]
@@ -93,8 +118,23 @@ async fn main() -> anyhow::Result<()> {
 
     // Subcommands run without loading the bootstrap config or booting
     // any listener.
-    if let Some(CliCommand::Validate { resources }) = cli.command {
-        return run_validate(&resources);
+    match cli.command {
+        Some(CliCommand::Validate { resources }) => return run_validate(&resources),
+        Some(CliCommand::Export {
+            etcd,
+            prefix,
+            reveal_secrets,
+            output,
+        }) => {
+            return export::run(export::ExportArgs {
+                endpoints: etcd,
+                prefix,
+                reveal_secrets,
+                output,
+            })
+            .await;
+        }
+        None => {}
     }
 
     let config_path = cli

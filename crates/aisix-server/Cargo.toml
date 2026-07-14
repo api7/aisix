@@ -35,6 +35,9 @@ clap.workspace = true
 config.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# `aisix export` emits the resources file with the same YAML library the
+# file source parses with, so the output is guaranteed to re-parse.
+yaml-rust2.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 etcd-client.workspace = true
