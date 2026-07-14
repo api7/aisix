@@ -463,6 +463,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
                     &cfg.etcd.endpoints,
                     etcd_prefix.clone(),
                     connect_options.clone(),
+                    Some(cfg.etcd.auth_token_refresh_secs),
                 )
                 .await
                 .map_err(|e| anyhow::anyhow!("etcd connect failed: {e}"))?,
@@ -733,7 +734,11 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     // gets a read-only view of the file-loaded snapshot (writes return
     // 409 pointing at the file).
     let admin_store: Option<Arc<dyn ConfigStore>> = match (admin_client, &file_source_path) {
-        (Some((client, prefix)), _) => Some(Arc::new(EtcdConfigStore::new(client, prefix))),
+        (Some((client, prefix)), _) => Some(Arc::new(EtcdConfigStore::new(
+            client,
+            prefix,
+            Some(cfg.etcd.auth_token_refresh_secs),
+        ))),
         (None, Some(path)) if !cfg.managed.is_managed() => Some(Arc::new(FileManagedStore::new(
             snapshot_handle.clone(),
             path.display().to_string(),
@@ -1389,6 +1394,7 @@ models:
             password_env: None,
             dial_timeout_ms: 5000,
             request_timeout_ms: 5000,
+            auth_token_refresh_secs: 240,
             tls: None,
         };
         let opts = build_etcd_connect_options(&etcd).unwrap();
@@ -1408,6 +1414,7 @@ models:
             password_env: None,
             dial_timeout_ms: 5000,
             request_timeout_ms: 5000,
+            auth_token_refresh_secs: 240,
             tls: Some(aisix_core::EtcdTlsConfig {
                 ca_cert_file: "/definitely/does/not/exist/ca.crt".into(),
                 client_cert_file: "/tmp/c.crt".into(),

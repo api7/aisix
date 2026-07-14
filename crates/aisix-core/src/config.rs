@@ -113,6 +113,12 @@ pub struct EtcdConfig {
     pub dial_timeout_ms: u64,
     #[serde(default = "EtcdConfig::default_request_timeout")]
     pub request_timeout_ms: u64,
+    /// How often the auth-token refresh loop calls `Client::refresh_token`
+    /// (only relevant when `user` is set). Must stay well under the
+    /// etcd cluster's `--auth-token-ttl`, or a write between refreshes
+    /// can hit "etcdserver: invalid auth token".
+    #[serde(default = "EtcdConfig::default_auth_refresh_secs")]
+    pub auth_token_refresh_secs: u64,
     /// Optional TLS / mTLS bundle used to authenticate to the etcd
     /// endpoint. Required when talking to an aisix.cloud DP Manager
     /// (see prd-09 §9.3.3 — the CP issues a 10-year client cert via
@@ -313,6 +319,7 @@ impl Default for EtcdConfig {
             password_env: None,
             dial_timeout_ms: Self::default_dial_timeout(),
             request_timeout_ms: Self::default_request_timeout(),
+            auth_token_refresh_secs: Self::default_auth_refresh_secs(),
             tls: None,
         }
     }
@@ -327,6 +334,9 @@ impl EtcdConfig {
     }
     const fn default_request_timeout() -> u64 {
         5_000
+    }
+    const fn default_auth_refresh_secs() -> u64 {
+        240
     }
 
     pub const fn dial_timeout(&self) -> Duration {
@@ -902,6 +912,7 @@ admin:
         );
         let cfg = Config::load_from_path(Some(f.path())).unwrap();
         assert_eq!(cfg.etcd.endpoints, vec!["http://127.0.0.1:2379"]);
+        assert_eq!(cfg.etcd.auth_token_refresh_secs, 240);
         assert_eq!(cfg.proxy.request_body_limit_bytes, 10 * 1024 * 1024);
         assert!(cfg.observability.metrics.prometheus.enabled);
         // The dedicated metrics listener defaults to 0.0.0.0:9090 in
@@ -940,6 +951,25 @@ managed:
         let f = write_yaml(&format!("{base}  heartbeat_interval_secs: 5\n"));
         let cfg = Config::load_from_path(Some(f.path())).unwrap();
         assert_eq!(cfg.managed.heartbeat_interval_secs, 5);
+    }
+
+    #[test]
+    fn etcd_auth_token_refresh_secs_can_be_overridden() {
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+  prefix: "/aisix"
+  auth_token_refresh_secs: 60
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+"#,
+        );
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert_eq!(cfg.etcd.auth_token_refresh_secs, 60);
     }
 
     #[test]

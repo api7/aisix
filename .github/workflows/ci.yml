@@ -94,6 +94,16 @@ jobs:
         env:
           ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
           ETCD_ADVERTISE_CLIENT_URLS: http://0.0.0.0:2379
+      # Auth-enabled etcd for token-refresh regression tests (separate
+      # container with short TTL so the tests don't wait 5+ minutes).
+      # Port 2380 to avoid colliding with the main etcd above.
+      etcd-auth:
+        image: quay.io/coreos/etcd:v3.5.18
+        ports: ["2380:2379"]
+        env:
+          ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
+          ETCD_ADVERTISE_CLIENT_URLS: http://0.0.0.0:2379
+          ETCD_AUTH_TOKEN_TTL: "5"
     env:
       # Picked up by crates/aisix-cache/tests/redis_integration.rs.
       # The tests no-op when this is unset (local dev), so absence is safe.
@@ -129,6 +139,20 @@ jobs:
       ADMIN_TEST_ETCD_URL: http://127.0.0.1:2379
       # Picked up by crates/aisix-etcd/tests/watch_integration.rs.
       ETCD_TEST_URL: http://127.0.0.1:2379
+      # Auth-token-refresh regression tests below, against the
+      # `etcd-auth` service (short --auth-token-ttl). User/password
+      # created by the "Enable auth on etcd-auth" step. The tests
+      # themselves pass a 2s refresh interval directly to
+      # EtcdConfigProvider::connect/EtcdConfigStore::new — well under
+      # the 5s TTL, with a 3s margin absorbing scheduler/RPC jitter on
+      # a busy CI runner so the refresh tick reliably lands before the
+      # original token expires.
+      ETCD_TEST_AUTH_URL: http://127.0.0.1:2380
+      ETCD_TEST_USER: citest
+      ETCD_TEST_PASSWORD: citestpw
+      ADMIN_TEST_ETCD_AUTH_URL: http://127.0.0.1:2380
+      ADMIN_TEST_ETCD_USER: citest
+      ADMIN_TEST_ETCD_PASSWORD: citestpw
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -186,6 +210,27 @@ jobs:
           sleep 2
           docker exec redis-fo-sentinel redis-cli -p 26380 sentinel get-master-addr-by-name myfo | tr -d '\r' | tr '\n' ' ' | grep -qE '127\.0\.0\.1 +6381' \
             || { echo "::error::Failover sentinel 26380 did not resolve myfo to the master"; exit 1; }
+      - name: Enable auth on etcd-auth
+        # The etcd-auth service (port 2380) has --auth-token-ttl=5 but
+        # ships with no users. etcd requires a user named "root" to exist
+        # before `auth enable` (hardcoded precondition). Create root user,
+        # then the test user, grant both the root role, then enable auth.
+        # The token-refresh tests need this to exercise the "write past TTL"
+        # regression scenario (production incident: "etcdserver: invalid
+        # auth token"). The image's default entrypoint is `etcd` itself,
+        # so `etcdctl` must be invoked via an explicit --entrypoint override.
+        run: |
+          docker run --rm --network host --entrypoint etcdctl \
+            quay.io/coreos/etcd:v3.5.18 --endpoints=http://127.0.0.1:2380 user add root:rootpw
+          docker run --rm --network host --entrypoint etcdctl \
+            quay.io/coreos/etcd:v3.5.18 --endpoints=http://127.0.0.1:2380 user grant-role root root
+          docker run --rm --network host --entrypoint etcdctl \
+            quay.io/coreos/etcd:v3.5.18 --endpoints=http://127.0.0.1:2380 user add citest:citestpw
+          docker run --rm --network host --entrypoint etcdctl \
+            quay.io/coreos/etcd:v3.5.18 --endpoints=http://127.0.0.1:2380 user grant-role citest root
+          docker run --rm --network host --entrypoint etcdctl \
+            quay.io/coreos/etcd:v3.5.18 --endpoints=http://127.0.0.1:2380 auth enable
+          echo "etcd-auth (port 2380) now requires authentication; root and citest users both have root role"
       - name: unit tests with coverage
         run: cargo llvm-cov --workspace --all-features --lcov --output-path lcov-unit.info
       - uses: actions/upload-artifact@v7
