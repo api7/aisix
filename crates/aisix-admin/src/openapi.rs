@@ -38,7 +38,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
   "info": {
     "title": "AISIX Admin API",
     "version": "dev",
-    "description": "The AISIX Admin API is the standalone management interface for configuring the gateway at runtime. Use it when you operate AISIX directly and need to create or update models, caller API keys, provider credentials, guardrails, cache policies, and observability exporters.\n\nManaged deployments do not expose this listener. Configure managed gateways through the AISIX managed control plane."
+    "description": "The AISIX Admin API is the self-hosted management interface for configuring the gateway at runtime. Use it when you operate AISIX directly and need to create or update models, caller API keys, provider credentials, guardrails, cache policies, and observability exporters.\n\nManaged deployments do not expose this listener. Configure managed gateways through the AISIX managed control plane."
   },
   "paths": {
     "/livez": {
@@ -3947,7 +3947,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
           }
         },
         "additionalProperties": false,
-        "description": "Standalone Admin API request body for creating or updating a caller API key. Ownership fields supplied by the managed control plane are not accepted by this API."
+        "description": "Self-hosted Admin API request body for creating or updating a caller API key. Ownership fields supplied by the managed control plane are not accepted by this API."
       }
     }
   },
