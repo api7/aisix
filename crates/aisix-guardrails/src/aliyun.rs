@@ -233,9 +233,14 @@ impl AliyunTextModerationGuardrail {
             return Err(AliyunFailure::ServerError);
         }
         if !status.is_success() {
+            // Echo the provider's actual reason (e.g. `InvalidAccessKeyId.NotFound`
+            // or a 404 HTML page) — a bare status code can't tell a wrong access
+            // key from a wrong region/endpoint.
+            let response_body = crate::read_error_body_capped(resp).await;
             tracing::error!(
                 row = %self.row_name,
                 http_status = status.as_u16(),
+                response_body = %response_body,
                 "aliyun TextModerationPlus returned 4xx — check region/access keys configuration",
             );
             return Err(AliyunFailure::ConfigError);
@@ -255,6 +260,8 @@ impl AliyunTextModerationGuardrail {
                 tracing::error!(
                     row = %self.row_name,
                     aliyun_code = body.code,
+                    aliyun_message =
+                        %crate::truncate_error_body_for_log(body.message.as_deref().unwrap_or("")),
                     "aliyun TextModerationPlus auth/permission error — check access keys",
                 );
                 Err(AliyunFailure::ConfigError)
@@ -380,6 +387,8 @@ impl AliyunFailure {
 struct AliyunResponse {
     #[serde(rename = "Code", default)]
     code: i32,
+    #[serde(rename = "Message", default)]
+    message: Option<String>,
     #[serde(rename = "Data", default)]
     data: Option<AliyunData>,
 }
@@ -682,6 +691,129 @@ mod tests {
         // input fail_open=false → config error blocks
         let g = build(&server.uri(), "high", false);
         assert!(g.check_input(&req("x")).await.is_block());
+    }
+
+    /// A tracing writer that appends every emitted byte into a shared buffer so
+    /// a test can assert what a log line carried.
+    #[derive(Clone)]
+    struct BufWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for BufWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl tracing_subscriber::fmt::MakeWriter<'_> for BufWriter {
+        type Writer = BufWriter;
+        fn make_writer(&self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Run `f` with a log-capturing subscriber installed and return everything
+    /// it emitted.
+    async fn capture_logs<F, Fut>(f: F) -> String
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(BufWriter(buf.clone()))
+            .finish();
+        {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            f().await;
+        }
+        let bytes = buf.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    // The three error-body log scenarios live in ONE test on purpose: the
+    // capture uses a thread-local default subscriber (`set_default`), so two
+    // capture tests running in parallel would race over it. Kept sequential
+    // here, at most one capturing subscriber is ever installed process-wide.
+    #[tokio::test]
+    async fn error_paths_log_provider_diagnostics() {
+        // 1. A wrong access key: green-cip answers 4xx (the customer saw 404)
+        //    with a body naming the cause. Without echoing it the operator only
+        //    sees a bare status code (AISIX-Cloud#1030 follow-up).
+        {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+                    "Code": "InvalidAccessKeyId.NotFound",
+                    "Message": "Specified access key is not found.",
+                    "RequestId": "ABC-123",
+                })))
+                .mount(&server)
+                .await;
+            let uri = server.uri();
+            let logged = capture_logs(|| async {
+                let g = build(&uri, "high", false);
+                assert!(g.check_input(&req("x")).await.is_block());
+            })
+            .await;
+            assert!(
+                logged.contains("response_body") && logged.contains("InvalidAccessKeyId.NotFound"),
+                "4xx log must echo the provider's actual reason; got: {logged}"
+            );
+        }
+
+        // 2. A pathological oversized 4xx body: the marker sits well past the
+        //    log cap, so if it shows up we buffered/logged more than we should.
+        {
+            let server = MockServer::start().await;
+            let filler = "X".repeat(crate::MAX_ERROR_BODY_LOG_BYTES + 4_000);
+            Mock::given(method("POST"))
+                .respond_with(
+                    ResponseTemplate::new(400).set_body_string(format!("{filler}__TAIL_MARKER__")),
+                )
+                .mount(&server)
+                .await;
+            let uri = server.uri();
+            let logged = capture_logs(|| async {
+                let g = build(&uri, "high", false);
+                assert!(g.check_input(&req("x")).await.is_block());
+            })
+            .await;
+            assert!(
+                logged.contains("XXXX"),
+                "the head of the body must be logged"
+            );
+            assert!(
+                !logged.contains("__TAIL_MARKER__"),
+                "the logged body must be capped, not echoed in full",
+            );
+        }
+
+        // 3. HTTP 200 but an app-level error Code — the Message carries the
+        //    reason (e.g. an access key lacking llm_response_moderation).
+        {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "Code": 403,
+                    "Message": "AccessKey has no permission for llm_response_moderation",
+                })))
+                .mount(&server)
+                .await;
+            let uri = server.uri();
+            let logged = capture_logs(|| async {
+                let g = build(&uri, "high", false);
+                assert!(g.check_input(&req("x")).await.is_block());
+            })
+            .await;
+            assert!(
+                logged.contains("aliyun_message")
+                    && logged.contains("no permission for llm_response_moderation"),
+                "app-level error log must echo the Aliyun Message; got: {logged}"
+            );
+        }
     }
 
     #[test]

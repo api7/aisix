@@ -161,11 +161,11 @@ impl OpenaiModerationGuardrail {
             // (bad api_key / endpoint / model). Error level: with
             // fail_open=true this silently bypasses the guardrail on every
             // request until the operator notices.
-            let body = resp.text().await.unwrap_or_default();
+            let response_body = crate::read_error_body_capped(resp).await;
             tracing::error!(
                 row = %self.row_name,
                 http_status = status.as_u16(),
-                response_body = %crate::truncate_error_body_for_log(&body),
+                response_body = %response_body,
                 "openai moderation returned 4xx — check endpoint, api_key, and model configuration",
             );
             return Err(ModerationFailure::ConfigError);

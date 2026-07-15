@@ -63,6 +63,29 @@ pub(crate) fn truncate_error_body_for_log(body: &str) -> &str {
     &body[..end]
 }
 
+/// Read a guardrail provider's error-response body for logging, stopping once
+/// [`MAX_ERROR_BODY_LOG_BYTES`] have arrived. We only ever log a snippet, so a
+/// broken provider returning a huge 4xx body can't make us buffer the whole
+/// thing. Reads chunk-by-chunk and gives up on the first read error — this is
+/// best-effort diagnostics on a path that's already returning an error.
+#[cfg(any(
+    feature = "azure-content-safety",
+    feature = "aliyun-text-moderation",
+    feature = "lakera",
+    feature = "openai-moderation",
+    feature = "presidio",
+))]
+pub(crate) async fn read_error_body_capped(mut resp: reqwest::Response) -> String {
+    let mut buf: Vec<u8> = Vec::new();
+    while buf.len() < MAX_ERROR_BODY_LOG_BYTES {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => buf.extend_from_slice(&chunk),
+            Ok(None) | Err(_) => break,
+        }
+    }
+    truncate_error_body_for_log(&String::from_utf8_lossy(&buf)).to_owned()
+}
+
 /// The text a guardrail should scan for one message.
 ///
 /// Prefers the flat `content` string; when it's empty, falls back to
