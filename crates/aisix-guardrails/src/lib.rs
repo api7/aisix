@@ -42,6 +42,50 @@ use aisix_core::models::GuardrailMonitorHit;
 use aisix_gateway::{ChatFormat, ChatMessage, ChatResponse};
 use async_trait::async_trait;
 
+/// Max bytes of an upstream guardrail-provider error body to echo into a log
+/// line. Mirrors nginx's single-error-line cap (`NGX_MAX_ERROR_STR` = 2048) so
+/// a verbose HTML error page or stack trace can't blow up the log.
+pub(crate) const MAX_ERROR_BODY_LOG_BYTES: usize = 2048;
+
+/// Truncate a guardrail-provider error body for logging: at most
+/// [`MAX_ERROR_BODY_LOG_BYTES`] bytes, cut on a UTF-8 char boundary so a
+/// multi-byte character is never split. Returned verbatim otherwise — the
+/// whole point is to surface the provider's actual reason (e.g. Aliyun's
+/// `InvalidAccessKeyId.NotFound`) that a bare status code hides.
+pub(crate) fn truncate_error_body_for_log(body: &str) -> &str {
+    if body.len() <= MAX_ERROR_BODY_LOG_BYTES {
+        return body;
+    }
+    let mut end = MAX_ERROR_BODY_LOG_BYTES;
+    while end > 0 && !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    &body[..end]
+}
+
+/// Read a guardrail provider's error-response body for logging, stopping once
+/// [`MAX_ERROR_BODY_LOG_BYTES`] have arrived. We only ever log a snippet, so a
+/// broken provider returning a huge 4xx body can't make us buffer the whole
+/// thing. Reads chunk-by-chunk and gives up on the first read error — this is
+/// best-effort diagnostics on a path that's already returning an error.
+#[cfg(any(
+    feature = "azure-content-safety",
+    feature = "aliyun-text-moderation",
+    feature = "lakera",
+    feature = "openai-moderation",
+    feature = "presidio",
+))]
+pub(crate) async fn read_error_body_capped(mut resp: reqwest::Response) -> String {
+    let mut buf: Vec<u8> = Vec::new();
+    while buf.len() < MAX_ERROR_BODY_LOG_BYTES {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => buf.extend_from_slice(&chunk),
+            Ok(None) | Err(_) => break,
+        }
+    }
+    truncate_error_body_for_log(&String::from_utf8_lossy(&buf)).to_owned()
+}
+
 /// The text a guardrail should scan for one message.
 ///
 /// Prefers the flat `content` string; when it's empty, falls back to
@@ -549,6 +593,39 @@ pub trait Guardrail: Send + Sync + 'static {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncate_error_body_short_passes_through() {
+        assert_eq!(truncate_error_body_for_log("boom"), "boom");
+        // Exactly at the cap is not truncated.
+        let at_cap = "a".repeat(MAX_ERROR_BODY_LOG_BYTES);
+        assert_eq!(truncate_error_body_for_log(&at_cap), at_cap);
+    }
+
+    #[test]
+    fn truncate_error_body_caps_length() {
+        let big = "a".repeat(MAX_ERROR_BODY_LOG_BYTES + 500);
+        let out = truncate_error_body_for_log(&big);
+        assert_eq!(out.len(), MAX_ERROR_BODY_LOG_BYTES);
+    }
+
+    #[test]
+    fn truncate_error_body_never_splits_a_char() {
+        // '€' is 3 bytes; place a run of them so the byte cap lands mid-char.
+        // The result must stay ≤ cap AND be valid UTF-8 (no split), i.e. end
+        // on a char boundary just below the cap.
+        let s = "€".repeat(MAX_ERROR_BODY_LOG_BYTES); // 3 * cap bytes
+        let out = truncate_error_body_for_log(&s);
+        assert!(out.len() <= MAX_ERROR_BODY_LOG_BYTES);
+        assert!(
+            out.len() > MAX_ERROR_BODY_LOG_BYTES - 3,
+            "should fill the budget to within one char"
+        );
+        assert!(
+            out.chars().all(|c| c == '€'),
+            "must not emit a partial char"
+        );
+    }
 
     #[test]
     fn message_scan_text_falls_back_to_content_blocks() {

@@ -174,9 +174,11 @@ impl PromptShieldGuardrail {
             // silently bypasses the guardrail on every request until
             // the operator notices. A persistent error-level log is
             // the only signal they get.
+            let response_body = crate::read_error_body_capped(resp).await;
             tracing::error!(
                 row = %self.row_name,
                 http_status = status.as_u16(),
+                response_body = %response_body,
                 "azure content safety returned 4xx — check endpoint and api_key configuration",
             );
             return Err(AcsFailure::ConfigError);

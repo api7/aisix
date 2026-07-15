@@ -167,9 +167,11 @@ impl LakeraGuardrail {
             // (bad api_key / project_id / endpoint). Error level: with
             // fail_open=true this silently bypasses the guardrail on every
             // request until the operator notices.
+            let response_body = crate::read_error_body_capped(resp).await;
             tracing::error!(
                 row = %self.row_name,
                 http_status = status.as_u16(),
+                response_body = %response_body,
                 "lakera guard returned 4xx — check endpoint, api_key, and project_id configuration",
             );
             return Err(LakeraFailure::ConfigError);

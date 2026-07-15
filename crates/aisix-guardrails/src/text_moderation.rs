@@ -173,9 +173,11 @@ impl TextModerationGuardrail {
             return Err(AcsFailure::ServerError);
         }
         if !status.is_success() {
+            let response_body = crate::read_error_body_capped(resp).await;
             tracing::error!(
                 row = %self.row_name,
                 http_status = status.as_u16(),
+                response_body = %response_body,
                 "azure content safety text:analyze returned 4xx — check endpoint and api_key configuration",
             );
             return Err(AcsFailure::ConfigError);

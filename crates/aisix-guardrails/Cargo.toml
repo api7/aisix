@@ -78,3 +78,4 @@ presidio = ["dep:reqwest"]
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }
 wiremock.workspace = true
+tracing-subscriber.workspace = true

@@ -216,10 +216,12 @@ impl PresidioGuardrail {
         if !status.is_success() {
             // 4xx other than 429 — almost always a misconfiguration
             // (bad URL path, unsupported language, malformed entity list).
+            let response_body = crate::read_error_body_capped(resp).await;
             tracing::error!(
                 row = %self.row_name,
                 http_status = status.as_u16(),
                 url = %url,
+                response_body = %response_body,
                 "presidio returned 4xx — check analyzer_url/anonymizer_url, language, and entities configuration",
             );
             return Err(PresidioFailure::ConfigError);
