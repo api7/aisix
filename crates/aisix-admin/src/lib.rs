@@ -440,14 +440,35 @@ async fn status_ready_handler(
 /// while both exist. Unauthenticated like `/status/config` — it exposes
 /// model names and health states, the same sensitivity class; restrict
 /// access at the network layer.
+///
+/// Store failures answer a fixed `{"error_msg": "failed to list models"}`
+/// 500: this listener is unauthenticated, so backend detail (etcd
+/// endpoints, connection errors) stays in the server log instead of the
+/// response body. The admin-key-gated endpoint keeps its detailed
+/// envelope.
 async fn status_models_handler(
     axum::extract::State(state): axum::extract::State<MetricsState>,
-) -> Result<axum::Json<Vec<models_status_handler::ModelStatusView>>, AdminError> {
-    let all_models = state.models_status.store.list_models().await?;
-    Ok(axum::Json(models_status_handler::render_models_status(
+) -> Response {
+    use axum::response::IntoResponse;
+
+    let all_models = match state.models_status.store.list_models().await {
+        Ok(models) => models,
+        Err(e) => {
+            tracing::error!(error = %e, "GET /status/models: listing models failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(ErrorBody {
+                    error_msg: "failed to list models".into(),
+                }),
+            )
+                .into_response();
+        }
+    };
+    axum::Json(models_status_handler::render_models_status(
         all_models,
         state.models_status.runtime_status_tracker.as_deref(),
-    )))
+    ))
+    .into_response()
 }
 
 fn normalized_prometheus_path(path: &str) -> String {
@@ -969,6 +990,86 @@ mod tests {
             .unwrap();
         let resp = run(app, req).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn status_models_store_failure_never_leaks_backend_detail() {
+        use aisix_core::resource::ResourceEntry;
+        use aisix_core::{
+            A2aAgent, ApiKey, CachePolicy, Guardrail, McpServer, Model, ObservabilityExporter,
+            ProviderKey,
+        };
+
+        // A store whose every call fails with backend detail an anonymous
+        // caller must never see (mimics an etcd outage: the client error
+        // names endpoints/addresses).
+        const LEAKY: &str = "connect to http://10.0.0.7:2379 refused";
+        struct FailingStore;
+
+        macro_rules! impl_failing_store {
+            ($( { $ty:ty, $put:ident, $get:ident, $list:ident, $delete:ident } )+) => {
+                #[async_trait::async_trait]
+                impl ConfigStore for FailingStore {
+                    $(
+                        async fn $put(&self, _entry: ResourceEntry<$ty>) -> Result<(), StoreError> {
+                            Err(StoreError::Backend(LEAKY.into()))
+                        }
+                        async fn $get(
+                            &self,
+                            _id: &str,
+                        ) -> Result<Option<ResourceEntry<$ty>>, StoreError> {
+                            Err(StoreError::Backend(LEAKY.into()))
+                        }
+                        async fn $list(&self) -> Result<Vec<ResourceEntry<$ty>>, StoreError> {
+                            Err(StoreError::Backend(LEAKY.into()))
+                        }
+                        async fn $delete(&self, _id: &str) -> Result<bool, StoreError> {
+                            Err(StoreError::Backend(LEAKY.into()))
+                        }
+                    )+
+                }
+            };
+        }
+        impl_failing_store! {
+            { Model, put_model, get_model, list_models, delete_model }
+            { ApiKey, put_apikey, get_apikey, list_apikeys, delete_apikey }
+            { ProviderKey, put_provider_key, get_provider_key, list_provider_keys, delete_provider_key }
+            { Guardrail, put_guardrail, get_guardrail, list_guardrails, delete_guardrail }
+            { CachePolicy, put_cache_policy, get_cache_policy, list_cache_policies, delete_cache_policy }
+            { ObservabilityExporter, put_observability_exporter, get_observability_exporter, list_observability_exporters, delete_observability_exporter }
+            { McpServer, put_mcp_server, get_mcp_server, list_mcp_servers, delete_mcp_server }
+            { A2aAgent, put_a2a_agent, get_a2a_agent, list_a2a_agents, delete_a2a_agent }
+        }
+
+        let app = metrics_router(
+            Arc::new(Metrics::new(false)),
+            aisix_core::ConfigStatus::new(aisix_core::SourceKind::Etcd),
+            &PrometheusConfig {
+                enabled: true,
+                path: "/metrics".into(),
+                addr: "0.0.0.0:9090".into(),
+            },
+            ModelsStatusState {
+                store: Arc::new(FailingStore),
+                runtime_status_tracker: None,
+            },
+        );
+        let resp = run(
+            app,
+            Request::builder()
+                .uri("/status/models")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            !body.contains("10.0.0.7") && !body.contains("connect"),
+            "unauthenticated status listener must not leak store backend detail: {body}",
+        );
+        assert_eq!(body, r#"{"error_msg":"failed to list models"}"#);
     }
 
     #[tokio::test]
