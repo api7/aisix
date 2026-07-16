@@ -17,6 +17,7 @@
 #![deny(rust_2018_idioms)]
 
 pub mod config;
+pub mod config_status;
 pub mod error;
 pub mod filesource;
 pub mod models;
@@ -29,6 +30,10 @@ pub use config::{
     AdminConfig, CacheBackend, CacheConfig, Config, EtcdConfig, EtcdTlsConfig, ManagedConfig,
     ObservabilityConfig, ProxyConfig, RateLimitBackend, RateLimitConfig, RealIpConfig,
     RedisConnConfig, RedisMode, TlsConfig,
+};
+pub use config_status::{
+    hash_bytes, hash_entries, AppliedSnapshot, ConfigMetricsView, ConfigState, ConfigStatus,
+    ConfigStatusView, IncomingRejection, LoadObservation, RejectedResource, SourceKind,
 };
 pub use error::{
     AdminError, AdminErrorEnvelope, BootstrapError, ProxyError, ProxyErrorEnvelope, RateLimitScope,

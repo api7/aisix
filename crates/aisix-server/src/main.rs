@@ -26,7 +26,8 @@ use aisix_cache::{Cache, MemoryCache, RedisCache};
 use aisix_core::models::Adapter;
 use aisix_core::snapshot::SnapshotHandle;
 use aisix_core::{
-    AisixSnapshot, CacheBackend, Config, EtcdConfig, EtcdTlsConfig, RateLimitBackend,
+    AisixSnapshot, CacheBackend, Config, ConfigStatus, EtcdConfig, EtcdTlsConfig, RateLimitBackend,
+    SourceKind,
 };
 use aisix_etcd::{EtcdConfigProvider, SnapshotCache, Supervisor};
 use aisix_gateway::Hub;
@@ -145,6 +146,7 @@ fn run_validate(resources: &Path) -> anyhow::Result<()> {
 async fn file_reload_loop(
     path: PathBuf,
     handle: SnapshotHandle<AisixSnapshot>,
+    config_status: ConfigStatus,
     mut cancel: watch::Receiver<bool>,
 ) {
     #[cfg(unix)]
@@ -168,8 +170,14 @@ async fn file_reload_loop(
                     // large file can't stall in-flight requests.
                     let load_path = path.clone();
                     let next_generation = generation + 1;
+                    let reload_status = config_status.clone();
                     let loaded = tokio::task::spawn_blocking(move || {
-                        aisix_core::filesource::load_resources_file(&load_path, next_generation)
+                        aisix_core::filesource::load_resources_file_tracked(
+                            &load_path,
+                            next_generation,
+                            true,
+                            &reload_status,
+                        )
                     })
                     .await;
                     let loaded = match loaded {
@@ -418,13 +426,15 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     // file (`resources_file` in config) or etcd + watch supervisor.
     // Config validation already guaranteed exactly one is selected.
     let file_source_path = cfg.resources_file.clone().map(PathBuf::from);
-    let (snapshot_handle, supervisor, watch_task, admin_client) =
+    let (snapshot_handle, supervisor, watch_task, admin_client, config_status) =
         if let Some(path) = &file_source_path {
             // FILE MODE: load once at boot, fail fast with the aggregated
             // error report on any problem. SIGHUP re-runs the identical
             // pipeline; a failed reload keeps the last-good snapshot.
-            let snapshot = aisix_core::filesource::load_resources_file(path, 1)
-                .map_err(|report| anyhow::anyhow!("{report}"))?;
+            let config_status = ConfigStatus::new(SourceKind::File);
+            let snapshot =
+                aisix_core::filesource::load_resources_file_tracked(path, 1, true, &config_status)
+                    .map_err(|report| anyhow::anyhow!("{report}"))?;
             tracing::info!(
                 file = %path.display(),
                 resources = snapshot.total_entries(),
@@ -434,9 +444,10 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
             let reload_task = tokio::spawn(file_reload_loop(
                 path.clone(),
                 handle.clone(),
+                config_status.clone(),
                 cancel_rx.clone(),
             ));
-            (handle, None, reload_task, None)
+            (handle, None, reload_task, None, config_status)
         } else {
             // ETCD MODE (unchanged behavior).
             //
@@ -502,9 +513,16 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
             // proxy is ready to serve from cached config the moment the watch
             // task takes its first iteration.
             supervisor.restore_from_cache();
+            let config_status = supervisor.config_status();
             let handle = supervisor.handle();
             let watch_task = tokio::spawn(supervisor.clone().run(cancel_rx.clone()));
-            (handle, Some(supervisor), watch_task, admin_client)
+            (
+                handle,
+                Some(supervisor),
+                watch_task,
+                admin_client,
+                config_status,
+            )
         };
     // Spawn heartbeat worker if we have a config for it. The
     // JoinHandle is awaited after graceful shutdown below so the
@@ -802,7 +820,8 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
             // probe.
             std::net::TcpListener::bind(metrics_addr)
                 .map_err(|e| anyhow::anyhow!("metrics listener bind {metrics_addr} failed: {e}"))?;
-            let metrics_router = aisix_admin::metrics_router(metrics.clone(), prom);
+            let metrics_router =
+                aisix_admin::metrics_router(metrics.clone(), config_status.clone(), prom);
             Some(tokio::spawn(serve_http(
                 metrics_addr,
                 metrics_router,

@@ -120,6 +120,7 @@ dependencies = [
  "aisix-core",
  "async-trait",
  "base64 0.22.1",
+ "chrono",
  "etcd-client",
  "futures",
  "serde",

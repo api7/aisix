@@ -62,10 +62,20 @@ pub use state::AdminState;
 pub use store::{ConfigStore, InMemoryStore, StoreError};
 
 use aisix_core::config::PrometheusConfig;
+use aisix_core::ConfigStatus;
 use aisix_obs::Metrics;
 use axum::routing::{get, post};
 use axum::{http::StatusCode, response::Response, Router};
 use std::sync::Arc;
+
+/// Shared state for the dedicated metrics/status listener: the Prometheus
+/// [`Metrics`] handle plus the load-observability [`ConfigStatus`]. Both are
+/// cheap to clone.
+#[derive(Clone)]
+pub struct MetricsState {
+    pub metrics: Arc<Metrics>,
+    pub config_status: ConfigStatus,
+}
 
 pub fn admin_openapi_json() -> &'static str {
     openapi::merged_openapi()
@@ -247,40 +257,91 @@ async fn file_managed_write_guard(
     next.run(req).await
 }
 
-/// Build the router for the **dedicated** Prometheus metrics listener —
-/// only the scrape endpoint at `prometheus.path`, backed by the shared
-/// [`Metrics`] handle. No admin state, no auth-protected routes, no
-/// playground.
+/// Build the router for the **dedicated** metrics/status listener — the
+/// Prometheus scrape endpoint at `prometheus.path`, plus the load-
+/// observability endpoints `GET /status/config` and `GET /status/ready`,
+/// backed by the shared [`Metrics`] and [`ConfigStatus`] handles. No admin
+/// state, no auth-protected routes, no playground.
 ///
 /// `aisix-server` binds this on `observability.metrics.prometheus.addr`
-/// whenever prometheus is enabled. This is the only metrics surface —
-/// the same in standalone and managed mode; the admin listener never
-/// serves `/metrics`.
-pub fn metrics_router(metrics: Arc<Metrics>, prometheus: &PrometheusConfig) -> Router {
+/// whenever prometheus is enabled. This is the only metrics/status surface —
+/// the same in standalone and managed mode; the admin listener never serves
+/// `/metrics` or `/status/config`.
+pub fn metrics_router(
+    metrics: Arc<Metrics>,
+    config_status: ConfigStatus,
+    prometheus: &PrometheusConfig,
+) -> Router {
+    let state = MetricsState {
+        metrics,
+        config_status,
+    };
     Router::new()
         .route(
             &normalized_prometheus_path(&prometheus.path),
             get(metrics_handler),
         )
-        .with_state(metrics)
+        .route("/status/config", get(status_config_handler))
+        .route("/status/ready", get(status_ready_handler))
+        .with_state(state)
 }
 
-/// Prometheus scrape handler. The recorder handle is a required
-/// argument, so there is no 503 branch. Unauthenticated by design —
-/// restrict access at the network layer. Emits
-/// `text/plain; version=0.0.4`.
+/// Prometheus scrape handler. Reflects the live config load-observability
+/// state into the recorder (so the `aisix_config_*` series are current) then
+/// renders. Unauthenticated by design — restrict access at the network layer.
+/// Emits `text/plain; version=0.0.4`.
 async fn metrics_handler(
-    axum::extract::State(metrics): axum::extract::State<Arc<Metrics>>,
+    axum::extract::State(state): axum::extract::State<MetricsState>,
 ) -> Response {
     use axum::http::header::CONTENT_TYPE;
     use axum::response::IntoResponse;
 
+    state
+        .metrics
+        .sync_config_status(&state.config_status.metrics());
     (
         StatusCode::OK,
         [(CONTENT_TYPE, "text/plain; version=0.0.4")],
-        metrics.render(),
+        state.metrics.render(),
     )
         .into_response()
+}
+
+/// `GET /status/config` — the load-observability contract. Answers "did my
+/// config take effect, and if not why?" from the live [`ConfigStatus`].
+/// Unauthenticated like the scrape; restrict at the network layer.
+async fn status_config_handler(
+    axum::extract::State(state): axum::extract::State<MetricsState>,
+) -> Response {
+    use axum::response::IntoResponse;
+    (StatusCode::OK, axum::Json(state.config_status.view())).into_response()
+}
+
+/// `GET /status/ready` — 503 with "no configuration available" until the
+/// first valid configuration is applied, 200 afterward. A liveness-agnostic
+/// readiness gate for the config source only; the admin listener's `/readyz`
+/// keeps its shutdown/staleness semantics.
+async fn status_ready_handler(
+    axum::extract::State(state): axum::extract::State<MetricsState>,
+) -> Response {
+    use axum::http::header::CONTENT_TYPE;
+    use axum::response::IntoResponse;
+
+    if state.config_status.is_ready() {
+        (
+            StatusCode::OK,
+            [(CONTENT_TYPE, "text/plain; charset=utf-8")],
+            "ok",
+        )
+            .into_response()
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(CONTENT_TYPE, "text/plain; charset=utf-8")],
+            "no configuration available",
+        )
+            .into_response()
+    }
 }
 
 fn normalized_prometheus_path(path: &str) -> String {
@@ -448,6 +509,7 @@ mod tests {
 
         let app = metrics_router(
             metrics,
+            aisix_core::ConfigStatus::new(aisix_core::SourceKind::Etcd),
             &PrometheusConfig {
                 enabled: true,
                 path: "/metrics".into(),
@@ -498,6 +560,7 @@ mod tests {
 
         let app = metrics_router(
             Arc::new(Metrics::new(false)),
+            aisix_core::ConfigStatus::new(aisix_core::SourceKind::Etcd),
             &PrometheusConfig {
                 enabled: true,
                 path: "internal/prom".into(),
@@ -526,6 +589,160 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn status_ready_is_503_before_config_and_200_after() {
+        use aisix_core::config_status::{
+            AppliedSnapshot, ConfigStatus, LoadObservation, SourceKind,
+        };
+        let cs = ConfigStatus::new(SourceKind::Etcd);
+        let app = metrics_router(
+            Arc::new(Metrics::new(false)),
+            cs.clone(),
+            &PrometheusConfig {
+                enabled: true,
+                path: "/metrics".into(),
+                addr: "0.0.0.0:9090".into(),
+            },
+        );
+
+        // Before any config: 503 "no configuration available".
+        let resp = run(
+            app.clone(),
+            Request::builder()
+                .uri("/status/ready")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
+        assert_eq!(
+            std::str::from_utf8(&bytes).unwrap(),
+            "no configuration available"
+        );
+
+        // After a valid apply: 200.
+        cs.record_load(LoadObservation {
+            source_hash: "h".into(),
+            observed_revision: Some(1),
+            applied: Some(AppliedSnapshot {
+                config_hash: "h".into(),
+                revision: Some(1),
+                resource_counts: Default::default(),
+            }),
+            rejected: vec![],
+            is_reload: true,
+            wholly_rejected: false,
+        });
+        let resp = run(
+            app,
+            Request::builder()
+                .uri("/status/ready")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn status_config_serves_the_derived_view() {
+        use aisix_core::config_status::{
+            AppliedSnapshot, ConfigStatus, LoadObservation, SourceKind,
+        };
+        let cs = ConfigStatus::new(SourceKind::Etcd);
+        cs.record_load(LoadObservation {
+            source_hash: "src".into(),
+            observed_revision: Some(9),
+            applied: Some(AppliedSnapshot {
+                config_hash: "app".into(),
+                revision: Some(9),
+                resource_counts: [("models".to_string(), 1)].into_iter().collect(),
+            }),
+            rejected: vec![aisix_core::IncomingRejection {
+                identity: "/aisix/models/bad".into(),
+                resource_kind: "models".into(),
+                resource_id: "bad".into(),
+                last_error_kind: "schema_failed".into(),
+                last_error: "schema validation failed at `/display_name`".into(),
+                seen_at: chrono::Utc::now(),
+            }],
+            is_reload: true,
+            wholly_rejected: false,
+        });
+        let app = metrics_router(
+            Arc::new(Metrics::new(false)),
+            cs,
+            &PrometheusConfig {
+                enabled: true,
+                path: "/metrics".into(),
+                addr: "0.0.0.0:9090".into(),
+            },
+        );
+        let resp = run(
+            app,
+            Request::builder()
+                .uri("/status/config")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v["state"], "degraded");
+        assert_eq!(v["source"]["type"], "etcd");
+        assert_eq!(v["source"]["observed_revision"], 9);
+        assert_eq!(v["applied"]["applied_revision"], 9);
+        assert_eq!(v["applied"]["resource_counts"]["models"], 1);
+        assert_eq!(v["rejected"][0]["resource_kind"], "models");
+        assert_eq!(v["rejected"][0]["last_error_kind"], "schema_failed");
+    }
+
+    #[tokio::test]
+    async fn metrics_scrape_reflects_config_status_series() {
+        use aisix_core::config_status::{
+            AppliedSnapshot, ConfigStatus, LoadObservation, SourceKind,
+        };
+        let cs = ConfigStatus::new(SourceKind::Etcd);
+        cs.record_load(LoadObservation {
+            source_hash: "src".into(),
+            observed_revision: Some(5),
+            applied: Some(AppliedSnapshot {
+                config_hash: "deadbeef".into(),
+                revision: Some(5),
+                resource_counts: [("models".to_string(), 2)].into_iter().collect(),
+            }),
+            rejected: vec![],
+            is_reload: true,
+            wholly_rejected: false,
+        });
+        let app = metrics_router(
+            Arc::new(Metrics::new(false)),
+            cs,
+            &PrometheusConfig {
+                enabled: true,
+                path: "/metrics".into(),
+                addr: "0.0.0.0:9090".into(),
+            },
+        );
+        let resp = run(
+            app,
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(text.contains("aisix_config_last_reload_successful 1"));
+        assert!(text.contains("aisix_config_observed_revision 5"));
+        assert!(text.contains("aisix_config_applied_revision 5"));
+        assert!(text.contains("aisix_config_hash_info{hash=\"deadbeef\"} 1"));
+        assert!(text.contains("aisix_config_source_connected 1"));
     }
 
     #[tokio::test]

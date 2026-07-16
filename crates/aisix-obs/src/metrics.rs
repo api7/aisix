@@ -116,6 +116,21 @@ pub const M_REQUEST_E2E_LATENCY_SECONDS: &str = "aisix_request_e2e_latency_secon
 /// [`M_REQUEST_E2E_LATENCY_SECONDS`] (with `streaming="true"` always).
 pub const M_REQUEST_TTFT_SECONDS: &str = "aisix_request_ttft_seconds";
 
+// ── Config load-observability series (load-observability contract) ─────────
+// Reflected from [`aisix_core::ConfigMetricsView`] at scrape time via
+// [`Metrics::sync_config_status`]. Standard Prometheus config-reload naming so
+// the series read the same as the control plane exposes.
+pub const M_CONFIG_LAST_RELOAD_SUCCESSFUL: &str = "aisix_config_last_reload_successful";
+pub const M_CONFIG_LAST_RELOAD_SUCCESS_TIMESTAMP: &str =
+    "aisix_config_last_reload_success_timestamp_seconds";
+pub const M_CONFIG_RELOADS_TOTAL: &str = "aisix_config_reloads_total";
+pub const M_CONFIG_RELOAD_FAILURES_TOTAL: &str = "aisix_config_reload_failures_total";
+pub const M_CONFIG_REJECTED_RESOURCES: &str = "aisix_config_rejected_resources";
+pub const M_CONFIG_OBSERVED_REVISION: &str = "aisix_config_observed_revision";
+pub const M_CONFIG_APPLIED_REVISION: &str = "aisix_config_applied_revision";
+pub const M_CONFIG_HASH_INFO: &str = "aisix_config_hash_info";
+pub const M_CONFIG_SOURCE_CONNECTED: &str = "aisix_config_source_connected";
+
 /// Bucket edges for the two SLO histograms, spanning LLM latency ranges:
 /// sub-100ms cache hits / TTFT through multi-minute long generations.
 /// 14 edges → 15 `_bucket` series per label combination; keep
@@ -141,6 +156,17 @@ struct MetricsInner {
     /// process serves exactly one environment. `"unknown"` when the DP
     /// runs standalone (no control plane).
     env_id: String,
+    /// Last labels emitted for the config load-observability gauges, so
+    /// [`Metrics::sync_config_status`] can zero out stale label series (the
+    /// applied hash changed, or a kind's rejections cleared) instead of
+    /// leaving a second, contradictory sample in the exposition.
+    config_labels: Mutex<ConfigLabelState>,
+}
+
+#[derive(Default)]
+struct ConfigLabelState {
+    last_hash: Option<String>,
+    last_rejected_kinds: std::collections::HashSet<String>,
 }
 
 impl std::fmt::Debug for Metrics {
@@ -188,6 +214,7 @@ impl Metrics {
                 } else {
                     env_id.to_string()
                 },
+                config_labels: Mutex::new(ConfigLabelState::default()),
             }),
         }
     }
@@ -195,6 +222,83 @@ impl Metrics {
     /// Render the current metric values in Prometheus text exposition format.
     pub fn render(&self) -> String {
         self.inner.handle.render()
+    }
+
+    /// Reflect the config load-observability state into the recorder. Called
+    /// at scrape time by the metrics/status listener so `aisix_config_*`
+    /// series always mirror the live [`aisix_core::ConfigStatus`]. Idempotent
+    /// and cheap; safe to call on every scrape.
+    ///
+    /// Etcd-only series (`observed_revision`, `applied_revision`,
+    /// `source_connected`) are emitted only in etcd mode. Label churn on the
+    /// info/rejected gauges (`hash_info`, `rejected_resources`) zeroes the
+    /// prior label set so the exposition never carries two live samples.
+    pub fn sync_config_status(&self, view: &aisix_core::ConfigMetricsView) {
+        use aisix_core::SourceKind;
+        let etcd = matches!(view.source_kind, SourceKind::Etcd);
+        metrics::with_local_recorder(&self.inner.recorder, || {
+            metrics::gauge!(M_CONFIG_LAST_RELOAD_SUCCESSFUL).set(if view.last_reload_successful {
+                1.0
+            } else {
+                0.0
+            });
+            if let Some(ts) = view.last_reload_success_ts {
+                metrics::gauge!(M_CONFIG_LAST_RELOAD_SUCCESS_TIMESTAMP).set(ts as f64);
+            }
+            // Counters are tracked authoritatively in ConfigStatus; mirror the
+            // absolute value so the counter stays monotonic across scrapes.
+            metrics::counter!(M_CONFIG_RELOADS_TOTAL).absolute(view.reloads_total);
+            for (reason, count) in &view.reload_failures {
+                metrics::counter!(M_CONFIG_RELOAD_FAILURES_TOTAL, "reason" => *reason)
+                    .absolute(*count);
+            }
+
+            if etcd {
+                metrics::gauge!(M_CONFIG_SOURCE_CONNECTED).set(if view.connected == Some(true) {
+                    1.0
+                } else {
+                    0.0
+                });
+                if let Some(rev) = view.observed_revision {
+                    metrics::gauge!(M_CONFIG_OBSERVED_REVISION).set(rev as f64);
+                }
+                if let Some(rev) = view.applied_revision {
+                    metrics::gauge!(M_CONFIG_APPLIED_REVISION).set(rev as f64);
+                }
+            }
+
+            let mut labels = self.inner.config_labels.lock().expect("config label state");
+
+            // Info-style hash gauge: exactly one live `hash_info{hash=…} 1`;
+            // the previously-current hash is zeroed on change so a scraper can
+            // filter `== 1`. The `hash` label churns as the applied config
+            // changes, and a zeroed series is retained by the recorder — but
+            // the churn is bounded by the number of DISTINCT config states
+            // (operator/CP edits, a low-frequency event — never per-request),
+            // not by traffic. The series name is part of the frozen cross-plane
+            // metric contract the control plane also exposes, so it stays.
+            if labels.last_hash.as_deref() != view.config_hash.as_deref() {
+                if let Some(prev) = labels.last_hash.take() {
+                    metrics::gauge!(M_CONFIG_HASH_INFO, "hash" => prev).set(0.0);
+                }
+            }
+            if let Some(hash) = &view.config_hash {
+                metrics::gauge!(M_CONFIG_HASH_INFO, "hash" => hash.clone()).set(1.0);
+                labels.last_hash = Some(hash.clone());
+            }
+
+            // Rejected-resource gauge per kind: set current, zero cleared kinds.
+            for kind in &labels.last_rejected_kinds {
+                if !view.rejected_by_kind.contains_key(kind) {
+                    metrics::gauge!(M_CONFIG_REJECTED_RESOURCES, "kind" => kind.clone()).set(0.0);
+                }
+            }
+            for (kind, count) in &view.rejected_by_kind {
+                metrics::gauge!(M_CONFIG_REJECTED_RESOURCES, "kind" => kind.clone())
+                    .set(*count as f64);
+            }
+            labels.last_rejected_kinds = view.rejected_by_kind.keys().cloned().collect();
+        });
     }
 
     /// Record the outcome of one proxy request.
@@ -1417,6 +1521,85 @@ mod tests {
             "legacy duration series must stay a summary (quantiles), got:\n{out}"
         );
         assert!(out.contains("aisix_request_duration_seconds"));
+    }
+
+    fn config_metrics_view(source_kind: aisix_core::SourceKind) -> aisix_core::ConfigMetricsView {
+        aisix_core::ConfigMetricsView {
+            source_kind,
+            last_reload_successful: true,
+            last_reload_success_ts: Some(1_760_000_000),
+            reloads_total: 3,
+            reload_failures: std::collections::BTreeMap::new(),
+            rejected_by_kind: std::collections::BTreeMap::new(),
+            observed_revision: Some(42),
+            applied_revision: Some(42),
+            config_hash: Some("abc123".into()),
+            connected: Some(true),
+        }
+    }
+
+    #[test]
+    fn config_status_sync_renders_all_series_in_etcd_mode() {
+        let m = Metrics::new(false);
+        let mut view = config_metrics_view(aisix_core::SourceKind::Etcd);
+        view.last_reload_successful = false;
+        view.reload_failures.insert("validate", 2);
+        view.rejected_by_kind.insert("models".to_string(), 1);
+        m.sync_config_status(&view);
+        let out = m.render();
+
+        assert!(out.contains(&format!("{M_CONFIG_LAST_RELOAD_SUCCESSFUL} 0")));
+        assert!(out.contains(M_CONFIG_LAST_RELOAD_SUCCESS_TIMESTAMP));
+        assert!(out.contains(&format!("{M_CONFIG_RELOADS_TOTAL} 3")));
+        assert!(out.contains(&format!(
+            "{M_CONFIG_RELOAD_FAILURES_TOTAL}{{reason=\"validate\"}} 2"
+        )));
+        assert!(out.contains(&format!(
+            "{M_CONFIG_REJECTED_RESOURCES}{{kind=\"models\"}} 1"
+        )));
+        assert!(out.contains(&format!("{M_CONFIG_OBSERVED_REVISION} 42")));
+        assert!(out.contains(&format!("{M_CONFIG_APPLIED_REVISION} 42")));
+        assert!(out.contains(&format!("{M_CONFIG_HASH_INFO}{{hash=\"abc123\"}} 1")));
+        assert!(out.contains(&format!("{M_CONFIG_SOURCE_CONNECTED} 1")));
+    }
+
+    #[test]
+    fn config_status_sync_omits_etcd_only_series_in_file_mode() {
+        let m = Metrics::new(false);
+        let view = config_metrics_view(aisix_core::SourceKind::File);
+        m.sync_config_status(&view);
+        let out = m.render();
+        // Source-agnostic series still present.
+        assert!(out.contains(M_CONFIG_LAST_RELOAD_SUCCESSFUL));
+        assert!(out.contains(M_CONFIG_RELOADS_TOTAL));
+        // Etcd-only series absent in file mode.
+        assert!(!out.contains(M_CONFIG_OBSERVED_REVISION));
+        assert!(!out.contains(M_CONFIG_APPLIED_REVISION));
+        assert!(!out.contains(M_CONFIG_SOURCE_CONNECTED));
+    }
+
+    #[test]
+    fn config_status_sync_zeroes_stale_hash_and_rejected_labels() {
+        let m = Metrics::new(false);
+        let mut first = config_metrics_view(aisix_core::SourceKind::Etcd);
+        first.config_hash = Some("hash-A".into());
+        first.rejected_by_kind.insert("models".to_string(), 2);
+        m.sync_config_status(&first);
+
+        // The applied config changes and the models rejection clears.
+        let mut second = config_metrics_view(aisix_core::SourceKind::Etcd);
+        second.config_hash = Some("hash-B".into());
+        // rejected_by_kind empty now.
+        m.sync_config_status(&second);
+
+        let out = m.render();
+        // Exactly one live hash sample: old zeroed, new is 1.
+        assert!(out.contains(&format!("{M_CONFIG_HASH_INFO}{{hash=\"hash-A\"}} 0")));
+        assert!(out.contains(&format!("{M_CONFIG_HASH_INFO}{{hash=\"hash-B\"}} 1")));
+        // The cleared kind is zeroed, not left at its stale count.
+        assert!(out.contains(&format!(
+            "{M_CONFIG_REJECTED_RESOURCES}{{kind=\"models\"}} 0"
+        )));
     }
 
     /// Issue #408 audit MEDIUM-2: pin every boundary of

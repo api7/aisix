@@ -33,9 +33,11 @@
 //!   unique per kind.
 
 mod desugar;
+mod status;
 mod yaml;
 
 pub use desugar::{derive_id, FILE_RESOURCE_NAMESPACE};
+pub use status::load_resources_file_tracked;
 
 use serde_json::Value;
 use std::collections::BTreeMap;
