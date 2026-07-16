@@ -38,7 +38,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
   "info": {
     "title": "AISIX Admin API",
     "version": "dev",
-    "description": "The AISIX Admin API is the self-hosted management interface for configuring the gateway at runtime. Use it when you operate AISIX directly and need to create or update models, caller API keys, provider credentials, guardrails, cache policies, and observability exporters.\n\nManaged deployments do not expose this listener. Configure managed gateways through the AISIX managed control plane."
+    "description": "The AISIX Admin API is the self-hosted management interface for configuring the gateway at runtime. Use it when you operate AISIX directly and need to create or update models, caller API keys, provider credentials, guardrails, cache policies, and observability exporters.\n\nThe write endpoints (POST, PUT, DELETE) are deprecated in favor of declarative configuration: load resources from a `resources_file` (`resources.yaml`) or write them to etcd directly. Write endpoints remain functional, and every mutating response carries a `Deprecation` header (RFC 9745) plus a `Link` header with `rel=\"deprecation\"` pointing at the migration documentation. Read endpoints are not deprecated.\n\nManaged deployments do not expose this listener. Configure managed gateways through the AISIX managed control plane."
   },
   "paths": {
     "/livez": {
@@ -4123,6 +4123,7 @@ pub(crate) fn merged_openapi() -> &'static str {
         add_schema_defaults(&mut doc);
         add_schema_examples(&mut doc);
         document_former_apikeys_paths(&mut doc);
+        mark_admin_write_operations_deprecated(&mut doc);
         wrap_ref_siblings_for_redoc(&mut doc);
 
         serde_json::to_string(&doc).expect("merged OpenAPI must serialise")
@@ -4176,6 +4177,49 @@ fn document_former_apikeys_paths(doc: &mut Value) {
             }
         }
         doc["paths"][*former] = item;
+    }
+}
+
+/// Mark every mutating `/admin/v1/*` operation (POST/PUT/DELETE,
+/// rotate included) as `deprecated: true` and point its description at
+/// the declarative configuration paths. One programmatic pass instead
+/// of thirty hand-edited operations, mirroring the router-level header
+/// chokepoint: a newly documented write route picks the marking up
+/// automatically. Runs after [`document_former_apikeys_paths`] so the
+/// former `apikeys` spelling is covered too. Read operations and
+/// non-resource endpoints (playground, health, OpenAPI) are untouched.
+fn mark_admin_write_operations_deprecated(doc: &mut Value) {
+    const NOTE: &str = "**Deprecated write path**: configure resources declaratively \
+         instead, either through a `resources_file` (`resources.yaml`) or by writing \
+         to etcd directly. This endpoint remains functional; mutating responses carry \
+         a `Deprecation` header (RFC 9745) and a `Link` header with `rel=\"deprecation\"` \
+         pointing at the migration documentation.";
+
+    let Some(paths) = doc["paths"].as_object_mut() else {
+        return;
+    };
+    for (path, item) in paths.iter_mut() {
+        if !path.starts_with("/admin/v1/") {
+            continue;
+        }
+        let Some(ops) = item.as_object_mut() else {
+            continue;
+        };
+        for method in ["post", "put", "delete"] {
+            let Some(op) = ops.get_mut(method).and_then(Value::as_object_mut) else {
+                continue;
+            };
+            op.insert("deprecated".to_string(), Value::Bool(true));
+            match op.get_mut("description") {
+                Some(Value::String(description)) => {
+                    description.push_str("\n\n");
+                    description.push_str(NOTE);
+                }
+                _ => {
+                    op.insert("description".to_string(), Value::String(NOTE.to_string()));
+                }
+            }
+        }
     }
 }
 
@@ -4741,6 +4785,52 @@ mod tests {
         assert_eq!(
             actual, expected,
             "OpenAPI paths must match the admin router exactly; metrics live on the dedicated metrics listener"
+        );
+    }
+
+    #[tokio::test]
+    async fn openapi_marks_every_admin_write_operation_deprecated() {
+        let parsed: serde_json::Value =
+            serde_json::from_str(merged_openapi()).expect("merged_openapi must parse");
+        let paths = parsed["paths"]
+            .as_object()
+            .expect("paths must be an object");
+
+        let mut write_ops = 0;
+        for (path, item) in paths {
+            let item = item.as_object().expect("path item must be an object");
+            for (method, op) in item {
+                if method == "parameters" {
+                    continue;
+                }
+                let is_admin_write = path.starts_with("/admin/v1/")
+                    && matches!(method.as_str(), "post" | "put" | "delete");
+                if is_admin_write {
+                    write_ops += 1;
+                    assert_eq!(
+                        op["deprecated"], true,
+                        "{method} {path} is a resource write and must be marked deprecated"
+                    );
+                    let description = op["description"].as_str().unwrap_or_default();
+                    assert!(
+                        description.contains("resources_file"),
+                        "{method} {path} must point at the declarative configuration paths"
+                    );
+                } else {
+                    assert!(
+                        op.get("deprecated").is_none(),
+                        "{method} {path} is a read or non-resource operation and must NOT be marked deprecated"
+                    );
+                }
+            }
+        }
+        // 8 resource collections × (create + update + delete) + the
+        // api_keys rotate, plus the four write operations mirrored onto
+        // the former `apikeys` spelling. Update deliberately when the
+        // resource surface changes — like the exact path-set test above.
+        assert_eq!(
+            write_ops, 29,
+            "unexpected number of deprecated write operations"
         );
     }
 

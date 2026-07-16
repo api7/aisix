@@ -29,6 +29,13 @@
 //! [`ConfigStore`] trait; production wires an etcd-backed impl in a
 //! follow-up PR, tests use [`InMemoryStore`].
 //!
+//! The write endpoints above (POST/PUT/DELETE, including rotate) are
+//! deprecated in favor of the declarative configuration paths — a
+//! `resources_file` source (`resources.yaml`) or direct etcd writes.
+//! They remain functional; every mutating response carries the RFC 9745
+//! `Deprecation` header and a `rel="deprecation"` `Link` (stamped by
+//! [`deprecated_write_headers`] so new write routes can't omit them).
+//!
 //! Errors follow the simple admin envelope: `{"error_msg": "..."}`,
 //! distinct from the proxy's OpenAI-style envelope.
 
@@ -80,6 +87,22 @@ pub struct MetricsState {
 pub fn admin_openapi_json() -> &'static str {
     openapi::merged_openapi()
 }
+
+/// RFC 9745 `Deprecation` value for the Admin API write path: a
+/// structured-field date (RFC 9651 Section 3.3.7), as the RFC requires —
+/// the boolean form from earlier drafts is not valid. The timestamp is
+/// the release date of the file-based resource source (`resources_file`),
+/// the point at which declarative configuration became the recommended
+/// way to manage standalone resources; a past date means the write path
+/// "was deprecated at that date". It stays functional — this header is
+/// the in-band signal, not a removal.
+const ADMIN_WRITE_DEPRECATION: &str = "@1783929480";
+
+/// RFC 8288 `Link` with the `deprecation` relation type registered by
+/// RFC 9745 — human-readable documentation covering the declarative
+/// configuration paths that replace Admin API writes.
+const ADMIN_WRITE_DEPRECATION_LINK: &str =
+    "<https://docs.api7.ai/ai-gateway/getting-started/self-hosted-quickstart>; rel=\"deprecation\"";
 
 pub fn build_router(state: AdminState) -> Router {
     // Eagerly build the merged OpenAPI doc so any panic in schema
@@ -223,9 +246,60 @@ pub fn build_router(state: AdminState) -> Router {
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             file_managed_write_guard,
-        ));
+        ))
+        // Deprecation signal for the Admin API write path. Added after
+        // (= outside of) the file-managed guard so the guard's 409 file-
+        // managed responses carry the headers too.
+        .layer(axum::middleware::from_fn(deprecated_write_headers));
 
     router.with_state(state)
+}
+
+/// True for a mutating request against the `/admin/v1/*` resource
+/// surface — POST/PUT/DELETE, rotate included. GET/HEAD/OPTIONS are the
+/// read surface, and non-resource endpoints (playground, livez/readyz,
+/// openapi) never count. One predicate shared by the file-managed write
+/// guard and the deprecation-header layer so the two views of "a write"
+/// can't drift apart.
+fn is_admin_resource_write(method: &axum::http::Method, path: &str) -> bool {
+    use axum::http::Method;
+
+    !matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS)
+        && path.starts_with("/admin/v1/")
+}
+
+/// Stamp the deprecation signal onto every mutating `/admin/v1/*`
+/// response, whatever its status: one chokepoint above the whole
+/// resource router, so newly added write routes can't ship without it.
+/// Applies in both etcd mode and file mode (the file-managed 409
+/// carries it too). The read surface and non-resource endpoints pass
+/// through untouched.
+///
+/// Emits, per RFC 9745:
+/// - `Deprecation: @<sf-date>` ([`ADMIN_WRITE_DEPRECATION`])
+/// - `Link: <docs>; rel="deprecation"` ([`ADMIN_WRITE_DEPRECATION_LINK`])
+async fn deprecated_write_headers(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    use axum::http::{header, HeaderName, HeaderValue};
+
+    let is_write = is_admin_resource_write(req.method(), req.uri().path());
+    let mut resp = next.run(req).await;
+    if is_write {
+        let headers = resp.headers_mut();
+        headers.insert(
+            HeaderName::from_static("deprecation"),
+            HeaderValue::from_static(ADMIN_WRITE_DEPRECATION),
+        );
+        // `Link` is list-valued (RFC 8288) — append rather than insert
+        // so a handler-provided link relation is never clobbered.
+        headers.append(
+            header::LINK,
+            HeaderValue::from_static(ADMIN_WRITE_DEPRECATION_LINK),
+        );
+    }
+    resp
 }
 
 /// Reject mutating `/admin/v1/*` requests with a 409 when resources are
@@ -242,11 +316,9 @@ async fn file_managed_write_guard(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
-    use axum::http::Method;
     use axum::response::IntoResponse;
 
-    let is_read = matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS);
-    if !is_read && req.uri().path().starts_with("/admin/v1/") {
+    if is_admin_resource_write(req.method(), req.uri().path()) {
         if let Some(path) = state.file_managed_path.as_deref() {
             if auth::is_admin_authorized(req.headers(), &state.admin_keys) {
                 return AdminError::FileManaged(FileManagedStore::read_only_message(path))
@@ -2004,6 +2076,128 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ──────────────────── Write-path deprecation signal ────────────────────
+
+    fn assert_deprecation_headers(resp: &axum::http::Response<Body>, context: &str) {
+        let deprecation = resp
+            .headers()
+            .get("deprecation")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_else(|| panic!("{context}: missing Deprecation header"));
+        // RFC 9745: the value is a structured-field Date (`@<unix>`),
+        // pinned to the release that shipped the file-based source.
+        assert_eq!(deprecation, ADMIN_WRITE_DEPRECATION, "{context}");
+        assert!(deprecation.starts_with('@'), "{context}: not an sf-date");
+
+        let link = resp
+            .headers()
+            .get(axum::http::header::LINK)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_else(|| panic!("{context}: missing Link header"));
+        assert!(
+            link.contains("rel=\"deprecation\""),
+            "{context}: Link lacks the deprecation relation: {link}"
+        );
+        assert!(
+            link.contains("https://docs.api7.ai/"),
+            "{context}: Link must point at the published docs: {link}"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_write_responses_carry_rfc9745_deprecation_headers() {
+        // Representative create: 200 with both headers.
+        let state = build_state();
+        let app = build_router(state.clone());
+        let resp = run(
+            app,
+            auth_req("POST", "/admin/v1/models", Some(model_payload("dep"))),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_deprecation_headers(&resp, "POST /admin/v1/models");
+
+        // The signal covers the whole write path, not just the happy
+        // path: rotate (POST), a DELETE, and even a failed write (404)
+        // all carry it — the deprecation is a property of the endpoint,
+        // not of the outcome.
+        let app = build_router(state.clone());
+        let resp = run(
+            app,
+            auth_req("POST", "/admin/v1/api_keys/missing/rotate", None),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_deprecation_headers(&resp, "POST /admin/v1/api_keys/{id}/rotate");
+
+        // Former `apikeys` spelling is the same deprecated write path.
+        let app = build_router(state);
+        let resp = run(app, auth_req("DELETE", "/admin/v1/apikeys/missing", None)).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_deprecation_headers(&resp, "DELETE /admin/v1/apikeys/{id}");
+    }
+
+    #[tokio::test]
+    async fn file_managed_409_carries_the_deprecation_headers_too() {
+        let app = build_router(build_file_managed_state());
+        let resp = run(
+            app,
+            auth_req("POST", "/admin/v1/models", Some(model_payload("new"))),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert_deprecation_headers(&resp, "file-managed POST /admin/v1/models");
+    }
+
+    #[tokio::test]
+    async fn read_and_non_resource_responses_carry_no_deprecation_header() {
+        let state = build_state();
+
+        // Reads across the resource + status surface.
+        for uri in [
+            "/admin/v1/models",
+            "/admin/v1/models/status",
+            "/admin/v1/health",
+        ] {
+            let app = build_router(state.clone());
+            let resp = run(app, auth_req("GET", uri, None)).await;
+            assert_eq!(resp.status(), StatusCode::OK, "GET {uri}");
+            assert!(
+                resp.headers().get("deprecation").is_none(),
+                "GET {uri} must NOT carry a Deprecation header"
+            );
+        }
+
+        // Unauthenticated public surface.
+        let app = build_router(state.clone());
+        let req = Request::builder()
+            .uri("/admin/openapi.json")
+            .body(Body::empty())
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().get("deprecation").is_none());
+
+        // The playground is a POST on the admin listener but NOT part of
+        // the deprecated resource write path (501 here: no proxy router
+        // is wired in this test state).
+        let app = build_router(state);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/playground/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({"model": "m", "messages": []}).to_string(),
+            ))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+        assert!(
+            resp.headers().get("deprecation").is_none(),
+            "playground must NOT carry a Deprecation header"
+        );
     }
 
     #[tokio::test]

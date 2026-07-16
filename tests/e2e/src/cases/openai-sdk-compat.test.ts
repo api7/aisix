@@ -209,4 +209,45 @@ describe("openai SDK compat: drive gateway through real client", () => {
     expect(testCalls).toHaveLength(1);
     expect(testCalls[0]?.method).toBe("POST");
   });
+
+  // The deprecation signal is part of the admin-write contract this
+  // suite deliberately exercises: every mutating Admin API response
+  // must carry the `Deprecation` header — a structured-field date per
+  // RFC 9745 (https://www.rfc-editor.org/rfc/rfc9745), so `@<unix>`,
+  // not the draft-era boolean — plus a `Link` with rel="deprecation"
+  // pointing at the declarative-configuration docs. Reads carry
+  // neither: the read surface is not deprecated.
+  test("admin writes carry the RFC 9745 deprecation signal; reads do not", async (ctx) => {
+    if (!etcdReachable || !app || !nonStreamUpstream) {
+      ctx.skip();
+      return;
+    }
+
+    const auth = {
+      authorization: `Bearer ${app.adminKey}`,
+      "content-type": "application/json",
+    };
+    const write = await fetch(`${app.adminUrl}/admin/v1/provider_keys`, {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({
+        display_name: "sdk-compat-deprecation-probe-pk",
+        provider: "openai",
+        adapter: "openai",
+        secret: "sk-mock",
+        api_base: `${nonStreamUpstream.baseUrl}/v1`,
+      }),
+    });
+    expect(write.status).toBe(200);
+    expect(write.headers.get("deprecation")).toMatch(/^@\d+$/);
+    const link = write.headers.get("link") ?? "";
+    expect(link).toContain('rel="deprecation"');
+    expect(link).toMatch(/<https:\/\/[^>]+>/);
+
+    const read = await fetch(`${app.adminUrl}/admin/v1/provider_keys`, {
+      headers: { authorization: `Bearer ${app.adminKey}` },
+    });
+    expect(read.status).toBe(200);
+    expect(read.headers.get("deprecation")).toBeNull();
+  });
 });
