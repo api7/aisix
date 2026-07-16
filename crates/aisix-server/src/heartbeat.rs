@@ -83,6 +83,17 @@ pub type AppliedRevisionFetcher = Arc<dyn Fn() -> i64 + Send + Sync>;
 /// them as resettable, not lifetime totals.
 pub type ExporterHealthFetcher = Arc<dyn Fn() -> HashMap<String, SinkStatsSnapshot> + Send + Sync>;
 
+/// Per-tick source of the applied configuration hash — the sha256 the
+/// supervisor computed over the accepted (served) resource set
+/// (`ConfigStatus::applied_config_hash`, added in #774). Reported as
+/// `config_hash` so cp-api can diff the hash a DP node actually applied
+/// against the hash it expects that node to be serving (per-node config
+/// verification). Returning `None` (config not applied yet) or leaving
+/// the fetcher unwired (tests / managed configs) omits the field, so the
+/// legacy body shape is preserved and cp-api's tolerance of its absence
+/// is honoured.
+pub type ConfigHashFetcher = Arc<dyn Fn() -> Option<String> + Send + Sync>;
+
 /// File paths to the on-disk mTLS bundle the heartbeat client presents
 /// to cp-api. Same three files written by cert-bundle provisioning and
 /// re-used on every subsequent boot when the bundle is already on disk.
@@ -134,6 +145,11 @@ pub struct HeartbeatConfig {
     /// Optional source of per-exporter delivery counters. `None`
     /// reports an empty `exporter_health` array. See #519 D.2.
     pub exporter_health_fetcher: Option<ExporterHealthFetcher>,
+    /// Optional source of the supervisor's applied config hash. `None`
+    /// (tests / managed-mode configs without a supervisor wired in) omits
+    /// `config_hash` from the body — cp-api tolerates its absence. See
+    /// #774.
+    pub config_hash_fetcher: Option<ConfigHashFetcher>,
 }
 
 impl std::fmt::Debug for HeartbeatConfig {
@@ -156,6 +172,10 @@ impl std::fmt::Debug for HeartbeatConfig {
             .field(
                 "exporter_health_fetcher",
                 &self.exporter_health_fetcher.as_ref().map(|_| "<fn>"),
+            )
+            .field(
+                "config_hash_fetcher",
+                &self.config_hash_fetcher.as_ref().map(|_| "<fn>"),
             )
             .finish()
     }
@@ -183,6 +203,7 @@ impl HeartbeatConfig {
             rejection_fetcher: None,
             applied_revision_fetcher: None,
             exporter_health_fetcher: None,
+            config_hash_fetcher: None,
         }
     }
 
@@ -202,6 +223,12 @@ impl HeartbeatConfig {
     /// Wire the exporter delivery-counter source (#519 D.2).
     pub fn with_exporter_health_fetcher(mut self, fetcher: ExporterHealthFetcher) -> Self {
         self.exporter_health_fetcher = Some(fetcher);
+        self
+    }
+
+    /// Wire the supervisor's applied config-hash source (#774).
+    pub fn with_config_hash_fetcher(mut self, fetcher: ConfigHashFetcher) -> Self {
+        self.config_hash_fetcher = Some(fetcher);
         self
     }
 }
@@ -282,6 +309,15 @@ struct HeartbeatBody<'a> {
     /// against the revision returned by its own kine writes: a DP with
     /// `applied_revision >= write_revision` has seen that write.
     applied_revision: i64,
+    /// The sha256 the DP computed over its applied (served) config set
+    /// (#774). Omitted from the wire when the supervisor has not applied a
+    /// snapshot yet, or the fetcher isn't wired (tests / managed-mode
+    /// configs), so cp-api still sees the historical body shape — cp-api
+    /// records it on telemetry-bearing beats and tolerates its absence.
+    /// Present, it lets cp-api diff the hash a node applied against the
+    /// hash it expects that node to serve.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    config_hash: Option<String>,
     /// Per-exporter delivery counters (#519 D.2), sorted by exporter
     /// name. Always present; empty when no exporter pipeline has
     /// started. Counters reset when an exporter's pipeline is rebuilt
@@ -299,6 +335,12 @@ struct HeartbeatBody<'a> {
 /// already trims sink errors to 200 chars; this is the wire-side
 /// guarantee so a future verbose sink can't bloat the heartbeat.
 const EXPORTER_LAST_ERROR_MAX_CHARS: usize = 256;
+
+/// Defensive cap on the reported `config_hash` length. The applied hash
+/// is a 64-char sha256 hex string, so this never triggers in practice —
+/// it matches the cp-api ingestion contract (`config_hash` ≤ 128 chars)
+/// so a future hash-scheme change can't overflow the CP's column.
+const CONFIG_HASH_MAX_CHARS: usize = 128;
 
 /// On-the-wire shape of one exporter's delivery health (#519 D.2). Kept
 /// separate from `aisix_obs::SinkStatsSnapshot` so the obs crate's
@@ -365,6 +407,13 @@ async fn send(client: &reqwest::Client, cfg: &HeartbeatConfig, uptime: i64) -> a
         .as_ref()
         .map(|fetcher| fetcher())
         .unwrap_or(0);
+    let config_hash = cfg
+        .config_hash_fetcher
+        .as_ref()
+        .and_then(|fetcher| fetcher())
+        // Defensive clamp — the hash is 64 hex chars, but the CP column
+        // caps at 128 so never send more.
+        .map(|h| h.chars().take(CONFIG_HASH_MAX_CHARS).collect::<String>());
     let mut exporter_health: Vec<ExporterHealthWire> = cfg
         .exporter_health_fetcher
         .as_ref()
@@ -390,6 +439,7 @@ async fn send(client: &reqwest::Client, cfg: &HeartbeatConfig, uptime: i64) -> a
             version: &BUILD_VERSION,
             supported_guardrail_kinds: aisix_guardrails::supported_kinds(),
             applied_revision,
+            config_hash,
             exporter_health,
             rejected_resources: rejections,
         })
@@ -708,6 +758,81 @@ mod tests {
             .unwrap()
             .iter()
             .any(|k| k == "keyword"));
+        // No config-hash fetcher wired → the field stays off the wire so
+        // the legacy body shape is preserved (#774).
+        assert!(
+            body.get("config_hash").is_none(),
+            "config_hash must stay off the wire when no fetcher is wired",
+        );
+    }
+
+    /// #774: a telemetry-bearing beat carries the supervisor's applied
+    /// config hash so cp-api can diff expected-vs-reported config per
+    /// node. A normal 64-hex-char hash rides verbatim; an over-long value
+    /// is clamped to 128 chars (the cp-api ingestion contract).
+    #[tokio::test]
+    async fn send_includes_and_clamps_config_hash() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/dp/heartbeat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true
+            })))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mtls = write_test_bundle(dir.path());
+
+        // Real-shaped hash (64 hex chars) rides unchanged.
+        let hash64 = "a".repeat(64);
+        let cfg = cfg_with_bundle(format!("{}/dp/heartbeat", server.uri()), mtls.clone())
+            .with_config_hash_fetcher({
+                let h = hash64.clone();
+                Arc::new(move || Some(h.clone()))
+            });
+        send(&plain_client(), &cfg, 7).await.unwrap();
+
+        // A pathologically long value is clamped to 128 chars.
+        let cfg_long = cfg_with_bundle(format!("{}/dp/heartbeat", server.uri()), mtls)
+            .with_config_hash_fetcher(Arc::new(|| Some("b".repeat(300))));
+        send(&plain_client(), &cfg_long, 8).await.unwrap();
+
+        let received = server.received_requests().await.unwrap();
+        let b0: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
+        assert_eq!(b0["config_hash"], hash64);
+
+        let b1: serde_json::Value = serde_json::from_slice(&received[1].body).unwrap();
+        assert_eq!(b1["config_hash"].as_str().unwrap().len(), 128);
+        assert_eq!(b1["config_hash"], "b".repeat(128));
+    }
+
+    /// A wired fetcher that yields `None` (config not applied yet) still
+    /// omits `config_hash` — the CP treats absence and "no hash yet" the
+    /// same, and the legacy body shape is preserved.
+    #[tokio::test]
+    async fn send_omits_config_hash_when_fetcher_yields_none() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/dp/heartbeat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true
+            })))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mtls = write_test_bundle(dir.path());
+        let cfg = cfg_with_bundle(format!("{}/dp/heartbeat", server.uri()), mtls)
+            .with_config_hash_fetcher(Arc::new(|| None));
+        send(&plain_client(), &cfg, 7).await.unwrap();
+
+        let received = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
+        assert!(
+            body.get("config_hash").is_none(),
+            "a None fetcher result must omit config_hash from the wire",
+        );
     }
 
     /// #592: every heartbeat carries the per-boot instance identity —

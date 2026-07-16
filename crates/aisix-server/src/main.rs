@@ -712,6 +712,9 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     //   - applied_revision: the highest etcd revision the supervisor has
     //     applied, so cp-api can show "propagating…" until the DP catches
     //     up with a kine write (#519 B.3)
+    //   - config_hash: the hash of the applied (served) config set, so
+    //     cp-api can diff the hash a node reports against the hash it
+    //     expects that node to be serving (#774)
     //   - supported_guardrail_kinds + exporter_health (#519 B.6 / D.2)
     let heartbeat_task = heartbeat_cfg.map(|mut h| {
         // Heartbeat only exists in managed mode, which config
@@ -726,6 +729,10 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
         }));
         let watch_status = supervisor.watch_status();
         h = h.with_applied_revision_fetcher(Arc::new(move || watch_status.snapshot().revision));
+        let config_status_for_heartbeat = supervisor.config_status();
+        h = h.with_config_hash_fetcher(Arc::new(move || {
+            config_status_for_heartbeat.applied_config_hash()
+        }));
         let fan_out = proxy_state.otlp_fan_out.clone();
         h = h.with_exporter_health_fetcher(Arc::new(move || fan_out.exporter_stats()));
         heartbeat::spawn(h, cancel_rx.clone())

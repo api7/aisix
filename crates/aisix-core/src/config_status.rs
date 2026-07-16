@@ -387,6 +387,15 @@ impl ConfigStatus {
         self.inner.lock().unwrap().ever_applied
     }
 
+    /// The hash of the last applied (served) config snapshot, or `None`
+    /// when no snapshot has been applied yet this boot. A cheap targeted
+    /// read for callers that need only the hash — the heartbeat's
+    /// per-node config-verification field — without building the full
+    /// [`Self::view`] / [`Self::metrics`] snapshot.
+    pub fn applied_config_hash(&self) -> Option<String> {
+        self.inner.lock().unwrap().config_hash.clone()
+    }
+
     /// Point-in-time JSON view for `GET /status/config`.
     pub fn view(&self) -> ConfigStatusView {
         self.inner.lock().unwrap().view()
@@ -708,6 +717,31 @@ mod tests {
         assert_eq!(applied.resource_counts.get("models"), Some(&2));
         assert_eq!(applied.apply_seq, 1);
         assert!(v.last_failure.is_none());
+    }
+
+    #[test]
+    fn applied_config_hash_is_none_until_applied_then_tracks_latest() {
+        let cs = ConfigStatus::new(SourceKind::Etcd);
+        assert_eq!(cs.applied_config_hash(), None);
+        cs.record_load(LoadObservation {
+            source_hash: "h1".into(),
+            observed_revision: Some(1),
+            applied: Some(applied("h1", &[("models", 1)])),
+            rejected: vec![],
+            is_reload: true,
+            wholly_rejected: false,
+        });
+        assert_eq!(cs.applied_config_hash().as_deref(), Some("h1"));
+        // A later apply carrying a new hash is reflected.
+        cs.record_load(LoadObservation {
+            source_hash: "h2".into(),
+            observed_revision: Some(2),
+            applied: Some(applied("h2", &[("models", 1)])),
+            rejected: vec![],
+            is_reload: true,
+            wholly_rejected: false,
+        });
+        assert_eq!(cs.applied_config_hash().as_deref(), Some("h2"));
     }
 
     #[test]
