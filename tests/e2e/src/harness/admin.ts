@@ -8,6 +8,12 @@ export class AdminClient {
   constructor(
     private readonly baseUrl: string,
     private readonly adminKey: string,
+    /**
+     * Base URL of the dedicated metrics/status listener
+     * (`app.metricsUrl`). Required by `listModelStatuses`, which reads
+     * the per-model runtime health view from `GET /status/models` there.
+     */
+    private readonly metricsBaseUrl?: string,
   ) {}
 
   async createModel(
@@ -58,7 +64,25 @@ export class AdminClient {
   }
 
   async listModelStatuses(): Promise<Array<Record<string, unknown>>> {
-    return this.json<Array<Record<string, unknown>>>("GET", "/admin/v1/models/status");
+    // Per-model runtime health is an operational read served by the
+    // metrics/status listener (`GET /status/models`, unauthenticated —
+    // same trust domain as `/status/config`). Same JSON as the admin
+    // listener's `GET /admin/v1/models/status`; consumers keep their
+    // assertions while exercising the status-listener endpoint.
+    if (!this.metricsBaseUrl) {
+      throw new Error(
+        "listModelStatuses reads GET /status/models on the metrics/status listener — " +
+          "construct AdminClient with the metricsBaseUrl argument (app.metricsUrl)",
+      );
+    }
+    const res = await harnessRequest(`${this.metricsBaseUrl}/status/models`, {
+      method: "GET",
+    });
+    const text = await res.body.text();
+    if (res.statusCode >= 300) {
+      throw new Error(`GET /status/models → ${res.statusCode}: ${text.slice(0, 512)}`);
+    }
+    return JSON.parse(text) as Array<Record<string, unknown>>;
   }
 
   async json<T = Record<string, unknown>>(

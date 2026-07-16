@@ -71,17 +71,29 @@ pub use store::{ConfigStore, InMemoryStore, StoreError};
 use aisix_core::config::PrometheusConfig;
 use aisix_core::ConfigStatus;
 use aisix_obs::Metrics;
+use aisix_proxy::ModelRuntimeStatusTracker;
 use axum::routing::{get, post};
 use axum::{http::StatusCode, response::Response, Router};
 use std::sync::Arc;
 
 /// Shared state for the dedicated metrics/status listener: the Prometheus
-/// [`Metrics`] handle plus the load-observability [`ConfigStatus`]. Both are
-/// cheap to clone.
+/// [`Metrics`] handle, the load-observability [`ConfigStatus`], and the
+/// [`ModelsStatusState`] behind `GET /status/models`. All cheap to clone.
 #[derive(Clone)]
 pub struct MetricsState {
     pub metrics: Arc<Metrics>,
     pub config_status: ConfigStatus,
+    pub models_status: ModelsStatusState,
+}
+
+/// Sources behind `GET /status/models` on the metrics/status listener:
+/// the same resource store the admin surface reads plus the proxy's
+/// shared runtime status tracker, so the status-listener view renders
+/// from exactly the sources `GET /admin/v1/models/status` renders from.
+#[derive(Clone)]
+pub struct ModelsStatusState {
+    pub store: Arc<dyn ConfigStore>,
+    pub runtime_status_tracker: Option<Arc<ModelRuntimeStatusTracker>>,
 }
 
 pub fn admin_openapi_json() -> &'static str {
@@ -330,10 +342,11 @@ async fn file_managed_write_guard(
 }
 
 /// Build the router for the **dedicated** metrics/status listener — the
-/// Prometheus scrape endpoint at `prometheus.path`, plus the load-
-/// observability endpoints `GET /status/config` and `GET /status/ready`,
-/// backed by the shared [`Metrics`] and [`ConfigStatus`] handles. No admin
-/// state, no auth-protected routes, no playground.
+/// Prometheus scrape endpoint at `prometheus.path`, plus the operational
+/// read endpoints `GET /status/config`, `GET /status/ready`, and
+/// `GET /status/models`, backed by the shared [`Metrics`],
+/// [`ConfigStatus`], and [`ModelsStatusState`] handles. No admin state,
+/// no auth-protected routes, no playground.
 ///
 /// `aisix-server` binds this on `observability.metrics.prometheus.addr`
 /// whenever prometheus is enabled. This is the only metrics/status surface —
@@ -343,10 +356,12 @@ pub fn metrics_router(
     metrics: Arc<Metrics>,
     config_status: ConfigStatus,
     prometheus: &PrometheusConfig,
+    models_status: ModelsStatusState,
 ) -> Router {
     let state = MetricsState {
         metrics,
         config_status,
+        models_status,
     };
     Router::new()
         .route(
@@ -355,6 +370,7 @@ pub fn metrics_router(
         )
         .route("/status/config", get(status_config_handler))
         .route("/status/ready", get(status_ready_handler))
+        .route("/status/models", get(status_models_handler))
         .with_state(state)
 }
 
@@ -416,6 +432,72 @@ async fn status_ready_handler(
     }
 }
 
+/// Upper bound on the store read behind `GET /status/models`: the
+/// listener is unauthenticated and polled by probes and dashboards, so a
+/// stalled configuration store must not park those requests (or hold the
+/// shared store client) indefinitely — past this, the request answers
+/// the same fixed 500 a store error does.
+const STATUS_MODELS_STORE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The fixed store-failure answer for `GET /status/models`: this
+/// listener is unauthenticated, so backend detail (etcd endpoints,
+/// connection errors) stays in the server log instead of the response
+/// body. The admin-key-gated endpoint keeps its detailed envelope.
+fn status_models_store_failure() -> Response {
+    use axum::response::IntoResponse;
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        axum::Json(ErrorBody {
+            error_msg: "failed to list models".into(),
+        }),
+    )
+        .into_response()
+}
+
+/// `GET /status/models` — the per-model runtime health view (cooldown /
+/// background-check state) as an operational read on the status listener.
+/// Renders through [`models_status_handler::render_models_status`], the
+/// same render (and the same store + tracker handles) behind
+/// `GET /admin/v1/models/status`, so the two responses are identical
+/// while both exist. Unauthenticated like `/status/config` — it exposes
+/// the model catalog (ids and display names) and health states; restrict
+/// access at the network layer.
+///
+/// Store failures answer the fixed 500 from
+/// [`status_models_store_failure`], and the store read is bounded by
+/// [`STATUS_MODELS_STORE_TIMEOUT`] so a hung store degrades into that
+/// same answer instead of parking anonymous pollers.
+async fn status_models_handler(
+    axum::extract::State(state): axum::extract::State<MetricsState>,
+) -> Response {
+    use axum::response::IntoResponse;
+
+    let listed = tokio::time::timeout(
+        STATUS_MODELS_STORE_TIMEOUT,
+        state.models_status.store.list_models(),
+    )
+    .await;
+    let all_models = match listed {
+        Ok(Ok(models)) => models,
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, "GET /status/models: listing models failed");
+            return status_models_store_failure();
+        }
+        Err(_) => {
+            tracing::error!(
+                timeout = ?STATUS_MODELS_STORE_TIMEOUT,
+                "GET /status/models: listing models timed out"
+            );
+            return status_models_store_failure();
+        }
+    };
+    axum::Json(models_status_handler::render_models_status(
+        all_models,
+        state.models_status.runtime_status_tracker.as_deref(),
+    ))
+    .into_response()
+}
+
 fn normalized_prometheus_path(path: &str) -> String {
     let path = path.trim();
     if path.is_empty() {
@@ -473,6 +555,15 @@ mod tests {
         let handle = SnapshotHandle::new(AisixSnapshot::new());
         let store = InMemoryStore::new() as Arc<dyn ConfigStore>;
         AdminState::new(handle, store, &cfg())
+    }
+
+    /// `ModelsStatusState` over an empty in-memory store, for metrics
+    /// listener tests that don't exercise `/status/models`.
+    fn empty_models_status() -> ModelsStatusState {
+        ModelsStatusState {
+            store: InMemoryStore::new() as Arc<dyn ConfigStore>,
+            runtime_status_tracker: None,
+        }
     }
 
     fn model_payload(name: &str) -> Value {
@@ -587,6 +678,7 @@ mod tests {
                 path: "/metrics".into(),
                 addr: "0.0.0.0:9090".into(),
             },
+            empty_models_status(),
         );
 
         // The dedicated listener serves the prometheus scrape.
@@ -638,6 +730,7 @@ mod tests {
                 path: "internal/prom".into(),
                 addr: "0.0.0.0:9090".into(),
             },
+            empty_models_status(),
         );
 
         // Path is normalized to a leading slash and served there.
@@ -677,6 +770,7 @@ mod tests {
                 path: "/metrics".into(),
                 addr: "0.0.0.0:9090".into(),
             },
+            empty_models_status(),
         );
 
         // Before any config: 503 "no configuration available".
@@ -752,6 +846,7 @@ mod tests {
                 path: "/metrics".into(),
                 addr: "0.0.0.0:9090".into(),
             },
+            empty_models_status(),
         );
         let resp = run(
             app,
@@ -798,6 +893,7 @@ mod tests {
                 path: "/metrics".into(),
                 addr: "0.0.0.0:9090".into(),
             },
+            empty_models_status(),
         );
         let resp = run(
             app,
@@ -815,6 +911,268 @@ mod tests {
         assert!(text.contains("aisix_config_applied_revision 5"));
         assert!(text.contains("aisix_config_hash_info{hash=\"deadbeef\"} 1"));
         assert!(text.contains("aisix_config_source_connected 1"));
+    }
+
+    #[tokio::test]
+    async fn status_models_serves_the_admin_view_byte_for_byte() {
+        use aisix_core::resource::ResourceEntry;
+        use aisix_core::Model;
+        use aisix_proxy::ModelRuntimeStatusTracker;
+        use std::time::Duration;
+
+        let store = InMemoryStore::new() as Arc<dyn ConfigStore>;
+        let direct: Model = serde_json::from_value(model_payload("gpt4")).unwrap();
+        store
+            .put_model(ResourceEntry {
+                id: "direct-1".into(),
+                value: direct,
+                revision: 1,
+            })
+            .await
+            .unwrap();
+        let routing: Model = serde_json::from_value(json!({
+            "display_name": "router",
+            "routing": {
+                "targets": [{"model": "gpt4"}]
+            }
+        }))
+        .unwrap();
+        store
+            .put_model(ResourceEntry {
+                id: "routing-1".into(),
+                value: routing,
+                revision: 1,
+            })
+            .await
+            .unwrap();
+
+        let tracker = Arc::new(ModelRuntimeStatusTracker::new());
+        tracker.mark_cooldown("direct-1", Duration::from_secs(60), "upstream_rate_limited");
+
+        // Admin listener view (auth-protected).
+        let admin_app = build_router(
+            AdminState::new(
+                SnapshotHandle::new(AisixSnapshot::new()),
+                Arc::clone(&store),
+                &cfg(),
+            )
+            .with_runtime_status_tracker(Arc::clone(&tracker)),
+        );
+        let resp = run(admin_app, auth_req("GET", "/admin/v1/models/status", None)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let admin_bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+
+        // Status listener view — no auth header — over the SAME store +
+        // tracker handles, exactly how `aisix-server` wires standalone mode.
+        let metrics_app = metrics_router(
+            Arc::new(Metrics::new(false)),
+            aisix_core::ConfigStatus::new(aisix_core::SourceKind::Etcd),
+            &PrometheusConfig {
+                enabled: true,
+                path: "/metrics".into(),
+                addr: "0.0.0.0:9090".into(),
+            },
+            ModelsStatusState {
+                store,
+                runtime_status_tracker: Some(tracker),
+            },
+        );
+        let resp = run(
+            metrics_app,
+            Request::builder()
+                .uri("/status/models")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let status_bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+
+        assert_eq!(
+            admin_bytes, status_bytes,
+            "GET /status/models must serve the exact bytes of GET /admin/v1/models/status",
+        );
+
+        // Sanity on the shared body: cooldown state and the virtual row
+        // actually render.
+        let rows: Value = serde_json::from_slice(&status_bytes).unwrap();
+        let rows = rows.as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        let direct = rows.iter().find(|row| row["id"] == "direct-1").unwrap();
+        assert_eq!(direct["status"], "cooldown");
+        assert_eq!(direct["status_reason"], "upstream_rate_limited");
+        assert!(!direct["cooldown_until"].is_null());
+        let routing = rows.iter().find(|row| row["id"] == "routing-1").unwrap();
+        assert_eq!(routing["status"], "not_applicable");
+    }
+
+    #[tokio::test]
+    async fn admin_router_does_not_serve_status_models() {
+        // The operational read lives on the metrics/status listener; the
+        // admin listener keeps only its own `/admin/v1/models/status`.
+        let app = build_router(build_state());
+        let req = Request::builder()
+            .uri("/status/models")
+            .body(Body::empty())
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn status_models_store_failure_never_leaks_backend_detail() {
+        use aisix_core::resource::ResourceEntry;
+        use aisix_core::{
+            A2aAgent, ApiKey, CachePolicy, Guardrail, McpServer, Model, ObservabilityExporter,
+            ProviderKey,
+        };
+
+        // A store whose every call fails with backend detail an anonymous
+        // caller must never see (mimics an etcd outage: the client error
+        // names endpoints/addresses).
+        const LEAKY: &str = "connect to http://10.0.0.7:2379 refused";
+        struct FailingStore;
+
+        macro_rules! impl_failing_store {
+            ($( { $ty:ty, $put:ident, $get:ident, $list:ident, $delete:ident } )+) => {
+                #[async_trait::async_trait]
+                impl ConfigStore for FailingStore {
+                    $(
+                        async fn $put(&self, _entry: ResourceEntry<$ty>) -> Result<(), StoreError> {
+                            Err(StoreError::Backend(LEAKY.into()))
+                        }
+                        async fn $get(
+                            &self,
+                            _id: &str,
+                        ) -> Result<Option<ResourceEntry<$ty>>, StoreError> {
+                            Err(StoreError::Backend(LEAKY.into()))
+                        }
+                        async fn $list(&self) -> Result<Vec<ResourceEntry<$ty>>, StoreError> {
+                            Err(StoreError::Backend(LEAKY.into()))
+                        }
+                        async fn $delete(&self, _id: &str) -> Result<bool, StoreError> {
+                            Err(StoreError::Backend(LEAKY.into()))
+                        }
+                    )+
+                }
+            };
+        }
+        impl_failing_store! {
+            { Model, put_model, get_model, list_models, delete_model }
+            { ApiKey, put_apikey, get_apikey, list_apikeys, delete_apikey }
+            { ProviderKey, put_provider_key, get_provider_key, list_provider_keys, delete_provider_key }
+            { Guardrail, put_guardrail, get_guardrail, list_guardrails, delete_guardrail }
+            { CachePolicy, put_cache_policy, get_cache_policy, list_cache_policies, delete_cache_policy }
+            { ObservabilityExporter, put_observability_exporter, get_observability_exporter, list_observability_exporters, delete_observability_exporter }
+            { McpServer, put_mcp_server, get_mcp_server, list_mcp_servers, delete_mcp_server }
+            { A2aAgent, put_a2a_agent, get_a2a_agent, list_a2a_agents, delete_a2a_agent }
+        }
+
+        let app = metrics_router(
+            Arc::new(Metrics::new(false)),
+            aisix_core::ConfigStatus::new(aisix_core::SourceKind::Etcd),
+            &PrometheusConfig {
+                enabled: true,
+                path: "/metrics".into(),
+                addr: "0.0.0.0:9090".into(),
+            },
+            ModelsStatusState {
+                store: Arc::new(FailingStore),
+                runtime_status_tracker: None,
+            },
+        );
+        let resp = run(
+            app,
+            Request::builder()
+                .uri("/status/models")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            !body.contains("10.0.0.7") && !body.contains("connect"),
+            "unauthenticated status listener must not leak store backend detail: {body}",
+        );
+        assert_eq!(body, r#"{"error_msg":"failed to list models"}"#);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn status_models_answers_the_fixed_500_when_the_store_hangs() {
+        use aisix_core::resource::ResourceEntry;
+        use aisix_core::{
+            A2aAgent, ApiKey, CachePolicy, Guardrail, McpServer, Model, ObservabilityExporter,
+            ProviderKey,
+        };
+
+        // A store whose every call never resolves (mimics a blackholed
+        // etcd: the connection hangs instead of failing). The paused
+        // clock auto-advances past STATUS_MODELS_STORE_TIMEOUT, so the
+        // test asserts the timeout arm without real waiting.
+        struct HangingStore;
+
+        macro_rules! impl_hanging_store {
+            ($( { $ty:ty, $put:ident, $get:ident, $list:ident, $delete:ident } )+) => {
+                #[async_trait::async_trait]
+                impl ConfigStore for HangingStore {
+                    $(
+                        async fn $put(&self, _entry: ResourceEntry<$ty>) -> Result<(), StoreError> {
+                            std::future::pending().await
+                        }
+                        async fn $get(
+                            &self,
+                            _id: &str,
+                        ) -> Result<Option<ResourceEntry<$ty>>, StoreError> {
+                            std::future::pending().await
+                        }
+                        async fn $list(&self) -> Result<Vec<ResourceEntry<$ty>>, StoreError> {
+                            std::future::pending().await
+                        }
+                        async fn $delete(&self, _id: &str) -> Result<bool, StoreError> {
+                            std::future::pending().await
+                        }
+                    )+
+                }
+            };
+        }
+        impl_hanging_store! {
+            { Model, put_model, get_model, list_models, delete_model }
+            { ApiKey, put_apikey, get_apikey, list_apikeys, delete_apikey }
+            { ProviderKey, put_provider_key, get_provider_key, list_provider_keys, delete_provider_key }
+            { Guardrail, put_guardrail, get_guardrail, list_guardrails, delete_guardrail }
+            { CachePolicy, put_cache_policy, get_cache_policy, list_cache_policies, delete_cache_policy }
+            { ObservabilityExporter, put_observability_exporter, get_observability_exporter, list_observability_exporters, delete_observability_exporter }
+            { McpServer, put_mcp_server, get_mcp_server, list_mcp_servers, delete_mcp_server }
+            { A2aAgent, put_a2a_agent, get_a2a_agent, list_a2a_agents, delete_a2a_agent }
+        }
+
+        let app = metrics_router(
+            Arc::new(Metrics::new(false)),
+            aisix_core::ConfigStatus::new(aisix_core::SourceKind::Etcd),
+            &PrometheusConfig {
+                enabled: true,
+                path: "/metrics".into(),
+                addr: "0.0.0.0:9090".into(),
+            },
+            ModelsStatusState {
+                store: Arc::new(HangingStore),
+                runtime_status_tracker: None,
+            },
+        );
+        let resp = run(
+            app,
+            Request::builder()
+                .uri("/status/models")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert_eq!(body, r#"{"error_msg":"failed to list models"}"#);
     }
 
     #[tokio::test]

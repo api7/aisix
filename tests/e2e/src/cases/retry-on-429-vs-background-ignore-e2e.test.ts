@@ -64,7 +64,7 @@ describe("retry_on_429 vs background ignore e2e", () => {
     });
 
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    admin = new AdminClient(app.adminUrl, app.adminKey, app.metricsUrl);
     seed = new SeedClient(etcd, app.etcdPrefix);
 
     const primaryPk = await seed.createProviderKey({
