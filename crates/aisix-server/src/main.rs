@@ -805,6 +805,23 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
         ))),
         _ => None,
     };
+    // Per-model runtime health as an operational read on the metrics/status
+    // listener (`GET /status/models`). Standalone mode shares the admin
+    // surface's store handle, so the status-listener view and
+    // `GET /admin/v1/models/status` read the very same source; managed mode
+    // has no admin store and serves the applied snapshot through the same
+    // read-only view file mode uses (the path only appears in write
+    // rejections, which the read-only status listener never issues).
+    let status_models_state = aisix_admin::ModelsStatusState {
+        store: match &admin_store {
+            Some(store) => Arc::clone(store),
+            None => Arc::new(FileManagedStore::new(
+                snapshot_handle.clone(),
+                "the control plane",
+            )),
+        },
+        runtime_status_tracker: Some(runtime_status_tracker.clone()),
+    };
     let admin_serve_handle = if let Some(admin_store) = admin_store {
         let mut admin_state = AdminState::new(snapshot_handle.clone(), admin_store, &cfg.admin)
             // Share the health tracker so /admin/v1/health reflects live
@@ -867,8 +884,12 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
             // probe.
             std::net::TcpListener::bind(metrics_addr)
                 .map_err(|e| anyhow::anyhow!("metrics listener bind {metrics_addr} failed: {e}"))?;
-            let metrics_router =
-                aisix_admin::metrics_router(metrics.clone(), config_status.clone(), prom);
+            let metrics_router = aisix_admin::metrics_router(
+                metrics.clone(),
+                config_status.clone(),
+                prom,
+                status_models_state,
+            );
             Some(tokio::spawn(serve_http(
                 metrics_addr,
                 metrics_router,

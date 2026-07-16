@@ -75,7 +75,7 @@ describe("runtime status e2e", () => {
     });
 
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    admin = new AdminClient(app.adminUrl, app.adminKey, app.metricsUrl);
     seed = new SeedClient(etcd, app.etcdPrefix);
 
     const flakyPk = await seed.createProviderKey({

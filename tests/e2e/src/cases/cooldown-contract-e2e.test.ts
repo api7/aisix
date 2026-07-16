@@ -75,7 +75,7 @@ describe("cooldown contract (H1) — 401 cools down despite being non-retryable"
     });
 
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    admin = new AdminClient(app.adminUrl, app.adminKey, app.metricsUrl);
     seed = new SeedClient(etcd, app.etcdPrefix);
 
     const failPk = await seed.createProviderKey({
@@ -226,7 +226,7 @@ describe("cooldown contract (M1) — 429 cools down even when retry_on_429=false
     });
 
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    admin = new AdminClient(app.adminUrl, app.adminKey, app.metricsUrl);
     seed = new SeedClient(etcd, app.etcdPrefix);
 
     const rateLimitedPk = await seed.createProviderKey({
@@ -379,7 +379,7 @@ describe("cooldown contract (H2) — Retry-After header from upstream drives TTL
     });
 
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    admin = new AdminClient(app.adminUrl, app.adminKey, app.metricsUrl);
     seed = new SeedClient(etcd, app.etcdPrefix);
 
     const upstreamPk = await seed.createProviderKey({
@@ -517,7 +517,7 @@ describe("filter contract (H3) — all candidates unhealthy returns 503", () => 
     });
 
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    admin = new AdminClient(app.adminUrl, app.adminKey, app.metricsUrl);
     seed = new SeedClient(etcd, app.etcdPrefix);
 
     const aPk = await seed.createProviderKey({
@@ -647,7 +647,7 @@ describe("filter contract (H3 escape hatch) — try_anyway sends to known-bad", 
     });
 
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    admin = new AdminClient(app.adminUrl, app.adminKey, app.metricsUrl);
     seed = new SeedClient(etcd, app.etcdPrefix);
 
     const pk = await seed.createProviderKey({
@@ -766,7 +766,7 @@ describe("cooldown observability — a cooldown transition emits aisix_deploymen
     });
 
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    admin = new AdminClient(app.adminUrl, app.adminKey, app.metricsUrl);
     seed = new SeedClient(etcd, app.etcdPrefix);
 
     const failPk = await seed.createProviderKey({
@@ -959,7 +959,7 @@ describe("cooldown observability — the state gauge follows a target back into 
     });
 
     app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    admin = new AdminClient(app.adminUrl, app.adminKey, app.metricsUrl);
     seed = new SeedClient(etcd, app.etcdPrefix);
 
     const flakyPk = await seed.createProviderKey({
