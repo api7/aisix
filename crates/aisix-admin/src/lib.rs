@@ -432,36 +432,63 @@ async fn status_ready_handler(
     }
 }
 
+/// Upper bound on the store read behind `GET /status/models`: the
+/// listener is unauthenticated and polled by probes and dashboards, so a
+/// stalled configuration store must not park those requests (or hold the
+/// shared store client) indefinitely — past this, the request answers
+/// the same fixed 500 a store error does.
+const STATUS_MODELS_STORE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The fixed store-failure answer for `GET /status/models`: this
+/// listener is unauthenticated, so backend detail (etcd endpoints,
+/// connection errors) stays in the server log instead of the response
+/// body. The admin-key-gated endpoint keeps its detailed envelope.
+fn status_models_store_failure() -> Response {
+    use axum::response::IntoResponse;
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        axum::Json(ErrorBody {
+            error_msg: "failed to list models".into(),
+        }),
+    )
+        .into_response()
+}
+
 /// `GET /status/models` — the per-model runtime health view (cooldown /
 /// background-check state) as an operational read on the status listener.
 /// Renders through [`models_status_handler::render_models_status`], the
 /// same render (and the same store + tracker handles) behind
 /// `GET /admin/v1/models/status`, so the two responses are identical
 /// while both exist. Unauthenticated like `/status/config` — it exposes
-/// model names and health states, the same sensitivity class; restrict
+/// the model catalog (ids and display names) and health states; restrict
 /// access at the network layer.
 ///
-/// Store failures answer a fixed `{"error_msg": "failed to list models"}`
-/// 500: this listener is unauthenticated, so backend detail (etcd
-/// endpoints, connection errors) stays in the server log instead of the
-/// response body. The admin-key-gated endpoint keeps its detailed
-/// envelope.
+/// Store failures answer the fixed 500 from
+/// [`status_models_store_failure`], and the store read is bounded by
+/// [`STATUS_MODELS_STORE_TIMEOUT`] so a hung store degrades into that
+/// same answer instead of parking anonymous pollers.
 async fn status_models_handler(
     axum::extract::State(state): axum::extract::State<MetricsState>,
 ) -> Response {
     use axum::response::IntoResponse;
 
-    let all_models = match state.models_status.store.list_models().await {
-        Ok(models) => models,
-        Err(e) => {
+    let listed = tokio::time::timeout(
+        STATUS_MODELS_STORE_TIMEOUT,
+        state.models_status.store.list_models(),
+    )
+    .await;
+    let all_models = match listed {
+        Ok(Ok(models)) => models,
+        Ok(Err(e)) => {
             tracing::error!(error = %e, "GET /status/models: listing models failed");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                axum::Json(ErrorBody {
-                    error_msg: "failed to list models".into(),
-                }),
-            )
-                .into_response();
+            return status_models_store_failure();
+        }
+        Err(_) => {
+            tracing::error!(
+                timeout = ?STATUS_MODELS_STORE_TIMEOUT,
+                "GET /status/models: listing models timed out"
+            );
+            return status_models_store_failure();
         }
     };
     axum::Json(models_status_handler::render_models_status(
@@ -1069,6 +1096,82 @@ mod tests {
             !body.contains("10.0.0.7") && !body.contains("connect"),
             "unauthenticated status listener must not leak store backend detail: {body}",
         );
+        assert_eq!(body, r#"{"error_msg":"failed to list models"}"#);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn status_models_answers_the_fixed_500_when_the_store_hangs() {
+        use aisix_core::resource::ResourceEntry;
+        use aisix_core::{
+            A2aAgent, ApiKey, CachePolicy, Guardrail, McpServer, Model, ObservabilityExporter,
+            ProviderKey,
+        };
+
+        // A store whose every call never resolves (mimics a blackholed
+        // etcd: the connection hangs instead of failing). The paused
+        // clock auto-advances past STATUS_MODELS_STORE_TIMEOUT, so the
+        // test asserts the timeout arm without real waiting.
+        struct HangingStore;
+
+        macro_rules! impl_hanging_store {
+            ($( { $ty:ty, $put:ident, $get:ident, $list:ident, $delete:ident } )+) => {
+                #[async_trait::async_trait]
+                impl ConfigStore for HangingStore {
+                    $(
+                        async fn $put(&self, _entry: ResourceEntry<$ty>) -> Result<(), StoreError> {
+                            std::future::pending().await
+                        }
+                        async fn $get(
+                            &self,
+                            _id: &str,
+                        ) -> Result<Option<ResourceEntry<$ty>>, StoreError> {
+                            std::future::pending().await
+                        }
+                        async fn $list(&self) -> Result<Vec<ResourceEntry<$ty>>, StoreError> {
+                            std::future::pending().await
+                        }
+                        async fn $delete(&self, _id: &str) -> Result<bool, StoreError> {
+                            std::future::pending().await
+                        }
+                    )+
+                }
+            };
+        }
+        impl_hanging_store! {
+            { Model, put_model, get_model, list_models, delete_model }
+            { ApiKey, put_apikey, get_apikey, list_apikeys, delete_apikey }
+            { ProviderKey, put_provider_key, get_provider_key, list_provider_keys, delete_provider_key }
+            { Guardrail, put_guardrail, get_guardrail, list_guardrails, delete_guardrail }
+            { CachePolicy, put_cache_policy, get_cache_policy, list_cache_policies, delete_cache_policy }
+            { ObservabilityExporter, put_observability_exporter, get_observability_exporter, list_observability_exporters, delete_observability_exporter }
+            { McpServer, put_mcp_server, get_mcp_server, list_mcp_servers, delete_mcp_server }
+            { A2aAgent, put_a2a_agent, get_a2a_agent, list_a2a_agents, delete_a2a_agent }
+        }
+
+        let app = metrics_router(
+            Arc::new(Metrics::new(false)),
+            aisix_core::ConfigStatus::new(aisix_core::SourceKind::Etcd),
+            &PrometheusConfig {
+                enabled: true,
+                path: "/metrics".into(),
+                addr: "0.0.0.0:9090".into(),
+            },
+            ModelsStatusState {
+                store: Arc::new(HangingStore),
+                runtime_status_tracker: None,
+            },
+        );
+        let resp = run(
+            app,
+            Request::builder()
+                .uri("/status/models")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
         assert_eq!(body, r#"{"error_msg":"failed to list models"}"#);
     }
 

@@ -28,7 +28,7 @@ etcd-client.workspace = true
 aisix-obs = { path = "../aisix-obs" }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt"] }
+tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
 testcontainers.workspace = true
 aisix-gateway = { path = "../aisix-gateway" }
 aisix-provider-openai = { path = "../aisix-provider-openai" }
