@@ -200,16 +200,20 @@ mod tests {
         }
     }
 
-    /// AISIX-Cloud#1065: a real upstream error long enough to matter
-    /// must survive into telemetry whole. Azure's content-management
-    /// policy message is ~260 chars — the old 256-char cap clipped its
-    /// tail (the doc link that says what to actually do about it).
+    /// AISIX-Cloud#1065: an upstream error long enough to matter must
+    /// survive into telemetry whole. A content-filter refusal — the
+    /// shape that provoked the issue — runs past 256 chars, and the old
+    /// cap clipped its tail, which is exactly where the actionable part
+    /// (the link explaining the policy) sits. Hence a fixture that is
+    /// prose ending in a URL, not a run of filler: what has to survive
+    /// is the END of a realistically long message.
     #[test]
     fn long_upstream_message_is_not_clipped() {
-        let upstream = "The response was filtered due to the prompt triggering \
-             Azure OpenAI's content management policy. Please modify your prompt \
-             and retry. To learn more about our content filtering policies please \
-             read our documentation: https://go.microsoft.com/fwlink/?linkid=2198766";
+        let upstream = "The response was filtered because the prompt triggered \
+             the provider's content management policy. Please modify your prompt \
+             and retry. To learn more about the content filtering policies that \
+             apply here, read the documentation at \
+             https://upstream.example/docs/content-filtering";
         assert!(
             upstream.len() > 256,
             "fixture must exceed the old cap to be a regression test"
@@ -218,7 +222,7 @@ mod tests {
         let got = attempt_error_message(&upstream_status(upstream));
 
         assert!(
-            got.ends_with("https://go.microsoft.com/fwlink/?linkid=2198766"),
+            got.ends_with("https://upstream.example/docs/content-filtering"),
             "message tail was clipped: {got}"
         );
         assert!(got.contains(upstream), "message body was altered: {got}");
