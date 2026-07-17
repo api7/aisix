@@ -78,10 +78,18 @@ pub(crate) async fn realtime(
         Ok(prep) => {
             let state2 = state.clone();
             let client2 = client.clone();
-            ws.protocols(["realtime"])
-                .on_upgrade(move |socket| async move {
+            // `on_upgrade` runs the session on a detached task, so the
+            // request span has to be attached to the future rather than
+            // inherited — without it the session's guardrail checks log
+            // without a `request_id` (AISIX-Cloud#1060).
+            let span = tracing::Span::current();
+            ws.protocols(["realtime"]).on_upgrade(move |socket| {
+                use tracing::Instrument as _;
+                async move {
                     run_session(state2, prep, socket, client2, request_id, started).await;
-                })
+                }
+                .instrument(span)
+            })
         }
         Err(err) => {
             let status = err.status().as_u16();

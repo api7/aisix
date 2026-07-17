@@ -2182,7 +2182,11 @@ where
         (None, true) => Some(aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES),
         (None, false) => None,
     };
-    async_stream::stream! {
+    // Re-attach the request span: the body is polled after the request-id
+    // middleware returns, so the end-of-stream output-guardrail scan
+    // (`EosOutputScan::observe`) would otherwise log without a
+    // `request_id` (AISIX-Cloud#1060).
+    crate::request_id::in_request_span(async_stream::stream! {
         let mut guard = ResponsesUsageGuard {
             slot: Some((
                 on_complete,
@@ -2240,7 +2244,7 @@ where
                 hits,
             );
         }
-    }
+    })
 }
 
 /// Collect the assistant's output text from a Responses-API response object
