@@ -145,13 +145,24 @@ pub(crate) fn routing_error_class(err: &BridgeError) -> &'static str {
     }
 }
 
-/// Short, control-char-stripped error string for the per-attempt
-/// `error_message` telemetry field (#655). Capped like `sanitize_tag`.
+/// Upper bound on the per-attempt `error_message` telemetry field.
+///
+/// Sized as a backstop, not as the real limit: an `UpstreamStatus`
+/// message is already bounded to [`aisix_gateway::MAX_UPSTREAM_ERROR_MESSAGE_BYTES`]
+/// (1 KiB) by the bridge, so a cap above that byte budget leaves the
+/// bridge's bound as the only one that ever fires and the operator sees
+/// the whole message the bridge kept. A tighter cap silently clipped it
+/// a second time (AISIX-Cloud#1065).
+const MAX_ATTEMPT_ERROR_MESSAGE_CHARS: usize = 2048;
+
+/// Control-char-stripped error string for the per-attempt
+/// `error_message` telemetry field (#655), capped at
+/// [`MAX_ATTEMPT_ERROR_MESSAGE_CHARS`].
 pub(crate) fn attempt_error_message(err: &BridgeError) -> String {
     err.to_string()
         .chars()
         .filter(|c| !c.is_control())
-        .take(256)
+        .take(MAX_ATTEMPT_ERROR_MESSAGE_CHARS)
         .collect()
 }
 
@@ -172,4 +183,73 @@ pub(crate) fn attempt_error_from_proxy(err: &ProxyError) -> (String, String) {
 /// Milliseconds elapsed since `started`, saturating at `u32::MAX`.
 pub(crate) fn ms_since(started: Instant) -> u32 {
     started.elapsed().as_millis().min(u32::MAX as u128) as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aisix_gateway::{UpstreamWire, MAX_UPSTREAM_ERROR_MESSAGE_BYTES};
+
+    fn upstream_status(message: &str) -> BridgeError {
+        BridgeError::UpstreamStatus {
+            status: 400,
+            message: message.to_string(),
+            parsed: None,
+            wire: UpstreamWire::OpenAI,
+            retry_after: None,
+        }
+    }
+
+    /// AISIX-Cloud#1065: a real upstream error long enough to matter
+    /// must survive into telemetry whole. Azure's content-management
+    /// policy message is ~260 chars — the old 256-char cap clipped its
+    /// tail (the doc link that says what to actually do about it).
+    #[test]
+    fn long_upstream_message_is_not_clipped() {
+        let upstream = "The response was filtered due to the prompt triggering \
+             Azure OpenAI's content management policy. Please modify your prompt \
+             and retry. To learn more about our content filtering policies please \
+             read our documentation: https://go.microsoft.com/fwlink/?linkid=2198766";
+        assert!(
+            upstream.len() > 256,
+            "fixture must exceed the old cap to be a regression test"
+        );
+
+        let got = attempt_error_message(&upstream_status(upstream));
+
+        assert!(
+            got.ends_with("https://go.microsoft.com/fwlink/?linkid=2198766"),
+            "message tail was clipped: {got}"
+        );
+        assert!(got.contains(upstream), "message body was altered: {got}");
+    }
+
+    /// The cap sits above the bridge's own byte bound, so anything the
+    /// bridge already truncated passes through untouched — the bridge
+    /// stays the single limit that fires.
+    #[test]
+    fn cap_clears_the_bridge_message_bound() {
+        let bridge_capped = "x".repeat(MAX_UPSTREAM_ERROR_MESSAGE_BYTES);
+        let got = attempt_error_message(&upstream_status(&bridge_capped));
+        assert!(
+            got.contains(&bridge_capped),
+            "a bridge-bounded message must reach telemetry whole"
+        );
+    }
+
+    /// The cap is still a backstop: a bridge variant carrying an
+    /// unbounded string (`Config`, here) can't write unbounded telemetry.
+    #[test]
+    fn pathological_message_still_hits_the_backstop() {
+        let got = attempt_error_message(&BridgeError::Config("y".repeat(9000)));
+        assert_eq!(got.chars().count(), MAX_ATTEMPT_ERROR_MESSAGE_CHARS);
+    }
+
+    /// Control characters stay stripped — a multi-line upstream body
+    /// must not break the single-string telemetry field.
+    #[test]
+    fn control_chars_are_stripped() {
+        let got = attempt_error_message(&upstream_status("line one\nline\ttwo"));
+        assert!(got.ends_with("line onelinetwo"), "got: {got}");
+    }
 }
