@@ -282,19 +282,27 @@ impl AliyunTextModerationGuardrail {
             return (Err(AliyunFailure::ServerError), diag);
         }
         if !status.is_success() {
-            // Echo the provider's actual reason (e.g. `InvalidAccessKeyId.NotFound`
-            // or a 404 HTML page) — a bare status code can't tell a wrong access
-            // key from a wrong region/endpoint. The body is NOT parsed as
-            // `AliyunResponse` here: on an HTTP error Aliyun types `Code` as a
-            // symbolic string rather than the int it uses on HTTP 200, so the
-            // struct wouldn't deserialize. The raw capped body already carries
-            // the code and message verbatim.
+            // Report the provider's error CODE (e.g. `InvalidAccessKeyId.NotFound`)
+            // — a bare status can't tell a wrong access key from a wrong
+            // region/endpoint (#773). Only the code: an RPC-layer error body is
+            // untrusted free text that can quote the request back at us. A wrong
+            // access-key SECRET answers `SignatureDoesNotMatch` with the whole
+            // StringToSign in `Message`, which embeds our percent-encoded
+            // `ServiceParameters` — i.e. the caller's prompt, plus the AccessKey
+            // id. Logging the raw body therefore leaked every moderated prompt
+            // the moment someone fanned an access key wrong. `Code` is a symbolic
+            // error class from a closed vocabulary and structurally cannot carry
+            // request content, so it is the only field taken (#153).
+            //
+            // The body is still read (capped) rather than skipped, since the code
+            // lives in it; it is just never logged verbatim.
             let response_body = crate::read_error_body_capped(resp).await;
+            diag.code = extract_error_code(&response_body);
             tracing::error!(
                 row = %self.row_name,
                 aliyun_request_id = %diag.request_id,
                 http_status = status.as_u16(),
-                response_body = %response_body,
+                aliyun_code = %diag.code,
                 "aliyun TextModerationPlus returned 4xx — check region/access keys configuration",
             );
             return (Err(AliyunFailure::ConfigError), diag);
@@ -359,6 +367,36 @@ impl AliyunTextModerationGuardrail {
         } else {
             GuardrailVerdict::block(format!("aliyun text moderation unavailable ({tag})"))
         }
+    }
+}
+
+/// Best-effort pull of the error `Code` out of an Aliyun error body.
+///
+/// Two shapes are live, depending on which layer rejected the call:
+/// - RPC layer (bad key/signature) → JSON: `{"Code":"InvalidAccessKeyId.NotFound",…}`
+/// - endpoint layer (bad host/path) → XML: `<Error><Code>InvalidAction.NotFound</Code>…`
+///
+/// Empty when neither matches — the accompanying `http_status` still says
+/// something, and an unrecognized body is exactly the one we must not echo.
+///
+/// The XML arm is a substring scan rather than a parser: one tag out of a
+/// fixed vendor envelope doesn't justify an XML dependency, and a wrong guess
+/// costs a blank log field, not a leak.
+fn extract_error_code(body: &str) -> String {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
+        if let Some(code) = v.get("Code") {
+            // A string on this path; render a stray number rather than drop it.
+            return code
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| code.to_string());
+        }
+    }
+    match (body.find("<Code>"), body.find("</Code>")) {
+        (Some(start), Some(end)) if start + "<Code>".len() <= end => {
+            body[start + "<Code>".len()..end].to_owned()
+        }
+        _ => String::new(),
     }
 }
 
@@ -715,6 +753,29 @@ mod tests {
     }
 
     #[test]
+    fn extract_error_code_handles_both_live_error_shapes() {
+        // RPC layer → JSON. Body copied from a live green-cip 404.
+        assert_eq!(
+            extract_error_code(
+                r#"{"RequestId":"x","Message":"Specified access key is not found.","Code":"InvalidAccessKeyId.NotFound"}"#
+            ),
+            "InvalidAccessKeyId.NotFound"
+        );
+        // Endpoint layer → XML. Body copied from a live green-cip bad-path 404.
+        assert_eq!(
+            extract_error_code(
+                "<?xml version='1.0' encoding='UTF-8'?><Error><RequestId>x</RequestId>\
+                 <Code>InvalidAction.NotFound</Code><Message>Specified api is not found.</Message></Error>"
+            ),
+            "InvalidAction.NotFound"
+        );
+        // Neither shape → empty, never a guess at the raw text.
+        assert_eq!(extract_error_code("<html>502 Bad Gateway</html>"), "");
+        assert_eq!(extract_error_code(""), "");
+        assert_eq!(extract_error_code(r#"{"no_code_here":1}"#), "");
+    }
+
+    #[test]
     fn percent_encode_matches_aliyun_rules() {
         assert_eq!(percent_encode("a b"), "a%20b");
         assert_eq!(percent_encode("/"), "%2F");
@@ -946,8 +1007,8 @@ mod tests {
     #[tokio::test]
     async fn error_paths_log_provider_diagnostics() {
         // 1. A wrong access key: green-cip answers 4xx (the customer saw 404)
-        //    with a body naming the cause. Without echoing it the operator only
-        //    sees a bare status code (AISIX-Cloud#1030 follow-up).
+        //    with a body naming the cause. Without the code the operator only
+        //    sees a bare status (AISIX-Cloud#1030 follow-up).
         {
             let server = MockServer::start().await;
             Mock::given(method("POST"))
@@ -965,13 +1026,58 @@ mod tests {
             })
             .await;
             assert!(
-                logged.contains("response_body") && logged.contains("InvalidAccessKeyId.NotFound"),
-                "4xx log must echo the provider's actual reason; got: {logged}"
+                logged.contains("aliyun_code=InvalidAccessKeyId.NotFound"),
+                "4xx log must name the provider's error code; got: {logged}"
             );
         }
 
-        // 2. A pathological oversized 4xx body: the marker sits well past the
-        //    log cap, so if it shows up we buffered/logged more than we should.
+        // 2. The reason a 4xx body is never logged verbatim: a wrong access-key
+        //    SECRET answers `SignatureDoesNotMatch` quoting the whole
+        //    StringToSign, which embeds the percent-encoded ServiceParameters —
+        //    the caller's prompt — plus the AccessKey id. Body copied from a
+        //    live green-cip response. Only `Code` may survive into a log (#153).
+        {
+            let server = MockServer::start().await;
+            let string_to_sign = "POST&%2F&AccessKeyId%3DLTAI_LEAKED_KEY_ID%26Action%3D\
+                 TextModerationPlus%26ServiceParameters%3D%257B%2522content%2522%253A\
+                 %2520%2522CANARY_CALLER_PROMPT%2522%257D%26Version%3D2022-03-02";
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                    "RequestId": "SIG-ERR-1",
+                    "Code": "SignatureDoesNotMatch",
+                    "Message": format!(
+                        "Specified signature is not matched with our calculation. \
+                         server string to sign is:{string_to_sign}"
+                    ),
+                    "HostId": "green-cip.cn-shanghai.aliyuncs.com",
+                })))
+                .mount(&server)
+                .await;
+            let uri = server.uri();
+            let logged = capture_logs(|| async {
+                let g = build(&uri, "high", false);
+                assert!(g.check_input(&req("x")).await.is_block());
+            })
+            .await;
+            assert!(
+                logged.contains("aliyun_code=SignatureDoesNotMatch"),
+                "the error code must still reach the operator; got: {logged}"
+            );
+            for leak in [
+                "CANARY_CALLER_PROMPT",
+                "LTAI_LEAKED_KEY_ID",
+                "string to sign",
+                "ServiceParameters",
+            ] {
+                assert!(
+                    !logged.contains(leak),
+                    "a 4xx body must never be echoed — leaked {leak:?}; got: {logged}"
+                );
+            }
+        }
+
+        // 2b. An unparseable 4xx body yields no code rather than a raw echo: an
+        //     unrecognized body is exactly the one we can't vouch for.
         {
             let server = MockServer::start().await;
             let filler = "X".repeat(crate::MAX_ERROR_BODY_LOG_BYTES + 4_000);
@@ -988,12 +1094,12 @@ mod tests {
             })
             .await;
             assert!(
-                logged.contains("XXXX"),
-                "the head of the body must be logged"
+                logged.contains("http_status=400"),
+                "the status still has to be reported; got: {logged}"
             );
             assert!(
-                !logged.contains("__TAIL_MARKER__"),
-                "the logged body must be capped, not echoed in full",
+                !logged.contains("XXXX") && !logged.contains("__TAIL_MARKER__"),
+                "no part of an unrecognized body may be echoed; got: {logged}"
             );
         }
 

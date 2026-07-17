@@ -38,6 +38,38 @@ const CALLER_KEY_HASH = createHash("sha256")
 
 const RISKY_MARKER = "aliyunreqidmarker";
 
+// Anthropic-shaped stream carrying the marker, for the /v1/messages generator.
+const ANTHROPIC_STREAM_EVENTS = [
+  JSON.stringify({
+    type: "message_start",
+    message: {
+      id: "msg_reqid",
+      role: "assistant",
+      content: [],
+      model: "claude-3-5-haiku-20241022",
+      stop_reason: null,
+      usage: { input_tokens: 5, output_tokens: 1 },
+    },
+  }),
+  JSON.stringify({
+    type: "content_block_start",
+    index: 0,
+    content_block: { type: "text", text: "" },
+  }),
+  JSON.stringify({
+    type: "content_block_delta",
+    index: 0,
+    delta: { type: "text_delta", text: `here is ${RISKY_MARKER} in the stream` },
+  }),
+  JSON.stringify({ type: "content_block_stop", index: 0 }),
+  JSON.stringify({
+    type: "message_delta",
+    delta: { stop_reason: "end_turn" },
+    usage: { output_tokens: 12 },
+  }),
+  JSON.stringify({ type: "message_stop" }),
+];
+
 // Fixed per service, so a log line proves WHICH upstream call it came from
 // rather than just that some id was copied through.
 const INPUT_REQUEST_ID = "ALIYUN-INPUT-REQ-0001";
@@ -142,6 +174,7 @@ describe("aliyun guardrail e2e: upstream RequestId is preserved and correlatable
   let app: SpawnedApp | undefined;
   let benignUpstream: OpenAiUpstream | undefined;
   let streamUpstream: OpenAiUpstream | undefined;
+  let anthropicStreamUpstream: OpenAiUpstream | undefined;
   let aliyun: AliyunMock | undefined;
   let seed: SeedClient | undefined;
   let etcdReachable = false;
@@ -183,6 +216,13 @@ describe("aliyun guardrail e2e: upstream RequestId is preserved and correlatable
       eventDelayMs: 50,
     });
 
+    // Anthropic-shaped upstream for the /v1/messages passthrough generator —
+    // a structurally different builder from chat's, wired the same way.
+    anthropicStreamUpstream = await startOpenAiUpstream({
+      streamEvents: ANTHROPIC_STREAM_EVENTS,
+      eventDelayMs: 2,
+    });
+
     // A block logs at info; the harness default is warn.
     app = await spawnApp({ extraEnv: { RUST_LOG: "info" } });
     seed = new SeedClient(etcd, app.etcdPrefix);
@@ -211,9 +251,25 @@ describe("aliyun guardrail e2e: upstream RequestId is preserved and correlatable
       provider_key_id: streamPk.id,
     });
 
+    const anthropicPk = await seed.createProviderKey({
+      display_name: "aliyun-reqid-msg-pk",
+      secret: "sk-mock",
+      api_base: anthropicStreamUpstream.baseUrl,
+    });
+    await seed.createModel({
+      display_name: "aliyun-reqid-msg-e2e",
+      provider: "anthropic",
+      model_name: "claude-3-5-haiku-20241022",
+      provider_key_id: anthropicPk.id,
+    });
+
     await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
-      allowed_models: ["aliyun-reqid-e2e", "aliyun-reqid-stream-e2e"],
+      allowed_models: [
+        "aliyun-reqid-e2e",
+        "aliyun-reqid-stream-e2e",
+        "aliyun-reqid-msg-e2e",
+      ],
     });
 
     await seed.createGuardrail({
@@ -231,21 +287,9 @@ describe("aliyun guardrail e2e: upstream RequestId is preserved and correlatable
       window_size: 16,
       window_overlap_size: 4,
     });
-  });
 
-  afterAll(async () => {
-    await app?.exit();
-    await benignUpstream?.close();
-    await streamUpstream?.close();
-    await aliyun?.close();
-  });
-
-  test("input block: one log line joins x-aisix-request-id to Aliyun's RequestId", async (ctx) => {
-    if (!etcdReachable || !app) {
-      ctx.skip();
-      return;
-    }
-
+    // Gate the whole suite on the guardrail being live, so no test depends on
+    // an earlier one having waited.
     await waitConfigPropagation(async () => {
       const probe = await fetch(`${app!.proxyUrl}/v1/chat/completions`, {
         method: "POST",
@@ -260,6 +304,21 @@ describe("aliyun guardrail e2e: upstream RequestId is preserved and correlatable
       });
       return probe.status === 422;
     });
+  });
+
+  afterAll(async () => {
+    await app?.exit();
+    await benignUpstream?.close();
+    await streamUpstream?.close();
+    await anthropicStreamUpstream?.close();
+    await aliyun?.close();
+  });
+
+  test("input block: one log line joins x-aisix-request-id to Aliyun's RequestId", async (ctx) => {
+    if (!etcdReachable || !app) {
+      ctx.skip();
+      return;
+    }
 
     const res = await fetch(`${app.proxyUrl}/v1/chat/completions`, {
       method: "POST",
@@ -333,6 +392,9 @@ describe("aliyun guardrail e2e: upstream RequestId is preserved and correlatable
     const wire = await res.text();
     expect(wire).toContain("event: error");
     expect(wire).not.toContain(RISK_WORDS);
+    // Same envelope contract as the non-streaming path: the upstream id is
+    // ours to log, not the caller's to see.
+    expect(wire).not.toContain(OUTPUT_REQUEST_ID);
 
     // The output check runs inside the SSE generator, which hyper polls
     // after `ensure_request_id` has already returned. Without the span being
@@ -344,6 +406,43 @@ describe("aliyun guardrail e2e: upstream RequestId is preserved and correlatable
         l.includes(`request_id=${gatewayRequestId}`) &&
         l.includes(`aliyun_request_id=${OUTPUT_REQUEST_ID}`),
       "the streamed-output block line joining the gateway and Aliyun request ids",
+    );
+  });
+
+  // A second, structurally different generator. Chat's builder passing does
+  // not prove /v1/messages' does — each is a separate call site, and a missing
+  // one fails silently (uncorrelated logs, green tests).
+  test("streamed /v1/messages output block keeps the request span too", async (ctx) => {
+    if (!etcdReachable || !app) {
+      ctx.skip();
+      return;
+    }
+
+    const res = await fetch(`${app.proxyUrl}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-api-key": CALLER_PLAINTEXT },
+      body: JSON.stringify({
+        model: "aliyun-reqid-msg-e2e",
+        max_tokens: 64,
+        messages: [{ role: "user", content: "tell me something" }],
+        stream: true,
+      }),
+    });
+    expect(res.status).toBe(200);
+
+    const gatewayRequestId = res.headers.get("x-aisix-request-id");
+    expect(gatewayRequestId).toBeTruthy();
+
+    const wire = await res.text();
+    expect(wire).not.toContain(RISK_WORDS);
+    expect(wire).not.toContain(OUTPUT_REQUEST_ID);
+
+    await waitForLogLine(
+      app,
+      (l) =>
+        l.includes(`request_id=${gatewayRequestId}`) &&
+        l.includes(`aliyun_request_id=${OUTPUT_REQUEST_ID}`),
+      "the /v1/messages streamed-output block line joining both request ids",
     );
   });
 });
