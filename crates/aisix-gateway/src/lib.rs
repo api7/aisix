@@ -12,6 +12,7 @@
 //!   that dispatches `ChatFormat` to the right `Bridge`.
 //! - [`sse`] — a provider-agnostic SSE line decoder. Bridges that stream
 //!   over SSE feed it raw bytes and pull typed events back out.
+//! - [`credential`] — cache keys for credential-derived upstream tokens.
 //!
 //! The concrete HTTP transport lives in the provider crates — keeping
 //! this crate free of `reqwest` at the public-API level makes it testable
@@ -22,6 +23,7 @@
 
 pub mod bridge;
 pub mod chat;
+pub mod credential;
 pub mod hub;
 pub mod sse;
 
@@ -34,5 +36,6 @@ pub use chat::{
     ChatChunk, ChatDelta, ChatFormat, ChatMessage, ChatResponse, EmbeddingObject, EmbeddingRequest,
     EmbeddingResponse, EmbeddingUsage, EmbeddingVector, FinishReason, Role, UsageStats,
 };
+pub use credential::credential_fingerprint;
 pub use hub::Hub;
 pub use sse::{SseDecoder, SseEvent};
