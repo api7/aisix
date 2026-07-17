@@ -1229,7 +1229,10 @@ pub fn build_responses_bridge_stream(
             yield Ok(b);
         }
     };
-    axum::body::Body::from_stream(stream)
+    // Re-attach the request span: the body is polled after the request-id
+    // middleware returns, so the end-of-stream output-guardrail check
+    // would otherwise log without a `request_id` (AISIX-Cloud#1060).
+    axum::body::Body::from_stream(crate::request_id::in_request_span(stream))
 }
 
 /// Responses-API SSE `error` frame for an output-guardrail block. Carries the

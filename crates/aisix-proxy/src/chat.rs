@@ -4311,10 +4311,16 @@ where
         // there with whatever StreamCompletion has been captured up
         // to that point.
     };
-    DeliveryCounter {
+    // Hyper polls this generator after the request-id middleware has
+    // returned, so re-attach the request span here — while we're still
+    // on the handler's stack and it is current. Without it the
+    // end-of-stream output-guardrail checks below log without a
+    // `request_id` and can't be traced back to the caller's
+    // `x-aisix-request-id` (AISIX-Cloud#1060).
+    crate::request_id::in_request_span(DeliveryCounter {
         inner: Box::pin(inner),
         delivered,
-    }
+    })
 }
 
 /// Stream wrapper that increments `delivered` on every `poll_next ->

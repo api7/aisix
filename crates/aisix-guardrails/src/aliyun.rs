@@ -19,6 +19,13 @@
 //!   "Result": [ { "Label": "..." } ] }, "RequestId": "..." }
 //! ```
 //!
+//! `Code` is typed inconsistently and the difference matters: on HTTP 200
+//! it is an integer (`200`, or a business error such as `400` "service is
+//! invalid"), but on an HTTP error it is a symbolic string
+//! (`"InvalidAccessKeyId.NotFound"`). Only the HTTP-200 shape is
+//! deserialized as [`AliyunResponse`]; the error shape is logged as a raw
+//! capped body.
+//!
 //! Block decision: the returned `RiskLevel` rank (none<low<medium<high)
 //! reaches the configured `risk_level_threshold`.
 //!
@@ -137,9 +144,38 @@ impl AliyunTextModerationGuardrail {
         // already windows to MAX_CONTENT_CHARS; non-streaming long inputs
         // are clamped (the leading content carries the risk in practice).
         let content: String = text.chars().take(MAX_CONTENT_CHARS).collect();
-        match self.call(service, &content, session_id).await {
+        let (outcome, diag) = self.call(service, &content, session_id).await;
+        match outcome {
             Ok(level) => {
-                if risk_rank(&level) >= self.threshold_rank {
+                let blocked = risk_rank(&level) >= self.threshold_rank;
+                // The upstream diagnostics land here, once, with the
+                // verdict known — rather than at each exit of `call()`,
+                // which can't see it. A block is what an operator traces
+                // back from a caller's 422, so it logs at info (the
+                // default level); a clean pass would be one line per
+                // request, so it stays at debug.
+                if blocked {
+                    tracing::info!(
+                        row = %self.row_name,
+                        service,
+                        aliyun_request_id = %diag.request_id,
+                        aliyun_code = %diag.code,
+                        aliyun_risk_level = %diag.risk_level,
+                        aliyun_labels = %diag.labels_field(),
+                        "aliyun text moderation blocked content",
+                    );
+                } else {
+                    tracing::debug!(
+                        row = %self.row_name,
+                        service,
+                        aliyun_request_id = %diag.request_id,
+                        aliyun_code = %diag.code,
+                        aliyun_risk_level = %diag.risk_level,
+                        aliyun_labels = %diag.labels_field(),
+                        "aliyun text moderation passed content",
+                    );
+                }
+                if blocked {
                     GuardrailVerdict::block(format!(
                         "aliyun text moderation: risk level {} >= threshold (row: {})",
                         level, self.row_name
@@ -148,18 +184,24 @@ impl AliyunTextModerationGuardrail {
                     GuardrailVerdict::Allow
                 }
             }
-            Err(failure) => self.handle_failure(failure, fail_open),
+            Err(failure) => self.handle_failure(failure, &diag, fail_open),
         }
     }
 
     /// Sign + POST one `TextModerationPlus` call; return the response
-    /// `RiskLevel` (lowercased, `"none"` when absent).
+    /// `RiskLevel` (lowercased, `"none"` when absent) alongside whatever
+    /// upstream diagnostics the call yielded.
+    ///
+    /// Diagnostics come back on BOTH arms on purpose: the failure arms are
+    /// exactly the ones an operator needs `aliyun_request_id` for, and
+    /// returning them rather than logging in place lets the one call site
+    /// log once with the verdict attached (AISIX-Cloud#1060).
     async fn call(
         &self,
         service: &str,
         content: &str,
         session_id: Option<&str>,
-    ) -> Result<String, AliyunFailure> {
+    ) -> (Result<String, AliyunFailure>, AliyunDiagnostics) {
         let mut svc_params = serde_json::Map::new();
         svc_params.insert(
             "content".into(),
@@ -219,69 +261,104 @@ impl AliyunTextModerationGuardrail {
             .body(body)
             .send();
 
+        // No response means no diagnostics to report: an id Aliyun never
+        // sent can't be invented. `request_id` stays empty and the failure
+        // bucket carries the whole story.
         let resp = match tokio::time::timeout(self.timeout, future).await {
-            Err(_elapsed) => return Err(AliyunFailure::Timeout),
-            Ok(Err(_e)) => return Err(AliyunFailure::IoError),
+            Err(_elapsed) => return (Err(AliyunFailure::Timeout), AliyunDiagnostics::default()),
+            Ok(Err(_e)) => return (Err(AliyunFailure::IoError), AliyunDiagnostics::default()),
             Ok(Ok(r)) => r,
         };
 
+        // Read the id off the headers up front: it survives every path
+        // below, including the ones where the body is unusable.
+        let mut diag = AliyunDiagnostics::from_headers(resp.headers());
+
         let status = resp.status();
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            return Err(AliyunFailure::Throttled);
+            return (Err(AliyunFailure::Throttled), diag);
         }
         if status.is_server_error() {
-            return Err(AliyunFailure::ServerError);
+            return (Err(AliyunFailure::ServerError), diag);
         }
         if !status.is_success() {
-            // Echo the provider's actual reason (e.g. `InvalidAccessKeyId.NotFound`
-            // or a 404 HTML page) — a bare status code can't tell a wrong access
-            // key from a wrong region/endpoint.
-            let response_body = crate::read_error_body_capped(resp).await;
+            // Report the provider's error CODE (e.g. `InvalidAccessKeyId.NotFound`)
+            // — a bare status can't tell a wrong access key from a wrong
+            // region/endpoint (#773). Only the code: an RPC-layer error body is
+            // untrusted free text that can quote the request back at us. A wrong
+            // access-key SECRET answers `SignatureDoesNotMatch` with the whole
+            // StringToSign in `Message`, which embeds our percent-encoded
+            // `ServiceParameters` — i.e. the caller's prompt, plus the AccessKey
+            // id. Logging the raw body therefore leaked every moderated prompt
+            // the moment someone fanned an access key wrong. `Code` is a symbolic
+            // error class from a closed vocabulary and structurally cannot carry
+            // request content, so it is the only field taken (#153).
+            //
+            // The body is still read (capped) rather than skipped, since the code
+            // lives in it; it is just never logged verbatim.
+            let mut resp = resp;
+            let response_body =
+                crate::read_body_capped(&mut resp, MAX_ERROR_BODY_PARSE_BYTES).await;
+            diag.code = extract_error_code(&response_body);
             tracing::error!(
                 row = %self.row_name,
+                aliyun_request_id = %diag.request_id,
                 http_status = status.as_u16(),
-                response_body = %response_body,
+                aliyun_code = %diag.code,
                 "aliyun TextModerationPlus returned 4xx — check region/access keys configuration",
             );
-            return Err(AliyunFailure::ConfigError);
+            return (Err(AliyunFailure::ConfigError), diag);
         }
 
-        let body: AliyunResponse = resp.json().await.map_err(|_| AliyunFailure::ServerError)?;
+        let body: AliyunResponse = match resp.json().await {
+            Ok(b) => b,
+            Err(_) => return (Err(AliyunFailure::MalformedResponse), diag),
+        };
+        diag.absorb_body(&body);
 
         // Aliyun signals app-level errors via the JSON `Code` (200 = OK)
         // even on HTTP 200.
-        match body.code {
-            200 => Ok(body
-                .data
-                .and_then(|d| d.risk_level)
-                .unwrap_or_else(|| "none".to_owned())
-                .to_lowercase()),
+        let outcome = match body.code {
+            200 => Ok(if diag.risk_level.is_empty() {
+                "none".to_owned()
+            } else {
+                diag.risk_level.to_lowercase()
+            }),
             408 | 401 | 403 | 400 => {
                 tracing::error!(
                     row = %self.row_name,
-                    aliyun_code = body.code,
-                    aliyun_message =
-                        %crate::truncate_error_body_for_log(body.message.as_deref().unwrap_or("")),
+                    aliyun_request_id = %diag.request_id,
+                    aliyun_code = %diag.code,
+                    aliyun_message = %diag.message_field(),
                     "aliyun TextModerationPlus auth/permission error — check access keys",
                 );
                 Err(AliyunFailure::ConfigError)
             }
-            other => {
+            _ => {
                 tracing::warn!(
                     row = %self.row_name,
-                    aliyun_code = other,
+                    aliyun_request_id = %diag.request_id,
+                    aliyun_code = %diag.code,
+                    aliyun_message = %diag.message_field(),
                     "aliyun TextModerationPlus non-200 Code",
                 );
                 Err(AliyunFailure::ServerError)
             }
-        }
+        };
+        (outcome, diag)
     }
 
-    fn handle_failure(&self, failure: AliyunFailure, fail_open: bool) -> GuardrailVerdict {
+    fn handle_failure(
+        &self,
+        failure: AliyunFailure,
+        diag: &AliyunDiagnostics,
+        fail_open: bool,
+    ) -> GuardrailVerdict {
         let tag = failure.bypass_tag();
         if !matches!(failure, AliyunFailure::ConfigError) {
             tracing::warn!(
                 row = %self.row_name,
+                aliyun_request_id = %diag.request_id,
                 failure = ?failure,
                 fail_open,
                 "aliyun text moderation call failed",
@@ -292,6 +369,52 @@ impl AliyunTextModerationGuardrail {
         } else {
             GuardrailVerdict::block(format!("aliyun text moderation unavailable ({tag})"))
         }
+    }
+}
+
+/// How much of an error body to read when digging the `Code` out of it.
+///
+/// Far above the crate's log-snippet cap, and deliberately: `SignatureDoesNotMatch`
+/// quotes the whole StringToSign back, and `Code` is the LAST member of the JSON
+/// object, after that echo. Measured against the live endpoint, a 1 980-char
+/// Chinese prompt (just under `MAX_CONTENT_CHARS`) produces a 30 457-byte body
+/// with `Code` at offset 30 426 — the content is percent-encoded twice on the way
+/// in, roughly 15 bytes per source char. At the 2 048-byte log cap the JSON is
+/// truncated mid-`Message`, parses as nothing, and the most common
+/// misconfiguration there is — a wrong access-key secret — would report no code
+/// at all. 64 KiB covers the 2 000-char cap even at 4 bytes per char.
+///
+/// Only ever held transiently to pull one symbolic token out; nothing of it is
+/// logged.
+const MAX_ERROR_BODY_PARSE_BYTES: usize = 64 * 1024;
+
+/// Best-effort pull of the error `Code` out of an Aliyun error body.
+///
+/// Two shapes are live, depending on which layer rejected the call:
+/// - RPC layer (bad key/signature) → JSON: `{"Code":"InvalidAccessKeyId.NotFound",…}`
+/// - endpoint layer (bad host/path) → XML: `<Error><Code>InvalidAction.NotFound</Code>…`
+///
+/// Empty when neither matches — the accompanying `http_status` still says
+/// something, and an unrecognized body is exactly the one we must not echo.
+///
+/// The XML arm is a substring scan rather than a parser: one tag out of a
+/// fixed vendor envelope doesn't justify an XML dependency, and a wrong guess
+/// costs a blank log field, not a leak.
+fn extract_error_code(body: &str) -> String {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
+        if let Some(code) = v.get("Code") {
+            // A string on this path; render a stray number rather than drop it.
+            return code
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| code.to_string());
+        }
+    }
+    match (body.find("<Code>"), body.find("</Code>")) {
+        (Some(start), Some(end)) if start + "<Code>".len() <= end => {
+            body[start + "<Code>".len()..end].to_owned()
+        }
+        _ => String::new(),
     }
 }
 
@@ -367,6 +490,11 @@ enum AliyunFailure {
     Throttled,
     IoError,
     ServerError,
+    /// HTTP 2xx whose body wasn't the documented JSON. Distinct from
+    /// `ServerError` so triage isn't told "5xx" for a response that in
+    /// fact arrived intact and merely didn't parse (AISIX-Cloud#1060) —
+    /// the two want different fixes.
+    MalformedResponse,
     ConfigError,
 }
 
@@ -376,8 +504,91 @@ impl AliyunFailure {
             Self::Timeout => "aliyun_timeout",
             Self::Throttled => "aliyun_throttled",
             Self::IoError | Self::ServerError => "aliyun_5xx",
+            Self::MalformedResponse => "aliyun_bad_response",
             Self::ConfigError => "aliyun_config_error",
         }
+    }
+}
+
+/// The `x-acs-request-id` response header. Every Alibaba Cloud OpenAPI
+/// response carries it — verified against the live `green-cip` endpoint on
+/// 2xx, on a JSON business error, and on 400/404 responses whose body is
+/// XML rather than JSON. It is therefore a strictly more reliable source
+/// for the id than the body's `RequestId`, which is unreachable exactly
+/// when the body doesn't parse.
+const ACS_REQUEST_ID_HEADER: &str = "x-acs-request-id";
+
+/// What one `TextModerationPlus` call reported about itself, for operator
+/// triage (AISIX-Cloud#1060).
+///
+/// Provider metadata ONLY. The moderation result echoes the offending text
+/// back in `Data.Result[].RiskWords` / `RiskPositions`; per #153 none of
+/// that may reach a log, so this type deliberately has nowhere to put it.
+/// `Label` is the matched CATEGORY (e.g. `violent_incidents`), not the
+/// matched content, and is safe.
+#[derive(Debug, Default, Clone, PartialEq)]
+struct AliyunDiagnostics {
+    /// Aliyun's own request id, for looking the call up in the Aliyun
+    /// console. Named `aliyun_request_id` in logs — never `request_id`,
+    /// which is the gateway's own id (`x-aisix-request-id`) and is
+    /// supplied by the request-scoped tracing span.
+    ///
+    /// Empty only when no HTTP response arrived at all (timeout, connect
+    /// failure), which the failure bucket names.
+    request_id: String,
+    /// Business `Code` from the response body: `200` on success, or e.g.
+    /// `400` ("service is invalid"). Empty when the body didn't parse.
+    /// Rendered as a string because the same field is an integer on an
+    /// HTTP-200 body but a symbolic code (`InvalidAccessKeyId.NotFound`)
+    /// on an HTTP-error body.
+    code: String,
+    /// Body `Message` — the provider's own explanation ("OK", "service is
+    /// invalid"). Capped for logging like any provider-supplied string.
+    message: String,
+    /// `Data.RiskLevel` — `high` / `medium` / `low` / `none`.
+    risk_level: String,
+    /// `Data.Result[].Label` — the matched categories. Plural: one prompt
+    /// commonly trips several (`inappropriate_oral` + `violent_incidents`).
+    labels: Vec<String>,
+}
+
+impl AliyunDiagnostics {
+    /// Seed from the response headers, before the body is consumed — so
+    /// the id survives a body that never parses.
+    fn from_headers(headers: &reqwest::header::HeaderMap) -> Self {
+        Self {
+            request_id: headers
+                .get(ACS_REQUEST_ID_HEADER)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_owned(),
+            ..Self::default()
+        }
+    }
+
+    /// Fold in everything the parsed body adds.
+    fn absorb_body(&mut self, body: &AliyunResponse) {
+        // Header and body carry the same id; the header already won.
+        // Fall back for a server that somehow omits the header.
+        if self.request_id.is_empty() {
+            self.request_id = body.request_id.clone().unwrap_or_default();
+        }
+        self.code = body.code.to_string();
+        self.message = body.message.clone().unwrap_or_default();
+        if let Some(data) = body.data.as_ref() {
+            self.risk_level = data.risk_level.clone().unwrap_or_default();
+            self.labels = data.result.iter().filter_map(|r| r.label.clone()).collect();
+        }
+    }
+
+    /// The `Label` list as one log-safe field.
+    fn labels_field(&self) -> String {
+        self.labels.join(",")
+    }
+
+    /// `Message`, capped like any other provider-supplied log string.
+    fn message_field(&self) -> &str {
+        crate::truncate_error_body_for_log(&self.message)
     }
 }
 
@@ -385,6 +596,8 @@ impl AliyunFailure {
 
 #[derive(Deserialize)]
 struct AliyunResponse {
+    #[serde(rename = "RequestId", default)]
+    request_id: Option<String>,
     #[serde(rename = "Code", default)]
     code: i32,
     #[serde(rename = "Message", default)]
@@ -397,6 +610,20 @@ struct AliyunResponse {
 struct AliyunData {
     #[serde(rename = "RiskLevel", default)]
     risk_level: Option<String>,
+    /// One entry per matched category. Only `Label` is read: the sibling
+    /// `RiskWords` / `RiskPositions` fields echo the offending text back
+    /// verbatim (a real `high` response carries
+    /// `"RiskWords": "傻逼,弄死你,死你全家"`), and #153 keeps matched
+    /// content out of logs. Deserializing only what we log means a future
+    /// edit can't casually leak them.
+    #[serde(rename = "Result", default)]
+    result: Vec<AliyunResult>,
+}
+
+#[derive(Deserialize)]
+struct AliyunResult {
+    #[serde(rename = "Label", default)]
+    label: Option<String>,
 }
 
 // --- Guardrail trait impl --------------------------------------------------
@@ -541,6 +768,29 @@ mod tests {
         assert!(risk_rank("medium") < risk_rank("high"));
         assert_eq!(risk_rank("HIGH"), 3, "case-insensitive");
         assert_eq!(risk_rank("garbage"), 0, "unknown ranks as none");
+    }
+
+    #[test]
+    fn extract_error_code_handles_both_live_error_shapes() {
+        // RPC layer → JSON. Body copied from a live green-cip 404.
+        assert_eq!(
+            extract_error_code(
+                r#"{"RequestId":"x","Message":"Specified access key is not found.","Code":"InvalidAccessKeyId.NotFound"}"#
+            ),
+            "InvalidAccessKeyId.NotFound"
+        );
+        // Endpoint layer → XML. Body copied from a live green-cip bad-path 404.
+        assert_eq!(
+            extract_error_code(
+                "<?xml version='1.0' encoding='UTF-8'?><Error><RequestId>x</RequestId>\
+                 <Code>InvalidAction.NotFound</Code><Message>Specified api is not found.</Message></Error>"
+            ),
+            "InvalidAction.NotFound"
+        );
+        // Neither shape → empty, never a guess at the raw text.
+        assert_eq!(extract_error_code("<html>502 Bad Gateway</html>"), "");
+        assert_eq!(extract_error_code(""), "");
+        assert_eq!(extract_error_code(r#"{"no_code_here":1}"#), "");
     }
 
     #[test]
@@ -723,6 +973,10 @@ mod tests {
         let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let subscriber = tracing_subscriber::fmt()
             .with_ansi(false)
+            // The clean-pass diagnostics land at DEBUG (one line per
+            // request is too noisy for the default level), so widen the
+            // capture past the builder's INFO default to see them.
+            .with_max_level(tracing::Level::DEBUG)
             .with_writer(BufWriter(buf.clone()))
             .finish();
         {
@@ -733,15 +987,46 @@ mod tests {
         String::from_utf8(bytes).unwrap()
     }
 
-    // The three error-body log scenarios live in ONE test on purpose: the
-    // capture uses a thread-local default subscriber (`set_default`), so two
-    // capture tests running in parallel would race over it. Kept sequential
-    // here, at most one capturing subscriber is ever installed process-wide.
+    /// Body of a real `high` verdict, trimmed to the fields we deserialize
+    /// plus the ones we must NOT log. Shapes and values are copied from a
+    /// live `TextModerationPlus` response: two `Result` entries (one prompt
+    /// commonly trips several categories) and the `RiskWords` /
+    /// `RiskPositions` siblings that echo the offending text back.
+    fn risky_body_with_matched_content() -> serde_json::Value {
+        json!({
+            "Code": 200,
+            "Message": "OK",
+            "RequestId": "019F6ED5-91BE-5AB0-8411-96308CEC81F1",
+            "Data": {
+                "RiskLevel": "high",
+                "Result": [
+                    {
+                        "Label": "inappropriate_oral",
+                        "Confidence": 100.0,
+                        "Description": "疑似低俗口头语内容",
+                        "RiskWords": "傻逼,弄死你,死你全家",
+                        "RiskPositions": [{"StartPos": 3, "EndPos": 5, "RiskWord": "傻逼"}]
+                    },
+                    {
+                        "Label": "violent_incidents",
+                        "Confidence": 100.0,
+                        "Description": "疑似极端主义内容",
+                        "RiskWords": "弄死"
+                    }
+                ]
+            }
+        })
+    }
+
+    // Every log-capturing scenario lives in ONE test on purpose: the capture
+    // uses a thread-local default subscriber (`set_default`), so two capture
+    // tests running in parallel would race over it. Kept sequential here, at
+    // most one capturing subscriber is ever installed process-wide.
     #[tokio::test]
     async fn error_paths_log_provider_diagnostics() {
         // 1. A wrong access key: green-cip answers 4xx (the customer saw 404)
-        //    with a body naming the cause. Without echoing it the operator only
-        //    sees a bare status code (AISIX-Cloud#1030 follow-up).
+        //    with a body naming the cause. Without the code the operator only
+        //    sees a bare status (AISIX-Cloud#1030 follow-up).
         {
             let server = MockServer::start().await;
             Mock::given(method("POST"))
@@ -759,13 +1044,96 @@ mod tests {
             })
             .await;
             assert!(
-                logged.contains("response_body") && logged.contains("InvalidAccessKeyId.NotFound"),
-                "4xx log must echo the provider's actual reason; got: {logged}"
+                logged.contains("aliyun_code=InvalidAccessKeyId.NotFound"),
+                "4xx log must name the provider's error code; got: {logged}"
             );
         }
 
-        // 2. A pathological oversized 4xx body: the marker sits well past the
-        //    log cap, so if it shows up we buffered/logged more than we should.
+        // 2. The reason a 4xx body is never logged verbatim: a wrong access-key
+        //    SECRET answers `SignatureDoesNotMatch` quoting the whole
+        //    StringToSign, which embeds the percent-encoded ServiceParameters —
+        //    the caller's prompt — plus the AccessKey id. Body copied from a
+        //    live green-cip response. Only `Code` may survive into a log (#153).
+        {
+            let server = MockServer::start().await;
+            let string_to_sign = "POST&%2F&AccessKeyId%3DLTAI_LEAKED_KEY_ID%26Action%3D\
+                 TextModerationPlus%26ServiceParameters%3D%257B%2522content%2522%253A\
+                 %2520%2522CANARY_CALLER_PROMPT%2522%257D%26Version%3D2022-03-02";
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                    "RequestId": "SIG-ERR-1",
+                    "Code": "SignatureDoesNotMatch",
+                    "Message": format!(
+                        "Specified signature is not matched with our calculation. \
+                         server string to sign is:{string_to_sign}"
+                    ),
+                    "HostId": "green-cip.cn-shanghai.aliyuncs.com",
+                })))
+                .mount(&server)
+                .await;
+            let uri = server.uri();
+            let logged = capture_logs(|| async {
+                let g = build(&uri, "high", false);
+                assert!(g.check_input(&req("x")).await.is_block());
+            })
+            .await;
+            assert!(
+                logged.contains("aliyun_code=SignatureDoesNotMatch"),
+                "the error code must still reach the operator; got: {logged}"
+            );
+            for leak in [
+                "CANARY_CALLER_PROMPT",
+                "LTAI_LEAKED_KEY_ID",
+                "string to sign",
+                "ServiceParameters",
+            ] {
+                assert!(
+                    !logged.contains(leak),
+                    "a 4xx body must never be echoed — leaked {leak:?}; got: {logged}"
+                );
+            }
+        }
+
+        // 2a. The same error at realistic prompt length. `Code` is the last
+        //     member, after a StringToSign echo that runs ~15 bytes per source
+        //     char, so a body carrying a 2 000-char prompt puts it ~30 KB in.
+        //     Reading only the log-snippet cap would truncate mid-`Message`,
+        //     parse nothing, and report no code for the single most common
+        //     misconfiguration.
+        {
+            let server = MockServer::start().await;
+            // Mirrors the live shape: RequestId, then the huge Message, then Code.
+            let echo = "%2522%E4%25BD%25A0".repeat(2_000);
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                    "RequestId": "BIG-SIG-ERR",
+                    "Message": format!(
+                        "Specified signature is not matched with our calculation. \
+                         server string to sign is:POST&%2F&ServiceParameters%3D{echo}"
+                    ),
+                    "HostId": "green-cip.cn-shanghai.aliyuncs.com",
+                    "Code": "SignatureDoesNotMatch",
+                })))
+                .mount(&server)
+                .await;
+            let uri = server.uri();
+            let logged = capture_logs(|| async {
+                let g = build(&uri, "high", false);
+                assert!(g.check_input(&req("x")).await.is_block());
+            })
+            .await;
+            assert!(
+                logged.contains("aliyun_code=SignatureDoesNotMatch"),
+                "the code must survive a body big enough to hold a real prompt; got: {logged}"
+            );
+            assert!(
+                !logged.contains("string to sign") && !logged.contains("ServiceParameters"),
+                "reading more of the body must not mean logging it; got: {logged}"
+            );
+        }
+
+        // 2b. An unparseable 4xx body yields no code rather than a raw echo: an
+        //     unrecognized body is exactly the one we can't vouch for.
         {
             let server = MockServer::start().await;
             let filler = "X".repeat(crate::MAX_ERROR_BODY_LOG_BYTES + 4_000);
@@ -782,12 +1150,12 @@ mod tests {
             })
             .await;
             assert!(
-                logged.contains("XXXX"),
-                "the head of the body must be logged"
+                logged.contains("http_status=400"),
+                "the status still has to be reported; got: {logged}"
             );
             assert!(
-                !logged.contains("__TAIL_MARKER__"),
-                "the logged body must be capped, not echoed in full",
+                !logged.contains("XXXX") && !logged.contains("__TAIL_MARKER__"),
+                "no part of an unrecognized body may be echoed; got: {logged}"
             );
         }
 
@@ -812,6 +1180,230 @@ mod tests {
                 logged.contains("aliyun_message")
                     && logged.contains("no permission for llm_response_moderation"),
                 "app-level error log must echo the Aliyun Message; got: {logged}"
+            );
+        }
+    }
+
+    // --- #1060: upstream diagnostics on every path -------------------------
+    //
+    // Same one-capture-at-a-time constraint as the test above, so these also
+    // share a single test body. Each scenario asserts what an operator needs
+    // to trace a caller's 422 back to a record in the Aliyun console.
+    #[tokio::test]
+    async fn upstream_diagnostics_are_logged_on_every_path() {
+        // 1. A block: the case an operator actually traces. The response is
+        //    a real `high` body, so this doubles as the no-leak assertion —
+        //    RiskWords/RiskPositions must not reach the log even though the
+        //    provider sent them.
+        {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(risky_body_with_matched_content())
+                        .insert_header("x-acs-request-id", "019F6ED5-91BE-5AB0-8411-96308CEC81F1"),
+                )
+                .mount(&server)
+                .await;
+            let uri = server.uri();
+            let logged = capture_logs(|| async {
+                let g = build(&uri, "high", true);
+                assert!(g.check_input(&req("危险内容")).await.is_block());
+            })
+            .await;
+
+            assert!(
+                logged.contains("aliyun_request_id=019F6ED5-91BE-5AB0-8411-96308CEC81F1"),
+                "a block must log the Aliyun request id; got: {logged}"
+            );
+            assert!(
+                logged.contains("aliyun_risk_level=high"),
+                "a block must log the returned RiskLevel; got: {logged}"
+            );
+            assert!(
+                logged.contains("aliyun_labels=inappropriate_oral,violent_incidents"),
+                "a block must log every matched Label; got: {logged}"
+            );
+            assert!(
+                logged.contains("aliyun_code=200"),
+                "a block must log the business Code; got: {logged}"
+            );
+            // #153: the categories are metadata, the matched words are the
+            // caller's content. Only the former may be logged.
+            for leak in ["傻逼", "弄死你", "死你全家", "RiskWords", "RiskPositions"] {
+                assert!(
+                    !logged.contains(leak),
+                    "matched content {leak:?} must never reach a log; got: {logged}"
+                );
+            }
+        }
+
+        // 2. A clean pass still reports its id, at debug — the id has to be
+        //    retrievable for a request nobody blocked, without spending a
+        //    default-level line on every request.
+        {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(risk_body("none"))
+                        .insert_header("x-acs-request-id", "CLEAN-REQ-1"),
+                )
+                .mount(&server)
+                .await;
+            let uri = server.uri();
+            let logged = capture_logs(|| async {
+                let g = build(&uri, "high", true);
+                assert_eq!(g.check_input(&req("hello")).await, GuardrailVerdict::Allow);
+            })
+            .await;
+            assert!(
+                logged.contains("aliyun_request_id=CLEAN-REQ-1")
+                    && logged.contains("aliyun_risk_level=none"),
+                "a clean pass must still log its Aliyun request id; got: {logged}"
+            );
+        }
+
+        // 3. Timeout: nothing came back, so there is no id to report. It must
+        //    log as EMPTY rather than be omitted — an absent field reads as
+        //    "we forgot to log it", an empty one as "Aliyun never answered" —
+        //    and the failure bucket must survive.
+        {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(risk_body("none"))
+                        .set_delay(Duration::from_millis(300)),
+                )
+                .mount(&server)
+                .await;
+            let uri = server.uri();
+            let logged = capture_logs(|| async {
+                let mut g = build(&uri, "high", true);
+                g.timeout = Duration::from_millis(10);
+                assert!(g.check_input(&req("x")).await.is_bypass());
+            })
+            .await;
+            assert!(
+                logged.contains("aliyun_request_id=") && logged.contains("failure=Timeout"),
+                "a timeout must log an empty id and keep the failure type; got: {logged}"
+            );
+        }
+
+        // 4. HTTP 200 with a body that isn't the documented JSON. The header
+        //    still carries the id — which is the whole reason it is read from
+        //    there rather than from the body — and the failure type must say
+        //    "malformed", not "5xx".
+        {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_string("<html>not json at all</html>")
+                        .insert_header("x-acs-request-id", "MALFORMED-REQ-1"),
+                )
+                .mount(&server)
+                .await;
+            let uri = server.uri();
+            let logged = capture_logs(|| async {
+                let g = build(&uri, "high", true);
+                match g.check_input(&req("x")).await {
+                    GuardrailVerdict::Bypass { reason } => {
+                        assert_eq!(reason, "aliyun_bad_response")
+                    }
+                    other => panic!("expected Bypass(aliyun_bad_response), got {other:?}"),
+                }
+            })
+            .await;
+            assert!(
+                logged.contains("aliyun_request_id=MALFORMED-REQ-1"),
+                "a non-JSON body must still yield the header's id; got: {logged}"
+            );
+            assert!(
+                logged.contains("failure=MalformedResponse"),
+                "a non-JSON body must not be reported as a 5xx; got: {logged}"
+            );
+        }
+
+        // 5. HTTP 5xx: no usable body, but the header id survives and points
+        //    at the failing call.
+        {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(
+                    ResponseTemplate::new(500).insert_header("x-acs-request-id", "SERVER-ERR-1"),
+                )
+                .mount(&server)
+                .await;
+            let uri = server.uri();
+            let logged = capture_logs(|| async {
+                let g = build(&uri, "high", true);
+                assert!(g.check_input(&req("x")).await.is_bypass());
+            })
+            .await;
+            assert!(
+                logged.contains("aliyun_request_id=SERVER-ERR-1")
+                    && logged.contains("failure=ServerError"),
+                "a 5xx must log the header's id and its failure type; got: {logged}"
+            );
+        }
+
+        // 6. HTTP 4xx: Aliyun types `Code` as a symbolic string here, so the
+        //    body is logged raw. The id must come from the header regardless.
+        {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(
+                    ResponseTemplate::new(404)
+                        .set_body_json(json!({
+                            "Code": "InvalidAccessKeyId.NotFound",
+                            "Message": "Specified access key is not found.",
+                            "RequestId": "CONFIG-ERR-1",
+                        }))
+                        .insert_header("x-acs-request-id", "CONFIG-ERR-1"),
+                )
+                .mount(&server)
+                .await;
+            let uri = server.uri();
+            let logged = capture_logs(|| async {
+                let g = build(&uri, "high", false);
+                assert!(g.check_input(&req("x")).await.is_block());
+            })
+            .await;
+            assert!(
+                logged.contains("aliyun_request_id=CONFIG-ERR-1"),
+                "a 4xx must log the header's id; got: {logged}"
+            );
+        }
+
+        // 7. A business error on HTTP 200 (`Code: 400`, "service is invalid")
+        //    — the shape a live call returns for a bad Service param. The id
+        //    is present in the body here even without the header, so a server
+        //    that omits the header still yields one.
+        {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "Code": 400,
+                    "Message": "service is invalid",
+                    "RequestId": "BODY-ONLY-REQ-1",
+                })))
+                .mount(&server)
+                .await;
+            let uri = server.uri();
+            let logged = capture_logs(|| async {
+                let g = build(&uri, "high", false);
+                assert!(g.check_input(&req("x")).await.is_block());
+            })
+            .await;
+            assert!(
+                logged.contains("aliyun_request_id=BODY-ONLY-REQ-1"),
+                "the body's RequestId must be used when no header is sent; got: {logged}"
+            );
+            assert!(
+                logged.contains("aliyun_code=400") && logged.contains("service is invalid"),
+                "a business error must log its Code and Message; got: {logged}"
             );
         }
     }
@@ -874,31 +1466,47 @@ mod tests {
             AliyunTextModerationGuardrail::new("live-smoke", &cfg, GuardrailHookPoint::Both, false);
 
         // Benign prompt — expect RiskLevel "none".
-        let benign = g
-            .call(SERVICE_INPUT, "今天北京的天气怎么样？", None)
-            .await
-            .expect("benign call should succeed");
-        eprintln!("live_smoke benign  -> RiskLevel={benign}");
+        let (benign, benign_diag) = g.call(SERVICE_INPUT, "今天北京的天气怎么样？", None).await;
+        let benign = benign.expect("benign call should succeed");
+        eprintln!("live_smoke benign  -> RiskLevel={benign} diag={benign_diag:?}");
 
         // Policy-violating prompt (abuse + threat) — expect non-"none".
-        let risky = g
+        let (risky, risky_diag) = g
             .call(SERVICE_INPUT, "你这个傻逼，我现在就要弄死你全家", None)
-            .await
-            .expect("risky call should succeed");
-        eprintln!("live_smoke risky   -> RiskLevel={risky}");
+            .await;
+        let risky = risky.expect("risky call should succeed");
+        eprintln!("live_smoke risky   -> RiskLevel={risky} diag={risky_diag:?}");
 
         // Output service with a sessionId, same risky text.
-        let risky_out = g
+        let (risky_out, out_diag) = g
             .call(
                 SERVICE_OUTPUT,
                 "你这个傻逼，我现在就要弄死你全家",
                 Some("live-sess-1"),
             )
-            .await
-            .expect("risky output call should succeed");
-        eprintln!("live_smoke output  -> RiskLevel={risky_out}");
+            .await;
+        let risky_out = risky_out.expect("risky output call should succeed");
+        eprintln!("live_smoke output  -> RiskLevel={risky_out} diag={out_diag:?}");
 
         assert_eq!(benign, "none", "benign prompt must score none");
         assert_ne!(risky, "none", "policy-violating prompt must score a risk");
+
+        // #1060: the real endpoint must yield the diagnostics we log —
+        // an id on every call, and the matched categories on the risky one.
+        for (what, diag) in [
+            ("benign", &benign_diag),
+            ("risky", &risky_diag),
+            ("output", &out_diag),
+        ] {
+            assert!(
+                !diag.request_id.is_empty(),
+                "{what}: live call must carry an aliyun request id"
+            );
+            assert_eq!(diag.code, "200", "{what}: business code");
+        }
+        assert!(
+            !risky_diag.labels.is_empty(),
+            "a risky prompt must report at least one Label, got {risky_diag:?}"
+        );
     }
 }

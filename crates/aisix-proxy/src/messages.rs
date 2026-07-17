@@ -2173,7 +2173,10 @@ fn build_anthropic_sse_stream(
             }
         }
     };
-    axum::body::Body::from_stream(stream)
+    // Re-attach the request span: the body is polled after the request-id
+    // middleware returns, so the end-of-stream output-guardrail check
+    // would otherwise log without a `request_id` (AISIX-Cloud#1060).
+    axum::body::Body::from_stream(crate::request_id::in_request_span(stream))
 }
 
 /// Anthropic-shape SSE error frame for a streaming guardrail block. Built
@@ -3012,7 +3015,11 @@ where
         // guard drops here → on_complete fires (delivery-gated).
     };
     AnthropicDeliveryCounter {
-        inner: Box::pin(inner),
+        // Re-attach the request span: the body is polled after the
+        // request-id middleware returns, so the end-of-stream
+        // output-guardrail check would otherwise log without a
+        // `request_id` (AISIX-Cloud#1060).
+        inner: Box::pin(crate::request_id::in_request_span(inner)),
         delivered,
     }
 }

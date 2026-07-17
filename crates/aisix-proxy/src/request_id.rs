@@ -2,6 +2,7 @@ use axum::extract::Request;
 use axum::http::{HeaderName, HeaderValue};
 use axum::middleware::Next;
 use axum::response::Response;
+use tracing::Instrument as _;
 use uuid::Uuid;
 
 /// Response header carrying the gateway request id so a client can
@@ -34,6 +35,19 @@ pub(crate) struct RequestId(pub String);
 /// it back through `ClientContext` keeps the header equal to the
 /// telemetry `request_id`, so the header is actually usable for
 /// correlation rather than a second, unrelated id.
+///
+/// It also opens the request-scoped tracing span, so every log line a
+/// request emits carries its `request_id` without each call site having
+/// to thread one down (AISIX-Cloud#1060). That is what makes a deep
+/// diagnostic — e.g. the Aliyun guardrail's `aliyun_request_id` — join
+/// back to the `x-aisix-request-id` the caller was handed. The span is
+/// attached to the future rather than entered with a guard: a guard held
+/// across an await would leak the span onto whatever else the executor
+/// runs on this thread.
+///
+/// Response-body streams (SSE) are polled after this middleware returns,
+/// so they fall outside the span. Generators that moderate streamed
+/// output re-attach it explicitly — see `chat::build_sse_stream`.
 pub(crate) async fn ensure_request_id(mut request: Request, next: Next) -> Response {
     let id = request
         .extensions()
@@ -42,7 +56,8 @@ pub(crate) async fn ensure_request_id(mut request: Request, next: Next) -> Respo
         .unwrap_or_else(new_request_id);
     request.extensions_mut().insert(RequestId(id.clone()));
 
-    let mut response = next.run(request).await;
+    let span = tracing::info_span!("request", request_id = %id);
+    let mut response = next.run(request).instrument(span).await;
 
     // If the handler already stamped the header (from the same id), keep
     // it; otherwise stamp it here so no response is ever without one.
@@ -52,6 +67,52 @@ pub(crate) async fn ensure_request_id(mut request: Request, next: Next) -> Respo
         }
     }
     response
+}
+
+/// Stream adapter that enters `span` for the duration of every
+/// `poll_next`.
+struct InSpan<T> {
+    inner: std::pin::Pin<Box<dyn futures::Stream<Item = T> + Send>>,
+    span: tracing::Span,
+}
+
+impl<T> futures::Stream for InSpan<T> {
+    type Item = T;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let span = self.span.clone();
+        let _entered = span.enter();
+        self.inner.as_mut().poll_next(cx)
+    }
+}
+
+/// Re-attach the caller's current tracing span to a response-body stream.
+///
+/// A streamed response is polled by hyper AFTER [`ensure_request_id`] has
+/// returned, so its span is no longer active by then: without this, every
+/// log event a generator emits — notably the output-guardrail checks that
+/// run at end-of-stream — lands outside the request span and loses its
+/// `request_id` (AISIX-Cloud#1060).
+///
+/// MUST be called while still inside the handler, since it captures
+/// [`tracing::Span::current`] at construction time — calling it from
+/// somewhere the request span isn't active silently attaches a no-op span
+/// and correlation is lost with no error.
+///
+/// Entering inside `poll_next` rather than holding a guard across the
+/// generator's awaits is what `tracing`'s own `Instrumented` future does:
+/// `poll_next` is synchronous, so the guard cannot leak onto whatever the
+/// executor runs next on this thread.
+pub(crate) fn in_request_span<T: 'static>(
+    stream: impl futures::Stream<Item = T> + Send + 'static,
+) -> impl futures::Stream<Item = T> + Send + 'static {
+    InSpan {
+        inner: Box::pin(stream),
+        span: tracing::Span::current(),
+    }
 }
 
 #[cfg(test)]
