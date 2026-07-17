@@ -8,9 +8,9 @@
 //! `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer` plus
 //! `assertion=<jwt>` to the SA's `token_uri` (typically
 //! `https://oauth2.googleapis.com/token`). Parse `{access_token,
-//! expires_in}` from the response. Cache keyed by SA `client_email`
-//! with TTL refresh ~60s before expiry so an in-flight request never
-//! lands on an expired token.
+//! expires_in}` from the response. Cache keyed by a fingerprint of the
+//! whole SA credential, with TTL refresh ~60s before expiry so an
+//! in-flight request never lands on an expired token.
 //!
 //! # References
 //!
@@ -21,7 +21,7 @@
 //! - Standard SA JSON shape: emitted verbatim by
 //!   `gcloud iam service-accounts keys create`.
 
-use aisix_gateway::BridgeError;
+use aisix_gateway::{credential_fingerprint, BridgeError};
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -100,6 +100,19 @@ impl ServiceAccountKey {
         }
         Ok(())
     }
+
+    /// Token-cache key. Every field of the credential feeds the
+    /// fingerprint — add new fields here when the struct grows, or a
+    /// rotation that only touches the new field will serve the stale
+    /// token for its full TTL.
+    fn cache_key(&self) -> String {
+        credential_fingerprint(&[
+            &self.typ,
+            &self.private_key,
+            &self.client_email,
+            &self.token_uri,
+        ])
+    }
 }
 
 /// JWT claims for the bearer assertion. Field names per RFC 7523 §3.
@@ -127,8 +140,11 @@ struct CachedToken {
 }
 
 /// In-process token cache + minter. One instance per VertexBridge.
-/// Cache is keyed by SA's `client_email` so multiple ProviderKeys
-/// backed by the same SA share a token slot.
+/// Cache is keyed by a fingerprint of the whole SA credential, so
+/// ProviderKeys backed by the same SA share a token slot while a
+/// rotated SA key mints fresh. Keying by `client_email` alone would
+/// pin the pre-rotation token for its full TTL — rotation issues a new
+/// `private_key` under the same email.
 pub(crate) struct TokenMinter {
     client: Client,
     cache: Arc<RwLock<HashMap<String, CachedToken>>>,
@@ -164,10 +180,11 @@ impl TokenMinter {
     /// when one exists and is unexpired; otherwise mints a fresh one
     /// and caches it.
     pub async fn get_token(&self, sa: &ServiceAccountKey) -> Result<String, BridgeError> {
+        let key = sa.cache_key();
         // Read-lock for the common path.
         {
             let cache = self.cache.read().await;
-            if let Some(cached) = cache.get(&sa.client_email) {
+            if let Some(cached) = cache.get(&key) {
                 if cached.expires_at > Instant::now() {
                     return Ok(cached.access_token.clone());
                 }
@@ -180,10 +197,7 @@ impl TokenMinter {
             expires_at: Instant::now()
                 + Duration::from_secs(expires_in_secs).saturating_sub(TOKEN_REFRESH_SAFETY_MARGIN),
         };
-        self.cache
-            .write()
-            .await
-            .insert(sa.client_email.clone(), cached);
+        self.cache.write().await.insert(key, cached);
         Ok(access_token)
     }
 
@@ -350,6 +364,39 @@ mod tests {
         let iat = token_data.claims["iat"].as_u64().unwrap();
         let exp = token_data.claims["exp"].as_u64().unwrap();
         assert_eq!(exp - iat, JWT_EXPIRY_SECS);
+    }
+
+    #[tokio::test]
+    async fn cache_remints_after_the_service_account_key_is_rotated() {
+        // Rotating a GCP service-account key issues a new private_key
+        // under the SAME client_email, so a cache keyed on the email
+        // alone serves the pre-rotation token for its full hour. The
+        // gateway would keep authenticating with the key the operator
+        // just replaced, and report success while doing it.
+        let (private_pem, _) = test_key_pair();
+        let rotated_pem = include_str!("../test-fixtures/test_sa_private_rotated.pem").to_string();
+        assert_ne!(private_pem, rotated_pem, "fixture keys must differ");
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "ya29.per-key",
+                "expires_in": 3600,
+                "token_type": "Bearer"
+            })))
+            // The assertion: two mints, not one. Both SAs share a
+            // client_email, so the pre-fix cache answered the second
+            // get_token from the first one's slot.
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let minter = TokenMinter::new(Client::new()).with_token_endpoint_override(server.uri());
+        let before = sample_sa(&private_pem, &server.uri());
+        let after = sample_sa(&rotated_pem, &server.uri());
+        assert_eq!(before.client_email, after.client_email);
+        minter.get_token(&before).await.unwrap();
+        minter.get_token(&after).await.unwrap();
     }
 
     #[tokio::test]
