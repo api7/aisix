@@ -296,7 +296,9 @@ impl AliyunTextModerationGuardrail {
             //
             // The body is still read (capped) rather than skipped, since the code
             // lives in it; it is just never logged verbatim.
-            let response_body = crate::read_error_body_capped(resp).await;
+            let mut resp = resp;
+            let response_body =
+                crate::read_body_capped(&mut resp, MAX_ERROR_BODY_PARSE_BYTES).await;
             diag.code = extract_error_code(&response_body);
             tracing::error!(
                 row = %self.row_name,
@@ -369,6 +371,22 @@ impl AliyunTextModerationGuardrail {
         }
     }
 }
+
+/// How much of an error body to read when digging the `Code` out of it.
+///
+/// Far above the crate's log-snippet cap, and deliberately: `SignatureDoesNotMatch`
+/// quotes the whole StringToSign back, and `Code` is the LAST member of the JSON
+/// object, after that echo. Measured against the live endpoint, a 1 980-char
+/// Chinese prompt (just under `MAX_CONTENT_CHARS`) produces a 30 457-byte body
+/// with `Code` at offset 30 426 — the content is percent-encoded twice on the way
+/// in, roughly 15 bytes per source char. At the 2 048-byte log cap the JSON is
+/// truncated mid-`Message`, parses as nothing, and the most common
+/// misconfiguration there is — a wrong access-key secret — would report no code
+/// at all. 64 KiB covers the 2 000-char cap even at 4 bytes per char.
+///
+/// Only ever held transiently to pull one symbolic token out; nothing of it is
+/// logged.
+const MAX_ERROR_BODY_PARSE_BYTES: usize = 64 * 1024;
 
 /// Best-effort pull of the error `Code` out of an Aliyun error body.
 ///
@@ -1074,6 +1092,44 @@ mod tests {
                     "a 4xx body must never be echoed — leaked {leak:?}; got: {logged}"
                 );
             }
+        }
+
+        // 2a. The same error at realistic prompt length. `Code` is the last
+        //     member, after a StringToSign echo that runs ~15 bytes per source
+        //     char, so a body carrying a 2 000-char prompt puts it ~30 KB in.
+        //     Reading only the log-snippet cap would truncate mid-`Message`,
+        //     parse nothing, and report no code for the single most common
+        //     misconfiguration.
+        {
+            let server = MockServer::start().await;
+            // Mirrors the live shape: RequestId, then the huge Message, then Code.
+            let echo = "%2522%E4%25BD%25A0".repeat(2_000);
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                    "RequestId": "BIG-SIG-ERR",
+                    "Message": format!(
+                        "Specified signature is not matched with our calculation. \
+                         server string to sign is:POST&%2F&ServiceParameters%3D{echo}"
+                    ),
+                    "HostId": "green-cip.cn-shanghai.aliyuncs.com",
+                    "Code": "SignatureDoesNotMatch",
+                })))
+                .mount(&server)
+                .await;
+            let uri = server.uri();
+            let logged = capture_logs(|| async {
+                let g = build(&uri, "high", false);
+                assert!(g.check_input(&req("x")).await.is_block());
+            })
+            .await;
+            assert!(
+                logged.contains("aliyun_code=SignatureDoesNotMatch"),
+                "the code must survive a body big enough to hold a real prompt; got: {logged}"
+            );
+            assert!(
+                !logged.contains("string to sign") && !logged.contains("ServiceParameters"),
+                "reading more of the body must not mean logging it; got: {logged}"
+            );
         }
 
         // 2b. An unparseable 4xx body yields no code rather than a raw echo: an

@@ -76,14 +76,33 @@ pub(crate) fn truncate_error_body_for_log(body: &str) -> &str {
     feature = "presidio",
 ))]
 pub(crate) async fn read_error_body_capped(mut resp: reqwest::Response) -> String {
+    truncate_error_body_for_log(&read_body_capped(&mut resp, MAX_ERROR_BODY_LOG_BYTES).await)
+        .to_owned()
+}
+
+/// Read at most `cap` bytes of a response body, chunk by chunk, giving up on
+/// the first read error.
+///
+/// Split out from [`read_error_body_capped`] because a caller that PARSES the
+/// body needs a different budget from one that logs a snippet of it: a snippet
+/// can stop anywhere, whereas a truncated body may simply not contain the field
+/// being looked for. See `aliyun::MAX_ERROR_BODY_PARSE_BYTES`.
+#[cfg(any(
+    feature = "azure-content-safety",
+    feature = "aliyun-text-moderation",
+    feature = "lakera",
+    feature = "openai-moderation",
+    feature = "presidio",
+))]
+pub(crate) async fn read_body_capped(resp: &mut reqwest::Response, cap: usize) -> String {
     let mut buf: Vec<u8> = Vec::new();
-    while buf.len() < MAX_ERROR_BODY_LOG_BYTES {
+    while buf.len() < cap {
         match resp.chunk().await {
             Ok(Some(chunk)) => buf.extend_from_slice(&chunk),
             Ok(None) | Err(_) => break,
         }
     }
-    truncate_error_body_for_log(&String::from_utf8_lossy(&buf)).to_owned()
+    String::from_utf8_lossy(&buf).into_owned()
 }
 
 /// The text a guardrail should scan for one message.
