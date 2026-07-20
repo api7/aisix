@@ -145,6 +145,17 @@ describe("aisix_llm_tokens_by_client_total model label (AISIX-Cloud#1044)", () =
       key_hash: CALLER_HASH,
       allowed_models: [MODEL_A, MODEL_B, RESPONSES_MODEL],
     });
+
+    // Wait here rather than in a test, so each test is independently runnable.
+    const probe = new ProxyClient(app.proxyUrl, CALLER);
+    await waitConfigPropagation(async () => {
+      const res = await probe.listModels();
+      if (res.status !== 200) return false;
+      const data = (res.body as { data?: Array<{ id?: string }> }).data ?? [];
+      return [MODEL_A, MODEL_B, RESPONSES_MODEL].every((m) =>
+        data.some((d) => d.id === m),
+      );
+    });
   });
 
   afterAll(async () => {
@@ -159,16 +170,6 @@ describe("aisix_llm_tokens_by_client_total model label (AISIX-Cloud#1044)", () =
       ctx.skip();
       return;
     }
-
-    const probe = new ProxyClient(app.proxyUrl, CALLER);
-    await waitConfigPropagation(async () => {
-      const res = await probe.listModels();
-      if (res.status !== 200) return false;
-      const data = (res.body as { data?: Array<{ id?: string }> }).data ?? [];
-      return [MODEL_A, MODEL_B, RESPONSES_MODEL].every((m) =>
-        data.some((d) => d.id === m),
-      );
-    });
 
     // Same client UA, two different models: A non-streaming, B streaming —
     // exercising both chat recording paths.
