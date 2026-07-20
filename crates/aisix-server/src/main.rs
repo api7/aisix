@@ -686,6 +686,12 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     // so a real DP scrape surfaces UsageEvent throughput without
     // needing cp-api or an OTLP receiver in the loop.
     proxy_state = proxy_state.with_usage_sink(usage_sink.with_metrics((*metrics).clone()));
+    // AISIX-Cloud#1045: operator UA→client_type rules. Compile errors are
+    // boot-fatal — a dropped rule would silently misattribute traffic.
+    let client_classifier =
+        aisix_obs::ClientTypeClassifier::compile(&cfg.observability.metrics.client_type_rules)
+            .map_err(|e| anyhow::anyhow!(e))?;
+    proxy_state = proxy_state.with_client_classifier(Arc::new(client_classifier));
     if let Some(client) = budget_client {
         proxy_state = proxy_state.with_budget_client(client);
     }

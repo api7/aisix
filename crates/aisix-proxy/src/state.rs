@@ -20,7 +20,7 @@ use aisix_core::snapshot::SnapshotHandle;
 use aisix_core::{AisixSnapshot, ProxyConfig};
 use aisix_gateway::Hub;
 use aisix_guardrails::LiveGuardrailIndex;
-use aisix_obs::{Metrics, OtlpHttpFanOut, UsageSink};
+use aisix_obs::{ClientTypeClassifier, Metrics, OtlpHttpFanOut, UsageSink};
 use aisix_ratelimit::Limiter;
 use dashmap::DashSet;
 use std::sync::Arc;
@@ -148,6 +148,11 @@ pub struct ProxyState {
     /// deterministic `request_id = "batch-<id>"` on the emitted events is
     /// what keeps cross-restart re-emission idempotent on the cp-api side.
     pub billed_batches: Arc<dashmap::DashSet<String>>,
+    /// Boot-compiled User-Agent → `client_type` classifier: operator
+    /// rules from `observability.metrics.client_type_rules` first, then
+    /// the built-in allowlist (AISIX-Cloud#1045). Default = built-ins
+    /// only; the server bootstrap swaps in the compiled config rules.
+    pub client_classifier: Arc<ClientTypeClassifier>,
 }
 
 impl ProxyState {
@@ -172,6 +177,7 @@ impl ProxyState {
             request_body_limit_bytes: cfg.request_body_limit_bytes,
             real_ip: Arc::new(ResolvedRealIp::from_config(&cfg.real_ip)),
             billed_batches: Arc::new(dashmap::DashSet::new()),
+            client_classifier: Arc::new(ClientTypeClassifier::builtin()),
         }
     }
 
@@ -203,6 +209,7 @@ impl ProxyState {
             request_body_limit_bytes: cfg.request_body_limit_bytes,
             real_ip: Arc::new(ResolvedRealIp::from_config(&cfg.real_ip)),
             billed_batches: Arc::new(dashmap::DashSet::new()),
+            client_classifier: Arc::new(ClientTypeClassifier::builtin()),
         }
     }
 
@@ -245,6 +252,7 @@ impl ProxyState {
             request_body_limit_bytes: cfg.request_body_limit_bytes,
             real_ip: Arc::new(ResolvedRealIp::from_config(&cfg.real_ip)),
             billed_batches: Arc::new(dashmap::DashSet::new()),
+            client_classifier: Arc::new(ClientTypeClassifier::builtin()),
         }
     }
 
@@ -260,6 +268,14 @@ impl ProxyState {
     /// deterministic one via `LiveGuardrailIndex::new(stub_handle, None)`.
     pub fn with_guardrail_index(mut self, index: Arc<LiveGuardrailIndex>) -> Self {
         self.guardrail_index = index;
+        self
+    }
+
+    /// Swap in the classifier compiled from
+    /// `observability.metrics.client_type_rules` (AISIX-Cloud#1045).
+    /// Default is built-ins only.
+    pub fn with_client_classifier(mut self, classifier: Arc<ClientTypeClassifier>) -> Self {
+        self.client_classifier = classifier;
         self
     }
 

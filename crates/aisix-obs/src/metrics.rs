@@ -513,9 +513,11 @@ impl Metrics {
     }
 
     /// #890 req-4: record token volume for the inbound `client_type` on the
-    /// dedicated [`M_LLM_TOKENS_BY_CLIENT_TOTAL`] series. `client_type` is a
-    /// `&'static str` from [`client_type_from_user_agent`] so cardinality is
-    /// bounded; zero dims are skipped to keep the series sparse.
+    /// dedicated [`M_LLM_TOKENS_BY_CLIENT_TOTAL`] series. `client_type` MUST
+    /// come from [`ClientTypeClassifier::classify`] (or the built-in
+    /// [`client_type_from_user_agent`]) — never raw client input — so the
+    /// value set stays bounded by built-ins ∪ boot-validated operator rules
+    /// (AISIX-Cloud#1045); zero dims are skipped to keep the series sparse.
     ///
     /// `model` (AISIX-Cloud#1044) is the requested logical model — callers
     /// MUST pass the same value they put in [`UsageLabels::model`] (or its
@@ -533,7 +535,7 @@ impl Metrics {
     /// and the `aisix_llm_total_tokens_total` fix in #679).
     pub fn record_llm_tokens_by_client(
         &self,
-        client_type: &'static str,
+        client_type: &str,
         model: &str,
         input_tokens: u64,
         output_tokens: u64,
@@ -546,7 +548,7 @@ impl Metrics {
             if input_tokens > 0 {
                 metrics::counter!(
                     M_LLM_TOKENS_BY_CLIENT_TOTAL,
-                    "client_type" => client_type,
+                    "client_type" => client_type.to_string(),
                     "model" => model.to_string(),
                     "token_type" => "input",
                 )
@@ -555,7 +557,7 @@ impl Metrics {
             if output_tokens > 0 {
                 metrics::counter!(
                     M_LLM_TOKENS_BY_CLIENT_TOTAL,
-                    "client_type" => client_type,
+                    "client_type" => client_type.to_string(),
                     "model" => model.to_string(),
                     "token_type" => "output",
                 )
@@ -564,7 +566,7 @@ impl Metrics {
             if total_tokens > 0 {
                 metrics::counter!(
                     M_LLM_TOKENS_BY_CLIENT_TOTAL,
-                    "client_type" => client_type,
+                    "client_type" => client_type.to_string(),
                     "model" => model.to_string(),
                     "token_type" => "total",
                 )
@@ -839,6 +841,37 @@ pub fn client_type_from_user_agent(user_agent: &str) -> &'static str {
         ("claude-code", "claude-code"),
         ("codex", "codex"),
         ("cline", "cline"),
+        // Cline-family forks (AISIX-Cloud#1045). Each sends `<Product>/<ver>`
+        // on its OpenAI-compatible provider path (Roo since PR #5492,
+        // Kilo ≤5.16.2, Zoo ≥3.54.0); the second spelling covers the
+        // `roo-code/<ver> (<os>; <arch>)`-style native-path variants.
+        ("roo-code", "roo-code"),
+        ("roocode", "roo-code"),
+        ("kilo-code", "kilocode"),
+        ("kilocode", "kilocode"),
+        ("zoo-code", "zoo-code"),
+        ("zoocode", "zoo-code"),
+        // VS Code Copilot Chat BYOK sends `GitHubCopilotChat/<ver>` from
+        // the user's machine; the broader needle also catches other
+        // `GitHubCopilot*` variants should they surface in a UA.
+        ("githubcopilot", "github-copilot"),
+        // Cursor routes BYO-endpoint traffic through its own backend,
+        // which presents `Cursor/1.0` (version segment is fixed).
+        ("cursor", "cursor"),
+        // Terminal agents / editors (AISIX-Cloud#1045). opencode PREFIXES
+        // the Vercel AI SDK UA (`opencode/<ver> ai-sdk/…`), so it must
+        // stay ahead of the `ai-sdk/provider-utils` bucket below. Qwen
+        // Code sends `QwenCode/<ver> (<os>; <arch>)` on OpenAI paths but
+        // masquerades as `claude-cli/…` toward non-Anthropic hosts on its
+        // Anthropic path — that traffic lands in `claude-code`, which a
+        // substring table cannot untangle. Gemini CLI embeds the surface
+        // (`GeminiCLI-tui/<ver>/<model> (…)`). `zed/` keeps the slash so
+        // the needle requires the `Zed/<ver>` token form.
+        ("opencode", "opencode"),
+        ("qwencode", "qwen-code"),
+        ("geminicli", "gemini-cli"),
+        ("charm-crush", "crush"),
+        ("zed/", "zed"),
         ("aider", "aider"),
         ("openai-python", "openai-python"),
         ("openai/python", "openai-python"),
@@ -853,6 +886,10 @@ pub fn client_type_from_user_agent(user_agent: &str) -> &'static str {
         ("llama_index", "llamaindex"),
         ("llamaindex", "llamaindex"),
         ("litellm", "litellm"),
+        // Vercel AI SDK default UA (`ai/<v> ai-sdk/provider-utils/<v>
+        // runtime/<rt>`) — the whole-SDK bucket for tools that don't
+        // override it (Cline 4.x, Kilo Code 7.x, …).
+        ("ai-sdk/provider-utils", "vercel-ai-sdk"),
         ("curl", "curl"),
         ("python-requests", "python-requests"),
         ("python-httpx", "httpx"),
@@ -872,6 +909,96 @@ pub fn client_type_from_user_agent(user_agent: &str) -> &'static str {
         }
     }
     "other"
+}
+
+/// Boot-compiled `client_type` classifier: operator rules from
+/// `observability.metrics.client_type_rules` (AISIX-Cloud#1045) tried in
+/// config order first, then the built-in
+/// [`client_type_from_user_agent`] allowlist. Custom rules deliberately
+/// outrank built-ins so a deployment can re-bucket anything — e.g. an
+/// in-house tool whose UA embeds `axios` and would otherwise land in
+/// `node`. Cardinality stays bounded: a match emits the rule's fixed
+/// `client` value (validated at compile), never request-derived text.
+#[derive(Debug, Default)]
+pub struct ClientTypeClassifier {
+    rules: Vec<(regex::Regex, String)>,
+}
+
+impl ClientTypeClassifier {
+    pub const MAX_RULES: usize = 64;
+    pub const MAX_PATTERN_LEN: usize = 512;
+    pub const MAX_CLIENT_LEN: usize = 64;
+
+    /// Built-ins only — the behaviour of every deployment without
+    /// `client_type_rules` configured.
+    pub fn builtin() -> Self {
+        Self::default()
+    }
+
+    /// Compile + validate operator rules. Errors are boot-fatal by design
+    /// (a silently dropped rule would misattribute traffic until someone
+    /// notices the label is missing).
+    pub fn compile(rules: &[aisix_core::ClientTypeRule]) -> Result<Self, String> {
+        if rules.len() > Self::MAX_RULES {
+            return Err(format!(
+                "observability.metrics.client_type_rules: {} rules exceed the limit of {}",
+                rules.len(),
+                Self::MAX_RULES
+            ));
+        }
+        let mut compiled = Vec::with_capacity(rules.len());
+        for (i, rule) in rules.iter().enumerate() {
+            let ctx = format!("observability.metrics.client_type_rules[{i}]");
+            if rule.pattern.is_empty() || rule.pattern.len() > Self::MAX_PATTERN_LEN {
+                return Err(format!(
+                    "{ctx}: pattern must be 1..={} bytes",
+                    Self::MAX_PATTERN_LEN
+                ));
+            }
+            if !valid_client_label(&rule.client) {
+                return Err(format!(
+                    "{ctx}: client {:?} must match [a-z0-9][a-z0-9._-]* and be at most {} chars",
+                    rule.client,
+                    Self::MAX_CLIENT_LEN
+                ));
+            }
+            let re = regex::RegexBuilder::new(&rule.pattern)
+                .case_insensitive(true)
+                .build()
+                .map_err(|e| format!("{ctx}: invalid pattern: {e}"))?;
+            compiled.push((re, rule.client.clone()));
+        }
+        Ok(Self { rules: compiled })
+    }
+
+    /// Classify a raw inbound `User-Agent`. Empty/whitespace UA is always
+    /// `unknown` (custom rules never see it — `unknown` keeps meaning "the
+    /// client sent nothing"); then custom rules in config order (first
+    /// match wins); then the built-in table; then `other`.
+    pub fn classify<'a>(&'a self, user_agent: &str) -> &'a str {
+        let ua = user_agent.trim();
+        if ua.is_empty() {
+            return "unknown";
+        }
+        for (re, client) in &self.rules {
+            if re.is_match(ua) {
+                return client;
+            }
+        }
+        client_type_from_user_agent(ua)
+    }
+}
+
+/// Prometheus-safe label value: lowercase alnum start, then alnum/`.`/`_`/`-`.
+fn valid_client_label(label: &str) -> bool {
+    if label.is_empty() || label.len() > ClientTypeClassifier::MAX_CLIENT_LEN {
+        return false;
+    }
+    let mut chars = label.chars();
+    let first = chars.next().expect("non-empty checked above");
+    (first.is_ascii_lowercase() || first.is_ascii_digit())
+        && chars
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-'))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1430,6 +1557,174 @@ mod tests {
             client_type_from_user_agent("SomeRandomBespokeClient/9.9"),
             "other"
         );
+    }
+
+    /// AISIX-Cloud#1045: coding clients added from source-verified UA
+    /// samples (real formats quoted from each product's provider code —
+    /// see the issue's evidence table).
+    #[test]
+    fn client_type_recognises_coding_clients_1045() {
+        // Cline v3.56+ sends `Cline/<ver>` on both BYO paths (PR #8872).
+        assert_eq!(client_type_from_user_agent("Cline/3.89.2"), "cline");
+        // Roo Code OpenAI-compatible path (DEFAULT_HEADERS since PR #5492)
+        // and its `roo-code/<ver> (<os>; <arch>)` native-path variant.
+        assert_eq!(client_type_from_user_agent("RooCode/3.54.0"), "roo-code");
+        assert_eq!(
+            client_type_from_user_agent("roo-code/3.54.0 (darwin 23.5.0; arm64) node/20.19.0"),
+            "roo-code"
+        );
+        // Kilo Code ≤5.16.2 (legacy Roo fork lineage).
+        assert_eq!(client_type_from_user_agent("Kilo-Code/5.16.2"), "kilocode");
+        // Zoo Code — the community continuation of archived Roo Code;
+        // marketplace builds carry large patch numbers.
+        assert_eq!(
+            client_type_from_user_agent("ZooCode/3.71.100268"),
+            "zoo-code"
+        );
+        // Vercel AI SDK default UA — the bucket for AI-SDK-based tools
+        // that don't override it (Cline 4.x on node, Kilo 7.x on bun).
+        assert_eq!(
+            client_type_from_user_agent(
+                "ai/6.0.144 ai-sdk/provider-utils/4.0.22 runtime/node.js/26"
+            ),
+            "vercel-ai-sdk"
+        );
+        assert_eq!(
+            client_type_from_user_agent(
+                "ai/6.0.168 ai-sdk/provider-utils/4.0.29 runtime/bun/1.3.6"
+            ),
+            "vercel-ai-sdk"
+        );
+        // VS Code Copilot Chat BYOK (nodeFetcher.ts default UA).
+        assert_eq!(
+            client_type_from_user_agent("GitHubCopilotChat/0.44.0"),
+            "github-copilot"
+        );
+        // Cursor's backend presents a fixed version segment.
+        assert_eq!(client_type_from_user_agent("Cursor/1.0"), "cursor");
+        // Copilot CLI BYOK exposes only the SDK UA — classified as the
+        // SDK, not as Copilot (identification limit recorded in #1045).
+        assert_eq!(
+            client_type_from_user_agent("OpenAI/JS 5.20.1"),
+            "openai-node"
+        );
+        // opencode prefixes the AI-SDK UA — the product token must win
+        // over the `ai-sdk/provider-utils` bucket also present in the UA.
+        assert_eq!(
+            client_type_from_user_agent(
+                "opencode/1.18.3 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14"
+            ),
+            "opencode"
+        );
+        // Qwen Code, OpenAI-compatible path (live-captured format).
+        assert_eq!(
+            client_type_from_user_agent("QwenCode/0.20.0 (linux; x64)"),
+            "qwen-code"
+        );
+        // Qwen Code's Anthropic path masquerades as Claude Code toward
+        // gateways — a KNOWN collision: it lands in `claude-code`.
+        assert_eq!(
+            client_type_from_user_agent("claude-cli/0.20.0 (external, cli)"),
+            "claude-code"
+        );
+        // Gemini CLI (Gemini-protocol only today; UA still recognised).
+        assert_eq!(
+            client_type_from_user_agent(
+                "GeminiCLI-tui/0.51.0/gemini-3.1-pro-preview (linux; x64; terminal)"
+            ),
+            "gemini-cli"
+        );
+        // Crush and Zed set product UAs on their shared HTTP clients.
+        assert_eq!(
+            client_type_from_user_agent("Charm-Crush/1.0.0 (https://charm.land/crush)"),
+            "crush"
+        );
+        assert_eq!(
+            client_type_from_user_agent("Zed/0.198.0 (linux; x86_64)"),
+            "zed"
+        );
+    }
+
+    /// AISIX-Cloud#1045: operator rules outrank built-ins, first match
+    /// wins, non-matches fall back to the built-in table, and empty UA
+    /// stays `unknown` even under a match-anything rule.
+    #[test]
+    fn classifier_custom_rules_first_match_then_builtin_fallback() {
+        let rule = |pattern: &str, client: &str| aisix_core::ClientTypeRule {
+            pattern: pattern.into(),
+            client: client.into(),
+        };
+        let c = ClientTypeClassifier::compile(&[
+            rule("^internal-agent/", "internal-agent"),
+            // Overlaps the rule above — order decides (first match wins).
+            rule("internal", "internal-other"),
+            // Re-buckets a UA the built-in table would call "node".
+            rule("billing-batcher", "billing-batcher"),
+            rule(".*", "catch-all"),
+        ])
+        .expect("valid rules");
+
+        assert_eq!(c.classify("internal-agent/2.1"), "internal-agent");
+        assert_eq!(c.classify("acme-internal-tool/1.0"), "internal-other");
+        // Case-insensitive by default.
+        assert_eq!(c.classify("Internal-Agent/9.9"), "internal-agent");
+        // axios UA would be built-in "node"; the custom rule outranks it.
+        assert_eq!(
+            c.classify("billing-batcher/3.0 axios/1.6.0"),
+            "billing-batcher"
+        );
+        // Empty/whitespace UA never reaches custom rules — even ".*".
+        assert_eq!(c.classify(""), "unknown");
+        assert_eq!(c.classify("   "), "unknown");
+        // The ".*" rule shadows the built-in fallback for everything else.
+        assert_eq!(c.classify("curl/8.4.0"), "catch-all");
+
+        // Without a catch-all, non-matching UAs use the built-in table.
+        let c = ClientTypeClassifier::compile(&[rule("^internal-agent/", "internal-agent")])
+            .expect("valid rules");
+        assert_eq!(c.classify("curl/8.4.0"), "curl");
+        assert_eq!(c.classify("SomeRandomBespokeClient/9.9"), "other");
+
+        // Built-ins only (no config) — same behaviour as the free function.
+        let c = ClientTypeClassifier::builtin();
+        assert_eq!(c.classify("claude-cli/1.2.3"), "claude-code");
+        assert_eq!(c.classify(""), "unknown");
+    }
+
+    /// AISIX-Cloud#1045: invalid rule sets are rejected at compile (boot)
+    /// time — count cap, pattern syntax/length, label charset/length.
+    #[test]
+    fn classifier_rejects_invalid_rule_sets() {
+        let rule = |pattern: &str, client: &str| aisix_core::ClientTypeRule {
+            pattern: pattern.into(),
+            client: client.into(),
+        };
+        // Broken regex syntax.
+        assert!(ClientTypeClassifier::compile(&[rule("([unclosed", "x")])
+            .unwrap_err()
+            .contains("invalid pattern"));
+        // Empty and oversized patterns.
+        assert!(ClientTypeClassifier::compile(&[rule("", "x")]).is_err());
+        let oversized = "a".repeat(ClientTypeClassifier::MAX_PATTERN_LEN + 1);
+        assert!(ClientTypeClassifier::compile(&[rule(&oversized, "x")]).is_err());
+        // Label charset: uppercase, leading dash, spaces, empty, too long.
+        for bad in ["Upper", "-lead", "has space", "", "田"] {
+            assert!(
+                ClientTypeClassifier::compile(&[rule("ok", bad)]).is_err(),
+                "label {bad:?} should be rejected"
+            );
+        }
+        let long_label = "a".repeat(ClientTypeClassifier::MAX_CLIENT_LEN + 1);
+        assert!(ClientTypeClassifier::compile(&[rule("ok", &long_label)]).is_err());
+        // Valid edge labels pass.
+        assert!(ClientTypeClassifier::compile(&[rule("ok", "0-tool_v2.beta")]).is_ok());
+        // Rule-count cap.
+        let too_many: Vec<_> = (0..=ClientTypeClassifier::MAX_RULES)
+            .map(|i| rule(&format!("tool-{i}"), "tool"))
+            .collect();
+        assert!(ClientTypeClassifier::compile(&too_many)
+            .unwrap_err()
+            .contains("exceed"));
     }
 
     #[test]

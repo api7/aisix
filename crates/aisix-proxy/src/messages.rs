@@ -2534,7 +2534,7 @@ fn emit_anthropic_usage_event(
     // #1002: total_tokens_all folds in the Anthropic cache counters.
     // AISIX-Cloud#1044: same requested logical model as the UsageLabels above.
     state.metrics.record_llm_tokens_by_client(
-        aisix_obs::client_type_from_user_agent(&client.user_agent),
+        state.client_classifier.classify(&client.user_agent),
         model,
         u64::from(metrics.prompt_tokens),
         u64::from(metrics.completion_tokens),

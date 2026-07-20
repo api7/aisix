@@ -66,6 +66,13 @@ observability:
       addr: "0.0.0.0:9090"
     otlp:
       enabled: false
+    # Optional User-Agent -> client_type mapping rules for the
+    # aisix_llm_tokens_by_client_total metric (first match wins, tried
+    # before the built-in allowlist; regex, case-insensitive). See
+    # config.example.yaml for the full annotation.
+    # client_type_rules:
+    #   - pattern: "^py-billing-batcher/"
+    #     client: billing-batcher
   tracing:
     otlp:
       enabled: false

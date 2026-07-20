@@ -2559,7 +2559,7 @@ fn emit_usage_event(
     // #1002: cache-inclusive total via the shared helper — cache counters are
     // non-zero only on the #825 Anthropic bridge path.
     state.metrics.record_llm_tokens_by_client(
-        aisix_obs::client_type_from_user_agent(&client.user_agent),
+        state.client_classifier.classify(&client.user_agent),
         requested_model,
         u64::from(usage.prompt_tokens),
         u64::from(usage.completion_tokens),
