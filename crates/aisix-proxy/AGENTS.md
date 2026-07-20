@@ -28,18 +28,31 @@ onto whatever the executor runs next on that thread.
 written against it silently never runs for group traffic, and nothing errors —
 requests keep succeeding on a target that should have been excluded.
 
-Decide, and encode the decision at the call site:
+**The default is that a per-model gate binds each target.** Anything an operator
+configures ON a model — rate limits, `allowed_cidrs`, cooldown, health, timeouts —
+is a statement about that model, and reaching it through a group must not strip it.
+Two gates are deliberately entry-scoped instead: guardrail attachment (resolved
+from `model_id` before dispatch, by design) and the group's own copy of any of the
+above. Anything else that only checks `model_entry` / `virtual_entry` is a bug.
 
-- **Binds each target** (anything protecting the upstream behind it — rate limits,
-  cooldown, health, timeouts): resolve it from the attempt model *inside* the
-  dispatch loop, in all four group-capable endpoints (chat, messages,
-  count_tokens, responses) and in both the streaming and non-streaming branches.
-  A limit-shaped gate should skip the target and let dispatch continue rather than
-  failing the whole request — see `quota::reserve_routing_target`.
-- **Binds the requested entry** (anything scoped to the alias the caller named —
-  `allowed_cidrs`, guardrail attachment): keep it pre-dispatch, and say so in the
-  user-facing docs, because the group/member split is otherwise invisible.
+Two shapes, both already implemented — copy the nearest one:
 
-A reservation-shaped gate additionally must not double-charge: `reserve_routing_target`
-returns `None` for non-routing dispatch, whose model layers the pre-dispatch
-`quota::enforce*` already reserved.
+- **Filter the candidate set** (static per-caller predicates like `allowed_cidrs`):
+  drop ineligible targets in `routing::resolve_attempt_models` *before* the strategy
+  picks, so `max_fallbacks` budgets attempts across reachable targets and a
+  metric-based strategy ranks only those. Empty result → the gate's own error.
+  Do NOT fold these into `filter_attempt_models`: its
+  `when_all_unavailable: try_anyway` policy hands back the unfiltered list, which
+  would defeat an allowlist. See `routing::targets_allowed_for_ip`.
+- **Check per attempt** (dynamic/stateful gates like a rate-limit reservation):
+  resolve from the attempt model *inside* the dispatch loop, in all four
+  group-capable endpoints (chat, messages, count_tokens, responses) and in both the
+  streaming and non-streaming branches; skip the target and continue rather than
+  failing the whole request. See `quota::reserve_routing_target`, which also shows
+  the non-double-charge rule: it returns `None` for non-routing dispatch, whose
+  model layers the pre-dispatch `quota::enforce*` already reserved.
+
+Whichever shape, the group's own gate stays enforced pre-dispatch — the two tiers
+are additive, not either/or — and a caller-visible rejection must keep the
+direct-model envelope (`ModelIpRestricted` names no model and no CIDR), so a group
+never becomes a probe for which members exist.

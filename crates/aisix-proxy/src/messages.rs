@@ -638,6 +638,7 @@ async fn dispatch(
                     .as_deref()
                     .unwrap_or(auth.entry.id.as_str()),
             ),
+            source_ip: &client.source_ip,
         },
     )?;
 

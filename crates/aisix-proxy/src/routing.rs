@@ -424,14 +424,46 @@ pub(crate) fn filter_attempt_models(
 }
 
 /// Per-request routing inputs threaded into [`resolve_attempt_models`]: the
-/// tags that gate tag/metadata routing and the stability key for sticky
-/// (A/B / canary) weighted selection. Tags come from request headers; the
-/// stability key is the routing-key header when present, otherwise the
+/// tags that gate tag/metadata routing, the stability key for sticky
+/// (A/B / canary) weighted selection, and the caller's resolved source IP
+/// for the per-target client-IP allowlist. Tags come from request headers;
+/// the stability key is the routing-key header when present, otherwise the
 /// caller's API key id.
+///
+/// `source_ip` defaults to the empty string, which
+/// [`aisix_core::Model::ip_allowed`] treats as "not in range" — so a caller
+/// that forgets to thread it fails closed on restricted targets rather than
+/// silently disabling the allowlist.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct RoutingRequest<'a> {
     pub tags: &'a [String],
     pub stability_key: Option<&'a str>,
+    pub source_ip: &'a str,
+}
+
+/// Drop the targets whose own `allowed_cidrs` excludes `source_ip`.
+///
+/// Deliberately NOT folded into [`filter_attempt_models`]: that filter's
+/// `when_all_unavailable: try_anyway` policy hands back the *unfiltered*
+/// candidate list, which would send a request to a target the operator just
+/// declared off-limits for this caller. An allowlist has no "try anyway".
+fn targets_allowed_for_ip(
+    snapshot: &AisixSnapshot,
+    targets: Vec<RoutingTarget>,
+    source_ip: &str,
+) -> Vec<RoutingTarget> {
+    targets
+        .into_iter()
+        .filter(|t| {
+            // An unresolvable name is left in place so the resolution loop
+            // below still reports it as a config error, rather than being
+            // silently swallowed here as an IP rejection.
+            snapshot
+                .models
+                .get_by_name(&t.model)
+                .is_none_or(|entry| entry.value.ip_allowed(source_ip))
+        })
+        .collect()
 }
 
 /// Resolve the ordered list of concrete Models a request will attempt.
@@ -468,6 +500,19 @@ pub(crate) fn resolve_attempt_models(
             "no routing target matches request tags {:?}",
             req.tags
         )));
+    }
+    // Client-IP pre-filter (AISIX-Cloud#1087 follow-up): a target whose own
+    // `allowed_cidrs` excludes this caller is not a candidate. Applied BEFORE
+    // the strategy picks, so `max_fallbacks` budgets attempts across the
+    // targets this caller may actually reach, and a metric-based strategy
+    // ranks only those. The group's own `allowed_cidrs` is separately enforced
+    // pre-dispatch by `dispatch::check_ip_access`; this adds the member tier
+    // that a group previously bypassed entirely.
+    let eligible = targets_allowed_for_ip(snapshot, eligible, req.source_ip);
+    if eligible.is_empty() {
+        // Report the name the caller asked for, not the excluded members —
+        // matching `ModelForbidden`, and without disclosing group internals.
+        return Err(ProxyError::ModelIpRestricted(virtual_name.to_string()));
     }
     let filtered_routing = Routing {
         targets: eligible,
@@ -653,6 +698,88 @@ mod tests {
         assert_eq!(
             model_names(&eligible_targets(&targets, &[])),
             vec!["eu", "us"]
+        );
+    }
+
+    // ───────────────── per-target client-IP allowlist ─────────────────
+
+    fn ip_snapshot(models: &[(&str, Option<Vec<&str>>)]) -> AisixSnapshot {
+        let table = aisix_core::snapshot::ResourceTable::default();
+        for (i, (name, cidrs)) in models.iter().enumerate() {
+            let model: Model = serde_json::from_value(serde_json::json!({
+                "display_name": name,
+                "provider": "openai",
+                "model_name": "up",
+                "provider_key_id": "pk-1",
+                "allowed_cidrs": cidrs,
+            }))
+            .unwrap();
+            table.insert(aisix_core::ResourceEntry::new(format!("m-{i}"), model, 1));
+        }
+        AisixSnapshot {
+            models: table,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn ip_filter_drops_only_the_out_of_range_target() {
+        let snap = ip_snapshot(&[("restricted", Some(vec!["10.0.0.0/8"])), ("open", None)]);
+        let targets = vec![tagged("restricted", &[]), tagged("open", &[])];
+
+        // In range → both stay candidates.
+        assert_eq!(
+            model_names(&targets_allowed_for_ip(&snap, targets.clone(), "10.1.2.3")),
+            vec!["restricted", "open"]
+        );
+        // Out of range → the restricted member drops out, the group still serves.
+        assert_eq!(
+            model_names(&targets_allowed_for_ip(&snap, targets, "8.8.8.8")),
+            vec!["open"]
+        );
+    }
+
+    #[test]
+    fn ip_filter_empties_when_every_target_excludes_the_caller() {
+        // The caller turns an empty result into a 403 rather than dispatching.
+        let snap = ip_snapshot(&[
+            ("a", Some(vec!["10.0.0.0/8"])),
+            ("b", Some(vec!["192.168.0.0/16"])),
+        ]);
+        let targets = vec![tagged("a", &[]), tagged("b", &[])];
+        assert!(targets_allowed_for_ip(&snap, targets, "8.8.8.8").is_empty());
+    }
+
+    #[test]
+    fn ip_filter_fails_closed_on_an_unattributable_source_ip() {
+        // Mirrors `Model::ip_allowed`: an empty/unparseable IP can never
+        // satisfy a configured allowlist, so a request whose peer address
+        // was lost must not reach a restricted target.
+        let snap = ip_snapshot(&[("restricted", Some(vec!["10.0.0.0/8"]))]);
+        let targets = vec![tagged("restricted", &[])];
+        assert!(targets_allowed_for_ip(&snap, targets, "").is_empty());
+    }
+
+    #[test]
+    fn ip_filter_keeps_unresolvable_names_for_the_config_error_path() {
+        // A target naming a Model that isn't in the snapshot must surface as
+        // the existing "does not resolve to a Model" config error, not be
+        // silently swallowed here as an IP rejection.
+        let snap = ip_snapshot(&[("known", None)]);
+        let targets = vec![tagged("ghost", &[])];
+        assert_eq!(
+            model_names(&targets_allowed_for_ip(&snap, targets, "8.8.8.8")),
+            vec!["ghost"]
+        );
+    }
+
+    #[test]
+    fn ip_filter_is_a_noop_when_no_target_restricts() {
+        let snap = ip_snapshot(&[("a", None), ("b", None)]);
+        let targets = vec![tagged("a", &[]), tagged("b", &[])];
+        assert_eq!(
+            model_names(&targets_allowed_for_ip(&snap, targets, "8.8.8.8")),
+            vec!["a", "b"]
         );
     }
 
