@@ -699,8 +699,9 @@ async fn dispatch(
             };
             // Reserve THIS target's own model rate-limit layers before
             // dispatching to it (AISIX-Cloud#1087). Over-limit → record a
-            // 429 attempt and fail over to the next target (same-target
-            // retries can't help — the window won't reset mid-loop).
+            // 429 attempt and move on to the remaining targets in strategy
+            // order (same-target retries can't help — the window won't
+            // reset mid-loop).
             let mut member_reservation = match crate::quota::reserve_routing_target(
                 state,
                 is_routing_request,

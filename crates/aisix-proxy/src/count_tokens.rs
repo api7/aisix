@@ -212,8 +212,8 @@ async fn dispatch(
         }
         any_anthropic = true;
         // Reserve THIS target's own model rate-limit layers before
-        // dispatching to it (AISIX-Cloud#1087); over-limit → fail over to
-        // the next target. Like the handler-level `_reservation` it is
+        // dispatching to it (AISIX-Cloud#1087); over-limit → skip it and
+        // try the remaining targets. Like the handler-level `_reservation` it is
         // never token-committed — count_tokens burns no generation tokens;
         // the drop at scope end releases the concurrency slot.
         let _member_reservation = match crate::quota::reserve_routing_target(

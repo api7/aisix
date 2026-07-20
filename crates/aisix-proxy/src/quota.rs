@@ -301,8 +301,8 @@ pub(crate) async fn reserve_model_only(
 /// so reserving again would double-count the request (AISIX-Cloud#1087).
 ///
 /// An `Err` means this target is over one of its own limits right now —
-/// the dispatch loops treat that as a failed 429 attempt and fail over to
-/// the next target (matching LiteLLM, which filters rate-limited
+/// the dispatch loops treat that as a failed 429 attempt and continue with
+/// the remaining targets (matching LiteLLM, which filters rate-limited
 /// deployments out of the candidate set).
 pub(crate) async fn reserve_routing_target(
     state: &ProxyState,

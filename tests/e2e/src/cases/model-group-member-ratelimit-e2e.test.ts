@@ -191,6 +191,19 @@ describe("model group member rate limit e2e (AISIX-Cloud#1087)", () => {
     return r.body.choices?.[0]?.message?.content ?? "";
   }
 
+  /**
+   * Sleep until the current wall-clock minute has at least `headroomSecs`
+   * left. The limiter buckets on fixed wall-clock minutes
+   * (`window_start = now - now % 60`), so a burst that straddles a boundary
+   * silently gets a fresh quota and the failover/429 assertions would flap.
+   * Waiting for headroom keeps each burst inside one window.
+   */
+  async function awaitWindowHeadroom(headroomSecs: number): Promise<void> {
+    const secondsLeft = 60 - (Math.floor(Date.now() / 1000) % 60);
+    if (secondsLeft >= headroomSecs) return;
+    await new Promise((r) => setTimeout(r, secondsLeft * 1000 + 100));
+  }
+
   test("over-limit member fails over to the next target (RPM)", async (ctx) => {
     if (!etcdReachable || !app) {
       ctx.skip();
@@ -208,6 +221,7 @@ describe("model group member rate limit e2e (AISIX-Cloud#1087)", () => {
       },
     });
     await waitModelsListed(["mgrl-limited", "mgrl-backup", "mgrl-group"]);
+    await awaitWindowHeadroom(5);
 
     // First call through the group lands on the first target.
     expect(servedContent(await callGroup("mgrl-group"))).toBe("served-by-limited");
@@ -236,6 +250,7 @@ describe("model group member rate limit e2e (AISIX-Cloud#1087)", () => {
       },
     });
     await waitModelsListed(["mgrl-c1", "mgrl-c2", "mgrl-both-limited"]);
+    await awaitWindowHeadroom(5);
 
     expect(servedContent(await callGroup("mgrl-both-limited"))).toBe("served-by-c1");
     expect(servedContent(await callGroup("mgrl-both-limited"))).toBe("served-by-c2");
@@ -266,6 +281,7 @@ describe("model group member rate limit e2e (AISIX-Cloud#1087)", () => {
       },
     });
     await waitModelsListed(["mgrl-tpm", "mgrl-tpm-backup", "mgrl-tpm-group"]);
+    await awaitWindowHeadroom(5);
 
     // First call is served by the TPM-capped member and commits 8 tokens
     // to ITS bucket (the reservation-merge under test — pre-fix the
@@ -301,6 +317,9 @@ describe("model group member rate limit e2e (AISIX-Cloud#1087)", () => {
       "mgrl-stream-backup",
       "mgrl-stream-group",
     ]);
+    // The follow-up poll below runs for up to 5s after the first stream,
+    // so this burst needs more headroom than the non-streaming cases.
+    await awaitWindowHeadroom(15);
 
     const streamCall = async (): Promise<{ status: number; text: string }> => {
       const res = await fetch(`${app!.proxyUrl}/v1/chat/completions`, {
@@ -380,6 +399,7 @@ describe("model group member rate limit e2e (AISIX-Cloud#1087)", () => {
       },
     });
     await waitModelsListed(["mgrl-an-limited", "mgrl-an-backup", "mgrl-an-group"]);
+    await awaitWindowHeadroom(5);
 
     const callMessages = async (): Promise<{ status: number; text: string }> => {
       const res = await fetch(`${app!.proxyUrl}/v1/messages`, {
