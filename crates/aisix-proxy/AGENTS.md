@@ -31,9 +31,16 @@ requests keep succeeding on a target that should have been excluded.
 **The default is that a per-model gate binds each target.** Anything an operator
 configures ON a model — rate limits, `allowed_cidrs`, cooldown, health, timeouts —
 is a statement about that model, and reaching it through a group must not strip it.
-Two gates are deliberately entry-scoped instead: guardrail attachment (resolved
-from `model_id` before dispatch, by design) and the group's own copy of any of the
+The only deliberately entry-scoped gate is the group's own copy of any of the
 above. Anything else that only checks `model_entry` / `virtual_entry` is a bug.
+
+Guardrail attachment is the **known open exception, not a settled design**: the
+chain resolves from `RequestContext.model_id` before dispatch, so a guardrail
+scoped to a member never runs for group traffic (measured: direct 422, via group
+200). It is unfixed because the semantics are undecided, not because entry scope
+is correct — input guardrails run before a target is picked, and under failover
+there is no single "winning member" to resolve against. Tracked in
+AISIX-Cloud#1090; do not cite it as precedent for scoping a new gate to the entry.
 
 Two shapes, both already implemented — copy the nearest one:
 
