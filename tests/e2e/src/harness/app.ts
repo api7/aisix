@@ -37,6 +37,13 @@ export interface AppOverrides {
    */
   extraEnv?: Record<string, string>;
   /**
+   * `observability.metrics.client_type_rules` (AISIX-Cloud#1045): operator
+   * UA→client_type regex rules, tried before the built-in allowlist.
+   * A dedicated override because `extra` replaces whole top-level blocks
+   * and the observability block carries the harness-picked metrics port.
+   */
+  clientTypeRules?: Array<{ pattern: string; client: string }>;
+  /**
    * FILE MODE: contents of a standalone `resources.yaml`. When set, the
    * generated config carries `resources_file` (pointing at this content
    * written into the tmp dir) and NO `etcd` section — the gateway loads
@@ -172,6 +179,9 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
           addr: `127.0.0.1:${metricsPort}`,
         },
         otlp: { enabled: false, endpoint: "http://127.0.0.1:4317" },
+        ...(overrides.clientTypeRules
+          ? { client_type_rules: overrides.clientTypeRules }
+          : {}),
       },
       tracing: { otlp: { enabled: false, endpoint: "http://127.0.0.1:4317", sample_ratio: 1 } },
     },

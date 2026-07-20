@@ -72,6 +72,21 @@ observability:
     otlp:
       enabled: false
       endpoint: "http://127.0.0.1:4317"
+    # Optional User-Agent -> client_type mapping rules for the
+    # aisix_llm_tokens_by_client_total metric. Tried in order (first match
+    # wins) BEFORE the built-in client allowlist, so you can classify
+    # in-house tools or re-bucket a built-in match. `pattern` is a regex
+    # (max 512 bytes), matched case-insensitively and unanchored against
+    # the raw User-Agent; `client` is the fixed label value emitted on
+    # match ([a-z0-9][a-z0-9._-]*, max 64 chars; max 64 rules). Validated at
+    # boot; changes require a restart. The metric label set stays bounded:
+    # only these fixed values (plus built-ins / "other" / "unknown") are
+    # ever emitted — never the raw User-Agent.
+    # client_type_rules:
+    #   - pattern: "^py-billing-batcher/"
+    #     client: billing-batcher
+    #   - pattern: "internal-eval-harness"
+    #     client: eval-harness
   tracing:
     otlp:
       enabled: false

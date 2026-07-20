@@ -157,7 +157,7 @@ pub async fn chat_completions(
                 let snap = state.snapshot.load();
                 crate::usage_attr::provider_key_metric_name(&snap, &success.provider_key_id)
             };
-            let client_type = aisix_obs::client_type_from_user_agent(&client.user_agent);
+            let client_type = state.client_classifier.classify(&client.user_agent);
             record_success(
                 &state.metrics,
                 &success.provider,
@@ -1400,7 +1400,10 @@ async fn dispatch(
             crate::usage_attr::provider_key_metric_name(&snap, &pk_id)
         };
         let user_name_for_metrics = auth.key().user_name.clone();
-        let client_type_for_metrics = aisix_obs::client_type_from_user_agent(&client.user_agent);
+        let client_type_for_metrics = state
+            .client_classifier
+            .classify(&client.user_agent)
+            .to_string();
         // Captured for the stream-end telemetry closure so
         // emit_usage_event can look up `telemetry_tags` for per-PK
         // attribution (#302 M17 / AISIX-Cloud#436). The metrics
@@ -1584,7 +1587,7 @@ async fn dispatch(
                 // AISIX-Cloud#1044: same requested logical model as the
                 // UsageLabels above.
                 metrics_for_stream.record_llm_tokens_by_client(
-                    client_type_for_metrics,
+                    &client_type_for_metrics,
                     &model_for_metrics,
                     u64::from(comp.prompt_tokens),
                     u64::from(comp.completion_tokens),
@@ -3152,7 +3155,7 @@ fn record_success(
     // #890 req-3 readable name + req-4 client type + req-1/req-2 dimensions.
     user_name: Option<&str>,
     provider_key_name: &str,
-    client_type: &'static str,
+    client_type: &str,
     stream: bool,
     is_fallback: bool,
     status: u16,

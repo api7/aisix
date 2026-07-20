@@ -500,6 +500,26 @@ impl ObservabilityConfig {
 pub struct MetricsConfig {
     pub prometheus: PrometheusConfig,
     pub otlp: OtlpConfig,
+    /// Operator-defined User-Agent → `client_type` mapping rules
+    /// (AISIX-Cloud#1045), consulted BEFORE the built-in allowlist so a
+    /// deployment can classify in-house tools (or re-bucket a built-in
+    /// match). Deployment-scoped on purpose: the labels these rules mint
+    /// go to this DP's own Prometheus scrape surface, so the operator who
+    /// owns the scrape owns the label set. Order matters (first match
+    /// wins); compiled + validated at boot (fail-fast), never hot-reloaded.
+    pub client_type_rules: Vec<ClientTypeRule>,
+}
+
+/// One `client_type_rules` entry: a regex tried against the raw inbound
+/// `User-Agent` (case-insensitive, unanchored — anchor with `^` yourself),
+/// and the bounded label value emitted on match. The label — not the UA —
+/// becomes the Prometheus `client_type` value, so cardinality stays capped
+/// by the rule count.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClientTypeRule {
+    pub pattern: String,
+    pub client: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
