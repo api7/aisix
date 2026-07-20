@@ -2479,6 +2479,28 @@ fn emit_usage_event(
     state
         .otlp_fan_out
         .fan_out(&event, content, exporters.iter().map(|e| &e.value));
+    // AISIX-Cloud#1044: token volume by inbound client type × model. Codex
+    // traffic arrives on /v1/responses, so leaving this endpoint out of the
+    // by-client series made an allowlisted client invisible in it. All three
+    // usage-bearing paths (non-streaming, verbatim streaming, bridge
+    // streaming) funnel through here. `requested_model` resolved at dispatch
+    // on every path that reaches this emit, so the label is bounded by the
+    // configured model set. The per-key `aisix_llm_*_tokens_total` family
+    // intentionally stays chat/messages-scoped (cross-API audit #646-652).
+    // #1002: cache-inclusive total via the shared helper — cache counters are
+    // non-zero only on the #825 Anthropic bridge path.
+    state.metrics.record_llm_tokens_by_client(
+        aisix_obs::client_type_from_user_agent(&client.user_agent),
+        requested_model,
+        u64::from(usage.prompt_tokens),
+        u64::from(usage.completion_tokens),
+        total_tokens_with_cache(
+            usage.prompt_tokens,
+            usage.completion_tokens,
+            usage.cache_creation_tokens,
+            usage.cache_read_tokens,
+        ),
+    );
 }
 
 /// Emit a zero-token `UsageEvent` for a failed / pre-dispatch attempt

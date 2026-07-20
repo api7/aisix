@@ -1523,8 +1523,11 @@ async fn dispatch(
                 // #1002: comp.total_tokens is the cache-inclusive total (an
                 // Anthropic upstream bridged to an OpenAI-shape client folds
                 // cache tokens into total_tokens per #679).
+                // AISIX-Cloud#1044: same requested logical model as the
+                // UsageLabels above.
                 metrics_for_stream.record_llm_tokens_by_client(
                     client_type_for_metrics,
+                    &model_for_metrics,
                     u64::from(comp.prompt_tokens),
                     u64::from(comp.completion_tokens),
                     comp.total_tokens,
@@ -3107,8 +3110,11 @@ fn record_success(
     // streaming tokens arrive in the SSE on_complete and are recorded there).
     // No-op when all counts are zero (e.g. the streaming branch here).
     // #1002: s.total_tokens is the cache-inclusive canonical total.
+    // AISIX-Cloud#1044: `model` is the same requested logical model recorded
+    // on the UsageLabels above.
     metrics.record_llm_tokens_by_client(
         client_type,
+        model,
         s.prompt_tokens.unwrap_or(0),
         s.completion_tokens.unwrap_or(0),
         s.total_tokens.unwrap_or(0),

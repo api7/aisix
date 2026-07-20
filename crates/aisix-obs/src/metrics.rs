@@ -42,11 +42,16 @@ pub const M_LLM_REQUESTS_TOTAL: &str = "aisix_llm_requests_total";
 pub const M_LLM_REQUEST_DURATION: &str = "aisix_llm_request_duration_seconds";
 pub const M_LLM_API_LATENCY: &str = "aisix_llm_api_latency_seconds";
 pub const M_LLM_TTFT: &str = "aisix_llm_time_to_first_token_seconds";
-/// Issue #890 req-4: token volume sliced by inbound client type only — a
+/// Issue #890 req-4: token volume sliced by inbound client type — a
 /// DEDICATED low-cardinality series so the client dimension never multiplies
 /// the per-key `aisix_llm_*_tokens_total` families. `client_type` is
 /// normalised to a bounded allowlist by [`client_type_from_user_agent`]; the
 /// raw user-agent + client version stay in logs / `UsageEvent`, never here.
+/// AISIX-Cloud#1044 adds a `model` label (the requested logical model, same
+/// value as the `aisix_llm_*` families' `model`) so the series answers
+/// "which models is each client spending tokens on". The label set stays
+/// client_type × model × token_type — per-key/team/user dimensions belong to
+/// the `aisix_llm_*_tokens_total` families (or UsageEvent/logs), never here.
 pub const M_LLM_TOKENS_BY_CLIENT_TOTAL: &str = "aisix_llm_tokens_by_client_total";
 pub const M_PROXY_IN_FLIGHT: &str = "aisix_proxy_in_flight_requests";
 pub const M_PROXY_REQUESTS_TOTAL: &str = "aisix_proxy_requests_total";
@@ -512,6 +517,13 @@ impl Metrics {
     /// `&'static str` from [`client_type_from_user_agent`] so cardinality is
     /// bounded; zero dims are skipped to keep the series sparse.
     ///
+    /// `model` (AISIX-Cloud#1044) is the requested logical model — callers
+    /// MUST pass the same value they put in [`UsageLabels::model`] (or its
+    /// endpoint's equivalent), never the raw client string of an unresolved
+    /// request nor the routed `upstream_model`, so the label stays bounded by
+    /// the configured model set and joins cleanly with the `aisix_llm_*`
+    /// families.
+    ///
     /// `total_tokens` is the caller's canonical cache-inclusive total
     /// (`input + output + Anthropic cache_creation/cache_read`), emitted under
     /// `token_type="total"` (AISIX-Cloud#1002). It is passed in — not derived
@@ -522,6 +534,7 @@ impl Metrics {
     pub fn record_llm_tokens_by_client(
         &self,
         client_type: &'static str,
+        model: &str,
         input_tokens: u64,
         output_tokens: u64,
         total_tokens: u64,
@@ -534,6 +547,7 @@ impl Metrics {
                 metrics::counter!(
                     M_LLM_TOKENS_BY_CLIENT_TOTAL,
                     "client_type" => client_type,
+                    "model" => model.to_string(),
                     "token_type" => "input",
                 )
                 .increment(input_tokens);
@@ -542,6 +556,7 @@ impl Metrics {
                 metrics::counter!(
                     M_LLM_TOKENS_BY_CLIENT_TOTAL,
                     "client_type" => client_type,
+                    "model" => model.to_string(),
                     "token_type" => "output",
                 )
                 .increment(output_tokens);
@@ -550,6 +565,7 @@ impl Metrics {
                 metrics::counter!(
                     M_LLM_TOKENS_BY_CLIENT_TOTAL,
                     "client_type" => client_type,
+                    "model" => model.to_string(),
                     "token_type" => "total",
                 )
                 .increment(total_tokens);
@@ -1326,10 +1342,10 @@ mod tests {
         let m = Metrics::new(false);
         // The caller's canonical total is cache-inclusive, so it can exceed
         // input+output: 155 = 100 + 40 + 15 cache tokens (#1002).
-        m.record_llm_tokens_by_client("openai-python", 100, 40, 155);
-        m.record_llm_tokens_by_client("openai-python", 10, 0, 10);
+        m.record_llm_tokens_by_client("openai-python", "gpt-4o", 100, 40, 155);
+        m.record_llm_tokens_by_client("openai-python", "gpt-4o", 10, 0, 10);
         // All-zero is a no-op (keeps the series sparse).
-        m.record_llm_tokens_by_client("curl", 0, 0, 0);
+        m.record_llm_tokens_by_client("curl", "gpt-4o", 0, 0, 0);
         let rendered = m.render();
         assert!(rendered.contains(M_LLM_TOKENS_BY_CLIENT_TOTAL));
         assert!(rendered.contains("client_type=\"openai-python\""));
@@ -1342,9 +1358,46 @@ mod tests {
             .lines()
             .any(|l| l.starts_with("aisix_llm_tokens_by_client_total{")
                 && l.contains("token_type=\"total\"")
+                && l.contains("model=\"gpt-4o\"")
                 && l.trim_end().ends_with(" 165")));
         // The all-zero curl call recorded nothing.
         assert!(!rendered.contains("client_type=\"curl\""));
+    }
+
+    #[test]
+    fn tokens_by_client_splits_series_per_model() {
+        // AISIX-Cloud#1044: one client type spending on two models must
+        // produce two independent series per token_type, and every series
+        // must carry the model label.
+        let m = Metrics::new(false);
+        m.record_llm_tokens_by_client("claude-code", "claude-sonnet", 100, 60, 160);
+        m.record_llm_tokens_by_client("claude-code", "claude-haiku", 30, 10, 40);
+        let rendered = m.render();
+        let series: Vec<&str> = rendered
+            .lines()
+            .filter(|l| l.starts_with("aisix_llm_tokens_by_client_total{"))
+            .collect();
+        // 2 models × 3 token types, all under the same client_type.
+        assert_eq!(series.len(), 6);
+        assert!(series
+            .iter()
+            .all(|l| l.contains("client_type=\"claude-code\"") && l.contains("model=")));
+        let value_of = |model: &str, token_type: &str| {
+            series
+                .iter()
+                .find(|l| {
+                    l.contains(&format!("model=\"{model}\""))
+                        && l.contains(&format!("token_type=\"{token_type}\""))
+                })
+                .and_then(|l| l.trim_end().rsplit(' ').next())
+                .map(|v| v.parse::<u64>().unwrap())
+        };
+        assert_eq!(value_of("claude-sonnet", "input"), Some(100));
+        assert_eq!(value_of("claude-sonnet", "output"), Some(60));
+        assert_eq!(value_of("claude-sonnet", "total"), Some(160));
+        assert_eq!(value_of("claude-haiku", "input"), Some(30));
+        assert_eq!(value_of("claude-haiku", "output"), Some(10));
+        assert_eq!(value_of("claude-haiku", "total"), Some(40));
     }
 
     #[test]
