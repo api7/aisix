@@ -20,3 +20,26 @@ silently uncorrelated, which reads exactly like working code:
 
 Do not hold a span guard across an await to work around this — it leaks the span
 onto whatever the executor runs next on that thread.
+
+## A per-model gate must say whether it binds the requested entry or each target
+
+`resolve_attempt_models` expands a routing model into targets, so `model_entry` /
+`virtual_entry` is the **group**, which carries none of a member's config. A gate
+written against it silently never runs for group traffic, and nothing errors —
+requests keep succeeding on a target that should have been excluded.
+
+Decide, and encode the decision at the call site:
+
+- **Binds each target** (anything protecting the upstream behind it — rate limits,
+  cooldown, health, timeouts): resolve it from the attempt model *inside* the
+  dispatch loop, in all four group-capable endpoints (chat, messages,
+  count_tokens, responses) and in both the streaming and non-streaming branches.
+  A limit-shaped gate should skip the target and let dispatch continue rather than
+  failing the whole request — see `quota::reserve_routing_target`.
+- **Binds the requested entry** (anything scoped to the alias the caller named —
+  `allowed_cidrs`, guardrail attachment): keep it pre-dispatch, and say so in the
+  user-facing docs, because the group/member split is otherwise invisible.
+
+A reservation-shaped gate additionally must not double-charge: `reserve_routing_target`
+returns `None` for non-routing dispatch, whose model layers the pre-dispatch
+`quota::enforce*` already reserved.
