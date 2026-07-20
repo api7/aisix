@@ -200,6 +200,7 @@ async fn dispatch(
         .map(|r| r.fallback_on_statuses_or_default())
         .unwrap_or(&[]);
 
+    let is_routing_request = model_entry.value.routing.is_some();
     let mut last_err: Option<ProxyError> = None;
     let mut any_anthropic = false;
     for target in &attempt_models {
@@ -210,6 +211,26 @@ async fn dispatch(
             continue;
         }
         any_anthropic = true;
+        // Reserve THIS target's own model rate-limit layers before
+        // dispatching to it (AISIX-Cloud#1087); over-limit → fail over to
+        // the next target. Like the handler-level `_reservation` it is
+        // never token-committed — count_tokens burns no generation tokens;
+        // the drop at scope end releases the concurrency slot.
+        let _member_reservation = match crate::quota::reserve_routing_target(
+            state,
+            is_routing_request,
+            &target.model.display_name,
+            &target.id,
+            &target.model,
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                last_err = Some(e);
+                continue;
+            }
+        };
         match count_tokens_to_target(
             state,
             &snapshot,

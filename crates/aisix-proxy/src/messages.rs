@@ -697,6 +697,37 @@ async fn dispatch(
             } else {
                 String::new()
             };
+            // Reserve THIS target's own model rate-limit layers before
+            // dispatching to it (AISIX-Cloud#1087). Over-limit → record a
+            // 429 attempt and fail over to the next target (same-target
+            // retries can't help — the window won't reset mid-loop).
+            let mut member_reservation = match crate::quota::reserve_routing_target(
+                state,
+                is_routing_request,
+                &target.model.display_name,
+                &target.id,
+                &target.model,
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    routing.attempts.push(AttemptRecord {
+                        index: idx,
+                        kind,
+                        target_model,
+                        target_model_id: target.id.clone(),
+                        provider_key_id: pk_id.clone(),
+                        status: 429,
+                        success: false,
+                        error_class: "rate_limit_exceeded".to_string(),
+                        error_message: e.to_string(),
+                        latency_ms: 0,
+                    });
+                    last_err = Some(e);
+                    continue 'targets;
+                }
+            };
             let attempt_started = Instant::now();
             match dispatch_to_target(
                 state,
@@ -719,6 +750,7 @@ async fn dispatch(
                     ..Default::default()
                 },
                 &mut reservation,
+                &mut member_reservation,
                 redactions_out.clone(),
                 monitor_hits_out.clone(),
             )
@@ -749,7 +781,14 @@ async fn dispatch(
                     // end-of-stream guard (#688), so `reservation` is `None` and
                     // this is skipped.
                     if !outcome.usage_handled_by_stream {
-                        if let Some(r) = reservation.take() {
+                        if let Some(mut r) = reservation.take() {
+                            // Fold this target's model-layer reservation in
+                            // (AISIX-Cloud#1087) so one commit bills the
+                            // member's TPM/TPD too. Already `None` when the
+                            // streaming path folded it into the guard.
+                            if let Some(member) = member_reservation.take() {
+                                r.merge(member);
+                            }
                             let total = total_tokens_with_cache(
                                 outcome.metrics.prompt_tokens,
                                 outcome.metrics.completion_tokens,
@@ -829,6 +868,12 @@ async fn dispatch_to_target(
     // post-stream token accounting into the end-of-stream guard. Left in place
     // on the non-streaming / error paths for the handler to commit or retry.
     reservation: &mut Option<aisix_ratelimit::MultiReservation>,
+    // This target's own model-layer reservation (routing dispatch only,
+    // AISIX-Cloud#1087). The streaming path folds it into `reservation`
+    // before the take above so the end-of-stream guard covers the member's
+    // limits; the non-streaming path leaves it for the handler to commit
+    // alongside `reservation`.
+    member_reservation: &mut Option<aisix_ratelimit::MultiReservation>,
     // Input-side PII mask counts (#932) — the streaming paths merge these
     // into their end-of-stream telemetry emit (the non-streaming emit
     // happens in `messages()`, which already holds them).
@@ -858,6 +903,7 @@ async fn dispatch_to_target(
             client,
             attempt,
             reservation,
+            member_reservation,
             input_redactions,
             input_monitor_hits,
         )
@@ -882,6 +928,7 @@ async fn dispatch_to_target(
         client,
         attempt,
         reservation,
+        member_reservation,
         input_redactions,
         input_monitor_hits,
     )
@@ -911,6 +958,10 @@ async fn anthropic_passthrough_dispatch(
     client_ctx: &ClientContext,
     attempt: AttemptInfo,
     reservation: &mut Option<aisix_ratelimit::MultiReservation>,
+    // This target's own model-layer reservation (AISIX-Cloud#1087); folded
+    // into `reservation` before the streaming take so the end-of-stream
+    // guard covers the member's limits.
+    member_reservation: &mut Option<aisix_ratelimit::MultiReservation>,
     input_redactions: crate::redact::RedactionCounts,
     input_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
 ) -> Result<DispatchOutcome, ProxyError> {
@@ -1173,6 +1224,16 @@ async fn anthropic_passthrough_dispatch(
         // TPM/TPD accounting and `into_stream_hold` keeps the concurrency slot(s)
         // until the stream ends (mirrors chat.rs). `take()` leaves the handler's
         // `reservation` as `None`, so it won't also `commit_tokens`.
+        //
+        // Fold this target's model-layer reservation in first (AISIX-Cloud#1087)
+        // so the guard covers the member's limits too; `take()` leaves it `None`
+        // for the same reason.
+        if let Some(member) = member_reservation.take() {
+            match reservation.as_mut() {
+                Some(main) => main.merge(member),
+                None => *reservation = Some(member),
+            }
+        }
         let post_stream_keys = reservation.as_ref().map(|r| r.keys()).unwrap_or_default();
         let stream_hold = reservation.take().map(|r| r.into_stream_hold());
         let limiter_c = std::sync::Arc::clone(&state.limiter);
@@ -1535,6 +1596,10 @@ async fn cross_provider_dispatch(
     client: &ClientContext,
     attempt: AttemptInfo,
     reservation: &mut Option<aisix_ratelimit::MultiReservation>,
+    // This target's own model-layer reservation (AISIX-Cloud#1087); folded
+    // into `reservation` before the streaming take so the end-of-stream
+    // guard covers the member's limits.
+    member_reservation: &mut Option<aisix_ratelimit::MultiReservation>,
     input_redactions: crate::redact::RedactionCounts,
     input_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
 ) -> Result<DispatchOutcome, ProxyError> {
@@ -1697,6 +1762,16 @@ async fn cross_provider_dispatch(
         // keys drive post-stream TPM/TPD accounting, the hold keeps the
         // concurrency slot(s) until the stream ends. `take()` leaves the
         // handler's `reservation` as `None` so it won't also `commit_tokens`.
+        //
+        // Fold this target's model-layer reservation in first (AISIX-Cloud#1087)
+        // so the guard covers the member's limits too; `take()` leaves it `None`
+        // so the handler won't also commit it.
+        if let Some(member) = member_reservation.take() {
+            match reservation.as_mut() {
+                Some(main) => main.merge(member),
+                None => *reservation = Some(member),
+            }
+        }
         let post_stream_keys = reservation.as_ref().map(|r| r.keys()).unwrap_or_default();
         let stream_hold = reservation.take().map(|r| r.into_stream_hold());
         let limiter_for_stream = std::sync::Arc::clone(&state.limiter);

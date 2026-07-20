@@ -195,6 +195,15 @@ impl MultiReservation {
         self.reservations.iter().map(|r| r.key.clone()).collect()
     }
 
+    /// Absorb another reservation's layers into this one, so a single
+    /// `commit_tokens` / `into_stream_hold` finalises both. Used by the
+    /// routing dispatch to fold the winning target's model-layer
+    /// reservation into the request-level reservation once the winner
+    /// is known.
+    pub fn merge(&mut self, other: MultiReservation) {
+        self.reservations.extend(other.reservations);
+    }
+
     /// Convert into an owned [`StreamConcurrencyGuard`] for the streaming
     /// path. The per-layer concurrency slots stay held — they are NOT
     /// released here — and are released only when the returned guard drops,
@@ -668,6 +677,27 @@ mod tests {
 
         let keys = multi.keys();
         assert_eq!(keys, vec!["api_key:k1", "model:m1", "team:t1"]);
+    }
+
+    #[tokio::test]
+    async fn multi_reservation_merge_commits_and_releases_absorbed_layers() {
+        let clock = TestClock::new(100);
+        let limiter = Limiter::local_with_clock(clock.clone());
+        let l = limits(None, Some(1000), Some(1));
+
+        let main = limiter.pre_commit("api_key:k1", &l).await.unwrap();
+        let member = limiter.pre_commit("model:target", &l).await.unwrap();
+
+        let mut multi = MultiReservation::new(vec![main]);
+        multi.merge(MultiReservation::new(vec![member]));
+        assert_eq!(multi.keys(), vec!["api_key:k1", "model:target"]);
+
+        // One commit finalises both layers: tokens land on each and the
+        // absorbed layer's concurrency slot is released.
+        multi.commit_tokens(300).await;
+        let s = limiter.peek("model:target", &l).await.unwrap();
+        assert_eq!(s.tpm_used, 300);
+        assert!(limiter.pre_commit("model:target", &l).await.is_ok());
     }
 
     #[tokio::test]

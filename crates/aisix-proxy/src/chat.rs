@@ -1058,12 +1058,14 @@ async fn dispatch(
     }
 
     // Multi-layer rate-limit reservation (api_key inline + model inline + policies).
+    // `mut` so a routing dispatch can fold the winning target's model-layer
+    // reservation into it once the winner is known (AISIX-Cloud#1087).
     let model_rl = crate::quota::ModelRateLimit::from_model(
         &req.model,
         &virtual_entry.id,
         &virtual_entry.value,
     );
-    let reservation = crate::quota::enforce_rate_limit(state, auth, Some(&model_rl))
+    let mut reservation = crate::quota::enforce_rate_limit(state, auth, Some(&model_rl))
         .await
         .map_err(&with_model)?;
 
@@ -1138,6 +1140,11 @@ async fn dispatch(
             kind: &'static str,
         }
         let mut won: Option<StreamWin> = None;
+        // The winning target's own model-layer reservation (routing dispatch
+        // only) — folded into `reservation` after the loop so the stream hold
+        // and post-stream token accounting cover the member's limits too
+        // (AISIX-Cloud#1087).
+        let mut won_member_reservation: Option<aisix_ratelimit::MultiReservation> = None;
 
         'targets: for attempt in &attempt_models {
             let model = &attempt.model;
@@ -1162,6 +1169,43 @@ async fn dispatch(
                 model.display_name.clone()
             } else {
                 String::new()
+            };
+            // Reserve THIS target's own model rate-limit layers before
+            // dispatching to it (AISIX-Cloud#1087). Over-limit → record a
+            // 429 attempt and fail over to the next target (same-target
+            // retries can't help — the window won't reset mid-loop).
+            let member_reservation = match crate::quota::reserve_routing_target(
+                state,
+                is_routing_request,
+                &model.display_name,
+                &attempt.id,
+                model,
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    stream_routing.attempts.push(AttemptRecord {
+                        index: idx,
+                        kind,
+                        target_model,
+                        target_model_id: attempt.id.clone(),
+                        provider_key_id: pk_entry.id.clone(),
+                        status: 429,
+                        success: false,
+                        error_class: "rate_limit_exceeded".to_string(),
+                        error_message: e.to_string(),
+                        latency_ms: 0,
+                    });
+                    last_err = Some(BridgeError::upstream_status(
+                        429,
+                        format!(
+                            "routing target {:?} is over its model rate limit: {e}",
+                            model.display_name
+                        ),
+                    ));
+                    continue 'targets;
+                }
             };
             let model_arc = Arc::new(model.clone());
             let pk_arc = Arc::new(pk_entry.value.clone());
@@ -1242,6 +1286,7 @@ async fn dispatch(
                         idx,
                         kind,
                     });
+                    won_member_reservation = member_reservation;
                     break 'targets;
                 }
                 Err(err) => {
@@ -1306,6 +1351,13 @@ async fn dispatch(
         // which the CompleteOnDrop guard fires on both paths). Pre-fix the
         // permit was released here, letting a key capped at N run far more
         // than N simultaneous streams (#450).
+        //
+        // Fold the winning target's model-layer reservation in first, so the
+        // stream hold keeps its concurrency slot(s) and `post_stream_keys`
+        // bills its TPM/TPD at stream end too (AISIX-Cloud#1087).
+        if let Some(member) = won_member_reservation.take() {
+            reservation.merge(member);
+        }
         let post_stream_keys = reservation.keys();
         let stream_concurrency_hold = reservation.into_stream_hold();
         // least_busy: keep this target counted as in-flight for the stream's
@@ -1864,8 +1916,13 @@ async fn dispatch(
     let is_routing_request =
         virtual_entry.value.routing.is_some() || virtual_entry.value.is_semantic();
     let mut routing = RoutingTelemetry::default();
+    // The winning target's own model-layer reservation (routing dispatch
+    // only) — folded into `reservation` at the commit point below so the
+    // member's TPM/TPD bills with the request-level layers
+    // (AISIX-Cloud#1087).
+    let mut won_member_reservation: Option<aisix_ratelimit::MultiReservation> = None;
 
-    for attempt in &attempt_models {
+    'targets: for attempt in &attempt_models {
         let model = &attempt.model;
         let Some(provider) = model.provider.as_deref() else {
             last_err = Some(BridgeError::Config("model has no provider".into()));
@@ -1915,6 +1972,44 @@ async fn dispatch(
                 String::new()
             };
 
+            // Reserve THIS target's own model rate-limit layers before
+            // dispatching to it (AISIX-Cloud#1087). Over-limit → record a
+            // 429 attempt and fail over to the next target (same-target
+            // retries can't help — the window won't reset mid-loop).
+            let member_reservation = match crate::quota::reserve_routing_target(
+                state,
+                is_routing_request,
+                &model.display_name,
+                &attempt.id,
+                model,
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    routing.attempts.push(AttemptRecord {
+                        index: attempt_index,
+                        kind,
+                        target_model,
+                        target_model_id: attempt.id.clone(),
+                        provider_key_id: pk_entry.id.clone(),
+                        status: 429,
+                        success: false,
+                        error_class: "rate_limit_exceeded".to_string(),
+                        error_message: e.to_string(),
+                        latency_ms: 0,
+                    });
+                    last_err = Some(BridgeError::upstream_status(
+                        429,
+                        format!(
+                            "routing target {:?} is over its model rate limit: {e}",
+                            model.display_name
+                        ),
+                    ));
+                    continue 'targets;
+                }
+            };
+
             let attempt_started = Instant::now();
             // least_busy: count this target as in-flight for the upstream
             // call. The response is fully buffered, so the target is done
@@ -1950,6 +2045,7 @@ async fn dispatch(
                         error_message: String::new(),
                         latency_ms: attempt_latency_ms,
                     });
+                    won_member_reservation = member_reservation;
                     upstream = Some(resp);
                     break;
                 }
@@ -2046,6 +2142,12 @@ async fn dispatch(
     let provider_request_id = upstream.id.clone();
     let provider_model_version = upstream.model.clone();
     let finish_reason = finish_reason_label(&upstream.finish_reason);
+    // Fold the winning target's model-layer reservation in so one commit
+    // bills the member's TPM/TPD alongside the request-level layers
+    // (AISIX-Cloud#1087).
+    if let Some(member) = won_member_reservation.take() {
+        reservation.merge(member);
+    }
     reservation.commit_tokens(total).await;
 
     // cp-api recomputes cost server-side from its pricing catalog when
