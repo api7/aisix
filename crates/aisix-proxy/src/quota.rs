@@ -319,6 +319,16 @@ pub(crate) async fn reserve_routing_target(
         .map(Some)
 }
 
+/// Seconds until the offending window reopens, for a
+/// [`reserve_routing_target`] rejection. `chat.rs` funnels its rejection
+/// through a `BridgeError`, which would otherwise drop the hint the
+/// `/v1/messages` and `/v1/responses` loops keep by carrying the
+/// `ProxyError::RateLimit` itself — so every endpoint's all-targets-exhausted
+/// 429 lands with the same `Retry-After`.
+pub(crate) fn retry_after_of(err: &ProxyError) -> Option<u64> {
+    err.retry_after_secs()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

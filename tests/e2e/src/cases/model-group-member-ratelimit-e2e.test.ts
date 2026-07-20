@@ -255,10 +255,27 @@ describe("model group member rate limit e2e (AISIX-Cloud#1087)", () => {
     expect(servedContent(await callGroup("mgrl-both-limited"))).toBe("served-by-c1");
     expect(servedContent(await callGroup("mgrl-both-limited"))).toBe("served-by-c2");
 
-    // Both members exhausted → the request fails with 429, not a 5xx.
-    const third = await callGroup("mgrl-both-limited");
+    // Both members exhausted → the request fails with 429, not a 5xx, and
+    // carries the limiter's `Retry-After` so SDK back-off still works. The
+    // hint is the load-bearing half: a bare 429 makes clients retry
+    // immediately against a window that has not reopened.
+    const third = await fetch(`${app!.proxyUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${CALLER_PLAINTEXT}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "mgrl-both-limited",
+        messages: [{ role: "user", content: "hello" }],
+      }),
+    });
     expect(third.status).toBe(429);
-    expect(third.body.error?.message ?? "").toContain("rate limit");
+    const body = (await third.json()) as { error?: { message?: string } };
+    expect(body.error?.message ?? "").toContain("rate limit");
+    const retryAfter = Number.parseInt(third.headers.get("retry-after") ?? "", 10);
+    expect(retryAfter).toBeGreaterThan(0);
+    expect(retryAfter).toBeLessThanOrEqual(60);
   });
 
   test("winning member's TPM bucket is committed, throttling the next call", async (ctx) => {

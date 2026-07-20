@@ -1198,12 +1198,16 @@ async fn dispatch(
                         error_message: e.to_string(),
                         latency_ms: 0,
                     });
-                    last_err = Some(BridgeError::upstream_status(
+                    // Keep the limiter's own Retry-After hint on the wire:
+                    // when every target is exhausted this error becomes the
+                    // client's 429, and SDKs back off on that header.
+                    last_err = Some(BridgeError::upstream_status_with_retry_after(
                         429,
                         format!(
                             "routing target {:?} is over its model rate limit: {e}",
                             model.display_name
                         ),
+                        crate::quota::retry_after_of(&e).map(Duration::from_secs),
                     ));
                     continue 'targets;
                 }
@@ -2001,12 +2005,16 @@ async fn dispatch(
                         error_message: e.to_string(),
                         latency_ms: 0,
                     });
-                    last_err = Some(BridgeError::upstream_status(
+                    // Keep the limiter's own Retry-After hint on the wire:
+                    // when every target is exhausted this error becomes the
+                    // client's 429, and SDKs back off on that header.
+                    last_err = Some(BridgeError::upstream_status_with_retry_after(
                         429,
                         format!(
                             "routing target {:?} is over its model rate limit: {e}",
                             model.display_name
                         ),
+                        crate::quota::retry_after_of(&e).map(Duration::from_secs),
                     ));
                     continue 'targets;
                 }
