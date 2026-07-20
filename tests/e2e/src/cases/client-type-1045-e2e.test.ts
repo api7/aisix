@@ -222,10 +222,16 @@ describe("client_type built-ins + operator rules (AISIX-Cloud#1045)", () => {
     }
 
     await chatWithUa(app, "SomeRandomBespokeClient/9.9");
+    // Empty UA must stay `unknown` even though a match-anything custom
+    // rule set could otherwise claim it.
+    await chatWithUa(app, "");
     const text = await pollSeries(
       app,
-      (t) => seriesValue(t, "other", "total") !== undefined,
+      (t) =>
+        seriesValue(t, "other", "total") !== undefined &&
+        seriesValue(t, "unknown", "total") !== undefined,
     );
     expect(seriesValue(text, "other", "total")).toBe(USAGE.total_tokens);
+    expect(seriesValue(text, "unknown", "total")).toBe(USAGE.total_tokens);
   });
 });
