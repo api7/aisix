@@ -4622,7 +4622,10 @@ mod tests {
         // `output` → completion stays 0.
         assert_eq!(event.prompt_tokens, 8);
         assert_eq!(event.completion_tokens, 0);
-        assert!(event.usage_estimated, "locally-counted tokens must be flagged");
+        assert!(
+            event.usage_estimated,
+            "locally-counted tokens must be flagged"
+        );
     }
 
     /// #808: a streaming `/v1/responses` 200 (e.g. all Codex traffic, which
@@ -4949,7 +4952,10 @@ data: [DONE]\n\n";
         // + "user" (1) + "hi" (1) + 3 reply priming = 8. Empty output → 0.
         assert_eq!(event.prompt_tokens, 8);
         assert_eq!(event.completion_tokens, 0);
-        assert!(event.usage_estimated, "locally-counted tokens must be flagged");
+        assert!(
+            event.usage_estimated,
+            "locally-counted tokens must be flagged"
+        );
     }
 
     /// #429 follow-up: a 200 whose `usage` carries

@@ -1065,7 +1065,10 @@ mod tests {
         // the completion side stays 0 (nothing to count).
         assert_eq!(event.prompt_tokens, 1);
         assert_eq!(event.completion_tokens, 0);
-        assert!(event.usage_estimated, "locally-counted tokens must be flagged");
+        assert!(
+            event.usage_estimated,
+            "locally-counted tokens must be flagged"
+        );
     }
 
     /// #429 follow-up: a 200 whose `usage` carries
@@ -1286,7 +1289,10 @@ mod tests {
         // prompt "x" = 1 token; no choices text → completion stays 0.
         assert_eq!(event.prompt_tokens, 1);
         assert_eq!(event.completion_tokens, 0);
-        assert!(event.usage_estimated, "locally-counted tokens must be flagged");
+        assert!(
+            event.usage_estimated,
+            "locally-counted tokens must be flagged"
+        );
     }
 
     /// AISIX-Cloud#867 parity: a successful /v1/completions 200 must stamp

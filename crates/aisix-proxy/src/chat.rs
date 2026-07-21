@@ -5028,7 +5028,10 @@ mod complete_on_drop_tests {
         };
         let out = drop_and_capture_with_estimator(comp, 0);
         assert_eq!(out.prompt_tokens, 8);
-        assert_eq!(out.completion_tokens, 0, "nothing delivered → nothing billed");
+        assert_eq!(
+            out.completion_tokens, 0,
+            "nothing delivered → nothing billed"
+        );
         assert_eq!(out.total_tokens, 8);
         assert!(out.usage_estimated);
     }
