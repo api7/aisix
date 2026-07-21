@@ -125,9 +125,18 @@ describe("status/config: etcd watch source", () => {
     }
 
     let cfg: StatusConfig | undefined;
+    // "synced" alone races the seed: the state flips synced on an EARLY
+    // revision before all three seeded resources are applied, and the
+    // count asserts below then read undefined. Wait until the applied
+    // snapshot actually contains the seeded resources.
     await waitConfigPropagation(async () => {
       cfg = await getStatusConfig(app!);
-      return cfg.state === "synced";
+      return (
+        cfg.state === "synced" &&
+        cfg.applied?.resource_counts.models === 1 &&
+        cfg.applied?.resource_counts.provider_keys === 1 &&
+        cfg.applied?.resource_counts.api_keys === 1
+      );
     });
 
     expect(cfg!.source.type).toBe("etcd");
