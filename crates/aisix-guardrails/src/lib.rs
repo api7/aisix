@@ -615,6 +615,16 @@ pub trait Guardrail: Send + Sync + 'static {
     }
 }
 
+/// Serializes the tests (across modules) that install a log-capturing
+/// tracing subscriber. `set_default` is thread-local, but tracing's
+/// GLOBAL max-level hint is recomputed when any dispatcher is dropped —
+/// a concurrently finishing capture test can lower it to OFF and make
+/// this thread's `tracing::info!` fast-path away before reaching the
+/// thread-local subscriber. One capture test at a time, process-wide.
+/// A tokio mutex because the guard spans the captured async body.
+#[cfg(test)]
+pub(crate) static TRACING_CAPTURE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;

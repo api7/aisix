@@ -973,6 +973,8 @@ mod tests {
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = ()>,
     {
+        // One capture test at a time, process-wide (see TRACING_CAPTURE_LOCK).
+        let _capture_guard = crate::TRACING_CAPTURE_LOCK.lock().await;
         let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let subscriber = tracing_subscriber::fmt()
             .with_ansi(false)

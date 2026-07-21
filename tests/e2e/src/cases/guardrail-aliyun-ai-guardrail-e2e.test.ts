@@ -36,6 +36,7 @@ const CALLER_KEY_HASH = createHash("sha256")
 // plain-letter markers are detectable in the raw request the mock receives.
 const RISKY_MARKER = "aigblockmarker";
 const WATCH_MARKER = "aigwatchmarker";
+const MASK_MARKER = "aigmaskmarker";
 
 interface AigMockRequest {
   action: string;
@@ -82,31 +83,51 @@ async function startAigMock(): Promise<AigMock> {
 
       const suggestion = content.includes(RISKY_MARKER)
         ? "block"
-        : content.includes(WATCH_MARKER)
-          ? "watch"
-          : "pass";
+        : content.includes(MASK_MARKER)
+          ? "mask"
+          : content.includes(WATCH_MARKER)
+            ? "watch"
+            : "pass";
       res.statusCode = 200;
       res.setHeader("content-type", "application/json");
+      const detail =
+        suggestion === "mask"
+          ? {
+              Type: "sensitiveData",
+              Level: "S2",
+              Suggestion: "mask",
+              Result: [
+                {
+                  Label: "1814",
+                  Level: "S2",
+                  // The doc-shaped desensitized rewrite of the submitted
+                  // content — what the DP must write back into the body.
+                  Ext: {
+                    Desensitization: content.replaceAll(MASK_MARKER, "[MASKED]"),
+                    SensitiveData: [MASK_MARKER],
+                  },
+                },
+              ],
+            }
+          : {
+              Type: "contentModeration",
+              Level: suggestion === "block" ? "high" : "none",
+              Suggestion: suggestion,
+              Result: [
+                {
+                  Label:
+                    suggestion === "block" ? "violent_incidents" : "nonLabel",
+                  Level: suggestion === "block" ? "high" : "none",
+                },
+              ],
+            };
       res.end(
         JSON.stringify({
           Code: 200,
           Message: "OK",
           RequestId: "mock-aig-req-1",
           Data: {
-            Detail: [
-              {
-                Type: "contentModeration",
-                Level: suggestion === "block" ? "high" : "none",
-                Suggestion: suggestion,
-                Result: [
-                  {
-                    Label:
-                      suggestion === "block" ? "violent_incidents" : "nonLabel",
-                    Level: suggestion === "block" ? "high" : "none",
-                  },
-                ],
-              },
-            ],
+            Detail: [detail],
             Suggestion: suggestion,
           },
         }),
@@ -130,6 +151,7 @@ describe("aliyun AI guardrail e2e: MultiModalGuard suggestion drives the verdict
   let app: SpawnedApp | undefined;
   let benignUpstream: OpenAiUpstream | undefined;
   let riskyOutputUpstream: OpenAiUpstream | undefined;
+  let maskOutputUpstream: OpenAiUpstream | undefined;
   let streamUpstream: OpenAiUpstream | undefined;
   let aig: AigMock | undefined;
   let seed: SeedClient | undefined;
@@ -180,6 +202,28 @@ describe("aliyun AI guardrail e2e: MultiModalGuard suggestion drives the verdict
       },
     });
 
+    // Upstream whose RESPONSE carries the mask marker — exercises the
+    // desensitization write-back on the output hook.
+    maskOutputUpstream = await startOpenAiUpstream({
+      nonStreamBody: {
+        id: "cmpl-mask-out",
+        object: "chat.completion",
+        created: Math.floor(Date.now() / 1000),
+        model: "gpt-4o-mini",
+        choices: [
+          {
+            index: 0,
+            message: {
+              role: "assistant",
+              content: `the number is ${MASK_MARKER} ok`,
+            },
+            finish_reason: "stop",
+          },
+        ],
+        usage: { prompt_tokens: 5, completion_tokens: 6, total_tokens: 11 },
+      },
+    });
+
     streamUpstream = await startOpenAiUpstream({
       streamEvents: [
         '{"id":"strm-aig","object":"chat.completion.chunk","model":"gpt-4o-mini","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}',
@@ -217,6 +261,18 @@ describe("aliyun AI guardrail e2e: MultiModalGuard suggestion drives the verdict
       provider_key_id: riskyOutPk.id,
     });
 
+    const maskOutPk = await seed.createProviderKey({
+      display_name: "aig-mask-e2e-pk",
+      secret: "sk-mock",
+      api_base: `${maskOutputUpstream.baseUrl}/v1`,
+    });
+    await seed.createModel({
+      display_name: "aig-mask-e2e",
+      provider: "openai",
+      model_name: "gpt-4o-mini",
+      provider_key_id: maskOutPk.id,
+    });
+
     const streamPk = await seed.createProviderKey({
       display_name: "aig-stream-e2e-pk",
       secret: "sk-mock",
@@ -231,7 +287,7 @@ describe("aliyun AI guardrail e2e: MultiModalGuard suggestion drives the verdict
 
     await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
-      allowed_models: ["aig-e2e", "aig-out-e2e", "aig-stream-e2e"],
+      allowed_models: ["aig-e2e", "aig-out-e2e", "aig-mask-e2e", "aig-stream-e2e"],
     });
 
     // One env-wide guardrail covering input + output. Small window so the
@@ -257,6 +313,7 @@ describe("aliyun AI guardrail e2e: MultiModalGuard suggestion drives the verdict
     await app?.exit();
     await benignUpstream?.close();
     await riskyOutputUpstream?.close();
+    await maskOutputUpstream?.close();
     await streamUpstream?.close();
     await aig?.close();
   });
@@ -342,7 +399,7 @@ describe("aliyun AI guardrail e2e: MultiModalGuard suggestion drives the verdict
     expect(benignUpstream.receivedRequests.length).toBe(okBefore + 1);
   });
 
-  test("suggestion=block on output → 422 after upstream call, session+chat ids sent", async (ctx) => {
+  test("suggestion=block on output → 422 after upstream call", async (ctx) => {
     if (!etcdReachable || !app || !riskyOutputUpstream) {
       ctx.skip();
       return;
@@ -371,18 +428,36 @@ describe("aliyun AI guardrail e2e: MultiModalGuard suggestion drives the verdict
     // Output hook runs AFTER the upstream → the upstream IS hit.
     expect(riskyOutputUpstream.receivedRequests.length).toBe(upstreamBefore + 1);
 
-    // The output call used the Pro response service and carried BOTH
-    // correlation ids (sessionId for content concatenation, chatId for
-    // the console's Q/A-round record).
+    // The output call used the Pro response service. A non-streaming
+    // response is a single call, so the streaming-correlation ids
+    // (sessionId/chatId) are not needed — the streaming case below
+    // asserts them where they matter.
     const outCall = aig!.requests.find(
       (r) =>
         r.service === "response_security_check_pro" &&
         r.content.includes(RISKY_MARKER),
     );
     expect(outCall, "expected a response_security_check_pro call").toBeDefined();
-    expect(outCall?.sessionId, "output call must carry a sessionId").toBeTruthy();
-    expect(outCall?.chatId, "output call must carry a chatId").toBeTruthy();
-    expect(outCall?.chatId).toBe(outCall?.sessionId);
+  });
+
+  test("suggestion=mask on output → desensitized text written back, 200", async (ctx) => {
+    if (!etcdReachable || !app || !maskOutputUpstream) {
+      ctx.skip();
+      return;
+    }
+    const client = new OpenAI({
+      apiKey: CALLER_PLAINTEXT,
+      baseURL: `${app.proxyUrl}/v1`,
+      maxRetries: 0,
+    });
+
+    const completion = await client.chat.completions.create({
+      model: "aig-mask-e2e",
+      messages: [{ role: "user", content: "an innocent question" }],
+    });
+    const content = completion.choices[0]?.message.content ?? "";
+    expect(content).toBe("the number is [MASKED] ok");
+    expect(content).not.toContain(MASK_MARKER);
   });
 
   test("streaming risky output → SSE error event, stable session/chat ids across windows", async (ctx) => {

@@ -67,7 +67,7 @@ use crate::aliyun::{
     extract_error_code, percent_encode, sign, AliyunFailure, ACS_REQUEST_ID_HEADER,
     MAX_ERROR_BODY_PARSE_BYTES,
 };
-use crate::{Guardrail, GuardrailVerdict, StreamOutputPolicy};
+use crate::{Guardrail, GuardrailVerdict, SegmentsOutcome, StreamOutputPolicy};
 
 const ACTION: &str = "MultiModalGuard";
 const API_VERSION: &str = "2022-03-02";
@@ -152,10 +152,17 @@ impl AliyunAiGuardrail {
         }
     }
 
-    /// Check one piece of text with the given service code. `session_id`
-    /// (when set) is forwarded as both `ServiceParameters.sessionId` and
-    /// `.chatId` so Aliyun correlates the windows of one streamed
-    /// response into one console record.
+    /// Check one piece of text with the given service code, on the BLOB
+    /// path — the `check_input` / `check_output` families, which have no
+    /// mask write-back channel (they serve the mid-stream windows among
+    /// others). A `mask` suggestion therefore maps to Block here:
+    /// releasing the un-masked content would defeat the operator's
+    /// Aliyun-side desensitization policy. The segment path
+    /// ([`Self::moderate_segments`]) is where masking is honored.
+    ///
+    /// `session_id` (when set) is forwarded as both
+    /// `ServiceParameters.sessionId` and `.chatId` so Aliyun correlates
+    /// the windows of one streamed response into one console record.
     async fn moderate(
         &self,
         service: &str,
@@ -169,8 +176,8 @@ impl AliyunAiGuardrail {
         let content: String = text.chars().take(MAX_CONTENT_CHARS).collect();
         let (outcome, diag) = self.call(service, &content, session_id).await;
         match outcome {
-            Ok(suggestion) => {
-                let blocked = suggestion == "block";
+            Ok(reply) => {
+                let blocked = matches!(reply.suggestion.as_str(), "block" | "mask");
                 // Diagnostics land here, once, with the verdict known. A
                 // block is what an operator traces back from a caller's
                 // 422, so it logs at info (the default level); a clean
@@ -198,32 +205,215 @@ impl AliyunAiGuardrail {
                         "aliyun AI guardrail passed content",
                     );
                 }
-                if blocked {
-                    GuardrailVerdict::block(format!(
-                        "aliyun AI guardrail: suggestion {} (row: {})",
-                        suggestion, self.row_name
-                    ))
-                } else {
-                    GuardrailVerdict::Allow
+                match reply.suggestion.as_str() {
+                    "block" => GuardrailVerdict::block(format!(
+                        "aliyun AI guardrail: suggestion block (row: {})",
+                        self.row_name
+                    )),
+                    // No write-back channel on this path — fail toward the
+                    // policy (mask means "this must not go out as-is").
+                    "mask" => GuardrailVerdict::block(format!(
+                        "aliyun AI guardrail: content requires masking (row: {})",
+                        self.row_name
+                    )),
+                    _ => GuardrailVerdict::Allow,
                 }
             }
             Err(failure) => self.handle_failure(failure, &diag, fail_open),
         }
     }
 
+    /// Segment-mode moderation: verdict plus positional mask write-back,
+    /// serving `moderate_input_segments` / `moderate_output_segments`
+    /// (the non-streaming bodies and the held-back tail of a streamed
+    /// response — the paths that CAN rewrite content).
+    ///
+    /// One call on the joined text decides the verdict (same cost as the
+    /// blob path). A non-streaming body is a single call, so the
+    /// streaming-correlation parameters (`sessionId`/`chatId`) are not
+    /// sent on this path. Only when Aliyun answers `mask` does more work
+    /// happen:
+    /// - a single segment (the common case — an assistant reply, a lone
+    ///   user message) takes the joined call's `Ext.Desensitization`
+    ///   directly;
+    /// - multiple segments are re-checked one call per segment, because
+    ///   MultiModalGuard takes ONE `content` string and returns ONE
+    ///   desensitized text — there is no per-block alignment in a single
+    ///   call the way Bedrock's content array gives (the re-calls keep
+    ///   `masked[i]` aligned with `texts[i]` by construction).
+    /// - `mask` with no usable `Desensitization` fails closed: the policy
+    ///   said this content must not go out as-is, and there is nothing to
+    ///   rewrite it with.
+    async fn moderate_segments(&self, texts: &[String], output: bool) -> SegmentsOutcome {
+        let service = service_code(&self.service_level, output);
+        let fail_open = if output {
+            self.output_fail_open
+        } else {
+            self.fail_open
+        };
+        let joined = texts.join("\n");
+        if joined.is_empty() {
+            return SegmentsOutcome::allow();
+        }
+        let content: String = joined.chars().take(MAX_CONTENT_CHARS).collect();
+        let (outcome, diag) = self.call(service, &content, None).await;
+        let reply = match outcome {
+            Ok(r) => r,
+            Err(failure) => {
+                return SegmentsOutcome::from_verdict(
+                    self.handle_failure(failure, &diag, fail_open),
+                )
+            }
+        };
+        match reply.suggestion.as_str() {
+            "block" => {
+                tracing::info!(
+                    row = %self.row_name,
+                    service,
+                    aliyun_request_id = %diag.request_id,
+                    aliyun_suggestion = %diag.suggestion,
+                    aliyun_dimensions = %diag.dimensions_field(),
+                    aliyun_labels = %diag.labels_field(),
+                    "aliyun AI guardrail blocked content",
+                );
+                SegmentsOutcome::from_verdict(GuardrailVerdict::block(format!(
+                    "aliyun AI guardrail: suggestion block (row: {})",
+                    self.row_name
+                )))
+            }
+            "mask" => {
+                tracing::info!(
+                    row = %self.row_name,
+                    service,
+                    aliyun_request_id = %diag.request_id,
+                    aliyun_dimensions = %diag.dimensions_field(),
+                    aliyun_labels = %diag.labels_field(),
+                    "aliyun AI guardrail masking content",
+                );
+                self.masked_segments(texts, service, fail_open, reply, &diag)
+                    .await
+            }
+            _ => {
+                tracing::debug!(
+                    row = %self.row_name,
+                    service,
+                    aliyun_request_id = %diag.request_id,
+                    aliyun_suggestion = %diag.suggestion,
+                    aliyun_dimensions = %diag.dimensions_field(),
+                    "aliyun AI guardrail passed content",
+                );
+                SegmentsOutcome::allow()
+            }
+        }
+    }
+
+    /// Build the positionally-aligned masked replacements after the
+    /// joined call answered `mask`. See [`Self::moderate_segments`] for
+    /// the single- vs multi-segment strategy.
+    async fn masked_segments(
+        &self,
+        texts: &[String],
+        service: &str,
+        fail_open: bool,
+        first_reply: CallReply,
+        first_diag: &AigDiagnostics,
+    ) -> SegmentsOutcome {
+        let mut counts: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
+        if let [only] = texts {
+            return match first_reply.desensitization {
+                Some(masked) if !masked.is_empty() => {
+                    for label in &first_diag.labels {
+                        *counts.entry(label.clone()).or_insert(0) += 1;
+                    }
+                    SegmentsOutcome {
+                        verdict: GuardrailVerdict::Allow,
+                        masked: Some(vec![reattach_clipped_tail(only, masked)]),
+                        counts,
+                        monitor_hits: Vec::new(),
+                    }
+                }
+                _ => self.mask_without_replacement(first_diag),
+            };
+        }
+        // Multi-segment: one call per slot for aligned replacements.
+        let mut masked: Vec<String> = Vec::with_capacity(texts.len());
+        for text in texts {
+            if text.is_empty() {
+                masked.push(String::new());
+                continue;
+            }
+            let content: String = text.chars().take(MAX_CONTENT_CHARS).collect();
+            let (outcome, diag) = self.call(service, &content, None).await;
+            let reply = match outcome {
+                Ok(r) => r,
+                Err(failure) => {
+                    return SegmentsOutcome::from_verdict(
+                        self.handle_failure(failure, &diag, fail_open),
+                    )
+                }
+            };
+            match reply.suggestion.as_str() {
+                // A segment that blocks on its own kills the request —
+                // strictest wins across the per-segment verdicts.
+                "block" => {
+                    return SegmentsOutcome::from_verdict(GuardrailVerdict::block(format!(
+                        "aliyun AI guardrail: suggestion block (row: {})",
+                        self.row_name
+                    )))
+                }
+                "mask" => match reply.desensitization {
+                    Some(m) if !m.is_empty() => {
+                        for label in &diag.labels {
+                            *counts.entry(label.clone()).or_insert(0) += 1;
+                        }
+                        masked.push(reattach_clipped_tail(text, m));
+                    }
+                    _ => return self.mask_without_replacement(&diag),
+                },
+                _ => masked.push(text.clone()),
+            }
+        }
+        SegmentsOutcome {
+            verdict: GuardrailVerdict::Allow,
+            masked: Some(masked),
+            counts,
+            monitor_hits: Vec::new(),
+        }
+    }
+
+    /// `mask` suggested but no `Ext.Desensitization` came back: there is
+    /// nothing to rewrite with, and releasing the original would defeat
+    /// the policy — fail closed.
+    fn mask_without_replacement(&self, diag: &AigDiagnostics) -> SegmentsOutcome {
+        tracing::warn!(
+            row = %self.row_name,
+            aliyun_request_id = %diag.request_id,
+            aliyun_labels = %diag.labels_field(),
+            "aliyun AI guardrail suggested mask but returned no desensitized text; \
+             blocking instead of releasing unmasked content",
+        );
+        SegmentsOutcome::from_verdict(GuardrailVerdict::block(format!(
+            "aliyun AI guardrail: content requires masking (row: {})",
+            self.row_name
+        )))
+    }
+
     /// Sign + POST one `MultiModalGuard` call; return the response's
-    /// overall `Data.Suggestion` (lowercased, `"pass"` when absent)
-    /// alongside whatever upstream diagnostics the call yielded.
+    /// overall `Data.Suggestion` (lowercased, `"pass"` when absent) plus
+    /// any desensitized replacement text, alongside whatever upstream
+    /// diagnostics the call yielded.
     ///
     /// Diagnostics come back on BOTH arms on purpose (AISIX-Cloud#1060):
     /// the failure arms are exactly the ones an operator needs
-    /// `aliyun_request_id` for.
+    /// `aliyun_request_id` for. The desensitized text travels in
+    /// [`CallReply`], NOT in the diagnostics — it is caller content, and
+    /// [`AigDiagnostics`] keeps its structurally-content-free promise.
     async fn call(
         &self,
         service: &str,
         content: &str,
         session_id: Option<&str>,
-    ) -> (Result<String, AliyunFailure>, AigDiagnostics) {
+    ) -> (Result<CallReply, AliyunFailure>, AigDiagnostics) {
         let mut svc_params = serde_json::Map::new();
         svc_params.insert(
             "content".into(),
@@ -336,13 +526,17 @@ impl AliyunAiGuardrail {
         // Aliyun signals app-level errors via the JSON `Code` (200 = OK)
         // even on HTTP 200.
         let outcome = match body.code {
-            200 => Ok(if diag.suggestion.is_empty() {
-                // Tolerate a missing Suggestion the way an unknown one is
-                // tolerated: release. Blocking on a field Aliyun didn't
-                // send would turn a vendor response change into an outage.
-                "pass".to_owned()
-            } else {
-                diag.suggestion.to_lowercase()
+            200 => Ok(CallReply {
+                suggestion: if diag.suggestion.is_empty() {
+                    // Tolerate a missing Suggestion the way an unknown one
+                    // is tolerated: release. Blocking on a field Aliyun
+                    // didn't send would turn a vendor response change into
+                    // an outage.
+                    "pass".to_owned()
+                } else {
+                    diag.suggestion.to_lowercase()
+                },
+                desensitization: body.desensitization(),
             }),
             // 408 on this action means the AI Guardrails commodity isn't
             // activated on the account ("you haven't activated the
@@ -406,6 +600,36 @@ impl AliyunAiGuardrail {
         } else {
             GuardrailVerdict::block(format!("aliyun AI guardrail unavailable ({tag})"))
         }
+    }
+}
+
+/// The moderation-relevant part of one successful `MultiModalGuard`
+/// call: the overall suggestion, and — when the suggestion is `mask` —
+/// Aliyun's desensitized rewrite of the submitted content
+/// (`Detail[].Result[].Ext.Desensitization`).
+///
+/// Deliberately separate from [`AigDiagnostics`]: the desensitized text
+/// IS caller content (with the sensitive spans replaced) and must never
+/// reach a log, while the diagnostics type promises to be structurally
+/// content-free.
+struct CallReply {
+    /// Overall `Data.Suggestion`, lowercased; `"pass"` when absent.
+    suggestion: String,
+    /// The desensitized full text of the submitted `content`, when
+    /// Aliyun provided one.
+    desensitization: Option<String>,
+}
+
+/// Re-attach the tail of a segment that was clipped to
+/// [`MAX_CONTENT_CHARS`] before the call: the desensitized text Aliyun
+/// returned covers only the clipped prefix, and dropping the remainder
+/// on write-back would truncate the caller's content.
+fn reattach_clipped_tail(original: &str, masked_prefix: String) -> String {
+    let tail: String = original.chars().skip(MAX_CONTENT_CHARS).collect();
+    if tail.is_empty() {
+        masked_prefix
+    } else {
+        format!("{masked_prefix}{tail}")
     }
 }
 
@@ -526,6 +750,24 @@ struct AigResponse {
     data: Option<AigData>,
 }
 
+impl AigResponse {
+    /// Aliyun's desensitized rewrite of the submitted content, when the
+    /// response carries one (`Detail[].Result[].Ext.Desensitization` on
+    /// a `mask` suggestion). Scans every result and keeps the LAST
+    /// non-empty rewrite: each detected item's `Ext` restates the full
+    /// desensitized text, and later entries fold in the earlier
+    /// replacements. (Doc-derived; re-verified against the live endpoint
+    /// during #1070 QA.)
+    fn desensitization(&self) -> Option<String> {
+        let data = self.data.as_ref()?;
+        data.detail
+            .iter()
+            .flat_map(|d| d.result.iter())
+            .filter_map(|r| r.desensitization())
+            .rfind(|s| !s.is_empty())
+    }
+}
+
 #[derive(Deserialize)]
 struct AigData {
     /// Overall verdict across all dimensions, computed by Aliyun from the
@@ -551,11 +793,11 @@ struct AigDetail {
     /// Dimension-level suggestion.
     #[serde(rename = "Suggestion", default)]
     suggestion: Option<String>,
-    /// One entry per matched (or scanned) category. Only `Label` and
-    /// `Level` are read: sibling fields (`Ext`, descriptions, positions)
-    /// can echo matched content, and #153 keeps matched content out of
-    /// logs. Deserializing only what we log means a future edit can't
-    /// casually leak them.
+    /// One entry per matched (or scanned) category. Only `Label`,
+    /// `Level`, and `Ext.Desensitization` are read: other sibling fields
+    /// (descriptions, matched values, positions) echo matched content,
+    /// and #153 keeps matched content out of logs. The desensitization
+    /// is extracted for WRITE-BACK only — it never reaches a log either.
     #[serde(rename = "Result", default)]
     result: Vec<AigResult>,
 }
@@ -568,6 +810,32 @@ struct AigResult {
     /// category rather than a detection.
     #[serde(rename = "Level", default)]
     level: Option<String>,
+    /// Extension blob. Kept as a raw `Value` because Aliyun types it
+    /// inconsistently — a JSON object on sensitive-data detections, but
+    /// the literal string `"{}"` elsewhere — and only the
+    /// `Desensitization` member is ever read out of it.
+    #[serde(rename = "Ext", default)]
+    ext: Option<serde_json::Value>,
+}
+
+impl AigResult {
+    /// `Ext.Desensitization`, tolerating both `Ext` encodings (object,
+    /// or a JSON document nested inside a string).
+    fn desensitization(&self) -> Option<String> {
+        let ext = self.ext.as_ref()?;
+        let owned;
+        let obj = match ext {
+            serde_json::Value::Object(o) => o,
+            serde_json::Value::String(s) => {
+                owned = serde_json::from_str::<serde_json::Value>(s).ok()?;
+                owned.as_object()?
+            }
+            _ => return None,
+        };
+        obj.get("Desensitization")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
+    }
 }
 
 // --- Guardrail trait impl --------------------------------------------------
@@ -650,6 +918,37 @@ impl Guardrail for AliyunAiGuardrail {
             self.output_fail_open,
         )
         .await
+    }
+
+    // --- remote segment moderation: honors Aliyun's `mask` suggestion ---
+    //
+    // The segment path is what lets a `mask` suggestion actually rewrite
+    // the body (non-streaming requests/responses and the held-back tail
+    // of a streamed response). The blob checks above serve the paths with
+    // no write-back channel and map `mask` to Block there.
+
+    fn moderates_segments(&self) -> bool {
+        true
+    }
+
+    async fn moderate_input_segments(&self, texts: &[String]) -> SegmentsOutcome {
+        if !matches!(
+            self.hook_point,
+            GuardrailHookPoint::Input | GuardrailHookPoint::Both
+        ) {
+            return SegmentsOutcome::allow();
+        }
+        self.moderate_segments(texts, false).await
+    }
+
+    async fn moderate_output_segments(&self, texts: &[String]) -> SegmentsOutcome {
+        if !matches!(
+            self.hook_point,
+            GuardrailHookPoint::Output | GuardrailHookPoint::Both
+        ) {
+            return SegmentsOutcome::allow();
+        }
+        self.moderate_segments(texts, true).await
     }
 }
 
@@ -778,20 +1077,197 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn watch_and_mask_suggestions_release() {
-        for s in ["watch", "mask"] {
-            let server = MockServer::start().await;
-            Mock::given(method("POST"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(suggestion_body(s)))
-                .mount(&server)
-                .await;
-            let g = build(&server.uri(), true);
-            assert_eq!(
-                g.check_input(&req("x")).await,
-                GuardrailVerdict::Allow,
-                "suggestion {s} must release the content"
-            );
+    async fn watch_suggestion_releases_on_both_paths() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(suggestion_body("watch")))
+            .mount(&server)
+            .await;
+        let g = build(&server.uri(), true);
+        assert_eq!(g.check_input(&req("x")).await, GuardrailVerdict::Allow);
+        let seg = g.moderate_input_segments(&["watch this".to_owned()]).await;
+        assert_eq!(seg.verdict, GuardrailVerdict::Allow);
+        assert!(seg.masked.is_none(), "watch must not rewrite anything");
+    }
+
+    /// The doc-shaped mask response: sensitiveData dimension, S-level
+    /// vocabulary, and the desensitized rewrite inside `Result[].Ext`.
+    fn mask_body(desensitization: Option<&str>) -> serde_json::Value {
+        let ext = match desensitization {
+            Some(d) => json!({ "Desensitization": d, "SensitiveData": ["138****5678"] }),
+            None => json!({}),
+        };
+        json!({
+            "Code": 200,
+            "Message": "OK",
+            "RequestId": "mask-req-1",
+            "Data": {
+                "Detail": [
+                    {
+                        "Type": "sensitiveData",
+                        "Level": "S2",
+                        "Suggestion": "mask",
+                        "Result": [
+                            { "Label": "1814", "Description": "手机号（中国内地）",
+                              "Level": "S2", "Ext": ext }
+                        ]
+                    }
+                ],
+                "Suggestion": "mask"
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn mask_blocks_on_the_blob_path() {
+        // check_input / check_output have no write-back channel (they
+        // serve the mid-stream windows): releasing un-masked content
+        // there would defeat the operator's desensitization policy.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(mask_body(Some("my phone is 【手机号码】 thanks"))),
+            )
+            .mount(&server)
+            .await;
+        let g = build(&server.uri(), true);
+        assert!(g.check_input(&req("x")).await.is_block());
+        assert!(g.check_output(&resp("y")).await.is_block());
+    }
+
+    #[tokio::test]
+    async fn mask_rewrites_a_single_segment() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(mask_body(Some("my phone is 【手机号码】 thanks"))),
+            )
+            .expect(1) // single segment: the joined call's rewrite is used directly
+            .mount(&server)
+            .await;
+        let g = build(&server.uri(), true);
+        let seg = g
+            .moderate_output_segments(&["my phone is 13812345678 thanks".to_owned()])
+            .await;
+        assert_eq!(seg.verdict, GuardrailVerdict::Allow);
+        assert_eq!(
+            seg.masked,
+            Some(vec!["my phone is 【手机号码】 thanks".to_owned()]),
+            "the Ext.Desensitization text must be written back"
+        );
+        assert_eq!(seg.counts.get("1814"), Some(&1), "masked label counted");
+    }
+
+    /// Answers per-content: the joined call (its JSON-escaped newline
+    /// percent-encodes to %5Cn) suggests mask; a re-called segment
+    /// containing the marker masks with a rewrite; other segments pass.
+    fn mount_segment_aware_mask(server_uri: &str) -> impl wiremock::Respond {
+        let _ = server_uri;
+        struct R;
+        impl wiremock::Respond for R {
+            fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+                let body = std::str::from_utf8(&request.body).unwrap_or("");
+                if body.contains("%5Cn") {
+                    // the joined multi-segment probe
+                    ResponseTemplate::new(200).set_body_json(mask_body(None))
+                } else if body.contains("phonemask") {
+                    ResponseTemplate::new(200).set_body_json(mask_body(Some("phone [MASKED] here")))
+                } else {
+                    ResponseTemplate::new(200).set_body_json(suggestion_body("pass"))
+                }
+            }
         }
+        R
+    }
+
+    #[tokio::test]
+    async fn mask_realigns_multi_segment_via_per_segment_recalls() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(mount_segment_aware_mask(&server.uri()))
+            .mount(&server)
+            .await;
+        let g = build(&server.uri(), true);
+        let texts = vec![
+            "send to alice".to_owned(),
+            "phone phonemask here".to_owned(),
+            "regards".to_owned(),
+        ];
+        let seg = g.moderate_input_segments(&texts).await;
+        assert_eq!(seg.verdict, GuardrailVerdict::Allow);
+        assert_eq!(
+            seg.masked,
+            Some(vec![
+                "send to alice".to_owned(),
+                "phone [MASKED] here".to_owned(),
+                "regards".to_owned(),
+            ]),
+            "only the masking segment is rewritten; slots stay aligned"
+        );
+    }
+
+    #[tokio::test]
+    async fn mask_without_desensitization_fails_closed() {
+        // Aliyun says the content must be masked but returns nothing to
+        // rewrite it with → releasing the original would defeat the
+        // policy, so the segment path must block.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(mask_body(None)))
+            .mount(&server)
+            .await;
+        let g = build(&server.uri(), true);
+        let seg = g
+            .moderate_output_segments(&["some sensitive text".to_owned()])
+            .await;
+        assert!(seg.verdict.is_block());
+        assert!(seg.masked.is_none());
+    }
+
+    #[tokio::test]
+    async fn mask_ext_encoded_as_json_string_still_parses() {
+        // Aliyun types Ext inconsistently: an object on sensitive-data
+        // detections, but sometimes a JSON document nested in a string.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "Code": 200,
+                "RequestId": "r",
+                "Data": {
+                    "Detail": [
+                        { "Type": "sensitiveData", "Level": "S1", "Suggestion": "mask",
+                          "Result": [
+                              { "Label": "1814", "Level": "S1",
+                                "Ext": "{\"Desensitization\":\"call 【手机号码】 now\"}" }
+                          ] }
+                    ],
+                    "Suggestion": "mask"
+                }
+            })))
+            .mount(&server)
+            .await;
+        let g = build(&server.uri(), true);
+        let seg = g
+            .moderate_input_segments(&["call 13812345678 now".to_owned()])
+            .await;
+        assert_eq!(seg.verdict, GuardrailVerdict::Allow);
+        assert_eq!(seg.masked, Some(vec!["call 【手机号码】 now".to_owned()]));
+    }
+
+    #[test]
+    fn reattach_clipped_tail_restores_overflow() {
+        // Under the cap: the masked text stands alone.
+        assert_eq!(
+            reattach_clipped_tail("short", "masked".to_owned()),
+            "masked"
+        );
+        // Over the cap: the un-scanned remainder is re-attached so the
+        // write-back doesn't truncate the caller's content.
+        let long: String = "a".repeat(MAX_CONTENT_CHARS + 5);
+        let out = reattach_clipped_tail(&long, "MASKED".to_owned());
+        assert_eq!(out, format!("MASKED{}", "a".repeat(5)));
     }
 
     #[tokio::test]
@@ -925,6 +1401,8 @@ mod tests {
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = ()>,
     {
+        // One capture test at a time, process-wide (see TRACING_CAPTURE_LOCK).
+        let _capture_guard = crate::TRACING_CAPTURE_LOCK.lock().await;
         let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let subscriber = tracing_subscriber::fmt()
             .with_ansi(false)
@@ -1200,7 +1678,10 @@ mod tests {
             .call(service_code("pro", false), "今天北京的天气怎么样？", None)
             .await;
         let benign = benign.expect("benign call should succeed");
-        eprintln!("live_smoke benign  -> Suggestion={benign} diag={benign_diag:?}");
+        eprintln!(
+            "live_smoke benign  -> Suggestion={} diag={benign_diag:?}",
+            benign.suggestion
+        );
 
         // Prompt-attack style input — expect a non-"pass" suggestion once
         // the console policy is set to block prompt attacks.
@@ -1212,7 +1693,10 @@ mod tests {
             )
             .await;
         let risky = risky.expect("risky call should succeed");
-        eprintln!("live_smoke risky   -> Suggestion={risky} diag={risky_diag:?}");
+        eprintln!(
+            "live_smoke risky   -> Suggestion={} diag={risky_diag:?}",
+            risky.suggestion
+        );
 
         // Output service with a session/chat id, violent text.
         let (risky_out, out_diag) = g
@@ -1223,9 +1707,29 @@ mod tests {
             )
             .await;
         let risky_out = risky_out.expect("risky output call should succeed");
-        eprintln!("live_smoke output  -> Suggestion={risky_out} diag={out_diag:?}");
+        eprintln!(
+            "live_smoke output  -> Suggestion={} diag={out_diag:?}",
+            risky_out.suggestion
+        );
 
-        assert_eq!(benign, "pass", "benign prompt must pass");
+        // Sensitive-data prompt — with the console desensitization policy
+        // on, expect Suggestion "mask" WITH a desensitized rewrite (the
+        // assumption the write-back relies on; see AigResponse::desensitization).
+        let (masked, masked_diag) = g
+            .call(
+                service_code("pro", false),
+                "我的手机号是13812345678，身份证号是110101199003070018，请帮我登记",
+                None,
+            )
+            .await;
+        let masked = masked.expect("sensitive-data call should succeed");
+        eprintln!(
+            "live_smoke mask    -> Suggestion={} desensitization_present={} diag={masked_diag:?}",
+            masked.suggestion,
+            masked.desensitization.is_some(),
+        );
+
+        assert_eq!(benign.suggestion, "pass", "benign prompt must pass");
         for (what, diag) in [
             ("benign", &benign_diag),
             ("risky", &risky_diag),
