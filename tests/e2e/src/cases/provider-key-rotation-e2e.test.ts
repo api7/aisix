@@ -2,7 +2,6 @@ import { createHash } from "node:crypto";
 import OpenAI from "openai";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
   SeedClient,
   spawnApp,
@@ -66,13 +65,13 @@ function errMsg(e: unknown): string {
 describe("provider_key rotation: zero in-flight disruption (#196 L3 / #271)", () => {
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
-  let admin: AdminClient | undefined;
+  let etcd: EtcdClient | undefined;
   let seed: SeedClient | undefined;
   let pkId = "";
   let etcdReachable = false;
 
   beforeAll(async () => {
-    const etcd = new EtcdClient();
+    etcd = new EtcdClient();
     etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
@@ -89,8 +88,9 @@ describe("provider_key rotation: zero in-flight disruption (#196 L3 / #271)", ()
       },
     });
 
-    app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    // No admin listener: the provider key is seeded and rotated straight
+    // in etcd, and the rotation is verified by reading the key back.
+    app = await spawnApp({ admin: false });
     seed = new SeedClient(etcd, app.etcdPrefix);
 
     const pk = await seed.createProviderKey({
@@ -117,7 +117,7 @@ describe("provider_key rotation: zero in-flight disruption (#196 L3 / #271)", ()
   });
 
   test("an in-place secret rotation under sustained load keeps dispatch serving and bumps revision", async (ctx) => {
-    if (!etcdReachable || !app || !upstream || !admin || !pkId) {
+    if (!etcdReachable || !app || !upstream || !etcd || !pkId) {
       ctx.skip();
       return;
     }
@@ -143,10 +143,6 @@ describe("provider_key rotation: zero in-flight disruption (#196 L3 / #271)", ()
         return false;
       }
     });
-
-    const revBefore = Number(
-      ((await admin.json("GET", `/admin/v1/provider_keys/${pkId}`)) as { revision?: number }).revision ?? 0,
-    );
 
     // Sustained concurrent load. One worker fires the in-place secret
     // rotation when it grabs index ROTATE_AT; the rest keep chatting,
@@ -199,10 +195,12 @@ describe("provider_key rotation: zero in-flight disruption (#196 L3 / #271)", ()
     ).toEqual([]);
     expect(success).toBe(TOTAL_REQUESTS);
 
-    // The rotation actually took effect (revision bumped).
-    const revAfter = Number(
-      ((await admin.json("GET", `/admin/v1/provider_keys/${pkId}`)) as { revision?: number }).revision ?? 0,
-    );
-    expect(revAfter).toBeGreaterThan(revBefore);
+    // The rotation actually took effect: the store now holds the rotated
+    // secret (guards the liveness assertion above against a no-op update —
+    // a rotation that silently did nothing would leave the original secret).
+    const rawAfter = await etcd.get(`${app.etcdPrefix}/provider_keys/${pkId}`);
+    expect(rawAfter, "provider_key missing from etcd after rotation").toBeDefined();
+    const pkAfter = JSON.parse(rawAfter!) as { secret?: string };
+    expect(pkAfter.secret).toBe("sk-mock-v2-rotated");
   }, 90_000);
 });
