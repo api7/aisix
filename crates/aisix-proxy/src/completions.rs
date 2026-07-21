@@ -79,6 +79,9 @@ struct CompletionDispatchSuccess {
 struct CompletionUsage {
     prompt_tokens: u32,
     completion_tokens: u32,
+    /// True when any counter was filled by the local estimator because
+    /// the upstream reported no usage (AISIX-Cloud#1074).
+    usage_estimated: bool,
 }
 
 pub async fn completions(
@@ -330,7 +333,39 @@ async fn dispatch(
             // Extract usage BEFORE moving resp_json into the Response
             // so the success struct carries typed counters rather
             // than re-parsing JSON downstream.
-            let usage = extract_completion_usage(&resp_json);
+            //
+            // Token-estimation fallback (AISIX-Cloud#1074): a missing or
+            // zero usage block fills locally — legacy completions is plain
+            // text on both sides, so the plain-text counting rule applies
+            // to each. The 200-without-usage edge previously skipped the
+            // event entirely; it now emits an estimated record instead.
+            // Telemetry only — the response body forwards untouched.
+            let usage = {
+                let mut u = extract_completion_usage(&resp_json).unwrap_or(CompletionUsage {
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    usage_estimated: false,
+                });
+                let est_model = model.upstream_model().unwrap_or("unknown");
+                if u.prompt_tokens == 0 {
+                    let n = count_completion_prompt(est_model, body.get("prompt"));
+                    if n > 0 {
+                        u.prompt_tokens = n;
+                        u.usage_estimated = true;
+                    }
+                }
+                if u.completion_tokens == 0 {
+                    let n = crate::token_estimate::count_text(
+                        est_model,
+                        &completion_output_text(&resp_json),
+                    );
+                    if n > 0 {
+                        u.completion_tokens = n;
+                        u.usage_estimated = true;
+                    }
+                }
+                Some(u)
+            };
             // #911 [21]: commit the actual token cost so TPM/TPD is enforced
             // for /v1/completions the same way chat + embeddings enforce it.
             // Pre-fix the reservation dropped uncommitted, so the token
@@ -510,7 +545,27 @@ fn extract_completion_usage(body: &Value) -> Option<CompletionUsage> {
     Some(CompletionUsage {
         prompt_tokens,
         completion_tokens,
+        usage_estimated: false,
     })
+}
+
+/// Count the legacy /v1/completions `prompt` for the token-estimation
+/// fallback (AISIX-Cloud#1074): a plain string, an array of strings, an
+/// array of token ids (exact count), or an array of token-id arrays.
+/// Plain-text counting — the legacy surface has no message overhead.
+fn count_completion_prompt(model: &str, prompt: Option<&Value>) -> u32 {
+    match prompt {
+        Some(Value::String(s)) => crate::token_estimate::count_text(model, s),
+        Some(Value::Array(items)) => items.iter().fold(0u32, |acc, item| {
+            acc.saturating_add(match item {
+                Value::String(s) => crate::token_estimate::count_text(model, s),
+                Value::Number(_) => 1,
+                Value::Array(tokens) => tokens.len().min(u32::MAX as usize) as u32,
+                _ => 0,
+            })
+        }),
+        _ => 0,
+    }
 }
 
 /// Concatenate the `text` of every choice in a /v1/completions response for
@@ -571,6 +626,7 @@ fn emit_usage_event(
         requested_model: requested_model.to_string(),
         prompt_tokens: usage.prompt_tokens,
         completion_tokens: usage.completion_tokens,
+        usage_estimated: usage.usage_estimated,
         latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
         status_code,
         inbound_protocol: "openai".to_string(),
@@ -960,12 +1016,13 @@ mod tests {
 
     /// Companion: an upstream 200 with `usage: {}` (malformed —
     /// `prompt_tokens` is a required field on every legitimate
-    /// completion response) must NOT emit a zero-everything noise
-    /// row. Per audit MEDIUM-1 on PR #425 — applied preemptively
-    /// here so /v1/completions and /v1/responses share the same
-    /// edge-case gate.
+    /// completion response) now emits an ESTIMATED usage event
+    /// (AISIX-Cloud#1074) instead of dropping the record: the tokens
+    /// are counted locally and the event is marked `usage_estimated`.
+    /// (Pre-#1074 this dropped the event entirely — per audit MEDIUM-1
+    /// on PR #425 — which left the request invisible to billing.)
     #[tokio::test]
-    async fn skips_usage_event_when_upstream_usage_block_is_empty() {
+    async fn estimates_usage_event_when_upstream_usage_block_is_empty() {
         use aisix_obs::UsageSink;
 
         let upstream = MockServer::start().await;
@@ -1000,14 +1057,15 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        let recv = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await;
-        if let Ok(Some(ev)) = recv {
-            panic!(
-                "no UsageEvent should be emitted when upstream usage block is malformed, \
-                 but got prompt_tokens={}",
-                ev.prompt_tokens,
-            );
-        }
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("estimated UsageEvent must be emitted when usage block is malformed")
+            .expect("usage_sink sender dropped");
+        // prompt "x" = 1 token; the upstream body has no choices text, so
+        // the completion side stays 0 (nothing to count).
+        assert_eq!(event.prompt_tokens, 1);
+        assert_eq!(event.completion_tokens, 0);
+        assert!(event.usage_estimated, "locally-counted tokens must be flagged");
     }
 
     /// #429 follow-up: a 200 whose `usage` carries
@@ -1180,13 +1238,13 @@ mod tests {
         }
     }
 
-    /// Issue #403 audit LOW-1: a 200 response with NO `usage` block
-    /// at all (vs `usage: {}` which is empty-but-present) must not
-    /// emit. Pins the outer `body.get("usage")?` short-circuit in
-    /// `extract_completion_usage` distinctly from the inner empty
-    /// case.
+    /// A 200 response with NO `usage` block at all (vs `usage: {}`
+    /// which is empty-but-present) emits an ESTIMATED usage event
+    /// (AISIX-Cloud#1074) — the request must not stay invisible to
+    /// billing. (Pre-#1074, per issue #403 audit LOW-1, this dropped
+    /// the event entirely.)
     #[tokio::test]
-    async fn skips_usage_event_when_upstream_omits_usage_block_entirely() {
+    async fn estimates_usage_event_when_upstream_omits_usage_block_entirely() {
         use aisix_obs::UsageSink;
 
         let upstream = MockServer::start().await;
@@ -1221,14 +1279,14 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        let recv = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await;
-        if let Ok(Some(ev)) = recv {
-            panic!(
-                "no UsageEvent when `usage` key is entirely absent, \
-                 got prompt_tokens={}",
-                ev.prompt_tokens,
-            );
-        }
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("estimated UsageEvent must be emitted when `usage` is absent")
+            .expect("usage_sink sender dropped");
+        // prompt "x" = 1 token; no choices text → completion stays 0.
+        assert_eq!(event.prompt_tokens, 1);
+        assert_eq!(event.completion_tokens, 0);
+        assert!(event.usage_estimated, "locally-counted tokens must be flagged");
     }
 
     /// AISIX-Cloud#867 parity: a successful /v1/completions 200 must stamp

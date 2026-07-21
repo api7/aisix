@@ -116,6 +116,9 @@ impl From<ProxyError> for ResponsesDispatchError {
 struct ResponseUsage {
     prompt_tokens: u32,
     completion_tokens: u32,
+    /// True when any token counter was filled by the local estimator
+    /// because the upstream reported no usage (AISIX-Cloud#1074).
+    usage_estimated: bool,
     /// o1/o3/GPT-5 class models surface reasoning tokens as a
     /// subset of `completion_tokens` via
     /// `usage.output_tokens_details.reasoning_tokens`. Zero for
@@ -1177,7 +1180,31 @@ async fn responses_to_target(
             // #808: the whole SSE response is buffered here, so parse its
             // terminal event for usage and let the handler emit (the body is
             // a single complete chunk now, not a live stream).
-            let usage = responses_sse_usage(&buf);
+            //
+            // Token-estimation fallback (AISIX-Cloud#1074): a buffered
+            // stream with zero/missing usage fills the counters locally —
+            // telemetry only, the buffered bytes forward untouched.
+            let usage = {
+                let mut u = responses_sse_usage(&buf).unwrap_or_default();
+                if u.prompt_tokens == 0 || u.completion_tokens == 0 {
+                    let est = crate::token_estimate::Estimator::new(
+                        &upstream_model,
+                        crate::token_estimate::PromptInput::Responses(body.clone()),
+                    );
+                    let filled = crate::token_estimate::fill_missing(
+                        &est,
+                        u.prompt_tokens,
+                        u.completion_tokens,
+                        Some(&responses_sse_output_text(&buf)),
+                    );
+                    if filled.estimated {
+                        u.prompt_tokens = filled.prompt_tokens;
+                        u.completion_tokens = filled.completion_tokens;
+                        u.usage_estimated = true;
+                    }
+                }
+                Some(u)
+            };
             // Content capture (AISIX-Cloud#947): the assembled output text,
             // read from the POST-redaction buffer so masked PII stays masked
             // in the exported content.
@@ -1294,14 +1321,39 @@ async fn responses_to_target(
             chain: Arc::clone(&chain_arc),
             upstream_model: upstream_model.clone(),
         });
+        // Token-estimation fallback context (AISIX-Cloud#1074): the request
+        // body is cloned because the closure runs at end-of-stream Drop.
+        // Tokenized only if the upstream never reports usage.
+        let estimator_c = crate::token_estimate::Estimator::new(
+            &upstream_model,
+            crate::token_estimate::PromptInput::Responses(body.clone()),
+        );
         let parsed_stream = build_responses_passthrough_stream(
             body_stream,
             content_cap,
             eos_scan,
-            move |usage, out_text, output_hits| {
+            move |mut usage, out_text, output_hits| {
                 // Streams that reach here are committed 200s — the
                 // `!status.is_success()` guard above returned early on errors.
                 //
+                // Token-estimation fallback (AISIX-Cloud#1074): a stream that
+                // ends without a terminal usage event (client abort, relay
+                // that omits usage) fills the missing counters from the
+                // request + the assembled output text, BEFORE the TPM
+                // accounting and the emit below.
+                if usage.prompt_tokens == 0 || usage.completion_tokens == 0 {
+                    let filled = crate::token_estimate::fill_missing(
+                        &estimator_c,
+                        usage.prompt_tokens,
+                        usage.completion_tokens,
+                        Some(&out_text),
+                    );
+                    if filled.estimated {
+                        usage.prompt_tokens = filled.prompt_tokens;
+                        usage.completion_tokens = filled.completion_tokens;
+                        usage.usage_estimated = true;
+                    }
+                }
                 // #688: apply the terminal token cost to TPM/TPD and release the
                 // concurrency hold now the stream has ended (sync analog of the
                 // reservation's async `commit_tokens`, which this closure can't await).
@@ -1402,7 +1454,31 @@ async fn responses_to_target(
         // emission. Pulled here (before the response is moved into
         // `Json::into_response`) so the success struct can carry
         // typed counters rather than re-parsing JSON downstream.
-        let usage = extract_response_usage(&json_body);
+        // Token-estimation fallback (AISIX-Cloud#1074): a body with zero or
+        // missing usage fills the counters locally — telemetry only, the
+        // response body is forwarded untouched. A body with no `usage`
+        // object at all becomes a wholly-estimated record instead of None.
+        let usage = {
+            let mut u = extract_response_usage(&json_body).unwrap_or_default();
+            if u.prompt_tokens == 0 || u.completion_tokens == 0 {
+                let est = crate::token_estimate::Estimator::new(
+                    &upstream_model,
+                    crate::token_estimate::PromptInput::Responses(body.clone()),
+                );
+                let filled = crate::token_estimate::fill_missing(
+                    &est,
+                    u.prompt_tokens,
+                    u.completion_tokens,
+                    Some(&responses_output_text(&json_body)),
+                );
+                if filled.estimated {
+                    u.prompt_tokens = filled.prompt_tokens;
+                    u.completion_tokens = filled.completion_tokens;
+                    u.usage_estimated = true;
+                }
+            }
+            Some(u)
+        };
 
         // #719: run the output guardrail chain on the assistant's text so a
         // configured output block isn't bypassable by calling /v1/responses
@@ -1693,6 +1769,13 @@ async fn responses_cross_provider_to_target(
         let stream_hold = reservation.take().map(|r| r.into_stream_hold());
         let limiter_c = std::sync::Arc::clone(&state.limiter);
         let captured_prompt_c = captured_prompt.clone();
+        // Token-estimation fallback context (AISIX-Cloud#1074): the request
+        // body is cloned because the stream owns it until an end-of-stream
+        // Drop. Tokenized only if the bridged upstream never reports usage.
+        let estimator = crate::token_estimate::Estimator::new(
+            model.upstream_model().unwrap_or("unknown"),
+            crate::token_estimate::PromptInput::Responses(body.clone()),
+        );
         let sse_body = crate::responses_bridge::build_responses_bridge_stream(
             upstream,
             encoder,
@@ -1702,6 +1785,7 @@ async fn responses_cross_provider_to_target(
             max_buffer_bytes,
             requested_model.to_string(),
             content_cap,
+            Some(estimator),
             move |comp| {
                 // #688: apply the terminal token cost to TPM/TPD and release the
                 // concurrency hold now the stream has ended (sync analog of the
@@ -1727,6 +1811,7 @@ async fn responses_cross_provider_to_target(
                     cached_prompt_tokens: comp.cached_prompt_tokens,
                     cache_creation_tokens: comp.cache_creation_tokens,
                     cache_read_tokens: comp.cache_read_tokens,
+                    usage_estimated: comp.usage_estimated,
                 };
                 // A clean stream is a committed 200; an output-guardrail block
                 // (or fail-closed overflow) bills the upstream tokens but is
@@ -1826,13 +1911,37 @@ async fn responses_cross_provider_to_target(
     state.health.record_success(&model.display_name);
     state.runtime_status.mark_healthy(model_id);
 
-    let usage = ResponseUsage {
-        prompt_tokens: resp.usage.prompt_tokens,
-        completion_tokens: resp.usage.completion_tokens,
-        reasoning_tokens: resp.usage.reasoning_tokens,
-        cached_prompt_tokens: resp.usage.cached_prompt_tokens,
-        cache_creation_tokens: resp.usage.cache_creation_tokens,
-        cache_read_tokens: resp.usage.cache_read_tokens,
+    let usage = {
+        let mut u = ResponseUsage {
+            prompt_tokens: resp.usage.prompt_tokens,
+            completion_tokens: resp.usage.completion_tokens,
+            reasoning_tokens: resp.usage.reasoning_tokens,
+            cached_prompt_tokens: resp.usage.cached_prompt_tokens,
+            cache_creation_tokens: resp.usage.cache_creation_tokens,
+            cache_read_tokens: resp.usage.cache_read_tokens,
+            usage_estimated: false,
+        };
+        // Token-estimation fallback (AISIX-Cloud#1074): fill counters the
+        // bridged upstream never reported. Telemetry only — the re-encoded
+        // Responses JSON below carries the upstream's own usage.
+        if u.prompt_tokens == 0 || u.completion_tokens == 0 {
+            let est = crate::token_estimate::Estimator::new(
+                model.upstream_model().unwrap_or("unknown"),
+                crate::token_estimate::PromptInput::Responses(body.clone()),
+            );
+            let filled = crate::token_estimate::fill_missing(
+                &est,
+                u.prompt_tokens,
+                u.completion_tokens,
+                Some(&crate::chat::estimation_output_text(&resp)),
+            );
+            if filled.estimated {
+                u.prompt_tokens = filled.prompt_tokens;
+                u.completion_tokens = filled.completion_tokens;
+                u.usage_estimated = true;
+            }
+        }
+        u
     };
 
     // #719: run output guardrails on the bridged response before re-encoding
@@ -1975,6 +2084,7 @@ fn extract_response_usage(body: &Value) -> Option<ResponseUsage> {
     Some(ResponseUsage {
         prompt_tokens,
         completion_tokens,
+        usage_estimated: false,
         reasoning_tokens,
         cached_prompt_tokens,
         // OpenAI verbatim path: no Anthropic-style cache counters.
@@ -2237,21 +2347,27 @@ where
     S: futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send + 'static,
     F: FnOnce(ResponseUsage, String, Vec<aisix_core::GuardrailMonitorHit>) + Send + 'static,
 {
-    // The scan reads the same assembled output text the capture produces, so
-    // an attached scan forces the accumulator on even when no exporter wants
-    // content. The cap bounds delta accumulation; a terminal event's full
-    // output text is instead bounded by MAX_SSE_FRAME_BUF_BYTES (an oversized
-    // frame never parses) and re-truncated by both consumers —
-    // `CapturedContent::new` at the exporter cap and `EosOutputScan::observe`
-    // at the scan bound — so neither sees beyond its own limit.
-    let capture_cap = match (content_cap, eos_scan.is_some()) {
-        (Some(cap), true) => {
-            Some((cap as usize).max(aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES))
-        }
-        (Some(cap), false) => Some(cap as usize),
-        (None, true) => Some(aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES),
-        (None, false) => None,
-    };
+    // The scan and the token-estimation fallback read the same assembled
+    // output text the capture produces, so the accumulator is now ALWAYS
+    // on (AISIX-Cloud#1074) — whether estimation is needed is only known
+    // at end-of-stream — with the estimation cap as the floor. The cap
+    // bounds delta accumulation; a terminal event's full output text is
+    // instead bounded by MAX_SSE_FRAME_BUF_BYTES (an oversized frame
+    // never parses) and re-truncated by each consumer —
+    // `CapturedContent::new` at the exporter cap and
+    // `EosOutputScan::observe` at the scan bound — so none sees beyond
+    // its own limit.
+    let capture_cap = Some(
+        content_cap
+            .map(|cap| cap as usize)
+            .unwrap_or(0)
+            .max(if eos_scan.is_some() {
+                aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES
+            } else {
+                0
+            })
+            .max(crate::token_estimate::OUTPUT_ACCUMULATION_CAP),
+    );
     // Re-attach the request span: the body is polled after the request-id
     // middleware returns, so the end-of-stream output-guardrail scan
     // (`EosOutputScan::observe`) would otherwise log without a
@@ -2524,6 +2640,7 @@ fn emit_usage_event(
         // verbatim OpenAI path.
         cache_creation_tokens: usage.cache_creation_tokens,
         cache_read_tokens: usage.cache_read_tokens,
+        usage_estimated: usage.usage_estimated,
         latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
         status_code,
         inbound_protocol: "openai".to_string(),
@@ -4451,14 +4568,13 @@ mod tests {
         );
     }
 
-    /// Companion: an upstream response missing the `usage` block
-    /// entirely (some edge / error response shapes) must NOT emit
-    /// — there's nothing meaningful to attribute. Pre-#404 the
-    /// handler emitted nothing; we keep that behaviour for this
-    /// edge so the api_key isn't credited with zero-everything
-    /// noise rows.
+    /// Companion: an upstream 200 missing the `usage` block entirely
+    /// (some relay / compat backends) now emits an ESTIMATED usage
+    /// event (AISIX-Cloud#1074) — the call must not stay invisible to
+    /// billing. (Pre-#1074 this edge kept the pre-#404 no-emit
+    /// behaviour.)
     #[tokio::test]
-    async fn skips_usage_event_when_upstream_omits_usage_block() {
+    async fn estimates_usage_event_when_upstream_omits_usage_block() {
         use aisix_obs::UsageSink;
 
         let upstream = MockServer::start().await;
@@ -4497,18 +4613,16 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        // Wait briefly — no event should arrive. `Ok(None)` means
-        // the channel closed (state dropped) without sending; `Err`
-        // means timeout. Both are acceptable "no event" outcomes;
-        // only `Ok(Some(_))` would be a real failure.
-        let recv = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await;
-        if let Ok(Some(ev)) = recv {
-            panic!(
-                "expected NO event when usage block absent, but got: \
-                 prompt_tokens={}, completion_tokens={}, status_code={}",
-                ev.prompt_tokens, ev.completion_tokens, ev.status_code,
-            );
-        }
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("estimated UsageEvent must be emitted when `usage` is absent")
+            .expect("usage_sink sender dropped");
+        // input "hello" per the cookbook message scheme: 3 per-message
+        // + "user" (1) + "hello" (1) + 3 reply priming = 8. Empty
+        // `output` → completion stays 0.
+        assert_eq!(event.prompt_tokens, 8);
+        assert_eq!(event.completion_tokens, 0);
+        assert!(event.usage_estimated, "locally-counted tokens must be flagged");
     }
 
     /// #808: a streaming `/v1/responses` 200 (e.g. all Codex traffic, which
@@ -4782,13 +4896,14 @@ data: [DONE]\n\n";
         }
     }
 
-    /// Issue #404 audit MEDIUM-1: a 200 with `usage: {}` (malformed
-    /// — `input_tokens` is required by the Responses-API spec) must
-    /// NOT emit a zero-everything noise row. Same edge as the
-    /// `skips_usage_event_when_upstream_omits_usage_block` test but
-    /// the gate is one layer deeper — `usage` exists but is empty.
+    /// A 200 with `usage: {}` (malformed — `input_tokens` is required
+    /// by the Responses-API spec) now emits an ESTIMATED usage event
+    /// (AISIX-Cloud#1074) instead of dropping the record. Same edge as
+    /// the omitted-usage test but the gate is one layer deeper —
+    /// `usage` exists but is empty. (Pre-#1074, per issue #404 audit
+    /// MEDIUM-1, this dropped the event entirely.)
     #[tokio::test]
-    async fn skips_usage_event_when_usage_block_is_empty_audit_m1() {
+    async fn estimates_usage_event_when_usage_block_is_empty() {
         use aisix_obs::UsageSink;
 
         let upstream = MockServer::start().await;
@@ -4826,14 +4941,15 @@ data: [DONE]\n\n";
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        let recv = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await;
-        if let Ok(Some(ev)) = recv {
-            panic!(
-                "no UsageEvent should be emitted for malformed `usage: {{}}`, \
-                 got prompt_tokens={}",
-                ev.prompt_tokens,
-            );
-        }
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("estimated UsageEvent must be emitted for malformed `usage: {}`")
+            .expect("usage_sink sender dropped");
+        // input "hi" counts per the cookbook message scheme: 3 per-message
+        // + "user" (1) + "hi" (1) + 3 reply priming = 8. Empty output → 0.
+        assert_eq!(event.prompt_tokens, 8);
+        assert_eq!(event.completion_tokens, 0);
+        assert!(event.usage_estimated, "locally-counted tokens must be flagged");
     }
 
     /// #429 follow-up: a 200 whose `usage` carries

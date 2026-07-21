@@ -1239,12 +1239,21 @@ async fn anthropic_passthrough_dispatch(
         let post_stream_keys = reservation.as_ref().map(|r| r.keys()).unwrap_or_default();
         let stream_hold = reservation.take().map(|r| r.into_stream_hold());
         let limiter_c = std::sync::Arc::clone(&state.limiter);
+        // Token-estimation fallback context (AISIX-Cloud#1074): the inbound
+        // Anthropic request body is cloned because the stream owns it until
+        // an end-of-stream Drop. Tokenized only if the upstream never
+        // reports usage.
+        let estimator = crate::token_estimate::Estimator::new(
+            &upstream_model,
+            crate::token_estimate::PromptInput::Anthropic(body.clone()),
+        );
         let parsed_stream = build_anthropic_passthrough_stream(
             body_stream,
             started,
             stream_guardrail,
             model_name.to_string(),
             content_cap,
+            Some(estimator),
             move |usage| {
                 // Streaming responses that got this far are 200 — the
                 // !status.is_success() guard above returned early on
@@ -1274,6 +1283,7 @@ async fn anthropic_passthrough_dispatch(
                     completion_tokens: usage.completion_tokens,
                     cache_creation_tokens: usage.cache_creation_tokens,
                     cache_read_tokens: usage.cache_read_tokens,
+                    usage_estimated: usage.usage_estimated,
                     provider_request_id: usage.provider_request_id,
                     provider_model_version: usage.provider_model_version,
                     finish_reason: usage.finish_reason,
@@ -1393,7 +1403,14 @@ async fn anthropic_passthrough_dispatch(
             })
             .map_err(ProxyError::Bridge)?;
 
-        let metrics = anthropic_metrics_from_response_json(&json_body);
+        let mut metrics = anthropic_metrics_from_response_json(&json_body);
+        // Token-estimation fallback (AISIX-Cloud#1074): an
+        // Anthropic-compatible relay may omit `usage` entirely — fill
+        // the missing counters locally before the emit below. The
+        // response body is forwarded verbatim, untouched.
+        fill_missing_anthropic_metrics(&mut metrics, &upstream_model, &body, || {
+            anthropic_estimation_output_text(&json_body)
+        });
 
         // #448 (#22): run output guardrails on the passthrough response.
         // The body is forwarded verbatim, so extract its text (content
@@ -1511,6 +1528,74 @@ async fn anthropic_passthrough_dispatch(
     }
 }
 
+/// Token-estimation fallback for a non-streaming `/v1/messages` response
+/// (AISIX-Cloud#1074): fill token counters the upstream never reported
+/// and mark the metrics estimated. `output_text` is built lazily — only
+/// when estimation actually runs.
+fn fill_missing_anthropic_metrics(
+    metrics: &mut AnthropicUsageMetrics,
+    upstream_model: &str,
+    body: &Value,
+    output_text: impl FnOnce() -> String,
+) {
+    if metrics.prompt_tokens != 0 && metrics.completion_tokens != 0 {
+        return;
+    }
+    let est = crate::token_estimate::Estimator::new(
+        upstream_model,
+        crate::token_estimate::PromptInput::Anthropic(body.clone()),
+    );
+    let filled = crate::token_estimate::fill_missing(
+        &est,
+        metrics.prompt_tokens,
+        metrics.completion_tokens,
+        Some(&output_text()),
+    );
+    if filled.estimated {
+        metrics.prompt_tokens = filled.prompt_tokens;
+        metrics.completion_tokens = filled.completion_tokens;
+        metrics.usage_estimated = true;
+    }
+}
+
+/// Generated output text for the token-estimation fallback: text blocks
+/// plus `tool_use` name/input and `thinking` — the response-side analog
+/// of the streaming accumulation. (`anthropic_response_text` below stays
+/// text-only: it feeds content capture, whose shape is an established
+/// contract.)
+fn anthropic_estimation_output_text(body: &Value) -> String {
+    let Some(blocks) = body.get("content").and_then(Value::as_array) else {
+        return String::new();
+    };
+    let mut out = String::new();
+    for block in blocks {
+        match block.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                if let Some(t) = block.get("text").and_then(Value::as_str) {
+                    out.push_str(t);
+                }
+            }
+            Some("thinking") => {
+                if let Some(t) = block.get("thinking").and_then(Value::as_str) {
+                    out.push_str(t);
+                }
+            }
+            Some("tool_use") => {
+                if let Some(n) = block.get("name").and_then(Value::as_str) {
+                    out.push_str(n);
+                }
+                if let Some(input) = block.get("input") {
+                    if !input.is_null() {
+                        out.push_str(&input.to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 /// Concatenate the text from an Anthropic response's `content` blocks — the
 /// assistant's assembled output text, for content-capturing exporters.
 fn anthropic_response_text(body: &Value) -> String {
@@ -1533,6 +1618,7 @@ fn anthropic_response_text(body: &Value) -> String {
 fn anthropic_metrics_from_response_json(body: &Value) -> AnthropicUsageMetrics {
     let usage = body.get("usage");
     AnthropicUsageMetrics {
+        usage_estimated: false,
         prompt_tokens: usage
             .and_then(|u| u.get("input_tokens"))
             .and_then(Value::as_u64)
@@ -1777,6 +1863,13 @@ async fn cross_provider_dispatch(
         let post_stream_keys = reservation.as_ref().map(|r| r.keys()).unwrap_or_default();
         let stream_hold = reservation.take().map(|r| r.into_stream_hold());
         let limiter_for_stream = std::sync::Arc::clone(&state.limiter);
+        // Token-estimation fallback context (AISIX-Cloud#1074): the inbound
+        // Anthropic request body is cloned because the stream owns it until
+        // an end-of-stream Drop.
+        let estimator = crate::token_estimate::Estimator::new(
+            &upstream_model,
+            crate::token_estimate::PromptInput::Anthropic(body.clone()),
+        );
         let sse_body = build_anthropic_sse_stream(
             upstream,
             encoder,
@@ -1784,6 +1877,7 @@ async fn cross_provider_dispatch(
             stream_guardrail,
             model_name.to_string(),
             content_cap,
+            Some(estimator),
             move |comp| {
                 // #688: apply the terminal token cost to TPM/TPD and release the
                 // concurrency hold now the stream has ended (sync analog of the
@@ -1808,6 +1902,7 @@ async fn cross_provider_dispatch(
                     completion_tokens: comp.completion_tokens,
                     cache_creation_tokens: comp.cache_creation_tokens,
                     cache_read_tokens: comp.cache_read_tokens,
+                    usage_estimated: comp.usage_estimated,
                     provider_request_id: comp.provider_request_id,
                     provider_model_version: comp.provider_model_version,
                     finish_reason: comp.finish_reason,
@@ -1952,16 +2047,23 @@ async fn cross_provider_dispatch(
         crate::redact::redact_chat_response(resolved_chain.as_ref(), &mut resp);
     crate::redact::merge_counts(&mut output_redactions, output_seg_counts);
 
-    let metrics = AnthropicUsageMetrics {
+    let mut metrics = AnthropicUsageMetrics {
         prompt_tokens: resp.usage.prompt_tokens,
         completion_tokens: resp.usage.completion_tokens,
         cache_creation_tokens: resp.usage.cache_creation_tokens,
         cache_read_tokens: resp.usage.cache_read_tokens,
+        usage_estimated: false,
         provider_request_id: resp.id.clone(),
         provider_model_version: resp.model.clone(),
         finish_reason: finish_reason_label(&resp.finish_reason),
         ttft_ms: 0,
     };
+    // Token-estimation fallback (AISIX-Cloud#1074): fill counters the
+    // bridged upstream never reported. Telemetry only — the rendered
+    // Anthropic JSON below carries the upstream's own usage.
+    fill_missing_anthropic_metrics(&mut metrics, &upstream_model, body, || {
+        crate::chat::estimation_output_text(&resp)
+    });
     // Capture the prompt (the Anthropic request body) + assembled assistant
     // text for content-capturing exporters (gated); threaded to `fan_out` via
     // `DispatchOutcome`, never to the CP sink.
@@ -2001,6 +2103,7 @@ async fn cross_provider_dispatch(
 /// Errors in the stream surface as a final `event: error` frame so
 /// SSE clients see something actionable rather than a half-complete
 /// stream.
+#[allow(clippy::too_many_arguments)]
 fn build_anthropic_sse_stream(
     upstream: aisix_gateway::ChatChunkStream,
     encoder: aisix_provider_anthropic::AnthropicSseEncoder,
@@ -2010,6 +2113,9 @@ fn build_anthropic_sse_stream(
     // Largest content cap any content-capturing exporter wants, or `None` to
     // skip response accumulation (the common, content-free path).
     content_cap: Option<u32>,
+    // Token-estimation fallback context (AISIX-Cloud#1074); see
+    // `CompleteAnthropicStreamOnDrop::estimator`.
+    estimator: Option<crate::token_estimate::Estimator>,
     on_complete: impl FnOnce(AnthropicStreamCompletion) + Send + 'static,
 ) -> axum::body::Body {
     use futures::StreamExt;
@@ -2033,6 +2139,7 @@ fn build_anthropic_sse_stream(
     let stream = async_stream::stream! {
         let mut guard = CompleteAnthropicStreamOnDrop {
             slot: Some((on_complete, AnthropicStreamCompletion::default())),
+            estimator,
         };
         let mut upstream = upstream;
         let mut first_chunk_seen = false;
@@ -2091,6 +2198,33 @@ fn build_anthropic_sse_stream(
                         if let Some(t) = chunk.delta.content.as_deref() {
                             if comp.response_text.len() < cap as usize {
                                 comp.response_text.push_str(t);
+                            }
+                        }
+                    }
+                    // Token-estimation accumulator (AISIX-Cloud#1074): all
+                    // generated output, always on (whether the fallback is
+                    // needed is only known at end-of-stream), bounded.
+                    if comp.est_output_text.len()
+                        < crate::token_estimate::OUTPUT_ACCUMULATION_CAP
+                    {
+                        if let Some(t) = chunk.delta.content.as_deref() {
+                            comp.est_output_text.push_str(t);
+                        }
+                        if let Some(t) = chunk.delta.reasoning_content.as_deref() {
+                            comp.est_output_text.push_str(t);
+                        }
+                        if let Some(tcs) = chunk.delta.tool_calls.as_ref() {
+                            for tc in tcs {
+                                if let Some(f) = tc.get("function") {
+                                    if let Some(n) = f.get("name").and_then(|v| v.as_str()) {
+                                        comp.est_output_text.push_str(n);
+                                    }
+                                    if let Some(a) =
+                                        f.get("arguments").and_then(|v| v.as_str())
+                                    {
+                                        comp.est_output_text.push_str(a);
+                                    }
+                                }
                             }
                         }
                     }
@@ -2290,10 +2424,18 @@ struct AnthropicStreamCompletion {
     completion_tokens: u32,
     cache_creation_tokens: u32,
     cache_read_tokens: u32,
+    /// True when the Drop guard filled any token counter from the local
+    /// estimator (AISIX-Cloud#1074).
+    usage_estimated: bool,
     provider_request_id: String,
     provider_model_version: String,
     finish_reason: String,
     ttft_ms: u32,
+    /// Generated output (content + reasoning + tool-call text) accumulated
+    /// for the token-estimation fallback (AISIX-Cloud#1074). Always on,
+    /// bounded to `token_estimate::OUTPUT_ACCUMULATION_CAP`; never leaves
+    /// the process.
+    est_output_text: String,
     /// Assembled assistant text for content-capturing exporters, accumulated
     /// across chunks ONLY when an exporter wants full content (bounded to the
     /// capture cap). Empty otherwise. Read by the on_complete closure; never
@@ -2310,6 +2452,9 @@ struct AnthropicStreamCompletion {
 
 struct CompleteAnthropicStreamOnDrop<F: FnOnce(AnthropicStreamCompletion)> {
     slot: Option<(F, AnthropicStreamCompletion)>,
+    /// Token-estimation fallback (AISIX-Cloud#1074); fills counters the
+    /// upstream never reported before `on_complete` runs.
+    estimator: Option<crate::token_estimate::Estimator>,
 }
 
 impl<F: FnOnce(AnthropicStreamCompletion)> CompleteAnthropicStreamOnDrop<F> {
@@ -2324,7 +2469,25 @@ impl<F: FnOnce(AnthropicStreamCompletion)> CompleteAnthropicStreamOnDrop<F> {
 
 impl<F: FnOnce(AnthropicStreamCompletion)> Drop for CompleteAnthropicStreamOnDrop<F> {
     fn drop(&mut self) {
-        if let Some((f, c)) = self.slot.take() {
+        if let Some((f, mut c)) = self.slot.take() {
+            // Token-estimation fallback (AISIX-Cloud#1074): fill the
+            // counters the upstream never reported. This surface has no
+            // delivered-count gate (unlike chat.rs / the passthrough
+            // guard), so the estimate covers whatever the bridge produced
+            // before the stream ended.
+            if let Some(est) = self.estimator.take() {
+                let filled = crate::token_estimate::fill_missing(
+                    &est,
+                    c.prompt_tokens,
+                    c.completion_tokens,
+                    Some(c.est_output_text.as_str()),
+                );
+                if filled.estimated {
+                    c.prompt_tokens = filled.prompt_tokens;
+                    c.completion_tokens = filled.completion_tokens;
+                    c.usage_estimated = true;
+                }
+            }
             f(c);
         }
     }
@@ -2394,6 +2557,9 @@ struct AnthropicUsageMetrics {
     completion_tokens: u32,
     cache_creation_tokens: u32,
     cache_read_tokens: u32,
+    /// True when any token counter was filled by the local estimator
+    /// because the upstream reported no usage (AISIX-Cloud#1074).
+    usage_estimated: bool,
     provider_request_id: String,
     provider_model_version: String,
     finish_reason: String,
@@ -2468,6 +2634,7 @@ fn emit_anthropic_usage_event(
         completion_tokens: metrics.completion_tokens,
         cache_creation_tokens: metrics.cache_creation_tokens,
         cache_read_tokens: metrics.cache_read_tokens,
+        usage_estimated: metrics.usage_estimated,
         latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
         status_code,
         provider_request_id: metrics.provider_request_id,
@@ -2601,6 +2768,15 @@ struct AnthropicStreamUsage {
     completion_tokens: u32,
     cache_creation_tokens: u32,
     cache_read_tokens: u32,
+    /// True once a `message_delta` carried a numeric `output_tokens`.
+    /// Without it, `completion_tokens` holds only the `message_start`
+    /// placeholder floor (often 1) — the token-estimation fallback
+    /// treats that floor as "missing" so an aborted stream estimates
+    /// from the delivered text instead of recording the placeholder.
+    output_tokens_from_delta: bool,
+    /// True when `AnthropicStreamGuard::drop` filled any token counter
+    /// from the local estimator (AISIX-Cloud#1074).
+    usage_estimated: bool,
     provider_request_id: String,
     provider_model_version: String,
     finish_reason: String,
@@ -2698,6 +2874,7 @@ fn update_anthropic_usage(
                 if let Some(v) = usage.get("output_tokens") {
                     if let Some(t) = v.as_u64() {
                         acc.completion_tokens = acc.completion_tokens.max(t as u32);
+                        acc.output_tokens_from_delta = true;
                     } else {
                         // PR #436 audit LOW-1: a `usage` object present but
                         // with a non-numeric `output_tokens` leaves
@@ -2812,6 +2989,10 @@ pub(crate) fn extract_sse_data_line(frame: &[u8]) -> Option<&[u8]> {
 struct AnthropicStreamGuard<F: FnOnce(AnthropicStreamUsage)> {
     slot: Option<(F, AnthropicStreamUsage)>,
     delivered: Arc<AtomicU32>,
+    /// Token-estimation fallback (AISIX-Cloud#1074): fills counters the
+    /// upstream never reported. Prompt from the captured request body,
+    /// completion from the accumulated `response_text`.
+    estimator: Option<crate::token_estimate::Estimator>,
 }
 
 impl<F: FnOnce(AnthropicStreamUsage)> AnthropicStreamGuard<F> {
@@ -2837,6 +3018,30 @@ impl<F: FnOnce(AnthropicStreamUsage)> Drop for AnthropicStreamGuard<F> {
                 usage.completion_tokens = 0;
                 usage.cache_creation_tokens = 0;
                 usage.cache_read_tokens = 0;
+            }
+            // Token-estimation fallback (AISIX-Cloud#1074), after the #419
+            // gate. A floor-only completion count (message_start placeholder,
+            // no message_delta) is treated as missing so an aborted stream
+            // estimates from the delivered text; max() keeps the floor when
+            // the estimate has nothing to add.
+            if let Some(est) = self.estimator.take() {
+                let upstream_completion = if usage.output_tokens_from_delta {
+                    usage.completion_tokens
+                } else {
+                    0
+                };
+                let output = (delivered > 0).then_some(usage.response_text.as_str());
+                let filled = crate::token_estimate::fill_missing(
+                    &est,
+                    usage.prompt_tokens,
+                    upstream_completion,
+                    output,
+                );
+                if filled.estimated {
+                    usage.prompt_tokens = filled.prompt_tokens;
+                    usage.completion_tokens = filled.completion_tokens.max(usage.completion_tokens);
+                    usage.usage_estimated = true;
+                }
             }
             f(usage);
         }
@@ -2877,6 +3082,9 @@ fn build_anthropic_passthrough_stream<S, F>(
     // When `Some`, the assembled `response_text` is preserved (not taken by the
     // guardrail scan) so the on_complete content capture can read it.
     content_cap: Option<u32>,
+    // Token-estimation fallback context (AISIX-Cloud#1074); see
+    // `AnthropicStreamGuard::estimator`.
+    estimator: Option<crate::token_estimate::Estimator>,
     on_complete: F,
 ) -> AnthropicDeliveryCounter<reqwest::Result<Bytes>>
 where
@@ -2904,6 +3112,7 @@ where
         let mut guard = AnthropicStreamGuard {
             slot: Some((on_complete, AnthropicStreamUsage::default())),
             delivered: delivered_for_drop,
+            estimator,
         };
         futures::pin_mut!(upstream);
         let mut buf: Vec<u8> = Vec::new();
@@ -4504,6 +4713,7 @@ event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"
                         usage,
                     )),
                     delivered,
+                    estimator: None,
                 };
                 drop(guard);
             }

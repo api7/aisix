@@ -66,6 +66,11 @@ serde_json = "1"
 jsonschema = "0.28"
 schemars = "0.8"
 
+# Local token estimation for usage telemetry when the upstream response
+# carries no usage block (AISIX-Cloud#1074). BPE ranks are bundled; no
+# network access at runtime.
+tiktoken-rs = "0.12"
+
 # Concurrency primitives
 arc-swap = "1.7"
 dashmap = "6.1"

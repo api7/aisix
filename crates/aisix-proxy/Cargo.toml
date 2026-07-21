@@ -41,6 +41,8 @@ http-body-util.workspace = true
 bytes.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# Token-estimation fallback for usage telemetry (token_estimate.rs).
+tiktoken-rs.workspace = true
 futures.workspace = true
 tokio-tungstenite.workspace = true
 async-trait.workspace = true

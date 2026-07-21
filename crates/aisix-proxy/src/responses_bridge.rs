@@ -910,10 +910,21 @@ pub struct ResponsesStreamCompletion {
     /// wants full content (bounded to the capture cap). Empty otherwise.
     /// Read by the on_complete telemetry closure; never reaches the CP sink.
     pub response_text: String,
+    /// True when the Drop guard filled any token counter from the local
+    /// estimator (AISIX-Cloud#1074).
+    pub usage_estimated: bool,
+    /// Generated output (content + reasoning + tool-call text) accumulated
+    /// for the token-estimation fallback (AISIX-Cloud#1074). Always on,
+    /// bounded to `token_estimate::OUTPUT_ACCUMULATION_CAP`; never leaves
+    /// the process.
+    est_output_text: String,
 }
 
 struct CompleteOnDrop<F: FnOnce(ResponsesStreamCompletion)> {
     slot: Option<(F, ResponsesStreamCompletion)>,
+    /// Token-estimation fallback (AISIX-Cloud#1074); fills counters the
+    /// upstream never reported before `on_complete` runs.
+    estimator: Option<crate::token_estimate::Estimator>,
 }
 
 impl<F: FnOnce(ResponsesStreamCompletion)> CompleteOnDrop<F> {
@@ -928,7 +939,23 @@ impl<F: FnOnce(ResponsesStreamCompletion)> CompleteOnDrop<F> {
 
 impl<F: FnOnce(ResponsesStreamCompletion)> Drop for CompleteOnDrop<F> {
     fn drop(&mut self) {
-        if let Some((f, comp)) = self.slot.take() {
+        if let Some((f, mut comp)) = self.slot.take() {
+            // Token-estimation fallback (AISIX-Cloud#1074): fill the
+            // counters the upstream never reported from the request +
+            // the accumulated output text.
+            if let Some(est) = self.estimator.take() {
+                let filled = crate::token_estimate::fill_missing(
+                    &est,
+                    comp.prompt_tokens,
+                    comp.completion_tokens,
+                    Some(comp.est_output_text.as_str()),
+                );
+                if filled.estimated {
+                    comp.prompt_tokens = filled.prompt_tokens;
+                    comp.completion_tokens = filled.completion_tokens;
+                    comp.usage_estimated = true;
+                }
+            }
             f(comp);
         }
     }
@@ -964,13 +991,19 @@ pub fn build_responses_bridge_stream(
     // Largest content cap any content-capturing exporter wants
     // (AISIX-Cloud#947); `None` skips response-text accumulation entirely.
     content_cap: Option<u32>,
+    // Token-estimation fallback context (AISIX-Cloud#1074); see
+    // `CompleteOnDrop::estimator`.
+    estimator: Option<crate::token_estimate::Estimator>,
     on_complete: impl FnOnce(ResponsesStreamCompletion) + Send + 'static,
 ) -> axum::body::Body {
     use futures::StreamExt;
 
     let mut encoder = encoder;
     let stream = async_stream::stream! {
-        let mut guard = CompleteOnDrop { slot: Some((on_complete, ResponsesStreamCompletion::default())) };
+        let mut guard = CompleteOnDrop {
+            slot: Some((on_complete, ResponsesStreamCompletion::default())),
+            estimator,
+        };
         let mut upstream = upstream;
         let mut first_chunk_seen = false;
         let buffering = output_guardrail.is_some() && hold_back;
@@ -1004,6 +1037,36 @@ pub fn build_responses_bridge_stream(
                         {
                             if comp.response_text.len() < cap as usize {
                                 comp.response_text.push_str(text);
+                            }
+                        }
+                        // Token-estimation accumulator (AISIX-Cloud#1074):
+                        // all generated output, always on (whether the
+                        // fallback is needed is only known at end-of-stream),
+                        // bounded.
+                        if comp.est_output_text.len()
+                            < crate::token_estimate::OUTPUT_ACCUMULATION_CAP
+                        {
+                            if let Some(text) = chunk.delta.content.as_deref() {
+                                comp.est_output_text.push_str(text);
+                            }
+                            if let Some(text) = chunk.delta.reasoning_content.as_deref() {
+                                comp.est_output_text.push_str(text);
+                            }
+                            if let Some(tcs) = chunk.delta.tool_calls.as_ref() {
+                                for tc in tcs {
+                                    if let Some(f) = tc.get("function") {
+                                        if let Some(n) =
+                                            f.get("name").and_then(|v| v.as_str())
+                                        {
+                                            comp.est_output_text.push_str(n);
+                                        }
+                                        if let Some(a) =
+                                            f.get("arguments").and_then(|v| v.as_str())
+                                        {
+                                            comp.est_output_text.push_str(a);
+                                        }
+                                    }
+                                }
                             }
                         }
                         if let Some(u) = chunk.usage.as_ref() {

@@ -98,6 +98,20 @@ pub struct UsageEvent {
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub cache_read_tokens: u32,
 
+    /// True when any token counter on this event was locally estimated
+    /// with the gateway's tokenizer because the upstream response
+    /// carried no usage block (AISIX-Cloud#1074) — e.g. an
+    /// OpenAI-compatible relay that ignores `stream_options.include_usage`,
+    /// a client disconnect before the terminal usage chunk, or an
+    /// upstream error mid-stream. False when every counter came from
+    /// the upstream (or the event carries no tokens at all). Estimated
+    /// counts approximate the model's real tokenizer; consumers that
+    /// need provider-billed exactness can filter on this flag. cp-api
+    /// persists it to `dpmgr_usage_events.usage_estimated`; on the wire
+    /// false is omitted via `skip_serializing_if`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub usage_estimated: bool,
+
     pub latency_ms: u32,
 
     /// Time to first token in milliseconds. Only meaningful on the

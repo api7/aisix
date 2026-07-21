@@ -241,6 +241,7 @@ pub async fn chat_completions(
                         reasoning_tokens: success.reasoning_tokens,
                         cache_creation_tokens: success.cache_creation_tokens,
                         cache_read_tokens: success.cache_read_tokens,
+                        usage_estimated: success.usage_estimated,
                         provider_request_id: success.provider_request_id.clone(),
                         provider_model_version: success.provider_model_version.clone(),
                         finish_reason: success.finish_reason.clone(),
@@ -508,6 +509,7 @@ pub async fn chat_completions(
                             reasoning_tokens: c.reasoning_tokens,
                             cache_creation_tokens: c.cache_creation_tokens,
                             cache_read_tokens: c.cache_read_tokens,
+                            usage_estimated: c.usage_estimated,
                             provider_request_id: c.provider_request_id,
                             provider_model_version: c.provider_model_version,
                             finish_reason: c.finish_reason,
@@ -592,6 +594,10 @@ struct Success {
     prompt_tokens: Option<u64>,
     completion_tokens: Option<u64>,
     total_tokens: Option<u64>,
+    /// True when the token counters were filled by the local estimator
+    /// because the upstream response carried no usage block
+    /// (AISIX-Cloud#1074). Lands on `UsageEvent::usage_estimated`.
+    usage_estimated: bool,
     /// Provider-specific cache + reasoning token counters. Default 0
     /// for providers that don't expose them; cp-api falls back to the
     /// standard prompt / completion rate when these are 0.
@@ -704,6 +710,40 @@ impl CacheStatus {
 /// message's text. `ChatMessage::content` already carries the
 /// concatenated text of multimodal content blocks, so this also covers
 /// vision/array-shaped messages (non-text blocks are skipped upstream).
+/// Generated output text for the token-estimation fallback
+/// (AISIX-Cloud#1074) — the non-streaming analog of the stream loop's
+/// `est_output_text` accumulation: message content + reasoning +
+/// tool-call name/argument text. Only built when estimation runs.
+pub(crate) fn estimation_output_text(resp: &aisix_gateway::ChatResponse) -> String {
+    let mut out = resp.message.content.clone().unwrap_or_default();
+    if let Some(s) = resp
+        .message
+        .extra
+        .get("reasoning_content")
+        .and_then(|v| v.as_str())
+    {
+        out.push_str(s);
+    }
+    if let Some(tcs) = resp
+        .message
+        .extra
+        .get("tool_calls")
+        .and_then(|v| v.as_array())
+    {
+        for tc in tcs {
+            if let Some(f) = tc.get("function") {
+                if let Some(n) = f.get("name").and_then(|v| v.as_str()) {
+                    out.push_str(n);
+                }
+                if let Some(a) = f.get("arguments").and_then(|v| v.as_str()) {
+                    out.push_str(a);
+                }
+            }
+        }
+    }
+    out
+}
+
 fn last_user_message_text(req: &ChatFormat) -> Option<String> {
     req.messages
         .iter()
@@ -801,6 +841,10 @@ struct UpstreamCharge {
     provider_key_id: String,
     prompt_tokens: u32,
     completion_tokens: u32,
+    /// True when the counters above were filled by the local estimator
+    /// (AISIX-Cloud#1074) — the billed-then-blocked upstream response
+    /// carried no usage block.
+    usage_estimated: bool,
     cached_prompt_tokens: u32,
     reasoning_tokens: u32,
     cache_creation_tokens: u32,
@@ -1467,6 +1511,14 @@ async fn dispatch(
             .and_then(|so| so.get("include_usage"))
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        // Token-estimation fallback context (AISIX-Cloud#1074): the
+        // request is cloned here because the stream owns it until an
+        // end-of-stream Drop — where the borrow is long gone. Tokenized
+        // only if the upstream never reports usage.
+        let estimator = crate::token_estimate::Estimator::new(
+            &upstream_model_for_metrics,
+            crate::token_estimate::PromptInput::Chat(Box::new(req.clone())),
+        );
         let sse_stream = build_sse_stream(
             upstream,
             now,
@@ -1477,6 +1529,7 @@ async fn dispatch(
             client_requested_usage,
             // Single upstream: nothing pre-incurred, so no usage to fold in.
             aisix_gateway::chat::UsageStats::default(),
+            Some(estimator),
             move |comp: StreamCompletion| {
                 // Rate-limit accounting (TPM cap) for all layers.
                 for key in &post_stream_keys {
@@ -1501,6 +1554,7 @@ async fn dispatch(
                         reasoning_tokens: comp.reasoning_tokens,
                         cache_creation_tokens: comp.cache_creation_tokens,
                         cache_read_tokens: comp.cache_read_tokens,
+                        usage_estimated: comp.usage_estimated,
                         provider_request_id: comp.provider_request_id,
                         provider_model_version: comp.provider_model_version,
                         finish_reason: comp.finish_reason,
@@ -1649,6 +1703,7 @@ async fn dispatch(
             // top-level handler skips its own `emit_usage_event` for
             // streaming via `telemetry_handled_by_stream` below.
             prompt_tokens: None,
+            usage_estimated: false,
             completion_tokens: None,
             total_tokens: None,
             cost_usd: 0.0,
@@ -1830,6 +1885,42 @@ async fn dispatch(
                     .upstream_model()
                     .unwrap_or("unknown")
                     .to_string();
+                // Token-estimation fallback (AISIX-Cloud#1074): a stored
+                // response whose original upstream never reported usage
+                // replays zeros — fill them like the fresh-response path
+                // so hit rows (and their saved-token stats) don't record
+                // silent zeros.
+                let (prompt, completion, total, usage_estimated) = if prompt == 0 || completion == 0
+                {
+                    let est = crate::token_estimate::Estimator::new(
+                        &upstream_model,
+                        crate::token_estimate::PromptInput::Chat(Box::new(req.clone())),
+                    );
+                    let filled = crate::token_estimate::fill_missing(
+                        &est,
+                        prompt as u32,
+                        completion as u32,
+                        Some(cached.message.content.as_deref().unwrap_or("")),
+                    );
+                    if filled.estimated {
+                        let total = crate::usage_attr::total_tokens_with_cache(
+                            filled.prompt_tokens,
+                            filled.completion_tokens,
+                            cache_creation_tokens,
+                            cache_read_tokens,
+                        );
+                        (
+                            filled.prompt_tokens as u64,
+                            filled.completion_tokens as u64,
+                            total,
+                            true,
+                        )
+                    } else {
+                        (prompt, completion, total, false)
+                    }
+                } else {
+                    (prompt, completion, total, false)
+                };
                 // Capture the prompt + cached response for content-capturing
                 // exporters (gated). A cache hit still served content to the
                 // caller, so it's logged like a fresh response.
@@ -1851,6 +1942,7 @@ async fn dispatch(
                     prompt_tokens: Some(prompt),
                     completion_tokens: Some(completion),
                     total_tokens: Some(total),
+                    usage_estimated,
                     cached_prompt_tokens,
                     reasoning_tokens,
                     cache_creation_tokens,
@@ -2146,9 +2238,50 @@ async fn dispatch(
     // Output guardrail. Tokens still count against quota — the upstream
     // already burned them — so commit before the check, and refuse the
     // refusal-write to the cache so a re-request gets a fresh chance.
-    let prompt = upstream.usage.prompt_tokens as u64;
-    let completion = upstream.usage.completion_tokens as u64;
-    let total = upstream.usage.total_tokens as u64;
+    //
+    // Token-estimation fallback (AISIX-Cloud#1074): when the upstream
+    // response carries no usage block, fill the missing counters locally
+    // BEFORE the quota commit and telemetry below so neither records
+    // silent zeros. Local variables only — `render_response` serialises
+    // the upstream body untouched, so the client never sees synthesised
+    // usage presented as the provider's.
+    let (prompt_tokens_u32, completion_tokens_u32, usage_estimated) = {
+        let (p, c) = (
+            upstream.usage.prompt_tokens,
+            upstream.usage.completion_tokens,
+        );
+        if p == 0 || c == 0 {
+            let est = crate::token_estimate::Estimator::new(
+                &upstream_model,
+                crate::token_estimate::PromptInput::Chat(Box::new(req.clone())),
+            );
+            let filled = crate::token_estimate::fill_missing(
+                &est,
+                p,
+                c,
+                Some(&estimation_output_text(&upstream)),
+            );
+            (
+                filled.prompt_tokens,
+                filled.completion_tokens,
+                filled.estimated,
+            )
+        } else {
+            (p, c, false)
+        }
+    };
+    let prompt = prompt_tokens_u32 as u64;
+    let completion = completion_tokens_u32 as u64;
+    let total = if usage_estimated {
+        crate::usage_attr::total_tokens_with_cache(
+            prompt_tokens_u32,
+            completion_tokens_u32,
+            upstream.usage.cache_creation_tokens,
+            upstream.usage.cache_read_tokens,
+        )
+    } else {
+        upstream.usage.total_tokens as u64
+    };
     // Snapshot the cache / reasoning counters + provider identity before
     // the upstream gets moved into render_response below — we need them
     // on the Success struct for telemetry.
@@ -2205,8 +2338,9 @@ async fn dispatch(
             // output-blocked requests.
             let charge = UpstreamCharge {
                 provider_key_id: provider_key_id.clone(),
-                prompt_tokens: upstream.usage.prompt_tokens,
-                completion_tokens: upstream.usage.completion_tokens,
+                prompt_tokens: prompt_tokens_u32,
+                completion_tokens: completion_tokens_u32,
+                usage_estimated,
                 cached_prompt_tokens,
                 reasoning_tokens,
                 cache_creation_tokens,
@@ -2318,6 +2452,7 @@ async fn dispatch(
         prompt_tokens: Some(prompt),
         completion_tokens: Some(completion),
         total_tokens: Some(total),
+        usage_estimated,
         cached_prompt_tokens,
         reasoning_tokens,
         cache_creation_tokens,
@@ -2711,6 +2846,14 @@ async fn dispatch_ensemble(
         let judge_concurrency_hold = judge_reservation.into_stream_hold();
         let limiter = Arc::clone(&state.limiter);
 
+        // Token-estimation fallback (AISIX-Cloud#1074) for the streamed
+        // judge: `comp` carries the JUDGE's stream-only counts, so the
+        // estimator gets the judge's own request (panel members buffered
+        // their usage separately).
+        let judge_estimator = crate::token_estimate::Estimator::new(
+            judge_model.upstream_model().unwrap_or("unknown"),
+            crate::token_estimate::PromptInput::Chat(Box::new(judge_req)),
+        );
         let sse_stream = build_sse_stream(
             judge_stream,
             created_ts,
@@ -2722,6 +2865,7 @@ async fn dispatch_ensemble(
             content_cap,
             client_requested_usage,
             panel_usage_sum,
+            Some(judge_estimator),
             move |comp: StreamCompletion| {
                 // Rate-limit accounting: the panel tokens (already round-tripped)
                 // plus the streamed judge's final total, against every layer.
@@ -2786,6 +2930,7 @@ async fn dispatch_ensemble(
                         reasoning_tokens: comp.reasoning_tokens,
                         cache_creation_tokens: comp.cache_creation_tokens,
                         cache_read_tokens: comp.cache_read_tokens,
+                        usage_estimated: comp.usage_estimated,
                         provider_request_id: comp.provider_request_id,
                         provider_model_version: comp.provider_model_version,
                         finish_reason: comp.finish_reason,
@@ -2862,6 +3007,7 @@ async fn dispatch_ensemble(
             prompt_tokens: None,
             completion_tokens: None,
             total_tokens: None,
+            usage_estimated: false,
             cost_usd: 0.0,
             cached_prompt_tokens: 0,
             reasoning_tokens: 0,
@@ -3105,6 +3251,7 @@ async fn dispatch_ensemble(
         prompt_tokens: None,
         completion_tokens: None,
         total_tokens: None,
+        usage_estimated: false,
         cached_prompt_tokens: 0,
         reasoning_tokens: 0,
         cache_creation_tokens: 0,
@@ -3312,6 +3459,7 @@ fn emit_usage_event(
         reasoning_tokens: extras.reasoning_tokens,
         cache_creation_tokens: extras.cache_creation_tokens,
         cache_read_tokens: extras.cache_read_tokens,
+        usage_estimated: extras.usage_estimated,
         latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
         status_code,
         provider_request_id: extras.provider_request_id,
@@ -3419,6 +3567,10 @@ struct UsageExtras {
     reasoning_tokens: u32,
     cache_creation_tokens: u32,
     cache_read_tokens: u32,
+    /// True when any token counter was filled by the local estimator
+    /// because the upstream reported no usage (AISIX-Cloud#1074). Lands
+    /// on `UsageEvent::usage_estimated`.
+    usage_estimated: bool,
     provider_request_id: String,
     provider_model_version: String,
     finish_reason: String,
@@ -3676,6 +3828,19 @@ struct StreamCompletion {
     /// capture cap). Empty otherwise. Read by the on_complete telemetry
     /// closure; never reaches the CP sink.
     response_text: String,
+    /// Generated output (content + reasoning + tool-call text) accumulated
+    /// for the token-estimation fallback (AISIX-Cloud#1074). Always on —
+    /// the terminal usage chunk that would make it unnecessary arrives
+    /// only at end-of-stream — but bounded to
+    /// `token_estimate::OUTPUT_ACCUMULATION_CAP`. Unlike `response_text`
+    /// this never leaves the process: it is tokenized in
+    /// `CompleteOnDrop::drop` when the upstream reported no usage, then
+    /// discarded.
+    est_output_text: String,
+    /// True when `CompleteOnDrop::drop` filled any token counter from the
+    /// local estimator because the upstream never reported it. Threaded
+    /// into `UsageEvent::usage_estimated` by the on_complete closure.
+    usage_estimated: bool,
     /// Per-detector PII mask counts applied to the held stream at release
     /// (#932). Merged with the input-side counts by the on_complete
     /// telemetry closure. Detector names only, never matched values.
@@ -3732,6 +3897,11 @@ struct CompleteOnDrop<F: FnOnce(StreamCompletion)> {
     /// returning `Ready(Some(_))` is exact — that's the moment the
     /// item handed to the consumer.
     delivered: Arc<AtomicU32>,
+    /// Token-estimation fallback (AISIX-Cloud#1074): when the stream
+    /// ends with no upstream-reported usage, Drop fills the missing
+    /// counters from this estimator (prompt from the captured request,
+    /// completion from `est_output_text`) and sets `usage_estimated`.
+    estimator: Option<crate::token_estimate::Estimator>,
 }
 
 impl<F: FnOnce(StreamCompletion)> CompleteOnDrop<F> {
@@ -3767,6 +3937,36 @@ impl<F: FnOnce(StreamCompletion)> Drop for CompleteOnDrop<F> {
                 c.cache_read_tokens = 0;
                 c.total_tokens = c.prompt_tokens as u64;
             }
+            // Token-estimation fallback (AISIX-Cloud#1074), after the #419
+            // gate so a zero-delivered disconnect never bills estimated
+            // completion tokens (the prompt still fills — upstream processed
+            // it regardless, same "prompts always billed" contract). Runs
+            // only for counters the upstream left at zero; a stream with a
+            // real usage chunk is untouched.
+            if let Some(est) = self.estimator.take() {
+                let output = (delivered > 0).then_some(c.est_output_text.as_str());
+                let filled = crate::token_estimate::fill_missing(
+                    &est,
+                    c.prompt_tokens,
+                    c.completion_tokens,
+                    output,
+                );
+                if filled.estimated {
+                    c.prompt_tokens = filled.prompt_tokens;
+                    c.completion_tokens = filled.completion_tokens;
+                    c.usage_estimated = true;
+                    // Estimation only fills counters the upstream never
+                    // reported, so the cache adders are zero or upstream-
+                    // authoritative — the recompute stays consistent with
+                    // `total_tokens_with_cache`.
+                    c.total_tokens = crate::usage_attr::total_tokens_with_cache(
+                        c.prompt_tokens,
+                        c.completion_tokens,
+                        c.cache_creation_tokens,
+                        c.cache_read_tokens,
+                    );
+                }
+            }
             f(c);
         }
     }
@@ -3795,6 +3995,9 @@ fn build_sse_stream<F>(
     // `on_complete` (`comp`) counts stay stream-only. Zero for single-upstream
     // callers, where the fold is a no-op.
     base_usage: aisix_gateway::chat::UsageStats,
+    // Token-estimation fallback context (AISIX-Cloud#1074); see
+    // `CompleteOnDrop::estimator`.
+    estimator: Option<crate::token_estimate::Estimator>,
     on_complete: F,
 ) -> impl Stream<Item = Result<Event, Infallible>>
 where
@@ -3816,6 +4019,7 @@ where
         let mut guard = CompleteOnDrop {
             slot: Some((on_complete, StreamCompletion::default())),
             delivered: delivered_for_drop,
+            estimator,
         };
         futures::pin_mut!(upstream);
         // Per #204: accumulate the assistant's content across chunks
@@ -3938,6 +4142,34 @@ where
                         if let Some(cap) = content_cap {
                             if comp.response_text.len() < cap as usize {
                                 comp.response_text.push_str(text);
+                            }
+                        }
+                    }
+                    // Token-estimation accumulator (AISIX-Cloud#1074): all
+                    // generated output — content, reasoning, tool-call text —
+                    // bounded to its own cap. Always on: whether the fallback
+                    // is needed is only known at end-of-stream.
+                    if comp.est_output_text.len()
+                        < crate::token_estimate::OUTPUT_ACCUMULATION_CAP
+                    {
+                        if let Some(text) = chunk.delta.content.as_deref() {
+                            comp.est_output_text.push_str(text);
+                        }
+                        if let Some(text) = chunk.delta.reasoning_content.as_deref() {
+                            comp.est_output_text.push_str(text);
+                        }
+                        if let Some(tcs) = chunk.delta.tool_calls.as_ref() {
+                            for tc in tcs {
+                                if let Some(f) = tc.get("function") {
+                                    if let Some(n) = f.get("name").and_then(|v| v.as_str()) {
+                                        comp.est_output_text.push_str(n);
+                                    }
+                                    if let Some(a) =
+                                        f.get("arguments").and_then(|v| v.as_str())
+                                    {
+                                        comp.est_output_text.push_str(a);
+                                    }
+                                }
                             }
                         }
                     }
@@ -4717,11 +4949,107 @@ mod complete_on_drop_tests {
                     comp,
                 )),
                 delivered,
+                estimator: None,
             };
             drop(guard);
         }
         let out = captured.lock().unwrap().take().expect("on_complete fired");
         out
+    }
+
+    /// Same as [`drop_and_capture`] but with a token estimator armed
+    /// (AISIX-Cloud#1074) — the request is one user message "Hello".
+    fn drop_and_capture_with_estimator(
+        comp: StreamCompletion,
+        delivered_count: u32,
+    ) -> StreamCompletion {
+        let captured: Arc<Mutex<Option<StreamCompletion>>> = Arc::new(Mutex::new(None));
+        let cap = captured.clone();
+        let delivered = Arc::new(AtomicU32::new(delivered_count));
+        let req = aisix_gateway::chat::ChatFormat::new(
+            "relay-model",
+            vec![aisix_gateway::chat::ChatMessage {
+                role: aisix_gateway::chat::Role::User,
+                content: Some("Hello".into()),
+                content_blocks: None,
+                name: None,
+                tool_call_id: None,
+                extra: serde_json::Map::new(),
+            }],
+        );
+        {
+            let guard = CompleteOnDrop {
+                slot: Some((
+                    move |c: StreamCompletion| {
+                        *cap.lock().unwrap() = Some(c);
+                    },
+                    comp,
+                )),
+                delivered,
+                estimator: Some(crate::token_estimate::Estimator::new(
+                    "relay-model",
+                    crate::token_estimate::PromptInput::Chat(Box::new(req)),
+                )),
+            };
+            drop(guard);
+        }
+        let out = captured.lock().unwrap().take().expect("on_complete fired");
+        out
+    }
+
+    /// AISIX-Cloud#1074: a stream that ended with no upstream usage
+    /// fills prompt + completion from the estimator and flags the
+    /// completion. Expected prompt: 3 per-message + "user" (1) +
+    /// "Hello" (1) + 3 reply priming = 8 (cl100k fallback encoding);
+    /// completion: "Hello world" = 2.
+    #[test]
+    fn estimator_fills_missing_usage_at_drop() {
+        let comp = StreamCompletion {
+            est_output_text: "Hello world".into(),
+            chunks_delivered: 0, // set by Drop, ignored on input
+            ..Default::default()
+        };
+        let out = drop_and_capture_with_estimator(comp, 3);
+        assert_eq!(out.prompt_tokens, 8);
+        assert_eq!(out.completion_tokens, 2);
+        assert_eq!(out.total_tokens, 10);
+        assert!(out.usage_estimated);
+    }
+
+    /// AISIX-Cloud#1074 × #419: a zero-delivered disconnect still
+    /// estimates the prompt (prompts are always billed) but must NOT
+    /// bill estimated completion tokens for content that never
+    /// crossed the wire.
+    #[test]
+    fn estimator_respects_zero_delivered_gate() {
+        let comp = StreamCompletion {
+            est_output_text: "Hello world".into(),
+            ..Default::default()
+        };
+        let out = drop_and_capture_with_estimator(comp, 0);
+        assert_eq!(out.prompt_tokens, 8);
+        assert_eq!(out.completion_tokens, 0, "nothing delivered → nothing billed");
+        assert_eq!(out.total_tokens, 8);
+        assert!(out.usage_estimated);
+    }
+
+    /// AISIX-Cloud#1074: upstream-reported usage wins — the armed
+    /// estimator must not touch a stream that carried a real usage
+    /// block, and the event stays unflagged.
+    #[test]
+    fn estimator_leaves_upstream_usage_untouched() {
+        let comp = StreamCompletion {
+            prompt_tokens: 17,
+            completion_tokens: 23,
+            total_tokens: 40,
+            est_output_text: "Hello world".into(),
+            ..Default::default()
+        };
+        let out = drop_and_capture_with_estimator(comp, 5);
+        assert_eq!(out.prompt_tokens, 17);
+        assert_eq!(out.completion_tokens, 23);
+        assert_eq!(out.total_tokens, 40);
+        assert!(!out.usage_estimated);
     }
 
     #[test]
@@ -4868,6 +5196,7 @@ mod delivery_counter_tests {
                     },
                 )),
                 delivered: delivered_for_drop,
+                estimator: None,
             };
             // Silence unused-field warning on the test side; guard
             // is held by the body for its full lifetime.

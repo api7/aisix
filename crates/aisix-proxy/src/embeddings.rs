@@ -170,6 +170,7 @@ pub async fn embeddings(
                     status,
                     elapsed,
                     success.prompt_tokens,
+                    success.usage_estimated,
                     &client,
                     success.redactions.clone(),
                     success.monitor_hits.clone(),
@@ -242,6 +243,9 @@ struct EmbedDispatchSuccess {
     /// into `content_mode = full`.
     captured_content: Option<CapturedContent>,
     prompt_tokens: u32,
+    /// True when `prompt_tokens` came from the local estimator because
+    /// the upstream reported no usage (AISIX-Cloud#1074).
+    usage_estimated: bool,
     /// `true` when the dispatch produced a real 200 from the upstream
     /// (we have authoritative usage data to attribute). `false` for the
     /// 501-NotImplemented branch where no upstream call was made.
@@ -401,18 +405,37 @@ async fn dispatch(
             // answered — same recovery signal as rerank/audio/chat.
             state.health.record_success(&body.model);
             state.runtime_status.mark_healthy(&model_entry.id);
+            // Token accounting (#226 / AISIX-Cloud#1074). Embeddings are
+            // input-only, so `prompt_tokens == total_tokens` on the OpenAI
+            // shape. Providers that report only `total_tokens` (e.g. some
+            // rerank/embed backends) get prompt from total — upstream-
+            // authoritative, not an estimate. Only when the upstream
+            // reports nothing at all does the local estimator count the
+            // request `input`. Telemetry only — the response body is
+            // forwarded untouched.
+            let (prompt_tokens, usage_estimated) = if embed_resp.usage.prompt_tokens > 0 {
+                (embed_resp.usage.prompt_tokens, false)
+            } else if embed_resp.usage.total_tokens > 0 {
+                (embed_resp.usage.total_tokens, false)
+            } else {
+                let upstream_model = model.upstream_model().unwrap_or("unknown");
+                let estimated = req.input.iter().fold(0u32, |acc, s| {
+                    acc.saturating_add(crate::token_estimate::count_text(upstream_model, s))
+                });
+                (estimated, estimated > 0)
+            };
             // Commit the reservation — release the concurrency permit
             // and finalise RPM. Embeddings do report prompt_tokens via
             // EmbeddingResponse.usage; thread it through so TPM works
-            // here even though other handlers commit 0.
+            // here even though other handlers commit 0. The estimation
+            // fallback above keeps this accurate for upstreams that
+            // report no usage.
             reservation
-                .commit_tokens(embed_resp.usage.total_tokens as u64)
+                .commit_tokens(u64::from(
+                    (embed_resp.usage.total_tokens).max(prompt_tokens),
+                ))
                 .await;
             let provider_label = provider.to_ascii_lowercase();
-            // Capture the prompt_tokens count BEFORE moving the
-            // embed_resp into the JSON response — the handler needs
-            // this for UsageEvent emission downstream (#226).
-            let prompt_tokens = embed_resp.usage.prompt_tokens;
             // Content capture (#700): the full response JSON, vectors
             // included (LiteLLM parity); CapturedContent::new truncates to
             // the cap.
@@ -433,6 +456,7 @@ async fn dispatch(
                 redactions: redactions.clone(),
                 monitor_hits: monitor_hits.clone(),
                 prompt_tokens,
+                usage_estimated,
                 upstream_called: true,
                 captured_content,
             })
@@ -455,6 +479,7 @@ async fn dispatch(
                 redactions: redactions.clone(),
                 monitor_hits: monitor_hits.clone(),
                 prompt_tokens: 0,
+                usage_estimated: false,
                 captured_content: None,
                 // No upstream call happened — the handler reads this
                 // and skips UsageEvent emission. Distinguished from
@@ -544,6 +569,7 @@ fn emit_usage_event(
     status_code: u16,
     elapsed: Duration,
     prompt_tokens: u32,
+    usage_estimated: bool,
     client: &ClientContext,
     // Per-detector PII mask counts (#932) applied to the input.
     redacted_entity_counts: crate::redact::RedactionCounts,
@@ -587,6 +613,7 @@ fn emit_usage_event(
         api_key_id: api_key_id.to_string(),
         requested_model: requested_model.to_string(),
         prompt_tokens,
+        usage_estimated,
         latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
         status_code,
         inbound_protocol: "openai".to_string(),
