@@ -57,7 +57,8 @@ describe("cache TTL eviction e2e: entry expires after ttl_seconds", () => {
     if (!etcdReachable) return;
 
     upstream = await startOpenAiUpstream();
-    app = await spawnApp();
+    // No admin listener: every resource here is seeded straight to etcd.
+    app = await spawnApp({ admin: false });
     seed = new SeedClient(etcd, app.etcdPrefix);
 
     const pk = await seed.createProviderKey({

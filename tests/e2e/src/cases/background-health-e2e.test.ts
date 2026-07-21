@@ -59,7 +59,10 @@ describe("background health e2e", () => {
       },
     });
 
-    app = await spawnApp();
+    // The admin listener is off; `admin` here is used only for
+    // listModelStatuses, which reads GET /status/models on the metrics
+    // listener. Resources are seeded straight to etcd via `seed`.
+    app = await spawnApp({ admin: false });
     admin = new AdminClient(app.adminUrl, app.adminKey, app.metricsUrl);
     seed = new SeedClient(etcd, app.etcdPrefix);
 
