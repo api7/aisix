@@ -20,6 +20,8 @@
 
 #[cfg(feature = "aliyun-text-moderation")]
 mod aliyun;
+#[cfg(feature = "aliyun-text-moderation")]
+mod aliyun_ai_guardrail;
 #[cfg(feature = "bedrock")]
 mod bedrock;
 mod build;
@@ -150,6 +152,8 @@ pub fn supported_kinds() -> &'static [&'static str] {
         "azure_content_safety_text_moderation",
         #[cfg(feature = "aliyun-text-moderation")]
         "aliyun_text_moderation",
+        #[cfg(feature = "aliyun-text-moderation")]
+        "aliyun_ai_guardrail",
         #[cfg(feature = "bedrock")]
         "bedrock",
         #[cfg(feature = "lakera")]
@@ -163,6 +167,8 @@ pub fn supported_kinds() -> &'static [&'static str] {
 
 #[cfg(feature = "aliyun-text-moderation")]
 pub use aliyun::AliyunTextModerationGuardrail;
+#[cfg(feature = "aliyun-text-moderation")]
+pub use aliyun_ai_guardrail::AliyunAiGuardrail;
 #[cfg(feature = "bedrock")]
 pub use bedrock::BedrockGuardrail;
 pub use build::{
@@ -733,6 +739,7 @@ mod tests {
                 "azure_content_safety",
                 "azure_content_safety_text_moderation",
                 "aliyun_text_moderation",
+                "aliyun_ai_guardrail",
                 "bedrock",
                 "lakera",
                 "openai_moderation",
@@ -765,6 +772,12 @@ mod tests {
                 "aliyun_text_moderation" => serde_json::json!({
                     "kind": "aliyun_text_moderation",
                     "region": "ap-southeast-1",
+                    "access_key_id": "ak",
+                    "access_key_secret": "sk",
+                }),
+                "aliyun_ai_guardrail" => serde_json::json!({
+                    "kind": "aliyun_ai_guardrail",
+                    "region": "cn-shanghai",
                     "access_key_id": "ak",
                     "access_key_secret": "sk",
                 }),

@@ -38,12 +38,12 @@ pub use cache_policy::{AppliesTo, CacheBackend, CachePolicy};
 pub use embedding::EmbeddingConfig;
 pub use ensemble::{EnsembleConfig, Judge, PanelMember};
 pub use guardrail::{
-    AliyunTextModerationConfig, AppliedGuardrail, AzureContentSafetyConfig,
-    AzureContentSafetyTextModerationConfig, BedrockAWSCredentials, BedrockConfig,
-    BedrockLatencyMode, Guardrail, GuardrailAttachment, GuardrailHookPoint, GuardrailKind,
-    GuardrailMonitorHit, GuardrailScopeType, KeywordConfig, KeywordPattern, LakeraConfig,
-    OpenaiModerationConfig, PiiConfig, PiiCustomPattern, PiiDetectorConfig, PresidioConfig,
-    PresidioEntityConfig,
+    AliyunAiGuardrailConfig, AliyunTextModerationConfig, AppliedGuardrail,
+    AzureContentSafetyConfig, AzureContentSafetyTextModerationConfig, BedrockAWSCredentials,
+    BedrockConfig, BedrockLatencyMode, Guardrail, GuardrailAttachment, GuardrailHookPoint,
+    GuardrailKind, GuardrailMonitorHit, GuardrailScopeType, KeywordConfig, KeywordPattern,
+    LakeraConfig, OpenaiModerationConfig, PiiConfig, PiiCustomPattern, PiiDetectorConfig,
+    PresidioConfig, PresidioEntityConfig,
 };
 pub use mcp_server::{McpAuthType, McpServer, McpTransport};
 pub use model::{

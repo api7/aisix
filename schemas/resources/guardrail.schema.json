@@ -618,6 +618,95 @@
       "type": "object"
     },
     {
+      "description": "Aliyun AI Guardrails (AI 安全护栏). Policy-driven moderation via the `MultiModalGuard` action on `green-cip.<region>.aliyuncs.com`; the verdict follows the console-configured policy's `Suggestion`. On input and/or output, including streaming output.",
+      "properties": {
+        "access_key_id": {
+          "description": "Aliyun AccessKey ID.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "access_key_secret": {
+          "description": "Aliyun AccessKey secret. Decrypted before projection. Plaintext is held in memory only and is not logged. Used to sign the request.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "endpoint": {
+          "default": null,
+          "description": "Explicit endpoint override as a full URL with no trailing slash. When set, it takes precedence over `region`.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "aliyun_ai_guardrail"
+          ],
+          "type": "string"
+        },
+        "max_buffer_bytes": {
+          "default": 262144,
+          "description": "Max bytes buffered in `buffer_full` mode before `on_buffer_exceeded` applies.",
+          "format": "uint64",
+          "minimum": 1.0,
+          "type": "integer"
+        },
+        "on_buffer_exceeded": {
+          "default": "fail_closed",
+          "description": "Buffer-overflow policy for streamed output when the buffer cap is hit.",
+          "type": "string"
+        },
+        "output_fail_open": {
+          "default": false,
+          "description": "Fail-open policy for the output hook. When disabled, an Aliyun outage does not release unscanned model output.",
+          "type": "boolean"
+        },
+        "region": {
+          "description": "Aliyun region the guardrail lives in, e.g. `cn-shanghai`. The data plane builds the endpoint `https://green-cip.<region>.aliyuncs.com`.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "service_level": {
+          "default": "pro",
+          "description": "Which AI Guardrails service tier to call: `pro` uses `query_security_check_pro` / `response_security_check_pro`, `basic` uses `query_security_check` / `response_security_check`. Must match the tier activated on the Aliyun account.",
+          "type": "string"
+        },
+        "stream_processing_mode": {
+          "default": "window",
+          "description": "Streaming output moderation mode: sliding-window incremental release or whole-response hold-back.",
+          "type": "string"
+        },
+        "timeout_ms": {
+          "default": 5000,
+          "description": "HTTP call timeout in milliseconds. `fail_open` and `output_fail_open` govern the verdict when it elapses. A value of `0` triggers the timeout immediately.",
+          "format": "uint32",
+          "maximum": 4294967295.0,
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "window_overlap_size": {
+          "default": 128,
+          "description": "Chars carried between windows so a span split across a boundary is still caught.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "window_size": {
+          "default": 2000,
+          "description": "Sliding-window size in characters when window mode is used. Aliyun limits each MultiModalGuard call to 2,000 characters of text.",
+          "format": "uint32",
+          "maximum": 2000.0,
+          "minimum": 1.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "access_key_id",
+        "access_key_secret",
+        "kind",
+        "region"
+      ],
+      "type": "object"
+    },
+    {
       "description": "Built-in sensitive-data detection and redaction inside AISIX. Built-in detectors and custom regex patterns can mask matched spans or block traffic on input, output, or both, including buffered streaming output. Always available and does not call an external service.",
       "properties": {
         "custom_patterns": {
