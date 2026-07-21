@@ -1900,7 +1900,7 @@ async fn dispatch(
                         &est,
                         prompt as u32,
                         completion as u32,
-                        Some(cached.message.content.as_deref().unwrap_or("")),
+                        Some(&estimation_output_text(&cached)),
                     );
                     if filled.estimated {
                         let total = crate::usage_attr::total_tokens_with_cache(

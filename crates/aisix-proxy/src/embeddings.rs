@@ -810,6 +810,102 @@ mod tests {
         assert_eq!(ev.applied_guardrails[0].hook, "input");
     }
 
+    /// AISIX-Cloud#1074: an embeddings upstream that reports only
+    /// `total_tokens` (no `prompt_tokens`) fills prompt from total —
+    /// upstream-authoritative, NOT estimated, so the event stays
+    /// unflagged. Pre-#1074 this recorded prompt_tokens=0.
+    #[tokio::test]
+    async fn prompt_falls_back_to_total_tokens_unflagged() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "object": "list",
+                "data": [{"object": "embedding", "index": 0, "embedding": [0.1_f32]}],
+                "model": "text-embedding-3-small",
+                "usage": {"total_tokens": 6}
+            })))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("my-embed"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let handle = SnapshotHandle::new(snap);
+        let state = crate::ProxyState::new(handle, hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let app = crate::build_router(state);
+
+        let body = serde_json::json!({"model": "my-embed", "input": "hello world"});
+        let resp = tower::ServiceExt::oneshot(app, make_req(body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted")
+            .expect("usage_sink sender dropped");
+        assert_eq!(ev.prompt_tokens, 6, "prompt falls back to total_tokens");
+        assert!(
+            !ev.usage_estimated,
+            "total_tokens is upstream-authoritative, not an estimate"
+        );
+    }
+
+    /// AISIX-Cloud#1074: an embeddings upstream that reports NO usage at
+    /// all gets the prompt estimated from the request `input` and the
+    /// event flagged. "hello world" = 2 tokens (cl100k, and the seeded
+    /// model name text-embedding-3-small maps to cl100k too).
+    #[tokio::test]
+    async fn prompt_estimated_and_flagged_when_usage_absent() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "object": "list",
+                "data": [{"object": "embedding", "index": 0, "embedding": [0.1_f32]}],
+                "model": "text-embedding-3-small"
+            })))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("my-embed"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let handle = SnapshotHandle::new(snap);
+        let state = crate::ProxyState::new(handle, hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let app = crate::build_router(state);
+
+        let body = serde_json::json!({"model": "my-embed", "input": "hello world"});
+        let resp = tower::ServiceExt::oneshot(app, make_req(body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted")
+            .expect("usage_sink sender dropped");
+        assert_eq!(ev.prompt_tokens, 2, "estimated from the request input");
+        assert!(ev.usage_estimated, "locally-counted tokens must be flagged");
+    }
+
     /// #719: /v1/embeddings explicitly bypassed all guardrails, so a content
     /// block configured on /v1/chat/completions was evadable by sending the
     /// same text to /v1/embeddings. A configured input guardrail must now

@@ -387,19 +387,28 @@ describe("usage estimation e2e (AISIX-Cloud#1074): missing upstream usage is loc
     });
     expect(res.status).toBe(200);
     const reader = res.body!.getReader();
-    // Pull one chunk off the wire, then abort — the upstream still has
-    // events pending (150ms pacing), so this is a genuine mid-stream
-    // disconnect, not a raced clean close.
-    await reader.read();
+    // Read until the first content delta has crossed the wire, then
+    // abort — the upstream still has events pending (150ms pacing), so
+    // this is a genuine mid-stream disconnect after real delivery, not
+    // a raced clean close.
+    const decoder = new TextDecoder();
+    let wire = "";
+    while (!wire.includes('"content":"Hello"')) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      wire += decoder.decode(value, { stream: true });
+    }
+    expect(wire).toContain('"content":"Hello"');
     controller.abort();
 
     // The Drop guard fires on disconnect and estimates from what was
     // delivered: the prompt side is exact; the completion side covers
-    // at least the first delivered content token(s) but must stay below
-    // the full response (we aborted before " world" et al.).
+    // at least the delivered "Hello" (1 token) and at most the full
+    // response ("Hello world" = 2) if the abort raced the tail.
     const { input, output } = await waitTokenMetrics("est-chat-abort");
     expect(input).toBe(EXPECTED_PROMPT_TOKENS);
-    expect(output).toBeGreaterThanOrEqual(0);
+    expect(output).toBeGreaterThanOrEqual(1);
+    expect(output).toBeLessThanOrEqual(EXPECTED_COMPLETION_TOKENS);
     await waitSlsFlagged("est-chat-abort");
   }, 60_000);
 
@@ -433,6 +442,7 @@ describe("usage estimation e2e (AISIX-Cloud#1074): missing upstream usage is loc
     });
 
     const inputBefore = await tokenMetric("aisix_llm_input_tokens_total", "est-msgs-stream");
+    const outputBefore = await tokenMetric("aisix_llm_output_tokens_total", "est-msgs-stream");
     const res = await call();
     expect(res.status).toBe(200);
     const body = await res.text();
@@ -449,11 +459,11 @@ describe("usage estimation e2e (AISIX-Cloud#1074): missing upstream usage is loc
       if (input > inputBefore) break;
       await new Promise((r) => setTimeout(r, 100));
     }
-    // Prompt estimate is exact (one user message "hi" = 8). The output
-    // accumulator joins text deltas with separators, so bound the
-    // completion estimate instead of pinning it.
+    // Both sides are exact: one user message "hi" = 8, and the
+    // estimation accumulator is a raw concatenation of the text deltas
+    // ("Hello world" = 2) — no separators to inflate the count.
     expect(input - inputBefore).toBe(EXPECTED_PROMPT_TOKENS);
-    expect(output).toBeGreaterThanOrEqual(EXPECTED_COMPLETION_TOKENS);
+    expect(output - outputBefore).toBe(EXPECTED_COMPLETION_TOKENS);
     await waitSlsFlagged("est-msgs-stream");
   }, 60_000);
 

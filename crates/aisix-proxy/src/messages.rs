@@ -2787,6 +2787,14 @@ struct AnthropicStreamUsage {
     /// Assistant text accumulated from `content_block_delta` frames, for
     /// the end-of-stream output guardrail (#448).
     response_text: String,
+    /// Generated output (text + thinking + tool name/arguments)
+    /// accumulated for the token-estimation fallback (AISIX-Cloud#1074).
+    /// Separate from `response_text`, which belongs to the guardrail
+    /// scan: the scan `take`s that buffer (so estimation would read "")
+    /// and pads it with newline separators (which inflate per-frame
+    /// counts). Bounded to `token_estimate::OUTPUT_ACCUMULATION_CAP`;
+    /// never leaves the process.
+    est_output_text: String,
     /// Per-detector PII mask counts applied to the held stream at release
     /// (#932). Merged with the input-side counts by the on_complete emit.
     redacted_entity_counts: crate::redact::RedactionCounts,
@@ -2866,6 +2874,26 @@ fn update_anthropic_usage(
                         acc.response_text.push('\n');
                         acc.response_text.push_str(&input.to_string());
                     }
+                }
+            }
+            // Token-estimation accumulator (AISIX-Cloud#1074): raw
+            // concatenation (no separators — a separator per frame would
+            // inflate the count), plus `thinking` deltas, which are
+            // billed output but out of guardrail scope.
+            if acc.est_output_text.len() < crate::token_estimate::OUTPUT_ACCUMULATION_CAP {
+                if let Some(delta) = json.get("delta") {
+                    for key in ["text", "thinking", "partial_json"] {
+                        if let Some(t) = delta.get(key).and_then(Value::as_str) {
+                            acc.est_output_text.push_str(t);
+                        }
+                    }
+                }
+                if let Some(name) = json
+                    .get("content_block")
+                    .and_then(|cb| cb.get("name"))
+                    .and_then(Value::as_str)
+                {
+                    acc.est_output_text.push_str(name);
                 }
             }
         }
@@ -3030,7 +3058,7 @@ impl<F: FnOnce(AnthropicStreamUsage)> Drop for AnthropicStreamGuard<F> {
                 } else {
                     0
                 };
-                let output = (delivered > 0).then_some(usage.response_text.as_str());
+                let output = (delivered > 0).then_some(usage.est_output_text.as_str());
                 let filled = crate::token_estimate::fill_missing(
                     &est,
                     usage.prompt_tokens,
@@ -4751,6 +4779,145 @@ event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"
             "completion kept when delivered>0"
         );
         assert_eq!(out.chunks_delivered, 5);
+    }
+
+    /// AISIX-Cloud#1074: the passthrough guard's estimation fallback and
+    /// its `message_start` floor normalization. The floor (a placeholder
+    /// `output_tokens`, often 1, with no `message_delta` ever arriving)
+    /// must count as "missing" so an aborted stream estimates from the
+    /// delivered text — but a real `message_delta` count must win
+    /// untouched, and an empty estimate must not clobber the floor.
+    #[test]
+    fn stream_guard_estimates_missing_usage_with_floor_normalization() {
+        use super::{AnthropicStreamGuard, AnthropicStreamUsage, AtomicU32};
+        use std::sync::{Arc, Mutex};
+
+        fn drop_with_estimator(
+            usage: AnthropicStreamUsage,
+            delivered_count: u32,
+        ) -> AnthropicStreamUsage {
+            let captured: Arc<Mutex<Option<AnthropicStreamUsage>>> = Arc::new(Mutex::new(None));
+            let cap = captured.clone();
+            let delivered = Arc::new(AtomicU32::new(delivered_count));
+            let body = serde_json::json!({
+                "model": "relay-claude",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "Hello"}]
+            });
+            {
+                let guard = AnthropicStreamGuard {
+                    slot: Some((
+                        move |u: AnthropicStreamUsage| {
+                            *cap.lock().unwrap() = Some(u);
+                        },
+                        usage,
+                    )),
+                    delivered,
+                    estimator: Some(crate::token_estimate::Estimator::new(
+                        "relay-claude",
+                        crate::token_estimate::PromptInput::Anthropic(body),
+                    )),
+                };
+                drop(guard);
+            }
+            let out = captured.lock().unwrap().take().expect("on_complete fired");
+            out
+        }
+
+        // Expected prompt for one user message "Hello" (cl100k fallback):
+        // 3 per-message + "user" (1) + "Hello" (1) + 3 reply priming = 8.
+        // Floor-only (message_start placeholder, no message_delta) with
+        // delivered text: the floor counts as missing, the estimate wins.
+        let out = drop_with_estimator(
+            AnthropicStreamUsage {
+                completion_tokens: 1,
+                output_tokens_from_delta: false,
+                est_output_text: "Hello world".into(),
+                ..Default::default()
+            },
+            3,
+        );
+        assert_eq!(out.prompt_tokens, 8);
+        assert_eq!(out.completion_tokens, 2, "estimate supersedes the floor");
+        assert!(out.usage_estimated);
+
+        // Floor-only with NO delivered text: nothing to estimate on the
+        // completion side — the floor is retained, prompt still fills.
+        let out = drop_with_estimator(
+            AnthropicStreamUsage {
+                completion_tokens: 1,
+                output_tokens_from_delta: false,
+                ..Default::default()
+            },
+            3,
+        );
+        assert_eq!(out.prompt_tokens, 8);
+        assert_eq!(out.completion_tokens, 1, "empty estimate keeps the floor");
+        assert!(out.usage_estimated, "prompt side was estimated");
+
+        // Real message_delta count: upstream wins untouched, unflagged.
+        let out = drop_with_estimator(
+            AnthropicStreamUsage {
+                prompt_tokens: 37,
+                completion_tokens: 52,
+                output_tokens_from_delta: true,
+                est_output_text: "Hello world".into(),
+                ..Default::default()
+            },
+            3,
+        );
+        assert_eq!(out.prompt_tokens, 37);
+        assert_eq!(out.completion_tokens, 52);
+        assert!(!out.usage_estimated);
+    }
+
+    /// AISIX-Cloud#1074: the non-streaming fill helper and its output
+    /// extraction — zero counters fill from the estimator and flag the
+    /// metrics; upstream-reported counters stay untouched. The output
+    /// extractor covers text + thinking + tool_use name/input.
+    #[test]
+    fn fill_missing_anthropic_metrics_fills_zeros_only() {
+        use super::{
+            anthropic_estimation_output_text, fill_missing_anthropic_metrics, AnthropicUsageMetrics,
+        };
+
+        let body = serde_json::json!({
+            "model": "relay-claude",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "Hello"}]
+        });
+        let resp = serde_json::json!({
+            "content": [
+                {"type": "text", "text": "Hello"},
+                {"type": "thinking", "thinking": " world"},
+                {"type": "tool_use", "id": "tu_1", "name": "f", "input": {}}
+            ]
+        });
+        // Output extraction: text + thinking + tool name + input JSON.
+        let text = anthropic_estimation_output_text(&resp);
+        assert_eq!(text, "Hello worldf{}");
+
+        // Both sides missing → both fill, flagged. Prompt = 8 (see the
+        // floor test above for the arithmetic).
+        let mut m = AnthropicUsageMetrics::default();
+        fill_missing_anthropic_metrics(&mut m, "relay-claude", &body, || {
+            anthropic_estimation_output_text(&resp)
+        });
+        assert_eq!(m.prompt_tokens, 8);
+        assert!(m.completion_tokens > 0);
+        assert!(m.usage_estimated);
+
+        // Upstream-reported → untouched, unflagged, extractor never runs.
+        let mut m = AnthropicUsageMetrics {
+            prompt_tokens: 11,
+            completion_tokens: 7,
+            ..Default::default()
+        };
+        fill_missing_anthropic_metrics(&mut m, "relay-claude", &body, || {
+            panic!("output extractor must not run when usage is complete")
+        });
+        assert_eq!((m.prompt_tokens, m.completion_tokens), (11, 7));
+        assert!(!m.usage_estimated);
     }
 
     /// Helper for the streaming variants of (Anthropic inbound) ×

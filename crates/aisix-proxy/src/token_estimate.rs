@@ -98,10 +98,7 @@ impl Estimator {
 /// Count `text` as plain text with the model's encoding — the
 /// completion-side rule (no message overhead).
 pub fn count_text(model: &str, text: &str) -> u32 {
-    if text.is_empty() {
-        return 0;
-    }
-    clamp(bpe_for(model).encode_ordinary(text).len())
+    enc(bpe_for(model), text)
 }
 
 /// Per-field `or` fill: upstream values win when non-zero; zeros are
@@ -153,11 +150,56 @@ fn clamp(n: usize) -> u32 {
     n.min(u32::MAX as usize) as u32
 }
 
+/// Encode in slices of this size. The tokenizer's regex engine is
+/// superlinear on long unbroken runs (a multi-MiB single piece burns
+/// seconds of CPU) and its vendored wrapper unwraps regex failures —
+/// a ~1 MiB whitespace run panics with a fancy-regex StackOverflow.
+/// Slicing linearizes the cost and keeps any failure small; each
+/// boundary can split at most one token (+1 per slice, negligible).
+const ENCODE_SLICE_BYTES: usize = 64 * 1024;
+
+/// Total bytes exactly tokenized per [`enc`] call; the tail beyond it
+/// extrapolates at ~4 bytes/token. Real prompts sit far below this
+/// (≈256K tokens of English), so accuracy is unaffected — the cap
+/// exists so an adversarial multi-MiB piece can't pin a runtime
+/// worker inside a Drop guard.
+const EXACT_COUNT_BUDGET: usize = 1 << 20;
+
+/// Estimated-token fallback rate for text the exact pass skipped or
+/// the tokenizer failed on: the ~4-bytes-per-token rule of thumb.
+fn approx_tokens(bytes: usize) -> u32 {
+    clamp(bytes / 4)
+}
+
+/// Panic-proof, cost-bounded token count. Estimation runs on the
+/// request hot path and inside Drop guards (where a second panic
+/// during an unwind aborts the process), so the tokenizer must never
+/// panic out of here and must never burn unbounded CPU: encode in
+/// bounded slices, catch any tokenizer panic, and extrapolate the
+/// remainder past the exact-count budget.
 fn enc(bpe: &CoreBPE, text: &str) -> u32 {
-    if text.is_empty() {
-        return 0;
+    let mut n: u32 = 0;
+    let mut rest = text;
+    let mut budget = EXACT_COUNT_BUDGET;
+    while !rest.is_empty() {
+        if budget == 0 {
+            return n.saturating_add(approx_tokens(rest.len()));
+        }
+        let mut cut = ENCODE_SLICE_BYTES.min(rest.len());
+        while !rest.is_char_boundary(cut) {
+            cut += 1;
+        }
+        let (head, tail) = rest.split_at(cut);
+        let counted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            bpe.encode_ordinary(head).len()
+        }))
+        .map(clamp)
+        .unwrap_or_else(|_| approx_tokens(head.len()));
+        n = n.saturating_add(counted);
+        budget = budget.saturating_sub(cut);
+        rest = tail;
     }
-    clamp(bpe.encode_ordinary(text).len())
+    n
 }
 
 // ---------------------------------------------------------------------
@@ -618,6 +660,35 @@ mod tests {
         assert_eq!(count_text("gpt-4", "Hello world"), 2);
         // Unknown model uses the same fallback encoding.
         assert_eq!(count_text("some-proxy-model", "Hello world"), 2);
+    }
+
+    /// Audit HIGH-1 regression: a ~1 MiB unbroken whitespace run makes
+    /// the tokenizer's regex engine fail (StackOverflow) and its
+    /// vendored wrapper panic. `enc` slices the input and catches the
+    /// panic, so estimation must return a sane count instead of
+    /// panicking (which inside a Drop guard during an unwind would
+    /// abort the whole process).
+    #[test]
+    fn adversarial_whitespace_run_does_not_panic() {
+        let evil = " ".repeat(1 << 20) + "x";
+        let n = count_text("gpt-4", &evil);
+        assert!(n > 0, "a 1 MiB run must still produce a count, got {n}");
+    }
+
+    /// Text past the exact-count budget extrapolates at ~4 bytes/token
+    /// instead of burning unbounded CPU: the count keeps growing with
+    /// input size beyond the budget.
+    #[test]
+    fn exact_count_budget_extrapolates_tail() {
+        let base = "hello world ".repeat((1 << 20) / 12 + 1); // ≈ budget-sized
+        let doubled = base.repeat(2);
+        let n1 = count_text("gpt-4", &base);
+        let n2 = count_text("gpt-4", &doubled);
+        assert!(n2 > n1, "tail beyond the budget must still be counted");
+        // The extrapolated tail (~4 B/token) stays within 2× of the
+        // exact rate for this corpus (~3 B/token), so the total is the
+        // right order of magnitude.
+        assert!(n2 < n1 * 3);
     }
 
     #[test]
