@@ -10,6 +10,16 @@ import { EtcdClient } from "./etcd.js";
 import { harnessRequest } from "./http.js";
 
 export interface AppOverrides {
+  /**
+   * Whether to bind the admin listener. Defaults to `true`. When `false`,
+   * the gateway runs with `admin.enabled = false` — no admin listener is
+   * bound even in etcd/file mode, mirroring the post-removal world. Seed
+   * resources through `SeedClient`/`EtcdClient` (never the Admin API), and
+   * readiness is gated on the proxy `/livez` plus the metrics listener
+   * instead of the admin health endpoint. `adminUrl`/`adminKey` are still
+   * returned but point at an unbound port.
+   */
+  admin?: boolean;
   /** Inserted into `admin.admin_keys`. Defaults to a fresh random key. */
   adminKey?: string;
   /** Whether to enable the Prometheus scrape endpoint. Defaults to true. */
@@ -139,6 +149,7 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
   }
 
   const prometheusEnabled = overrides.prometheus ?? true;
+  const adminEnabled = overrides.admin ?? true;
   const [proxyPort, adminPort, metricsPort] = await pickFreePorts(3);
   const adminKey = overrides.adminKey ?? `admin-${randomUUID()}`;
   const etcdPrefix = `/aisix-e2e-${randomUUID()}`;
@@ -167,7 +178,9 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
       request_body_limit_bytes: 10485760,
       ...(overrides.realIp ? { real_ip: overrides.realIp } : {}),
     },
-    admin: { addr: `127.0.0.1:${adminPort}`, admin_keys: [adminKey] },
+    admin: adminEnabled
+      ? { addr: `127.0.0.1:${adminPort}`, admin_keys: [adminKey] }
+      : { addr: `127.0.0.1:${adminPort}`, enabled: false },
     observability: {
       service_name: "aisix-e2e",
       log_level: "warn",
@@ -247,7 +260,15 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
     await Promise.race([
       Promise.all([
         waitForReady(`${proxyUrl}/livez`, READY_TIMEOUT_MS),
-        waitForReady(`${adminUrl}/admin/v1/health`, READY_TIMEOUT_MS, adminKey),
+        // The admin health endpoint only exists when the admin listener is
+        // bound; with `admin: false` there is no admin surface, so gate on
+        // the proxy `/livez` and the metrics listener alone. (If both
+        // `admin` and `prometheus` are off, readiness reduces to the proxy
+        // `/livez` — liveness only; a case that needs config-propagation
+        // readiness should keep prometheus on, as the default does.)
+        ...(adminEnabled
+          ? [waitForReady(`${adminUrl}/admin/v1/health`, READY_TIMEOUT_MS, adminKey)]
+          : []),
         // Gate on the dedicated metrics listener too, so scrapes in the test
         // never race the listener coming up. Skipped when prometheus is
         // disabled — nothing binds the metrics port then.

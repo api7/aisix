@@ -434,6 +434,15 @@ impl RealIpConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AdminConfig {
+    /// When `false`, the admin listener is not bound even in standalone
+    /// (etcd or file) mode. The proxy and the metrics/status listener are
+    /// unaffected, so resources are managed declaratively — a resources
+    /// file, or direct writes to the configuration store — with
+    /// `GET /status/config` and the proxy `GET /livez` as the operational
+    /// feedback. Managed mode never binds the admin listener regardless.
+    /// Defaults to `true`.
+    #[serde(default = "AdminConfig::default_enabled")]
+    pub enabled: bool,
     #[serde(default = "AdminConfig::default_addr")]
     pub addr: String,
     /// Statically-provisioned admin keys. A request is authorised if it
@@ -451,11 +460,16 @@ impl AdminConfig {
         // if they leave it at the default without overriding.
         "127.0.0.1:0".into()
     }
+
+    fn default_enabled() -> bool {
+        true
+    }
 }
 
 impl Default for AdminConfig {
     fn default() -> Self {
         Self {
+            enabled: Self::default_enabled(),
             addr: Self::default_addr(),
             admin_keys: Vec::new(),
             tls: None,
@@ -827,11 +841,12 @@ impl Config {
                     .into(),
             ));
         }
-        // In managed mode the admin listener is not bound, so requiring
-        // admin_keys or a valid admin.addr would be punishing the user
-        // for fields that aren't going to be used. In standalone mode
-        // we keep the original invariants.
-        if !self.managed.is_managed() {
+        // The admin listener is not bound in managed mode, nor when
+        // `admin.enabled = false`, so requiring admin_keys or a valid
+        // admin.addr in those cases would be punishing the user for
+        // fields that aren't going to be used. When it will bind, keep
+        // the original invariants.
+        if !self.managed.is_managed() && self.admin.enabled {
             if self.admin.admin_keys.is_empty() {
                 return Err(BootstrapError::Config(
                     "admin.admin_keys must contain at least one key \
@@ -1105,6 +1120,65 @@ admin:
         );
         let err = Config::load_from_path(Some(f.path())).unwrap_err();
         assert!(err.to_string().contains("admin.admin_keys"));
+    }
+
+    #[test]
+    fn admin_enabled_defaults_to_true() {
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+  prefix: "/aisix"
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+"#,
+        );
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert!(cfg.admin.enabled);
+    }
+
+    #[test]
+    fn admin_disabled_relaxes_admin_key_requirement() {
+        // With the admin listener switched off, there is no bound surface
+        // to authenticate, so an empty admin_keys is no longer an error —
+        // resources are managed declaratively (etcd here).
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+  prefix: "/aisix"
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  enabled: false
+"#,
+        );
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert!(!cfg.admin.enabled);
+        assert!(cfg.admin.admin_keys.is_empty());
+    }
+
+    #[test]
+    fn admin_disabled_relaxes_admin_key_requirement_in_file_mode() {
+        // File mode routes through a distinct admin store variant, and it
+        // too binds a read-only admin surface by default. With the admin
+        // listener switched off, the same relaxation applies — no
+        // admin_keys required.
+        let f = write_yaml(
+            r#"
+resources_file: "/etc/aisix/resources.yaml"
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  enabled: false
+"#,
+        );
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert!(!cfg.admin.enabled);
+        assert!(cfg.admin.admin_keys.is_empty());
     }
 
     #[test]

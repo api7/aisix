@@ -522,8 +522,11 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
             // admin surface is bound. We could share a single underlying
             // connection via `Client::clone()` but keeping two is cleaner:
             // writes and the watch stream don't contend on the same mutex.
-            // In managed mode this client is simply skipped.
-            let admin_client = if cfg.managed.is_managed() {
+            // Skipped whenever the admin listener is not bound — managed mode,
+            // or `admin.enabled = false` — so admin-off doesn't pay for (or
+            // fail boot on) a connection it immediately drops; `/status/models`
+            // then reads through the snapshot, as it does in managed mode.
+            let admin_client = if cfg.managed.is_managed() || !cfg.admin.enabled {
                 None
             } else {
                 Some((
@@ -828,7 +831,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
         },
         runtime_status_tracker: Some(runtime_status_tracker.clone()),
     };
-    let admin_serve_handle = if let Some(admin_store) = admin_store {
+    let admin_serve_handle = if let Some(admin_store) = admin_store.filter(|_| cfg.admin.enabled) {
         let mut admin_state = AdminState::new(snapshot_handle.clone(), admin_store, &cfg.admin)
             // Share the health tracker so /admin/v1/health reflects live
             // per-model upstream failure counts.
@@ -865,10 +868,14 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
         )))
     } else {
         // Drop unused shared components so the compiler can see they
-        // don't escape managed mode. The health tracker exists on
+        // don't escape the admin-less paths. The health tracker exists on
         // proxy_state and keeps working regardless.
         let _ = (&health_tracker, &livez_state, &runtime_status_tracker);
-        tracing::info!("managed mode enabled — admin surface not bound");
+        if cfg.managed.is_managed() {
+            tracing::info!("managed mode enabled — admin surface not bound");
+        } else {
+            tracing::info!("admin.enabled = false — admin surface not bound");
+        }
         None
     };
 
