@@ -2204,25 +2204,24 @@ fn build_anthropic_sse_stream(
                     // Token-estimation accumulator (AISIX-Cloud#1074): all
                     // generated output, always on (whether the fallback is
                     // needed is only known at end-of-stream), bounded.
-                    if comp.est_output_text.len()
-                        < crate::token_estimate::OUTPUT_ACCUMULATION_CAP
                     {
+                        use crate::token_estimate::push_capped;
                         if let Some(t) = chunk.delta.content.as_deref() {
-                            comp.est_output_text.push_str(t);
+                            push_capped(&mut comp.est_output_text, t);
                         }
                         if let Some(t) = chunk.delta.reasoning_content.as_deref() {
-                            comp.est_output_text.push_str(t);
+                            push_capped(&mut comp.est_output_text, t);
                         }
                         if let Some(tcs) = chunk.delta.tool_calls.as_ref() {
                             for tc in tcs {
                                 if let Some(f) = tc.get("function") {
                                     if let Some(n) = f.get("name").and_then(|v| v.as_str()) {
-                                        comp.est_output_text.push_str(n);
+                                        push_capped(&mut comp.est_output_text, n);
                                     }
                                     if let Some(a) =
                                         f.get("arguments").and_then(|v| v.as_str())
                                     {
-                                        comp.est_output_text.push_str(a);
+                                        push_capped(&mut comp.est_output_text, a);
                                     }
                                 }
                             }
@@ -2880,11 +2879,12 @@ fn update_anthropic_usage(
             // concatenation (no separators — a separator per frame would
             // inflate the count), plus `thinking` deltas, which are
             // billed output but out of guardrail scope.
-            if acc.est_output_text.len() < crate::token_estimate::OUTPUT_ACCUMULATION_CAP {
+            {
+                use crate::token_estimate::push_capped;
                 if let Some(delta) = json.get("delta") {
                     for key in ["text", "thinking", "partial_json"] {
                         if let Some(t) = delta.get(key).and_then(Value::as_str) {
-                            acc.est_output_text.push_str(t);
+                            push_capped(&mut acc.est_output_text, t);
                         }
                     }
                 }
@@ -2893,7 +2893,7 @@ fn update_anthropic_usage(
                     .and_then(|cb| cb.get("name"))
                     .and_then(Value::as_str)
                 {
-                    acc.est_output_text.push_str(name);
+                    push_capped(&mut acc.est_output_text, name);
                 }
             }
         }

@@ -32,6 +32,28 @@ use tiktoken_rs::CoreBPE;
 /// becomes a lower bound instead of the buffer growing without limit.
 pub const OUTPUT_ACCUMULATION_CAP: usize = 1 << 20;
 
+/// Append `s` to an estimation accumulator, hard-capped at
+/// [`OUTPUT_ACCUMULATION_CAP`]: the final fragment is truncated at a
+/// char boundary and anything past the cap is dropped (the estimate
+/// becomes a lower bound). Checking the cap per push — rather than
+/// once per chunk — keeps a single oversized chunk from overshooting
+/// the buffer by its full size.
+pub fn push_capped(buf: &mut String, s: &str) {
+    let remaining = OUTPUT_ACCUMULATION_CAP.saturating_sub(buf.len());
+    if remaining == 0 || s.is_empty() {
+        return;
+    }
+    if s.len() <= remaining {
+        buf.push_str(s);
+        return;
+    }
+    let mut cut = remaining;
+    while !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    buf.push_str(&s[..cut]);
+}
+
 const TOKENS_PER_MESSAGE: u32 = 3;
 const TOKENS_PER_NAME: u32 = 1;
 /// "Every reply is primed with `<|start|>assistant<|message|>`."
@@ -673,6 +695,25 @@ mod tests {
         let evil = " ".repeat(1 << 20) + "x";
         let n = count_text("gpt-4", &evil);
         assert!(n > 0, "a 1 MiB run must still produce a count, got {n}");
+    }
+
+    /// The estimation accumulator is a hard cap: a single oversized
+    /// push cannot overshoot it, and the truncation lands on a char
+    /// boundary.
+    #[test]
+    fn push_capped_is_a_hard_cap() {
+        let mut buf = String::new();
+        push_capped(&mut buf, &"a".repeat(OUTPUT_ACCUMULATION_CAP - 1));
+        // Multi-byte char straddling the cap: truncated cleanly, never
+        // past the cap, never a panic.
+        push_capped(&mut buf, "汉汉汉");
+        assert!(buf.len() <= OUTPUT_ACCUMULATION_CAP);
+        assert!(buf.is_char_boundary(buf.len()));
+        // Full buffer: further pushes are no-ops.
+        let len = buf.len();
+        push_capped(&mut buf, &"b".repeat(64));
+        assert!(buf.len() <= OUTPUT_ACCUMULATION_CAP);
+        assert!(buf.len() >= len);
     }
 
     /// Text past the exact-count budget extrapolates at ~4 bytes/token

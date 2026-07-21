@@ -1043,14 +1043,13 @@ pub fn build_responses_bridge_stream(
                         // all generated output, always on (whether the
                         // fallback is needed is only known at end-of-stream),
                         // bounded.
-                        if comp.est_output_text.len()
-                            < crate::token_estimate::OUTPUT_ACCUMULATION_CAP
                         {
+                            use crate::token_estimate::push_capped;
                             if let Some(text) = chunk.delta.content.as_deref() {
-                                comp.est_output_text.push_str(text);
+                                push_capped(&mut comp.est_output_text, text);
                             }
                             if let Some(text) = chunk.delta.reasoning_content.as_deref() {
-                                comp.est_output_text.push_str(text);
+                                push_capped(&mut comp.est_output_text, text);
                             }
                             if let Some(tcs) = chunk.delta.tool_calls.as_ref() {
                                 for tc in tcs {
@@ -1058,12 +1057,12 @@ pub fn build_responses_bridge_stream(
                                         if let Some(n) =
                                             f.get("name").and_then(|v| v.as_str())
                                         {
-                                            comp.est_output_text.push_str(n);
+                                            push_capped(&mut comp.est_output_text, n);
                                         }
                                         if let Some(a) =
                                             f.get("arguments").and_then(|v| v.as_str())
                                         {
-                                            comp.est_output_text.push_str(a);
+                                            push_capped(&mut comp.est_output_text, a);
                                         }
                                     }
                                 }
