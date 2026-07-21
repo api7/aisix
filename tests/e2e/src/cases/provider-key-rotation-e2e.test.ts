@@ -20,20 +20,21 @@ import {
 // and must not wedge dispatch.
 //
 // What this pins: under sustained concurrency (8 workers, 80 requests),
-// an in-place secret rotation (PUT /admin/v1/provider_keys/:id) fired
-// mid-stream keeps every request serving and bumps the resource
-// revision. The caller's api_key and model alias are never touched.
+// an in-place secret rotation (a declarative update to the provider_key
+// document — same id + api_base, new secret) fired mid-stream keeps every
+// request serving, and the rotated secret lands in the store. The caller's
+// api_key and model alias are never touched.
 //
 // IMPORTANT scope note (from the #523 audit): "zero in-flight
 // disruption" is largely an ARCHITECTURAL guarantee here, NOT a property
 // this test could falsify. The DP holds one shared upstream client and
 // reads `pk.secret` / `pk.api_base` per-request from an atomic ArcSwap
 // snapshot; an in-flight request keeps its own snapshot Arc to
-// completion and a watch-applied PUT CAS-swaps a fresh snapshot — there
-// is no per-provider_key client or pool to tear down. So this is a
+// completion and a watch-applied update CAS-swaps a fresh snapshot —
+// there is no per-provider_key client or pool to tear down. So this is a
 // liveness/smoke pin over the rotate-under-load path (it would catch a
 // future regression that wedged dispatch or broke watch-apply on a PK
-// PUT) plus a revision-bump check — it is not a teardown-race probe.
+// update) plus a store read-back check — it is not a teardown-race probe.
 //
 // The real remaining facet is #220: asserting the rotated secret
 // actually reaches upstream (old rejected / new accepted). The mock
@@ -41,8 +42,8 @@ import {
 // tracked separately, not closed by this test.
 //
 // Reference: OpenAI Chat Completions shape the caller sees
-// (https://platform.openai.com/docs/api-reference/chat); admin
-// provider_key update is PUT /admin/v1/provider_keys/:id.
+// (https://platform.openai.com/docs/api-reference/chat). The rotation is
+// an in-place update of the provider_key document (same id, new secret).
 
 const CALLER_PLAINTEXT = "sk-pkrot-e2e-caller";
 const CALLER_KEY_HASH = createHash("sha256")
