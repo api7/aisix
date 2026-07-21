@@ -828,7 +828,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
         },
         runtime_status_tracker: Some(runtime_status_tracker.clone()),
     };
-    let admin_serve_handle = if let Some(admin_store) = admin_store {
+    let admin_serve_handle = if let Some(admin_store) = admin_store.filter(|_| cfg.admin.enabled) {
         let mut admin_state = AdminState::new(snapshot_handle.clone(), admin_store, &cfg.admin)
             // Share the health tracker so /admin/v1/health reflects live
             // per-model upstream failure counts.
@@ -865,10 +865,14 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
         )))
     } else {
         // Drop unused shared components so the compiler can see they
-        // don't escape managed mode. The health tracker exists on
+        // don't escape the admin-less paths. The health tracker exists on
         // proxy_state and keeps working regardless.
         let _ = (&health_tracker, &livez_state, &runtime_status_tracker);
-        tracing::info!("managed mode enabled — admin surface not bound");
+        if cfg.managed.is_managed() {
+            tracing::info!("managed mode enabled — admin surface not bound");
+        } else {
+            tracing::info!("admin.enabled = false — admin surface not bound");
+        }
         None
     };
 

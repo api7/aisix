@@ -57,6 +57,7 @@ async fn build_state_with_real_etcd(url: &str, prefix: &str) -> AdminState {
     let store: Arc<dyn ConfigStore> = Arc::new(EtcdConfigStore::new(client, prefix));
     let handle = SnapshotHandle::new(AisixSnapshot::new());
     let cfg = AdminConfig {
+        enabled: true,
         addr: "127.0.0.1:0".into(),
         admin_keys: vec![ADMIN_KEY.into()],
         tls: None,

@@ -545,6 +545,7 @@ mod tests {
 
     fn cfg() -> AdminConfig {
         AdminConfig {
+            enabled: true,
             addr: "127.0.0.1:0".into(),
             admin_keys: vec!["admin-secret".into()],
             tls: None,
