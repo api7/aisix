@@ -13,17 +13,45 @@ import {
 
 // E2E: the gateway runs with the admin listener switched off
 // (`admin.enabled = false`), the shape it takes once the Admin API is
-// removed. Resources are seeded straight to etcd — never the Admin API —
-// and the full request path must still work, with the metrics/status
-// listener as the only feedback surface. This pins that the admin
-// listener is genuinely not required to serve traffic.
+// removed. Resources reach the gateway declaratively — never the Admin
+// API — and the full request path must still work, with the
+// metrics/status listener as the only feedback surface. Both resource
+// sources are covered, because they bind the admin surface through
+// distinct store variants (etcd vs the file-managed snapshot):
+//   - etcd source, seeded straight to etcd via SeedClient;
+//   - standalone `resources_file`, loaded from a declarative file.
 
-const CALLER_PLAINTEXT = "sk-admin-off-caller";
-const CALLER_KEY_HASH = createHash("sha256")
-  .update(CALLER_PLAINTEXT)
+const ETCD_CALLER_PLAINTEXT = "sk-admin-off-etcd-caller";
+const ETCD_CALLER_KEY_HASH = createHash("sha256")
+  .update(ETCD_CALLER_PLAINTEXT)
   .digest("hex");
 
-describe("admin disabled: gateway serves seeded-via-etcd config with no admin listener", () => {
+const FILE_CALLER_PLAINTEXT = "sk-admin-off-file-caller";
+// `key_env` sugar: the plaintext travels to the gateway via this env var
+// (never `AISIX_`-prefixed — the config loader claims that namespace).
+const FILE_CALLER_KEY_ENV = "ADMIN_OFF_FILE_CALLER_KEY";
+
+/**
+ * With `admin.enabled = false` the admin port is never bound, so a
+ * connection to it is refused (the port was reserved by the harness, but
+ * nothing listens). Assert the specific connection-refused cause rather
+ * than any throw, so a wrongly-bound listener — or a DNS/abort error —
+ * can't satisfy the check.
+ */
+async function expectAdminPortRefused(adminUrl: string): Promise<void> {
+  let caught: unknown;
+  try {
+    await fetch(`${adminUrl}/admin/v1/health`);
+  } catch (e) {
+    caught = e;
+  }
+  expect(caught).toBeDefined();
+  const code = (caught as { cause?: { code?: string } } | undefined)?.cause
+    ?.code;
+  expect(code).toBe("ECONNREFUSED");
+}
+
+describe("admin disabled, etcd source: gateway serves seeded-via-etcd config with no admin listener", () => {
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
   let etcdReachable = false;
@@ -51,7 +79,7 @@ describe("admin disabled: gateway serves seeded-via-etcd config with no admin li
       provider_key_id: pk.id,
     });
     await seed.createApiKey({
-      key_hash: CALLER_KEY_HASH,
+      key_hash: ETCD_CALLER_KEY_HASH,
       allowed_models: ["admin-off-model"],
     });
   });
@@ -68,7 +96,7 @@ describe("admin disabled: gateway serves seeded-via-etcd config with no admin li
     }
 
     const client = new OpenAI({
-      apiKey: CALLER_PLAINTEXT,
+      apiKey: ETCD_CALLER_PLAINTEXT,
       baseURL: `${app.proxyUrl}/v1`,
       maxRetries: 0,
     });
@@ -93,15 +121,16 @@ describe("admin disabled: gateway serves seeded-via-etcd config with no admin li
     expect(upstream!.receivedRequests.length).toBeGreaterThan(0);
   });
 
-  test("the metrics/status listener still reports the applied configuration", async (ctx) => {
+  test("the metrics/status listener reports exactly the applied configuration", async (ctx) => {
     if (!etcdReachable || !app) {
       ctx.skip();
       return;
     }
 
     // The load-observability contract is the operational feedback that
-    // replaces admin reads: it is served on the metrics listener, so it
-    // stays available with the admin listener off.
+    // replaces admin reads: served on the metrics listener, so it stays
+    // available with the admin listener off. The etcd prefix is unique to
+    // this spawn, so the seeded one-of-each is the whole population.
     const res = await fetch(`${app.metricsUrl}/status/config`);
     expect(res.status).toBe(200);
     const body = (await res.json()) as {
@@ -109,7 +138,10 @@ describe("admin disabled: gateway serves seeded-via-etcd config with no admin li
       applied?: { resource_counts?: Record<string, number> };
     };
     expect(typeof body.state).toBe("string");
-    expect(body.applied?.resource_counts?.models).toBeGreaterThanOrEqual(1);
+    const counts = body.applied?.resource_counts ?? {};
+    expect(counts.models).toBe(1);
+    expect(counts.provider_keys).toBe(1);
+    expect(counts.api_keys).toBe(1);
   });
 
   test("no admin listener is bound", async (ctx) => {
@@ -117,12 +149,89 @@ describe("admin disabled: gateway serves seeded-via-etcd config with no admin li
       ctx.skip();
       return;
     }
+    await expectAdminPortRefused(app.adminUrl);
+  });
+});
 
-    // With `admin.enabled = false` the admin port is never bound, so a
-    // connection to it is refused. (The port was reserved by the harness
-    // but nothing listens on it.)
-    await expect(
-      fetch(`${app.adminUrl}/admin/v1/health`),
-    ).rejects.toThrow();
+describe("admin disabled, file source: gateway serves a declarative resources.yaml with no admin listener", () => {
+  let app: SpawnedApp | undefined;
+  let upstream: OpenAiUpstream | undefined;
+
+  beforeAll(async () => {
+    upstream = await startOpenAiUpstream();
+    // File mode never contacts etcd; combined with admin off, the gateway
+    // has neither an admin surface nor a configuration store — the shape a
+    // single-container standalone gateway takes post-removal.
+    app = await spawnApp({
+      admin: false,
+      resourcesFile: `
+_format_version: "1"
+provider_keys:
+  - display_name: admin-off-file-pk
+    provider: openai
+    api_key: sk-mock
+    api_base: ${upstream.baseUrl}/v1
+models:
+  - display_name: admin-off-file-model
+    provider: openai
+    model_name: gpt-4o-mini
+    provider_key: admin-off-file-pk
+api_keys:
+  - display_name: admin-off-file-caller
+    key_env: ${FILE_CALLER_KEY_ENV}
+    allowed_models: ["admin-off-file-model"]
+`,
+      extraEnv: { [FILE_CALLER_KEY_ENV]: FILE_CALLER_PLAINTEXT },
+    });
+  });
+
+  afterAll(async () => {
+    await app?.exit();
+    await upstream?.close();
+  });
+
+  test("a request from a declarative file serves with the admin listener off", async () => {
+    if (!app || !upstream) throw new Error("setup failed");
+
+    const client = new OpenAI({
+      apiKey: FILE_CALLER_PLAINTEXT,
+      baseURL: `${app.proxyUrl}/v1`,
+      maxRetries: 0,
+    });
+
+    let responded = false;
+    await waitConfigPropagation(async () => {
+      try {
+        const r = await client.chat.completions.create({
+          model: "admin-off-file-model",
+          messages: [{ role: "user", content: "admin-off-file-probe" }],
+        });
+        responded = r.choices[0]?.message.role === "assistant";
+        return responded;
+      } catch {
+        return false;
+      }
+    });
+    expect(responded).toBe(true);
+    expect(upstream.receivedRequests.length).toBeGreaterThan(0);
+  });
+
+  test("the metrics/status listener reports the file-loaded configuration", async () => {
+    if (!app) throw new Error("setup failed");
+
+    const res = await fetch(`${app.metricsUrl}/status/config`);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      state?: string;
+      source?: { type?: string };
+      applied?: { resource_counts?: Record<string, number> };
+    };
+    expect(body.source?.type).toBe("file");
+    expect(body.applied?.resource_counts?.models).toBe(1);
+  });
+
+  test("no admin listener is bound in file mode", async () => {
+    if (!app) throw new Error("setup failed");
+    await expectAdminPortRefused(app.adminUrl);
   });
 });

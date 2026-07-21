@@ -522,8 +522,11 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
             // admin surface is bound. We could share a single underlying
             // connection via `Client::clone()` but keeping two is cleaner:
             // writes and the watch stream don't contend on the same mutex.
-            // In managed mode this client is simply skipped.
-            let admin_client = if cfg.managed.is_managed() {
+            // Skipped whenever the admin listener is not bound — managed mode,
+            // or `admin.enabled = false` — so admin-off doesn't pay for (or
+            // fail boot on) a connection it immediately drops; `/status/models`
+            // then reads through the snapshot, as it does in managed mode.
+            let admin_client = if cfg.managed.is_managed() || !cfg.admin.enabled {
                 None
             } else {
                 Some((

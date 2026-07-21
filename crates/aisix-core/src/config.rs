@@ -1162,6 +1162,26 @@ admin:
     }
 
     #[test]
+    fn admin_disabled_relaxes_admin_key_requirement_in_file_mode() {
+        // File mode routes through a distinct admin store variant, and it
+        // too binds a read-only admin surface by default. With the admin
+        // listener switched off, the same relaxation applies — no
+        // admin_keys required.
+        let f = write_yaml(
+            r#"
+resources_file: "/etc/aisix/resources.yaml"
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  enabled: false
+"#,
+        );
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert!(!cfg.admin.enabled);
+        assert!(cfg.admin.admin_keys.is_empty());
+    }
+
+    #[test]
     fn rejects_empty_etcd_endpoints() {
         let f = write_yaml(
             r#"

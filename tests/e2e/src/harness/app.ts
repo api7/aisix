@@ -262,7 +262,10 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
         waitForReady(`${proxyUrl}/livez`, READY_TIMEOUT_MS),
         // The admin health endpoint only exists when the admin listener is
         // bound; with `admin: false` there is no admin surface, so gate on
-        // the proxy `/livez` and the metrics listener alone.
+        // the proxy `/livez` and the metrics listener alone. (If both
+        // `admin` and `prometheus` are off, readiness reduces to the proxy
+        // `/livez` — liveness only; a case that needs config-propagation
+        // readiness should keep prometheus on, as the default does.)
         ...(adminEnabled
           ? [waitForReady(`${adminUrl}/admin/v1/health`, READY_TIMEOUT_MS, adminKey)]
           : []),
