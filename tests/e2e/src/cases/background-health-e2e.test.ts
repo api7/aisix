@@ -249,9 +249,14 @@ describe("background health e2e", () => {
       },
     });
 
-    const statuses = await admin.listModelStatuses();
-    const staleModel = statuses.find((row) => row.display_name === "bg-stale-short");
-    expect(staleModel).toBeTruthy();
+    // Config propagation is asynchronous: the model seeded above reaches
+    // the status listing only after the snapshot refresh. Poll for the
+    // row instead of asserting eagerly — on a loaded CI runner the
+    // immediate read raced the watch and failed with `undefined`.
+    await waitConfigPropagation(async () => {
+      const rows = await admin!.listModelStatuses();
+      return rows.some((row) => row.display_name === "bg-stale-short");
+    });
 
     await waitConfigPropagation(async () => {
       const rows = await admin!.listModelStatuses();
