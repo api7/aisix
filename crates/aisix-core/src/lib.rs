@@ -43,11 +43,12 @@ pub use models::{
     validate_mcp_server, validate_model, validate_observability_exporter, validate_provider_key,
     validate_rate_limit_policy, A2aAgent, A2aAuthType, A2aProtocolVersion, Adapter, AisixSnapshot,
     ApiKey, AppliedGuardrail, CachePolicy, CooldownConfig, ExporterKind, Guardrail,
-    GuardrailHookPoint, GuardrailKind, GuardrailMonitorHit, KeywordConfig, KeywordPattern,
-    McpAuthType, McpServer, McpTransport, Model, ObservabilityExporter, ParamConstraints,
-    PolicyScope, PolicyWindow, ProviderKey, RateLimit, RateLimitPolicy, RequestOverrides,
-    ResponseOverrides, Routing, RoutingStrategy, RoutingTarget, SchemaError, StreamDoneMarker,
-    TelemetryKind, TelemetryTags, WhenAllUnavailablePolicy, DEFAULT_COOLDOWN_TRIGGER_STATUSES,
+    GuardrailExecution, GuardrailHookPoint, GuardrailKind, GuardrailMetricsSink,
+    GuardrailMonitorHit, KeywordConfig, KeywordPattern, McpAuthType, McpServer, McpTransport,
+    Model, ObservabilityExporter, ParamConstraints, PolicyScope, PolicyWindow, ProviderKey,
+    RateLimit, RateLimitPolicy, RequestOverrides, ResponseOverrides, Routing, RoutingStrategy,
+    RoutingTarget, SchemaError, StreamDoneMarker, TelemetryKind, TelemetryTags,
+    WhenAllUnavailablePolicy, DEFAULT_COOLDOWN_TRIGGER_STATUSES,
 };
 pub use resource::{Resource, ResourceEntry};
 pub use snapshot::{ResourceTable, SnapshotHandle};

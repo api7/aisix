@@ -1069,6 +1069,10 @@ pub fn build_index_from_snapshot(
 pub struct LiveGuardrailIndex {
     snapshot: SnapshotHandle<AisixSnapshot>,
     bedrock_endpoint_url: Option<String>,
+    /// Per-execution telemetry receiver, attached to every resolved chain
+    /// (AISIX-Cloud#1076). `None` (tests, standalone construction) records
+    /// nothing; the server bootstrap wires the metrics layer's sink.
+    metrics_sink: Option<Arc<dyn aisix_core::GuardrailMetricsSink>>,
     cache: Mutex<IndexCache>,
 }
 
@@ -1082,6 +1086,16 @@ impl LiveGuardrailIndex {
         snapshot: SnapshotHandle<AisixSnapshot>,
         bedrock_endpoint_url: Option<String>,
     ) -> Arc<Self> {
+        Self::new_with_sink(snapshot, bedrock_endpoint_url, None)
+    }
+
+    /// Like [`LiveGuardrailIndex::new`], also attaching a metrics sink to
+    /// every chain [`LiveGuardrailIndex::resolve`] hands out.
+    pub fn new_with_sink(
+        snapshot: SnapshotHandle<AisixSnapshot>,
+        bedrock_endpoint_url: Option<String>,
+        metrics_sink: Option<Arc<dyn aisix_core::GuardrailMetricsSink>>,
+    ) -> Arc<Self> {
         // Read version before load — same ordering discipline as LiveGuardrailChain.
         let last_version = snapshot.version();
         let snap = snapshot.load();
@@ -1093,6 +1107,7 @@ impl LiveGuardrailIndex {
         Arc::new(Self {
             snapshot,
             bedrock_endpoint_url,
+            metrics_sink,
             cache: Mutex::new(IndexCache {
                 last_version,
                 index,
@@ -1142,7 +1157,9 @@ impl LiveGuardrailIndex {
     /// arc clone + `O(n)` linear walk over attachment rows). Rebuilds only
     /// on snapshot version change.
     pub fn resolve(&self, ctx: &RequestContext<'_>) -> GuardrailChain {
-        self.current().resolve(ctx)
+        self.current()
+            .resolve(ctx)
+            .with_metrics_sink(self.metrics_sink.clone())
     }
 
     /// `true` when the resolved index has no guardrail entries — neither
@@ -2137,6 +2154,117 @@ mod tests {
             .await
             .is_block());
         assert!(!live.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // per-execution metrics sink (AISIX-Cloud#1076)
+    // -----------------------------------------------------------------------
+
+    #[derive(Default)]
+    struct RecordingSink(std::sync::Mutex<Vec<(String, String, &'static str, &'static str)>>);
+
+    impl aisix_core::GuardrailMetricsSink for RecordingSink {
+        fn record_guardrail_execution(&self, exec: &aisix_core::GuardrailExecution<'_>) {
+            self.0.lock().unwrap().push((
+                exec.guardrail_name.to_owned(),
+                exec.kind.to_owned(),
+                exec.phase,
+                exec.result,
+            ));
+        }
+    }
+
+    /// A sink attached via `LiveGuardrailIndex::new_with_sink` reaches every
+    /// resolved chain: executions carry the row name, the row `kind`, and
+    /// the enforced result — a monitor-mode member's suppressed outcome
+    /// records as `would_block`/`would_mask`, not `blocked`/`masked`.
+    #[tokio::test]
+    async fn live_index_sink_records_resolved_chain_executions() {
+        let snap = AisixSnapshot::new();
+        snap.guardrails.insert(entry(
+            "watch-pii",
+            "g-1",
+            parse(
+                r#"{
+                    "name": "watch-pii",
+                    "enforcement_mode": "monitor",
+                    "kind": "pii",
+                    "created_at": "2024-01-01T00:00:00Z",
+                    "detectors": [
+                        { "type": "email", "action": "mask" },
+                        { "type": "us_ssn", "action": "block" }
+                    ]
+                }"#,
+            ),
+        ));
+        snap.guardrails.insert(entry(
+            "block-secrets",
+            "g-2",
+            parse(
+                r#"{
+                    "name": "block-secrets",
+                    "kind": "keyword",
+                    "created_at": "2024-01-02T00:00:00Z",
+                    "patterns": [{ "kind": "literal", "value": "AKIA" }]
+                }"#,
+            ),
+        ));
+        let sink = Arc::new(RecordingSink::default());
+        let live =
+            LiveGuardrailIndex::new_with_sink(SnapshotHandle::new(snap), None, Some(sink.clone()));
+        let ctx = RequestContext {
+            model_id: "m1",
+            api_key_id: "k1",
+            team_id: None,
+        };
+
+        // Monitor-mode pii mask hit + keyword block: the suppressed mask
+        // records as would_mask; the enforcing keyword block as blocked.
+        let (v, _) = live
+            .resolve(&ctx)
+            .check_input_observed(&req("mail alice@example.com and AKIA"))
+            .await;
+        assert!(v.is_block());
+        assert_eq!(
+            std::mem::take(&mut *sink.0.lock().unwrap()),
+            vec![
+                (
+                    "watch-pii".to_owned(),
+                    "pii".to_owned(),
+                    "input",
+                    "would_mask",
+                ),
+                (
+                    "block-secrets".to_owned(),
+                    "keyword".to_owned(),
+                    "input",
+                    "blocked",
+                ),
+            ],
+        );
+
+        // Monitor-mode would_block: the suppressed pii Block records as
+        // would_block while the enforced verdict stays Allow.
+        let (v, _) = live
+            .resolve(&ctx)
+            .check_input_observed(&req("ssn 123-45-6789"))
+            .await;
+        assert_eq!(v, GuardrailVerdict::Allow);
+        let records = std::mem::take(&mut *sink.0.lock().unwrap());
+        assert_eq!(
+            records[0],
+            (
+                "watch-pii".to_owned(),
+                "pii".to_owned(),
+                "input",
+                "would_block",
+            ),
+        );
+
+        // The plain `new` constructor keeps recording off.
+        let unsinked = LiveGuardrailIndex::new(SnapshotHandle::new(AisixSnapshot::new()), None);
+        let _ = unsinked.resolve(&ctx).check_input(&req("hi")).await;
+        assert!(sink.0.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

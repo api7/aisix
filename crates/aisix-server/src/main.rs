@@ -711,10 +711,13 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     // `None` so a `docker run -e AISIX_BEDROCK_ENDPOINT_URL=`
     // doesn't accidentally redirect Bedrock calls into thin air.
     let bedrock_endpoint_url = cfg.bedrock_endpoint_url.clone().filter(|s| !s.is_empty());
-    proxy_state = proxy_state.with_guardrail_index(aisix_guardrails::LiveGuardrailIndex::new(
-        snapshot_handle.clone(),
-        bedrock_endpoint_url,
-    ));
+    let guardrail_metrics_sink = proxy_state.metrics.clone();
+    proxy_state =
+        proxy_state.with_guardrail_index(aisix_guardrails::LiveGuardrailIndex::new_with_sink(
+            snapshot_handle.clone(),
+            bedrock_endpoint_url,
+            Some(guardrail_metrics_sink),
+        ));
     // Heartbeat worker — spawned after proxy_state exists so it can read
     // the exporter fan-out's delivery counters. Each tick reports:
     //   - rejected_resources: the supervisor's loader rejections (#115)

@@ -753,6 +753,37 @@ pub struct GuardrailMonitorHit {
     pub counts: std::collections::BTreeMap<String, u32>,
 }
 
+/// One guardrail member execution as observed by the chain fold
+/// (AISIX-Cloud#1076): identity, phase, enforced outcome, and wall-clock
+/// duration. All fields are bounded values safe for metric labels — never
+/// matched content (#153 no-leak criterion).
+#[derive(Debug, Clone, Copy)]
+pub struct GuardrailExecution<'a> {
+    /// Configured (row) name of the guardrail.
+    pub guardrail_name: &'a str,
+    /// The `kind` discriminator (`GuardrailKind::kind_str`). `keyword` and
+    /// `pii` run in-process; every other kind calls a remote service.
+    pub kind: &'a str,
+    /// Which side ran: `input` or `output`.
+    pub phase: &'static str,
+    /// Enforced outcome: `allowed` / `blocked` / `masked` / `bypassed`
+    /// (remote failure + fail-open) / `would_block` / `would_mask`
+    /// (monitor mode).
+    pub result: &'static str,
+    /// Bounded failure tag (e.g. `lakera_timeout`) when the guardrail could
+    /// not evaluate and failed open (`result = bypassed`); `None` otherwise.
+    pub error_type: Option<&'a str>,
+    /// Wall-clock time the member call took.
+    pub elapsed: std::time::Duration,
+}
+
+/// Receiver for per-execution guardrail telemetry. Implemented by the
+/// metrics layer (aisix-obs) and injected into the resolved chain at
+/// build time, so aisix-guardrails stays free of a metrics dependency.
+pub trait GuardrailMetricsSink: Send + Sync + 'static {
+    fn record_guardrail_execution(&self, exec: &GuardrailExecution<'_>);
+}
+
 /// Content policy evaluated before or after upstream calls.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
 pub struct Guardrail {

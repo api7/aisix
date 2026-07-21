@@ -84,6 +84,27 @@ pub const M_USAGE_EVENT_DROPS_TOTAL: &str = "aisix_usage_event_drops_total";
 /// `/v1/messages` path in — read these as chat-path, not gateway-wide.
 pub const M_GUARDRAIL_BLOCKS_TOTAL: &str = "aisix_guardrail_blocks_total";
 pub const M_GUARDRAIL_BYPASSES_TOTAL: &str = "aisix_guardrail_bypasses_total";
+/// Per-execution guardrail latency histogram (AISIX-Cloud#1076), recorded
+/// by the chain fold for every member consulted on any handler — chat,
+/// messages, responses, embeddings, streaming end-of-stream/window scans,
+/// cache-hit output checks, and the segment (Bedrock-style) pass alike.
+/// Labels:
+/// - `env_id`: constant per DP process (`unknown` standalone).
+/// - `guardrail`: the configured (row) name.
+/// - `kind`: the guardrail kind discriminator (`keyword`/`pii` run
+///   in-process; every other kind calls a remote service, so this label
+///   splits local vs remote latency).
+/// - `phase`: `input` / `output`.
+/// - `result`: `allowed` / `blocked` / `masked` / `bypassed` (remote
+///   failure + fail-open) / `would_block` / `would_mask` (monitor mode).
+/// - `error_type`: bounded failure tag (e.g. `lakera_timeout`) when
+///   `result="bypassed"`, else `none`. Fail-closed failures surface as
+///   `blocked` (the timeout budget shows up in the latency distribution).
+///
+/// The `_count` series doubles as a per-guardrail execution counter, so
+/// there is no separate `aisix_guardrail_requests_total` (LiteLLM's
+/// `litellm_guardrail_requests_total` equivalent = `sum by (...)` of it).
+pub const M_GUARDRAIL_LATENCY_SECONDS: &str = "aisix_guardrail_latency_seconds";
 /// Issue #408: counter for UsageEvents successfully enqueued onto the
 /// `UsageSink` (i.e. handed off to the telemetry worker for delivery
 /// to cp-api + per-env OTLP exporters). Operators slice this by:
@@ -144,6 +165,15 @@ pub const LATENCY_HISTOGRAM_BUCKETS: &[f64] = &[
     0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0,
 ];
 
+/// Bucket edges for [`M_GUARDRAIL_LATENCY_SECONDS`] — shifted an order of
+/// magnitude below the SLO buckets: local (keyword/pii) checks run in
+/// microseconds, the added-latency budget under scrutiny is ~50 ms
+/// (AISIX-Cloud#1076), and remote guardrail timeouts default to 5 s. The
+/// 30 s top edge outlives any configurable guardrail timeout.
+pub const GUARDRAIL_LATENCY_BUCKETS: &[f64] = &[
+    0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
+];
+
 /// Holds an isolated `PrometheusRecorder` plus its render handle.
 /// `metrics::*` macros talk to whatever recorder is in scope; we use
 /// `metrics::with_local_recorder` so each write lands on the instance
@@ -192,10 +222,10 @@ impl Metrics {
     /// histograms. Empty ids (standalone DP) collapse to `"unknown"`,
     /// matching the missing-dimension convention used elsewhere.
     pub fn new_with_env_id(env_id: &str) -> Self {
-        // Buckets ONLY for the two SLO histograms: with `metrics-exporter-
-        // prometheus`, a distribution without configured buckets renders as
-        // a summary — which is what every legacy `histogram!` series here
-        // intentionally stays as.
+        // Buckets ONLY for the SLO histograms and the guardrail latency
+        // histogram: with `metrics-exporter-prometheus`, a distribution
+        // without configured buckets renders as a summary — which is what
+        // every legacy `histogram!` series here intentionally stays as.
         let recorder = PrometheusBuilder::new()
             .set_buckets_for_metric(
                 Matcher::Full(M_REQUEST_E2E_LATENCY_SECONDS.to_string()),
@@ -205,6 +235,11 @@ impl Metrics {
             .set_buckets_for_metric(
                 Matcher::Full(M_REQUEST_TTFT_SECONDS.to_string()),
                 LATENCY_HISTOGRAM_BUCKETS,
+            )
+            .expect("static bucket list is non-empty")
+            .set_buckets_for_metric(
+                Matcher::Full(M_GUARDRAIL_LATENCY_SECONDS.to_string()),
+                GUARDRAIL_LATENCY_BUCKETS,
             )
             .expect("static bucket list is non-empty")
             .build_recorder();
@@ -350,6 +385,25 @@ impl Metrics {
                 )
                 .increment(1);
             }
+        });
+    }
+
+    /// Record one guardrail member execution on
+    /// [`M_GUARDRAIL_LATENCY_SECONDS`] (AISIX-Cloud#1076). Called by the
+    /// chain fold through the `GuardrailMetricsSink` impl below — once per
+    /// member per hook pass, on every handler.
+    pub fn record_guardrail_execution(&self, exec: &aisix_core::GuardrailExecution<'_>) {
+        metrics::with_local_recorder(&self.inner.recorder, || {
+            metrics::histogram!(
+                M_GUARDRAIL_LATENCY_SECONDS,
+                "env_id" => self.inner.env_id.clone(),
+                "guardrail" => exec.guardrail_name.to_string(),
+                "kind" => exec.kind.to_string(),
+                "phase" => exec.phase.to_string(),
+                "result" => exec.result.to_string(),
+                "error_type" => exec.error_type.unwrap_or("none").to_string(),
+            )
+            .record(exec.elapsed.as_secs_f64());
         });
     }
 
@@ -766,6 +820,15 @@ impl Metrics {
             )
             .record(ttft.as_secs_f64());
         });
+    }
+}
+
+/// The injection point the guardrail chain records through
+/// (AISIX-Cloud#1076): `aisix-guardrails` sees only this core trait, so it
+/// stays free of a metrics dependency.
+impl aisix_core::GuardrailMetricsSink for Metrics {
+    fn record_guardrail_execution(&self, exec: &aisix_core::GuardrailExecution<'_>) {
+        Metrics::record_guardrail_execution(self, exec);
     }
 }
 
@@ -1329,6 +1392,48 @@ mod tests {
         assert!(rendered.contains("provider=\"openai\""));
         assert!(rendered.contains("outcome=\"success\""));
         assert!(rendered.contains(M_REQUEST_DURATION));
+    }
+
+    /// AISIX-Cloud#1076: the per-execution guardrail histogram renders with
+    /// real `_bucket{le=…}` series (quantile-aggregatable, not a summary)
+    /// and the full bounded label set; `error_type` defaults to `none`.
+    #[test]
+    fn guardrail_execution_renders_bucketed_histogram_with_labels() {
+        let m = Metrics::new_with_env_id("env-7");
+        m.record_guardrail_execution(&aisix_core::GuardrailExecution {
+            guardrail_name: "block-secrets",
+            kind: "keyword",
+            phase: "input",
+            result: "blocked",
+            error_type: None,
+            elapsed: Duration::from_micros(300),
+        });
+        m.record_guardrail_execution(&aisix_core::GuardrailExecution {
+            guardrail_name: "lakera-prod",
+            kind: "lakera",
+            phase: "output",
+            result: "bypassed",
+            error_type: Some("lakera_timeout"),
+            elapsed: Duration::from_secs(5),
+        });
+        let out = m.render();
+        assert!(
+            out.contains("aisix_guardrail_latency_seconds_bucket"),
+            "{out}"
+        );
+        // 0.3 ms lands in the first (1 ms) bucket — the sub-SLO edges exist.
+        assert!(out.contains("le=\"0.001\""), "{out}");
+        assert!(out.contains("env_id=\"env-7\""));
+        assert!(out.contains("guardrail=\"block-secrets\""));
+        assert!(out.contains("kind=\"keyword\""));
+        assert!(out.contains("phase=\"input\""));
+        assert!(out.contains("result=\"blocked\""));
+        assert!(out.contains("error_type=\"none\""));
+        assert!(out.contains("guardrail=\"lakera-prod\""));
+        assert!(out.contains("result=\"bypassed\""));
+        assert!(out.contains("error_type=\"lakera_timeout\""));
+        // No per-key/per-user dimension may ride a bucketed histogram.
+        assert!(!out.contains("api_key_id="));
     }
 
     #[test]
