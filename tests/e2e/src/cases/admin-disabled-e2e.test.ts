@@ -230,6 +230,25 @@ api_keys:
     expect(body.applied?.resource_counts?.models).toBe(1);
   });
 
+  test("the runtime health view serves from the file snapshot on the status listener", async () => {
+    if (!app) throw new Error("setup failed");
+
+    // /status/models reads through the file-mode FileManagedStore — the
+    // exact read surface that must stay live with the admin listener off
+    // (the admin endpoint that used to back this view is unbound here).
+    const res = await fetch(`${app.metricsUrl}/status/models`);
+    expect(res.status).toBe(200);
+    const rows = (await res.json()) as Array<{
+      display_name?: string;
+      kind?: string;
+      status?: string;
+    }>;
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.display_name).toBe("admin-off-file-model");
+    expect(rows[0]?.kind).toBe("direct");
+    expect(rows[0]?.status).toBe("healthy");
+  });
+
   test("no admin listener is bound in file mode", async () => {
     if (!app) throw new Error("setup failed");
     await expectAdminPortRefused(app.adminUrl);
