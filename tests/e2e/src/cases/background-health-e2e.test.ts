@@ -59,7 +59,10 @@ describe("background health e2e", () => {
       },
     });
 
-    app = await spawnApp();
+    // The admin listener is off; `admin` here is used only for
+    // listModelStatuses, which reads GET /status/models on the metrics
+    // listener. Resources are seeded straight to etcd via `seed`.
+    app = await spawnApp({ admin: false });
     admin = new AdminClient(app.adminUrl, app.adminKey, app.metricsUrl);
     seed = new SeedClient(etcd, app.etcdPrefix);
 
@@ -246,9 +249,14 @@ describe("background health e2e", () => {
       },
     });
 
-    const statuses = await admin.listModelStatuses();
-    const staleModel = statuses.find((row) => row.display_name === "bg-stale-short");
-    expect(staleModel).toBeTruthy();
+    // Config propagation is asynchronous: the model seeded above reaches
+    // the status listing only after the snapshot refresh. Poll for the
+    // row instead of asserting eagerly — on a loaded CI runner the
+    // immediate read raced the watch and failed with `undefined`.
+    await waitConfigPropagation(async () => {
+      const rows = await admin!.listModelStatuses();
+      return rows.some((row) => row.display_name === "bg-stale-short");
+    });
 
     await waitConfigPropagation(async () => {
       const rows = await admin!.listModelStatuses();
