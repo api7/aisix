@@ -157,12 +157,14 @@ pub struct ProxyState {
 
 impl ProxyState {
     pub fn new(snapshot: SnapshotHandle<AisixSnapshot>, hub: Arc<Hub>, cfg: &ProxyConfig) -> Self {
-        let guardrail_index = LiveGuardrailIndex::new(snapshot.clone(), None);
+        let metrics = Arc::new(Metrics::new(false));
+        let guardrail_index =
+            LiveGuardrailIndex::new_with_sink(snapshot.clone(), None, Some(metrics.clone()));
         Self {
             snapshot,
             hub,
             limiter: Arc::new(Limiter::new()),
-            metrics: Arc::new(Metrics::new(false)),
+            metrics,
             cache: Some(CacheBackends::memory_only()),
             routing: Arc::new(RoutingRegistry::new()),
             semantic_cache: Arc::new(crate::semantic::SemanticVectorCache::default()),
@@ -189,12 +191,14 @@ impl ProxyState {
         limiter: Arc<Limiter>,
         cfg: &ProxyConfig,
     ) -> Self {
-        let guardrail_index = LiveGuardrailIndex::new(snapshot.clone(), None);
+        let metrics = Arc::new(Metrics::new(false));
+        let guardrail_index =
+            LiveGuardrailIndex::new_with_sink(snapshot.clone(), None, Some(metrics.clone()));
         Self {
             snapshot,
             hub,
             limiter,
-            metrics: Arc::new(Metrics::new(false)),
+            metrics,
             cache: Some(CacheBackends::memory_only()),
             routing: Arc::new(RoutingRegistry::new()),
             semantic_cache: Arc::new(crate::semantic::SemanticVectorCache::default()),
@@ -224,7 +228,8 @@ impl ProxyState {
         cache: Option<CacheBackends>,
         cfg: &ProxyConfig,
     ) -> Self {
-        let guardrail_index = LiveGuardrailIndex::new(snapshot.clone(), None);
+        let guardrail_index =
+            LiveGuardrailIndex::new_with_sink(snapshot.clone(), None, Some(metrics.clone()));
         // The bootstrap constructor is the one place the tracker gets a
         // metrics sink + snapshot handle, so cooldown transitions emit
         // `aisix_deployment_*`. Clone both before they are moved into the
