@@ -126,9 +126,9 @@ describe("guardrail disabled-bypass e2e: enabled:false → no block", () => {
       // response means the dispatcher is ready.
       await waitConfigPropagation(async () => {
         try {
-          const cfg = (await (
-            await fetch(`${app!.metricsUrl}/status/config`)
-          ).json()) as {
+          const res = await fetch(`${app!.metricsUrl}/status/config`);
+          if (!res.ok) return false;
+          const cfg = (await res.json()) as {
             applied?: { resource_counts?: Record<string, number> };
           };
           if ((cfg.applied?.resource_counts?.guardrails ?? 0) < 1) {
