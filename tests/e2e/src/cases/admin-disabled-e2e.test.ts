@@ -152,8 +152,9 @@ describe("admin disabled, etcd source: gateway serves seeded-via-etcd config wit
 
     // /livez and /readyz live on the proxy listener — the health surface
     // that survives the Admin API's removal. /readyz carries the full
-    // readiness semantics (config freshness from the watch + shutdown),
-    // so once the seeded config has applied it must report ready.
+    // readiness semantics (config freshness from the watch + shutdown);
+    // it reports ready once the initial load applies (an empty prefix
+    // counts), so it settles at 200 regardless of seed timing.
     await waitConfigPropagation(async () => {
       try {
         const r = await fetch(`${app!.proxyUrl}/readyz`);

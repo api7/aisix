@@ -931,6 +931,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn readyz_503s_when_the_config_probe_reports_no_apply_yet() {
+        // Pins the config_apply_age plumbing through the router: a wired
+        // probe reporting "no apply yet" must gate readiness with a 503.
+        // Without this, dropping the probe wiring would leave readyz
+        // reporting `[+]config ok` unconditionally (the field-None path),
+        // byte-identical to wired-and-fresh — a silent downgrade of
+        // readiness to shutdown-only that no other test would notice.
+        let hub = Arc::new(Hub::new());
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
+        let state = build_state(snap, hub).with_config_apply_age(Arc::new(|| None));
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/readyz?verbose")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(text.contains("[-]config failed: not ready"));
+    }
+
+    #[tokio::test]
     async fn health_route_is_not_found() {
         let hub = Arc::new(Hub::new());
         let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
