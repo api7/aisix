@@ -16,3 +16,22 @@ docker pull ghcr.io/api7/aisix:__VERSION__
 Rolling tags (`__MINOR__`, `latest`) and the `docker.io/api7/aisix` mirror for private/offline deployments are listed on the [package page](https://github.com/orgs/api7/packages/container/package/aisix).
 
 ---
+
+<!-- ─────────────────────────────────────────────────────────────────────────
+     RELEASE NOTES — polish this section before publishing, then delete this
+     comment. Full house style + examples: RELEASING.md §2.
+
+     1. Headline (optional, one line) — the story of the release, if it has one.
+        e.g. "AISIX becomes a gateway for AI agents, not just LLM calls."
+     2. Highlights — 3–6 plain-language bullets, most important first.
+     3. Themed sections — keep only the ones that apply, e.g.:
+          ## 🧭 Routing              ## 🛡️ Guardrails       ## 🔭 Observability
+          ## 🔐 Security & isolation ## 🔌 API surface       ## 🧩 MCP & A2A
+        Cite PRs as (#123); describe each feature by its own function — no
+        comparisons to other products.
+     4. ## ⚠️ Breaking changes — its own section: old → new spelling + what to
+        update.
+
+     The auto-generated "What's Changed" list below is the raw commit index:
+     fold it into the sections above, then trim it or keep it as a full log.
+     ───────────────────────────────────────────────────────────────────────── -->

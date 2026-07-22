@@ -28,9 +28,9 @@ Pushing the tag triggers two workflows:
 ## 2. Polish the release notes
 
 Edit the draft before publishing. The Get-started/Download header and the
-full-changelog link are already in place — polish the middle: insert the
-narrative and highlights **between the header's `---` divider and the
-What's Changed list**. House style (see the
+full-changelog link are already in place, and a commented **curated-notes
+scaffold** sits between the header's `---` divider and the What's Changed list —
+fill it in, then delete the comment. House style (see the
 [published releases](https://github.com/api7/aisix/releases) for examples):
 
 - Lead with a short narrative line when the release has one (e.g. "AISIX

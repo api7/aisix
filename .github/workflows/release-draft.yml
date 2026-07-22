@@ -6,8 +6,9 @@ name: release-draft
 # out until a human publishes.
 #
 # The draft body leads with a fixed "Get started + Download" header
-# (.github/release-notes-header.md, version-stamped from the tag), followed by
-# GitHub's auto-generated "What's Changed" list.
+# (.github/release-notes-header.md, version-stamped from the tag), then a
+# commented curated-notes scaffold (themed-section skeleton the maintainer
+# fills in), then GitHub's auto-generated "What's Changed" list.
 #
 # No-op if a release for the tag already exists (e.g. created manually).
 
