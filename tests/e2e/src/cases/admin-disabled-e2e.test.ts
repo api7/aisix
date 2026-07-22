@@ -144,6 +144,37 @@ describe("admin disabled, etcd source: gateway serves seeded-via-etcd config wit
     expect(counts.api_keys).toBe(1);
   });
 
+  test("the proxy health endpoints serve with the admin listener off", async (ctx) => {
+    if (!etcdReachable || !app) {
+      ctx.skip();
+      return;
+    }
+
+    // /livez and /readyz live on the proxy listener — the health surface
+    // that survives the Admin API's removal. /readyz carries the full
+    // readiness semantics (config freshness from the watch + shutdown),
+    // so once the seeded config has applied it must report ready.
+    await waitConfigPropagation(async () => {
+      try {
+        const r = await fetch(`${app!.proxyUrl}/readyz`);
+        await r.text();
+        return r.status === 200;
+      } catch {
+        return false;
+      }
+    });
+
+    const livez = await fetch(`${app!.proxyUrl}/livez`);
+    expect(livez.status).toBe(200);
+    expect(await livez.text()).toBe("ok");
+
+    const verbose = await fetch(`${app!.proxyUrl}/readyz?verbose`);
+    expect(verbose.status).toBe(200);
+    const body = await verbose.text();
+    expect(body).toContain("[+]shutdown ok");
+    expect(body).toContain("[+]config ok");
+  });
+
   test("no admin listener is bound", async (ctx) => {
     if (!etcdReachable || !app) {
       ctx.skip();
@@ -247,6 +278,32 @@ api_keys:
     expect(rows[0]?.display_name).toBe("admin-off-file-model");
     expect(rows[0]?.kind).toBe("direct");
     expect(rows[0]?.status).toBe("healthy");
+  });
+
+  test("the proxy health endpoints serve in file mode with the admin listener off", async () => {
+    if (!app) throw new Error("setup failed");
+
+    // File mode loads at boot and has no watch to go stale, so /readyz on
+    // the proxy listener reports ready as soon as the file has applied.
+    await waitConfigPropagation(async () => {
+      try {
+        const r = await fetch(`${app!.proxyUrl}/readyz`);
+        await r.text();
+        return r.status === 200;
+      } catch {
+        return false;
+      }
+    });
+
+    const livez = await fetch(`${app!.proxyUrl}/livez`);
+    expect(livez.status).toBe(200);
+    expect(await livez.text()).toBe("ok");
+
+    const verbose = await fetch(`${app!.proxyUrl}/readyz?verbose`);
+    expect(verbose.status).toBe(200);
+    const body = await verbose.text();
+    expect(body).toContain("[+]shutdown ok");
+    expect(body).toContain("[+]config ok");
   });
 
   test("no admin listener is bound in file mode", async () => {
