@@ -154,6 +154,16 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
 
   const prometheusEnabled = overrides.prometheus ?? true;
   const adminEnabled = overrides.admin ?? false;
+  // `extra` is spread over the generated config at the top level, so an
+  // `extra.admin` would replace the generated admin block and could bind
+  // the listener while readiness still keys off `adminEnabled` and skips
+  // the admin health gate. Keep the `admin` boolean the single source of
+  // truth for the admin listener.
+  if (overrides.extra && "admin" in overrides.extra) {
+    throw new Error(
+      "spawnApp: control the admin listener with the `admin` boolean override, not `extra.admin`",
+    );
+  }
   const [proxyPort, adminPort, metricsPort] = await pickFreePorts(3);
   const adminKey = overrides.adminKey ?? `admin-${randomUUID()}`;
   const etcdPrefix = `/aisix-e2e-${randomUUID()}`;
