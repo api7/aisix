@@ -1,9 +1,13 @@
 name: release-draft
 
-# Create a draft GitHub Release with auto-generated notes whenever a
-# release tag (vX.Y.Z) is pushed — the skeleton a maintainer polishes into
-# curated notes before publishing (see RELEASING.md). Draft releases do
-# not notify watchers, so nothing goes out until a human publishes.
+# Create a draft GitHub Release whenever a release tag (vX.Y.Z) is pushed —
+# the skeleton a maintainer polishes into curated notes before publishing
+# (see RELEASING.md). Draft releases do not notify watchers, so nothing goes
+# out until a human publishes.
+#
+# The draft body leads with a fixed "Get started + Download" header
+# (.github/release-notes-header.md, version-stamped from the tag), followed by
+# GitHub's auto-generated "What's Changed" list.
 #
 # No-op if a release for the tag already exists (e.g. created manually).
 
@@ -23,7 +27,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Create draft release with generated notes
+      - name: Check out the release-notes header template
+        uses: actions/checkout@v4
+
+      - name: Create draft release with header + generated notes
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ github.ref_name }}
@@ -33,9 +40,22 @@ jobs:
             echo "release for $TAG already exists — nothing to do"
             exit 0
           fi
+
+          VERSION="${TAG#v}"            # v0.4.0 -> 0.4.0 (image tags carry no leading v)
+          MINOR="${VERSION%.*}"         # 0.4.0 -> 0.4  (0.4.0-rc.1 -> 0.4.0-rc, close enough)
+
+          # Version-stamped docs + download header every release should lead with.
+          sed -e "s/__VERSION__/$VERSION/g" -e "s/__MINOR__/$MINOR/g" \
+            .github/release-notes-header.md > release-body.md
+
+          # GitHub's auto-generated "What's Changed" skeleton, appended below the header.
+          gh api "repos/$REPO/releases/generate-notes" \
+            -f tag_name="$TAG" --jq .body >> release-body.md
+
           # Pre-release tags (v0.4.0-rc.1) get the prerelease flag.
           case "$TAG" in *-*) PRE=--prerelease ;; *) PRE= ;; esac
+
           gh release create "$TAG" -R "$REPO" $PRE \
             --draft \
-            --generate-notes \
+            --notes-file release-body.md \
             --title "$TAG"

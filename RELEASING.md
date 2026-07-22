@@ -19,12 +19,18 @@ Pushing the tag triggers two workflows:
   deployments, signs the images with cosign, and stamps the version into the
   binary so a running gateway self-reports `X.Y.Z` (`--version`, `Server`
   header) and `X.Y.Z+sha-<short>` in its managed-mode heartbeat.
-- **`release-draft.yml`** creates a **draft** GitHub Release for the tag with
-  auto-generated notes as a starting skeleton.
+- **`release-draft.yml`** creates a **draft** GitHub Release for the tag. The
+  draft already leads with a version-stamped **Get started + Download** header
+  (from [`.github/release-notes-header.md`](.github/release-notes-header.md):
+  docs, self-hosted quickstart, and the `docker pull` command), followed by
+  GitHub's auto-generated **What's Changed** list as a starting skeleton.
 
 ## 2. Polish the release notes
 
-Edit the draft before publishing. House style (see the
+Edit the draft before publishing. The Get-started/Download header and the
+full-changelog link are already in place — polish the middle: insert the
+narrative and highlights **between the header's `---` divider and the
+What's Changed list**. House style (see the
 [published releases](https://github.com/api7/aisix/releases) for examples):
 
 - Lead with a short narrative line when the release has one (e.g. "AISIX
@@ -37,13 +43,11 @@ Edit the draft before publishing. House style (see the
   cite internal issue trackers.
 - Describe each feature by its own function — no comparisons against other
   products.
-- End with the install snippet and a full-changelog compare link:
+- Keep the download/install details in the header block; don't hand-add a
+  second install snippet at the bottom.
 
-  ```bash
-  docker pull ghcr.io/api7/aisix:X.Y.Z
-  ```
-
-  `**Full changelog**: https://github.com/api7/aisix/compare/<previous release tag>...vX.Y.Z`
+If the header text itself needs to change (new docs URL, extra image
+registry), edit `.github/release-notes-header.md` — not each release by hand.
 
 ## 3. Publish
 
