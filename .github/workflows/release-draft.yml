@@ -29,7 +29,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Check out the release-notes header template
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Create draft release with header + generated notes
         env:
@@ -43,15 +43,33 @@ jobs:
           fi
 
           VERSION="${TAG#v}"            # v0.4.0 -> 0.4.0 (image tags carry no leading v)
-          MINOR="${VERSION%.*}"         # 0.4.0 -> 0.4  (0.4.0-rc.1 -> 0.4.0-rc, close enough)
+
+          # Rolling-tags sentence. docker-image.yml publishes the :X.Y (and
+          # :latest) tags only for stable releases; docker/metadata-action skips
+          # major.minor for pre-release semver, so a -rc draft must not advertise
+          # an :X.Y tag that never gets pushed.
+          PKG="https://github.com/orgs/api7/packages/container/package/aisix"
+          case "$TAG" in
+            *-*)
+              ROLLING="Other image tags and the \`docker.io/api7/aisix\` mirror for private/offline deployments are listed on the [package page]($PKG)."
+              ;;
+            *)
+              MINOR="${VERSION%.*}"     # 0.4.0 -> 0.4
+              ROLLING="Rolling tags (\`$MINOR\`, \`latest\`) and the \`docker.io/api7/aisix\` mirror for private/offline deployments are listed on the [package page]($PKG)."
+              ;;
+          esac
 
           # Version-stamped docs + download header every release should lead with.
-          sed -e "s/__VERSION__/$VERSION/g" -e "s/__MINOR__/$MINOR/g" \
+          # '#' delimiter for __ROLLING_TAGS__ so the URL's slashes don't clash.
+          sed -e "s/__VERSION__/$VERSION/g" -e "s#__ROLLING_TAGS__#${ROLLING}#" \
             .github/release-notes-header.md > release-body.md
 
-          # GitHub's auto-generated "What's Changed" skeleton, appended below the header.
+          # GitHub's auto-generated "What's Changed" skeleton, appended below the
+          # header. Fall back to a bare heading so a transient API failure still
+          # produces a draft (with the header) instead of no release at all.
           gh api "repos/$REPO/releases/generate-notes" \
-            -f tag_name="$TAG" --jq .body >> release-body.md
+            -f tag_name="$TAG" --jq .body >> release-body.md \
+            || printf '## What'"'"'s Changed\n' >> release-body.md
 
           # Pre-release tags (v0.4.0-rc.1) get the prerelease flag.
           case "$TAG" in *-*) PRE=--prerelease ;; *) PRE= ;; esac

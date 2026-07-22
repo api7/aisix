@@ -13,7 +13,7 @@ Pull the container image from the GitHub Container Registry:
 docker pull ghcr.io/api7/aisix:__VERSION__
 ```
 
-Rolling tags (`__MINOR__`, `latest`) and the `docker.io/api7/aisix` mirror for private/offline deployments are listed on the [package page](https://github.com/orgs/api7/packages/container/package/aisix).
+__ROLLING_TAGS__
 
 ---
 
