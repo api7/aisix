@@ -22,8 +22,9 @@ Pushing the tag triggers two workflows:
 - **`release-draft.yml`** creates a **draft** GitHub Release for the tag. The
   draft already leads with a version-stamped **Get started + Download** header
   (from [`.github/release-notes-header.md`](.github/release-notes-header.md):
-  docs, self-hosted quickstart, and the `docker pull` command), followed by
-  GitHub's auto-generated **What's Changed** list as a starting skeleton.
+  docs, self-hosted quickstart, and the `docker pull` command), then a commented
+  curated-notes scaffold to fill in, then GitHub's auto-generated **What's
+  Changed** list as a starting skeleton.
 
 ## 2. Polish the release notes
 
