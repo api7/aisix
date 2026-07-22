@@ -51,7 +51,9 @@ describe("openai SDK compat: drive gateway through real client", () => {
       ],
     });
 
-    app = await spawnApp();
+    // Held-back: this test drives the Admin API surface itself, so it
+    // keeps the admin listener bound (the suite default is now admin-off).
+    app = await spawnApp({ admin: true });
     // Deliberately seeds via the Admin API: deprecation-window coverage.
     admin = new AdminClient(app.adminUrl, app.adminKey);
 

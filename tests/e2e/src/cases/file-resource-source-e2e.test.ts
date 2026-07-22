@@ -74,7 +74,10 @@ describe("file resource source: smoke + admin write-guard", () => {
 
   beforeAll(async () => {
     upstream = await startOpenAiUpstream();
+    // Held-back: exercises the file-mode admin write-rejection (409), so
+    // the admin listener stays bound (the suite default is now admin-off).
     app = await spawnApp({
+      admin: true,
       resourcesFile: fileModeResources(upstream.baseUrl),
       extraEnv: { [CALLER_KEY_ENV]: CALLER_PLAINTEXT },
     });
@@ -255,6 +258,7 @@ describe("file resource source: differential vs etcd mode", () => {
     // The SAME logical resource set on both gateways: one provider key,
     // an allowed model, a forbidden model, one caller key.
     fileApp = await spawnApp({
+      admin: true,
       resourcesFile: `
 _format_version: "1"
 provider_keys:
@@ -278,7 +282,7 @@ api_keys:
 `,
     });
 
-    etcdApp = await spawnApp();
+    etcdApp = await spawnApp({ admin: true });
     const seed = new SeedClient(etcd, etcdApp.etcdPrefix);
     const pk = await seed.createProviderKey({
       display_name: "diff-pk",
@@ -411,6 +415,7 @@ api_keys:
   beforeAll(async () => {
     upstream = await startOpenAiUpstream();
     app = await spawnApp({
+      admin: true,
       resourcesFile: reloadFile(upstream.baseUrl, ["reload-a"]),
     });
   });
@@ -487,6 +492,7 @@ describe("file resource source: fail-fast boot", () => {
     let caught: unknown;
     try {
       await spawnApp({
+        admin: true,
         resourcesFile: `
 _format_version: "1"
 models:

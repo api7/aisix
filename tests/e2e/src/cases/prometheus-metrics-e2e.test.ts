@@ -30,7 +30,9 @@ describe("prometheus metrics e2e", () => {
     upstream = await startOpenAiUpstream({
       nonStreamBody: responseBody(),
     });
-    app = await spawnApp();
+    // Held-back: asserts the admin listener's health endpoint, so it keeps
+    // admin bound (the suite default is now admin-off).
+    app = await spawnApp({ admin: true });
     seed = new SeedClient(etcd, app.etcdPrefix);
 
     await configureOpenAi(seed, upstream, "prometheus-gpt");
@@ -92,7 +94,7 @@ describe("prometheus metrics e2e", () => {
     const customUpstream = await startOpenAiUpstream({
       nonStreamBody: responseBody(),
     });
-    const customApp = await spawnApp({ prometheusPath: "/custom-metrics" });
+    const customApp = await spawnApp({ admin: true, prometheusPath: "/custom-metrics" });
     try {
       const customSeed = new SeedClient(new EtcdClient(), customApp.etcdPrefix);
       await configureOpenAi(customSeed, customUpstream, "prometheus-custom-gpt");
@@ -187,7 +189,7 @@ describe("prometheus metrics e2e", () => {
       return;
     }
 
-    const disabledApp = await spawnApp({ prometheus: false });
+    const disabledApp = await spawnApp({ admin: true, prometheus: false });
     try {
       // No listener at all: the fetch must fail at the connection level,
       // not return an HTTP error.

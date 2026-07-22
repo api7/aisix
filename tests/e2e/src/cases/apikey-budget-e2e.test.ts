@@ -22,7 +22,9 @@ describe("apikey max_budget_usd e2e: standalone admin rejects removed field", ()
     etcdReachable = await new EtcdClient().ping();
     if (!etcdReachable) return;
 
-    app = await spawnApp();
+    // Held-back: this test drives the Admin API surface itself, so it
+    // keeps the admin listener bound (the suite default is now admin-off).
+    app = await spawnApp({ admin: true });
     admin = new AdminClient(app.adminUrl, app.adminKey);
   });
 

@@ -11,13 +11,17 @@ import { harnessRequest } from "./http.js";
 
 export interface AppOverrides {
   /**
-   * Whether to bind the admin listener. Defaults to `true`. When `false`,
-   * the gateway runs with `admin.enabled = false` — no admin listener is
-   * bound even in etcd/file mode, mirroring the post-removal world. Seed
-   * resources through `SeedClient`/`EtcdClient` (never the Admin API), and
-   * readiness is gated on the proxy `/livez` plus the metrics listener
-   * instead of the admin health endpoint. `adminUrl`/`adminKey` are still
-   * returned but point at an unbound port.
+   * Whether to bind the admin listener. **Defaults to `false`** — the
+   * gateway runs with `admin.enabled = false`, no admin listener bound,
+   * mirroring the post-removal world; readiness gates on the proxy
+   * `/livez` plus the metrics listener, and `adminUrl`/`adminKey` are
+   * still returned but point at an unbound port. Resources are seeded
+   * through `SeedClient`/`EtcdClient`, never the Admin API.
+   *
+   * Only tests whose subject IS the Admin API surface (the held-back set —
+   * admin auth, write-rejection, deprecation headers, status-equivalence,
+   * key rotation) opt back in with `admin: true`; they stay admin-on until
+   * the Admin API is removed, then get deleted.
    */
   admin?: boolean;
   /** Inserted into `admin.admin_keys`. Defaults to a fresh random key. */
@@ -149,7 +153,7 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
   }
 
   const prometheusEnabled = overrides.prometheus ?? true;
-  const adminEnabled = overrides.admin ?? true;
+  const adminEnabled = overrides.admin ?? false;
   const [proxyPort, adminPort, metricsPort] = await pickFreePorts(3);
   const adminKey = overrides.adminKey ?? `admin-${randomUUID()}`;
   const etcdPrefix = `/aisix-e2e-${randomUUID()}`;

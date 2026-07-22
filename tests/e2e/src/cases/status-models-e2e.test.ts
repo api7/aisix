@@ -86,7 +86,9 @@ describe("status/models: etcd mode — equivalence with the admin endpoint", () 
       },
     });
 
-    app = await spawnApp();
+    // Held-back: compares /status/models to /admin/v1/models/status, so it
+    // keeps admin bound (the suite default is now admin-off).
+    app = await spawnApp({ admin: true });
     const seed = new SeedClient(etcd, app.etcdPrefix);
 
     const failPk = await seed.createProviderKey({
@@ -201,6 +203,7 @@ describe("status/models: standalone file source", () => {
 
   beforeAll(async () => {
     app = await spawnApp({
+      admin: true,
       resourcesFile: `
 _format_version: "1"
 provider_keys:
