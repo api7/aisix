@@ -126,7 +126,10 @@ describe("anthropic upstream e2e: OpenAI in, Anthropic out, OpenAI back to calle
 
     const completion = await client.chat.completions.create({
       model: "an-e2e",
-      messages: [{ role: "user", content: "hi" }],
+      messages: [
+        { role: "system", content: "you are terse" },
+        { role: "user", content: "hi" },
+      ],
     });
 
     // Response wire shape: must be OpenAI-shaped on the way out.
@@ -159,11 +162,19 @@ describe("anthropic upstream e2e: OpenAI in, Anthropic out, OpenAI back to calle
     const sentBody = JSON.parse(messagesReq!.body) as {
       model?: string;
       max_tokens?: unknown;
+      system?: unknown;
       messages?: Array<{ role?: string; content?: unknown }>;
     };
     // model_name from the Model resource (Anthropic's id), not the
     // gateway's display_name "an-e2e".
     expect(sentBody.model).toBe("claude-3-5-haiku-20241022");
+    // A plain-string system message must go out in Anthropic's STRING
+    // `system` form — byte-identical to what the gateway has always
+    // sent. The block-array form is reserved for callers that sent
+    // typed blocks themselves (covered by the cache_control scenario
+    // below); flipping plain-text callers to array form would change
+    // the wire bytes for every existing caller.
+    expect(sentBody.system).toBe("you are terse");
     // Anthropic's API requires `max_tokens`; OpenAI's doesn't. The
     // gateway must inject a value when crossing the boundary.
     expect(typeof sentBody.max_tokens).toBe("number");
@@ -499,7 +510,31 @@ describe("anthropic upstream e2e: client cache_control markers survive translati
             { type: "text", text: "conversation history" },
             {
               type: "text",
+              text: "first question",
+              cache_control: { type: "ephemeral" },
+            },
+          ],
+        },
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "text",
+              text: "prior answer",
+              cache_control: { type: "ephemeral" },
+            },
+          ],
+        },
+        {
+          role: "user",
+          content: [
+            {
+              type: "text",
               text: "latest question",
+              // Stray per-part metadata (an OpenAI streaming index
+              // replayed from assembled history) must NOT reach the
+              // strict Anthropic validator.
+              index: 0,
               cache_control: { type: "ephemeral", ttl: "1h" },
             },
           ],
@@ -539,12 +574,31 @@ describe("anthropic upstream e2e: client cache_control markers survive translati
       },
     ]);
 
-    // Message markers: per-block structure preserved (2 blocks stay 2
-    // blocks — a marker means "cache through here", so its position is
-    // the payload), marker on the block the caller marked, TTL intact.
+    // Message markers on EVERY turn, not just the first: per-block
+    // structure preserved (2 blocks stay 2 blocks — a marker means
+    // "cache through here", so its position is the payload), markers on
+    // user AND replayed-assistant turns, TTL intact, and the stray
+    // `index` field stripped before the strict upstream validator.
+    expect(sentBody.messages).toHaveLength(3);
     expect(sentBody.messages?.[0]?.role).toBe("user");
     expect(sentBody.messages?.[0]?.content).toEqual([
       { type: "text", text: "conversation history" },
+      {
+        type: "text",
+        text: "first question",
+        cache_control: { type: "ephemeral" },
+      },
+    ]);
+    expect(sentBody.messages?.[1]?.role).toBe("assistant");
+    expect(sentBody.messages?.[1]?.content).toEqual([
+      {
+        type: "text",
+        text: "prior answer",
+        cache_control: { type: "ephemeral" },
+      },
+    ]);
+    expect(sentBody.messages?.[2]?.role).toBe("user");
+    expect(sentBody.messages?.[2]?.content).toEqual([
       {
         type: "text",
         text: "latest question",
@@ -552,11 +606,17 @@ describe("anthropic upstream e2e: client cache_control markers survive translati
       },
     ]);
 
-    // Tool marker: tool definitions sit first in the prompt-cache
-    // prefix hierarchy; the marker must ride the translated tool.
-    expect(sentBody.tools?.[0]).toMatchObject({
-      name: "get_weather",
-      cache_control: { type: "ephemeral" },
-    });
+    // Tool translation, exact shape: Anthropic's `{name, input_schema}`
+    // — no OpenAI `type`/`function` wrapper riding along (the strict
+    // upstream rejects unknown tool fields), `input_schema` translated
+    // from `parameters`, marker intact. Tool definitions sit first in
+    // the prompt-cache prefix hierarchy.
+    expect(sentBody.tools).toEqual([
+      {
+        name: "get_weather",
+        input_schema: { type: "object", properties: {} },
+        cache_control: { type: "ephemeral" },
+      },
+    ]);
   });
 });

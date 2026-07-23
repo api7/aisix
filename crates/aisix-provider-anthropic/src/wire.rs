@@ -131,17 +131,16 @@ impl<'a> AnthropicMessage<'a> {
     }
 
     /// Message content built from a caller's typed content blocks
-    /// ([`ChatMessage::content_blocks`]): text blocks forward verbatim —
-    /// OpenAI and Anthropic share the `{type:"text", text}` shape, and
-    /// block-level fields the caller attached (notably `cache_control`
-    /// prompt-cache markers) ride along unchanged. Flattening through the
+    /// ([`ChatMessage::content_blocks`]): text blocks map 1:1 — OpenAI
+    /// and Anthropic share the `{type:"text", text}` shape, and the
+    /// block-level fields Anthropic accepts (notably `cache_control`
+    /// prompt-cache markers) ride along in place. Flattening through the
     /// concatenated-text path would silently strip them (AISIX-Cloud#1110
-    /// Gap A). Non-text blocks (images/audio) are skipped — the same
-    /// cross-provider content limitation as the text path. Degrades to a
-    /// single empty text block when nothing survives, because Anthropic
-    /// rejects an empty `content` array.
+    /// Gap A); see [`anthropic_text_blocks`] for the per-block filter.
+    /// Degrades to a single empty text block when nothing survives,
+    /// because Anthropic rejects an empty `content` array.
     pub(crate) fn from_blocks(role: &'a str, blocks: &[serde_json::Value]) -> Self {
-        let mut content = text_blocks_verbatim(blocks);
+        let mut content = anthropic_text_blocks(blocks);
         if content.is_empty() {
             content.push(serde_json::json!({"type": "text", "text": ""}));
         }
@@ -158,8 +157,8 @@ impl<'a> AnthropicMessage<'a> {
     /// prior tool calls before sending the matching tool results; without
     /// translating `tool_calls` here the following `tool_result` would
     /// reference a `tool_use` the upstream never saw and 400. When the
-    /// caller sent typed content blocks, their text blocks forward
-    /// verbatim (preserving `cache_control` markers) instead of the
+    /// caller sent typed content blocks, their text blocks map 1:1
+    /// (preserving `cache_control` markers) instead of the
     /// flattened text. Empty content with no tool calls degrades to an
     /// empty text block so the message isn't dropped (Anthropic rejects
     /// an empty `content` array).
@@ -169,7 +168,7 @@ impl<'a> AnthropicMessage<'a> {
         tool_calls: Option<&[serde_json::Value]>,
     ) -> Self {
         let mut content: Vec<serde_json::Value> = match blocks {
-            Some(blocks) => text_blocks_verbatim(blocks),
+            Some(blocks) => anthropic_text_blocks(blocks),
             None => Vec::new(),
         };
         if content.is_empty() && !text.is_empty() {
@@ -190,15 +189,42 @@ impl<'a> AnthropicMessage<'a> {
 }
 
 /// Forward the `{type:"text", …}` blocks of an OpenAI-shape content
-/// array verbatim onto the Anthropic wire, preserving block-level
-/// fields such as `cache_control`. Non-text blocks are dropped —
-/// callers needing image/audio input on this bridge hit the documented
+/// array onto the Anthropic wire. Two guarantees per block:
+///
+/// * **Marker fidelity** — the fields Anthropic accepts on a text block
+///   (`text`, `cache_control`, `citations`) forward unchanged, so a
+///   caller's prompt-cache markers survive translation with their
+///   block positions intact.
+/// * **Clean-block guarantee** — everything else is dropped, matching
+///   what the flattened-text path always guaranteed: stray caller
+///   metadata (e.g. an OpenAI streaming `index` replayed from assembled
+///   history) 400s at Anthropic's strict request validator, and
+///   degenerate blocks (missing or whitespace-only `text`) are rejected
+///   per-block upstream — both previously vanished in the flatten, so
+///   forwarding them would break requests that worked before.
+///
+/// Non-text blocks (images/audio) are dropped — the documented
 /// cross-provider content limitation, unchanged by this helper.
-fn text_blocks_verbatim(blocks: &[serde_json::Value]) -> Vec<serde_json::Value> {
+fn anthropic_text_blocks(blocks: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    const KEEP: &[&str] = &["type", "text", "cache_control", "citations"];
     blocks
         .iter()
         .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
-        .cloned()
+        .filter(|b| {
+            b.get("text")
+                .and_then(|t| t.as_str())
+                .is_some_and(|t| !t.trim().is_empty())
+        })
+        .map(|b| {
+            let kept: serde_json::Map<String, serde_json::Value> = b
+                .as_object()
+                .into_iter()
+                .flatten()
+                .filter(|(k, _)| KEEP.contains(&k.as_str()))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            serde_json::Value::Object(kept)
+        })
         .collect()
 }
 
@@ -366,7 +392,7 @@ fn build_system(system_msgs: &[&ChatMessage]) -> Option<AnthropicSystem> {
     let blocks: Vec<serde_json::Value> = system_msgs
         .iter()
         .flat_map(|m| match m.content_blocks.as_deref() {
-            Some(blocks) => text_blocks_verbatim(blocks),
+            Some(blocks) => anthropic_text_blocks(blocks),
             None => vec![serde_json::json!({"type": "text", "text": m.content_str()})],
         })
         .collect();
@@ -2234,6 +2260,63 @@ mod tests {
         assert_eq!(
             msgs[0].content,
             vec![serde_json::json!({"type": "text", "text": ""})]
+        );
+    }
+
+    #[test]
+    fn split_system_drops_degenerate_text_blocks_but_keeps_marked_ones() {
+        // Empty / missing-text segments are common from templating code
+        // and vanished in the old flatten; Anthropic rejects them
+        // per-block, so forwarding them would 400 requests that worked
+        // before. They must be filtered while the marked block survives.
+        let req = ChatFormat::new(
+            "claude",
+            vec![block_message(
+                Role::User,
+                serde_json::json!([
+                    {"type": "text", "text": ""},
+                    {"type": "text"},
+                    {"type": "text", "text": "   "},
+                    {"type": "text", "text": "hi",
+                     "cache_control": {"type": "ephemeral"}},
+                ]),
+            )],
+        );
+        let (_system, msgs) = split_system(&req).unwrap();
+        assert_eq!(
+            msgs[0].content,
+            vec![serde_json::json!({
+                "type": "text", "text": "hi",
+                "cache_control": {"type": "ephemeral"},
+            })]
+        );
+    }
+
+    #[test]
+    fn split_system_strips_stray_fields_from_forwarded_blocks() {
+        // Callers built against lax OpenAI-compatible upstreams replay
+        // assembled history carrying per-part metadata (e.g. a
+        // streaming `index`). Anthropic's strict validator rejects
+        // unknown block fields, and the old flatten path absorbed them
+        // — only the fields Anthropic accepts may forward.
+        let req = ChatFormat::new(
+            "claude",
+            vec![block_message(
+                Role::User,
+                serde_json::json!([
+                    {"type": "text", "text": "hi", "index": 0,
+                     "annotations": [],
+                     "cache_control": {"type": "ephemeral"}},
+                ]),
+            )],
+        );
+        let (_system, msgs) = split_system(&req).unwrap();
+        assert_eq!(
+            msgs[0].content,
+            vec![serde_json::json!({
+                "type": "text", "text": "hi",
+                "cache_control": {"type": "ephemeral"},
+            })]
         );
     }
 
