@@ -114,8 +114,9 @@ pub(crate) fn decode_routed_id(id: &str) -> Option<(String, String)> {
 
 /// Charset guard for ids interpolated into upstream URL paths. A decoded
 /// (attacker-suppliable) id must never smuggle path separators or query
-/// metacharacters into the upstream URL.
-fn require_safe_upstream_id(raw: &str) -> Result<(), ProxyError> {
+/// metacharacters into the upstream URL. `pub(crate)`: the videos
+/// surface applies the same guard to decoded upstream task ids.
+pub(crate) fn require_safe_upstream_id(raw: &str) -> Result<(), ProxyError> {
     let ok = !raw.is_empty()
         && raw.len() <= 256
         && raw

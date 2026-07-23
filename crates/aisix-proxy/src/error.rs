@@ -157,6 +157,13 @@ pub enum ProxyError {
     ApiKeyDisabled,
     #[error("model {0:?} not found")]
     ModelNotFound(String),
+    /// A `/v1/videos/{video_id}` id that this gateway could not have
+    /// minted — undecodable, or referencing a Model entry that no longer
+    /// exists in the snapshot. 404, mirroring how the upstream videos
+    /// API treats unknown job ids. The id echoes back verbatim: the
+    /// caller supplied it, so it leaks nothing.
+    #[error("video {0:?} not found")]
+    VideoNotFound(String),
     #[error("API key is not allowed to use model {0:?}")]
     ModelForbidden(String),
     /// The resolved client IP is outside the model's `allowed_cidrs`
@@ -240,6 +247,7 @@ impl ProxyError {
             ProxyError::ModelForbidden(_) => StatusCode::FORBIDDEN,
             ProxyError::ModelIpRestricted(_) => StatusCode::FORBIDDEN,
             ProxyError::ModelNotFound(_) => StatusCode::NOT_FOUND,
+            ProxyError::VideoNotFound(_) => StatusCode::NOT_FOUND,
             ProxyError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
             ProxyError::ProviderUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             ProxyError::AllCandidatesUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
@@ -262,6 +270,7 @@ impl ProxyError {
             ProxyError::ModelForbidden(_) => "permission_denied",
             ProxyError::ModelIpRestricted(_) => "permission_denied",
             ProxyError::ModelNotFound(_) => "model_not_found",
+            ProxyError::VideoNotFound(_) => "video_not_found",
             ProxyError::InvalidRequest(_) => "invalid_request_error",
             ProxyError::RequestTooLarge { .. } => "invalid_request_error",
             ProxyError::ProviderUnavailable => "provider_unavailable",

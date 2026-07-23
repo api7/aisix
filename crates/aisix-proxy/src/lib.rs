@@ -64,6 +64,7 @@ mod stream_timeout;
 mod token_estimate;
 mod usage_attr;
 mod util;
+mod videos;
 
 pub use auth::AuthenticatedKey;
 pub use error::{ErrorEnvelope, ProxyError};
@@ -112,6 +113,13 @@ pub fn build_router(state: ProxyState) -> Router {
         .route("/v1/audio/transcriptions", post(audio::transcriptions))
         .route("/v1/audio/translations", post(audio::translations))
         .route("/v1/audio/speech", post(audio::speech))
+        // Unified video-generation surface (AISIX-Cloud#1118 Phase 1):
+        // submit → poll → fetch. Auth/ACL/quota enforced inside the
+        // handlers; the GET routes are exempt from model-level rate
+        // limits by design (see videos.rs).
+        .route("/v1/videos", post(videos::create_video))
+        .route("/v1/videos/:id", get(videos::get_video))
+        .route("/v1/videos/:id/content", get(videos::video_content))
         // OpenAI Realtime WebSocket relay (#721). Auth/ACL/quota are
         // enforced pre-upgrade inside the handler.
         .route("/v1/realtime", get(realtime::realtime))
