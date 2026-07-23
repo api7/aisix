@@ -18,21 +18,40 @@
 use std::sync::OnceLock;
 use std::time::Duration;
 
-/// Query-parameter names whose values are redacted out of logged URLs.
-/// Vertex/Gemini accept `?key=` and `?access_token=`, and an operator can
-/// put either directly in a ProviderKey `api_base`, so a URL echoed into a
-/// log line can carry live credentials.
-const SENSITIVE_QUERY_PARAMS: &[&str] = &[
+/// Suffixes marking a query parameter whose value is a credential and must
+/// be redacted out of logged URLs. Vertex/Gemini accept `?key=` and
+/// `?access_token=`, and an operator can put either directly in a
+/// ProviderKey `api_base`, so a URL echoed into a log line can carry live
+/// credentials.
+///
+/// Matched as a **suffix** of the parameter name after lowercasing and
+/// stripping `-`/`_`, which covers the vendor-prefixed and punctuation
+/// variants without enumerating them: `api-key` / `api_key` / `apiKey` all
+/// end in `key`; `client_secret` in `secret`; SigV4's `X-Amz-Signature`,
+/// `X-Amz-Security-Token`, and `X-Amz-Credential` in `signature`, `token`,
+/// and `credential`. Over-redacting an unrelated parameter costs a little
+/// diagnostic detail; under-redacting leaks a live key into a log store.
+const SENSITIVE_PARAM_SUFFIXES: &[&str] = &[
     "key",
-    "api_key",
-    "apikey",
-    "access_token",
     "token",
-    "password",
     "secret",
+    "password",
+    "credential",
     "sig",
     "signature",
 ];
+
+/// Whether a query parameter's value is credential material.
+fn is_sensitive_param(name: &str) -> bool {
+    let normalized: String = name
+        .chars()
+        .filter(|c| *c != '-' && *c != '_')
+        .flat_map(|c| c.to_lowercase())
+        .collect();
+    SENSITIVE_PARAM_SUFFIXES
+        .iter()
+        .any(|s| normalized.ends_with(s))
+}
 
 /// Cap on how many `source()` links are walked. Real reqwest/hyper chains
 /// are 3-5 deep; the bound just keeps a pathological cycle from running away.
@@ -179,8 +198,7 @@ fn redact_url(url: &reqwest::Url) -> String {
     let pairs: Vec<(String, String)> = url
         .query_pairs()
         .map(|(k, v)| {
-            let lower = k.to_ascii_lowercase();
-            if SENSITIVE_QUERY_PARAMS.contains(&lower.as_str()) {
+            if is_sensitive_param(&k) {
                 (k.into_owned(), "REDACTED".to_string())
             } else {
                 (k.into_owned(), v.into_owned())
@@ -241,6 +259,50 @@ mod tests {
         assert!(out.contains("x=1"), "{out}");
     }
 
+    /// Suffix matching exists so vendor-prefixed and punctuation variants
+    /// don't have to be enumerated one by one — each of these would have
+    /// slipped through an exact-name denylist.
+    #[test]
+    fn redacts_credential_parameter_aliases() {
+        for name in [
+            "api-key",
+            "api_key",
+            "apiKey",
+            "client_secret",
+            "client-secret",
+            "X-Amz-Signature",
+            "X-Amz-Security-Token",
+            "X-Amz-Credential",
+            "SIG",
+            "refresh_token",
+            "subscription-key",
+        ] {
+            let url = reqwest::Url::parse(&format!("https://h/p?{name}=live-secret-value&keep=1"))
+                .unwrap();
+            let out = redact_url(&url);
+            assert!(
+                !out.contains("live-secret-value"),
+                "{name} was not redacted: {out}"
+            );
+            assert!(out.contains("keep=1"), "{name} over-redacted: {out}");
+        }
+    }
+
+    /// The flip side: parameters that merely look credential-ish must stay
+    /// readable, since they are the diagnostic content of the URL.
+    #[test]
+    fn keeps_non_credential_parameters_readable() {
+        let url = reqwest::Url::parse(
+            "https://h/p?api-version=2024-10-21&alt=sse&keyword=hello&signature_version=4",
+        )
+        .unwrap();
+        let out = redact_url(&url);
+        assert!(out.contains("api-version=2024-10-21"), "{out}");
+        assert!(out.contains("alt=sse"), "{out}");
+        assert!(out.contains("keyword=hello"), "{out}");
+        assert!(out.contains("signature_version=4"), "{out}");
+    }
+
     #[test]
     fn url_without_query_is_untouched() {
         let url = reqwest::Url::parse("https://api.openai.com/v1/chat/completions").unwrap();
@@ -297,11 +359,16 @@ mod tests {
     /// made AISIX-Cloud#1122 undiagnosable from the logs.
     #[tokio::test]
     async fn real_transport_error_names_the_root_cause() {
-        // Port 1 on loopback: nothing listens, so the connect is refused
-        // immediately (no timeout, no external network needed).
+        // Bind an ephemeral loopback port and immediately release it, so the
+        // connect is refused straight away without assuming any fixed port
+        // is free (no timeout, no external network needed).
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        drop(listener);
+
         let client = client_builder().build().expect("client builds");
         let err = client
-            .get("http://127.0.0.1:1/v1/chat/completions")
+            .get(format!("http://{addr}/v1/chat/completions"))
             .send()
             .await
             .expect_err("connect to a closed port must fail");
