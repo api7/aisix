@@ -545,6 +545,7 @@ where
             Ok(r) => r,
             Err(_) => Err(BridgeError::Timeout {
                 elapsed_ms: started.elapsed().as_millis() as u64,
+                cause: String::new(),
             }),
         },
     }
@@ -827,6 +828,7 @@ where
                     Err(_) => {
                         Err(BridgeError::Timeout {
                             elapsed_ms: started.elapsed().as_millis() as u64,
+                            cause: String::new(),
                         })?;
                         unreachable!()
                     }

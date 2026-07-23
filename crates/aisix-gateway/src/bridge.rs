@@ -121,13 +121,32 @@ impl BridgeContext {
     }
 }
 
+/// `": {cause}"` when a transport-layer cause is known, otherwise empty —
+/// keeps the timeout message unchanged for the gateway's own deadlines.
+fn timeout_cause_suffix(cause: &str) -> String {
+    if cause.is_empty() {
+        String::new()
+    } else {
+        format!(": {cause}")
+    }
+}
+
 /// Error surfaced by any Bridge. Each variant maps to a stable
 /// client-visible HTTP status and OpenAI-style error code so the proxy
 /// layer can translate without further inspection.
 #[derive(Debug, thiserror::Error)]
 pub enum BridgeError {
-    #[error("upstream request timed out after {elapsed_ms}ms")]
-    Timeout { elapsed_ms: u64 },
+    /// An upstream call exceeded a time budget.
+    ///
+    /// `cause` names the transport-layer reason when reqwest reported one,
+    /// and is empty when one of the gateway's own deadlines elapsed. Three
+    /// unrelated conditions all satisfy `reqwest::Error::is_timeout()` — a
+    /// `connect_timeout`, hyper's request timeout, and the kernel's own
+    /// `ETIMEDOUT` on an unanswered SYN — so without the cause they render
+    /// as the same sentence and an operator cannot tell "the upstream is
+    /// slow" from "we never reached it" (AISIX-Cloud#1093).
+    #[error("upstream request timed out after {elapsed_ms}ms{}", timeout_cause_suffix(.cause))]
+    Timeout { elapsed_ms: u64, cause: String },
     /// Upstream returned a non-2xx HTTP status. `retry_after` carries
     /// the upstream's `Retry-After` header parsed to a Duration when
     /// present — used by the cooldown layer to honor provider-supplied
@@ -485,7 +504,43 @@ mod tests {
 
     #[test]
     fn timeout_maps_to_504() {
-        let e = BridgeError::Timeout { elapsed_ms: 30_000 };
+        let e = BridgeError::Timeout {
+            cause: String::new(),
+            elapsed_ms: 30_000,
+        };
+        assert_eq!(e.http_status(), 504);
+        assert_eq!(e.error_type(), "timeout");
+    }
+
+    /// A gateway-owned deadline has no transport cause, and its message
+    /// must stay byte-identical to what it was before `cause` existed —
+    /// operators and log queries key on this sentence.
+    #[test]
+    fn timeout_without_cause_renders_unchanged() {
+        let e = BridgeError::Timeout {
+            elapsed_ms: 30_000,
+            cause: String::new(),
+        };
+        assert_eq!(e.to_string(), "upstream request timed out after 30000ms");
+    }
+
+    /// With a transport cause the message names it, so an expired
+    /// `connect_timeout` and an expired request budget stop looking
+    /// identical (AISIX-Cloud#1093).
+    #[test]
+    fn timeout_with_cause_appends_it() {
+        let e = BridgeError::Timeout {
+            elapsed_ms: 5_001,
+            cause: "error sending request: client error (Connect): tcp connect error: \
+                    Connection timed out (os error 110)"
+                .to_string(),
+        };
+        assert_eq!(
+            e.to_string(),
+            "upstream request timed out after 5001ms: error sending request: \
+             client error (Connect): tcp connect error: Connection timed out (os error 110)"
+        );
+        // Status and telemetry class are unaffected by the added detail.
         assert_eq!(e.http_status(), 504);
         assert_eq!(e.error_type(), "timeout");
     }

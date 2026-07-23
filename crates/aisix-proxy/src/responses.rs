@@ -1075,6 +1075,7 @@ async fn responses_to_target(
                                 model.cooldown.as_ref(),
                                 aisix_gateway::BridgeError::Timeout {
                                     elapsed_ms: d.as_millis() as u64,
+                                    cause: String::new(),
                                 },
                             )
                         })

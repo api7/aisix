@@ -1073,7 +1073,10 @@ mod tests {
             &[]
         ));
         assert!(is_retryable(
-            &BridgeError::Timeout { elapsed_ms: 1 },
+            &BridgeError::Timeout {
+                cause: String::new(),
+                elapsed_ms: 1
+            },
             false,
             &[]
         ));

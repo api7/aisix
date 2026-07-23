@@ -4792,7 +4792,14 @@ mod cooldown_tests {
 
     #[test]
     fn default_config_cooldowns_timeout_and_transport_errors() {
-        assert!(decide_cooldown(&BridgeError::Timeout { elapsed_ms: 30_000 }, None).is_some());
+        assert!(decide_cooldown(
+            &BridgeError::Timeout {
+                cause: String::new(),
+                elapsed_ms: 30_000
+            },
+            None
+        )
+        .is_some());
         assert!(decide_cooldown(&BridgeError::Transport("conn refused".into()), None).is_some());
         assert!(decide_cooldown(&BridgeError::StreamAborted, None).is_some());
         assert!(decide_cooldown(&BridgeError::UpstreamDecode("bad json".into()), None).is_some());
@@ -4856,7 +4863,14 @@ mod cooldown_tests {
             trigger_on_timeout: Some(false),
             ..Default::default()
         };
-        assert!(decide_cooldown(&BridgeError::Timeout { elapsed_ms: 1 }, Some(&cfg)).is_none());
+        assert!(decide_cooldown(
+            &BridgeError::Timeout {
+                cause: String::new(),
+                elapsed_ms: 1
+            },
+            Some(&cfg)
+        )
+        .is_none());
     }
 
     #[test]

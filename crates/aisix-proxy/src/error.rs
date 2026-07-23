@@ -320,6 +320,18 @@ impl ProxyError {
         {
             return render_bridge_upstream_envelope(*status, message, parsed.as_deref(), *wire);
         }
+        // A timeout's transport cause names the upstream host and the
+        // connection-layer fault it hit. Same rule as the 5xx body below:
+        // that is operator diagnostics, so it reaches the logs and the
+        // per-attempt telemetry through `Display`, while the caller keeps
+        // the bare sentence it has always had — an `api_base` is internal
+        // topology and does not belong in a customer-facing envelope.
+        if let ProxyError::Bridge(aisix_gateway::BridgeError::Timeout { elapsed_ms, .. }) = self {
+            return ErrorEnvelope::new(
+                format!("upstream request timed out after {elapsed_ms}ms"),
+                self.kind(),
+            );
+        }
         let env = ErrorEnvelope::new(self.to_string(), self.kind());
         match self {
             ProxyError::BudgetExceeded(r) => env.with_code("budget_exceeded").with_budget(r),
@@ -542,6 +554,37 @@ pub(crate) fn proxy_error_from_json_rejection(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// AISIX-Cloud#1093 carries the transport cause on a timeout so an
+    /// operator can tell a `connect_timeout` from an expired request
+    /// budget. That cause names the upstream host, so it must reach the
+    /// logs and telemetry (`Display`) but NOT the caller's envelope —
+    /// same split the 5xx path already enforces.
+    #[test]
+    fn timeout_cause_reaches_logs_but_not_the_caller() {
+        let err = ProxyError::Bridge(aisix_gateway::BridgeError::Timeout {
+            elapsed_ms: 5_002,
+            cause: "error sending request for url (http://10.1.2.3:8080/v1/messages): \
+                    client error (Connect): tcp connect error: deadline has elapsed"
+                .to_string(),
+        });
+
+        // Operator-facing: the full chain, which is what the WARN log line
+        // and the per-attempt `error_message` are built from.
+        let logged = err.to_string();
+        assert!(logged.contains("deadline has elapsed"), "{logged}");
+        assert!(logged.contains("10.1.2.3"), "{logged}");
+
+        // Customer-facing: the bare sentence, byte-identical to what it
+        // was before `cause` existed, with no internal topology in it.
+        let envelope = err.envelope();
+        assert_eq!(
+            envelope.error.message,
+            "upstream request timed out after 5002ms"
+        );
+        assert!(!envelope.error.message.contains("10.1.2.3"));
+        assert_eq!(err.status(), StatusCode::GATEWAY_TIMEOUT);
+    }
 
     #[test]
     fn missing_auth_maps_to_401_invalid_api_key() {
