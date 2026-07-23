@@ -6,13 +6,14 @@
 //!
 //! - System prompt is a top-level `system` field, not a message with
 //!   `role: "system"` — we collapse all leading system messages into one
-//!   string and forward it there.
+//!   string (or an array of text blocks when the caller sent typed
+//!   blocks, so `cache_control` markers survive) and forward it there.
 //! - Only `user` and `assistant` roles on the wire. `tool` messages from
 //!   ChatFormat are rejected at the bridge boundary rather than being
 //!   silently re-classified.
 //! - Content is an array of blocks — we emit a single `{"type":"text",…}`
-//!   block per message and read the concatenation of text blocks on the
-//!   way back.
+//!   block per message (typed caller blocks forward their text blocks
+//!   verbatim) and read the concatenation of text blocks on the way back.
 //! - `max_tokens` is required by Anthropic. We default to a safe ceiling
 //!   when the client didn't set one, but log the fallback so operators
 //!   can tune the default if desired.
@@ -30,13 +31,54 @@ use serde::{Deserialize, Serialize};
 /// enough that a runaway prompt doesn't burn tokens silently.
 pub const DEFAULT_MAX_TOKENS: u32 = 4096;
 
+/// The top-level `system` field — Anthropic accepts a plain string or an
+/// array of text content blocks, documented as equivalent shapes
+/// (<https://docs.anthropic.com/en/api/messages#parameter-system>).
+///
+/// The gateway emits the string form whenever every system message came
+/// in as plain text (byte-identical to what it has always sent), and
+/// switches to the block-array form only when a caller's system message
+/// itself carried typed blocks — whose block-level fields (notably
+/// `cache_control` prompt-cache markers) must survive translation
+/// (AISIX-Cloud#1110 Gap A).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum AnthropicSystem {
+    Text(String),
+    Blocks(Vec<serde_json::Value>),
+}
+
+impl AnthropicSystem {
+    /// Attach a `cache_control` marker to the last system block,
+    /// promoting the string form to a single text block so the marker
+    /// has somewhere to live. Skips an empty/whitespace-only last block
+    /// (a blank system prompt promotes to `{"type":"text","text":""}`),
+    /// which Anthropic rejects with a 400 — see [`is_empty_text_block`].
+    fn mark_last_block(&mut self, marker: serde_json::Value) {
+        if let AnthropicSystem::Text(s) = self {
+            let text = std::mem::take(s);
+            *self =
+                AnthropicSystem::Blocks(vec![serde_json::json!({"type": "text", "text": text})]);
+        }
+        if let AnthropicSystem::Blocks(blocks) = self {
+            if let Some(obj) = blocks
+                .last_mut()
+                .filter(|b| !is_empty_text_block(b))
+                .and_then(|b| b.as_object_mut())
+            {
+                obj.insert("cache_control".into(), marker);
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct AnthropicRequest<'a> {
     pub model: &'a str,
     pub messages: Vec<AnthropicMessage<'a>>,
     pub max_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub system: Option<String>,
+    pub system: Option<AnthropicSystem>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -112,17 +154,48 @@ impl<'a> AnthropicMessage<'a> {
         }
     }
 
+    /// Message content built from a caller's typed content blocks
+    /// ([`ChatMessage::content_blocks`]): text blocks map 1:1 — OpenAI
+    /// and Anthropic share the `{type:"text", text}` shape, and the
+    /// block-level fields Anthropic accepts (notably `cache_control`
+    /// prompt-cache markers) ride along in place. Flattening through the
+    /// concatenated-text path would silently strip them (AISIX-Cloud#1110
+    /// Gap A); see [`anthropic_text_blocks`] for the per-block filter.
+    /// Degrades to a single empty text block when nothing survives,
+    /// because Anthropic rejects an empty `content` array.
+    pub(crate) fn from_blocks(role: &'a str, blocks: &[serde_json::Value]) -> Self {
+        let mut content = anthropic_text_blocks(blocks);
+        if content.is_empty() {
+            content.push(serde_json::json!({"type": "text", "text": ""}));
+        }
+        Self {
+            role,
+            content,
+            _lifetime: std::marker::PhantomData,
+        }
+    }
+
     /// Assistant turn replayed from conversation history, carrying its
     /// text (when any) plus any OpenAI-shape `tool_calls` translated into
     /// Anthropic `tool_use` blocks. An agent loop replays the assistant's
     /// prior tool calls before sending the matching tool results; without
     /// translating `tool_calls` here the following `tool_result` would
-    /// reference a `tool_use` the upstream never saw and 400. Empty text
-    /// with no tool calls degrades to an empty text block so the message
-    /// isn't dropped (Anthropic rejects an empty `content` array).
-    pub(crate) fn assistant(text: &str, tool_calls: Option<&[serde_json::Value]>) -> Self {
-        let mut content: Vec<serde_json::Value> = Vec::new();
-        if !text.is_empty() {
+    /// reference a `tool_use` the upstream never saw and 400. When the
+    /// caller sent typed content blocks, their text blocks map 1:1
+    /// (preserving `cache_control` markers) instead of the
+    /// flattened text. Empty content with no tool calls degrades to an
+    /// empty text block so the message isn't dropped (Anthropic rejects
+    /// an empty `content` array).
+    pub(crate) fn assistant(
+        text: &str,
+        blocks: Option<&[serde_json::Value]>,
+        tool_calls: Option<&[serde_json::Value]>,
+    ) -> Self {
+        let mut content: Vec<serde_json::Value> = match blocks {
+            Some(blocks) => anthropic_text_blocks(blocks),
+            None => Vec::new(),
+        };
+        if content.is_empty() && !text.is_empty() {
             content.push(serde_json::json!({"type": "text", "text": text}));
         }
         if let Some(tcs) = tool_calls {
@@ -137,6 +210,46 @@ impl<'a> AnthropicMessage<'a> {
             _lifetime: std::marker::PhantomData,
         }
     }
+}
+
+/// Forward the `{type:"text", …}` blocks of an OpenAI-shape content
+/// array onto the Anthropic wire. Two guarantees per block:
+///
+/// * **Marker fidelity** — the fields Anthropic accepts on a text block
+///   (`text`, `cache_control`, `citations`) forward unchanged, so a
+///   caller's prompt-cache markers survive translation with their
+///   block positions intact.
+/// * **Clean-block guarantee** — everything else is dropped, matching
+///   what the flattened-text path always guaranteed: stray caller
+///   metadata (e.g. an OpenAI streaming `index` replayed from assembled
+///   history) 400s at Anthropic's strict request validator, and
+///   degenerate blocks (missing or whitespace-only `text`) are rejected
+///   per-block upstream — both previously vanished in the flatten, so
+///   forwarding them would break requests that worked before.
+///
+/// Non-text blocks (images/audio) are dropped — the documented
+/// cross-provider content limitation, unchanged by this helper.
+fn anthropic_text_blocks(blocks: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    const KEEP: &[&str] = &["type", "text", "cache_control", "citations"];
+    blocks
+        .iter()
+        .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+        .filter(|b| {
+            b.get("text")
+                .and_then(|t| t.as_str())
+                .is_some_and(|t| !t.trim().is_empty())
+        })
+        .map(|b| {
+            let kept: serde_json::Map<String, serde_json::Value> = b
+                .as_object()
+                .into_iter()
+                .flatten()
+                .filter(|(k, _)| KEEP.contains(&k.as_str()))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            serde_json::Value::Object(kept)
+        })
+        .collect()
 }
 
 /// Translate an array of OpenAI-shape `tool_calls`
@@ -201,9 +314,13 @@ pub enum TranslateError {
 }
 
 /// Split the gateway's flat ChatFormat into Anthropic's (system, messages)
-/// shape. Consecutive system messages at the head are concatenated with
-/// a blank line, matching how users typically compose multi-paragraph
-/// system prompts in the OpenAI format.
+/// shape. Consecutive plain-text system messages at the head are
+/// concatenated with a blank line into the string form, matching how
+/// users typically compose multi-paragraph system prompts in the OpenAI
+/// format; when any head system message carried typed content blocks,
+/// the whole system prompt switches to Anthropic's block-array form so
+/// block-level fields (`cache_control` prompt-cache markers) survive —
+/// see [`AnthropicSystem`].
 ///
 /// Role::Tool turns translate to Anthropic's `{role:"user", content:
 /// [{type:"tool_result", tool_use_id, content}]}` shape per
@@ -211,8 +328,8 @@ pub enum TranslateError {
 /// (caller sends the tool's output back to the model) round-trips.
 pub fn split_system<'a>(
     req: &'a ChatFormat,
-) -> Result<(Option<String>, Vec<AnthropicMessage<'a>>), TranslateError> {
-    let mut system_parts: Vec<&'a str> = Vec::new();
+) -> Result<(Option<AnthropicSystem>, Vec<AnthropicMessage<'a>>), TranslateError> {
+    let mut system_msgs: Vec<&'a ChatMessage> = Vec::new();
     let mut messages: Vec<AnthropicMessage<'a>> = Vec::new();
     let mut seen_non_system = false;
 
@@ -223,14 +340,14 @@ pub fn split_system<'a>(
                     // System messages interleaved with user/assistant
                     // turns don't map cleanly; append as a user turn to
                     // preserve semantics without silently dropping them.
-                    messages.push(AnthropicMessage::text("user", m.content_str()));
+                    messages.push(user_turn(m));
                 } else {
-                    system_parts.push(m.content_str());
+                    system_msgs.push(m);
                 }
             }
             Role::User => {
                 seen_non_system = true;
-                messages.push(AnthropicMessage::text("user", m.content_str()));
+                messages.push(user_turn(m));
             }
             Role::Assistant => {
                 seen_non_system = true;
@@ -239,7 +356,11 @@ pub fn split_system<'a>(
                     .get("tool_calls")
                     .and_then(|v| v.as_array())
                     .map(Vec::as_slice);
-                messages.push(AnthropicMessage::assistant(m.content_str(), tool_calls));
+                messages.push(AnthropicMessage::assistant(
+                    m.content_str(),
+                    m.content_blocks.as_deref(),
+                    tool_calls,
+                ));
             }
             Role::Tool => {
                 seen_non_system = true;
@@ -252,21 +373,63 @@ pub fn split_system<'a>(
         }
     }
 
-    let system = if system_parts.is_empty() {
-        None
-    } else {
-        Some(system_parts.join("\n\n"))
-    };
     // Fold consecutive same-role turns so the alternating-role invariant
     // Anthropic enforces holds for multi-turn tool loops and parallel
     // tool calls.
-    Ok((system, merge_consecutive_roles(messages)))
+    Ok((
+        build_system(&system_msgs),
+        merge_consecutive_roles(messages),
+    ))
+}
+
+/// A user-role turn: forward typed content blocks verbatim when the
+/// caller sent them (preserving `cache_control` markers), else the
+/// single-text-block shape from the flattened text.
+fn user_turn(m: &ChatMessage) -> AnthropicMessage<'_> {
+    match m.content_blocks.as_deref() {
+        Some(blocks) => AnthropicMessage::from_blocks("user", blocks),
+        None => AnthropicMessage::text("user", m.content_str()),
+    }
+}
+
+/// Collapse the leading system messages into the top-level `system`
+/// field. All-plain-text input keeps the historical `"\n\n"`-joined
+/// string form byte-for-byte; any block-carrying message switches the
+/// whole prompt to the block-array form, plain parts becoming their own
+/// text blocks in order. Falls back to the string form when no text
+/// block survives (e.g. image-only blocks), matching the flattened-text
+/// behavior for that degenerate input.
+fn build_system(system_msgs: &[&ChatMessage]) -> Option<AnthropicSystem> {
+    if system_msgs.is_empty() {
+        return None;
+    }
+    let joined = || {
+        system_msgs
+            .iter()
+            .map(|m| m.content_str())
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    };
+    if system_msgs.iter().all(|m| m.content_blocks.is_none()) {
+        return Some(AnthropicSystem::Text(joined()));
+    }
+    let blocks: Vec<serde_json::Value> = system_msgs
+        .iter()
+        .flat_map(|m| match m.content_blocks.as_deref() {
+            Some(blocks) => anthropic_text_blocks(blocks),
+            None => vec![serde_json::json!({"type": "text", "text": m.content_str()})],
+        })
+        .collect();
+    if blocks.is_empty() {
+        return Some(AnthropicSystem::Text(joined()));
+    }
+    Some(AnthropicSystem::Blocks(blocks))
 }
 
 pub fn build_request<'a>(
     req: &'a ChatFormat,
     upstream_model: &'a str,
-    system: Option<String>,
+    system: Option<AnthropicSystem>,
     messages: Vec<AnthropicMessage<'a>>,
     stream: bool,
 ) -> AnthropicRequest<'a> {
@@ -295,6 +458,91 @@ pub fn build_request<'a>(
         tool_choice,
         extra: extras,
     }
+}
+
+/// Inject a pair of prompt-cache breakpoints into a request that carries
+/// none of its own — one on the last system block, one on the last
+/// content block of the final message — so the stable tools+system
+/// prefix and the whole conversation prefix are cached
+/// (<https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching>).
+///
+/// Standing down entirely when the caller already supplied any
+/// `cache_control` marker (on system, messages, or tools) is deliberate:
+/// it never overrides the caller's own strategy, and it is what keeps the
+/// request within Anthropic's four-breakpoint cap — this function adds at
+/// most two markers, and only to a request that had zero.
+///
+/// `ttl` is the wire value for the injected markers (`5m` or `1h`); `5m`
+/// is emitted as the bare `{"type":"ephemeral"}` Anthropic treats as the
+/// five-minute default. A *below-minimum-length* prompt is a documented
+/// silent no-op upstream, so no length gate is applied — but an *empty*
+/// text block is a different case Anthropic rejects with a 400
+/// (`cache_control cannot be set for empty text blocks`), so the marker
+/// is never attached to one. The empty-text degrade shape is reachable
+/// on the final turn (an image-only user message flattens to a single
+/// `{"type":"text","text":""}` block) and on a blank system prompt.
+pub fn inject_cache_breakpoints(req: &mut AnthropicRequest<'_>, ttl: &str) {
+    if request_has_cache_control(req) {
+        return;
+    }
+    let marker = cache_control_marker(ttl);
+    if let Some(system) = req.system.as_mut() {
+        system.mark_last_block(marker.clone());
+    }
+    if let Some(block) = req
+        .messages
+        .last_mut()
+        .and_then(|m| m.content.last_mut())
+        .filter(|b| !is_empty_text_block(b))
+        .and_then(|b| b.as_object_mut())
+    {
+        block.insert("cache_control".into(), marker);
+    }
+}
+
+/// Whether a content block is a text block with empty or whitespace-only
+/// text. Anthropic rejects `cache_control` on such a block with a 400
+/// (`cache_control cannot be set for empty text blocks`), so the
+/// injector must skip it — it cannot be cached anyway.
+fn is_empty_text_block(block: &serde_json::Value) -> bool {
+    block.get("type").and_then(|t| t.as_str()) == Some("text")
+        && block
+            .get("text")
+            .and_then(|t| t.as_str())
+            .is_none_or(|t| t.trim().is_empty())
+}
+
+/// The marker written by [`inject_cache_breakpoints`]. `1h` carries the
+/// explicit `ttl`; `5m` (and any other value) uses the bare ephemeral
+/// form that defaults to five minutes.
+fn cache_control_marker(ttl: &str) -> serde_json::Value {
+    if ttl == "1h" {
+        serde_json::json!({"type": "ephemeral", "ttl": "1h"})
+    } else {
+        serde_json::json!({"type": "ephemeral"})
+    }
+}
+
+/// Whether the request already carries any caller-supplied `cache_control`
+/// marker on a system block, a message content block, or a tool
+/// definition — the stand-down signal for [`inject_cache_breakpoints`].
+/// The string-form system prompt cannot carry a marker, so only the
+/// block form is scanned.
+fn request_has_cache_control(req: &AnthropicRequest<'_>) -> bool {
+    let system_marked = matches!(&req.system, Some(AnthropicSystem::Blocks(b)) if b.iter().any(block_has_cache_control));
+    system_marked
+        || req
+            .messages
+            .iter()
+            .any(|m| m.content.iter().any(block_has_cache_control))
+        || req
+            .tools
+            .as_ref()
+            .is_some_and(|tools| tools.iter().any(block_has_cache_control))
+}
+
+fn block_has_cache_control(block: &serde_json::Value) -> bool {
+    block.get("cache_control").is_some()
 }
 
 /// Translate the caller's OpenAI-shape `tools` array into
@@ -337,6 +585,20 @@ pub fn translate_openai_tools_to_anthropic(
             // `input_schema` verbatim — both are JSON Schema.
             if let Some(params) = function.get("parameters") {
                 anthropic_tool.insert("input_schema".into(), params.clone());
+            }
+            // Anthropic tools accept a `cache_control` prompt-cache
+            // marker on the tool entry
+            // (<https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching>).
+            // OpenAI-shape callers attach it at the tool's top level or
+            // inside `function`; forward either spelling — tool
+            // definitions sit first in the prompt-cache prefix
+            // hierarchy, so a stripped marker silently disables the
+            // caller's whole caching strategy (AISIX-Cloud#1110 Gap A).
+            if let Some(cc) = t
+                .get("cache_control")
+                .or_else(|| function.get("cache_control"))
+            {
+                anthropic_tool.insert("cache_control".into(), cc.clone());
             }
             Some(serde_json::Value::Object(anthropic_tool))
         })
@@ -1738,8 +2000,10 @@ mod tests {
         );
         let (system, msgs) = split_system(&req).unwrap();
         assert_eq!(
-            system.as_deref(),
-            Some("you are helpful\n\nrespond concisely")
+            system,
+            Some(AnthropicSystem::Text(
+                "you are helpful\n\nrespond concisely".into()
+            ))
         );
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].role, "user");
@@ -1930,6 +2194,481 @@ mod tests {
         assert_eq!(msgs[2].content.len(), 2);
         assert_eq!(msgs[2].content[0]["tool_use_id"], "t1");
         assert_eq!(msgs[2].content[1]["tool_use_id"], "t2");
+    }
+
+    /// Serialize a built request and return the JSON value of its
+    /// `system` field (Value::Null when absent) — the wire shape the
+    /// Anthropic upstream actually sees.
+    fn wire_system(req: &ChatFormat) -> serde_json::Value {
+        let (system, messages) = split_system(req).unwrap();
+        let built = build_request(req, "claude-sonnet-4-5", system, messages, false);
+        serde_json::to_value(&built).unwrap()["system"].clone()
+    }
+
+    /// ChatMessage carrying a typed content-block array, as produced by
+    /// deserializing the OpenAI array-form `content` (blocks land in
+    /// `content_blocks`, concatenated text in `content`).
+    fn block_message(role: Role, blocks: serde_json::Value) -> ChatMessage {
+        let raw = serde_json::json!({"role": role, "content": blocks});
+        serde_json::from_value(raw).unwrap()
+    }
+
+    #[test]
+    fn split_system_plain_system_messages_stay_string_on_the_wire() {
+        // Byte-stability pin: callers sending plain-string system
+        // messages must keep getting the exact string form the gateway
+        // has always emitted — the block-array form is reserved for
+        // callers that themselves sent typed blocks.
+        let req = ChatFormat::new(
+            "claude",
+            vec![
+                ChatMessage::system("you are helpful"),
+                ChatMessage::system("respond concisely"),
+                ChatMessage::user("hi"),
+            ],
+        );
+        assert_eq!(
+            wire_system(&req),
+            serde_json::json!("you are helpful\n\nrespond concisely")
+        );
+    }
+
+    #[test]
+    fn split_system_preserves_cache_control_on_system_blocks() {
+        // A caller marking its system prompt for provider-side prompt
+        // caching sends array-form content with a `cache_control`
+        // marker. The marker must reach the upstream — flattening to
+        // the concatenated string silently strips it and the caller
+        // pays full input price every turn (AISIX-Cloud#1110 Gap A).
+        let req = ChatFormat::new(
+            "claude",
+            vec![
+                block_message(
+                    Role::System,
+                    serde_json::json!([
+                        {"type": "text", "text": "big stable prefix",
+                         "cache_control": {"type": "ephemeral"}},
+                    ]),
+                ),
+                ChatMessage::user("hi"),
+            ],
+        );
+        assert_eq!(
+            wire_system(&req),
+            serde_json::json!([
+                {"type": "text", "text": "big stable prefix",
+                 "cache_control": {"type": "ephemeral"}},
+            ])
+        );
+    }
+
+    #[test]
+    fn split_system_mixed_plain_and_block_system_messages_become_blocks() {
+        // One plain system message + one block-form system message:
+        // the whole system prompt goes to array form, the plain part
+        // becoming its own text block, order preserved.
+        let req = ChatFormat::new(
+            "claude",
+            vec![
+                ChatMessage::system("you are helpful"),
+                block_message(
+                    Role::System,
+                    serde_json::json!([
+                        {"type": "text", "text": "cached tail",
+                         "cache_control": {"type": "ephemeral", "ttl": "1h"}},
+                    ]),
+                ),
+                ChatMessage::user("hi"),
+            ],
+        );
+        assert_eq!(
+            wire_system(&req),
+            serde_json::json!([
+                {"type": "text", "text": "you are helpful"},
+                {"type": "text", "text": "cached tail",
+                 "cache_control": {"type": "ephemeral", "ttl": "1h"}},
+            ])
+        );
+    }
+
+    #[test]
+    fn split_system_preserves_cache_control_on_user_content_blocks() {
+        // Per-block structure must survive: a marker on block 2 of 2
+        // means "cache through here" — concatenating the blocks into
+        // one loses the position along with the marker.
+        let req = ChatFormat::new(
+            "claude",
+            vec![block_message(
+                Role::User,
+                serde_json::json!([
+                    {"type": "text", "text": "conversation so far"},
+                    {"type": "text", "text": "latest turn",
+                     "cache_control": {"type": "ephemeral"}},
+                ]),
+            )],
+        );
+        let (_system, msgs) = split_system(&req).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].role, "user");
+        assert_eq!(msgs[0].content.len(), 2);
+        assert_eq!(msgs[0].content[0]["text"], "conversation so far");
+        assert!(msgs[0].content[0].get("cache_control").is_none());
+        assert_eq!(
+            msgs[0].content[1]["cache_control"],
+            serde_json::json!({"type": "ephemeral"})
+        );
+    }
+
+    #[test]
+    fn split_system_preserves_cache_control_on_assistant_content_blocks() {
+        // Markers on replayed assistant history turns must survive too
+        // — and tool_calls translation still appends its tool_use
+        // blocks after the text blocks.
+        let mut msg = block_message(
+            Role::Assistant,
+            serde_json::json!([
+                {"type": "text", "text": "prior answer",
+                 "cache_control": {"type": "ephemeral"}},
+            ]),
+        );
+        msg.extra.insert(
+            "tool_calls".into(),
+            serde_json::json!([{
+                "id": "t1", "type": "function",
+                "function": {"name": "f", "arguments": "{}"},
+            }]),
+        );
+        let req = ChatFormat::new("claude", vec![ChatMessage::user("hi"), msg]);
+        let (_system, msgs) = split_system(&req).unwrap();
+        assert_eq!(msgs[1].role, "assistant");
+        assert_eq!(msgs[1].content.len(), 2);
+        assert_eq!(
+            msgs[1].content[0]["cache_control"],
+            serde_json::json!({"type": "ephemeral"})
+        );
+        assert_eq!(msgs[1].content[1]["type"], "tool_use");
+    }
+
+    #[test]
+    fn user_message_with_only_non_text_blocks_degrades_to_empty_text_block() {
+        // Image-only content: non-text blocks are skipped on this
+        // bridge (documented cross-provider limitation), and the
+        // message must still carry a non-empty content array —
+        // Anthropic rejects `content: []`.
+        let req = ChatFormat::new(
+            "claude",
+            vec![block_message(
+                Role::User,
+                serde_json::json!([
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,xyz"}},
+                ]),
+            )],
+        );
+        let (_system, msgs) = split_system(&req).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(
+            msgs[0].content,
+            vec![serde_json::json!({"type": "text", "text": ""})]
+        );
+    }
+
+    #[test]
+    fn split_system_drops_degenerate_text_blocks_but_keeps_marked_ones() {
+        // Empty / missing-text segments are common from templating code
+        // and vanished in the old flatten; Anthropic rejects them
+        // per-block, so forwarding them would 400 requests that worked
+        // before. They must be filtered while the marked block survives.
+        let req = ChatFormat::new(
+            "claude",
+            vec![block_message(
+                Role::User,
+                serde_json::json!([
+                    {"type": "text", "text": ""},
+                    {"type": "text"},
+                    {"type": "text", "text": "   "},
+                    {"type": "text", "text": "hi",
+                     "cache_control": {"type": "ephemeral"}},
+                ]),
+            )],
+        );
+        let (_system, msgs) = split_system(&req).unwrap();
+        assert_eq!(
+            msgs[0].content,
+            vec![serde_json::json!({
+                "type": "text", "text": "hi",
+                "cache_control": {"type": "ephemeral"},
+            })]
+        );
+    }
+
+    #[test]
+    fn split_system_strips_stray_fields_from_forwarded_blocks() {
+        // Callers built against lax OpenAI-compatible upstreams replay
+        // assembled history carrying per-part metadata (e.g. a
+        // streaming `index`). Anthropic's strict validator rejects
+        // unknown block fields, and the old flatten path absorbed them
+        // — only the fields Anthropic accepts may forward.
+        let req = ChatFormat::new(
+            "claude",
+            vec![block_message(
+                Role::User,
+                serde_json::json!([
+                    {"type": "text", "text": "hi", "index": 0,
+                     "annotations": [],
+                     "cache_control": {"type": "ephemeral"}},
+                ]),
+            )],
+        );
+        let (_system, msgs) = split_system(&req).unwrap();
+        assert_eq!(
+            msgs[0].content,
+            vec![serde_json::json!({
+                "type": "text", "text": "hi",
+                "cache_control": {"type": "ephemeral"},
+            })]
+        );
+    }
+
+    #[test]
+    fn translate_tools_preserves_cache_control_marker() {
+        // Anthropic tools accept a `cache_control` marker on the tool
+        // entry; OpenAI-shape callers attach it at the tool's top
+        // level (or inside `function`). Both spellings must survive —
+        // tool definitions sit first in the prompt-cache prefix
+        // hierarchy, so a stripped marker silently disables the
+        // caller's whole caching strategy.
+        let tools = serde_json::json!([
+            {"type": "function",
+             "function": {"name": "a", "parameters": {"type": "object"}},
+             "cache_control": {"type": "ephemeral"}},
+            {"type": "function",
+             "function": {"name": "b", "cache_control": {"type": "ephemeral", "ttl": "1h"}}},
+            {"type": "function", "function": {"name": "c"}},
+        ]);
+        let translated = translate_openai_tools_to_anthropic(tools).unwrap();
+        assert_eq!(
+            translated[0]["cache_control"],
+            serde_json::json!({"type": "ephemeral"})
+        );
+        assert_eq!(
+            translated[1]["cache_control"],
+            serde_json::json!({"type": "ephemeral", "ttl": "1h"})
+        );
+        assert!(translated[2].get("cache_control").is_none());
+    }
+
+    /// Build a request from `req`, run injection with `ttl`, and return
+    /// the serialized wire body — what the upstream actually receives.
+    fn injected_wire(req: &ChatFormat, ttl: &str) -> serde_json::Value {
+        let (system, messages) = split_system(req).unwrap();
+        let mut built = build_request(req, "claude-sonnet-4-5", system, messages, false);
+        inject_cache_breakpoints(&mut built, ttl);
+        serde_json::to_value(&built).unwrap()
+    }
+
+    #[test]
+    fn inject_marks_last_system_block_and_final_message_block() {
+        let req = ChatFormat::new(
+            "claude",
+            vec![
+                ChatMessage::system("big stable prefix"),
+                ChatMessage::user("first"),
+                ChatMessage::assistant("answer"),
+                ChatMessage::user("latest"),
+            ],
+        );
+        let wire = injected_wire(&req, "5m");
+        // Plain-string system promotes to a one-block array carrying the
+        // 5m marker (bare ephemeral form).
+        assert_eq!(
+            wire["system"],
+            serde_json::json!([
+                {"type": "text", "text": "big stable prefix",
+                 "cache_control": {"type": "ephemeral"}},
+            ])
+        );
+        // Only the final message's last block is marked; earlier turns
+        // stay clean.
+        let msgs = wire["messages"].as_array().unwrap();
+        assert!(msgs[0]["content"][0].get("cache_control").is_none());
+        let last = msgs.last().unwrap();
+        assert_eq!(last["role"], "user");
+        assert_eq!(
+            last["content"][0]["cache_control"],
+            serde_json::json!({"type": "ephemeral"})
+        );
+    }
+
+    #[test]
+    fn inject_one_hour_ttl_carries_explicit_ttl() {
+        let req = ChatFormat::new("claude", vec![ChatMessage::user("hi")]);
+        let wire = injected_wire(&req, "1h");
+        let msgs = wire["messages"].as_array().unwrap();
+        assert_eq!(
+            msgs[0]["content"][0]["cache_control"],
+            serde_json::json!({"type": "ephemeral", "ttl": "1h"})
+        );
+    }
+
+    #[test]
+    fn inject_with_no_system_marks_only_the_trailing_message() {
+        let req = ChatFormat::new("claude", vec![ChatMessage::user("hi")]);
+        let wire = injected_wire(&req, "5m");
+        assert!(wire.get("system").is_none() || wire["system"].is_null());
+        assert_eq!(
+            wire["messages"][0]["content"][0]["cache_control"],
+            serde_json::json!({"type": "ephemeral"})
+        );
+    }
+
+    #[test]
+    fn inject_stands_down_when_client_marked_a_message_block() {
+        // Client set its own marker → gateway injects nothing, anywhere.
+        let req = ChatFormat::new(
+            "claude",
+            vec![
+                ChatMessage::system("prefix"),
+                block_message(
+                    Role::User,
+                    serde_json::json!([
+                        {"type": "text", "text": "hi",
+                         "cache_control": {"type": "ephemeral"}},
+                    ]),
+                ),
+            ],
+        );
+        let wire = injected_wire(&req, "5m");
+        // System stayed the plain string form (never promoted / marked).
+        assert_eq!(wire["system"], serde_json::json!("prefix"));
+        // The one marker present is the client's; no second one added.
+        assert_eq!(
+            wire["messages"][0]["content"][0]["cache_control"],
+            serde_json::json!({"type": "ephemeral"})
+        );
+    }
+
+    #[test]
+    fn inject_stands_down_when_client_marked_a_tool() {
+        // A marker on a tool definition also suppresses injection — the
+        // stand-down scan covers tools, not just messages/system.
+        let mut req = ChatFormat::new("claude", vec![ChatMessage::user("hi")]);
+        req.extra.insert(
+            "tools".into(),
+            serde_json::json!([{
+                "type": "function",
+                "function": {"name": "f", "parameters": {"type": "object"}},
+                "cache_control": {"type": "ephemeral"},
+            }]),
+        );
+        let wire = injected_wire(&req, "5m");
+        assert!(wire["messages"][0]["content"][0]
+            .get("cache_control")
+            .is_none());
+    }
+
+    #[test]
+    fn inject_skips_empty_text_final_block() {
+        // An image-only final user turn flattens to a single empty text
+        // block (images dropped on this bridge). Anthropic 400s on
+        // cache_control attached to an empty text block, so the injector
+        // must leave it unmarked.
+        let req = ChatFormat::new(
+            "claude",
+            vec![
+                ChatMessage::system("prefix"),
+                block_message(
+                    Role::User,
+                    serde_json::json!([
+                        {"type": "image_url", "image_url": {"url": "data:image/png;base64,xyz"}},
+                    ]),
+                ),
+            ],
+        );
+        let wire = injected_wire(&req, "5m");
+        // System still gets its marker (non-empty), but the degraded
+        // empty final block does not.
+        assert_eq!(
+            wire["system"][0]["cache_control"],
+            serde_json::json!({"type": "ephemeral"})
+        );
+        assert_eq!(
+            wire["messages"][0]["content"][0],
+            serde_json::json!({"type": "text", "text": ""})
+        );
+    }
+
+    #[test]
+    fn inject_skips_blank_system_prompt() {
+        // A whitespace-only system message promotes to an empty text
+        // block; it must not be marked (same 400 hazard).
+        let req = ChatFormat::new(
+            "claude",
+            vec![ChatMessage::system("   "), ChatMessage::user("hi")],
+        );
+        let wire = injected_wire(&req, "5m");
+        // System, if emitted as blocks, carries no marker on the empty
+        // block; the trailing user message still gets one.
+        if let Some(sys) = wire.get("system").filter(|v| v.is_array()) {
+            assert!(sys[0].get("cache_control").is_none());
+        }
+        assert_eq!(
+            wire["messages"][0]["content"][0]["cache_control"],
+            serde_json::json!({"type": "ephemeral"})
+        );
+    }
+
+    #[test]
+    fn inject_marks_only_the_last_block_of_a_multi_block_final_message() {
+        // Final message with several content blocks: only the LAST is
+        // marked (a marker means "cache through here"), earlier blocks
+        // stay clean — guards against marking the first or every block.
+        let req = ChatFormat::new(
+            "claude",
+            vec![block_message(
+                Role::User,
+                serde_json::json!([
+                    {"type": "text", "text": "block A"},
+                    {"type": "text", "text": "block B"},
+                    {"type": "text", "text": "block C"},
+                ]),
+            )],
+        );
+        let wire = injected_wire(&req, "5m");
+        let content = wire["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 3);
+        assert!(content[0].get("cache_control").is_none());
+        assert!(content[1].get("cache_control").is_none());
+        assert_eq!(
+            content[2]["cache_control"],
+            serde_json::json!({"type": "ephemeral"})
+        );
+    }
+
+    #[test]
+    fn inject_appends_marker_to_client_block_form_system() {
+        // Client sent a block-form system with NO marker of its own:
+        // injection marks its last block in place (no string promotion).
+        let req = ChatFormat::new(
+            "claude",
+            vec![
+                block_message(
+                    Role::System,
+                    serde_json::json!([
+                        {"type": "text", "text": "line one"},
+                        {"type": "text", "text": "line two"},
+                    ]),
+                ),
+                ChatMessage::user("hi"),
+            ],
+        );
+        let wire = injected_wire(&req, "5m");
+        let sys = wire["system"].as_array().unwrap();
+        assert_eq!(sys.len(), 2);
+        assert!(sys[0].get("cache_control").is_none());
+        assert_eq!(
+            sys[1]["cache_control"],
+            serde_json::json!({"type": "ephemeral"})
+        );
     }
 
     #[test]

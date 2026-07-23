@@ -21,6 +21,10 @@ import {
 //
 // The assertion is a LOWER bound on elapsed time, which the exponential
 // floor makes non-flaky.
+//
+// The same router is exercised twice — non-streaming and `stream: true` —
+// because the two dispatch loops are written separately in chat.rs and the
+// streaming one used to ignore `retries` outright (AISIX-Cloud#1119).
 
 const CALLER_PLAINTEXT = "sk-retry-backoff-caller";
 const CALLER_KEY_HASH = createHash("sha256")
@@ -128,6 +132,59 @@ describe("retry backoff e2e: same-target retries wait before re-hitting upstream
     // Three attempts to the single target (initial + 2 retries).
     expect(upstream.receivedRequests.length - hitsBefore).toBe(3);
     // ...and the two inter-retry backoffs make it take at least the floor.
+    expect(elapsed).toBeGreaterThanOrEqual(MIN_EXPECTED_MS);
+  });
+
+  // AISIX-Cloud#1119: the streaming dispatch loop walked the target list
+  // once and never read `routing.retries`, so a retryable failure went
+  // straight to fail-over — and with a single target (this router) the
+  // request just failed. Same router, same upstream, `stream: true`: the
+  // attempt count and the backoff floor must match the non-streaming case.
+  test("retries=2 applies to streaming requests too", async (ctx) => {
+    if (!etcdReachable || !app || !upstream) {
+      ctx.skip();
+      return;
+    }
+
+    const client = new OpenAI({
+      apiKey: CALLER_PLAINTEXT,
+      baseURL: `${app.proxyUrl}/v1`,
+      maxRetries: 0,
+    });
+
+    await waitConfigPropagation(async () => {
+      const before = upstream!.receivedRequests.length;
+      try {
+        await client.chat.completions.create({
+          model: "retry-backoff-router",
+          messages: [{ role: "user", content: "probe" }],
+        });
+      } catch {
+        // expected: upstream is always 503.
+      }
+      return upstream!.receivedRequests.length > before;
+    });
+
+    const hitsBefore = upstream.receivedRequests.length;
+    const start = Date.now();
+    let caught: unknown;
+    try {
+      const stream = await client.chat.completions.create({
+        model: "retry-backoff-router",
+        messages: [{ role: "user", content: "drive the streaming retries" }],
+        stream: true,
+      });
+      for await (const _chunk of stream) {
+        // Drain; the upstream never gets far enough to emit one.
+      }
+    } catch (e) {
+      caught = e;
+    }
+    const elapsed = Date.now() - start;
+
+    expect(caught).toBeInstanceOf(APIError);
+    // Pre-fix this was 1: streaming attempted the single target once.
+    expect(upstream.receivedRequests.length - hitsBefore).toBe(3);
     expect(elapsed).toBeGreaterThanOrEqual(MIN_EXPECTED_MS);
   });
 });

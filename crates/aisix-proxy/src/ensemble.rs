@@ -161,6 +161,11 @@ impl ModelCaller for ProxyModelCaller<'_> {
 pub struct PanelOutcome {
     pub model: String,
     pub usage: UsageStats,
+    /// The member's answer text (content + reasoning + tool-call text),
+    /// captured so the dispatch layer can estimate this sub-call's
+    /// completion tokens when the member backend reports no usage
+    /// (AISIX-Cloud#1074). Never billed directly — only a fallback.
+    pub est_output_text: String,
 }
 
 /// Everything the dispatch layer needs after an ensemble run: the judge's
@@ -172,6 +177,12 @@ pub struct EnsembleOutcome {
     pub response: ChatResponse,
     pub panel: Vec<PanelOutcome>,
     pub judge_model: String,
+    /// The judge's synthesis request, kept so the dispatch layer can
+    /// estimate the judge sub-call's prompt tokens when the judge backend
+    /// reports no usage (AISIX-Cloud#1074). The streaming path builds its
+    /// own judge estimator from `run_ensemble_panel`'s `judge_req`; this
+    /// field carries the same request out of the buffered path.
+    pub judge_req: ChatFormat,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -255,6 +266,7 @@ pub(crate) async fn run_ensemble_panel(
                 panel.push(PanelOutcome {
                     model,
                     usage: resp.usage.clone(),
+                    est_output_text: crate::chat::estimation_output_text(&resp),
                 });
                 candidates.push(resp);
             }
@@ -311,6 +323,7 @@ pub async fn run_ensemble(
         response,
         panel,
         judge_model: config.judge.model.clone(),
+        judge_req,
     })
 }
 
@@ -409,6 +422,7 @@ async fn call_with_optional_timeout(
             Ok(result) => result,
             Err(_) => Err(BridgeError::Timeout {
                 elapsed_ms: d.as_millis() as u64,
+                cause: String::new(),
             }),
         },
         None => caller.call(target, req).await,
@@ -626,7 +640,10 @@ mod tests {
             .on(
                 "judge",
                 vec![
-                    Err(BridgeError::Timeout { elapsed_ms: 1 }),
+                    Err(BridgeError::Timeout {
+                        cause: String::new(),
+                        elapsed_ms: 1,
+                    }),
                     ok("judge", "second attempt wins"),
                 ],
             );

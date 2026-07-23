@@ -106,6 +106,7 @@ bytes = "1"
 rand = "0.8"
 regex = "1"
 base64 = "0.22"
+url = "2"
 
 # Crypto (M6 v3 CP register flow + ApiKey hash auth)
 sha2 = "0.10"

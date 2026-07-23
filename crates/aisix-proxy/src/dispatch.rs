@@ -26,18 +26,25 @@ use aisix_gateway::{Bridge, BridgeError, Hub};
 
 /// Map a `reqwest` transport error from a raw-passthrough dispatch
 /// (`/v1/responses`, `/v1/messages` Anthropic, `/v1/messages/count_tokens`)
-/// into the gateway's [`BridgeError`]. A timed-out request (the per-request
-/// `.timeout(model.request_timeout())` budget elapsed) becomes
+/// into the gateway's [`BridgeError`]. A timed-out request becomes
 /// [`BridgeError::Timeout`] so it surfaces as 504, classifies as `"timeout"`
 /// in telemetry, and participates in routing failover exactly like the
 /// Bridge-trait path (#554). Everything else stays a transport error.
+///
+/// `is_timeout()` is satisfied by three unrelated conditions — the
+/// configured request budget expiring in hyper, the `connect_timeout`
+/// expiring, and the kernel returning `ETIMEDOUT` for an unanswered SYN —
+/// so the reqwest cause chain is carried onto the error. Without it all
+/// three render as one sentence and an operator cannot tell a slow
+/// upstream from one that was never reached (AISIX-Cloud#1093).
 pub(crate) fn reqwest_error_to_bridge(e: &reqwest::Error, started: Instant) -> BridgeError {
     if e.is_timeout() {
         BridgeError::Timeout {
             elapsed_ms: started.elapsed().as_millis() as u64,
+            cause: aisix_gateway::transport_error_message(e),
         }
     } else {
-        BridgeError::Transport(e.to_string())
+        BridgeError::Transport(aisix_gateway::transport_error_message(e))
     }
 }
 
@@ -266,6 +273,73 @@ pub(crate) fn require_api_key<'a>(
 mod tests {
     use super::*;
     use aisix_core::resource::ResourceEntry;
+
+    /// AISIX-Cloud#1093: `reqwest::Error::is_timeout()` is satisfied by an
+    /// expired request budget, an expired `connect_timeout`, and the
+    /// kernel's `ETIMEDOUT`. The mapped error must carry the cause chain so
+    /// those are distinguishable — otherwise every one of them renders as
+    /// the same "timed out after Nms" sentence.
+    #[tokio::test]
+    async fn timeout_mapping_carries_the_transport_cause() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(5)))
+            .mount(&server)
+            .await;
+
+        let started = Instant::now();
+        let err = reqwest::Client::new()
+            .post(server.uri())
+            .timeout(std::time::Duration::from_millis(50))
+            .send()
+            .await
+            .expect_err("the 50ms budget must expire against a 5s upstream");
+        assert!(err.is_timeout(), "precondition: reqwest reports a timeout");
+
+        let mapped = reqwest_error_to_bridge(&err, started);
+        match &mapped {
+            BridgeError::Timeout { cause, .. } => {
+                assert!(!cause.is_empty(), "timeout must carry its cause chain");
+            }
+            other => panic!("expected Timeout, got {other:?}"),
+        }
+        // The rendered message keeps the elapsed budget AND names the cause.
+        let rendered = mapped.to_string();
+        assert!(
+            rendered.contains("upstream request timed out"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.len() > "upstream request timed out after 50ms".len(),
+            "cause must widen the message: {rendered}"
+        );
+    }
+
+    /// A non-timeout transport failure still maps to `Transport`, so the
+    /// two stay distinguishable by variant as well as by message.
+    #[tokio::test]
+    async fn non_timeout_transport_error_stays_transport() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let err = reqwest::Client::new()
+            .post(format!("http://{addr}/"))
+            .send()
+            .await
+            .expect_err("connect to a closed port must fail");
+        assert!(!err.is_timeout());
+
+        match reqwest_error_to_bridge(&err, Instant::now()) {
+            BridgeError::Transport(msg) => {
+                assert!(msg.to_lowercase().contains("refused"), "{msg}");
+            }
+            other => panic!("expected Transport, got {other:?}"),
+        }
+    }
 
     fn snapshot_with(provider_key_id: &str) -> AisixSnapshot {
         let snap = AisixSnapshot::new();

@@ -99,3 +99,17 @@ managed:
 
 cache:
   backend: "memory"
+
+# Connection-layer settings for outbound calls to LLM providers. Shown
+# with their defaults; uncomment to override. `pool_idle_timeout_secs`
+# is the one to lower when a load balancer, NAT gateway, or service mesh
+# between this DP and the provider closes idle connections sooner than
+# the gateway expires them — the symptom is intermittent transport
+# errors against an otherwise healthy upstream.
+upstream:
+  # connect_timeout_ms: 5000
+  # tcp_keepalive_secs: 60
+  # tcp_keepalive_interval_secs: 30
+  # tcp_keepalive_retries: 5
+  pool_idle_timeout_secs: 30
+  # pool_max_idle_per_host: 32

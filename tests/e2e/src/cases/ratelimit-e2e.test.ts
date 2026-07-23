@@ -7,6 +7,7 @@ import {
   ProxyClient,
   spawnApp,
   startOpenAiUpstream,
+  awaitWindowHeadroom,
   waitConfigPropagation,
   type OpenAiUpstream,
   type SpawnedApp,
@@ -93,6 +94,10 @@ describe("rate limit e2e: RPM=1 second call gets 429", () => {
       maxRetries: 0,
     });
 
+    // The limiter buckets on fixed wall-clock minutes, so a burst that
+    // straddles a boundary gets a fresh allowance and the 429 assertion
+    // below flaps. Keep the whole burst inside one window.
+    await awaitWindowHeadroom();
     // First call burns the only allowed slot.
     const ok = await client.chat.completions.create({
       model: "rl-e2e",

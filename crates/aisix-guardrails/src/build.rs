@@ -344,6 +344,24 @@ fn build_one_inner(
         GuardrailKind::AliyunTextModeration(_) => {
             Err(BuildError::FeatureDisabled("aliyun-text-moderation"))
         }
+        #[cfg(feature = "aliyun-text-moderation")]
+        GuardrailKind::AliyunAiGuardrail(cfg) => {
+            // #1070: MultiModalGuard dispatcher (Aliyun AI Guardrails — a
+            // different product from TextModerationPlus above, same signing
+            // scheme). cp-api already decrypted the access_key_secret at
+            // projection time; the config carries plaintext.
+            let g = crate::aliyun_ai_guardrail::AliyunAiGuardrail::new(
+                row.name.clone(),
+                cfg,
+                row.hook_point,
+                row.fail_open,
+            );
+            Ok(Some(Arc::new(g)))
+        }
+        #[cfg(not(feature = "aliyun-text-moderation"))]
+        GuardrailKind::AliyunAiGuardrail(_) => {
+            Err(BuildError::FeatureDisabled("aliyun-text-moderation"))
+        }
         #[cfg(feature = "lakera")]
         GuardrailKind::Lakera(cfg) => {
             // #52: HTTP-based /v2/guard dispatcher. cp-api already decrypted

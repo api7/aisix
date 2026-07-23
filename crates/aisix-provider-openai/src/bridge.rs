@@ -148,7 +148,7 @@ impl Default for OpenAiBridge {
 }
 
 fn default_client() -> Client {
-    Client::builder()
+    aisix_gateway::client_builder()
         .user_agent("aisix/0.1")
         .build()
         .unwrap_or_else(|_| Client::new())
@@ -282,6 +282,7 @@ where
             Ok(r) => r,
             Err(_) => Err(BridgeError::Timeout {
                 elapsed_ms: started.elapsed().as_millis() as u64,
+                cause: String::new(),
             }),
         },
     }
@@ -407,7 +408,7 @@ impl Bridge for OpenAiBridge {
                 .json(&body)
                 .send()
                 .await
-                .map_err(|e| BridgeError::Transport(e.to_string()))?;
+                .map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
 
             let status = resp.status();
             if !status.is_success() {
@@ -457,7 +458,7 @@ impl Bridge for OpenAiBridge {
                 .json(&body)
                 .send()
                 .await
-                .map_err(|e| BridgeError::Transport(e.to_string()))?;
+                .map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
 
             let status = resp.status();
             if !status.is_success() {
@@ -514,7 +515,7 @@ impl Bridge for OpenAiBridge {
                 .json(&outbound)
                 .send()
                 .await
-                .map_err(|e| BridgeError::Transport(e.to_string()))?;
+                .map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
 
             let status = resp.status();
             if !status.is_success() {
@@ -569,7 +570,7 @@ impl Bridge for OpenAiBridge {
                 .json(&outbound)
                 .send()
                 .await
-                .map_err(|e| BridgeError::Transport(e.to_string()))?;
+                .map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
 
             let status = resp.status();
             if !status.is_success() {
@@ -616,7 +617,7 @@ impl Bridge for OpenAiBridge {
                 .json(&body)
                 .send()
                 .await
-                .map_err(|e| BridgeError::Transport(e.to_string()))
+                .map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))
         })
         .await?;
 
@@ -668,7 +669,7 @@ where
         let mut stream = Box::pin(byte_stream);
         let mut done_marker_seen = false;
         'outer: while let Some(next) = stream.next().await {
-            let chunk = next.map_err(|e| BridgeError::Transport(e.to_string()))?;
+            let chunk = next.map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
             for event in decoder.feed(chunk.as_ref()) {
                 match event {
                     SseEvent::Done => {

@@ -114,10 +114,15 @@ pub(crate) fn decode_routed_id(id: &str) -> Option<(String, String)> {
 
 /// Charset guard for ids interpolated into upstream URL paths. A decoded
 /// (attacker-suppliable) id must never smuggle path separators or query
-/// metacharacters into the upstream URL.
-fn require_safe_upstream_id(raw: &str) -> Result<(), ProxyError> {
+/// metacharacters into the upstream URL. `pub(crate)`: the videos
+/// surface applies the same guard to decoded upstream task ids.
+pub(crate) fn require_safe_upstream_id(raw: &str) -> Result<(), ProxyError> {
     let ok = !raw.is_empty()
         && raw.len() <= 256
+        // `.` / `..` are valid under the charset but are path-segment
+        // aliases some upstream routers normalise — never forward them.
+        && raw != "."
+        && raw != ".."
         && raw
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'));
@@ -366,7 +371,7 @@ async fn send_upstream(
                 &state.runtime_status,
                 &target.model_entry.id,
                 target.model_entry.value.cooldown.as_ref(),
-                aisix_gateway::BridgeError::Transport(e.to_string()),
+                aisix_gateway::BridgeError::Transport(aisix_gateway::transport_error_message(&e)),
             )
         })
         .map_err(ProxyError::Bridge)?;
@@ -1795,6 +1800,10 @@ mod tests {
             "file#frag",
             "file abc",
             "file&x=1",
+            // Bare path-segment aliases: valid charset, but some
+            // upstream routers normalise them into the parent path.
+            ".",
+            "..",
         ] {
             assert!(
                 require_safe_upstream_id(bad).is_err(),

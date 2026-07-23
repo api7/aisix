@@ -151,7 +151,7 @@ impl Default for AzureOpenAiBridge {
 }
 
 fn default_client() -> Client {
-    Client::builder()
+    aisix_gateway::client_builder()
         .user_agent("aisix/0.1")
         .build()
         .unwrap_or_else(|_| Client::new())
@@ -545,6 +545,7 @@ where
             Ok(r) => r,
             Err(_) => Err(BridgeError::Timeout {
                 elapsed_ms: started.elapsed().as_millis() as u64,
+                cause: String::new(),
             }),
         },
     }
@@ -700,7 +701,7 @@ impl Bridge for AzureOpenAiBridge {
                 .json(&body)
                 .send()
                 .await
-                .map_err(|e| BridgeError::Transport(e.to_string()))?;
+                .map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
 
             let status = resp.status();
             if !status.is_success() {
@@ -757,7 +758,7 @@ impl Bridge for AzureOpenAiBridge {
                 .json(&body)
                 .send()
                 .await
-                .map_err(|e| BridgeError::Transport(e.to_string()))
+                .map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))
         })
         .await?;
 
@@ -828,6 +829,7 @@ where
                     Err(_) => {
                         Err(BridgeError::Timeout {
                             elapsed_ms: d.as_millis() as u64,
+                            cause: String::new(),
                         })?;
                         unreachable!()
                     }
@@ -835,7 +837,7 @@ where
                 None => stream.next().await,
             };
             let Some(next) = next else { break 'outer; };
-            let chunk = next.map_err(|e| BridgeError::Transport(e.to_string()))?;
+            let chunk = next.map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
             for event in decoder.feed(chunk.as_ref()) {
                 match event {
                     SseEvent::Done => {

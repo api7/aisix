@@ -696,6 +696,7 @@ mod tests {
                 "azure_content_safety",
                 "azure_content_safety_text_moderation",
                 "aliyun_text_moderation",
+                "aliyun_ai_guardrail",
                 "bedrock",
                 "lakera",
                 "openai_moderation",

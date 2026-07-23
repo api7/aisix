@@ -24,8 +24,8 @@ use reqwest::{header, Client, StatusCode};
 use std::time::{Duration, Instant};
 
 use crate::wire::{
-    build_request, response_into_chat_response, split_system, AnthropicResponse,
-    AnthropicStreamEvent, StreamState,
+    build_request, inject_cache_breakpoints, response_into_chat_response, split_system,
+    AnthropicResponse, AnthropicStreamEvent, StreamState,
 };
 
 /// Matches the API header that Anthropic bakes backwards-compat into.
@@ -68,7 +68,7 @@ impl Default for AnthropicBridge {
 }
 
 fn default_client() -> Client {
-    Client::builder()
+    aisix_gateway::client_builder()
         .user_agent("aisix/0.1")
         .build()
         .unwrap_or_else(|_| Client::new())
@@ -171,6 +171,25 @@ fn upstream_model(ctx: &BridgeContext) -> Result<&str, BridgeError> {
         .ok_or_else(|| BridgeError::InvalidUpstreamConfig("model.model_name missing".into()))
 }
 
+/// Apply the Model's `auto_prompt_caching` setting to the outbound
+/// request. A no-op unless the operator enabled it; the wire-level
+/// stand-down (a caller who set their own markers wins) lives in
+/// [`inject_cache_breakpoints`]. Shared by the streaming and
+/// non-streaming paths so they can't drift.
+fn maybe_inject_cache_breakpoints(
+    body: &mut crate::wire::AnthropicRequest<'_>,
+    ctx: &BridgeContext,
+) {
+    if let Some(apc) = ctx
+        .model
+        .auto_prompt_caching
+        .as_ref()
+        .filter(|apc| apc.enabled)
+    {
+        inject_cache_breakpoints(body, apc.ttl_or_default().as_wire_str());
+    }
+}
+
 async fn map_http_error(status: StatusCode, resp: reqwest::Response) -> BridgeError {
     aisix_gateway::capture_upstream_error_http(
         status,
@@ -226,6 +245,7 @@ where
             Ok(r) => r,
             Err(_) => Err(BridgeError::Timeout {
                 elapsed_ms: started.elapsed().as_millis() as u64,
+                cause: String::new(),
             }),
         },
     }
@@ -248,7 +268,8 @@ impl Bridge for AnthropicBridge {
 
         let (system, messages) =
             split_system(req).map_err(|e| BridgeError::InvalidUpstreamConfig(e.to_string()))?;
-        let body = build_request(req, upstream, system, messages, false);
+        let mut body = build_request(req, upstream, system, messages, false);
+        maybe_inject_cache_breakpoints(&mut body, ctx);
         let url = format!("{base}/v1/messages");
         let client = self.client.clone();
         let api_version = self.api_version;
@@ -265,7 +286,7 @@ impl Bridge for AnthropicBridge {
                 .json(&body)
                 .send()
                 .await
-                .map_err(|e| BridgeError::Transport(e.to_string()))?;
+                .map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
 
             let status = resp.status();
             if !status.is_success() {
@@ -292,7 +313,8 @@ impl Bridge for AnthropicBridge {
 
         let (system, messages) =
             split_system(req).map_err(|e| BridgeError::InvalidUpstreamConfig(e.to_string()))?;
-        let body = build_request(req, upstream, system, messages, true);
+        let mut body = build_request(req, upstream, system, messages, true);
+        maybe_inject_cache_breakpoints(&mut body, ctx);
         let url = format!("{base}/v1/messages");
         let client = self.client.clone();
         let api_version = self.api_version;
@@ -310,7 +332,7 @@ impl Bridge for AnthropicBridge {
                 .json(&body)
                 .send()
                 .await
-                .map_err(|e| BridgeError::Transport(e.to_string()))
+                .map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))
         })
         .await?;
 
@@ -337,7 +359,7 @@ where
         let mut state = StreamState::default();
 
         while let Some(next) = stream.next().await {
-            let chunk = next.map_err(|e| BridgeError::Transport(e.to_string()))?;
+            let chunk = next.map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
             for event in decoder.feed(chunk.as_ref()) {
                 let SseEvent::Data(payload) = event else { continue };
                 let parsed: AnthropicStreamEvent = serde_json::from_str(&payload)
@@ -386,6 +408,135 @@ mod tests {
 
     fn sample_ctx(base: &str) -> BridgeContext {
         BridgeContext::new("req-1", sample_model(), sample_provider_key(base))
+    }
+
+    /// A ctx whose Model has `auto_prompt_caching` set to the given JSON
+    /// (e.g. `{"enabled":true,"ttl":"1h"}` or `{"enabled":false}`).
+    fn caching_ctx(base: &str, apc: serde_json::Value) -> BridgeContext {
+        let model: Model = serde_json::from_value(serde_json::json!({
+            "display_name": "my-claude",
+            "provider": "anthropic",
+            "model_name": "claude-sonnet-4-5",
+            "provider_key_id": "11111111-1111-1111-1111-111111111111",
+            "auto_prompt_caching": apc,
+        }))
+        .unwrap();
+        BridgeContext::new("req-1", Arc::new(model), sample_provider_key(base))
+    }
+
+    /// Capture the single body the bridge POSTed to the mock upstream.
+    async fn captured_body(server: &MockServer) -> serde_json::Value {
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 1, "expected exactly one upstream request");
+        serde_json::from_slice(&reqs[0].body).unwrap()
+    }
+
+    /// Mount a minimal non-streaming 200 so `chat` completes.
+    async fn mount_ok_nonstream(server: &MockServer) {
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "msg_x", "type": "message", "role": "assistant",
+                "model": "claude-sonnet-4-5",
+                "content": [{"type": "text", "text": "ok"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            })))
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn non_streaming_injects_breakpoints_when_enabled() {
+        let server = MockServer::start().await;
+        mount_ok_nonstream(&server).await;
+        let ctx = caching_ctx(
+            &server.uri(),
+            serde_json::json!({"enabled": true, "ttl": "1h"}),
+        );
+        // req() is system("you are helpful") + user("hi") — no markers.
+        AnthropicBridge::new().chat(&req(), &ctx).await.unwrap();
+
+        let body = captured_body(&server).await;
+        assert_eq!(
+            body["system"],
+            serde_json::json!([
+                {"type": "text", "text": "you are helpful",
+                 "cache_control": {"type": "ephemeral", "ttl": "1h"}},
+            ])
+        );
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(
+            msgs.last().unwrap()["content"]
+                .as_array()
+                .unwrap()
+                .last()
+                .unwrap()["cache_control"],
+            serde_json::json!({"type": "ephemeral", "ttl": "1h"})
+        );
+    }
+
+    #[tokio::test]
+    async fn non_streaming_does_not_inject_when_disabled() {
+        // Field present but enabled:false must inject nothing — distinct
+        // from the field-absent case sample_ctx covers.
+        let server = MockServer::start().await;
+        mount_ok_nonstream(&server).await;
+        let ctx = caching_ctx(&server.uri(), serde_json::json!({"enabled": false}));
+        AnthropicBridge::new().chat(&req(), &ctx).await.unwrap();
+
+        let body = captured_body(&server).await;
+        // Plain-string system, no markers anywhere.
+        assert_eq!(body["system"], serde_json::json!("you are helpful"));
+        assert!(body["messages"][0]["content"][0]
+            .get("cache_control")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn streaming_injects_breakpoints_when_enabled() {
+        // The streaming path must inject identically to the
+        // non-streaming path (handler-families lockstep). Capture the
+        // outbound body, not just the streamed chunks.
+        let server = MockServer::start().await;
+        let sse = "\
+event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"model\":\"claude-sonnet-4-5\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":1}}}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n";
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&server)
+            .await;
+        let ctx = caching_ctx(
+            &server.uri(),
+            serde_json::json!({"enabled": true, "ttl": "1h"}),
+        );
+        let mut stream = AnthropicBridge::new()
+            .chat_stream(&req(), &ctx)
+            .await
+            .unwrap();
+        while stream.next().await.is_some() {}
+
+        let body = captured_body(&server).await;
+        assert_eq!(
+            body["system"][0]["cache_control"],
+            serde_json::json!({"type": "ephemeral", "ttl": "1h"})
+        );
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(
+            msgs.last().unwrap()["content"]
+                .as_array()
+                .unwrap()
+                .last()
+                .unwrap()["cache_control"],
+            serde_json::json!({"type": "ephemeral", "ttl": "1h"})
+        );
     }
 
     fn req() -> ChatFormat {

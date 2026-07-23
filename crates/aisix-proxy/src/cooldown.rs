@@ -161,7 +161,14 @@ mod tests {
         };
         assert!(decide_cooldown(&upstream(429), Some(&cfg)).is_none());
         assert!(decide_cooldown(&upstream(503), Some(&cfg)).is_none());
-        assert!(decide_cooldown(&BridgeError::Timeout { elapsed_ms: 1 }, Some(&cfg)).is_none());
+        assert!(decide_cooldown(
+            &BridgeError::Timeout {
+                cause: String::new(),
+                elapsed_ms: 1
+            },
+            Some(&cfg)
+        )
+        .is_none());
     }
 
     #[test]

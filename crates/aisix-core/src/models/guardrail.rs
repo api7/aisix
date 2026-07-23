@@ -339,6 +339,87 @@ fn default_aliyun_risk_level_threshold() -> String {
     "high".to_owned()
 }
 
+/// Config block for `kind: "aliyun_ai_guardrail"`. Calls Aliyun's AI
+/// Guardrails product (AI 安全护栏, action `MultiModalGuard`, version
+/// `2022-03-02`) on the `green-cip.<region>.aliyuncs.com` endpoint for
+/// policy-driven moderation on input and/or output (including streaming
+/// output).
+///
+/// A DIFFERENT Aliyun product from `aliyun_text_moderation`
+/// (TextModerationPlus / Content Moderation): AI Guardrails is activated,
+/// billed, and policy-configured separately (commodity
+/// `lvwang_guardrail_public_cn`), and its calls appear in the AI
+/// Guardrails console. The input hook uses the `query_security_check_pro`
+/// service code (`query_security_check` at `service_level: "basic"`), the
+/// output hook `response_security_check_pro` / `response_security_check`.
+///
+/// Verdicts follow the returned `Data.Suggestion`, which Aliyun computes
+/// from the check/block policies configured in its console — there is no
+/// local risk threshold. `block` blocks; anything else passes (detection
+/// detail lands in logs/telemetry).
+///
+/// Only `access_key_secret` is a secret (decrypted by cp-api before kine
+/// projection. It is plaintext in DP memory only and never logged). Every
+/// other field travels in the clear.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AliyunAiGuardrailConfig {
+    /// Aliyun region the guardrail lives in, e.g. `cn-shanghai`. The data plane
+    /// builds the endpoint `https://green-cip.<region>.aliyuncs.com`.
+    #[schemars(length(min = 1))]
+    pub region: String,
+    /// Explicit endpoint override as a full URL with no trailing slash. When set, it takes precedence over `region`.
+    #[serde(default)]
+    #[schemars(length(min = 1))]
+    pub endpoint: Option<String>,
+    /// Aliyun AccessKey ID.
+    #[schemars(length(min = 1))]
+    pub access_key_id: String,
+    /// Aliyun AccessKey secret. Decrypted before projection. Plaintext is held
+    /// in memory only and is not logged. Used to sign the request.
+    #[schemars(length(min = 1))]
+    pub access_key_secret: String,
+    /// Which AI Guardrails service tier to call: `pro` uses
+    /// `query_security_check_pro` / `response_security_check_pro`, `basic`
+    /// uses `query_security_check` / `response_security_check`. Must match
+    /// the tier activated on the Aliyun account.
+    #[serde(default = "default_aliyun_aig_service_level")]
+    pub service_level: String,
+    /// HTTP call timeout in milliseconds. `fail_open` and `output_fail_open`
+    /// govern the verdict when it elapses. A value of `0` triggers the timeout
+    /// immediately.
+    #[serde(default = "default_acs_timeout_ms")]
+    #[schemars(range(max = 4_294_967_295u32))]
+    pub timeout_ms: u32,
+    /// Fail-open policy for the output hook. When disabled, an Aliyun outage does not release unscanned model output.
+    #[serde(default)]
+    pub output_fail_open: bool,
+
+    // --- streaming-output controls (consumed by aisix-proxy build_sse_stream) ---
+    /// Streaming output moderation mode: sliding-window incremental release
+    /// or whole-response hold-back.
+    #[serde(default = "default_acs_stream_processing_mode")]
+    pub stream_processing_mode: String,
+    /// Sliding-window size in characters when window mode is used. Aliyun limits each MultiModalGuard call to 2,000 characters of text.
+    #[serde(default = "default_aliyun_window_size")]
+    #[schemars(range(min = 1, max = 2_000))]
+    pub window_size: u32,
+    /// Chars carried between windows so a span split across a boundary is still caught.
+    #[serde(default = "default_aliyun_window_overlap_size")]
+    pub window_overlap_size: u32,
+    /// Max bytes buffered in `buffer_full` mode before `on_buffer_exceeded` applies.
+    #[serde(default = "default_acs_max_buffer_bytes")]
+    #[schemars(range(min = 1))]
+    pub max_buffer_bytes: u64,
+    /// Buffer-overflow policy for streamed output when the buffer cap is hit.
+    #[serde(default = "default_acs_on_buffer_exceeded")]
+    pub on_buffer_exceeded: String,
+}
+
+fn default_aliyun_aig_service_level() -> String {
+    "pro".to_owned()
+}
+
 /// One built-in detector selection for `kind: "pii"`. The `type` names the
 /// detector to enable; `action` optionally overrides the guardrail-level
 /// `default_action` for this detector only.
@@ -662,6 +743,11 @@ pub enum GuardrailKind {
     /// `TextModerationPlus` action on `green-cip.<region>.aliyuncs.com`, on
     /// input and/or output, including streaming output.
     AliyunTextModeration(AliyunTextModerationConfig),
+    /// Aliyun AI Guardrails (AI 安全护栏). Policy-driven moderation via the
+    /// `MultiModalGuard` action on `green-cip.<region>.aliyuncs.com`; the
+    /// verdict follows the console-configured policy's `Suggestion`. On
+    /// input and/or output, including streaming output.
+    AliyunAiGuardrail(AliyunAiGuardrailConfig),
     /// Built-in sensitive-data detection and redaction inside AISIX. Built-in
     /// detectors and custom regex patterns can mask matched spans or block
     /// traffic on input, output, or both, including buffered streaming output.
@@ -696,6 +782,7 @@ impl GuardrailKind {
                 "azure_content_safety_text_moderation"
             }
             GuardrailKind::AliyunTextModeration(_) => "aliyun_text_moderation",
+            GuardrailKind::AliyunAiGuardrail(_) => "aliyun_ai_guardrail",
             GuardrailKind::Pii(_) => "pii",
             GuardrailKind::Lakera(_) => "lakera",
             GuardrailKind::OpenaiModeration(_) => "openai_moderation",
@@ -1257,6 +1344,68 @@ mod tests {
                 assert_eq!(c.window_overlap_size, 0, "explicit 0 overlap must survive");
             }
             _ => panic!("expected AliyunTextModeration variant"),
+        }
+    }
+
+    #[test]
+    fn aliyun_ai_guardrail_kind_parses_with_defaults() {
+        // cp-api omits unset fields (omitempty); the DP must apply the
+        // documented defaults so a minimal row still moderates correctly.
+        let v = json!({
+            "name": "aig-guard",
+            "kind": "aliyun_ai_guardrail",
+            "region": "cn-shanghai",
+            "access_key_id": "LTAI_EXAMPLE",
+            "access_key_secret": "PLAINTEXT_FOR_TEST"
+        });
+        let g: Guardrail = serde_json::from_value(v).unwrap();
+        match g.config {
+            GuardrailKind::AliyunAiGuardrail(ref c) => {
+                assert_eq!(c.region, "cn-shanghai");
+                assert_eq!(c.access_key_id, "LTAI_EXAMPLE");
+                assert_eq!(c.access_key_secret, "PLAINTEXT_FOR_TEST");
+                assert_eq!(c.endpoint, None);
+                assert_eq!(c.service_level, "pro");
+                assert_eq!(c.timeout_ms, 5_000);
+                assert!(!c.output_fail_open);
+                assert_eq!(c.stream_processing_mode, "window");
+                assert_eq!(c.window_size, 2_000);
+                assert_eq!(c.window_overlap_size, 128);
+                assert_eq!(c.max_buffer_bytes, 262_144);
+                assert_eq!(c.on_buffer_exceeded, "fail_closed");
+            }
+            _ => panic!("expected AliyunAiGuardrail variant"),
+        }
+    }
+
+    #[test]
+    fn aliyun_ai_guardrail_kind_round_trips_set_fields() {
+        let v = json!({
+            "name": "aig-guard",
+            "kind": "aliyun_ai_guardrail",
+            "region": "cn-beijing",
+            "endpoint": "http://127.0.0.1:8080",
+            "access_key_id": "id",
+            "access_key_secret": "secret",
+            "service_level": "basic",
+            "timeout_ms": 3000,
+            "output_fail_open": true,
+            "stream_processing_mode": "buffer_full",
+            "window_size": 1000,
+            "window_overlap_size": 0
+        });
+        let g: Guardrail = serde_json::from_value(v).unwrap();
+        match g.config {
+            GuardrailKind::AliyunAiGuardrail(ref c) => {
+                assert_eq!(c.endpoint.as_deref(), Some("http://127.0.0.1:8080"));
+                assert_eq!(c.service_level, "basic");
+                assert_eq!(c.timeout_ms, 3000);
+                assert!(c.output_fail_open);
+                assert_eq!(c.stream_processing_mode, "buffer_full");
+                assert_eq!(c.window_size, 1000);
+                assert_eq!(c.window_overlap_size, 0, "explicit 0 overlap must survive");
+            }
+            _ => panic!("expected AliyunAiGuardrail variant"),
         }
     }
 

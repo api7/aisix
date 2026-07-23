@@ -505,6 +505,7 @@ fn map_sdk_error(
             };
             BridgeError::Timeout {
                 elapsed_ms: reported,
+                cause: String::new(),
             }
         }
         SdkError::DispatchFailure(_) => BridgeError::Transport("upstream dispatch failed".into()),
@@ -1501,6 +1502,7 @@ where
         if started.elapsed() >= d {
             return BridgeError::Timeout {
                 elapsed_ms: started.elapsed().as_millis() as u64,
+                cause: String::new(),
             };
         }
     }
@@ -1508,6 +1510,7 @@ where
         SdkError::ServiceError(svc) => bedrock_service_error_to_upstream_status(svc),
         SdkError::TimeoutError(_) => BridgeError::Timeout {
             elapsed_ms: started.elapsed().as_millis() as u64,
+            cause: String::new(),
         },
         other => BridgeError::Transport(format!("{other}")),
     }

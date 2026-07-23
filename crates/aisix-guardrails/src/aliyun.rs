@@ -386,7 +386,7 @@ impl AliyunTextModerationGuardrail {
 ///
 /// Only ever held transiently to pull one symbolic token out; nothing of it is
 /// logged.
-const MAX_ERROR_BODY_PARSE_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_ERROR_BODY_PARSE_BYTES: usize = 64 * 1024;
 
 /// Best-effort pull of the error `Code` out of an Aliyun error body.
 ///
@@ -400,7 +400,7 @@ const MAX_ERROR_BODY_PARSE_BYTES: usize = 64 * 1024;
 /// The XML arm is a substring scan rather than a parser: one tag out of a
 /// fixed vendor envelope doesn't justify an XML dependency, and a wrong guess
 /// costs a blank log field, not a leak.
-fn extract_error_code(body: &str) -> String {
+pub(crate) fn extract_error_code(body: &str) -> String {
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
         if let Some(code) = v.get("Code") {
             // A string on this path; render a stray number rather than drop it.
@@ -436,7 +436,7 @@ fn risk_rank(level: &str) -> u8 {
 /// (uppercase). Space → `%20`. (Aliyun additionally maps `+`→`%20`,
 /// `*`→`%2A`, `%7E`→`~`; we never emit `+` or a literal `*`, and `~` is
 /// already unreserved, so encoding each non-unreserved byte covers it.)
-fn percent_encode(s: &str) -> String {
+pub(crate) fn percent_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len() * 3);
     for b in s.bytes() {
         match b {
@@ -455,7 +455,7 @@ fn percent_encode(s: &str) -> String {
 /// Build the RPC v1 `StringToSign` from the (already key-sorted) params.
 /// Factored out so the canonicalization is unit-testable independent of
 /// the HMAC step.
-fn string_to_sign(params: &std::collections::BTreeMap<&str, String>) -> String {
+pub(crate) fn string_to_sign(params: &std::collections::BTreeMap<&str, String>) -> String {
     let mut canonical = String::new();
     for (k, v) in params {
         if !canonical.is_empty() {
@@ -473,7 +473,10 @@ fn string_to_sign(params: &std::collections::BTreeMap<&str, String>) -> String {
 }
 
 /// Compute the RPC v1 signature: `Base64(HMAC-SHA1(secret + "&", StringToSign))`.
-fn sign(params: &std::collections::BTreeMap<&str, String>, access_key_secret: &str) -> String {
+pub(crate) fn sign(
+    params: &std::collections::BTreeMap<&str, String>,
+    access_key_secret: &str,
+) -> String {
     let sts = string_to_sign(params);
     let key = format!("{access_key_secret}&");
     let mut mac =
@@ -485,7 +488,7 @@ fn sign(params: &std::collections::BTreeMap<&str, String>, access_key_secret: &s
 /// Failure cause buckets. `bypass_tag()` maps to the strings stored in
 /// `usage_events.guardrail_bypassed_reason`.
 #[derive(Debug)]
-enum AliyunFailure {
+pub(crate) enum AliyunFailure {
     Timeout,
     Throttled,
     IoError,
@@ -499,7 +502,7 @@ enum AliyunFailure {
 }
 
 impl AliyunFailure {
-    fn bypass_tag(&self) -> &'static str {
+    pub(crate) fn bypass_tag(&self) -> &'static str {
         match self {
             Self::Timeout => "aliyun_timeout",
             Self::Throttled => "aliyun_throttled",
@@ -516,7 +519,7 @@ impl AliyunFailure {
 /// XML rather than JSON. It is therefore a strictly more reliable source
 /// for the id than the body's `RequestId`, which is unreachable exactly
 /// when the body doesn't parse.
-const ACS_REQUEST_ID_HEADER: &str = "x-acs-request-id";
+pub(crate) const ACS_REQUEST_ID_HEADER: &str = "x-acs-request-id";
 
 /// What one `TextModerationPlus` call reported about itself, for operator
 /// triage (AISIX-Cloud#1060).
@@ -970,6 +973,8 @@ mod tests {
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = ()>,
     {
+        // One capture test at a time, process-wide (see TRACING_CAPTURE_LOCK).
+        let _capture_guard = crate::TRACING_CAPTURE_LOCK.lock().await;
         let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let subscriber = tracing_subscriber::fmt()
             .with_ansi(false)

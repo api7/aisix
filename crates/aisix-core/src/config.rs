@@ -61,6 +61,12 @@ pub struct Config {
     /// one global window instead of one-per-replica (api7/AISIX-Cloud#798).
     #[serde(default)]
     pub ratelimit: RateLimitConfig,
+    /// Connection-layer tuning for outbound calls to LLM providers.
+    /// Defaults bound the connect phase, keep TCP keepalive on, and expire
+    /// pooled connections well before a typical LB/NAT/proxy hop would —
+    /// see [`UpstreamConfig`].
+    #[serde(default)]
+    pub upstream: UpstreamConfig,
     /// Optional managed-mode configuration. When `managed.enabled = true`
     /// the admin API and Playground endpoints are **not** bound — the DP
     /// is a pure etcd reader driven by the aisix.cloud control plane.
@@ -755,6 +761,56 @@ pub enum RateLimitBackend {
     Redis,
 }
 
+/// Connection-layer settings for the HTTP clients that call LLM providers.
+///
+/// These are deployment properties of the network path to the upstream, not
+/// per-tenant configuration, so they live in the DP config file rather than
+/// on a Model or ProviderKey resource.
+///
+/// The defaults exist because reqwest's own are wrong for a gateway sitting
+/// behind an LB/NAT/proxy hop: no connect timeout, TCP keepalive off, and a
+/// 90s pooled-connection lifetime that outlives the idle timeout of a
+/// typical hop — so a connection reaped upstream can still be handed out
+/// here, and the request fails with an opaque transport error.
+///
+/// Every duration accepts `0` to disable that individual knob.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct UpstreamConfig {
+    /// Max time for DNS + TCP + TLS before an attempt fails. Without it a
+    /// black-holed upstream is bounded only by the model's overall timeout.
+    pub connect_timeout_ms: u64,
+    /// Idle seconds before the kernel sends its first TCP keepalive probe.
+    /// Keeps a long wait for a slow first token from being reaped by a NAT
+    /// or LB idle timer.
+    pub tcp_keepalive_secs: u64,
+    /// Seconds between subsequent keepalive probes.
+    pub tcp_keepalive_interval_secs: u64,
+    /// Unacknowledged probes before the kernel drops the connection.
+    pub tcp_keepalive_retries: u32,
+    /// How long an idle connection may sit in the pool before it is
+    /// discarded. **Keep this below the shortest idle timeout on the path
+    /// to the provider** (LB, NAT gateway, corporate proxy, service mesh),
+    /// or the pool will hand out connections the far end already closed.
+    pub pool_idle_timeout_secs: u64,
+    /// Cap on idle connections kept per upstream host. `null` (the
+    /// default) leaves reqwest's unbounded behaviour.
+    pub pool_max_idle_per_host: Option<usize>,
+}
+
+impl Default for UpstreamConfig {
+    fn default() -> Self {
+        Self {
+            connect_timeout_ms: 5_000,
+            tcp_keepalive_secs: 60,
+            tcp_keepalive_interval_secs: 30,
+            tcp_keepalive_retries: 5,
+            pool_idle_timeout_secs: 30,
+            pool_max_idle_per_host: None,
+        }
+    }
+}
+
 impl Config {
     /// Load + merge + validate.
     ///
@@ -1232,6 +1288,61 @@ admin:
         assert_eq!(cfg.ratelimit.backend, RateLimitBackend::Memory);
         assert!(cfg.ratelimit.redis.is_none());
         assert_eq!(cfg.ratelimit.concurrency_ttl_secs, 300);
+    }
+
+    /// An `upstream:` block is optional; the defaults must still bound the
+    /// connect phase, keep TCP keepalive on, and expire pooled connections
+    /// sooner than reqwest's own 90s (AISIX-Cloud#1122).
+    #[test]
+    fn upstream_defaults_apply_when_the_block_is_absent() {
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://localhost:2379"]
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+"#,
+        );
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert_eq!(cfg.upstream.connect_timeout_ms, 5_000);
+        assert_eq!(cfg.upstream.tcp_keepalive_secs, 60);
+        assert_eq!(cfg.upstream.tcp_keepalive_interval_secs, 30);
+        assert_eq!(cfg.upstream.tcp_keepalive_retries, 5);
+        assert!(cfg.upstream.pool_idle_timeout_secs < 90);
+        assert!(cfg.upstream.pool_max_idle_per_host.is_none());
+    }
+
+    /// Operators behind a proxy with a short idle timeout need to lower
+    /// `pool_idle_timeout_secs`; every knob must be individually settable
+    /// and `0` must round-trip (it means "leave this one off").
+    #[test]
+    fn upstream_block_overrides_individual_knobs() {
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://localhost:2379"]
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+upstream:
+  connect_timeout_ms: 2000
+  pool_idle_timeout_secs: 10
+  tcp_keepalive_secs: 0
+  pool_max_idle_per_host: 16
+"#,
+        );
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert_eq!(cfg.upstream.connect_timeout_ms, 2_000);
+        assert_eq!(cfg.upstream.pool_idle_timeout_secs, 10);
+        assert_eq!(cfg.upstream.tcp_keepalive_secs, 0);
+        assert_eq!(cfg.upstream.pool_max_idle_per_host, Some(16));
+        // Unspecified knobs keep their defaults.
+        assert_eq!(cfg.upstream.tcp_keepalive_interval_secs, 30);
     }
 
     #[test]

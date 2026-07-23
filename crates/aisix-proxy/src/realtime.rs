@@ -405,7 +405,7 @@ async fn run_session(
                 &state.runtime_status,
                 &model_entry.id,
                 model_entry.value.cooldown.as_ref(),
-                aisix_gateway::BridgeError::Transport(e.to_string()),
+                aisix_gateway::BridgeError::Transport(aisix_gateway::error_with_causes(&e)),
             );
             emit_access_log(
                 &Method::GET,
