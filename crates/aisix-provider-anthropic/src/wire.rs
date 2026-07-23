@@ -48,6 +48,26 @@ pub enum AnthropicSystem {
     Blocks(Vec<serde_json::Value>),
 }
 
+impl AnthropicSystem {
+    /// Attach a `cache_control` marker to the last system block,
+    /// promoting the string form to a single text block so the marker
+    /// has somewhere to live. A no-op only if the block form is somehow
+    /// empty (unreachable in practice — a system prompt always has at
+    /// least one block).
+    fn mark_last_block(&mut self, marker: serde_json::Value) {
+        if let AnthropicSystem::Text(s) = self {
+            let text = std::mem::take(s);
+            *self =
+                AnthropicSystem::Blocks(vec![serde_json::json!({"type": "text", "text": text})]);
+        }
+        if let AnthropicSystem::Blocks(blocks) = self {
+            if let Some(obj) = blocks.last_mut().and_then(|b| b.as_object_mut()) {
+                obj.insert("cache_control".into(), marker);
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct AnthropicRequest<'a> {
     pub model: &'a str,
@@ -434,6 +454,73 @@ pub fn build_request<'a>(
         tool_choice,
         extra: extras,
     }
+}
+
+/// Inject a pair of prompt-cache breakpoints into a request that carries
+/// none of its own — one on the last system block, one on the last
+/// content block of the final message — so the stable tools+system
+/// prefix and the whole conversation prefix are cached
+/// (<https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching>).
+///
+/// Standing down entirely when the caller already supplied any
+/// `cache_control` marker (on system, messages, or tools) is deliberate:
+/// it never overrides the caller's own strategy, and it is what keeps the
+/// request within Anthropic's four-breakpoint cap — this function adds at
+/// most two markers, and only to a request that had zero.
+///
+/// `ttl` is the wire value for the injected markers (`5m` or `1h`); `5m`
+/// is emitted as the bare `{"type":"ephemeral"}` Anthropic treats as the
+/// five-minute default. Below-minimum prompts are a documented silent
+/// no-op upstream, so no length gate is applied here.
+pub fn inject_cache_breakpoints(req: &mut AnthropicRequest<'_>, ttl: &str) {
+    if request_has_cache_control(req) {
+        return;
+    }
+    let marker = cache_control_marker(ttl);
+    if let Some(system) = req.system.as_mut() {
+        system.mark_last_block(marker.clone());
+    }
+    if let Some(block) = req
+        .messages
+        .last_mut()
+        .and_then(|m| m.content.last_mut())
+        .and_then(|b| b.as_object_mut())
+    {
+        block.insert("cache_control".into(), marker);
+    }
+}
+
+/// The marker written by [`inject_cache_breakpoints`]. `1h` carries the
+/// explicit `ttl`; `5m` (and any other value) uses the bare ephemeral
+/// form that defaults to five minutes.
+fn cache_control_marker(ttl: &str) -> serde_json::Value {
+    if ttl == "1h" {
+        serde_json::json!({"type": "ephemeral", "ttl": "1h"})
+    } else {
+        serde_json::json!({"type": "ephemeral"})
+    }
+}
+
+/// Whether the request already carries any caller-supplied `cache_control`
+/// marker on a system block, a message content block, or a tool
+/// definition — the stand-down signal for [`inject_cache_breakpoints`].
+/// The string-form system prompt cannot carry a marker, so only the
+/// block form is scanned.
+fn request_has_cache_control(req: &AnthropicRequest<'_>) -> bool {
+    let system_marked = matches!(&req.system, Some(AnthropicSystem::Blocks(b)) if b.iter().any(block_has_cache_control));
+    system_marked
+        || req
+            .messages
+            .iter()
+            .any(|m| m.content.iter().any(block_has_cache_control))
+        || req
+            .tools
+            .as_ref()
+            .is_some_and(|tools| tools.iter().any(block_has_cache_control))
+}
+
+fn block_has_cache_control(block: &serde_json::Value) -> bool {
+    block.get("cache_control").is_some()
 }
 
 /// Translate the caller's OpenAI-shape `tools` array into
@@ -2346,6 +2433,142 @@ mod tests {
             serde_json::json!({"type": "ephemeral", "ttl": "1h"})
         );
         assert!(translated[2].get("cache_control").is_none());
+    }
+
+    /// Build a request from `req`, run injection with `ttl`, and return
+    /// the serialized wire body — what the upstream actually receives.
+    fn injected_wire(req: &ChatFormat, ttl: &str) -> serde_json::Value {
+        let (system, messages) = split_system(req).unwrap();
+        let mut built = build_request(req, "claude-sonnet-4-5", system, messages, false);
+        inject_cache_breakpoints(&mut built, ttl);
+        serde_json::to_value(&built).unwrap()
+    }
+
+    #[test]
+    fn inject_marks_last_system_block_and_final_message_block() {
+        let req = ChatFormat::new(
+            "claude",
+            vec![
+                ChatMessage::system("big stable prefix"),
+                ChatMessage::user("first"),
+                ChatMessage::assistant("answer"),
+                ChatMessage::user("latest"),
+            ],
+        );
+        let wire = injected_wire(&req, "5m");
+        // Plain-string system promotes to a one-block array carrying the
+        // 5m marker (bare ephemeral form).
+        assert_eq!(
+            wire["system"],
+            serde_json::json!([
+                {"type": "text", "text": "big stable prefix",
+                 "cache_control": {"type": "ephemeral"}},
+            ])
+        );
+        // Only the final message's last block is marked; earlier turns
+        // stay clean.
+        let msgs = wire["messages"].as_array().unwrap();
+        assert!(msgs[0]["content"][0].get("cache_control").is_none());
+        let last = msgs.last().unwrap();
+        assert_eq!(last["role"], "user");
+        assert_eq!(
+            last["content"][0]["cache_control"],
+            serde_json::json!({"type": "ephemeral"})
+        );
+    }
+
+    #[test]
+    fn inject_one_hour_ttl_carries_explicit_ttl() {
+        let req = ChatFormat::new("claude", vec![ChatMessage::user("hi")]);
+        let wire = injected_wire(&req, "1h");
+        let msgs = wire["messages"].as_array().unwrap();
+        assert_eq!(
+            msgs[0]["content"][0]["cache_control"],
+            serde_json::json!({"type": "ephemeral", "ttl": "1h"})
+        );
+    }
+
+    #[test]
+    fn inject_with_no_system_marks_only_the_trailing_message() {
+        let req = ChatFormat::new("claude", vec![ChatMessage::user("hi")]);
+        let wire = injected_wire(&req, "5m");
+        assert!(wire.get("system").is_none() || wire["system"].is_null());
+        assert_eq!(
+            wire["messages"][0]["content"][0]["cache_control"],
+            serde_json::json!({"type": "ephemeral"})
+        );
+    }
+
+    #[test]
+    fn inject_stands_down_when_client_marked_a_message_block() {
+        // Client set its own marker → gateway injects nothing, anywhere.
+        let req = ChatFormat::new(
+            "claude",
+            vec![
+                ChatMessage::system("prefix"),
+                block_message(
+                    Role::User,
+                    serde_json::json!([
+                        {"type": "text", "text": "hi",
+                         "cache_control": {"type": "ephemeral"}},
+                    ]),
+                ),
+            ],
+        );
+        let wire = injected_wire(&req, "5m");
+        // System stayed the plain string form (never promoted / marked).
+        assert_eq!(wire["system"], serde_json::json!("prefix"));
+        // The one marker present is the client's; no second one added.
+        assert_eq!(
+            wire["messages"][0]["content"][0]["cache_control"],
+            serde_json::json!({"type": "ephemeral"})
+        );
+    }
+
+    #[test]
+    fn inject_stands_down_when_client_marked_a_tool() {
+        // A marker on a tool definition also suppresses injection — the
+        // stand-down scan covers tools, not just messages/system.
+        let mut req = ChatFormat::new("claude", vec![ChatMessage::user("hi")]);
+        req.extra.insert(
+            "tools".into(),
+            serde_json::json!([{
+                "type": "function",
+                "function": {"name": "f", "parameters": {"type": "object"}},
+                "cache_control": {"type": "ephemeral"},
+            }]),
+        );
+        let wire = injected_wire(&req, "5m");
+        assert!(wire["messages"][0]["content"][0]
+            .get("cache_control")
+            .is_none());
+    }
+
+    #[test]
+    fn inject_appends_marker_to_client_block_form_system() {
+        // Client sent a block-form system with NO marker of its own:
+        // injection marks its last block in place (no string promotion).
+        let req = ChatFormat::new(
+            "claude",
+            vec![
+                block_message(
+                    Role::System,
+                    serde_json::json!([
+                        {"type": "text", "text": "line one"},
+                        {"type": "text", "text": "line two"},
+                    ]),
+                ),
+                ChatMessage::user("hi"),
+            ],
+        );
+        let wire = injected_wire(&req, "5m");
+        let sys = wire["system"].as_array().unwrap();
+        assert_eq!(sys.len(), 2);
+        assert!(sys[0].get("cache_control").is_none());
+        assert_eq!(
+            sys[1]["cache_control"],
+            serde_json::json!({"type": "ephemeral"})
+        );
     }
 
     #[test]

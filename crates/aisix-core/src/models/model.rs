@@ -158,6 +158,47 @@ impl CooldownConfig {
     }
 }
 
+/// Cache lifetime for gateway-injected prompt-cache breakpoints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub enum CacheTtl {
+    #[serde(rename = "5m")]
+    FiveMinutes,
+    #[serde(rename = "1h")]
+    OneHour,
+}
+
+impl CacheTtl {
+    /// The value emitted on the upstream `cache_control.ttl` field.
+    pub fn as_wire_str(self) -> &'static str {
+        match self {
+            CacheTtl::FiveMinutes => "5m",
+            CacheTtl::OneHour => "1h",
+        }
+    }
+}
+
+/// Automatic prompt-cache breakpoint injection for a direct Anthropic
+/// model. When enabled, the gateway adds cache-control markers to
+/// requests that carry none of their own, so callers get provider-side
+/// prompt-cache discounts without changing their requests. Requests that
+/// already set their own cache-control markers are forwarded unchanged.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AutoPromptCaching {
+    /// Whether automatic prompt-cache injection is active for this model.
+    pub enabled: bool,
+    /// Cache lifetime for injected breakpoints: `5m` (default when omitted) or `1h`. A `1h` cache write costs 2x the base input rate versus 1.25x for `5m`, so it pays off only when the cached prefix is reused across a longer session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<CacheTtl>,
+}
+
+impl AutoPromptCaching {
+    /// Effective TTL — operator override or the built-in 5-minute default.
+    pub fn ttl_or_default(&self) -> CacheTtl {
+        self.ttl.unwrap_or(CacheTtl::FiveMinutes)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Model {
@@ -237,6 +278,10 @@ pub struct Model {
     /// Direct-model-only request-path cooldown configuration. Omit this field to use the built-in cooldown behavior.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cooldown: Option<CooldownConfig>,
+
+    /// Automatic prompt-cache breakpoint injection for direct Anthropic models. Omit to leave injection off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_prompt_caching: Option<AutoPromptCaching>,
 
     /// Non-schema runtime id. Not part of the JSON payload — filled in by
     /// the snapshot loader from the etcd key path. Kept here so `Resource`

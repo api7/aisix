@@ -24,8 +24,8 @@ use reqwest::{header, Client, StatusCode};
 use std::time::{Duration, Instant};
 
 use crate::wire::{
-    build_request, response_into_chat_response, split_system, AnthropicResponse,
-    AnthropicStreamEvent, StreamState,
+    build_request, inject_cache_breakpoints, response_into_chat_response, split_system,
+    AnthropicResponse, AnthropicStreamEvent, StreamState,
 };
 
 /// Matches the API header that Anthropic bakes backwards-compat into.
@@ -171,6 +171,25 @@ fn upstream_model(ctx: &BridgeContext) -> Result<&str, BridgeError> {
         .ok_or_else(|| BridgeError::InvalidUpstreamConfig("model.model_name missing".into()))
 }
 
+/// Apply the Model's `auto_prompt_caching` setting to the outbound
+/// request. A no-op unless the operator enabled it; the wire-level
+/// stand-down (a caller who set their own markers wins) lives in
+/// [`inject_cache_breakpoints`]. Shared by the streaming and
+/// non-streaming paths so they can't drift.
+fn maybe_inject_cache_breakpoints(
+    body: &mut crate::wire::AnthropicRequest<'_>,
+    ctx: &BridgeContext,
+) {
+    if let Some(apc) = ctx
+        .model
+        .auto_prompt_caching
+        .as_ref()
+        .filter(|apc| apc.enabled)
+    {
+        inject_cache_breakpoints(body, apc.ttl_or_default().as_wire_str());
+    }
+}
+
 async fn map_http_error(status: StatusCode, resp: reqwest::Response) -> BridgeError {
     aisix_gateway::capture_upstream_error_http(
         status,
@@ -248,7 +267,8 @@ impl Bridge for AnthropicBridge {
 
         let (system, messages) =
             split_system(req).map_err(|e| BridgeError::InvalidUpstreamConfig(e.to_string()))?;
-        let body = build_request(req, upstream, system, messages, false);
+        let mut body = build_request(req, upstream, system, messages, false);
+        maybe_inject_cache_breakpoints(&mut body, ctx);
         let url = format!("{base}/v1/messages");
         let client = self.client.clone();
         let api_version = self.api_version;
@@ -292,7 +312,8 @@ impl Bridge for AnthropicBridge {
 
         let (system, messages) =
             split_system(req).map_err(|e| BridgeError::InvalidUpstreamConfig(e.to_string()))?;
-        let body = build_request(req, upstream, system, messages, true);
+        let mut body = build_request(req, upstream, system, messages, true);
+        maybe_inject_cache_breakpoints(&mut body, ctx);
         let url = format!("{base}/v1/messages");
         let client = self.client.clone();
         let api_version = self.api_version;

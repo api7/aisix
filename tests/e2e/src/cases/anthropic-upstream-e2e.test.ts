@@ -620,3 +620,191 @@ describe("anthropic upstream e2e: client cache_control markers survive translati
     ]);
   });
 });
+
+// E2E (AISIX-Cloud#1110 Phase 1): a model with `auto_prompt_caching`
+// enabled makes the gateway INJECT cache_control breakpoints into
+// requests that carry none of their own — one on the last system block,
+// one on the last content block of the final message — so callers get
+// provider-side prompt-cache discounts without changing their requests.
+// A caller that set its own markers wins (stand-down).
+const INJ_CALLER_PLAINTEXT = "sk-an-e2e-inject-caller";
+const INJ_CALLER_KEY_HASH = createHash("sha256")
+  .update(INJ_CALLER_PLAINTEXT)
+  .digest("hex");
+
+describe("anthropic upstream e2e: auto_prompt_caching injects breakpoints (AISIX-Cloud#1110)", () => {
+  let app: SpawnedApp | undefined;
+  let upstream: OpenAiUpstream | undefined;
+  let seed: SeedClient | undefined;
+  let etcdReachable = false;
+
+  beforeAll(async () => {
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
+    if (!etcdReachable) return;
+
+    upstream = await startOpenAiUpstream({
+      nonStreamBody: {
+        id: "msg_inj_01",
+        type: "message",
+        role: "assistant",
+        content: [{ type: "text", text: "ok" }],
+        model: "claude-3-5-haiku-20241022",
+        stop_reason: "end_turn",
+        usage: { input_tokens: 5, output_tokens: 1 },
+      },
+    });
+    app = await spawnApp();
+    seed = new SeedClient(etcd, app.etcdPrefix);
+
+    const pk = await seed.createProviderKey({
+      display_name: "an-e2e-inject-pk",
+      provider: "anthropic",
+      adapter: "anthropic",
+      secret: "sk-ant-mock",
+      api_base: upstream.baseUrl,
+    });
+    await seed.createModel({
+      display_name: "an-e2e-inject",
+      provider: "anthropic",
+      model_name: "claude-3-5-haiku-20241022",
+      provider_key_id: pk.id,
+      auto_prompt_caching: { enabled: true, ttl: "1h" },
+    });
+    await seed.createApiKey({
+      key_hash: INJ_CALLER_KEY_HASH,
+      allowed_models: ["an-e2e-inject"],
+    });
+  });
+
+  afterAll(async () => {
+    await app?.exit();
+    await upstream?.close();
+  });
+
+  test("plain request gets breakpoints on system + final message, at the configured ttl", async (ctx) => {
+    if (!etcdReachable || !app || !upstream) {
+      ctx.skip();
+      return;
+    }
+
+    const proxy = new ProxyClient(app.proxyUrl, INJ_CALLER_PLAINTEXT);
+
+    await waitConfigPropagation(async () => {
+      const r = await proxy.chat({
+        model: "an-e2e-inject",
+        messages: [{ role: "user", content: "ready-probe" }],
+      });
+      return r.status === 200;
+    });
+
+    const baseline = upstream.receivedRequests.length;
+
+    // A plain OpenAI-shape request with NO cache_control anywhere.
+    const { status } = await proxy.chat({
+      model: "an-e2e-inject",
+      messages: [
+        { role: "system", content: "big stable system prefix" },
+        { role: "user", content: "first turn" },
+        { role: "assistant", content: "prior answer" },
+        { role: "user", content: "latest turn" },
+      ],
+    });
+    expect(status).toBe(200);
+
+    const messagesReq = upstream.receivedRequests
+      .slice(baseline)
+      .find((r) => r.path.startsWith("/v1/messages"));
+    expect(messagesReq).toBeDefined();
+    const sentBody = JSON.parse(messagesReq!.body) as {
+      system?: unknown;
+      messages?: Array<{ role?: string; content?: Array<Record<string, unknown>> }>;
+    };
+
+    // System breakpoint: the plain-string system promotes to a
+    // one-block array carrying the injected marker at the configured
+    // 1h ttl.
+    expect(sentBody.system).toEqual([
+      {
+        type: "text",
+        text: "big stable system prefix",
+        cache_control: { type: "ephemeral", ttl: "1h" },
+      },
+    ]);
+
+    // Trailing breakpoint: ONLY the final message's last block is
+    // marked — earlier turns stay clean (the marker advances with the
+    // conversation, it doesn't blanket every turn).
+    const msgs = sentBody.messages!;
+    expect(msgs).toHaveLength(3);
+    expect(msgs[0]?.content?.[0]?.cache_control).toBeUndefined();
+    expect(msgs[1]?.content?.[0]?.cache_control).toBeUndefined();
+    expect(msgs[2]?.role).toBe("user");
+    expect(msgs[2]?.content?.[0]).toEqual({
+      type: "text",
+      text: "latest turn",
+      cache_control: { type: "ephemeral", ttl: "1h" },
+    });
+  });
+
+  test("stand-down: a caller that set its own marker gets nothing injected", async (ctx) => {
+    if (!etcdReachable || !app || !upstream) {
+      ctx.skip();
+      return;
+    }
+
+    const proxy = new ProxyClient(app.proxyUrl, INJ_CALLER_PLAINTEXT);
+
+    await waitConfigPropagation(async () => {
+      const r = await proxy.chat({
+        model: "an-e2e-inject",
+        messages: [{ role: "user", content: "ready-probe" }],
+      });
+      return r.status === 200;
+    });
+
+    const baseline = upstream.receivedRequests.length;
+
+    // Caller marks its own system prefix. The gateway must not add a
+    // second system marker, and must not mark the trailing message —
+    // exceeding Anthropic's 4-breakpoint cap or overriding the caller's
+    // strategy would be the bug.
+    const { status } = await proxy.chat({
+      model: "an-e2e-inject",
+      messages: [
+        {
+          role: "system",
+          content: [
+            {
+              type: "text",
+              text: "caller-managed prefix",
+              cache_control: { type: "ephemeral" },
+            },
+          ],
+        },
+        { role: "user", content: "hello" },
+      ],
+    });
+    expect(status).toBe(200);
+
+    const messagesReq = upstream.receivedRequests
+      .slice(baseline)
+      .find((r) => r.path.startsWith("/v1/messages"));
+    expect(messagesReq).toBeDefined();
+    const sentBody = JSON.parse(messagesReq!.body) as {
+      system?: Array<Record<string, unknown>>;
+      messages?: Array<{ content?: Array<Record<string, unknown>> }>;
+    };
+
+    // Exactly the caller's one marker survives; the trailing user
+    // message is untouched.
+    expect(sentBody.system).toEqual([
+      {
+        type: "text",
+        text: "caller-managed prefix",
+        cache_control: { type: "ephemeral" },
+      },
+    ]);
+    expect(sentBody.messages?.[0]?.content?.[0]?.cache_control).toBeUndefined();
+  });
+});
