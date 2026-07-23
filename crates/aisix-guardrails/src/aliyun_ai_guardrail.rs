@@ -753,11 +753,24 @@ struct AigResponse {
 impl AigResponse {
     /// Aliyun's desensitized rewrite of the submitted content, when the
     /// response carries one (`Detail[].Result[].Ext.Desensitization` on
-    /// a `mask` suggestion). Scans every result and keeps the LAST
-    /// non-empty rewrite: each detected item's `Ext` restates the full
-    /// desensitized text, and later entries fold in the earlier
-    /// replacements. (Doc-derived; re-verified against the live endpoint
-    /// during #1070 QA.)
+    /// a `mask` suggestion).
+    ///
+    /// Contract, verified against the live endpoint during #1070 QA: the
+    /// `sensitiveData` dimension puts the COMPLETE desensitized text — every
+    /// masked span already applied — in exactly ONE `Result`'s
+    /// `Ext.Desensitization`; sibling `Result`s (a second sensitive sub-type
+    /// that also matched) carry only `Ext.SensitiveData` metadata with no
+    /// `Desensitization` key. So there is a single carrier and it is the
+    /// whole rewrite. Scanning all results and taking the last non-empty
+    /// therefore returns that one full rewrite (first vs last is moot with a
+    /// single carrier); the fold is written this way so a redundant second
+    /// full-text carrier, were one ever returned, still yields a complete
+    /// rewrite rather than a partial one.
+    ///
+    /// Observed live shape (input "座机010-…，手机138…，还有一个139…"):
+    /// `Result[0]` Label 1790 (landline) → `Ext.Desensitization` = the full
+    /// text with the landline AND both mobiles masked; `Result[1]` Label 1814
+    /// (mobile) → `Ext.SensitiveData` only, no `Desensitization`.
     fn desensitization(&self) -> Option<String> {
         let data = self.data.as_ref()?;
         data.detail
@@ -1228,8 +1241,11 @@ mod tests {
 
     #[tokio::test]
     async fn mask_ext_encoded_as_json_string_still_parses() {
-        // Aliyun types Ext inconsistently: an object on sensitive-data
-        // detections, but sometimes a JSON document nested in a string.
+        // The live sensitiveData Ext is a JSON object (confirmed in #1070 QA,
+        // see `mask_real_multi_result_shape_picks_the_full_text_carrier`). The
+        // string-encoded form is a defensive tolerance for the way Aliyun
+        // types `Ext` inconsistently across its green actions; keep it covered
+        // so a nested-JSON-string body can't silently drop the mask.
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -1254,6 +1270,69 @@ mod tests {
             .await;
         assert_eq!(seg.verdict, GuardrailVerdict::Allow);
         assert_eq!(seg.masked, Some(vec!["call 【手机号码】 now".to_owned()]));
+    }
+
+    #[tokio::test]
+    async fn mask_real_multi_result_shape_picks_the_full_text_carrier() {
+        // The EXACT live response shape captured in #1070 QA for an input
+        // carrying a landline + two mobiles: the sensitiveData dimension
+        // returns TWO Results, but only the first (landline sub-type 1790)
+        // carries `Ext.Desensitization` — the COMPLETE rewrite with every
+        // span masked. The sibling (mobile sub-type 1814) carries only
+        // `Ext.SensitiveData` (the original matched values — a leak vector we
+        // must never read) with NO Desensitization. The write-back must be
+        // the one full-text carrier, not an empty/partial sibling.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "Code": 200,
+                "Message": "OK",
+                "RequestId": "r",
+                "Data": {
+                    "Detail": [
+                        {
+                            "Type": "sensitiveData", "Level": "S2", "Suggestion": "mask",
+                            "Result": [
+                                { "Label": "1790", "Level": "S1",
+                                  "Description": "电话号码",
+                                  "Ext": { "Desensitization": "座机【电话号码】，手机【手机号码】，还有一个【手机号码】都能打",
+                                           "SensitiveData": ["010-88886666"] } },
+                                { "Label": "1814", "Level": "S2",
+                                  "Description": "手机号（中国内地）",
+                                  "Ext": { "SensitiveData": ["13999998888", "13812345678"] } }
+                            ]
+                        },
+                        { "Type": "promptAttack", "Level": "none", "Suggestion": "pass",
+                          "Result": [ { "Label": "nonLabel", "Level": "none" } ] }
+                    ],
+                    "Suggestion": "mask"
+                }
+            })))
+            .mount(&server)
+            .await;
+        let g = build(&server.uri(), true);
+        let seg = g
+            .moderate_input_segments(&[
+                "座机010-88886666，手机13812345678，还有一个13999998888都能打".to_owned(),
+            ])
+            .await;
+        assert_eq!(seg.verdict, GuardrailVerdict::Allow);
+        assert_eq!(
+            seg.masked,
+            Some(vec![
+                "座机【电话号码】，手机【手机号码】，还有一个【手机号码】都能打".to_owned()
+            ]),
+            "must write back the one full-text carrier, not the sibling with no Desensitization"
+        );
+        // The original matched values in Ext.SensitiveData must never surface
+        // (neither in the masked text nor the counts).
+        let masked = seg.masked.unwrap().join("");
+        for leak in ["010-88886666", "13999998888", "13812345678"] {
+            assert!(
+                !masked.contains(leak),
+                "matched value {leak:?} leaked into write-back"
+            );
+        }
     }
 
     #[test]
@@ -1712,34 +1791,96 @@ mod tests {
             risky_out.suggestion
         );
 
-        // Sensitive-data prompt — with the console desensitization policy
-        // on, expect Suggestion "mask" WITH a desensitized rewrite (the
-        // assumption the write-back relies on; see AigResponse::desensitization).
+        // Sensitive-data prompt — a phone number, which the enabled
+        // desensitization sub-types mask. When the console has the
+        // sensitive-data module on with a "脱敏" action, expect Suggestion
+        // "mask" WITH a full desensitized rewrite carrying the mask token and
+        // NOT the original value. When the module is off (a fresh account),
+        // this is "pass" with no rewrite — tolerated so the smoke test still
+        // runs, but the shape is asserted whenever a rewrite IS returned.
+        const PHONE: &str = "13812345678";
         let (masked, masked_diag) = g
             .call(
                 service_code("pro", false),
-                "我的手机号是13812345678，身份证号是110101199003070018，请帮我登记",
+                &format!("我的手机号是{PHONE}，请帮我登记"),
                 None,
             )
             .await;
         let masked = masked.expect("sensitive-data call should succeed");
         eprintln!(
-            "live_smoke mask    -> Suggestion={} desensitization_present={} diag={masked_diag:?}",
-            masked.suggestion,
-            masked.desensitization.is_some(),
+            "live_smoke mask    -> Suggestion={} desensitization={:?} diag={masked_diag:?}",
+            masked.suggestion, masked.desensitization,
         );
 
-        assert_eq!(benign.suggestion, "pass", "benign prompt must pass");
+        // Benign content must RELEASE, but the exact suggestion depends on
+        // console config: with the sensitive-data module's action set to
+        // "观察/watch", even a no-match prompt bubbles a top-level "watch"
+        // (verified live in #1070 QA — a plain weather prompt returned
+        // sensitiveData S0/watch → top-level watch). Both pass and watch
+        // release; only block/mask would act. Assert it does not act.
+        assert!(
+            matches!(benign.suggestion.as_str(), "pass" | "watch"),
+            "benign prompt must release (pass|watch), got {}",
+            benign.suggestion
+        );
         for (what, diag) in [
             ("benign", &benign_diag),
             ("risky", &risky_diag),
             ("output", &out_diag),
+            ("mask", &masked_diag),
         ] {
             assert!(
                 !diag.request_id.is_empty(),
                 "{what}: live call must carry an aliyun request id"
             );
             assert_eq!(diag.code, "200", "{what}: business code");
+        }
+
+        // When the desensitization policy is on, pin the contract the
+        // write-back relies on (verified live in #1070 QA): a mask suggestion
+        // returns the FULL rewrite with the value masked and the original
+        // never echoed in Desensitization.
+        if masked.suggestion == "mask" {
+            let rewrite = masked
+                .desensitization
+                .as_deref()
+                .expect("a live mask suggestion must carry Ext.Desensitization");
+            assert!(
+                !rewrite.contains(PHONE),
+                "the desensitized rewrite must not echo the original value: {rewrite}"
+            );
+            assert!(
+                rewrite.contains('【'),
+                "the desensitized rewrite must carry a mask token: {rewrite}"
+            );
+
+            // Exercise the full SEGMENT write-back path (moderate_segments →
+            // masked_segments → desensitization) against the live endpoint,
+            // not just the raw call: the segment output is what the proxy
+            // writes back into the request/response body.
+            let seg_text = format!("我的手机号是{PHONE}，请帮我登记");
+            let seg = g.moderate_input_segments(&[seg_text]).await;
+            assert_eq!(
+                seg.verdict,
+                GuardrailVerdict::Allow,
+                "a live mask must release (Allow) after write-back"
+            );
+            let out = seg
+                .masked
+                .as_ref()
+                .expect("segment mask must yield a rewritten body")
+                .join("");
+            eprintln!("live_smoke segmask -> {out}");
+            assert!(
+                !out.contains(PHONE) && out.contains('【'),
+                "segment write-back must carry the masked rewrite, not the original: {out}"
+            );
+        } else {
+            eprintln!(
+                "live_smoke mask    -> sensitive-data module appears OFF \
+                 (Suggestion={}); enable it + a 脱敏 action to exercise the mask path",
+                masked.suggestion
+            );
         }
     }
 }
