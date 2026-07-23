@@ -140,3 +140,25 @@ export async function waitConfigPropagation(
   }
   throw new Error(`waitConfigPropagation: condition not met within ${timeoutMs}ms`);
 }
+
+/**
+ * Sleep until the current wall-clock minute has at least `headroomSecs`
+ * left.
+ *
+ * The rate limiter buckets on **fixed wall-clock windows** — see
+ * `roll_if_stale` in `crates/aisix-ratelimit/src/window.rs`, which
+ * computes `bucket_start = (now / window_secs) * window_secs`. A burst
+ * that straddles a boundary therefore lands in two different buckets and
+ * the later request silently gets a fresh allowance, so any "the next
+ * call must be 429" assertion flaps depending on when in the minute CI
+ * happened to run it.
+ *
+ * Call this immediately before a burst that must land inside one window.
+ * Nothing else in the test needs to change: the wait only happens in the
+ * last few seconds of a minute, so the usual run pays nothing.
+ */
+export async function awaitWindowHeadroom(headroomSecs = 10): Promise<void> {
+  const secondsLeft = 60 - (Math.floor(Date.now() / 1000) % 60);
+  if (secondsLeft >= headroomSecs) return;
+  await new Promise((r) => setTimeout(r, secondsLeft * 1000 + 100));
+}

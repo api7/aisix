@@ -1,5 +1,5 @@
 export { spawnApp, type SpawnedApp, type AppOverrides } from "./app.js";
-export { AdminClient, waitConfigPropagation } from "./admin.js";
+export { AdminClient, waitConfigPropagation, awaitWindowHeadroom } from "./admin.js";
 export { ProxyClient } from "./proxy.js";
 export { EtcdClient } from "./etcd.js";
 export { SeedClient } from "./seed.js";

@@ -6,6 +6,7 @@ import {
   ProxyClient,
   spawnApp,
   startOpenAiUpstream,
+  awaitWindowHeadroom,
   waitConfigPropagation,
   type OpenAiUpstream,
   type SpawnedApp,
@@ -191,18 +192,6 @@ describe("model group member rate limit e2e (AISIX-Cloud#1087)", () => {
     return r.body.choices?.[0]?.message?.content ?? "";
   }
 
-  /**
-   * Sleep until the current wall-clock minute has at least `headroomSecs`
-   * left. The limiter buckets on fixed wall-clock minutes
-   * (`window_start = now - now % 60`), so a burst that straddles a boundary
-   * silently gets a fresh quota and the failover/429 assertions would flap.
-   * Waiting for headroom keeps each burst inside one window.
-   */
-  async function awaitWindowHeadroom(headroomSecs: number): Promise<void> {
-    const secondsLeft = 60 - (Math.floor(Date.now() / 1000) % 60);
-    if (secondsLeft >= headroomSecs) return;
-    await new Promise((r) => setTimeout(r, secondsLeft * 1000 + 100));
-  }
 
   test("over-limit member fails over to the next target (RPM)", async (ctx) => {
     if (!etcdReachable || !app) {

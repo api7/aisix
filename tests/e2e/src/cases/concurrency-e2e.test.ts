@@ -7,6 +7,7 @@ import {
   ProxyClient,
   spawnApp,
   startOpenAiUpstream,
+  awaitWindowHeadroom,
   waitConfigPropagation,
   type OpenAiUpstream,
   type SpawnedApp,
@@ -122,6 +123,11 @@ describe("concurrency e2e: rate-limit isolation across callers", () => {
       maxRetries: 0,
     });
 
+    // The limiter buckets on fixed wall-clock minutes. Here the readiness
+    // probes themselves consume the RPM=1 slots, so probe AND assertion
+    // must land in the same window — ask for enough headroom to cover the
+    // propagation polling that follows.
+    await awaitWindowHeadroom(20);
     // Readiness gate: caller A's first call succeeds.
     await waitConfigPropagation(async () => {
       try {

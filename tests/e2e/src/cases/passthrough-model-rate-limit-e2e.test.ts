@@ -5,6 +5,7 @@ import {
   SeedClient,
   spawnApp,
   startOpenAiUpstream,
+  awaitWindowHeadroom,
   waitConfigPropagation,
   type OpenAiUpstream,
   type SpawnedApp,
@@ -138,6 +139,10 @@ describe("passthrough e2e: body-model rate limiting on the raw tunnel", () => {
       return;
     }
 
+    // The limiter buckets on fixed wall-clock minutes, so a burst that
+    // straddles a boundary gets a fresh allowance and the 429 assertion
+    // below flaps. Keep the whole burst inside one window.
+    await awaitWindowHeadroom();
     // First submission consumes the model's single rpm slot.
     const first = await callSynth(VIDEO_MODEL);
     expect(first.status).toBe(200);

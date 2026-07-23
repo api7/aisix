@@ -5,6 +5,7 @@ import {
   SeedClient,
   spawnApp,
   startOpenAiUpstream,
+  awaitWindowHeadroom,
   waitConfigPropagation,
   type OpenAiUpstream,
   type SpawnedApp,
@@ -280,6 +281,10 @@ describe("videos e2e: unified submit/poll/content surface", () => {
       return;
     }
 
+    // The limiter buckets on fixed wall-clock minutes, so a burst that
+    // straddles a boundary gets a fresh allowance and the 429 assertion
+    // below flaps. Keep the whole burst inside one window.
+    await awaitWindowHeadroom();
     // First submit consumes the model's single rpm slot.
     const first = await submit(RL_MODEL);
     expect(first.status).toBe(200);
