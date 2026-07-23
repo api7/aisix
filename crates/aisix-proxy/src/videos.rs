@@ -587,7 +587,19 @@ pub async fn create_video(
     match dispatch_create(&state, &auth, body, &client).await {
         Ok(success) => {
             let status = success.response.status().as_u16();
-            telemetry.finish(status, &success.provider, &model_name);
+            // Label by the RESOLVED entry's display_name, not the requested
+            // alias: a wildcard Model (`wan/*`) accepts unbounded alias
+            // strings, and raw caller input in the `model` label is the
+            // #451 cardinality failure. Exact-match requests are unchanged
+            // (alias == display_name); wildcard traffic aggregates under
+            // the pattern itself.
+            let snap = state.snapshot.load();
+            let model_label = snap
+                .models
+                .get_by_id(&success.model_id)
+                .map(|e| e.value.display_name.clone())
+                .unwrap_or_else(|| crate::usage_attr::UNRESOLVED_MODEL_LABEL.to_string());
+            telemetry.finish(status, &success.provider, &model_label);
             // One zero-token UsageEvent per accepted submit — visible in
             // /logs and the budget ledger like every other endpoint.
             // Per-second cost is computed control-plane-side once the
@@ -1700,6 +1712,70 @@ mod tests {
         assert!(
             !rendered.contains(&id),
             "the caller-controlled video id must never appear as a metric label"
+        );
+    }
+
+    /// The submit success path labels metrics by the RESOLVED entry's
+    /// display name, never the caller's alias: a wildcard Model accepts
+    /// unbounded alias strings, so labeling by the request would be the
+    /// #451 cardinality failure on this route too.
+    #[tokio::test]
+    async fn submit_success_metric_label_is_resolved_display_name_not_alias() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(DASHSCOPE_SUBMIT_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(pending_submit_response()))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let snap = AisixSnapshot::new();
+        let pk_json = format!(
+            r#"{{"display_name":"ali-up","secret":"sk-up","api_base":"{}","provider":"alibaba"}}"#,
+            upstream.uri()
+        );
+        let pk: aisix_core::ProviderKey = serde_json::from_str(&pk_json).unwrap();
+        snap.provider_keys.insert(ResourceEntry::new(PK_ID, pk, 1));
+        let m: Model = serde_json::from_str(&format!(
+            r#"{{
+                "display_name": "wan/*",
+                "provider": "alibaba",
+                "model_name": "*",
+                "provider_key_id": "{PK_ID}"
+            }}"#
+        ))
+        .unwrap();
+        snap.models.insert(ResourceEntry::new(MODEL_ID, m, 1));
+        let key: ApiKey = serde_json::from_str(
+            r#"{"key_hash": "8b6712790a2089c67aa97a2d80022df18cc65c7814350e33baebe79aab508891", "allowed_models": ["wan/turbo-cardinality-probe"]}"#,
+        )
+        .unwrap();
+        snap.apikeys.insert(ResourceEntry::new("k-1", key, 1));
+
+        let hub = Arc::new(Hub::new());
+        let handle = SnapshotHandle::new(snap);
+        let state = crate::ProxyState::new(handle, hub, &cfg()).without_cache();
+        let metrics = state.metrics.clone();
+        let app = crate::build_router(state);
+
+        let resp = tower::ServiceExt::oneshot(
+            app,
+            post_videos(
+                serde_json::json!({"model": "wan/turbo-cardinality-probe", "prompt": "hi"}),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let rendered = metrics.render();
+        assert!(
+            rendered.contains("model=\"wan/*\""),
+            "submit success must label by the resolved wildcard pattern: {rendered}"
+        );
+        assert!(
+            !rendered.contains("wan/turbo-cardinality-probe"),
+            "the caller alias must never appear as a metric label: {rendered}"
         );
     }
 
