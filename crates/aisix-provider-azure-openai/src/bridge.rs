@@ -781,11 +781,13 @@ impl Bridge for AzureOpenAiBridge {
         let bridge_name = self.name;
         let request_id_for_log = ctx.request_id.clone();
 
-        // Audit H2: thread the deadline into the streaming loop so a
-        // slow / hanging upstream body can't wedge the connection
-        // after headers arrive. The post-headers POST already covered
-        // the initial wait; this covers the per-chunk wait too.
-        let stream_deadline = ctx.deadline.map(|d| started + d);
+        // Audit H2: thread the budget into the streaming loop so a slow /
+        // hanging upstream body can't wedge the connection after headers
+        // arrive. It bounds the wait for EACH chunk and resets after every
+        // successful read — `stream_timeout` is defined as the maximum gap
+        // *between* chunks, so a long-but-healthy response must not be cut
+        // off just because its total duration exceeds one gap's budget.
+        let per_chunk_timeout = ctx.deadline;
 
         let byte_stream = resp.bytes_stream();
         let stream = build_chunk_stream(
@@ -794,8 +796,7 @@ impl Bridge for AzureOpenAiBridge {
             done_marker_policy,
             bridge_name,
             request_id_for_log,
-            stream_deadline,
-            started,
+            per_chunk_timeout,
         );
         Ok(Box::pin(stream))
     }
@@ -807,8 +808,7 @@ fn build_chunk_stream<S>(
     done_marker_policy: Option<StreamDoneMarker>,
     bridge_name: &'static str,
     request_id: String,
-    deadline: Option<Instant>,
-    started: Instant,
+    per_chunk_timeout: Option<Duration>,
 ) -> impl futures::Stream<Item = Result<ChatChunk, BridgeError>> + Send
 where
     S: futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send + 'static,
@@ -818,15 +818,16 @@ where
         let mut stream = Box::pin(byte_stream);
         let mut done_marker_seen = false;
         'outer: loop {
-            // Audit H2: enforce deadline on each per-chunk wait. The
-            // first POST is already covered upstream; this covers the
-            // body-streaming phase. `None` deadline disables timeout.
-            let next = match deadline {
-                Some(d) => match tokio::time::timeout_at(d.into(), stream.next()).await {
+            // Audit H2: bound each individual chunk wait. `tokio::time::timeout`
+            // (not `timeout_at`) so the budget restarts on every chunk — the
+            // configured value is the maximum inter-chunk gap, not a ceiling on
+            // the response as a whole. `None` disables the timeout.
+            let next = match per_chunk_timeout {
+                Some(d) => match tokio::time::timeout(d, stream.next()).await {
                     Ok(item) => item,
                     Err(_) => {
                         Err(BridgeError::Timeout {
-                            elapsed_ms: started.elapsed().as_millis() as u64,
+                            elapsed_ms: d.as_millis() as u64,
                         })?;
                         unreachable!()
                     }
@@ -2004,6 +2005,66 @@ mod tests {
             }
             Err(other) => panic!("expected Timeout, got {other:?}"),
         }
+    }
+
+    /// AISIX-Cloud#1122: `stream_timeout` is defined as the maximum gap
+    /// *between* chunks (see `Model::stream_timeout`), but the budget was
+    /// applied as `timeout_at(started + d)` — one absolute instant reused
+    /// for every chunk, i.e. a ceiling on the whole response. A long but
+    /// perfectly healthy stream was cut off with a Timeout once its total
+    /// duration passed a single gap's budget.
+    ///
+    /// Here every gap (80ms) is comfortably inside the budget (250ms)
+    /// while the total (~320ms) is past it. Per-chunk semantics deliver
+    /// the whole stream; the absolute deadline truncated it.
+    #[tokio::test]
+    async fn stream_budget_bounds_each_chunk_gap_not_the_whole_response() {
+        use futures::stream::StreamExt as _;
+
+        let gap = Duration::from_millis(80);
+        let budget = Duration::from_millis(250);
+        let frames: Vec<bytes::Bytes> = vec![
+            bytes::Bytes::from(
+                "data: {\"id\":\"x\",\"model\":\"m\",\"choices\":[{\"delta\":{\"content\":\"a\"},\"finish_reason\":null}]}\n\n",
+            ),
+            bytes::Bytes::from(
+                "data: {\"id\":\"x\",\"model\":\"m\",\"choices\":[{\"delta\":{\"content\":\"b\"},\"finish_reason\":null}]}\n\n",
+            ),
+            bytes::Bytes::from(
+                "data: {\"id\":\"x\",\"model\":\"m\",\"choices\":[{\"delta\":{\"content\":\"c\"},\"finish_reason\":\"stop\"}]}\n\n",
+            ),
+            bytes::Bytes::from("data: [DONE]\n\n"),
+        ];
+        let byte_stream = futures::stream::iter(frames).then(move |b| async move {
+            tokio::time::sleep(gap).await;
+            Ok::<bytes::Bytes, reqwest::Error>(b)
+        });
+
+        let started = Instant::now();
+        let mut stream = Box::pin(build_chunk_stream(
+            byte_stream,
+            None,
+            None,
+            "azure-openai",
+            "req-per-chunk".to_string(),
+            Some(budget),
+        ));
+
+        let mut content = String::new();
+        while let Some(item) = stream.next().await {
+            let chunk = item.expect("no chunk may time out — every gap is within budget");
+            if let Some(text) = chunk.delta.content.as_deref() {
+                content.push_str(text);
+            }
+        }
+
+        assert_eq!(content, "abc", "the whole stream must be delivered");
+        assert!(
+            started.elapsed() > budget,
+            "the test is only meaningful if the total run outlasts one gap's \
+             budget (elapsed {:?}, budget {budget:?})",
+            started.elapsed()
+        );
     }
 
     // ─── AAD (Entra ID) auth scheme (D6.6) ─────────────────────────
