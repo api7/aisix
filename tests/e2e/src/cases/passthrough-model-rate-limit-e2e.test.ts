@@ -155,6 +155,20 @@ describe("passthrough e2e: body-model rate limiting on the raw tunnel", () => {
       error?: { type?: unknown };
     };
     expect(err.error?.type).toBe("rate_limit_exceeded");
+
+    // Task polling — the second half of the provider's async journey —
+    // is a bodyless GET carrying no `model` field, so the exhausted
+    // model bucket must NOT block it. A client that submitted a task
+    // right before hitting the cap must still be able to poll it to
+    // completion.
+    for (let i = 0; i < 3; i += 1) {
+      const poll = await fetch(
+        `${app!.proxyUrl}/passthrough/alibaba/api/v1/tasks/task-pt-rl-01`,
+        { method: "GET", headers: { authorization: headers.authorization } },
+      );
+      expect(poll.status).toBe(200);
+      await poll.text();
+    }
   });
 
   test("unregistered body model: repeated calls keep flowing (no model-layer cap)", async (ctx) => {
