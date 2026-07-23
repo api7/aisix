@@ -749,11 +749,13 @@ pub(crate) fn estimation_output_text(resp: &aisix_gateway::ChatResponse) -> Stri
 /// silent zeros; estimate the prompt from that sub-call's own request
 /// (`req`: the client request for a panel member — every member shares the
 /// inbound messages — or the synthesis request for the judge) and the
-/// completion from the sub-call's answer text, tokenized with its model.
-/// Returns `(prompt, completion, usage_estimated)` under the #794
-/// or-semantics: a non-zero upstream value always wins, estimation fills
-/// only zeros. One helper so every sub-call emit site (non-streaming panel
-/// + judge, streaming panel) can't drift apart.
+/// completion from the sub-call's answer text. `model` is the sub-call's
+/// resolved **upstream** model (not the operator alias) so the tokenizer
+/// encoding matches the real backend, consistent with the direct and
+/// streaming-judge paths. Returns `(prompt, completion, usage_estimated)`
+/// under the #794 or-semantics: a non-zero upstream value always wins,
+/// estimation fills only zeros. One helper so every sub-call emit site
+/// (non-streaming panel + judge, streaming panel) can't drift apart.
 fn estimate_subcall_tokens(
     req: &ChatFormat,
     model: &str,
@@ -2584,16 +2586,26 @@ async fn dispatch_ensemble(
         ))
     })?;
 
-    // Resolve a sub-call's target by display_name → (model_id, provider_key_id)
-    // for telemetry; empty pair if the target was deleted between dispatch and
-    // emit (cp-api stores NULL). Shared by both the success and 502 paths.
-    let resolve_sub = |display_name: &str| -> (String, String) {
+    // Resolve a sub-call's target by display_name → (model_id, provider_key_id,
+    // upstream_model). The first two are telemetry attribution; the third is
+    // the tokenizer key for the #1074 estimation fallback — the estimator keys
+    // off the real upstream model, not the operator alias, exactly as the
+    // direct and streaming-judge paths do (a `gpt-4o` alias must select
+    // o200k_base, not the cl100k default an unrecognised alias falls back to).
+    // Empty ids if the target was deleted between dispatch and emit (cp-api
+    // stores NULL); the tokenizer then degrades to the display name.
+    let resolve_sub = |display_name: &str| -> (String, String, String) {
         match snapshot.models.get_by_name(display_name) {
             Some(entry) => (
                 entry.id.clone(),
                 entry.value.provider_key_id.clone().unwrap_or_default(),
+                entry
+                    .value
+                    .upstream_model()
+                    .unwrap_or(display_name)
+                    .to_string(),
             ),
-            None => (String::new(), String::new()),
+            None => (String::new(), String::new(), display_name.to_string()),
         }
     };
     // Emit one usage event for a single (already-billed) panel member.
@@ -2604,12 +2616,18 @@ async fn dispatch_ensemble(
     // 0-based slot; `blocked` sets the event's `guardrail_blocked` flag.
     let emit_panel_member =
         |member: &crate::ensemble::PanelOutcome, index: usize, blocked: bool, bypass: &str| {
-            let (sub_model_id, sub_provider_key_id) = resolve_sub(&member.model);
+            let (sub_model_id, sub_provider_key_id, sub_upstream_model) =
+                resolve_sub(&member.model);
             // #1074: a member backend that omitted usage gets its prompt
             // estimated from the shared client request and its completion
-            // from the member's own answer text.
-            let (prompt_tokens, completion_tokens, usage_estimated) =
-                estimate_subcall_tokens(req, &member.model, &member.usage, &member.est_output_text);
+            // from the member's own answer text, tokenized with the member's
+            // resolved upstream model.
+            let (prompt_tokens, completion_tokens, usage_estimated) = estimate_subcall_tokens(
+                req,
+                &sub_upstream_model,
+                &member.usage,
+                &member.est_output_text,
+            );
             emit_usage_event(
                 state,
                 request_id,
@@ -2811,17 +2829,22 @@ async fn dispatch_ensemble(
             attempt_model: String,
             usage: aisix_gateway::chat::UsageStats,
             est_output_text: String,
+            /// Resolved upstream model — the tokenizer key for the #1074
+            /// estimate, pre-resolved here because the `'static` closure
+            /// can't reach the snapshot (mirrors `model_id`).
+            est_model: String,
         }
         let panel_telem: Vec<PanelTelem> = panel
             .iter()
             .map(|p| {
-                let (model_id, provider_key_id) = resolve_sub(&p.model);
+                let (model_id, provider_key_id, est_model) = resolve_sub(&p.model);
                 PanelTelem {
                     model_id,
                     provider_key_id,
                     attempt_model: p.model.clone(),
                     usage: p.usage.clone(),
                     est_output_text: p.est_output_text.clone(),
+                    est_model,
                 }
             })
             .collect();
@@ -2840,7 +2863,9 @@ async fn dispatch_ensemble(
             .fold(aisix_gateway::chat::UsageStats::default(), |acc, p| {
                 acc.saturating_add(&p.usage)
             });
-        let (judge_model_id, judge_provider_key_id) = resolve_sub(&ensemble_cfg.judge.model);
+        // The streamed judge estimator keys off `judge_model.upstream_model()`
+        // directly (below), so resolve_sub's upstream_model is unused here.
+        let (judge_model_id, judge_provider_key_id, _) = resolve_sub(&ensemble_cfg.judge.model);
         let judge_attempt_model = ensemble_cfg.judge.model.clone();
         let judge_attempt_index = panel.len() as u32;
 
@@ -2941,7 +2966,7 @@ async fn dispatch_ensemble(
                     let (prompt_tokens, completion_tokens, usage_estimated) =
                         estimate_subcall_tokens(
                             &req_for_panel_est,
-                            &member.attempt_model,
+                            &member.est_model,
                             &member.usage,
                             &member.est_output_text,
                         );
@@ -3174,14 +3199,16 @@ async fn dispatch_ensemble(
         for (index, member) in outcome.panel.iter().enumerate() {
             emit_panel_member(member, index, blocked, bypass);
         }
-        let (judge_model_id, judge_provider_key_id) = resolve_sub(&outcome.judge_model);
+        let (judge_model_id, judge_provider_key_id, judge_upstream_model) =
+            resolve_sub(&outcome.judge_model);
         // #1074: estimate the judge sub-call when its backend omitted usage —
         // prompt from the judge's synthesis request, completion from the
         // synthesized answer text (read post-mask; token count is
-        // mask-invariant to within placeholder length).
+        // mask-invariant to within placeholder length), tokenized with the
+        // judge's resolved upstream model.
         let (judge_prompt, judge_completion, judge_estimated) = estimate_subcall_tokens(
             &outcome.judge_req,
-            &outcome.judge_model,
+            &judge_upstream_model,
             &judge_usage,
             &estimation_output_text(&outcome.response),
         );
