@@ -30,5 +30,9 @@ bytes.workspace = true
 http.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt", "time"] }
+# `net` + `io-util` back the hand-rolled SSE upstream in
+# `chat_stream_delivers_a_long_stream_whose_gaps_stay_within_budget`, which
+# needs to emit frames on a schedule — wiremock can only delay a response as
+# a whole, so it cannot distinguish per-chunk from total-duration timeouts.
+tokio = { workspace = true, features = ["macros", "rt", "time", "net", "io-util"] }
 wiremock.workspace = true

@@ -2067,6 +2067,124 @@ mod tests {
         );
     }
 
+    /// The same contract as the test above, but driven through the public
+    /// `chat_stream` entry point instead of `build_chunk_stream`, so it
+    /// also covers `chat_stream` actually forwarding `ctx.deadline` — the
+    /// helper-level test alone would still pass if that wiring were
+    /// dropped.
+    ///
+    /// Needs an upstream that emits frames on a schedule, which wiremock
+    /// cannot do (`set_delay` delays the response as a whole, which is
+    /// exactly the distinction under test), so this hand-rolls a one-shot
+    /// SSE server: no `content-length`, `connection: close`, body framed
+    /// by EOF.
+    #[tokio::test]
+    async fn chat_stream_delivers_a_long_stream_whose_gaps_stay_within_budget() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let gap = Duration::from_millis(80);
+        let budget = Duration::from_millis(250);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            // Drain the request headers so the client's write completes.
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            sock.write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+            sock.flush().await.unwrap();
+            for text in ["a", "b", "c"] {
+                tokio::time::sleep(gap).await;
+                let frame = format!(
+                    "data: {{\"id\":\"x\",\"model\":\"m\",\"choices\":[{{\"delta\":{{\"content\":\"{text}\"}},\"finish_reason\":null}}]}}\n\n"
+                );
+                sock.write_all(frame.as_bytes()).await.unwrap();
+                sock.flush().await.unwrap();
+            }
+            tokio::time::sleep(gap).await;
+            sock.write_all(b"data: [DONE]\n\n").await.unwrap();
+            sock.flush().await.unwrap();
+            sock.shutdown().await.unwrap();
+        });
+
+        let bridge = AzureOpenAiBridge::new()
+            .with_url_override(mock_chat_url(&format!("http://{addr}"), "gpt4o-prod"));
+        let mut ctx = canonical_test_ctx();
+        ctx.deadline = Some(budget);
+        let req = ChatFormat::new("my-azure-gpt4", vec![ChatMessage::user("hi")]);
+
+        let started = Instant::now();
+        let mut stream = bridge.chat_stream(&req, &ctx).await.expect("stream opens");
+        let mut content = String::new();
+        while let Some(item) = stream.next().await {
+            let chunk = item.expect("no chunk may time out — every gap is within budget");
+            if let Some(text) = chunk.delta.content.as_deref() {
+                content.push_str(text);
+            }
+        }
+
+        assert_eq!(content, "abc", "the whole stream must be delivered");
+        assert!(
+            started.elapsed() > budget,
+            "the test is only meaningful if the total run outlasts one gap's \
+             budget (elapsed {:?}, budget {budget:?})",
+            started.elapsed()
+        );
+    }
+
+    /// The counterpart that actually pins the wiring: response headers
+    /// arrive immediately, so the connect-phase `with_deadline` is already
+    /// satisfied, and only then does a single gap exceed the budget. The
+    /// per-chunk timeout is therefore the only thing that can fire — so
+    /// this test fails if `chat_stream` ever stops forwarding
+    /// `ctx.deadline` into the stream, which the delivery test above
+    /// (and a helper-level test) would not catch.
+    #[tokio::test]
+    async fn chat_stream_times_out_when_one_gap_exceeds_the_budget() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let budget = Duration::from_millis(150);
+        let stall = Duration::from_millis(700);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            // Headers first and flushed, so the bridge commits the stream.
+            sock.write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+            sock.flush().await.unwrap();
+            // ...then stall well past the budget before the first frame.
+            tokio::time::sleep(stall).await;
+            let _ = sock.write_all(b"data: [DONE]\n\n").await;
+        });
+
+        let bridge = AzureOpenAiBridge::new()
+            .with_url_override(mock_chat_url(&format!("http://{addr}"), "gpt4o-prod"));
+        let mut ctx = canonical_test_ctx();
+        ctx.deadline = Some(budget);
+        let req = ChatFormat::new("my-azure-gpt4", vec![ChatMessage::user("hi")]);
+
+        let mut stream = bridge
+            .chat_stream(&req, &ctx)
+            .await
+            .expect("headers arrive within the budget, so the stream opens");
+        match stream.next().await {
+            Some(Err(BridgeError::Timeout { .. })) => {}
+            other => panic!("expected a per-chunk Timeout, got {other:?}"),
+        }
+    }
+
     // ─── AAD (Entra ID) auth scheme (D6.6) ─────────────────────────
 
     /// JSON-shaped Azure secret triggering the AAD branch.
