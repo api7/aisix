@@ -51,9 +51,9 @@ pub enum AnthropicSystem {
 impl AnthropicSystem {
     /// Attach a `cache_control` marker to the last system block,
     /// promoting the string form to a single text block so the marker
-    /// has somewhere to live. A no-op only if the block form is somehow
-    /// empty (unreachable in practice — a system prompt always has at
-    /// least one block).
+    /// has somewhere to live. Skips an empty/whitespace-only last block
+    /// (a blank system prompt promotes to `{"type":"text","text":""}`),
+    /// which Anthropic rejects with a 400 — see [`is_empty_text_block`].
     fn mark_last_block(&mut self, marker: serde_json::Value) {
         if let AnthropicSystem::Text(s) = self {
             let text = std::mem::take(s);
@@ -61,7 +61,11 @@ impl AnthropicSystem {
                 AnthropicSystem::Blocks(vec![serde_json::json!({"type": "text", "text": text})]);
         }
         if let AnthropicSystem::Blocks(blocks) = self {
-            if let Some(obj) = blocks.last_mut().and_then(|b| b.as_object_mut()) {
+            if let Some(obj) = blocks
+                .last_mut()
+                .filter(|b| !is_empty_text_block(b))
+                .and_then(|b| b.as_object_mut())
+            {
                 obj.insert("cache_control".into(), marker);
             }
         }
@@ -470,8 +474,13 @@ pub fn build_request<'a>(
 ///
 /// `ttl` is the wire value for the injected markers (`5m` or `1h`); `5m`
 /// is emitted as the bare `{"type":"ephemeral"}` Anthropic treats as the
-/// five-minute default. Below-minimum prompts are a documented silent
-/// no-op upstream, so no length gate is applied here.
+/// five-minute default. A *below-minimum-length* prompt is a documented
+/// silent no-op upstream, so no length gate is applied — but an *empty*
+/// text block is a different case Anthropic rejects with a 400
+/// (`cache_control cannot be set for empty text blocks`), so the marker
+/// is never attached to one. The empty-text degrade shape is reachable
+/// on the final turn (an image-only user message flattens to a single
+/// `{"type":"text","text":""}` block) and on a blank system prompt.
 pub fn inject_cache_breakpoints(req: &mut AnthropicRequest<'_>, ttl: &str) {
     if request_has_cache_control(req) {
         return;
@@ -484,10 +493,23 @@ pub fn inject_cache_breakpoints(req: &mut AnthropicRequest<'_>, ttl: &str) {
         .messages
         .last_mut()
         .and_then(|m| m.content.last_mut())
+        .filter(|b| !is_empty_text_block(b))
         .and_then(|b| b.as_object_mut())
     {
         block.insert("cache_control".into(), marker);
     }
+}
+
+/// Whether a content block is a text block with empty or whitespace-only
+/// text. Anthropic rejects `cache_control` on such a block with a 400
+/// (`cache_control cannot be set for empty text blocks`), so the
+/// injector must skip it — it cannot be cached anyway.
+fn is_empty_text_block(block: &serde_json::Value) -> bool {
+    block.get("type").and_then(|t| t.as_str()) == Some("text")
+        && block
+            .get("text")
+            .and_then(|t| t.as_str())
+            .is_none_or(|t| t.trim().is_empty())
 }
 
 /// The marker written by [`inject_cache_breakpoints`]. `1h` carries the
@@ -2542,6 +2564,84 @@ mod tests {
         assert!(wire["messages"][0]["content"][0]
             .get("cache_control")
             .is_none());
+    }
+
+    #[test]
+    fn inject_skips_empty_text_final_block() {
+        // An image-only final user turn flattens to a single empty text
+        // block (images dropped on this bridge). Anthropic 400s on
+        // cache_control attached to an empty text block, so the injector
+        // must leave it unmarked.
+        let req = ChatFormat::new(
+            "claude",
+            vec![
+                ChatMessage::system("prefix"),
+                block_message(
+                    Role::User,
+                    serde_json::json!([
+                        {"type": "image_url", "image_url": {"url": "data:image/png;base64,xyz"}},
+                    ]),
+                ),
+            ],
+        );
+        let wire = injected_wire(&req, "5m");
+        // System still gets its marker (non-empty), but the degraded
+        // empty final block does not.
+        assert_eq!(
+            wire["system"][0]["cache_control"],
+            serde_json::json!({"type": "ephemeral"})
+        );
+        assert_eq!(
+            wire["messages"][0]["content"][0],
+            serde_json::json!({"type": "text", "text": ""})
+        );
+    }
+
+    #[test]
+    fn inject_skips_blank_system_prompt() {
+        // A whitespace-only system message promotes to an empty text
+        // block; it must not be marked (same 400 hazard).
+        let req = ChatFormat::new(
+            "claude",
+            vec![ChatMessage::system("   "), ChatMessage::user("hi")],
+        );
+        let wire = injected_wire(&req, "5m");
+        // System, if emitted as blocks, carries no marker on the empty
+        // block; the trailing user message still gets one.
+        if let Some(sys) = wire.get("system").filter(|v| v.is_array()) {
+            assert!(sys[0].get("cache_control").is_none());
+        }
+        assert_eq!(
+            wire["messages"][0]["content"][0]["cache_control"],
+            serde_json::json!({"type": "ephemeral"})
+        );
+    }
+
+    #[test]
+    fn inject_marks_only_the_last_block_of_a_multi_block_final_message() {
+        // Final message with several content blocks: only the LAST is
+        // marked (a marker means "cache through here"), earlier blocks
+        // stay clean — guards against marking the first or every block.
+        let req = ChatFormat::new(
+            "claude",
+            vec![block_message(
+                Role::User,
+                serde_json::json!([
+                    {"type": "text", "text": "block A"},
+                    {"type": "text", "text": "block B"},
+                    {"type": "text", "text": "block C"},
+                ]),
+            )],
+        );
+        let wire = injected_wire(&req, "5m");
+        let content = wire["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 3);
+        assert!(content[0].get("cache_control").is_none());
+        assert!(content[1].get("cache_control").is_none());
+        assert_eq!(
+            content[2]["cache_control"],
+            serde_json::json!({"type": "ephemeral"})
+        );
     }
 
     #[test]
