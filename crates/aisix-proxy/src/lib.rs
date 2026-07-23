@@ -2565,6 +2565,152 @@ data: [DONE]\n\n"
         assert_eq!(v["error"]["type"], "rate_limit_exceeded");
     }
 
+    // ---- regression coverage for api7/AISIX-Cloud#1116 --------------
+    // Pre-fix the passthrough tunnel passed `None` to quota::enforce, so
+    // a Model's inline rate_limit (and model-scope policies) never
+    // applied to passthrough traffic — for provider endpoints with no
+    // typed surface (e.g. video generation) the model limit was
+    // unenforceable everywhere. Post-fix the top-level `model` field of
+    // a JSON passthrough body is matched against the addressed
+    // provider's configured Models and its limits reserved like the
+    // typed endpoints.
+
+    fn model_entry_with_rate_limit(
+        name: &str,
+        rate_limit: serde_json::Value,
+    ) -> ResourceEntry<Model> {
+        let cfg = format!(
+            r#"{{
+                "display_name": "{name}",
+                "provider": "openai",
+                "model_name": "gpt-4o",
+                "provider_key_id": "{PK_ID}",
+                "rate_limit": {rate_limit}
+            }}"#
+        );
+        let model: Model = serde_json::from_str(&cfg).unwrap();
+        ResourceEntry::new("model-id-1", model, 1)
+    }
+
+    #[tokio::test]
+    async fn passthrough_enforces_model_rate_limit_from_body_model_field() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(
+                "/api/v1/services/aigc/video-generation/video-synthesis",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "output": {"task_id": "t-1", "task_status": "PENDING"}
+            })))
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry_with_rate_limit(
+            "my-video-model",
+            serde_json::json!({"rpm": 1}),
+        ));
+        snap.apikeys
+            .insert(apikey_entry("sk-caller", &["my-video-model"]));
+        let state = build_state(snap, hub);
+
+        let body = serde_json::json!({
+            "model": "my-video-model",
+            "input": {"prompt": "a cardboard city at night"},
+            "parameters": {"resolution": "720P"}
+        });
+        let make_req = || {
+            Request::builder()
+                .method("POST")
+                .uri("/passthrough/openai/api/v1/services/aigc/video-generation/video-synthesis")
+                .header("authorization", "Bearer sk-caller")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+
+        // First request consumes the model's only RPM slot.
+        let resp = run(build_router(state.clone()), make_req()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Pre-fix: 200 again (model layer skipped on passthrough).
+        // Post-fix: 429 — the body's `model` resolved the configured
+        // Model and its rpm=1 cap now gates the tunnel.
+        let resp = run(build_router(state.clone()), make_req()).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "passthrough must enforce the body model's rate limit (api7/AISIX-Cloud#1116)",
+        );
+        let body_bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(v["error"]["type"], "rate_limit_exceeded");
+    }
+
+    #[tokio::test]
+    async fn passthrough_unregistered_or_absent_body_model_keeps_key_layer_only() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/anything"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        // Model has rpm=1, but requests below never name it — its bucket
+        // must stay untouched. The API key carries rpm=2 to pin that the
+        // key layer still gates the tunnel (and 429s on the 3rd call).
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry_with_rate_limit(
+            "my-video-model",
+            serde_json::json!({"rpm": 1}),
+        ));
+        snap.apikeys.insert(apikey_entry_with_limits(
+            "sk-caller",
+            &["my-video-model"],
+            Some(serde_json::json!({"rpm": 2})),
+        ));
+        let state = build_state(snap, hub);
+
+        let make_req = |body: &'static str| {
+            Request::builder()
+                .method("POST")
+                .uri("/passthrough/openai/anything")
+                .header("authorization", "Bearer sk-caller")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap()
+        };
+
+        // Unregistered model name → no model-layer reservation, passes.
+        let resp = run(
+            build_router(state.clone()),
+            make_req(r#"{"model":"not-a-configured-model","input":"x"}"#),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Non-JSON body → tolerated, no model-layer reservation.
+        let resp = run(build_router(state.clone()), make_req("plain text body")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Third call trips the KEY-level rpm=2 — the request-level
+        // layers keep gating the tunnel exactly as before the fix.
+        let resp = run(
+            build_router(state.clone()),
+            make_req(r#"{"model":"not-a-configured-model","input":"x"}"#),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "key-level rate limit must keep applying to passthrough",
+        );
+    }
+
     /// Regression for issue #108: streaming chat used to commit
     /// `0` tokens up front and never look at the upstream's terminal
     /// usage frame. TPM caps were silently bypassed for all streaming
