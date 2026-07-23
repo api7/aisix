@@ -581,31 +581,58 @@ async fn dispatch(
 /// Model-level rate-limit identity for a passthrough request, resolved from
 /// the JSON body's top-level `model` field (api7/AISIX-Cloud#1116).
 ///
+/// The name is matched against the addressed provider's configured Models
+/// twice over: an exact `display_name` hit first (the gateway alias), then
+/// the provider-native `model_name` — the tunnel forwards bodies verbatim,
+/// so callers typically name the upstream id, not the gateway alias. Either
+/// way the reservation is keyed by the entry's `display_name`, so tunnel
+/// and typed traffic to the same Model draw from one bucket.
+///
 /// Returns `None` when the body is not JSON, carries no string `model`
-/// field, or the name doesn't match a configured Model of the addressed
-/// provider — the request then reserves only the request-level layers,
-/// mirroring the pre-fix behavior. The provider constraint keeps a
-/// same-named Model of a different provider from being charged for this
-/// tunnel's traffic. Exact `display_name` match only: wildcard Models are
-/// a typed-endpoint resolution feature, not replicated here.
+/// field, or nothing matches within the addressed provider — the request
+/// then reserves only the request-level layers, mirroring the pre-fix
+/// behavior. A same-named Model of a different provider never matches.
+/// Wildcard (`*`) display names are a typed-endpoint resolution feature,
+/// not replicated here.
 fn body_model_rate_limit(
     snapshot: &aisix_core::AisixSnapshot,
     provider_lower: &str,
     body: &[u8],
 ) -> Option<crate::quota::ModelRateLimit> {
-    let parsed: serde_json::Value = serde_json::from_slice(body).ok()?;
-    let name = parsed.get("model")?.as_str()?;
-    let entry = snapshot.models.get_by_name(name)?;
-    if !entry
-        .value
-        .provider
-        .as_deref()
-        .is_some_and(|p| p.eq_ignore_ascii_case(provider_lower))
-    {
-        return None;
+    // Field probe, not a full `Value` DOM: unknown fields are skipped
+    // without allocating, so a large tunnel body costs one `String` here,
+    // not a parsed copy of itself. A non-string `model` fails the whole
+    // deserialize and lands on the same `None` fallback.
+    #[derive(serde::Deserialize)]
+    struct BodyModelProbe {
+        model: Option<String>,
     }
+    let name = serde_json::from_slice::<BodyModelProbe>(body).ok()?.model?;
+    let matches_provider = |m: &aisix_core::Model| {
+        m.provider
+            .as_deref()
+            .is_some_and(|p| p.eq_ignore_ascii_case(provider_lower))
+    };
+    let entry = snapshot
+        .models
+        .get_by_name(&name)
+        .filter(|e| matches_provider(&e.value))
+        .or_else(|| {
+            // Provider-native id fallback. `min_by_key` keeps the pick
+            // deterministic when several Models pin the same upstream id.
+            snapshot
+                .models
+                .entries()
+                .into_iter()
+                .filter(|e| {
+                    matches_provider(&e.value)
+                        && e.value.model_name.as_deref() == Some(name.as_str())
+                        && !e.value.display_name.contains('*')
+                })
+                .min_by_key(|e| e.id.clone())
+        })?;
     Some(crate::quota::ModelRateLimit::from_model(
-        name,
+        &entry.value.display_name,
         &entry.id,
         &entry.value,
     ))

@@ -148,6 +148,7 @@ describe("passthrough e2e: body-model rate limiting on the raw tunnel", () => {
 
     // Second submission must be rejected by the gateway — NOT reach
     // the upstream — with the standard rate-limit envelope.
+    const upstreamCallsBefore = upstreams[0]!.receivedRequests.length;
     const second = await callSynth(VIDEO_MODEL);
     expect(second.status).toBe(429);
     expect(second.headers.get("retry-after")).toBeTruthy();
@@ -155,6 +156,8 @@ describe("passthrough e2e: body-model rate limiting on the raw tunnel", () => {
       error?: { type?: unknown };
     };
     expect(err.error?.type).toBe("rate_limit_exceeded");
+    // The 429 was produced by the gateway: no upstream round-trip.
+    expect(upstreams[0]!.receivedRequests.length).toBe(upstreamCallsBefore);
 
     // Task polling — the second half of the provider's async journey —
     // is a bodyless GET carrying no `model` field, so the exhausted

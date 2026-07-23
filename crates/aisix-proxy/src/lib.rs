@@ -2579,11 +2579,19 @@ data: [DONE]\n\n"
         name: &str,
         rate_limit: serde_json::Value,
     ) -> ResourceEntry<Model> {
+        model_entry_named(name, "gpt-4o", rate_limit)
+    }
+
+    fn model_entry_named(
+        display_name: &str,
+        model_name: &str,
+        rate_limit: serde_json::Value,
+    ) -> ResourceEntry<Model> {
         let cfg = format!(
             r#"{{
-                "display_name": "{name}",
+                "display_name": "{display_name}",
                 "provider": "openai",
-                "model_name": "gpt-4o",
+                "model_name": "{model_name}",
                 "provider_key_id": "{PK_ID}",
                 "rate_limit": {rate_limit}
             }}"#
@@ -2709,6 +2717,165 @@ data: [DONE]\n\n"
             StatusCode::TOO_MANY_REQUESTS,
             "key-level rate limit must keep applying to passthrough",
         );
+    }
+
+    /// A `model`-scope RateLimitPolicy row (no inline rate_limit on the
+    /// Model) must gate the tunnel too — the policy path matches by the
+    /// resolved entry id, which is only exercised when the body model
+    /// lookup propagates it.
+    #[tokio::test]
+    async fn passthrough_enforces_model_scope_policy_from_body_model_field() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/anything"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("my-video-model"));
+        snap.rate_limit_policies.insert(ResourceEntry::new(
+            "pol-1",
+            serde_json::from_value(serde_json::json!({
+                "name": "video-cap",
+                "scope": "model",
+                "scope_ref": "model-id-1",
+                "window": "minute",
+                "max_requests": 1
+            }))
+            .unwrap(),
+            1,
+        ));
+        snap.apikeys
+            .insert(apikey_entry("sk-caller", &["my-video-model"]));
+        let state = build_state(snap, hub);
+
+        let make_req = || {
+            Request::builder()
+                .method("POST")
+                .uri("/passthrough/openai/anything")
+                .header("authorization", "Bearer sk-caller")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"model":"my-video-model","input":"x"}"#))
+                .unwrap()
+        };
+
+        let resp = run(build_router(state.clone()), make_req()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = run(build_router(state.clone()), make_req()).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "model-scope policy must gate passthrough via the body model",
+        );
+    }
+
+    /// The tunnel forwards bodies verbatim, so callers typically name the
+    /// provider-native id (`model_name`), not the gateway alias
+    /// (`display_name`). The limit must bind either way, and the bucket is
+    /// keyed by the alias so tunnel and typed traffic share one budget.
+    #[tokio::test]
+    async fn passthrough_matches_provider_native_model_name_for_rate_limit() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/anything"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry_named(
+            "ali-video-alias",
+            "happyhorse-1.1-t2v",
+            serde_json::json!({"rpm": 1}),
+        ));
+        snap.apikeys
+            .insert(apikey_entry("sk-caller", &["ali-video-alias"]));
+        let state = build_state(snap, hub);
+
+        // Caller names the upstream id, not the alias — the alias's cap
+        // must still bind.
+        let make_req = || {
+            Request::builder()
+                .method("POST")
+                .uri("/passthrough/openai/anything")
+                .header("authorization", "Bearer sk-caller")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"model":"happyhorse-1.1-t2v","input":"x"}"#))
+                .unwrap()
+        };
+
+        let resp = run(build_router(state.clone()), make_req()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = run(build_router(state.clone()), make_req()).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "provider-native model_name must resolve the Model's rate limit",
+        );
+    }
+
+    /// A same-named Model registered under a DIFFERENT provider must not
+    /// be charged for this tunnel's traffic: the body name only matches
+    /// within the addressed provider.
+    #[tokio::test]
+    async fn passthrough_same_named_model_of_other_provider_is_not_limited() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/anything"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = new_snap(&upstream.uri());
+        // Credential-lending model for the addressed provider — unlimited.
+        snap.models.insert(model_entry("openai-lender"));
+        // Same body-name model under another provider, rpm=1. Its bucket
+        // must stay untouched by /passthrough/openai traffic.
+        let cross: Model = serde_json::from_str(&format!(
+            r#"{{
+                "display_name": "cross-model",
+                "provider": "anthropic",
+                "model_name": "cross-model",
+                "provider_key_id": "{PK_ID}",
+                "rate_limit": {{"rpm": 1}}
+            }}"#
+        ))
+        .unwrap();
+        snap.models
+            .insert(ResourceEntry::new("model-id-cross", cross, 1));
+        snap.apikeys
+            .insert(apikey_entry("sk-caller", &["openai-lender", "cross-model"]));
+        let state = build_state(snap, hub);
+
+        let make_req = || {
+            Request::builder()
+                .method("POST")
+                .uri("/passthrough/openai/anything")
+                .header("authorization", "Bearer sk-caller")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"model":"cross-model","input":"x"}"#))
+                .unwrap()
+        };
+
+        // Both calls pass: the anthropic model's rpm=1 bucket is never
+        // drawn from by the openai tunnel.
+        for _ in 0..2 {
+            let resp = run(build_router(state.clone()), make_req()).await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "cross-provider same-named model must not gate this tunnel",
+            );
+        }
     }
 
     /// Regression for issue #108: streaming chat used to commit
