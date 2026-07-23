@@ -506,7 +506,7 @@ async fn dispatch(
                 &state.runtime_status,
                 &model_entry.id,
                 model.cooldown.as_ref(),
-                aisix_gateway::BridgeError::Transport(e.to_string()),
+                aisix_gateway::BridgeError::Transport(aisix_gateway::transport_error_message(&e)),
             )
         })
         .map_err(ProxyError::Bridge)?;

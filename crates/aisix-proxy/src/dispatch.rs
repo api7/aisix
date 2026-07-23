@@ -37,7 +37,7 @@ pub(crate) fn reqwest_error_to_bridge(e: &reqwest::Error, started: Instant) -> B
             elapsed_ms: started.elapsed().as_millis() as u64,
         }
     } else {
-        BridgeError::Transport(e.to_string())
+        BridgeError::Transport(aisix_gateway::transport_error_message(e))
     }
 }
 

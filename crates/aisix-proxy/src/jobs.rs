@@ -366,7 +366,7 @@ async fn send_upstream(
                 &state.runtime_status,
                 &target.model_entry.id,
                 target.model_entry.value.cooldown.as_ref(),
-                aisix_gateway::BridgeError::Transport(e.to_string()),
+                aisix_gateway::BridgeError::Transport(aisix_gateway::transport_error_message(&e)),
             )
         })
         .map_err(ProxyError::Bridge)?;

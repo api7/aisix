@@ -31,7 +31,7 @@ use aisix_core::{
     SourceKind,
 };
 use aisix_etcd::{EtcdConfigProvider, SnapshotCache, Supervisor};
-use aisix_gateway::Hub;
+use aisix_gateway::{Hub, UpstreamHttpConfig};
 use aisix_obs::{init_tracing, install_otlp_tracer, Metrics};
 use aisix_provider_anthropic::AnthropicBridge;
 use aisix_provider_azure_openai::AzureOpenAiBridge;
@@ -44,6 +44,7 @@ use aisix_proxy::{CacheBackends, ProxyState};
 use aisix_ratelimit::{Limiter, RedisStore};
 use clap::Parser;
 use etcd_client::{Certificate, ConnectOptions, Identity, TlsOptions};
+use std::time::Duration;
 use tokio::sync::watch;
 
 #[derive(Debug, Parser)]
@@ -149,6 +150,10 @@ async fn main() -> anyhow::Result<()> {
     init_tracing(&cfg.observability).map_err(|e| anyhow::anyhow!("tracing init failed: {e}"))?;
     let _otlp = install_otlp_tracer(&cfg.observability)
         .map_err(|e| anyhow::anyhow!("otlp init failed: {e}"))?;
+
+    // Before any bridge builds its `reqwest::Client` — the connection
+    // pools are constructed once and can't be reconfigured afterwards.
+    aisix_gateway::upstream_http::init(upstream_http_config(&cfg.upstream));
 
     run(cfg).await
 }
@@ -1220,6 +1225,25 @@ fn load_heartbeat_config_from_disk(
 /// <https://docs.cohere.com/reference/chat>). Cohere's `/v1/rerank`
 /// native surface is keyed off `Model.provider == "cohere"` in
 /// `crates/aisix-proxy/src/rerank.rs` and bypasses the Bridge.
+/// Translate the `upstream:` config block into the gateway's client
+/// settings. Every duration treats `0` as "leave this knob off".
+fn upstream_http_config(cfg: &aisix_core::config::UpstreamConfig) -> UpstreamHttpConfig {
+    fn ms(v: u64) -> Option<Duration> {
+        (v > 0).then(|| Duration::from_millis(v))
+    }
+    fn secs(v: u64) -> Option<Duration> {
+        (v > 0).then(|| Duration::from_secs(v))
+    }
+    UpstreamHttpConfig {
+        connect_timeout: ms(cfg.connect_timeout_ms),
+        tcp_keepalive: secs(cfg.tcp_keepalive_secs),
+        tcp_keepalive_interval: secs(cfg.tcp_keepalive_interval_secs),
+        tcp_keepalive_retries: (cfg.tcp_keepalive_retries > 0).then_some(cfg.tcp_keepalive_retries),
+        pool_idle_timeout: secs(cfg.pool_idle_timeout_secs),
+        pool_max_idle_per_host: cfg.pool_max_idle_per_host,
+    }
+}
+
 fn build_hub() -> Hub {
     let hub = Hub::new();
 

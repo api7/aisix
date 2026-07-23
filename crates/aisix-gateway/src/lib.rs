@@ -13,10 +13,12 @@
 //! - [`sse`] — a provider-agnostic SSE line decoder. Bridges that stream
 //!   over SSE feed it raw bytes and pull typed events back out.
 //! - [`credential`] — cache keys for credential-derived upstream tokens.
+//! - [`upstream_http`] — connection-layer settings every provider client
+//!   shares (connect timeout, TCP keepalive, pool expiry) plus the
+//!   cause-chain rendering for transport errors.
 //!
-//! The concrete HTTP transport lives in the provider crates — keeping
-//! this crate free of `reqwest` at the public-API level makes it testable
-//! without wiremock.
+//! Request/response translation lives in the provider crates; this crate
+//! owns only what all of them must agree on.
 
 #![forbid(unsafe_code)]
 #![deny(rust_2018_idioms)]
@@ -26,6 +28,7 @@ pub mod chat;
 pub mod credential;
 pub mod hub;
 pub mod sse;
+pub mod upstream_http;
 
 pub use bridge::{
     capture_upstream_error_http, content_type_is_json, parse_retry_after, read_body_capped,
@@ -39,3 +42,6 @@ pub use chat::{
 pub use credential::credential_fingerprint;
 pub use hub::Hub;
 pub use sse::{SseDecoder, SseEvent};
+pub use upstream_http::{
+    client_builder, error_with_causes, transport_error_message, UpstreamHttpConfig,
+};
