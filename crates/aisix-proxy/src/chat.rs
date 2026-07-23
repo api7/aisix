@@ -1155,6 +1155,19 @@ async fn dispatch(
     // the remaining chunks, so a mid-stream stall terminates the response
     // (no fallback once the 200 is committed).
     if req.is_streaming() {
+        // `routing.retries` — how many times to re-hit the SAME target (with
+        // backoff) on a retryable failure before failing over to the next one.
+        // Read here for the same reason the non-streaming loop below reads it:
+        // the two loops are written separately, and streaming used to skip
+        // `retries` entirely (AISIX-Cloud#1119), so a retryable first-chunk
+        // failure fell straight over to the next target — or, with a single
+        // target, failed the request outright.
+        let retries = virtual_entry
+            .value
+            .routing
+            .as_ref()
+            .map(|r| r.retries_or_default())
+            .unwrap_or(0);
         let retry_on_429 = virtual_entry
             .value
             .routing
@@ -1209,54 +1222,6 @@ async fn dispatch(
                 ));
                 continue 'targets;
             };
-            let (idx, kind) = stream_routing.begin_attempt(&model.display_name);
-            let target_model = if is_routing_request {
-                model.display_name.clone()
-            } else {
-                String::new()
-            };
-            // Reserve THIS target's own model rate-limit layers before
-            // dispatching to it (AISIX-Cloud#1087). Over-limit → record a
-            // 429 attempt and move on to the remaining targets in strategy
-            // order (same-target retries can't help — the window won't
-            // reset mid-loop).
-            let member_reservation = match crate::quota::reserve_routing_target(
-                state,
-                is_routing_request,
-                &model.display_name,
-                &attempt.id,
-                model,
-            )
-            .await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    stream_routing.attempts.push(AttemptRecord {
-                        index: idx,
-                        kind,
-                        target_model,
-                        target_model_id: attempt.id.clone(),
-                        provider_key_id: pk_entry.id.clone(),
-                        status: 429,
-                        success: false,
-                        error_class: "rate_limit_exceeded".to_string(),
-                        error_message: e.to_string(),
-                        latency_ms: 0,
-                    });
-                    // Keep the limiter's own Retry-After hint on the wire:
-                    // when every target is exhausted this error becomes the
-                    // client's 429, and SDKs back off on that header.
-                    last_err = Some(BridgeError::upstream_status_with_retry_after(
-                        429,
-                        format!(
-                            "routing target {:?} is over its model rate limit: {e}",
-                            model.display_name
-                        ),
-                        crate::quota::retry_after_of(&e).map(Duration::from_secs),
-                    ));
-                    continue 'targets;
-                }
-            };
             let model_arc = Arc::new(model.clone());
             let pk_arc = Arc::new(pk_entry.value.clone());
             // Streaming deadline (#554): bound the connect by the effective
@@ -1266,110 +1231,181 @@ async fn dispatch(
             if let Some(d) = model.stream_timeout_effective() {
                 ctx = ctx.with_deadline(d);
             }
-            let attempt_started = Instant::now();
             // Effective streaming budget: `stream_timeout`, falling back to
             // `timeout`. Used for the connect deadline (above) AND the
-            // per-chunk read timeout + first-chunk peek here, so the budget
+            // per-chunk read timeout + first-chunk peek below, so the budget
             // is applied consistently.
             let stream_budget = model.stream_timeout_effective();
-            // Connect, then — only when a streaming budget is configured —
-            // peek the first chunk so a slow or erroring first token fails
-            // over before the 200 is committed. Without a budget there is
-            // nothing to gate on, so the stream is committed directly (a
-            // first-chunk error then surfaces in-band, exactly like the
-            // pre-#554 behavior). The read-timeout wrapper is a no-op when
-            // the budget is None.
-            let attempt_stream: Result<aisix_gateway::ChatChunkStream, BridgeError> =
-                match bridge.chat_stream(req, &ctx).await {
-                    Err(e) => Err(e),
-                    Ok(up) => {
-                        let up = crate::stream_timeout::with_read_timeout(up, stream_budget);
-                        if stream_budget.is_some() {
-                            let mut up = up;
-                            match up.next().await {
-                                // Re-prepend the peeked chunk so the SSE pump
-                                // sees the whole stream (and records TTFT on
-                                // the first content chunk); the wrapper keeps
-                                // enforcing the read timeout on the rest.
-                                Some(Ok(chunk)) => Ok(Box::pin(
-                                    futures::stream::once(std::future::ready(
-                                        Ok::<_, BridgeError>(chunk),
-                                    ))
-                                    .chain(up),
-                                )
-                                    as aisix_gateway::ChatChunkStream),
-                                Some(Err(e)) => Err(e),
-                                None => Err(BridgeError::StreamAborted),
-                            }
-                        } else {
-                            Ok(up)
-                        }
+
+            // Re-hit the SAME target `retries` times before failing over,
+            // mirroring the non-streaming loop below (AISIX-Cloud#1119).
+            for attempt_idx in 0..=retries {
+                let (idx, kind) = stream_routing.begin_attempt(&model.display_name);
+                let target_model = if is_routing_request {
+                    model.display_name.clone()
+                } else {
+                    String::new()
+                };
+                // Reserve THIS target's own model rate-limit layers before
+                // dispatching to it (AISIX-Cloud#1087). Over-limit → record a
+                // 429 attempt and move on to the remaining targets in strategy
+                // order (same-target retries can't help — the window won't
+                // reset mid-loop).
+                let member_reservation = match crate::quota::reserve_routing_target(
+                    state,
+                    is_routing_request,
+                    &model.display_name,
+                    &attempt.id,
+                    model,
+                )
+                .await
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        stream_routing.attempts.push(AttemptRecord {
+                            index: idx,
+                            kind,
+                            target_model,
+                            target_model_id: attempt.id.clone(),
+                            provider_key_id: pk_entry.id.clone(),
+                            status: 429,
+                            success: false,
+                            error_class: "rate_limit_exceeded".to_string(),
+                            error_message: e.to_string(),
+                            latency_ms: 0,
+                        });
+                        // Keep the limiter's own Retry-After hint on the wire:
+                        // when every target is exhausted this error becomes the
+                        // client's 429, and SDKs back off on that header.
+                        last_err = Some(BridgeError::upstream_status_with_retry_after(
+                            429,
+                            format!(
+                                "routing target {:?} is over its model rate limit: {e}",
+                                model.display_name
+                            ),
+                            crate::quota::retry_after_of(&e).map(Duration::from_secs),
+                        ));
+                        continue 'targets;
                     }
                 };
-            let latency_ms = attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
-            match attempt_stream {
-                Ok(upstream) => {
-                    state.health.record_success(&model.display_name);
-                    state.runtime_status.mark_healthy(&attempt.id);
-                    // Feed the least_latency EWMA. For streaming this is
-                    // time-to-first-response (upstream stream established) —
-                    // the routing-relevant latency signal.
-                    state.runtime_status.record_latency(&attempt.id, latency_ms);
-                    stream_routing.attempts.push(AttemptRecord {
-                        index: idx,
-                        kind,
-                        target_model,
-                        target_model_id: attempt.id.clone(),
-                        provider_key_id: pk_entry.id.clone(),
-                        status: 200,
-                        success: true,
-                        error_class: String::new(),
-                        error_message: String::new(),
-                        latency_ms,
-                    });
-                    won = Some(StreamWin {
-                        model: model.clone(),
-                        target_id: attempt.id.clone(),
-                        provider_lc: provider.to_ascii_lowercase(),
-                        pk_id: pk_entry.id.clone(),
-                        upstream,
-                        idx,
-                        kind,
-                    });
-                    won_member_reservation = member_reservation;
-                    break 'targets;
-                }
-                Err(err) => {
-                    stream_routing.attempts.push(AttemptRecord {
-                        index: idx,
-                        kind,
-                        target_model,
-                        target_model_id: attempt.id.clone(),
-                        provider_key_id: pk_entry.id.clone(),
-                        status: err.http_status(),
-                        success: false,
-                        error_class: routing_error_class(&err).to_string(),
-                        error_message: attempt_error_message(&err),
-                        latency_ms,
-                    });
-                    let retryable = is_retryable(&err, retry_on_429, fallback_statuses);
-                    tracing::warn!(
-                        target_model = %model.display_name,
-                        error = %err,
-                        retryable,
-                        "streaming routing target attempt failed",
-                    );
-                    if retryable {
-                        state.health.record_failure(&model.display_name);
-                    }
-                    if let Some((ttl, reason)) =
-                        decide_cooldown(&err, attempt.model.cooldown.as_ref())
-                    {
-                        state.runtime_status.mark_cooldown(&attempt.id, ttl, reason);
-                    }
-                    last_err = Some(err);
-                    if !retryable {
+                let attempt_started = Instant::now();
+                // Connect, then — only when a streaming budget is configured —
+                // peek the first chunk so a slow or erroring first token fails
+                // over before the 200 is committed. Without a budget there is
+                // nothing to gate on, so the stream is committed directly (a
+                // first-chunk error then surfaces in-band, exactly like the
+                // pre-#554 behavior). The read-timeout wrapper is a no-op when
+                // the budget is None.
+                let attempt_stream: Result<aisix_gateway::ChatChunkStream, BridgeError> =
+                    match bridge.chat_stream(req, &ctx).await {
+                        Err(e) => Err(e),
+                        Ok(up) => {
+                            let up = crate::stream_timeout::with_read_timeout(up, stream_budget);
+                            if stream_budget.is_some() {
+                                let mut up = up;
+                                match up.next().await {
+                                    // Re-prepend the peeked chunk so the SSE pump
+                                    // sees the whole stream (and records TTFT on
+                                    // the first content chunk); the wrapper keeps
+                                    // enforcing the read timeout on the rest.
+                                    Some(Ok(chunk)) => Ok(Box::pin(
+                                        futures::stream::once(std::future::ready(Ok::<
+                                            _,
+                                            BridgeError,
+                                        >(
+                                            chunk
+                                        )))
+                                        .chain(up),
+                                    )
+                                        as aisix_gateway::ChatChunkStream),
+                                    Some(Err(e)) => Err(e),
+                                    None => Err(BridgeError::StreamAborted),
+                                }
+                            } else {
+                                Ok(up)
+                            }
+                        }
+                    };
+                let latency_ms = attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+                match attempt_stream {
+                    Ok(upstream) => {
+                        state.health.record_success(&model.display_name);
+                        state.runtime_status.mark_healthy(&attempt.id);
+                        // Feed the least_latency EWMA. For streaming this is
+                        // time-to-first-response (upstream stream established) —
+                        // the routing-relevant latency signal.
+                        state.runtime_status.record_latency(&attempt.id, latency_ms);
+                        stream_routing.attempts.push(AttemptRecord {
+                            index: idx,
+                            kind,
+                            target_model,
+                            target_model_id: attempt.id.clone(),
+                            provider_key_id: pk_entry.id.clone(),
+                            status: 200,
+                            success: true,
+                            error_class: String::new(),
+                            error_message: String::new(),
+                            latency_ms,
+                        });
+                        won = Some(StreamWin {
+                            model: model.clone(),
+                            target_id: attempt.id.clone(),
+                            provider_lc: provider.to_ascii_lowercase(),
+                            pk_id: pk_entry.id.clone(),
+                            upstream,
+                            idx,
+                            kind,
+                        });
+                        won_member_reservation = member_reservation;
                         break 'targets;
+                    }
+                    Err(err) => {
+                        stream_routing.attempts.push(AttemptRecord {
+                            index: idx,
+                            kind,
+                            target_model,
+                            target_model_id: attempt.id.clone(),
+                            provider_key_id: pk_entry.id.clone(),
+                            status: err.http_status(),
+                            success: false,
+                            error_class: routing_error_class(&err).to_string(),
+                            error_message: attempt_error_message(&err),
+                            latency_ms,
+                        });
+                        let retryable = is_retryable(&err, retry_on_429, fallback_statuses);
+                        tracing::warn!(
+                            target_model = %model.display_name,
+                            target_attempt = attempt_idx + 1,
+                            error = %err,
+                            retryable,
+                            "streaming routing target attempt failed",
+                        );
+                        if retryable {
+                            state.health.record_failure(&model.display_name);
+                        }
+                        if let Some((ttl, reason)) =
+                            decide_cooldown(&err, attempt.model.cooldown.as_ref())
+                        {
+                            state.runtime_status.mark_cooldown(&attempt.id, ttl, reason);
+                        }
+                        last_err = Some(err);
+                        if !retryable {
+                            break 'targets;
+                        }
+                        if attempt_idx == retries {
+                            break;
+                        }
+                        // Exponential backoff + jitter before re-hitting the
+                        // SAME target (#788 P2); cross-target fail-over (the
+                        // outer loop) stays immediate.
+                        let backoff = crate::routing::retry_backoff((attempt_idx + 1) as u32);
+                        tracing::debug!(
+                            target_model = %model.display_name,
+                            next_attempt = attempt_idx + 2,
+                            backoff_ms = backoff.as_millis() as u64,
+                            "backing off before same-target retry",
+                        );
+                        tokio::time::sleep(backoff).await;
                     }
                 }
             }

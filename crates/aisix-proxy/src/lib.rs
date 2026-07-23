@@ -4253,8 +4253,8 @@ data: [DONE]\n\n";
         let resp = run(app, req).await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
 
-        // Streaming attempts only the first target (#655): the single
-        // failed initial attempt is emitted as one per-attempt event.
+        // Single target, `retries` unset (defaults to 0): exactly one
+        // attempt, emitted as one per-attempt event (#655).
         let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
             .await
             .expect("usage event was never emitted")
@@ -4282,6 +4282,193 @@ data: [DONE]\n\n";
                 extra.error_class
             );
         }
+    }
+
+    /// AISIX-Cloud#1119: the streaming path must honour `routing.retries`
+    /// exactly like the non-streaming one. Before the fix the streaming
+    /// loop walked targets once and never re-hit the same target, so a
+    /// retryable failure fell straight over — the operator saw
+    /// `initial → fallback` with the configured `retry #1` missing.
+    /// `retries=1` on an always-502 primary must make TWO attempts on it
+    /// before the secondary is tried.
+    #[tokio::test]
+    async fn streaming_routing_honors_same_target_retries() {
+        use aisix_obs::UsageSink;
+
+        let flaky_upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(502).set_body_string("try again"))
+            // initial + one same-target retry. Pre-fix this was 1.
+            .expect(2)
+            .mount(&flaky_upstream)
+            .await;
+
+        let good_upstream = MockServer::start().await;
+        let sse = "\
+data: {\"id\":\"up-1\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"after retries\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"up-1\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+data: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .expect(1)
+            .mount(&good_upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+
+        let snap = AisixSnapshot::new();
+        snap.provider_keys
+            .insert(pk_entry_with_id("pk-flaky", &flaky_upstream.uri()));
+        snap.provider_keys
+            .insert(pk_entry_with_id("pk-good", &good_upstream.uri()));
+        snap.models
+            .insert(model_entry_with_id("m-flaky", "primary", "pk-flaky"));
+        snap.models
+            .insert(model_entry_with_id("m-good", "secondary", "pk-good"));
+        snap.models.insert(routing_entry(
+            "smart",
+            "failover",
+            &["primary", "secondary"],
+            Some(1),
+            Some(1),
+            None,
+        ));
+        snap.apikeys.insert(apikey_entry("sk-caller", &["smart"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = build_router(build_state(snap, hub).with_usage_sink(UsageSink::new(tx)));
+        let body = serde_json::json!({
+            "model": "smart",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Drain the stream — the winning attempt's UsageEvent is emitted
+        // by the end-of-stream Drop guard, so it isn't observable until
+        // the body is fully consumed.
+        let mut body_stream = resp.into_body().into_data_stream();
+        let mut decoder = SseDecoder::new();
+        let mut sse_events = Vec::new();
+        while let Some(chunk) = body_stream.next().await {
+            sse_events.extend(decoder.feed(chunk.unwrap().as_ref()));
+        }
+        assert!(sse_events.contains(&SseEvent::Done), "missing [DONE]");
+
+        // initial (primary 502) → retry (primary 502) → fallback (secondary 200)
+        let mut events = Vec::new();
+        for _ in 0..3 {
+            let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+                .await
+                .expect("usage event was never emitted")
+                .expect("sender dropped");
+            events.push(ev);
+        }
+        events.sort_by_key(|e| e.attempt_index);
+
+        assert_eq!(events[0].attempt_kind, "initial");
+        assert_eq!(events[0].attempt_model, "primary");
+        assert_eq!(events[0].status_code, 502);
+
+        // The attempt the operator reported missing in #1119.
+        assert_eq!(
+            events[1].attempt_kind, "retry",
+            "same-target retry must precede fail-over"
+        );
+        assert_eq!(events[1].attempt_model, "primary");
+        assert_eq!(events[1].model_id, "m-flaky");
+        assert_eq!(events[1].status_code, 502);
+
+        assert_eq!(events[2].attempt_kind, "fallback");
+        assert_eq!(events[2].attempt_model, "secondary");
+        assert_eq!(events[2].status_code, 200);
+    }
+
+    /// AISIX-Cloud#1119 / #1122: with a SINGLE target there is nothing to
+    /// fail over to, so `routing.retries` is the only thing standing
+    /// between a transient upstream blip and a failed request. The
+    /// streaming path used to attempt once and give up.
+    #[tokio::test]
+    async fn streaming_routing_retries_single_target_before_failing() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(502).set_body_string("transient"))
+            // initial + two same-target retries. Pre-fix this was 1.
+            .expect(3)
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+
+        let snap = AisixSnapshot::new();
+        snap.provider_keys
+            .insert(pk_entry_with_id("pk-only", &upstream.uri()));
+        snap.models
+            .insert(model_entry_with_id("m-only", "primary", "pk-only"));
+        snap.models.insert(routing_entry(
+            "smart",
+            "failover",
+            &["primary"],
+            Some(2),
+            None,
+            None,
+        ));
+        snap.apikeys.insert(apikey_entry("sk-caller", &["smart"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = build_router(build_state(snap, hub).with_usage_sink(UsageSink::new(tx)));
+        let body = serde_json::json!({
+            "model": "smart",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+
+        let mut events = Vec::new();
+        for _ in 0..3 {
+            let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+                .await
+                .expect("usage event was never emitted")
+                .expect("sender dropped");
+            events.push(ev);
+        }
+        events.sort_by_key(|e| e.attempt_index);
+        assert_eq!(events[0].attempt_kind, "initial");
+        assert_eq!(events[1].attempt_kind, "retry");
+        assert_eq!(events[2].attempt_kind, "retry");
+        assert!(
+            events.iter().all(|e| e.attempt_model == "primary"),
+            "all attempts stay on the single configured target"
+        );
     }
 
     #[tokio::test]
