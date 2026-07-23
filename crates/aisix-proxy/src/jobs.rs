@@ -119,6 +119,10 @@ pub(crate) fn decode_routed_id(id: &str) -> Option<(String, String)> {
 pub(crate) fn require_safe_upstream_id(raw: &str) -> Result<(), ProxyError> {
     let ok = !raw.is_empty()
         && raw.len() <= 256
+        // `.` / `..` are valid under the charset but are path-segment
+        // aliases some upstream routers normalise — never forward them.
+        && raw != "."
+        && raw != ".."
         && raw
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'));
@@ -1796,6 +1800,10 @@ mod tests {
             "file#frag",
             "file abc",
             "file&x=1",
+            // Bare path-segment aliases: valid charset, but some
+            // upstream routers normalise them into the parent path.
+            ".",
+            "..",
         ] {
             assert!(
                 require_safe_upstream_id(bad).is_err(),

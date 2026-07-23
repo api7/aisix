@@ -62,25 +62,42 @@ const DASHSCOPE_TASK_PATH: &str = "/api/v1/tasks";
 
 // ─────────────────────────── id codec ───────────────────────────
 
-/// Encode `(model_entry_id, upstream_task_id)` into the caller-visible
-/// video id: `base64url_nopad("<model_entry_id>:<task_id>")`.
-fn encode_video_id(model_entry_id: &str, task_id: &str) -> String {
-    URL_SAFE_NO_PAD.encode(format!("{model_entry_id}:{task_id}"))
+/// Encode `(model_entry_id, requested_alias, upstream_task_id)` into the
+/// caller-visible video id:
+/// `base64url_nopad("<model_entry_id>:<base64url_nopad(alias)>:<task_id>")`.
+///
+/// The alias segment carries the model name the caller REQUESTED at
+/// submit time (which, for wildcard Models like `wan/*`, differs from
+/// the stored display name). The GET routes re-run the key ACL against
+/// this alias — the identical check the submit performed — so a key
+/// allowlisted for `wan/turbo` can poll the task it submitted even
+/// though it cannot access the literal `wan/*` display name. The alias
+/// is itself base64url-encoded so it can never collide with the `:`
+/// separators regardless of its content.
+fn encode_video_id(model_entry_id: &str, alias: &str, task_id: &str) -> String {
+    URL_SAFE_NO_PAD.encode(format!(
+        "{model_entry_id}:{}:{task_id}",
+        URL_SAFE_NO_PAD.encode(alias)
+    ))
 }
 
-/// Decode a caller-supplied video id back to `(model_entry_id, task_id)`.
-/// `None` for anything that isn't a well-formed gateway id — the GET
-/// routes surface that as 404 (the id can't name a task this gateway
-/// submitted). `split_once` on the FIRST `:` — model entry ids are
-/// UUID-shaped and never contain one, while provider task ids might.
-fn decode_video_id(id: &str) -> Option<(String, String)> {
+/// Decode a caller-supplied video id back to
+/// `(model_entry_id, requested_alias, task_id)`. `None` for anything
+/// that isn't a well-formed gateway id — the GET routes surface that as
+/// 404 (the id can't name a task this gateway submitted). The first two
+/// segments never contain `:` (UUID-shaped entry id, base64url alias),
+/// so two `split_once` calls leave the remainder — which MAY contain
+/// `:` — as the provider task id.
+fn decode_video_id(id: &str) -> Option<(String, String, String)> {
     let bytes = URL_SAFE_NO_PAD.decode(id).ok()?;
     let s = String::from_utf8(bytes).ok()?;
-    let (entry_id, task_id) = s.split_once(':')?;
-    if entry_id.is_empty() || task_id.is_empty() {
+    let (entry_id, rest) = s.split_once(':')?;
+    let (alias_b64, task_id) = rest.split_once(':')?;
+    let alias = String::from_utf8(URL_SAFE_NO_PAD.decode(alias_b64).ok()?).ok()?;
+    if entry_id.is_empty() || alias.is_empty() || task_id.is_empty() {
         return None;
     }
-    Some((entry_id.to_string(), task_id.to_string()))
+    Some((entry_id.to_string(), alias, task_id.to_string()))
 }
 
 // ─────────────────────── status normalisation ───────────────────────
@@ -336,6 +353,23 @@ fn resolve_video_target(
 
 // ─────────────────────── upstream plumbing ───────────────────────
 
+/// The DashScope host root for the native task endpoints. Operators
+/// routinely configure alibaba ProviderKeys with the OpenAI-compatible
+/// base (`…/compatible-mode/v1`) or a versioned root (`…/api/v1`,
+/// `…/v1`) because that is what every chat-endpoint example uses;
+/// naively appending `/api/v1/services/…` to those produces an opaque
+/// upstream 404. Strip ONE known suffix (most specific first) so both
+/// conventions reach the same native root.
+fn dashscope_root(base: &str) -> &str {
+    let trimmed = base.trim_end_matches('/');
+    for suffix in ["/compatible-mode/v1", "/api/v1", "/v1"] {
+        if let Some(rest) = trimmed.strip_suffix(suffix) {
+            return rest.trim_end_matches('/');
+        }
+    }
+    trimmed
+}
+
 /// One DashScope HTTP round-trip: Bearer auth, optional async-submit
 /// header, the model's E2E timeout, cooldown accounting on transport
 /// failures (parity with jobs / passthrough, #701). Non-2xx responses
@@ -422,7 +456,7 @@ async fn poll_task(
     crate::jobs::require_safe_upstream_id(task_id)?;
     let url = format!(
         "{}{}/{}",
-        target.base_url.trim_end_matches('/'),
+        dashscope_root(&target.base_url),
         DASHSCOPE_TASK_PATH,
         task_id
     );
@@ -702,7 +736,7 @@ async fn dispatch_create(
         dashscope_submit_body(&upstream_model, &body.prompt, seconds, body.size.as_deref())?;
     let url = format!(
         "{}{}",
-        target.base_url.trim_end_matches('/'),
+        dashscope_root(&target.base_url),
         DASHSCOPE_SUBMIT_PATH
     );
 
@@ -744,13 +778,13 @@ async fn dispatch_create(
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     let video = VideoObject {
-        id: encode_video_id(&target.model_entry.id, task_id),
+        id: encode_video_id(&target.model_entry.id, &body.model, task_id),
         object: "video",
         // Echo the caller's requested model name, like every other
         // typed endpoint (wildcard aliases included).
         model: body.model.clone(),
         status,
-        progress: 0,
+        progress: if status == "completed" { 100 } else { 0 },
         created_at,
         seconds: seconds.map(|s| s.to_string()),
         size: body.size.clone(),
@@ -773,26 +807,39 @@ async fn dispatch_create(
 /// Decode + resolve the target for a GET route. 404 for ids this gateway
 /// could not have minted (undecodable, or naming a Model entry that no
 /// longer exists in the snapshot).
+///
+/// The key ACL runs against the REQUESTED ALIAS carried inside the id —
+/// the identical check the submit performed — so wildcard-alias journeys
+/// (Model `wan/*`, key allowlisted for `wan/turbo`) can poll their own
+/// tasks. Two deliberate 404 folds close a disclosure oracle on guessed
+/// entry UUIDs: an ACL denial and the unsupported-provider case both
+/// surface as `video_not_found`, because a 403 (which would echo a model
+/// identity) or a 501 (which reveals the entry exists and names its
+/// provider family) would let a caller probe the Model table by minting
+/// crafted ids. The submit path keeps its distinct 403/501 — there the
+/// caller already knows the model name they asked for, so there is
+/// nothing to disclose.
 fn resolve_get_target(
     state: &ProxyState,
     auth: &AuthenticatedKey,
     video_id: &str,
     source_ip: &str,
-) -> Result<Result<(VideoTarget, String), Response>, ProxyError> {
-    let (entry_id, task_id) =
+) -> Result<(VideoTarget, String), ProxyError> {
+    let (entry_id, alias, task_id) =
         decode_video_id(video_id).ok_or_else(|| ProxyError::VideoNotFound(video_id.to_string()))?;
     let snapshot = state.snapshot.load();
     let model_entry = snapshot
         .models
         .get_by_id(&entry_id)
         .ok_or_else(|| ProxyError::VideoNotFound(video_id.to_string()))?;
-    let display_name = model_entry.value.display_name.clone();
-    Ok(
-        match resolve_video_target(state, auth, model_entry, &display_name, source_ip)? {
-            Ok(target) => Ok((target, task_id)),
-            Err(resp) => Err(resp),
-        },
-    )
+    match resolve_video_target(state, auth, model_entry, &alias, source_ip) {
+        Ok(Ok(target)) => Ok((target, task_id)),
+        // Unsupported provider → uniform 404 (oracle fold, see above).
+        Ok(Err(_)) => Err(ProxyError::VideoNotFound(video_id.to_string())),
+        // ACL denial → uniform 404 (oracle fold, see above).
+        Err(ProxyError::ModelForbidden(_)) => Err(ProxyError::VideoNotFound(video_id.to_string())),
+        Err(e) => Err(e),
+    }
 }
 
 pub async fn get_video(
@@ -811,11 +858,7 @@ pub async fn get_video(
     };
 
     let result: Result<(Response, String, String), ProxyError> = async {
-        let (target, task_id) =
-            match resolve_get_target(&state, &auth, &video_id, &client.source_ip)? {
-                Ok(pair) => pair,
-                Err(resp) => return Ok((resp, "unknown".into(), video_id.clone())),
-            };
+        let (target, task_id) = resolve_get_target(&state, &auth, &video_id, &client.source_ip)?;
         // Poll traffic is exempt from model-level limits BY DESIGN
         // (AISIX-Cloud#1118 decision 3): a client polling a task it
         // already paid an RPM slot to submit must not starve itself.
@@ -865,11 +908,7 @@ pub async fn video_content(
     };
 
     let result: Result<(Response, String, String), ProxyError> = async {
-        let (target, task_id) =
-            match resolve_get_target(&state, &auth, &video_id, &client.source_ip)? {
-                Ok(pair) => pair,
-                Err(resp) => return Ok((resp, "unknown".into(), video_id.clone())),
-            };
+        let (target, task_id) = resolve_get_target(&state, &auth, &video_id, &client.source_ip)?;
         // Same model-layer exemption as the poll route (see get_video).
         let reservation = crate::quota::enforce(&state, &auth, None).await?;
         let result = poll_task(&state, &target, &task_id, &client.request_id).await;
@@ -893,11 +932,26 @@ pub async fn video_content(
                         "completed task has no video URL".into(),
                     ))
                 })?;
-                let location = axum::http::HeaderValue::from_str(video_url).map_err(|_| {
-                    ProxyError::Bridge(aisix_gateway::BridgeError::UpstreamDecode(
-                        "completed task has a malformed video URL".into(),
-                    ))
-                })?;
+                // The redirect target is provider-supplied: require a
+                // well-formed absolute http(s) URL so a malformed or
+                // exotic-scheme value (javascript:, file:, data:) can
+                // never ride the Location header to the caller. The
+                // host itself remains operator-trusted upstream
+                // infrastructure — the gateway never fetches the URL.
+                let parsed = url::Url::parse(video_url)
+                    .ok()
+                    .filter(|u| matches!(u.scheme(), "http" | "https"))
+                    .ok_or_else(|| {
+                        ProxyError::Bridge(aisix_gateway::BridgeError::UpstreamDecode(
+                            "completed task has a malformed or non-http video URL".into(),
+                        ))
+                    })?;
+                let location =
+                    axum::http::HeaderValue::from_str(parsed.as_str()).map_err(|_| {
+                        ProxyError::Bridge(aisix_gateway::BridgeError::UpstreamDecode(
+                            "completed task has a malformed video URL".into(),
+                        ))
+                    })?;
                 let mut resp = StatusCode::FOUND.into_response();
                 resp.headers_mut().insert(header::LOCATION, location);
                 resp
@@ -1024,19 +1078,40 @@ mod tests {
 
     #[test]
     fn video_id_roundtrip() {
-        let id = encode_video_id("11111111-2222-3333-4444-555555555555", "task-abc.123");
+        let id = encode_video_id(
+            "11111111-2222-3333-4444-555555555555",
+            "wan/turbo",
+            "task-abc.123",
+        );
         assert_eq!(
             decode_video_id(&id),
             Some((
                 "11111111-2222-3333-4444-555555555555".to_string(),
+                "wan/turbo".to_string(),
                 "task-abc.123".to_string()
             ))
         );
-        // A task id containing `:` survives — split is on the FIRST colon.
-        let id = encode_video_id("m-1", "ns:task:9");
+        // A task id containing `:` survives — the first two segments
+        // (entry id, base64url alias) never contain one.
+        let id = encode_video_id("m-1", "my-video", "ns:task:9");
         assert_eq!(
             decode_video_id(&id),
-            Some(("m-1".to_string(), "ns:task:9".to_string()))
+            Some((
+                "m-1".to_string(),
+                "my-video".to_string(),
+                "ns:task:9".to_string()
+            ))
+        );
+        // An alias containing `:` cannot break the framing — it rides
+        // base64url-encoded inside its segment.
+        let id = encode_video_id("m-1", "weird:alias", "task-1");
+        assert_eq!(
+            decode_video_id(&id),
+            Some((
+                "m-1".to_string(),
+                "weird:alias".to_string(),
+                "task-1".to_string()
+            ))
         );
     }
 
@@ -1049,9 +1124,27 @@ mod tests {
             decode_video_id(&URL_SAFE_NO_PAD.encode("no-separator")),
             None
         );
-        // Empty halves.
-        assert_eq!(decode_video_id(&URL_SAFE_NO_PAD.encode(":task")), None);
-        assert_eq!(decode_video_id(&URL_SAFE_NO_PAD.encode("model:")), None);
+        // Two-segment (pre-alias) shape no longer decodes.
+        assert_eq!(decode_video_id(&URL_SAFE_NO_PAD.encode("entry:task")), None);
+        // Empty segments.
+        let alias_b64 = URL_SAFE_NO_PAD.encode("alias");
+        assert_eq!(
+            decode_video_id(&URL_SAFE_NO_PAD.encode(format!(":{alias_b64}:task"))),
+            None
+        );
+        assert_eq!(
+            decode_video_id(&URL_SAFE_NO_PAD.encode("model::task")),
+            None
+        );
+        assert_eq!(
+            decode_video_id(&URL_SAFE_NO_PAD.encode(format!("model:{alias_b64}:"))),
+            None
+        );
+        // Alias segment that isn't valid base64url.
+        assert_eq!(
+            decode_video_id(&URL_SAFE_NO_PAD.encode("model:!!!:task")),
+            None
+        );
         // Non-UTF8 payload.
         assert_eq!(
             decode_video_id(&URL_SAFE_NO_PAD.encode([0xff, 0xfe, b':', b'x'])),
@@ -1061,6 +1154,37 @@ mod tests {
         // as base64 only by coincidence, and then fails the separator
         // check; either way it must not resolve.
         assert_eq!(decode_video_id("task-123"), None);
+    }
+
+    #[test]
+    fn dashscope_root_strips_known_api_base_suffixes() {
+        // The OpenAI-compatible base operators paste from chat examples.
+        assert_eq!(
+            dashscope_root("https://dashscope.aliyuncs.com/compatible-mode/v1"),
+            "https://dashscope.aliyuncs.com"
+        );
+        assert_eq!(
+            dashscope_root("https://dashscope.aliyuncs.com/compatible-mode/v1/"),
+            "https://dashscope.aliyuncs.com"
+        );
+        // Native versioned roots.
+        assert_eq!(
+            dashscope_root("https://dashscope.aliyuncs.com/api/v1"),
+            "https://dashscope.aliyuncs.com"
+        );
+        assert_eq!(
+            dashscope_root("https://dashscope.aliyuncs.com/v1"),
+            "https://dashscope.aliyuncs.com"
+        );
+        // Bare host is untouched; only ONE suffix is stripped.
+        assert_eq!(
+            dashscope_root("https://dashscope.aliyuncs.com"),
+            "https://dashscope.aliyuncs.com"
+        );
+        assert_eq!(
+            dashscope_root("https://host/api/v1/api/v1"),
+            "https://host/api/v1"
+        );
     }
 
     #[test]
@@ -1228,7 +1352,11 @@ mod tests {
         let id = v["id"].as_str().unwrap();
         assert_eq!(
             decode_video_id(id),
-            Some((MODEL_ID.to_string(), "task-123".to_string()))
+            Some((
+                MODEL_ID.to_string(),
+                "my-video".to_string(),
+                "task-123".to_string()
+            ))
         );
 
         // Upstream wire shape: async header + DashScope envelope with
@@ -1262,7 +1390,7 @@ mod tests {
             .await;
 
         let app = build_app(new_snap(&upstream.uri(), "alibaba", ""));
-        let id = encode_video_id(MODEL_ID, "task-123");
+        let id = encode_video_id(MODEL_ID, "my-video", "task-123");
         let resp = tower::ServiceExt::oneshot(app, get_uri(&format!("/v1/videos/{id}")))
             .await
             .unwrap();
@@ -1293,7 +1421,7 @@ mod tests {
             .await;
 
         let app = build_app(new_snap(&upstream.uri(), "alibaba", ""));
-        let id = encode_video_id(MODEL_ID, "task-bad");
+        let id = encode_video_id(MODEL_ID, "my-video", "task-bad");
         let resp = tower::ServiceExt::oneshot(app, get_uri(&format!("/v1/videos/{id}")))
             .await
             .unwrap();
@@ -1323,7 +1451,7 @@ mod tests {
             .await;
 
         let app = build_app(new_snap(&upstream.uri(), "alibaba", ""));
-        let id = encode_video_id(MODEL_ID, "task-123");
+        let id = encode_video_id(MODEL_ID, "my-video", "task-123");
         let resp = tower::ServiceExt::oneshot(app, get_uri(&format!("/v1/videos/{id}/content")))
             .await
             .unwrap();
@@ -1348,7 +1476,7 @@ mod tests {
             .await;
 
         let app = build_app(new_snap(&upstream.uri(), "alibaba", ""));
-        let id = encode_video_id(MODEL_ID, "task-123");
+        let id = encode_video_id(MODEL_ID, "my-video", "task-123");
         let resp = tower::ServiceExt::oneshot(app, get_uri(&format!("/v1/videos/{id}/content")))
             .await
             .unwrap();
@@ -1375,7 +1503,7 @@ mod tests {
 
         // Decodable id naming a Model entry that doesn't exist.
         let app = build_app(new_snap("http://unused", "alibaba", ""));
-        let ghost = encode_video_id("no-such-entry", "task-1");
+        let ghost = encode_video_id("no-such-entry", "my-video", "task-1");
         let resp = tower::ServiceExt::oneshot(app, get_uri(&format!("/v1/videos/{ghost}")))
             .await
             .unwrap();
@@ -1536,5 +1664,252 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("duration out of range"));
+    }
+
+    /// HIGH-1 (PR #811 audit): a GET on an id that resolves to a
+    /// non-serving state must record the fixed `unresolved` metric
+    /// label — never the caller-controlled video id, which would let an
+    /// authenticated caller explode Prometheus cardinality by minting
+    /// random ids against a known entry UUID.
+    #[tokio::test]
+    async fn get_error_paths_record_unresolved_metric_label_not_the_raw_id() {
+        // A known entry UUID with a non-alibaba provider: pre-fix this
+        // hit the unsupported-provider branch and recorded the raw id.
+        let snap = new_snap("http://unused", "zhipu", "");
+        let hub = Arc::new(Hub::new());
+        let handle = SnapshotHandle::new(snap);
+        let state = crate::ProxyState::new(handle, hub, &cfg()).without_cache();
+        let metrics = state.metrics.clone();
+        let app = crate::build_router(state);
+
+        let id = encode_video_id(MODEL_ID, "my-video", "task-zzz");
+        let resp = tower::ServiceExt::oneshot(app, get_uri(&format!("/v1/videos/{id}")))
+            .await
+            .unwrap();
+        // MED-3 fold: unsupported provider on a GET is a uniform 404.
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        let rendered = metrics.render();
+        assert!(
+            rendered.contains(&format!(
+                "model=\"{}\"",
+                crate::usage_attr::UNRESOLVED_MODEL_LABEL
+            )),
+            "GET error path must record the bounded sentinel label: {rendered}"
+        );
+        assert!(
+            !rendered.contains(&id),
+            "the caller-controlled video id must never appear as a metric label"
+        );
+    }
+
+    /// MED-2 (PR #811 audit): wildcard-alias journey. The key is
+    /// allowlisted for the concrete alias (`wan/turbo`), NOT the
+    /// wildcard Model's display name (`wan/*`). The id carries the
+    /// alias, so poll + content re-run the SAME ACL check the submit
+    /// passed — pre-fix the GETs checked the display name and 403'd
+    /// the caller's own task.
+    #[tokio::test]
+    async fn wildcard_alias_submit_poll_content_all_succeed() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(DASHSCOPE_SUBMIT_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(pending_submit_response()))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("{DASHSCOPE_TASK_PATH}/task-123")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "output": {
+                    "task_id": "task-123",
+                    "task_status": "SUCCEEDED",
+                    "video_url": "https://cdn.example.com/wan-turbo.mp4"
+                },
+                "request_id": "req-w1"
+            })))
+            .mount(&upstream)
+            .await;
+
+        let snap = AisixSnapshot::new();
+        let pk_json = format!(
+            r#"{{"display_name":"ali-up","secret":"sk-up","api_base":"{}","provider":"alibaba"}}"#,
+            upstream.uri()
+        );
+        let pk: aisix_core::ProviderKey = serde_json::from_str(&pk_json).unwrap();
+        snap.provider_keys.insert(ResourceEntry::new(PK_ID, pk, 1));
+        let m: Model = serde_json::from_str(&format!(
+            r#"{{
+                "display_name": "wan/*",
+                "provider": "alibaba",
+                "model_name": "*",
+                "provider_key_id": "{PK_ID}"
+            }}"#
+        ))
+        .unwrap();
+        snap.models.insert(ResourceEntry::new(MODEL_ID, m, 1));
+        let key: ApiKey = serde_json::from_str(
+            r#"{"key_hash": "8b6712790a2089c67aa97a2d80022df18cc65c7814350e33baebe79aab508891", "allowed_models": ["wan/turbo"]}"#,
+        )
+        .unwrap();
+        snap.apikeys.insert(ResourceEntry::new("k-1", key, 1));
+
+        let app = build_app(snap);
+        let created = tower::ServiceExt::oneshot(
+            app.clone(),
+            post_videos(serde_json::json!({"model": "wan/turbo", "prompt": "hi"})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+        let v = body_json(created).await;
+        assert_eq!(v["model"], "wan/turbo");
+        let id = v["id"].as_str().unwrap().to_string();
+        // The captured segment resolves the upstream model id.
+        let received = upstream.received_requests().await.unwrap();
+        let wire: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
+        assert_eq!(wire["model"], "turbo");
+
+        let poll = tower::ServiceExt::oneshot(app.clone(), get_uri(&format!("/v1/videos/{id}")))
+            .await
+            .unwrap();
+        assert_eq!(poll.status(), StatusCode::OK);
+        let polled = body_json(poll).await;
+        assert_eq!(polled["status"], "completed");
+
+        let content = tower::ServiceExt::oneshot(app, get_uri(&format!("/v1/videos/{id}/content")))
+            .await
+            .unwrap();
+        assert_eq!(content.status(), StatusCode::FOUND);
+    }
+
+    /// MED-3 (PR #811 audit): a key NOT allowlisted for the model gets a
+    /// uniform 404 on the GET routes — not a 403 echoing a model
+    /// identity — and the upstream is never contacted. A crafted id
+    /// must not turn the poll route into a Model-table existence probe.
+    #[tokio::test]
+    async fn restricted_key_gets_404_on_poll_and_upstream_untouched() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("{DASHSCOPE_TASK_PATH}/task-123")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "output": {"task_id": "task-123", "task_status": "RUNNING"}
+            })))
+            .expect(0)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri(), "alibaba", "");
+        // Overwrite the caller key with one that cannot access the model.
+        let key: ApiKey = serde_json::from_str(
+            r#"{"key_hash": "8b6712790a2089c67aa97a2d80022df18cc65c7814350e33baebe79aab508891", "allowed_models": ["other-model"]}"#,
+        )
+        .unwrap();
+        snap.apikeys.insert(ResourceEntry::new("k-1", key, 1));
+
+        let app = build_app(snap);
+        let id = encode_video_id(MODEL_ID, "my-video", "task-123");
+        for suffix in ["", "/content"] {
+            let resp = tower::ServiceExt::oneshot(
+                app.clone(),
+                get_uri(&format!("/v1/videos/{id}{suffix}")),
+            )
+            .await
+            .unwrap();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+            let v = body_json(resp).await;
+            assert_eq!(v["error"]["type"], "video_not_found");
+            let msg = v["error"]["message"].as_str().unwrap();
+            assert!(
+                !msg.contains("my-video"),
+                "the model identity must not leak through the 404: {msg}"
+            );
+        }
+    }
+
+    /// MED-5 (PR #811 audit): an alibaba ProviderKey configured with the
+    /// OpenAI-compatible base (`…/compatible-mode/v1` — what every chat
+    /// example uses) must still reach the native task endpoints instead
+    /// of producing `…/compatible-mode/v1/api/v1/services/…` 404s.
+    #[tokio::test]
+    async fn compatible_mode_api_base_reaches_native_dashscope_paths() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(DASHSCOPE_SUBMIT_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(pending_submit_response()))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let base = format!("{}/compatible-mode/v1", upstream.uri());
+        let app = build_app(new_snap(&base, "alibaba", ""));
+        let resp = tower::ServiceExt::oneshot(
+            app,
+            post_videos(serde_json::json!({"model": "my-video", "prompt": "hi"})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let received = upstream.received_requests().await.unwrap();
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].url.path(), DASHSCOPE_SUBMIT_PATH);
+    }
+
+    /// MED-4 (PR #811 audit): the content redirect only forwards
+    /// http(s) URLs — an exotic scheme from a misbehaving upstream must
+    /// not ride the Location header to the caller.
+    #[tokio::test]
+    async fn content_rejects_non_http_video_url_scheme() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("{DASHSCOPE_TASK_PATH}/task-123")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "output": {
+                    "task_id": "task-123",
+                    "task_status": "SUCCEEDED",
+                    "video_url": "javascript:alert(1)"
+                }
+            })))
+            .mount(&upstream)
+            .await;
+
+        let app = build_app(new_snap(&upstream.uri(), "alibaba", ""));
+        let id = encode_video_id(MODEL_ID, "my-video", "task-123");
+        let resp = tower::ServiceExt::oneshot(app, get_uri(&format!("/v1/videos/{id}/content")))
+            .await
+            .unwrap();
+        assert_ne!(resp.status(), StatusCode::FOUND);
+        assert!(resp.headers().get(header::LOCATION).is_none());
+    }
+
+    /// MED-6 (PR #811 audit): the model client-IP allowlist gates the
+    /// GET routes too. With `allowed_cidrs` set and no resolvable
+    /// source IP the request is rejected before any upstream contact.
+    #[tokio::test]
+    async fn allowed_cidrs_enforced_on_poll_route() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("{DASHSCOPE_TASK_PATH}/task-123")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "output": {"task_id": "task-123", "task_status": "RUNNING"}
+            })))
+            .expect(0)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(
+            &upstream.uri(),
+            "alibaba",
+            r#", "allowed_cidrs": ["203.0.113.0/24"]"#,
+        );
+        let app = build_app(snap);
+        let id = encode_video_id(MODEL_ID, "my-video", "task-123");
+        let resp = tower::ServiceExt::oneshot(app, get_uri(&format!("/v1/videos/{id}")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let v = body_json(resp).await;
+        assert_eq!(v["error"]["code"], "ip_restricted");
     }
 }

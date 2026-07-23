@@ -49,6 +49,9 @@ async-trait.workspace = true
 async-stream = "0.3"
 dashmap.workspace = true
 base64.workspace = true
+# Scheme validation of provider-supplied redirect targets on
+# `GET /v1/videos/:id/content` (already in the tree via reqwest).
+url.workspace = true
 # Per-request weighted-random target selection in `routing::weighted_pick`.
 # `thread_rng()` gives proper per-request entropy that converges to the
 # configured weights over a finite sample (fix for #197 — the prior

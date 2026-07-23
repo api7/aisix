@@ -189,10 +189,12 @@ describe("videos e2e: unified submit/poll/content surface", () => {
     // Readiness: poll a synthetic id on the probe model. A completed
     // video object proves the apikey + model + provider-key rows have
     // all propagated. The probe never touches the scripted upstream or
-    // the rpm=1 model.
-    const probeVideoId = Buffer.from(`${probeModelId}:probe-task`).toString(
-      "base64url",
-    );
+    // the rpm=1 model. Id layout: entry-id : b64url(alias) : task-id,
+    // all wrapped in base64url.
+    const probeAlias = Buffer.from(PROBE_MODEL).toString("base64url");
+    const probeVideoId = Buffer.from(
+      `${probeModelId}:${probeAlias}:probe-task`,
+    ).toString("base64url");
     await waitConfigPropagation(async () => {
       try {
         const r = await getVideo(probeVideoId);
@@ -324,9 +326,10 @@ describe("videos e2e: unified submit/poll/content surface", () => {
 
     // A well-formed encoding that names a model entry which does not
     // exist is equally a 404.
-    const ghost = Buffer.from("no-such-model-entry:task-1").toString(
-      "base64url",
-    );
+    const ghostAlias = Buffer.from("some-model").toString("base64url");
+    const ghost = Buffer.from(
+      `no-such-model-entry:${ghostAlias}:task-1`,
+    ).toString("base64url");
     const ghostResp = await getVideo(ghost);
     expect(ghostResp.status).toBe(404);
     await ghostResp.text();
