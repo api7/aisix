@@ -3,6 +3,7 @@ import OpenAI from "openai";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
+  ProxyClient,
   SeedClient,
   spawnApp,
   startOpenAiUpstream,
@@ -396,5 +397,166 @@ describe("anthropic upstream e2e: cache tokens fold into total_tokens (#906)", (
     expect(completion.usage?.prompt_tokens).toBe(10);
     expect(completion.usage?.completion_tokens).toBe(4);
     expect(completion.usage?.total_tokens).toBe(10 + 4 + 200 + 800);
+  });
+});
+
+// E2E (AISIX-Cloud#1110 Gap A): a caller managing its own provider-side
+// prompt caching attaches `cache_control` markers to content blocks (and
+// tool definitions) in the OpenAI shape. Those markers MUST reach the
+// Anthropic upstream — a translation that flattens blocks to
+// concatenated text silently strips them, the upstream caches nothing,
+// and the caller pays full input price every turn while believing its
+// caching strategy is active. Marker shape per
+// <https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching>.
+const CC_CALLER_PLAINTEXT = "sk-an-e2e-cachectl-caller";
+const CC_CALLER_KEY_HASH = createHash("sha256")
+  .update(CC_CALLER_PLAINTEXT)
+  .digest("hex");
+
+describe("anthropic upstream e2e: client cache_control markers survive translation", () => {
+  let app: SpawnedApp | undefined;
+  let upstream: OpenAiUpstream | undefined;
+  let seed: SeedClient | undefined;
+  let etcdReachable = false;
+
+  beforeAll(async () => {
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
+    if (!etcdReachable) return;
+
+    upstream = await startOpenAiUpstream({
+      nonStreamBody: {
+        id: "msg_cc_01",
+        type: "message",
+        role: "assistant",
+        content: [{ type: "text", text: "ok" }],
+        model: "claude-3-5-haiku-20241022",
+        stop_reason: "end_turn",
+        usage: { input_tokens: 5, output_tokens: 1 },
+      },
+    });
+    app = await spawnApp();
+    seed = new SeedClient(etcd, app.etcdPrefix);
+
+    const pk = await seed.createProviderKey({
+      display_name: "an-e2e-cachectl-pk",
+      provider: "anthropic",
+      adapter: "anthropic",
+      secret: "sk-ant-mock",
+      api_base: upstream.baseUrl,
+    });
+    await seed.createModel({
+      display_name: "an-e2e-cachectl",
+      provider: "anthropic",
+      model_name: "claude-3-5-haiku-20241022",
+      provider_key_id: pk.id,
+    });
+    await seed.createApiKey({
+      key_hash: CC_CALLER_KEY_HASH,
+      allowed_models: ["an-e2e-cachectl"],
+    });
+  });
+
+  afterAll(async () => {
+    await app?.exit();
+    await upstream?.close();
+  });
+
+  test("system/message/tool cache_control markers reach the upstream body", async (ctx) => {
+    if (!etcdReachable || !app || !upstream) {
+      ctx.skip();
+      return;
+    }
+
+    const proxy = new ProxyClient(app.proxyUrl, CC_CALLER_PLAINTEXT);
+
+    await waitConfigPropagation(async () => {
+      const r = await proxy.chat({
+        model: "an-e2e-cachectl",
+        messages: [{ role: "user", content: "ready-probe" }],
+      });
+      return r.status === 200;
+    });
+
+    const baseline = upstream.receivedRequests.length;
+
+    const { status } = await proxy.chat({
+      model: "an-e2e-cachectl",
+      messages: [
+        {
+          role: "system",
+          content: [
+            {
+              type: "text",
+              text: "big stable system prefix",
+              cache_control: { type: "ephemeral" },
+            },
+          ],
+        },
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "conversation history" },
+            {
+              type: "text",
+              text: "latest question",
+              cache_control: { type: "ephemeral", ttl: "1h" },
+            },
+          ],
+        },
+      ],
+      tools: [
+        {
+          type: "function",
+          function: {
+            name: "get_weather",
+            parameters: { type: "object", properties: {} },
+          },
+          cache_control: { type: "ephemeral" },
+        },
+      ],
+    });
+    expect(status).toBe(200);
+
+    const messagesReq = upstream.receivedRequests
+      .slice(baseline)
+      .find((r) => r.path.startsWith("/v1/messages"));
+    expect(messagesReq).toBeDefined();
+    const sentBody = JSON.parse(messagesReq!.body) as {
+      system?: unknown;
+      messages?: Array<{ role?: string; content?: unknown }>;
+      tools?: Array<Record<string, unknown>>;
+    };
+
+    // System marker: the block-form system prompt must go out as
+    // Anthropic's block-array `system`, marker intact — not flattened
+    // to a plain string.
+    expect(sentBody.system).toEqual([
+      {
+        type: "text",
+        text: "big stable system prefix",
+        cache_control: { type: "ephemeral" },
+      },
+    ]);
+
+    // Message markers: per-block structure preserved (2 blocks stay 2
+    // blocks — a marker means "cache through here", so its position is
+    // the payload), marker on the block the caller marked, TTL intact.
+    expect(sentBody.messages?.[0]?.role).toBe("user");
+    expect(sentBody.messages?.[0]?.content).toEqual([
+      { type: "text", text: "conversation history" },
+      {
+        type: "text",
+        text: "latest question",
+        cache_control: { type: "ephemeral", ttl: "1h" },
+      },
+    ]);
+
+    // Tool marker: tool definitions sit first in the prompt-cache
+    // prefix hierarchy; the marker must ride the translated tool.
+    expect(sentBody.tools?.[0]).toMatchObject({
+      name: "get_weather",
+      cache_control: { type: "ephemeral" },
+    });
   });
 });
