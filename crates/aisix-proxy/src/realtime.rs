@@ -57,6 +57,7 @@ use crate::auth::AuthenticatedKey;
 use crate::client_ip::ClientContext;
 use crate::error::ProxyError;
 use crate::state::ProxyState;
+use aisix_gateway::BridgeError;
 
 /// Azure Realtime GA api-version (see the jobs surface twin constant).
 const AZURE_REALTIME_API_VERSION: &str = "2024-10-01-preview";
@@ -93,7 +94,14 @@ pub(crate) async fn realtime(
         }
         Err(err) => {
             let status = err.status().as_u16();
-            emit_access_log(&Method::GET, status, started.elapsed(), &request_id, None);
+            emit_access_log(
+                &Method::GET,
+                status,
+                started.elapsed(),
+                &request_id,
+                None,
+                Some(&err),
+            );
             crate::usage_attr::emit_error_usage_event(
                 &state,
                 "realtime",
@@ -401,18 +409,22 @@ async fn run_session(
                     reason: "upstream connect failed".into(),
                 })))
                 .await;
-            crate::cooldown::note_failure(
+            // `note_failure` hands the error back, so the same value that
+            // drove the cooldown decision also names the failure in the
+            // access log instead of being rebuilt.
+            let connect_err = ProxyError::Bridge(crate::cooldown::note_failure(
                 &state.runtime_status,
                 &model_entry.id,
                 model_entry.value.cooldown.as_ref(),
                 aisix_gateway::BridgeError::Transport(aisix_gateway::error_with_causes(&e)),
-            );
+            ));
             emit_access_log(
                 &Method::GET,
                 502,
                 started.elapsed(),
                 &request_id,
                 Some((&provider_label, &requested_model)),
+                Some(&connect_err),
             );
             crate::usage_attr::emit_error_usage_event(
                 &state,
@@ -433,6 +445,19 @@ async fn run_session(
     let mut usage = SessionUsage::default();
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
     let mut close_status: u16 = 200;
+    // Paired with `close_status`: every branch that sets a FAILING status
+    // also names the failure, so the access log can say why a session
+    // ended (AISIX-Cloud#1093).
+    //
+    // A client-side transport error (`Some(Err(_))` on the receive half)
+    // is deliberately not one of them: it keeps `close_status` 200 and
+    // stays `None`. Reclassifying it is a behaviour change, not a logging
+    // one — `RequestOutcome::from_status` would flip that session from
+    // `success` to `client_error` and move every operator's realtime
+    // success rate. That belongs with the termination-reason taxonomy
+    // (`downstream_remote_disconnect` and friends) the issue asks for
+    // separately, which needs its own status decision.
+    let mut session_error: Option<ProxyError> = None;
     // Operator-configured stream idle deadline (stream_timeout on the
     // Model). Absent → no idle cap; realtime sessions are long-lived by
     // design.
@@ -456,6 +481,10 @@ async fn run_session(
                         })))
                         .await;
                     close_status = 504;
+                    session_error = Some(ProxyError::Bridge(BridgeError::Timeout {
+                        elapsed_ms: cap.as_millis() as u64,
+                        cause: "no realtime frame within the stream idle budget".into(),
+                    }));
                     break;
                 }
             },
@@ -483,6 +512,9 @@ async fn run_session(
                                 })))
                                 .await;
                             close_status = 400;
+                            session_error = Some(ProxyError::ContentFiltered(
+                                "realtime frame blocked by a guardrail".into(),
+                            ));
                             break;
                         }
                     }
@@ -526,6 +558,9 @@ async fn run_session(
                                 })))
                                 .await;
                             close_status = 400;
+                            session_error = Some(ProxyError::ContentFiltered(
+                                "realtime frame blocked by a guardrail".into(),
+                            ));
                             break;
                         }
                     }
@@ -557,6 +592,9 @@ async fn run_session(
                         })))
                         .await;
                     close_status = 502;
+                    session_error = Some(ProxyError::Bridge(BridgeError::Transport(
+                        aisix_gateway::error_with_causes(&e),
+                    )));
                     break;
                 }
                 None => {
@@ -577,6 +615,7 @@ async fn run_session(
         elapsed,
         &request_id,
         Some((&provider_label, &requested_model)),
+        session_error.as_ref(),
     );
     state.metrics.record_request(
         &provider_label,
@@ -681,7 +720,15 @@ fn emit_access_log(
     elapsed: Duration,
     request_id: &str,
     target: Option<(&str, &str)>,
+    error: Option<&ProxyError>,
 ) {
+    let (error_kind, error) = match error {
+        Some(e) => {
+            let (kind, msg) = crate::attempt::access_log_error(e);
+            (Some(kind), Some(msg))
+        }
+        None => (None, None),
+    };
     AccessLog {
         method: method.as_str(),
         path: "/v1/realtime",
@@ -697,6 +744,8 @@ fn emit_access_log(
         served_by_model: None,
         routing_attempt_count: None,
         routing_fallback_count: None,
+        error_kind,
+        error: error.as_deref(),
     }
     .emit();
 }

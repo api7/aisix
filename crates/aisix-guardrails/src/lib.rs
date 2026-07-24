@@ -109,28 +109,45 @@ pub(crate) async fn read_body_capped(resp: &mut reqwest::Response, cap: usize) -
 
 /// The text a guardrail should scan for one message.
 ///
-/// Prefers the flat `content` string; when it's empty, falls back to
-/// concatenating the `text`-type entries of `content_blocks`. A caller
-/// that sends the OpenAI content-block shape
-/// (`content: [{ "type": "text", "text": "…" }]`) with an empty
-/// top-level string would otherwise bypass moderation entirely (#465).
-/// Non-text blocks (image/audio) are out of scope — multimodal
+/// Scans every text surface the provider bridges can forward upstream, so
+/// a caller can't hide a payload in one field while a benign value sits in
+/// another. These are independent wire fields and the bridges forward
+/// whichever is present:
+///   * flat `content`;
+///   * the `text`-type entries of `content_blocks` (empty `content` with
+///     the text only in blocks is the round-trip shape, #465; a benign
+///     `content` plus a payload in blocks is the split-field bypass);
+///   * `extra["tool_calls"]` — history-replay tool calls travel upstream
+///     verbatim through `extra` (the OpenAI bridge flattens them, the
+///     Anthropic bridge translates them into `tool_use` blocks). The whole
+///     payload is serialized so neither a function name nor an argument
+///     can hide a banned token, matching `ChatResponse::guardrail_output_text`
+///     and `redact_chat_format`, which already cover this surface.
+///
+/// Non-text content blocks (image/audio) are out of scope — multimodal
 /// moderation is a separate feature. Every guardrail's input/output
 /// collector goes through this so the families can't drift.
 pub(crate) fn message_scan_text(m: &ChatMessage) -> String {
+    let mut parts: Vec<String> = Vec::new();
     let content = m.content_str();
     if !content.is_empty() {
-        return content.to_string();
+        parts.push(content.to_string());
     }
-    match m.content_blocks.as_ref() {
-        Some(blocks) => blocks
-            .iter()
-            .filter(|b| b.get("type").and_then(serde_json::Value::as_str) == Some("text"))
-            .filter_map(|b| b.get("text").and_then(serde_json::Value::as_str))
-            .collect::<Vec<_>>()
-            .join("\n"),
-        None => String::new(),
+    if let Some(blocks) = m.content_blocks.as_ref() {
+        parts.extend(
+            blocks
+                .iter()
+                .filter(|b| b.get("type").and_then(serde_json::Value::as_str) == Some("text"))
+                .filter_map(|b| b.get("text").and_then(serde_json::Value::as_str))
+                .map(str::to_string),
+        );
     }
+    if let Some(tool_calls) = m.extra.get("tool_calls") {
+        if !tool_calls.is_null() {
+            parts.push(tool_calls.to_string());
+        }
+    }
+    parts.join("\n")
 }
 
 /// The guardrail `kind` discriminators compiled into this binary.
@@ -698,6 +715,54 @@ mod tests {
         let empty: ChatMessage =
             serde_json::from_value(serde_json::json!({"role": "user", "content": ""})).unwrap();
         assert_eq!(message_scan_text(&empty), "");
+    }
+
+    #[test]
+    fn message_scan_text_scans_content_blocks_even_when_flat_content_is_nonempty() {
+        // Guardrail bypass: `content` and `content_blocks` are independent
+        // wire fields, and the provider bridges forward `content_blocks`
+        // when present. A caller that puts benign text in `content` and a
+        // payload in `content_blocks` would slip the payload past a scan
+        // that only reads `content`. The scanned text must be the UNION so
+        // it is a superset of everything a bridge can forward upstream.
+        let split: ChatMessage = serde_json::from_value(serde_json::json!({
+            "role": "user",
+            "content": "benign cover text",
+            "content_blocks": [{"type": "text", "text": "hidden payload"}]
+        }))
+        .unwrap();
+        let scanned = message_scan_text(&split);
+        assert!(
+            scanned.contains("benign cover text") && scanned.contains("hidden payload"),
+            "scan must cover both content and content_blocks, got {scanned:?}"
+        );
+    }
+
+    #[test]
+    fn message_scan_text_scans_tool_call_payload() {
+        // Same bypass class via `extra["tool_calls"]`: history-replay tool
+        // calls are forwarded upstream verbatim, so a payload in a
+        // function name or arguments must be scanned. The whole payload is
+        // serialized (matching guardrail_output_text), so both surfaces are
+        // covered.
+        let msg: ChatMessage = serde_json::from_value(serde_json::json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{
+                "id": "c1",
+                "type": "function",
+                "function": {
+                    "name": "lookup_evilname",
+                    "arguments": "{\"q\":\"hidden arg payload\"}"
+                }
+            }]
+        }))
+        .unwrap();
+        let scanned = message_scan_text(&msg);
+        assert!(
+            scanned.contains("hidden arg payload") && scanned.contains("lookup_evilname"),
+            "scan must cover tool_call name and arguments, got {scanned:?}"
+        );
     }
 
     struct DefaultPolicyGuardrail;

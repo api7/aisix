@@ -155,15 +155,38 @@ pub(crate) fn routing_error_class(err: &BridgeError) -> &'static str {
 /// a second time (AISIX-Cloud#1065).
 const MAX_ATTEMPT_ERROR_MESSAGE_CHARS: usize = 2048;
 
+/// Control-char-stripped, capped rendering of an error's `Display`.
+///
+/// Anything that a log reader would treat as a line break is dropped, so a
+/// multi-line upstream body can't split the one-line-per-record shape of
+/// the telemetry field and the access log. U+2028/U+2029 are listed
+/// explicitly: they are `Zl`/`Zp`, not `Cc`, so `is_control()` lets them
+/// through even though plenty of viewers break lines on them.
+fn sanitize_error_message(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_control() && !matches!(c, '\u{2028}' | '\u{2029}'))
+        .take(MAX_ATTEMPT_ERROR_MESSAGE_CHARS)
+        .collect()
+}
+
 /// Control-char-stripped error string for the per-attempt
 /// `error_message` telemetry field (#655), capped at
 /// [`MAX_ATTEMPT_ERROR_MESSAGE_CHARS`].
 pub(crate) fn attempt_error_message(err: &BridgeError) -> String {
-    err.to_string()
-        .chars()
-        .filter(|c| !c.is_control())
-        .take(MAX_ATTEMPT_ERROR_MESSAGE_CHARS)
-        .collect()
+    sanitize_error_message(&err.to_string())
+}
+
+/// Failure class + reason for the access log's `error_kind` / `error`
+/// fields.
+///
+/// Deliberately NOT [`attempt_error_from_proxy`]: that one leaves the
+/// message empty for every non-bridge variant, which is fine for a
+/// per-attempt record (the class is the point) but would put a failed
+/// request back to carrying no reason at all — the gap this exists to
+/// close. Here every variant contributes its `Display`, because the access
+/// log is the one line an operator gets per request.
+pub(crate) fn access_log_error(err: &ProxyError) -> (&'static str, String) {
+    (err.kind(), sanitize_error_message(&err.to_string()))
 }
 
 /// Bounded error class + short message for a per-attempt record, derived
@@ -189,6 +212,59 @@ pub(crate) fn ms_since(started: Instant) -> u32 {
 mod tests {
     use super::*;
     use aisix_gateway::{UpstreamWire, MAX_UPSTREAM_ERROR_MESSAGE_BYTES};
+
+    /// AISIX-Cloud#1093: the access log is the one line an operator gets
+    /// per request, so EVERY failure has to name itself there — including
+    /// the variants `attempt_error_from_proxy` deliberately leaves
+    /// message-less because a per-attempt record only needs the class.
+    #[test]
+    fn access_log_error_names_every_variant_not_just_bridge_ones() {
+        // The cause added for #1093 has to survive into the access log —
+        // it is what separates "the upstream is slow" from "we never
+        // reached it", which render identically without it.
+        let (kind, msg) = access_log_error(&ProxyError::Bridge(BridgeError::Timeout {
+            elapsed_ms: 7167,
+            cause: "tcp connect error: Connection timed out (os error 110)".into(),
+        }));
+        assert_eq!(kind, "timeout");
+        assert_eq!(
+            msg,
+            "upstream request timed out after 7167ms: \
+             tcp connect error: Connection timed out (os error 110)"
+        );
+
+        // A non-bridge variant: `attempt_error_from_proxy` yields "" here,
+        // which would put the access log right back to naming no cause.
+        let not_found = ProxyError::ModelNotFound("model \"ghost\" not found".into());
+        let (kind, msg) = access_log_error(&not_found);
+        assert_eq!(kind, "model_not_found");
+        assert!(msg.contains("ghost"), "{msg}");
+        assert!(
+            attempt_error_from_proxy(&not_found).1.is_empty(),
+            "per-attempt records intentionally carry no message here — \
+             that is why the access log needs its own helper"
+        );
+    }
+
+    /// Control chars would break the one-line-per-request shape that makes
+    /// the access log greppable.
+    #[test]
+    fn access_log_error_strips_control_chars_and_caps_length() {
+        // U+2028/U+2029 are Zl/Zp rather than Cc, so `is_control()` alone
+        // would forward them and a log viewer would break the record.
+        let (_, msg) = access_log_error(&ProxyError::InvalidRequest(
+            "bad\nrequest\tbody\u{2028}split\u{2029}again\r\n".into(),
+        ));
+        assert!(
+            !msg.contains(['\n', '\r', '\t', '\u{2028}', '\u{2029}']),
+            "{msg:?}"
+        );
+        assert!(msg.ends_with("badrequestbodysplitagain"), "{msg}");
+
+        let long = ProxyError::InvalidRequest("x".repeat(MAX_ATTEMPT_ERROR_MESSAGE_CHARS * 2));
+        let (_, msg) = access_log_error(&long);
+        assert_eq!(msg.chars().count(), MAX_ATTEMPT_ERROR_MESSAGE_CHARS);
+    }
 
     fn upstream_status(message: &str) -> BridgeError {
         BridgeError::UpstreamStatus {

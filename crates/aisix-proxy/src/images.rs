@@ -87,6 +87,7 @@ pub async fn image_generations(
                 200,
                 elapsed,
                 &request_id,
+                None,
             );
             state.metrics.record_request(
                 &success.provider,
@@ -136,6 +137,7 @@ pub async fn image_generations(
                 status,
                 elapsed,
                 &request_id,
+                Some(&err),
             );
             let snap = state.snapshot.load();
             let metric_model = crate::usage_attr::metric_model_label(&snap, &model_name);
@@ -460,7 +462,15 @@ fn emit_access_log(
     status: u16,
     latency: Duration,
     request_id: &str,
+    error: Option<&ProxyError>,
 ) {
+    let (error_kind, error) = match error {
+        Some(e) => {
+            let (kind, msg) = crate::attempt::access_log_error(e);
+            (Some(kind), Some(msg))
+        }
+        None => (None, None),
+    };
     AccessLog {
         method: "POST",
         path: "/v1/images/generations",
@@ -476,6 +486,8 @@ fn emit_access_log(
         served_by_model: None,
         routing_attempt_count: None,
         routing_fallback_count: None,
+        error_kind,
+        error: error.as_deref(),
     }
     .emit();
 }

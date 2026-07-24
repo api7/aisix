@@ -164,6 +164,7 @@ pub async fn passthrough(
                 status,
                 elapsed,
                 &request_id,
+                None,
             );
             state.metrics.record_request(
                 &provider_label,
@@ -203,6 +204,7 @@ pub async fn passthrough(
                 status,
                 elapsed,
                 &request_id,
+                Some(&err),
             );
             state.metrics.record_request(
                 &provider,
@@ -698,6 +700,7 @@ fn copy_safe_headers(src: &HeaderMap, dst: &mut HeaderMap) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_access_log(
     method: &Method,
     path: &str,
@@ -706,7 +709,15 @@ fn emit_access_log(
     status: u16,
     elapsed: Duration,
     request_id: &str,
+    error: Option<&ProxyError>,
 ) {
+    let (error_kind, error) = match error {
+        Some(e) => {
+            let (kind, msg) = crate::attempt::access_log_error(e);
+            (Some(kind), Some(msg))
+        }
+        None => (None, None),
+    };
     AccessLog {
         method: method.as_str(),
         path,
@@ -722,6 +733,8 @@ fn emit_access_log(
         served_by_model: None,
         routing_attempt_count: None,
         routing_fallback_count: None,
+        error_kind,
+        error: error.as_deref(),
     }
     .emit();
 }
