@@ -498,7 +498,7 @@ enum VideoProvider {
     /// canonical id for this vendor; the CP catalog entry is tracked
     /// follow-up work).
     Volcengine,
-    /// Runway (Gen / Veo families via the Runway Developer API). Provider
+    /// Runway (Gen family plus Runway-hosted Veo, e.g. veo3/veo3.1, via the Runway Developer API — distinct from Google-direct Veo). Provider
     /// string `runwayml` — the models.dev canonical vendor id; the short
     /// `runway` spelling is accepted too (the zhipuai/zhipu precedent).
     /// First overseas provider on this surface: its task `output` is an
@@ -1785,8 +1785,8 @@ mod tests {
 
     #[test]
     fn runway_submit_body_maps_prompt_duration_and_ratio() {
-        let body = runway_submit_body("gen4_5", "a cat", Some(5), Some("1280x720")).unwrap();
-        assert_eq!(body["model"], "gen4_5");
+        let body = runway_submit_body("gen4.5", "a cat", Some(5), Some("1280x720")).unwrap();
+        assert_eq!(body["model"], "gen4.5");
         // The wire field is `promptText`, not `prompt`.
         assert_eq!(body["promptText"], "a cat");
         assert!(body.get("prompt").is_none());
@@ -1795,12 +1795,12 @@ mod tests {
 
         // Unset params are omitted (Runway requires `ratio` for several
         // models, so the provider — not the gateway — decides the default).
-        let body = runway_submit_body("gen4_5", "a cat", None, None).unwrap();
+        let body = runway_submit_body("gen4.5", "a cat", None, None).unwrap();
         assert!(body.get("duration").is_none());
         assert!(body.get("ratio").is_none());
 
         // A malformed size still fails fast before any upstream call.
-        assert!(runway_submit_body("gen4_5", "a cat", None, Some("bogus")).is_err());
+        assert!(runway_submit_body("gen4.5", "a cat", None, Some("bogus")).is_err());
     }
 
     #[test]

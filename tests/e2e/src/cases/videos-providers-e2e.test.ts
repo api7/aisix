@@ -11,7 +11,7 @@ import {
 } from "../harness/index.js";
 
 // E2E: /v1/videos provider adapters beyond DashScope — Zhipu BigModel
-// (CogVideoX), Volcengine Ark (Seedance), and Runway (Gen / Veo). One
+// (CogVideoX), Volcengine Ark (Seedance), and Runway (Gen plus Runway-hosted Veo). One
 // full user journey per provider against a mock upstream serving that
 // provider's documented response shapes:
 //
@@ -232,7 +232,7 @@ describe("videos e2e: zhipu + ark + runway provider adapters", () => {
       zhipuUpstream.baseUrl,
     );
     await seedModel(ARK_MODEL, "volcengine", "seedance-mock", arkUpstream.baseUrl);
-    await seedModel(RUNWAY_MODEL, "runwayml", "gen4_5", runwayUpstream.baseUrl);
+    await seedModel(RUNWAY_MODEL, "runwayml", "gen4.5", runwayUpstream.baseUrl);
     const zhipuProbe = await seedModel(
       ZHIPU_PROBE_MODEL,
       "zhipuai",
@@ -248,7 +248,7 @@ describe("videos e2e: zhipu + ark + runway provider adapters", () => {
     const runwayProbe = await seedModel(
       RUNWAY_PROBE_MODEL,
       "runwayml",
-      "gen4_5",
+      "gen4.5",
       runwayProbeUpstream.baseUrl,
     );
     zhipuProbeId = zhipuProbe.id;
@@ -333,6 +333,8 @@ describe("videos e2e: zhipu + ark + runway provider adapters", () => {
     expect(wire.duration).toBe(10);
     expect(wire.size).toBe("1920x1080");
     expect(sub.headers["x-dashscope-async"]).toBeUndefined();
+    // The Runway version header must not bleed onto other providers.
+    expect(sub.headers[RUNWAY_VERSION_HEADER]).toBeUndefined();
 
     const poll = await getVideo(id);
     expect(poll.status).toBe(200);
@@ -422,7 +424,7 @@ describe("videos e2e: zhipu + ark + runway provider adapters", () => {
     expect(sub.path).toBe("/v1/text_to_video");
     expect(sub.headers[RUNWAY_VERSION_HEADER]).toBe(RUNWAY_VERSION_VALUE);
     const wire = JSON.parse(sub.body) as Record<string, unknown>;
-    expect(wire.model).toBe("gen4_5");
+    expect(wire.model).toBe("gen4.5");
     // The wire field is `promptText`, not `prompt`.
     expect(wire.promptText).toBe("a paper boat in the rain");
     expect(wire.prompt).toBeUndefined();
