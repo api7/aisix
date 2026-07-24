@@ -660,17 +660,6 @@ async fn dispatch(
     let is_routing_request = model_entry.value.routing.is_some();
     let mut routing = RoutingTelemetry::default();
 
-    // `routing.retries` — how many times to re-hit the SAME target (with
-    // backoff) on a retryable failure before failing over to the next target.
-    // Honoured here exactly like chat.rs (#641); 0 (the default) keeps the
-    // fail-over-only behaviour. /v1/messages previously ignored it entirely.
-    let retries = model_entry
-        .value
-        .routing
-        .as_ref()
-        .map(|r| r.retries_or_default())
-        .unwrap_or(0);
-
     // Walk targets, failing over to the next only on a retryable upstream
     // failure. A 4xx / config error is returned as-is — retrying other
     // targets won't help. Streaming and non-streaming share this loop:
@@ -686,11 +675,27 @@ async fn dispatch(
         let pk_id = crate::dispatch::resolve_provider_key(&snapshot, &target.model)
             .map(|e| e.id.clone())
             .unwrap_or_default();
-        for attempt_idx in 0..=retries {
-            // Exponential backoff + jitter before re-hitting the SAME target
+        // How many times to re-hit the SAME target (with backoff) on a
+        // retryable failure before failing over to the next target.
+        // Honoured here exactly like chat.rs (#641), and resolved per target
+        // so a direct model gets a budget too — it used to be pinned at zero
+        // because the knob only existed on the group.
+        let budget = crate::routing::effective_retries(
+            &target.model,
+            model_entry.value.routing.as_ref(),
+            state.default_retries,
+            i + 1 < n,
+        );
+        for attempt_idx in 0..=budget.attempts {
+            // Upstream `Retry-After` when the last failure carried one, else
+            // exponential backoff + jitter, before re-hitting the SAME target
             // (#641); cross-target fall-over (the outer loop) stays immediate.
             if attempt_idx > 0 {
-                tokio::time::sleep(crate::routing::retry_backoff(attempt_idx as u32)).await;
+                let hint = last_err.as_ref().and_then(|e| match e {
+                    ProxyError::Bridge(be) => crate::routing::retry_after_hint(be),
+                    _ => None,
+                });
+                tokio::time::sleep(crate::routing::retry_backoff(attempt_idx as u32, hint)).await;
             }
             let (idx, kind) = routing.begin_attempt(&target.model.display_name);
             let target_model = if is_routing_request {
@@ -820,6 +825,12 @@ async fn dispatch(
                         error_message,
                         latency_ms: ms_since(attempt_started),
                     });
+                    // See `RetryBudget::covers`: a default budget skips
+                    // same-target retries for timeouts; fail-over is unaffected.
+                    let budget_covers = match &e {
+                        ProxyError::Bridge(be) => budget.covers(be),
+                        _ => true,
+                    };
                     last_err = Some(e);
                     // Non-retryable → stop entirely (retrying or failing over
                     // won't help). Retryable → re-hit the same target until
@@ -828,7 +839,7 @@ async fn dispatch(
                     if !retryable {
                         break 'targets;
                     }
-                    if attempt_idx == retries {
+                    if attempt_idx == budget.attempts || !budget_covers {
                         if i + 1 >= n {
                             break 'targets;
                         }

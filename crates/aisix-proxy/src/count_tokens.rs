@@ -204,7 +204,7 @@ async fn dispatch(
     let is_routing_request = model_entry.value.routing.is_some();
     let mut last_err: Option<ProxyError> = None;
     let mut any_anthropic = false;
-    for target in &attempt_models {
+    for (target_idx, target) in attempt_models.iter().enumerate() {
         // count_tokens has no upstream equivalent for non-Anthropic
         // providers; skip foreign targets in a mixed group rather than
         // dispatching to an upstream that would 404.
@@ -232,25 +232,54 @@ async fn dispatch(
                 continue;
             }
         };
-        match count_tokens_to_target(
-            state,
-            &snapshot,
-            body,
+        // Same-target retries before failing over, like the other
+        // group-capable endpoints. This loop had fail-over only: a
+        // transient 502 on the sole Anthropic target failed the request
+        // outright even with a retry budget configured.
+        let budget = crate::routing::effective_retries(
             &target.model,
-            &target.id,
-            request_id,
-        )
-        .await
-        {
-            Ok(resp) => return Ok((resp, "anthropic".to_string())),
-            Err(e) => {
-                let retryable = matches!(
-                    &e,
-                    ProxyError::Bridge(be) if crate::routing::is_retryable(be, retry_on_429, fallback_statuses)
-                );
-                last_err = Some(e);
-                if !retryable {
-                    break;
+            model_entry.value.routing.as_ref(),
+            state.default_retries,
+            target_idx + 1 < attempt_models.len(),
+        );
+        for attempt_idx in 0..=budget.attempts {
+            if attempt_idx > 0 {
+                let hint = last_err.as_ref().and_then(|e| match e {
+                    ProxyError::Bridge(be) => crate::routing::retry_after_hint(be),
+                    _ => None,
+                });
+                tokio::time::sleep(crate::routing::retry_backoff(attempt_idx as u32, hint)).await;
+            }
+            match count_tokens_to_target(
+                state,
+                &snapshot,
+                body,
+                &target.model,
+                &target.id,
+                request_id,
+            )
+            .await
+            {
+                Ok(resp) => return Ok((resp, "anthropic".to_string())),
+                Err(e) => {
+                    let retryable = matches!(
+                        &e,
+                        ProxyError::Bridge(be) if crate::routing::is_retryable(be, retry_on_429, fallback_statuses)
+                    );
+                    // See `RetryBudget::covers`: a default budget skips
+                    // same-target retries for timeouts; fail-over is
+                    // unaffected (the outer loop still moves on).
+                    let budget_covers = match &e {
+                        ProxyError::Bridge(be) => budget.covers(be),
+                        _ => true,
+                    };
+                    last_err = Some(e);
+                    if !retryable {
+                        return Err(last_err.unwrap_or(ProxyError::ProviderUnavailable));
+                    }
+                    if !budget_covers {
+                        break;
+                    }
                 }
             }
         }

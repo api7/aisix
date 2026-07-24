@@ -1193,19 +1193,6 @@ async fn dispatch(
     // the remaining chunks, so a mid-stream stall terminates the response
     // (no fallback once the 200 is committed).
     if req.is_streaming() {
-        // `routing.retries` — how many times to re-hit the SAME target (with
-        // backoff) on a retryable failure before failing over to the next one.
-        // Read here for the same reason the non-streaming loop below reads it:
-        // the two loops are written separately, and streaming used to skip
-        // `retries` entirely (AISIX-Cloud#1119), so a retryable first-chunk
-        // failure fell straight over to the next target — or, with a single
-        // target, failed the request outright.
-        let retries = virtual_entry
-            .value
-            .routing
-            .as_ref()
-            .map(|r| r.retries_or_default())
-            .unwrap_or(0);
         let retry_on_429 = virtual_entry
             .value
             .routing
@@ -1242,7 +1229,7 @@ async fn dispatch(
         // (AISIX-Cloud#1087).
         let mut won_member_reservation: Option<aisix_ratelimit::MultiReservation> = None;
 
-        'targets: for attempt in &attempt_models {
+        'targets: for (target_idx, attempt) in attempt_models.iter().enumerate() {
             let model = &attempt.model;
             let Ok(provider) = crate::dispatch::require_provider(model) else {
                 last_err = Some(BridgeError::Config("model has no provider".into()));
@@ -1275,9 +1262,22 @@ async fn dispatch(
             // is applied consistently.
             let stream_budget = model.stream_timeout_effective();
 
-            // Re-hit the SAME target `retries` times before failing over,
-            // mirroring the non-streaming loop below (AISIX-Cloud#1119).
-            for attempt_idx in 0..=retries {
+            // How many times to re-hit the SAME target (with backoff) on a
+            // retryable failure before failing over to the next one.
+            // Resolved per target, not once per request: the budget belongs
+            // to the upstream being hit, so a group may mix a target that
+            // tolerates three retries with one that tolerates none.
+            // Streaming used to skip `retries` entirely (AISIX-Cloud#1119);
+            // a direct model used to be pinned at zero because the knob only
+            // existed on the group.
+            let budget = crate::routing::effective_retries(
+                model,
+                virtual_entry.value.routing.as_ref(),
+                state.default_retries,
+                target_idx + 1 < attempt_models.len(),
+            );
+
+            for attempt_idx in 0..=budget.attempts {
                 let (idx, kind) = stream_routing.begin_attempt(&model.display_name);
                 let target_model = if is_routing_request {
                     model.display_name.clone()
@@ -1426,17 +1426,24 @@ async fn dispatch(
                         {
                             state.runtime_status.mark_cooldown(&attempt.id, ttl, reason);
                         }
+                        let retry_after = crate::routing::retry_after_hint(&err);
+                        // An unconfigured budget does not spend itself on a
+                        // timeout — see `RetryBudget::covers`. Fail-over is
+                        // unaffected: the outer loop still moves on.
+                        let budget_covers = budget.covers(&err);
                         last_err = Some(err);
                         if !retryable {
                             break 'targets;
                         }
-                        if attempt_idx == retries {
+                        if attempt_idx == budget.attempts || !budget_covers {
                             break;
                         }
-                        // Exponential backoff + jitter before re-hitting the
+                        // Upstream `Retry-After` when it gave one, else
+                        // exponential backoff + jitter, before re-hitting the
                         // SAME target (#788 P2); cross-target fail-over (the
                         // outer loop) stays immediate.
-                        let backoff = crate::routing::retry_backoff((attempt_idx + 1) as u32);
+                        let backoff =
+                            crate::routing::retry_backoff((attempt_idx + 1) as u32, retry_after);
                         tracing::debug!(
                             target_model = %model.display_name,
                             next_attempt = attempt_idx + 2,
@@ -2073,12 +2080,6 @@ async fn dispatch(
     // requests (AISIX-Cloud#410). Stays `None` until an attempt wins.
     let mut chosen_target_display_name: Option<String> = None;
     let mut upstream: Option<aisix_gateway::ChatResponse> = None;
-    let retries = virtual_entry
-        .value
-        .routing
-        .as_ref()
-        .map(|routing| routing.retries_or_default())
-        .unwrap_or(0);
     let retry_on_429 = virtual_entry
         .value
         .routing
@@ -2100,7 +2101,7 @@ async fn dispatch(
     // (AISIX-Cloud#1087).
     let mut won_member_reservation: Option<aisix_ratelimit::MultiReservation> = None;
 
-    'targets: for attempt in &attempt_models {
+    'targets: for (target_idx, attempt) in attempt_models.iter().enumerate() {
         let model = &attempt.model;
         let Some(provider) = model.provider.as_deref() else {
             last_err = Some(BridgeError::Config("model has no provider".into()));
@@ -2136,8 +2137,15 @@ async fn dispatch(
         if let Some(d) = model.request_timeout() {
             ctx = ctx.with_deadline(d);
         }
+        // Per-target retry budget — see the streaming loop above.
+        let budget = crate::routing::effective_retries(
+            model,
+            virtual_entry.value.routing.as_ref(),
+            state.default_retries,
+            target_idx + 1 < attempt_models.len(),
+        );
 
-        for attempt_idx in 0..=retries {
+        for attempt_idx in 0..=budget.attempts {
             // Per-attempt telemetry kind (#655): the first attempt overall
             // is "initial"; a different target than the previous attempt is
             // a "fallback"; the same target again is a "retry".
@@ -2266,18 +2274,25 @@ async fn dispatch(
                     {
                         state.runtime_status.mark_cooldown(&attempt.id, ttl, reason);
                     }
+                    let retry_after = crate::routing::retry_after_hint(&err);
+                    // See `RetryBudget::covers`: a default budget skips
+                    // same-target retries for timeouts. Fail-over is
+                    // unaffected.
+                    let budget_covers = budget.covers(&err);
                     last_err = Some(err);
                     if !retryable {
                         break;
                     }
-                    if attempt_idx == retries {
+                    if attempt_idx == budget.attempts || !budget_covers {
                         break;
                     }
-                    // #788 P2: exponential backoff + jitter before retrying
-                    // the SAME target, so a transiently-failing upstream gets
-                    // a pause instead of being hammered. Cross-target fallover
-                    // (the outer loop) stays immediate.
-                    let backoff = crate::routing::retry_backoff((attempt_idx + 1) as u32);
+                    // #788 P2: upstream `Retry-After` when supplied, else
+                    // exponential backoff + jitter, before retrying the SAME
+                    // target, so a transiently-failing upstream gets a pause
+                    // instead of being hammered. Cross-target fallover (the
+                    // outer loop) stays immediate.
+                    let backoff =
+                        crate::routing::retry_backoff((attempt_idx + 1) as u32, retry_after);
                     tracing::debug!(
                         target_model = %model.display_name,
                         next_attempt = attempt_idx + 2,

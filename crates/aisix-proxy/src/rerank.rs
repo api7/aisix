@@ -388,61 +388,70 @@ async fn dispatch(
     }
 
     let client = crate::http_client::client();
-    let mut req = client.post(&url).headers(headers).json(body);
-    // #554: rerank is non-streaming; apply the E2E request timeout.
-    if let Some(d) = model.request_timeout() {
-        req = req.timeout(d);
-    }
-    let send_started = Instant::now();
-    let upstream_resp = req
-        .send()
-        .await
-        .map_err(|e| {
-            crate::cooldown::note_failure(
-                &state.runtime_status,
-                &model_entry.id,
-                model.cooldown.as_ref(),
-                crate::dispatch::reqwest_error_to_bridge(&e, send_started),
-            )
+    // Send, check the status, and read the body as one retryable unit, so a
+    // transient fault anywhere in that sequence is retried rather than
+    // surfacing to the caller. `note_failure` runs per attempt, matching
+    // chat.rs: the cooldown decision is independent of the retry decision —
+    // a target that just failed should be deprioritised for the NEXT
+    // request even if this one recovers on retry.
+    let tracker = &state.runtime_status;
+    let model_id: &str = &model_entry.id;
+    let cooldown_cfg = model.cooldown.as_ref();
+    let (upstream_headers, body_bytes) =
+        match crate::routing::retrying_dispatch(state, model, "/v1/rerank", || {
+            let mut req = client.post(&url).headers(headers.clone()).json(body);
+            // #554: rerank is non-streaming; apply the E2E request timeout.
+            if let Some(d) = model.request_timeout() {
+                req = req.timeout(d);
+            }
+            async move {
+                let send_started = Instant::now();
+                let upstream_resp = req.send().await.map_err(|e| {
+                    crate::cooldown::note_failure(
+                        tracker,
+                        model_id,
+                        cooldown_cfg,
+                        crate::dispatch::reqwest_error_to_bridge(&e, send_started),
+                    )
+                })?;
+
+                let status = upstream_resp.status();
+                if !status.is_success() {
+                    let status_u16 = status.as_u16();
+                    let retry_after = aisix_gateway::parse_retry_after(upstream_resp.headers());
+                    let message = upstream_resp.text().await.unwrap_or_default();
+                    return Err(crate::cooldown::note_failure(
+                        tracker,
+                        model_id,
+                        cooldown_cfg,
+                        aisix_gateway::BridgeError::upstream_status_with_retry_after(
+                            status_u16,
+                            message.chars().take(1024).collect::<String>(),
+                            retry_after,
+                        ),
+                    ));
+                }
+
+                let upstream_headers = upstream_resp.headers().clone();
+                let body_bytes = upstream_resp.bytes().await.map_err(|e| {
+                    crate::cooldown::note_failure(
+                        tracker,
+                        model_id,
+                        cooldown_cfg,
+                        aisix_gateway::BridgeError::UpstreamDecode(e.to_string()),
+                    )
+                })?;
+                Ok((upstream_headers, body_bytes))
+            }
         })
-        .map_err(ProxyError::Bridge)?;
-
-    let status = upstream_resp.status();
-
-    if !status.is_success() {
-        let status_u16 = status.as_u16();
-        let retry_after = aisix_gateway::parse_retry_after(upstream_resp.headers());
-        let message = upstream_resp.text().await.unwrap_or_default();
-        let err = aisix_gateway::BridgeError::upstream_status_with_retry_after(
-            status_u16,
-            message.chars().take(1024).collect::<String>(),
-            retry_after,
-        );
-        if let Some((ttl, reason)) = crate::cooldown::decide_cooldown(&err, model.cooldown.as_ref())
+        .await
         {
-            state
-                .runtime_status
-                .mark_cooldown(&model_entry.id, ttl, reason);
-        }
-        return Err(ProxyError::Bridge(err));
-    }
+            Ok(v) => v,
+            Err(err) => return Err(ProxyError::Bridge(err)),
+        };
 
     state.health.record_success(&model_name);
     state.runtime_status.mark_healthy(&model_entry.id);
-
-    let upstream_headers = upstream_resp.headers().clone();
-    let body_bytes = upstream_resp
-        .bytes()
-        .await
-        .map_err(|e| {
-            crate::cooldown::note_failure(
-                &state.runtime_status,
-                &model_entry.id,
-                model.cooldown.as_ref(),
-                aisix_gateway::BridgeError::UpstreamDecode(e.to_string()),
-            )
-        })
-        .map_err(ProxyError::Bridge)?;
 
     // Extract usage from the upstream body BEFORE handing the bytes
     // off to the response builder. We parse for telemetry but still

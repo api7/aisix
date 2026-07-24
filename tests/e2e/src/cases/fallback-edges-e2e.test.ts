@@ -331,10 +331,17 @@ describe("fallback edge cases e2e", () => {
     expect(typeof errMsg).toBe("string");
     expect((errMsg as string).length).toBeGreaterThan(0);
 
-    // Both targets were tried exactly once each (the failover walk).
-    // A regression that bailed after the first failure (or hammered
-    // the same target twice) would inflate / deflate these counts.
+    // The fail-over walk visits both targets, and the retry budget makes
+    // the counts asymmetric on purpose:
+    //
+    //   target 1 — a fallback is queued behind it, so the (unconfigured)
+    //              default budget defers: one attempt, then move on.
+    //   target 2 — last in line with nothing to fall over to, so the
+    //              default budget applies: initial + 2 retries.
+    //
+    // A regression that bailed after the first failure would drop bad2 to
+    // 0; one that ground every target would inflate bad1 to 3.
     expect(bad1.receivedRequests.length - bad1Baseline).toBe(1);
-    expect(bad2.receivedRequests.length - bad2Baseline).toBe(1);
+    expect(bad2.receivedRequests.length - bad2Baseline).toBe(3);
   });
 });

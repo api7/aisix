@@ -700,6 +700,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
         aisix_obs::ClientTypeClassifier::compile(&cfg.observability.metrics.client_type_rules)
             .map_err(|e| anyhow::anyhow!(e))?;
     proxy_state = proxy_state.with_client_classifier(Arc::new(client_classifier));
+    proxy_state = proxy_state.with_default_retries(cfg.upstream.retries);
     if let Some(client) = budget_client {
         proxy_state = proxy_state.with_budget_client(client);
     }

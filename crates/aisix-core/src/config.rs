@@ -761,11 +761,13 @@ pub enum RateLimitBackend {
     Redis,
 }
 
-/// Connection-layer settings for the HTTP clients that call LLM providers.
+/// Deployment-wide behaviour for outbound calls to LLM providers: the
+/// connection layer, plus the retry budget every dispatch starts from.
 ///
 /// These are deployment properties of the network path to the upstream, not
 /// per-tenant configuration, so they live in the DP config file rather than
-/// on a Model or ProviderKey resource.
+/// on a Model or ProviderKey resource. A tenant that needs a different
+/// budget for one model overrides it with `Model.retries`.
 ///
 /// The defaults exist because reqwest's own are wrong for a gateway sitting
 /// behind an LB/NAT/proxy hop: no connect timeout, TCP keepalive off, and a
@@ -796,6 +798,16 @@ pub struct UpstreamConfig {
     /// Cap on idle connections kept per upstream host. `null` (the
     /// default) leaves reqwest's unbounded behaviour.
     pub pool_max_idle_per_host: Option<usize>,
+    /// Retry attempts after a retryable upstream failure, applied to every
+    /// dispatch that does not override it via `Model.retries` or a model
+    /// group's `routing.retries`. `0` disables retrying deployment-wide.
+    ///
+    /// The default matches the OpenAI SDK / LiteLLM router default (2), so
+    /// a transient upstream fault is absorbed instead of surfacing to the
+    /// caller. Raising it multiplies the load a failing upstream sees:
+    /// each retry re-sends the full request body, and stacks on top of any
+    /// retry the provider's own edge performs.
+    pub retries: u32,
 }
 
 impl Default for UpstreamConfig {
@@ -807,9 +819,15 @@ impl Default for UpstreamConfig {
             tcp_keepalive_retries: 5,
             pool_idle_timeout_secs: 30,
             pool_max_idle_per_host: None,
+            retries: DEFAULT_UPSTREAM_RETRIES,
         }
     }
 }
+
+/// Deployment-wide retry default. Matches `openai.DEFAULT_MAX_RETRIES`,
+/// which is also what the LiteLLM router falls back to when neither
+/// `router_settings.num_retries` nor `litellm_settings.num_retries` is set.
+pub const DEFAULT_UPSTREAM_RETRIES: u32 = 2;
 
 impl Config {
     /// Load + merge + validate.

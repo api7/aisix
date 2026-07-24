@@ -184,6 +184,16 @@ upstream:
   # Cap on idle connections kept per upstream host. Unset = unbounded.
   # pool_max_idle_per_host: 32
 
+  # Retry attempts after a retryable upstream failure (5xx, timeout,
+  # transport). Applies to every model that does not set its own `retries`,
+  # and to every model group that does not set `routing.retries`. Set to 0
+  # to disable retrying deployment-wide.
+  #
+  # Each retry re-sends the full request body and stacks on top of any retry
+  # the provider's own edge performs, so raising this multiplies the load a
+  # struggling upstream sees.
+  # retries: 2
+
 # Models, API keys, provider keys, guardrails, cache policies, and
 # observability exporters are NOT defined in this file. They are stored
 # in etcd and managed via the Admin API (see docs/api-admin.md). This

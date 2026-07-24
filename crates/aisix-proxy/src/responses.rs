@@ -537,33 +537,37 @@ async fn dispatch(
         .unwrap_or(&[]);
     let is_routing_request = model_entry.value.routing.is_some();
     let mut routing = RoutingTelemetry::default();
-    // `routing.retries` — same-target retries (with backoff) before failing
-    // over, honoured exactly like chat.rs / messages.rs (#641). 0 (default)
-    // keeps fail-over-only; /v1/responses previously ignored it entirely.
-    let retries = model_entry
-        .value
-        .routing
-        .as_ref()
-        .map(|r| r.retries_or_default())
-        .unwrap_or(0);
-
     // Walk the targets, failing over on a retryable failure. Streaming and
     // non-streaming share this loop: the per-target dispatch branches
     // internally and, for streaming, only returns Ok once the first chunk
     // has arrived under `stream_timeout` (#554) — so the 200 is committed to
     // exactly one target and a slow first chunk fails over.
     let mut last_err: Option<ProxyError> = None;
-    'targets: for target in &attempt_models {
+    'targets: for (target_idx, target) in attempt_models.iter().enumerate() {
         // Resolved ProviderKey UUID for this target — feeds the per-PK
         // telemetry attribution tags on the emitted UsageEvent
         // (AISIX-Cloud#867). Recorded on the AttemptRecord (success + failure)
         // so both the winner and each failed-attempt event can attribute it.
         let pk_id = target.model.provider_key_id.clone().unwrap_or_default();
-        for attempt_idx in 0..=retries {
-            // Exponential backoff + jitter before re-hitting the SAME target
+        // Same-target retries before failing over, honoured exactly like
+        // chat.rs / messages.rs (#641) and resolved per target so a direct
+        // model gets a budget too.
+        let budget = crate::routing::effective_retries(
+            &target.model,
+            model_entry.value.routing.as_ref(),
+            state.default_retries,
+            target_idx + 1 < attempt_models.len(),
+        );
+        for attempt_idx in 0..=budget.attempts {
+            // Upstream `Retry-After` when the last failure carried one, else
+            // exponential backoff + jitter, before re-hitting the SAME target
             // (#641); cross-target fall-over (the outer loop) stays immediate.
             if attempt_idx > 0 {
-                tokio::time::sleep(crate::routing::retry_backoff(attempt_idx as u32)).await;
+                let hint = last_err.as_ref().and_then(|e| match e {
+                    ProxyError::Bridge(be) => crate::routing::retry_after_hint(be),
+                    _ => None,
+                });
+                tokio::time::sleep(crate::routing::retry_backoff(attempt_idx as u32, hint)).await;
             }
             let (idx, kind) = routing.begin_attempt(&target.model.display_name);
             let target_model = if is_routing_request {
@@ -723,6 +727,12 @@ async fn dispatch(
                         error_message,
                         latency_ms: ms_since(attempt_started),
                     });
+                    // See `RetryBudget::covers`: a default budget skips
+                    // same-target retries for timeouts; fail-over is unaffected.
+                    let budget_covers = match &e {
+                        ProxyError::Bridge(be) => budget.covers(be),
+                        _ => true,
+                    };
                     last_err = Some(e);
                     // Non-retryable → stop entirely. Retryable → re-hit the
                     // same target until `retries` is exhausted, then fall over
@@ -730,7 +740,7 @@ async fn dispatch(
                     if !retryable {
                         break 'targets;
                     }
-                    if attempt_idx == retries {
+                    if attempt_idx == budget.attempts || !budget_covers {
                         break;
                     }
                 }
@@ -4875,25 +4885,43 @@ data: [DONE]\n\n";
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
 
-        let recv = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await;
-        let ev = recv
-            .expect("a failed-attempt UsageEvent must be emitted within the timeout")
-            .expect("the usage sink channel must not be closed");
-        assert_eq!(ev.status_code, 502, "failed attempt records the mapped 502");
-        assert_eq!(ev.prompt_tokens, 0, "failed attempt has zero tokens");
-        assert_eq!(ev.completion_tokens, 0, "failed attempt has zero tokens");
-        assert_eq!(ev.attempt_index, 0, "single direct-model attempt");
-        assert_eq!(ev.attempt_kind, "initial");
+        // A direct model now carries the deployment default retry budget (2),
+        // so a persistent 5xx produces three attempts — initial + two retries
+        // — each its own zero-token event. Before the per-model budget landed
+        // the knob only existed on a model group, so this was one attempt.
+        let mut events = Vec::new();
+        for _ in 0..3 {
+            let ev = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .expect("a failed-attempt UsageEvent must be emitted within the timeout")
+                .expect("the usage sink channel must not be closed");
+            events.push(ev);
+        }
+        events.sort_by_key(|e| e.attempt_index);
+        for ev in &events {
+            assert_eq!(ev.status_code, 502, "failed attempt records the mapped 502");
+            assert_eq!(ev.prompt_tokens, 0, "failed attempt has zero tokens");
+            assert_eq!(ev.completion_tokens, 0, "failed attempt has zero tokens");
+            assert_eq!(
+                ev.error_class, "upstream_status",
+                "500 upstream maps to an upstream_status error class",
+            );
+        }
         assert_eq!(
-            ev.error_class, "upstream_status",
-            "500 upstream maps to an upstream_status error class",
+            events
+                .iter()
+                .map(|e| e.attempt_kind.as_str())
+                .collect::<Vec<_>>(),
+            vec!["initial", "retry", "retry"],
+            "the retries re-hit the SAME model, so they are retries not fallbacks",
         );
-        // Exactly one event — a direct model has no further attempts and no
-        // separate terminal event (the attempt itself is terminal).
+
+        // No further events — the budget is exhausted and there is no
+        // separate terminal event (the last attempt itself is terminal).
         let extra = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await;
         if let Ok(Some(ev)) = extra {
             panic!(
-                "expected exactly one event for a single failed attempt, got a second: \
+                "expected exactly three events for an exhausted budget, got a fourth: \
                  attempt_index={} status_code={}",
                 ev.attempt_index, ev.status_code,
             );
