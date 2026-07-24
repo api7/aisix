@@ -561,28 +561,35 @@ async fn multipart_dispatch(
     let url = crate::dispatch::build_v1_url(&base, upstream_path);
     let provider_label = provider.to_ascii_lowercase();
 
-    // Rebuild the multipart form with `model` rewritten.
-    let mut form = multipart::Form::new();
-    for (name, file_name, content_type, data) in fields {
-        let field_data = if name == "model" {
-            Bytes::copy_from_slice(upstream_model.as_bytes())
-        } else {
-            data
-        };
+    // Rebuild the multipart form with `model` rewritten. A `multipart::Form`
+    // is single-use (sending consumes it), so this is a closure rather than a
+    // value: each retry attempt below builds a fresh one. That is only
+    // possible because every part is `Part::bytes` over an in-memory `Bytes`
+    // — a streamed part could not be replayed.
+    let build_form = || {
+        let mut form = multipart::Form::new();
+        for (name, file_name, content_type, data) in &fields {
+            let field_data = if name == "model" {
+                Bytes::copy_from_slice(upstream_model.as_bytes())
+            } else {
+                data.clone()
+            };
 
-        let data_vec = field_data.to_vec();
-        let mut part = if let Some(ct) = content_type {
-            multipart::Part::bytes(data_vec.clone())
-                .mime_str(&ct)
-                .unwrap_or_else(|_| multipart::Part::bytes(data_vec))
-        } else {
-            multipart::Part::bytes(data_vec)
-        };
-        if let Some(fname) = file_name {
-            part = part.file_name(fname);
+            let data_vec = field_data.to_vec();
+            let mut part = if let Some(ct) = content_type {
+                multipart::Part::bytes(data_vec.clone())
+                    .mime_str(ct)
+                    .unwrap_or_else(|_| multipart::Part::bytes(data_vec))
+            } else {
+                multipart::Part::bytes(data_vec)
+            };
+            if let Some(fname) = file_name {
+                part = part.file_name(fname.clone());
+            }
+            form = form.part(name.clone(), part);
         }
-        form = form.part(name, part);
-    }
+        form
+    };
 
     // Build headers explicitly so the PK's `request.default_headers` can inject
     // operator headers (AISIX-Cloud#867 follow-up). The body is a multipart
@@ -610,63 +617,74 @@ async fn multipart_dispatch(
     }
 
     let client = crate::http_client::client();
-    let mut req = client.post(&url).headers(headers).multipart(form);
-    // #554/#911: audio transcription/translation is non-streaming; apply the
-    // per-model E2E request timeout like the other direct-upstream paths
-    // (count_tokens/rerank/responses) so a slow/blackholed audio provider
-    // fails over and the model's timeout cooldown can engage.
-    if let Some(d) = model.request_timeout() {
-        req = req.timeout(d);
-    }
-    let resp = req
-        .send()
-        .await
-        .map_err(|e| {
-            crate::cooldown::note_failure(
-                &state.runtime_status,
-                &model_entry.id,
-                model.cooldown.as_ref(),
-                aisix_gateway::BridgeError::Transport(aisix_gateway::transport_error_message(&e)),
-            )
-        })
-        .map_err(ProxyError::Bridge)?;
+    let tracker = &state.runtime_status;
+    let model_id: &str = &model_entry.id;
+    let cooldown_cfg = model.cooldown.as_ref();
+    // Send, check the status, and read the body as one retryable unit. See
+    // the same shape in rerank.rs for why `note_failure` stays per attempt.
+    let (upstream_headers, body_bytes) =
+        match crate::routing::retrying_dispatch(state, model, "/v1/audio/transcriptions", || {
+            let mut req = client
+                .post(&url)
+                .headers(headers.clone())
+                .multipart(build_form());
+            // #554/#911: audio transcription/translation is non-streaming; apply
+            // the per-model E2E request timeout like the other direct-upstream
+            // paths (count_tokens/rerank/responses) so a slow/blackholed audio
+            // provider fails over and the model's timeout cooldown can engage.
+            if let Some(d) = model.request_timeout() {
+                req = req.timeout(d);
+            }
+            async move {
+                let resp = req.send().await.map_err(|e| {
+                    crate::cooldown::note_failure(
+                        tracker,
+                        model_id,
+                        cooldown_cfg,
+                        aisix_gateway::BridgeError::Transport(
+                            aisix_gateway::transport_error_message(&e),
+                        ),
+                    )
+                })?;
 
-    let status = resp.status();
-    if !status.is_success() {
-        let s = status.as_u16();
-        let retry_after = aisix_gateway::parse_retry_after(resp.headers());
-        let msg = resp.text().await.unwrap_or_default();
-        let err = aisix_gateway::BridgeError::upstream_status_with_retry_after(
-            s,
-            msg.chars().take(1024).collect::<String>(),
-            retry_after,
-        );
-        if let Some((ttl, reason)) = crate::cooldown::decide_cooldown(&err, model.cooldown.as_ref())
+                let status = resp.status();
+                if !status.is_success() {
+                    let s = status.as_u16();
+                    let retry_after = aisix_gateway::parse_retry_after(resp.headers());
+                    let msg = resp.text().await.unwrap_or_default();
+                    return Err(crate::cooldown::note_failure(
+                        tracker,
+                        model_id,
+                        cooldown_cfg,
+                        aisix_gateway::BridgeError::upstream_status_with_retry_after(
+                            s,
+                            msg.chars().take(1024).collect::<String>(),
+                            retry_after,
+                        ),
+                    ));
+                }
+
+                // Relay response headers that matter for the client.
+                let upstream_headers = resp.headers().clone();
+                let body_bytes = resp.bytes().await.map_err(|e| {
+                    crate::cooldown::note_failure(
+                        tracker,
+                        model_id,
+                        cooldown_cfg,
+                        aisix_gateway::BridgeError::UpstreamDecode(e.to_string()),
+                    )
+                })?;
+                Ok((upstream_headers, body_bytes))
+            }
+        })
+        .await
         {
-            state
-                .runtime_status
-                .mark_cooldown(&model_entry.id, ttl, reason);
-        }
-        return Err(ProxyError::Bridge(err));
-    }
+            Ok(v) => v,
+            Err(err) => return Err(ProxyError::Bridge(err)),
+        };
 
     state.health.record_success(&model_name);
     state.runtime_status.mark_healthy(&model_entry.id);
-
-    // Relay response headers that matter for the client.
-    let upstream_headers = resp.headers().clone();
-    let body_bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| {
-            crate::cooldown::note_failure(
-                &state.runtime_status,
-                &model_entry.id,
-                model.cooldown.as_ref(),
-                aisix_gateway::BridgeError::UpstreamDecode(e.to_string()),
-            )
-        })
-        .map_err(ProxyError::Bridge)?;
 
     // Parse the response body best-effort for a `usage` token block
     // (gpt-4o-transcribe returns one; whisper-1 returns none, and the
@@ -972,63 +990,72 @@ async fn speech_dispatch(
     }
 
     let client = crate::http_client::client();
-    let mut req = client
-        .post(crate::dispatch::build_v1_url(&base, "/audio/speech"))
-        .headers(headers)
-        .json(&body);
-    // #554/#911: speech synthesis is non-streaming; apply the per-model E2E
-    // request timeout (same as count_tokens/rerank/responses).
-    if let Some(d) = model.request_timeout() {
-        req = req.timeout(d);
-    }
-    let resp = req
-        .send()
-        .await
-        .map_err(|e| {
-            crate::cooldown::note_failure(
-                &state.runtime_status,
-                &model_entry.id,
-                model.cooldown.as_ref(),
-                aisix_gateway::BridgeError::Transport(aisix_gateway::transport_error_message(&e)),
-            )
-        })
-        .map_err(ProxyError::Bridge)?;
+    let speech_url = crate::dispatch::build_v1_url(&base, "/audio/speech");
+    let tracker = &state.runtime_status;
+    let model_id: &str = &model_entry.id;
+    let cooldown_cfg = model.cooldown.as_ref();
+    // Send, check the status, and read the body as one retryable unit. See
+    // the same shape in rerank.rs for why `note_failure` stays per attempt.
+    let (upstream_headers, body_bytes) =
+        match crate::routing::retrying_dispatch(state, model, "/v1/audio/speech", || {
+            let mut req = client
+                .post(speech_url.clone())
+                .headers(headers.clone())
+                .json(&body);
+            // #554/#911: speech synthesis is non-streaming; apply the per-model
+            // E2E request timeout (same as count_tokens/rerank/responses).
+            if let Some(d) = model.request_timeout() {
+                req = req.timeout(d);
+            }
+            async move {
+                let resp = req.send().await.map_err(|e| {
+                    crate::cooldown::note_failure(
+                        tracker,
+                        model_id,
+                        cooldown_cfg,
+                        aisix_gateway::BridgeError::Transport(
+                            aisix_gateway::transport_error_message(&e),
+                        ),
+                    )
+                })?;
 
-    let status = resp.status();
-    if !status.is_success() {
-        let s = status.as_u16();
-        let retry_after = aisix_gateway::parse_retry_after(resp.headers());
-        let msg = resp.text().await.unwrap_or_default();
-        let err = aisix_gateway::BridgeError::upstream_status_with_retry_after(
-            s,
-            msg.chars().take(1024).collect::<String>(),
-            retry_after,
-        );
-        if let Some((ttl, reason)) = crate::cooldown::decide_cooldown(&err, model.cooldown.as_ref())
+                let status = resp.status();
+                if !status.is_success() {
+                    let s = status.as_u16();
+                    let retry_after = aisix_gateway::parse_retry_after(resp.headers());
+                    let msg = resp.text().await.unwrap_or_default();
+                    return Err(crate::cooldown::note_failure(
+                        tracker,
+                        model_id,
+                        cooldown_cfg,
+                        aisix_gateway::BridgeError::upstream_status_with_retry_after(
+                            s,
+                            msg.chars().take(1024).collect::<String>(),
+                            retry_after,
+                        ),
+                    ));
+                }
+
+                let upstream_headers = resp.headers().clone();
+                let body_bytes = resp.bytes().await.map_err(|e| {
+                    crate::cooldown::note_failure(
+                        tracker,
+                        model_id,
+                        cooldown_cfg,
+                        aisix_gateway::BridgeError::UpstreamDecode(e.to_string()),
+                    )
+                })?;
+                Ok((upstream_headers, body_bytes))
+            }
+        })
+        .await
         {
-            state
-                .runtime_status
-                .mark_cooldown(&model_entry.id, ttl, reason);
-        }
-        return Err(ProxyError::Bridge(err));
-    }
+            Ok(v) => v,
+            Err(err) => return Err(ProxyError::Bridge(err)),
+        };
 
     state.health.record_success(&model_name);
     state.runtime_status.mark_healthy(&model_entry.id);
-
-    let upstream_headers = resp.headers().clone();
-    let body_bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| {
-            crate::cooldown::note_failure(
-                &state.runtime_status,
-                &model_entry.id,
-                model.cooldown.as_ref(),
-                aisix_gateway::BridgeError::UpstreamDecode(e.to_string()),
-            )
-        })
-        .map_err(ProxyError::Bridge)?;
 
     // #911 [21]: speech synthesis (TTS) reports no token usage — it is billed
     // per input character — so there are no tokens to add to TPM/TPD. Commit 0

@@ -85,27 +85,202 @@ const RETRY_BACKOFF_MAX_MS: u64 = 2_000;
 /// top of the exponential term.
 const RETRY_BACKOFF_JITTER_MS: u64 = 250;
 
+/// Longest upstream-supplied `Retry-After` we are willing to sit on before
+/// falling back to our own exponential term. LiteLLM honours anything up to
+/// 60s (`_calculate_retry_after`); an inline proxy cannot — the wait burns
+/// the caller's own latency budget, and a 45s hold reads as a hang to the
+/// client. Same reason the exponential bounds below are tightened relative
+/// to LiteLLM's library defaults.
+const RETRY_AFTER_HONOR_MAX_MS: u64 = 5_000;
+
 /// Backoff before retrying the **same** target, for 1-based retry number
-/// `retry` (`retry == 0` → no wait). Exponential term `base * 2^(retry-1)`
-/// capped at [`RETRY_BACKOFF_MAX_MS`], plus uniform additive jitter in
-/// `[0, RETRY_BACKOFF_JITTER_MS]`.
+/// `retry` (`retry == 0` → no wait).
 ///
-/// Same strategy as LiteLLM's router (`_calculate_retry_after`: capped
-/// exponential floor + additive jitter — not full-jitter-to-zero, so a
-/// struggling upstream always gets a real pause), with bounds tightened
-/// from LiteLLM's library defaults (0.5s base / 8s cap) to suit an inline
-/// proxy where the retry runs inside a single request's latency budget.
-/// Cross-target fallover is deliberately NOT backed off — a different,
-/// presumably healthy target should be tried immediately (LiteLLM's
-/// healthy-deployment fast-path).
-pub fn retry_backoff(retry: u32) -> Duration {
+/// When the upstream told us how long to wait (`Retry-After`, typically on
+/// a 429) and the hint is within [`RETRY_AFTER_HONOR_MAX_MS`], we do what
+/// it says — a provider's own quota window beats a guess. Otherwise:
+/// exponential term `base * 2^(retry-1)` capped at [`RETRY_BACKOFF_MAX_MS`].
+/// Either way uniform additive jitter in `[0, RETRY_BACKOFF_JITTER_MS]` is
+/// added, so a fleet retrying off the same upstream fault does not
+/// synchronise.
+///
+/// Same strategy as LiteLLM's router (`_calculate_retry_after`: honour a
+/// sane `Retry-After`, else capped exponential floor + additive jitter —
+/// not full-jitter-to-zero, so a struggling upstream always gets a real
+/// pause), with bounds tightened from LiteLLM's library defaults (0.5s base
+/// / 8s cap / 60s `Retry-After` ceiling) to suit an inline proxy where the
+/// retry runs inside a single request's latency budget. Cross-target
+/// fallover is deliberately NOT backed off — a different, presumably
+/// healthy target should be tried immediately (LiteLLM's healthy-deployment
+/// fast-path).
+pub fn retry_backoff(retry: u32, retry_after: Option<Duration>) -> Duration {
     if retry == 0 {
         return Duration::ZERO;
     }
+    let jitter = rand::thread_rng().gen_range(0..=RETRY_BACKOFF_JITTER_MS);
+    if let Some(hint) = retry_after {
+        let hint_ms = hint.as_millis().min(u64::MAX as u128) as u64;
+        if hint_ms > 0 && hint_ms <= RETRY_AFTER_HONOR_MAX_MS {
+            return Duration::from_millis(hint_ms + jitter);
+        }
+    }
     let exp = RETRY_BACKOFF_BASE_MS.saturating_mul(1u64 << (retry - 1).min(20));
     let base = exp.min(RETRY_BACKOFF_MAX_MS);
-    let jitter = rand::thread_rng().gen_range(0..=RETRY_BACKOFF_JITTER_MS);
     Duration::from_millis(base + jitter)
+}
+
+/// The `Retry-After` hint an upstream attached to this failure, if any.
+/// Only [`BridgeError::UpstreamStatus`] carries one (parsed by
+/// `aisix_gateway::parse_retry_after`); transport faults and timeouts have
+/// nothing to report.
+pub fn retry_after_hint(err: &BridgeError) -> Option<Duration> {
+    match err {
+        BridgeError::UpstreamStatus { retry_after, .. } => *retry_after,
+        _ => None,
+    }
+}
+
+/// Retry budget for one dispatch target, resolved across the three levels
+/// an operator can set it at.
+///
+/// `target.retries` (this model's own budget) wins, then the group's
+/// `routing.retries` (the historical knob, now a group-wide default), then
+/// the deployment-wide `upstream.retries` from the DP config.
+///
+/// Per-target beats per-group because a routing target *is* a Model: "how
+/// many times may this upstream be re-hit" is a property of that upstream,
+/// and target A tolerating three retries says nothing about target B. A
+/// direct (non-group) model has no `group`, which is exactly why it used to
+/// end up with a hardcoded zero — the knob only ever existed on the group.
+///
+/// `has_fallback_targets` says whether another candidate target is still
+/// queued behind this one. It only gates the DEPLOYMENT DEFAULT: when the
+/// operator configured nothing and a fallback is available, prefer failing
+/// over to grinding the same failing upstream. An explicitly configured
+/// budget — at either level, including `0` — is always honoured as written.
+///
+/// That distinction is what keeps the default from silently degrading
+/// `timeout`-driven fail-over (#554): a two-target group whose first target
+/// times out should move on after one timeout, not after three. It also
+/// tracks what LiteLLM actually does, which is easy to misread. Its
+/// `num_retries` does not re-hit one deployment — each retry re-enters
+/// deployment selection, and the failed deployment has meanwhile been
+/// cooled down, so a retry inside a multi-deployment group lands on a
+/// DIFFERENT deployment. Same-target grinding is what LiteLLM does only
+/// when a group holds a single deployment, which is exactly the case this
+/// keeps the default for.
+pub fn effective_retries(
+    target: &aisix_core::Model,
+    group: Option<&aisix_core::models::routing::Routing>,
+    deployment_default: u32,
+    has_fallback_targets: bool,
+) -> RetryBudget {
+    if let Some(explicit) = target.retries.or_else(|| group.and_then(|r| r.retries)) {
+        return RetryBudget {
+            attempts: explicit as usize,
+            configured: true,
+        };
+    }
+    RetryBudget {
+        attempts: if has_fallback_targets {
+            0
+        } else {
+            deployment_default as usize
+        },
+        configured: false,
+    }
+}
+
+/// How many same-target retries this dispatch may spend, and whether the
+/// operator asked for them.
+#[derive(Debug, Clone, Copy)]
+pub struct RetryBudget {
+    /// Retries after the initial attempt.
+    pub attempts: usize,
+    /// True when the number came from `Model.retries` or `routing.retries`
+    /// rather than from the deployment default.
+    configured: bool,
+}
+
+impl RetryBudget {
+    /// Whether `err` is allowed to spend this budget.
+    ///
+    /// A budget the operator never configured does not retry timeouts. A
+    /// `timeout` is an explicit "stop waiting on this upstream" threshold,
+    /// so spending an unasked-for budget on it triples the very wait the
+    /// operator bounded — and an upstream that just burned the full budget
+    /// will most likely burn it again. Transport faults and 5xx are the
+    /// opposite: they fail fast and are often momentary, which is exactly
+    /// what a retry is for.
+    ///
+    /// An explicitly configured budget retries everything retryable,
+    /// timeouts included — the operator asked for it by name.
+    ///
+    /// Timeouts remain retryable for FAIL-OVER purposes either way
+    /// (`is_retryable`); this only governs re-hitting the same target.
+    pub fn covers(&self, err: &BridgeError) -> bool {
+        self.configured || !matches!(err, BridgeError::Timeout { .. })
+    }
+}
+
+/// Drive one single-model upstream call under that model's retry budget.
+///
+/// The group-capable endpoints (chat, messages, responses, count_tokens)
+/// keep their own loops: they also walk fall-over targets and emit
+/// per-attempt telemetry, neither of which applies here. Every other
+/// endpoint — embeddings, rerank, completions, audio, images, videos,
+/// passthrough — dispatches to exactly one model, and this is their whole
+/// retry story.
+///
+/// `retry_on_429` / `fallback_on_statuses` are group-level knobs, so the
+/// default classification applies: 5xx, timeout, transport, decode and
+/// stream-abort retry; every 4xx (429 included) is returned as-is.
+pub(crate) async fn retrying_dispatch<F, Fut, T>(
+    state: &crate::ProxyState,
+    model: &aisix_core::Model,
+    endpoint: &'static str,
+    mut call: F,
+) -> Result<T, BridgeError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, BridgeError>>,
+{
+    let budget = effective_retries(model, None, state.default_retries, false);
+    let mut last_err: Option<BridgeError> = None;
+    for attempt_idx in 0..=budget.attempts {
+        if attempt_idx > 0 {
+            let hint = last_err.as_ref().and_then(retry_after_hint);
+            let backoff = retry_backoff(attempt_idx as u32, hint);
+            tracing::debug!(
+                endpoint,
+                model = %model.display_name,
+                next_attempt = attempt_idx + 1,
+                backoff_ms = backoff.as_millis() as u64,
+                "backing off before retry",
+            );
+            tokio::time::sleep(backoff).await;
+        }
+        match call().await {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                if !is_retryable(&e, false, &[]) || !budget.covers(&e) {
+                    return Err(e);
+                }
+                tracing::warn!(
+                    endpoint,
+                    model = %model.display_name,
+                    attempt = attempt_idx + 1,
+                    max_attempts = budget.attempts + 1,
+                    error = %e,
+                    "retryable upstream failure",
+                );
+                last_err = Some(e);
+            }
+        }
+    }
+    // Unreachable with `last_err == None`: the loop body either returns or
+    // stores an error, and it runs at least once.
+    Err(last_err.unwrap_or_else(|| BridgeError::Config("retry loop produced no error".into())))
 }
 
 #[derive(Default)]
@@ -1155,7 +1330,7 @@ mod tests {
     // ── retry_backoff ─────────────────────────────────────────────
     #[test]
     fn retry_backoff_zero_is_no_wait() {
-        assert_eq!(retry_backoff(0), Duration::ZERO);
+        assert_eq!(retry_backoff(0, None), Duration::ZERO);
     }
 
     #[test]
@@ -1175,7 +1350,7 @@ mod tests {
             let mut min = u64::MAX;
             let mut max = 0u64;
             for _ in 0..2000 {
-                let ms = retry_backoff(retry).as_millis() as u64;
+                let ms = retry_backoff(retry, None).as_millis() as u64;
                 min = min.min(ms);
                 max = max.max(ms);
             }
@@ -1185,6 +1360,134 @@ mod tests {
                 "retry {retry}: max {max} > floor {floor} + jitter 250",
             );
         }
+    }
+
+    #[test]
+    fn retry_backoff_honours_a_sane_retry_after() {
+        // A provider-supplied hint inside the honour window wins over the
+        // exponential term, even when the exponential term would be shorter
+        // (retry 1 → 250ms floor, hint → 3000ms).
+        let mut min = u64::MAX;
+        for _ in 0..500 {
+            let ms = retry_backoff(1, Some(Duration::from_millis(3_000))).as_millis() as u64;
+            min = min.min(ms);
+            assert!((3_000..=3_250).contains(&ms), "hint not honoured: {ms}ms");
+        }
+        assert!(min >= 3_000);
+    }
+
+    #[test]
+    fn retry_backoff_ignores_an_out_of_range_retry_after() {
+        // Above the honour ceiling we fall back to our own exponential term
+        // rather than parking the caller's request for a minute. A zero hint
+        // is meaningless and falls back too.
+        for hint in [Duration::from_secs(60), Duration::ZERO] {
+            let ms = retry_backoff(1, Some(hint)).as_millis() as u64;
+            assert!(
+                (250..=500).contains(&ms),
+                "expected the exponential term for hint {hint:?}, got {ms}ms",
+            );
+        }
+    }
+
+    // ── effective_retries ─────────────────────────────────────────
+    fn model_with_retries(retries: Option<u32>) -> Model {
+        let mut m: Model = serde_json::from_str(
+            r#"{"display_name":"m","provider":"openai","model_name":"gpt-4o","provider_key_id":"pk"}"#,
+        )
+        .unwrap();
+        m.retries = retries;
+        m
+    }
+
+    fn group_with_retries(retries: Option<u32>) -> aisix_core::models::routing::Routing {
+        let mut r: aisix_core::models::routing::Routing =
+            serde_json::from_str(r#"{"targets":[{"model":"a"}]}"#).unwrap();
+        r.retries = retries;
+        r
+    }
+
+    /// `budget(target, group, default, has_fallback)` — reads better than
+    /// four positional args repeated in every assertion below.
+    fn budget(
+        target: Option<u32>,
+        group: Option<Option<u32>>,
+        default: u32,
+        has_fallback: bool,
+    ) -> RetryBudget {
+        let m = model_with_retries(target);
+        match group {
+            Some(g) => effective_retries(&m, Some(&group_with_retries(g)), default, has_fallback),
+            None => effective_retries(&m, None, default, has_fallback),
+        }
+    }
+
+    #[test]
+    fn effective_retries_prefers_the_target_then_the_group_then_the_default() {
+        // Target wins over group.
+        assert_eq!(budget(Some(1), Some(Some(5)), 2, false).attempts, 1);
+        // Group applies when the target is silent.
+        assert_eq!(budget(None, Some(Some(5)), 2, false).attempts, 5);
+        // Deployment default applies when both are silent.
+        assert_eq!(budget(None, Some(None), 2, false).attempts, 2);
+        // A direct model has no group at all — the case that used to be
+        // hardcoded to zero.
+        assert_eq!(budget(None, None, 2, false).attempts, 2);
+    }
+
+    #[test]
+    fn effective_retries_honours_an_explicit_zero_at_every_level() {
+        // `Some(0)` is an opt-out, not "unset" — it must not fall through to
+        // the next level, or an operator could never turn retrying off.
+        assert_eq!(budget(Some(0), Some(Some(5)), 2, false).attempts, 0);
+        assert_eq!(budget(None, Some(Some(0)), 2, false).attempts, 0);
+        assert_eq!(budget(None, None, 0, false).attempts, 0);
+    }
+
+    #[test]
+    fn effective_retries_default_defers_to_a_fallback_target() {
+        // Nothing configured + another target queued behind this one: prefer
+        // failing over to grinding a failing upstream. This is what keeps the
+        // default from tripling the latency of `timeout`-driven fail-over
+        // (#554) — and it matches LiteLLM, whose retries re-enter deployment
+        // selection rather than re-hitting the same deployment.
+        assert_eq!(budget(None, None, 2, true).attempts, 0);
+        assert_eq!(budget(None, Some(None), 2, true).attempts, 0);
+        // The LAST target has nothing to fall over to, so the default applies
+        // there — the request still gets its retries before giving up.
+        assert_eq!(budget(None, Some(None), 2, false).attempts, 2);
+    }
+
+    #[test]
+    fn effective_retries_explicit_config_beats_the_fallback_heuristic() {
+        // The heuristic only gates the DEFAULT. An operator who asked for
+        // same-target retries gets them even with fallbacks queued up.
+        assert_eq!(budget(Some(3), None, 2, true).attempts, 3);
+        assert_eq!(budget(None, Some(Some(3)), 2, true).attempts, 3);
+    }
+
+    #[test]
+    fn a_default_budget_does_not_spend_itself_on_a_timeout() {
+        let timeout = BridgeError::Timeout {
+            elapsed_ms: 7_000,
+            cause: String::new(),
+        };
+        let server_error = BridgeError::upstream_status(503, "unavailable");
+
+        // Unconfigured: a timeout must not be re-hit on the same target —
+        // the operator bounded that wait on purpose, and tripling it is the
+        // opposite of what `timeout` asks for. Transient 5xx still retries.
+        let default = budget(None, None, 2, false);
+        assert!(!default.covers(&timeout));
+        assert!(default.covers(&server_error));
+
+        // Configured: the operator named the number, so it applies to
+        // everything retryable, timeouts included.
+        let configured = budget(Some(2), None, 2, false);
+        assert!(configured.covers(&timeout));
+        assert!(configured.covers(&server_error));
+        // ...including when it came from the group.
+        assert!(budget(None, Some(Some(2)), 2, false).covers(&timeout));
     }
 
     // ── filter_attempt_models ─────────────────────────────────────

@@ -236,6 +236,10 @@ pub struct Model {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_timeout: Option<u64>,
 
+    /// Retry attempts against this model after a retryable upstream failure, before the request gives up (or, inside a model group, fails over to the next target). Absent falls back to the group's `routing.retries`, then to the deployment-wide `upstream.retries` default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retries: Option<u32>,
+
     /// Request, token, and concurrency limits for this model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limit: Option<RateLimit>,

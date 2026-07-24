@@ -734,7 +734,16 @@ describe("filter contract (H3 escape hatch) — try_anyway sends to known-bad", 
     // mapping in BridgeError::http_status, but the upstream request
     // is what we're verifying here).
     expect([502, 503]).toContain(resp.status);
-    expect(downUpstream.receivedRequests.length - baseline).toBe(1);
+    // 3 = the initial attempt + the deployment default retry budget (2).
+    // This group holds a single target, so there is nothing to fall over to
+    // and the default budget applies rather than deferring — and a 503 is
+    // exactly the transient class the budget exists for. What this test
+    // actually pins is that a request *was sent* to the unhealthy target at
+    // all, which is the `try_anyway` contract.
+    expect(
+      downUpstream.receivedRequests.length - baseline,
+    ).toBeGreaterThanOrEqual(1);
+    expect(downUpstream.receivedRequests.length - baseline).toBe(3);
   });
 });
 

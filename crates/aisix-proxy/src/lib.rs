@@ -4075,6 +4075,151 @@ data: [DONE]\n\n";
         );
     }
 
+    /// A direct (non-group) model retries a transient upstream failure.
+    ///
+    /// The retry budget used to live only on `routing`, so a model without a
+    /// model group was pinned at zero attempts-after-the-first: a single 502
+    /// went straight back to the caller with no second try, no matter what
+    /// the operator configured. Nothing could be configured — there was no
+    /// field to set.
+    #[tokio::test]
+    async fn direct_model_retries_a_transient_failure_then_succeeds() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(502).set_body_string("upstream down"))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-ok",
+                "model": "gpt-4o",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "recovered"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })))
+            .with_priority(2)
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = new_snap(&upstream.uri());
+        snap.models
+            .insert(direct_model_entry("m-solo", "solo", "gpt-4o"));
+        snap.apikeys.insert(apikey_entry("sk-caller", &["solo"]));
+        let app = build_router(build_state(snap, hub));
+
+        let body = serde_json::json!({
+            "model": "solo",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+
+        let resp = run(app, req).await;
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the retry must recover the request: {}",
+            String::from_utf8_lossy(&bytes)
+        );
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["choices"][0]["message"]["content"], "recovered");
+        // The `.expect(1)` on both mocks asserts exactly two upstream calls.
+    }
+
+    /// `Model.retries` overrides the group budget for that target only.
+    /// `Some(0)` is an explicit opt-out and must not fall through to the
+    /// group's larger budget.
+    #[tokio::test]
+    async fn model_retries_overrides_the_group_budget() {
+        let bad_upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(502).set_body_string("upstream down"))
+            // Exactly one attempt on this target despite `routing.retries: 5`.
+            .expect(1)
+            .mount(&bad_upstream)
+            .await;
+
+        let good_upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-good",
+                "model": "gpt-4o",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "fallback worked"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })))
+            .expect(1)
+            .mount(&good_upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = AisixSnapshot::new();
+        snap.provider_keys
+            .insert(pk_entry_with_id("pk-bad", &bad_upstream.uri()));
+        snap.provider_keys
+            .insert(pk_entry_with_id("pk-good", &good_upstream.uri()));
+        let mut no_retry: Model = serde_json::from_str(
+            r#"{"display_name":"primary","provider":"openai","model_name":"gpt-4o",
+                "provider_key_id":"pk-bad","retries":0}"#,
+        )
+        .unwrap();
+        no_retry.retries = Some(0);
+        snap.models.insert(ResourceEntry::new("m-bad", no_retry, 1));
+        snap.models
+            .insert(model_entry_with_id("m-good", "secondary", "pk-good"));
+        snap.models.insert(routing_entry(
+            "smart",
+            "failover",
+            &["primary", "secondary"],
+            Some(5),
+            None,
+            None,
+        ));
+        snap.apikeys.insert(apikey_entry("sk-caller", &["smart"]));
+        let app = build_router(build_state(snap, hub));
+
+        let body = serde_json::json!({
+            "model": "smart",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        // The `.expect(1)` on the bad upstream is the real assertion: the
+        // target's own `retries: 0` beat the group's `retries: 5`.
+    }
+
     #[tokio::test]
     async fn routing_retries_current_target_before_failover() {
         use aisix_obs::UsageSink;
@@ -4237,7 +4382,10 @@ data: [DONE]\n\n";
             "smart",
             "failover",
             &["primary"],
-            None,
+            // Single-target group: there is nothing to fall over to, so the
+            // default budget WOULD apply here. Pin it off — this test asserts
+            // the attempt record for one failed try, not the retry policy.
+            Some(0),
             None,
             None,
         ));
@@ -4528,6 +4676,9 @@ data: [DONE]\n\n";
             "smart",
             "failover",
             &["primary", "secondary"],
+            // Unset on purpose: with a fallback target queued, the default
+            // budget defers to it, so the sequence is initial -> fallback
+            // with no same-target grinding in between.
             None,
             None,
             None,
@@ -4653,6 +4804,9 @@ data: [DONE]\n\n";
             "smart",
             "failover",
             &["primary", "secondary"],
+            // Unset on purpose: with a fallback target queued, the default
+            // budget defers to it, so the sequence is initial -> fallback
+            // with no same-target grinding in between.
             None,
             None,
             None,
@@ -6387,12 +6541,17 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
         upstream_model: &str,
         rate_limit: serde_json::Value,
     ) -> ResourceEntry<Model> {
+        // `retries: 0` — the rate-limit tests that use this helper assert on
+        // reservation accounting, and want one upstream call per dispatch.
+        // Under the default budget a single mocked failure would be retried
+        // into a success and the assertion would test nothing.
         let cfg = format!(
             r#"{{
                 "display_name": "{name}",
                 "provider": "openai",
                 "model_name": "{upstream_model}",
                 "provider_key_id": "{PK_ID}",
+                "retries": 0,
                 "rate_limit": {rate_limit}
             }}"#
         );

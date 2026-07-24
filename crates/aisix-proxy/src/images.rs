@@ -301,7 +301,11 @@ async fn dispatch(
 
     let provider_label = provider.to_ascii_lowercase();
 
-    match bridge.generate_image(&body, &ctx).await {
+    match crate::routing::retrying_dispatch(state, model, "/v1/images/generations", || {
+        bridge.generate_image(&body, &ctx)
+    })
+    .await
+    {
         Ok(resp_json) => {
             // #701: clear any cooldown/unhealthy mark now the upstream
             // answered — same recovery signal as rerank/audio/chat.

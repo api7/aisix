@@ -732,25 +732,6 @@ async fn provider_call(
     request_id: &str,
 ) -> Result<serde_json::Value, ProxyError> {
     let client = crate::http_client::client();
-    let mut builder = client
-        .request(method, url)
-        .header(header::AUTHORIZATION, format!("Bearer {}", target.secret))
-        .header("x-aisix-request-id", request_id);
-    if let Some(b) = body {
-        if target.provider.submit_headers_async() {
-            // DashScope requires the async-mode header — it rejects
-            // synchronous video-synthesis calls outright.
-            builder = builder.header("X-DashScope-Async", "enable");
-        }
-        builder = builder
-            .header(header::CONTENT_TYPE, "application/json")
-            .json(b);
-    }
-    if let Some(d) = target.model_entry.value.request_timeout() {
-        builder = builder.timeout(d);
-    }
-
-    let started = Instant::now();
     let note = |e: aisix_gateway::BridgeError| {
         crate::cooldown::note_failure(
             &state.runtime_status,
@@ -759,49 +740,77 @@ async fn provider_call(
             e,
         )
     };
-    let resp = builder
-        .send()
-        .await
-        .map_err(|e| note(crate::dispatch::reqwest_error_to_bridge(&e, started)))
-        .map_err(ProxyError::Bridge)?;
-    let status = resp.status().as_u16();
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| note(aisix_gateway::BridgeError::UpstreamDecode(e.to_string())))
-        .map_err(ProxyError::Bridge)?;
 
-    if !(200..300).contains(&status) {
-        // Best-effort parse of the vendor error envelope: DashScope puts
-        // `{code, message}` at the top level; the other vendors nest an
-        // OpenAI-style `{error: {code, message}}`. Try both, fall back
-        // to a generic marker for non-JSON bodies.
-        let parsed: Option<serde_json::Value> = serde_json::from_slice(&bytes).ok();
-        let message = parsed
-            .and_then(|p| {
-                let scope = if p.get("error").is_some() {
-                    p.get("error").cloned().unwrap_or_default()
-                } else {
-                    p
-                };
-                let code = nonempty_str(scope.get("code")).map(str::to_string);
-                let msg = nonempty_str(scope.get("message")).map(str::to_string);
-                match (code, msg) {
-                    (Some(code), Some(msg)) => Some(format!("{code}: {msg}")),
-                    (None, Some(msg)) => Some(msg),
-                    (Some(code), None) => Some(code),
-                    (None, None) => None,
-                }
+    // Every /v1/videos upstream call — submit, poll, content fetch — funnels
+    // through here, so wrapping this one function gives the whole surface a
+    // retry budget. `note` stays per attempt (see rerank.rs).
+    crate::routing::retrying_dispatch(state, &target.model_entry.value, "/v1/videos", || {
+        let mut builder = client
+            .request(method.clone(), url)
+            .header(header::AUTHORIZATION, format!("Bearer {}", target.secret))
+            .header("x-aisix-request-id", request_id);
+        if let Some(b) = body {
+            if target.provider.submit_headers_async() {
+                // DashScope requires the async-mode header — it rejects
+                // synchronous video-synthesis calls outright.
+                builder = builder.header("X-DashScope-Async", "enable");
+            }
+            builder = builder
+                .header(header::CONTENT_TYPE, "application/json")
+                .json(b);
+        }
+        if let Some(d) = target.model_entry.value.request_timeout() {
+            builder = builder.timeout(d);
+        }
+        async move {
+            let started = Instant::now();
+            let resp = builder
+                .send()
+                .await
+                .map_err(|e| note(crate::dispatch::reqwest_error_to_bridge(&e, started)))?;
+            let status = resp.status().as_u16();
+            let bytes = resp
+                .bytes()
+                .await
+                .map_err(|e| note(aisix_gateway::BridgeError::UpstreamDecode(e.to_string())))?;
+
+            if !(200..300).contains(&status) {
+                // Best-effort parse of the vendor error envelope: DashScope
+                // puts `{code, message}` at the top level; the other vendors
+                // nest an OpenAI-style `{error: {code, message}}`. Try both,
+                // fall back to a generic marker for non-JSON bodies.
+                let parsed: Option<serde_json::Value> = serde_json::from_slice(&bytes).ok();
+                let message = parsed
+                    .and_then(|p| {
+                        let scope = if p.get("error").is_some() {
+                            p.get("error").cloned().unwrap_or_default()
+                        } else {
+                            p
+                        };
+                        let code = nonempty_str(scope.get("code")).map(str::to_string);
+                        let msg = nonempty_str(scope.get("message")).map(str::to_string);
+                        match (code, msg) {
+                            (Some(code), Some(msg)) => Some(format!("{code}: {msg}")),
+                            (None, Some(msg)) => Some(msg),
+                            (Some(code), None) => Some(code),
+                            (None, None) => None,
+                        }
+                    })
+                    .unwrap_or_else(|| "upstream error".to_string());
+                return Err(note(aisix_gateway::BridgeError::upstream_status(
+                    status, message,
+                )));
+            }
+
+            serde_json::from_slice(&bytes).map_err(|e| {
+                aisix_gateway::BridgeError::UpstreamDecode(format!(
+                    "invalid task response from upstream: {e}"
+                ))
             })
-            .unwrap_or_else(|| "upstream error".to_string());
-        return Err(note(aisix_gateway::BridgeError::upstream_status(status, message)).into());
-    }
-
-    serde_json::from_slice(&bytes).map_err(|e| {
-        ProxyError::Bridge(aisix_gateway::BridgeError::UpstreamDecode(format!(
-            "invalid task response from upstream: {e}"
-        )))
+        }
     })
+    .await
+    .map_err(ProxyError::Bridge)
 }
 
 /// Poll the provider task for a decoded video id and reduce it to the
