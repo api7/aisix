@@ -11,9 +11,9 @@ import {
 } from "../harness/index.js";
 
 // E2E: /v1/videos provider adapters beyond DashScope — Zhipu BigModel
-// (CogVideoX) and Volcengine Ark (Seedance). One full user journey per
-// provider against a mock upstream serving that provider's documented
-// response shapes:
+// (CogVideoX), Volcengine Ark (Seedance), and Runway (Gen / Veo). One
+// full user journey per provider against a mock upstream serving that
+// provider's documented response shapes:
 //
 //   Zhipu:  submit → {id, task_status: PROCESSING}
 //           poll   → {task_status: PROCESSING} (in_progress)
@@ -22,6 +22,12 @@ import {
 //   Ark:    submit → {id}                     (queued — no status field)
 //           poll   → {status: running}        (in_progress)
 //           fetch  → {status: succeeded, content: {video_url}} → 302
+//
+//   Runway: submit → {id}                     (queued — no status field)
+//           poll   → {status: RUNNING}        (in_progress)
+//           fetch  → {status: SUCCEEDED, output: [signedUrl]} → 302
+//           and the mandatory X-Runway-Version header must reach the
+//           upstream on BOTH the submit POST and the poll GET.
 //
 // The DashScope journeys stay covered by videos-e2e.test.ts.
 
@@ -32,15 +38,22 @@ const CALLER_KEY_HASH = createHash("sha256")
 
 const ZHIPU_MODEL = "videos-e2e-zhipu-model";
 const ARK_MODEL = "videos-e2e-ark-model";
+const RUNWAY_MODEL = "videos-e2e-runway-model";
 const ZHIPU_PROBE_MODEL = "videos-e2e-zhipu-probe";
 const ARK_PROBE_MODEL = "videos-e2e-ark-probe";
+const RUNWAY_PROBE_MODEL = "videos-e2e-runway-probe";
+// The Runway API version header, mandatory on every call. Source: official
+// runwayml SDK `_client.py` default `X-Runway-Version: 2024-11-06`.
+const RUNWAY_VERSION_HEADER = "x-runway-version";
+const RUNWAY_VERSION_VALUE = "2024-11-06";
 
-describe("videos e2e: zhipu + ark provider adapters", () => {
+describe("videos e2e: zhipu + ark + runway provider adapters", () => {
   let app: SpawnedApp | undefined;
   let seed: SeedClient | undefined;
   let etcdReachable = false;
   let zhipuProbeId = "";
   let arkProbeId = "";
+  let runwayProbeId = "";
   const upstreams: OpenAiUpstream[] = [];
 
   const headers = {
@@ -69,6 +82,7 @@ describe("videos e2e: zhipu + ark provider adapters", () => {
 
   let zhipuUpstream: OpenAiUpstream | undefined;
   let arkUpstream: OpenAiUpstream | undefined;
+  let runwayUpstream: OpenAiUpstream | undefined;
 
   beforeAll(async () => {
     const etcd = new EtcdClient();
@@ -143,6 +157,27 @@ describe("videos e2e: zhipu + ark provider adapters", () => {
     });
     upstreams.push(arkUpstream);
 
+    runwayUpstream = await startOpenAiUpstream({
+      scriptedResponses: [
+        // submit → only the task id (no status → queued)
+        { nonStreamBody: { id: "rw-e2e-task-1" } },
+        // poll → RUNNING (in_progress)
+        { nonStreamBody: { id: "rw-e2e-task-1", status: "RUNNING" } },
+        // fetch poll → SUCCEEDED with an array of signed output URLs
+        {
+          nonStreamBody: {
+            id: "rw-e2e-task-1",
+            status: "SUCCEEDED",
+            createdAt: "2026-07-24T00:00:00Z",
+            output: [
+              "https://cdn.example.com/videos/runway-e2e.mp4?token=signed-jwt-blob",
+            ],
+          },
+        },
+      ],
+    });
+    upstreams.push(runwayUpstream);
+
     // Unscripted probe upstreams: any poll returns a completed task in
     // the provider's own shape, so readiness probing never consumes the
     // scripted steps above.
@@ -161,6 +196,14 @@ describe("videos e2e: zhipu + ark provider adapters", () => {
       },
     });
     upstreams.push(arkProbeUpstream);
+    const runwayProbeUpstream = await startOpenAiUpstream({
+      nonStreamBody: {
+        id: "rw-probe",
+        status: "SUCCEEDED",
+        output: ["https://cdn.example.com/probe-r.mp4"],
+      },
+    });
+    upstreams.push(runwayProbeUpstream);
 
     const seedModel = async (
       name: string,
@@ -189,6 +232,7 @@ describe("videos e2e: zhipu + ark provider adapters", () => {
       zhipuUpstream.baseUrl,
     );
     await seedModel(ARK_MODEL, "volcengine", "seedance-mock", arkUpstream.baseUrl);
+    await seedModel(RUNWAY_MODEL, "runwayml", "gen4_5", runwayUpstream.baseUrl);
     const zhipuProbe = await seedModel(
       ZHIPU_PROBE_MODEL,
       "zhipuai",
@@ -201,8 +245,15 @@ describe("videos e2e: zhipu + ark provider adapters", () => {
       "seedance-mock",
       arkProbeUpstream.baseUrl,
     );
+    const runwayProbe = await seedModel(
+      RUNWAY_PROBE_MODEL,
+      "runwayml",
+      "gen4_5",
+      runwayProbeUpstream.baseUrl,
+    );
     zhipuProbeId = zhipuProbe.id;
     arkProbeId = arkProbe.id;
+    runwayProbeId = runwayProbe.id;
 
     await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
@@ -232,7 +283,17 @@ describe("videos e2e: zhipu + ark provider adapters", () => {
           return false;
         }
         const aj = (await a.json()) as { status?: unknown };
-        return aj.status === "completed";
+        if (aj.status !== "completed") return false;
+
+        const r = await getVideo(
+          syntheticId(runwayProbeId, RUNWAY_PROBE_MODEL, "probe-task"),
+        );
+        if (r.status !== 200) {
+          await r.text();
+          return false;
+        }
+        const rj = (await r.json()) as { status?: unknown };
+        return rj.status === "completed";
       } catch {
         return false;
       }
@@ -335,6 +396,63 @@ describe("videos e2e: zhipu + ark provider adapters", () => {
     // Both GETs hit the poll endpoint; no extra submit ever went out.
     expect(
       arkUpstream!.receivedRequests.filter((r) => r.method === "POST").length,
+    ).toBe(1);
+  });
+
+  test("runway: submit → poll → content 302, version header on both legs", async (ctx) => {
+    if (!etcdReachable || !app || !seed) {
+      ctx.skip();
+      return;
+    }
+
+    const created = await submit(RUNWAY_MODEL, { seconds: 5, size: "1280x720" });
+    expect(created.status).toBe(200);
+    const video = (await created.json()) as Record<string, unknown>;
+    expect(video.object).toBe("video");
+    // The create response carries only the task id — queued.
+    expect(video.status).toBe("queued");
+    expect(video.model).toBe(RUNWAY_MODEL);
+    const id = video.id as string;
+
+    // Submit wire: {model, promptText, duration, ratio} on the documented
+    // text_to_video path, and the mandatory version header.
+    expect(runwayUpstream!.receivedRequests.length).toBe(1);
+    const sub = runwayUpstream!.receivedRequests[0]!;
+    expect(sub.method).toBe("POST");
+    expect(sub.path).toBe("/v1/text_to_video");
+    expect(sub.headers[RUNWAY_VERSION_HEADER]).toBe(RUNWAY_VERSION_VALUE);
+    const wire = JSON.parse(sub.body) as Record<string, unknown>;
+    expect(wire.model).toBe("gen4_5");
+    // The wire field is `promptText`, not `prompt`.
+    expect(wire.promptText).toBe("a paper boat in the rain");
+    expect(wire.prompt).toBeUndefined();
+    expect(wire.duration).toBe(5);
+    // size WIDTHxHEIGHT → ratio WIDTH:HEIGHT (2024-11-06 resolution form).
+    expect(wire.ratio).toBe("1280:720");
+
+    const poll = await getVideo(id);
+    expect(poll.status).toBe(200);
+    const polled = (await poll.json()) as Record<string, unknown>;
+    expect(polled.status).toBe("in_progress");
+    const pollReq = runwayUpstream!.receivedRequests[1]!;
+    expect(pollReq.method).toBe("GET");
+    expect(pollReq.path).toBe("/v1/tasks/rw-e2e-task-1");
+    // The version header must ride the poll GET too (Runway requires it on
+    // every call, unlike DashScope's submit-only async marker).
+    expect(pollReq.headers[RUNWAY_VERSION_HEADER]).toBe(RUNWAY_VERSION_VALUE);
+
+    const content = await getVideo(id, "/content");
+    expect(content.status).toBe(302);
+    expect(content.headers.get("location")).toBe(
+      "https://cdn.example.com/videos/runway-e2e.mp4?token=signed-jwt-blob",
+    );
+    // The content fetch also carries the version header on its poll.
+    expect(runwayUpstream!.receivedRequests[2]!.headers[RUNWAY_VERSION_HEADER]).toBe(
+      RUNWAY_VERSION_VALUE,
+    );
+    // Both GETs hit the poll endpoint; only the one submit POST went out.
+    expect(
+      runwayUpstream!.receivedRequests.filter((r) => r.method === "POST").length,
     ).toBe(1);
   });
 });

@@ -29,6 +29,7 @@
 //! | `alibaba` | `POST {root}/api/v1/services/aigc/video-generation/video-synthesis` (`X-DashScope-Async: enable` mandatory) | `GET {root}/api/v1/tasks/{task_id}` | <https://help.aliyun.com/zh/model-studio/text-to-video-api-reference> |
 //! | `zhipuai` | `POST {root}/api/paas/v4/videos/generations` | `GET {root}/api/paas/v4/async-result/{id}` | <https://docs.bigmodel.cn/api-reference/%E6%A8%A1%E5%9E%8B-api/%E8%A7%86%E9%A2%91%E7%94%9F%E6%88%90%E5%BC%82%E6%AD%A5> |
 //! | `volcengine` | `POST {root}/api/v3/contents/generations/tasks` | `GET {root}/api/v3/contents/generations/tasks/{id}` | official Ark SDK (`volcengine-python-sdk`, `volcenginesdkarkruntime/resources/content_generation/tasks.py` + `types/content_generation/content_generation_task.py`; the vendor doc pages render client-side only) |
+//! | `runwayml` | `POST {root}/v1/text_to_video` (`X-Runway-Version` header mandatory on submit AND poll) | `GET {root}/v1/tasks/{id}` | official `runwayml` SDK (`sdk-python` `resources/text_to_video.py`, `resources/tasks.py`, `types/task_retrieve_response.py`) + <https://docs.dev.runwayml.com/api-details/versions/2024-11-06/> |
 //!
 //! Parameter mapping per provider (`seconds` / `size` from the unified
 //! request; anything a provider does not support is omitted, never
@@ -39,6 +40,7 @@
 //! | `alibaba` | `parameters.duration` (int) | `parameters.size` `"W*H"` (early Wan families; wan2.7 tier fields are a tracked follow-up) |
 //! | `zhipuai` | `duration` (int) | `size` `"WxH"` verbatim (the provider documents the same `WIDTHxHEIGHT` spelling) |
 //! | `volcengine` | `duration` (int) | omitted — the provider expresses output dimensions as `resolution`/`ratio` quality tiers, which cannot represent an arbitrary `WIDTHxHEIGHT` without a lossy invented mapping |
+//! | `runwayml` | `duration` (int) | `ratio` `"WIDTH:HEIGHT"` — the 2024-11-06 API expresses the output resolution as a `WIDTH:HEIGHT` string (a per-model enum of pixel resolutions, e.g. `"1280:720"`), so the unified `WIDTHxHEIGHT` maps losslessly by swapping the separator (mirrors the DashScope `x`→`*` treatment); the provider validates the value against its per-model enum |
 //!
 //! Status normalisation onto the unified four-value enum:
 //!
@@ -47,6 +49,7 @@
 //! | `alibaba` | `PENDING` | `RUNNING` | `SUCCEEDED` | `FAILED` / `CANCELED` / `UNKNOWN` / other |
 //! | `zhipuai` | — (no queued state) | `PROCESSING` | `SUCCESS` | `FAIL` / other |
 //! | `volcengine` | `queued` | `running` | `succeeded` | `failed` / `cancelled` / `expired` / other |
+//! | `runwayml` | `PENDING` / `THROTTLED` | `RUNNING` | `SUCCEEDED` | `FAILED` / `CANCELLED` / other |
 //!
 //! **Rate limiting**: submit enforces the model-level layers exactly like
 //! chat / embeddings. The two GET routes deliberately pass `None` for the
@@ -90,6 +93,22 @@ const ZHIPU_TASK_PATH: &str = "/api/paas/v4/async-result";
 /// (`self._post("/contents/generations/tasks", ...)` relative to the
 /// `…/api/v3` client base).
 const ARK_TASKS_PATH: &str = "/api/v3/contents/generations/tasks";
+/// Runway text-to-video submit path. Runway's documented API base is the
+/// bare host `https://api.dev.runwayml.com`; the `/v1` segment belongs to
+/// the endpoint path, not the base. Source: official `runwayml` SDK,
+/// `src/runwayml/resources/text_to_video.py`
+/// (`self._post("/v1/text_to_video", ...)`).
+const RUNWAY_SUBMIT_PATH: &str = "/v1/text_to_video";
+/// Runway task poll path prefix — poll GETs `{path}/{id}`. Source:
+/// official SDK `src/runwayml/resources/tasks.py` (`/v1/tasks/{id}`).
+const RUNWAY_TASK_PATH: &str = "/v1/tasks";
+/// The Runway API version header, required on EVERY request (submit and
+/// poll) — a missing/unknown value 400s. Unlike DashScope's submit-only
+/// async marker, this header must ride the poll GETs too. Source: official
+/// SDK `src/runwayml/_client.py` (`X-Runway-Version`, default `2024-11-06`)
+/// and <https://docs.dev.runwayml.com/api-details/versions/2024-11-06/>.
+const RUNWAY_VERSION_HEADER: &str = "X-Runway-Version";
+const RUNWAY_VERSION_VALUE: &str = "2024-11-06";
 
 // ─────────────────────────── id codec ───────────────────────────
 
@@ -168,6 +187,21 @@ fn map_ark_status(status: &str) -> &'static str {
         "queued" => "queued",
         "running" => "in_progress",
         "succeeded" => "completed",
+        _ => "failed",
+    }
+}
+
+/// Map a Runway task `status` onto the unified enum. The official SDK
+/// discriminated union (`types/task_retrieve_response.py`) documents six
+/// states: `PENDING` / `THROTTLED` (both pre-run — the task is accepted
+/// but not yet executing → queued), `RUNNING` (in_progress), `SUCCEEDED`
+/// (completed), and `FAILED` / `CANCELLED` (failed). Unrecognised strings
+/// collapse to `failed` rather than leaking provider taxonomy.
+fn map_runway_status(status: &str) -> &'static str {
+    match status {
+        "PENDING" | "THROTTLED" => "queued",
+        "RUNNING" => "in_progress",
+        "SUCCEEDED" => "completed",
         _ => "failed",
     }
 }
@@ -409,6 +443,44 @@ fn ark_submit_body(
     Ok(body)
 }
 
+/// `"1280x720"` → `"1280:720"`. Runway's 2024-11-06 API expresses the
+/// output resolution as `ratio` in `WIDTH:HEIGHT` form (a per-model enum
+/// of pixel resolutions — e.g. `"1280:720"`, `"1920:1080"` — no longer an
+/// aspect like `16:9`), so the unified `WIDTHxHEIGHT` maps losslessly by a
+/// separator swap, mirroring the DashScope `x`→`*` treatment. The strict
+/// digit shape is validated first (shared `require_wxh`) so a malformed
+/// value 400s before the provider is contacted; the provider itself
+/// validates the result against its per-model resolution enum.
+fn map_runway_ratio(size: &str) -> Result<String, ProxyError> {
+    Ok(require_wxh(size)?.replacen('x', ":", 1))
+}
+
+/// Build the Runway text-to-video submit body: `{model, promptText}` plus
+/// optional `ratio` (from `size`, `WIDTH:HEIGHT`) and `duration` (int
+/// seconds). Field names are the wire aliases the official SDK pins
+/// (`src/runwayml/types/text_to_video_create_params.py`: `promptText`,
+/// `ratio`, `duration`). Unset params are omitted; Runway requires `ratio`
+/// for several models, so omitting `size` lets the provider return its own
+/// "ratio required" 400 rather than the gateway inventing a default.
+fn runway_submit_body(
+    upstream_model: &str,
+    prompt: &str,
+    seconds: Option<u64>,
+    size: Option<&str>,
+) -> Result<serde_json::Value, ProxyError> {
+    let mut body = serde_json::json!({
+        "model": upstream_model,
+        "promptText": prompt,
+    });
+    if let Some(secs) = seconds {
+        body["duration"] = serde_json::json!(secs);
+    }
+    if let Some(size) = size {
+        body["ratio"] = serde_json::json!(map_runway_ratio(size)?);
+    }
+    Ok(body)
+}
+
 // ─────────────────────── provider dispatch ───────────────────────
 
 /// The provider families the videos surface can drive. Dispatch is a
@@ -426,6 +498,13 @@ enum VideoProvider {
     /// canonical id for this vendor; the CP catalog entry is tracked
     /// follow-up work).
     Volcengine,
+    /// Runway (Gen / Veo families via the Runway Developer API). Provider
+    /// string `runwayml` — the models.dev canonical vendor id; the short
+    /// `runway` spelling is accepted too (the zhipuai/zhipu precedent).
+    /// First overseas provider on this surface: its task `output` is an
+    /// array of signed, self-authenticating URLs, a clean fit for the 302
+    /// content route.
+    Runway,
 }
 
 impl VideoProvider {
@@ -441,6 +520,12 @@ impl VideoProvider {
             Some(Self::Zhipu)
         } else if provider.eq_ignore_ascii_case("volcengine") {
             Some(Self::Volcengine)
+        } else if provider.eq_ignore_ascii_case("runwayml")
+            // `runwayml` is the models.dev-canonical id; accept the common
+            // short spelling too (same tolerance as zhipuai/zhipu).
+            || provider.eq_ignore_ascii_case("runway")
+        {
+            Some(Self::Runway)
         } else {
             None
         }
@@ -458,6 +543,11 @@ impl VideoProvider {
             Self::Zhipu => &["/api/paas/v4"],
             // The common Ark base is `https://ark.cn-beijing.volces.com/api/v3`.
             Self::Volcengine => &["/api/v3"],
+            // Runway's documented api_base is the bare host
+            // `https://api.dev.runwayml.com` — the `/v1` lives in the
+            // endpoint paths, not the base — so there is no version suffix
+            // to strip (no stripper invented per the PR brief).
+            Self::Runway => &[],
         };
         for suffix in suffixes {
             if let Some(rest) = trimmed.strip_suffix(suffix) {
@@ -473,6 +563,7 @@ impl VideoProvider {
             Self::Alibaba => format!("{root}{DASHSCOPE_SUBMIT_PATH}"),
             Self::Zhipu => format!("{root}{ZHIPU_SUBMIT_PATH}"),
             Self::Volcengine => format!("{root}{ARK_TASKS_PATH}"),
+            Self::Runway => format!("{root}{RUNWAY_SUBMIT_PATH}"),
         }
     }
 
@@ -482,6 +573,7 @@ impl VideoProvider {
             Self::Alibaba => format!("{root}{DASHSCOPE_TASK_PATH}/{task_id}"),
             Self::Zhipu => format!("{root}{ZHIPU_TASK_PATH}/{task_id}"),
             Self::Volcengine => format!("{root}{ARK_TASKS_PATH}/{task_id}"),
+            Self::Runway => format!("{root}{RUNWAY_TASK_PATH}/{task_id}"),
         }
     }
 
@@ -496,6 +588,7 @@ impl VideoProvider {
             Self::Alibaba => dashscope_submit_body(upstream_model, prompt, seconds, size),
             Self::Zhipu => zhipu_submit_body(upstream_model, prompt, seconds, size),
             Self::Volcengine => ark_submit_body(upstream_model, prompt, seconds, size),
+            Self::Runway => runway_submit_body(upstream_model, prompt, seconds, size),
         }
     }
 
@@ -503,6 +596,18 @@ impl VideoProvider {
     /// (omitting it rejects video-synthesis calls outright).
     fn submit_headers_async(self) -> bool {
         self == Self::Alibaba
+    }
+
+    /// A provider header that must ride EVERY request — submit and poll
+    /// alike — returned as `(name, value)`. Runway's API version header is
+    /// mandatory on all calls (a missing value 400s), unlike DashScope's
+    /// submit-only async marker. Returns `None` for providers that need no
+    /// such header.
+    fn all_request_header(self) -> Option<(&'static str, &'static str)> {
+        match self {
+            Self::Runway => Some((RUNWAY_VERSION_HEADER, RUNWAY_VERSION_VALUE)),
+            _ => None,
+        }
     }
 
     /// Reduce a provider submit response to the task id + initial
@@ -544,6 +649,17 @@ impl VideoProvider {
                 // `ContentGenerationTaskID { id }` per the official SDK —
                 // the create response carries no status; a just-created
                 // task is queued.
+                let task_id = nonempty_str(v.get("id"))
+                    .ok_or_else(|| upstream_decode("submit response has no task id"))?;
+                Ok(SubmitView {
+                    task_id: task_id.to_string(),
+                    status: "queued",
+                })
+            }
+            Self::Runway => {
+                // `NewTaskCreatedResponse { id }` per the official SDK
+                // (`types/text_to_video_create_response.py`) — the create
+                // response carries no status; a just-created task is queued.
                 let task_id = nonempty_str(v.get("id"))
                     .ok_or_else(|| upstream_decode("submit response has no task id"))?;
                 Ok(SubmitView {
@@ -637,6 +753,34 @@ impl VideoProvider {
                         .get("error")
                         .and_then(|e| nonempty_str(e.get("message")))
                         .map(str::to_string),
+                })
+            }
+            Self::Runway => {
+                // `TaskRetrieveResponse { status, output: [url, …],
+                // failure, failureCode }` per the official SDK
+                // (`types/task_retrieve_response.py`). `output` is a bare
+                // array of signed URLs, present only on SUCCEEDED — take
+                // the first for the 302. Failure detail is the human
+                // `failure` string + machine `failureCode` (camelCase wire
+                // alias). No per-task duration is reported on the wire.
+                let status = map_runway_status(
+                    v.get("status")
+                        .and_then(|s| s.as_str())
+                        .ok_or_else(|| upstream_decode("task response has no `status`"))?,
+                );
+                let video_url = v
+                    .get("output")
+                    .and_then(|o| o.as_array())
+                    .and_then(|arr| arr.first())
+                    .and_then(|first| first.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
+                Ok(PollView {
+                    status,
+                    video_url,
+                    seconds: None,
+                    error_code: nonempty_str(v.get("failureCode")).map(str::to_string),
+                    error_message: nonempty_str(v.get("failure")).map(str::to_string),
                 })
             }
         }
@@ -736,6 +880,12 @@ async fn provider_call(
         .request(method, url)
         .header(header::AUTHORIZATION, format!("Bearer {}", target.secret))
         .header("x-aisix-request-id", request_id);
+    // A provider header required on every call (submit and poll) — e.g.
+    // Runway's mandatory `X-Runway-Version`. Applied unconditionally,
+    // before the submit-only body/header block below.
+    if let Some((name, value)) = target.provider.all_request_header() {
+        builder = builder.header(name, value);
+    }
     if let Some(b) = body {
         if target.provider.submit_headers_async() {
             // DashScope requires the async-mode header — it rejects
@@ -1543,6 +1693,18 @@ mod tests {
             Volcengine.root("https://ark.cn-beijing.volces.com"),
             "https://ark.cn-beijing.volces.com"
         );
+
+        // Runway: documented base is the bare host — no version suffix is
+        // stripped (the `/v1` belongs to the path); only a trailing slash
+        // is trimmed.
+        assert_eq!(
+            Runway.root("https://api.dev.runwayml.com"),
+            "https://api.dev.runwayml.com"
+        );
+        assert_eq!(
+            Runway.root("https://api.dev.runwayml.com/"),
+            "https://api.dev.runwayml.com"
+        );
     }
 
     #[test]
@@ -1564,6 +1726,14 @@ mod tests {
             Volcengine.poll_url("https://ark.cn-beijing.volces.com/api/v3", "cgt-1"),
             "https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks/cgt-1"
         );
+        assert_eq!(
+            Runway.submit_url("https://api.dev.runwayml.com"),
+            "https://api.dev.runwayml.com/v1/text_to_video"
+        );
+        assert_eq!(
+            Runway.poll_url("https://api.dev.runwayml.com", "t-r1"),
+            "https://api.dev.runwayml.com/v1/tasks/t-r1"
+        );
     }
 
     #[test]
@@ -1582,6 +1752,55 @@ mod tests {
         assert_eq!(map_ark_status("failed"), "failed");
         assert_eq!(map_ark_status("cancelled"), "failed");
         assert_eq!(map_ark_status("expired"), "failed");
+    }
+
+    #[test]
+    fn runway_status_mapping_table() {
+        // The six documented states (official SDK discriminated union):
+        // PENDING/THROTTLED are both pre-run → queued.
+        assert_eq!(map_runway_status("PENDING"), "queued");
+        assert_eq!(map_runway_status("THROTTLED"), "queued");
+        assert_eq!(map_runway_status("RUNNING"), "in_progress");
+        assert_eq!(map_runway_status("SUCCEEDED"), "completed");
+        assert_eq!(map_runway_status("FAILED"), "failed");
+        assert_eq!(map_runway_status("CANCELLED"), "failed");
+        assert_eq!(map_runway_status("SOMETHING_NEW"), "failed");
+    }
+
+    #[test]
+    fn runway_ratio_maps_size_by_separator_swap() {
+        // WIDTHxHEIGHT → WIDTH:HEIGHT (the 2024-11-06 `ratio` spelling).
+        assert_eq!(map_runway_ratio("1280x720").unwrap(), "1280:720");
+        assert_eq!(map_runway_ratio("1920x1080").unwrap(), "1920:1080");
+        // Malformed values fail fast, identically to the other providers.
+        for bad in [
+            "1280*720", "1280:720", "1280", "x720", "1280x", "12a0x720", "",
+        ] {
+            assert!(
+                map_runway_ratio(bad).is_err(),
+                "ratio {bad:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn runway_submit_body_maps_prompt_duration_and_ratio() {
+        let body = runway_submit_body("gen4_5", "a cat", Some(5), Some("1280x720")).unwrap();
+        assert_eq!(body["model"], "gen4_5");
+        // The wire field is `promptText`, not `prompt`.
+        assert_eq!(body["promptText"], "a cat");
+        assert!(body.get("prompt").is_none());
+        assert_eq!(body["duration"], 5);
+        assert_eq!(body["ratio"], "1280:720");
+
+        // Unset params are omitted (Runway requires `ratio` for several
+        // models, so the provider — not the gateway — decides the default).
+        let body = runway_submit_body("gen4_5", "a cat", None, None).unwrap();
+        assert!(body.get("duration").is_none());
+        assert!(body.get("ratio").is_none());
+
+        // A malformed size still fails fast before any upstream call.
+        assert!(runway_submit_body("gen4_5", "a cat", None, Some("bogus")).is_err());
     }
 
     #[test]
@@ -2670,5 +2889,148 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("model parameter invalid"));
+    }
+
+    // ──────────────────── Runway (Gen / Veo) journey ────────────────────
+
+    /// Runway happy path: submit maps onto `{model, promptText, duration,
+    /// ratio}` (official SDK `text_to_video` create); the create response
+    /// carries only `{id}` (→ queued); poll maps `SUCCEEDED` + the first
+    /// `output[]` signed URL; content 302s to it. The mandatory
+    /// `X-Runway-Version` header must reach the upstream on BOTH the submit
+    /// POST and the poll GET.
+    #[tokio::test]
+    async fn runway_submit_poll_content_journey_sends_version_header_on_both_legs() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(RUNWAY_SUBMIT_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "rw-task-1"
+            })))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("{RUNWAY_TASK_PATH}/rw-task-1")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "rw-task-1",
+                "status": "SUCCEEDED",
+                "createdAt": "2026-07-24T00:00:00Z",
+                "output": ["https://cdn.runwayml.example/out.mp4?token=signed-jwt-blob"]
+            })))
+            .mount(&upstream)
+            .await;
+
+        let app = build_app(new_snap(&upstream.uri(), "runwayml", ""));
+        let created = tower::ServiceExt::oneshot(
+            app.clone(),
+            post_videos(serde_json::json!({
+                "model": "my-video",
+                "prompt": "a robot dances",
+                "seconds": 5,
+                "size": "1280x720"
+            })),
+        )
+        .await
+        .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+        let v = body_json(created).await;
+        assert_eq!(v["object"], "video");
+        // The create response has no status — a just-created task is queued.
+        assert_eq!(v["status"], "queued");
+        assert_eq!(v["model"], "my-video");
+        let id = v["id"].as_str().unwrap().to_string();
+        assert_eq!(
+            decode_video_id(&id),
+            Some((
+                MODEL_ID.to_string(),
+                "my-video".to_string(),
+                "rw-task-1".to_string()
+            ))
+        );
+
+        // Submit wire shape: promptText, duration int, ratio W:H, Bearer
+        // auth, and the mandatory version header. No DashScope marker.
+        // Only the submit POST has hit the upstream at this point.
+        let received = upstream.received_requests().await.unwrap();
+        assert_eq!(received.len(), 1);
+        let sub = &received[0];
+        let wire: serde_json::Value = serde_json::from_slice(&sub.body).unwrap();
+        assert_eq!(wire["model"], "wan-upstream");
+        assert_eq!(wire["promptText"], "a robot dances");
+        assert_eq!(wire["duration"], 5);
+        assert_eq!(wire["ratio"], "1280:720");
+        assert!(wire.get("prompt").is_none());
+        assert!(!sub.headers.contains_key("x-dashscope-async"));
+        assert_eq!(
+            sub.headers
+                .get(RUNWAY_VERSION_HEADER)
+                .map(|h| h.to_str().unwrap()),
+            Some(RUNWAY_VERSION_VALUE),
+            "submit must carry the X-Runway-Version header"
+        );
+
+        let poll = tower::ServiceExt::oneshot(app.clone(), get_uri(&format!("/v1/videos/{id}")))
+            .await
+            .unwrap();
+        assert_eq!(poll.status(), StatusCode::OK);
+        let polled = body_json(poll).await;
+        assert_eq!(polled["status"], "completed");
+        assert_eq!(polled["progress"], 100);
+
+        // The poll GET must also carry the version header (Runway requires
+        // it on every call, unlike DashScope's submit-only marker). The
+        // second request the upstream saw is that poll GET.
+        let after_poll = upstream.received_requests().await.unwrap();
+        assert_eq!(after_poll.len(), 2);
+        let poll_req = &after_poll[1];
+        assert_eq!(
+            poll_req
+                .headers
+                .get(RUNWAY_VERSION_HEADER)
+                .map(|h| h.to_str().unwrap()),
+            Some(RUNWAY_VERSION_VALUE),
+            "poll must carry the X-Runway-Version header"
+        );
+
+        let content = tower::ServiceExt::oneshot(app, get_uri(&format!("/v1/videos/{id}/content")))
+            .await
+            .unwrap();
+        assert_eq!(content.status(), StatusCode::FOUND);
+        assert_eq!(
+            content.headers().get(header::LOCATION).unwrap(),
+            "https://cdn.runwayml.example/out.mp4?token=signed-jwt-blob"
+        );
+    }
+
+    /// A failed Runway task surfaces the SDK-documented `failure` /
+    /// `failureCode` fields through the unified error object on poll.
+    #[tokio::test]
+    async fn runway_failed_task_carries_failure_code_and_message() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("{RUNWAY_TASK_PATH}/rw-bad")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "rw-bad",
+                "status": "FAILED",
+                "failure": "The generation failed safety moderation.",
+                "failureCode": "SAFETY.INPUT.TEXT"
+            })))
+            .mount(&upstream)
+            .await;
+
+        let app = build_app(new_snap(&upstream.uri(), "runway", ""));
+        let id = encode_video_id(MODEL_ID, "my-video", "rw-bad");
+        let resp = tower::ServiceExt::oneshot(app, get_uri(&format!("/v1/videos/{id}")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v["status"], "failed");
+        assert_eq!(v["error"]["code"], "SAFETY.INPUT.TEXT");
+        assert_eq!(
+            v["error"]["message"],
+            "The generation failed safety moderation."
+        );
     }
 }
