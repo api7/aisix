@@ -36,6 +36,7 @@ name = "aisix-a2a"
 version = "0.3.0"
 dependencies = [
  "aisix-core",
+ "aisix-gateway",
  "async-trait",
  "axum",
  "futures",
@@ -182,6 +183,7 @@ name = "aisix-mcp"
 version = "0.3.0"
 dependencies = [
  "aisix-core",
+ "aisix-gateway",
  "async-trait",
  "axum",
  "futures",
@@ -203,6 +205,7 @@ name = "aisix-obs"
 version = "0.3.0"
 dependencies = [
  "aisix-core",
+ "aisix-gateway",
  "aliyun-log-sdk-protobuf",
  "aliyun-log-sdk-sign",
  "async-trait",
@@ -423,6 +426,7 @@ dependencies = [
  "config",
  "etcd-client",
  "hostname",
+ "hyper-util",
  "rcgen",
  "reqwest 0.12.28",
  "rustls 0.23.38",

@@ -21,6 +21,13 @@ silently uncorrelated, which reads exactly like working code:
 Do not hold a span guard across an await to work around this — it leaks the span
 onto whatever the executor runs next on that thread.
 
+A `text/event-stream` body needs a second wrapper for the same reason — nothing
+errors when it is missed. Pass it through `sse_keepalive::with_heartbeat(…,
+sse_keepalive::interval())` (or, on an axum `Sse`, `keep_alive` with that
+interval) so a model that is slow to its first token doesn't look like an
+abandoned connection to a proxy in front. Only for SSE: the same wrapper on an
+opaque binary passthrough (audio, images) corrupts it.
+
 ## A per-model gate must say whether it binds the requested entry or each target
 
 `resolve_attempt_models` expands a routing model into targets, so `model_entry` /

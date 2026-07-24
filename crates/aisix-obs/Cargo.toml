@@ -10,6 +10,9 @@ description = "aisix: observability (tracing, metrics, access log, OTLP export)"
 
 [dependencies]
 aisix-core = { path = "../aisix-core" }
+# For `client_builder()`: exporter HTTP clients share the process-wide
+# connection settings like every other outbound call.
+aisix-gateway = { path = "../aisix-gateway" }
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

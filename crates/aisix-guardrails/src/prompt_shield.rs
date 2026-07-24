@@ -98,12 +98,12 @@ impl PromptShieldGuardrail {
         hook_point: GuardrailHookPoint,
         fail_open: bool,
     ) -> Self {
-        let client = reqwest::Client::builder()
-            // Per-call timeout is enforced via tokio::time::timeout in
-            // call_api(); the connection pool uses reqwest's default idle
-            // timeout (90 s). No pool customisation is needed here.
+        // Per-call timeout is enforced via tokio::time::timeout in
+        // call_api(); the connection layer is the shared one, so a pooled
+        // connection expires before a hop in front of the service reaps it.
+        let client = aisix_gateway::client_builder()
             .build()
-            .expect("reqwest::Client::builder() failed; this should never happen");
+            .expect("guardrail http client builds");
         Self {
             row_name: row_name.into(),
             // Strip trailing slash so we can always append SHIELD_PATH with

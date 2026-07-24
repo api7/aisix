@@ -62,7 +62,7 @@ fn shared_client() -> reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT
         .get_or_init(|| {
-            reqwest::Client::builder()
+            aisix_gateway::client_builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .expect("reqwest client (redirect-disabled) builds")

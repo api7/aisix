@@ -154,6 +154,11 @@ async fn main() -> anyhow::Result<()> {
     // Before any bridge builds its `reqwest::Client` — the connection
     // pools are constructed once and can't be reconfigured afterwards.
     aisix_gateway::upstream_http::init(upstream_http_config(&cfg.upstream));
+    // Before the first streaming response is built.
+    aisix_proxy::sse_keepalive::init(
+        (cfg.downstream.sse_keepalive_interval_secs > 0)
+            .then(|| Duration::from_secs(cfg.downstream.sse_keepalive_interval_secs)),
+    );
 
     run(cfg).await
 }
@@ -310,6 +315,11 @@ fn select_managed_boot_path(bundle_on_disk: bool, bundle_provided: bool) -> Mana
 /// Factored out of `main` so the integration tests can drive the full
 /// startup with a real config struct and still use `#[tokio::test]`.
 async fn run(mut cfg: Config) -> anyhow::Result<()> {
+    // Applied to every listener. `0` (the default) keeps idle client
+    // connections open until the peer closes them.
+    let downstream_idle_timeout = (cfg.downstream.idle_timeout_secs > 0)
+        .then(|| Duration::from_secs(cfg.downstream.idle_timeout_secs));
+
     // Operator-supplied extra trust root, threaded into every
     // outbound mTLS client (etcd, heartbeat, telemetry, BudgetClient).
     // Needed for e2e / on-prem deployments where the
@@ -871,6 +881,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
             admin_addr,
             admin_router,
             admin_tls,
+            downstream_idle_timeout,
             cancel_rx.clone(),
             "admin",
         )))
@@ -915,6 +926,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
                 metrics_addr,
                 metrics_router,
                 None,
+                downstream_idle_timeout,
                 cancel_rx.clone(),
                 "metrics",
             )))
@@ -930,6 +942,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
         proxy_addr,
         proxy_router,
         proxy_tls,
+        downstream_idle_timeout,
         cancel_rx.clone(),
         "proxy",
     );
@@ -1300,54 +1313,97 @@ fn background_check_interval(snapshot: &aisix_core::AisixSnapshot) -> std::time:
 /// rest of the process. Wired for #473: `proxy.tls` / `admin.tls` were
 /// parsed but never reached the listener, so the documented config silently
 /// served plain HTTP.
+///
+/// Both variants run on `axum_server` rather than `axum::serve` because
+/// only the former exposes the hyper connection builder, which is where
+/// `downstream.idle_timeout_secs` has to be applied (AISIX-Cloud#1126).
 async fn serve_http(
     addr: std::net::SocketAddr,
     router: axum::Router,
     tls: Option<aisix_core::TlsConfig>,
+    idle_timeout: Option<Duration>,
     cancel: watch::Receiver<bool>,
     label: &'static str,
 ) -> anyhow::Result<()> {
-    match tls {
+    // Resolved before binding so a bad cert path still fails with the
+    // same error it always did, before a port is taken.
+    let tls_config = match tls {
+        Some(tls) => Some(
+            axum_server::tls_rustls::RustlsConfig::from_pem_file(&tls.cert_file, &tls.key_file)
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "{label}.tls: failed to load cert_file={:?} / key_file={:?}: {e}",
+                        tls.cert_file,
+                        tls.key_file
+                    )
+                })?,
+        ),
+        None => None,
+    };
+
+    let listener = std::net::TcpListener::bind(addr)
+        .map_err(|e| anyhow::anyhow!("{label} listener bind {addr} failed: {e}"))?;
+    listener.set_nonblocking(true)?;
+
+    let handle = axum_server::Handle::new();
+    tokio::spawn({
+        let handle = handle.clone();
+        async move {
+            shutdown_signal(cancel, label).await;
+            // `None` = drain without a deadline: an in-flight LLM stream
+            // can run for minutes, and the platform (k8s
+            // terminationGracePeriodSeconds, systemd TimeoutStopSec)
+            // already caps how long that may take. Idle connections are
+            // closed immediately either way.
+            handle.graceful_shutdown(None);
+        }
+    });
+
+    // ConnectInfo<SocketAddr> exposes the TCP peer to the proxy's real-ip
+    // resolver (#492). Harmless for the admin listener, which ignores it.
+    let make_service = router.into_make_service_with_connect_info::<std::net::SocketAddr>();
+
+    match tls_config {
         None => {
-            let listener = tokio::net::TcpListener::bind(addr).await?;
             tracing::info!(%addr, label, "aisix listening (http)");
-            // ConnectInfo<SocketAddr> exposes the TCP peer to the proxy's
-            // real-ip resolver (#492). Harmless for the admin listener,
-            // which ignores it.
-            axum::serve(
-                listener,
-                router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-            )
-            .with_graceful_shutdown(shutdown_signal(cancel, label))
-            .await?;
-            Ok(())
+            let mut server = axum_server::from_tcp(listener).handle(handle);
+            apply_idle_timeout(server.http_builder(), idle_timeout);
+            server.serve(make_service).await?;
         }
-        Some(tls) => {
-            let tls_config =
-                axum_server::tls_rustls::RustlsConfig::from_pem_file(&tls.cert_file, &tls.key_file)
-                    .await
-                    .map_err(|e| {
-                        anyhow::anyhow!(
-                            "{label}.tls: failed to load cert_file={:?} / key_file={:?}: {e}",
-                            tls.cert_file,
-                            tls.key_file
-                        )
-                    })?;
-            let handle = axum_server::Handle::new();
-            tokio::spawn({
-                let handle = handle.clone();
-                async move {
-                    shutdown_signal(cancel, label).await;
-                    handle.graceful_shutdown(Some(std::time::Duration::from_secs(10)));
-                }
-            });
+        Some(tls_config) => {
             tracing::info!(%addr, label, "aisix listening (https)");
-            axum_server::bind_rustls(addr, tls_config)
-                .handle(handle)
-                .serve(router.into_make_service_with_connect_info::<std::net::SocketAddr>())
-                .await?;
-            Ok(())
+            let mut server = axum_server::from_tcp_rustls(listener, tls_config).handle(handle);
+            apply_idle_timeout(server.http_builder(), idle_timeout);
+            server.serve(make_service).await?;
         }
+    }
+    Ok(())
+}
+
+/// Close an accepted HTTP/1.1 connection that sits idle for `idle_timeout`.
+///
+/// hyper arms this timer only when it is waiting for a request head, and
+/// it only waits for one once the previous response has been fully written
+/// (`Conn::can_read_head` requires the read half to be back at `Init`,
+/// which `try_keep_alive` reaches only when reading *and* writing are
+/// done). So a slow model or a long SSE stream is never interrupted — the
+/// timer covers exactly the between-requests window.
+///
+/// hyper defaults this to 30s but drops the default unless a timer is
+/// installed, and neither axum nor axum_server installs one — which is why
+/// the gateway held idle connections forever before this.
+///
+/// HTTP/2 has no equivalent knob in hyper; h2 connections are unaffected.
+fn apply_idle_timeout(
+    builder: &mut hyper_util::server::conn::auto::Builder<hyper_util::rt::TokioExecutor>,
+    idle_timeout: Option<Duration>,
+) {
+    if let Some(d) = idle_timeout {
+        builder
+            .http1()
+            .timer(hyper_util::rt::TokioTimer::new())
+            .header_read_timeout(d);
     }
 }
 

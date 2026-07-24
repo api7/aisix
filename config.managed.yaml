@@ -113,3 +113,11 @@ upstream:
   # tcp_keepalive_retries: 5
   pool_idle_timeout_secs: 30
   # pool_max_idle_per_host: 32
+
+# Connection-layer settings for the inbound side. `idle_timeout_secs: 0`
+# (the default) never closes an idle client connection, leaving that to
+# the peer — set it only when a node in front pools connections for a
+# known, shorter time, and keep it above that value.
+downstream:
+  idle_timeout_secs: 0
+  # sse_keepalive_interval_secs: 15
