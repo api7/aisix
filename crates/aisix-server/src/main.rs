@@ -154,11 +154,6 @@ async fn main() -> anyhow::Result<()> {
     // Before any bridge builds its `reqwest::Client` — the connection
     // pools are constructed once and can't be reconfigured afterwards.
     aisix_gateway::upstream_http::init(upstream_http_config(&cfg.upstream));
-    // Before the first streaming response is built.
-    aisix_proxy::sse_keepalive::init(
-        (cfg.downstream.sse_keepalive_interval_secs > 0)
-            .then(|| Duration::from_secs(cfg.downstream.sse_keepalive_interval_secs)),
-    );
 
     run(cfg).await
 }
@@ -319,6 +314,13 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     // connections open until the peer closes them.
     let downstream_idle_timeout = (cfg.downstream.idle_timeout_secs > 0)
         .then(|| Duration::from_secs(cfg.downstream.idle_timeout_secs));
+    // Here rather than in `main` so anything that drives `run` directly —
+    // the integration tests — gets the configured interval instead of
+    // silently falling back to the default.
+    aisix_proxy::sse_keepalive::init(
+        (cfg.downstream.sse_keepalive_interval_secs > 0)
+            .then(|| Duration::from_secs(cfg.downstream.sse_keepalive_interval_secs)),
+    );
 
     // Operator-supplied extra trust root, threaded into every
     // outbound mTLS client (etcd, heartbeat, telemetry, BudgetClient).
