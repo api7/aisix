@@ -156,11 +156,15 @@ pub(crate) fn routing_error_class(err: &BridgeError) -> &'static str {
 const MAX_ATTEMPT_ERROR_MESSAGE_CHARS: usize = 2048;
 
 /// Control-char-stripped, capped rendering of an error's `Display`.
-/// Control chars are dropped so a multi-line upstream body can't break the
-/// one-line-per-record shape of the telemetry field and the access log.
+///
+/// Anything that a log reader would treat as a line break is dropped, so a
+/// multi-line upstream body can't split the one-line-per-record shape of
+/// the telemetry field and the access log. U+2028/U+2029 are listed
+/// explicitly: they are `Zl`/`Zp`, not `Cc`, so `is_control()` lets them
+/// through even though plenty of viewers break lines on them.
 fn sanitize_error_message(s: &str) -> String {
     s.chars()
-        .filter(|c| !c.is_control())
+        .filter(|c| !c.is_control() && !matches!(c, '\u{2028}' | '\u{2029}'))
         .take(MAX_ATTEMPT_ERROR_MESSAGE_CHARS)
         .collect()
 }
@@ -246,10 +250,16 @@ mod tests {
     /// the access log greppable.
     #[test]
     fn access_log_error_strips_control_chars_and_caps_length() {
-        let (_, msg) =
-            access_log_error(&ProxyError::InvalidRequest("bad\nrequest\tbody\r\n".into()));
-        assert!(!msg.contains(['\n', '\r', '\t']), "{msg}");
-        assert!(msg.ends_with("badrequestbody"), "{msg}");
+        // U+2028/U+2029 are Zl/Zp rather than Cc, so `is_control()` alone
+        // would forward them and a log viewer would break the record.
+        let (_, msg) = access_log_error(&ProxyError::InvalidRequest(
+            "bad\nrequest\tbody\u{2028}split\u{2029}again\r\n".into(),
+        ));
+        assert!(
+            !msg.contains(['\n', '\r', '\t', '\u{2028}', '\u{2029}']),
+            "{msg:?}"
+        );
+        assert!(msg.ends_with("badrequestbodysplitagain"), "{msg}");
 
         let long = ProxyError::InvalidRequest("x".repeat(MAX_ATTEMPT_ERROR_MESSAGE_CHARS * 2));
         let (_, msg) = access_log_error(&long);

@@ -57,6 +57,7 @@ use crate::auth::AuthenticatedKey;
 use crate::client_ip::ClientContext;
 use crate::error::ProxyError;
 use crate::state::ProxyState;
+use aisix_gateway::BridgeError;
 
 /// Azure Realtime GA api-version (see the jobs surface twin constant).
 const AZURE_REALTIME_API_VERSION: &str = "2024-10-01-preview";
@@ -444,6 +445,10 @@ async fn run_session(
     let mut usage = SessionUsage::default();
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
     let mut close_status: u16 = 200;
+    // Paired with `close_status`: every branch that sets a failing status
+    // also names the failure, so the access log can say WHY a session
+    // ended (AISIX-Cloud#1093). `None` only for a clean close.
+    let mut session_error: Option<ProxyError> = None;
     // Operator-configured stream idle deadline (stream_timeout on the
     // Model). Absent → no idle cap; realtime sessions are long-lived by
     // design.
@@ -467,6 +472,10 @@ async fn run_session(
                         })))
                         .await;
                     close_status = 504;
+                    session_error = Some(ProxyError::Bridge(BridgeError::Timeout {
+                        elapsed_ms: cap.as_millis() as u64,
+                        cause: "no realtime frame within the stream idle budget".into(),
+                    }));
                     break;
                 }
             },
@@ -494,6 +503,9 @@ async fn run_session(
                                 })))
                                 .await;
                             close_status = 400;
+                            session_error = Some(ProxyError::ContentFiltered(
+                                "realtime frame blocked by a guardrail".into(),
+                            ));
                             break;
                         }
                     }
@@ -537,6 +549,9 @@ async fn run_session(
                                 })))
                                 .await;
                             close_status = 400;
+                            session_error = Some(ProxyError::ContentFiltered(
+                                "realtime frame blocked by a guardrail".into(),
+                            ));
                             break;
                         }
                     }
@@ -568,6 +583,9 @@ async fn run_session(
                         })))
                         .await;
                     close_status = 502;
+                    session_error = Some(ProxyError::Bridge(BridgeError::Transport(
+                        aisix_gateway::error_with_causes(&e),
+                    )));
                     break;
                 }
                 None => {
@@ -588,7 +606,7 @@ async fn run_session(
         elapsed,
         &request_id,
         Some((&provider_label, &requested_model)),
-        None,
+        session_error.as_ref(),
     );
     state.metrics.record_request(
         &provider_label,
