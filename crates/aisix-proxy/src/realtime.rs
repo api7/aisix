@@ -93,7 +93,14 @@ pub(crate) async fn realtime(
         }
         Err(err) => {
             let status = err.status().as_u16();
-            emit_access_log(&Method::GET, status, started.elapsed(), &request_id, None);
+            emit_access_log(
+                &Method::GET,
+                status,
+                started.elapsed(),
+                &request_id,
+                None,
+                Some(&err),
+            );
             crate::usage_attr::emit_error_usage_event(
                 &state,
                 "realtime",
@@ -401,18 +408,22 @@ async fn run_session(
                     reason: "upstream connect failed".into(),
                 })))
                 .await;
-            crate::cooldown::note_failure(
+            // `note_failure` hands the error back, so the same value that
+            // drove the cooldown decision also names the failure in the
+            // access log instead of being rebuilt.
+            let connect_err = ProxyError::Bridge(crate::cooldown::note_failure(
                 &state.runtime_status,
                 &model_entry.id,
                 model_entry.value.cooldown.as_ref(),
                 aisix_gateway::BridgeError::Transport(aisix_gateway::error_with_causes(&e)),
-            );
+            ));
             emit_access_log(
                 &Method::GET,
                 502,
                 started.elapsed(),
                 &request_id,
                 Some((&provider_label, &requested_model)),
+                Some(&connect_err),
             );
             crate::usage_attr::emit_error_usage_event(
                 &state,
@@ -577,6 +588,7 @@ async fn run_session(
         elapsed,
         &request_id,
         Some((&provider_label, &requested_model)),
+        None,
     );
     state.metrics.record_request(
         &provider_label,
@@ -681,7 +693,15 @@ fn emit_access_log(
     elapsed: Duration,
     request_id: &str,
     target: Option<(&str, &str)>,
+    error: Option<&ProxyError>,
 ) {
+    let (error_kind, error) = match error {
+        Some(e) => {
+            let (kind, msg) = crate::attempt::access_log_error(e);
+            (Some(kind), Some(msg))
+        }
+        None => (None, None),
+    };
     AccessLog {
         method: method.as_str(),
         path: "/v1/realtime",
@@ -697,6 +717,8 @@ fn emit_access_log(
         served_by_model: None,
         routing_attempt_count: None,
         routing_fallback_count: None,
+        error_kind,
+        error: error.as_deref(),
     }
     .emit();
 }

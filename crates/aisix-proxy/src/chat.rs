@@ -187,6 +187,7 @@ pub async fn chat_completions(
                 success.total_tokens,
                 &request_id,
                 &success.routing,
+                None,
             );
             // Per #655: emit a zero-token event for each failed attempt
             // that preceded the winner (non-streaming fallover). No-op for
@@ -424,6 +425,7 @@ pub async fn chat_completions(
                 al_total,
                 &request_id,
                 &routing,
+                Some(&err),
             );
             // `resolved_model_id` is populated by `dispatch` once
             // `req.model` resolves against the snapshot, so a guardrail /
@@ -3849,7 +3851,15 @@ fn emit_access_log(
     total_tokens: Option<u64>,
     request_id: &str,
     routing: &RoutingTelemetry,
+    error: Option<&ProxyError>,
 ) {
+    let (error_kind, error) = match error {
+        Some(e) => {
+            let (kind, msg) = crate::attempt::access_log_error(e);
+            (Some(kind), Some(msg))
+        }
+        None => (None, None),
+    };
     // Per #655 the access log stays ONE line per request (the transport
     // plane), carrying user-perceived `latency` + the final status plus a
     // routing summary. The per-attempt detail lives in telemetry only.
@@ -3875,6 +3885,8 @@ fn emit_access_log(
             0 => None,
             n => Some(n),
         },
+        error_kind,
+        error: error.as_deref(),
     }
     .emit();
 }

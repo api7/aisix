@@ -1011,8 +1011,15 @@ struct Telemetry<'a> {
 }
 
 impl Telemetry<'_> {
-    fn finish(&self, status: u16, provider: &str, model_label: &str) {
+    fn finish(&self, status: u16, provider: &str, model_label: &str, error: Option<&ProxyError>) {
         let elapsed = self.started.elapsed();
+        let (error_kind, error) = match error {
+            Some(e) => {
+                let (kind, msg) = crate::attempt::access_log_error(e);
+                (Some(kind), Some(msg))
+            }
+            None => (None, None),
+        };
         AccessLog {
             method: self.method,
             path: &self.path,
@@ -1028,6 +1035,8 @@ impl Telemetry<'_> {
             served_by_model: None,
             routing_attempt_count: None,
             routing_fallback_count: None,
+            error_kind,
+            error: error.as_deref(),
         }
         .emit();
         self.state.metrics.record_request(
@@ -1069,6 +1078,7 @@ pub async fn create_video(
                 err.status().as_u16(),
                 "unknown",
                 crate::usage_attr::UNRESOLVED_MODEL_LABEL,
+                Some(&err),
             );
             return err.into_response();
         }
@@ -1090,7 +1100,7 @@ pub async fn create_video(
                 .get_by_id(&success.model_id)
                 .map(|e| e.value.display_name.clone())
                 .unwrap_or_else(|| crate::usage_attr::UNRESOLVED_MODEL_LABEL.to_string());
-            telemetry.finish(status, &success.provider, &model_label);
+            telemetry.finish(status, &success.provider, &model_label, None);
             // One zero-token UsageEvent per accepted submit — visible in
             // /logs and the budget ledger like every other endpoint.
             // Per-second cost is computed control-plane-side once the
@@ -1117,7 +1127,7 @@ pub async fn create_video(
             let status = err.status().as_u16();
             let snap = state.snapshot.load();
             let metric_model = crate::usage_attr::metric_model_label(&snap, &model_name);
-            telemetry.finish(status, "unknown", metric_model);
+            telemetry.finish(status, "unknown", metric_model, Some(&err));
             // #655 parity: failed submits surface in Logs as zero-token
             // events instead of vanishing.
             crate::usage_attr::emit_error_usage_event(
@@ -1367,7 +1377,7 @@ pub async fn get_video(
 
     match result {
         Ok((resp, provider, model_label)) => {
-            telemetry.finish(resp.status().as_u16(), &provider, &model_label);
+            telemetry.finish(resp.status().as_u16(), &provider, &model_label, None);
             resp
         }
         Err(err) => {
@@ -1375,6 +1385,7 @@ pub async fn get_video(
                 err.status().as_u16(),
                 "unknown",
                 crate::usage_attr::UNRESOLVED_MODEL_LABEL,
+                Some(&err),
             );
             err.into_response()
         }
@@ -1469,7 +1480,7 @@ pub async fn video_content(
 
     match result {
         Ok((resp, provider, model_label)) => {
-            telemetry.finish(resp.status().as_u16(), &provider, &model_label);
+            telemetry.finish(resp.status().as_u16(), &provider, &model_label, None);
             resp
         }
         Err(err) => {
@@ -1477,6 +1488,7 @@ pub async fn video_content(
                 err.status().as_u16(),
                 "unknown",
                 crate::usage_attr::UNRESOLVED_MODEL_LABEL,
+                Some(&err),
             );
             err.into_response()
         }

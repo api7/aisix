@@ -93,6 +93,11 @@ pub async fn mcp_endpoint(
         completion_tokens: None,
         total_tokens: None,
         request_id: &request_id,
+        // `dispatch` renders its own `Response` rather than surfacing a
+        // `ProxyError`, so there is no typed error to name here. The status
+        // code is all this endpoint can attribute a failure to.
+        error_kind: None,
+        error: None,
         served_by_model: None,
         routing_attempt_count: None,
         routing_fallback_count: None,

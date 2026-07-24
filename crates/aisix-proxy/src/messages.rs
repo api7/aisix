@@ -171,6 +171,7 @@ pub async fn messages(
                 elapsed,
                 &request_id,
                 &routing,
+                None,
             );
             state.metrics.record_request(
                 &provider_label,
@@ -286,6 +287,7 @@ pub async fn messages(
                 elapsed,
                 &request_id,
                 &routing,
+                Some(&err),
             );
             let snap = state.snapshot.load();
             let metric_model = crate::usage_attr::metric_model_label(&snap, &model_name);
@@ -3340,6 +3342,7 @@ where
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_access_log(
     model: &str,
     provider: &str,
@@ -3348,7 +3351,15 @@ fn emit_access_log(
     latency: Duration,
     request_id: &str,
     routing: &RoutingTelemetry,
+    error: Option<&ProxyError>,
 ) {
+    let (error_kind, error) = match error {
+        Some(e) => {
+            let (kind, msg) = crate::attempt::access_log_error(e);
+            (Some(kind), Some(msg))
+        }
+        None => (None, None),
+    };
     // Per #655 the access log stays ONE line per request, carrying the
     // user-perceived `latency` + final status plus a routing summary; the
     // per-attempt detail lives in telemetry.
@@ -3377,6 +3388,8 @@ fn emit_access_log(
             0 => None,
             n => Some(n),
         },
+        error_kind,
+        error: error.as_deref(),
     }
     .emit();
 }
