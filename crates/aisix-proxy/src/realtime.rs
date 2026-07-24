@@ -445,9 +445,18 @@ async fn run_session(
     let mut usage = SessionUsage::default();
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
     let mut close_status: u16 = 200;
-    // Paired with `close_status`: every branch that sets a failing status
-    // also names the failure, so the access log can say WHY a session
-    // ended (AISIX-Cloud#1093). `None` only for a clean close.
+    // Paired with `close_status`: every branch that sets a FAILING status
+    // also names the failure, so the access log can say why a session
+    // ended (AISIX-Cloud#1093).
+    //
+    // A client-side transport error (`Some(Err(_))` on the receive half)
+    // is deliberately not one of them: it keeps `close_status` 200 and
+    // stays `None`. Reclassifying it is a behaviour change, not a logging
+    // one — `RequestOutcome::from_status` would flip that session from
+    // `success` to `client_error` and move every operator's realtime
+    // success rate. That belongs with the termination-reason taxonomy
+    // (`downstream_remote_disconnect` and friends) the issue asks for
+    // separately, which needs its own status decision.
     let mut session_error: Option<ProxyError> = None;
     // Operator-configured stream idle deadline (stream_timeout on the
     // Model). Absent → no idle cap; realtime sessions are long-lived by
