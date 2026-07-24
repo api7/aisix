@@ -344,4 +344,57 @@ describe("guardrail keyword e2e: blocks forbidden literal in any message role", 
     },
     60_000,
   );
+
+  test(
+    "forbidden literal hidden in tool_call arguments behind benign content → 422",
+    async (ctx) => {
+      if (!etcdReachable || !app || !upstream) {
+        ctx.skip();
+        return;
+      }
+
+      const client = new OpenAI({
+        apiKey: CALLER_PLAINTEXT,
+        baseURL: `${app.proxyUrl}/v1`,
+        maxRetries: 0,
+      });
+      await waitForGuardrailActive(client, "user");
+
+      const upstreamHitsBefore = upstream.receivedRequests.length;
+
+      // The other half of the same bypass class: a replayed assistant
+      // tool call hides the forbidden literal in its arguments, which the
+      // bridge forwards upstream verbatim. Benign flat content everywhere.
+      const proxy = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
+      const res = await proxy.chat({
+        model: "gr-loc-model",
+        messages: [
+          { role: "user", content: "look this up for me" },
+          {
+            role: "assistant",
+            content: null,
+            tool_calls: [
+              {
+                id: "c1",
+                type: "function",
+                function: {
+                  name: "lookup",
+                  arguments: `{"q":"the ${FORBIDDEN_WORD} formula"}`,
+                },
+              },
+            ],
+          },
+          { role: "user", content: "continue" },
+        ],
+      });
+
+      expect(res.status).toBe(422);
+      expect((res.body as { error?: { type?: unknown } })?.error?.type).toBe(
+        "content_filter",
+      );
+      expect(upstream.receivedRequests.length).toBe(upstreamHitsBefore);
+      expect(JSON.stringify(res.body ?? {})).not.toContain(FORBIDDEN_WORD);
+    },
+    60_000,
+  );
 });

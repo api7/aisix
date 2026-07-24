@@ -213,6 +213,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn blocks_keyword_hidden_in_tool_call_arguments() {
+        // Same bypass via `extra["tool_calls"]`: a history-replay tool
+        // call carries the banned keyword in its arguments, which the
+        // bridges forward upstream. Must be scanned and blocked.
+        let msg: ChatMessage = serde_json::from_value(serde_json::json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{
+                "id": "c1",
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "arguments": "{\"q\":\"the FORBIDDEN word\"}"
+                }
+            }]
+        }))
+        .unwrap();
+        let g = KeywordBlocklist::new(vec![KeywordRule::literal("Forbidden")]);
+        let v = g.check_input(&ChatFormat::new("m", vec![msg])).await;
+        assert!(
+            v.is_block(),
+            "keyword hidden in tool_call arguments must be blocked"
+        );
+    }
+
+    #[tokio::test]
     async fn empty_literal_pattern_never_matches() {
         let g = KeywordBlocklist::new(vec![KeywordRule::literal("")]);
         let v = g.check_input(&req(&[("user", "anything")])).await;
