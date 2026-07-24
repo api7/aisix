@@ -36,6 +36,7 @@ etcd:
   endpoints:
     - "https://placeholder-overridden-at-register:2379"
   prefix: "/aisix"
+  # auth_token_refresh_secs: 240
   dial_timeout_ms: 5000
   request_timeout_ms: 5000
 

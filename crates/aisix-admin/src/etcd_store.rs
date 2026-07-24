@@ -54,8 +54,12 @@ impl std::fmt::Debug for EtcdConfigStore {
 }
 
 impl EtcdConfigStore {
-    pub fn new(client: Client, prefix: impl Into<String>) -> Self {
+    /// `refresh_secs` sets the auth-token refresh interval (typically
+    /// `EtcdConfig.auth_token_refresh_secs`); `None` or `0` uses the
+    /// hardcoded default — see `aisix_etcd::start_token_refresh_task`.
+    pub fn new(client: Client, prefix: impl Into<String>, refresh_secs: Option<u64>) -> Self {
         let prefix = prefix.into().trim_end_matches('/').to_string();
+        aisix_etcd::start_token_refresh_task(client.clone(), refresh_secs);
         Self {
             client: Mutex::new(client),
             prefix,
@@ -411,7 +415,7 @@ mod tests {
             .unwrap()
             .block_on(client_fut)
             .expect("lazy connect never fails synchronously");
-        EtcdConfigStore::new(client, "/aisix")
+        EtcdConfigStore::new(client, "/aisix", None)
     }
 
     #[test]
@@ -451,7 +455,7 @@ mod tests {
                 None,
             ))
             .expect("lazy connect never fails synchronously");
-        let store = EtcdConfigStore::new(client, "/aisix/");
+        let store = EtcdConfigStore::new(client, "/aisix/", None);
         assert_eq!(store.prefix(), "/aisix");
         assert_eq!(store.key_for("models", "a"), "/aisix/models/a");
     }
@@ -481,7 +485,7 @@ mod tests {
         let client = etcd_client::Client::connect([endpoint], None)
             .await
             .expect("etcd client");
-        let store = EtcdConfigStore::new(client, "/aisix-it");
+        let store = EtcdConfigStore::new(client, "/aisix-it", None);
 
         let model: Model = serde_json::from_str(
             r#"{

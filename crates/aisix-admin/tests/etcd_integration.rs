@@ -37,6 +37,11 @@ fn etcd_url() -> Option<String> {
     std::env::var("ADMIN_TEST_ETCD_URL").ok()
 }
 
+/// Separate from `ADMIN_TEST_ETCD_URL`: CI's etcd container has no auth.
+fn auth_etcd_url() -> Option<String> {
+    std::env::var("ADMIN_TEST_ETCD_AUTH_URL").ok()
+}
+
 /// Per-test prefix so concurrent tests in this binary don't collide.
 fn unique_prefix() -> String {
     let nanos = SystemTime::now()
@@ -54,7 +59,7 @@ async fn build_state_with_real_etcd(url: &str, prefix: &str) -> AdminState {
     let client = etcd_client::Client::connect([url], None)
         .await
         .expect("etcd connect");
-    let store: Arc<dyn ConfigStore> = Arc::new(EtcdConfigStore::new(client, prefix));
+    let store: Arc<dyn ConfigStore> = Arc::new(EtcdConfigStore::new(client, prefix, None));
     let handle = SnapshotHandle::new(AisixSnapshot::new());
     let cfg = AdminConfig {
         enabled: true,
@@ -403,4 +408,80 @@ async fn loader_picks_up_every_admin_write() {
     assert_eq!(snap.cache_policies.len(), 1);
     assert_eq!(snap.observability_exporters.len(), 1);
     assert_eq!(snap.mcp_servers.len(), 1);
+}
+
+// ─────────────────────────── Auth token refresh ───────────────────────────
+//
+// Regression test for a production incident: Admin API calls made long
+// after boot failed with "etcdserver: invalid auth token". Root cause:
+// `EtcdConfigStore`'s write-path client authenticated once at connect
+// time and never refreshed, so any write issued past
+// `--auth-token-ttl` (default 300s) hit UNAUTHENTICATED.
+// `EtcdConfigStore::new` now spawns `aisix_etcd::start_token_refresh_task`
+// to fix this.
+//
+// Requires `ADMIN_TEST_ETCD_AUTH_URL` (auth-enabled etcd, short TTL) +
+// `ADMIN_TEST_ETCD_USER` / `ADMIN_TEST_ETCD_PASSWORD`; no-ops otherwise.
+//
+// Local run:
+//   docker run --rm -p 2379:2379 quay.io/coreos/etcd:v3.5.18 \
+//     --listen-client-urls=http://0.0.0.0:2379 \
+//     --advertise-client-urls=http://0.0.0.0:2379 --auth-token-ttl=5
+//   etcdctl user add root:rootpw && etcdctl user grant-role root root \
+//     && etcdctl user add test:testpw && etcdctl user grant-role test root \
+//     && etcdctl auth enable
+//   ADMIN_TEST_ETCD_AUTH_URL=http://127.0.0.1:2379 ADMIN_TEST_ETCD_USER=test \
+//   ADMIN_TEST_ETCD_PASSWORD=testpw \
+//   cargo test -p aisix-admin --test etcd_integration \
+//     admin_write_survives_token_expiry -- --nocapture
+#[tokio::test]
+async fn admin_write_survives_token_expiry() {
+    let Some(url) = auth_etcd_url() else {
+        eprintln!("skipping: ADMIN_TEST_ETCD_AUTH_URL not set");
+        return;
+    };
+    let user = std::env::var("ADMIN_TEST_ETCD_USER").expect("ADMIN_TEST_ETCD_USER required");
+    let password =
+        std::env::var("ADMIN_TEST_ETCD_PASSWORD").expect("ADMIN_TEST_ETCD_PASSWORD required");
+
+    let prefix = unique_prefix();
+    let options = etcd_client::ConnectOptions::new().with_user(user, password);
+    let client = etcd_client::Client::connect([url.as_str()], Some(options))
+        .await
+        .expect("etcd connect with auth");
+    // Mirrors main.rs's production bootstrap call, but with a 2s refresh
+    // interval — well under the 5s --auth-token-ttl the local-run etcd is
+    // started with above, so the loop refreshes before expiry.
+    let store: Arc<dyn ConfigStore> = Arc::new(EtcdConfigStore::new(client, prefix, Some(2)));
+    let handle = SnapshotHandle::new(AisixSnapshot::new());
+    let cfg = AdminConfig {
+        addr: "127.0.0.1:0".into(),
+        admin_keys: vec![ADMIN_KEY.into()],
+        tls: None,
+    };
+    let state = AdminState::new(handle, store, &cfg);
+
+    // Wait past the 5s TTL window (1s margin absorbs scheduler jitter);
+    // without refresh this POST would 401.
+    tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+
+    let app = build_router(state);
+    let resp = app
+        .oneshot(auth_post(
+            "/admin/v1/models",
+            json!({
+                "display_name": "post-expiry",
+                "provider": "openai",
+                "model_name": "gpt-4o",
+                "provider_key_id": "11111111-1111-1111-1111-111111111111"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "admin write after token-TTL window should succeed; a non-OK \
+         status here means the auth-token refresh loop isn't running",
+    );
 }
