@@ -20,13 +20,33 @@
 //! the jobs surface (`jobs::encode_routed_id`), minus the `aisix-` prefix
 //! since video ids never round-trip into other request bodies.
 //!
-//! **Phase 1 provider coverage**: Alibaba DashScope (Wan), per
-//! <https://help.aliyun.com/zh/model-studio/text-to-video-api-reference>:
-//! submit `POST {api_base}/api/v1/services/aigc/video-generation/video-synthesis`
-//! with the mandatory `X-DashScope-Async: enable` header, poll
-//! `GET {api_base}/api/v1/tasks/{task_id}`. Other providers on these
-//! routes return 501 `not_implemented` (same convention as the
-//! embeddings handler's unsupported-provider branch).
+//! **Phase 1 provider coverage** (dispatch by the Model's open
+//! `provider` string, case-insensitive; any other provider returns 501
+//! `not_implemented` on submit, folded to 404 on the GET routes):
+//!
+//! | provider | submit | poll | contract source |
+//! |---|---|---|---|
+//! | `alibaba` | `POST {root}/api/v1/services/aigc/video-generation/video-synthesis` (`X-DashScope-Async: enable` mandatory) | `GET {root}/api/v1/tasks/{task_id}` | <https://help.aliyun.com/zh/model-studio/text-to-video-api-reference> |
+//! | `zhipuai` | `POST {root}/api/paas/v4/videos/generations` | `GET {root}/api/paas/v4/async-result/{id}` | <https://docs.bigmodel.cn/api-reference/%E6%A8%A1%E5%9E%8B-api/%E8%A7%86%E9%A2%91%E7%94%9F%E6%88%90%E5%BC%82%E6%AD%A5> |
+//! | `volcengine` | `POST {root}/api/v3/contents/generations/tasks` | `GET {root}/api/v3/contents/generations/tasks/{id}` | official Ark SDK (`volcengine-python-sdk`, `volcenginesdkarkruntime/resources/content_generation/tasks.py` + `types/content_generation/content_generation_task.py`; the vendor doc pages render client-side only) |
+//!
+//! Parameter mapping per provider (`seconds` / `size` from the unified
+//! request; anything a provider does not support is omitted, never
+//! guessed into a different parameter):
+//!
+//! | provider | `seconds` | `size` |
+//! |---|---|---|
+//! | `alibaba` | `parameters.duration` (int) | `parameters.size` `"W*H"` (early Wan families; wan2.7 tier fields are a tracked follow-up) |
+//! | `zhipuai` | `duration` (int) | `size` `"WxH"` verbatim (the provider documents the same `WIDTHxHEIGHT` spelling) |
+//! | `volcengine` | `duration` (int) | omitted — the provider expresses output dimensions as `resolution`/`ratio` quality tiers, which cannot represent an arbitrary `WIDTHxHEIGHT` without a lossy invented mapping |
+//!
+//! Status normalisation onto the unified four-value enum:
+//!
+//! | provider | queued | in_progress | completed | failed |
+//! |---|---|---|---|---|
+//! | `alibaba` | `PENDING` | `RUNNING` | `SUCCEEDED` | `FAILED` / `CANCELED` / `UNKNOWN` / other |
+//! | `zhipuai` | — (no queued state) | `PROCESSING` | `SUCCESS` | `FAIL` / other |
+//! | `volcengine` | `queued` | `running` | `succeeded` | `failed` / `cancelled` / `expired` / other |
 //!
 //! **Rate limiting**: submit enforces the model-level layers exactly like
 //! chat / embeddings. The two GET routes deliberately pass `None` for the
@@ -59,6 +79,17 @@ use crate::state::ProxyState;
 const DASHSCOPE_SUBMIT_PATH: &str = "/api/v1/services/aigc/video-generation/video-synthesis";
 /// DashScope async task poll path prefix.
 const DASHSCOPE_TASK_PATH: &str = "/api/v1/tasks";
+/// Zhipu BigModel async video-generation submit path. Source:
+/// <https://docs.bigmodel.cn/api-reference/%E6%A8%A1%E5%9E%8B-api/%E8%A7%86%E9%A2%91%E7%94%9F%E6%88%90%E5%BC%82%E6%AD%A5>.
+const ZHIPU_SUBMIT_PATH: &str = "/api/paas/v4/videos/generations";
+/// Zhipu BigModel async result poll path prefix (same doc).
+const ZHIPU_TASK_PATH: &str = "/api/paas/v4/async-result";
+/// Ark content-generation tasks path — submit POSTs it, poll GETs
+/// `{path}/{id}`. Source: official Ark SDK,
+/// `volcenginesdkarkruntime/resources/content_generation/tasks.py`
+/// (`self._post("/contents/generations/tasks", ...)` relative to the
+/// `…/api/v3` client base).
+const ARK_TASKS_PATH: &str = "/api/v3/contents/generations/tasks";
 
 // ─────────────────────────── id codec ───────────────────────────
 
@@ -112,6 +143,31 @@ fn map_task_status(task_status: &str) -> &'static str {
         "PENDING" => "queued",
         "RUNNING" => "in_progress",
         "SUCCEEDED" => "completed",
+        _ => "failed",
+    }
+}
+
+/// Map a Zhipu BigModel `task_status` onto the unified enum. The
+/// provider documents exactly three states — `PROCESSING` / `SUCCESS` /
+/// `FAIL` — with no distinct queued phase, so an accepted-but-unstarted
+/// task surfaces as `in_progress`.
+fn map_zhipu_status(task_status: &str) -> &'static str {
+    match task_status {
+        "PROCESSING" => "in_progress",
+        "SUCCESS" => "completed",
+        _ => "failed",
+    }
+}
+
+/// Map an Ark content-generation task `status` onto the unified enum.
+/// The SDK documents `queued` / `running` / `succeeded` / `failed` /
+/// `cancelled` (the task-list filter also admits `expired`); everything
+/// terminal-but-unsuccessful collapses to `failed`.
+fn map_ark_status(status: &str) -> &'static str {
+    match status {
+        "queued" => "queued",
+        "running" => "in_progress",
+        "succeeded" => "completed",
         _ => "failed",
     }
 }
@@ -197,41 +253,31 @@ struct VideoErrorObject {
     message: String,
 }
 
-/// DashScope response envelope (submit and poll share it).
-#[derive(Debug, Deserialize)]
-struct DashScopeResponse {
-    #[serde(default)]
-    output: Option<DashScopeOutput>,
-    #[serde(default)]
-    usage: Option<DashScopeUsage>,
-    /// Top-level error code/message on non-2xx responses.
-    #[serde(default)]
-    code: Option<String>,
-    #[serde(default)]
-    message: Option<String>,
+// ─────────────────── normalised provider task views ───────────────────
+
+/// A provider submit response reduced to what the unified surface needs.
+struct SubmitView {
+    task_id: String,
+    /// Already-normalised unified status.
+    status: &'static str,
 }
 
-#[derive(Debug, Deserialize)]
-struct DashScopeOutput {
-    #[serde(default)]
-    task_id: Option<String>,
-    #[serde(default)]
-    task_status: Option<String>,
-    #[serde(default)]
+/// A provider poll response reduced to what the unified surface needs.
+struct PollView {
+    /// Already-normalised unified status.
+    status: &'static str,
+    /// The downloadable video URL (set when the task succeeded and the
+    /// provider reports one).
     video_url: Option<String>,
-    /// Task-level failure detail (set when `task_status == "FAILED"`).
-    #[serde(default)]
-    code: Option<String>,
-    #[serde(default)]
-    message: Option<String>,
+    /// Generated duration in seconds, when the provider reports it.
+    seconds: Option<String>,
+    /// Failure detail, populated only when `status == "failed"`.
+    error_code: Option<String>,
+    error_message: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct DashScopeUsage {
-    #[serde(default)]
-    output_video_duration: Option<u64>,
-    #[serde(default)]
-    duration: Option<u64>,
+fn upstream_decode(msg: &str) -> ProxyError {
+    ProxyError::Bridge(aisix_gateway::BridgeError::UpstreamDecode(msg.to_string()))
 }
 
 // ─────────────────────── DashScope param mapping ───────────────────────
@@ -288,6 +334,308 @@ fn is_dim(s: &str) -> bool {
     !s.is_empty() && s.len() <= 5 && s.bytes().all(|b| b.is_ascii_digit())
 }
 
+/// Validate the unified `WIDTHxHEIGHT` shape without rewriting it —
+/// Zhipu documents the identical spelling (`"1920x1080"`, `"1280x720"`,
+/// …), so the value passes through verbatim once validated.
+fn require_wxh(size: &str) -> Result<&str, ProxyError> {
+    let valid = size
+        .split_once('x')
+        .is_some_and(|(w, h)| is_dim(w) && is_dim(h));
+    if !valid {
+        return Err(ProxyError::InvalidRequest(format!(
+            "`size` must be formatted as WIDTHxHEIGHT (e.g. \"1280x720\"), got {size:?}"
+        )));
+    }
+    Ok(size)
+}
+
+/// Build the Zhipu BigModel submit body: flat `{model, prompt}` plus
+/// optional `duration` (int seconds) and `size` (`WIDTHxHEIGHT`,
+/// verbatim — the provider documents the same spelling as the unified
+/// contract). Unset params are omitted.
+fn zhipu_submit_body(
+    upstream_model: &str,
+    prompt: &str,
+    seconds: Option<u64>,
+    size: Option<&str>,
+) -> Result<serde_json::Value, ProxyError> {
+    let mut body = serde_json::json!({
+        "model": upstream_model,
+        "prompt": prompt,
+    });
+    if let Some(secs) = seconds {
+        body["duration"] = serde_json::json!(secs);
+    }
+    if let Some(size) = size {
+        body["size"] = serde_json::json!(require_wxh(size)?);
+    }
+    Ok(body)
+}
+
+/// Build the Ark content-generation submit body: `{model, content:
+/// [{type: "text", text: prompt}]}` plus optional top-level `duration`
+/// (int seconds) — the exact field set of the official SDK's
+/// `tasks.create(model=…, content=…, duration=…, resolution=…, …)`.
+///
+/// `size` is deliberately NOT forwarded: the provider expresses output
+/// dimensions as `resolution` ("720p"/"1080p") + `ratio` ("16:9") tiers,
+/// which cannot represent an arbitrary `WIDTHxHEIGHT` without a lossy
+/// invented mapping (the same reasoning that keeps wan2.7 tier mapping a
+/// follow-up). The provider default applies; a debug line records the
+/// drop for operators.
+fn ark_submit_body(
+    upstream_model: &str,
+    prompt: &str,
+    seconds: Option<u64>,
+    size: Option<&str>,
+) -> Result<serde_json::Value, ProxyError> {
+    if let Some(size) = size {
+        // Still validate the shape so a malformed value fails fast and
+        // identically across providers.
+        require_wxh(size)?;
+        tracing::debug!(
+            size = %size,
+            "`size` is not forwarded to this provider (tier-based resolution/ratio \
+             fields only); provider default applies"
+        );
+    }
+    let mut body = serde_json::json!({
+        "model": upstream_model,
+        "content": [{ "type": "text", "text": prompt }],
+    });
+    if let Some(secs) = seconds {
+        body["duration"] = serde_json::json!(secs);
+    }
+    Ok(body)
+}
+
+// ─────────────────────── provider dispatch ───────────────────────
+
+/// The provider families the videos surface can drive. Dispatch is a
+/// plain match on the Model's open `provider` string — three adapters do
+/// not justify a trait registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VideoProvider {
+    /// Alibaba Model Studio / DashScope (Wan). Provider string `alibaba`.
+    Alibaba,
+    /// Zhipu BigModel (CogVideoX family). Provider string `zhipuai` —
+    /// the canonical vendor id the control-plane catalog uses.
+    Zhipu,
+    /// Volcengine Ark (Seedance family). Provider string `volcengine` —
+    /// the vendor's own name (the public model catalog carries no
+    /// canonical id for this vendor; the CP catalog entry is tracked
+    /// follow-up work).
+    Volcengine,
+}
+
+impl VideoProvider {
+    fn from_provider(provider: &str) -> Option<Self> {
+        if provider.eq_ignore_ascii_case("alibaba") {
+            Some(Self::Alibaba)
+        } else if provider.eq_ignore_ascii_case("zhipuai") {
+            Some(Self::Zhipu)
+        } else if provider.eq_ignore_ascii_case("volcengine") {
+            Some(Self::Volcengine)
+        } else {
+            None
+        }
+    }
+
+    /// The vendor host root for the native task endpoints, derived from
+    /// the ProviderKey `api_base`. Each vendor's OpenAI-compatible base
+    /// (what every chat example pre-fills) carries a version suffix that
+    /// must not be doubled into the task paths; strip ONE known suffix.
+    fn root(self, base: &str) -> &str {
+        let trimmed = base.trim_end_matches('/');
+        let suffixes: &[&str] = match self {
+            Self::Alibaba => &["/compatible-mode/v1", "/api/v1", "/v1"],
+            // The CP catalog pre-fills `https://open.bigmodel.cn/api/paas/v4`.
+            Self::Zhipu => &["/api/paas/v4"],
+            // The common Ark base is `https://ark.cn-beijing.volces.com/api/v3`.
+            Self::Volcengine => &["/api/v3"],
+        };
+        for suffix in suffixes {
+            if let Some(rest) = trimmed.strip_suffix(suffix) {
+                return rest.trim_end_matches('/');
+            }
+        }
+        trimmed
+    }
+
+    fn submit_url(self, base: &str) -> String {
+        let root = self.root(base);
+        match self {
+            Self::Alibaba => format!("{root}{DASHSCOPE_SUBMIT_PATH}"),
+            Self::Zhipu => format!("{root}{ZHIPU_SUBMIT_PATH}"),
+            Self::Volcengine => format!("{root}{ARK_TASKS_PATH}"),
+        }
+    }
+
+    fn poll_url(self, base: &str, task_id: &str) -> String {
+        let root = self.root(base);
+        match self {
+            Self::Alibaba => format!("{root}{DASHSCOPE_TASK_PATH}/{task_id}"),
+            Self::Zhipu => format!("{root}{ZHIPU_TASK_PATH}/{task_id}"),
+            Self::Volcengine => format!("{root}{ARK_TASKS_PATH}/{task_id}"),
+        }
+    }
+
+    fn submit_body(
+        self,
+        upstream_model: &str,
+        prompt: &str,
+        seconds: Option<u64>,
+        size: Option<&str>,
+    ) -> Result<serde_json::Value, ProxyError> {
+        match self {
+            Self::Alibaba => dashscope_submit_body(upstream_model, prompt, seconds, size),
+            Self::Zhipu => zhipu_submit_body(upstream_model, prompt, seconds, size),
+            Self::Volcengine => ark_submit_body(upstream_model, prompt, seconds, size),
+        }
+    }
+
+    /// DashScope alone requires the async-mode marker on submit
+    /// (omitting it rejects video-synthesis calls outright).
+    fn submit_headers_async(self) -> bool {
+        self == Self::Alibaba
+    }
+
+    /// Reduce a provider submit response to the task id + initial
+    /// unified status.
+    fn parse_submit(self, v: &serde_json::Value) -> Result<SubmitView, ProxyError> {
+        match self {
+            Self::Alibaba => {
+                let output = v
+                    .get("output")
+                    .ok_or_else(|| upstream_decode("submit response has no `output` object"))?;
+                let task_id = nonempty_str(output.get("task_id"))
+                    .ok_or_else(|| upstream_decode("submit response has no task id"))?;
+                let status = map_task_status(
+                    output
+                        .get("task_status")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("PENDING"),
+                );
+                Ok(SubmitView {
+                    task_id: task_id.to_string(),
+                    status,
+                })
+            }
+            Self::Zhipu => {
+                // `{model, id, request_id, task_status}` per the vendor doc.
+                let task_id = nonempty_str(v.get("id"))
+                    .ok_or_else(|| upstream_decode("submit response has no task id"))?;
+                let status = map_zhipu_status(
+                    v.get("task_status")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("PROCESSING"),
+                );
+                Ok(SubmitView {
+                    task_id: task_id.to_string(),
+                    status,
+                })
+            }
+            Self::Volcengine => {
+                // `ContentGenerationTaskID { id }` per the official SDK —
+                // the create response carries no status; a just-created
+                // task is queued.
+                let task_id = nonempty_str(v.get("id"))
+                    .ok_or_else(|| upstream_decode("submit response has no task id"))?;
+                Ok(SubmitView {
+                    task_id: task_id.to_string(),
+                    status: "queued",
+                })
+            }
+        }
+    }
+
+    /// Reduce a provider poll response to the unified task view.
+    fn parse_poll(self, v: &serde_json::Value) -> Result<PollView, ProxyError> {
+        match self {
+            Self::Alibaba => {
+                let output = v
+                    .get("output")
+                    .ok_or_else(|| upstream_decode("task response has no `output` object"))?;
+                let status = map_task_status(
+                    output
+                        .get("task_status")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("UNKNOWN"),
+                );
+                let seconds = v
+                    .get("usage")
+                    .and_then(|u| u.get("output_video_duration").or_else(|| u.get("duration")))
+                    .and_then(|d| d.as_u64())
+                    .map(|d| d.to_string());
+                Ok(PollView {
+                    status,
+                    video_url: nonempty_str(output.get("video_url")).map(str::to_string),
+                    seconds,
+                    error_code: nonempty_str(output.get("code")).map(str::to_string),
+                    error_message: nonempty_str(output.get("message")).map(str::to_string),
+                })
+            }
+            Self::Zhipu => {
+                // `{task_status, video_result: [{url, cover_image_url}]}`
+                // per the vendor doc; no per-task failure detail is
+                // documented, so a failed task carries the generic error.
+                let status = map_zhipu_status(
+                    v.get("task_status")
+                        .and_then(|s| s.as_str())
+                        .ok_or_else(|| upstream_decode("task response has no `task_status`"))?,
+                );
+                let video_url = v
+                    .get("video_result")
+                    .and_then(|r| r.as_array())
+                    .and_then(|arr| arr.first())
+                    .and_then(|first| nonempty_str(first.get("url")))
+                    .map(str::to_string);
+                Ok(PollView {
+                    status,
+                    video_url,
+                    seconds: None,
+                    error_code: None,
+                    error_message: None,
+                })
+            }
+            Self::Volcengine => {
+                // `ContentGenerationTask { status, content.video_url,
+                // error {code, message}, duration, … }` per the official SDK.
+                let status = map_ark_status(
+                    v.get("status")
+                        .and_then(|s| s.as_str())
+                        .ok_or_else(|| upstream_decode("task response has no `status`"))?,
+                );
+                let seconds = v
+                    .get("duration")
+                    .and_then(|d| d.as_u64())
+                    .map(|d| d.to_string());
+                Ok(PollView {
+                    status,
+                    video_url: v
+                        .get("content")
+                        .and_then(|c| nonempty_str(c.get("video_url")))
+                        .map(str::to_string),
+                    seconds,
+                    error_code: v
+                        .get("error")
+                        .and_then(|e| nonempty_str(e.get("code")))
+                        .map(str::to_string),
+                    error_message: v
+                        .get("error")
+                        .and_then(|e| nonempty_str(e.get("message")))
+                        .map(str::to_string),
+                })
+            }
+        }
+    }
+}
+
+/// A non-empty string field, if present.
+fn nonempty_str(v: Option<&serde_json::Value>) -> Option<&str> {
+    v.and_then(|v| v.as_str()).filter(|s| !s.is_empty())
+}
+
 // ─────────────────────── resolved dispatch target ───────────────────────
 
 /// Everything the three handlers need after resolving a Model for the
@@ -295,6 +643,7 @@ fn is_dim(s: &str) -> bool {
 struct VideoTarget {
     model_entry: std::sync::Arc<aisix_core::ResourceEntry<aisix_core::Model>>,
     pk_id: String,
+    provider: VideoProvider,
     provider_label: String,
     base_url: String,
     secret: String,
@@ -325,25 +674,27 @@ fn resolve_video_target(
     crate::dispatch::check_ip_access(&model_entry.value, source_ip)?;
 
     let provider = crate::dispatch::require_provider(&model_entry.value)?.to_string();
-    // Phase 1 covers DashScope only; other providers get a typed 501 so
-    // callers can tell "wrong provider" from "wrong request". Zhipu and
-    // Volcano mappings are tracked follow-ups on the same surface.
-    if !provider.eq_ignore_ascii_case("alibaba") {
+    // Providers outside the mapped set get a typed 501 so callers can
+    // tell "wrong provider" from "wrong request" (folded to 404 on the
+    // GET routes by resolve_get_target). MiniMax (Files-API fetch
+    // indirection) is the tracked Phase 2 follow-up.
+    let Some(video_provider) = VideoProvider::from_provider(&provider) else {
         let env = ErrorEnvelope::new(
             format!("provider {provider:?} is not yet supported on /v1/videos"),
             "not_implemented",
         );
         return Ok(Err((StatusCode::NOT_IMPLEMENTED, Json(env)).into_response()));
-    }
+    };
 
     let pk_entry = crate::dispatch::resolve_provider_key(&snapshot, &model_entry.value)?;
-    // There is no built-in default api_base for the `alibaba` vendor —
-    // the ProviderKey must carry it (regional DashScope endpoints).
+    // None of the mapped vendors has a built-in default api_base — the
+    // ProviderKey must carry the regional endpoint.
     let base_url = crate::dispatch::resolve_base_url(&pk_entry.value)?;
     let secret = crate::dispatch::require_api_key(&pk_entry.value, &model_entry.value)?.to_string();
 
     Ok(Ok(VideoTarget {
         pk_id: pk_entry.id.to_string(),
+        provider: video_provider,
         provider_label: provider.to_ascii_lowercase(),
         base_url,
         secret,
@@ -353,47 +704,33 @@ fn resolve_video_target(
 
 // ─────────────────────── upstream plumbing ───────────────────────
 
-/// The DashScope host root for the native task endpoints. Operators
-/// routinely configure alibaba ProviderKeys with the OpenAI-compatible
-/// base (`…/compatible-mode/v1`) or a versioned root (`…/api/v1`,
-/// `…/v1`) because that is what every chat-endpoint example uses;
-/// naively appending `/api/v1/services/…` to those produces an opaque
-/// upstream 404. Strip ONE known suffix (most specific first) so both
-/// conventions reach the same native root.
-fn dashscope_root(base: &str) -> &str {
-    let trimmed = base.trim_end_matches('/');
-    for suffix in ["/compatible-mode/v1", "/api/v1", "/v1"] {
-        if let Some(rest) = trimmed.strip_suffix(suffix) {
-            return rest.trim_end_matches('/');
-        }
-    }
-    trimmed
-}
-
-/// One DashScope HTTP round-trip: Bearer auth, optional async-submit
-/// header, the model's E2E timeout, cooldown accounting on transport
-/// failures (parity with jobs / passthrough, #701). Non-2xx responses
-/// map to `BridgeError::UpstreamStatus` carrying the upstream `message`
-/// (4xx pass through the standard envelope; 5xx bodies are redacted by
-/// the shared renderer in error.rs).
-async fn dashscope_call(
+/// One provider HTTP round-trip: Bearer auth (all three vendors),
+/// provider-specific submit headers, the model's E2E timeout, cooldown
+/// accounting on transport failures (parity with jobs / passthrough,
+/// #701). Non-2xx responses map to `BridgeError::UpstreamStatus`
+/// carrying the upstream `message` (4xx pass through the standard
+/// envelope; 5xx bodies are redacted by the shared renderer in
+/// error.rs).
+async fn provider_call(
     state: &ProxyState,
     target: &VideoTarget,
     method: reqwest::Method,
     url: &str,
     body: Option<&serde_json::Value>,
     request_id: &str,
-) -> Result<DashScopeResponse, ProxyError> {
+) -> Result<serde_json::Value, ProxyError> {
     let client = crate::http_client::client();
     let mut builder = client
         .request(method, url)
         .header(header::AUTHORIZATION, format!("Bearer {}", target.secret))
         .header("x-aisix-request-id", request_id);
     if let Some(b) = body {
-        // The submit endpoint requires the async-mode header — DashScope
-        // rejects synchronous video-synthesis calls outright.
+        if target.provider.submit_headers_async() {
+            // DashScope requires the async-mode header — it rejects
+            // synchronous video-synthesis calls outright.
+            builder = builder.header("X-DashScope-Async", "enable");
+        }
         builder = builder
-            .header("X-DashScope-Async", "enable")
             .header(header::CONTENT_TYPE, "application/json")
             .json(b);
     }
@@ -423,15 +760,26 @@ async fn dashscope_call(
         .map_err(ProxyError::Bridge)?;
 
     if !(200..300).contains(&status) {
-        // Best-effort parse of the DashScope `{code, message}` error
-        // envelope; fall back to a generic marker for non-JSON bodies.
-        let parsed: Option<DashScopeResponse> = serde_json::from_slice(&bytes).ok();
+        // Best-effort parse of the vendor error envelope: DashScope puts
+        // `{code, message}` at the top level; the other vendors nest an
+        // OpenAI-style `{error: {code, message}}`. Try both, fall back
+        // to a generic marker for non-JSON bodies.
+        let parsed: Option<serde_json::Value> = serde_json::from_slice(&bytes).ok();
         let message = parsed
-            .and_then(|p| match (p.code, p.message) {
-                (Some(code), Some(msg)) => Some(format!("{code}: {msg}")),
-                (None, Some(msg)) => Some(msg),
-                (Some(code), None) => Some(code),
-                (None, None) => None,
+            .and_then(|p| {
+                let scope = if p.get("error").is_some() {
+                    p.get("error").cloned().unwrap_or_default()
+                } else {
+                    p
+                };
+                let code = nonempty_str(scope.get("code")).map(str::to_string);
+                let msg = nonempty_str(scope.get("message")).map(str::to_string);
+                match (code, msg) {
+                    (Some(code), Some(msg)) => Some(format!("{code}: {msg}")),
+                    (None, Some(msg)) => Some(msg),
+                    (Some(code), None) => Some(code),
+                    (None, None) => None,
+                }
             })
             .unwrap_or_else(|| "upstream error".to_string());
         return Err(note(aisix_gateway::BridgeError::upstream_status(status, message)).into());
@@ -444,64 +792,45 @@ async fn dashscope_call(
     })
 }
 
-/// Poll the DashScope task for a decoded video id. Shared by the two GET
-/// routes. Charset-guards the decoded (attacker-suppliable) task id
-/// before interpolating it into the upstream URL.
+/// Poll the provider task for a decoded video id and reduce it to the
+/// unified view. Shared by the two GET routes. Charset-guards the
+/// decoded (attacker-suppliable) task id before interpolating it into
+/// the upstream URL.
 async fn poll_task(
     state: &ProxyState,
     target: &VideoTarget,
     task_id: &str,
     request_id: &str,
-) -> Result<DashScopeResponse, ProxyError> {
+) -> Result<PollView, ProxyError> {
     crate::jobs::require_safe_upstream_id(task_id)?;
-    let url = format!(
-        "{}{}/{}",
-        dashscope_root(&target.base_url),
-        DASHSCOPE_TASK_PATH,
-        task_id
-    );
-    dashscope_call(state, target, reqwest::Method::GET, &url, None, request_id).await
+    let url = target.provider.poll_url(&target.base_url, task_id);
+    let v = provider_call(state, target, reqwest::Method::GET, &url, None, request_id).await?;
+    target.provider.parse_poll(&v)
 }
 
-/// Build the poll-shaped [`VideoObject`] from a DashScope task response.
-fn video_object_from_poll(
-    video_id: &str,
-    model: &str,
-    resp: &DashScopeResponse,
-) -> Result<VideoObject, ProxyError> {
-    let output = resp.output.as_ref().ok_or_else(|| {
-        ProxyError::Bridge(aisix_gateway::BridgeError::UpstreamDecode(
-            "task response has no `output` object".into(),
-        ))
-    })?;
-    let task_status = output.task_status.as_deref().unwrap_or("UNKNOWN");
-    let status = map_task_status(task_status);
-    let seconds = resp
-        .usage
-        .as_ref()
-        .and_then(|u| u.output_video_duration.or(u.duration))
-        .map(|d| d.to_string());
-    let error = (status == "failed").then(|| VideoErrorObject {
-        code: output
-            .code
+/// Build the poll-shaped [`VideoObject`] from the unified task view.
+fn video_object_from_poll(video_id: &str, model: &str, poll: &PollView) -> VideoObject {
+    let error = (poll.status == "failed").then(|| VideoErrorObject {
+        code: poll
+            .error_code
             .clone()
             .unwrap_or_else(|| "video_generation_failed".into()),
-        message: output
-            .message
+        message: poll
+            .error_message
             .clone()
             .unwrap_or_else(|| "video generation failed".into()),
     });
-    Ok(VideoObject {
+    VideoObject {
         id: video_id.to_string(),
         object: "video",
         model: model.to_string(),
-        status,
-        progress: if status == "completed" { 100 } else { 0 },
+        status: poll.status,
+        progress: if poll.status == "completed" { 100 } else { 0 },
         created_at: 0,
-        seconds,
+        seconds: poll.seconds.clone(),
         size: None,
         error,
-    })
+    }
 }
 
 // ─────────────────────── shared handler tail ───────────────────────
@@ -744,15 +1073,15 @@ async fn dispatch_create(
 
     let upstream_model =
         crate::dispatch::require_upstream_model(&target.model_entry.value)?.to_string();
-    let submit_body =
-        dashscope_submit_body(&upstream_model, &body.prompt, seconds, body.size.as_deref())?;
-    let url = format!(
-        "{}{}",
-        dashscope_root(&target.base_url),
-        DASHSCOPE_SUBMIT_PATH
-    );
+    let submit_body = target.provider.submit_body(
+        &upstream_model,
+        &body.prompt,
+        seconds,
+        body.size.as_deref(),
+    )?;
+    let url = target.provider.submit_url(&target.base_url);
 
-    let result = dashscope_call(
+    let result = provider_call(
         state,
         &target,
         reqwest::Method::POST,
@@ -769,34 +1098,20 @@ async fn dispatch_create(
     state.health.record_success(&body.model);
     state.runtime_status.mark_healthy(&target.model_entry.id);
 
-    let output = resp.output.as_ref().ok_or_else(|| {
-        ProxyError::Bridge(aisix_gateway::BridgeError::UpstreamDecode(
-            "submit response has no `output` object".into(),
-        ))
-    })?;
-    let task_id = output
-        .task_id
-        .as_deref()
-        .filter(|t| !t.is_empty())
-        .ok_or_else(|| {
-            ProxyError::Bridge(aisix_gateway::BridgeError::UpstreamDecode(
-                "submit response has no task id".into(),
-            ))
-        })?;
-    let status = map_task_status(output.task_status.as_deref().unwrap_or("PENDING"));
+    let submit = target.provider.parse_submit(&resp)?;
 
     let created_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     let video = VideoObject {
-        id: encode_video_id(&target.model_entry.id, &body.model, task_id),
+        id: encode_video_id(&target.model_entry.id, &body.model, &submit.task_id),
         object: "video",
         // Echo the caller's requested model name, like every other
         // typed endpoint (wildcard aliases included).
         model: body.model.clone(),
-        status,
-        progress: if status == "completed" { 100 } else { 0 },
+        status: submit.status,
+        progress: if submit.status == "completed" { 100 } else { 0 },
         created_at,
         seconds: seconds.map(|s| s.to_string()),
         size: body.size.clone(),
@@ -878,8 +1193,8 @@ pub async fn get_video(
         let reservation = crate::quota::enforce(&state, &auth, None).await?;
         let result = poll_task(&state, &target, &task_id, &client.request_id).await;
         reservation.commit_tokens(0).await;
-        let resp = result?;
-        let video = video_object_from_poll(&video_id, target.display_name(), &resp)?;
+        let poll = result?;
+        let video = video_object_from_poll(&video_id, target.display_name(), &poll);
         Ok((
             Json(video).into_response(),
             target.provider_label.clone(),
@@ -925,21 +1240,15 @@ pub async fn video_content(
         let reservation = crate::quota::enforce(&state, &auth, None).await?;
         let result = poll_task(&state, &target, &task_id, &client.request_id).await;
         reservation.commit_tokens(0).await;
-        let resp = result?;
+        let poll = result?;
 
-        let output = resp.output.as_ref().ok_or_else(|| {
-            ProxyError::Bridge(aisix_gateway::BridgeError::UpstreamDecode(
-                "task response has no `output` object".into(),
-            ))
-        })?;
-        let task_status = output.task_status.as_deref().unwrap_or("UNKNOWN");
-        let response = match map_task_status(task_status) {
+        let response = match poll.status {
             // Phase 1 fetches by 302 redirect to the provider's own URL —
             // zero relay bandwidth (AISIX-Cloud#1118 decision 5). A
             // streaming proxy for providers whose URLs need gateway
             // credentials is a tracked follow-up.
             "completed" => {
-                let video_url = output.video_url.as_deref().ok_or_else(|| {
+                let video_url = poll.video_url.as_deref().ok_or_else(|| {
                     ProxyError::Bridge(aisix_gateway::BridgeError::UpstreamDecode(
                         "completed task has no video URL".into(),
                     ))
@@ -969,10 +1278,10 @@ pub async fn video_content(
                 resp
             }
             "failed" => {
-                let detail = output
-                    .message
+                let detail = poll
+                    .error_message
                     .clone()
-                    .or_else(|| output.code.clone())
+                    .or_else(|| poll.error_code.clone())
                     .unwrap_or_else(|| "video generation failed".into());
                 return Err(ProxyError::InvalidRequest(format!(
                     "video generation failed: {detail}"
@@ -1169,34 +1478,129 @@ mod tests {
     }
 
     #[test]
-    fn dashscope_root_strips_known_api_base_suffixes() {
-        // The OpenAI-compatible base operators paste from chat examples.
+    fn provider_roots_strip_known_api_base_suffixes() {
+        use VideoProvider::*;
+        // DashScope: the OpenAI-compatible base operators paste from
+        // chat examples, plus native versioned roots.
         assert_eq!(
-            dashscope_root("https://dashscope.aliyuncs.com/compatible-mode/v1"),
+            Alibaba.root("https://dashscope.aliyuncs.com/compatible-mode/v1"),
             "https://dashscope.aliyuncs.com"
         );
         assert_eq!(
-            dashscope_root("https://dashscope.aliyuncs.com/compatible-mode/v1/"),
-            "https://dashscope.aliyuncs.com"
-        );
-        // Native versioned roots.
-        assert_eq!(
-            dashscope_root("https://dashscope.aliyuncs.com/api/v1"),
+            Alibaba.root("https://dashscope.aliyuncs.com/compatible-mode/v1/"),
             "https://dashscope.aliyuncs.com"
         );
         assert_eq!(
-            dashscope_root("https://dashscope.aliyuncs.com/v1"),
+            Alibaba.root("https://dashscope.aliyuncs.com/api/v1"),
+            "https://dashscope.aliyuncs.com"
+        );
+        assert_eq!(
+            Alibaba.root("https://dashscope.aliyuncs.com/v1"),
             "https://dashscope.aliyuncs.com"
         );
         // Bare host is untouched; only ONE suffix is stripped.
         assert_eq!(
-            dashscope_root("https://dashscope.aliyuncs.com"),
+            Alibaba.root("https://dashscope.aliyuncs.com"),
             "https://dashscope.aliyuncs.com"
         );
         assert_eq!(
-            dashscope_root("https://host/api/v1/api/v1"),
+            Alibaba.root("https://host/api/v1/api/v1"),
             "https://host/api/v1"
         );
+
+        // Zhipu: the CP catalog pre-fills the /api/paas/v4 base.
+        assert_eq!(
+            Zhipu.root("https://open.bigmodel.cn/api/paas/v4"),
+            "https://open.bigmodel.cn"
+        );
+        assert_eq!(
+            Zhipu.root("https://open.bigmodel.cn/api/paas/v4/"),
+            "https://open.bigmodel.cn"
+        );
+        assert_eq!(
+            Zhipu.root("https://open.bigmodel.cn"),
+            "https://open.bigmodel.cn"
+        );
+
+        // Ark: the common base carries /api/v3.
+        assert_eq!(
+            Volcengine.root("https://ark.cn-beijing.volces.com/api/v3"),
+            "https://ark.cn-beijing.volces.com"
+        );
+        assert_eq!(
+            Volcengine.root("https://ark.cn-beijing.volces.com"),
+            "https://ark.cn-beijing.volces.com"
+        );
+    }
+
+    #[test]
+    fn provider_urls_compose_root_and_documented_paths() {
+        use VideoProvider::*;
+        assert_eq!(
+            Zhipu.submit_url("https://open.bigmodel.cn/api/paas/v4"),
+            "https://open.bigmodel.cn/api/paas/v4/videos/generations"
+        );
+        assert_eq!(
+            Zhipu.poll_url("https://open.bigmodel.cn/api/paas/v4", "t-1"),
+            "https://open.bigmodel.cn/api/paas/v4/async-result/t-1"
+        );
+        assert_eq!(
+            Volcengine.submit_url("https://ark.cn-beijing.volces.com/api/v3"),
+            "https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks"
+        );
+        assert_eq!(
+            Volcengine.poll_url("https://ark.cn-beijing.volces.com/api/v3", "cgt-1"),
+            "https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks/cgt-1"
+        );
+    }
+
+    #[test]
+    fn zhipu_status_mapping_table() {
+        assert_eq!(map_zhipu_status("PROCESSING"), "in_progress");
+        assert_eq!(map_zhipu_status("SUCCESS"), "completed");
+        assert_eq!(map_zhipu_status("FAIL"), "failed");
+        assert_eq!(map_zhipu_status("SOMETHING_NEW"), "failed");
+    }
+
+    #[test]
+    fn ark_status_mapping_table() {
+        assert_eq!(map_ark_status("queued"), "queued");
+        assert_eq!(map_ark_status("running"), "in_progress");
+        assert_eq!(map_ark_status("succeeded"), "completed");
+        assert_eq!(map_ark_status("failed"), "failed");
+        assert_eq!(map_ark_status("cancelled"), "failed");
+        assert_eq!(map_ark_status("expired"), "failed");
+    }
+
+    #[test]
+    fn zhipu_submit_body_maps_duration_and_size_verbatim() {
+        let body = zhipu_submit_body("cogvideox-3", "a cat", Some(10), Some("1920x1080")).unwrap();
+        assert_eq!(body["model"], "cogvideox-3");
+        assert_eq!(body["prompt"], "a cat");
+        assert_eq!(body["duration"], 10);
+        // The provider documents the unified WIDTHxHEIGHT spelling — no rewrite.
+        assert_eq!(body["size"], "1920x1080");
+
+        let body = zhipu_submit_body("cogvideox-3", "a cat", None, None).unwrap();
+        assert!(body.get("duration").is_none());
+        assert!(body.get("size").is_none());
+    }
+
+    #[test]
+    fn ark_submit_body_maps_duration_and_drops_size() {
+        let body = ark_submit_body("seedance-pro", "a cat", Some(5), Some("1280x720")).unwrap();
+        assert_eq!(body["model"], "seedance-pro");
+        assert_eq!(body["content"][0]["type"], "text");
+        assert_eq!(body["content"][0]["text"], "a cat");
+        assert_eq!(body["duration"], 5);
+        // No explicit-dimension field exists upstream — `size` must not
+        // be forwarded under any invented name.
+        assert!(body.get("size").is_none());
+        assert!(body.get("resolution").is_none());
+        assert!(body.get("ratio").is_none());
+
+        // A malformed size still fails fast, identically across providers.
+        assert!(ark_submit_body("seedance-pro", "a cat", None, Some("bogus")).is_err());
     }
 
     #[test]
@@ -1524,7 +1928,7 @@ mod tests {
 
     #[tokio::test]
     async fn unsupported_provider_returns_501_not_implemented() {
-        let app = build_app(new_snap("http://unused", "zhipu", ""));
+        let app = build_app(new_snap("http://unused", "minimax", ""));
         let resp = tower::ServiceExt::oneshot(
             app,
             post_videos(serde_json::json!({"model": "my-video", "prompt": "hi"})),
@@ -1687,7 +2091,7 @@ mod tests {
     async fn get_error_paths_record_unresolved_metric_label_not_the_raw_id() {
         // A known entry UUID with a non-alibaba provider: pre-fix this
         // hit the unsupported-provider branch and recorded the raw id.
-        let snap = new_snap("http://unused", "zhipu", "");
+        let snap = new_snap("http://unused", "minimax", "");
         let hub = Arc::new(Hub::new());
         let handle = SnapshotHandle::new(snap);
         let state = crate::ProxyState::new(handle, hub, &cfg()).without_cache();
@@ -1987,5 +2391,244 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
         let v = body_json(resp).await;
         assert_eq!(v["error"]["code"], "ip_restricted");
+    }
+
+    // ───────────────────── Zhipu (CogVideoX) journey ─────────────────────
+
+    /// Zhipu happy path: submit maps `{model, prompt, duration, size}`
+    /// onto the vendor's flat envelope (doc: BigModel async video
+    /// generation API); poll maps `SUCCESS` + `video_result[0].url`;
+    /// content 302s to that URL.
+    #[tokio::test]
+    async fn zhipu_submit_poll_content_journey() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(ZHIPU_SUBMIT_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "wan-upstream",
+                "id": "zp-task-1",
+                "request_id": "req-zp-1",
+                "task_status": "PROCESSING"
+            })))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("{ZHIPU_TASK_PATH}/zp-task-1")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "wan-upstream",
+                "request_id": "req-zp-2",
+                "task_status": "SUCCESS",
+                "video_result": [{
+                    "url": "https://cdn.example.com/cogvideo.mp4",
+                    "cover_image_url": "https://cdn.example.com/cover.png"
+                }]
+            })))
+            .mount(&upstream)
+            .await;
+
+        let app = build_app(new_snap(&upstream.uri(), "zhipuai", ""));
+        let created = tower::ServiceExt::oneshot(
+            app.clone(),
+            post_videos(serde_json::json!({
+                "model": "my-video",
+                "prompt": "a cat",
+                "seconds": 10,
+                "size": "1920x1080"
+            })),
+        )
+        .await
+        .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+        let v = body_json(created).await;
+        assert_eq!(v["object"], "video");
+        // The vendor has no distinct queued state — an accepted task is
+        // PROCESSING, which normalises to in_progress.
+        assert_eq!(v["status"], "in_progress");
+        assert_eq!(v["model"], "my-video");
+        let id = v["id"].as_str().unwrap().to_string();
+        assert_eq!(
+            decode_video_id(&id),
+            Some((
+                MODEL_ID.to_string(),
+                "my-video".to_string(),
+                "zp-task-1".to_string()
+            ))
+        );
+
+        // Wire shape: flat body, duration int, size verbatim, Bearer auth.
+        let received = upstream.received_requests().await.unwrap();
+        let sub = &received[0];
+        let wire: serde_json::Value = serde_json::from_slice(&sub.body).unwrap();
+        assert_eq!(wire["model"], "wan-upstream");
+        assert_eq!(wire["prompt"], "a cat");
+        assert_eq!(wire["duration"], 10);
+        assert_eq!(wire["size"], "1920x1080");
+        // No DashScope-only header bleeds across providers.
+        assert!(!sub.headers.contains_key("x-dashscope-async"));
+
+        let poll = tower::ServiceExt::oneshot(app.clone(), get_uri(&format!("/v1/videos/{id}")))
+            .await
+            .unwrap();
+        assert_eq!(poll.status(), StatusCode::OK);
+        let polled = body_json(poll).await;
+        assert_eq!(polled["status"], "completed");
+        assert_eq!(polled["progress"], 100);
+
+        let content = tower::ServiceExt::oneshot(app, get_uri(&format!("/v1/videos/{id}/content")))
+            .await
+            .unwrap();
+        assert_eq!(content.status(), StatusCode::FOUND);
+        assert_eq!(
+            content.headers().get(header::LOCATION).unwrap(),
+            "https://cdn.example.com/cogvideo.mp4"
+        );
+    }
+
+    // ──────────────────── Ark (Seedance) journey ────────────────────
+
+    /// Ark happy path: submit maps onto `{model, content: [{type:
+    /// "text", text}], duration}` (official SDK `tasks.create`); the
+    /// create response carries only the task id (→ queued); poll maps
+    /// `succeeded` + `content.video_url` + top-level `duration`;
+    /// content 302s to the URL.
+    #[tokio::test]
+    async fn ark_submit_poll_content_journey() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(ARK_TASKS_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cgt-2026-0001"
+            })))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("{ARK_TASKS_PATH}/cgt-2026-0001")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cgt-2026-0001",
+                "model": "wan-upstream",
+                "status": "succeeded",
+                "content": {
+                    "video_url": "https://cdn.example.com/seedance.mp4"
+                },
+                "usage": { "completion_tokens": 108900 },
+                "duration": 5,
+                "resolution": "720p",
+                "ratio": "16:9",
+                "created_at": 1770000000,
+                "updated_at": 1770000060
+            })))
+            .mount(&upstream)
+            .await;
+
+        let app = build_app(new_snap(&upstream.uri(), "volcengine", ""));
+        let created = tower::ServiceExt::oneshot(
+            app.clone(),
+            post_videos(serde_json::json!({
+                "model": "my-video",
+                "prompt": "a robot dances",
+                "seconds": "5",
+                "size": "1280x720"
+            })),
+        )
+        .await
+        .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+        let v = body_json(created).await;
+        assert_eq!(v["object"], "video");
+        // The create response has no status — a just-created task is queued.
+        assert_eq!(v["status"], "queued");
+        let id = v["id"].as_str().unwrap().to_string();
+
+        // Wire shape: content array with the text prompt, duration int,
+        // and NO size under any name (tier fields are provider-side
+        // defaults; forwarding an invented mapping is worse than the
+        // provider default).
+        let received = upstream.received_requests().await.unwrap();
+        let sub = &received[0];
+        let wire: serde_json::Value = serde_json::from_slice(&sub.body).unwrap();
+        assert_eq!(wire["model"], "wan-upstream");
+        assert_eq!(wire["content"][0]["type"], "text");
+        assert_eq!(wire["content"][0]["text"], "a robot dances");
+        assert_eq!(wire["duration"], 5);
+        assert!(wire.get("size").is_none());
+        assert!(wire.get("resolution").is_none());
+        assert!(!sub.headers.contains_key("x-dashscope-async"));
+
+        let poll = tower::ServiceExt::oneshot(app.clone(), get_uri(&format!("/v1/videos/{id}")))
+            .await
+            .unwrap();
+        assert_eq!(poll.status(), StatusCode::OK);
+        let polled = body_json(poll).await;
+        assert_eq!(polled["status"], "completed");
+        assert_eq!(polled["seconds"], "5");
+
+        let content = tower::ServiceExt::oneshot(app, get_uri(&format!("/v1/videos/{id}/content")))
+            .await
+            .unwrap();
+        assert_eq!(content.status(), StatusCode::FOUND);
+        assert_eq!(
+            content.headers().get(header::LOCATION).unwrap(),
+            "https://cdn.example.com/seedance.mp4"
+        );
+    }
+
+    /// A failed Ark task surfaces the SDK-documented `error {code,
+    /// message}` through the unified error object on poll.
+    #[tokio::test]
+    async fn ark_failed_task_carries_error_object() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("{ARK_TASKS_PATH}/cgt-bad")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cgt-bad",
+                "status": "failed",
+                "error": {
+                    "code": "OutputVideoSensitiveContentDetected",
+                    "message": "The request failed because the output video may contain sensitive information."
+                }
+            })))
+            .mount(&upstream)
+            .await;
+
+        let app = build_app(new_snap(&upstream.uri(), "volcengine", ""));
+        let id = encode_video_id(MODEL_ID, "my-video", "cgt-bad");
+        let resp = tower::ServiceExt::oneshot(app, get_uri(&format!("/v1/videos/{id}")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v["status"], "failed");
+        assert_eq!(v["error"]["code"], "OutputVideoSensitiveContentDetected");
+    }
+
+    /// A Zhipu-style nested `{error: {code, message}}` on a non-2xx
+    /// submit passes through the standard 4xx envelope (the DashScope
+    /// top-level shape is covered by upstream_4xx_maps_to_error_envelope).
+    #[tokio::test]
+    async fn zhipu_nested_error_envelope_maps_to_4xx_message() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(ZHIPU_SUBMIT_PATH))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": { "code": "1210", "message": "model parameter invalid" }
+            })))
+            .mount(&upstream)
+            .await;
+
+        let app = build_app(new_snap(&upstream.uri(), "zhipuai", ""));
+        let resp = tower::ServiceExt::oneshot(
+            app,
+            post_videos(serde_json::json!({"model": "my-video", "prompt": "hi"})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let v = body_json(resp).await;
+        assert!(v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("model parameter invalid"));
     }
 }
