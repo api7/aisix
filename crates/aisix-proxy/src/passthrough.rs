@@ -512,14 +512,16 @@ async fn dispatch(
             }
 
             async move {
+                // See audio.rs: an elapsed `timeout` must surface as
+                // `BridgeError::Timeout`, not as a generic transport fault,
+                // so the retry budget can tell the two apart.
+                let send_started = std::time::Instant::now();
                 let upstream_resp = builder.send().await.map_err(|e| {
                     crate::cooldown::note_failure(
                         tracker,
                         model_id,
                         cooldown_cfg,
-                        aisix_gateway::BridgeError::Transport(
-                            aisix_gateway::transport_error_message(&e),
-                        ),
+                        crate::dispatch::reqwest_error_to_bridge(&e, send_started),
                     )
                 })?;
 

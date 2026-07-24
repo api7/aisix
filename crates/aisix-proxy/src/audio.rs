@@ -636,14 +636,20 @@ async fn multipart_dispatch(
                 req = req.timeout(d);
             }
             async move {
+                // `reqwest_error_to_bridge`, not a bare `Transport`: an
+                // elapsed `timeout` has to surface as `BridgeError::Timeout`
+                // or it is indistinguishable from a connection fault. That
+                // distinction now decides whether the default retry budget
+                // is spent on it (`RetryBudget::covers`) — classifying a
+                // timeout as transport made the model's own timeout get
+                // retried, turning a 400ms budget into ~2s.
+                let send_started = Instant::now();
                 let resp = req.send().await.map_err(|e| {
                     crate::cooldown::note_failure(
                         tracker,
                         model_id,
                         cooldown_cfg,
-                        aisix_gateway::BridgeError::Transport(
-                            aisix_gateway::transport_error_message(&e),
-                        ),
+                        crate::dispatch::reqwest_error_to_bridge(&e, send_started),
                     )
                 })?;
 
@@ -1008,14 +1014,20 @@ async fn speech_dispatch(
                 req = req.timeout(d);
             }
             async move {
+                // `reqwest_error_to_bridge`, not a bare `Transport`: an
+                // elapsed `timeout` has to surface as `BridgeError::Timeout`
+                // or it is indistinguishable from a connection fault. That
+                // distinction now decides whether the default retry budget
+                // is spent on it (`RetryBudget::covers`) — classifying a
+                // timeout as transport made the model's own timeout get
+                // retried, turning a 400ms budget into ~2s.
+                let send_started = Instant::now();
                 let resp = req.send().await.map_err(|e| {
                     crate::cooldown::note_failure(
                         tracker,
                         model_id,
                         cooldown_cfg,
-                        aisix_gateway::BridgeError::Transport(
-                            aisix_gateway::transport_error_message(&e),
-                        ),
+                        crate::dispatch::reqwest_error_to_bridge(&e, send_started),
                     )
                 })?;
 
