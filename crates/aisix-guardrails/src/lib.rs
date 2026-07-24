@@ -109,28 +109,32 @@ pub(crate) async fn read_body_capped(resp: &mut reqwest::Response, cap: usize) -
 
 /// The text a guardrail should scan for one message.
 ///
-/// Prefers the flat `content` string; when it's empty, falls back to
-/// concatenating the `text`-type entries of `content_blocks`. A caller
-/// that sends the OpenAI content-block shape
-/// (`content: [{ "type": "text", "text": "…" }]`) with an empty
-/// top-level string would otherwise bypass moderation entirely (#465).
+/// Scans the UNION of the flat `content` string and the `text`-type
+/// entries of `content_blocks`. Both are independent wire fields, and the
+/// provider bridges forward `content_blocks` upstream when it is present,
+/// so scanning only one lets a caller hide a payload in the other: benign
+/// `content` plus a real payload in `content_blocks` (or the round-trip
+/// shape with empty `content` and the text in `content_blocks`, #465)
+/// would otherwise slip past every guardrail. Scanning the union keeps
+/// the scanned text a superset of everything a bridge can forward.
 /// Non-text blocks (image/audio) are out of scope — multimodal
 /// moderation is a separate feature. Every guardrail's input/output
 /// collector goes through this so the families can't drift.
 pub(crate) fn message_scan_text(m: &ChatMessage) -> String {
+    let mut parts: Vec<&str> = Vec::new();
     let content = m.content_str();
     if !content.is_empty() {
-        return content.to_string();
+        parts.push(content);
     }
-    match m.content_blocks.as_ref() {
-        Some(blocks) => blocks
-            .iter()
-            .filter(|b| b.get("type").and_then(serde_json::Value::as_str) == Some("text"))
-            .filter_map(|b| b.get("text").and_then(serde_json::Value::as_str))
-            .collect::<Vec<_>>()
-            .join("\n"),
-        None => String::new(),
+    if let Some(blocks) = m.content_blocks.as_ref() {
+        parts.extend(
+            blocks
+                .iter()
+                .filter(|b| b.get("type").and_then(serde_json::Value::as_str) == Some("text"))
+                .filter_map(|b| b.get("text").and_then(serde_json::Value::as_str)),
+        );
     }
+    parts.join("\n")
 }
 
 /// The guardrail `kind` discriminators compiled into this binary.
@@ -698,6 +702,27 @@ mod tests {
         let empty: ChatMessage =
             serde_json::from_value(serde_json::json!({"role": "user", "content": ""})).unwrap();
         assert_eq!(message_scan_text(&empty), "");
+    }
+
+    #[test]
+    fn message_scan_text_scans_content_blocks_even_when_flat_content_is_nonempty() {
+        // Guardrail bypass: `content` and `content_blocks` are independent
+        // wire fields, and the provider bridges forward `content_blocks`
+        // when present. A caller that puts benign text in `content` and a
+        // payload in `content_blocks` would slip the payload past a scan
+        // that only reads `content`. The scanned text must be the UNION so
+        // it is a superset of everything a bridge can forward upstream.
+        let split: ChatMessage = serde_json::from_value(serde_json::json!({
+            "role": "user",
+            "content": "benign cover text",
+            "content_blocks": [{"type": "text", "text": "hidden payload"}]
+        }))
+        .unwrap();
+        let scanned = message_scan_text(&split);
+        assert!(
+            scanned.contains("benign cover text") && scanned.contains("hidden payload"),
+            "scan must cover both content and content_blocks, got {scanned:?}"
+        );
     }
 
     struct DefaultPolicyGuardrail;

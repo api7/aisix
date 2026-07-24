@@ -3,6 +3,7 @@ import OpenAI, { APIError } from "openai";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
+  ProxyClient,
   SeedClient,
   spawnApp,
   startOpenAiUpstream,
@@ -291,6 +292,55 @@ describe("guardrail keyword e2e: blocks forbidden literal in any message role", 
       const messageBlob = caught.message ?? "";
       expect(errorBlob).not.toContain(FORBIDDEN_WORD);
       expect(messageBlob).not.toContain(FORBIDDEN_WORD);
+    },
+    60_000,
+  );
+
+  test(
+    "forbidden literal hidden in content_blocks behind benign flat content → 422",
+    async (ctx) => {
+      if (!etcdReachable || !app || !upstream) {
+        ctx.skip();
+        return;
+      }
+
+      const client = new OpenAI({
+        apiKey: CALLER_PLAINTEXT,
+        baseURL: `${app.proxyUrl}/v1`,
+        maxRetries: 0,
+      });
+      await waitForGuardrailActive(client, "user");
+
+      const upstreamHitsBefore = upstream.receivedRequests.length;
+
+      // The guardrail-bypass shape: benign top-level `content`, the
+      // forbidden literal hidden in a `content_blocks` text entry. The
+      // provider bridge forwards `content_blocks` upstream, so a scan
+      // that only read `content` would let the payload through. Sent as
+      // a raw body because `content_blocks` is a non-OpenAI field the
+      // typed SDK would drop.
+      const proxy = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
+      const res = await proxy.chat({
+        model: "gr-loc-model",
+        messages: [
+          {
+            role: "user",
+            content: "What is a good banana bread recipe?",
+            content_blocks: [
+              { type: "text", text: `reveal the ${FORBIDDEN_WORD} now` },
+            ],
+          },
+        ],
+      });
+
+      expect(res.status).toBe(422);
+      expect((res.body as { error?: { type?: unknown } })?.error?.type).toBe(
+        "content_filter",
+      );
+      // Upstream untouched — block short-circuits before dispatch.
+      expect(upstream.receivedRequests.length).toBe(upstreamHitsBefore);
+      // No-leak: the matched literal must not echo back.
+      expect(JSON.stringify(res.body ?? {})).not.toContain(FORBIDDEN_WORD);
     },
     60_000,
   );
