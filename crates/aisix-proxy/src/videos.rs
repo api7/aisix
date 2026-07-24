@@ -432,7 +432,12 @@ impl VideoProvider {
     fn from_provider(provider: &str) -> Option<Self> {
         if provider.eq_ignore_ascii_case("alibaba") {
             Some(Self::Alibaba)
-        } else if provider.eq_ignore_ascii_case("zhipuai") {
+        } else if provider.eq_ignore_ascii_case("zhipuai")
+            // `zhipuai` is the catalog-canonical id; accept the common
+            // short spelling too so an operator-typed `zhipu` Model
+            // doesn't 501 on the one surface that dispatches by vendor.
+            || provider.eq_ignore_ascii_case("zhipu")
+        {
             Some(Self::Zhipu)
         } else if provider.eq_ignore_ascii_case("volcengine") {
             Some(Self::Volcengine)
@@ -562,10 +567,17 @@ impl VideoProvider {
                         .and_then(|s| s.as_str())
                         .unwrap_or("UNKNOWN"),
                 );
+                // Per-field `as_u64` so a present-but-null
+                // `output_video_duration` still falls back to `duration`
+                // (a bare `.get(..).or_else(..)` would see `Some(Null)`
+                // and never try the fallback key).
                 let seconds = v
                     .get("usage")
-                    .and_then(|u| u.get("output_video_duration").or_else(|| u.get("duration")))
-                    .and_then(|d| d.as_u64())
+                    .and_then(|u| {
+                        u.get("output_video_duration")
+                            .and_then(|d| d.as_u64())
+                            .or_else(|| u.get("duration").and_then(|d| d.as_u64()))
+                    })
                     .map(|d| d.to_string());
                 Ok(PollView {
                     status,
@@ -2601,6 +2613,34 @@ mod tests {
         let v = body_json(resp).await;
         assert_eq!(v["status"], "failed");
         assert_eq!(v["error"]["code"], "OutputVideoSensitiveContentDetected");
+    }
+
+    /// A Zhipu `FAIL` poll yields `status: "failed"` with the generic
+    /// gateway error object — the vendor's task payload carries no
+    /// per-task failure detail (its `VideoObject` has no error fields),
+    /// so the documented behavior is the `video_generation_failed`
+    /// fallback code.
+    #[tokio::test]
+    async fn zhipu_fail_status_yields_generic_error_object() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("{ZHIPU_TASK_PATH}/zt-bad")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "zt-bad",
+                "task_status": "FAIL"
+            })))
+            .mount(&upstream)
+            .await;
+
+        let app = build_app(new_snap(&upstream.uri(), "zhipuai", ""));
+        let id = encode_video_id(MODEL_ID, "my-video", "zt-bad");
+        let resp = tower::ServiceExt::oneshot(app, get_uri(&format!("/v1/videos/{id}")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v["status"], "failed");
+        assert_eq!(v["error"]["code"], "video_generation_failed");
     }
 
     /// A Zhipu-style nested `{error: {code, message}}` on a non-2xx
