@@ -1419,8 +1419,12 @@ async fn responses_to_target(
                 );
             },
         );
-        let mut response =
-            axum::response::Response::new(axum::body::Body::from_stream(Box::pin(parsed_stream)));
+        let mut response = axum::response::Response::new(axum::body::Body::from_stream(
+            crate::sse_keepalive::with_heartbeat(
+                Box::pin(parsed_stream),
+                crate::sse_keepalive::interval(),
+            ),
+        ));
         apply_passthrough_headers(&mut response, &headers, request_id);
 
         Ok(ResponseDispatchSuccess {

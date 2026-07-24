@@ -46,6 +46,10 @@ rcgen.workspace = true
 uuid.workspace = true
 hostname.workspace = true
 x509-parser = "0.16"
+# Only for the hyper connection builder `axum_server::Server::http_builder()`
+# hands back — where `downstream.idle_timeout_secs` is applied. Same 0.1.x
+# axum-server itself depends on, so the builder types unify.
+hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
 
 [dev-dependencies]
 tempfile = "3"

@@ -67,6 +67,11 @@ pub struct Config {
     /// see [`UpstreamConfig`].
     #[serde(default)]
     pub upstream: UpstreamConfig,
+    /// Connection-layer tuning for the inbound side: how long an idle
+    /// client connection is held, and how often a stalled SSE response
+    /// emits a heartbeat — see [`DownstreamConfig`].
+    #[serde(default)]
+    pub downstream: DownstreamConfig,
     /// Optional managed-mode configuration. When `managed.enabled = true`
     /// the admin API and Playground endpoints are **not** bound — the DP
     /// is a pure etcd reader driven by the aisix.cloud control plane.
@@ -811,6 +816,48 @@ impl Default for UpstreamConfig {
     }
 }
 
+/// Connection-layer settings for the inbound side — the client (or the
+/// gateway in front of this one) talking to the proxy and admin listeners.
+///
+/// The mirror image of [`UpstreamConfig`]: that one governs the pool the
+/// gateway *dials out* with, this one governs the connections it *accepts*.
+/// Both matter in a multi-hop chain, where the rule is that every node's
+/// client-side idle timeout must stay below the next node's server-side one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct DownstreamConfig {
+    /// How long an accepted connection may sit idle — response fully
+    /// written, no next request started — before the gateway closes it.
+    /// Applies to both listeners, and to HTTP/1.1 only.
+    ///
+    /// `0` (the default) never closes an idle connection, leaving that to
+    /// the peer. That default is deliberate: a gateway in front of this one
+    /// pools its own connections (Envoy's upstream idle default is an hour),
+    /// and closing first is exactly what hands *it* a stale connection. Set
+    /// this **above** the pool idle timeout of whatever sits in front, and
+    /// only when idle connections need reclaiming.
+    ///
+    /// An in-flight request is never interrupted, however long it runs: the
+    /// timer only arms once the connection is between requests.
+    pub idle_timeout_secs: u64,
+    /// Interval between SSE heartbeat comments (`:\n\n`) sent on a
+    /// streaming response while the upstream produces nothing.
+    ///
+    /// Keeps a proxy between the client and the gateway from treating a
+    /// model that is slow to its first token as an abandoned connection.
+    /// `0` disables the heartbeat.
+    pub sse_keepalive_interval_secs: u64,
+}
+
+impl Default for DownstreamConfig {
+    fn default() -> Self {
+        Self {
+            idle_timeout_secs: 0,
+            sse_keepalive_interval_secs: 15,
+        }
+    }
+}
+
 impl Config {
     /// Load + merge + validate.
     ///
@@ -1343,6 +1390,49 @@ upstream:
         assert_eq!(cfg.upstream.pool_max_idle_per_host, Some(16));
         // Unspecified knobs keep their defaults.
         assert_eq!(cfg.upstream.tcp_keepalive_interval_secs, 30);
+    }
+
+    /// The inbound side defaults to today's behaviour: idle connections are
+    /// held until the peer closes them (closing first is what hands the
+    /// node in front a stale connection), and SSE responses heartbeat every
+    /// 15s (AISIX-Cloud#1126).
+    #[test]
+    fn downstream_defaults_hold_idle_connections_and_keep_the_sse_heartbeat() {
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://localhost:2379"]
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+"#,
+        );
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert_eq!(cfg.downstream.idle_timeout_secs, 0);
+        assert_eq!(cfg.downstream.sse_keepalive_interval_secs, 15);
+    }
+
+    #[test]
+    fn downstream_block_overrides_individual_knobs() {
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://localhost:2379"]
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+downstream:
+  idle_timeout_secs: 90
+"#,
+        );
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert_eq!(cfg.downstream.idle_timeout_secs, 90);
+        // Unspecified knobs keep their defaults.
+        assert_eq!(cfg.downstream.sse_keepalive_interval_secs, 15);
     }
 
     #[test]

@@ -184,6 +184,29 @@ upstream:
   # Cap on idle connections kept per upstream host. Unset = unbounded.
   # pool_max_idle_per_host: 32
 
+# Connection-layer settings for the inbound side — the clients, or the
+# gateway in front of this one, talking to the listeners above. The
+# mirror image of `upstream:`.
+downstream:
+  # How long an accepted connection may sit idle — response written, no
+  # next request started — before the gateway closes it. HTTP/1.1 only.
+  # An in-flight request or SSE stream is never interrupted, however long
+  # it runs; the timer only arms between requests.
+  #
+  # 0 (the default) never closes an idle connection and leaves that to
+  # the peer. Whatever sits in front pools its own connections, and
+  # closing first is what hands *it* a connection it thinks is still
+  # usable — the same failure this gateway avoids upstream by keeping
+  # pool_idle_timeout_secs low. If you set this, keep it ABOVE the pool
+  # idle timeout of the node in front.
+  idle_timeout_secs: 0
+
+  # Interval between SSE heartbeat comments (":\n\n") sent while a
+  # streaming response has produced nothing. Keeps a proxy in front from
+  # treating a model that is slow to its first token as an abandoned
+  # connection. 0 disables the heartbeat.
+  # sse_keepalive_interval_secs: 15
+
 # Models, API keys, provider keys, guardrails, cache policies, and
 # observability exporters are NOT defined in this file. They are stored
 # in etcd and managed via the Admin API (see docs/api-admin.md). This

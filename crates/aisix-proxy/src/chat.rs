@@ -1768,8 +1768,10 @@ async fn dispatch(
                 drop(in_flight_hold);
             },
         );
-        let response =
-            Sse::new(sse_stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)));
+        let mut response = Sse::new(sse_stream);
+        if let Some(d) = crate::sse_keepalive::interval() {
+            response = response.keep_alive(KeepAlive::new().interval(d));
+        }
         return Ok(Success {
             response: response.into_response(),
             provider: provider.to_ascii_lowercase(),
@@ -3118,8 +3120,10 @@ async fn dispatch_ensemble(
                 drop(judge_concurrency_hold);
             },
         );
-        let response =
-            Sse::new(sse_stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)));
+        let mut response = Sse::new(sse_stream);
+        if let Some(d) = crate::sse_keepalive::interval() {
+            response = response.keep_alive(KeepAlive::new().interval(d));
+        }
         return Ok(Success {
             response: response.into_response(),
             // No single provider/model/key governs an ensemble response.
