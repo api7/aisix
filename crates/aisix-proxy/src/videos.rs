@@ -1266,11 +1266,14 @@ async fn proxy_content(
     let content_type = resp.headers().get(header::CONTENT_TYPE).cloned();
     let content_length = resp.headers().get(header::CONTENT_LENGTH).cloned();
 
+    // `in_request_span` so each `poll_next` re-enters the handler's request
+    // span: without it the per-chunk read-timeout warnings lose their
+    // request-id correlation, unlike every other streaming path in the crate
+    // (chat / messages / responses / responses_bridge all wrap the same way).
     let wrapped: std::pin::Pin<
         Box<dyn futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>,
-    > = Box::pin(crate::stream_timeout::with_read_timeout_bytes(
-        resp.bytes_stream(),
-        stream_budget,
+    > = Box::pin(crate::request_id::in_request_span(
+        crate::stream_timeout::with_read_timeout_bytes(resp.bytes_stream(), stream_budget),
     ));
     let mut response = Response::new(axum::body::Body::from_stream(wrapped));
     let headers = response.headers_mut();
