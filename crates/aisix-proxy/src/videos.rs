@@ -9,8 +9,13 @@
 //!    job object (`object: "video"`, `status: "queued"`).
 //! 2. `GET /v1/videos/:id` — poll the job. Statuses normalise to the
 //!    four-value enum `queued` / `in_progress` / `completed` / `failed`.
-//! 3. `GET /v1/videos/:id/content` — 302 redirect to the provider's
-//!    video URL once the task has succeeded.
+//! 3. `GET /v1/videos/:id/content` — deliver the finished video once the
+//!    task has succeeded, per the provider's content mode: `Redirect` (302
+//!    to the provider's signed, credential-free URL — Alibaba / Zhipu /
+//!    Volcengine / Runway) or `Proxy` (the gateway streams the bytes from
+//!    the provider's authenticated content endpoint with the provider
+//!    credential injected — OpenAI Sora), constant-memory, never buffering
+//!    the whole file.
 //!
 //! **Stateless task addressing**: the gateway persists nothing. The
 //! caller-visible id is `base64url_nopad("<model_entry_id>:<upstream_task_id>")`
@@ -30,6 +35,7 @@
 //! | `zhipuai` | `POST {root}/api/paas/v4/videos/generations` | `GET {root}/api/paas/v4/async-result/{id}` | <https://docs.bigmodel.cn/api-reference/%E6%A8%A1%E5%9E%8B-api/%E8%A7%86%E9%A2%91%E7%94%9F%E6%88%90%E5%BC%82%E6%AD%A5> |
 //! | `volcengine` | `POST {root}/api/v3/contents/generations/tasks` | `GET {root}/api/v3/contents/generations/tasks/{id}` | official Ark SDK (`volcengine-python-sdk`, `volcenginesdkarkruntime/resources/content_generation/tasks.py` + `types/content_generation/content_generation_task.py`; the vendor doc pages render client-side only) |
 //! | `runwayml` | `POST {root}/v1/text_to_video` (`X-Runway-Version` header mandatory on submit AND poll) | `GET {root}/v1/tasks/{id}` | official `runwayml` SDK (`sdk-python` `resources/text_to_video.py`, `resources/tasks.py`, `types/task_retrieve_response.py`) + <https://docs.dev.runwayml.com/api-details/versions/2024-11-06/> |
+//! | `openai` | `POST {base}/v1/videos` (bearer; `base` defaults to `https://api.openai.com`) | `GET {base}/v1/videos/{id}` | official `openai-python` SDK (`resources/videos.py`, `types/video.py`, `types/video_create_params.py`) + <https://developers.openai.com/api/reference/resources/videos/> |
 //!
 //! Parameter mapping per provider (`seconds` / `size` from the unified
 //! request; anything a provider does not support is omitted, never
@@ -41,6 +47,7 @@
 //! | `zhipuai` | `duration` (int) | `size` `"WxH"` verbatim (the provider documents the same `WIDTHxHEIGHT` spelling) |
 //! | `volcengine` | `duration` (int) | omitted — the provider expresses output dimensions as `resolution`/`ratio` quality tiers, which cannot represent an arbitrary `WIDTHxHEIGHT` without a lossy invented mapping |
 //! | `runwayml` | `duration` (int) | `ratio` `"WIDTH:HEIGHT"` — the 2024-11-06 API expresses the output resolution as a `WIDTH:HEIGHT` string (a per-model enum of pixel resolutions, e.g. `"1280:720"`), so the unified `WIDTHxHEIGHT` maps losslessly by swapping the separator (mirrors the DashScope `x`→`*` treatment); the provider validates the value against its per-model enum |
+//! | `openai` | `seconds` (string enum `"4"`/`"8"`/`"12"`) | `size` `"WIDTHxHEIGHT"` verbatim — the inbound surface is already OpenAI-shaped, so this is a near-identity mapping; the provider validates the concrete resolution enum |
 //!
 //! Status normalisation onto the unified four-value enum:
 //!
@@ -50,6 +57,7 @@
 //! | `zhipuai` | — (no queued state) | `PROCESSING` | `SUCCESS` | `FAIL` / other |
 //! | `volcengine` | `queued` | `running` | `succeeded` | `failed` / `cancelled` / `expired` / other |
 //! | `runwayml` | `PENDING` / `THROTTLED` | `RUNNING` | `SUCCEEDED` | `FAILED` / `CANCELLED` / other |
+//! | `openai` | `queued` | `in_progress` | `completed` | `failed` / other (1:1 — the SDK already types these four) |
 //!
 //! **Rate limiting**: submit enforces the model-level layers exactly like
 //! chat / embeddings. The two GET routes deliberately pass `None` for the
@@ -109,6 +117,13 @@ const RUNWAY_TASK_PATH: &str = "/v1/tasks";
 /// and <https://docs.dev.runwayml.com/api-details/versions/2024-11-06/>.
 const RUNWAY_VERSION_HEADER: &str = "X-Runway-Version";
 const RUNWAY_VERSION_VALUE: &str = "2024-11-06";
+/// OpenAI Sora videos base path (version-independent — `build_v1_url` owns
+/// the `/v1` prefix). Submit POSTs it, poll GETs `{path}/{id}`, content
+/// GETs `{path}/{id}/content`. Source: official `openai-python` SDK,
+/// `resources/videos.py` (`self._post("/videos", …)`,
+/// `self._get("/videos/{video_id}", …)`,
+/// `self._get("/videos/{video_id}/content", …)`).
+const OPENAI_VIDEOS_PATH: &str = "/videos";
 
 // ─────────────────────────── id codec ───────────────────────────
 
@@ -202,6 +217,20 @@ fn map_runway_status(status: &str) -> &'static str {
         "PENDING" | "THROTTLED" => "queued",
         "RUNNING" => "in_progress",
         "SUCCEEDED" => "completed",
+        _ => "failed",
+    }
+}
+
+/// Map an OpenAI Sora video job `status` onto the unified enum. The SDK
+/// (`openai-python` `types/video.py`) already types `status` as exactly the
+/// four unified values — `queued` / `in_progress` / `completed` / `failed` —
+/// so this is an identity map that additionally collapses any unrecognised
+/// string to `failed` rather than leaking a novel state through the surface.
+fn map_openai_status(status: &str) -> &'static str {
+    match status {
+        "queued" => "queued",
+        "in_progress" => "in_progress",
+        "completed" => "completed",
         _ => "failed",
     }
 }
@@ -305,6 +334,10 @@ struct PollView {
     video_url: Option<String>,
     /// Generated duration in seconds, when the provider reports it.
     seconds: Option<String>,
+    /// Real completion percentage (0–100), when the provider reports a
+    /// granular value (Sora). `None` for providers that expose no progress —
+    /// those fall back to the binary 0/100 derived from `status`.
+    progress: Option<u32>,
     /// Failure detail, populated only when `status == "failed"`.
     error_code: Option<String>,
     error_message: Option<String>,
@@ -481,6 +514,37 @@ fn runway_submit_body(
     Ok(body)
 }
 
+/// Build the OpenAI Sora submit body: `{model, prompt}` plus optional
+/// `seconds` (rendered as the string enum `"4"`/`"8"`/`"12"` the create
+/// param types) and `size` (`WIDTHxHEIGHT`, verbatim). The inbound surface
+/// is already OpenAI-shaped, so this is a near-identity mapping — the only
+/// transform is rendering the normalised integer `seconds` back to a string.
+/// Field names/values pinned against the official `openai-python` SDK
+/// (`types/video_create_params.py`: `model` = `sora-2` / `sora-2-pro`,
+/// `prompt`, `seconds` = `Literal["4","8","12"]`, `size` = the
+/// `WIDTHxHEIGHT` resolution enum). Unset params are omitted; `size` shape
+/// is validated by the shared `require_wxh` so a malformed value 400s before
+/// the provider is contacted, while the provider validates the concrete
+/// resolution enum.
+fn openai_submit_body(
+    upstream_model: &str,
+    prompt: &str,
+    seconds: Option<u64>,
+    size: Option<&str>,
+) -> Result<serde_json::Value, ProxyError> {
+    let mut body = serde_json::json!({
+        "model": upstream_model,
+        "prompt": prompt,
+    });
+    if let Some(secs) = seconds {
+        body["seconds"] = serde_json::json!(secs.to_string());
+    }
+    if let Some(size) = size {
+        body["size"] = serde_json::json!(require_wxh(size)?);
+    }
+    Ok(body)
+}
+
 // ─────────────────────── provider dispatch ───────────────────────
 
 /// The provider families the videos surface can drive. Dispatch is a
@@ -505,6 +569,15 @@ enum VideoProvider {
     /// array of signed, self-authenticating URLs, a clean fit for the 302
     /// content route.
     Runway,
+    /// OpenAI Sora (`sora-2` / `sora-2-pro`). Provider string `openai`.
+    /// First `Proxy`-delivery consumer: the finished video is fetched from
+    /// `GET {base}/videos/{id}/content` with the provider credential (the
+    /// job object carries no downloadable URL), so the gateway streams the
+    /// bytes back rather than 302-redirecting. Also the first video provider
+    /// WITH a built-in default base (`https://api.openai.com`, the same the
+    /// chat path uses) — an openai video Model with no `api_base` falls back
+    /// to it, unlike the other four (`api_base` required).
+    Openai,
 }
 
 impl VideoProvider {
@@ -526,6 +599,8 @@ impl VideoProvider {
             || provider.eq_ignore_ascii_case("runway")
         {
             Some(Self::Runway)
+        } else if provider.eq_ignore_ascii_case("openai") {
+            Some(Self::Openai)
         } else {
             None
         }
@@ -548,6 +623,10 @@ impl VideoProvider {
             // endpoint paths, not the base — so there is no version suffix
             // to strip (no stripper invented per the PR brief).
             Self::Runway => &[],
+            // OpenAI composes its URLs via `build_v1_url` (which owns the
+            // `/v1` prefix and tolerates both the bare-host and `…/v1`
+            // conventions), so `root` is never consulted for it.
+            Self::Openai => &[],
         };
         for suffix in suffixes {
             if let Some(rest) = trimmed.strip_suffix(suffix) {
@@ -558,22 +637,33 @@ impl VideoProvider {
     }
 
     fn submit_url(self, base: &str) -> String {
+        // OpenAI uses the version-independent `/videos` path under the
+        // shared `build_v1_url` normalizer; the other four compose the
+        // vendor's versioned path onto the stripped host root.
+        if self == Self::Openai {
+            return crate::dispatch::build_v1_url(base, OPENAI_VIDEOS_PATH);
+        }
         let root = self.root(base);
         match self {
             Self::Alibaba => format!("{root}{DASHSCOPE_SUBMIT_PATH}"),
             Self::Zhipu => format!("{root}{ZHIPU_SUBMIT_PATH}"),
             Self::Volcengine => format!("{root}{ARK_TASKS_PATH}"),
             Self::Runway => format!("{root}{RUNWAY_SUBMIT_PATH}"),
+            Self::Openai => unreachable!("handled above"),
         }
     }
 
     fn poll_url(self, base: &str, task_id: &str) -> String {
+        if self == Self::Openai {
+            return crate::dispatch::build_v1_url(base, &format!("{OPENAI_VIDEOS_PATH}/{task_id}"));
+        }
         let root = self.root(base);
         match self {
             Self::Alibaba => format!("{root}{DASHSCOPE_TASK_PATH}/{task_id}"),
             Self::Zhipu => format!("{root}{ZHIPU_TASK_PATH}/{task_id}"),
             Self::Volcengine => format!("{root}{ARK_TASKS_PATH}/{task_id}"),
             Self::Runway => format!("{root}{RUNWAY_TASK_PATH}/{task_id}"),
+            Self::Openai => unreachable!("handled above"),
         }
     }
 
@@ -589,6 +679,7 @@ impl VideoProvider {
             Self::Zhipu => zhipu_submit_body(upstream_model, prompt, seconds, size),
             Self::Volcengine => ark_submit_body(upstream_model, prompt, seconds, size),
             Self::Runway => runway_submit_body(upstream_model, prompt, seconds, size),
+            Self::Openai => openai_submit_body(upstream_model, prompt, seconds, size),
         }
     }
 
@@ -667,6 +758,20 @@ impl VideoProvider {
                     status: "queued",
                 })
             }
+            Self::Openai => {
+                // The OpenAI video job object `{id, status, progress, …}`
+                // (`openai-python` `types/video.py`) — a real `status` rides
+                // the create response (unlike Ark/Runway), so map it through
+                // rather than assuming `queued`.
+                let task_id = nonempty_str(v.get("id"))
+                    .ok_or_else(|| upstream_decode("submit response has no task id"))?;
+                let status =
+                    map_openai_status(v.get("status").and_then(|s| s.as_str()).unwrap_or("queued"));
+                Ok(SubmitView {
+                    task_id: task_id.to_string(),
+                    status,
+                })
+            }
         }
     }
 
@@ -699,6 +804,7 @@ impl VideoProvider {
                     status,
                     video_url: nonempty_str(output.get("video_url")).map(str::to_string),
                     seconds,
+                    progress: None,
                     error_code: nonempty_str(output.get("code")).map(str::to_string),
                     error_message: nonempty_str(output.get("message")).map(str::to_string),
                 })
@@ -722,6 +828,7 @@ impl VideoProvider {
                     status,
                     video_url,
                     seconds: None,
+                    progress: None,
                     error_code: None,
                     error_message: None,
                 })
@@ -745,6 +852,7 @@ impl VideoProvider {
                         .and_then(|c| nonempty_str(c.get("video_url")))
                         .map(str::to_string),
                     seconds,
+                    progress: None,
                     error_code: v
                         .get("error")
                         .and_then(|e| nonempty_str(e.get("code")))
@@ -779,17 +887,131 @@ impl VideoProvider {
                     status,
                     video_url,
                     seconds: None,
+                    progress: None,
                     error_code: nonempty_str(v.get("failureCode")).map(str::to_string),
                     error_message: nonempty_str(v.get("failure")).map(str::to_string),
                 })
+            }
+            Self::Openai => {
+                // `Video { status, progress, seconds, error {code, message} }`
+                // per the SDK (`openai-python` `types/video.py`). The job
+                // object carries NO downloadable URL — the finished bytes come
+                // from the separate `…/content` endpoint (Proxy delivery), so
+                // `video_url` stays None. `progress` is a real 0–100 percentage
+                // and is passed through (the other providers report only a
+                // binary 0/100 derived from status). `seconds` is a string on
+                // the wire.
+                let status = map_openai_status(
+                    v.get("status")
+                        .and_then(|s| s.as_str())
+                        .ok_or_else(|| upstream_decode("task response has no `status`"))?,
+                );
+                let progress = v
+                    .get("progress")
+                    .and_then(|p| p.as_u64())
+                    .map(|p| p.min(100) as u32);
+                Ok(PollView {
+                    status,
+                    video_url: None,
+                    seconds: nonempty_str(v.get("seconds")).map(str::to_string),
+                    progress,
+                    error_code: v
+                        .get("error")
+                        .and_then(|e| nonempty_str(e.get("code")))
+                        .map(str::to_string),
+                    error_message: v
+                        .get("error")
+                        .and_then(|e| nonempty_str(e.get("message")))
+                        .map(str::to_string),
+                })
+            }
+        }
+    }
+
+    /// Decide how the content route delivers a **completed** task's video.
+    ///
+    /// - Signed-URL providers (Alibaba / Zhipu / Volcengine / Runway) return
+    ///   [`ContentDelivery::Redirect`] carrying the poll-surfaced public URL —
+    ///   the existing zero-bandwidth 302 path.
+    /// - Proxy-delivery providers (OpenAI Sora; later Google-direct / Vertex
+    ///   Veo, Azure Sora) return [`ContentDelivery::Proxy`] carrying the
+    ///   provider's authenticated content endpoint. The job object exposes no
+    ///   downloadable URL, so the gateway must fetch the bytes itself with the
+    ///   provider credential and stream them back.
+    ///
+    /// The task id is charset-guarded before it is interpolated into the new
+    /// content-proxy URL (the same guard `poll_task` applies before the poll
+    /// URL) so an attacker-suppliable decoded id can never smuggle path
+    /// segments into the upstream request.
+    fn content_delivery(
+        self,
+        base: &str,
+        task_id: &str,
+        poll: &PollView,
+    ) -> Result<ContentDelivery, ProxyError> {
+        match self {
+            Self::Openai => {
+                crate::jobs::require_safe_upstream_id(task_id)?;
+                Ok(ContentDelivery::Proxy {
+                    url: crate::dispatch::build_v1_url(
+                        base,
+                        &format!("{OPENAI_VIDEOS_PATH}/{task_id}/content"),
+                    ),
+                })
+            }
+            _ => {
+                let video_url = poll.video_url.as_deref().ok_or_else(|| {
+                    ProxyError::Bridge(aisix_gateway::BridgeError::UpstreamDecode(
+                        "completed task has no video URL".into(),
+                    ))
+                })?;
+                Ok(ContentDelivery::Redirect(video_url.to_string()))
             }
         }
     }
 }
 
+/// How the content route delivers a completed task's finished video.
+enum ContentDelivery {
+    /// 302 to a signed, credential-free provider URL (existing path).
+    Redirect(String),
+    /// Gateway-mediated download: GET the provider's authenticated content
+    /// endpoint with the provider credential and stream the bytes back to the
+    /// caller with constant memory. The credential never reaches the client.
+    Proxy { url: String },
+}
+
 /// A non-empty string field, if present.
 fn nonempty_str(v: Option<&serde_json::Value>) -> Option<&str> {
     v.and_then(|v| v.as_str()).filter(|s| !s.is_empty())
+}
+
+/// Best-effort extraction of a vendor error envelope's message from a
+/// non-2xx upstream body. DashScope puts `{code, message}` at the top level;
+/// the OpenAI-style vendors nest `{error: {code, message}}`. Falls back to a
+/// generic marker for non-JSON or fieldless bodies so a typed error is always
+/// producible. Shared by the JSON task calls ([`provider_call`]) and the
+/// content-proxy path ([`proxy_content`]) — both must map a non-2xx upstream
+/// to a typed error rather than surfacing the raw body.
+fn parse_provider_error_message(bytes: &[u8]) -> String {
+    let parsed: Option<serde_json::Value> = serde_json::from_slice(bytes).ok();
+    parsed
+        .and_then(|p| {
+            let scope = if p.get("error").is_some() {
+                p.get("error").cloned().unwrap_or_default()
+            } else {
+                p
+            };
+            let code = nonempty_str(scope.get("code")).map(str::to_string);
+            let msg = nonempty_str(scope.get("message")).map(str::to_string);
+            match (code, msg) {
+                (Some(code), Some(msg)) => Some(format!("{code}: {msg}")),
+                (None, Some(msg)) => Some(msg),
+                (Some(code), None) => Some(code),
+                (None, None) => None,
+            }
+        })
+        .unwrap_or_else(|| "upstream error".to_string())
 }
 
 // ─────────────────────── resolved dispatch target ───────────────────────
@@ -843,9 +1065,18 @@ fn resolve_video_target(
     };
 
     let pk_entry = crate::dispatch::resolve_provider_key(&snapshot, &model_entry.value)?;
-    // None of the mapped vendors has a built-in default api_base — the
-    // ProviderKey must carry the regional endpoint.
-    let base_url = crate::dispatch::resolve_base_url(&pk_entry.value)?;
+    // Of the mapped vendors only OpenAI has a built-in default api_base (the
+    // same one the chat path uses) — an openai video Model with no `api_base`
+    // falls back to it. The other four express regional endpoints, so their
+    // ProviderKey must carry `api_base`; a missing one surfaces the standard
+    // error.
+    let base_url = match crate::dispatch::resolve_base_url(&pk_entry.value) {
+        Ok(b) => b,
+        Err(_) if video_provider == VideoProvider::Openai => {
+            aisix_provider_openai::OPENAI_DEFAULT_BASE.to_string()
+        }
+        Err(e) => return Err(e),
+    };
     let secret = crate::dispatch::require_api_key(&pk_entry.value, &model_entry.value)?.to_string();
 
     Ok(Ok(VideoTarget {
@@ -922,28 +1153,7 @@ async fn provider_call(
         .map_err(ProxyError::Bridge)?;
 
     if !(200..300).contains(&status) {
-        // Best-effort parse of the vendor error envelope: DashScope puts
-        // `{code, message}` at the top level; the other vendors nest an
-        // OpenAI-style `{error: {code, message}}`. Try both, fall back
-        // to a generic marker for non-JSON bodies.
-        let parsed: Option<serde_json::Value> = serde_json::from_slice(&bytes).ok();
-        let message = parsed
-            .and_then(|p| {
-                let scope = if p.get("error").is_some() {
-                    p.get("error").cloned().unwrap_or_default()
-                } else {
-                    p
-                };
-                let code = nonempty_str(scope.get("code")).map(str::to_string);
-                let msg = nonempty_str(scope.get("message")).map(str::to_string);
-                match (code, msg) {
-                    (Some(code), Some(msg)) => Some(format!("{code}: {msg}")),
-                    (None, Some(msg)) => Some(msg),
-                    (Some(code), None) => Some(code),
-                    (None, None) => None,
-                }
-            })
-            .unwrap_or_else(|| "upstream error".to_string());
+        let message = parse_provider_error_message(&bytes);
         return Err(note(aisix_gateway::BridgeError::upstream_status(status, message)).into());
     }
 
@@ -970,6 +1180,100 @@ async fn poll_task(
     target.provider.parse_poll(&v)
 }
 
+/// Stream a Proxy-delivery provider's authenticated content endpoint back to
+/// the caller with **constant memory**.
+///
+/// The gateway issues `GET <url>` with the provider bearer injected (the same
+/// credential the submit used; it never reaches the client), then — crucially
+/// — checks the upstream status BEFORE constructing any streaming body: a
+/// non-2xx (403 expired/not-ready, 404, …) is read as a small body, mapped to
+/// a typed [`ProxyError`], and returned as a JSON error envelope. It must
+/// never be streamed back to the client labelled `video/mp4`.
+///
+/// On success, reqwest's chunked byte stream is bridged straight into an axum
+/// streaming body (`reqwest::Response::bytes_stream()` → per-chunk read-timeout
+/// wrapper → `axum::body::Body::from_stream`) — the whole file is never
+/// buffered in memory (the explicit differentiator from gateways that read the
+/// entire file before returning it). Connect and per-chunk reads are bounded by
+/// the model's streaming budget via the same `#554` wrappers the raw
+/// passthroughs use, so a slow/stalling upstream fails over or truncates
+/// instead of hanging forever. Upstream `Content-Type` and `Content-Length`
+/// (when present) are relayed and a download `Content-Disposition` is set.
+async fn proxy_content(
+    state: &ProxyState,
+    target: &VideoTarget,
+    url: &str,
+    request_id: &str,
+) -> Result<Response, ProxyError> {
+    let client = crate::http_client::client();
+    let mut builder = client
+        .get(url)
+        .header(header::AUTHORIZATION, format!("Bearer {}", target.secret))
+        .header("x-aisix-request-id", request_id);
+    // A provider header required on every call (e.g. Runway's version header) —
+    // future-proofs Proxy mode for such vendors; a no-op for OpenAI.
+    if let Some((name, value)) = target.provider.all_request_header() {
+        builder = builder.header(name, value);
+    }
+
+    let stream_budget = target.model_entry.value.stream_timeout_effective();
+    let started = Instant::now();
+    let note = |e: aisix_gateway::BridgeError| {
+        crate::cooldown::note_failure(
+            &state.runtime_status,
+            &target.model_entry.id,
+            target.model_entry.value.cooldown.as_ref(),
+            e,
+        )
+    };
+    let resp = crate::stream_timeout::send_with_deadline(builder, stream_budget, started)
+        .await
+        .map_err(&note)
+        .map_err(ProxyError::Bridge)?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        // Status checked BEFORE any body is constructed: an expired /
+        // not-ready content URL must surface as a typed error envelope, never
+        // as a truncated `video/mp4` stream. The error body is small — read
+        // it whole to recover the vendor message.
+        let code = status.as_u16();
+        let bytes = resp.bytes().await.unwrap_or_default();
+        let message = parse_provider_error_message(&bytes);
+        return Err(ProxyError::Bridge(note(
+            aisix_gateway::BridgeError::upstream_status(code, message),
+        )));
+    }
+
+    // Relay the upstream content headers before consuming the response into a
+    // byte stream. reqwest strips `Content-Length` when it transparently
+    // decompresses, so it is relayed only when the upstream sent it (video
+    // bytes are not compressed, so it is normally present and accurate).
+    let content_type = resp.headers().get(header::CONTENT_TYPE).cloned();
+    let content_length = resp.headers().get(header::CONTENT_LENGTH).cloned();
+
+    let wrapped: std::pin::Pin<
+        Box<dyn futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>,
+    > = Box::pin(crate::stream_timeout::with_read_timeout_bytes(
+        resp.bytes_stream(),
+        stream_budget,
+    ));
+    let mut response = Response::new(axum::body::Body::from_stream(wrapped));
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        content_type.unwrap_or_else(|| axum::http::HeaderValue::from_static("video/mp4")),
+    );
+    if let Some(cl) = content_length {
+        headers.insert(header::CONTENT_LENGTH, cl);
+    }
+    headers.insert(
+        header::CONTENT_DISPOSITION,
+        axum::http::HeaderValue::from_static("attachment; filename=\"video.mp4\""),
+    );
+    Ok(response)
+}
+
 /// Build the poll-shaped [`VideoObject`] from the unified task view.
 fn video_object_from_poll(video_id: &str, model: &str, poll: &PollView) -> VideoObject {
     let error = (poll.status == "failed").then(|| VideoErrorObject {
@@ -987,7 +1291,11 @@ fn video_object_from_poll(video_id: &str, model: &str, poll: &PollView) -> Video
         object: "video",
         model: model.to_string(),
         status: poll.status,
-        progress: if poll.status == "completed" { 100 } else { 0 },
+        // Pass through a provider-reported granular percentage (Sora);
+        // otherwise fall back to the binary 0/100 derived from status.
+        progress: poll
+            .progress
+            .unwrap_or(if poll.status == "completed" { 100 } else { 0 }),
         created_at: 0,
         seconds: poll.seconds.clone(),
         size: None,
@@ -1416,39 +1724,49 @@ pub async fn video_content(
         let poll = result?;
 
         let response = match poll.status {
-            // Phase 1 fetches by 302 redirect to the provider's own URL —
-            // zero relay bandwidth (AISIX-Cloud#1118 decision 5). A
-            // streaming proxy for providers whose URLs need gateway
-            // credentials is a tracked follow-up.
+            // A completed task is delivered per the provider's content mode
+            // (AISIX-Cloud#1118, content-proxy design):
+            //   Redirect — 302 to a signed, credential-free provider URL
+            //              (Alibaba / Zhipu / Volcengine / Runway), zero
+            //              relay bandwidth.
+            //   Proxy    — the gateway fetches the provider's authenticated
+            //              content endpoint with the provider credential and
+            //              streams the bytes back with constant memory
+            //              (OpenAI Sora; later Google-direct / Vertex Veo).
             "completed" => {
-                let video_url = poll.video_url.as_deref().ok_or_else(|| {
-                    ProxyError::Bridge(aisix_gateway::BridgeError::UpstreamDecode(
-                        "completed task has no video URL".into(),
-                    ))
-                })?;
-                // The redirect target is provider-supplied: require a
-                // well-formed absolute http(s) URL so a malformed or
-                // exotic-scheme value (javascript:, file:, data:) can
-                // never ride the Location header to the caller. The
-                // host itself remains operator-trusted upstream
-                // infrastructure — the gateway never fetches the URL.
-                let parsed = url::Url::parse(video_url)
-                    .ok()
-                    .filter(|u| matches!(u.scheme(), "http" | "https"))
-                    .ok_or_else(|| {
-                        ProxyError::Bridge(aisix_gateway::BridgeError::UpstreamDecode(
-                            "completed task has a malformed or non-http video URL".into(),
-                        ))
-                    })?;
-                let location =
-                    axum::http::HeaderValue::from_str(parsed.as_str()).map_err(|_| {
-                        ProxyError::Bridge(aisix_gateway::BridgeError::UpstreamDecode(
-                            "completed task has a malformed video URL".into(),
-                        ))
-                    })?;
-                let mut resp = StatusCode::FOUND.into_response();
-                resp.headers_mut().insert(header::LOCATION, location);
-                resp
+                match target
+                    .provider
+                    .content_delivery(&target.base_url, &task_id, &poll)?
+                {
+                    ContentDelivery::Redirect(video_url) => {
+                        // The redirect target is provider-supplied: require a
+                        // well-formed absolute http(s) URL so a malformed or
+                        // exotic-scheme value (javascript:, file:, data:) can
+                        // never ride the Location header to the caller. The
+                        // host itself remains operator-trusted upstream
+                        // infrastructure — the gateway never fetches the URL.
+                        let parsed = url::Url::parse(&video_url)
+                            .ok()
+                            .filter(|u| matches!(u.scheme(), "http" | "https"))
+                            .ok_or_else(|| {
+                                ProxyError::Bridge(aisix_gateway::BridgeError::UpstreamDecode(
+                                    "completed task has a malformed or non-http video URL".into(),
+                                ))
+                            })?;
+                        let location =
+                            axum::http::HeaderValue::from_str(parsed.as_str()).map_err(|_| {
+                                ProxyError::Bridge(aisix_gateway::BridgeError::UpstreamDecode(
+                                    "completed task has a malformed video URL".into(),
+                                ))
+                            })?;
+                        let mut resp = StatusCode::FOUND.into_response();
+                        resp.headers_mut().insert(header::LOCATION, location);
+                        resp
+                    }
+                    ContentDelivery::Proxy { url } => {
+                        proxy_content(&state, &target, &url, &client.request_id).await?
+                    }
+                }
             }
             "failed" => {
                 let detail = poll
@@ -3044,5 +3362,300 @@ mod tests {
             v["error"]["message"],
             "The generation failed safety moderation."
         );
+    }
+
+    // ──────────────────── OpenAI (Sora) journey ────────────────────
+
+    #[test]
+    fn openai_status_mapping_table() {
+        // The SDK types `status` as exactly the four unified values, so the
+        // map is identity; any unrecognised string collapses to failed.
+        assert_eq!(map_openai_status("queued"), "queued");
+        assert_eq!(map_openai_status("in_progress"), "in_progress");
+        assert_eq!(map_openai_status("completed"), "completed");
+        assert_eq!(map_openai_status("failed"), "failed");
+        assert_eq!(map_openai_status("SOMETHING_NEW"), "failed");
+    }
+
+    #[test]
+    fn openai_submit_body_is_near_identity_with_string_seconds() {
+        // seconds → string enum, size verbatim WIDTHxHEIGHT, prompt/model flat.
+        let body = openai_submit_body("sora-2", "a cat", Some(8), Some("1280x720")).unwrap();
+        assert_eq!(body["model"], "sora-2");
+        assert_eq!(body["prompt"], "a cat");
+        // The create param types seconds as the string enum "4"/"8"/"12".
+        assert_eq!(body["seconds"], "8");
+        assert_eq!(body["size"], "1280x720");
+
+        // Unset params are omitted.
+        let body = openai_submit_body("sora-2", "a cat", None, None).unwrap();
+        assert!(body.get("seconds").is_none());
+        assert!(body.get("size").is_none());
+
+        // A malformed size still fails fast before any upstream call.
+        assert!(openai_submit_body("sora-2", "a cat", None, Some("bogus")).is_err());
+    }
+
+    #[test]
+    fn openai_urls_compose_via_build_v1_and_content_path() {
+        use VideoProvider::*;
+        // Both the bare-host and the `…/v1` conventions land on the same URL.
+        assert_eq!(
+            Openai.submit_url("https://api.openai.com"),
+            "https://api.openai.com/v1/videos"
+        );
+        assert_eq!(
+            Openai.submit_url("https://api.openai.com/v1"),
+            "https://api.openai.com/v1/videos"
+        );
+        assert_eq!(
+            Openai.poll_url("https://api.openai.com/v1", "vid_123"),
+            "https://api.openai.com/v1/videos/vid_123"
+        );
+    }
+
+    #[test]
+    fn content_mode_selection_openai_is_proxy_others_are_redirect() {
+        // OpenAI → Proxy carrying the authenticated content endpoint (the
+        // task id is charset-guarded into the URL); the other four → Redirect
+        // carrying the poll-surfaced signed URL.
+        let poll_with_url = PollView {
+            status: "completed",
+            video_url: Some("https://cdn.example.com/out.mp4".into()),
+            seconds: None,
+            progress: None,
+            error_code: None,
+            error_message: None,
+        };
+        for p in [
+            VideoProvider::Alibaba,
+            VideoProvider::Zhipu,
+            VideoProvider::Volcengine,
+            VideoProvider::Runway,
+        ] {
+            match p
+                .content_delivery("https://host", "task-1", &poll_with_url)
+                .unwrap()
+            {
+                ContentDelivery::Redirect(u) => {
+                    assert_eq!(u, "https://cdn.example.com/out.mp4")
+                }
+                ContentDelivery::Proxy { .. } => panic!("{p:?} must be Redirect"),
+            }
+        }
+
+        // OpenAI ignores the (absent) poll URL and builds the content
+        // endpoint from base + task id.
+        let poll_no_url = PollView {
+            status: "completed",
+            video_url: None,
+            seconds: None,
+            progress: Some(100),
+            error_code: None,
+            error_message: None,
+        };
+        match VideoProvider::Openai
+            .content_delivery("https://api.openai.com/v1", "vid_123", &poll_no_url)
+            .unwrap()
+        {
+            ContentDelivery::Proxy { url } => {
+                assert_eq!(url, "https://api.openai.com/v1/videos/vid_123/content")
+            }
+            ContentDelivery::Redirect(_) => panic!("openai must be Proxy"),
+        }
+
+        // A task id that would smuggle path segments is rejected before the
+        // URL is built.
+        assert!(VideoProvider::Openai
+            .content_delivery("https://api.openai.com/v1", "../secret", &poll_no_url)
+            .is_err());
+    }
+
+    /// An openai video Model whose ProviderKey carries NO `api_base` falls
+    /// back to the built-in OpenAI default (`https://api.openai.com`) — the
+    /// submit therefore reaches `…/v1/videos`. The other four providers keep
+    /// requiring `api_base`. Verified here by pointing the default at a mock
+    /// via a full submit→poll journey is not possible (the default host is
+    /// fixed), so this asserts the URL the fallback composes.
+    #[test]
+    fn openai_default_base_composes_videos_url() {
+        assert_eq!(
+            aisix_provider_openai::OPENAI_DEFAULT_BASE,
+            "https://api.openai.com/v1"
+        );
+        assert_eq!(
+            VideoProvider::Openai.submit_url(aisix_provider_openai::OPENAI_DEFAULT_BASE),
+            "https://api.openai.com/v1/videos"
+        );
+    }
+
+    /// Sora full journey against a mock upstream: submit maps onto
+    /// `{model, prompt, seconds, size}`; poll passes through the real
+    /// `progress` percentage; content is delivered by PROXY — the gateway
+    /// GETs `…/videos/{id}/content` with the provider bearer and streams the
+    /// MP4 bytes back with `video/mp4`, and the provider key never reaches the
+    /// client.
+    #[tokio::test]
+    async fn openai_submit_poll_content_proxy_journey() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/videos"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "video_abc123",
+                "object": "video",
+                "model": "sora-2",
+                "status": "queued",
+                "progress": 0,
+                "created_at": 1770000000
+            })))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        // Poll returns in_progress with a granular progress percentage.
+        Mock::given(method("GET"))
+            .and(path("/v1/videos/video_abc123"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "video_abc123",
+                "object": "video",
+                "model": "sora-2",
+                "status": "completed",
+                "progress": 100,
+                "seconds": "8",
+                "created_at": 1770000000
+            })))
+            .mount(&upstream)
+            .await;
+        // The authenticated content endpoint serves the MP4 bytes.
+        Mock::given(method("GET"))
+            .and(path("/v1/videos/video_abc123/content"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "video/mp4")
+                    .set_body_bytes(b"MP4-BYTES-SORA".to_vec()),
+            )
+            .mount(&upstream)
+            .await;
+
+        let app = build_app(new_snap(&upstream.uri(), "openai", ""));
+        let created = tower::ServiceExt::oneshot(
+            app.clone(),
+            post_videos(serde_json::json!({
+                "model": "my-video",
+                "prompt": "a cat",
+                "seconds": "8",
+                "size": "1280x720"
+            })),
+        )
+        .await
+        .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+        let v = body_json(created).await;
+        assert_eq!(v["object"], "video");
+        assert_eq!(v["status"], "queued");
+        assert_eq!(v["model"], "my-video");
+        let id = v["id"].as_str().unwrap().to_string();
+
+        // Submit wire shape: flat {model, prompt, seconds string, size}.
+        let received = upstream.received_requests().await.unwrap();
+        let wire: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
+        assert_eq!(wire["model"], "wan-upstream");
+        assert_eq!(wire["prompt"], "a cat");
+        assert_eq!(wire["seconds"], "8");
+        assert_eq!(wire["size"], "1280x720");
+
+        // Poll passes the real progress percentage through.
+        let poll = tower::ServiceExt::oneshot(app.clone(), get_uri(&format!("/v1/videos/{id}")))
+            .await
+            .unwrap();
+        assert_eq!(poll.status(), StatusCode::OK);
+        let polled = body_json(poll).await;
+        assert_eq!(polled["status"], "completed");
+        assert_eq!(polled["progress"], 100);
+
+        // Content: PROXY streaming. The client gets the MP4 bytes and
+        // video/mp4; the provider key never appears.
+        let content = tower::ServiceExt::oneshot(app, get_uri(&format!("/v1/videos/{id}/content")))
+            .await
+            .unwrap();
+        assert_eq!(content.status(), StatusCode::OK);
+        assert_eq!(
+            content
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("video/mp4")
+        );
+        assert!(content.headers().get(header::CONTENT_DISPOSITION).is_some());
+        let body = to_bytes(content.into_body(), 65536).await.unwrap();
+        assert_eq!(&body[..], b"MP4-BYTES-SORA");
+        assert!(
+            !body.windows(5).any(|w| w == b"sk-up"),
+            "the provider key must never reach the client body"
+        );
+
+        // The upstream content GET carried the provider bearer.
+        let all = upstream.received_requests().await.unwrap();
+        let content_req = all
+            .iter()
+            .find(|r| r.url.path() == "/v1/videos/video_abc123/content")
+            .expect("content endpoint must have been called");
+        assert_eq!(
+            content_req
+                .headers
+                .get("authorization")
+                .map(|h| h.to_str().unwrap()),
+            Some("Bearer sk-up"),
+            "the gateway must inject the provider bearer on the content GET"
+        );
+    }
+
+    /// PROXY content: when the upstream content GET returns a non-2xx (e.g.
+    /// 403 expired/not-ready), the gateway maps it to a typed JSON error
+    /// envelope — it must NOT stream an error body back as video/mp4.
+    #[tokio::test]
+    async fn openai_content_proxy_upstream_403_maps_to_error_envelope() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/videos/video_x/content"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                "error": {"code": "expired", "message": "download URL has expired"}
+            })))
+            .mount(&upstream)
+            .await;
+        // The content route polls first; the task is completed.
+        Mock::given(method("GET"))
+            .and(path("/v1/videos/video_x"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "video_x",
+                "object": "video",
+                "model": "sora-2",
+                "status": "completed",
+                "progress": 100
+            })))
+            .mount(&upstream)
+            .await;
+
+        let app = build_app(new_snap(&upstream.uri(), "openai", ""));
+        let id = encode_video_id(MODEL_ID, "my-video", "video_x");
+        let resp = tower::ServiceExt::oneshot(app, get_uri(&format!("/v1/videos/{id}/content")))
+            .await
+            .unwrap();
+        // Not a 2xx video stream — a typed error envelope.
+        assert_ne!(resp.status(), StatusCode::OK);
+        assert_ne!(resp.status(), StatusCode::FOUND);
+        let ct = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            !ct.contains("video/mp4"),
+            "an upstream content error must not be labelled video/mp4"
+        );
+        let v = body_json(resp).await;
+        assert!(v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("download URL has expired"));
     }
 }
