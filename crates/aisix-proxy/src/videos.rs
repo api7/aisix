@@ -1236,9 +1236,19 @@ async fn proxy_content(
         // Status checked BEFORE any body is constructed: an expired /
         // not-ready content URL must surface as a typed error envelope, never
         // as a truncated `video/mp4` stream. The error body is small — read
-        // it whole to recover the vendor message.
+        // it whole to recover the vendor message, but bound the read by the
+        // same per-request budget so a non-2xx upstream that then stalls its
+        // error body cannot hang the handler (the success path is already
+        // bounded per-chunk; this closes the error branch).
         let code = status.as_u16();
-        let bytes = resp.bytes().await.unwrap_or_default();
+        let bytes = match stream_budget {
+            Some(d) => tokio::time::timeout(d, resp.bytes())
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .unwrap_or_default(),
+            None => resp.bytes().await.unwrap_or_default(),
+        };
         let message = parse_provider_error_message(&bytes);
         return Err(ProxyError::Bridge(note(
             aisix_gateway::BridgeError::upstream_status(code, message),
@@ -1249,6 +1259,10 @@ async fn proxy_content(
     // byte stream. reqwest strips `Content-Length` when it transparently
     // decompresses, so it is relayed only when the upstream sent it (video
     // bytes are not compressed, so it is normally present and accurate).
+    // If a mid-stream read timeout truncates the body, the relayed
+    // Content-Length exceeds the bytes delivered; the connection closes and
+    // the client observes a short read (an incomplete download), which is the
+    // intended signal that the transfer failed rather than a silent partial.
     let content_type = resp.headers().get(header::CONTENT_TYPE).cloned();
     let content_length = resp.headers().get(header::CONTENT_LENGTH).cloned();
 

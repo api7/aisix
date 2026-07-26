@@ -264,6 +264,8 @@ describe("videos e2e: openai Sora content-streaming proxy", () => {
     expect(bodyText).toBe(MP4_BYTES);
     // The provider credential must NEVER appear in the client-visible bytes.
     expect(bodyText).not.toContain(PROVIDER_SECRET);
+    // ...nor echo the upstream auth header back to the client.
+    expect(content.headers.get("authorization")).toBeNull();
 
     // The upstream content GET carried the provider bearer (injected by the
     // gateway) — and the client never saw it.
