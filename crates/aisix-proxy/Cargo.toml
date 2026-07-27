@@ -35,6 +35,9 @@ aisix-guardrails = { path = "../aisix-guardrails" }
 tokio.workspace = true
 axum.workspace = true
 reqwest.workspace = true
+# Inbound OIDC/JWT verification on the proxy auth path (jwt.rs). Same
+# major as the vertex provider's service-account signer.
+jsonwebtoken = "9"
 tower.workspace = true
 tower-http.workspace = true
 http-body-util.workspace = true

@@ -486,6 +486,9 @@ impl<P: ConfigProvider> Supervisor<P> {
             for e in tiny.a2a_agents.entries() {
                 new.a2a_agents.insert(clone_entry(&e));
             }
+            for e in tiny.oidc_providers.entries() {
+                new.oidc_providers.insert(clone_entry(&e));
+            }
             new
         });
         self.remove_rejection_for_key(&entry.key);
@@ -544,6 +547,7 @@ impl<P: ConfigProvider> Supervisor<P> {
             "mcp_servers" => snap.mcp_servers.get_by_id(parsed.id).is_some(),
             "mcp_policies" => snap.mcp_policies.get_by_id(parsed.id).is_some(),
             "a2a_agents" => snap.a2a_agents.get_by_id(parsed.id).is_some(),
+            "oidc_providers" => snap.oidc_providers.get_by_id(parsed.id).is_some(),
             _ => false,
         };
         let removed_rejection = self.remove_rejection_for_key(key_str);
@@ -599,6 +603,9 @@ impl<P: ConfigProvider> Supervisor<P> {
                 }
                 "a2a_agents" => {
                     new.a2a_agents.remove(parsed.id);
+                }
+                "oidc_providers" => {
+                    new.oidc_providers.remove(parsed.id);
                 }
                 _ => {}
             }
@@ -850,6 +857,9 @@ fn clone_snapshot(src: &AisixSnapshot) -> AisixSnapshot {
     for e in src.a2a_agents.entries() {
         out.a2a_agents.insert(clone_entry(&e));
     }
+    for e in src.oidc_providers.entries() {
+        out.oidc_providers.insert(clone_entry(&e));
+    }
     out
 }
 
@@ -873,6 +883,7 @@ fn resource_counts(snap: &AisixSnapshot) -> BTreeMap<String, usize> {
         ("mcp_servers", snap.mcp_servers.len()),
         ("mcp_policies", snap.mcp_policies.len()),
         ("a2a_agents", snap.a2a_agents.len()),
+        ("oidc_providers", snap.oidc_providers.len()),
     ] {
         if n > 0 {
             counts.insert(kind.to_string(), n);
@@ -1015,6 +1026,15 @@ mod tests {
             "scope_id": "m-1",
             "priority": 100
         }"#;
+        // An OIDC trust provider created mid-run (AISIX-Cloud#1080).
+        // Same trap as #826: the kind existed in the loader but was
+        // initially missing from apply_put's merge loop, so enabling
+        // JWT auth via watch silently never took effect until resync.
+        const VALID_OIDC_PROVIDER: &[u8] = br#"{
+            "name": "watch-idp",
+            "issuer": "https://idp.example.com/realms/agents",
+            "audiences": ["aisix-gateway"]
+        }"#;
 
         let provider = Arc::new(FakeProvider::new(vec![], 0));
         let sup = Supervisor::new(provider, "/aisix");
@@ -1038,6 +1058,11 @@ mod tests {
                 VALID_OBSERVABILITY_EXPORTER,
                 "ObservabilityExporter",
             ),
+            (
+                "/aisix/oidc_providers/op-1",
+                VALID_OIDC_PROVIDER,
+                "OidcProvider",
+            ),
         ] {
             assert!(
                 sup.apply_put(&entry(key, body, 2)),
@@ -1059,6 +1084,7 @@ mod tests {
             1,
             "ObservabilityExporter not merged"
         );
+        assert_eq!(snap.oidc_providers.len(), 1, "OidcProvider not merged");
     }
 
     #[tokio::test]
@@ -1078,6 +1104,13 @@ mod tests {
                     br#"{"guardrail_id":"g-1","scope_type":"model","scope_id":"m-1","priority":100}"#,
                     1,
                 ),
+                // AISIX-Cloud#1080: deleting a trust provider must reach
+                // the snapshot, or revoking JWT auth never takes effect.
+                entry(
+                    "/aisix/oidc_providers/op-1",
+                    br#"{"name":"idp","issuer":"https://idp.example.com","audiences":["aisix"]}"#,
+                    1,
+                ),
             ],
             1,
         ));
@@ -1085,10 +1118,13 @@ mod tests {
         sup.load_once().await.unwrap();
         assert_eq!(sup.handle().load().provider_keys.len(), 1);
         assert_eq!(sup.handle().load().guardrail_attachments.len(), 1);
+        assert_eq!(sup.handle().load().oidc_providers.len(), 1);
         assert!(sup.apply_delete("/aisix/provider_keys/pk-1"));
         assert!(sup.handle().load().provider_keys.is_empty());
         assert!(sup.apply_delete("/aisix/guardrail_attachments/ga-1"));
         assert!(sup.handle().load().guardrail_attachments.is_empty());
+        assert!(sup.apply_delete("/aisix/oidc_providers/op-1"));
+        assert!(sup.handle().load().oidc_providers.is_empty());
     }
 
     #[tokio::test]

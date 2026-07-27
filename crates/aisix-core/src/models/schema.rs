@@ -33,6 +33,7 @@ pub struct Schemas {
     pub mcp_server: Validator,
     pub mcp_policy: Validator,
     pub a2a_agent: Validator,
+    pub oidc_provider: Validator,
 }
 
 pub static SCHEMAS: Lazy<Arc<Schemas>> = Lazy::new(|| Arc::new(Schemas::compile()));
@@ -73,6 +74,9 @@ impl Schemas {
             a2a_agent: jsonschema::options()
                 .build(&a2a_agent_root_schema())
                 .expect("a2a_agent schema is well-formed"),
+            oidc_provider: jsonschema::options()
+                .build(&oidc_provider_root_schema())
+                .expect("oidc_provider schema is well-formed"),
         }
     }
 }
@@ -145,6 +149,10 @@ pub fn validate_a2a_agent(value: &Value) -> Result<(), SchemaError> {
 
 pub fn validate_mcp_policy(value: &Value) -> Result<(), SchemaError> {
     validate(&SCHEMAS.mcp_policy, value)
+}
+
+pub fn validate_oidc_provider(value: &Value) -> Result<(), SchemaError> {
+    validate(&SCHEMAS.oidc_provider, value)
 }
 
 /// Build a resource's canonical JSON Schema from its struct via `schemars`,
@@ -368,6 +376,15 @@ fn title_single_value_enum_variants(
                 .or_insert_with(|| Value::String((*title).to_string()));
         }
     }
+}
+
+/// Canonical JSON Schema for the `oidc_provider` resource, derived from the
+/// [`OidcProvider`](crate::models::OidcProvider) struct. Uses the
+/// plain-but-absent `Option` representation (`false`): the control plane
+/// omits unset fields (`jwks_uri`, `bound_claims`) rather than sending an
+/// explicit `null`.
+pub fn oidc_provider_root_schema() -> Value {
+    struct_root_schema::<crate::models::OidcProvider>(false)
 }
 
 /// Canonical JSON Schema for the `mcp_policy` resource, derived from the

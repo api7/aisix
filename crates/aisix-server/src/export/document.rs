@@ -303,6 +303,21 @@ pub fn build_export_document(snapshot: &AisixSnapshot, reveal_secrets: bool) -> 
         ),
     );
 
+    // oidc_providers — identity: name; no secrets (issuer / audiences /
+    // JWKS endpoint are all public trust configuration).
+    push_kind(
+        &mut collections,
+        "oidc_providers",
+        emit_entries(
+            &snapshot.oidc_providers,
+            |p| p.name.clone(),
+            "oidc_providers",
+            &mut diag,
+            |_, _, _| {},
+            |_, _| {},
+        ),
+    );
+
     // guardrail_attachments are consumed above to decide which guardrails
     // are gateway-wide; they are not a file collection of their own.
 

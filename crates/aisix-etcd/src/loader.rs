@@ -14,9 +14,10 @@
 use aisix_core::models::{
     validate_a2a_agent, validate_apikey, validate_cache_policy, validate_guardrail,
     validate_guardrail_attachment, validate_mcp_policy, validate_mcp_server, validate_model,
-    validate_observability_exporter, validate_provider_key, validate_rate_limit_policy, A2aAgent,
-    ApiKey, CachePolicy, Guardrail, GuardrailAttachment, McpPolicy, McpServer, Model,
-    ObservabilityExporter, ProviderKey, RateLimitPolicy, SchemaError,
+    validate_observability_exporter, validate_oidc_provider, validate_provider_key,
+    validate_rate_limit_policy, A2aAgent, ApiKey, CachePolicy, Guardrail, GuardrailAttachment,
+    McpPolicy, McpServer, Model, ObservabilityExporter, OidcProvider, ProviderKey, RateLimitPolicy,
+    SchemaError,
 };
 use aisix_core::resource::ResourceEntry;
 use aisix_core::AisixSnapshot;
@@ -279,6 +280,18 @@ pub fn build_snapshot(prefix: &str, entries: &[RawEntry]) -> (AisixSnapshot, Bui
                     &mut stats,
                 ) {
                     snapshot.a2a_agents.insert(entry);
+                }
+            }
+            "oidc_providers" => {
+                if let Some(entry) = validate_and_parse::<OidcProvider>(
+                    &raw.key,
+                    raw.revision,
+                    parsed,
+                    &value,
+                    validate_oidc_provider,
+                    &mut stats,
+                ) {
+                    snapshot.oidc_providers.insert(entry);
                 }
             }
             other => {

@@ -46,9 +46,10 @@ use yaml_rust2::{Yaml, YamlLoader};
 
 use crate::models::{
     validate_a2a_agent, validate_apikey, validate_cache_policy, validate_guardrail,
-    validate_mcp_server, validate_model, validate_observability_exporter, validate_provider_key,
-    validate_rate_limit_policy, A2aAgent, ApiKey, CachePolicy, Guardrail, McpServer, Model,
-    ObservabilityExporter, ProviderKey, RateLimitPolicy, SchemaError,
+    validate_mcp_server, validate_model, validate_observability_exporter, validate_oidc_provider,
+    validate_provider_key, validate_rate_limit_policy, A2aAgent, ApiKey, CachePolicy, Guardrail,
+    McpServer, Model, ObservabilityExporter, OidcProvider, ProviderKey, RateLimitPolicy,
+    SchemaError,
 };
 use crate::resource::ResourceEntry;
 use crate::AisixSnapshot;
@@ -101,8 +102,8 @@ impl std::error::Error for FileSourceErrors {}
 /// change semantics without silently misreading old gateways' files.
 const SUPPORTED_FORMAT_VERSION: &str = "1";
 
-/// Fixed processing order for the nine resource collections.
-const KINDS: [(&str, IdentityField); 9] = [
+/// Fixed processing order for the ten resource collections.
+const KINDS: [(&str, IdentityField); 10] = [
     ("provider_keys", IdentityField::DisplayName),
     ("models", IdentityField::DisplayName),
     ("api_keys", IdentityField::DisplayName),
@@ -112,6 +113,7 @@ const KINDS: [(&str, IdentityField); 9] = [
     ("cache_policies", IdentityField::Name),
     ("observability_exporters", IdentityField::Name),
     ("rate_limit_policies", IdentityField::Name),
+    ("oidc_providers", IdentityField::Name),
 ];
 
 /// Load `path` into a fresh [`AisixSnapshot`], resolving `${VAR}`
@@ -315,6 +317,7 @@ pub fn load_from_str(
     let mut cache_policies: Vec<(String, String, CachePolicy)> = Vec::new();
     let mut observability_exporters: Vec<(String, String, ObservabilityExporter)> = Vec::new();
     let mut rate_limit_policies: Vec<(String, String, RateLimitPolicy)> = Vec::new();
+    let mut oidc_providers: Vec<(String, String, OidcProvider)> = Vec::new();
 
     for mut entry in prepared {
         let id = derive_id(entry.kind, &entry.identity);
@@ -400,6 +403,11 @@ pub fn load_from_str(
                     rate_limit_policies.push((id, scope, t));
                 }
             }
+            "oidc_providers" => {
+                if let Some(t) = finish(&scope, &entry.doc, validate_oidc_provider, &mut errors) {
+                    oidc_providers.push((id, scope, t));
+                }
+            }
             other => unreachable!("kind {other} is not in KINDS"),
         }
     }
@@ -483,6 +491,24 @@ pub fn load_from_str(
         }
     }
 
+    // JWT authentication selects the key by `jwt_subject`, so two keys
+    // sharing one subject would silently tie-break at auth time. Reject
+    // the ambiguity at load, mirroring the key_hash uniqueness above.
+    let mut seen_subjects: BTreeMap<&str, &str> = BTreeMap::new();
+    for (_, scope, key) in &apikeys {
+        if let Some(subject) = key.jwt_subject.as_deref() {
+            if let Some(first) = seen_subjects.insert(subject, scope.as_str()) {
+                errors.push(LoadError {
+                    scope: scope.clone(),
+                    message: format!(
+                        "duplicate jwt_subject {subject:?}: already used by {first} — \
+                         every api key must have a distinct jwt_subject"
+                    ),
+                });
+            }
+        }
+    }
+
     // An explicit `provider_key_id` must also resolve: in file mode every
     // provider-key id is derived from its name, so any other value is
     // guaranteed dangling and would only surface per-request.
@@ -552,6 +578,11 @@ pub fn load_from_str(
     for (id, _, v) in rate_limit_policies {
         snapshot
             .rate_limit_policies
+            .insert(ResourceEntry::new(id, v, revision));
+    }
+    for (id, _, v) in oidc_providers {
+        snapshot
+            .oidc_providers
             .insert(ResourceEntry::new(id, v, revision));
     }
     Ok(snapshot)

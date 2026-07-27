@@ -56,6 +56,7 @@ api_keys:
   - display_name: ci-bot
     key_env: E2E_CI_BOT_KEY
     allowed_models: ["gpt-4o", "balanced"]
+    jwt_subject: agent-ci-bot
   - display_name: ops
     key_hash: 91ed2dbc407561556f3e7be98ba0bd2a57986d6a868c482d867d19c6d40d201c
     allowed_models: ["*"]
@@ -101,6 +102,12 @@ rate_limit_policies:
     scope_ref: team-uuid-1
     window: hour
     max_requests: 1000
+
+oidc_providers:
+  - name: corp-keycloak
+    issuer: https://sso.example.com/realms/agents
+    audiences: ["aisix-gateway"]
+    required_scopes: ["ai.access"]
 "#;
 
 fn full_env() -> HashMap<String, String> {
@@ -123,6 +130,25 @@ fn full_valid_file_loads_every_kind() {
     assert_eq!(snap.cache_policies.len(), 1);
     assert_eq!(snap.observability_exporters.len(), 1);
     assert_eq!(snap.rate_limit_policies.len(), 3);
+    assert_eq!(snap.oidc_providers.len(), 1);
+
+    // The OIDC provider loads with serde defaults filled.
+    let idp = snap.oidc_providers.get_by_name("corp-keycloak").unwrap();
+    assert_eq!(idp.value.issuer, "https://sso.example.com/realms/agents");
+    assert_eq!(idp.value.identity_claim, "sub");
+    assert!(idp.value.enabled);
+
+    // The ci-bot key carries its JWT identity binding.
+    let ci_bot_hash = crate::models::ApiKey::hash_bearer("sk-ci-plaintext");
+    assert_eq!(
+        snap.apikeys
+            .get_by_name(&ci_bot_hash)
+            .unwrap()
+            .value
+            .jwt_subject
+            .as_deref(),
+        Some("agent-ci-bot")
+    );
 
     // Interpolation landed in the provider key (full + partial).
     let pk = snap.provider_keys.get_by_name("openai-prod").unwrap();
@@ -462,6 +488,29 @@ api_keys:
     // …and never echoes the credential in either form.
     assert!(!errs[0].contains(plain), "plaintext leaked: {errs:?}");
     assert!(!errs[0].contains(&hash), "hash leaked: {errs:?}");
+}
+
+#[test]
+fn duplicate_jwt_subject_across_api_keys_is_a_load_error() {
+    // JWT auth selects the key by jwt_subject — a duplicate would
+    // silently tie-break at auth time, so it fails the load like the
+    // duplicate-credential rule above.
+    let contents = r#"
+_format_version: "1"
+api_keys:
+  - display_name: first
+    key_hash: "1111111111111111111111111111111111111111111111111111111111111111"
+    allowed_models: ["*"]
+    jwt_subject: agent-shared
+  - display_name: second
+    key_hash: "2222222222222222222222222222222222222222222222222222222222222222"
+    allowed_models: ["*"]
+    jwt_subject: agent-shared
+"#;
+    let errs = errors_of(load(contents, &env_of(&[])));
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    assert!(errs[0].contains("duplicate jwt_subject"), "{errs:?}");
+    assert!(errs[0].contains("agent-shared"), "{errs:?}");
 }
 
 #[test]

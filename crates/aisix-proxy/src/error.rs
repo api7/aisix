@@ -155,6 +155,39 @@ pub enum ProxyError {
     /// (#933). Same disclosure reasoning as [`Self::ApiKeyExpired`].
     #[error("API key has been disabled")]
     ApiKeyDisabled,
+    /// The bearer was a JWT whose validation failed: malformed token,
+    /// untrusted issuer, bad signature, audience mismatch, or an
+    /// unresolvable signing key. Deliberately collapsed into one
+    /// caller-visible reason so a probe cannot use the taxonomy as an
+    /// oracle for which issuers this gateway trusts; the detailed
+    /// reason goes to the auth decision log only.
+    #[error("invalid JWT")]
+    JwtInvalid,
+    /// The JWT's `exp` deadline has passed. Caller-visible as
+    /// "expired" for the same reason as [`Self::ApiKeyExpired`]: the
+    /// caller already holds the token, and naming the reason tells
+    /// them to fetch a fresh one from their identity provider instead
+    /// of debugging a rejection.
+    #[error("JWT has expired")]
+    JwtExpired,
+    /// The JWT verified but does not satisfy the trust provider's
+    /// `required_scopes` / `bound_claims` requirements. 403: the
+    /// caller is authenticated, just not entitled.
+    #[error("JWT does not satisfy the required scopes or claims")]
+    JwtClaimsRejected,
+    /// The JWT verified but no API key carries a `jwt_subject` equal
+    /// to its identity claim. Named explicitly (not a generic invalid
+    /// credential) because the fix — binding a key to the identity —
+    /// belongs to the gateway operator, and the caller-visible code is
+    /// what they'll be shown when onboarding a fleet of agents.
+    #[error("no API key is bound to this JWT identity")]
+    JwtIdentityUnmapped,
+    /// The signing keys for the matched trust provider could not be
+    /// fetched (identity provider unreachable and nothing cached).
+    /// 503 rather than 401: the token was not judged invalid, the
+    /// gateway just cannot verify it right now — retryable.
+    #[error("unable to fetch the identity provider's signing keys")]
+    JwksUnavailable,
     #[error("model {0:?} not found")]
     ModelNotFound(String),
     /// A `/v1/videos/{video_id}` id that this gateway could not have
@@ -243,7 +276,12 @@ impl ProxyError {
             ProxyError::MissingAuth
             | ProxyError::InvalidApiKey
             | ProxyError::ApiKeyExpired
-            | ProxyError::ApiKeyDisabled => StatusCode::UNAUTHORIZED,
+            | ProxyError::ApiKeyDisabled
+            | ProxyError::JwtInvalid
+            | ProxyError::JwtExpired
+            | ProxyError::JwtIdentityUnmapped => StatusCode::UNAUTHORIZED,
+            ProxyError::JwtClaimsRejected => StatusCode::FORBIDDEN,
+            ProxyError::JwksUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             ProxyError::ModelForbidden(_) => StatusCode::FORBIDDEN,
             ProxyError::ModelIpRestricted(_) => StatusCode::FORBIDDEN,
             ProxyError::ModelNotFound(_) => StatusCode::NOT_FOUND,
@@ -266,7 +304,14 @@ impl ProxyError {
             ProxyError::MissingAuth
             | ProxyError::InvalidApiKey
             | ProxyError::ApiKeyExpired
-            | ProxyError::ApiKeyDisabled => "invalid_api_key",
+            | ProxyError::ApiKeyDisabled
+            | ProxyError::JwtInvalid
+            | ProxyError::JwtExpired
+            | ProxyError::JwtIdentityUnmapped => "invalid_api_key",
+            ProxyError::JwtClaimsRejected => "permission_denied",
+            // Auth infrastructure fault, not a credential judgment — the
+            // generic server-fault family, like a 5xx from dispatch.
+            ProxyError::JwksUnavailable => "api_error",
             ProxyError::ModelForbidden(_) => "permission_denied",
             ProxyError::ModelIpRestricted(_) => "permission_denied",
             ProxyError::ModelNotFound(_) => "model_not_found",
@@ -353,6 +398,18 @@ impl ProxyError {
             // `error.type` stays the family-wide `invalid_api_key`.
             ProxyError::ApiKeyExpired => env.with_code("api_key_expired"),
             ProxyError::ApiKeyDisabled => env.with_code("api_key_disabled"),
+            // Same stable-code convention for the JWT auth path
+            // (AISIX-Cloud#1080/#1081): SDKs and agent frameworks branch
+            // on `error.code` to decide between refreshing the token
+            // (`jwt_expired`), fixing the token request
+            // (`jwt_invalid` / `jwt_claims_rejected`), and asking the
+            // gateway operator to bind the identity to a key
+            // (`jwt_identity_unmapped`).
+            ProxyError::JwtInvalid => env.with_code("jwt_invalid"),
+            ProxyError::JwtExpired => env.with_code("jwt_expired"),
+            ProxyError::JwtClaimsRejected => env.with_code("jwt_claims_rejected"),
+            ProxyError::JwtIdentityUnmapped => env.with_code("jwt_identity_unmapped"),
+            ProxyError::JwksUnavailable => env.with_code("jwks_unavailable"),
             _ => env,
         }
     }
