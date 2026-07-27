@@ -25,6 +25,7 @@ pub mod mcp_policy;
 pub mod mcp_server;
 pub mod model;
 pub mod observability_exporter;
+pub mod oidc_provider;
 pub mod provider_key;
 pub mod rate_limit;
 pub mod rate_limit_policy;
@@ -55,6 +56,7 @@ pub use observability_exporter::{
     AliyunSlsConfig, DatadogConfig, ExporterKind, ObjectStoreCompression, ObjectStoreConfig,
     ObjectStoreProvider, ObservabilityExporter, OtlpHttpConfig, SlsContentMode,
 };
+pub use oidc_provider::{BoundClaimExpect, OidcProvider};
 pub use provider_key::{
     ParamConstraints, ProviderKey, RequestOverrides, ResponseOverrides, StreamDoneMarker,
     TelemetryKind, TelemetryTags,
@@ -65,8 +67,8 @@ pub use routing::{Routing, RoutingStrategy, RoutingTarget, WhenAllUnavailablePol
 pub use schema::{
     validate_a2a_agent, validate_apikey, validate_cache_policy, validate_guardrail,
     validate_guardrail_attachment, validate_mcp_policy, validate_mcp_server, validate_model,
-    validate_observability_exporter, validate_provider_key, validate_rate_limit_policy,
-    SchemaError,
+    validate_observability_exporter, validate_oidc_provider, validate_provider_key,
+    validate_rate_limit_policy, SchemaError,
 };
 pub use semantic::{
     Aggregation, DistanceMetric, EmbeddingFailureMode, OnEmbeddingFailure, Semantic, SemanticMatch,

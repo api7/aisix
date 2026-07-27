@@ -46,9 +46,10 @@ use yaml_rust2::{Yaml, YamlLoader};
 
 use crate::models::{
     validate_a2a_agent, validate_apikey, validate_cache_policy, validate_guardrail,
-    validate_mcp_server, validate_model, validate_observability_exporter, validate_provider_key,
-    validate_rate_limit_policy, A2aAgent, ApiKey, CachePolicy, Guardrail, McpServer, Model,
-    ObservabilityExporter, ProviderKey, RateLimitPolicy, SchemaError,
+    validate_mcp_server, validate_model, validate_observability_exporter, validate_oidc_provider,
+    validate_provider_key, validate_rate_limit_policy, A2aAgent, ApiKey, CachePolicy, Guardrail,
+    McpServer, Model, ObservabilityExporter, OidcProvider, ProviderKey, RateLimitPolicy,
+    SchemaError,
 };
 use crate::resource::ResourceEntry;
 use crate::AisixSnapshot;
@@ -101,8 +102,36 @@ impl std::error::Error for FileSourceErrors {}
 /// change semantics without silently misreading old gateways' files.
 const SUPPORTED_FORMAT_VERSION: &str = "1";
 
-/// Fixed processing order for the nine resource collections.
-const KINDS: [(&str, IdentityField); 9] = [
+/// True when a URL embeds credentials that must not sit in a public JWKS
+/// endpoint: userinfo (`user:pass@host`) or a credential-bearing query
+/// parameter. String-scanned rather than URL-parsed to avoid pulling a
+/// URL crate into `aisix-core`.
+pub(crate) fn url_has_credentials(url: &str) -> bool {
+    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    // Authority ends at the first '/', '?', or '#'.
+    let authority_end = after_scheme
+        .find(['/', '?', '#'])
+        .unwrap_or(after_scheme.len());
+    if after_scheme[..authority_end].contains('@') {
+        return true;
+    }
+    if let Some((_, query)) = url.split_once('?') {
+        let query = query.split('#').next().unwrap_or(query);
+        for pair in query.split('&') {
+            let key = pair.split('=').next().unwrap_or(pair).to_ascii_lowercase();
+            if matches!(
+                key.as_str(),
+                "access_token" | "token" | "client_secret" | "password" | "api_key" | "apikey"
+            ) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Fixed processing order for the ten resource collections.
+const KINDS: [(&str, IdentityField); 10] = [
     ("provider_keys", IdentityField::DisplayName),
     ("models", IdentityField::DisplayName),
     ("api_keys", IdentityField::DisplayName),
@@ -112,6 +141,7 @@ const KINDS: [(&str, IdentityField); 9] = [
     ("cache_policies", IdentityField::Name),
     ("observability_exporters", IdentityField::Name),
     ("rate_limit_policies", IdentityField::Name),
+    ("oidc_providers", IdentityField::Name),
 ];
 
 /// Load `path` into a fresh [`AisixSnapshot`], resolving `${VAR}`
@@ -315,6 +345,7 @@ pub fn load_from_str(
     let mut cache_policies: Vec<(String, String, CachePolicy)> = Vec::new();
     let mut observability_exporters: Vec<(String, String, ObservabilityExporter)> = Vec::new();
     let mut rate_limit_policies: Vec<(String, String, RateLimitPolicy)> = Vec::new();
+    let mut oidc_providers: Vec<(String, String, OidcProvider)> = Vec::new();
 
     for mut entry in prepared {
         let id = derive_id(entry.kind, &entry.identity);
@@ -400,6 +431,11 @@ pub fn load_from_str(
                     rate_limit_policies.push((id, scope, t));
                 }
             }
+            "oidc_providers" => {
+                if let Some(t) = finish(&scope, &entry.doc, validate_oidc_provider, &mut errors) {
+                    oidc_providers.push((id, scope, t));
+                }
+            }
             other => unreachable!("kind {other} is not in KINDS"),
         }
     }
@@ -483,6 +519,82 @@ pub fn load_from_str(
         }
     }
 
+    // JWT authentication selects the key by (jwt_provider, jwt_subject),
+    // so a subject is set only alongside the provider allowed to assert
+    // it, and that pair must be unique — otherwise auth would silently
+    // tie-break, or (without a provider) a second trusted IdP could
+    // impersonate this identity. Reject both at load.
+    let mut seen_subjects: BTreeMap<(&str, &str), &str> = BTreeMap::new();
+    for (_, scope, key) in &apikeys {
+        match (key.jwt_subject.as_deref(), key.jwt_provider.as_deref()) {
+            (Some(subject), Some(provider)) => {
+                if let Some(first) = seen_subjects.insert((provider, subject), scope.as_str()) {
+                    errors.push(LoadError {
+                        scope: scope.clone(),
+                        message: format!(
+                            "duplicate jwt binding {provider:?}/{subject:?}: already used by \
+                             {first} — every (jwt_provider, jwt_subject) pair must be distinct"
+                        ),
+                    });
+                }
+            }
+            (Some(subject), None) => {
+                errors.push(LoadError {
+                    scope: scope.clone(),
+                    message: format!(
+                        "jwt_subject {subject:?} is set without jwt_provider — a subject must \
+                         name the OIDC provider allowed to assert it, or a second trusted \
+                         provider could impersonate this identity"
+                    ),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    // Two enabled providers sharing one issuer are ambiguous: they carry
+    // different audience/scope/claim policies, and JWT auth would have to
+    // pick one. Reject the duplicate at load (the DP resolver also fails
+    // closed at runtime, but the file can and should surface it).
+    let mut seen_issuers: BTreeMap<&str, &str> = BTreeMap::new();
+    for (_, scope, provider) in &oidc_providers {
+        if !provider.enabled {
+            continue;
+        }
+        if let Some(first) = seen_issuers.insert(provider.issuer.as_str(), scope.as_str()) {
+            errors.push(LoadError {
+                scope: scope.clone(),
+                message: format!(
+                    "duplicate enabled OIDC issuer {:?}: already used by {first} — every \
+                     enabled provider must have a distinct issuer",
+                    provider.issuer
+                ),
+            });
+        }
+    }
+
+    // A JWKS/discovery URL must never carry embedded credentials
+    // (`user:pass@host` or a credential query): JWKS material is public,
+    // credentials there would only leak (e.g. through a snapshot export).
+    for (_, scope, provider) in &oidc_providers {
+        for (field, url) in [
+            ("issuer", Some(&provider.issuer)),
+            ("jwks_uri", provider.jwks_uri.as_ref()),
+        ] {
+            if let Some(url) = url {
+                if url_has_credentials(url) {
+                    errors.push(LoadError {
+                        scope: scope.clone(),
+                        message: format!(
+                            "OIDC provider {field} must not embed credentials (user info or a \
+                             token query parameter) — JWKS endpoints are public"
+                        ),
+                    });
+                }
+            }
+        }
+    }
+
     // An explicit `provider_key_id` must also resolve: in file mode every
     // provider-key id is derived from its name, so any other value is
     // guaranteed dangling and would only surface per-request.
@@ -552,6 +664,11 @@ pub fn load_from_str(
     for (id, _, v) in rate_limit_policies {
         snapshot
             .rate_limit_policies
+            .insert(ResourceEntry::new(id, v, revision));
+    }
+    for (id, _, v) in oidc_providers {
+        snapshot
+            .oidc_providers
             .insert(ResourceEntry::new(id, v, revision));
     }
     Ok(snapshot)

@@ -135,7 +135,7 @@ async fn prepare(
     headers: &HeaderMap,
     client: &ClientContext,
 ) -> Result<Prepared, ProxyError> {
-    let auth = authenticate(state, headers)?;
+    let auth = authenticate(state, headers).await?;
 
     let requested_model = params
         .get("model")
@@ -258,28 +258,31 @@ async fn prepare(
 
 /// Header bearer (`Authorization` / `x-api-key`) first, then the browser
 /// subprotocol credential.
-fn authenticate(state: &ProxyState, headers: &HeaderMap) -> Result<AuthenticatedKey, ProxyError> {
+async fn authenticate(
+    state: &ProxyState,
+    headers: &HeaderMap,
+) -> Result<AuthenticatedKey, ProxyError> {
     if let Some(auth) = headers.get(axum::http::header::AUTHORIZATION) {
         let s = auth.to_str().map_err(|_| ProxyError::MissingAuth)?;
         let token = s.strip_prefix("Bearer ").map(str::trim).unwrap_or("");
         if token.is_empty() {
             return Err(ProxyError::MissingAuth);
         }
-        return crate::auth::authenticate_token(state, token);
+        return crate::auth::authenticate_token(state, token).await;
     }
     if let Some(raw) = headers.get("x-api-key") {
         let token = raw.to_str().map_err(|_| ProxyError::MissingAuth)?.trim();
         if token.is_empty() {
             return Err(ProxyError::MissingAuth);
         }
-        return crate::auth::authenticate_token(state, token);
+        return crate::auth::authenticate_token(state, token).await;
     }
     if let Some(proto) = headers.get("sec-websocket-protocol") {
         let s = proto.to_str().map_err(|_| ProxyError::MissingAuth)?;
         for item in s.split(',') {
             if let Some(token) = item.trim().strip_prefix(SUBPROTOCOL_KEY_PREFIX) {
                 if !token.is_empty() {
-                    return crate::auth::authenticate_token(state, token);
+                    return crate::auth::authenticate_token(state, token).await;
                 }
             }
         }

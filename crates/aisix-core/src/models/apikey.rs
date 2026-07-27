@@ -49,6 +49,27 @@ pub struct ApiKey {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_name: Option<String>,
 
+    /// External identity bound to this key for JWT authentication.
+    /// When a request presents a valid JWT issued by the
+    /// `oidc_providers` entry named in `jwt_provider`, the value of
+    /// that provider's `identity_claim` selects the key whose
+    /// `jwt_subject` equals it, and the request proceeds with this
+    /// key's permissions, rate limits, and budget. The `(jwt_provider,
+    /// jwt_subject)` pair is unique within the environment. When
+    /// omitted, the key is never selected by JWT authentication.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
+    pub jwt_subject: Option<String>,
+
+    /// Name of the `oidc_providers` entry permitted to assert this
+    /// key's `jwt_subject`. A subject is only ever resolved for the
+    /// trust provider named here, so a second trusted provider cannot
+    /// mint a token impersonating this provider's identity of the same
+    /// name. Required whenever `jwt_subject` is set; ignored otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
+    pub jwt_provider: Option<String>,
+
     /// MCP tools this key may call, as namespaced `<server>__<tool>` names
     /// (the form the gateway exposes). Entries are matched as single-`*`
     /// globs, mirroring `allowed_models`: `"*"` grants every tool and
@@ -249,6 +270,8 @@ mod tests {
             team_id: None,
             user_id: None,
             user_name: None,
+            jwt_subject: None,
+            jwt_provider: None,
             allowed_tools: None,
             mcp_access: None,
             allowed_agents: None,
@@ -479,6 +502,27 @@ mod tests {
         assert!(k.team_id.is_none());
         assert!(k.user_id.is_none());
         assert!(k.user_name.is_none());
+    }
+
+    #[test]
+    fn jwt_subject_roundtrips_and_defaults_absent() {
+        // Every pre-existing key payload lacks `jwt_subject`; it must load
+        // as None and stay off the wire so mixed-fleet DPs keep accepting
+        // the row.
+        let legacy = sample();
+        assert!(legacy.jwt_subject.is_none());
+        let v = serde_json::to_value(&legacy).unwrap();
+        assert!(v.get("jwt_subject").is_none());
+
+        let k: ApiKey = serde_json::from_str(
+            r#"{"key_hash":"h","allowed_models":[],"jwt_subject":"agent-billing-01","jwt_provider":"corp-idp"}"#,
+        )
+        .unwrap();
+        assert_eq!(k.jwt_subject.as_deref(), Some("agent-billing-01"));
+        assert_eq!(k.jwt_provider.as_deref(), Some("corp-idp"));
+        let v = serde_json::to_value(&k).unwrap();
+        assert_eq!(v["jwt_subject"], "agent-billing-01");
+        assert_eq!(v["jwt_provider"], "corp-idp");
     }
 
     #[test]

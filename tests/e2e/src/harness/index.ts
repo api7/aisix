@@ -15,3 +15,4 @@ export {
   type MockSls,
   type CapturedPutLogs,
 } from "./sls-mock.js";
+export { startMockIdp, agentClaims, type MockIdp, type SignOpts } from "./jwks-mock.js";

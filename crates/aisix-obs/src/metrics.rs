@@ -84,6 +84,17 @@ pub const M_USAGE_EVENT_DROPS_TOTAL: &str = "aisix_usage_event_drops_total";
 /// `/v1/messages` path in — read these as chat-path, not gateway-wide.
 pub const M_GUARDRAIL_BLOCKS_TOTAL: &str = "aisix_guardrail_blocks_total";
 pub const M_GUARDRAIL_BYPASSES_TOTAL: &str = "aisix_guardrail_bypasses_total";
+/// Per-request inbound authentication decisions
+/// (AISIX-Cloud#1080/#1081). Before this series, a rejected credential
+/// was invisible: the auth extractor short-circuits ahead of every
+/// handler, so no request counter and no access-log line ever fired
+/// for a 401. Labels, all bounded:
+/// - `method`: `api_key` / `jwt` / `none` (no credential presented).
+/// - `result`: `allowed` / `denied`.
+/// - `reason`: the DP-internal denial reason class (e.g. `unknown_key`,
+///   `key_expired`, `jwt_bad_signature`, `jwt_untrusted_issuer`,
+///   `jwt_identity_unmapped`); `none` when allowed.
+pub const M_AUTH_DECISIONS_TOTAL: &str = "aisix_auth_decisions_total";
 /// Per-execution guardrail latency histogram (AISIX-Cloud#1076), recorded
 /// by the chain fold for every member consulted on any handler — chat,
 /// messages, responses, embeddings, streaming end-of-stream/window scans,
@@ -366,6 +377,22 @@ impl Metrics {
                 "status" => status.to_string(),
             )
             .record(duration.as_secs_f64());
+        });
+    }
+
+    /// Record one inbound authentication decision on
+    /// [`M_AUTH_DECISIONS_TOTAL`] (AISIX-Cloud#1081). Called from the
+    /// proxy auth choke point for every credential judgment — allowed
+    /// or denied, API-key and JWT paths alike.
+    pub fn record_auth_decision(&self, method: &str, allowed: bool, reason: &str) {
+        metrics::with_local_recorder(&self.inner.recorder, || {
+            metrics::counter!(
+                M_AUTH_DECISIONS_TOTAL,
+                "method" => method.to_string(),
+                "result" => if allowed { "allowed" } else { "denied" }.to_string(),
+                "reason" => if reason.is_empty() { "none" } else { reason }.to_string(),
+            )
+            .increment(1);
         });
     }
 

@@ -44,6 +44,7 @@ pub mod health;
 mod http_client;
 mod images;
 mod jobs;
+mod jwt;
 mod mcp;
 mod messages;
 mod model_resolve;
