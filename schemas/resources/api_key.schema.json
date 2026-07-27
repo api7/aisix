@@ -2,6 +2,64 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "additionalProperties": false,
   "definitions": {
+    "McpAccess": {
+      "additionalProperties": false,
+      "description": "Policy-driven MCP access configuration on an API key. When present, this block supersedes the key's legacy `allowed_tools` list: the allow side of the key's effective grant is computed from the applicable [`McpPolicy`] rows and `mode`, and `allowed_tools` is not consulted.",
+      "properties": {
+        "allow": {
+          "description": "Namespaced `<server>__<tool>` patterns intersected with the inherited grant when `mode` is `restrict`, using the same single-`*` glob matching as `allowed_tools`. Ignored for the other modes.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "deny": {
+          "description": "Namespaced `<server>__<tool>` patterns subtracted from the key's effective grant, using the same single-`*` glob matching as `allow`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "mode": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/McpAccessMode"
+            }
+          ],
+          "description": "How the key combines with the applicable policies: `inherit`, `restrict`, or `deny`."
+        }
+      },
+      "required": [
+        "mode"
+      ],
+      "type": "object"
+    },
+    "McpAccessMode": {
+      "description": "Per-key MCP access block, carried on the API key resource. Selects how the key combines with the environment's and its team's [`McpPolicy`] rows.",
+      "oneOf": [
+        {
+          "description": "The key uses the inherited grant unchanged: its team's active policy when one exists, otherwise the environment-default policy.",
+          "enum": [
+            "inherit"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The key uses the intersection of the inherited grant and its own `allow` patterns — a restriction can only narrow what the policies grant, never widen it.",
+          "enum": [
+            "restrict"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The key has no MCP tool access at all.",
+          "enum": [
+            "deny"
+          ],
+          "type": "string"
+        }
+      ]
+    },
     "RateLimit": {
       "additionalProperties": false,
       "properties": {
@@ -116,6 +174,17 @@
       "description": "SHA-256 hexadecimal hash of the plaintext bearer. The proxy hashes incoming bearer tokens before lookup.",
       "minLength": 1,
       "type": "string"
+    },
+    "mcp_access": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/McpAccess"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Policy-driven MCP access for this key. When present, it supersedes `allowed_tools`: the key's grant is computed from the environment's and its team's MCP access policies according to `mode` (`inherit`, `restrict`, or `deny`), and `allowed_tools` is not consulted. When omitted, the key keeps the explicit `allowed_tools` behavior — with policy `deny` patterns still subtracted, since deny applies to every key the policy covers."
     },
     "rate_limit": {
       "anyOf": [

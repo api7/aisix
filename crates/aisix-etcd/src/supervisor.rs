@@ -480,6 +480,9 @@ impl<P: ConfigProvider> Supervisor<P> {
             for e in tiny.mcp_servers.entries() {
                 new.mcp_servers.insert(clone_entry(&e));
             }
+            for e in tiny.mcp_policies.entries() {
+                new.mcp_policies.insert(clone_entry(&e));
+            }
             for e in tiny.a2a_agents.entries() {
                 new.a2a_agents.insert(clone_entry(&e));
             }
@@ -539,6 +542,7 @@ impl<P: ConfigProvider> Supervisor<P> {
             }
             "rate_limit_policies" => snap.rate_limit_policies.get_by_id(parsed.id).is_some(),
             "mcp_servers" => snap.mcp_servers.get_by_id(parsed.id).is_some(),
+            "mcp_policies" => snap.mcp_policies.get_by_id(parsed.id).is_some(),
             "a2a_agents" => snap.a2a_agents.get_by_id(parsed.id).is_some(),
             _ => false,
         };
@@ -589,6 +593,9 @@ impl<P: ConfigProvider> Supervisor<P> {
                 }
                 "mcp_servers" => {
                     new.mcp_servers.remove(parsed.id);
+                }
+                "mcp_policies" => {
+                    new.mcp_policies.remove(parsed.id);
                 }
                 "a2a_agents" => {
                     new.a2a_agents.remove(parsed.id);
@@ -837,6 +844,9 @@ fn clone_snapshot(src: &AisixSnapshot) -> AisixSnapshot {
     for e in src.mcp_servers.entries() {
         out.mcp_servers.insert(clone_entry(&e));
     }
+    for e in src.mcp_policies.entries() {
+        out.mcp_policies.insert(clone_entry(&e));
+    }
     for e in src.a2a_agents.entries() {
         out.a2a_agents.insert(clone_entry(&e));
     }
@@ -861,6 +871,7 @@ fn resource_counts(snap: &AisixSnapshot) -> BTreeMap<String, usize> {
         ),
         ("rate_limit_policies", snap.rate_limit_policies.len()),
         ("mcp_servers", snap.mcp_servers.len()),
+        ("mcp_policies", snap.mcp_policies.len()),
         ("a2a_agents", snap.a2a_agents.len()),
     ] {
         if n > 0 {

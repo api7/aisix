@@ -228,9 +228,10 @@ async fn dispatch(
     }
 
     let snapshot = state.snapshot.load();
-    // Scope the gateway to the tools this caller's key permits, so MCP tool
-    // access is governed by the same key object as LLM access.
-    let acl = aisix_mcp::ToolAcl::from_allowed(auth.key().allowed_tools.as_deref());
+    // Scope the gateway to the tools this caller's key permits — resolved
+    // from the key together with the environment/team MCP access policies —
+    // so MCP tool access is governed by the same key object as LLM access.
+    let acl = aisix_mcp::ToolAcl::resolve(&snapshot, auth.key(), chrono::Utc::now());
     let gateway = aisix_mcp::McpGateway::from_snapshot(&snapshot).with_tool_acl(acl);
     let service = aisix_mcp::streamable_http_service(gateway);
     let request = Request::from_parts(parts, Body::from(bytes));
@@ -596,6 +597,103 @@ mod tests {
             listed.status(),
             StatusCode::TOO_MANY_REQUESTS,
             "tools/list must not be rate-limited"
+        );
+    }
+
+    /// Read a JSON-RPC response body (the endpoint is configured for JSON
+    /// responses, not SSE).
+    async fn body_json(resp: axum::response::Response) -> serde_json::Value {
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.expect("body");
+        serde_json::from_slice(&bytes).expect("JSON-RPC body")
+    }
+
+    #[tokio::test]
+    async fn mcp_access_deny_mode_rejects_tool_calls_at_the_acl() {
+        // The key's legacy allowlist grants everything, but its mcp_access
+        // block says deny — the policy layer must win. The rejection is the
+        // ACL's neutral "not available" (reached before upstream routing),
+        // not the router's "unknown MCP server", which proves the endpoint
+        // resolves the ACL from the key + policies rather than allowed_tools
+        // alone.
+        let key_hash = ApiKey::hash_bearer(TOKEN);
+        let apikey: ApiKey = serde_json::from_value(serde_json::json!({
+            "key_hash": key_hash,
+            "allowed_models": ["*"],
+            "allowed_tools": ["*"],
+            "mcp_access": { "mode": "deny" },
+        }))
+        .expect("valid apikey");
+        let snapshot = AisixSnapshot::new();
+        snapshot
+            .apikeys
+            .insert(ResourceEntry::new("ak-1", apikey, 1));
+
+        let router = router_with(snapshot);
+        let resp = router
+            .oneshot(tools_call_request())
+            .await
+            .expect("router responds");
+        let body = body_json(resp).await;
+        let message = body["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("not available"),
+            "deny-mode key must be rejected by the ACL, got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn env_policy_deny_overlays_legacy_key_at_the_endpoint() {
+        // A legacy key (no mcp_access block) with a wildcard allowlist, plus
+        // an env policy that denies exactly one tool: the denied tool is
+        // rejected by the ACL while any other name still reaches routing
+        // (and fails as "unknown MCP server" — no upstreams are registered).
+        let key_hash = ApiKey::hash_bearer(TOKEN);
+        let apikey: ApiKey = serde_json::from_value(serde_json::json!({
+            "key_hash": key_hash,
+            "allowed_models": ["*"],
+            "allowed_tools": ["*"],
+        }))
+        .expect("valid apikey");
+        let policy: aisix_core::models::McpPolicy = serde_json::from_value(serde_json::json!({
+            "scope": "env",
+            "mode": "none",
+            "deny": ["ghost__tool"],
+        }))
+        .expect("valid policy");
+        let snapshot = AisixSnapshot::new();
+        snapshot
+            .apikeys
+            .insert(ResourceEntry::new("ak-1", apikey, 1));
+        snapshot
+            .mcp_policies
+            .insert(ResourceEntry::new("p-env", policy, 1));
+
+        let router = router_with(snapshot);
+
+        let denied = router
+            .clone()
+            .oneshot(tools_call_request()) // calls ghost__tool
+            .await
+            .expect("router responds");
+        let body = body_json(denied).await;
+        let message = body["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("not available"),
+            "env-policy deny must subtract from a legacy key, got: {body}"
+        );
+
+        let other = router
+            .oneshot(mcp_request(
+                "tools/call",
+                serde_json::json!({ "name": "other__tool", "arguments": {} }),
+            ))
+            .await
+            .expect("router responds");
+        let body = body_json(other).await;
+        let message = body["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("unknown MCP server"),
+            "a non-denied tool must still pass the ACL for a wildcard legacy key, got: {body}"
         );
     }
 

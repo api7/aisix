@@ -16,6 +16,8 @@ aisix-core = { path = "../aisix-core" }
 aisix-gateway = { path = "../aisix-gateway" }
 tokio.workspace = true
 async-trait.workspace = true
+# Effective-ACL resolution timestamps policy expiry checks (`ToolAcl::resolve`).
+chrono.workspace = true
 futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true
