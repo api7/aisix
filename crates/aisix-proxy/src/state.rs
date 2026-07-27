@@ -153,6 +153,10 @@ pub struct ProxyState {
     /// the built-in allowlist (AISIX-Cloud#1045). Default = built-ins
     /// only; the server bootstrap swaps in the compiled config rules.
     pub client_classifier: Arc<ClientTypeClassifier>,
+    /// Deployment-wide retry budget (`upstream.retries`) — the floor every
+    /// dispatch falls back to when neither the target Model nor its model
+    /// group sets one. See `routing::effective_retries`.
+    pub default_retries: u32,
 }
 
 impl ProxyState {
@@ -180,6 +184,7 @@ impl ProxyState {
             real_ip: Arc::new(ResolvedRealIp::from_config(&cfg.real_ip)),
             billed_batches: Arc::new(dashmap::DashSet::new()),
             client_classifier: Arc::new(ClientTypeClassifier::builtin()),
+            default_retries: aisix_core::config::DEFAULT_UPSTREAM_RETRIES,
         }
     }
 
@@ -214,6 +219,7 @@ impl ProxyState {
             real_ip: Arc::new(ResolvedRealIp::from_config(&cfg.real_ip)),
             billed_batches: Arc::new(dashmap::DashSet::new()),
             client_classifier: Arc::new(ClientTypeClassifier::builtin()),
+            default_retries: aisix_core::config::DEFAULT_UPSTREAM_RETRIES,
         }
     }
 
@@ -258,6 +264,7 @@ impl ProxyState {
             real_ip: Arc::new(ResolvedRealIp::from_config(&cfg.real_ip)),
             billed_batches: Arc::new(dashmap::DashSet::new()),
             client_classifier: Arc::new(ClientTypeClassifier::builtin()),
+            default_retries: aisix_core::config::DEFAULT_UPSTREAM_RETRIES,
         }
     }
 
@@ -281,6 +288,13 @@ impl ProxyState {
     /// Default is built-ins only.
     pub fn with_client_classifier(mut self, classifier: Arc<ClientTypeClassifier>) -> Self {
         self.client_classifier = classifier;
+        self
+    }
+
+    /// Apply the deployment-wide `upstream.retries` budget. Default is
+    /// [`aisix_core::config::DEFAULT_UPSTREAM_RETRIES`].
+    pub fn with_default_retries(mut self, retries: u32) -> Self {
+        self.default_retries = retries;
         self
     }
 

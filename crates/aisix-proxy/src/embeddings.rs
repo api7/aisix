@@ -401,7 +401,18 @@ async fn dispatch(
         ctx = ctx.with_deadline(d);
     }
 
-    match bridge.embed(&req, &ctx).await {
+    // #701: per-attempt cooldown accounting — see completions.rs.
+    let tracker = &state.runtime_status;
+    let cooldown_model_id: &str = &model_entry.id;
+    let cooldown_cfg = model.cooldown.as_ref();
+    match crate::routing::retrying_dispatch(state, model, "/v1/embeddings", || async {
+        bridge
+            .embed(&req, &ctx)
+            .await
+            .map_err(|e| crate::cooldown::note_failure(tracker, cooldown_model_id, cooldown_cfg, e))
+    })
+    .await
+    {
         Ok(embed_resp) => {
             // #701: clear any cooldown/unhealthy mark now the upstream
             // answered — same recovery signal as rerank/audio/chat.
@@ -492,16 +503,7 @@ async fn dispatch(
         }
         Err(e) => {
             reservation.commit_tokens(0).await;
-            // #701: mark the failure on the runtime status so the cooldown /
-            // circuit-breaker sees flapping upstreams reached only via this
-            // endpoint — same policy as rerank/audio/chat. `note_failure` is
-            // a no-op for non-triggering categories (e.g. Config errors).
-            let e = crate::cooldown::note_failure(
-                &state.runtime_status,
-                &model_entry.id,
-                model.cooldown.as_ref(),
-                e,
-            );
+            // Cooldown was already noted per attempt inside the retry loop.
             Err(ProxyError::Bridge(e))
         }
     }
@@ -1459,6 +1461,54 @@ mod tests {
         assert!(event.provider_featured);
         assert_eq!(event.branded_provider, "openai");
         assert_eq!(event.pk_label, "prod-embeddings-key");
+    }
+
+    /// `/v1/embeddings` retries a transient upstream failure.
+    ///
+    /// This endpoint dispatches to exactly one model and had no retry loop at
+    /// all — a single 502 was the caller's problem. It now shares
+    /// `routing::retrying_dispatch` with the other single-model endpoints, so
+    /// the model's retry budget applies here too.
+    #[tokio::test]
+    async fn retries_a_transient_upstream_failure() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/embeddings"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("overloaded"))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(upstream_response()))
+            .with_priority(2)
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("text-embedding-3-small"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let app = build_app(snap);
+        let resp = tower::ServiceExt::oneshot(
+            app,
+            make_req(serde_json::json!({
+                "model": "text-embedding-3-small",
+                "input": "hello"
+            })),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "the retry must recover the request",
+        );
+        // The `.expect(1)` on both mocks asserts exactly two upstream calls.
     }
 
     /// Issue #456 (#226 family): the 501 NotImplemented path (provider

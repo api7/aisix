@@ -206,7 +206,7 @@ async fn dispatch(
     let is_routing_request = model_entry.value.routing.is_some();
     let mut last_err: Option<ProxyError> = None;
     let mut any_anthropic = false;
-    for target in &attempt_models {
+    for (target_idx, target) in attempt_models.iter().enumerate() {
         // count_tokens has no upstream equivalent for non-Anthropic
         // providers; skip foreign targets in a mixed group rather than
         // dispatching to an upstream that would 404.
@@ -234,25 +234,63 @@ async fn dispatch(
                 continue;
             }
         };
-        match count_tokens_to_target(
-            state,
-            &snapshot,
-            body,
+        // Same-target retries before failing over, like the other
+        // group-capable endpoints. This loop had fail-over only: a
+        // transient 502 on the sole Anthropic target failed the request
+        // outright even with a retry budget configured.
+        //
+        // "Another target queued" counts only Anthropic targets: the loop
+        // `continue`s past everything else, so in a mixed group like
+        // [anthropic, openai] the openai entry is not a real fallback —
+        // treating it as one would suppress the default budget on the only
+        // target that can actually serve the request.
+        let has_usable_fallback = attempt_models[target_idx + 1..]
+            .iter()
+            .any(|t| t.model.provider.as_deref() == Some("anthropic"));
+        let budget = crate::routing::effective_retries(
             &target.model,
-            &target.id,
-            request_id,
-        )
-        .await
-        {
-            Ok(resp) => return Ok((resp, "anthropic".to_string())),
-            Err(e) => {
-                let retryable = matches!(
-                    &e,
-                    ProxyError::Bridge(be) if crate::routing::is_retryable(be, retry_on_429, fallback_statuses)
-                );
-                last_err = Some(e);
-                if !retryable {
-                    break;
+            model_entry.value.routing.as_ref(),
+            state.default_retries,
+            has_usable_fallback,
+        );
+        for attempt_idx in 0..=budget.attempts {
+            if attempt_idx > 0 {
+                let hint = last_err.as_ref().and_then(|e| match e {
+                    ProxyError::Bridge(be) => crate::routing::retry_after_hint(be),
+                    _ => None,
+                });
+                tokio::time::sleep(crate::routing::retry_backoff(attempt_idx as u32, hint)).await;
+            }
+            match count_tokens_to_target(
+                state,
+                &snapshot,
+                body,
+                &target.model,
+                &target.id,
+                request_id,
+            )
+            .await
+            {
+                Ok(resp) => return Ok((resp, "anthropic".to_string())),
+                Err(e) => {
+                    let retryable = matches!(
+                        &e,
+                        ProxyError::Bridge(be) if crate::routing::is_retryable(be, retry_on_429, fallback_statuses)
+                    );
+                    // See `RetryBudget::covers`: a default budget skips
+                    // same-target retries for timeouts; fail-over is
+                    // unaffected (the outer loop still moves on).
+                    let budget_covers = match &e {
+                        ProxyError::Bridge(be) => budget.covers(be),
+                        _ => true,
+                    };
+                    last_err = Some(e);
+                    if !retryable {
+                        return Err(last_err.unwrap_or(ProxyError::ProviderUnavailable));
+                    }
+                    if !budget_covers {
+                        break;
+                    }
                 }
             }
         }
@@ -543,6 +581,75 @@ mod tests {
             .header("content-type", "application/json")
             .body(axum::body::Body::from(body.to_string()))
             .unwrap()
+    }
+
+    /// Mixed group [anthropic, openai]: the openai target is `continue`d
+    /// past (count_tokens has no upstream there), so it is NOT a usable
+    /// fallback — the default retry budget must apply on the anthropic
+    /// target as if it were the last one. Counting the skipped target as
+    /// a fallback would have suppressed the budget and failed the request
+    /// on the first transient 502.
+    #[tokio::test]
+    async fn mixed_group_spends_the_default_budget_on_the_only_anthropic_target() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages/count_tokens"))
+            .respond_with(ResponseTemplate::new(502).set_body_string("upstream down"))
+            .up_to_n_times(2)
+            .with_priority(1)
+            .mount(&upstream)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages/count_tokens"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"input_tokens": 7})),
+            )
+            .with_priority(2)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        let claude = {
+            let json = format!(
+                r#"{{"display_name":"ct-claude","provider":"anthropic","model_name":"claude-haiku-4-5-20251001","provider_key_id":"{PK_ID}"}}"#
+            );
+            let m: Model = serde_json::from_str(&json).unwrap();
+            ResourceEntry::new("m-ct-claude", m, 1)
+        };
+        let gpt = {
+            let json = format!(
+                r#"{{"display_name":"ct-gpt","provider":"openai","model_name":"gpt-4o","provider_key_id":"{PK_ID}"}}"#
+            );
+            let m: Model = serde_json::from_str(&json).unwrap();
+            ResourceEntry::new("m-ct-gpt", m, 1)
+        };
+        let group = {
+            let json = r#"{"display_name":"ct-mixed","routing":{"strategy":"failover","targets":[{"model":"ct-claude"},{"model":"ct-gpt"}]}}"#;
+            let m: Model = serde_json::from_str(json).unwrap();
+            ResourceEntry::new("m-ct-mixed", m, 1)
+        };
+        snap.models.insert(claude);
+        snap.models.insert(gpt);
+        snap.models.insert(group);
+        snap.apikeys.insert(apikey_entry(&["ct-mixed"]));
+
+        let app = build_app(snap);
+        let resp = app
+            .oneshot(make_req(serde_json::json!({
+                "model": "ct-mixed",
+                "messages": [{"role": "user", "content": "hi"}]
+            })))
+            .await
+            .unwrap();
+
+        // Two 502s absorbed by the default budget, third attempt wins.
+        assert_eq!(resp.status(), StatusCode::OK);
+        let received = upstream.received_requests().await.unwrap();
+        assert_eq!(
+            received.len(),
+            3,
+            "initial + 2 retries on the sole anthropic target",
+        );
     }
 
     #[tokio::test]

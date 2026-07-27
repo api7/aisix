@@ -1107,31 +1107,6 @@ async fn provider_call(
     request_id: &str,
 ) -> Result<serde_json::Value, ProxyError> {
     let client = crate::http_client::client();
-    let mut builder = client
-        .request(method, url)
-        .header(header::AUTHORIZATION, format!("Bearer {}", target.secret))
-        .header("x-aisix-request-id", request_id);
-    // A provider header required on every call (submit and poll) — e.g.
-    // Runway's mandatory `X-Runway-Version`. Applied unconditionally,
-    // before the submit-only body/header block below.
-    if let Some((name, value)) = target.provider.all_request_header() {
-        builder = builder.header(name, value);
-    }
-    if let Some(b) = body {
-        if target.provider.submit_headers_async() {
-            // DashScope requires the async-mode header — it rejects
-            // synchronous video-synthesis calls outright.
-            builder = builder.header("X-DashScope-Async", "enable");
-        }
-        builder = builder
-            .header(header::CONTENT_TYPE, "application/json")
-            .json(b);
-    }
-    if let Some(d) = target.model_entry.value.request_timeout() {
-        builder = builder.timeout(d);
-    }
-
-    let started = Instant::now();
     let note = |e: aisix_gateway::BridgeError| {
         crate::cooldown::note_failure(
             &state.runtime_status,
@@ -1140,28 +1115,81 @@ async fn provider_call(
             e,
         )
     };
-    let resp = builder
-        .send()
-        .await
-        .map_err(|e| note(crate::dispatch::reqwest_error_to_bridge(&e, started)))
-        .map_err(ProxyError::Bridge)?;
-    let status = resp.status().as_u16();
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| note(aisix_gateway::BridgeError::UpstreamDecode(e.to_string())))
-        .map_err(ProxyError::Bridge)?;
 
-    if !(200..300).contains(&status) {
-        let message = parse_provider_error_message(&bytes);
-        return Err(note(aisix_gateway::BridgeError::upstream_status(status, message)).into());
-    }
+    // Every /v1/videos JSON round-trip — submit, poll, content-URL fetch —
+    // funnels through here, so wrapping this one function gives the whole
+    // surface a retry budget. `note` stays per attempt (see rerank.rs).
+    //
+    // The submit POST creates a PAID generation task, so a failure after
+    // the upstream returned its status (a body-read or parse failure —
+    // `UpstreamDecode`) must not be replayed: the task exists upstream,
+    // its id was in the lost body, and a retry would start a second one
+    // the caller also can't see. Send-phase transport failures stay
+    // retryable for POST too — whether the request arrived is unknowable,
+    // and the provider SDKs make the same call for their own paid
+    // generation POSTs. GETs (poll / content URL) retry everything.
+    let retry_permit = |e: &aisix_gateway::BridgeError| {
+        method == reqwest::Method::GET
+            || !matches!(e, aisix_gateway::BridgeError::UpstreamDecode(_))
+    };
+    crate::routing::retrying_dispatch_gated(
+        state,
+        &target.model_entry.value,
+        "/v1/videos",
+        retry_permit,
+        || {
+            let mut builder = client
+                .request(method.clone(), url)
+                .header(header::AUTHORIZATION, format!("Bearer {}", target.secret))
+                .header("x-aisix-request-id", request_id);
+            // A provider header required on every call (submit and poll) — e.g.
+            // Runway's mandatory `X-Runway-Version`. Applied unconditionally,
+            // before the submit-only body/header block below.
+            if let Some((name, value)) = target.provider.all_request_header() {
+                builder = builder.header(name, value);
+            }
+            if let Some(b) = body {
+                if target.provider.submit_headers_async() {
+                    // DashScope requires the async-mode header — it rejects
+                    // synchronous video-synthesis calls outright.
+                    builder = builder.header("X-DashScope-Async", "enable");
+                }
+                builder = builder
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .json(b);
+            }
+            if let Some(d) = target.model_entry.value.request_timeout() {
+                builder = builder.timeout(d);
+            }
+            async move {
+                let started = Instant::now();
+                let resp = builder
+                    .send()
+                    .await
+                    .map_err(|e| note(crate::dispatch::reqwest_error_to_bridge(&e, started)))?;
+                let status = resp.status().as_u16();
+                let bytes = resp
+                    .bytes()
+                    .await
+                    .map_err(|e| note(aisix_gateway::BridgeError::UpstreamDecode(e.to_string())))?;
 
-    serde_json::from_slice(&bytes).map_err(|e| {
-        ProxyError::Bridge(aisix_gateway::BridgeError::UpstreamDecode(format!(
-            "invalid task response from upstream: {e}"
-        )))
-    })
+                if !(200..300).contains(&status) {
+                    let message = parse_provider_error_message(&bytes);
+                    return Err(note(aisix_gateway::BridgeError::upstream_status(
+                        status, message,
+                    )));
+                }
+
+                serde_json::from_slice(&bytes).map_err(|e| {
+                    aisix_gateway::BridgeError::UpstreamDecode(format!(
+                        "invalid task response from upstream: {e}"
+                    ))
+                })
+            }
+        },
+    )
+    .await
+    .map_err(ProxyError::Bridge)
 }
 
 /// Poll the provider task for a decoded video id and reduce it to the
@@ -2369,6 +2397,72 @@ mod tests {
         assert_eq!(wire["input"]["prompt"], "a cardboard city at night");
         assert_eq!(wire["parameters"]["duration"], 8);
         assert_eq!(wire["parameters"]["size"], "1280*720");
+    }
+
+    /// A submit whose upstream returned 200 with an unparseable body must
+    /// NOT be replayed: the paid task committed upstream — only its id was
+    /// lost — and a retry would start a second one the caller also can't
+    /// see. The `.expect(1)` is the assertion.
+    #[tokio::test]
+    async fn submit_decode_failure_is_not_replayed() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(DASHSCOPE_SUBMIT_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let app = build_app(new_snap(&upstream.uri(), "alibaba", ""));
+        let resp = tower::ServiceExt::oneshot(
+            app,
+            post_videos(serde_json::json!({
+                "model": "my-video",
+                "prompt": "a cardboard city at night"
+            })),
+        )
+        .await
+        .unwrap();
+
+        // The caller gets the failure; the task upstream ran once.
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    /// A transient 5xx on submit IS retried (send it again is the whole
+    /// point of the budget — no response committed, LiteLLM/OpenAI SDK
+    /// retry their own paid generation POSTs the same way), and the
+    /// second attempt recovers the request.
+    #[tokio::test]
+    async fn submit_transient_5xx_is_retried_then_succeeds() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(DASHSCOPE_SUBMIT_PATH))
+            .respond_with(ResponseTemplate::new(503).set_body_string("overloaded"))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(DASHSCOPE_SUBMIT_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(pending_submit_response()))
+            .with_priority(2)
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let app = build_app(new_snap(&upstream.uri(), "alibaba", ""));
+        let resp = tower::ServiceExt::oneshot(
+            app,
+            post_videos(serde_json::json!({
+                "model": "my-video",
+                "prompt": "a cardboard city at night"
+            })),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]

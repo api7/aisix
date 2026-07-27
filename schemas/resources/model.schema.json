@@ -407,7 +407,7 @@
           "type": "integer"
         },
         "retries": {
-          "description": "Retry attempts on the current target before failing over.",
+          "description": "Retry attempts on the current target before failing over, applied to every target that does not set its own `retries`. Absent falls back to the deployment-wide `upstream.retries` default.",
           "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
@@ -938,6 +938,12 @@
         }
       ],
       "description": "Request, token, and concurrency limits for this model."
+    },
+    "retries": {
+      "description": "Retry attempts against this model after a retryable upstream failure, before the request gives up (or, inside a model group, fails over to the next target). Absent falls back to the group's `routing.retries`, then to the deployment-wide `upstream.retries` default.",
+      "format": "uint32",
+      "minimum": 0.0,
+      "type": "integer"
     },
     "routing": {
       "allOf": [

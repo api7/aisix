@@ -29,7 +29,7 @@
       "minimum": 0.0
     },
     "retries": {
-      "description": "Retry attempts on the current target before failing over.",
+      "description": "Retry attempts on the current target before failing over, applied to every target that does not set its own `retries`. Absent falls back to the deployment-wide `upstream.retries` default.",
       "type": [
         "integer",
         "null"

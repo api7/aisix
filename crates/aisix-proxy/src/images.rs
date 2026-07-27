@@ -303,7 +303,18 @@ async fn dispatch(
 
     let provider_label = provider.to_ascii_lowercase();
 
-    match bridge.generate_image(&body, &ctx).await {
+    // #701: per-attempt cooldown accounting — see completions.rs.
+    let tracker = &state.runtime_status;
+    let cooldown_model_id: &str = &model_entry.id;
+    let cooldown_cfg = model.cooldown.as_ref();
+    match crate::routing::retrying_dispatch(state, model, "/v1/images/generations", || async {
+        bridge
+            .generate_image(&body, &ctx)
+            .await
+            .map_err(|e| crate::cooldown::note_failure(tracker, cooldown_model_id, cooldown_cfg, e))
+    })
+    .await
+    {
         Ok(resp_json) => {
             // #701: clear any cooldown/unhealthy mark now the upstream
             // answered — same recovery signal as rerank/audio/chat.
@@ -363,16 +374,7 @@ async fn dispatch(
         }
         Err(e) => {
             reservation.commit_tokens(0).await;
-            // #701: mark the failure on the runtime status so the cooldown /
-            // circuit-breaker sees flapping upstreams reached only via this
-            // endpoint — same policy as rerank/audio/chat. `note_failure` is
-            // a no-op for non-triggering categories (e.g. Config errors).
-            let e = crate::cooldown::note_failure(
-                &state.runtime_status,
-                &model_entry.id,
-                model.cooldown.as_ref(),
-                e,
-            );
+            // Cooldown was already noted per attempt inside the retry loop.
             Err(ProxyError::Bridge(e))
         }
     }
