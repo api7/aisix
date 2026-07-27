@@ -125,14 +125,22 @@ describe("jwt auth e2e: OIDC trust providers + jwt_subject key binding", () => {
       audiences: ["aisix-gateway"],
     });
 
-    // agent-1 → a key allowed MODEL only, rpm-limited to 2 so the
-    // rate-limit inheritance is observable. Bound to the mock-idp
-    // provider: the pair (jwt_provider, jwt_subject) is what a token
-    // resolves against.
+    // agent-1 → a key allowed MODEL only, bound to mock-idp. NOT
+    // rate-limited: 200-expecting tests share this identity, so its
+    // budget must not be exhaustible by earlier requests. The pair
+    // (jwt_provider, jwt_subject) is what a token resolves against.
     await seed.createApiKey({
       key_hash: createHash("sha256").update("sk-jwt-agent-1").digest("hex"),
       allowed_models: [MODEL],
       jwt_subject: "agent-1",
+      jwt_provider: "mock-idp",
+    });
+    // agent-rl → a dedicated rpm=2 key the rate-limit test can exhaust
+    // in isolation, so the coupling that flaked the shared key is gone.
+    await seed.createApiKey({
+      key_hash: createHash("sha256").update("sk-jwt-agent-rl").digest("hex"),
+      allowed_models: ["*"],
+      jwt_subject: "agent-rl",
       jwt_provider: "mock-idp",
       rate_limit: { rpm: 2 },
     });
@@ -212,13 +220,14 @@ describe("jwt auth e2e: OIDC trust providers + jwt_subject key binding", () => {
   test("the bound key's rate_limit applies: burst past rpm → 429", async (ctx) => {
     if (skipUnlessUp(ctx)) return;
 
-    // rpm=2 on agent-1's key. Earlier tests in this file consumed the
-    // window unpredictably, so just burst until a 429 shows up — the
-    // contract is that JWT-authenticated traffic hits the bound key's
-    // limiter at all (an unbound identity would never 429).
+    // A dedicated rpm=2 identity (agent-rl) no other test shares, so the
+    // burst-to-429 is deterministic and cannot starve the 200-expecting
+    // tests. The contract is that JWT-authenticated traffic hits the
+    // bound key's limiter at all (an unbound identity would never 429).
+    const rlClaims = () => validClaims({ sub: "agent-rl" });
     let saw429 = false;
     for (let i = 0; i < 6 && !saw429; i++) {
-      const res = await chat(app!, idp!.sign(validClaims()));
+      const res = await chat(app!, idp!.sign(rlClaims()));
       saw429 = res.status === 429;
       await res.text();
     }

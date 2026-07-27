@@ -102,6 +102,34 @@ impl std::error::Error for FileSourceErrors {}
 /// change semantics without silently misreading old gateways' files.
 const SUPPORTED_FORMAT_VERSION: &str = "1";
 
+/// True when a URL embeds credentials that must not sit in a public JWKS
+/// endpoint: userinfo (`user:pass@host`) or a credential-bearing query
+/// parameter. String-scanned rather than URL-parsed to avoid pulling a
+/// URL crate into `aisix-core`.
+pub(crate) fn url_has_credentials(url: &str) -> bool {
+    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    // Authority ends at the first '/', '?', or '#'.
+    let authority_end = after_scheme
+        .find(['/', '?', '#'])
+        .unwrap_or(after_scheme.len());
+    if after_scheme[..authority_end].contains('@') {
+        return true;
+    }
+    if let Some((_, query)) = url.split_once('?') {
+        let query = query.split('#').next().unwrap_or(query);
+        for pair in query.split('&') {
+            let key = pair.split('=').next().unwrap_or(pair).to_ascii_lowercase();
+            if matches!(
+                key.as_str(),
+                "access_token" | "token" | "client_secret" | "password" | "api_key" | "apikey"
+            ) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Fixed processing order for the ten resource collections.
 const KINDS: [(&str, IdentityField); 10] = [
     ("provider_keys", IdentityField::DisplayName),
@@ -521,6 +549,49 @@ pub fn load_from_str(
                 });
             }
             _ => {}
+        }
+    }
+
+    // Two enabled providers sharing one issuer are ambiguous: they carry
+    // different audience/scope/claim policies, and JWT auth would have to
+    // pick one. Reject the duplicate at load (the DP resolver also fails
+    // closed at runtime, but the file can and should surface it).
+    let mut seen_issuers: BTreeMap<&str, &str> = BTreeMap::new();
+    for (_, scope, provider) in &oidc_providers {
+        if !provider.enabled {
+            continue;
+        }
+        if let Some(first) = seen_issuers.insert(provider.issuer.as_str(), scope.as_str()) {
+            errors.push(LoadError {
+                scope: scope.clone(),
+                message: format!(
+                    "duplicate enabled OIDC issuer {:?}: already used by {first} — every \
+                     enabled provider must have a distinct issuer",
+                    provider.issuer
+                ),
+            });
+        }
+    }
+
+    // A JWKS/discovery URL must never carry embedded credentials
+    // (`user:pass@host` or a credential query): JWKS material is public,
+    // credentials there would only leak (e.g. through a snapshot export).
+    for (_, scope, provider) in &oidc_providers {
+        for (field, url) in [
+            ("issuer", Some(&provider.issuer)),
+            ("jwks_uri", provider.jwks_uri.as_ref()),
+        ] {
+            if let Some(url) = url {
+                if url_has_credentials(url) {
+                    errors.push(LoadError {
+                        scope: scope.clone(),
+                        message: format!(
+                            "OIDC provider {field} must not embed credentials (user info or a \
+                             token query parameter) — JWKS endpoints are public"
+                        ),
+                    });
+                }
+            }
         }
     }
 

@@ -118,22 +118,27 @@ impl<T: Resource> ResourceTable<T> {
         self.by_id.iter().any(|kv| pred(kv.value()))
     }
 
-    /// The lowest-`id` entry satisfying `pred`, without materialising the
-    /// table. The deterministic lowest-id tie-break matches the resolvers
-    /// that need a stable winner when duplicates exist transiently.
-    pub fn find_min_by_id(
+    /// The single entry satisfying `pred`, without materialising the
+    /// table. Returns `(None, true)` when more than one entry matches so
+    /// the caller can fail closed on an ambiguous lookup and log the
+    /// misconfiguration — a security-sensitive resolver must never pick
+    /// one of several matches silently. `(Some(_), false)` on exactly
+    /// one match; `(None, false)` on none.
+    pub fn find_unique_by(
         &self,
         pred: impl Fn(&ResourceEntry<T>) -> bool,
-    ) -> Option<Arc<ResourceEntry<T>>> {
-        self.by_id.iter().fold(None, |best, kv| {
+    ) -> (Option<Arc<ResourceEntry<T>>>, bool) {
+        let mut found: Option<Arc<ResourceEntry<T>>> = None;
+        for kv in self.by_id.iter() {
             if !pred(kv.value()) {
-                return best;
+                continue;
             }
-            match &best {
-                Some(b) if b.id <= kv.value().id => best,
-                _ => Some(kv.value().clone()),
+            if found.is_some() {
+                return (None, true);
             }
-        })
+            found = Some(kv.value().clone());
+        }
+        (found, false)
     }
 }
 

@@ -128,35 +128,56 @@ fn unverified_issuer(token: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// The enabled provider matching `iss`, ties broken by lowest id so
-/// duplicate rows resolve deterministically (same discipline as the MCP
-/// policy resolver).
+/// The enabled provider matching `iss`. Fails closed on ambiguity: if
+/// two enabled providers claim the same issuer their audience/scope/
+/// claim policies differ, so silently picking one would apply the wrong
+/// policy — the request is denied instead. The control plane enforces
+/// per-environment issuer uniqueness and the file loader rejects
+/// duplicates, so this only guards a transient etcd race or a CP bug.
 fn provider_for_issuer(
     snapshot: &AisixSnapshot,
     iss: &str,
 ) -> Option<Arc<ResourceEntry<OidcProvider>>> {
-    snapshot
+    let (found, ambiguous) = snapshot
         .oidc_providers
-        .find_min_by_id(|e| e.value.enabled && e.value.issuer == iss)
+        .find_unique_by(|e| e.value.enabled && e.value.issuer == iss);
+    if ambiguous {
+        tracing::warn!(
+            target: "aisix::auth",
+            issuer = %clip(iss),
+            "two enabled OIDC providers claim this issuer; failing closed — \
+             their policies differ and neither can be chosen unambiguously",
+        );
+    }
+    found
 }
 
-/// The API key bound to `subject` **as asserted by `provider_name`**,
-/// ties broken by lowest id. A key whose `jwt_provider` names a different
-/// trust provider is never a candidate: subjects are namespaced by the
-/// provider that vouched for them, so a second trusted provider cannot
-/// mint a token impersonating the first provider's identity of the same
-/// name. The control plane enforces `(jwt_provider, jwt_subject)`
-/// uniqueness, so the tie-break only matters for a transient duplicate
-/// mid-sync.
+/// The API key bound to `subject` **as asserted by `provider_name`**. A
+/// key whose `jwt_provider` names a different trust provider is never a
+/// candidate: subjects are namespaced by the provider that vouched for
+/// them, so a second trusted provider cannot mint a token impersonating
+/// the first provider's identity of the same name. Fails closed on
+/// ambiguity for the same reason as [`provider_for_issuer`] — the CP
+/// enforces `(jwt_provider, jwt_subject)` uniqueness and the file loader
+/// rejects duplicates, so this only guards a transient race.
 fn key_for_subject(
     snapshot: &AisixSnapshot,
     provider_name: &str,
     subject: &str,
 ) -> Option<Arc<ResourceEntry<ApiKey>>> {
-    snapshot.apikeys.find_min_by_id(|e| {
+    let (found, ambiguous) = snapshot.apikeys.find_unique_by(|e| {
         e.value.jwt_subject.as_deref() == Some(subject)
             && e.value.jwt_provider.as_deref() == Some(provider_name)
-    })
+    });
+    if ambiguous {
+        tracing::warn!(
+            target: "aisix::auth",
+            provider = %clip(provider_name),
+            "two API keys share one jwt binding; failing closed — the identity \
+             is ambiguous and neither key's limits can be applied",
+        );
+    }
+    found
 }
 
 /// Authenticate a JWT-shaped bearer. Called from the auth choke point
@@ -633,6 +654,9 @@ fn http_client() -> &'static reqwest::Client {
 /// discovery document cannot relocate trust material into our network.
 async fn resolve_jwks_url(prov: &OidcProvider) -> Result<String, String> {
     if let Some(u) = &prov.jwks_uri {
+        if url_has_credentials(u) {
+            return Err("jwks_uri must not embed credentials".to_string());
+        }
         return Ok(u.clone());
     }
     let now = Instant::now();
@@ -694,6 +718,9 @@ async fn resolve_jwks_url(prov: &OidcProvider) -> Result<String, String> {
             if !same_origin(&prov.issuer, &jwks_uri) {
                 return Err("discovery jwks_uri is not on the issuer's origin".to_string());
             }
+            if url_has_credentials(&jwks_uri) {
+                return Err("discovery jwks_uri must not embed credentials".to_string());
+            }
             write_recover(discovery_cache())
                 .entry(prov.issuer.clone())
                 .or_insert(DiscoveryEntry {
@@ -716,6 +743,29 @@ async fn resolve_jwks_url(prov: &OidcProvider) -> Result<String, String> {
             }
             Err(format!("OIDC discovery failed: {e}"))
         }
+    }
+}
+
+/// True when a URL embeds credentials that must never sit in a public
+/// JWKS endpoint: userinfo (`user:pass@host`) or a credential query
+/// parameter. A defense-in-depth mirror of the control plane's ingestion
+/// check, for file-mode and discovery-returned URLs.
+fn url_has_credentials(url: &str) -> bool {
+    match reqwest::Url::parse(url) {
+        Ok(u) => {
+            if !u.username().is_empty() || u.password().is_some() {
+                return true;
+            }
+            u.query_pairs().any(|(k, _)| {
+                matches!(
+                    k.to_ascii_lowercase().as_str(),
+                    "access_token" | "token" | "client_secret" | "password" | "api_key" | "apikey"
+                )
+            })
+        }
+        // Unparseable here is caught elsewhere (fetch fails); treat as
+        // credential-free so this check doesn't double-report.
+        Err(_) => false,
     }
 }
 
@@ -1171,20 +1221,36 @@ jyxumGxNpoIV8LlzsMsaWQ==
     }
 
     #[test]
-    fn provider_and_subject_selection_tie_break_on_lowest_id() {
+    fn provider_selection_is_unique_and_fails_closed_on_duplicate_issuer() {
         let snapshot = AisixSnapshot::new();
-        let mk = |id: &str, enabled: bool| {
+        let mk = |id: &str, issuer: &str, enabled: bool| {
             let mut p = base_provider();
+            p.issuer = issuer.to_string();
             p.enabled = enabled;
             snapshot.oidc_providers.insert(ResourceEntry::new(id, p, 1));
         };
-        mk("b-provider", true);
-        mk("a-provider", true);
-        mk("0-disabled", false);
-        let picked = provider_for_issuer(&snapshot, "https://idp.test/realms/agents").unwrap();
-        assert_eq!(picked.id, "a-provider");
-        assert!(provider_for_issuer(&snapshot, "https://other.test").is_none());
+        mk("corp", "https://corp.test", true);
+        mk("partner", "https://partner.test", true);
+        mk("disabled", "https://off.test", false);
+        assert_eq!(
+            provider_for_issuer(&snapshot, "https://corp.test")
+                .unwrap()
+                .id,
+            "corp"
+        );
+        // A disabled provider is not selected even on an exact issuer match.
+        assert!(provider_for_issuer(&snapshot, "https://off.test").is_none());
+        assert!(provider_for_issuer(&snapshot, "https://unknown.test").is_none());
 
+        // Two ENABLED providers claiming one issuer -> fail closed, not a
+        // silent pick (their audience/scope policies differ).
+        mk("corp-dup", "https://corp.test", true);
+        assert!(provider_for_issuer(&snapshot, "https://corp.test").is_none());
+    }
+
+    #[test]
+    fn key_selection_namespaces_by_provider_and_fails_closed_on_duplicate() {
+        let snapshot = AisixSnapshot::new();
         let mk_key = |id: &str, subject: Option<&str>, provider: Option<&str>| {
             let mut k: ApiKey =
                 serde_json::from_str(r#"{"key_hash":"h","allowed_models":["*"]}"#).unwrap();
@@ -1194,13 +1260,11 @@ jyxumGxNpoIV8LlzsMsaWQ==
             k.key_hash = format!("hash-{id}");
             snapshot.apikeys.insert(ResourceEntry::new(id, k, 1));
         };
-        mk_key("k-2", Some("agent-1"), Some("corp"));
         mk_key("k-1", Some("agent-1"), Some("corp"));
         mk_key("k-3", Some("agent-2"), Some("corp"));
         mk_key("k-4", None, None);
-        // A key bound to the SAME subject under a DIFFERENT provider must
-        // never be selected — this is the cross-provider impersonation
-        // guard (audit H1).
+        // Same subject under a DIFFERENT provider resolves separately —
+        // the cross-provider impersonation guard (audit H1).
         mk_key("k-5", Some("agent-1"), Some("partner"));
         assert_eq!(
             key_for_subject(&snapshot, "corp", "agent-1").unwrap().id,
@@ -1214,9 +1278,13 @@ jyxumGxNpoIV8LlzsMsaWQ==
             key_for_subject(&snapshot, "partner", "agent-1").unwrap().id,
             "k-5"
         );
-        // No provider match → no key, even though the subject exists.
+        // No provider match -> no key, even though the subject exists.
         assert!(key_for_subject(&snapshot, "unknown", "agent-1").is_none());
         assert!(key_for_subject(&snapshot, "corp", "agent-9").is_none());
+
+        // A duplicate (provider, subject) pair -> fail closed.
+        mk_key("k-1-dup", Some("agent-1"), Some("corp"));
+        assert!(key_for_subject(&snapshot, "corp", "agent-1").is_none());
     }
 
     #[test]

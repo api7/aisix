@@ -384,7 +384,27 @@ fn title_single_value_enum_variants(
 /// omits unset fields (`jwks_uri`, `bound_claims`) rather than sending an
 /// explicit `null`.
 pub fn oidc_provider_root_schema() -> Value {
-    struct_root_schema::<crate::models::OidcProvider>(false)
+    let mut schema = struct_root_schema::<crate::models::OidcProvider>(false);
+    // schemars does not propagate the `#[schemars(length(min = 1))]` on
+    // the `BoundClaimExpect::Any(Vec<String>)` variant into the untagged
+    // enum's array branch, so the generated schema would accept an empty
+    // `bound_claims` value list. Re-assert `minItems: 1` to match the
+    // model's non-empty contract.
+    if let Some(any_of) = schema
+        .get_mut("definitions")
+        .and_then(|d| d.get_mut("BoundClaimExpect"))
+        .and_then(|b| b.get_mut("anyOf"))
+        .and_then(Value::as_array_mut)
+    {
+        for branch in any_of.iter_mut() {
+            if branch.get("type").and_then(Value::as_str) == Some("array") {
+                if let Some(obj) = branch.as_object_mut() {
+                    obj.insert("minItems".to_string(), json!(1));
+                }
+            }
+        }
+    }
+    schema
 }
 
 /// Canonical JSON Schema for the `mcp_policy` resource, derived from the

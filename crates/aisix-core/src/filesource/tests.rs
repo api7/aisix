@@ -517,6 +517,44 @@ api_keys:
 }
 
 #[test]
+fn duplicate_enabled_oidc_issuer_is_a_load_error() {
+    let contents = r#"
+_format_version: "1"
+oidc_providers:
+  - name: corp-a
+    issuer: https://sso.example.com/realms/agents
+    audiences: ["aisix"]
+  - name: corp-b
+    issuer: https://sso.example.com/realms/agents
+    audiences: ["other"]
+"#;
+    let errs = errors_of(load(contents, &env_of(&[])));
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    assert!(
+        errs[0].contains("duplicate enabled OIDC issuer"),
+        "{errs:?}"
+    );
+}
+
+#[test]
+fn oidc_url_with_embedded_credentials_is_a_load_error() {
+    let contents = r#"
+_format_version: "1"
+oidc_providers:
+  - name: leaky
+    issuer: https://sso.example.com/realms/agents
+    audiences: ["aisix"]
+    jwks_uri: https://user:secret@sso.example.com/certs
+"#;
+    let errs = errors_of(load(contents, &env_of(&[])));
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("must not embed credentials")),
+        "{errs:?}"
+    );
+}
+
+#[test]
 fn jwt_subject_without_provider_is_a_load_error() {
     // A subject must name the provider allowed to assert it, or a second
     // trusted IdP could impersonate the identity (audit H1).
