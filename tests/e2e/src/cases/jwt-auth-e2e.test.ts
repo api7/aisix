@@ -402,8 +402,13 @@ describe("jwt auth e2e: OIDC trust providers + jwt_subject key binding", () => {
     if (skipUnlessUp(ctx)) return;
 
     // Omitting kid is legal; against a one-key set the sole signature
-    // key is the candidate. This exercises the no-kid fall-through path.
-    const res = await chat(app!, idp!.sign(validClaims(), { omitKid: true }));
+    // key is the candidate. Use the unrestricted agent-2 key so a
+    // successful auth is not masked by agent-1's rpm=2 window, which
+    // earlier successful requests may have consumed.
+    const res = await chat(
+      app!,
+      idp!.sign(validClaims({ sub: "agent-2" }), { omitKid: true }),
+    );
     expect(res.status).toBe(200);
     await res.text();
   });
