@@ -4,6 +4,7 @@ export { ProxyClient } from "./proxy.js";
 export { EtcdClient } from "./etcd.js";
 export { SeedClient } from "./seed.js";
 export { startOpenAiUpstream, type OpenAiUpstream, type ReceivedRequest } from "./upstream-openai.js";
+export { startMcpUpstream, type McpUpstream } from "./upstream-mcp.js";
 export { pickFreePort, pickFreePorts } from "./ports.js";
 export {
   startMockSls,

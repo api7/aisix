@@ -8,6 +8,7 @@ use super::a2a_agent::A2aAgent;
 use super::apikey::ApiKey;
 use super::cache_policy::CachePolicy;
 use super::guardrail::{Guardrail, GuardrailAttachment};
+use super::mcp_policy::McpPolicy;
 use super::mcp_server::McpServer;
 use super::model::Model;
 use super::observability_exporter::ObservabilityExporter;
@@ -40,6 +41,10 @@ pub struct AisixSnapshot {
     /// MCP gateway endpoint aggregates each enabled server's tools and routes
     /// tool calls back to the owning server.
     pub mcp_servers: ResourceTable<McpServer>,
+    /// MCP access policies: `/aisix/<env>/mcp_policies/<uuid>`. Environment-
+    /// default and team-scoped rows the MCP gateway endpoint combines with
+    /// each caller key's `mcp_access` block into the per-request tool ACL.
+    pub mcp_policies: ResourceTable<McpPolicy>,
     /// Registered upstream A2A agents: `/aisix/<env>/a2a_agents/<uuid>`. The
     /// A2A gateway endpoint fronts each enabled agent, forwarding JSON-RPC
     /// requests to it and serving its card with URLs rewritten to the gateway.
@@ -63,6 +68,7 @@ impl AisixSnapshot {
             + self.observability_exporters.len()
             + self.rate_limit_policies.len()
             + self.mcp_servers.len()
+            + self.mcp_policies.len()
             + self.a2a_agents.len()
     }
 }

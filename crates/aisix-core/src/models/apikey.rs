@@ -12,6 +12,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use super::mcp_policy::McpAccess;
 use super::rate_limit::RateLimit;
 use crate::resource::Resource;
 
@@ -57,6 +58,16 @@ pub struct ApiKey {
     /// access is granted explicitly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_tools: Option<Vec<String>>,
+
+    /// Policy-driven MCP access for this key. When present, it supersedes
+    /// `allowed_tools`: the key's grant is computed from the environment's
+    /// and its team's MCP access policies according to `mode` (`inherit`,
+    /// `restrict`, or `deny`), and `allowed_tools` is not consulted. When
+    /// omitted, the key keeps the explicit `allowed_tools` behavior — with
+    /// policy `deny` patterns still subtracted, since deny applies to every
+    /// key the policy covers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_access: Option<McpAccess>,
 
     /// A2A agents this key may reach, named by their registered names. Entries
     /// are matched as single-`*` globs, mirroring `allowed_tools`: `"*"` grants
@@ -126,9 +137,12 @@ impl ApiKey {
     /// A key with no `allowed_tools` (or an empty list) may call no MCP tools —
     /// access is granted explicitly, matching [`ApiKey::can_access`].
     ///
-    /// Currently exercised only by tests: the live MCP enforcement path builds
-    /// an `aisix_mcp::ToolAcl` from `allowed_tools` and uses the identical
-    /// matcher, so this method is kept in lockstep as the documented mirror.
+    /// This mirrors only the legacy allow side (a key without an `mcp_access`
+    /// block and ignoring policy `deny` overlays). Currently exercised only by
+    /// tests: the live MCP enforcement path builds an `aisix_mcp::ToolAcl`
+    /// resolved against the key **and** the environment/team MCP policies,
+    /// using the identical matcher; this method is kept in lockstep as the
+    /// documented mirror of its legacy component.
     pub fn can_access_tool(&self, tool: &str) -> bool {
         match &self.allowed_tools {
             None => false,
@@ -236,6 +250,7 @@ mod tests {
             user_id: None,
             user_name: None,
             allowed_tools: None,
+            mcp_access: None,
             allowed_agents: None,
             expires_at: None,
             disabled: false,
@@ -301,6 +316,40 @@ mod tests {
         assert!(any_server.can_access_tool("slack__readonly"));
         // The suffix still anchors — a longer tool name doesn't match.
         assert!(!any_server.can_access_tool("github__readonly_admin"));
+    }
+
+    #[test]
+    fn mcp_access_block_roundtrips_and_defaults_absent() {
+        // Every pre-existing key payload lacks `mcp_access`; it must load
+        // as None so the legacy allowed_tools behavior keeps applying.
+        let legacy = sample();
+        assert!(legacy.mcp_access.is_none());
+        let v = serde_json::to_value(&legacy).unwrap();
+        assert!(v.get("mcp_access").is_none());
+
+        let k: ApiKey = serde_json::from_str(
+            r#"{
+              "key_hash": "h",
+              "allowed_models": [],
+              "mcp_access": {"mode": "restrict", "allow": ["github__*"], "deny": ["github__delete_repo"]}
+            }"#,
+        )
+        .unwrap();
+        let access = k.mcp_access.as_ref().unwrap();
+        assert_eq!(access.mode, crate::models::McpAccessMode::Restrict);
+        assert_eq!(access.allow, vec!["github__*"]);
+        assert_eq!(access.deny, vec!["github__delete_repo"]);
+        // Round-trip preserves the block.
+        let v = serde_json::to_value(&k).unwrap();
+        assert_eq!(v["mcp_access"]["mode"], "restrict");
+    }
+
+    #[test]
+    fn mcp_access_rejects_unknown_inner_fields() {
+        let r: Result<ApiKey, _> = serde_json::from_str(
+            r#"{"key_hash":"h","allowed_models":[],"mcp_access":{"mode":"inherit","widen":["*"]}}"#,
+        );
+        assert!(r.is_err());
     }
 
     #[test]
