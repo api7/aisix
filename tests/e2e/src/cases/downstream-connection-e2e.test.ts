@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { connect, type Socket } from "node:net";
+import { Agent, fetch as fetchWithDispatcher } from "undici";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
@@ -28,6 +29,20 @@ const CALLER_PLAINTEXT = "sk-downstream-conn-1126";
 const CALLER_KEY_HASH = createHash("sha256").update(CALLER_PLAINTEXT).digest("hex");
 
 const IDLE_TIMEOUT_S = 2;
+// Client-side pool hygiene for the idle-timeout suite ONLY: with a 2s
+// server idle deadline, a keep-alive socket left in the default global
+// fetch pool by an earlier probe can be FIN'd by the gateway at the very
+// moment a later test reuses it — the exact stale-connection race the
+// feature documentation warns about, surfacing here as a flaky
+// "SocketError: other side closed". Discarding idle sockets client-side
+// well before the server deadline (0.5s < 2s) makes reuse always safe,
+// so the assertions stay about the gateway, not the client pool.
+const idleSuiteAgent = new Agent({
+  keepAliveTimeout: 500,
+  keepAliveMaxTimeout: 500,
+});
+const idleSuiteFetch: typeof fetchWithDispatcher = (url, init) =>
+  fetchWithDispatcher(url, { ...init, dispatcher: idleSuiteAgent });
 // Comfortably longer than the idle timeout: a request in flight for this
 // long must survive, which is exactly what the naive "close anything quiet"
 // implementation would get wrong.
@@ -175,7 +190,7 @@ describe("downstream idle timeout (AISIX-Cloud#1126)", () => {
       allowed_models: ["dc-slow-model"],
     });
     await waitConfigPropagation(async () => {
-      const res = await fetch(`${app!.proxyUrl}/v1/models`, {
+      const res = await idleSuiteFetch(`${app!.proxyUrl}/v1/models`, {
         headers: { authorization: `Bearer ${CALLER_PLAINTEXT}` },
       });
       if (!res.ok) return false;
@@ -187,6 +202,7 @@ describe("downstream idle timeout (AISIX-Cloud#1126)", () => {
   afterAll(async () => {
     await app?.exit();
     await slow?.close();
+    await idleSuiteAgent.close();
   });
 
   test("an idle keep-alive connection is closed at the configured deadline", async (ctx) => {
@@ -210,7 +226,7 @@ describe("downstream idle timeout (AISIX-Cloud#1126)", () => {
       return;
     }
     const started = Date.now();
-    const res = await fetch(`${app.proxyUrl}/v1/chat/completions`, {
+    const res = await idleSuiteFetch(`${app.proxyUrl}/v1/chat/completions`, {
       method: "POST",
       headers: {
         authorization: `Bearer ${CALLER_PLAINTEXT}`,
