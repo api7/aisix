@@ -491,21 +491,36 @@ pub fn load_from_str(
         }
     }
 
-    // JWT authentication selects the key by `jwt_subject`, so two keys
-    // sharing one subject would silently tie-break at auth time. Reject
-    // the ambiguity at load, mirroring the key_hash uniqueness above.
-    let mut seen_subjects: BTreeMap<&str, &str> = BTreeMap::new();
+    // JWT authentication selects the key by (jwt_provider, jwt_subject),
+    // so a subject is set only alongside the provider allowed to assert
+    // it, and that pair must be unique — otherwise auth would silently
+    // tie-break, or (without a provider) a second trusted IdP could
+    // impersonate this identity. Reject both at load.
+    let mut seen_subjects: BTreeMap<(&str, &str), &str> = BTreeMap::new();
     for (_, scope, key) in &apikeys {
-        if let Some(subject) = key.jwt_subject.as_deref() {
-            if let Some(first) = seen_subjects.insert(subject, scope.as_str()) {
+        match (key.jwt_subject.as_deref(), key.jwt_provider.as_deref()) {
+            (Some(subject), Some(provider)) => {
+                if let Some(first) = seen_subjects.insert((provider, subject), scope.as_str()) {
+                    errors.push(LoadError {
+                        scope: scope.clone(),
+                        message: format!(
+                            "duplicate jwt binding {provider:?}/{subject:?}: already used by \
+                             {first} — every (jwt_provider, jwt_subject) pair must be distinct"
+                        ),
+                    });
+                }
+            }
+            (Some(subject), None) => {
                 errors.push(LoadError {
                     scope: scope.clone(),
                     message: format!(
-                        "duplicate jwt_subject {subject:?}: already used by {first} — \
-                         every api key must have a distinct jwt_subject"
+                        "jwt_subject {subject:?} is set without jwt_provider — a subject must \
+                         name the OIDC provider allowed to assert it, or a second trusted \
+                         provider could impersonate this identity"
                     ),
                 });
             }
+            _ => {}
         }
     }
 

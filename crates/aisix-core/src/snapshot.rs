@@ -108,6 +108,33 @@ impl<T: Resource> ResourceTable<T> {
     pub fn entries(&self) -> Vec<Arc<ResourceEntry<T>>> {
         self.by_id.iter().map(|kv| kv.value().clone()).collect()
     }
+
+    /// True when any entry satisfies `pred`, without materialising the
+    /// table into a `Vec`. Cheaper than `entries().iter().any(...)` on the
+    /// hot path (no allocation, no per-row `Arc` clone). A DashMap shard
+    /// guard is held during the scan, so `pred` must not call back into
+    /// this table.
+    pub fn any(&self, pred: impl Fn(&ResourceEntry<T>) -> bool) -> bool {
+        self.by_id.iter().any(|kv| pred(kv.value()))
+    }
+
+    /// The lowest-`id` entry satisfying `pred`, without materialising the
+    /// table. The deterministic lowest-id tie-break matches the resolvers
+    /// that need a stable winner when duplicates exist transiently.
+    pub fn find_min_by_id(
+        &self,
+        pred: impl Fn(&ResourceEntry<T>) -> bool,
+    ) -> Option<Arc<ResourceEntry<T>>> {
+        self.by_id.iter().fold(None, |best, kv| {
+            if !pred(kv.value()) {
+                return best;
+            }
+            match &best {
+                Some(b) if b.id <= kv.value().id => best,
+                _ => Some(kv.value().clone()),
+            }
+        })
+    }
 }
 
 /// Handle consumers clone to reach the current snapshot.

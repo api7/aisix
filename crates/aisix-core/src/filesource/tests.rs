@@ -57,6 +57,7 @@ api_keys:
     key_env: E2E_CI_BOT_KEY
     allowed_models: ["gpt-4o", "balanced"]
     jwt_subject: agent-ci-bot
+    jwt_provider: corp-keycloak
   - display_name: ops
     key_hash: 91ed2dbc407561556f3e7be98ba0bd2a57986d6a868c482d867d19c6d40d201c
     allowed_models: ["*"]
@@ -140,15 +141,9 @@ fn full_valid_file_loads_every_kind() {
 
     // The ci-bot key carries its JWT identity binding.
     let ci_bot_hash = crate::models::ApiKey::hash_bearer("sk-ci-plaintext");
-    assert_eq!(
-        snap.apikeys
-            .get_by_name(&ci_bot_hash)
-            .unwrap()
-            .value
-            .jwt_subject
-            .as_deref(),
-        Some("agent-ci-bot")
-    );
+    let ci_bot = snap.apikeys.get_by_name(&ci_bot_hash).unwrap();
+    assert_eq!(ci_bot.value.jwt_subject.as_deref(), Some("agent-ci-bot"));
+    assert_eq!(ci_bot.value.jwt_provider.as_deref(), Some("corp-keycloak"));
 
     // Interpolation landed in the provider key (full + partial).
     let pk = snap.provider_keys.get_by_name("openai-prod").unwrap();
@@ -491,10 +486,11 @@ api_keys:
 }
 
 #[test]
-fn duplicate_jwt_subject_across_api_keys_is_a_load_error() {
-    // JWT auth selects the key by jwt_subject — a duplicate would
-    // silently tie-break at auth time, so it fails the load like the
-    // duplicate-credential rule above.
+fn duplicate_jwt_binding_across_api_keys_is_a_load_error() {
+    // JWT auth selects the key by (jwt_provider, jwt_subject) — a
+    // duplicate pair would silently tie-break at auth time, so it fails
+    // the load like the duplicate-credential rule above. The same
+    // subject under a DIFFERENT provider is allowed.
     let contents = r#"
 _format_version: "1"
 api_keys:
@@ -502,15 +498,39 @@ api_keys:
     key_hash: "1111111111111111111111111111111111111111111111111111111111111111"
     allowed_models: ["*"]
     jwt_subject: agent-shared
+    jwt_provider: corp
   - display_name: second
     key_hash: "2222222222222222222222222222222222222222222222222222222222222222"
     allowed_models: ["*"]
     jwt_subject: agent-shared
+    jwt_provider: corp
+  - display_name: third-other-provider
+    key_hash: "3333333333333333333333333333333333333333333333333333333333333333"
+    allowed_models: ["*"]
+    jwt_subject: agent-shared
+    jwt_provider: partner
 "#;
     let errs = errors_of(load(contents, &env_of(&[])));
     assert_eq!(errs.len(), 1, "{errs:?}");
-    assert!(errs[0].contains("duplicate jwt_subject"), "{errs:?}");
+    assert!(errs[0].contains("duplicate jwt binding"), "{errs:?}");
     assert!(errs[0].contains("agent-shared"), "{errs:?}");
+}
+
+#[test]
+fn jwt_subject_without_provider_is_a_load_error() {
+    // A subject must name the provider allowed to assert it, or a second
+    // trusted IdP could impersonate the identity (audit H1).
+    let contents = r#"
+_format_version: "1"
+api_keys:
+  - display_name: unqualified
+    key_hash: "4444444444444444444444444444444444444444444444444444444444444444"
+    allowed_models: ["*"]
+    jwt_subject: agent-x
+"#;
+    let errs = errors_of(load(contents, &env_of(&[])));
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    assert!(errs[0].contains("without jwt_provider"), "{errs:?}");
 }
 
 #[test]

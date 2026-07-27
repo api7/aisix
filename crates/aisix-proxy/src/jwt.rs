@@ -81,12 +81,21 @@ const ALLOWED_ALGS: [Algorithm; 9] = [
 /// multi-key JWKS.
 const MAX_KEYS_TRIED: usize = 8;
 
-/// True when the bearer has the structural shape of a JWT: three
-/// non-empty dot-separated segments whose first segment base64url-decodes
-/// to a JSON object carrying `alg` (a JOSE header). The header check
-/// keeps custom-imported API keys that merely contain dots on the
-/// API-key path.
+/// Upper bound on a bearer we will treat as a JWT. A real IdP token is a
+/// few KB; the cap stops a several-hundred-KB `Authorization` header from
+/// driving the base64/JSON work (done up to three times per request)
+/// before anything is verified.
+const MAX_JWT_BYTES: usize = 16 * 1024;
+
+/// True when the bearer has the structural shape of a JWT: within the
+/// size cap, three non-empty dot-separated segments whose first segment
+/// base64url-decodes to a JSON object carrying `alg` (a JOSE header). The
+/// header check keeps custom-imported API keys that merely contain dots
+/// on the API-key path.
 pub(crate) fn looks_like_jwt(token: &str) -> bool {
+    if token.len() > MAX_JWT_BYTES {
+        return false;
+    }
     let parts: Vec<&str> = token.splitn(4, '.').collect();
     if parts.len() != 3 || parts.iter().any(|p| p.is_empty()) {
         return false;
@@ -97,11 +106,7 @@ pub(crate) fn looks_like_jwt(token: &str) -> bool {
 /// True when the snapshot has at least one enabled trust provider — the
 /// gate for entering the JWT path at all.
 pub(crate) fn any_enabled_provider(snapshot: &AisixSnapshot) -> bool {
-    snapshot
-        .oidc_providers
-        .entries()
-        .iter()
-        .any(|e| e.value.enabled)
+    snapshot.oidc_providers.any(|e| e.value.enabled)
 }
 
 fn b64url_json(segment: &str) -> Option<serde_json::Value> {
@@ -130,44 +135,39 @@ fn provider_for_issuer(
     snapshot: &AisixSnapshot,
     iss: &str,
 ) -> Option<Arc<ResourceEntry<OidcProvider>>> {
-    let mut best: Option<Arc<ResourceEntry<OidcProvider>>> = None;
-    for entry in snapshot.oidc_providers.entries() {
-        if !entry.value.enabled || entry.value.issuer != iss {
-            continue;
-        }
-        match &best {
-            Some(b) if b.id <= entry.id => {}
-            _ => best = Some(entry),
-        }
-    }
-    best
+    snapshot
+        .oidc_providers
+        .find_min_by_id(|e| e.value.enabled && e.value.issuer == iss)
 }
 
-/// The API key bound to `subject` via `jwt_subject`, ties broken by
-/// lowest id. The control plane enforces per-environment uniqueness, so
-/// the tie-break only matters for a transient duplicate mid-sync.
-fn key_for_subject(snapshot: &AisixSnapshot, subject: &str) -> Option<Arc<ResourceEntry<ApiKey>>> {
-    let mut best: Option<Arc<ResourceEntry<ApiKey>>> = None;
-    for entry in snapshot.apikeys.entries() {
-        if entry.value.jwt_subject.as_deref() != Some(subject) {
-            continue;
-        }
-        match &best {
-            Some(b) if b.id <= entry.id => {}
-            _ => best = Some(entry),
-        }
-    }
-    best
+/// The API key bound to `subject` **as asserted by `provider_name`**,
+/// ties broken by lowest id. A key whose `jwt_provider` names a different
+/// trust provider is never a candidate: subjects are namespaced by the
+/// provider that vouched for them, so a second trusted provider cannot
+/// mint a token impersonating the first provider's identity of the same
+/// name. The control plane enforces `(jwt_provider, jwt_subject)`
+/// uniqueness, so the tie-break only matters for a transient duplicate
+/// mid-sync.
+fn key_for_subject(
+    snapshot: &AisixSnapshot,
+    provider_name: &str,
+    subject: &str,
+) -> Option<Arc<ResourceEntry<ApiKey>>> {
+    snapshot.apikeys.find_min_by_id(|e| {
+        e.value.jwt_subject.as_deref() == Some(subject)
+            && e.value.jwt_provider.as_deref() == Some(provider_name)
+    })
 }
 
 /// Authenticate a JWT-shaped bearer. Called from the auth choke point
-/// once [`looks_like_jwt`] and [`any_enabled_provider`] both hold.
+/// once [`looks_like_jwt`] and [`any_enabled_provider`] both hold, with
+/// the snapshot the gate already loaded (avoids a second atomic load;
+/// any change between them fails closed to `jwt_untrusted_issuer`).
 pub(crate) async fn authenticate_jwt(
     state: &ProxyState,
+    snapshot: &AisixSnapshot,
     token: &str,
 ) -> Result<AuthenticatedKey, ProxyError> {
-    let snapshot = state.snapshot.load();
-
     let header = match jsonwebtoken::decode_header(token) {
         Ok(h) => h,
         Err(_) => {
@@ -192,7 +192,7 @@ pub(crate) async fn authenticate_jwt(
         ));
     };
 
-    let Some(provider) = provider_for_issuer(&snapshot, &iss) else {
+    let Some(provider) = provider_for_issuer(snapshot, &iss) else {
         return Err(deny(
             state,
             "jwt_untrusted_issuer",
@@ -253,12 +253,12 @@ pub(crate) async fn authenticate_jwt(
         }
     };
 
-    let mut candidates = candidate_keys(&jwks, kid.as_deref());
+    let mut candidates = candidate_keys(&jwks, kid.as_deref(), header.alg);
     if candidates.is_empty() {
         // Unknown (or absent-yet-unmatched) kid: the identity provider may
         // have just rotated its keys — refetch once, rate-limited.
         if let Some(fresh) = refresh_jwks_rate_limited(&jwks_url).await {
-            candidates = candidate_keys(&fresh, kid.as_deref());
+            candidates = candidate_keys(&fresh, kid.as_deref(), header.alg);
         }
     }
     if candidates.is_empty() {
@@ -299,15 +299,15 @@ pub(crate) async fn authenticate_jwt(
         ));
     };
 
-    let Some(entry) = key_for_subject(&snapshot, subject) else {
+    let Some(entry) = key_for_subject(snapshot, &prov.name, subject) else {
         tracing::warn!(
             target: "aisix::auth",
             method = "jwt",
             reason = "jwt_identity_unmapped",
-            provider = %prov.name,
-            issuer = %iss,
-            subject = %subject,
-            "rejected inbound JWT: no API key carries this jwt_subject",
+            provider = %clip(&prov.name),
+            issuer = %clip(&iss),
+            subject = ?clip(subject),
+            "rejected inbound JWT: no API key binds this identity to this provider",
         );
         state
             .metrics
@@ -348,9 +348,29 @@ pub(crate) async fn authenticate_jwt(
     Ok(AuthenticatedKey { entry })
 }
 
+/// Cap on attacker-controlled token metadata reproduced in the decision
+/// log. `kid`, and `iss` before the issuer allow-list matches, come
+/// straight from an unauthenticated token, so they are logged with
+/// `Debug` (which escapes newlines and control bytes) and truncated —
+/// a probe cannot forge log lines or inflate log volume through them.
+const LOGGED_METADATA_MAX: usize = 128;
+
+fn clip(s: &str) -> &str {
+    match s.char_indices().nth(LOGGED_METADATA_MAX) {
+        Some((i, _)) => &s[..i],
+        None => s,
+    }
+}
+
 /// Record a denial on the metric + decision log and hand back the error.
 /// The raw token never appears here — only the reason class and the
-/// token's routing metadata (issuer / kid).
+/// token's routing metadata (issuer / kid), escaped and truncated.
+///
+/// Pre-allow-list reason classes (a malformed token, an untrusted or
+/// missing issuer) are the scanner-probe shapes: they carry no operator
+/// signal beyond the metric, so they log at `debug`. Once a trust
+/// provider has matched, a denial names a real configured issuer and is
+/// worth a `warn`.
 fn deny(
     state: &ProxyState,
     reason: &'static str,
@@ -359,14 +379,29 @@ fn deny(
     err: ProxyError,
 ) -> ProxyError {
     state.metrics.record_auth_decision("jwt", false, reason);
-    tracing::warn!(
-        target: "aisix::auth",
-        method = "jwt",
-        reason = %reason,
-        issuer = %issuer,
-        kid = %kid.unwrap_or(""),
-        "rejected inbound JWT",
+    let pre_match = matches!(
+        reason,
+        "jwt_malformed" | "jwt_missing_issuer" | "jwt_untrusted_issuer" | "jwt_alg_not_allowed"
     );
+    if pre_match {
+        tracing::debug!(
+            target: "aisix::auth",
+            method = "jwt",
+            reason = %reason,
+            issuer = ?clip(issuer),
+            kid = ?clip(kid.unwrap_or("")),
+            "rejected inbound JWT (pre-verification)",
+        );
+    } else {
+        tracing::warn!(
+            target: "aisix::auth",
+            method = "jwt",
+            reason = %reason,
+            issuer = ?clip(issuer),
+            kid = ?clip(kid.unwrap_or("")),
+            "rejected inbound JWT",
+        );
+    }
     err
 }
 
@@ -491,26 +526,43 @@ fn bound_claim_matches(actual: &serde_json::Value, expect: &BoundClaimExpect) ->
 /// otherwise every signature-use key in the set (bounded) — an identity
 /// provider mid-rotation may publish two keys, and some omit `kid`
 /// entirely.
-fn candidate_keys(jwks: &JwkSet, kid: Option<&str>) -> Vec<DecodingKey> {
+fn candidate_keys(jwks: &JwkSet, kid: Option<&str>, alg: Algorithm) -> Vec<DecodingKey> {
     match kid {
         Some(kid) => jwks
             .find(kid)
+            .filter(|jwk| usable_for_verification(jwk, alg))
             .and_then(|jwk| DecodingKey::from_jwk(jwk).ok())
             .into_iter()
             .collect(),
         None => jwks
             .keys
             .iter()
-            .filter(|jwk| {
-                jwk.common
-                    .public_key_use
-                    .as_ref()
-                    .is_none_or(|u| matches!(u, jsonwebtoken::jwk::PublicKeyUse::Signature))
-            })
+            .filter(|jwk| usable_for_verification(jwk, alg))
             .filter_map(|jwk| DecodingKey::from_jwk(jwk).ok())
             .take(MAX_KEYS_TRIED)
             .collect(),
     }
+}
+
+/// True when a JWK may verify a signature at `alg`: not an
+/// encryption-only key (RFC 7517 §4.2 `use`), and — when the key names
+/// an algorithm — that algorithm (RFC 7517 §4.4 `alg`). Applied on both
+/// the `kid`-matched and the fall-through paths so a `use:enc` or
+/// wrong-`alg` key is never tried, even when its `kid` is named.
+fn usable_for_verification(jwk: &jsonwebtoken::jwk::Jwk, alg: Algorithm) -> bool {
+    let use_ok = jwk
+        .common
+        .public_key_use
+        .as_ref()
+        .is_none_or(|u| matches!(u, jsonwebtoken::jwk::PublicKeyUse::Signature));
+    // `KeyAlgorithm` (JWK `alg`) and `Algorithm` (token `alg`) are
+    // distinct enums with no cross-conversion; their variant names are
+    // identical (RS256 … EdDSA), so compare the Debug spellings.
+    let alg_ok = jwk
+        .common
+        .key_algorithm
+        .is_none_or(|k| format!("{k:?}") == format!("{alg:?}"));
+    use_ok && alg_ok
 }
 
 // ── JWKS fetch + cache ───────────────────────────────────────────────
@@ -522,6 +574,26 @@ struct JwksEntry {
     last_attempt: Option<Instant>,
 }
 
+/// One issuer's resolved discovery result plus its rate-limit clock.
+struct DiscoveryEntry {
+    /// The resolved `jwks_uri` and when discovery last succeeded.
+    resolved: Option<(String, Instant)>,
+    /// Last discovery attempt, success or failure.
+    last_attempt: Option<Instant>,
+}
+
+/// Read a poisoned-lock-tolerant guard. A panic while some other request
+/// held the lock only ever happened during a map op (never across an
+/// await), so the map is structurally intact; recovering the inner value
+/// keeps JWT auth alive instead of poisoning it process-wide.
+fn read_recover<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    lock.read().unwrap_or_else(|e| e.into_inner())
+}
+
+fn write_recover<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+    lock.write().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Process-global JWKS cache keyed by URL. Guards are held only for map
 /// lookups/inserts, never across an await; concurrent misses may fetch in
 /// parallel (each result is valid — last insert wins).
@@ -530,9 +602,9 @@ fn jwks_cache() -> &'static RwLock<HashMap<String, JwksEntry>> {
     CACHE.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
-/// Discovery results keyed by issuer: the resolved JWKS URL.
-fn discovery_cache() -> &'static RwLock<HashMap<String, (String, Instant)>> {
-    static CACHE: OnceLock<RwLock<HashMap<String, (String, Instant)>>> = OnceLock::new();
+/// Discovery results keyed by issuer.
+fn discovery_cache() -> &'static RwLock<HashMap<String, DiscoveryEntry>> {
+    static CACHE: OnceLock<RwLock<HashMap<String, DiscoveryEntry>>> = OnceLock::new();
     CACHE.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
@@ -551,63 +623,144 @@ fn http_client() -> &'static reqwest::Client {
 }
 
 /// The JWKS URL for a provider: its configured `jwks_uri`, or the
-/// `jwks_uri` advertised by the issuer's OIDC discovery document
-/// (cached; a stale value keeps serving when a re-fetch fails).
+/// `jwks_uri` advertised by the issuer's OIDC discovery document.
+///
+/// Discovery is cached (TTL) and rate-limited on failure the same way
+/// the JWKS fetch is, so an issuer whose discovery document is down does
+/// not get re-probed once per request. The advertised `jwks_uri` is
+/// verified against the issuer (OIDC Discovery 1.0 §4.3) and constrained
+/// to the issuer's own origin, so a compromised or misconfigured
+/// discovery document cannot relocate trust material into our network.
 async fn resolve_jwks_url(prov: &OidcProvider) -> Result<String, String> {
     if let Some(u) = &prov.jwks_uri {
         return Ok(u.clone());
     }
     let now = Instant::now();
-    if let Some((url, at)) = discovery_cache().read().unwrap().get(&prov.issuer) {
-        if now.duration_since(*at) < JWKS_TTL {
-            return Ok(url.clone());
+    let (stale, attempted_recently) = {
+        let map = read_recover(discovery_cache());
+        match map.get(&prov.issuer) {
+            Some(entry) => {
+                if let Some((url, at)) = &entry.resolved {
+                    if now.duration_since(*at) < JWKS_TTL {
+                        return Ok(url.clone());
+                    }
+                }
+                (
+                    entry.resolved.as_ref().map(|(u, _)| u.clone()),
+                    entry
+                        .last_attempt
+                        .is_some_and(|at| now.duration_since(at) < JWKS_REFRESH_MIN_INTERVAL),
+                )
+            }
+            None => (None, false),
         }
+    };
+    if attempted_recently {
+        // Suppressed by the refresh interval: serve the stale resolution
+        // rather than probe a down issuer once per request.
+        return stale
+            .ok_or_else(|| "OIDC discovery suppressed by the refresh interval".to_string());
     }
+
+    // Stamp the attempt before awaiting so concurrent misses don't stampede.
+    write_recover(discovery_cache())
+        .entry(prov.issuer.clone())
+        .or_insert(DiscoveryEntry {
+            resolved: None,
+            last_attempt: None,
+        })
+        .last_attempt = Some(now);
+
     let discovery_url = format!(
         "{}/.well-known/openid-configuration",
         prov.issuer.trim_end_matches('/')
     );
     match fetch_json(&discovery_url).await {
         Ok(doc) => {
+            // §4.3: the document must claim the issuer we asked about.
+            if doc.get("issuer").and_then(|v| v.as_str()) != Some(prov.issuer.as_str()) {
+                return Err(
+                    "discovery document issuer does not match the configured issuer".to_string(),
+                );
+            }
             let jwks_uri = doc
                 .get("jwks_uri")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| "discovery document carries no jwks_uri".to_string())?
                 .to_string();
-            discovery_cache()
-                .write()
-                .unwrap()
-                .insert(prov.issuer.clone(), (jwks_uri.clone(), now));
+            // The advertised endpoint decides where trust material comes
+            // from, so it must stay on the issuer's own origin — otherwise
+            // the discovery document is an open redirect into our network.
+            if !same_origin(&prov.issuer, &jwks_uri) {
+                return Err("discovery jwks_uri is not on the issuer's origin".to_string());
+            }
+            write_recover(discovery_cache())
+                .entry(prov.issuer.clone())
+                .or_insert(DiscoveryEntry {
+                    resolved: None,
+                    last_attempt: Some(now),
+                })
+                .resolved = Some((jwks_uri.clone(), now));
             Ok(jwks_uri)
         }
         Err(e) => {
             // Serve the stale resolution rather than failing auth outright.
-            if let Some((url, _)) = discovery_cache().read().unwrap().get(&prov.issuer) {
+            if let Some(url) = stale {
                 tracing::warn!(
                     target: "aisix::auth",
-                    issuer = %prov.issuer,
+                    issuer = %clip(&prov.issuer),
                     error = %e,
                     "OIDC discovery re-fetch failed; keeping the previously resolved JWKS URL",
                 );
-                return Ok(url.clone());
+                return Ok(url);
             }
             Err(format!("OIDC discovery failed: {e}"))
         }
     }
 }
 
+/// True when `candidate` shares scheme + host + port with `base`.
+fn same_origin(base: &str, candidate: &str) -> bool {
+    match (reqwest::Url::parse(base), reqwest::Url::parse(candidate)) {
+        (Ok(b), Ok(c)) => {
+            b.scheme() == c.scheme()
+                && b.host_str() == c.host_str()
+                && b.port_or_known_default() == c.port_or_known_default()
+        }
+        _ => false,
+    }
+}
+
 /// The cached key set for `url`, fetching when absent or past
-/// [`JWKS_TTL`]. A failed re-fetch keeps serving the stale set
-/// (network-partition tolerance); with nothing cached the error
-/// propagates and the request fails closed as retryable.
+/// [`JWKS_TTL`]. A fetch attempted within [`JWKS_REFRESH_MIN_INTERVAL`]
+/// suppresses another one: one inbound JWT must never become one
+/// outbound JWKS fetch, or a slow/down endpoint turns every request into
+/// a [`JWKS_FETCH_TIMEOUT`] wait and floods the identity provider. A
+/// failed re-fetch keeps serving the stale set; with nothing cached the
+/// error propagates and the request fails closed as retryable.
 async fn get_jwks(url: &str) -> Result<Arc<JwkSet>, String> {
     let now = Instant::now();
-    if let Some(entry) = jwks_cache().read().unwrap().get(url) {
-        if let Some((jwks, fetched_at)) = &entry.jwks {
-            if now.duration_since(*fetched_at) < JWKS_TTL {
-                return Ok(jwks.clone());
+    let (stale, attempted_recently) = {
+        let map = read_recover(jwks_cache());
+        match map.get(url) {
+            Some(entry) => {
+                if let Some((jwks, fetched_at)) = &entry.jwks {
+                    if now.duration_since(*fetched_at) < JWKS_TTL {
+                        return Ok(jwks.clone());
+                    }
+                }
+                (
+                    entry.jwks.as_ref().map(|(j, _)| j.clone()),
+                    entry
+                        .last_attempt
+                        .is_some_and(|at| now.duration_since(at) < JWKS_REFRESH_MIN_INTERVAL),
+                )
             }
+            None => (None, false),
         }
+    };
+    if attempted_recently {
+        return stale.ok_or_else(|| "JWKS fetch suppressed by the refresh interval".to_string());
     }
     refresh_jwks(url).await
 }
@@ -616,7 +769,7 @@ async fn get_jwks(url: &str) -> Result<Arc<JwkSet>, String> {
 /// [`JWKS_REFRESH_MIN_INTERVAL`] of the previous attempt.
 async fn refresh_jwks_rate_limited(url: &str) -> Option<Arc<JwkSet>> {
     let now = Instant::now();
-    if let Some(entry) = jwks_cache().read().unwrap().get(url) {
+    if let Some(entry) = read_recover(jwks_cache()).get(url) {
         if let Some(at) = entry.last_attempt {
             if now.duration_since(at) < JWKS_REFRESH_MIN_INTERVAL {
                 return None;
@@ -628,9 +781,9 @@ async fn refresh_jwks_rate_limited(url: &str) -> Option<Arc<JwkSet>> {
 
 async fn refresh_jwks(url: &str) -> Result<Arc<JwkSet>, String> {
     // Stamp the attempt before awaiting so a slow endpoint is not
-    // hammered by concurrent unknown-kid refreshes.
+    // hammered by concurrent refreshes.
     {
-        let mut map = jwks_cache().write().unwrap();
+        let mut map = write_recover(jwks_cache());
         map.entry(url.to_string())
             .or_insert(JwksEntry {
                 jwks: None,
@@ -643,9 +796,7 @@ async fn refresh_jwks(url: &str) -> Result<Arc<JwkSet>, String> {
     }) {
         Ok(set) => {
             let arc = Arc::new(set);
-            jwks_cache()
-                .write()
-                .unwrap()
+            write_recover(jwks_cache())
                 .entry(url.to_string())
                 .and_modify(|e| e.jwks = Some((arc.clone(), Instant::now())))
                 .or_insert(JwksEntry {
@@ -655,7 +806,7 @@ async fn refresh_jwks(url: &str) -> Result<Arc<JwkSet>, String> {
             Ok(arc)
         }
         Err(e) => {
-            if let Some(entry) = jwks_cache().read().unwrap().get(url) {
+            if let Some(entry) = read_recover(jwks_cache()).get(url) {
                 if let Some((stale, _)) = &entry.jwks {
                     tracing::warn!(
                         target: "aisix::auth",
@@ -671,7 +822,7 @@ async fn refresh_jwks(url: &str) -> Result<Arc<JwkSet>, String> {
 }
 
 async fn fetch_json(url: &str) -> Result<serde_json::Value, String> {
-    let resp = http_client()
+    let mut resp = http_client()
         .get(url)
         .send()
         .await
@@ -679,14 +830,27 @@ async fn fetch_json(url: &str) -> Result<serde_json::Value, String> {
     if !resp.status().is_success() {
         return Err(format!("endpoint returned status {}", resp.status()));
     }
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| format!("reading response failed: {e}"))?;
-    if bytes.len() > JWKS_MAX_BYTES {
+    // Reject on the advertised length when present, then enforce the cap
+    // while streaming — `bytes()` would buffer the whole body first, so a
+    // hostile endpoint could OOM a small pod before any size check.
+    if resp
+        .content_length()
+        .is_some_and(|n| n > JWKS_MAX_BYTES as u64)
+    {
         return Err(format!("response exceeds {JWKS_MAX_BYTES} bytes"));
     }
-    serde_json::from_slice(&bytes).map_err(|e| format!("response is not JSON: {e}"))
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| format!("reading response failed: {e}"))?
+    {
+        if buf.len() + chunk.len() > JWKS_MAX_BYTES {
+            return Err(format!("response exceeds {JWKS_MAX_BYTES} bytes"));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&buf).map_err(|e| format!("response is not JSON: {e}"))
 }
 
 #[cfg(test)]
@@ -748,7 +912,7 @@ jyxumGxNpoIV8LlzsMsaWQ==
 
     fn decoding_keys() -> Vec<DecodingKey> {
         let jwks: JwkSet = serde_json::from_str(TEST_JWKS).unwrap();
-        candidate_keys(&jwks, Some("test-kid-1"))
+        candidate_keys(&jwks, Some("test-kid-1"), Algorithm::RS256)
     }
 
     fn sign(claims: &serde_json::Value) -> String {
@@ -993,10 +1157,17 @@ jyxumGxNpoIV8LlzsMsaWQ==
     #[test]
     fn candidate_keys_selects_by_kid_and_falls_back_to_all() {
         let jwks: JwkSet = serde_json::from_str(TEST_JWKS).unwrap();
-        assert_eq!(candidate_keys(&jwks, Some("test-kid-1")).len(), 1);
-        assert!(candidate_keys(&jwks, Some("rotated-away")).is_empty());
+        assert_eq!(
+            candidate_keys(&jwks, Some("test-kid-1"), Algorithm::RS256).len(),
+            1
+        );
+        assert!(candidate_keys(&jwks, Some("rotated-away"), Algorithm::RS256).is_empty());
         // No kid on the token: every signature key is a candidate.
-        assert_eq!(candidate_keys(&jwks, None).len(), 1);
+        assert_eq!(candidate_keys(&jwks, None, Algorithm::RS256).len(), 1);
+        // The JWK declares alg RS256, so a token claiming a different alg
+        // finds no usable key (RFC 7517 §4.4).
+        assert!(candidate_keys(&jwks, Some("test-kid-1"), Algorithm::PS256).is_empty());
+        assert!(candidate_keys(&jwks, None, Algorithm::ES256).is_empty());
     }
 
     #[test]
@@ -1014,21 +1185,71 @@ jyxumGxNpoIV8LlzsMsaWQ==
         assert_eq!(picked.id, "a-provider");
         assert!(provider_for_issuer(&snapshot, "https://other.test").is_none());
 
-        let mk_key = |id: &str, subject: Option<&str>| {
+        let mk_key = |id: &str, subject: Option<&str>, provider: Option<&str>| {
             let mut k: ApiKey =
                 serde_json::from_str(r#"{"key_hash":"h","allowed_models":["*"]}"#).unwrap();
             k.jwt_subject = subject.map(str::to_string);
+            k.jwt_provider = provider.map(str::to_string);
             // Distinct key_hash per row so the by-name index stays unique.
             k.key_hash = format!("hash-{id}");
             snapshot.apikeys.insert(ResourceEntry::new(id, k, 1));
         };
-        mk_key("k-2", Some("agent-1"));
-        mk_key("k-1", Some("agent-1"));
-        mk_key("k-3", Some("agent-2"));
-        mk_key("k-4", None);
-        assert_eq!(key_for_subject(&snapshot, "agent-1").unwrap().id, "k-1");
-        assert_eq!(key_for_subject(&snapshot, "agent-2").unwrap().id, "k-3");
-        assert!(key_for_subject(&snapshot, "agent-9").is_none());
+        mk_key("k-2", Some("agent-1"), Some("corp"));
+        mk_key("k-1", Some("agent-1"), Some("corp"));
+        mk_key("k-3", Some("agent-2"), Some("corp"));
+        mk_key("k-4", None, None);
+        // A key bound to the SAME subject under a DIFFERENT provider must
+        // never be selected — this is the cross-provider impersonation
+        // guard (audit H1).
+        mk_key("k-5", Some("agent-1"), Some("partner"));
+        assert_eq!(
+            key_for_subject(&snapshot, "corp", "agent-1").unwrap().id,
+            "k-1"
+        );
+        assert_eq!(
+            key_for_subject(&snapshot, "corp", "agent-2").unwrap().id,
+            "k-3"
+        );
+        assert_eq!(
+            key_for_subject(&snapshot, "partner", "agent-1").unwrap().id,
+            "k-5"
+        );
+        // No provider match → no key, even though the subject exists.
+        assert!(key_for_subject(&snapshot, "unknown", "agent-1").is_none());
+        assert!(key_for_subject(&snapshot, "corp", "agent-9").is_none());
+    }
+
+    #[test]
+    fn same_origin_matches_scheme_host_port() {
+        assert!(same_origin(
+            "https://sso.example.com/realms/x",
+            "https://sso.example.com/realms/x/certs"
+        ));
+        // default port equivalence
+        assert!(same_origin(
+            "https://sso.example.com",
+            "https://sso.example.com:443/certs"
+        ));
+        // different host / scheme / port all rejected
+        assert!(!same_origin(
+            "https://sso.example.com",
+            "https://evil.example.com/certs"
+        ));
+        assert!(!same_origin(
+            "https://sso.example.com",
+            "http://sso.example.com/certs"
+        ));
+        assert!(!same_origin(
+            "https://sso.example.com",
+            "https://sso.example.com:8443/certs"
+        ));
+    }
+
+    #[test]
+    fn oversized_token_is_not_a_jwt() {
+        let big = format!("{}.{}.{}", "a".repeat(MAX_JWT_BYTES), "b", "c");
+        assert!(big.len() > MAX_JWT_BYTES);
+        assert!(!looks_like_jwt(&big));
     }
 
     #[test]

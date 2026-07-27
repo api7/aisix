@@ -126,24 +126,39 @@ describe("jwt auth e2e: OIDC trust providers + jwt_subject key binding", () => {
     });
 
     // agent-1 → a key allowed MODEL only, rpm-limited to 2 so the
-    // rate-limit inheritance is observable.
+    // rate-limit inheritance is observable. Bound to the mock-idp
+    // provider: the pair (jwt_provider, jwt_subject) is what a token
+    // resolves against.
     await seed.createApiKey({
       key_hash: createHash("sha256").update("sk-jwt-agent-1").digest("hex"),
       allowed_models: [MODEL],
       jwt_subject: "agent-1",
+      jwt_provider: "mock-idp",
       rate_limit: { rpm: 2 },
     });
-    // agent-2 via the discovery provider, unrestricted models.
+    // agent-2 under mock-idp, unrestricted models.
     await seed.createApiKey({
       key_hash: createHash("sha256").update("sk-jwt-agent-2").digest("hex"),
       allowed_models: ["*"],
       jwt_subject: "agent-2",
+      jwt_provider: "mock-idp",
     });
-    // agent-disabled → a disabled key.
+    // A DISTINCT key with the SAME subject "agent-2" but bound to the
+    // discovery provider — proves subjects are namespaced by provider
+    // (audit H1): a token from mock-idp-discovery resolves here, not to
+    // the mock-idp agent-2 key above.
+    await seed.createApiKey({
+      key_hash: createHash("sha256").update("sk-jwt-agent-2-disc").digest("hex"),
+      allowed_models: ["*"],
+      jwt_subject: "agent-2",
+      jwt_provider: "mock-idp-discovery",
+    });
+    // agent-disabled → a disabled key under mock-idp.
     await seed.createApiKey({
       key_hash: createHash("sha256").update("sk-jwt-agent-3").digest("hex"),
       allowed_models: ["*"],
       jwt_subject: "agent-disabled",
+      jwt_provider: "mock-idp",
       disabled: true,
     });
 
@@ -321,12 +336,93 @@ describe("jwt auth e2e: OIDC trust providers + jwt_subject key binding", () => {
   test("discovery-resolved provider authenticates (no jwks_uri configured)", async (ctx) => {
     if (skipUnlessUp(ctx)) return;
 
+    // Signed by idp2, issuer idp2 → resolves the mock-idp-discovery
+    // provider (no jwks_uri, endpoint found via OIDC discovery) → maps
+    // to the agent-2 key bound to that provider.
     const res = await chat(
       app!,
       idp2!.sign(agentClaims(idp2!.url, { sub: "agent-2" })),
     );
     expect(res.status).toBe(200);
     await res.text();
+  });
+
+  test("cross-provider impersonation is blocked: same subject, other provider → 401", async (ctx) => {
+    if (skipUnlessUp(ctx)) return;
+
+    // A token from the discovery IdP asserting sub "agent-1" — a subject
+    // bound ONLY to the mock-idp provider. Even though the token is
+    // genuinely signed by a trusted provider, the identity must not
+    // resolve to the mock-idp agent-1 key (audit H1). agent-1 has no
+    // binding under mock-idp-discovery, so it is unmapped.
+    const res = await chat(
+      app!,
+      idp2!.sign(agentClaims(idp2!.url, { sub: "agent-1" })),
+    );
+    expect(res.status).toBe(401);
+    expect(await errorCode(res)).toBe("jwt_identity_unmapped");
+  });
+
+  test("no fallback: a JWT-shaped bearer that is also a valid API key is not retried as a key", async (ctx) => {
+    if (skipUnlessUp(ctx)) return;
+
+    // Seed a key whose PLAINTEXT is a real JWT from the trusted IdP but
+    // whose claims fail (wrong audience). Presented as a bearer it would
+    // authenticate on the key path — but the JWT path owns it and its
+    // failure is final, with no fall-through to the key lookup.
+    const plaintext = idp!.sign(validClaims({ aud: "someone-else" }));
+    await seed!.createApiKey({
+      key_hash: createHash("sha256").update(plaintext).digest("hex"),
+      allowed_models: [MODEL],
+    });
+    // Give the key time to propagate, then confirm it is still rejected
+    // as a JWT (never accepted as the key it also is).
+    await sleep(2500);
+    const res = await chat(app!, plaintext);
+    expect(res.status).toBe(401);
+    expect(await errorCode(res)).toBe("jwt_invalid");
+  });
+
+  test("algorithm confusion: an HS256 token is rejected (asymmetric-only allowlist)", async (ctx) => {
+    if (skipUnlessUp(ctx)) return;
+
+    // Forge the JOSE header alg to HS256 — the classic attempt to make
+    // the public JWKS modulus act as an HMAC secret. The signature is
+    // still the RS256 one, but the alg is outside ALLOWED_ALGS, so it is
+    // rejected before any key is tried.
+    const res = await chat(
+      app!,
+      idp!.sign(validClaims(), { header: { alg: "HS256" } }),
+    );
+    expect(res.status).toBe(401);
+    expect(await errorCode(res)).toBe("jwt_invalid");
+  });
+
+  test("a token with no kid verifies against a single-key JWKS", async (ctx) => {
+    if (skipUnlessUp(ctx)) return;
+
+    // Omitting kid is legal; against a one-key set the sole signature
+    // key is the candidate. This exercises the no-kid fall-through path.
+    const res = await chat(app!, idp!.sign(validClaims(), { omitKid: true }));
+    expect(res.status).toBe(200);
+    await res.text();
+  });
+
+  test("the JWKS is cached: a burst of requests does not refetch per request", async (ctx) => {
+    if (skipUnlessUp(ctx)) return;
+
+    // Warm the cache, record the fetch count, then burst. One inbound
+    // JWT must never be one outbound JWKS fetch (audit H2) — the count
+    // must not grow by the number of requests.
+    await waitFor200(() => chat(app!, idp!.sign(validClaims({ sub: "agent-2" }))));
+    const before = idp!.jwksFetches;
+    for (let i = 0; i < 8; i++) {
+      const res = await chat(app!, idp!.sign(validClaims({ sub: "agent-2" })));
+      await res.text();
+    }
+    // Allow a small slack for a TTL-boundary refresh, but nothing near
+    // one-per-request.
+    expect(idp!.jwksFetches - before).toBeLessThanOrEqual(1);
   });
 
   test("IdP key rotation is picked up without a restart", async (ctx) => {

@@ -65,16 +65,13 @@ pub(crate) async fn authenticate_token(
     state: &ProxyState,
     token: &str,
 ) -> Result<AuthenticatedKey, ProxyError> {
-    if crate::jwt::looks_like_jwt(token) {
-        let has_providers = crate::jwt::any_enabled_provider(&state.snapshot.load());
-        if has_providers {
-            return crate::jwt::authenticate_jwt(state, token).await;
-        }
+    let snapshot = state.snapshot.load();
+    if crate::jwt::looks_like_jwt(token) && crate::jwt::any_enabled_provider(&snapshot) {
+        return crate::jwt::authenticate_jwt(state, &snapshot, token).await;
         // No enabled trust provider: fall through to the key path so a
         // custom-imported key that happens to look like a JWT keeps
         // authenticating on deployments that never enable JWT auth.
     }
-    let snapshot = state.snapshot.load();
     // Self-hosted CP (prd-09a §9A.7B.4): the snapshot stores
     // SHA-256 hashes of the plaintext bearer, never the plaintext
     // itself. Hash the incoming token via the canonical helper
@@ -104,14 +101,30 @@ pub(crate) async fn authenticate_token(
 /// short-circuits ahead of every handler, so neither the request
 /// counter nor the access log ever fired). The token itself is never
 /// logged.
+///
+/// `unknown_key` is the scanner-probe shape (`Bearer <junk>`) and
+/// carries no operator signal beyond the metric — same reasoning as the
+/// extractor's `missing_credentials`, which is also metric-only. It logs
+/// at `debug` so an internet-facing DP is not flooded. `key_disabled` /
+/// `key_expired` name a real key an operator provisioned, so they stay
+/// at `warn`.
 fn deny_key(state: &ProxyState, reason: &'static str, err: ProxyError) -> ProxyError {
     state.metrics.record_auth_decision("api_key", false, reason);
-    tracing::warn!(
-        target: "aisix::auth",
-        method = "api_key",
-        reason = %reason,
-        "rejected inbound credential",
-    );
+    if reason == "unknown_key" {
+        tracing::debug!(
+            target: "aisix::auth",
+            method = "api_key",
+            reason = %reason,
+            "rejected inbound credential",
+        );
+    } else {
+        tracing::warn!(
+            target: "aisix::auth",
+            method = "api_key",
+            reason = %reason,
+            "rejected inbound credential",
+        );
+    }
     err
 }
 
