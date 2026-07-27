@@ -498,7 +498,7 @@ fn build_client(mtls: &MtlsBundle) -> anyhow::Result<reqwest::Client> {
 
     let ca = reqwest::Certificate::from_pem(&ca_pem).context("parse CA certificate")?;
 
-    let mut builder = reqwest::Client::builder()
+    let mut builder = aisix_gateway::client_builder()
         .timeout(Duration::from_secs(10))
         .user_agent(format!("aisix-dp/{}", &*BUILD_VERSION))
         .identity(identity)

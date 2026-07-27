@@ -125,9 +125,12 @@ impl AliyunAiGuardrail {
         hook_point: GuardrailHookPoint,
         fail_open: bool,
     ) -> Self {
-        let client = reqwest::Client::builder()
+        // Same connection-layer settings as every provider call: a bound
+        // connect phase, TCP keepalive on, and pooled connections expired
+        // before a hop in front of the guardrail service reaps them.
+        let client = aisix_gateway::client_builder()
             .build()
-            .expect("reqwest::Client::builder() failed; this should never happen");
+            .expect("guardrail http client builds");
         let endpoint = cfg
             .endpoint
             .clone()

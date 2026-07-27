@@ -68,7 +68,8 @@ uuid.workspace = true
 ipnet.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt"] }
+# `test-util` drives the SSE-heartbeat tests on a paused clock.
+tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
 # aisix-provider-anthropic + aisix-provider-openai moved to
 # [dependencies] so the /v1/messages handler can use their primitives
 # in non-test builds too.

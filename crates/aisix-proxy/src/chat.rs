@@ -187,6 +187,7 @@ pub async fn chat_completions(
                 success.total_tokens,
                 &request_id,
                 &success.routing,
+                None,
             );
             // Per #655: emit a zero-token event for each failed attempt
             // that preceded the winner (non-streaming fallover). No-op for
@@ -424,6 +425,7 @@ pub async fn chat_completions(
                 al_total,
                 &request_id,
                 &routing,
+                Some(&err),
             );
             // `resolved_model_id` is populated by `dispatch` once
             // `req.model` resolves against the snapshot, so a guardrail /
@@ -1773,8 +1775,10 @@ async fn dispatch(
                 drop(in_flight_hold);
             },
         );
-        let response =
-            Sse::new(sse_stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)));
+        let mut response = Sse::new(sse_stream);
+        if let Some(d) = crate::sse_keepalive::interval() {
+            response = response.keep_alive(KeepAlive::new().interval(d));
+        }
         return Ok(Success {
             response: response.into_response(),
             provider: provider.to_ascii_lowercase(),
@@ -3131,8 +3135,10 @@ async fn dispatch_ensemble(
                 drop(judge_concurrency_hold);
             },
         );
-        let response =
-            Sse::new(sse_stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)));
+        let mut response = Sse::new(sse_stream);
+        if let Some(d) = crate::sse_keepalive::interval() {
+            response = response.keep_alive(KeepAlive::new().interval(d));
+        }
         return Ok(Success {
             response: response.into_response(),
             // No single provider/model/key governs an ensemble response.
@@ -3864,7 +3870,15 @@ fn emit_access_log(
     total_tokens: Option<u64>,
     request_id: &str,
     routing: &RoutingTelemetry,
+    error: Option<&ProxyError>,
 ) {
+    let (error_kind, error) = match error {
+        Some(e) => {
+            let (kind, msg) = crate::attempt::access_log_error(e);
+            (Some(kind), Some(msg))
+        }
+        None => (None, None),
+    };
     // Per #655 the access log stays ONE line per request (the transport
     // plane), carrying user-perceived `latency` + the final status plus a
     // routing summary. The per-attempt detail lives in telemetry only.
@@ -3890,6 +3904,8 @@ fn emit_access_log(
             0 => None,
             n => Some(n),
         },
+        error_kind,
+        error: error.as_deref(),
     }
     .emit();
 }

@@ -81,6 +81,10 @@ pub async fn a2a_endpoint(
         completion_tokens: None,
         total_tokens: None,
         request_id: &request_id,
+        // Same as `/mcp`: `dispatch` returns an already-rendered `Response`,
+        // so no typed error reaches this point.
+        error_kind: None,
+        error: None,
         served_by_model: None,
         routing_attempt_count: None,
         routing_fallback_count: None,

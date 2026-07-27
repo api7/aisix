@@ -62,7 +62,7 @@ fn cache() -> &'static RwLock<HashMap<String, CachedToken>> {
 fn http_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
+        aisix_gateway::client_builder()
             .timeout(DEFAULT_UPSTREAM_TIMEOUT)
             .redirect(reqwest::redirect::Policy::none())
             .build()

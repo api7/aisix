@@ -187,6 +187,7 @@ pub async fn responses(
                 elapsed,
                 &request_id,
                 &success.routing,
+                None,
             );
             state.metrics.record_request(
                 &success.provider,
@@ -278,6 +279,7 @@ pub async fn responses(
                 elapsed,
                 &request_id,
                 &routing,
+                Some(&err),
             );
             let snap = state.snapshot.load();
             let metric_model = crate::usage_attr::metric_model_label(&snap, &model_name);
@@ -1427,8 +1429,12 @@ async fn responses_to_target(
                 );
             },
         );
-        let mut response =
-            axum::response::Response::new(axum::body::Body::from_stream(Box::pin(parsed_stream)));
+        let mut response = axum::response::Response::new(axum::body::Body::from_stream(
+            crate::sse_keepalive::with_heartbeat(
+                Box::pin(parsed_stream),
+                crate::sse_keepalive::interval(),
+            ),
+        ));
         apply_passthrough_headers(&mut response, &headers, request_id);
 
         Ok(ResponseDispatchSuccess {
@@ -2809,6 +2815,7 @@ fn emit_failed_attempts(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_access_log(
     model: &str,
     provider: &str,
@@ -2817,7 +2824,15 @@ fn emit_access_log(
     elapsed: Duration,
     request_id: &str,
     routing: &RoutingTelemetry,
+    error: Option<&ProxyError>,
 ) {
+    let (error_kind, error) = match error {
+        Some(e) => {
+            let (kind, msg) = crate::attempt::access_log_error(e);
+            (Some(kind), Some(msg))
+        }
+        None => (None, None),
+    };
     // Per #655 the access log stays ONE line per request, carrying the
     // user-perceived `latency` + final status plus a routing summary.
     let served_by = routing
@@ -2845,6 +2860,8 @@ fn emit_access_log(
             0 => None,
             n => Some(n),
         },
+        error_kind,
+        error: error.as_deref(),
     }
     .emit();
 }

@@ -30,6 +30,17 @@ export interface OpenAiUpstreamOptions {
   errorContentType?: string;
   /** Drop the connection after writing this many SSE events. */
   disconnectAfterEvents?: number;
+  /**
+   * Raw (non-JSON) 200 response body — e.g. MP4 bytes for the `/v1/videos`
+   * content-proxy path. When set (and `status` < 400), the reply is these
+   * bytes with `rawContentType` (default `application/octet-stream`) and an
+   * auto Content-Length, instead of the JSON body. Lets a test assert the
+   * gateway streams provider bytes back and injected the provider bearer on
+   * the content GET.
+   */
+  rawBody?: string;
+  /** Content-Type for `rawBody` (default `application/octet-stream`). */
+  rawContentType?: string;
   /** Per-request response script; used in order before static opts. */
   scriptedResponses?: OpenAiUpstreamStep[];
   /**
@@ -54,6 +65,10 @@ export interface OpenAiUpstreamStep {
   disconnectAfterEvents?: number;
   /** Extra response headers, same semantics as on the top-level options. */
   responseHeaders?: Record<string, string>;
+  /** Raw (non-JSON) 200 body — see `OpenAiUpstreamOptions.rawBody`. */
+  rawBody?: string;
+  /** Content-Type for `rawBody` (default `application/octet-stream`). */
+  rawContentType?: string;
 }
 
 export interface OpenAiUpstream {
@@ -97,14 +112,20 @@ export async function startOpenAiUpstream(
         method: req.method ?? "GET",
         path: req.url ?? "/",
         headers: Object.fromEntries(
-          Object.entries(req.headers).map(([k, v]) => [k, Array.isArray(v) ? v.join(",") : (v ?? "")]),
+          Object.entries(req.headers).map(([k, v]) => [
+            k,
+            Array.isArray(v) ? v.join(",") : (v ?? ""),
+          ]),
         ),
         body: raw,
       });
 
       if (step.responseDelayMs) await sleep(step.responseDelayMs);
 
-      const extraHeaders = { ...(opts.responseHeaders ?? {}), ...(step.responseHeaders ?? {}) };
+      const extraHeaders = {
+        ...(opts.responseHeaders ?? {}),
+        ...(step.responseHeaders ?? {}),
+      };
       for (const [k, v] of Object.entries(extraHeaders)) {
         res.setHeader(k, v);
       }
@@ -116,7 +137,23 @@ export async function startOpenAiUpstream(
           "content-type",
           step.errorContentType ?? opts.errorContentType ?? "application/json",
         );
-        res.end(JSON.stringify(step.errorBody ?? { error: { message: "mock error" } }));
+        res.end(
+          JSON.stringify(
+            step.errorBody ?? { error: { message: "mock error" } },
+          ),
+        );
+        return;
+      }
+
+      if (step.rawBody !== undefined) {
+        res.statusCode = 200;
+        res.setHeader(
+          "content-type",
+          step.rawContentType ?? "application/octet-stream",
+        );
+        // Buffer.from sets Content-Length automatically, exercising the
+        // gateway's content-length relay on the proxy path.
+        res.end(Buffer.from(step.rawBody));
         return;
       }
 
@@ -174,7 +211,9 @@ export async function startOpenAiUpstream(
   });
 
   const port = await pickFreePort();
-  await new Promise<void>((resolve) => server.listen(port, "127.0.0.1", resolve));
+  await new Promise<void>((resolve) =>
+    server.listen(port, "127.0.0.1", resolve),
+  );
   const baseUrl = `http://127.0.0.1:${port}`;
 
   return {

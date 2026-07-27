@@ -59,6 +59,7 @@ mod responses;
 mod responses_bridge;
 mod routing;
 mod semantic;
+pub mod sse_keepalive;
 mod state;
 mod stream_timeout;
 mod token_estimate;

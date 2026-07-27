@@ -105,7 +105,7 @@ fn exporter_pipeline_config() -> PipelineConfig {
 
 impl OtlpHttpFanOut {
     pub fn new() -> Self {
-        let client = reqwest::Client::builder()
+        let client = aisix_gateway::client_builder()
             .timeout(REQUEST_TIMEOUT)
             .user_agent(USER_AGENT)
             .build()

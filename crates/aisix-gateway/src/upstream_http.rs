@@ -236,6 +236,69 @@ mod tests {
         assert!(client.is_ok(), "{:?}", client.err());
     }
 
+    /// Every outbound HTTP client in the workspace must be built from
+    /// [`client_builder`], or it silently keeps reqwest's defaults — no
+    /// connect timeout, TCP keepalive off, and a 90s pooled-connection
+    /// lifetime that outlives a typical hop's idle timeout. Nothing else
+    /// catches that: such a client works fine until a load balancer
+    /// starts reaping connections it still considers usable.
+    ///
+    /// The first pass of this (AISIX-Cloud#1122) converted the provider
+    /// bridges only, leaving the guardrail, MCP, A2A, telemetry, and
+    /// exporter clients on the defaults — which is what this test exists
+    /// to stop repeating (AISIX-Cloud#1126).
+    #[test]
+    fn no_production_code_builds_a_bare_reqwest_client() {
+        let crates_dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/.."));
+        let mut offenders = Vec::new();
+        for file in rust_sources(crates_dir) {
+            let src = std::fs::read_to_string(&file).expect("read source");
+            // Tests build throwaway clients on purpose; only the
+            // production half of each file is in scope.
+            let production = match src.find("#[cfg(test)]") {
+                Some(i) => &src[..i],
+                None => &src[..],
+            };
+            for (n, line) in production.lines().enumerate() {
+                if line.contains("reqwest::Client::builder()")
+                    || line.contains("reqwest::Client::new()")
+                {
+                    offenders.push(format!("{}:{}", file.display(), n + 1));
+                }
+            }
+        }
+        // This module is where the shared builder is defined.
+        offenders.retain(|o| !o.contains("upstream_http.rs"));
+        assert!(
+            offenders.is_empty(),
+            "these build a reqwest client directly instead of \
+             `aisix_gateway::client_builder()`:\n{}",
+            offenders.join("\n"),
+        );
+    }
+
+    fn rust_sources(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return out;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if path
+                    .file_name()
+                    .is_some_and(|n| n == "tests" || n == "target")
+                {
+                    continue;
+                }
+                out.extend(rust_sources(&path));
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+        out
+    }
+
     #[test]
     fn redacts_credential_query_params_only() {
         let url = reqwest::Url::parse(

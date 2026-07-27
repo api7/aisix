@@ -171,6 +171,7 @@ pub async fn messages(
                 elapsed,
                 &request_id,
                 &routing,
+                None,
             );
             state.metrics.record_request(
                 &provider_label,
@@ -286,6 +287,7 @@ pub async fn messages(
                 elapsed,
                 &request_id,
                 &routing,
+                Some(&err),
             );
             let snap = state.snapshot.load();
             let metric_model = crate::usage_attr::metric_model_label(&snap, &model_name);
@@ -1354,8 +1356,9 @@ async fn anthropic_passthrough_dispatch(
             },
         );
 
-        let mut response =
-            axum::response::Response::new(axum::body::Body::from_stream(parsed_stream));
+        let mut response = axum::response::Response::new(axum::body::Body::from_stream(
+            crate::sse_keepalive::with_heartbeat(parsed_stream, crate::sse_keepalive::interval()),
+        ));
 
         // Copy content-type from upstream (should be text/event-stream).
         if let Some(ct) = headers.get("content-type") {
@@ -2397,7 +2400,10 @@ fn build_anthropic_sse_stream(
     // Re-attach the request span: the body is polled after the request-id
     // middleware returns, so the end-of-stream output-guardrail check
     // would otherwise log without a `request_id` (AISIX-Cloud#1060).
-    axum::body::Body::from_stream(crate::request_id::in_request_span(stream))
+    axum::body::Body::from_stream(crate::sse_keepalive::with_heartbeat(
+        crate::request_id::in_request_span(stream),
+        crate::sse_keepalive::interval(),
+    ))
 }
 
 /// Anthropic-shape SSE error frame for a streaming guardrail block. Built
@@ -3351,6 +3357,7 @@ where
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_access_log(
     model: &str,
     provider: &str,
@@ -3359,7 +3366,15 @@ fn emit_access_log(
     latency: Duration,
     request_id: &str,
     routing: &RoutingTelemetry,
+    error: Option<&ProxyError>,
 ) {
+    let (error_kind, error) = match error {
+        Some(e) => {
+            let (kind, msg) = crate::attempt::access_log_error(e);
+            (Some(kind), Some(msg))
+        }
+        None => (None, None),
+    };
     // Per #655 the access log stays ONE line per request, carrying the
     // user-perceived `latency` + final status plus a routing summary; the
     // per-attempt detail lives in telemetry.
@@ -3388,6 +3403,8 @@ fn emit_access_log(
             0 => None,
             n => Some(n),
         },
+        error_kind,
+        error: error.as_deref(),
     }
     .emit();
 }
