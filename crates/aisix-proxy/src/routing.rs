@@ -239,9 +239,41 @@ pub(crate) async fn retrying_dispatch<F, Fut, T>(
     state: &crate::ProxyState,
     model: &aisix_core::Model,
     endpoint: &'static str,
+    call: F,
+) -> Result<T, BridgeError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, BridgeError>>,
+{
+    retrying_dispatch_gated(state, model, endpoint, |_| true, call).await
+}
+
+/// [`retrying_dispatch`] with a caller-supplied `permit` predicate that can
+/// veto spending the budget on a particular failure.
+///
+/// Exists for the two endpoints that replay requests they did not author —
+/// passthrough and /v1/videos — where a retry can re-execute a
+/// **non-idempotent upstream write**. The dangerous case is a failure
+/// AFTER the upstream returned its status: the operation committed, only
+/// the response body was lost, and a retry duplicates it (a second file
+/// upload, a second paid video task whose id the caller never saw). Those
+/// callers veto `UpstreamDecode` for non-idempotent methods. Send-phase
+/// transport failures stay retryable — whether the request reached the
+/// upstream is unknowable there, and the OpenAI SDK / LiteLLM router both
+/// accept that ambiguity and retry POSTs on connection errors.
+///
+/// The first-class endpoints don't need a veto: their POST bodies are
+/// generation requests the gateway itself authored, where a replay is the
+/// documented cost of retrying (same as every provider SDK).
+pub(crate) async fn retrying_dispatch_gated<P, F, Fut, T>(
+    state: &crate::ProxyState,
+    model: &aisix_core::Model,
+    endpoint: &'static str,
+    permit: P,
     mut call: F,
 ) -> Result<T, BridgeError>
 where
+    P: Fn(&BridgeError) -> bool,
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<T, BridgeError>>,
 {
@@ -263,7 +295,7 @@ where
         match call().await {
             Ok(v) => return Ok(v),
             Err(e) => {
-                if !is_retryable(&e, false, &[]) || !budget.covers(&e) {
+                if !is_retryable(&e, false, &[]) || !budget.covers(&e) || !permit(&e) {
                     return Err(e);
                 }
                 tracing::warn!(

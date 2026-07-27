@@ -466,14 +466,32 @@ async fn dispatch(
     // 5xx never becomes a `BridgeError` on this path, so it is relayed
     // untouched (re-sending it would both break verbatim relay and stack on
     // top of the provider edge's own retries — see AISIX-Cloud#1121). Only
-    // transport and decode faults — where no response reached the client —
-    // are retried. The whole request is rebuilt per attempt because
-    // `RequestBuilder::send` consumes it.
+    // transport and decode faults are retried, and decode faults only for
+    // idempotent methods: a body-read failure means the upstream already
+    // returned its status — the operation committed and only the response
+    // was lost — so replaying a tunneled POST would duplicate a write this
+    // gateway does not understand (a second file upload, a second
+    // fine-tune). Send-phase transport failures stay retryable for every
+    // method: whether the request reached the upstream is unknowable, and
+    // the provider SDKs accept that ambiguity too. The whole request is
+    // rebuilt per attempt because `RequestBuilder::send` consumes it.
     let tracker = &state.runtime_status;
     let model_id: &str = &model_entry.id;
     let cooldown_cfg = model.cooldown.as_ref();
-    let (status, resp_headers, resp_body) =
-        match crate::routing::retrying_dispatch(&state, model, "passthrough", || {
+    // RFC 9110 §9.2.2 idempotent methods.
+    let idempotent = matches!(
+        method,
+        Method::GET | Method::HEAD | Method::OPTIONS | Method::TRACE | Method::PUT | Method::DELETE
+    );
+    let retry_permit = |e: &aisix_gateway::BridgeError| {
+        idempotent || !matches!(e, aisix_gateway::BridgeError::UpstreamDecode(_))
+    };
+    let (status, resp_headers, resp_body) = match crate::routing::retrying_dispatch_gated(
+        &state,
+        model,
+        "passthrough",
+        retry_permit,
+        || {
             let mut builder = client.request(method.clone(), &url);
             for (name, value) in &incoming_headers {
                 let n = name.as_str().to_ascii_lowercase();
@@ -539,12 +557,13 @@ async fn dispatch(
                 })?;
                 Ok((status, resp_headers, resp_body))
             }
-        })
-        .await
-        {
-            Ok(v) => v,
-            Err(err) => return Err(ProxyError::Bridge(err)),
-        };
+        },
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(err) => return Err(ProxyError::Bridge(err)),
+    };
 
     // #911 [6]: run OUTPUT guardrails on the passthrough response body — the
     // same whole-body text scan as the input hook, so forbidden model output

@@ -566,6 +566,14 @@ async fn multipart_dispatch(
     // whether the customer's api_base ends in /v1 or not.
     let url = crate::dispatch::build_v1_url(&base, upstream_path);
     let provider_label = provider.to_ascii_lowercase();
+    // Static label for retry tracing — this dispatch serves both audio
+    // sub-routes, and logging translations under the transcription label
+    // would mislead an operator reading retry output.
+    let retry_endpoint_label: &'static str = if upstream_path == "/audio/translations" {
+        "/v1/audio/translations"
+    } else {
+        "/v1/audio/transcriptions"
+    };
 
     // Rebuild the multipart form with `model` rewritten. A `multipart::Form`
     // is single-use (sending consumes it), so this is a closure rather than a
@@ -629,7 +637,7 @@ async fn multipart_dispatch(
     // Send, check the status, and read the body as one retryable unit. See
     // the same shape in rerank.rs for why `note_failure` stays per attempt.
     let (upstream_headers, body_bytes) =
-        match crate::routing::retrying_dispatch(state, model, "/v1/audio/transcriptions", || {
+        match crate::routing::retrying_dispatch(state, model, retry_endpoint_label, || {
             let mut req = client
                 .post(&url)
                 .headers(headers.clone())
