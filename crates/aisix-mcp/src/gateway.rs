@@ -144,11 +144,15 @@ impl ToolAcl {
     ///
     /// Inactive policies (disabled or expired) neither grant nor deny.
     pub fn resolve(snapshot: &AisixSnapshot, key: &ApiKey, now: DateTime<Utc>) -> Self {
-        // Pick the governing row per scope deterministically (lowest id wins)
-        // so a duplicated row — the writer enforces uniqueness — can only
-        // ever produce a stable outcome.
+        // Grant side: pick the governing row per scope deterministically
+        // (lowest id wins) so a duplicated row — the writer enforces
+        // uniqueness — can only ever produce a stable outcome. Deny side:
+        // union across EVERY active row that applies to this key, so a
+        // deny pattern can never disappear by losing a duplicate-row
+        // tie-break.
         let mut env_policy: Option<Arc<ResourceEntry<McpPolicy>>> = None;
         let mut team_policy: Option<Arc<ResourceEntry<McpPolicy>>> = None;
+        let mut deny: Vec<String> = Vec::new();
         for entry in snapshot.mcp_policies.entries() {
             if !entry.value.is_active_at(now) {
                 continue;
@@ -164,18 +168,11 @@ impl ToolAcl {
                     &mut team_policy
                 }
             };
+            deny.extend(entry.value.deny.iter().cloned());
             match slot {
                 Some(current) if current.id <= entry.id => {}
                 _ => *slot = Some(entry),
             }
-        }
-
-        let mut deny: Vec<String> = Vec::new();
-        if let Some(p) = &env_policy {
-            deny.extend(p.value.deny.iter().cloned());
-        }
-        if let Some(p) = &team_policy {
-            deny.extend(p.value.deny.iter().cloned());
         }
 
         let Some(access) = &key.mcp_access else {

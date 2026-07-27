@@ -4,7 +4,7 @@
   "definitions": {
     "McpAccess": {
       "additionalProperties": false,
-      "description": "Policy-driven MCP access configuration on an API key. When present, this block supersedes the key's legacy `allowed_tools` list: the allow side of the key's effective grant is computed from the applicable [`McpPolicy`] rows and `mode`, and `allowed_tools` is not consulted.",
+      "description": "Policy-driven MCP access configuration on an API key. When present, this block supersedes the key's `allowed_tools` list: the allow side of the key's effective grant is computed from the applicable MCP access policies and `mode`, and `allowed_tools` is not consulted.",
       "properties": {
         "allow": {
           "description": "Namespaced `<server>__<tool>` patterns intersected with the inherited grant when `mode` is `restrict`, using the same single-`*` glob matching as `allowed_tools`. Ignored for the other modes.",
@@ -35,7 +35,7 @@
       "type": "object"
     },
     "McpAccessMode": {
-      "description": "Per-key MCP access block, carried on the API key resource. Selects how the key combines with the environment's and its team's [`McpPolicy`] rows.",
+      "description": "How an API key combines with the applicable MCP access policies: `inherit`, `restrict`, or `deny`.",
       "oneOf": [
         {
           "description": "The key uses the inherited grant unchanged: its team's active policy when one exists, otherwise the environment-default policy.",

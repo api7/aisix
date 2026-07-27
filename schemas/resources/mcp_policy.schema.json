@@ -25,7 +25,7 @@
   ],
   "definitions": {
     "McpPolicyMode": {
-      "description": "What a [`McpPolicy`] grants before `deny` patterns are subtracted.",
+      "description": "What an MCP access policy grants before `deny` patterns are subtracted.",
       "oneOf": [
         {
           "description": "Grants no MCP tools.",
@@ -51,7 +51,7 @@
       ]
     },
     "McpPolicyScope": {
-      "description": "Which API keys a [`McpPolicy`] applies to.",
+      "description": "Which API keys an MCP access policy applies to.",
       "oneOf": [
         {
           "description": "The environment-wide default, applied to keys whose team has no active policy of its own.",

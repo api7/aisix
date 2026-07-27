@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::resource::Resource;
 
-/// Which API keys a [`McpPolicy`] applies to.
+/// Which API keys an MCP access policy applies to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum McpPolicyScope {
@@ -33,7 +33,7 @@ pub enum McpPolicyScope {
     Team,
 }
 
-/// What a [`McpPolicy`] grants before `deny` patterns are subtracted.
+/// What an MCP access policy grants before `deny` patterns are subtracted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum McpPolicyMode {
@@ -106,12 +106,12 @@ impl McpPolicy {
     /// is strict (`<`), matching API-key expiry: the policy still applies at
     /// the deadline instant itself.
     pub fn is_active_at(&self, now: DateTime<Utc>) -> bool {
-        self.enabled && !self.expires_at.is_some_and(|deadline| deadline < now)
+        self.enabled && self.expires_at.is_none_or(|deadline| deadline >= now)
     }
 }
 
-/// Per-key MCP access block, carried on the API key resource. Selects how the
-/// key combines with the environment's and its team's [`McpPolicy`] rows.
+/// How an API key combines with the applicable MCP access policies:
+/// `inherit`, `restrict`, or `deny`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum McpAccessMode {
@@ -127,9 +127,9 @@ pub enum McpAccessMode {
 }
 
 /// Policy-driven MCP access configuration on an API key. When present, this
-/// block supersedes the key's legacy `allowed_tools` list: the allow side of
-/// the key's effective grant is computed from the applicable
-/// [`McpPolicy`] rows and `mode`, and `allowed_tools` is not consulted.
+/// block supersedes the key's `allowed_tools` list: the allow side of the
+/// key's effective grant is computed from the applicable MCP access policies
+/// and `mode`, and `allowed_tools` is not consulted.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct McpAccess {

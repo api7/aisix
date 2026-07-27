@@ -890,6 +890,79 @@ async fn tool_acl_per_server_wildcard_scopes_to_one_server() {
         .expect_err("a tool outside the granted server must be rejected");
 }
 
+#[test]
+fn resolve_duplicate_scope_rows_deny_union_survives_tie_break() {
+    // Grant side: lowest id governs. Deny side: the union of every
+    // active applicable row — a deny must never vanish because its row
+    // lost the duplicate tie-break.
+    let snapshot = policy_snapshot(&[
+        (
+            "p-b",
+            serde_json::json!({"scope":"env","mode":"all","deny":["beta__echo"]}),
+        ),
+        ("p-a", serde_json::json!({"scope":"env","mode":"all"})),
+    ]);
+    let key = acl_key(serde_json::json!({
+        "key_hash":"h","allowed_models":[],"mcp_access":{"mode":"inherit"}
+    }));
+    let acl = resolve_now(&snapshot, &key);
+    assert!(acl.permits("alpha__echo"));
+    assert!(
+        !acl.permits("beta__echo"),
+        "the losing duplicate's deny must still subtract"
+    );
+}
+
+#[test]
+fn resolve_restrict_with_empty_allow_grants_nothing() {
+    // restrict + empty allow = the empty intersection, whatever the base.
+    let snapshot = policy_snapshot(&[("p-env", serde_json::json!({"scope":"env","mode":"all"}))]);
+    let key = acl_key(serde_json::json!({
+        "key_hash":"h","allowed_models":[],"mcp_access":{"mode":"restrict"}
+    }));
+    assert!(!resolve_now(&snapshot, &key).permits("alpha__echo"));
+}
+
+#[test]
+fn resolve_selected_with_empty_allow_grants_nothing() {
+    let snapshot = policy_snapshot(&[(
+        "p-env",
+        serde_json::json!({"scope":"env","mode":"selected"}),
+    )]);
+    let key = acl_key(serde_json::json!({
+        "key_hash":"h","allowed_models":[],"mcp_access":{"mode":"inherit"}
+    }));
+    assert!(!resolve_now(&snapshot, &key).permits("alpha__echo"));
+}
+
+#[test]
+fn resolve_team_row_without_scope_ref_matches_no_key() {
+    // The schema gate requires scope_ref on team rows; if a malformed
+    // row ever reaches the table anyway (this insert bypasses the
+    // loader), it must neither govern any key nor shadow the env
+    // default.
+    let snapshot = policy_snapshot(&[
+        (
+            "p-env",
+            serde_json::json!({"scope":"env","mode":"selected","allow":["alpha__*"]}),
+        ),
+        ("p-bad", serde_json::json!({"scope":"team","mode":"all"})),
+    ]);
+    let teamed = acl_key(serde_json::json!({
+        "key_hash":"h","allowed_models":[],"team_id":"team-1",
+        "mcp_access":{"mode":"inherit"}
+    }));
+    let acl = resolve_now(&snapshot, &teamed);
+    assert!(
+        acl.permits("alpha__echo"),
+        "env default must keep governing"
+    );
+    assert!(
+        !acl.permits("beta__echo"),
+        "a scope_ref-less team row must not grant anything"
+    );
+}
+
 #[tokio::test]
 async fn policy_resolved_acl_filters_list_and_rejects_calls() {
     // Full wiring: an env policy granting alpha only, denied one level up
