@@ -907,6 +907,7 @@ async fn dispatch_to_target(
             model,
             &target.id,
             &pk_entry.value,
+            &pk_entry.id,
             model_name,
             request_id,
             started,
@@ -1689,6 +1690,7 @@ async fn cross_provider_dispatch(
     model: &aisix_core::Model,
     model_id: &str,
     provider_key: &aisix_core::ProviderKey,
+    provider_key_id: &str,
     model_name: &str,
     request_id: &str,
     started: Instant,
@@ -1750,7 +1752,8 @@ async fn cross_provider_dispatch(
     // otherwise. The streaming path additionally enforces the per-chunk
     // read timeout below.
     let mut ctx = BridgeContext::new(request_id, model_arc, pk_arc)
-        .with_client(client.caller.clone(), Some(client.headers.clone()));
+        .with_client(client.caller.clone(), Some(client.headers.clone()))
+        .with_resource_ids(model_id, provider_key_id);
     let connect_deadline = if is_stream {
         model.stream_timeout_effective()
     } else {

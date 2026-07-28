@@ -1255,7 +1255,8 @@ async fn dispatch(
             // stream timeout; the read-timeout wrapper below enforces the
             // same budget on the first and subsequent chunks.
             let mut ctx = BridgeContext::new(request_id, model_arc, pk_arc)
-                .with_client(client.caller.clone(), Some(client.headers.clone()));
+                .with_client(client.caller.clone(), Some(client.headers.clone()))
+                .with_resource_ids(&attempt.id, &pk_entry.id);
             if let Some(d) = model.stream_timeout_effective() {
                 ctx = ctx.with_deadline(d);
             }
@@ -2139,7 +2140,8 @@ async fn dispatch(
         // surfaces as a retryable `BridgeError::Timeout`, so a slow target
         // fails over to the next one via the loop below.
         let mut ctx = BridgeContext::new(request_id, model_arc, pk_arc)
-            .with_client(client.caller.clone(), Some(client.headers.clone()));
+            .with_client(client.caller.clone(), Some(client.headers.clone()))
+            .with_resource_ids(&attempt.id, &pk_entry.id);
         if let Some(d) = model.request_timeout() {
             ctx = ctx.with_deadline(d);
         }
@@ -2832,7 +2834,8 @@ async fn dispatch_ensemble(
             Arc::new(judge_model.clone()),
             Arc::new(judge_pk.value.clone()),
         )
-        .with_client(client.caller.clone(), Some(client.headers.clone()));
+        .with_client(client.caller.clone(), Some(client.headers.clone()))
+        .with_resource_ids(&judge_entry.id, &judge_pk.id);
         if let Some(deadline) = judge_model.request_timeout() {
             judge_ctx = judge_ctx.with_deadline(deadline);
         }

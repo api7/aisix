@@ -136,7 +136,8 @@ impl ModelCaller for ProxyModelCaller<'_> {
         .with_client(
             self.client.caller.clone(),
             Some(self.client.headers.clone()),
-        );
+        )
+        .with_resource_ids(&entry.id, &pk_entry.id);
         if let Some(deadline) = model.request_timeout() {
             ctx = ctx.with_deadline(deadline);
         }

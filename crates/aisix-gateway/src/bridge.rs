@@ -16,7 +16,7 @@
 //! The trait is deliberately `async_trait` rather than GATs — ergonomic
 //! wins outweigh the boxing cost on the provider path.
 
-use aisix_core::{HeaderVars, Model, ProviderKey, Resource};
+use aisix_core::{HeaderVars, Model, ProviderKey};
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use http::HeaderMap;
@@ -109,6 +109,14 @@ pub struct BridgeContext {
     /// `request.forward_client_headers` allowlist. `None` on the same
     /// caller-less paths as above.
     pub client_headers: Option<std::sync::Arc<HeaderMap>>,
+    /// Snapshot ids of the resolved Model and ProviderKey, for the
+    /// `${model.id}` / `${provider_key.id}` header templates. They are
+    /// carried separately because a `Model` / `ProviderKey` value does not
+    /// know its own etcd id at runtime — the id lives on the enclosing
+    /// `ResourceEntry`, and `Resource::id()` on the value reads an
+    /// unpopulated field outside tests.
+    pub model_id: String,
+    pub provider_key_id: String,
 }
 
 impl BridgeContext {
@@ -124,6 +132,8 @@ impl BridgeContext {
             deadline: None,
             caller: CallerIdentity::default(),
             client_headers: None,
+            model_id: String::new(),
+            provider_key_id: String::new(),
         }
     }
 
@@ -146,6 +156,18 @@ impl BridgeContext {
         self
     }
 
+    /// Attach the snapshot ids of the resolved Model / ProviderKey. See
+    /// the field docs for why they cannot be read off the values.
+    pub fn with_resource_ids(
+        mut self,
+        model_id: impl Into<String>,
+        provider_key_id: impl Into<String>,
+    ) -> Self {
+        self.model_id = model_id.into();
+        self.provider_key_id = provider_key_id.into();
+        self
+    }
+
     /// The context [`crate::upstream_headers::apply_request_headers`] needs
     /// to render `default_headers` templates and forward client headers.
     pub fn header_ctx(&self) -> UpstreamHeaderContext<'_> {
@@ -157,9 +179,9 @@ impl BridgeContext {
                 api_key_name: self.caller.api_key_name.as_deref(),
                 api_key_team_id: self.caller.team_id.as_deref(),
                 api_key_user_id: self.caller.user_id.as_deref(),
-                model_id: Some(self.model.id()),
+                model_id: Some(&self.model_id),
                 model_name: Some(&self.model.display_name),
-                provider_key_id: Some(self.provider_key.id()),
+                provider_key_id: Some(&self.provider_key_id),
                 provider_key_name: Some(&self.provider_key.display_name),
             },
             client_headers: self.client_headers.as_deref(),

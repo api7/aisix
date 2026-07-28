@@ -297,7 +297,8 @@ async fn dispatch(
     let pk_arc = Arc::new(pk_entry.value.clone());
     // #554: apply the configured request `timeout` as the upstream deadline.
     let mut ctx = BridgeContext::new(request_id, model_arc, pk_arc)
-        .with_client(client_ctx.caller.clone(), Some(client_ctx.headers.clone()));
+        .with_client(client_ctx.caller.clone(), Some(client_ctx.headers.clone()))
+        .with_resource_ids(&model_entry.id, &pk_entry.id);
     if let Some(d) = model.request_timeout() {
         ctx = ctx.with_deadline(d);
     }

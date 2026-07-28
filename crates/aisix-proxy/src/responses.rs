@@ -1674,7 +1674,8 @@ async fn responses_cross_provider_to_target(
     let model_arc = Arc::new(model.clone());
     let pk_arc = Arc::new(pk_entry.value.clone());
     let mut ctx = BridgeContext::new(request_id, model_arc, pk_arc)
-        .with_client(client_ctx.caller.clone(), Some(client_ctx.headers.clone()));
+        .with_client(client_ctx.caller.clone(), Some(client_ctx.headers.clone()))
+        .with_resource_ids(model_id, &provider_key_id);
     let connect_deadline = if is_stream {
         model.stream_timeout_effective()
     } else {
