@@ -125,7 +125,7 @@ pub async fn embeddings(
     };
     let model_name = body.model.clone();
 
-    match dispatch(&state, &auth, body, &request_id, &client.source_ip).await {
+    match dispatch(&state, &auth, body, &request_id, &client).await {
         Ok(success) => {
             let elapsed = started.elapsed();
             let status = 200u16;
@@ -265,7 +265,7 @@ async fn dispatch(
     auth: &AuthenticatedKey,
     mut body: EmbeddingRequestBody,
     request_id: &str,
-    source_ip: &str,
+    client_ctx: &ClientContext,
 ) -> Result<EmbedDispatchSuccess, ProxyError> {
     let snapshot = state.snapshot.load();
 
@@ -277,7 +277,7 @@ async fn dispatch(
     }
 
     // Client-IP allowlist gate (#557): reject before guardrails / upstream.
-    crate::dispatch::check_ip_access(&model_entry.value, source_ip)?;
+    crate::dispatch::check_ip_access(&model_entry.value, &client_ctx.source_ip)?;
 
     let model = &model_entry.value;
     let provider = crate::dispatch::require_provider(model)?;
@@ -396,7 +396,8 @@ async fn dispatch(
     let model_arc = Arc::new(model.clone());
     let pk_arc = Arc::new(pk_entry.value.clone());
     // #554: apply the configured request `timeout` as the upstream deadline.
-    let mut ctx = BridgeContext::new(request_id, model_arc, pk_arc);
+    let mut ctx = BridgeContext::new(request_id, model_arc, pk_arc)
+        .with_client(client_ctx.caller.clone(), Some(client_ctx.headers.clone()));
     if let Some(d) = model.request_timeout() {
         ctx = ctx.with_deadline(d);
     }

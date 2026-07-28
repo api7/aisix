@@ -48,7 +48,14 @@ where
                 return Err(e);
             }
         };
-        authenticate_token(&proxy_state, &token).await
+        let authed = authenticate_token(&proxy_state, &token).await?;
+        // Publish the resolved key so extractors that run after this one can
+        // see who is calling without re-authenticating. `ClientContext` reads
+        // it for the `${request.api_key.*}` header templates
+        // (AISIX-Cloud#1112) — which is why every handler declares
+        // `auth: AuthenticatedKey` before `client: ClientContext`.
+        parts.extensions.insert(authed.entry.clone());
+        Ok(authed)
     }
 }
 

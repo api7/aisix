@@ -269,6 +269,37 @@ pub(crate) fn require_api_key<'a>(
     Ok(provider_key.api_key.as_str())
 }
 
+/// Build the outbound-header context for a dispatch path that constructs
+/// its upstream request directly instead of going through a `Bridge`
+/// (`/v1/messages`, `/v1/responses`, `/v1/messages/count_tokens`, audio,
+/// rerank, videos, jobs).
+///
+/// The Bridge paths get the same thing from
+/// [`aisix_gateway::BridgeContext::header_ctx`]; both must resolve the
+/// same variables from the same sources, so keep them in step.
+pub(crate) fn upstream_header_ctx<'a>(
+    pk: &'a ProviderKey,
+    pk_id: &'a str,
+    model: &'a Model,
+    model_id: &'a str,
+    client: &'a crate::client_ip::ClientContext,
+) -> aisix_gateway::UpstreamHeaderContext<'a> {
+    let caller = &client.caller;
+    aisix_gateway::UpstreamHeaderContext::from_overrides(pk.request.as_ref())
+        .with_vars(aisix_core::HeaderVars {
+            request_id: Some(&client.request_id),
+            api_key_id: Some(&caller.api_key_id),
+            api_key_name: caller.api_key_name.as_deref(),
+            api_key_team_id: caller.team_id.as_deref(),
+            api_key_user_id: caller.user_id.as_deref(),
+            model_id: Some(model_id),
+            model_name: Some(&model.display_name),
+            provider_key_id: Some(pk_id),
+            provider_key_name: Some(&pk.display_name),
+        })
+        .with_client_headers(&client.headers)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

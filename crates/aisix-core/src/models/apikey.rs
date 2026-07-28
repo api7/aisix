@@ -24,6 +24,12 @@ pub struct ApiKey {
     #[schemars(length(min = 1))]
     pub key_hash: String,
 
+    /// Operator-facing label for this key, as shown in the dashboard.
+    /// Read only by the `${request.api_key.name}` header template
+    /// (AISIX-Cloud#1112); never used for authentication or routing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+
     /// Model identifiers this key may use. An empty array denies access to every model.
     pub allowed_models: Vec<String>,
 
@@ -265,6 +271,7 @@ mod tests {
     fn empty_allowed_models_denies_everything() {
         let k = ApiKey {
             key_hash: "abc".into(),
+            display_name: None,
             allowed_models: vec![],
             rate_limit: None,
             team_id: None,

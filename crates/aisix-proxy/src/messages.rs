@@ -1026,13 +1026,14 @@ async fn anthropic_passthrough_dispatch(
         .unwrap_or(false);
 
     // Build the outbound HeaderMap explicitly so the PK's
-    // `request.default_headers` block can inject operator-supplied
-    // headers via the shared apply pipeline. The bridge-owned
-    // headers (x-api-key, anthropic-version, content-type,
-    // x-aisix-request-id) are inserted FIRST — `apply_default_headers`
-    // skips keys already present + the reserved auth-header blacklist
-    // (`x-api-key` is in `RESERVED_DEFAULT_HEADERS`), so operator
-    // headers can never clobber auth here (ai-gateway#337).
+    // `request.default_headers` / `request.forward_client_headers` can
+    // inject operator-supplied and allowlisted client headers via the
+    // shared apply pipeline. The bridge-owned headers (x-api-key,
+    // anthropic-version, content-type, x-aisix-request-id) are inserted
+    // FIRST — `apply_request_headers` skips keys already present + the
+    // reserved auth-header blacklist (`x-api-key` is in
+    // `RESERVED_UPSTREAM_HEADERS`), so neither source can clobber auth
+    // here (ai-gateway#337).
     let mut headers = axum::http::HeaderMap::new();
     let api_key_hv = HeaderValue::from_str(api_key).map_err(|e| {
         ProxyError::Bridge(aisix_gateway::BridgeError::Config(format!(
@@ -1054,9 +1055,10 @@ async fn anthropic_passthrough_dispatch(
         )))
     })?;
     headers.insert(HeaderName::from_static("x-aisix-request-id"), rid_hv);
-    if let Some(r) = pk_value.request.as_ref() {
-        aisix_provider_openai::overrides::apply_default_headers(&mut headers, &r.default_headers);
-    }
+    aisix_gateway::apply_request_headers(
+        &mut headers,
+        &crate::dispatch::upstream_header_ctx(pk_value, pk_id, model, model_id, client_ctx),
+    );
 
     let client = crate::http_client::client();
     let mut req_builder = client.post(&url).headers(headers).json(&body);
@@ -1747,7 +1749,8 @@ async fn cross_provider_dispatch(
     // the streaming read budget for stream calls, the E2E request timeout
     // otherwise. The streaming path additionally enforces the per-chunk
     // read timeout below.
-    let mut ctx = BridgeContext::new(request_id, model_arc, pk_arc);
+    let mut ctx = BridgeContext::new(request_id, model_arc, pk_arc)
+        .with_client(client.caller.clone(), Some(client.headers.clone()));
     let connect_deadline = if is_stream {
         model.stream_timeout_effective()
     } else {
@@ -3626,7 +3629,7 @@ mod tests {
     //
     // Issue refs: ai-gateway#335 (`apply_param_constraints` not wired
     // on /v1/messages), ai-gateway#337 (same gap for
-    // `apply_default_headers`). Same site / same fix covers
+    // `apply_request_headers`). Same site / same fix covers
     // `param_renames` and `default_body_fields`.
 
     /// Build an Anthropic ProviderKey JSON with the given request
@@ -3814,7 +3817,7 @@ mod tests {
     #[tokio::test]
     async fn anthropic_passthrough_default_headers_cannot_overwrite_x_api_key() {
         // Defense-in-depth: `x-api-key` is in
-        // `aisix_provider_openai::overrides::RESERVED_DEFAULT_HEADERS`
+        // `aisix_gateway::upstream_headers::RESERVED_UPSTREAM_HEADERS`
         // — even if cp-api validation slips and lets the operator
         // register a default_headers entry with `x-api-key`, the apply
         // function MUST drop it so the PK's secret remains the auth

@@ -28,6 +28,7 @@ pub mod chat;
 pub mod credential;
 pub mod hub;
 pub mod sse;
+pub mod upstream_headers;
 pub mod upstream_http;
 
 pub use bridge::{
@@ -42,6 +43,10 @@ pub use chat::{
 pub use credential::credential_fingerprint;
 pub use hub::Hub;
 pub use sse::{SseDecoder, SseEvent};
+pub use upstream_headers::{
+    apply_request_headers, resolve_extra_headers, CallerIdentity, UpstreamHeaderContext,
+    RESERVED_UPSTREAM_HEADERS,
+};
 pub use upstream_http::{
     client_builder, error_with_causes, transport_error_message, UpstreamHttpConfig,
 };

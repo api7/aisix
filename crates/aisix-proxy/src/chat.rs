@@ -1254,7 +1254,8 @@ async fn dispatch(
             // Streaming deadline (#554): bound the connect by the effective
             // stream timeout; the read-timeout wrapper below enforces the
             // same budget on the first and subsequent chunks.
-            let mut ctx = BridgeContext::new(request_id, model_arc, pk_arc);
+            let mut ctx = BridgeContext::new(request_id, model_arc, pk_arc)
+                .with_client(client.caller.clone(), Some(client.headers.clone()));
             if let Some(d) = model.stream_timeout_effective() {
                 ctx = ctx.with_deadline(d);
             }
@@ -2137,7 +2138,8 @@ async fn dispatch(
         // Per-attempt non-streaming deadline (#554): an elapsed `timeout`
         // surfaces as a retryable `BridgeError::Timeout`, so a slow target
         // fails over to the next one via the loop below.
-        let mut ctx = BridgeContext::new(request_id, model_arc, pk_arc);
+        let mut ctx = BridgeContext::new(request_id, model_arc, pk_arc)
+            .with_client(client.caller.clone(), Some(client.headers.clone()));
         if let Some(d) = model.request_timeout() {
             ctx = ctx.with_deadline(d);
         }
@@ -2719,6 +2721,7 @@ async fn dispatch_ensemble(
         state,
         snapshot,
         request_id,
+        client,
     };
 
     // Streaming ensemble (OPTION A): the panel must be buffered to synthesize,
@@ -2828,7 +2831,8 @@ async fn dispatch_ensemble(
             request_id,
             Arc::new(judge_model.clone()),
             Arc::new(judge_pk.value.clone()),
-        );
+        )
+        .with_client(client.caller.clone(), Some(client.headers.clone()));
         if let Some(deadline) = judge_model.request_timeout() {
             judge_ctx = judge_ctx.with_deadline(deadline);
         }

@@ -1025,6 +1025,11 @@ struct VideoTarget {
     provider_label: String,
     base_url: String,
     secret: String,
+    /// The ProviderKey's rendered `default_headers` plus the client headers
+    /// its `forward_client_headers` allowlist admits, resolved once when the
+    /// target is resolved so every round-trip on this surface (submit, poll,
+    /// content fetch) sends the same set (AISIX-Cloud#1112 / #1167).
+    extra_headers: Vec<(axum::http::HeaderName, axum::http::HeaderValue)>,
 }
 
 impl VideoTarget {
@@ -1042,14 +1047,14 @@ fn resolve_video_target(
     auth: &AuthenticatedKey,
     model_entry: std::sync::Arc<aisix_core::ResourceEntry<aisix_core::Model>>,
     acl_name: &str,
-    source_ip: &str,
+    client_ctx: &ClientContext,
 ) -> Result<Result<VideoTarget, Response>, ProxyError> {
     let snapshot = state.snapshot.load();
 
     if !auth.key().can_access(acl_name) {
         return Err(ProxyError::ModelForbidden(acl_name.to_string()));
     }
-    crate::dispatch::check_ip_access(&model_entry.value, source_ip)?;
+    crate::dispatch::check_ip_access(&model_entry.value, &client_ctx.source_ip)?;
 
     let provider = crate::dispatch::require_provider(&model_entry.value)?.to_string();
     // Providers outside the mapped set get a typed 501 so callers can
@@ -1079,6 +1084,14 @@ fn resolve_video_target(
     };
     let secret = crate::dispatch::require_api_key(&pk_entry.value, &model_entry.value)?.to_string();
 
+    let extra_headers =
+        aisix_gateway::resolve_extra_headers(&crate::dispatch::upstream_header_ctx(
+            &pk_entry.value,
+            &pk_entry.id,
+            &model_entry.value,
+            &model_entry.id,
+            client_ctx,
+        ));
     Ok(Ok(VideoTarget {
         pk_id: pk_entry.id.to_string(),
         provider: video_provider,
@@ -1086,6 +1099,7 @@ fn resolve_video_target(
         base_url,
         secret,
         model_entry,
+        extra_headers,
     }))
 }
 
@@ -1146,6 +1160,12 @@ async fn provider_call(
             // Runway's mandatory `X-Runway-Version`. Applied unconditionally,
             // before the submit-only body/header block below.
             if let Some((name, value)) = target.provider.all_request_header() {
+                builder = builder.header(name, value);
+            }
+            // Operator/client headers ride every round-trip. `reqwest` appends
+            // on repeat names, so the gateway-owned names above are filtered
+            // out of `extra_headers` at resolve time by the shared pipeline.
+            for (name, value) in &target.extra_headers {
                 builder = builder.header(name, value);
             }
             if let Some(b) = body {
@@ -1241,6 +1261,9 @@ async fn proxy_content(
     // A provider header required on every call (e.g. Runway's version header) —
     // future-proofs Proxy mode for such vendors; a no-op for OpenAI.
     if let Some((name, value)) = target.provider.all_request_header() {
+        builder = builder.header(name, value);
+    }
+    for (name, value) in &target.extra_headers {
         builder = builder.header(name, value);
     }
 
@@ -1534,21 +1557,20 @@ async fn dispatch_create(
         ));
     }
 
-    let target =
-        match resolve_video_target(state, auth, model_entry, &body.model, &client.source_ip)? {
-            Ok(t) => t,
-            Err(resp) => {
-                return Ok(CreateSuccess {
-                    response: resp,
-                    provider: "unknown".into(),
-                    model_id,
-                    provider_key_id: String::new(),
-                    applied_guardrails: Vec::new(),
-                    monitor_hits: Vec::new(),
-                    upstream_called: false,
-                })
-            }
-        };
+    let target = match resolve_video_target(state, auth, model_entry, &body.model, client)? {
+        Ok(t) => t,
+        Err(resp) => {
+            return Ok(CreateSuccess {
+                response: resp,
+                provider: "unknown".into(),
+                model_id,
+                provider_key_id: String::new(),
+                applied_guardrails: Vec::new(),
+                monitor_hits: Vec::new(),
+                upstream_called: false,
+            })
+        }
+    };
 
     // Input guardrail chain over the prompt — same resolution as chat /
     // embeddings, run BEFORE the rate-limit reservation so a policy
@@ -1675,7 +1697,7 @@ fn resolve_get_target(
     state: &ProxyState,
     auth: &AuthenticatedKey,
     video_id: &str,
-    source_ip: &str,
+    client_ctx: &ClientContext,
 ) -> Result<(VideoTarget, String), ProxyError> {
     let (entry_id, alias, task_id) =
         decode_video_id(video_id).ok_or_else(|| ProxyError::VideoNotFound(video_id.to_string()))?;
@@ -1684,7 +1706,7 @@ fn resolve_get_target(
         .models
         .get_by_id(&entry_id)
         .ok_or_else(|| ProxyError::VideoNotFound(video_id.to_string()))?;
-    match resolve_video_target(state, auth, model_entry, &alias, source_ip) {
+    match resolve_video_target(state, auth, model_entry, &alias, client_ctx) {
         Ok(Ok(target)) => Ok((target, task_id)),
         // Unsupported provider → uniform 404 (oracle fold, see above).
         Ok(Err(_)) => Err(ProxyError::VideoNotFound(video_id.to_string())),
@@ -1710,7 +1732,7 @@ pub async fn get_video(
     };
 
     let result: Result<(Response, String, String), ProxyError> = async {
-        let (target, task_id) = resolve_get_target(&state, &auth, &video_id, &client.source_ip)?;
+        let (target, task_id) = resolve_get_target(&state, &auth, &video_id, &client)?;
         // Poll traffic is exempt from model-level limits BY DESIGN
         // (AISIX-Cloud#1118 decision 3): a client polling a task it
         // already paid an RPM slot to submit must not starve itself.
@@ -1761,7 +1783,7 @@ pub async fn video_content(
     };
 
     let result: Result<(Response, String, String), ProxyError> = async {
-        let (target, task_id) = resolve_get_target(&state, &auth, &video_id, &client.source_ip)?;
+        let (target, task_id) = resolve_get_target(&state, &auth, &video_id, &client)?;
         // Same model-layer exemption as the poll route (see get_video).
         let reservation = crate::quota::enforce(&state, &auth, None).await?;
         let result = poll_task(&state, &target, &task_id, &client.request_id).await;

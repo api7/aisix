@@ -195,12 +195,24 @@ pub struct RequestOverrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub param_constraints: Option<ParamConstraints>,
 
-    /// `apply_default_headers` input. Top-level headers added to the
-    /// outbound request when the caller did not set them. Reserved
-    /// auth headers are dropped by `apply_default_headers` as
-    /// defense-in-depth.
+    /// Top-level headers added to the outbound request when the caller did
+    /// not set them. Values may reference the request context with `${...}`
+    /// variables, such as `"${request.api_key.team_id}"`; a header whose
+    /// variables do not all resolve is dropped rather than sent blank. See
+    /// [`crate::header_template`] for the closed variable vocabulary.
+    /// Reserved auth headers are dropped as defense-in-depth.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub default_headers: HashMap<String, String>,
+
+    /// Inbound client headers forwarded to the upstream provider, as
+    /// single-`*` glob patterns matched case-insensitively against the
+    /// header name (`"anthropic-beta"`, `"x-trace-*"`). Empty — the
+    /// default — forwards nothing, which is the behavior of every
+    /// standard-protocol endpoint before AISIX-Cloud#1167. Auth,
+    /// transport, and gateway-owned headers are never forwarded whatever
+    /// the patterns say.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forward_client_headers: Vec<String>,
 
     /// `apply_default_body_fields` input. Top-level body fields added
     /// when the caller did not set them. `serde_json::Map` preserves

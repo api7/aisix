@@ -12,7 +12,7 @@
 /// operator-supplied override would invalidate the signature.
 ///
 /// Same defense-in-depth pattern as OpenAiBridge's
-/// `RESERVED_DEFAULT_HEADERS` — cp-api should reject these at write
+/// `RESERVED_UPSTREAM_HEADERS` — cp-api should reject these at write
 /// time, but the DP enforces it again at apply time.
 pub(crate) fn reserved_sigv4_headers() -> &'static [&'static str] {
     &[

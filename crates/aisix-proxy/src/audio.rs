@@ -97,7 +97,7 @@ pub async fn transcriptions(
         // (build_v1_url) owns the `/v1` prefix.
         "/audio/transcriptions",
         &request_id,
-        &client.source_ip,
+        &client,
     )
     .await
     {
@@ -197,7 +197,7 @@ pub async fn translations(
         // (build_v1_url) owns the `/v1` prefix.
         "/audio/translations",
         &request_id,
-        &client.source_ip,
+        &client,
     )
     .await
     {
@@ -293,7 +293,7 @@ pub async fn speech(
         .unwrap_or("unknown")
         .to_string();
 
-    match speech_dispatch(&state, &auth, body, &request_id, &client.source_ip).await {
+    match speech_dispatch(&state, &auth, body, &request_id, &client).await {
         Ok((
             resp,
             provider,
@@ -401,7 +401,7 @@ async fn multipart_dispatch(
     mut multipart: Multipart,
     upstream_path: &str,
     request_id: &str,
-    source_ip: &str,
+    client_ctx: &ClientContext,
 ) -> Result<AudioDispatchSuccess, ProxyError> {
     // Collect all fields first so we can find `model` before building the
     // outgoing reqwest multipart.
@@ -439,7 +439,7 @@ async fn multipart_dispatch(
     }
 
     // Client-IP allowlist gate (#557): reject before quota / upstream.
-    crate::dispatch::check_ip_access(&model_entry.value, source_ip)?;
+    crate::dispatch::check_ip_access(&model_entry.value, &client_ctx.source_ip)?;
 
     // #696: transcriptions/translations run the guardrail chain too. The
     // audio bytes aren't scannable text, but the optional `prompt` form
@@ -605,11 +605,12 @@ async fn multipart_dispatch(
         form
     };
 
-    // Build headers explicitly so the PK's `request.default_headers` can inject
-    // operator headers (AISIX-Cloud#867 follow-up). The body is a multipart
-    // form, so the JSON body-field overrides don't apply here — only headers do.
-    // Content-Type is left to `.multipart()` (it sets the boundary). Reserved
-    // auth headers are protected by `apply_default_headers`.
+    // Build headers explicitly so the PK's `request.default_headers` and
+    // `request.forward_client_headers` can inject operator/client headers
+    // (AISIX-Cloud#867 follow-up). The body is a multipart form, so the JSON
+    // body-field overrides don't apply here — only headers do. Content-Type
+    // is left to `.multipart()` (it sets the boundary). Reserved auth
+    // headers are protected by `apply_request_headers`.
     let mut headers = axum::http::HeaderMap::new();
     let auth_hv = header::HeaderValue::from_str(&format!("Bearer {api_key}")).map_err(|e| {
         ProxyError::Bridge(aisix_gateway::BridgeError::Config(format!(
@@ -626,9 +627,16 @@ async fn multipart_dispatch(
         header::HeaderName::from_static("x-aisix-request-id"),
         rid_hv,
     );
-    if let Some(r) = pk_entry.value.request.as_ref() {
-        aisix_provider_openai::overrides::apply_default_headers(&mut headers, &r.default_headers);
-    }
+    aisix_gateway::apply_request_headers(
+        &mut headers,
+        &crate::dispatch::upstream_header_ctx(
+            &pk_entry.value,
+            &pk_entry.id,
+            model,
+            &model_entry.id,
+            client_ctx,
+        ),
+    );
 
     let client = crate::http_client::client();
     let tracker = &state.runtime_status;
@@ -860,7 +868,7 @@ async fn speech_dispatch(
     auth: &AuthenticatedKey,
     mut body: Value,
     request_id: &str,
-    source_ip: &str,
+    client_ctx: &ClientContext,
 ) -> Result<
     (
         Response,
@@ -889,7 +897,7 @@ async fn speech_dispatch(
     }
 
     // Client-IP allowlist gate (#557): reject before guardrails / upstream.
-    crate::dispatch::check_ip_access(&model_entry.value, source_ip)?;
+    crate::dispatch::check_ip_access(&model_entry.value, &client_ctx.source_ip)?;
 
     // #545: /v1/audio/speech must run input guardrails. Before this it
     // forwarded the user `input` text (synthesized to audio) with no
@@ -1005,9 +1013,16 @@ async fn speech_dispatch(
         header::HeaderName::from_static("x-aisix-request-id"),
         rid_hv,
     );
-    if let Some(r) = pk_entry.value.request.as_ref() {
-        aisix_provider_openai::overrides::apply_default_headers(&mut headers, &r.default_headers);
-    }
+    aisix_gateway::apply_request_headers(
+        &mut headers,
+        &crate::dispatch::upstream_header_ctx(
+            &pk_entry.value,
+            &pk_entry.id,
+            model,
+            &model_entry.id,
+            client_ctx,
+        ),
+    );
 
     let client = crate::http_client::client();
     let speech_url = crate::dispatch::build_v1_url(&base, "/audio/speech");

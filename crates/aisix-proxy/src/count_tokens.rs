@@ -268,6 +268,7 @@ async fn dispatch(
                 &target.model,
                 &target.id,
                 request_id,
+                client,
             )
             .await
             {
@@ -311,6 +312,7 @@ async fn dispatch(
 /// Dispatch one concrete Anthropic target's count_tokens passthrough to
 /// `{api_base}/v1/messages/count_tokens`. The caller has already
 /// confirmed `model.provider == anthropic`.
+#[allow(clippy::too_many_arguments)]
 async fn count_tokens_to_target(
     state: &ProxyState,
     snapshot: &aisix_core::AisixSnapshot,
@@ -318,6 +320,7 @@ async fn count_tokens_to_target(
     model: &aisix_core::Model,
     model_id: &str,
     request_id: &str,
+    client: &ClientContext,
 ) -> Result<Response, ProxyError> {
     let mut body = body.clone();
     let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
@@ -355,13 +358,14 @@ async fn count_tokens_to_target(
     let url = crate::dispatch::build_v1_url(&base, "/messages/count_tokens");
 
     // Build the outbound HeaderMap explicitly so the PK's
-    // `request.default_headers` block can inject operator-supplied
-    // headers (e.g. `anthropic-beta`) via the shared apply pipeline.
-    // The bridge-owned headers (x-api-key, anthropic-version,
-    // content-type, x-aisix-request-id) are inserted FIRST;
-    // `apply_default_headers` skips keys already present + the reserved
-    // auth-header blacklist (`x-api-key`), so operator headers can never
-    // clobber auth here (ai-gateway#337). Anthropic auth shape:
+    // `request.default_headers` / `request.forward_client_headers` can
+    // inject operator-supplied and allowlisted client headers (e.g.
+    // `anthropic-beta`) via the shared apply pipeline. The bridge-owned
+    // headers (x-api-key, anthropic-version, content-type,
+    // x-aisix-request-id) are inserted FIRST; `apply_request_headers`
+    // skips keys already present + the reserved auth-header blacklist
+    // (`x-api-key`), so neither source can clobber auth here
+    // (ai-gateway#337). Anthropic auth shape:
     // `x-api-key` + `anthropic-version`, NOT `Authorization: Bearer`.
     let mut headers = axum::http::HeaderMap::new();
     let api_key_hv = HeaderValue::from_str(api_key).map_err(|e| {
@@ -384,9 +388,16 @@ async fn count_tokens_to_target(
         )))
     })?;
     headers.insert(HeaderName::from_static("x-aisix-request-id"), rid_hv);
-    if let Some(r) = pk_entry.value.request.as_ref() {
-        aisix_provider_openai::overrides::apply_default_headers(&mut headers, &r.default_headers);
-    }
+    aisix_gateway::apply_request_headers(
+        &mut headers,
+        &crate::dispatch::upstream_header_ctx(
+            &pk_entry.value,
+            &pk_entry.id,
+            model,
+            model_id,
+            client,
+        ),
+    );
 
     let client = crate::http_client::client();
     let mut req = client.post(&url).headers(headers).json(&body);
@@ -927,7 +938,7 @@ mod tests {
 
     /// Operator `default_headers` must NOT be able to overwrite the
     /// gateway-owned `x-api-key` auth header (ai-gateway#337) — the
-    /// reserved blacklist in `apply_default_headers` protects it.
+    /// reserved blacklist in `apply_request_headers` protects it.
     #[tokio::test]
     async fn default_headers_cannot_overwrite_x_api_key() {
         let upstream = MockServer::start().await;

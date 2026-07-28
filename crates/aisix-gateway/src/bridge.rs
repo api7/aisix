@@ -16,12 +16,14 @@
 //! The trait is deliberately `async_trait` rather than GATs — ergonomic
 //! wins outweigh the boxing cost on the provider path.
 
-use aisix_core::{Model, ProviderKey};
+use aisix_core::{HeaderVars, Model, ProviderKey, Resource};
 use async_trait::async_trait;
 use futures::stream::BoxStream;
+use http::HeaderMap;
 use std::time::Duration;
 
 use crate::chat::{ChatChunk, ChatFormat, ChatResponse, EmbeddingRequest, EmbeddingResponse};
+use crate::upstream_headers::{CallerIdentity, UpstreamHeaderContext};
 
 /// Maximum number of bytes read from an upstream error response body
 /// before attempting JSON envelope parse. Bounds memory and parser cost
@@ -99,6 +101,14 @@ pub struct BridgeContext {
     /// Deadline for the entire upstream call. Bridges are expected to
     /// honour this by cancelling any in-flight HTTP request.
     pub deadline: Option<Duration>,
+    /// The authenticated caller, for `${request.api_key.*}` header
+    /// templates. Default (all-empty) on calls with no caller behind
+    /// them — a background job poll, an internal embedding lookup.
+    pub caller: CallerIdentity,
+    /// The inbound request's headers, source for the ProviderKey's
+    /// `request.forward_client_headers` allowlist. `None` on the same
+    /// caller-less paths as above.
+    pub client_headers: Option<std::sync::Arc<HeaderMap>>,
 }
 
 impl BridgeContext {
@@ -112,12 +122,48 @@ impl BridgeContext {
             model,
             provider_key,
             deadline: None,
+            caller: CallerIdentity::default(),
+            client_headers: None,
         }
     }
 
     pub fn with_deadline(mut self, deadline: Duration) -> Self {
         self.deadline = Some(deadline);
         self
+    }
+
+    /// Attach the caller identity and inbound headers the outbound-header
+    /// pipeline reads. Dispatch paths with a real client request call this;
+    /// leaving it off means no client header is ever forwarded and
+    /// `${request.api_key.*}` templates do not resolve.
+    pub fn with_client(
+        mut self,
+        caller: CallerIdentity,
+        client_headers: Option<std::sync::Arc<HeaderMap>>,
+    ) -> Self {
+        self.caller = caller;
+        self.client_headers = client_headers;
+        self
+    }
+
+    /// The context [`crate::upstream_headers::apply_request_headers`] needs
+    /// to render `default_headers` templates and forward client headers.
+    pub fn header_ctx(&self) -> UpstreamHeaderContext<'_> {
+        UpstreamHeaderContext {
+            overrides: self.provider_key.request.as_ref(),
+            vars: HeaderVars {
+                request_id: Some(&self.request_id),
+                api_key_id: Some(&self.caller.api_key_id),
+                api_key_name: self.caller.api_key_name.as_deref(),
+                api_key_team_id: self.caller.team_id.as_deref(),
+                api_key_user_id: self.caller.user_id.as_deref(),
+                model_id: Some(self.model.id()),
+                model_name: Some(&self.model.display_name),
+                provider_key_id: Some(self.provider_key.id()),
+                provider_key_name: Some(&self.provider_key.display_name),
+            },
+            client_headers: self.client_headers.as_deref(),
+        }
     }
 }
 

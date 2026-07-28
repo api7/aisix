@@ -86,6 +86,10 @@ pub(crate) struct ProxyModelCaller<'a> {
     pub state: &'a ProxyState,
     pub snapshot: &'a AisixSnapshot,
     pub request_id: &'a str,
+    /// The originating request's context. Member calls are dispatched on
+    /// the caller's behalf, so they carry the same caller identity and
+    /// forwardable client headers as a single-upstream dispatch would.
+    pub client: &'a crate::client_ip::ClientContext,
 }
 
 #[async_trait]
@@ -128,6 +132,10 @@ impl ModelCaller for ProxyModelCaller<'_> {
             self.request_id,
             Arc::new(model.clone()),
             Arc::new(pk_entry.value.clone()),
+        )
+        .with_client(
+            self.client.caller.clone(),
+            Some(self.client.headers.clone()),
         );
         if let Some(deadline) = model.request_timeout() {
             ctx = ctx.with_deadline(deadline);
