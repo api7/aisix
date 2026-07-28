@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use aisix_core::models::BackgroundModelCheck;
 use aisix_core::{AisixSnapshot, Model};
-use aisix_gateway::{BridgeContext, BridgeError, ChatFormat, ChatMessage, Hub};
+use aisix_gateway::{BridgeError, ChatFormat, ChatMessage, Hub};
 use tokio::sync::Semaphore;
 
 use crate::dispatch;
@@ -119,9 +119,15 @@ async fn check_direct_model(
         max_tokens: Some(cfg.max_tokens),
         ..ChatFormat::new(model.display_name.clone(), vec![])
     };
-    let model_arc = Arc::new(model.clone());
-    let pk_arc = Arc::new(pk_entry.value.clone());
-    let ctx = BridgeContext::new(request_id, model_arc, pk_arc).with_deadline(timeout(cfg));
+    let ctx = dispatch::bridge_ctx(
+        request_id,
+        model_id,
+        Arc::new(model.clone()),
+        &pk_entry.id,
+        Arc::new(pk_entry.value.clone()),
+        None,
+    )
+    .with_deadline(timeout(cfg));
 
     let _ = bridge.chat(&req, &ctx).await?;
     let _ = model_id;

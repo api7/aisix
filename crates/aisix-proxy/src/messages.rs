@@ -1709,7 +1709,7 @@ async fn cross_provider_dispatch(
     input_redactions: crate::redact::RedactionCounts,
     input_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
 ) -> Result<DispatchOutcome, ProxyError> {
-    use aisix_gateway::{Bridge, BridgeContext};
+    use aisix_gateway::Bridge;
     use aisix_provider_anthropic::{
         chat_response_into_anthropic_json, parse_inbound_request, translate_extras_to_openai_shape,
         AnthropicSseEncoder,
@@ -1745,15 +1745,19 @@ async fn cross_provider_dispatch(
     translate_extras_to_openai_shape(&mut chat.extra);
 
     let is_stream = chat.is_streaming();
-    let model_arc = Arc::new(model.clone());
-    let pk_arc = Arc::new(provider_key.clone());
+
     // #554: bound the upstream connect with the appropriate deadline —
     // the streaming read budget for stream calls, the E2E request timeout
     // otherwise. The streaming path additionally enforces the per-chunk
     // read timeout below.
-    let mut ctx = BridgeContext::new(request_id, model_arc, pk_arc)
-        .with_client(client.caller.clone(), Some(client.headers.clone()))
-        .with_resource_ids(model_id, provider_key_id);
+    let mut ctx = crate::dispatch::bridge_ctx(
+        request_id,
+        model_id,
+        Arc::new(model.clone()),
+        provider_key_id,
+        Arc::new(provider_key.clone()),
+        Some(client),
+    );
     let connect_deadline = if is_stream {
         model.stream_timeout_effective()
     } else {

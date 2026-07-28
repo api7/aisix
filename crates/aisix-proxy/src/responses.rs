@@ -1637,7 +1637,7 @@ async fn responses_cross_provider_to_target(
     // `input_redactions`.
     input_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
 ) -> Result<ResponseDispatchSuccess, ProxyError> {
-    use aisix_gateway::{Bridge, BridgeContext};
+    use aisix_gateway::Bridge;
 
     // Content capture (AISIX-Cloud#947), same contract as the verbatim
     // target: prompt = the client-facing Responses request body
@@ -1671,11 +1671,14 @@ async fn responses_cross_provider_to_target(
     let chat = crate::responses_bridge::responses_request_to_chat(requested_model, body);
 
     let is_stream = chat.is_streaming();
-    let model_arc = Arc::new(model.clone());
-    let pk_arc = Arc::new(pk_entry.value.clone());
-    let mut ctx = BridgeContext::new(request_id, model_arc, pk_arc)
-        .with_client(client_ctx.caller.clone(), Some(client_ctx.headers.clone()))
-        .with_resource_ids(model_id, &provider_key_id);
+    let mut ctx = crate::dispatch::bridge_ctx(
+        request_id,
+        model_id,
+        Arc::new(model.clone()),
+        &provider_key_id,
+        Arc::new(pk_entry.value.clone()),
+        Some(client_ctx),
+    );
     let connect_deadline = if is_stream {
         model.stream_timeout_effective()
     } else {

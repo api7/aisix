@@ -269,6 +269,37 @@ pub(crate) fn require_api_key<'a>(
     Ok(provider_key.api_key.as_str())
 }
 
+/// Build the [`BridgeContext`] for one upstream call.
+///
+/// The single chokepoint for wiring a Bridge dispatch: it carries the
+/// snapshot ids (which a `Model` / `ProviderKey` value does not know about
+/// itself) and, for a call made on behalf of a caller, that caller's
+/// identity and inbound headers. Both feed
+/// [`aisix_gateway::BridgeContext::header_ctx`], so a site that skipped
+/// either would silently stop rendering `${...}` header templates or
+/// forwarding allowlisted client headers, with no compiler signal —
+/// hence one constructor rather than a chain every caller must remember.
+///
+/// `client` is `None` for calls with no client request behind them: the
+/// semantic-router's embedding lookup and the background health prober.
+/// Those forward no client header and resolve no `${request.api_key.*}`
+/// variable, but still resolve the model / provider-key ones.
+pub(crate) fn bridge_ctx(
+    request_id: &str,
+    model_id: &str,
+    model: Arc<Model>,
+    provider_key_id: &str,
+    provider_key: Arc<ProviderKey>,
+    client: Option<&crate::client_ip::ClientContext>,
+) -> aisix_gateway::BridgeContext {
+    let ctx = aisix_gateway::BridgeContext::new(request_id, model, provider_key)
+        .with_resource_ids(model_id, provider_key_id);
+    match client {
+        Some(c) => ctx.with_client(c.caller.clone(), Some(c.headers.clone())),
+        None => ctx,
+    }
+}
+
 /// Build the outbound-header context for a dispatch path that constructs
 /// its upstream request directly instead of going through a `Bridge`
 /// (`/v1/messages`, `/v1/responses`, `/v1/messages/count_tokens`, audio,

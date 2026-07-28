@@ -18,7 +18,7 @@
 
 use aisix_cache::{Cache, CacheKey};
 use aisix_core::AppliedGuardrail;
-use aisix_gateway::{BridgeContext, BridgeError, ChatFormat};
+use aisix_gateway::{BridgeError, ChatFormat};
 use aisix_guardrails::GuardrailVerdict;
 use aisix_obs::{
     content_capture_cap, AccessLog, CapturedContent, LatencyLabels, LlmUsage, Metrics,
@@ -1249,14 +1249,18 @@ async fn dispatch(
                 ));
                 continue 'targets;
             };
-            let model_arc = Arc::new(model.clone());
-            let pk_arc = Arc::new(pk_entry.value.clone());
+
             // Streaming deadline (#554): bound the connect by the effective
             // stream timeout; the read-timeout wrapper below enforces the
             // same budget on the first and subsequent chunks.
-            let mut ctx = BridgeContext::new(request_id, model_arc, pk_arc)
-                .with_client(client.caller.clone(), Some(client.headers.clone()))
-                .with_resource_ids(&attempt.id, &pk_entry.id);
+            let mut ctx = crate::dispatch::bridge_ctx(
+                request_id,
+                &attempt.id,
+                Arc::new(model.clone()),
+                &pk_entry.id,
+                Arc::new(pk_entry.value.clone()),
+                Some(client),
+            );
             if let Some(d) = model.stream_timeout_effective() {
                 ctx = ctx.with_deadline(d);
             }
@@ -2134,14 +2138,18 @@ async fn dispatch(
             )));
             continue;
         };
-        let model_arc = Arc::new(model.clone());
-        let pk_arc = Arc::new(pk_entry.value.clone());
+
         // Per-attempt non-streaming deadline (#554): an elapsed `timeout`
         // surfaces as a retryable `BridgeError::Timeout`, so a slow target
         // fails over to the next one via the loop below.
-        let mut ctx = BridgeContext::new(request_id, model_arc, pk_arc)
-            .with_client(client.caller.clone(), Some(client.headers.clone()))
-            .with_resource_ids(&attempt.id, &pk_entry.id);
+        let mut ctx = crate::dispatch::bridge_ctx(
+            request_id,
+            &attempt.id,
+            Arc::new(model.clone()),
+            &pk_entry.id,
+            Arc::new(pk_entry.value.clone()),
+            Some(client),
+        );
         if let Some(d) = model.request_timeout() {
             ctx = ctx.with_deadline(d);
         }
@@ -2829,13 +2837,14 @@ async fn dispatch_ensemble(
                 )),
             ));
         };
-        let mut judge_ctx = BridgeContext::new(
+        let mut judge_ctx = crate::dispatch::bridge_ctx(
             request_id,
+            &judge_entry.id,
             Arc::new(judge_model.clone()),
+            &judge_pk.id,
             Arc::new(judge_pk.value.clone()),
-        )
-        .with_client(client.caller.clone(), Some(client.headers.clone()))
-        .with_resource_ids(&judge_entry.id, &judge_pk.id);
+            Some(client),
+        );
         if let Some(deadline) = judge_model.request_timeout() {
             judge_ctx = judge_ctx.with_deadline(deadline);
         }

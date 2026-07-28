@@ -19,7 +19,7 @@ use dashmap::DashMap;
 use aisix_core::models::{EmbeddingFailureMode, OnEmbeddingFailure, Semantic};
 use aisix_core::resource::ResourceEntry;
 use aisix_core::{AisixSnapshot, Model};
-use aisix_gateway::{BridgeContext, EmbeddingRequest, EmbeddingVector};
+use aisix_gateway::{EmbeddingRequest, EmbeddingVector};
 
 use crate::error::ProxyError;
 use crate::routing::AttemptModel;
@@ -314,10 +314,13 @@ async fn embed_texts(
         dimensions,
     };
     let ctx = {
-        let base = BridgeContext::new(
+        let base = crate::dispatch::bridge_ctx(
             request_id,
+            &embed_entry.id,
             Arc::new(model.clone()),
+            &pk_entry.id,
             Arc::new(pk_entry.value.clone()),
+            None,
         );
         match semantic.embedding_timeout() {
             Some(d) => base.with_deadline(d),
