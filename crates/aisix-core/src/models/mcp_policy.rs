@@ -24,7 +24,7 @@ use crate::resource::Resource;
 #[serde(rename_all = "snake_case")]
 pub enum McpPolicyScope {
     /// The environment-wide default, applied to keys whose team has no
-    /// active policy of its own.
+    /// enabled policy of its own.
     Env,
     /// A team-level policy, applied to the keys that belong to the team
     /// named by `scope_ref`. It replaces the environment default for those
@@ -98,7 +98,7 @@ fn default_enabled() -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum McpAccessMode {
-    /// The key uses the inherited grant unchanged: its team's active policy
+    /// The key uses the inherited grant unchanged: its team's enabled policy
     /// when one exists, otherwise the environment-default policy.
     Inherit,
     /// The key uses the intersection of the inherited grant and its own

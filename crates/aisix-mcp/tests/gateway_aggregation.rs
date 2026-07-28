@@ -894,7 +894,7 @@ async fn tool_acl_per_server_wildcard_scopes_to_one_server() {
 #[test]
 fn resolve_duplicate_scope_rows_deny_union_survives_tie_break() {
     // Grant side: lowest id governs. Deny side: the union of every
-    // active applicable row — a deny must never vanish because its row
+    // enabled applicable row — a deny must never vanish because its row
     // lost the duplicate tie-break.
     let snapshot = policy_snapshot(&[
         (

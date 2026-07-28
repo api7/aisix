@@ -54,7 +54,7 @@
       "description": "Which API keys an MCP access policy applies to.",
       "oneOf": [
         {
-          "description": "The environment-wide default, applied to keys whose team has no active policy of its own.",
+          "description": "The environment-wide default, applied to keys whose team has no enabled policy of its own.",
           "enum": [
             "env"
           ],
