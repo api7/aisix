@@ -409,8 +409,8 @@ pub fn oidc_provider_root_schema() -> Value {
 
 /// Canonical JSON Schema for the `mcp_policy` resource, derived from the
 /// [`McpPolicy`](crate::models::McpPolicy) struct. Uses the nullable `Option`
-/// representation (`true`) so `scope_ref`/`expires_at` accept an explicit
-/// `null` as well as being absent. The `scope`/`mode` closed sets come from
+/// representation (`true`) so `scope_ref` accepts an explicit `null` as
+/// well as being absent. The `scope`/`mode` closed sets come from
 /// the [`McpPolicyScope`](crate::models::McpPolicyScope) /
 /// [`McpPolicyMode`](crate::models::McpPolicyMode) enums, plus the one
 /// cross-field invariant `schemars` cannot express: a `team`-scoped policy
@@ -1531,7 +1531,6 @@ mod tests {
             "scope": "team",
             "scope_ref": "team-uuid-1",
             "mode": "all",
-            "expires_at": "2030-01-01T00:00:00Z",
             "enabled": true
         }))
         .unwrap();

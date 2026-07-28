@@ -524,7 +524,7 @@ fn policy_snapshot(rows: &[(&str, serde_json::Value)]) -> AisixSnapshot {
 }
 
 fn resolve_now(snapshot: &AisixSnapshot, key: &aisix_core::models::ApiKey) -> ToolAcl {
-    ToolAcl::resolve(snapshot, key, chrono::Utc::now())
+    ToolAcl::resolve(snapshot, key)
 }
 
 #[test]
@@ -732,7 +732,7 @@ fn resolve_inherit_ignores_key_allow_patterns() {
 }
 
 #[test]
-fn resolve_ignores_disabled_and_expired_policies() {
+fn resolve_ignores_disabled_policies() {
     let key = acl_key(serde_json::json!({
         "key_hash":"h","allowed_models":[],"team_id":"team-1",
         "mcp_access":{"mode":"inherit"}
@@ -755,12 +755,13 @@ fn resolve_ignores_disabled_and_expired_policies() {
     assert!(acl.permits("slack__post_message"));
     assert!(!acl.permits("github__create_issue"));
 
-    // Expired env policy → no grant at all (and its deny stops applying).
+    // Disabled env policy → no grant at all, and its deny stops
+    // applying (a disabled policy neither grants nor denies).
     let snapshot = policy_snapshot(&[(
         "p-env",
         serde_json::json!({
             "scope":"env","mode":"all","deny":["slack__*"],
-            "expires_at":"2000-01-01T00:00:00Z"
+            "enabled":false
         }),
     )]);
     let legacy = acl_key(serde_json::json!({
@@ -769,7 +770,7 @@ fn resolve_ignores_disabled_and_expired_policies() {
     assert!(!resolve_now(&snapshot, &key).permits("anything__at_all"));
     assert!(
         resolve_now(&snapshot, &legacy).permits("slack__post_message"),
-        "an expired policy's deny must stop applying"
+        "a disabled policy's deny must stop applying"
     );
 }
 

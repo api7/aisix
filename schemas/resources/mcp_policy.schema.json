@@ -87,16 +87,8 @@
     },
     "enabled": {
       "default": true,
-      "description": "Whether the policy is applied. A disabled policy is kept but ignored, exactly like an expired one. Treated as `true` when omitted.",
+      "description": "Whether the policy is applied. A disabled policy is kept but ignored. Treated as `true` when omitted.",
       "type": "boolean"
-    },
-    "expires_at": {
-      "description": "RFC 3339 timestamp after which the policy stops applying — it then neither grants nor denies anything. When omitted or set to `null`, the policy never expires.",
-      "format": "date-time",
-      "type": [
-        "string",
-        "null"
-      ]
     },
     "mode": {
       "allOf": [
