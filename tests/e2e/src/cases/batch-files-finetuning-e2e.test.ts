@@ -202,6 +202,26 @@ describe("jobs e2e: /v1/files + /v1/batches + /v1/fine_tuning/jobs (#720)", () =
       provider_key_id: pk.id,
     });
 
+    // A second key carrying operator headers, including one that collides
+    // with a gateway-owned name — see the header test below.
+    const hdrPk = await seed.createProviderKey({
+      display_name: "jobs-e2e-hdr-pk",
+      secret: "sk-upstream-jobs",
+      api_base: `${upstream.baseUrl}/v1`,
+      request: {
+        default_headers: {
+          "x-corp-trace": "jobs-operator-value",
+          "x-aisix-request-id": "operator-should-not-win",
+        },
+      },
+    });
+    await seed.createModel({
+      display_name: "jobs-e2e-hdr-model",
+      provider: "openai",
+      model_name: "gpt-4o",
+      provider_key_id: hdrPk.id,
+    });
+
     // Gate on the DP snapshot, not the store: /v1/models only lists the
     // model once the snapshot has it, and only authenticates once the
     // caller key has propagated too. Touches no upstream.
@@ -357,6 +377,48 @@ describe("jobs e2e: /v1/files + /v1/batches + /v1/fine_tuning/jobs (#720)", () =
     expect(resp.status).toBe(200);
     const body = (await resp.json()) as { id: string };
     expect(body.id.startsWith("aisix-")).toBe(true);
+  });
+
+  // The jobs surface applied no `default_headers` at all before #1167 — it
+  // built its upstream request with `RequestBuilder::header`, which APPENDS
+  // on a repeated name. So this pins both halves: the operator's header now
+  // reaches the upstream, and one that collides with a gateway-owned name
+  // neither wins nor doubles the value on the wire.
+  test("provider-key headers reach the jobs upstream without doubling gateway headers", async (ctx) => {
+    if (!etcdReachable || !app || !upstream) {
+      ctx.skip();
+      return;
+    }
+    const baseline = upstream.received.length;
+    const form = new FormData();
+    form.set("purpose", "batch");
+    form.set("model", "jobs-e2e-hdr-model");
+    form.set(
+      "file",
+      new Blob(['{"custom_id":"hdr"}\n'], { type: "application/jsonl" }),
+      "hdr.jsonl",
+    );
+    const resp = await fetch(`${app.proxyUrl}/v1/files`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${CALLER_PLAINTEXT}` },
+      body: form,
+    });
+    expect(resp.status).toBe(200);
+
+    const sent = upstream.received
+      .slice(baseline)
+      .filter((r) => r.method === "POST" && r.path === "/v1/files");
+    expect(sent).toHaveLength(1);
+    const headers = sent[0]!.headers;
+
+    expect(headers["x-corp-trace"]).toBe("jobs-operator-value");
+    // node joins repeated header values with a comma, so an appended
+    // duplicate shows up here as `<gateway>,operator-should-not-win`.
+    const rid = headers["x-aisix-request-id"] ?? "";
+    expect(rid).not.toContain(",");
+    expect(rid).not.toBe("operator-should-not-win");
+    expect(rid).not.toBe("");
+    expect(headers.authorization).toBe("Bearer sk-upstream-jobs");
   });
 
   test("auth is mandatory on the jobs surface", async (ctx) => {

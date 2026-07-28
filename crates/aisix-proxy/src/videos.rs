@@ -1152,28 +1152,44 @@ async fn provider_call(
         "/v1/videos",
         retry_permit,
         || {
-            let mut builder = client
-                .request(method.clone(), url)
-                .header(header::AUTHORIZATION, format!("Bearer {}", target.secret))
-                .header("x-aisix-request-id", request_id);
+            // Gateway-owned headers go into the map first; the operator /
+            // client set is merged on top and skips any name already there.
+            // `RequestBuilder::header` APPENDS on a repeat name, so building
+            // the map is what keeps a colliding operator header from putting
+            // two values of e.g. `x-aisix-request-id` on the wire.
+            let mut headers = axum::http::HeaderMap::new();
+            if let Ok(v) = header::HeaderValue::from_str(&format!("Bearer {}", target.secret)) {
+                headers.insert(header::AUTHORIZATION, v);
+            }
+            if let Ok(v) = header::HeaderValue::from_str(request_id) {
+                headers.insert(header::HeaderName::from_static("x-aisix-request-id"), v);
+            }
             // A provider header required on every call (submit and poll) — e.g.
             // Runway's mandatory `X-Runway-Version`. Applied unconditionally,
             // before the submit-only body/header block below.
             if let Some((name, value)) = target.provider.all_request_header() {
-                builder = builder.header(name, value);
-            }
-            // Operator/client headers ride every round-trip. `reqwest` appends
-            // on repeat names, so the gateway-owned names above are filtered
-            // out of `extra_headers` at resolve time by the shared pipeline.
-            for (name, value) in &target.extra_headers {
-                builder = builder.header(name, value);
-            }
-            if let Some(b) = body {
-                if target.provider.submit_headers_async() {
-                    // DashScope requires the async-mode header — it rejects
-                    // synchronous video-synthesis calls outright.
-                    builder = builder.header("X-DashScope-Async", "enable");
+                if let (Ok(n), Ok(v)) = (
+                    name.parse::<header::HeaderName>(),
+                    header::HeaderValue::from_str(value),
+                ) {
+                    headers.insert(n, v);
                 }
+            }
+            if target.provider.submit_headers_async() && body.is_some() {
+                // DashScope requires the async-mode header — it rejects
+                // synchronous video-synthesis calls outright.
+                headers.insert(
+                    header::HeaderName::from_static("x-dashscope-async"),
+                    header::HeaderValue::from_static("enable"),
+                );
+            }
+            for (name, value) in &target.extra_headers {
+                if !headers.contains_key(name) {
+                    headers.insert(name.clone(), value.clone());
+                }
+            }
+            let mut builder = client.request(method.clone(), url).headers(headers);
+            if let Some(b) = body {
                 builder = builder
                     .header(header::CONTENT_TYPE, "application/json")
                     .json(b);
@@ -1254,18 +1270,31 @@ async fn proxy_content(
     request_id: &str,
 ) -> Result<Response, ProxyError> {
     let client = crate::http_client::client();
-    let mut builder = client
-        .get(url)
-        .header(header::AUTHORIZATION, format!("Bearer {}", target.secret))
-        .header("x-aisix-request-id", request_id);
+    // Same map-then-merge shape as `provider_call` — see the comment there
+    // on why the gateway-owned names cannot be appended to.
+    let mut headers = axum::http::HeaderMap::new();
+    if let Ok(v) = header::HeaderValue::from_str(&format!("Bearer {}", target.secret)) {
+        headers.insert(header::AUTHORIZATION, v);
+    }
+    if let Ok(v) = header::HeaderValue::from_str(request_id) {
+        headers.insert(header::HeaderName::from_static("x-aisix-request-id"), v);
+    }
     // A provider header required on every call (e.g. Runway's version header) —
     // future-proofs Proxy mode for such vendors; a no-op for OpenAI.
     if let Some((name, value)) = target.provider.all_request_header() {
-        builder = builder.header(name, value);
+        if let (Ok(n), Ok(v)) = (
+            name.parse::<header::HeaderName>(),
+            header::HeaderValue::from_str(value),
+        ) {
+            headers.insert(n, v);
+        }
     }
     for (name, value) in &target.extra_headers {
-        builder = builder.header(name, value);
+        if !headers.contains_key(name) {
+            headers.insert(name.clone(), value.clone());
+        }
     }
+    let builder = client.get(url).headers(headers);
 
     let stream_budget = target.model_entry.value.stream_timeout_effective();
     let started = Instant::now();

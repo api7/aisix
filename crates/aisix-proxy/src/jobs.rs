@@ -359,17 +359,31 @@ async fn send_upstream(
         url,
     );
 
-    builder = match target.adapter {
-        Adapter::AzureOpenai => builder.header("api-key", &target.secret),
-        _ => builder.header(header::AUTHORIZATION, format!("Bearer {}", target.secret)),
+    // Gateway-owned headers go into the map first; the operator / client set
+    // is merged on top and skips any name already there.
+    // `RequestBuilder::header` APPENDS on a repeat name, so building the map
+    // is what keeps a colliding operator header from putting two values of
+    // e.g. `x-aisix-request-id` on the wire.
+    let mut headers = HeaderMap::new();
+    let (auth_name, auth_value) = match target.adapter {
+        Adapter::AzureOpenai => (
+            axum::http::HeaderName::from_static("api-key"),
+            target.secret.clone(),
+        ),
+        _ => (header::AUTHORIZATION, format!("Bearer {}", target.secret)),
     };
-    builder = builder.header("x-aisix-request-id", request_id);
-    // Operator/client headers ride every round-trip. `reqwest` appends on
-    // repeat names, so the gateway-owned names above are filtered out of
-    // `extra_headers` at resolve time by the shared pipeline.
-    for (name, value) in &target.extra_headers {
-        builder = builder.header(name, value);
+    if let Ok(v) = axum::http::HeaderValue::from_str(&auth_value) {
+        headers.insert(auth_name, v);
     }
+    if let Ok(v) = axum::http::HeaderValue::from_str(request_id) {
+        headers.insert(axum::http::HeaderName::from_static("x-aisix-request-id"), v);
+    }
+    for (name, value) in &target.extra_headers {
+        if !headers.contains_key(name) {
+            headers.insert(name.clone(), value.clone());
+        }
+    }
+    builder = builder.headers(headers);
 
     builder = match body {
         UpstreamBody::Empty => builder,
