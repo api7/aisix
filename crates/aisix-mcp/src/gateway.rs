@@ -26,7 +26,6 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
-use chrono::{DateTime, Utc};
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, Content, ErrorData, ListToolsResult,
     PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
@@ -127,34 +126,34 @@ impl ToolAcl {
     }
 
     /// Resolve the effective ACL for `key` from the `mcp_policies` in
-    /// `snapshot` at time `now`.
+    /// `snapshot`.
     ///
     /// - A key without an `mcp_access` block keeps its legacy allow side
-    ///   (`allowed_tools`, no inheritance) — with active policy `deny`
+    ///   (`allowed_tools`, no inheritance) — with enabled policies' `deny`
     ///   patterns still subtracted, since deny applies to every key a policy
     ///   covers.
     /// - `deny` mode grants nothing.
     /// - `inherit` / `restrict` take the base grant from the key's team
-    ///   policy when one is active, else the environment-default policy,
+    ///   policy when one is enabled, else the environment-default policy,
     ///   else nothing; `restrict` intersects the key's own `allow` patterns
     ///   on top.
     /// - Deny patterns are unioned across the environment policy, the team
     ///   policy, and the key — an environment-level deny holds even when a
     ///   team policy replaces the environment's grant.
     ///
-    /// Inactive policies (disabled or expired) neither grant nor deny.
-    pub fn resolve(snapshot: &AisixSnapshot, key: &ApiKey, now: DateTime<Utc>) -> Self {
+    /// Disabled policies neither grant nor deny.
+    pub fn resolve(snapshot: &AisixSnapshot, key: &ApiKey) -> Self {
         // Grant side: pick the governing row per scope deterministically
         // (lowest id wins) so a duplicated row — the writer enforces
         // uniqueness — can only ever produce a stable outcome. Deny side:
-        // union across EVERY active row that applies to this key, so a
+        // union across EVERY enabled row that applies to this key, so a
         // deny pattern can never disappear by losing a duplicate-row
         // tie-break.
         let mut env_policy: Option<Arc<ResourceEntry<McpPolicy>>> = None;
         let mut team_policy: Option<Arc<ResourceEntry<McpPolicy>>> = None;
         let mut deny: Vec<String> = Vec::new();
         for entry in snapshot.mcp_policies.entries() {
-            if !entry.value.is_active_at(now) {
+            if !entry.value.enabled {
                 continue;
             }
             let slot = match entry.value.scope {

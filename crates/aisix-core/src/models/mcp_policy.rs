@@ -15,7 +15,6 @@
 //! policy `deny` patterns still subtracted. The effective-ACL computation
 //! lives with the MCP gateway endpoint, which resolves it per request.
 
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::resource::Resource;
@@ -25,7 +24,7 @@ use crate::resource::Resource;
 #[serde(rename_all = "snake_case")]
 pub enum McpPolicyScope {
     /// The environment-wide default, applied to keys whose team has no
-    /// active policy of its own.
+    /// enabled policy of its own.
     Env,
     /// A team-level policy, applied to the keys that belong to the team
     /// named by `scope_ref`. It replaces the environment default for those
@@ -79,14 +78,8 @@ pub struct McpPolicy {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deny: Vec<String>,
 
-    /// RFC 3339 timestamp after which the policy stops applying — it then
-    /// neither grants nor denies anything. When omitted or set to `null`,
-    /// the policy never expires.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expires_at: Option<DateTime<Utc>>,
-
-    /// Whether the policy is applied. A disabled policy is kept but ignored,
-    /// exactly like an expired one. Treated as `true` when omitted.
+    /// Whether the policy is applied. A disabled policy is kept but
+    /// ignored. Treated as `true` when omitted.
     #[serde(default = "default_enabled")]
     pub enabled: bool,
 
@@ -100,22 +93,12 @@ fn default_enabled() -> bool {
     true
 }
 
-impl McpPolicy {
-    /// True if the policy participates in effective-ACL resolution at `now`:
-    /// enabled and not past its `expires_at` deadline. The expiry comparison
-    /// is strict (`<`), matching API-key expiry: the policy still applies at
-    /// the deadline instant itself.
-    pub fn is_active_at(&self, now: DateTime<Utc>) -> bool {
-        self.enabled && self.expires_at.is_none_or(|deadline| deadline >= now)
-    }
-}
-
 /// How an API key combines with the applicable MCP access policies:
 /// `inherit`, `restrict`, or `deny`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum McpAccessMode {
-    /// The key uses the inherited grant unchanged: its team's active policy
+    /// The key uses the inherited grant unchanged: its team's enabled policy
     /// when one exists, otherwise the environment-default policy.
     Inherit,
     /// The key uses the intersection of the inherited grant and its own
@@ -188,7 +171,6 @@ mod tests {
         assert_eq!(p.mode, McpPolicyMode::Selected);
         assert_eq!(p.allow, vec!["github__*", "postgres__query"]);
         assert_eq!(p.deny, vec!["github__delete_repository"]);
-        assert!(p.expires_at.is_none());
         assert!(p.enabled);
     }
 
@@ -223,37 +205,13 @@ mod tests {
     }
 
     #[test]
-    fn is_active_honors_enabled_and_expiry() {
+    fn enabled_defaults_true_and_roundtrips_false() {
         let active: McpPolicy = serde_json::from_str(r#"{"scope":"env","mode":"all"}"#).unwrap();
-        let now = chrono::Utc::now();
-        assert!(active.is_active_at(now));
+        assert!(active.enabled);
 
         let disabled: McpPolicy =
             serde_json::from_str(r#"{"scope":"env","mode":"all","enabled":false}"#).unwrap();
-        assert!(!disabled.is_active_at(now));
-
-        let expiring: McpPolicy = serde_json::from_str(
-            r#"{"scope":"env","mode":"all","expires_at":"2030-01-01T00:00:00Z"}"#,
-        )
-        .unwrap();
-        let before = "2029-12-31T23:59:59Z".parse().unwrap();
-        let at = "2030-01-01T00:00:00Z".parse().unwrap();
-        let after = "2030-01-01T00:00:01Z".parse().unwrap();
-        assert!(expiring.is_active_at(before));
-        // Strict comparison: still applies at the deadline instant itself,
-        // inactive strictly after it (same boundary as API-key expiry).
-        assert!(expiring.is_active_at(at));
-        assert!(!expiring.is_active_at(after));
-    }
-
-    #[test]
-    fn rejects_malformed_expires_at() {
-        // A non-RFC3339 string must fail deserialization so the loader
-        // rejects the row instead of silently treating the policy as
-        // never-expiring.
-        let r: Result<McpPolicy, _> =
-            serde_json::from_str(r#"{"scope":"env","mode":"all","expires_at":"tomorrow"}"#);
-        assert!(r.is_err());
+        assert!(!disabled.enabled);
     }
 
     #[test]
@@ -304,7 +262,6 @@ mod tests {
         assert!(v.get("allow").is_none());
         assert!(v.get("deny").is_none());
         assert!(v.get("scope_ref").is_none());
-        assert!(v.get("expires_at").is_none());
 
         let a: McpAccess = serde_json::from_str(r#"{"mode":"inherit"}"#).unwrap();
         let v = serde_json::to_value(&a).unwrap();

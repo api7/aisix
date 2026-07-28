@@ -38,7 +38,7 @@
       "description": "How an API key combines with the applicable MCP access policies: `inherit`, `restrict`, or `deny`.",
       "oneOf": [
         {
-          "description": "The key uses the inherited grant unchanged: its team's active policy when one exists, otherwise the environment-default policy.",
+          "description": "The key uses the inherited grant unchanged: its team's enabled policy when one exists, otherwise the environment-default policy.",
           "enum": [
             "inherit"
           ],

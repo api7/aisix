@@ -231,7 +231,7 @@ async fn dispatch(
     // Scope the gateway to the tools this caller's key permits — resolved
     // from the key together with the environment/team MCP access policies —
     // so MCP tool access is governed by the same key object as LLM access.
-    let acl = aisix_mcp::ToolAcl::resolve(&snapshot, auth.key(), chrono::Utc::now());
+    let acl = aisix_mcp::ToolAcl::resolve(&snapshot, auth.key());
     let gateway = aisix_mcp::McpGateway::from_snapshot(&snapshot).with_tool_acl(acl);
     let service = aisix_mcp::streamable_http_service(gateway);
     let request = Request::from_parts(parts, Body::from(bytes));

@@ -186,7 +186,6 @@ dependencies = [
  "aisix-gateway",
  "async-trait",
  "axum",
- "chrono",
  "futures",
  "hex",
  "http 1.4.0",
