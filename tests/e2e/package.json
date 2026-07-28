@@ -14,7 +14,7 @@
     "@types/ws": "8.5.12",
     "@vitest/coverage-v8": "2.1.9",
     "typescript": "5.5.4",
-    "vitest": "2.1.9",
+    "vitest": "3.2.6",
     "ws": "8.18.0"
   },
   "dependencies": {
