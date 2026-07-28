@@ -30,7 +30,6 @@ use aisix_core::{
 };
 use aisix_gateway::BridgeError;
 use dashmap::DashMap;
-use rand::Rng;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
@@ -117,7 +116,7 @@ pub fn retry_backoff(retry: u32, retry_after: Option<Duration>) -> Duration {
     if retry == 0 {
         return Duration::ZERO;
     }
-    let jitter = rand::thread_rng().gen_range(0..=RETRY_BACKOFF_JITTER_MS);
+    let jitter = rand::random_range(0..=RETRY_BACKOFF_JITTER_MS);
     if let Some(hint) = retry_after {
         let hint_ms = hint.as_millis().min(u64::MAX as u128) as u64;
         if hint_ms > 0 && hint_ms <= RETRY_AFTER_HONOR_MAX_MS {
@@ -477,7 +476,7 @@ fn weighted_pick(targets: &[RoutingTarget], sticky_key: Option<&str>) -> usize {
     }
     let pick = match sticky_key {
         Some(key) => stable_hash(key) % total,
-        None => rand::thread_rng().gen_range(0..total),
+        None => rand::random_range(0..total),
     };
     let mut acc: u64 = 0;
     for (i, t) in targets.iter().enumerate() {
