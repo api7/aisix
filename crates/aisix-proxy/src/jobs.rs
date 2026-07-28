@@ -143,6 +143,11 @@ pub(crate) struct JobTarget {
     pub pk_entry: Arc<ResourceEntry<ProviderKey>>,
     pub secret: String,
     pub adapter: Adapter,
+    /// The ProviderKey's rendered `default_headers` plus the client headers
+    /// its `forward_client_headers` allowlist admits, resolved once when the
+    /// target is resolved so every round-trip on this surface (upload, poll,
+    /// download) sends the same set (AISIX-Cloud#1112 / #1167).
+    pub extra_headers: Vec<(axum::http::HeaderName, axum::http::HeaderValue)>,
 }
 
 impl JobTarget {
@@ -185,7 +190,7 @@ pub(crate) fn resolve_target(
     state: &ProxyState,
     auth: &AuthenticatedKey,
     wanted: Option<&str>,
-    source_ip: &str,
+    client_ctx: &ClientContext,
 ) -> Result<JobTarget, ProxyError> {
     let snapshot = state.snapshot.load();
 
@@ -233,7 +238,7 @@ pub(crate) fn resolve_target(
     };
 
     let model = &model_entry.value;
-    crate::dispatch::check_ip_access(model, source_ip)?;
+    crate::dispatch::check_ip_access(model, &client_ctx.source_ip)?;
 
     let pk_entry = crate::dispatch::resolve_provider_key(&snapshot, model)?;
     let adapter = supported_adapter(&pk_entry.value).ok_or_else(|| {
@@ -246,11 +251,20 @@ pub(crate) fn resolve_target(
     })?;
     let secret = crate::dispatch::require_api_key(&pk_entry.value, model)?.to_string();
 
+    let extra_headers =
+        aisix_gateway::resolve_extra_headers(&crate::dispatch::upstream_header_ctx(
+            &pk_entry.value,
+            &pk_entry.id,
+            model,
+            &model_entry.id,
+            client_ctx,
+        ));
     Ok(JobTarget {
         model_entry,
         pk_entry,
         secret,
         adapter,
+        extra_headers,
     })
 }
 
@@ -345,11 +359,31 @@ async fn send_upstream(
         url,
     );
 
-    builder = match target.adapter {
-        Adapter::AzureOpenai => builder.header("api-key", &target.secret),
-        _ => builder.header(header::AUTHORIZATION, format!("Bearer {}", target.secret)),
+    // Gateway-owned headers go into the map first; the operator / client set
+    // is merged on top and skips any name already there.
+    // `RequestBuilder::header` APPENDS on a repeat name, so building the map
+    // is what keeps a colliding operator header from putting two values of
+    // e.g. `x-aisix-request-id` on the wire.
+    let mut headers = HeaderMap::new();
+    let (auth_name, auth_value) = match target.adapter {
+        Adapter::AzureOpenai => (
+            axum::http::HeaderName::from_static("api-key"),
+            target.secret.clone(),
+        ),
+        _ => (header::AUTHORIZATION, format!("Bearer {}", target.secret)),
     };
-    builder = builder.header("x-aisix-request-id", request_id);
+    if let Ok(v) = axum::http::HeaderValue::from_str(&auth_value) {
+        headers.insert(auth_name, v);
+    }
+    if let Ok(v) = axum::http::HeaderValue::from_str(request_id) {
+        headers.insert(axum::http::HeaderName::from_static("x-aisix-request-id"), v);
+    }
+    for (name, value) in &target.extra_headers {
+        if !headers.contains_key(name) {
+            headers.insert(name.clone(), value.clone());
+        }
+    }
+    builder = builder.headers(headers);
 
     builder = match body {
         UpstreamBody::Empty => builder,
@@ -792,7 +826,7 @@ pub(crate) async fn create_file(
         })?;
 
         let wanted = form_model.or_else(|| explicit_model(&params, &headers));
-        let target = resolve_target(&state, &auth, wanted.as_deref(), &client.source_ip)?;
+        let target = resolve_target(&state, &auth, wanted.as_deref(), &client)?;
 
         // Batch/fine-tune input files carry end-user content — scan them
         // like any other inbound payload.
@@ -1002,7 +1036,7 @@ pub(crate) async fn create_batch(
         let wanted = embedded
             .or(body_model)
             .or_else(|| explicit_model(&params, &headers));
-        let target = resolve_target(&state, &auth, wanted.as_deref(), &client.source_ip)?;
+        let target = resolve_target(&state, &auth, wanted.as_deref(), &client)?;
 
         // Forward the provider wire shape: raw file id, no gateway-only
         // routing fields.
@@ -1074,7 +1108,7 @@ pub(crate) async fn get_batch(
     let result = async {
         require_safe_upstream_id(&raw)?;
         let wanted = embedded.or_else(|| explicit_model(&params, &headers));
-        let target = resolve_target(&state, &auth, wanted.as_deref(), &client.source_ip)?;
+        let target = resolve_target(&state, &auth, wanted.as_deref(), &client)?;
         let _reservation = crate::quota::enforce(
             &state,
             &auth,
@@ -1223,7 +1257,7 @@ pub(crate) async fn create_ft_job(
             .unwrap_or((training_file.clone(), None));
         require_safe_upstream_id(&raw_training)?;
         let wanted = embedded.or_else(|| explicit_model(&params, &headers));
-        let target = resolve_target(&state, &auth, wanted.as_deref(), &client.source_ip)?;
+        let target = resolve_target(&state, &auth, wanted.as_deref(), &client)?;
 
         if let Some(obj) = req_json.as_object_mut() {
             obj.insert("training_file".into(), Value::String(raw_training));
@@ -1413,7 +1447,7 @@ async fn forward_simple(
             None => None,
         };
         let wanted = embedded.or_else(|| explicit_model(&params, &headers));
-        let target = resolve_target(&state, &auth, wanted.as_deref(), &client.source_ip)?;
+        let target = resolve_target(&state, &auth, wanted.as_deref(), &client)?;
 
         if let Some(body) = &spec.body {
             scan_input_blob(&state, &auth, &target, body, &mut monitor_hits).await?;

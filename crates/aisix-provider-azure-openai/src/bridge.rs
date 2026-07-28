@@ -16,8 +16,8 @@
 
 use aisix_core::{RequestOverrides, ResponseOverrides, StreamDoneMarker};
 use aisix_gateway::{
-    Bridge, BridgeContext, BridgeError, ChatChunk, ChatChunkStream, ChatFormat, ChatResponse,
-    SseDecoder, SseEvent,
+    apply_request_headers, Bridge, BridgeContext, BridgeError, ChatChunk, ChatChunkStream,
+    ChatFormat, ChatResponse, SseDecoder, SseEvent, UpstreamHeaderContext,
 };
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -30,9 +30,9 @@ use serde_json::Value;
 use std::time::{Duration, Instant};
 
 use aisix_provider_openai::overrides::{
-    apply_content_list_to_string, apply_default_body_fields, apply_default_headers,
-    apply_param_constraints, apply_param_renames, apply_stream_done_marker_policy,
-    extract_reasoning_field, StreamDoneOutcome,
+    apply_content_list_to_string, apply_default_body_fields, apply_param_constraints,
+    apply_param_renames, apply_stream_done_marker_policy, extract_reasoning_field,
+    StreamDoneOutcome,
 };
 use aisix_provider_openai::wire::{
     build_request, messages_from, response_into_chat_response, stream_chunk_into_chat_chunk,
@@ -587,17 +587,17 @@ fn prepare_outbound_body<T: serde::Serialize>(
 /// In both branches the bridge also sets `Content-Type: application/json`,
 /// `x-aisix-request-id: <ctx.request_id>`, and (for streaming)
 /// `Accept: text/event-stream`. Bridge-owned headers are inserted
-/// before `apply_default_headers` so the reserved-headers list in
-/// `aisix-provider-openai::overrides` (which already covers
-/// `api-key`, `authorization`, `x-api-key`, plus hop-by-hop /
-/// proxy-auth headers) cannot overwrite them. Defense in depth: the
-/// reserved-list blocks even before the `headers.contains_key` guard
-/// inside `apply_default_headers`.
+/// before `apply_request_headers` so the reserved-headers list in
+/// `aisix-gateway::upstream_headers` (which already covers `api-key`,
+/// `authorization`, `x-api-key`, plus proxy-auth / session headers)
+/// cannot overwrite them. Defense in depth: the reserved-list blocks
+/// even before the skip-if-present guard inside
+/// `apply_request_headers`.
 fn build_request_headers(
     auth: &AzureAuth,
     request_id: &str,
     sse: bool,
-    request: Option<&RequestOverrides>,
+    hdr: &UpstreamHeaderContext<'_>,
 ) -> Result<HeaderMap, BridgeError> {
     let mut headers = HeaderMap::new();
     match (&auth.api_key, &auth.bearer_token) {
@@ -644,9 +644,7 @@ fn build_request_headers(
             HeaderValue::from_static("text/event-stream"),
         );
     }
-    if let Some(r) = request {
-        apply_default_headers(&mut headers, &r.default_headers);
-    }
+    apply_request_headers(&mut headers, hdr);
     Ok(headers)
 }
 
@@ -684,12 +682,7 @@ impl Bridge for AzureOpenAiBridge {
             ctx.provider_key.request.as_ref(),
             ctx.provider_key.response.as_ref(),
         )?;
-        let headers = build_request_headers(
-            &auth,
-            &ctx.request_id,
-            false,
-            ctx.provider_key.request.as_ref(),
-        )?;
+        let headers = build_request_headers(&auth, &ctx.request_id, false, &ctx.header_ctx())?;
         let url = self.resolve_url(&upstream);
         let client = self.client.clone();
         let started = Instant::now();
@@ -741,12 +734,7 @@ impl Bridge for AzureOpenAiBridge {
             ctx.provider_key.request.as_ref(),
             ctx.provider_key.response.as_ref(),
         )?;
-        let headers = build_request_headers(
-            &auth,
-            &ctx.request_id,
-            true,
-            ctx.provider_key.request.as_ref(),
-        )?;
+        let headers = build_request_headers(&auth, &ctx.request_id, true, &ctx.header_ctx())?;
         let url = self.resolve_url(&upstream);
         let client = self.client.clone();
         let started = Instant::now();
@@ -1256,8 +1244,13 @@ mod tests {
     fn build_request_headers_uses_api_key_not_bearer() {
         // Critical Azure-vs-OpenAI distinction: the auth header is
         // literally `api-key`, NOT `Authorization: Bearer`.
-        let headers =
-            build_request_headers(&api_key_auth("az-secret-key"), "req-1", false, None).unwrap();
+        let headers = build_request_headers(
+            &api_key_auth("az-secret-key"),
+            "req-1",
+            false,
+            &UpstreamHeaderContext::default(),
+        )
+        .unwrap();
         assert_eq!(headers.get("api-key").unwrap(), "az-secret-key");
         assert!(
             !headers.contains_key("authorization"),
@@ -1273,7 +1266,13 @@ mod tests {
 
     #[test]
     fn build_request_headers_sets_sse_accept_when_streaming() {
-        let headers = build_request_headers(&api_key_auth("az-key"), "req-1", true, None).unwrap();
+        let headers = build_request_headers(
+            &api_key_auth("az-key"),
+            "req-1",
+            true,
+            &UpstreamHeaderContext::default(),
+        )
+        .unwrap();
         assert_eq!(headers.get("accept").unwrap(), "text/event-stream");
     }
 
@@ -1289,16 +1288,14 @@ mod tests {
         default_headers.insert("api-key".to_string(), "ATTACKER-KEY".to_string());
         default_headers.insert("authorization".to_string(), "Bearer ATTACKER".to_string());
         let request_overrides = RequestOverrides {
-            param_renames: HashMap::new(),
-            param_constraints: None,
-            default_body_fields: Default::default(),
             default_headers,
+            ..Default::default()
         };
         let headers = build_request_headers(
             &api_key_auth("legit-key"),
             "req-1",
             false,
-            Some(&request_overrides),
+            &UpstreamHeaderContext::from_overrides(Some(&request_overrides)),
         )
         .unwrap();
         assert_eq!(
@@ -1318,14 +1315,16 @@ mod tests {
         let mut default_headers = HashMap::new();
         default_headers.insert("x-custom-trace".to_string(), "trace-123".to_string());
         let request_overrides = RequestOverrides {
-            param_renames: HashMap::new(),
-            param_constraints: None,
-            default_body_fields: Default::default(),
             default_headers,
+            ..Default::default()
         };
-        let headers =
-            build_request_headers(&api_key_auth("k"), "req-1", false, Some(&request_overrides))
-                .unwrap();
+        let headers = build_request_headers(
+            &api_key_auth("k"),
+            "req-1",
+            false,
+            &UpstreamHeaderContext::from_overrides(Some(&request_overrides)),
+        )
+        .unwrap();
         assert_eq!(headers.get("x-custom-trace").unwrap(), "trace-123");
     }
 
@@ -1333,16 +1332,26 @@ mod tests {
     fn build_request_headers_rejects_invalid_api_key_chars() {
         // A secret with a newline would let an operator inject extra
         // headers via the api-key value.
-        let err = build_request_headers(&api_key_auth("legit\nx-evil: 1"), "req-1", false, None)
-            .unwrap_err();
+        let err = build_request_headers(
+            &api_key_auth("legit\nx-evil: 1"),
+            "req-1",
+            false,
+            &UpstreamHeaderContext::default(),
+        )
+        .unwrap_err();
         assert!(matches!(err, BridgeError::InvalidUpstreamCredentials(_)));
         assert_eq!(err.http_status(), 401);
     }
 
     #[test]
     fn build_request_headers_rejects_invalid_request_id_chars() {
-        let err =
-            build_request_headers(&api_key_auth("legit"), "req\nbad", false, None).unwrap_err();
+        let err = build_request_headers(
+            &api_key_auth("legit"),
+            "req\nbad",
+            false,
+            &UpstreamHeaderContext::default(),
+        )
+        .unwrap_err();
         assert!(matches!(err, BridgeError::Config(_)));
     }
 

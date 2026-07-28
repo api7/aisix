@@ -162,6 +162,13 @@
       "description": "Administratively disabled. A disabled key is rejected with `401` until it is enabled again; the key itself is preserved. Treated as `false` when omitted.",
       "type": "boolean"
     },
+    "display_name": {
+      "description": "Operator-facing label for this key, as shown in the dashboard. Read only by the `${request.api_key.name}` header template (AISIX-Cloud#1112); never used for authentication or routing.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "expires_at": {
       "description": "RFC 3339 timestamp after which the key stops authenticating. Requests presenting an expired key are rejected with `401`. When omitted or set to `null`, the key never expires.",
       "format": "date-time",

@@ -84,7 +84,7 @@ pub async fn rerank(
         .unwrap_or("")
         .to_string();
 
-    match dispatch(&state, &auth, &mut body, &request_id, &client.source_ip).await {
+    match dispatch(&state, &auth, &mut body, &request_id, &client).await {
         Ok(success) => {
             let elapsed = started.elapsed();
             let status = success.response.status().as_u16();
@@ -199,7 +199,7 @@ async fn dispatch(
     auth: &AuthenticatedKey,
     body: &mut Value,
     request_id: &str,
-    source_ip: &str,
+    client_ctx: &ClientContext,
 ) -> Result<RerankDispatchSuccess, ProxyError> {
     let snapshot = state.snapshot.load();
 
@@ -217,7 +217,7 @@ async fn dispatch(
     }
 
     // Client-IP allowlist gate (#557): reject before guardrails / upstream.
-    crate::dispatch::check_ip_access(&model_entry.value, source_ip)?;
+    crate::dispatch::check_ip_access(&model_entry.value, &client_ctx.source_ip)?;
 
     // #545: /v1/rerank must run input guardrails. Before this it forwarded
     // the user `query` + `documents` with no configured content/DLP check,
@@ -363,8 +363,9 @@ async fn dispatch(
     };
     let url = crate::dispatch::build_v1_url(&base, "/rerank");
 
-    // Build headers explicitly so the PK's `request.default_headers` can inject
-    // operator headers (reserved auth headers are protected by the apply step).
+    // Build headers explicitly so the PK's `request.default_headers` and
+    // `request.forward_client_headers` can inject operator/client headers
+    // (reserved auth headers are protected by the apply step).
     let mut headers = axum::http::HeaderMap::new();
     let auth_hv = HeaderValue::from_str(&format!("Bearer {api_key}")).map_err(|e| {
         ProxyError::Bridge(aisix_gateway::BridgeError::Config(format!(
@@ -385,9 +386,16 @@ async fn dispatch(
         axum::http::header::HeaderName::from_static("x-aisix-request-id"),
         rid_hv,
     );
-    if let Some(r) = pk_entry.value.request.as_ref() {
-        aisix_provider_openai::overrides::apply_default_headers(&mut headers, &r.default_headers);
-    }
+    aisix_gateway::apply_request_headers(
+        &mut headers,
+        &crate::dispatch::upstream_header_ctx(
+            &pk_entry.value,
+            &pk_entry.id,
+            model,
+            &model_entry.id,
+            client_ctx,
+        ),
+    );
 
     let client = crate::http_client::client();
     // Send, check the status, and read the body as one retryable unit, so a

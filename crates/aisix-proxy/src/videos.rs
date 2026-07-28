@@ -1025,6 +1025,11 @@ struct VideoTarget {
     provider_label: String,
     base_url: String,
     secret: String,
+    /// The ProviderKey's rendered `default_headers` plus the client headers
+    /// its `forward_client_headers` allowlist admits, resolved once when the
+    /// target is resolved so every round-trip on this surface (submit, poll,
+    /// content fetch) sends the same set (AISIX-Cloud#1112 / #1167).
+    extra_headers: Vec<(axum::http::HeaderName, axum::http::HeaderValue)>,
 }
 
 impl VideoTarget {
@@ -1042,14 +1047,14 @@ fn resolve_video_target(
     auth: &AuthenticatedKey,
     model_entry: std::sync::Arc<aisix_core::ResourceEntry<aisix_core::Model>>,
     acl_name: &str,
-    source_ip: &str,
+    client_ctx: &ClientContext,
 ) -> Result<Result<VideoTarget, Response>, ProxyError> {
     let snapshot = state.snapshot.load();
 
     if !auth.key().can_access(acl_name) {
         return Err(ProxyError::ModelForbidden(acl_name.to_string()));
     }
-    crate::dispatch::check_ip_access(&model_entry.value, source_ip)?;
+    crate::dispatch::check_ip_access(&model_entry.value, &client_ctx.source_ip)?;
 
     let provider = crate::dispatch::require_provider(&model_entry.value)?.to_string();
     // Providers outside the mapped set get a typed 501 so callers can
@@ -1079,6 +1084,14 @@ fn resolve_video_target(
     };
     let secret = crate::dispatch::require_api_key(&pk_entry.value, &model_entry.value)?.to_string();
 
+    let extra_headers =
+        aisix_gateway::resolve_extra_headers(&crate::dispatch::upstream_header_ctx(
+            &pk_entry.value,
+            &pk_entry.id,
+            &model_entry.value,
+            &model_entry.id,
+            client_ctx,
+        ));
     Ok(Ok(VideoTarget {
         pk_id: pk_entry.id.to_string(),
         provider: video_provider,
@@ -1086,6 +1099,7 @@ fn resolve_video_target(
         base_url,
         secret,
         model_entry,
+        extra_headers,
     }))
 }
 
@@ -1138,22 +1152,44 @@ async fn provider_call(
         "/v1/videos",
         retry_permit,
         || {
-            let mut builder = client
-                .request(method.clone(), url)
-                .header(header::AUTHORIZATION, format!("Bearer {}", target.secret))
-                .header("x-aisix-request-id", request_id);
+            // Gateway-owned headers go into the map first; the operator /
+            // client set is merged on top and skips any name already there.
+            // `RequestBuilder::header` APPENDS on a repeat name, so building
+            // the map is what keeps a colliding operator header from putting
+            // two values of e.g. `x-aisix-request-id` on the wire.
+            let mut headers = axum::http::HeaderMap::new();
+            if let Ok(v) = header::HeaderValue::from_str(&format!("Bearer {}", target.secret)) {
+                headers.insert(header::AUTHORIZATION, v);
+            }
+            if let Ok(v) = header::HeaderValue::from_str(request_id) {
+                headers.insert(header::HeaderName::from_static("x-aisix-request-id"), v);
+            }
             // A provider header required on every call (submit and poll) — e.g.
             // Runway's mandatory `X-Runway-Version`. Applied unconditionally,
             // before the submit-only body/header block below.
             if let Some((name, value)) = target.provider.all_request_header() {
-                builder = builder.header(name, value);
-            }
-            if let Some(b) = body {
-                if target.provider.submit_headers_async() {
-                    // DashScope requires the async-mode header — it rejects
-                    // synchronous video-synthesis calls outright.
-                    builder = builder.header("X-DashScope-Async", "enable");
+                if let (Ok(n), Ok(v)) = (
+                    name.parse::<header::HeaderName>(),
+                    header::HeaderValue::from_str(value),
+                ) {
+                    headers.insert(n, v);
                 }
+            }
+            if target.provider.submit_headers_async() && body.is_some() {
+                // DashScope requires the async-mode header — it rejects
+                // synchronous video-synthesis calls outright.
+                headers.insert(
+                    header::HeaderName::from_static("x-dashscope-async"),
+                    header::HeaderValue::from_static("enable"),
+                );
+            }
+            for (name, value) in &target.extra_headers {
+                if !headers.contains_key(name) {
+                    headers.insert(name.clone(), value.clone());
+                }
+            }
+            let mut builder = client.request(method.clone(), url).headers(headers);
+            if let Some(b) = body {
                 builder = builder
                     .header(header::CONTENT_TYPE, "application/json")
                     .json(b);
@@ -1234,15 +1270,31 @@ async fn proxy_content(
     request_id: &str,
 ) -> Result<Response, ProxyError> {
     let client = crate::http_client::client();
-    let mut builder = client
-        .get(url)
-        .header(header::AUTHORIZATION, format!("Bearer {}", target.secret))
-        .header("x-aisix-request-id", request_id);
+    // Same map-then-merge shape as `provider_call` — see the comment there
+    // on why the gateway-owned names cannot be appended to.
+    let mut headers = axum::http::HeaderMap::new();
+    if let Ok(v) = header::HeaderValue::from_str(&format!("Bearer {}", target.secret)) {
+        headers.insert(header::AUTHORIZATION, v);
+    }
+    if let Ok(v) = header::HeaderValue::from_str(request_id) {
+        headers.insert(header::HeaderName::from_static("x-aisix-request-id"), v);
+    }
     // A provider header required on every call (e.g. Runway's version header) —
     // future-proofs Proxy mode for such vendors; a no-op for OpenAI.
     if let Some((name, value)) = target.provider.all_request_header() {
-        builder = builder.header(name, value);
+        if let (Ok(n), Ok(v)) = (
+            name.parse::<header::HeaderName>(),
+            header::HeaderValue::from_str(value),
+        ) {
+            headers.insert(n, v);
+        }
     }
+    for (name, value) in &target.extra_headers {
+        if !headers.contains_key(name) {
+            headers.insert(name.clone(), value.clone());
+        }
+    }
+    let builder = client.get(url).headers(headers);
 
     let stream_budget = target.model_entry.value.stream_timeout_effective();
     let started = Instant::now();
@@ -1534,21 +1586,20 @@ async fn dispatch_create(
         ));
     }
 
-    let target =
-        match resolve_video_target(state, auth, model_entry, &body.model, &client.source_ip)? {
-            Ok(t) => t,
-            Err(resp) => {
-                return Ok(CreateSuccess {
-                    response: resp,
-                    provider: "unknown".into(),
-                    model_id,
-                    provider_key_id: String::new(),
-                    applied_guardrails: Vec::new(),
-                    monitor_hits: Vec::new(),
-                    upstream_called: false,
-                })
-            }
-        };
+    let target = match resolve_video_target(state, auth, model_entry, &body.model, client)? {
+        Ok(t) => t,
+        Err(resp) => {
+            return Ok(CreateSuccess {
+                response: resp,
+                provider: "unknown".into(),
+                model_id,
+                provider_key_id: String::new(),
+                applied_guardrails: Vec::new(),
+                monitor_hits: Vec::new(),
+                upstream_called: false,
+            })
+        }
+    };
 
     // Input guardrail chain over the prompt — same resolution as chat /
     // embeddings, run BEFORE the rate-limit reservation so a policy
@@ -1675,7 +1726,7 @@ fn resolve_get_target(
     state: &ProxyState,
     auth: &AuthenticatedKey,
     video_id: &str,
-    source_ip: &str,
+    client_ctx: &ClientContext,
 ) -> Result<(VideoTarget, String), ProxyError> {
     let (entry_id, alias, task_id) =
         decode_video_id(video_id).ok_or_else(|| ProxyError::VideoNotFound(video_id.to_string()))?;
@@ -1684,7 +1735,7 @@ fn resolve_get_target(
         .models
         .get_by_id(&entry_id)
         .ok_or_else(|| ProxyError::VideoNotFound(video_id.to_string()))?;
-    match resolve_video_target(state, auth, model_entry, &alias, source_ip) {
+    match resolve_video_target(state, auth, model_entry, &alias, client_ctx) {
         Ok(Ok(target)) => Ok((target, task_id)),
         // Unsupported provider → uniform 404 (oracle fold, see above).
         Ok(Err(_)) => Err(ProxyError::VideoNotFound(video_id.to_string())),
@@ -1710,7 +1761,7 @@ pub async fn get_video(
     };
 
     let result: Result<(Response, String, String), ProxyError> = async {
-        let (target, task_id) = resolve_get_target(&state, &auth, &video_id, &client.source_ip)?;
+        let (target, task_id) = resolve_get_target(&state, &auth, &video_id, &client)?;
         // Poll traffic is exempt from model-level limits BY DESIGN
         // (AISIX-Cloud#1118 decision 3): a client polling a task it
         // already paid an RPM slot to submit must not starve itself.
@@ -1761,7 +1812,7 @@ pub async fn video_content(
     };
 
     let result: Result<(Response, String, String), ProxyError> = async {
-        let (target, task_id) = resolve_get_target(&state, &auth, &video_id, &client.source_ip)?;
+        let (target, task_id) = resolve_get_target(&state, &auth, &video_id, &client)?;
         // Same model-layer exemption as the poll route (see get_video).
         let reservation = crate::quota::enforce(&state, &auth, None).await?;
         let result = poll_task(&state, &target, &task_id, &client.request_id).await;

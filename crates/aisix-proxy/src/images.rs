@@ -11,7 +11,7 @@
 //! 8. Providers that don't support image generation return 501.
 
 use aisix_core::AppliedGuardrail;
-use aisix_gateway::{BridgeContext, BridgeError};
+use aisix_gateway::BridgeError;
 use aisix_obs::{content_capture_cap, AccessLog, CapturedContent, RequestOutcome, UsageEvent};
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -77,7 +77,7 @@ pub async fn image_generations(
         .unwrap_or("unknown")
         .to_string();
 
-    match dispatch(&state, &auth, body, &request_id, &client.source_ip).await {
+    match dispatch(&state, &auth, body, &request_id, &client).await {
         Ok(success) => {
             let elapsed = started.elapsed();
             emit_access_log(
@@ -182,7 +182,7 @@ async fn dispatch(
     auth: &AuthenticatedKey,
     mut body: Value,
     request_id: &str,
-    source_ip: &str,
+    client_ctx: &ClientContext,
 ) -> Result<ImageDispatchSuccess, ProxyError> {
     // Owned so the #696 in-place prompt masking below can borrow `body`
     // mutably.
@@ -203,7 +203,7 @@ async fn dispatch(
     }
 
     // Client-IP allowlist gate (#557): reject before guardrails / upstream.
-    crate::dispatch::check_ip_access(&model_entry.value, source_ip)?;
+    crate::dispatch::check_ip_access(&model_entry.value, &client_ctx.source_ip)?;
 
     // #545: /v1/images/generations must run input guardrails. Before this it
     // forwarded the user `prompt` with no configured content/DLP check, so a
@@ -293,10 +293,15 @@ async fn dispatch(
     let bridge = crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value)
         .ok_or(ProxyError::ProviderUnavailable)?;
 
-    let model_arc = Arc::new(model.clone());
-    let pk_arc = Arc::new(pk_entry.value.clone());
     // #554: apply the configured request `timeout` as the upstream deadline.
-    let mut ctx = BridgeContext::new(request_id, model_arc, pk_arc);
+    let mut ctx = crate::dispatch::bridge_ctx(
+        request_id,
+        &model_entry.id,
+        Arc::new(model.clone()),
+        &pk_entry.id,
+        Arc::new(pk_entry.value.clone()),
+        Some(client_ctx),
+    );
     if let Some(d) = model.request_timeout() {
         ctx = ctx.with_deadline(d);
     }

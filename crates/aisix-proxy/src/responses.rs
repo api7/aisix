@@ -947,10 +947,11 @@ async fn responses_to_target(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    // Build headers explicitly so the PK's `request.default_headers` can inject
-    // operator headers. Bridge-owned headers go in FIRST; `apply_default_headers`
-    // skips already-present keys + the reserved auth blacklist, so an operator
-    // header can never clobber auth.
+    // Build headers explicitly so the PK's `request.default_headers` and
+    // `request.forward_client_headers` can inject operator/client headers.
+    // Bridge-owned headers go in FIRST; `apply_request_headers` skips
+    // already-present keys + the reserved auth blacklist, so neither can
+    // clobber auth.
     let mut headers = axum::http::HeaderMap::new();
     let auth_hv = HeaderValue::from_str(&format!("Bearer {api_key}")).map_err(|e| {
         ProxyError::Bridge(aisix_gateway::BridgeError::Config(format!(
@@ -968,9 +969,16 @@ async fn responses_to_target(
         )))
     })?;
     headers.insert(HeaderName::from_static("x-aisix-request-id"), rid_hv);
-    if let Some(r) = pk_entry.value.request.as_ref() {
-        aisix_provider_openai::overrides::apply_default_headers(&mut headers, &r.default_headers);
-    }
+    aisix_gateway::apply_request_headers(
+        &mut headers,
+        &crate::dispatch::upstream_header_ctx(
+            &pk_entry.value,
+            &pk_entry.id,
+            model,
+            model_id,
+            client_ctx,
+        ),
+    );
 
     let client = crate::http_client::client();
     let mut req = client.post(&url).headers(headers).json(&body);
@@ -1629,7 +1637,7 @@ async fn responses_cross_provider_to_target(
     // `input_redactions`.
     input_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
 ) -> Result<ResponseDispatchSuccess, ProxyError> {
-    use aisix_gateway::{Bridge, BridgeContext};
+    use aisix_gateway::Bridge;
 
     // Content capture (AISIX-Cloud#947), same contract as the verbatim
     // target: prompt = the client-facing Responses request body
@@ -1663,9 +1671,14 @@ async fn responses_cross_provider_to_target(
     let chat = crate::responses_bridge::responses_request_to_chat(requested_model, body);
 
     let is_stream = chat.is_streaming();
-    let model_arc = Arc::new(model.clone());
-    let pk_arc = Arc::new(pk_entry.value.clone());
-    let mut ctx = BridgeContext::new(request_id, model_arc, pk_arc);
+    let mut ctx = crate::dispatch::bridge_ctx(
+        request_id,
+        model_id,
+        Arc::new(model.clone()),
+        &provider_key_id,
+        Arc::new(pk_entry.value.clone()),
+        Some(client_ctx),
+    );
     let connect_deadline = if is_stream {
         model.stream_timeout_effective()
     } else {

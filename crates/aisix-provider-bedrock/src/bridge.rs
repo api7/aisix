@@ -19,7 +19,7 @@
 use aisix_gateway::{
     Bridge, BridgeContext, BridgeError, ChatChunk, ChatChunkStream, ChatDelta, ChatFormat,
     ChatMessage, ChatResponse, EmbeddingObject, EmbeddingRequest, EmbeddingResponse,
-    EmbeddingUsage, EmbeddingVector, FinishReason, Role, UsageStats,
+    EmbeddingUsage, EmbeddingVector, FinishReason, Role, UpstreamHeaderContext, UsageStats,
 };
 use async_trait::async_trait;
 use aws_credential_types::provider::SharedCredentialsProvider;
@@ -48,10 +48,11 @@ use aisix_provider_anthropic::wire::{
 
 // Per-`ProviderKey` request override pipeline (#302 §5 / #340). The JSON-body
 // transforms reuse the shared primitives the OpenAI / Vertex bridges call;
-// `default_headers` ride a pre-signing interceptor (see
-// [`DefaultHeadersInterceptor`]) so they land inside the SigV4-signed
-// canonical request rather than being appended after the signature is computed.
-use aisix_core::{ParamConstraints, RequestOverrides};
+// `default_headers` and forwarded client headers ride a pre-signing
+// interceptor (see [`DefaultHeadersInterceptor`]) so they land inside the
+// SigV4-signed canonical request rather than being appended after the
+// signature is computed.
+use aisix_core::ParamConstraints;
 use aisix_provider_openai::overrides::{
     apply_content_list_to_string, apply_default_body_fields, apply_param_constraints,
     apply_param_renames,
@@ -335,7 +336,7 @@ impl BedrockSecret {
 fn build_client(
     creds: &BedrockSecret,
     endpoint_url: Option<&str>,
-    request: Option<&RequestOverrides>,
+    hdr: &UpstreamHeaderContext<'_>,
 ) -> Result<BedrockClient, BridgeError> {
     if creds.region.trim().is_empty() {
         return Err(BridgeError::InvalidUpstreamConfig(
@@ -363,38 +364,37 @@ fn build_client(
     }
     let sdk_cfg = builder.build();
 
-    // Register the default-headers interceptor only when the PK actually
-    // carries (non-reserved) default_headers, so the common no-override path
+    // Register the extra-headers interceptor only when the PK actually
+    // contributes (non-SigV4-owned) headers, so the common no-override path
     // builds the client byte-for-byte as before. The interceptor injects at
     // `modify_before_signing`, so the headers are covered by the SigV4
     // signature (#340).
     let mut conf = aws_sdk_bedrockruntime::config::Builder::from(&sdk_cfg);
-    if let Some(r) = request {
-        let headers = filtered_default_headers(&r.default_headers);
-        if !headers.is_empty() {
-            conf = conf.interceptor(DefaultHeadersInterceptor { headers });
-        }
+    let headers = filtered_extra_headers(hdr);
+    if !headers.is_empty() {
+        conf = conf.interceptor(DefaultHeadersInterceptor { headers });
     }
     Ok(BedrockClient::from_conf(conf.build()))
 }
 
-/// Drop SigV4-owned headers ([`wire::reserved_sigv4_headers`]) from an
-/// operator-supplied `default_headers` block before they reach the signing
-/// interceptor. cp-api SHOULD reject these at write time (#302 §5), but the DP
+/// Resolve the ProviderKey's extra headers (rendered `default_headers` plus
+/// allowlisted client headers) and drop the SigV4-owned names
+/// ([`wire::reserved_sigv4_headers`]) before they reach the signing
+/// interceptor. cp-api SHOULD reject those at write time (#302 §5), but the DP
 /// enforces it again here as defense-in-depth — an override naming e.g.
 /// `x-amz-date` or `authorization` must never perturb the signature. Matching
 /// is case-insensitive (HTTP header names are).
-fn filtered_default_headers(
-    defaults: &std::collections::HashMap<String, String>,
-) -> Vec<(String, String)> {
+fn filtered_extra_headers(hdr: &UpstreamHeaderContext<'_>) -> Vec<(String, String)> {
     let reserved = wire::reserved_sigv4_headers();
-    defaults
-        .iter()
-        .filter(|(name, _)| {
-            let lower = name.to_ascii_lowercase();
-            !reserved.contains(&lower.as_str())
+    aisix_gateway::resolve_extra_headers(hdr)
+        .into_iter()
+        .filter(|(name, _)| !reserved.contains(&name.as_str()))
+        .map(|(name, value)| {
+            (
+                name.as_str().to_string(),
+                String::from_utf8_lossy(value.as_bytes()).into_owned(),
+            )
         })
-        .map(|(name, value)| (name.clone(), value.clone()))
         .collect()
 }
 
@@ -856,7 +856,7 @@ impl BedrockBridge {
         };
         // Converse paths carry no JSON body, but default_headers still apply
         // (header-level, publisher-agnostic) via the signing interceptor.
-        build_client(&creds, endpoint_url, ctx.provider_key.request.as_ref())
+        build_client(&creds, endpoint_url, &ctx.header_ctx())
     }
 
     /// Dispatch Bedrock chat via the unified Converse API.

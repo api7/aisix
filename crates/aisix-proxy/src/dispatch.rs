@@ -269,6 +269,68 @@ pub(crate) fn require_api_key<'a>(
     Ok(provider_key.api_key.as_str())
 }
 
+/// Build the [`BridgeContext`] for one upstream call.
+///
+/// The single chokepoint for wiring a Bridge dispatch: it carries the
+/// snapshot ids (which a `Model` / `ProviderKey` value does not know about
+/// itself) and, for a call made on behalf of a caller, that caller's
+/// identity and inbound headers. Both feed
+/// [`aisix_gateway::BridgeContext::header_ctx`], so a site that skipped
+/// either would silently stop rendering `${...}` header templates or
+/// forwarding allowlisted client headers, with no compiler signal —
+/// hence one constructor rather than a chain every caller must remember.
+///
+/// `client` is `None` for calls with no client request behind them: the
+/// semantic-router's embedding lookup and the background health prober.
+/// Those forward no client header and resolve no `${request.api_key.*}`
+/// variable, but still resolve the model / provider-key ones.
+pub(crate) fn bridge_ctx(
+    request_id: &str,
+    model_id: &str,
+    model: Arc<Model>,
+    provider_key_id: &str,
+    provider_key: Arc<ProviderKey>,
+    client: Option<&crate::client_ip::ClientContext>,
+) -> aisix_gateway::BridgeContext {
+    let ctx = aisix_gateway::BridgeContext::new(request_id, model, provider_key)
+        .with_resource_ids(model_id, provider_key_id);
+    match client {
+        Some(c) => ctx.with_client(c.caller.clone(), Some(c.headers.clone())),
+        None => ctx,
+    }
+}
+
+/// Build the outbound-header context for a dispatch path that constructs
+/// its upstream request directly instead of going through a `Bridge`
+/// (`/v1/messages`, `/v1/responses`, `/v1/messages/count_tokens`, audio,
+/// rerank, videos, jobs).
+///
+/// The Bridge paths get the same thing from
+/// [`aisix_gateway::BridgeContext::header_ctx`]; both must resolve the
+/// same variables from the same sources, so keep them in step.
+pub(crate) fn upstream_header_ctx<'a>(
+    pk: &'a ProviderKey,
+    pk_id: &'a str,
+    model: &'a Model,
+    model_id: &'a str,
+    client: &'a crate::client_ip::ClientContext,
+) -> aisix_gateway::UpstreamHeaderContext<'a> {
+    let caller = &client.caller;
+    aisix_gateway::UpstreamHeaderContext::from_overrides(pk.request.as_ref())
+        .with_vars(aisix_core::HeaderVars {
+            request_id: Some(&client.request_id),
+            api_key_id: Some(&caller.api_key_id),
+            api_key_name: caller.api_key_name.as_deref(),
+            api_key_team_id: caller.team_id.as_deref(),
+            api_key_user_id: caller.user_id.as_deref(),
+            model_id: Some(model_id),
+            model_name: Some(&model.display_name),
+            provider_key_id: Some(pk_id),
+            provider_key_name: Some(&pk.display_name),
+        })
+        .with_client_headers(&client.headers)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

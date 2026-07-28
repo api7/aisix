@@ -17,6 +17,13 @@ use std::ops::Deref;
 /// can build a secondary name-index without knowing the concrete type.
 pub trait Resource: Send + Sync + 'static {
     /// Stable UUID v4 identifying this resource (etcd key suffix).
+    ///
+    /// **Read the id from the enclosing [`ResourceEntry::id`], not from
+    /// here.** Implementations return a `runtime_id` field that the
+    /// snapshot loader does not populate, so at runtime this is the empty
+    /// string for every entity loaded from etcd — only tests set it. The
+    /// trait keeps the method because the snapshot's index construction is
+    /// generic over it.
     fn id(&self) -> &str;
 
     /// Human-readable unique name within the resource kind. Used for

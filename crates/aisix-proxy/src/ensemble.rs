@@ -28,7 +28,7 @@ use futures::future::join_all;
 
 use aisix_core::models::{EnsembleConfig, Judge, PanelMember};
 use aisix_core::AisixSnapshot;
-use aisix_gateway::bridge::{BridgeContext, BridgeError};
+use aisix_gateway::bridge::BridgeError;
 use aisix_gateway::chat::{ChatFormat, ChatMessage, ChatResponse, Role, UsageStats};
 
 use crate::state::ProxyState;
@@ -86,6 +86,10 @@ pub(crate) struct ProxyModelCaller<'a> {
     pub state: &'a ProxyState,
     pub snapshot: &'a AisixSnapshot,
     pub request_id: &'a str,
+    /// The originating request's context. Member calls are dispatched on
+    /// the caller's behalf, so they carry the same caller identity and
+    /// forwardable client headers as a single-upstream dispatch would.
+    pub client: &'a crate::client_ip::ClientContext,
 }
 
 #[async_trait]
@@ -124,10 +128,13 @@ impl ModelCaller for ProxyModelCaller<'_> {
             })?;
 
         // Per-member request deadline from the member Model's own `timeout`.
-        let mut ctx = BridgeContext::new(
+        let mut ctx = crate::dispatch::bridge_ctx(
             self.request_id,
+            &entry.id,
             Arc::new(model.clone()),
+            &pk_entry.id,
             Arc::new(pk_entry.value.clone()),
+            Some(self.client),
         );
         if let Some(deadline) = model.request_timeout() {
             ctx = ctx.with_deadline(deadline);

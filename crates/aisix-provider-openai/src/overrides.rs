@@ -34,10 +34,6 @@
 use std::collections::HashMap;
 
 use aisix_core::{ParamConstraints, StreamDoneMarker};
-use http::{
-    header::{HeaderName, HeaderValue},
-    HeaderMap,
-};
 use serde_json::{Map, Value};
 
 /// Outcome of evaluating an SSE stream against a
@@ -119,56 +115,6 @@ pub fn apply_param_constraints(body: &mut Value, constraints: &ParamConstraints)
         if let Some(num) = serde_json::Number::from_f64(next) {
             *temp = Value::Number(num);
         }
-    }
-}
-
-/// Authentication-related headers that `apply_default_headers` will
-/// never set, even if cp-api validation slips and allows them through.
-/// Defense-in-depth: a misconfigured `default_headers` block must never
-/// override the auth header the OpenAiBridge sets itself. cp-api SHOULD
-/// reject these at write time (issue #302 §5 validation rules), but
-/// the DP enforces it again at apply time.
-///
-/// `HeaderName` is case-insensitive so the lowercase form is the
-/// canonical comparison key.
-const RESERVED_DEFAULT_HEADERS: &[&str] = &[
-    "authorization",        // OpenAI / Anthropic / Vertex Bearer
-    "x-api-key",            // Anthropic raw, also OpenAI legacy proxies
-    "x-goog-api-key",       // Gemini API key
-    "api-key",              // Azure OpenAI key
-    "x-amz-security-token", // AWS SigV4 session header (Bedrock)
-    "x-amz-date",           // AWS SigV4 timestamp (Bedrock)
-];
-
-/// Apply `request.default_headers` to an outbound `HeaderMap`.
-///
-/// Headers already present on `headers` (case-insensitive, since
-/// [`http::HeaderName`] is case-insensitive) are left alone — the
-/// caller's explicit value always wins over a default. Names or
-/// values that fail [`HeaderName`] / [`HeaderValue`] parsing are
-/// silently skipped; the default block came from cp-api validation
-/// and any unparseable entry is a config error one layer up, not a
-/// runtime failure the dispatch should hard-fail on.
-///
-/// **Auth-header guard:** keys in [`RESERVED_DEFAULT_HEADERS`] are
-/// dropped before insertion as defense-in-depth — a misconfigured
-/// default_headers block must never inject `Authorization` or vendor
-/// API-key headers that would override the Bridge's own auth.
-pub fn apply_default_headers(headers: &mut HeaderMap, defaults: &HashMap<String, String>) {
-    for (name, value) in defaults {
-        let Ok(parsed_name) = name.parse::<HeaderName>() else {
-            continue;
-        };
-        if RESERVED_DEFAULT_HEADERS.contains(&parsed_name.as_str()) {
-            continue;
-        }
-        if headers.contains_key(&parsed_name) {
-            continue;
-        }
-        let Ok(parsed_value) = HeaderValue::from_str(value) else {
-            continue;
-        };
-        headers.insert(parsed_name, parsed_value);
     }
 }
 
@@ -499,85 +445,6 @@ mod tests {
         let constraints = ParamConstraints::default();
         apply_param_constraints(&mut body, &constraints);
         assert_eq!(body["temperature"].as_f64(), Some(2.0));
-    }
-
-    // --- apply_default_headers ------------------------------------
-
-    #[test]
-    fn adds_missing_default_header() {
-        let mut headers = HeaderMap::new();
-        let defaults = HashMap::from([("anthropic-version".to_string(), "2023-06-01".to_string())]);
-        apply_default_headers(&mut headers, &defaults);
-        assert_eq!(headers.get("anthropic-version").unwrap(), "2023-06-01");
-    }
-
-    #[test]
-    fn does_not_overwrite_existing_header() {
-        let mut headers = HeaderMap::new();
-        headers.insert("x-foo", HeaderValue::from_static("caller-value"));
-        let defaults = HashMap::from([("x-foo".to_string(), "default-value".to_string())]);
-        apply_default_headers(&mut headers, &defaults);
-        assert_eq!(headers.get("x-foo").unwrap(), "caller-value");
-    }
-
-    #[test]
-    fn header_match_is_case_insensitive() {
-        // Caller-set header in mixed case must still block a default
-        // header keyed in lowercase — http::HeaderName is canonicalized.
-        let mut headers = HeaderMap::new();
-        headers.insert("X-Foo", HeaderValue::from_static("caller-value"));
-        let defaults = HashMap::from([("x-foo".to_string(), "default-value".to_string())]);
-        apply_default_headers(&mut headers, &defaults);
-        assert_eq!(headers.get("x-foo").unwrap(), "caller-value");
-    }
-
-    #[test]
-    fn skips_unparseable_header_name() {
-        let mut headers = HeaderMap::new();
-        let defaults = HashMap::from([
-            ("not a valid name".to_string(), "v".to_string()),
-            ("x-foo".to_string(), "ok".to_string()),
-        ]);
-        apply_default_headers(&mut headers, &defaults);
-        assert!(headers.get("x-foo").is_some());
-        assert_eq!(headers.len(), 1);
-    }
-
-    #[test]
-    fn rejects_reserved_auth_headers() {
-        // Defense-in-depth: even if cp-api validation slipped and shipped
-        // a default_headers block containing Authorization / X-Api-Key /
-        // X-Goog-Api-Key, DP must not inject them. Case-insensitive via
-        // HeaderName canonicalization.
-        let mut headers = HeaderMap::new();
-        let defaults = HashMap::from([
-            (
-                "Authorization".to_string(),
-                "Bearer attacker-token".to_string(),
-            ),
-            ("X-Api-Key".to_string(), "attacker-key".to_string()),
-            ("X-API-KEY".to_string(), "attacker-key-2".to_string()),
-            (
-                "x-goog-api-key".to_string(),
-                "attacker-google-key".to_string(),
-            ),
-            ("x-foo".to_string(), "ok-default".to_string()),
-        ]);
-        apply_default_headers(&mut headers, &defaults);
-        assert!(
-            headers.get("authorization").is_none(),
-            "auth must be blocked"
-        );
-        assert!(
-            headers.get("x-api-key").is_none(),
-            "x-api-key must be blocked"
-        );
-        assert!(
-            headers.get("x-goog-api-key").is_none(),
-            "x-goog-api-key must be blocked"
-        );
-        assert_eq!(headers.get("x-foo").unwrap(), "ok-default");
-        assert_eq!(headers.len(), 1, "only x-foo should have been inserted");
     }
 
     // --- apply_default_body_fields --------------------------------

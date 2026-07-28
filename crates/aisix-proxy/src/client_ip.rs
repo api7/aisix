@@ -11,10 +11,12 @@
 //! trusted proxies configured (the default) the peer is always logged.
 
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 
 use aisix_core::config::RealIpConfig;
 use axum::extract::{ConnectInfo, FromRef, FromRequestParts};
 use axum::http::request::Parts;
+use axum::http::HeaderMap;
 use ipnet::IpNet;
 
 use crate::state::ProxyState;
@@ -142,6 +144,19 @@ pub struct ClientContext {
     /// the two always match. Falls back to a fresh id when the middleware
     /// isn't in the chain (e.g. a handler unit test with a bare router).
     pub request_id: String,
+    /// The request's inbound headers, kept so dispatch can honour a
+    /// ProviderKey's `request.forward_client_headers` allowlist
+    /// (AISIX-Cloud#1167). Held behind an `Arc` because every dispatch
+    /// path clones the context; nothing here is forwarded unless an
+    /// operator names the header.
+    pub headers: Arc<HeaderMap>,
+    /// The authenticated caller, for `${request.api_key.*}` header
+    /// templates (AISIX-Cloud#1112). Read from the request extension the
+    /// [`crate::auth::AuthenticatedKey`] extractor publishes, so it is
+    /// filled only when that extractor ran first — which every handler
+    /// arranges by declaring `auth` before `client`. Default (empty) on
+    /// the unauthenticated paths; those resolve no `api_key` variable.
+    pub caller: aisix_gateway::CallerIdentity,
 }
 
 #[axum::async_trait]
@@ -203,6 +218,12 @@ where
             routing_tags,
             routing_key,
             request_id,
+            headers: Arc::new(parts.headers.clone()),
+            caller: parts
+                .extensions
+                .get::<Arc<aisix_core::ResourceEntry<aisix_core::ApiKey>>>()
+                .map(|e| aisix_gateway::CallerIdentity::from_entry(e))
+                .unwrap_or_default(),
         })
     }
 }
