@@ -1495,7 +1495,10 @@ mod tests {
             .as_array()
             .unwrap();
         let ttft_attr = attrs.iter().find(|a| a["key"] == "aisix.upstream_ttft_ms");
-        assert!(ttft_attr.is_some(), "aisix.ttft_ms should be present");
+        assert!(
+            ttft_attr.is_some(),
+            "aisix.upstream_ttft_ms should be present"
+        );
         assert_eq!(ttft_attr.unwrap()["value"]["intValue"], "42");
     }
 

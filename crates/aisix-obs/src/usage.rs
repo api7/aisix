@@ -129,10 +129,11 @@ pub struct UsageEvent {
     /// are directly comparable. 0 on non-streaming, error, and
     /// cache-hit paths (omitted from the wire via skip_serializing_if).
     ///
-    /// This is what the UPSTREAM delivered. What the caller actually
-    /// waited for is `downstream_latency_ms`, which additionally covers
-    /// gateway-side work — most visibly an output guardrail that holds
-    /// the stream back to mask it.
+    /// This is what the UPSTREAM delivered on this attempt. What the
+    /// caller actually waited for is `downstream_latency_ms`, which also
+    /// covers gateway-side work — most visibly an output guardrail that
+    /// holds the stream back to mask it — and, when the request retried,
+    /// the earlier attempts too.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub upstream_ttft_ms: u32,
 
@@ -150,8 +151,13 @@ pub struct UsageEvent {
     /// response — including a failing one, so a request that never
     /// succeeded still shows what its caller waited for.
     ///
-    /// `downstream_latency_ms - upstream_ttft_ms` is therefore the
-    /// latency the gateway itself introduced.
+    /// `downstream_latency_ms - upstream_ttft_ms` is the wait the final
+    /// attempt's upstream did NOT account for. On a first-try request
+    /// that is gateway-side work (parsing, guardrail scans, hold-back).
+    /// On a request that retried or failed over it also contains every
+    /// earlier attempt plus the backoff, so it is NOT gateway overhead
+    /// there — read it together with `attempt_index` before attributing
+    /// the difference to anything.
     ///
     /// Absent (0) on the non-terminal attempts of a request, and on any
     /// path that never reached response delivery.

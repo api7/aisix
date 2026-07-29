@@ -1,3 +1,21 @@
+// E2E: a MASKING output guardrail puts the streamed response on the
+// hold-back path — nothing reaches the client until the whole response
+// scans clean. The caller therefore waits materially longer than the
+// upstream took to produce its first chunk, and the two figures must
+// show that:
+//
+//   upstream_ttft_ms      unchanged — the guardrail does not slow the
+//                         upstream leg down.
+//   downstream_latency_ms covers the whole wait, scan included.
+//
+// Measuring the caller-facing figure where the upstream chunk arrives
+// (rather than where bytes are handed to the client) collapses it to the
+// first number and hides the guardrail's cost entirely.
+//
+// This lives apart from `latency-upstream-downstream-e2e` because the
+// guardrail is env-scoped: seeding it in that file would silently push
+// its other cases onto the hold-back path too.
+
 import { createHash } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
@@ -33,7 +51,7 @@ import {
 // It also covers a bug fixed alongside: `/v1/responses` never recorded a
 // TTFT at all, so codex-class clients showed a blank figure.
 
-const CALLER_PLAINTEXT = "sk-latency-split-caller";
+const CALLER_PLAINTEXT = "sk-latency-holdback-caller";
 const CALLER_KEY_HASH = createHash("sha256")
   .update(CALLER_PLAINTEXT)
   .digest("hex");
@@ -130,7 +148,7 @@ function chatChunks(): string[] {
   return events;
 }
 
-describe("upstream vs downstream latency split", () => {
+describe("streamed latency under a hold-back output guardrail", () => {
   let etcdReachable = false;
   let app: SpawnedApp | undefined;
   let seed: SeedClient | undefined;
@@ -195,7 +213,7 @@ describe("upstream vs downstream latency split", () => {
     });
   }
 
-  test("without an output guardrail the two figures nearly coincide", async (ctx) => {
+  test("a masking output guardrail holds the stream back, and only the downstream figure shows it", async (ctx) => {
     if (!etcdReachable || !app || !seed || !otlp) {
       ctx.skip();
       return;
@@ -206,8 +224,17 @@ describe("upstream vs downstream latency split", () => {
       eventDelayMs: CHUNK_GAP_MS,
     });
     upstreams.push(upstream);
-    await createModel("latency-plain", upstream);
-    await awaitPropagation("plain");
+    await createModel("latency-masked", upstream);
+    // A masking detector puts the streamed-output policy into whole-response
+    // hold-back: nothing reaches the client until the scan clears.
+    await seed.createGuardrail({
+      name: "latency-split-mask",
+      enabled: true,
+      hook_point: "output",
+      kind: "pii",
+      detectors: [{ type: "email", action: "mask" }],
+    });
+    await awaitPropagation("masked");
 
     const res = await fetch(`${app.proxyUrl}/v1/chat/completions`, {
       method: "POST",
@@ -216,7 +243,7 @@ describe("upstream vs downstream latency split", () => {
         "content-type": "application/json",
       },
       body: JSON.stringify({
-        model: "latency-plain",
+        model: "latency-masked",
         messages: [{ role: "user", content: "stream please" }],
         stream: true,
       }),
@@ -230,63 +257,14 @@ describe("upstream vs downstream latency split", () => {
     const upstreamTtft = Number(span["aisix.upstream_ttft_ms"]);
     const downstream = Number(span["aisix.downstream_latency_ms"]);
 
-    expect(Number.isFinite(upstreamTtft)).toBe(true);
-    expect(Number.isFinite(downstream)).toBe(true);
-    // Live-forward: the client gets the first chunk as it arrives, so the
-    // caller-facing figure sits just above the upstream's TTFT — and well
-    // below the point where the whole stream has finished.
-    expect(downstream).toBeGreaterThanOrEqual(upstreamTtft);
-    expect(downstream - upstreamTtft).toBeLessThan(STREAM_TAIL_MS);
+    // The upstream still delivered its first chunk promptly — the guardrail
+    // does not slow the upstream leg down.
+    expect(upstreamTtft).toBeLessThan(STREAM_TAIL_MS);
+    // But the caller waited for the entire stream plus the scan. Measuring
+    // this off the upstream chunk (as the pre-split telemetry did) would
+    // report the small figure above and hide the guardrail's cost.
+    expect(downstream).toBeGreaterThanOrEqual(STREAM_TAIL_MS);
+    expect(downstream).toBeGreaterThan(upstreamTtft);
   });
 
-  test("/v1/responses streaming records a TTFT (it previously reported none)", async (ctx) => {
-    if (!etcdReachable || !app || !seed || !otlp) {
-      ctx.skip();
-      return;
-    }
-
-    const upstream = await startOpenAiUpstream({
-      streamEvents: [
-        JSON.stringify({ type: "response.created", response: { id: "resp_lat" } }),
-        JSON.stringify({ type: "response.output_text.delta", delta: "hello " }),
-        JSON.stringify({ type: "response.output_text.delta", delta: "there" }),
-        JSON.stringify({
-          type: "response.completed",
-          response: {
-            id: "resp_lat",
-            status: "completed",
-            usage: { input_tokens: 6, output_tokens: 9 },
-          },
-        }),
-        "[DONE]",
-      ],
-      eventDelayMs: CHUNK_GAP_MS,
-    });
-    upstreams.push(upstream);
-    await createModel("latency-responses", upstream);
-    await awaitPropagation("responses");
-
-    const res = await fetch(`${app.proxyUrl}/v1/responses`, {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${CALLER_PLAINTEXT}`,
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({
-        model: "latency-responses",
-        input: "measure ttft",
-        stream: true,
-      }),
-    });
-    expect(res.status).toBe(200);
-    const requestId = res.headers.get("x-aisix-request-id");
-    expect(requestId).toBeTruthy();
-    await res.text();
-
-    const span = await waitForSpan(otlp, requestId!);
-    // The regression: this attribute was absent entirely on /v1/responses.
-    expect(span["aisix.upstream_ttft_ms"]).toBeDefined();
-    expect(Number(span["aisix.upstream_ttft_ms"])).toBeGreaterThan(0);
-    expect(Number(span["aisix.downstream_latency_ms"])).toBeGreaterThan(0);
-  });
 });
