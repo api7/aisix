@@ -59,21 +59,28 @@ impl LivezState {
     }
 }
 
-/// A config snapshot older than this — or never applied — means the etcd
-/// watch isn't delivering fresh config, so the instance shouldn't be
-/// counted ready for traffic (#591). Matches the freshness threshold the
-/// admin health aggregate uses.
-pub const READYZ_STALE_AFTER: Duration = Duration::from_secs(300);
-
-/// Decide whether config freshness blocks readiness. `last_apply_age` is
-/// the time since the config watch last applied an event: `None` means no
-/// apply yet (still starting up / disconnected), `Some(age)` past the
-/// stale threshold means a wedged watch. Returns `Some(reason)` when the
-/// instance is not ready, `None` when config is fresh enough.
+/// Decide whether config availability blocks readiness. `last_apply_age` is
+/// the time since the config watch last applied an event; `None` means no
+/// apply yet — still starting up, or restarted with no usable snapshot
+/// cache. Returns `Some(reason)` when the instance cannot serve, `None`
+/// when it can.
+///
+/// The *age* is deliberately not an input. It measures time since the last
+/// config **event**, and an environment whose resources are not changing
+/// produces none — so a threshold on it reports a healthy gateway as
+/// unready once the environment goes quiet, which for most deployments is
+/// the steady state. `/readyz` previously blocked past 300s and took every
+/// replica out of its Service five minutes after a deployment went idle.
+///
+/// Nor is readiness the right lever for the case that threshold was aimed
+/// at. A genuinely wedged watch is a property of the config source, so it
+/// hits every replica at once: withdrawing them all converts "serving the
+/// last accepted config" into a total outage, with no healthy instance to
+/// shift traffic to. Config freshness stays observable — and alertable —
+/// on `/status/config` and the `aisix_config_*` metrics.
 pub fn config_readiness_block(last_apply_age: Option<Duration>) -> Option<&'static str> {
     match last_apply_age {
         None => Some("config not yet applied"),
-        Some(age) if age > READYZ_STALE_AFTER => Some("config watch is stale"),
         Some(_) => None,
     }
 }
@@ -797,12 +804,28 @@ mod tests {
     fn config_readiness_block_logic() {
         // No apply yet → not ready (startup).
         assert!(config_readiness_block(None).is_some());
-        // Fresh apply → ready.
+        // Applied → ready.
         assert!(config_readiness_block(Some(Duration::from_secs(5))).is_none());
-        // Beyond the stale threshold → not ready (wedged watch).
-        assert!(
-            config_readiness_block(Some(READYZ_STALE_AFTER + Duration::from_secs(1))).is_some()
-        );
+    }
+
+    #[test]
+    fn an_idle_environment_stays_ready() {
+        // The age is time since the last config EVENT, and an environment
+        // whose resources are not changing produces none. Blocking on it
+        // took every replica out of its Service five minutes after the
+        // deployment went quiet, while the watch was healthy the whole
+        // time. Ready must not depend on how long ago the last event was.
+        for age in [
+            Duration::from_secs(299),
+            Duration::from_secs(301),
+            Duration::from_secs(3600),
+            Duration::from_secs(86_400 * 7),
+        ] {
+            assert!(
+                config_readiness_block(Some(age)).is_none(),
+                "config applied {age:?} ago must still be ready",
+            );
+        }
     }
 
     #[tokio::test]
