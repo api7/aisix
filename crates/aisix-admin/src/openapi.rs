@@ -113,7 +113,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
             }
           },
           "503": {
-            "description": "Not ready: shutting down (drain), still starting up, or the config watch is stale",
+            "description": "Not ready: shutting down (drain), or no configuration applied yet",
             "content": {
               "text/plain": {
                 "schema": {
@@ -126,7 +126,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
         "tags": [
           "Health"
         ],
-        "description": "Traffic eligibility (readiness): 200 when the instance can serve, 503 while draining, before the first config apply, or when the etcd config watch is stale. Distinct from /livez (process liveness)."
+        "description": "Traffic eligibility (readiness): 200 when the instance can serve, 503 while draining or before the first config apply. Stays 200 for as long as the instance keeps serving that configuration, however long ago the last config event was — see /admin/v1/health and /status/config for configuration freshness. Distinct from /livez (process liveness)."
       }
     },
     "/admin/openapi.json": {

@@ -967,6 +967,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn readyz_stays_200_when_no_config_event_has_arrived_in_hours() {
+        // A gateway whose environment is not changing receives no config
+        // events, so the apply age grows without bound while the gateway is
+        // perfectly healthy. Readiness must not read that as a fault: it
+        // used to 503 past five minutes, which emptied the Kubernetes
+        // Service of every replica once a deployment went idle.
+        let hub = Arc::new(Hub::new());
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
+        let state = build_state(snap, hub)
+            .with_config_apply_age(Arc::new(|| Some(std::time::Duration::from_secs(7200))));
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/readyz?verbose")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(text.contains("[+]config ok"));
+    }
+
+    #[tokio::test]
     async fn health_route_is_not_found() {
         let hub = Arc::new(Hub::new());
         let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
