@@ -35,10 +35,13 @@ use rmcp::transport::streamable_http_server::session::local::LocalSessionManager
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{RoleServer, ServerHandler};
 
-use aisix_core::models::{ApiKey, McpAccessMode, McpPolicy, McpPolicyMode, McpPolicyScope};
+use aisix_core::models::{
+    ApiKey, McpAccessMode, McpPolicy, McpPolicyMode, McpPolicyScope, McpServerType,
+};
 use aisix_core::{AisixSnapshot, ResourceEntry};
 
 use crate::bridge::{upstream_from_mcp_server, EphemeralBridge, McpBridge};
+use crate::openapi::OpenApiBridge;
 
 /// Separator between an upstream server's registered name and a tool name in
 /// the aggregated namespace, e.g. `github__create_issue`. Server names must
@@ -274,11 +277,12 @@ impl McpGateway {
     }
 
     /// Build a gateway whose upstreams are the **enabled** `mcp_servers` in the
-    /// snapshot, each reached through an [`EphemeralBridge`] (connect per
-    /// request). Disabled servers are skipped. Registration order follows the
-    /// snapshot's iteration order; duplicate names are deduped (first
-    /// wins) by [`McpGateway::new`], though the Admin API already enforces
-    /// uniqueness.
+    /// snapshot: a `type: mcp` server is reached through an [`EphemeralBridge`]
+    /// (connect per request), a `type: openapi` server through an
+    /// [`OpenApiBridge`] that serves tools generated from its spec. Disabled
+    /// servers are skipped. Registration order follows the snapshot's
+    /// iteration order; duplicate names are deduped (first wins) by
+    /// [`McpGateway::new`], though the Admin API already enforces uniqueness.
     pub fn from_snapshot(snapshot: &AisixSnapshot) -> Self {
         let upstreams = snapshot
             .mcp_servers
@@ -286,9 +290,15 @@ impl McpGateway {
             .into_iter()
             .filter(|entry| entry.value.enabled)
             .map(|entry| {
-                let upstream = upstream_from_mcp_server(&entry.value);
-                let bridge: Arc<dyn McpBridge> = Arc::new(EphemeralBridge::new(upstream));
-                (entry.value.name.clone(), bridge)
+                let name = entry.value.name.clone();
+                let bridge: Arc<dyn McpBridge> = match entry.value.server_type {
+                    McpServerType::Mcp => {
+                        let upstream = upstream_from_mcp_server(&entry.value);
+                        Arc::new(EphemeralBridge::new(upstream))
+                    }
+                    McpServerType::Openapi => Arc::new(OpenApiBridge::new(entry)),
+                };
+                (name, bridge)
             });
         McpGateway::new(upstreams)
     }

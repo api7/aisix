@@ -17,6 +17,7 @@ pub mod bridge;
 pub mod error;
 pub mod gateway;
 mod oauth;
+pub mod openapi;
 
 pub use bridge::{
     upstream_from_mcp_server, EphemeralBridge, McpAuth, McpBridge, McpTool, McpToolResult,
@@ -24,3 +25,4 @@ pub use bridge::{
 };
 pub use error::McpError;
 pub use gateway::{streamable_http_service, McpGateway, ToolAcl, TOOL_NAMESPACE_SEPARATOR};
+pub use openapi::{validate_spec, OpenApiBridge};

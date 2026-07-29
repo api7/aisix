@@ -11,6 +11,9 @@ description = "aisix: Admin API + Playground + OpenAPI"
 [dependencies]
 aisix-core = { path = "../aisix-core" }
 aisix-etcd = { path = "../aisix-etcd" }
+# Strict OpenAPI-spec validation (`validate_spec`) for `type: openapi`
+# mcp_server writes.
+aisix-mcp = { path = "../aisix-mcp" }
 aisix-proxy = { path = "../aisix-proxy" }
 tokio.workspace = true
 axum.workspace = true

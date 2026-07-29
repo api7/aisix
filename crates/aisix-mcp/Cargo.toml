@@ -37,6 +37,8 @@ rmcp-reqwest = { package = "reqwest", version = "0.13", default-features = false
 # SHA-256 digest so a rotated secret never reuses the previous secret's token.
 sha2.workspace = true
 hex.workspace = true
+# Path-parameter encoding for OpenAPI-backed tool calls (`crate::openapi`).
+percent-encoding.workspace = true
 
 # Official MCP Rust SDK. Pinned exactly: rmcp is <16 months old and still
 # ships breaking changes on a roughly-monthly cadence, so we hold a fixed

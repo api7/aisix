@@ -284,7 +284,7 @@ impl RmcpBridge {
 /// Bound an upstream-derived error message for logging: control characters
 /// (log-injection vectors) are stripped and the text is truncated, since a
 /// bare non-success response embeds the upstream's body verbatim.
-fn sanitize_error_message(message: &str) -> String {
+pub(crate) fn sanitize_error_message(message: &str) -> String {
     const MAX_LEN: usize = 256;
     let cleaned: String = message
         .chars()
