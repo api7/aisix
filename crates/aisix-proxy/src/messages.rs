@@ -251,6 +251,13 @@ pub async fn messages(
                     .map(|w| w.target_model_id.as_str())
                     .unwrap_or(&model_id);
                 let attempt = winner.map(AttemptInfo::from_record).unwrap_or_default();
+                // `latency_ms` is scoped to the winning attempt: the failed
+                // attempts before it emitted their own events above, so
+                // `elapsed` (whole request) would double-count them. The
+                // access log carries the user-perceived total.
+                let winner_latency = winner
+                    .map(|w| Duration::from_millis(u64::from(w.latency_ms)))
+                    .unwrap_or(elapsed);
                 emit_anthropic_usage_event(
                     &state,
                     &request_id,
@@ -264,7 +271,7 @@ pub async fn messages(
                     auth.key().user_id.as_deref(),
                     auth.key().user_name.as_deref(),
                     status,
-                    elapsed,
+                    winner_latency,
                     metrics,
                     &client,
                     attempt,
@@ -746,6 +753,7 @@ async fn dispatch(
                 &model_name,
                 request_id,
                 started,
+                attempt_started,
                 &auth.entry.id,
                 auth.key().team_id.clone(),
                 auth.key().user_id.clone(),
@@ -869,6 +877,11 @@ async fn dispatch_to_target(
     model_name: &str,
     request_id: &str,
     started: Instant,
+    // When THIS attempt began. The streaming paths' end-of-stream
+    // UsageEvent reports `attempt_started.elapsed()` so `latency_ms` stays
+    // scoped to the attempt, matching the failed-attempt events and the
+    // non-streaming winner (`usage.rs` #655 contract).
+    attempt_started: Instant,
     api_key_id: &str,
     team_id: Option<String>,
     user_id: Option<String>,
@@ -911,6 +924,7 @@ async fn dispatch_to_target(
             model_name,
             request_id,
             started,
+            attempt_started,
             api_key_id,
             team_id,
             user_id,
@@ -936,6 +950,7 @@ async fn dispatch_to_target(
         model_name,
         request_id,
         started,
+        attempt_started,
         api_key_id,
         team_id,
         user_id,
@@ -966,6 +981,8 @@ async fn anthropic_passthrough_dispatch(
     model_name: &str,
     request_id: &str,
     started: Instant,
+    // When THIS attempt began — see `dispatch_to_target`.
+    attempt_started: Instant,
     api_key_id: &str,
     team_id: Option<String>,
     user_id: Option<String>,
@@ -1328,7 +1345,9 @@ async fn anthropic_passthrough_dispatch(
                     user_id_c.as_deref(),
                     user_name_c.as_deref(),
                     200,
-                    started.elapsed(),
+                    // Attempt-scoped, unlike the e2e histogram above: any
+                    // failed attempt before this one emitted its own event.
+                    attempt_started.elapsed(),
                     metrics,
                     &client_ctx_c,
                     attempt_c.clone(),
@@ -1694,6 +1713,8 @@ async fn cross_provider_dispatch(
     model_name: &str,
     request_id: &str,
     started: Instant,
+    // When THIS attempt began — see `dispatch_to_target`.
+    attempt_started: Instant,
     api_key_id: &str,
     team_id: Option<String>,
     user_id: Option<String>,
@@ -1845,6 +1866,7 @@ async fn cross_provider_dispatch(
         let user_id_for_telem = user_id;
         let user_name_for_telem = user_name;
         let started_for_telem = started;
+        let attempt_started_for_telem = attempt_started;
         // #492: log the same client IP/UA on streamed responses.
         let client_for_telem = client.clone();
         // Winning-attempt classification (#655) for the stream-end emit.
@@ -1955,7 +1977,8 @@ async fn cross_provider_dispatch(
                     user_id_for_telem.as_deref(),
                     user_name_for_telem.as_deref(),
                     200,
-                    started_for_telem.elapsed(),
+                    // Attempt-scoped — see the sibling passthrough path.
+                    attempt_started_for_telem.elapsed(),
                     metrics,
                     &client_for_telem,
                     attempt_for_telem.clone(),

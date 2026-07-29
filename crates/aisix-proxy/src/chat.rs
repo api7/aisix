@@ -496,6 +496,12 @@ pub async fn chat_completions(
                     let event_model_id = winner
                         .map(|w| w.target_model_id.as_str())
                         .unwrap_or(model_id_str);
+                    // ...and its own latency, for the same reason the success
+                    // path uses `winner_latency`: the preceding failed attempts
+                    // already emitted theirs.
+                    let winner_latency = winner
+                        .map(|w| Duration::from_millis(u64::from(w.latency_ms)))
+                        .unwrap_or(elapsed);
                     emit_usage_event(
                         &state,
                         &request_id,
@@ -503,7 +509,7 @@ pub async fn chat_completions(
                         &model_name,
                         &api_key_id,
                         status,
-                        elapsed,
+                        winner_latency,
                         c.prompt_tokens,
                         c.completion_tokens,
                         UsageExtras {
@@ -1223,6 +1229,11 @@ async fn dispatch(
             upstream: aisix_gateway::ChatChunkStream,
             idx: u32,
             kind: &'static str,
+            /// When this attempt began. The end-of-stream UsageEvent
+            /// reports `attempt_started.elapsed()` so `latency_ms` covers
+            /// this attempt alone, matching the failed-attempt events and
+            /// the non-streaming winner (#655 contract in `usage.rs`).
+            attempt_started: Instant,
         }
         let mut won: Option<StreamWin> = None;
         // The winning target's own model-layer reservation (routing dispatch
@@ -1401,6 +1412,7 @@ async fn dispatch(
                             upstream,
                             idx,
                             kind,
+                            attempt_started,
                         });
                         won_member_reservation = member_reservation;
                         break 'targets;
@@ -1478,6 +1490,7 @@ async fn dispatch(
             upstream,
             idx: winner_idx,
             kind: winner_kind,
+            attempt_started: winner_attempt_started,
         } = won;
         let model = &model;
         // Hold concurrency for the stream's full lifetime instead of
@@ -1635,7 +1648,12 @@ async fn dispatch(
                     &model_for_metrics,
                     &api_key_id_for_telem,
                     /* status_code */ 200,
-                    started.elapsed(),
+                    // Scoped to the winning attempt, not the request: the
+                    // failed attempts before it emit their own events and
+                    // `started` would double-count them (plus the pre-dispatch
+                    // work and the retry backoff). The access log keeps the
+                    // request-level figure.
+                    winner_attempt_started.elapsed(),
                     comp.prompt_tokens,
                     comp.completion_tokens,
                     UsageExtras {

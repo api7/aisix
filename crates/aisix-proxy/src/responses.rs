@@ -242,11 +242,15 @@ pub async fn responses(
                 if let Some(usage) = success.usage {
                     // Winning-attempt classification (#655). Direct models
                     // have no recorded attempt → AttemptInfo defaults.
-                    let attempt = success
-                        .routing
-                        .winner()
-                        .map(AttemptInfo::from_record)
-                        .unwrap_or_default();
+                    let winner = success.routing.winner();
+                    let attempt = winner.map(AttemptInfo::from_record).unwrap_or_default();
+                    // `latency_ms` is scoped to the winning attempt — the
+                    // failed ones before it emitted their own events, so
+                    // `elapsed` would double-count them. Access log keeps the
+                    // request-level total.
+                    let winner_latency = winner
+                        .map(|w| Duration::from_millis(u64::from(w.latency_ms)))
+                        .unwrap_or(elapsed);
                     emit_usage_event(
                         &state,
                         &request_id,
@@ -255,7 +259,7 @@ pub async fn responses(
                         &api_key_id,
                         &success.provider_key_id,
                         status,
-                        elapsed,
+                        winner_latency,
                         &usage,
                         &client,
                         attempt,
@@ -629,6 +633,7 @@ async fn dispatch(
                     request_id,
                     resolved_chain.clone(),
                     started,
+                    attempt_started,
                     &model_name,
                     &auth.entry.id,
                     client,
@@ -649,6 +654,7 @@ async fn dispatch(
                     request_id,
                     resolved_chain.clone(),
                     started,
+                    attempt_started,
                     &model_name,
                     &auth.entry.id,
                     client,
@@ -872,6 +878,10 @@ async fn responses_to_target(
     // path's Drop guard. Unused by the non-streaming / buffered paths,
     // which emit from the handler.
     started: Instant,
+    // When THIS attempt began. The end-of-stream UsageEvent reports
+    // `attempt_started.elapsed()` so `latency_ms` stays scoped to the
+    // attempt (`started` spans the whole request — see `usage.rs`).
+    attempt_started: Instant,
     requested_model: &str,
     api_key_id: &str,
     client_ctx: &ClientContext,
@@ -1426,7 +1436,9 @@ async fn responses_to_target(
                     &api_key_id_c,
                     &provider_key_id_c,
                     200,
-                    started.elapsed(),
+                    // Attempt-scoped, unlike the e2e histogram above: any
+                    // failed attempt before this one emitted its own event.
+                    attempt_started.elapsed(),
                     &usage,
                     &client_c,
                     attempt,
@@ -1620,6 +1632,8 @@ async fn responses_cross_provider_to_target(
     request_id: &str,
     chain: Arc<aisix_guardrails::GuardrailChain>,
     started: Instant,
+    // When THIS attempt began — see `responses_to_target`.
+    attempt_started: Instant,
     requested_model: &str,
     api_key_id: &str,
     client_ctx: &ClientContext,
@@ -1878,7 +1892,8 @@ async fn responses_cross_provider_to_target(
                     &api_key_id_c,
                     &provider_key_id_c,
                     status,
-                    started.elapsed(),
+                    // Attempt-scoped — see the sibling verbatim path.
+                    attempt_started.elapsed(),
                     &usage,
                     &client_c,
                     attempt_c,

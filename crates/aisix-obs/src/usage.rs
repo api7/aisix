@@ -253,11 +253,21 @@ pub struct UsageEvent {
     // Each UsageEvent now represents ONE upstream attempt. A request
     // that fails over emits multiple events sharing `request_id` (the
     // grouping/trace key); they are ordered by `attempt_index`. This
-    // mirrors a per-call logging model — `status_code`,
-    // `latency_ms`, and `ttft_ms` are scoped to THIS attempt, so the
-    // user-perceived total is reconstructed by summing the attempts of
-    // one `request_id`. Direct (non-routing) requests emit a single
-    // event with attempt_index=0, attempt_kind="initial".
+    // mirrors a per-call logging model — `status_code`, `latency_ms`,
+    // and `ttft_ms` are scoped to THIS attempt. Direct (non-routing)
+    // requests emit a single event with attempt_index=0,
+    // attempt_kind="initial".
+    //
+    // `latency_ms` measures that attempt alone: from the moment the
+    // attempt begins to the moment it settles — for a streamed attempt
+    // that is end-of-stream, not first-chunk (`ttft_ms` carries the
+    // first-token figure). It therefore excludes everything outside the
+    // attempt: request parsing, guardrail scans, routing, and the
+    // inter-attempt retry backoff. Summing a request's attempts yields
+    // upstream time, NOT the user-perceived total — that lives in the
+    // access log's `latency_ms`, which spans the whole request (and, on
+    // a streamed request, stops when the response head is handed to the
+    // client rather than when the body finishes).
     /// 0-based index of this attempt within the request. Together with
     /// `request_id` it uniquely identifies one attempt.
     #[serde(default)]
