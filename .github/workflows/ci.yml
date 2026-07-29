@@ -243,7 +243,11 @@ jobs:
           node-version: 20
       - uses: pnpm/action-setup@v6
         with:
-          version: 9
+          # Matches the pnpm developers run locally. The harness's
+          # `tests/e2e/pnpm-workspace.yaml` uses the `allowBuilds` key this
+          # line unlocks — pnpm 9 rejects that file outright, so the two
+          # must move together.
+          version: 11
       - name: check harness exists
         id: harness
         run: |
