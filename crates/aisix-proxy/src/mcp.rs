@@ -10,9 +10,9 @@
 //!
 //! A `tools/call` is governed by the SAME pipeline as an LLM request, keyed on
 //! the caller's API key: per-tool access control (the key's `allowed_tools`),
-//! rate-limit + budget (`quota::enforce`), guardrails on both the tool
-//! arguments (input) and the tool result (output), and a usage event into the
-//! shared sink.
+//! rate-limit + budget (`quota::enforce_mcp`, which adds the key's per-MCP-server
+//! limit to the shared layers), guardrails on both the tool arguments (input)
+//! and the tool result (output), and a usage event into the shared sink.
 
 use std::time::{Duration, Instant};
 
@@ -142,13 +142,15 @@ async fn dispatch(
         (String::new(), String::new())
     };
 
-    // Reuse the LLM path's rate-limit + budget gate on the unit of work. The
-    // reservation is held for the duration of the call and dropped after (no
-    // tokens to commit — a tool call carries no token cost), which releases the
-    // concurrency slot. On 429 / budget-exceeded this returns before any
-    // upstream is contacted — and the rejected call is still recorded.
+    // Reuse the LLM path's rate-limit + budget gate on the unit of work, plus
+    // the key's own limit for the MCP server this tool belongs to
+    // (AISIX-Cloud#1079). The reservation is held for the duration of the call
+    // and dropped after (no tokens to commit — a tool call carries no token
+    // cost), which releases the concurrency slot. On 429 / budget-exceeded this
+    // returns before any upstream is contacted — and the rejected call is still
+    // recorded.
     let _reservation = if is_tool_call {
-        match crate::quota::enforce(state, &auth, None).await {
+        match crate::quota::enforce_mcp(state, &auth, &mcp_server).await {
             Ok(reservation) => Some(reservation),
             Err(err) => {
                 let response = err.into_response();
@@ -544,6 +546,128 @@ mod tests {
             "tools/call",
             serde_json::json!({ "name": "ghost__tool", "arguments": {} }),
         )
+    }
+
+    /// A `tools/call` for `<server>__tool`, authenticated with `token`.
+    fn tools_call_on(token: &str, server: &str) -> HttpRequest<Body> {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": format!("{server}__tool"), "arguments": {} }
+        });
+        HttpRequest::post("/mcp")
+            .header("host", "mcp.aisix.example.com")
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    /// A snapshot carrying one key per `(id, token, mcp_rate_limits)` triple.
+    /// No key-level `rate_limit`, so any 429 can only come from the
+    /// per-MCP-server layer.
+    fn snapshot_with_mcp_server_limits(keys: &[(&str, &str, serde_json::Value)]) -> AisixSnapshot {
+        let snapshot = AisixSnapshot::new();
+        for (id, token, limits) in keys {
+            let apikey: ApiKey = serde_json::from_value(serde_json::json!({
+                "key_hash": ApiKey::hash_bearer(token),
+                "allowed_models": ["*"],
+                "allowed_tools": ["*"],
+                "mcp_rate_limits": limits,
+            }))
+            .expect("valid apikey");
+            snapshot.apikeys.insert(ResourceEntry::new(*id, apikey, 1));
+        }
+        snapshot
+    }
+
+    #[tokio::test]
+    async fn mcp_server_rate_limit_counts_per_server() {
+        // The key may call `alpha` once a minute; `beta` is uncapped.
+        let router = router_with(snapshot_with_mcp_server_limits(&[(
+            "ak-1",
+            TOKEN,
+            serde_json::json!({ "alpha": { "rpm": 1 } }),
+        )]));
+
+        let first = router
+            .clone()
+            .oneshot(tools_call_on(TOKEN, "alpha"))
+            .await
+            .expect("router responds");
+        assert_ne!(
+            first.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "first alpha tool call should pass the gate"
+        );
+
+        let second = router
+            .clone()
+            .oneshot(tools_call_on(TOKEN, "alpha"))
+            .await
+            .expect("router responds");
+        assert_eq!(
+            second.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "second alpha tool call in the window should be rate-limited"
+        );
+
+        // A server the key sets no limit for keeps its own (unlimited)
+        // counter — alpha's burst must not spend beta's budget.
+        for _ in 0..3 {
+            let other = router
+                .clone()
+                .oneshot(tools_call_on(TOKEN, "beta"))
+                .await
+                .expect("router responds");
+            assert_ne!(
+                other.status(),
+                StatusCode::TOO_MANY_REQUESTS,
+                "an unlimited server must not be limited by another server's burst"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_server_rate_limit_counts_per_key() {
+        // Two keys, each capped at one `alpha` call per minute. Exhausting
+        // one must leave the other's quota intact.
+        const OTHER_TOKEN: &str = "sk-mcp-endpoint-test-2";
+        let limits = serde_json::json!({ "alpha": { "rpm": 1 } });
+        let router = router_with(snapshot_with_mcp_server_limits(&[
+            ("ak-1", TOKEN, limits.clone()),
+            ("ak-2", OTHER_TOKEN, limits),
+        ]));
+
+        for _ in 0..2 {
+            router
+                .clone()
+                .oneshot(tools_call_on(TOKEN, "alpha"))
+                .await
+                .expect("router responds");
+        }
+        let exhausted = router
+            .clone()
+            .oneshot(tools_call_on(TOKEN, "alpha"))
+            .await
+            .expect("router responds");
+        assert_eq!(
+            exhausted.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "the first key should be at its alpha limit"
+        );
+
+        let other_key = router
+            .oneshot(tools_call_on(OTHER_TOKEN, "alpha"))
+            .await
+            .expect("router responds");
+        assert_ne!(
+            other_key.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "a second key must not be limited by the first key's burst"
+        );
     }
 
     #[tokio::test]

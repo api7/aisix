@@ -61,7 +61,7 @@ pub use provider_key::{
     ParamConstraints, ProviderKey, RequestOverrides, ResponseOverrides, StreamDoneMarker,
     TelemetryKind, TelemetryTags,
 };
-pub use rate_limit::RateLimit;
+pub use rate_limit::{McpRateLimit, RateLimit};
 pub use rate_limit_policy::{PolicyScope, PolicyWindow, RateLimitPolicy};
 pub use routing::{Routing, RoutingStrategy, RoutingTarget, WhenAllUnavailablePolicy};
 pub use schema::{

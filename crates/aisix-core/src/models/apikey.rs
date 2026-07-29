@@ -9,11 +9,13 @@
 //! looks up by the hash. Net security win: no plaintext API key
 //! ever sits in the DB or KV.
 
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::mcp_policy::McpAccess;
-use super::rate_limit::RateLimit;
+use super::rate_limit::{McpRateLimit, RateLimit};
 use crate::resource::Resource;
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -96,6 +98,16 @@ pub struct ApiKey {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_access: Option<McpAccess>,
 
+    /// Per-MCP-server limits for this key, keyed by the registered MCP server
+    /// name — the `<server>` half of the `<server>__<tool>` names the gateway
+    /// exposes. A `tools/call` is metered against the entry for the server it
+    /// targets **and** the key's own `rate_limit`, each in its own counter, so
+    /// a burst against one server never consumes another's budget. A server
+    /// with no entry here is bounded by `rate_limit` alone. Only tool calls
+    /// are metered; the `initialize` / `tools/list` handshake is not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_rate_limits: Option<BTreeMap<String, McpRateLimit>>,
+
     /// A2A agents this key may reach, named by their registered names. Entries
     /// are matched as single-`*` globs, mirroring `allowed_tools`: `"*"` grants
     /// every agent and an entry without a `*` matches one agent exactly. When
@@ -177,6 +189,13 @@ impl ApiKey {
                 .iter()
                 .any(|t| crate::wildcard::wildcard_matches(t, tool)),
         }
+    }
+
+    /// The limits this key carries for one MCP server, named as it is
+    /// registered (the `<server>` namespace of a `<server>__<tool>` call).
+    /// `None` when the key sets no limit for that server.
+    pub fn mcp_rate_limit(&self, server: &str) -> Option<&McpRateLimit> {
+        self.mcp_rate_limits.as_ref()?.get(server)
     }
 
     /// True if this key may reach the given A2A agent, named by its registered
@@ -281,6 +300,7 @@ mod tests {
             jwt_provider: None,
             allowed_tools: None,
             mcp_access: None,
+            mcp_rate_limits: None,
             allowed_agents: None,
             expires_at: None,
             disabled: false,
