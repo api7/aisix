@@ -60,6 +60,58 @@
         }
       ]
     },
+    "McpRateLimit": {
+      "additionalProperties": false,
+      "description": "Limits for one API key's calls to one MCP server (`ApiKey::mcp_rate_limits`).\n\nCarries only the request-count dimensions of [`RateLimit`]: an MCP `tools/call` commits no tokens, so a token-rate cap here would never be consumed — the shape leaves `tpm`/`tpd` out rather than accepting a knob that is silently inert.",
+      "properties": {
+        "concurrency": {
+          "description": "Max concurrent in-flight tool calls.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "rpd": {
+          "description": "Tool calls per 86,400-second window.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "rph": {
+          "description": "Tool calls per 3,600-second window.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "rpm": {
+          "description": "Tool calls per 60-second window.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "rps": {
+          "description": "Tool calls per 1-second window.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "RateLimit": {
       "additionalProperties": false,
       "properties": {
@@ -208,6 +260,16 @@
         }
       ],
       "description": "Policy-driven MCP access for this key. When present, it supersedes `allowed_tools`: the key's grant is computed from the environment's and its team's MCP access policies according to `mode` (`inherit`, `restrict`, or `deny`), and `allowed_tools` is not consulted. When omitted, the key keeps the explicit `allowed_tools` behavior — with policy `deny` patterns still subtracted, since deny applies to every key the policy covers."
+    },
+    "mcp_rate_limits": {
+      "additionalProperties": {
+        "$ref": "#/definitions/McpRateLimit"
+      },
+      "description": "Per-MCP-server limits for this key, keyed by the registered MCP server name — the `<server>` half of the `<server>__<tool>` names the gateway exposes. A `tools/call` is metered against the entry for the server it targets **and** the key's own `rate_limit`, each in its own counter, so a burst against one server never consumes another's budget. A server with no entry here is bounded by `rate_limit` alone. Only tool calls are metered; the `initialize` / `tools/list` handshake is not.",
+      "type": [
+        "object",
+        "null"
+      ]
     },
     "rate_limit": {
       "anyOf": [
