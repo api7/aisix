@@ -112,14 +112,51 @@ pub struct UsageEvent {
     #[serde(default, skip_serializing_if = "is_false")]
     pub usage_estimated: bool,
 
-    pub latency_ms: u32,
+    /// How long THIS attempt spent on the upstream, in milliseconds:
+    /// from the moment the attempt began to the moment it settled —
+    /// end-of-stream for a streamed attempt, not first-chunk.
+    ///
+    /// Attempt-scoped, so it excludes request parsing, guardrail scans,
+    /// routing, and the inter-attempt retry backoff. Summing a request's
+    /// attempts yields upstream time, NOT what the caller waited — that
+    /// is `downstream_latency_ms`.
+    pub upstream_latency_ms: u32,
 
-    /// Time to first token in milliseconds. Only meaningful on the
-    /// streaming path — measures elapsed time from request entry to
-    /// the first upstream SSE chunk. 0 on non-streaming, error, and
+    /// Time to the upstream's first token, in milliseconds — measured
+    /// from the start of THIS attempt to the first upstream SSE chunk
+    /// carrying generated output (role-only preamble chunks don't
+    /// count). Same attempt scope as `upstream_latency_ms`, so the two
+    /// are directly comparable. 0 on non-streaming, error, and
     /// cache-hit paths (omitted from the wire via skip_serializing_if).
+    ///
+    /// This is what the UPSTREAM delivered. What the caller actually
+    /// waited for is `downstream_latency_ms`, which additionally covers
+    /// gateway-side work — most visibly an output guardrail that holds
+    /// the stream back to mask it.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
-    pub ttft_ms: u32,
+    pub upstream_ttft_ms: u32,
+
+    /// What the CALLER waited for, in milliseconds: from the gateway
+    /// receiving the request to it handing the client the first thing
+    /// it can use —
+    ///
+    /// - non-streaming: the complete response is written;
+    /// - streaming: the first token is forwarded downstream.
+    ///
+    /// Request-scoped (unlike the two `upstream_*` fields above), so it
+    /// spans request parsing, guardrail scans, every failed attempt,
+    /// the retry backoff, and any output-guardrail hold-back. Recorded
+    /// once per request, on the attempt that produced the terminal
+    /// response — including a failing one, so a request that never
+    /// succeeded still shows what its caller waited for.
+    ///
+    /// `downstream_latency_ms - upstream_ttft_ms` is therefore the
+    /// latency the gateway itself introduced.
+    ///
+    /// Absent (0) on the non-terminal attempts of a request, and on any
+    /// path that never reached response delivery.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub downstream_latency_ms: u32,
 
     /// HTTP status code the proxy returned to the downstream caller.
     pub status_code: u16,
@@ -253,21 +290,21 @@ pub struct UsageEvent {
     // Each UsageEvent now represents ONE upstream attempt. A request
     // that fails over emits multiple events sharing `request_id` (the
     // grouping/trace key); they are ordered by `attempt_index`. This
-    // mirrors a per-call logging model — `status_code`, `latency_ms`,
-    // and `ttft_ms` are scoped to THIS attempt. Direct (non-routing)
-    // requests emit a single event with attempt_index=0,
-    // attempt_kind="initial".
+    // mirrors a per-call logging model — `status_code`,
+    // `upstream_latency_ms` and `upstream_ttft_ms` are scoped to THIS
+    // attempt. Direct (non-routing) requests emit a single event with
+    // attempt_index=0, attempt_kind="initial".
     //
-    // `latency_ms` measures that attempt alone: from the moment the
-    // attempt begins to the moment it settles — for a streamed attempt
-    // that is end-of-stream, not first-chunk (`ttft_ms` carries the
-    // first-token figure). It therefore excludes everything outside the
-    // attempt: request parsing, guardrail scans, routing, and the
-    // inter-attempt retry backoff. Summing a request's attempts yields
-    // upstream time, NOT the user-perceived total — that lives in the
-    // access log's `latency_ms`, which spans the whole request (and, on
-    // a streamed request, stops when the response head is handed to the
-    // client rather than when the body finishes).
+    // The two latency families answer different questions and are
+    // deliberately measured against different clocks:
+    //
+    //   upstream_*   — attempt-scoped. How the upstream behaved on this
+    //                  one call. Comparable across attempts.
+    //   downstream_* — request-scoped, written once per request. What
+    //                  the caller waited for, gateway overhead included.
+    //
+    // So a request's caller-facing latency is read off the single event
+    // carrying `downstream_latency_ms` — never by summing attempts.
     /// 0-based index of this attempt within the request. Together with
     /// `request_id` it uniquely identifies one attempt.
     #[serde(default)]
@@ -795,7 +832,7 @@ mod tests {
             requested_model: "smart-group".into(),
             prompt_tokens: 12,
             completion_tokens: 34,
-            latency_ms: 56,
+            upstream_latency_ms: 56,
             status_code: 200,
             cost_usd: 0.0012,
             guardrail_blocked: false,
@@ -831,7 +868,7 @@ mod tests {
         assert!(!json.contains("provider_request_id"));
         assert!(!json.contains("provider_model_version"));
         assert!(!json.contains("finish_reason"));
-        assert!(!json.contains("ttft_ms"));
+        assert!(!json.contains("upstream_ttft_ms"));
         // ProviderKey telemetry tag wire-compat (#302 M17 /
         // AISIX-Cloud#436). Pre-attribution DP images would emit
         // empty / false defaults, which must NOT appear on the wire.
@@ -953,7 +990,7 @@ mod tests {
             provider_request_id: "chatcmpl-abc".into(),
             provider_model_version: "gpt-4o-2024-08-06".into(),
             finish_reason: "stop".into(),
-            ttft_ms: 123,
+            upstream_ttft_ms: 123,
             ..Default::default()
         };
         let json = serde_json::to_string(&ev).unwrap();
@@ -964,7 +1001,7 @@ mod tests {
         assert!(json.contains(r#""provider_request_id":"chatcmpl-abc""#));
         assert!(json.contains(r#""provider_model_version":"gpt-4o-2024-08-06""#));
         assert!(json.contains(r#""finish_reason":"stop""#));
-        assert!(json.contains(r#""ttft_ms":123"#));
+        assert!(json.contains(r#""upstream_ttft_ms":123"#));
     }
 
     #[test]
@@ -978,7 +1015,7 @@ mod tests {
             status_code: 502,
             error_class: "upstream_status".into(),
             error_message: "upstream returned 502".into(),
-            latency_ms: 2000,
+            upstream_latency_ms: 2000,
             ..Default::default()
         };
         let json = serde_json::to_string(&failed).unwrap();

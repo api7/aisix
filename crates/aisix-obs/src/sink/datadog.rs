@@ -474,7 +474,7 @@ mod tests {
             status_code: 200,
             prompt_tokens: 5,
             completion_tokens: 7,
-            latency_ms: 123,
+            upstream_latency_ms: 123,
             provider_model_version: "gpt-4o-2024-08-06".into(),
             finish_reason: "stop".into(),
             ..UsageEvent::default()
@@ -523,7 +523,7 @@ mod tests {
         // AISIX custom dimensions under the `aisix.` prefix.
         assert_eq!(log["aisix.request_id"], "req-42");
         assert_eq!(log["aisix.model_id"], "gpt-4o");
-        assert_eq!(log["aisix.latency_ms"], 123);
+        assert_eq!(log["aisix.upstream_latency_ms"], 123);
 
         // The API key must NEVER appear in the body anywhere.
         let body_text = serde_json::to_string(&logs).unwrap();

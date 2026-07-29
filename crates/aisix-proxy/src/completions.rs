@@ -638,7 +638,10 @@ fn emit_usage_event(
         prompt_tokens: usage.prompt_tokens,
         completion_tokens: usage.completion_tokens,
         usage_estimated: usage.usage_estimated,
-        latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
+        // Single-attempt endpoint: the attempt spans the whole request, so
+        // the upstream figure and what the caller waited for coincide.
+        upstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
+        downstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
         status_code,
         inbound_protocol: "openai".to_string(),
         client_source_ip: client.source_ip.clone(),
