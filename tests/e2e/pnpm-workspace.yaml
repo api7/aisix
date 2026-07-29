@@ -1,0 +1,11 @@
+# pnpm 10+ does not run a dependency's install scripts unless it is named
+# here. esbuild (via vitest) links its platform binary in that script, and
+# pnpm 9 ran it by default — so keeping it enabled preserves the behavior
+# this harness has always had. Without the entry `pnpm install` fails with
+# ERR_PNPM_IGNORED_BUILDS.
+#
+# This file MUST NOT be committed while CI still installs with pnpm 9: a
+# workspace manifest without a `packages:` key fails that version outright
+# ("packages field missing or empty").
+allowBuilds:
+  esbuild: true
