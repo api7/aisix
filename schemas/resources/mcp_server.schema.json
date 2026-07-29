@@ -53,6 +53,27 @@
         }
       ]
     },
+    "McpServerType": {
+      "description": "What backs a registered MCP server entry.",
+      "oneOf": [
+        {
+          "description": "A real upstream MCP server the gateway connects to.",
+          "enum": [
+            "mcp"
+          ],
+          "title": "Upstream MCP server",
+          "type": "string"
+        },
+        {
+          "description": "A REST API described by an OpenAPI document; the gateway generates the tools itself and issues plain HTTP requests against `url`.",
+          "enum": [
+            "openapi"
+          ],
+          "title": "REST API described by an OpenAPI document",
+          "type": "string"
+        }
+      ]
+    },
     "McpTransport": {
       "description": "Transport used to reach an upstream MCP server.",
       "oneOf": [
@@ -68,6 +89,14 @@
     }
   },
   "properties": {
+    "api_key_header": {
+      "description": "Header name the API key is sent under when `type` is `openapi` and `auth_type` is `api_key`. Defaults to `x-api-key` when unset. Ignored for `type: mcp`, whose API-key header is fixed.",
+      "minLength": 1,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "auth_type": {
       "allOf": [
         {
@@ -110,11 +139,14 @@
       ]
     },
     "secret": {
-      "description": "Authentication credential for the upstream server. Its meaning follows `auth_type`: the bearer token when `auth_type` is `bearer` (sent as `Authorization: Bearer <secret>`), the API key when `auth_type` is `api_key` (sent as `x-api-key: <secret>`), or the OAuth client secret when `auth_type` is `oauth2`. Leave unset when `auth_type` is `none`.",
+      "description": "Authentication credential for the upstream server. Its meaning follows `auth_type`: the bearer token when `auth_type` is `bearer` (sent as `Authorization: Bearer <secret>`), the API key when `auth_type` is `api_key` (sent as `x-api-key: <secret>`, or under `api_key_header` for `type: openapi`), or the OAuth client secret when `auth_type` is `oauth2`. Leave unset when `auth_type` is `none`.",
       "type": [
         "string",
         "null"
       ]
+    },
+    "spec": {
+      "description": "The OpenAPI 3.x document (as a JSON object) whose operations become this server's tools. Required when `type` is `openapi`; ignored otherwise."
     },
     "timeout_ms": {
       "description": "Maximum time, in milliseconds, to wait for a single upstream operation (establishing the session, listing tools, or calling a tool). Must be at least `1` when set. When omitted, the gateway applies a built-in default.",
@@ -141,8 +173,17 @@
       "default": "streamable_http",
       "description": "Transport used to reach the upstream server. Streamable HTTP is the only supported transport."
     },
+    "type": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/McpServerType"
+        }
+      ],
+      "default": "mcp",
+      "description": "What backs this server: a real upstream MCP server (`mcp`, the default), or a plain REST API described by an OpenAPI document (`openapi`) whose operations the gateway itself exposes as MCP tools."
+    },
     "url": {
-      "description": "The upstream server's MCP endpoint URL, reached over the Streamable HTTP transport, such as `https://api.example.com/mcp`.",
+      "description": "For `type: mcp`, the upstream server's MCP endpoint URL, reached over the Streamable HTTP transport, such as `https://api.example.com/mcp`. For `type: openapi`, the REST API's base URL that generated tool calls are issued against, such as `https://erp.internal/api/v1`.",
       "minLength": 1,
       "type": "string"
     }

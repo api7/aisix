@@ -7,7 +7,7 @@
 
 use aisix_core::models::validate_mcp_server;
 use aisix_core::resource::ResourceEntry;
-use aisix_core::{McpAuthType, McpServer};
+use aisix_core::{McpAuthType, McpServer, McpServerType};
 use axum::extract::{Path, State};
 use axum::Json;
 use serde_json::Value;
@@ -130,6 +130,55 @@ fn decode(raw: &Value) -> Result<McpServer, AdminError> {
         }
         McpAuthType::Bearer | McpAuthType::ApiKey => {}
     }
+    // Per-type coupling: an openapi-backed server must carry a spec that
+    // strictly generates at least one tool (clear errors for an unusable or
+    // colliding document); an MCP server must not carry openapi-only fields.
+    match server.server_type {
+        McpServerType::Openapi => {
+            let spec = server.spec.as_ref().ok_or_else(|| {
+                AdminError::BadRequest(
+                    "spec (an OpenAPI 3.x document) is required when type is `openapi`".to_string(),
+                )
+            })?;
+            if !spec.is_object() {
+                return Err(AdminError::BadRequest(
+                    "spec must be a JSON object (an OpenAPI 3.x document)".to_string(),
+                ));
+            }
+            if let Some(version) = spec.get("swagger").and_then(Value::as_str) {
+                return Err(AdminError::BadRequest(format!(
+                    "Swagger {version} documents are not supported — convert the spec to \
+                     OpenAPI 3.x"
+                )));
+            }
+            aisix_mcp::validate_spec(spec)
+                .map_err(|e| AdminError::BadRequest(format!("invalid OpenAPI spec: {e}")))?;
+            if let Some(header) = server.api_key_header.as_deref() {
+                if server.auth_type != McpAuthType::ApiKey {
+                    return Err(AdminError::BadRequest(
+                        "api_key_header is only valid when auth_type is `api_key`".to_string(),
+                    ));
+                }
+                if http::HeaderName::from_bytes(header.as_bytes()).is_err() {
+                    return Err(AdminError::BadRequest(format!(
+                        "api_key_header `{header}` is not a valid HTTP header name"
+                    )));
+                }
+            }
+        }
+        McpServerType::Mcp => {
+            if server.spec.is_some() {
+                return Err(AdminError::BadRequest(
+                    "spec is only valid when type is `openapi`".to_string(),
+                ));
+            }
+            if server.api_key_header.is_some() {
+                return Err(AdminError::BadRequest(
+                    "api_key_header is only valid when type is `openapi`".to_string(),
+                ));
+            }
+        }
+    }
     Ok(server)
 }
 
@@ -197,6 +246,113 @@ mod tests {
             assert!(
                 matches!(err, AdminError::BadRequest(_)),
                 "oauth2 without `{missing}` must be a BadRequest"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_openapi_type_coupling() {
+        let minimal_spec = json!({
+            "openapi": "3.0.0",
+            "paths": { "/items": { "get": { "operationId": "listItems" } } }
+        });
+
+        // Well-formed openapi server passes.
+        let ok = decode(&json!({
+            "name": "erp",
+            "type": "openapi",
+            "url": "https://erp.internal/api",
+            "spec": minimal_spec,
+            "auth_type": "api_key",
+            "secret": "k",
+            "api_key_header": "X-ERP-Key"
+        }))
+        .expect("valid openapi server");
+        assert_eq!(ok.server_type, McpServerType::Openapi);
+
+        // Missing spec.
+        let err = decode(&json!({
+            "name": "erp",
+            "type": "openapi",
+            "url": "https://erp.internal/api"
+        }))
+        .unwrap_err();
+        assert!(
+            matches!(&err, AdminError::BadRequest(m) if m.contains("spec")),
+            "{err:?}"
+        );
+
+        // Swagger 2.0 gets a targeted conversion hint.
+        let err = decode(&json!({
+            "name": "erp",
+            "type": "openapi",
+            "url": "https://erp.internal/api",
+            "spec": { "swagger": "2.0", "paths": { "/a": { "get": {} } } }
+        }))
+        .unwrap_err();
+        assert!(
+            matches!(&err, AdminError::BadRequest(m) if m.contains("OpenAPI 3")),
+            "{err:?}"
+        );
+
+        // Colliding operationIds are a clear write-time error.
+        let err = decode(&json!({
+            "name": "erp",
+            "type": "openapi",
+            "url": "https://erp.internal/api",
+            "spec": { "paths": {
+                "/a": { "get": { "operationId": "foo/list" } },
+                "/b": { "get": { "operationId": "foo.list" } }
+            } }
+        }))
+        .unwrap_err();
+        assert!(
+            matches!(&err, AdminError::BadRequest(m) if m.contains("duplicate tool names")),
+            "{err:?}"
+        );
+
+        // api_key_header demands api_key auth and a valid header name.
+        let err = decode(&json!({
+            "name": "erp",
+            "type": "openapi",
+            "url": "https://erp.internal/api",
+            "spec": minimal_spec,
+            "api_key_header": "X-Key"
+        }))
+        .unwrap_err();
+        assert!(
+            matches!(&err, AdminError::BadRequest(m) if m.contains("auth_type")),
+            "{err:?}"
+        );
+        let err = decode(&json!({
+            "name": "erp",
+            "type": "openapi",
+            "url": "https://erp.internal/api",
+            "spec": minimal_spec,
+            "auth_type": "api_key",
+            "secret": "k",
+            "api_key_header": "bad header\nname"
+        }))
+        .unwrap_err();
+        assert!(
+            matches!(&err, AdminError::BadRequest(m) if m.contains("header name")),
+            "{err:?}"
+        );
+
+        // Openapi-only fields are rejected on a plain MCP server.
+        for (field, value) in [
+            ("spec", minimal_spec.clone()),
+            ("api_key_header", json!("X-Key")),
+        ] {
+            let err = decode(&json!({
+                "name": "gh",
+                "url": "https://x/mcp",
+                field: value
+            }))
+            .unwrap_err();
+            assert!(
+                matches!(&err, AdminError::BadRequest(m) if m.contains("openapi")),
+                "{field}: {err:?}"
             );
         }
     }

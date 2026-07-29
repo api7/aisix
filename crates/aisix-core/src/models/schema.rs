@@ -313,6 +313,14 @@ pub fn mcp_server_root_schema() -> Value {
             "McpTransport",
             &[("streamable_http", "Streamable HTTP")],
         );
+        title_single_value_enum_variants(
+            defs,
+            "McpServerType",
+            &[
+                ("mcp", "Upstream MCP server"),
+                ("openapi", "REST API described by an OpenAPI document"),
+            ],
+        );
     }
     schema
 }

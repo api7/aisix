@@ -1,10 +1,12 @@
-//! `McpServer` entity — a registered upstream MCP server.
+//! `McpServer` entity — a registered MCP tool source.
 //!
-//! Registers an upstream Model Context Protocol (MCP) server so the gateway can
-//! front it: its tools are aggregated into the gateway's own MCP endpoint under
-//! the namespace `<name>__<tool>`, and tool calls are routed back to it.
-//! The upstream credential is held by the gateway and is never exposed to the
-//! calling client.
+//! Registers either an upstream Model Context Protocol (MCP) server the
+//! gateway fronts (`type: mcp`), or a REST API described by an OpenAPI
+//! document whose operations the gateway itself exposes as tools
+//! (`type: openapi`). Either way the tools are aggregated into the gateway's
+//! own MCP endpoint under the namespace `<name>__<tool>`, and tool calls are
+//! routed back to the source. The upstream credential is held by the gateway
+//! and is never exposed to the calling client.
 //!
 //! etcd path: `{prefix}/mcp_servers/{uuid}`. Secondary index on `name`.
 
@@ -12,7 +14,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::resource::Resource;
 
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
+// `Eq` is deliberately absent: `spec` holds a `serde_json::Value`, which is
+// only `PartialEq` (JSON numbers are floats).
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct McpServer {
     /// Operator-facing label, unique within the gateway. It is used as the
@@ -26,10 +30,31 @@ pub struct McpServer {
     #[schemars(length(min = 1))]
     pub name: String,
 
-    /// The upstream server's MCP endpoint URL, reached over the Streamable HTTP
-    /// transport, such as `https://api.example.com/mcp`.
+    /// What backs this server: a real upstream MCP server (`mcp`, the
+    /// default), or a plain REST API described by an OpenAPI document
+    /// (`openapi`) whose operations the gateway itself exposes as MCP tools.
+    #[serde(rename = "type", default)]
+    pub server_type: McpServerType,
+
+    /// For `type: mcp`, the upstream server's MCP endpoint URL, reached over
+    /// the Streamable HTTP transport, such as `https://api.example.com/mcp`.
+    /// For `type: openapi`, the REST API's base URL that generated tool calls
+    /// are issued against, such as `https://erp.internal/api/v1`.
     #[schemars(length(min = 1))]
     pub url: String,
+
+    /// The OpenAPI 3.x document (as a JSON object) whose operations become
+    /// this server's tools. Required when `type` is `openapi`; ignored
+    /// otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec: Option<serde_json::Value>,
+
+    /// Header name the API key is sent under when `type` is `openapi` and
+    /// `auth_type` is `api_key`. Defaults to `x-api-key` when unset. Ignored
+    /// for `type: mcp`, whose API-key header is fixed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
+    pub api_key_header: Option<String>,
 
     /// Transport used to reach the upstream server. Streamable HTTP is the only
     /// supported transport.
@@ -45,8 +70,9 @@ pub struct McpServer {
     /// Authentication credential for the upstream server. Its meaning follows
     /// `auth_type`: the bearer token when `auth_type` is `bearer` (sent as
     /// `Authorization: Bearer <secret>`), the API key when `auth_type` is
-    /// `api_key` (sent as `x-api-key: <secret>`), or the OAuth client secret
-    /// when `auth_type` is `oauth2`. Leave unset when `auth_type` is `none`.
+    /// `api_key` (sent as `x-api-key: <secret>`, or under `api_key_header`
+    /// for `type: openapi`), or the OAuth client secret when `auth_type` is
+    /// `oauth2`. Leave unset when `auth_type` is `none`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret: Option<String>,
 
@@ -94,6 +120,20 @@ pub struct McpServer {
 
 fn default_enabled() -> bool {
     true
+}
+
+/// What backs a registered MCP server entry.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum McpServerType {
+    /// A real upstream MCP server the gateway connects to.
+    #[default]
+    Mcp,
+    /// A REST API described by an OpenAPI document; the gateway generates the
+    /// tools itself and issues plain HTTP requests against `url`.
+    Openapi,
 }
 
 /// Transport used to reach an upstream MCP server.
@@ -291,7 +331,10 @@ mod tests {
     fn round_trip_omits_default_optionals() {
         let original = McpServer {
             name: "github".into(),
+            server_type: McpServerType::Mcp,
             url: "https://x/mcp".into(),
+            spec: None,
+            api_key_header: None,
             transport: McpTransport::StreamableHttp,
             auth_type: McpAuthType::None,
             secret: None,
@@ -303,7 +346,56 @@ mod tests {
             runtime_id: String::new(),
         };
         let s = serde_json::to_string(&original).unwrap();
+        // Unset openapi-mode fields are omitted from the wire shape entirely.
+        assert!(!s.contains("spec"), "got: {s}");
+        assert!(!s.contains("api_key_header"), "got: {s}");
         let back: McpServer = serde_json::from_str(&s).unwrap();
         assert_eq!(original, back);
+    }
+
+    // ---- `type: openapi` ----
+
+    #[test]
+    fn defaults_to_mcp_type() {
+        let s: McpServer =
+            serde_json::from_str(r#"{"name":"github","url":"https://x/mcp"}"#).unwrap();
+        assert_eq!(s.server_type, McpServerType::Mcp);
+        assert!(s.spec.is_none());
+        assert!(s.api_key_header.is_none());
+    }
+
+    #[test]
+    fn deserialises_openapi_server_with_spec() {
+        let s: McpServer = serde_json::from_str(
+            r#"{"name":"erp","type":"openapi","url":"https://erp.internal/api",
+                "spec":{"openapi":"3.0.0","paths":{}},
+                "auth_type":"api_key","secret":"k","api_key_header":"X-ERP-Key"}"#,
+        )
+        .unwrap();
+        assert_eq!(s.server_type, McpServerType::Openapi);
+        assert_eq!(
+            s.spec.as_ref().and_then(|v| v.get("openapi")),
+            Some(&serde_json::Value::String("3.0.0".into()))
+        );
+        assert_eq!(s.api_key_header.as_deref(), Some("X-ERP-Key"));
+    }
+
+    #[test]
+    fn openapi_type_round_trips() {
+        let original: McpServer = serde_json::from_str(
+            r#"{"name":"erp","type":"openapi","url":"https://erp.internal/api","spec":{"openapi":"3.1.0","paths":{"/a":{"get":{"operationId":"x"}}}}}"#,
+        )
+        .unwrap();
+        let s = serde_json::to_string(&original).unwrap();
+        assert!(s.contains(r#""type":"openapi""#), "got: {s}");
+        let back: McpServer = serde_json::from_str(&s).unwrap();
+        assert_eq!(original, back);
+    }
+
+    #[test]
+    fn rejects_unknown_server_type() {
+        assert!(
+            serde_json::from_str::<McpServer>(r#"{"name":"x","url":"u","type":"grpc"}"#).is_err()
+        );
     }
 }
