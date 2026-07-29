@@ -240,7 +240,13 @@ jobs:
       - run: chmod +x target/debug/aisix
       - uses: actions/setup-node@v6
         with:
-          node-version: 20
+          # pnpm 11 requires Node 22.13 or newer — it imports `node:sqlite`
+          # for its store index. The job only passes on Node 20 because it
+          # happens not to reach that code path; any pnpm command that
+          # touches the store (a cache step, `pnpm store path`) fails with
+          # ERR_UNKNOWN_BUILTIN_MODULE. GitHub is also deprecating Node 20
+          # on its runners.
+          node-version: 22
       - uses: pnpm/action-setup@v6
         with:
           # Matches the pnpm developers run locally. The harness's
