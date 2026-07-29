@@ -891,7 +891,11 @@ pub struct ResponsesStreamCompletion {
     pub cache_creation_tokens: u32,
     pub cache_read_tokens: u32,
     pub finish_reason: String,
-    pub ttft_ms: u32,
+    /// Attempt-scoped time to the upstream's first generated chunk.
+    pub upstream_ttft_ms: u32,
+    /// Request-scoped time until the caller got its first response bytes.
+    /// Trails `upstream_ttft_ms` by any hold-back guardrail scan.
+    pub downstream_latency_ms: u32,
     /// Set when an output guardrail blocked the streamed response (a content
     /// block or a fail-closed buffer overflow). The upstream still billed, so
     /// the usage event carries the tokens but is marked blocked — matching
@@ -983,7 +987,10 @@ impl<F: FnOnce(ResponsesStreamCompletion)> Drop for CompleteOnDrop<F> {
 pub fn build_responses_bridge_stream(
     upstream: ChatChunkStream,
     encoder: ResponsesSseEncoder,
+    // Request clock — what the CALLER waited for.
     started: Instant,
+    // Attempt clock — how the UPSTREAM behaved on this call.
+    attempt_started: Instant,
     output_guardrail: Option<Arc<aisix_guardrails::GuardrailChain>>,
     hold_back: bool,
     max_buffer_bytes: usize,
@@ -1004,6 +1011,16 @@ pub fn build_responses_bridge_stream(
             slot: Some((on_complete, ResponsesStreamCompletion::default())),
             estimator,
         };
+        // Stamped on the first bytes that actually leave for the client —
+        // under hold-back that is the release, not the upstream chunk.
+        macro_rules! downstream_mark {
+            () => {
+                if guard.comp().downstream_latency_ms == 0 {
+                    guard.comp().downstream_latency_ms =
+                        started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+                }
+            };
+        }
         let mut upstream = upstream;
         let mut first_chunk_seen = false;
         let buffering = output_guardrail.is_some() && hold_back;
@@ -1019,8 +1036,8 @@ pub fn build_responses_bridge_stream(
                         && (chunk.delta.content.is_some() || chunk.delta.tool_calls.is_some())
                     {
                         first_chunk_seen = true;
-                        guard.comp().ttft_ms =
-                            started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+                        guard.comp().upstream_ttft_ms =
+                            attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
                     }
                     {
                         let comp = guard.comp();
@@ -1087,6 +1104,7 @@ pub fn build_responses_bridge_stream(
                             }
                             held.push(b);
                         } else {
+                            downstream_mark!();
                             yield Ok::<_, std::io::Error>(b);
                         }
                     }
@@ -1116,6 +1134,7 @@ pub fn build_responses_bridge_stream(
                     }
                     held.push(b);
                 } else {
+                    downstream_mark!();
                     yield Ok(b);
                 }
             }
@@ -1282,12 +1301,14 @@ pub fn build_responses_bridge_stream(
                     &mut guard.comp().redacted_entity_counts,
                     counts,
                 );
+                downstream_mark!();
                 yield Ok(bytes::Bytes::from(rewritten));
                 return;
             }
         }
         // Release the held events verbatim.
         for b in held {
+            downstream_mark!();
             yield Ok(b);
         }
     };

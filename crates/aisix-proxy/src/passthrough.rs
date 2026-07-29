@@ -700,7 +700,10 @@ fn emit_usage_event(
         occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         api_key_id: api_key_id.to_string(),
         status_code,
-        latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
+        // Single-attempt endpoint: the attempt spans the whole request, so
+        // the upstream figure and what the caller waited for coincide.
+        upstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
+        downstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
         inbound_protocol: "passthrough".to_string(),
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),

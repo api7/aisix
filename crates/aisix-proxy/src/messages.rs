@@ -258,6 +258,11 @@ pub async fn messages(
                 let winner_latency = winner
                     .map(|w| Duration::from_millis(u64::from(w.latency_ms)))
                     .unwrap_or(elapsed);
+                // Non-streaming: the caller waited for the complete response,
+                // which is exactly the request clock. (The streaming paths
+                // stamp this from inside the stream and skip this branch.)
+                let mut metrics = metrics;
+                metrics.downstream_latency_ms = elapsed.as_millis().min(u32::MAX as u128) as u32;
                 emit_anthropic_usage_event(
                     &state,
                     &request_id,
@@ -1283,6 +1288,7 @@ async fn anthropic_passthrough_dispatch(
         let parsed_stream = build_anthropic_passthrough_stream(
             body_stream,
             started,
+            attempt_started,
             stream_guardrail,
             model_name.to_string(),
             content_cap,
@@ -1320,7 +1326,8 @@ async fn anthropic_passthrough_dispatch(
                     provider_request_id: usage.provider_request_id,
                     provider_model_version: usage.provider_model_version,
                     finish_reason: usage.finish_reason,
-                    ttft_ms: usage.ttft_ms,
+                    upstream_ttft_ms: usage.upstream_ttft_ms,
+                    downstream_latency_ms: usage.downstream_latency_ms,
                 };
                 state_c.metrics.record_request_e2e_latency(
                     LatencyLabels {
@@ -1686,7 +1693,9 @@ fn anthropic_metrics_from_response_json(body: &Value) -> AnthropicUsageMetrics {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string(),
-        ttft_ms: 0,
+        upstream_ttft_ms: 0,
+        // Non-streaming: stamped by the handler, which holds the request clock.
+        downstream_latency_ms: 0,
     }
 }
 
@@ -1920,6 +1929,7 @@ async fn cross_provider_dispatch(
             upstream,
             encoder,
             started,
+            attempt_started,
             stream_guardrail,
             model_name.to_string(),
             content_cap,
@@ -1952,7 +1962,8 @@ async fn cross_provider_dispatch(
                     provider_request_id: comp.provider_request_id,
                     provider_model_version: comp.provider_model_version,
                     finish_reason: comp.finish_reason,
-                    ttft_ms: comp.ttft_ms,
+                    upstream_ttft_ms: comp.upstream_ttft_ms,
+                    downstream_latency_ms: comp.downstream_latency_ms,
                 };
                 state_for_telem.metrics.record_request_e2e_latency(
                     LatencyLabels {
@@ -2103,7 +2114,9 @@ async fn cross_provider_dispatch(
         provider_request_id: resp.id.clone(),
         provider_model_version: resp.model.clone(),
         finish_reason: finish_reason_label(&resp.finish_reason),
-        ttft_ms: 0,
+        upstream_ttft_ms: 0,
+        // Non-streaming: stamped by the handler, which holds the request clock.
+        downstream_latency_ms: 0,
     };
     // Token-estimation fallback (AISIX-Cloud#1074): fill counters the
     // bridged upstream never reported. Telemetry only — the rendered
@@ -2154,7 +2167,12 @@ async fn cross_provider_dispatch(
 fn build_anthropic_sse_stream(
     upstream: aisix_gateway::ChatChunkStream,
     encoder: aisix_provider_anthropic::AnthropicSseEncoder,
+    // Request clock — what the CALLER waited for
+    // (`downstream_latency_ms`), spanning every earlier attempt.
     started: Instant,
+    // Attempt clock — how the UPSTREAM behaved on this call
+    // (`upstream_ttft_ms`).
+    attempt_started: Instant,
     output_guardrail: Option<std::sync::Arc<aisix_guardrails::GuardrailChain>>,
     model_label: String,
     // Largest content cap any content-capturing exporter wants, or `None` to
@@ -2168,6 +2186,19 @@ fn build_anthropic_sse_stream(
     use futures::StreamExt;
 
     let mut encoder = encoder;
+    // Stamp the caller-facing figure on the first SSE bytes that actually
+    // leave for the client. Wrapping the encoder output here covers both
+    // the live-forward drain and the hold-back release; putting it on the
+    // outermost stream instead would misfire on a keep-alive heartbeat.
+    macro_rules! downstream_bytes {
+        ($guard:expr, $ev:expr) => {{
+            if $guard.comp().downstream_latency_ms == 0 {
+                $guard.comp().downstream_latency_ms =
+                    started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+            }
+            bytes::Bytes::from($ev.to_sse_string())
+        }};
+    }
     // #932 / #466-class: when the chain's streamed-output policy is the
     // whole-response hold-back (BufferFull — keyword/pii/bedrock output
     // guardrails), chunks are withheld from the encoder until the
@@ -2211,8 +2242,8 @@ fn build_anthropic_sse_stream(
                         && (chunk.delta.content.is_some() || chunk.delta.tool_calls.is_some())
                     {
                         first_chunk_seen = true;
-                        guard.comp().ttft_ms =
-                            started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+                        guard.comp().upstream_ttft_ms =
+                            attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
                     }
                     let comp = guard.comp();
                     if !chunk.id.is_empty() {
@@ -2292,7 +2323,7 @@ fn build_anthropic_sse_stream(
                         continue;
                     }
                     for ev in encoder.next_events(&chunk) {
-                        yield Ok::<_, std::io::Error>(bytes::Bytes::from(ev.to_sse_string()));
+                        yield Ok::<_, std::io::Error>(downstream_bytes!(guard, ev));
                     }
                     if encoder.is_finished() {
                         break;
@@ -2417,7 +2448,7 @@ fn build_anthropic_sse_stream(
             }
             for chunk in held_chunks.drain(..) {
                 for ev in encoder.next_events(&chunk) {
-                    yield Ok::<_, std::io::Error>(bytes::Bytes::from(ev.to_sse_string()));
+                    yield Ok::<_, std::io::Error>(downstream_bytes!(guard, ev));
                 }
                 if encoder.is_finished() {
                     break;
@@ -2426,7 +2457,7 @@ fn build_anthropic_sse_stream(
         }
         if !encoder.is_finished() {
             for ev in encoder.force_finish() {
-                yield Ok(bytes::Bytes::from(ev.to_sse_string()));
+                yield Ok(downstream_bytes!(guard, ev));
             }
         }
     };
@@ -2479,7 +2510,12 @@ struct AnthropicStreamCompletion {
     provider_request_id: String,
     provider_model_version: String,
     finish_reason: String,
-    ttft_ms: u32,
+    /// Attempt-scoped time to the upstream's first generated chunk.
+    upstream_ttft_ms: u32,
+    /// Request-scoped time until the caller got its first response
+    /// bytes. Trails `upstream_ttft_ms` by whatever the gateway did
+    /// in between — most visibly a hold-back output guardrail.
+    downstream_latency_ms: u32,
     /// Generated output (content + reasoning + tool-call text) accumulated
     /// for the token-estimation fallback (AISIX-Cloud#1074). Always on,
     /// bounded to `token_estimate::OUTPUT_ACCUMULATION_CAP`; never leaves
@@ -2612,7 +2648,8 @@ struct AnthropicUsageMetrics {
     provider_request_id: String,
     provider_model_version: String,
     finish_reason: String,
-    ttft_ms: u32,
+    upstream_ttft_ms: u32,
+    downstream_latency_ms: u32,
 }
 
 /// Emit a UsageEvent for a `/v1/messages` request. Mirrors
@@ -2684,12 +2721,13 @@ fn emit_anthropic_usage_event(
         cache_creation_tokens: metrics.cache_creation_tokens,
         cache_read_tokens: metrics.cache_read_tokens,
         usage_estimated: metrics.usage_estimated,
-        latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
+        upstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
+        downstream_latency_ms: metrics.downstream_latency_ms,
         status_code,
         provider_request_id: metrics.provider_request_id,
         provider_model_version: metrics.provider_model_version,
         finish_reason: metrics.finish_reason,
-        ttft_ms: metrics.ttft_ms,
+        upstream_ttft_ms: metrics.upstream_ttft_ms,
         inbound_protocol: "anthropic".to_string(),
         attempt_index: attempt.index,
         attempt_kind: attempt.kind,
@@ -2757,7 +2795,7 @@ fn emit_anthropic_usage_event(
         u64::from(metrics.completion_tokens),
         total_tokens_all,
     );
-    if metrics.ttft_ms > 0 {
+    if metrics.upstream_ttft_ms > 0 {
         state.metrics.record_request_ttft(
             LatencyLabels {
                 endpoint: "/v1/messages",
@@ -2766,7 +2804,7 @@ fn emit_anthropic_usage_event(
                 status: status_code,
                 streaming: true,
             },
-            Duration::from_millis(u64::from(metrics.ttft_ms)),
+            Duration::from_millis(u64::from(metrics.upstream_ttft_ms)),
         );
         state.metrics.record_time_to_first_token(
             UsageLabels {
@@ -2782,7 +2820,7 @@ fn emit_anthropic_usage_event(
                 user_id: user_id.unwrap_or("unknown"),
                 user_name: user_name.unwrap_or("unknown"),
             },
-            Duration::from_millis(u64::from(metrics.ttft_ms)),
+            Duration::from_millis(u64::from(metrics.upstream_ttft_ms)),
         );
     }
 }
@@ -2829,7 +2867,12 @@ struct AnthropicStreamUsage {
     provider_request_id: String,
     provider_model_version: String,
     finish_reason: String,
-    ttft_ms: u32,
+    /// Attempt-scoped time to the upstream's first content frame.
+    upstream_ttft_ms: u32,
+    /// Request-scoped time until the caller got its first response
+    /// bytes. Trails `upstream_ttft_ms` by whatever the gateway did
+    /// in between — most visibly a hold-back output guardrail.
+    downstream_latency_ms: u32,
     /// Count of upstream byte-chunks actually delivered to the client
     /// (read by the Drop guard for the #419 cost-leak gate).
     chunks_delivered: u32,
@@ -2854,12 +2897,14 @@ struct AnthropicStreamUsage {
 }
 
 /// Update the accumulator from one parsed SSE `data:` JSON object.
-/// Best-effort: unrecognised `type` values are ignored. `started` +
-/// `first_token_seen` drive the TTFT measurement (first content frame).
+/// Best-effort: unrecognised `type` values are ignored. The TTFT
+/// measurement (first content frame) is driven by `attempt_started` and
+/// `first_token_seen`, and is attempt-scoped — see
+/// `UsageEvent::upstream_ttft_ms`.
 fn update_anthropic_usage(
     acc: &mut AnthropicStreamUsage,
     json: &Value,
-    started: Instant,
+    attempt_started: Instant,
     first_token_seen: &mut bool,
 ) {
     match json.get("type").and_then(Value::as_str) {
@@ -2897,7 +2942,8 @@ fn update_anthropic_usage(
             // First content frame → record time-to-first-token.
             if !*first_token_seen {
                 *first_token_seen = true;
-                acc.ttft_ms = started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+                acc.upstream_ttft_ms =
+                    attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
             }
             // Accumulate assistant output for the end-of-stream output
             // guardrail (#448). text streams as `delta.text`; tool_use
@@ -3004,7 +3050,7 @@ fn update_anthropic_usage(
 fn drain_anthropic_sse_frames(
     buf: &mut Vec<u8>,
     acc: &mut AnthropicStreamUsage,
-    started: Instant,
+    attempt_started: Instant,
     first_token_seen: &mut bool,
 ) {
     // SSE event delimiter is a blank line. Anthropic emits `\n\n`;
@@ -3013,7 +3059,7 @@ fn drain_anthropic_sse_frames(
         let frame: Vec<u8> = buf.drain(..end).collect();
         if let Some(data) = extract_sse_data_line(&frame) {
             if let Ok(json) = serde_json::from_slice::<Value>(data) {
-                update_anthropic_usage(acc, &json, started, first_token_seen);
+                update_anthropic_usage(acc, &json, attempt_started, first_token_seen);
             }
         }
     }
@@ -3152,9 +3198,15 @@ impl<T> Stream for AnthropicDeliveryCounter<T> {
 /// in-flight and `on_complete` fires once at end-of-stream (or
 /// client-disconnect) with the accumulated counts. Bytes are forwarded
 /// verbatim — the client sees the exact upstream SSE wire shape.
+#[allow(clippy::too_many_arguments)]
 fn build_anthropic_passthrough_stream<S, F>(
     upstream: S,
+    // Request clock — what the CALLER waited for
+    // (`downstream_latency_ms`), spanning every earlier attempt.
     started: Instant,
+    // Attempt clock — how the UPSTREAM behaved on this call
+    // (`upstream_ttft_ms`).
+    attempt_started: Instant,
     output_guardrail: Option<std::sync::Arc<aisix_guardrails::GuardrailChain>>,
     model_label: String,
     // When `Some`, the assembled `response_text` is preserved (not taken by the
@@ -3206,7 +3258,7 @@ where
                 drain_anthropic_sse_frames(
                     &mut buf,
                     guard.usage(),
-                    started,
+                    attempt_started,
                     &mut first_token_seen,
                 );
                 // Bound the frame buffer (PR #436 audit MEDIUM-2). The
@@ -3255,6 +3307,10 @@ where
             // hold-back mode an Err lands here too: it is forwarded and
             // the held (unscanned) content is dropped — fail closed.
             let errored = item.is_err();
+            if !errored && guard.usage().downstream_latency_ms == 0 {
+                guard.usage().downstream_latency_ms =
+                    started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+            }
             yield item;
             if errored && hold_policy.is_some() {
                 return;
@@ -3371,9 +3427,17 @@ where
                         &mut guard.usage().redacted_entity_counts,
                         counts,
                     );
+                    if guard.usage().downstream_latency_ms == 0 {
+                        guard.usage().downstream_latency_ms =
+                            started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+                    }
                     yield Ok(Bytes::from(rewritten));
                 }
                 None => {
+                    if guard.usage().downstream_latency_ms == 0 {
+                        guard.usage().downstream_latency_ms =
+                            started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+                    }
                     yield Ok(Bytes::from(std::mem::take(&mut held)));
                 }
             }
@@ -4192,7 +4256,7 @@ data: [DONE]\n\n";
         assert_eq!(event.provider_model_version, "gpt-4o-2024-08-06");
         assert_eq!(event.finish_reason, "stop");
         assert!(
-            event.ttft_ms > 0,
+            event.upstream_ttft_ms > 0,
             "streaming /v1/messages telemetry must record TTFT"
         );
         assert!(rx.try_recv().is_err(), "usage event should be emitted once");
@@ -4634,7 +4698,7 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
         assert_eq!(event.finish_reason, "end_turn");
         assert_eq!(event.status_code, 200);
         assert!(
-            event.ttft_ms > 0,
+            event.upstream_ttft_ms > 0,
             "streaming /v1/messages telemetry must record TTFT",
         );
         assert!(rx.try_recv().is_err(), "usage event should be emitted once");

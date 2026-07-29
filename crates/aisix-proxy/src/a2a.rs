@@ -294,7 +294,10 @@ fn emit_a2a_usage(
         occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         api_key_id: auth.entry.id.clone(),
         status_code,
-        latency_ms: latency.as_millis().min(u32::MAX as u128) as u32,
+        // Single-attempt endpoint: the attempt spans the whole request, so
+        // the upstream figure and what the caller waited for coincide.
+        upstream_latency_ms: latency.as_millis().min(u32::MAX as u128) as u32,
+        downstream_latency_ms: latency.as_millis().min(u32::MAX as u128) as u32,
         inbound_protocol: "a2a".to_string(),
         a2a_agent_name: agent.to_string(),
         a2a_method: method.to_string(),

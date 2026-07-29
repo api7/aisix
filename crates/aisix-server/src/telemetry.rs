@@ -312,7 +312,7 @@ mod tests {
             api_key_id: "ak-uuid".into(),
             prompt_tokens: 10,
             completion_tokens: 20,
-            latency_ms: 30,
+            upstream_latency_ms: 30,
             status_code: 200,
             cost_usd: 0.001,
             guardrail_blocked: false,

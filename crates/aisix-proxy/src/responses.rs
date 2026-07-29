@@ -136,6 +136,14 @@ struct ResponseUsage {
     /// verbatim OpenAI path (OpenAI surfaces cache hits via
     /// `cached_prompt_tokens` instead).
     cache_read_tokens: u32,
+    /// Attempt-scoped time to the upstream's first content delta. 0 on the
+    /// non-streaming paths. Before this existed `/v1/responses` reported no
+    /// TTFT at all, so codex-class clients showed blank.
+    upstream_ttft_ms: u32,
+    /// Request-scoped time until the caller got its first response bytes.
+    /// 0 until the stream forwards something (or the handler stamps it on
+    /// the non-streaming paths).
+    downstream_latency_ms: u32,
 }
 
 pub async fn responses(
@@ -239,7 +247,12 @@ pub async fn responses(
                     },
                     elapsed,
                 );
-                if let Some(usage) = success.usage {
+                if let Some(mut usage) = success.usage {
+                    // Non-streaming: the caller waited for the complete
+                    // response, which is exactly the request clock. Streamed
+                    // responses stamp this from inside the stream and never
+                    // reach this branch (`usage` is None there).
+                    usage.downstream_latency_ms = elapsed.as_millis().min(u32::MAX as u128) as u32;
                     // Winning-attempt classification (#655). Direct models
                     // have no recorded attempt → AttemptInfo defaults.
                     let winner = success.routing.winner();
@@ -1361,6 +1374,8 @@ async fn responses_to_target(
         );
         let parsed_stream = build_responses_passthrough_stream(
             body_stream,
+            started,
+            attempt_started,
             content_cap,
             eos_scan,
             move |mut usage, out_text, output_hits| {
@@ -1824,6 +1839,7 @@ async fn responses_cross_provider_to_target(
             upstream,
             encoder,
             started,
+            attempt_started,
             output_guardrail,
             hold_back,
             max_buffer_bytes,
@@ -1856,6 +1872,8 @@ async fn responses_cross_provider_to_target(
                     cache_creation_tokens: comp.cache_creation_tokens,
                     cache_read_tokens: comp.cache_read_tokens,
                     usage_estimated: comp.usage_estimated,
+                    upstream_ttft_ms: comp.upstream_ttft_ms,
+                    downstream_latency_ms: comp.downstream_latency_ms,
                 };
                 // A clean stream is a committed 200; an output-guardrail block
                 // (or fail-closed overflow) bills the upstream tokens but is
@@ -1965,6 +1983,8 @@ async fn responses_cross_provider_to_target(
             cache_creation_tokens: resp.usage.cache_creation_tokens,
             cache_read_tokens: resp.usage.cache_read_tokens,
             usage_estimated: false,
+            upstream_ttft_ms: 0,
+            downstream_latency_ms: 0,
         };
         // Token-estimation fallback (AISIX-Cloud#1074): fill counters the
         // bridged upstream never reported. Telemetry only — the re-encoded
@@ -2135,6 +2155,10 @@ fn extract_response_usage(body: &Value) -> Option<ResponseUsage> {
         // OpenAI verbatim path: no Anthropic-style cache counters.
         cache_creation_tokens: 0,
         cache_read_tokens: 0,
+        // Carried across by the caller (`drain_responses_sse_frames`), which
+        // measured these before this terminal frame arrived.
+        upstream_ttft_ms: 0,
+        downstream_latency_ms: 0,
     })
 }
 
@@ -2186,10 +2210,27 @@ fn responses_sse_usage(bytes: &[u8]) -> Option<ResponseUsage> {
 /// an incomplete trailing frame is left in `buf` for the next chunk. Reuses
 /// the shared SSE framing helpers from the `/v1/messages` passthrough so the
 /// two surfaces parse identically.
+/// Whether this SSE event carries generated output. Mirrors the set
+/// `SseTextCapture::observe` accumulates, so TTFT lands on the same frame
+/// the capture considers the first real token.
+fn is_responses_content_delta(json: &Value) -> bool {
+    matches!(
+        json.get("type").and_then(Value::as_str),
+        Some(
+            "response.output_text.delta"
+                | "response.function_call_arguments.delta"
+                | "response.mcp_call_arguments.delta"
+                | "response.custom_tool_call_input.delta"
+        )
+    )
+}
+
 fn drain_responses_sse_frames(
     buf: &mut Vec<u8>,
     acc: &mut Option<ResponseUsage>,
     mut capture: Option<&mut SseTextCapture>,
+    attempt_started: Instant,
+    first_token_seen: &mut bool,
 ) {
     while let Some(end) = crate::messages::find_frame_end(buf) {
         let frame: Vec<u8> = buf.drain(..end).collect();
@@ -2198,8 +2239,26 @@ fn drain_responses_sse_frames(
                 continue;
             }
             if let Ok(json) = serde_json::from_slice::<Value>(data) {
+                // First content delta → upstream TTFT. `/v1/responses`
+                // reported none at all before this, so codex-class clients
+                // showed a blank figure.
+                if !*first_token_seen && is_responses_content_delta(&json) {
+                    *first_token_seen = true;
+                    acc.get_or_insert_with(Default::default).upstream_ttft_ms =
+                        attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+                }
                 if let Some(u) = parse_responses_terminal_usage(&json) {
-                    *acc = Some(u);
+                    // The terminal frame replaces the token counters; carry
+                    // the two latency figures measured before it across.
+                    let (ttft, down) = acc
+                        .as_ref()
+                        .map(|a| (a.upstream_ttft_ms, a.downstream_latency_ms))
+                        .unwrap_or_default();
+                    *acc = Some(ResponseUsage {
+                        upstream_ttft_ms: ttft,
+                        downstream_latency_ms: down,
+                        ..u
+                    });
                 }
                 if let Some(c) = capture.as_deref_mut() {
                     c.observe(&json);
@@ -2384,6 +2443,10 @@ impl EosOutputScan {
 /// SSE wire shape.
 fn build_responses_passthrough_stream<S, F>(
     upstream: S,
+    // Request clock — what the CALLER waited for.
+    started: Instant,
+    // Attempt clock — how the UPSTREAM behaved.
+    attempt_started: Instant,
     content_cap: Option<u32>,
     eos_scan: Option<EosOutputScan>,
     on_complete: F,
@@ -2427,13 +2490,20 @@ where
         };
         futures::pin_mut!(upstream);
         let mut buf: Vec<u8> = Vec::new();
+        let mut first_token_seen = false;
         while let Some(item) = upstream.next().await {
             if let Ok(bytes) = &item {
                 // Side-channel parse: copy into the frame buffer (the original
                 // `bytes` is yielded unchanged below) and drain complete frames.
                 buf.extend_from_slice(bytes);
                 let (usage_acc, capture) = guard.parts();
-                drain_responses_sse_frames(&mut buf, usage_acc, capture);
+                drain_responses_sse_frames(
+                    &mut buf,
+                    usage_acc,
+                    capture,
+                    attempt_started,
+                    &mut first_token_seen,
+                );
                 // Bound the frame buffer: the happy path drains complete frames
                 // above so `buf` only holds a partial trailing frame. A
                 // non-conformant upstream streaming bytes without a blank-line
@@ -2450,6 +2520,15 @@ where
                 }
             }
             // Forward the original item verbatim (Ok bytes OR a mid-stream Err).
+            // The first successful forward is what the caller waited for.
+            if item.is_ok() {
+                let (usage_acc, _) = guard.parts();
+                let acc = usage_acc.get_or_insert_with(Default::default);
+                if acc.downstream_latency_ms == 0 {
+                    acc.downstream_latency_ms =
+                        started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+                }
+            }
             yield item;
         }
         // Clean end-of-stream: run the monitor observation (needs async, so
@@ -2686,7 +2765,9 @@ fn emit_usage_event(
         cache_creation_tokens: usage.cache_creation_tokens,
         cache_read_tokens: usage.cache_read_tokens,
         usage_estimated: usage.usage_estimated,
-        latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
+        upstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
+        upstream_ttft_ms: usage.upstream_ttft_ms,
+        downstream_latency_ms: usage.downstream_latency_ms,
         status_code,
         inbound_protocol: "openai".to_string(),
         attempt_index: attempt.index,
@@ -2769,7 +2850,7 @@ fn emit_zero_token_event(
         requested_model: requested_model.to_string(),
         redacted_entity_counts,
         guardrail_monitor_hits,
-        latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
+        upstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
         status_code,
         inbound_protocol: "openai".to_string(),
         attempt_index: attempt.index,

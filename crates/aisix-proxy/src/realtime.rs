@@ -639,7 +639,10 @@ async fn run_session(
         completion_tokens: usage.output_tokens.min(u32::MAX as u64) as u32,
         cached_prompt_tokens: usage.cached_tokens.min(u32::MAX as u64) as u32,
         status_code: close_status,
-        latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
+        // Single-attempt endpoint: the attempt spans the whole request, so
+        // the upstream figure and what the caller waited for coincide.
+        upstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
+        downstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
         cost_usd: model_entry
             .value
             .cost

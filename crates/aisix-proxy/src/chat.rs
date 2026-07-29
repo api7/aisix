@@ -250,7 +250,11 @@ pub async fn chat_completions(
                         cache_status: success.cache_status.as_str().to_string(),
                         cache_hit_saved_input_tokens: success.cache_hit_saved_input_tokens,
                         cache_hit_saved_output_tokens: success.cache_hit_saved_output_tokens,
-                        ttft_ms: 0,
+                        // Non-streaming: nothing was streamed, so there is no
+                        // upstream TTFT; the caller waited for the whole
+                        // response, which is the request clock.
+                        upstream_ttft_ms: 0,
+                        downstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
                         attempt_index: winner.map(|w| w.index).unwrap_or(0),
                         attempt_kind: winner.map(|w| w.kind).unwrap_or("initial").to_string(),
                         attempt_model: winner.map(|w| w.target_model.clone()).unwrap_or_default(),
@@ -525,7 +529,8 @@ pub async fn chat_completions(
                             cache_status: c.cache_status.as_str().to_string(),
                             cache_hit_saved_input_tokens: 0,
                             cache_hit_saved_output_tokens: 0,
-                            ttft_ms: 0,
+                            upstream_ttft_ms: 0,
+                            downstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
                             attempt_index: winner.map(|w| w.index).unwrap_or(0),
                             attempt_kind: winner.map(|w| w.kind).unwrap_or("initial").to_string(),
                             attempt_model: winner
@@ -1626,6 +1631,7 @@ async fn dispatch(
             now,
             stream_guardrail,
             started,
+            winner_attempt_started,
             req.model.clone(),
             content_cap,
             client_requested_usage,
@@ -1685,7 +1691,8 @@ async fn dispatch(
                         cache_status: CacheStatus::Disabled.as_str().to_string(),
                         cache_hit_saved_input_tokens: 0,
                         cache_hit_saved_output_tokens: 0,
-                        ttft_ms: comp.ttft_ms,
+                        upstream_ttft_ms: comp.upstream_ttft_ms,
+                        downstream_latency_ms: comp.downstream_latency_ms,
                         // #554: the winning attempt may be a fallback target,
                         // not the initial one — record the real index/kind.
                         attempt_index: winner_idx,
@@ -1772,7 +1779,7 @@ async fn dispatch(
                         status: 200,
                         streaming: true,
                     },
-                    Duration::from_millis(u64::from(comp.ttft_ms)),
+                    Duration::from_millis(u64::from(comp.upstream_ttft_ms)),
                 );
                 metrics_for_stream.record_time_to_first_token(
                     UsageLabels {
@@ -1788,7 +1795,7 @@ async fn dispatch(
                         user_id: user_id_for_metrics.as_deref().unwrap_or("unknown"),
                         user_name: user_name_for_metrics.as_deref().unwrap_or("unknown"),
                     },
-                    Duration::from_millis(u64::from(comp.ttft_ms)),
+                    Duration::from_millis(u64::from(comp.upstream_ttft_ms)),
                 );
                 // Release the concurrency permit(s) now that the stream has
                 // completed (or was cancelled). on_complete is fired by the
@@ -2896,6 +2903,10 @@ async fn dispatch_ensemble(
             }
         };
 
+        // The judge is this response's upstream call, so its own clock is
+        // what `upstream_ttft_ms` should be measured against — `started`
+        // additionally covers the whole panel that ran before it.
+        let judge_started = Instant::now();
         let judge_stream = match judge_bridge.chat_stream(&judge_req, &judge_ctx).await {
             Ok(s) => s,
             // Judge connect failed AFTER the panel round-tripped: bill the
@@ -3022,6 +3033,7 @@ async fn dispatch_ensemble(
             created_ts,
             stream_guardrail,
             started,
+            judge_started,
             // Re-stamp the client-facing ensemble model name (e.g. "council")
             // onto every chunk — never the judge's upstream model id.
             req.model.clone(),
@@ -3115,7 +3127,11 @@ async fn dispatch_ensemble(
                             comp.bypass_reason
                         },
                         cache_status: CacheStatus::Disabled.as_str().to_string(),
-                        ttft_ms: comp.ttft_ms,
+                        upstream_ttft_ms: comp.upstream_ttft_ms,
+                        // The judge's stream is what the caller sees, so its
+                        // event carries the request-scoped figure; the panel
+                        // members' sub-call events leave it 0.
+                        downstream_latency_ms: comp.downstream_latency_ms,
                         attempt_index: judge_attempt_index,
                         attempt_kind: "judge".to_string(),
                         attempt_model: judge_attempt_model.clone(),
@@ -3161,7 +3177,7 @@ async fn dispatch_ensemble(
                         status: 200,
                         streaming: true,
                     },
-                    Duration::from_millis(u64::from(comp.ttft_ms)),
+                    Duration::from_millis(u64::from(comp.upstream_ttft_ms)),
                 );
                 // Release the concurrency permit(s) now the stream is done
                 // (or was cancelled) — on_complete fires on both paths (#450).
@@ -3650,7 +3666,8 @@ fn emit_usage_event(
         cache_creation_tokens: extras.cache_creation_tokens,
         cache_read_tokens: extras.cache_read_tokens,
         usage_estimated: extras.usage_estimated,
-        latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
+        upstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
+        downstream_latency_ms: extras.downstream_latency_ms,
         status_code,
         provider_request_id: extras.provider_request_id,
         provider_model_version: extras.provider_model_version,
@@ -3664,7 +3681,7 @@ fn emit_usage_event(
         cache_status: extras.cache_status,
         cache_hit_saved_input_tokens: extras.cache_hit_saved_input_tokens,
         cache_hit_saved_output_tokens: extras.cache_hit_saved_output_tokens,
-        ttft_ms: extras.ttft_ms,
+        upstream_ttft_ms: extras.upstream_ttft_ms,
         // chat.rs is the OpenAI-shape /v1/chat/completions handler.
         // /v1/responses / /v1/embeddings / /v1/audio* / /v1/images* /
         // /v1/rerank don't emit UsageEvents today; when they do they
@@ -3779,7 +3796,12 @@ struct UsageExtras {
     /// ingest from these + its pricing catalog (see #88).
     cache_hit_saved_input_tokens: u32,
     cache_hit_saved_output_tokens: u32,
-    ttft_ms: u32,
+    /// Attempt-scoped time to the upstream's first generated chunk.
+    upstream_ttft_ms: u32,
+    /// Request-scoped time until the caller got its first usable byte.
+    /// Set only on the attempt that delivered the terminal response;
+    /// left 0 on the others so a request carries exactly one figure.
+    downstream_latency_ms: u32,
     // ─── Per-attempt telemetry (#655) ───
     /// 0-based attempt index within the request.
     attempt_index: u32,
@@ -4007,9 +4029,14 @@ struct StreamCompletion {
     /// fail-opened on a streamed response. Empty string = no bypass.
     /// First-bypass-wins matches the non-streaming convention.
     bypass_reason: String,
-    /// Time to first token in milliseconds. Set once when the first
-    /// Ok(chunk) arrives in `build_sse_stream`.
-    ttft_ms: u32,
+    /// Attempt-scoped time to the UPSTREAM's first generated chunk.
+    /// Set once when that chunk arrives in `build_sse_stream`.
+    upstream_ttft_ms: u32,
+    /// Request-scoped time until the first chunk was handed DOWNSTREAM.
+    /// Under a hold-back output guardrail this trails
+    /// `upstream_ttft_ms` by the scan; without one they nearly coincide.
+    /// 0 when the stream ended before any content reached the client.
+    downstream_latency_ms: u32,
     /// Count of SSE events the **consumer actually pulled** from the
     /// stream — incremented on the post-yield resume in
     /// `build_sse_stream`. `async_stream::stream!` semantics: code
@@ -4177,7 +4204,13 @@ fn build_sse_stream<F>(
     upstream: aisix_gateway::ChatChunkStream,
     created: i64,
     output_guardrail: Option<StreamGuardrailContext>,
+    // Request clock — when the gateway received the request. Measures
+    // what the CALLER waited for (`downstream_latency_ms`).
     started: Instant,
+    // Attempt clock — when this upstream attempt began. Measures how the
+    // UPSTREAM behaved (`upstream_ttft_ms`), so retries and pre-dispatch
+    // work don't inflate it.
+    attempt_started: Instant,
     // Customer-facing model name (alias / routing group), re-stamped
     // onto every SSE chunk's `model` field per AISIX-Cloud#410. Owned
     // so it can move into the `async_stream::stream!` closure.
@@ -4287,6 +4320,17 @@ where
         // the Err arm mirrors the pre-hold-back defensive error frame.
         macro_rules! chunk_event {
             ($chunk:expr) => {{
+                // The caller's wait ends here — not when the upstream chunk
+                // arrived; a hold-back guardrail can sit between the two.
+                // Every content chunk is rendered through this macro, on
+                // both the live-forward and the hold-back release paths, so
+                // this catches the first one either way. Written straight
+                // into the accumulator rather than a local so a client that
+                // disconnects mid-stream still reports what it waited for.
+                if guard.comp().downstream_latency_ms == 0 {
+                    guard.comp().downstream_latency_ms =
+                        started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+                }
                 let rendered = render_chunk(created, $chunk, &client_facing_model);
                 match serde_json::to_string(&rendered) {
                     Ok(json) => Event::default().data(json),
@@ -4309,8 +4353,8 @@ where
                         && (chunk.delta.content.is_some() || chunk.delta.tool_calls.is_some())
                     {
                         first_chunk_seen = true;
-                        guard.comp().ttft_ms =
-                            started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+                        guard.comp().upstream_ttft_ms =
+                            attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
                     }
                     let comp = guard.comp();
                     if !chunk.id.is_empty() {
