@@ -337,6 +337,7 @@ fn build_client(
     creds: &BedrockSecret,
     endpoint_url: Option<&str>,
     hdr: &UpstreamHeaderContext<'_>,
+    deadline: Option<std::time::Duration>,
 ) -> Result<BedrockClient, BridgeError> {
     if creds.region.trim().is_empty() {
         return Err(BridgeError::InvalidUpstreamConfig(
@@ -352,10 +353,35 @@ fn build_client(
         None,
         "aisix-provider-bedrock",
     );
+    // The SDK enforces the deadlines the other bridges get from
+    // `tokio::time::timeout` wrappers: the shared `upstream.connect_timeout`
+    // bounds the dial, and the resolved per-request deadline cancels the
+    // whole operation (SdkError::TimeoutError → BridgeError::Timeout in
+    // `map_sdk_error`). Without these the SDK client has NO timeouts and a
+    // silent upstream holds the request open past the model's `timeout` —
+    // the deadline used to matter only for post-hoc error relabelling.
+    // `operation_timeout` covers send + response headers; a converse_stream
+    // body is bounded per-chunk by the proxy's read-timeout wrapper, same
+    // as every other bridge.
+    let mut timeouts = aws_smithy_types::timeout::TimeoutConfig::builder();
+    if let Some(d) = aisix_gateway::upstream_http::config().connect_timeout {
+        timeouts = timeouts.connect_timeout(d);
+    }
+    if let Some(d) = deadline {
+        timeouts = timeouts.operation_timeout(d);
+    }
     let mut builder = aws_config::SdkConfig::builder()
         .behavior_version(BehaviorVersion::latest())
         .region(Region::new(creds.region.clone()))
         .credentials_provider(SharedCredentialsProvider::new(aws_creds))
+        .timeout_config(timeouts.build())
+        // Retries belong to the gateway's own budget
+        // (`routing::effective_retries`), which emits per-attempt telemetry
+        // and honours per-model config. Left at its default the SDK would
+        // add a hidden standard-mode retry layer (3 attempts) underneath,
+        // grinding the upstream invisibly — no other bridge's HTTP client
+        // retries on its own.
+        .retry_config(aws_smithy_types::retry::RetryConfig::disabled())
         .sleep_impl(aws_smithy_async::rt::sleep::SharedAsyncSleep::new(
             aws_smithy_async::rt::sleep::TokioSleep::new(),
         ));
@@ -856,7 +882,7 @@ impl BedrockBridge {
         };
         // Converse paths carry no JSON body, but default_headers still apply
         // (header-level, publisher-agnostic) via the signing interceptor.
-        build_client(&creds, endpoint_url, &ctx.header_ctx())
+        build_client(&creds, endpoint_url, &ctx.header_ctx(), ctx.deadline)
     }
 
     /// Dispatch Bedrock chat via the unified Converse API.
@@ -2220,6 +2246,46 @@ mod tests {
         let chat = bridge.chat(&req, &ctx).await.unwrap();
         assert_eq!(chat.message.content_str(), "hello from bedrock");
         assert_eq!(chat.usage.total_tokens, 9);
+    }
+
+    /// The model's deadline must CANCEL a silent Bedrock call, not just
+    /// relabel an error after the fact. Before the SDK `timeout_config`
+    /// wiring, this call sat through the upstream's full 8 s delay and
+    /// came back `Ok` — the deadline was consulted only inside
+    /// `map_sdk_error`, which never ran on success.
+    #[tokio::test]
+    async fn chat_deadline_cancels_a_silent_upstream() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/model/.+/invoke$"))
+            .respond_with(
+                default_anthropic_response_template().set_delay(std::time::Duration::from_secs(8)),
+            )
+            .mount(&server)
+            .await;
+
+        let bridge = BedrockBridge::new().with_endpoint_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-deadline",
+            sample_model_with("anthropic.claude-3-5-sonnet-20241022-v2:0"),
+            sample_pk_with_secret(valid_secret_json()),
+        )
+        .with_deadline(std::time::Duration::from_millis(300));
+        let req = ChatFormat::new("my-claude", vec![ChatMessage::user("hi")]);
+
+        let started = std::time::Instant::now();
+        let err = bridge.chat(&req, &ctx).await.unwrap_err();
+        assert!(
+            matches!(err, BridgeError::Timeout { .. }),
+            "expected Timeout, got {err:?}"
+        );
+        // Generous CI margin, but far below the 8 s the upstream stalls:
+        // proves cancellation, not post-hoc relabelling.
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(4),
+            "deadline did not cancel the call: took {:?}",
+            started.elapsed()
+        );
     }
 
     #[tokio::test]
