@@ -677,23 +677,25 @@ impl Metrics {
     }
 
     pub fn record_proxy_request(&self, labels: RequestLabels<'_>, duration: Duration) {
-        self.with_request_series(labels, |handles| {
-            handles.proxy_requests.increment(1);
-            handles.proxy_duration.record(duration.as_secs_f64());
+        metrics::with_local_recorder(&self.inner.recorder, || {
+            labels.request_counter(M_PROXY_REQUESTS_TOTAL).increment(1);
+            labels
+                .request_duration_histogram(M_PROXY_REQUEST_DURATION)
+                .record(duration.as_secs_f64());
             if labels.outcome != RequestOutcome::Success {
-                handles
-                    .proxy_failed_requests
-                    .as_ref()
-                    .expect("failed requests have a cached counter")
+                labels
+                    .request_counter(M_PROXY_FAILED_REQUESTS_TOTAL)
                     .increment(1);
             }
         });
     }
 
     pub fn record_llm_request(&self, labels: RequestLabels<'_>, duration: Duration) {
-        self.with_request_series(labels, |handles| {
-            handles.llm_requests.increment(1);
-            handles.llm_duration.record(duration.as_secs_f64());
+        metrics::with_local_recorder(&self.inner.recorder, || {
+            labels.request_counter(M_LLM_REQUESTS_TOTAL).increment(1);
+            labels
+                .request_duration_histogram(M_LLM_REQUEST_DURATION)
+                .record(duration.as_secs_f64());
         });
     }
 
@@ -1805,9 +1807,49 @@ mod tests {
             );
         }
 
+        assert_eq!(
+            metrics.inner.request_series.read().len,
+            REQUEST_SERIES_CACHE_CAPACITY,
+            "request series handle cache must stay at its fixed capacity"
+        );
+
+        let evicted_model = (0..=REQUEST_SERIES_CACHE_CAPACITY)
+            .map(|index| format!("model-{index}"))
+            .find(|model| {
+                let labels = RequestLabels {
+                    model,
+                    ..RequestLabels::default()
+                };
+                let hash = Metrics::request_series_hash(labels);
+                metrics
+                    .inner
+                    .request_series
+                    .read()
+                    .get(hash, labels)
+                    .is_none()
+            })
+            .expect("one series must have been evicted");
+        metrics.record_proxy_and_llm_request(
+            RequestLabels {
+                model: &evicted_model,
+                ..RequestLabels::default()
+            },
+            Duration::from_millis(1),
+        );
+
+        assert_eq!(
+            metrics.inner.request_series.read().len,
+            REQUEST_SERIES_CACHE_CAPACITY,
+            "re-registering an evicted series must not grow the cache"
+        );
+        let rendered = metrics.render();
         assert!(
-            metrics.inner.request_series.read().len <= REQUEST_SERIES_CACHE_CAPACITY,
-            "request series handle cache exceeded its fixed capacity"
+            rendered.lines().any(|line| {
+                line.starts_with(M_PROXY_REQUESTS_TOTAL)
+                    && line.contains(&format!("model=\"{evicted_model}\""))
+                    && line.ends_with(" 2")
+            }),
+            "re-registering an evicted handle must continue the existing Prometheus series"
         );
     }
 
@@ -1831,6 +1873,125 @@ mod tests {
                     && line.ends_with(" 1")),
             "failed request counter was not incremented:\n{rendered}"
         );
+    }
+
+    #[test]
+    fn request_series_cache_distinguishes_hash_collisions() {
+        let metrics = Metrics::new(false);
+        let labels_a = RequestLabels {
+            model: "collision-a",
+            outcome: RequestOutcome::Success,
+            ..RequestLabels::default()
+        };
+        let labels_b = RequestLabels {
+            model: "collision-b",
+            outcome: RequestOutcome::Success,
+            ..RequestLabels::default()
+        };
+        let handles_a = metrics.register_request_series(labels_a);
+        let handles_b = metrics.register_request_series(labels_b);
+        let forced_hash = 7;
+        {
+            let mut cache = metrics.inner.request_series.write();
+            cache.insert(forced_hash, RequestLabelsOwned::new(labels_a), handles_a);
+            cache.insert(forced_hash, RequestLabelsOwned::new(labels_b), handles_b);
+            cache
+                .get(forced_hash, labels_a)
+                .expect("first colliding label set must remain addressable")
+                .proxy_requests
+                .increment(1);
+            cache
+                .get(forced_hash, labels_b)
+                .expect("second colliding label set must remain addressable")
+                .proxy_requests
+                .increment(2);
+        }
+
+        let rendered = metrics.render();
+        assert!(rendered.lines().any(|line| {
+            line.starts_with(M_PROXY_REQUESTS_TOTAL)
+                && line.contains("model=\"collision-a\"")
+                && line.ends_with(" 1")
+        }));
+        assert!(rendered.lines().any(|line| {
+            line.starts_with(M_PROXY_REQUESTS_TOTAL)
+                && line.contains("model=\"collision-b\"")
+                && line.ends_with(" 2")
+        }));
+    }
+
+    #[test]
+    fn concurrent_request_series_misses_register_once_and_record_every_call() {
+        const THREADS: usize = 16;
+
+        let metrics = Metrics::new(false);
+        let barrier = Arc::new(std::sync::Barrier::new(THREADS));
+        let threads = (0..THREADS)
+            .map(|_| {
+                let metrics = metrics.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    metrics.record_proxy_and_llm_request(
+                        RequestLabels::default(),
+                        Duration::from_millis(1),
+                    );
+                })
+            })
+            .collect::<Vec<_>>();
+        for thread in threads {
+            thread.join().expect("metric recording thread panicked");
+        }
+
+        assert_eq!(
+            metrics.inner.request_series.read().len,
+            1,
+            "concurrent first misses must converge on one cached handle set"
+        );
+        let rendered = metrics.render();
+        for metric in [
+            M_PROXY_REQUESTS_TOTAL,
+            M_LLM_REQUESTS_TOTAL,
+            M_PROXY_FAILED_REQUESTS_TOTAL,
+        ] {
+            assert!(
+                rendered
+                    .lines()
+                    .any(|line| line.starts_with(metric) && line.ends_with(" 16")),
+                "{metric} did not record every concurrent call:\n{rendered}"
+            );
+        }
+        for metric in [M_PROXY_REQUEST_DURATION, M_LLM_REQUEST_DURATION] {
+            let count = format!("{metric}_count");
+            assert!(
+                rendered
+                    .lines()
+                    .any(|line| line.starts_with(&count) && line.ends_with(" 16")),
+                "{metric} did not record every concurrent call:\n{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn individual_request_recorders_do_not_create_unrelated_metric_families() {
+        let proxy_only = Metrics::new(false);
+        proxy_only.record_proxy_request(
+            RequestLabels {
+                outcome: RequestOutcome::Success,
+                ..RequestLabels::default()
+            },
+            Duration::from_millis(1),
+        );
+        let rendered = proxy_only.render();
+        assert!(!rendered.contains(M_LLM_REQUESTS_TOTAL));
+        assert!(!rendered.contains(M_LLM_REQUEST_DURATION));
+
+        let llm_only = Metrics::new(false);
+        llm_only.record_llm_request(RequestLabels::default(), Duration::from_millis(1));
+        let rendered = llm_only.render();
+        assert!(!rendered.contains(M_PROXY_REQUESTS_TOTAL));
+        assert!(!rendered.contains(M_PROXY_FAILED_REQUESTS_TOTAL));
+        assert!(!rendered.contains(M_PROXY_REQUEST_DURATION));
     }
 
     #[test]
