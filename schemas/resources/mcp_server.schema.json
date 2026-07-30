@@ -80,6 +80,83 @@
           "token_url"
         ]
       }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "openapi"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "dependencies": {
+          "api_key_header": {
+            "properties": {
+              "auth_type": {
+                "const": "api_key"
+              }
+            },
+            "required": [
+              "auth_type"
+            ]
+          }
+        },
+        "properties": {
+          "api_key_header": {
+            "pattern": "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
+          },
+          "spec": {
+            "not": {
+              "required": [
+                "swagger"
+              ]
+            },
+            "type": "object"
+          }
+        },
+        "required": [
+          "spec"
+        ]
+      }
+    },
+    {
+      "if": {
+        "anyOf": [
+          {
+            "properties": {
+              "type": {
+                "const": "mcp"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "title": "type is mcp"
+          },
+          {
+            "not": {
+              "required": [
+                "type"
+              ]
+            },
+            "title": "type is absent (defaults to mcp)"
+          }
+        ]
+      },
+      "then": {
+        "properties": {
+          "api_key_header": {
+            "type": "null"
+          },
+          "spec": {
+            "type": "null"
+          }
+        }
+      }
     }
   ],
   "anyOf": [
@@ -197,7 +274,7 @@
     "display_name": {
       "description": "Accepted as an alternative spelling of `name`. Provide the label under exactly one of the two names.",
       "minLength": 1,
-      "pattern": "^(?:[^_]|_[^_])*_?$",
+      "pattern": "^(?:[^_]|_[^_])*$",
       "type": "string"
     },
     "enabled": {
@@ -208,7 +285,7 @@
     "name": {
       "description": "Operator-facing label, unique within the gateway. It is used as the namespace prefix for this server's tools, which are exposed to clients as `<name>__<tool>`, so it must not contain the reserved separator `__`.",
       "minLength": 1,
-      "pattern": "^(?:[^_]|_[^_])*_?$",
+      "pattern": "^(?:[^_]|_[^_])*$",
       "type": "string"
     },
     "scopes": {

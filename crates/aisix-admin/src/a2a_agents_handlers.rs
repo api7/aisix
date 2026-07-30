@@ -4,8 +4,9 @@
 //! reject duplicate names (409), generate a uuid v4 on POST, bump revision on
 //! PUT. The name is the path segment under which the agent is exposed
 //! (`/a2a/<name>`), so it must be a single URL path segment (no `/`). The
-//! per-auth_type credential coupling is enforced here too, since the flat
-//! schema stays permissive on it.
+//! per-auth_type credential coupling is enforced by the canonical schema, so
+//! every configuration path rejects an incomplete credential set; the checks
+//! below are defense in depth.
 
 use aisix_core::models::validate_a2a_agent;
 use aisix_core::resource::ResourceEntry;

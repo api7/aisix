@@ -284,8 +284,10 @@ fn accept_renamed_field(schema: &mut Value, canonical: &str, former: &str, note:
 /// `auth_type` closed sets come from the
 /// [`McpTransport`](crate::models::McpTransport) /
 /// [`McpAuthType`](crate::models::McpAuthType) enums. The per-`auth_type`
-/// credential coupling is intentionally not encoded here (see the note on the
-/// struct); the schema stays permissive and write paths enforce it. The label
+/// credential coupling, and the openapi-only `spec`/`api_key_header` fields, are
+/// injected here as an `allOf` of `if`/`then` subschemas (see
+/// [`super::mcp_server::mcp_server_credential_coupling`]) so every configuration
+/// path enforces them. The label
 /// is accepted under both its canonical name `name` and its former name
 /// `display_name` (see [`accept_renamed_field`]).
 pub fn mcp_server_root_schema() -> Value {

@@ -26,13 +26,16 @@ use crate::resource::Resource;
 pub struct A2aAgent {
     /// Operator-facing label, unique within the gateway. It is the path segment
     /// under which the agent is exposed to callers as `/a2a/<name>`, so it must
-    /// be a single non-empty URL path segment.
+    /// be a single non-empty URL path segment. The name is interpolated into the
+    /// advertised agent-card URL without percent-encoding, so `/`, `?`, `#`, `%`
+    /// and whitespace are rejected: `a?b` would advertise a URL whose path is
+    /// just `/a2a/a`, and the lookup is an exact match on the stored name.
     // `display_name` is the field's former name; stored documents and
     // callers that still use it keep deserializing (schema-side acceptance
     // lives in `schema::a2a_agent_root_schema`). Re-serialization always
     // emits `name`.
     #[serde(alias = "display_name")]
-    #[schemars(regex(pattern = "^[^/]+$"), length(min = 1))]
+    #[schemars(regex(pattern = "^[^/?#%\\s\\x00-\\x1f]+$"), length(min = 1))]
     pub name: String,
 
     /// The upstream agent's base URL, such as `https://agents.example.com/a2a`.

@@ -284,7 +284,7 @@ mod tests {
         }))
         .unwrap_err();
         assert!(
-            matches!(&err, AdminError::BadRequest(m) if m.contains("spec")),
+            err.status() == axum::http::StatusCode::BAD_REQUEST && err.to_string().contains("spec"),
             "{err:?}"
         );
 
@@ -296,8 +296,13 @@ mod tests {
             "spec": { "swagger": "2.0", "paths": { "/a": { "get": {} } } }
         }))
         .unwrap_err();
+        // The schema gate rejects the `swagger` key before the handler's own
+        // check runs, so the targeted "convert to OpenAPI 3.x" hint is no longer
+        // what the caller sees — the pointer names `/spec` instead. The rule is
+        // intact; only the message is less actionable. See the note on
+        // `mcp_server_credential_coupling`.
         assert!(
-            matches!(&err, AdminError::BadRequest(m) if m.contains("OpenAPI 3")),
+            err.status() == axum::http::StatusCode::BAD_REQUEST && err.to_string().contains("spec"),
             "{err:?}"
         );
 
@@ -313,7 +318,8 @@ mod tests {
         }))
         .unwrap_err();
         assert!(
-            matches!(&err, AdminError::BadRequest(m) if m.contains("duplicate tool names")),
+            err.status() == axum::http::StatusCode::BAD_REQUEST
+                && err.to_string().contains("duplicate tool names"),
             "{err:?}"
         );
 
@@ -327,7 +333,8 @@ mod tests {
         }))
         .unwrap_err();
         assert!(
-            matches!(&err, AdminError::BadRequest(m) if m.contains("auth_type")),
+            err.status() == axum::http::StatusCode::BAD_REQUEST
+                && err.to_string().contains("auth_type"),
             "{err:?}"
         );
         let err = decode(&json!({
@@ -341,7 +348,8 @@ mod tests {
         }))
         .unwrap_err();
         assert!(
-            matches!(&err, AdminError::BadRequest(m) if m.contains("header name")),
+            err.status() == axum::http::StatusCode::BAD_REQUEST
+                && err.to_string().contains("api_key_header"),
             "{err:?}"
         );
 
@@ -356,8 +364,11 @@ mod tests {
                 field: value
             }))
             .unwrap_err();
+            // The schema names the offending field via its pointer rather
+            // than explaining that it is openapi-only.
             assert!(
-                matches!(&err, AdminError::BadRequest(m) if m.contains("openapi")),
+                err.status() == axum::http::StatusCode::BAD_REQUEST
+                    && err.to_string().contains(field),
                 "{field}: {err:?}"
             );
         }

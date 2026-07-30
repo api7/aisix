@@ -29,10 +29,12 @@ pub struct McpServer {
     // emits `name`.
     #[serde(alias = "display_name")]
     // The name is the tool-namespace prefix: this server's tools are exposed to
-    // MCP clients as `<name>__<tool>`, so a name containing the `__` separator
-    // would make the split ambiguous. Rejected by the pattern below on every
-    // configuration path.
-    #[schemars(regex(pattern = "^(?:[^_]|_[^_])*_?$"), length(min = 1))]
+    // MCP clients as `<name>__<tool>` and parsed back with `split_once("__")`
+    // (see `aisix_mcp::gateway`). So the name must contain no `__` AND must not
+    // end in `_`: `gh_` + `x` and `gh` + `_x` both serialize to `gh___x`, and the
+    // split resolves the former to the non-existent server `gh`. The pattern
+    // below rejects both shapes on every configuration path.
+    #[schemars(regex(pattern = "^(?:[^_]|_[^_])*$"), length(min = 1))]
     pub name: String,
 
     /// What backs this server: a real upstream MCP server (`mcp`, the
@@ -81,14 +83,12 @@ pub struct McpServer {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret: Option<String>,
 
-    // Cross-field coupling (`oauth2` requires `client_id` + `secret` +
-    // `token_url`; `bearer`/`api_key` require `secret`) is deliberately NOT
-    // expressed in this flat schema — that would force restructuring the
-    // resource into a oneOf. The control plane enforces the coupling strictly
-    // at write time, this gateway's own Admin API re-checks it on write, and
-    // the runtime degrades gracefully when a snapshot-loaded server is
-    // mis-configured: its credential exchange fails, its tools become
-    // unavailable, and the failure is logged like any other upstream failure.
+    // Cross-field coupling (`auth_type` → credential set, and the openapi-only
+    // `spec`/`api_key_header` fields) is expressed as an injected `allOf` of
+    // `if`/`then` subschemas rather than in this flat struct — see
+    // `mcp_server_credential_coupling`. That keeps the resource flat (no oneOf
+    // restructuring) while giving the published schema and every runtime
+    // validator one shared definition.
     /// OAuth client identifier used for the OAuth 2.0 client credentials
     /// grant. Required when `auth_type` is `oauth2`; ignored otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -221,6 +221,62 @@ pub fn mcp_server_credential_coupling() -> Value {
                     "token_url": { "type": "string", "minLength": 1 }
                 }
             }
+        },
+        // Note on diagnosability: expressing "not a Swagger 2.0 document" as a
+        // schema constraint costs the targeted hint the write path used to emit
+        // ("convert the spec to OpenAPI 3.x"). A validator reports the failing
+        // pointer (`/spec`) and the constraint, not advice. The rule is what
+        // matters most here — a Swagger 2.0 document is rejected on every path
+        // — but a post-schema semantic hook in the loaders would let both the
+        // rule and the advice live in one place.
+        //
+        // An OpenAPI-backed server carries the document; `api_key_header` names
+        // the header the generated tools send the key in, so it only makes sense
+        // alongside `auth_type: api_key`, and it has to be a legal header name
+        // (RFC 7230 `tchar` — the same set `http::HeaderName` accepts).
+        {
+            "if": { "properties": { "type": { "const": "openapi" } }, "required": ["type"] },
+            "then": {
+                "required": ["spec"],
+                "properties": {
+                    "spec": {
+                        "type": "object",
+                        "not": { "required": ["swagger"] }
+                    },
+                    "api_key_header": { "pattern": "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$" }
+                },
+                "dependencies": {
+                    "api_key_header": {
+                        "properties": { "auth_type": { "const": "api_key" } },
+                        "required": ["auth_type"]
+                    }
+                }
+            }
+        },
+        // A plain MCP server has neither. `spec`/`api_key_header` are
+        // `Option`-typed, so an explicit `null` is equivalent to absent — hence
+        // `type: null` rather than a `required` negation. `type` defaults to
+        // `mcp`, so the missing-key case has to be covered too.
+        {
+            "if": {
+                "anyOf": [
+                    {
+                        "title": "type is mcp",
+                        "properties": { "type": { "const": "mcp" } },
+                        "required": ["type"]
+                    },
+                    {
+                        "title": "type is absent (defaults to mcp)",
+                        "not": { "required": ["type"] }
+                    }
+                ]
+            },
+            "then": {
+                "properties": {
+                    "spec": { "type": "null" },
+                    "api_key_header": { "type": "null" }
+                }
+            }
         }
     ])
 }
@@ -238,12 +294,72 @@ mod tests {
             .expect_err("a name containing `__` must be rejected");
         assert!(err.path.contains("name"), "unexpected path: {}", err.path);
 
-        // A single underscore is fine, including a trailing one.
-        for good in ["git_hub", "github_", "github"] {
+        // A single underscore inside or leading the name is fine.
+        for good in ["git_hub", "_github", "github", "a_b_c"] {
             let doc = json!({"name": good, "url": "https://x/mcp"});
             crate::models::schema::validate_mcp_server(&doc)
                 .unwrap_or_else(|e| panic!("{good} should be accepted: {e:?}"));
         }
+
+        // A trailing `_` collides with the separator's first byte: `gh_` + `x`
+        // and `gh` + `_x` both serialize to `gh___x`, and `split_once("__")`
+        // resolves `gh_` to the non-existent server `gh`, so every tool call
+        // against it fails.
+        for bad in ["github_", "_", "a_b_"] {
+            let doc = json!({"name": bad, "url": "https://x/mcp"});
+            crate::models::schema::validate_mcp_server(&doc)
+                .expect_err(&format!("{bad} ends in the separator's first byte"));
+        }
+    }
+
+    #[test]
+    fn schema_enforces_openapi_field_coupling() {
+        let spec = json!({"openapi": "3.0.0"});
+
+        // `openapi` type requires a `spec`, and it must be an OpenAPI 3.x object.
+        for bad in [
+            json!({"name": "s", "url": "https://x/mcp", "type": "openapi"}),
+            json!({"name": "s", "url": "https://x/mcp", "type": "openapi", "spec": "str"}),
+            json!({"name": "s", "url": "https://x/mcp", "type": "openapi", "spec": {"swagger": "2.0"}}),
+        ] {
+            crate::models::schema::validate_mcp_server(&bad)
+                .expect_err("an openapi server needs a 3.x spec object");
+        }
+
+        // `api_key_header` only makes sense with `auth_type: api_key`, and has to
+        // be a legal header name. This one is guarded by draft-07 `dependencies`
+        // — the draft 2019-09 spelling would be ignored, so keep this test.
+        let wrong_auth = json!({
+            "name": "s", "url": "https://x/mcp", "type": "openapi",
+            "spec": spec, "api_key_header": "X-Key"
+        });
+        crate::models::schema::validate_mcp_server(&wrong_auth)
+            .expect_err("api_key_header without auth_type api_key must be rejected");
+
+        let bad_header = json!({
+            "name": "s", "url": "https://x/mcp", "type": "openapi", "spec": spec,
+            "auth_type": "api_key", "secret": "s", "api_key_header": "bad header"
+        });
+        crate::models::schema::validate_mcp_server(&bad_header)
+            .expect_err("a header name with a space must be rejected");
+
+        // A plain mcp server carries neither field — `type` defaults to `mcp`,
+        // so the missing-key case is covered too.
+        for bad in [
+            json!({"name": "s", "url": "https://x/mcp", "spec": {"openapi": "3.0.0"}}),
+            json!({"name": "s", "url": "https://x/mcp", "api_key_header": "X-Key"}),
+        ] {
+            crate::models::schema::validate_mcp_server(&bad)
+                .expect_err("spec/api_key_header are openapi-only");
+        }
+
+        // The complete openapi shape validates.
+        let ok = json!({
+            "name": "s", "url": "https://x/mcp", "type": "openapi",
+            "spec": {"openapi": "3.0.0"}, "auth_type": "api_key",
+            "secret": "s", "api_key_header": "X-Key"
+        });
+        crate::models::schema::validate_mcp_server(&ok).expect("complete openapi server");
     }
 
     #[test]
