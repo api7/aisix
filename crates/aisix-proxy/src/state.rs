@@ -95,6 +95,13 @@ impl CacheBackends {
 
 #[derive(Clone)]
 pub struct ProxyState {
+    // Axum clones state for several layers on every request. Keep the many
+    // shared handles behind one refcount so each clone/drop uses one atomic.
+    inner: Arc<ProxyStateInner>,
+}
+
+#[derive(Clone)]
+pub struct ProxyStateInner {
     pub snapshot: SnapshotHandle<AisixSnapshot>,
     pub hub: Arc<Hub>,
     pub limiter: Arc<Limiter>,
@@ -164,12 +171,26 @@ pub struct ProxyState {
     pub default_timeouts: crate::routing::TimeoutDefaults,
 }
 
+impl std::ops::Deref for ProxyState {
+    type Target = ProxyStateInner;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl std::ops::DerefMut for ProxyState {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        Arc::make_mut(&mut self.inner)
+    }
+}
+
 impl ProxyState {
     pub fn new(snapshot: SnapshotHandle<AisixSnapshot>, hub: Arc<Hub>, cfg: &ProxyConfig) -> Self {
         let metrics = Arc::new(Metrics::new(false));
         let guardrail_index =
             LiveGuardrailIndex::new_with_sink(snapshot.clone(), None, Some(metrics.clone()));
-        Self {
+        Self::from_inner(ProxyStateInner {
             snapshot,
             hub,
             limiter: Arc::new(Limiter::new()),
@@ -191,7 +212,7 @@ impl ProxyState {
             client_classifier: Arc::new(ClientTypeClassifier::builtin()),
             default_retries: aisix_core::config::DEFAULT_UPSTREAM_RETRIES,
             default_timeouts: crate::routing::TimeoutDefaults::default(),
-        }
+        })
     }
 
     /// Alternative constructor for callers that want to share a preexisting
@@ -205,7 +226,7 @@ impl ProxyState {
         let metrics = Arc::new(Metrics::new(false));
         let guardrail_index =
             LiveGuardrailIndex::new_with_sink(snapshot.clone(), None, Some(metrics.clone()));
-        Self {
+        Self::from_inner(ProxyStateInner {
             snapshot,
             hub,
             limiter,
@@ -227,7 +248,7 @@ impl ProxyState {
             client_classifier: Arc::new(ClientTypeClassifier::builtin()),
             default_retries: aisix_core::config::DEFAULT_UPSTREAM_RETRIES,
             default_timeouts: crate::routing::TimeoutDefaults::default(),
-        }
+        })
     }
 
     /// Full constructor used by the server bootstrap — lets the same
@@ -251,7 +272,7 @@ impl ProxyState {
             metrics.clone(),
             snapshot.clone(),
         ));
-        Self {
+        Self::from_inner(ProxyStateInner {
             snapshot,
             hub,
             limiter,
@@ -273,13 +294,19 @@ impl ProxyState {
             client_classifier: Arc::new(ClientTypeClassifier::builtin()),
             default_retries: aisix_core::config::DEFAULT_UPSTREAM_RETRIES,
             default_timeouts: crate::routing::TimeoutDefaults::default(),
+        })
+    }
+
+    fn from_inner(inner: ProxyStateInner) -> Self {
+        Self {
+            inner: Arc::new(inner),
         }
     }
 
     /// Disable caching on an existing state. Used by tests that need
     /// every request to reach wiremock.
     pub fn without_cache(mut self) -> Self {
-        self.cache = None;
+        Arc::make_mut(&mut self.inner).cache = None;
         self
     }
 
@@ -287,7 +314,7 @@ impl ProxyState {
     /// wire a live snapshot-backed index; tests can substitute a
     /// deterministic one via `LiveGuardrailIndex::new(stub_handle, None)`.
     pub fn with_guardrail_index(mut self, index: Arc<LiveGuardrailIndex>) -> Self {
-        self.guardrail_index = index;
+        Arc::make_mut(&mut self.inner).guardrail_index = index;
         self
     }
 
@@ -295,14 +322,14 @@ impl ProxyState {
     /// `observability.metrics.client_type_rules` (AISIX-Cloud#1045).
     /// Default is built-ins only.
     pub fn with_client_classifier(mut self, classifier: Arc<ClientTypeClassifier>) -> Self {
-        self.client_classifier = classifier;
+        Arc::make_mut(&mut self.inner).client_classifier = classifier;
         self
     }
 
     /// Apply the deployment-wide `upstream.retries` budget. Default is
     /// [`aisix_core::config::DEFAULT_UPSTREAM_RETRIES`].
     pub fn with_default_retries(mut self, retries: u32) -> Self {
-        self.default_retries = retries;
+        Arc::make_mut(&mut self.inner).default_retries = retries;
         self
     }
 
@@ -310,7 +337,7 @@ impl ProxyState {
     /// `upstream.stream_timeout_ms` defaults, with `0` meaning "no
     /// default at that slot".
     pub fn with_default_timeouts(mut self, timeout_ms: u64, stream_timeout_ms: u64) -> Self {
-        self.default_timeouts = crate::routing::TimeoutDefaults {
+        Arc::make_mut(&mut self.inner).default_timeouts = crate::routing::TimeoutDefaults {
             request: (timeout_ms > 0).then(|| std::time::Duration::from_millis(timeout_ms)),
             stream: (stream_timeout_ms > 0)
                 .then(|| std::time::Duration::from_millis(stream_timeout_ms)),
@@ -322,14 +349,14 @@ impl ProxyState {
     /// the server bootstrap calls this in managed mode after spawning
     /// the sender worker.
     pub fn with_usage_sink(mut self, sink: UsageSink) -> Self {
-        self.usage_sink = sink;
+        Arc::make_mut(&mut self.inner).usage_sink = sink;
         self
     }
 
     /// Swap in a live `BudgetClient` that talks to cp-api. Default is
     /// the disabled (allow-all) client used in self-hosted dev.
     pub fn with_budget_client(mut self, client: Arc<BudgetClient>) -> Self {
-        self.budgets = client;
+        Arc::make_mut(&mut self.inner).budgets = client;
         self
     }
 
@@ -339,7 +366,54 @@ impl ProxyState {
         mut self,
         probe: Arc<dyn Fn() -> Option<std::time::Duration> + Send + Sync>,
     ) -> Self {
-        self.config_apply_age = Some(probe);
+        Arc::make_mut(&mut self.inner).config_apply_age = Some(probe);
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ProxyState;
+    use aisix_core::snapshot::SnapshotHandle;
+    use aisix_core::{AisixSnapshot, ProxyConfig};
+    use aisix_gateway::Hub;
+    use std::sync::Arc;
+
+    fn test_state() -> ProxyState {
+        ProxyState::new(
+            SnapshotHandle::new(AisixSnapshot::new()),
+            Arc::new(Hub::new()),
+            &ProxyConfig {
+                addr: "127.0.0.1:0".into(),
+                request_body_limit_bytes: 1_048_576,
+                tls: None,
+                real_ip: Default::default(),
+            },
+        )
+    }
+
+    #[test]
+    fn proxy_state_clone_shares_one_inner_and_mutation_is_copy_on_write() {
+        assert_eq!(
+            std::mem::size_of::<ProxyState>(),
+            std::mem::size_of::<Arc<()>>()
+        );
+
+        let original = test_state();
+        assert_eq!(Arc::strong_count(&original.inner), 1);
+
+        let mut cloned = original.clone();
+        assert!(Arc::ptr_eq(&original.inner, &cloned.inner));
+        assert_eq!(Arc::strong_count(&original.inner), 2);
+
+        cloned.cache = None;
+        assert!(!Arc::ptr_eq(&original.inner, &cloned.inner));
+        assert!(original.cache.is_some());
+        assert!(cloned.cache.is_none());
+
+        let configured = original.clone().with_default_retries(99);
+        assert!(!Arc::ptr_eq(&original.inner, &configured.inner));
+        assert_ne!(original.default_retries, 99);
+        assert_eq!(configured.default_retries, 99);
     }
 }
