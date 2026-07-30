@@ -1,6 +1,54 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "auth_type": {
+            "const": "bearer"
+          }
+        },
+        "required": [
+          "auth_type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "secret": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "secret"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "auth_type": {
+            "const": "api_key"
+          }
+        },
+        "required": [
+          "auth_type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "secret": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "secret"
+        ]
+      }
+    }
+  ],
   "anyOf": [
     {
       "required": [
@@ -80,6 +128,7 @@
     "display_name": {
       "description": "Accepted as an alternative spelling of `name`. Provide the label under exactly one of the two names.",
       "minLength": 1,
+      "pattern": "^[^/]+$",
       "type": "string"
     },
     "enabled": {
@@ -90,6 +139,7 @@
     "name": {
       "description": "Operator-facing label, unique within the gateway. It is the path segment under which the agent is exposed to callers as `/a2a/<name>`, so it must be a single non-empty URL path segment.",
       "minLength": 1,
+      "pattern": "^[^/]+$",
       "type": "string"
     },
     "protocol_version": {

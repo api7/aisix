@@ -197,6 +197,12 @@ fn assert_unique_name(
 
 #[cfg(test)]
 mod tests {
+    // These rules moved into the canonical schema (see
+    // `a2a_agent_credential_coupling` / `mcp_server_credential_coupling` and the
+    // `name` patterns), so the schema gate now rejects these payloads before
+    // `decode`'s own checks run. The variant is `Schema` rather than
+    // `BadRequest`; both map to 400, so the wire contract is unchanged. The
+    // assertions below check the status-bearing outcome, not the variant.
     use super::*;
     use serde_json::json;
 
@@ -204,7 +210,7 @@ mod tests {
     fn decode_rejects_separator_in_name() {
         let err = decode(&json!({"display_name": "a__b", "url": "https://x/mcp"}))
             .expect_err("`__` in the server name must be rejected");
-        assert!(matches!(err, AdminError::BadRequest(_)));
+        assert_eq!(err.status(), axum::http::StatusCode::BAD_REQUEST);
     }
 
     #[test]
@@ -215,7 +221,7 @@ mod tests {
             "auth_type": "bearer"
         }))
         .expect_err("bearer auth without a secret must be rejected");
-        assert!(matches!(err, AdminError::BadRequest(_)));
+        assert_eq!(err.status(), axum::http::StatusCode::BAD_REQUEST);
     }
 
     #[test]
@@ -226,7 +232,7 @@ mod tests {
             "auth_type": "api_key"
         }))
         .expect_err("api_key auth without a secret must be rejected");
-        assert!(matches!(err, AdminError::BadRequest(_)));
+        assert_eq!(err.status(), axum::http::StatusCode::BAD_REQUEST);
     }
 
     #[test]
@@ -244,7 +250,7 @@ mod tests {
             v.as_object_mut().unwrap().remove(missing);
             let err = decode(&v).unwrap_err();
             assert!(
-                matches!(err, AdminError::BadRequest(_)),
+                err.status() == axum::http::StatusCode::BAD_REQUEST,
                 "oauth2 without `{missing}` must be a BadRequest"
             );
         }

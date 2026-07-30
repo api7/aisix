@@ -290,6 +290,13 @@ fn accept_renamed_field(schema: &mut Value, canonical: &str, former: &str, note:
 /// `display_name` (see [`accept_renamed_field`]).
 pub fn mcp_server_root_schema() -> Value {
     let mut schema = struct_root_schema::<crate::models::McpServer>(true);
+    schema
+        .as_object_mut()
+        .expect("mcp server root schema is a JSON object")
+        .insert(
+            "allOf".to_string(),
+            super::mcp_server::mcp_server_credential_coupling(),
+        );
     accept_renamed_field(
         &mut schema,
         "name",
@@ -331,6 +338,13 @@ pub fn mcp_server_root_schema() -> Value {
 /// [`accept_renamed_field`]).
 pub fn a2a_agent_root_schema() -> Value {
     let mut schema = struct_root_schema::<crate::models::A2aAgent>(true);
+    schema
+        .as_object_mut()
+        .expect("a2a agent root schema is a JSON object")
+        .insert(
+            "allOf".to_string(),
+            super::a2a_agent::a2a_agent_credential_coupling(),
+        );
     accept_renamed_field(
         &mut schema,
         "name",
@@ -2966,15 +2980,33 @@ mod tests {
     }
 
     #[test]
-    fn mcp_server_schema_stays_permissive_on_credential_coupling() {
-        // The per-`auth_type` credential coupling (oauth2 ⇒ client_id +
-        // secret + token_url) is enforced by write paths, not this schema —
-        // an incomplete oauth2 row must still validate so the snapshot loader
-        // keeps it (the runtime degrades that server gracefully instead).
+    fn mcp_server_schema_enforces_credential_coupling() {
+        // This assertion is the inverse of what it used to be, deliberately.
+        // The coupling (oauth2 ⇒ client_id + secret + token_url) used to be
+        // left to write paths, on the reasoning that an incomplete row should
+        // still load and degrade at runtime. That reasoning depended on a write
+        // path existing to catch it; with resource writes removed from this
+        // gateway, leaving the schema permissive means nothing checks the
+        // coupling at all on the declarative and etcd paths.
+        //
+        // Rejecting at load is also the more diagnosable of the two failures: a
+        // rejected row is named in `GET /status/config`'s `rejected` array,
+        // whereas a loaded-but-degraded server silently serves no tools.
         let v = json!({
             "display_name": "x",
             "url": "https://x/mcp",
             "auth_type": "oauth2"
+        });
+        assert!(validate_mcp_server(&v).is_err());
+
+        // The complete set still validates.
+        let v = json!({
+            "display_name": "x",
+            "url": "https://x/mcp",
+            "auth_type": "oauth2",
+            "secret": "cs",
+            "client_id": "cid",
+            "token_url": "https://auth/token"
         });
         validate_mcp_server(&v).unwrap();
     }

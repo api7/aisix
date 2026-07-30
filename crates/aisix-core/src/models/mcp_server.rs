@@ -11,6 +11,7 @@
 //! etcd path: `{prefix}/mcp_servers/{uuid}`. Secondary index on `name`.
 
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 
 use crate::resource::Resource;
 
@@ -27,7 +28,11 @@ pub struct McpServer {
     // lives in `schema::mcp_server_root_schema`). Re-serialization always
     // emits `name`.
     #[serde(alias = "display_name")]
-    #[schemars(length(min = 1))]
+    // The name is the tool-namespace prefix: this server's tools are exposed to
+    // MCP clients as `<name>__<tool>`, so a name containing the `__` separator
+    // would make the split ambiguous. Rejected by the pattern below on every
+    // configuration path.
+    #[schemars(regex(pattern = "^(?:[^_]|_[^_])*_?$"), length(min = 1))]
     pub name: String,
 
     /// What backs this server: a real upstream MCP server (`mcp`, the
@@ -186,9 +191,82 @@ impl Resource for McpServer {
     }
 }
 
+/// The `auth_type` → credential coupling, as a JSON Schema `allOf` that
+/// [`crate::models::schema::mcp_server_root_schema`] injects into the generated
+/// schema. `schemars` cannot express a cross-field conditional, so this is the
+/// single definition the published schema and every runtime validator share:
+/// an incomplete credential set leaves the gateway authenticating upstream with
+/// nothing, so it is rejected at load rather than at first tool call.
+pub fn mcp_server_credential_coupling() -> Value {
+    let secret_required = json!({
+        "required": ["secret"],
+        "properties": { "secret": { "type": "string", "minLength": 1 } }
+    });
+    json!([
+        {
+            "if": { "properties": { "auth_type": { "const": "bearer" } }, "required": ["auth_type"] },
+            "then": secret_required
+        },
+        {
+            "if": { "properties": { "auth_type": { "const": "api_key" } }, "required": ["auth_type"] },
+            "then": secret_required
+        },
+        {
+            "if": { "properties": { "auth_type": { "const": "oauth2" } }, "required": ["auth_type"] },
+            "then": {
+                "required": ["secret", "client_id", "token_url"],
+                "properties": {
+                    "secret": { "type": "string", "minLength": 1 },
+                    "client_id": { "type": "string", "minLength": 1 },
+                    "token_url": { "type": "string", "minLength": 1 }
+                }
+            }
+        }
+    ])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn schema_rejects_tool_namespace_separator_in_name() {
+        // Tools are exposed as `<name>__<tool>`, so `__` inside the name makes
+        // the split ambiguous.
+        let doc = json!({"name": "git__hub", "url": "https://x/mcp"});
+        let err = crate::models::schema::validate_mcp_server(&doc)
+            .expect_err("a name containing `__` must be rejected");
+        assert!(err.path.contains("name"), "unexpected path: {}", err.path);
+
+        // A single underscore is fine, including a trailing one.
+        for good in ["git_hub", "github_", "github"] {
+            let doc = json!({"name": good, "url": "https://x/mcp"});
+            crate::models::schema::validate_mcp_server(&doc)
+                .unwrap_or_else(|e| panic!("{good} should be accepted: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn schema_requires_credentials_per_auth_type() {
+        for auth in ["bearer", "api_key"] {
+            let doc = json!({"name": "s", "url": "https://x/mcp", "auth_type": auth});
+            crate::models::schema::validate_mcp_server(&doc)
+                .expect_err(&format!("{auth} without a secret must be rejected"));
+        }
+
+        // oauth2 needs the client credentials and the token endpoint too.
+        let partial =
+            json!({"name": "s", "url": "https://x/mcp", "auth_type": "oauth2", "secret": "cs"});
+        crate::models::schema::validate_mcp_server(&partial)
+            .expect_err("oauth2 without client_id/token_url must be rejected");
+
+        let complete = json!({
+            "name": "s", "url": "https://x/mcp", "auth_type": "oauth2",
+            "secret": "cs", "client_id": "cid", "token_url": "https://auth/token"
+        });
+        crate::models::schema::validate_mcp_server(&complete)
+            .expect("a complete oauth2 credential set must be accepted");
+    }
 
     #[test]
     fn deserialises_minimal_mcp_server() {
