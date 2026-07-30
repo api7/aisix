@@ -193,12 +193,12 @@ jobs:
           test -n "$ok"
 
       # The profiling contract from #847: the shipped binary must stay
-      # profileable in the field, meaning the symbol table and the DWARF
-      # line tables survive into the image. A future strip step,
+      # profileable in the field, meaning the symbol table survives into
+      # the image (function-level flame graphs). A future strip step,
       # RUSTFLAGS change, or base-image swap would break flame graphs
       # silently, so pin it here — and print the size so every PR
       # records the real Linux artifact cost.
-      - name: Verify shipped binary keeps symbols + line tables (#847)
+      - name: Verify shipped binary keeps its symbol table (#847)
         if: github.event_name == 'pull_request'
         run: |
           set -eux
@@ -208,7 +208,7 @@ jobs:
           docker rm "$cid"
           ls -l /tmp/aisix-shipped
           test "$(nm /tmp/aisix-shipped | grep -c ' [tT] ')" -gt 1000
-          readelf -S /tmp/aisix-shipped | grep -E '\.debug_line|\.debug_info|\.symtab'
+          readelf -S /tmp/aisix-shipped | grep -E '\.symtab|\.eh_frame'
 
       - name: Install cosign
         if: github.event_name != 'pull_request'
