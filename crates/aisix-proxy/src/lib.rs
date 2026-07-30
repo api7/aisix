@@ -387,7 +387,15 @@ struct ClientCancelGuard {
 
 impl Drop for ClientCancelGuard {
     fn drop(&mut self) {
-        if !self.armed {
+        // A panicking handler also leaves the guard armed — its future is
+        // dropped mid-unwind exactly like a cancelled one. Attributing that
+        // to the caller would be wrong twice over: it fabricates a client
+        // disconnect that never happened, and it buries the panic under a
+        // benign-looking 499. A panic has its own signal (tokio surfaces the
+        // task failure and hyper drops the connection), so stay silent and
+        // let that stand. Emitting here would also risk a double panic,
+        // which aborts the process.
+        if !self.armed || std::thread::panicking() {
             return;
         }
         let latency = self.started.elapsed();
@@ -6159,6 +6167,37 @@ data: [DONE]\n\n";
         assert!(
             !rendered.contains(CANCEL_METRIC),
             "a completed request was miscounted as a client cancel: {rendered}"
+        );
+    }
+
+    /// A panicking handler drops the guard mid-unwind with `armed` still
+    /// set, which looks identical to a cancel from `Drop`'s point of view.
+    /// Recording it would invent a client disconnect that never happened and
+    /// bury the panic under a benign 499, so the guard must stay silent and
+    /// let the panic's own signal stand.
+    #[test]
+    fn cancel_guard_stays_silent_during_unwind() {
+        let metrics = std::sync::Arc::new(aisix_obs::Metrics::new(false));
+        let probe = metrics.clone();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = ClientCancelGuard {
+                armed: true,
+                metrics: metrics.clone(),
+                endpoint: "/v1/chat/completions",
+                method: axum::http::Method::POST,
+                uri: "/v1/chat/completions".parse().unwrap(),
+                request_id: "req-unwind".to_string(),
+                started: std::time::Instant::now(),
+            };
+            panic!("handler blew up");
+        }));
+
+        assert!(result.is_err(), "the test's own panic must have unwound");
+        assert!(
+            !probe.render().contains(CANCEL_METRIC),
+            "a panicking handler was miscounted as a client cancel: {}",
+            probe.render()
         );
     }
 
