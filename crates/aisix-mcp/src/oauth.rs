@@ -314,9 +314,20 @@ mod tests {
         }
     }
 
+    /// Every call mints a UNIQUE `client_id`. The token cache is
+    /// process-global and keyed by `(token_url, client_id, secret,
+    /// scopes)`; each test binds its endpoint on an ephemeral port, but
+    /// the OS can hand a later test the port a finished test just
+    /// released — with identical ids that collides the cache key, and
+    /// the later test is served the earlier test's token while its own
+    /// endpoint records zero hits (observed as CI flakes on
+    /// `second_call_within_expiry_hits_the_cache`). A per-call id keeps
+    /// every test's cache slice disjoint no matter how ports recycle.
     fn config(token_url: String) -> OAuthClientConfig {
+        static NEXT_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         OAuthClientConfig {
-            client_id: "cid".to_string(),
+            client_id: format!("cid-{n}"),
             client_secret: "s3cret".to_string(),
             token_url,
             scopes: Vec::new(),
@@ -341,7 +352,10 @@ mod tests {
             form.get("grant_type").map(String::as_str),
             Some("client_credentials")
         );
-        assert_eq!(form.get("client_id").map(String::as_str), Some("cid"));
+        assert_eq!(
+            form.get("client_id").map(String::as_str),
+            Some(cfg.client_id.as_str())
+        );
         assert_eq!(
             form.get("client_secret").map(String::as_str),
             Some("s3cret")
@@ -494,13 +508,17 @@ mod tests {
             expires_in: Some(3600),
         })
         .await;
+        // One base config, cloned: the test's subject is SAME client id +
+        // secret with different scopes (two `config()` calls would get
+        // distinct ids and stop testing that).
+        let base = config(endpoint.url());
         let read_cfg = OAuthClientConfig {
             scopes: vec!["read".to_string()],
-            ..config(endpoint.url())
+            ..base.clone()
         };
         let write_cfg = OAuthClientConfig {
             scopes: vec!["write".to_string()],
-            ..config(endpoint.url())
+            ..base
         };
 
         assert_eq!(get_or_fetch(&read_cfg).await.expect("read"), "tok-1");
