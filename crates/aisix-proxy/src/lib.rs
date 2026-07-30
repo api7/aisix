@@ -1650,6 +1650,70 @@ mod tests {
         );
     }
 
+    /// The passthrough tunnel reads its body manually (`to_bytes`), so
+    /// the `0` sentinel has to be widened there too — this is the site
+    /// the first audit round caught unconverted, where every POST got
+    /// `413 request body exceeds 0-byte limit` on the new default.
+    #[tokio::test]
+    async fn zero_limit_passthrough_post_is_not_rejected() {
+        let hub = Arc::new(Hub::new());
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
+        let app = build_router(build_state_with_limit(snap, hub, 0));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/passthrough/openai/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"model":"gpt-4o","input":"hi"}"#))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_ne!(
+            resp.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "limit 0 must not reject the passthrough body"
+        );
+        // Past the body read; the dispatch then failed on the unusable
+        // upstream.
+        assert!(
+            resp.status().is_server_error(),
+            "expected an upstream dispatch failure, got {}",
+            resp.status()
+        );
+    }
+
+    /// With a configured cap, a chunked over-limit passthrough body is
+    /// a 413 in the envelope — and a transport fault stays a 400, no
+    /// longer mislabelled as `RequestTooLarge`.
+    #[tokio::test]
+    async fn chunked_oversize_on_passthrough_returns_openai_envelope() {
+        let hub = Arc::new(Hub::new());
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
+        let app = build_router(build_state(snap, hub));
+
+        let chunk = vec![b'x'; 200 * 1024];
+        let stream =
+            futures::stream::iter((0..10).map(move |_| Ok::<_, std::io::Error>(chunk.clone())));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/passthrough/openai/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from_stream(stream))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let v: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("413 must carry the JSON envelope");
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        let message = v["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("limit"),
+            "413 message should reference the limit; got {message:?}"
+        );
+    }
+
     /// Issue #159 companion: a body within the cap must NOT be
     /// rejected — the middleware short-circuits ONLY when the
     /// Content-Length exceeds the cap, leaving normal traffic

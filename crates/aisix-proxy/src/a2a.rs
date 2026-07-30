@@ -425,6 +425,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chunked_oversized_body_returns_enveloped_413() {
+        // Same contract as /mcp: a chunked body over the cap surfaces as
+        // the enveloped 413 from the handler's capped read, not the old
+        // bare 400.
+        let app = router_with(snapshot_with(
+            "http://127.0.0.1:1/a2a",
+            true,
+            serde_json::json!(["invoice"]),
+        ));
+        let chunk = vec![b'a'; 200 * 1024];
+        let stream =
+            futures::stream::iter((0..10).map(move |_| Ok::<_, std::io::Error>(chunk.clone())));
+        let req = HttpRequest::post("/a2a/invoice")
+            .header("host", "a2a.aisix.example.com")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {TOKEN}"))
+            .body(Body::from_stream(stream))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .expect("read body");
+        let v: serde_json::Value =
+            serde_json::from_slice(&body).expect("413 must carry the JSON envelope");
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+    }
+
+    #[tokio::test]
     async fn endpoint_denies_key_without_allowed_agents_403() {
         // Unreachable upstream on purpose: the ACL must reject BEFORE any
         // upstream call is made.

@@ -353,11 +353,18 @@ async fn dispatch(
     // chunked / no-Content-Length / Content-Length-lying case once
     // the actual byte count exceeds the cap.
     let body_limit = state.request_body_limit_bytes;
-    let body_bytes: Bytes = axum::body::to_bytes(req.into_body(), body_limit)
-        .await
-        .map_err(|_| ProxyError::RequestTooLarge {
-            limit_bytes: body_limit,
-        })?;
+    let body_bytes: Bytes =
+        axum::body::to_bytes(req.into_body(), crate::error::body_read_cap(body_limit))
+            .await
+            .map_err(|err| {
+                if crate::error::is_length_limit_error(&err) {
+                    ProxyError::RequestTooLarge {
+                        limit_bytes: body_limit,
+                    }
+                } else {
+                    ProxyError::InvalidRequest("failed to read request body".into())
+                }
+            })?;
 
     // #911 [6]: run INPUT guardrails on the passthrough request body BEFORE it
     // reaches the upstream. The tunnel forwards arbitrary provider endpoints

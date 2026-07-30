@@ -912,6 +912,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chunked_oversized_body_returns_enveloped_413() {
+        // No Content-Length: the middleware can't pre-check, so the
+        // handler's own capped read fires. The length-limit error must
+        // surface as the enveloped 413 — matching what the middleware
+        // answers on this route — not the bare-400 "invalid request
+        // body" it used to fold into.
+        let router = router_with(snapshot_with_key());
+        let chunk = vec![b'a'; 200 * 1024];
+        let stream =
+            futures::stream::iter((0..10).map(move |_| Ok::<_, std::io::Error>(chunk.clone())));
+        let req = HttpRequest::post("/mcp")
+            .header("host", "mcp.aisix.example.com")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {TOKEN}"))
+            .body(Body::from_stream(stream))
+            .unwrap();
+        let resp = router.oneshot(req).await.expect("router responds");
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .expect("read body");
+        let v: serde_json::Value =
+            serde_json::from_slice(&body).expect("413 must carry the JSON envelope");
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+    }
+
+    #[tokio::test]
     async fn authenticated_request_reaches_the_mcp_gateway() {
         let router = router_with(snapshot_with_key());
         let resp = router

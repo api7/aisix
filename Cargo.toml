@@ -145,10 +145,19 @@ wiremock = "0.6"
 testcontainers = "0.23"
 tempfile = "3.13"
 
+# Shipped binaries must stay profileable in the field (perf / cargo
+# flamegraph against the very build a user runs), so keep the symbol
+# table: function-level flame graphs cost ~10 MiB over stripped. DWARF
+# stays out — line tables alone measured ~142 MB here (cgu=1 + thin
+# LTO explode inlined-instance records). For an ad-hoc line-level
+# build when a deep dive needs file:line attribution:
+#   CARGO_PROFILE_RELEASE_DEBUG=line-tables-only \
+#   CARGO_PROFILE_RELEASE_STRIP=none cargo build --release
+# See issue #847.
 [profile.release]
 lto = "thin"
 codegen-units = 1
-strip = "symbols"
+strip = "debuginfo"
 
 [profile.coverage]
 inherits = "dev"
