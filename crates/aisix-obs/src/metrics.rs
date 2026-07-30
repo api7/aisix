@@ -27,6 +27,7 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use parking_lot::RwLock;
@@ -202,6 +203,7 @@ struct MetricsInner {
     handle: PrometheusHandle,
     proxy_in_flight: Mutex<HashMap<(String, String), i64>>,
     request_series: RwLock<RequestSeriesCache>,
+    usage_series: RwLock<UsageSeriesCache>,
     /// Constant `env_id` label for the SLO latency histograms — one DP
     /// process serves exactly one environment. `"unknown"` when the DP
     /// runs standalone (no control plane).
@@ -220,6 +222,7 @@ struct ConfigLabelState {
 }
 
 const REQUEST_SERIES_CACHE_CAPACITY: usize = 1024;
+const USAGE_SERIES_CACHE_CAPACITY: usize = 1024;
 
 #[derive(Default)]
 struct RequestSeriesCache {
@@ -238,6 +241,27 @@ struct RequestSeriesHandles {
     proxy_duration: metrics::Histogram,
     llm_requests: metrics::Counter,
     llm_duration: metrics::Histogram,
+}
+
+#[derive(Default)]
+struct UsageSeriesCache {
+    entries: HashMap<u64, Vec<CachedUsageSeries>>,
+    len: usize,
+}
+
+struct CachedUsageSeries {
+    labels: UsageLabelsOwned,
+    handles: UsageSeriesHandles,
+}
+
+/// Usage dimensions are registered independently so a zero-valued token or
+/// spend field does not create an otherwise absent Prometheus series.
+#[derive(Default)]
+struct UsageSeriesHandles {
+    input_tokens: OnceLock<metrics::Counter>,
+    output_tokens: OnceLock<metrics::Counter>,
+    total_tokens: OnceLock<metrics::Counter>,
+    spend_micro_usd: OnceLock<metrics::Counter>,
 }
 
 struct RequestLabelsOwned {
@@ -298,6 +322,52 @@ impl RequestLabelsOwned {
     }
 }
 
+struct UsageLabelsOwned {
+    endpoint: String,
+    inbound_protocol: String,
+    provider: String,
+    model: String,
+    upstream_model: String,
+    provider_key_id: String,
+    provider_key_name: String,
+    api_key_id: String,
+    team_id: String,
+    user_id: String,
+    user_name: String,
+}
+
+impl UsageLabelsOwned {
+    fn new(labels: UsageLabels<'_>) -> Self {
+        Self {
+            endpoint: labels.endpoint.to_string(),
+            inbound_protocol: labels.inbound_protocol.to_string(),
+            provider: labels.provider.to_string(),
+            model: labels.model.to_string(),
+            upstream_model: labels.upstream_model.to_string(),
+            provider_key_id: labels.provider_key_id.to_string(),
+            provider_key_name: labels.provider_key_name.to_string(),
+            api_key_id: labels.api_key_id.to_string(),
+            team_id: labels.team_id.to_string(),
+            user_id: labels.user_id.to_string(),
+            user_name: labels.user_name.to_string(),
+        }
+    }
+
+    fn matches(&self, labels: UsageLabels<'_>) -> bool {
+        self.endpoint == labels.endpoint
+            && self.inbound_protocol == labels.inbound_protocol
+            && self.provider == labels.provider
+            && self.model == labels.model
+            && self.upstream_model == labels.upstream_model
+            && self.provider_key_id == labels.provider_key_id
+            && self.provider_key_name == labels.provider_key_name
+            && self.api_key_id == labels.api_key_id
+            && self.team_id == labels.team_id
+            && self.user_id == labels.user_id
+            && self.user_name == labels.user_name
+    }
+}
+
 impl RequestSeriesCache {
     fn get(&self, hash: u64, labels: RequestLabels<'_>) -> Option<&RequestSeriesHandles> {
         self.entries
@@ -319,6 +389,31 @@ impl RequestSeriesCache {
             .entry(hash)
             .or_default()
             .push(CachedRequestSeries { labels, handles });
+        self.len += 1;
+    }
+}
+
+impl UsageSeriesCache {
+    fn get(&self, hash: u64, labels: UsageLabels<'_>) -> Option<&UsageSeriesHandles> {
+        self.entries
+            .get(&hash)?
+            .iter()
+            .find(|entry| entry.labels.matches(labels))
+            .map(|entry| &entry.handles)
+    }
+
+    fn insert(&mut self, hash: u64, labels: UsageLabelsOwned, handles: UsageSeriesHandles) {
+        if self.len >= USAGE_SERIES_CACHE_CAPACITY {
+            if let Some(evicted_hash) = self.entries.keys().next().copied() {
+                if let Some(evicted) = self.entries.remove(&evicted_hash) {
+                    self.len -= evicted.len();
+                }
+            }
+        }
+        self.entries
+            .entry(hash)
+            .or_default()
+            .push(CachedUsageSeries { labels, handles });
         self.len += 1;
     }
 }
@@ -369,6 +464,7 @@ impl Metrics {
                 handle,
                 proxy_in_flight: Mutex::new(HashMap::new()),
                 request_series: RwLock::new(RequestSeriesCache::default()),
+                usage_series: RwLock::new(UsageSeriesCache::default()),
                 env_id: if env_id.is_empty() {
                     "unknown".to_string()
                 } else {
@@ -637,6 +733,22 @@ impl Metrics {
         hasher.finish()
     }
 
+    fn usage_series_hash(labels: UsageLabels<'_>) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        labels.endpoint.hash(&mut hasher);
+        labels.inbound_protocol.hash(&mut hasher);
+        labels.provider.hash(&mut hasher);
+        labels.model.hash(&mut hasher);
+        labels.upstream_model.hash(&mut hasher);
+        labels.provider_key_id.hash(&mut hasher);
+        labels.provider_key_name.hash(&mut hasher);
+        labels.api_key_id.hash(&mut hasher);
+        labels.team_id.hash(&mut hasher);
+        labels.user_id.hash(&mut hasher);
+        labels.user_name.hash(&mut hasher);
+        hasher.finish()
+    }
+
     fn register_request_series(&self, labels: RequestLabels<'_>) -> RequestSeriesHandles {
         metrics::with_local_recorder(&self.inner.recorder, || RequestSeriesHandles {
             proxy_requests: labels.request_counter(M_PROXY_REQUESTS_TOTAL),
@@ -673,6 +785,31 @@ impl Metrics {
             cache
                 .get(hash, labels)
                 .expect("request series was just inserted"),
+        );
+    }
+
+    fn with_usage_series(&self, labels: UsageLabels<'_>, record: impl FnOnce(&UsageSeriesHandles)) {
+        let hash = Self::usage_series_hash(labels);
+        {
+            let cache = self.inner.usage_series.read();
+            if let Some(handles) = cache.get(hash, labels) {
+                record(handles);
+                return;
+            }
+        }
+
+        let mut cache = self.inner.usage_series.write();
+        if cache.get(hash, labels).is_none() {
+            cache.insert(
+                hash,
+                UsageLabelsOwned::new(labels),
+                UsageSeriesHandles::default(),
+            );
+        }
+        record(
+            cache
+                .get(hash, labels)
+                .expect("usage series was just inserted"),
         );
     }
 
@@ -715,22 +852,41 @@ impl Metrics {
     }
 
     pub fn record_llm_usage(&self, labels: UsageLabels<'_>, usage: LlmUsage) {
-        if usage.is_empty() {
+        let spend_micro_usd = usage.spend_micro_usd();
+        if usage.input_tokens == 0
+            && usage.output_tokens == 0
+            && usage.total_tokens == 0
+            && spend_micro_usd.is_none()
+        {
             return;
         }
-        metrics::with_local_recorder(&self.inner.recorder, || {
-            if usage.input_tokens > 0 {
-                labels.record_counter(M_LLM_INPUT_TOKENS_TOTAL, u64::from(usage.input_tokens));
-            }
-            if usage.output_tokens > 0 {
-                labels.record_counter(M_LLM_OUTPUT_TOKENS_TOTAL, u64::from(usage.output_tokens));
-            }
-            if usage.total_tokens > 0 {
-                labels.record_counter(M_LLM_TOTAL_TOKENS_TOTAL, u64::from(usage.total_tokens));
-            }
-            if usage.spend_usd > 0.0 {
-                labels.record_spend_usd(usage.spend_usd);
-            }
+        self.with_usage_series(labels, |handles| {
+            metrics::with_local_recorder(&self.inner.recorder, || {
+                if usage.input_tokens > 0 {
+                    handles
+                        .input_tokens
+                        .get_or_init(|| labels.counter(M_LLM_INPUT_TOKENS_TOTAL))
+                        .increment(u64::from(usage.input_tokens));
+                }
+                if usage.output_tokens > 0 {
+                    handles
+                        .output_tokens
+                        .get_or_init(|| labels.counter(M_LLM_OUTPUT_TOKENS_TOTAL))
+                        .increment(u64::from(usage.output_tokens));
+                }
+                if usage.total_tokens > 0 {
+                    handles
+                        .total_tokens
+                        .get_or_init(|| labels.counter(M_LLM_TOTAL_TOKENS_TOTAL))
+                        .increment(u64::from(usage.total_tokens));
+                }
+                if let Some(value) = spend_micro_usd {
+                    handles
+                        .spend_micro_usd
+                        .get_or_init(|| labels.counter(M_LLM_SPEND_MICRO_USD_TOTAL))
+                        .increment(value);
+                }
+            });
         });
     }
 
@@ -1388,7 +1544,7 @@ impl Default for UsageLabels<'_> {
 }
 
 impl UsageLabels<'_> {
-    fn record_counter(&self, metric: &'static str, value: u64) {
+    fn counter(&self, metric: &'static str) -> metrics::Counter {
         metrics::counter!(
             metric,
             "endpoint" => self.endpoint.to_string(),
@@ -1403,32 +1559,6 @@ impl UsageLabels<'_> {
             "user_id" => self.user_id.to_string(),
             "user_name" => self.user_name.to_string(),
         )
-        .increment(value);
-    }
-
-    fn record_spend_usd(&self, value: f64) {
-        if !value.is_finite() || value <= 0.0 {
-            return;
-        }
-        let micro_usd = (value * 1_000_000.0).round();
-        if micro_usd <= 0.0 {
-            return;
-        }
-        metrics::counter!(
-            M_LLM_SPEND_MICRO_USD_TOTAL,
-            "endpoint" => self.endpoint.to_string(),
-            "inbound_protocol" => self.inbound_protocol.to_string(),
-            "provider" => self.provider.to_string(),
-            "model" => self.model.to_string(),
-            "upstream_model" => self.upstream_model.to_string(),
-            "provider_key_id" => self.provider_key_id.to_string(),
-            "provider_key_name" => self.provider_key_name.to_string(),
-            "api_key_id" => self.api_key_id.to_string(),
-            "team_id" => self.team_id.to_string(),
-            "user_id" => self.user_id.to_string(),
-            "user_name" => self.user_name.to_string(),
-        )
-        .increment(micro_usd as u64);
     }
 }
 
@@ -1441,11 +1571,12 @@ pub struct LlmUsage {
 }
 
 impl LlmUsage {
-    fn is_empty(self) -> bool {
-        self.input_tokens == 0
-            && self.output_tokens == 0
-            && self.total_tokens == 0
-            && self.spend_usd <= 0.0
+    fn spend_micro_usd(self) -> Option<u64> {
+        if !self.spend_usd.is_finite() || self.spend_usd <= 0.0 {
+            return None;
+        }
+        let micro_usd = (self.spend_usd * 1_000_000.0).round();
+        (micro_usd > 0.0).then_some(micro_usd as u64)
     }
 }
 
@@ -1970,6 +2101,180 @@ mod tests {
                 "{metric} did not record every concurrent call:\n{rendered}"
             );
         }
+    }
+
+    #[test]
+    fn usage_series_cache_is_lazy_and_reuses_handles() {
+        let metrics = Metrics::new(false);
+        let labels = UsageLabels {
+            model: "cached-usage-model",
+            ..UsageLabels::default()
+        };
+
+        metrics.record_llm_usage(
+            labels,
+            LlmUsage {
+                input_tokens: 5,
+                ..LlmUsage::default()
+            },
+        );
+        assert_eq!(
+            metrics.inner.usage_series.read().len,
+            1,
+            "the first non-zero usage sample must create one cached label set"
+        );
+        let rendered = metrics.render();
+        assert!(rendered.lines().any(|line| {
+            line.starts_with(M_LLM_INPUT_TOKENS_TOTAL)
+                && line.contains("model=\"cached-usage-model\"")
+                && line.ends_with(" 5")
+        }));
+        for absent in [
+            M_LLM_OUTPUT_TOKENS_TOTAL,
+            M_LLM_TOTAL_TOKENS_TOTAL,
+            M_LLM_SPEND_MICRO_USD_TOTAL,
+        ] {
+            assert!(
+                !rendered.contains(absent),
+                "a zero-valued usage dimension must not register {absent}"
+            );
+        }
+
+        metrics.record_llm_usage(
+            labels,
+            LlmUsage {
+                output_tokens: 7,
+                total_tokens: 7,
+                spend_usd: 0.001,
+                ..LlmUsage::default()
+            },
+        );
+        assert_eq!(
+            metrics.inner.usage_series.read().len,
+            1,
+            "repeated labels must reuse the cached usage handles"
+        );
+        let rendered = metrics.render();
+        for (metric, value) in [
+            (M_LLM_INPUT_TOKENS_TOTAL, 5),
+            (M_LLM_OUTPUT_TOKENS_TOTAL, 7),
+            (M_LLM_TOTAL_TOKENS_TOTAL, 7),
+            (M_LLM_SPEND_MICRO_USD_TOTAL, 1000),
+        ] {
+            assert!(
+                rendered.lines().any(|line| {
+                    line.starts_with(metric)
+                        && line.contains("model=\"cached-usage-model\"")
+                        && line.ends_with(&format!(" {value}"))
+                }),
+                "{metric} did not retain the expected value:\n{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_usage_series_misses_register_once_and_record_every_call() {
+        const THREADS: usize = 16;
+
+        let metrics = Metrics::new(false);
+        let barrier = Arc::new(std::sync::Barrier::new(THREADS));
+        let threads = (0..THREADS)
+            .map(|_| {
+                let metrics = metrics.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    metrics.record_llm_usage(
+                        UsageLabels::default(),
+                        LlmUsage {
+                            input_tokens: 1,
+                            output_tokens: 2,
+                            total_tokens: 3,
+                            spend_usd: 0.000001,
+                        },
+                    );
+                })
+            })
+            .collect::<Vec<_>>();
+        for thread in threads {
+            thread.join().expect("metric recording thread panicked");
+        }
+
+        assert_eq!(
+            metrics.inner.usage_series.read().len,
+            1,
+            "concurrent first misses must converge on one cached usage handle set"
+        );
+        let rendered = metrics.render();
+        for (metric, value) in [
+            (M_LLM_INPUT_TOKENS_TOTAL, THREADS),
+            (M_LLM_OUTPUT_TOKENS_TOTAL, THREADS * 2),
+            (M_LLM_TOTAL_TOKENS_TOTAL, THREADS * 3),
+            (M_LLM_SPEND_MICRO_USD_TOTAL, THREADS),
+        ] {
+            assert!(
+                rendered
+                    .lines()
+                    .any(|line| line.starts_with(metric) && line.ends_with(&format!(" {value}"))),
+                "{metric} did not record every concurrent call:\n{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn usage_series_handle_cache_is_bounded() {
+        let metrics = Metrics::new(false);
+        for index in 0..=USAGE_SERIES_CACHE_CAPACITY {
+            let model = format!("usage-model-{index}");
+            metrics.record_llm_usage(
+                UsageLabels {
+                    model: &model,
+                    ..UsageLabels::default()
+                },
+                LlmUsage {
+                    input_tokens: 1,
+                    ..LlmUsage::default()
+                },
+            );
+        }
+
+        assert_eq!(
+            metrics.inner.usage_series.read().len,
+            USAGE_SERIES_CACHE_CAPACITY,
+            "usage series handle cache must stay at its fixed capacity"
+        );
+    }
+
+    #[test]
+    fn usage_series_cache_distinguishes_hash_collisions() {
+        let labels_a = UsageLabels {
+            model: "usage-collision-a",
+            ..UsageLabels::default()
+        };
+        let labels_b = UsageLabels {
+            model: "usage-collision-b",
+            ..UsageLabels::default()
+        };
+        let forced_hash = 7;
+        let mut cache = UsageSeriesCache::default();
+        cache.insert(
+            forced_hash,
+            UsageLabelsOwned::new(labels_a),
+            UsageSeriesHandles::default(),
+        );
+        cache.insert(
+            forced_hash,
+            UsageLabelsOwned::new(labels_b),
+            UsageSeriesHandles::default(),
+        );
+
+        assert!(cache.get(forced_hash, labels_a).is_some());
+        assert!(cache.get(forced_hash, labels_b).is_some());
+        assert_eq!(
+            cache.entries[&forced_hash].len(),
+            2,
+            "colliding hashes must retain both exact label sets"
+        );
     }
 
     #[test]
