@@ -280,12 +280,16 @@ impl Default for TimeoutDefaults {
 ///
 /// The streaming budget resolves the RESOURCE levels first — the model /
 /// group `stream_timeout` (`0` defers, its historical semantics), then the
-/// resource-resolved `timeout` (so a model with only `timeout` gets that
-/// value as its streaming budget too, and `timeout: 0` opts the stream out
-/// as well) — and only then the deployment defaults, `stream_timeout_ms`
-/// falling back to `timeout_ms`. Resource config always beats deployment
-/// config, mirroring how the LiteLLM router resolves `stream_timeout`
-/// before ever consulting the global `request_timeout`.
+/// resource-resolved `timeout` — and only then the deployment defaults,
+/// `stream_timeout_ms` falling back to `timeout_ms`. Within that, the
+/// dedicated stream knob outranks the generic one at EVERY level: a
+/// group's `stream_timeout` beats a member's `timeout` for streams, and
+/// supplies a budget even to a member whose `timeout: 0` opted out of the
+/// request deadline. (A model with only `timeout` still gets that value
+/// as its streaming budget, and its `timeout: 0` still opts the stream
+/// out, whenever no resource-level `stream_timeout` exists.) This is the
+/// LiteLLM router's shape: the `stream_timeout` chain is exhausted before
+/// the non-stream `timeout` chain is consulted at all.
 pub fn effective_timeouts(
     target: &Model,
     group: Option<&Model>,
@@ -1751,6 +1755,35 @@ mod tests {
         );
         assert!(!t.stream_configured);
         assert_eq!(t.stream, None);
+    }
+
+    #[test]
+    fn effective_timeouts_stream_knob_outranks_the_timeout_knob_across_levels() {
+        // The dedicated stream knob wins at every level: a group
+        // `stream_timeout` beats a member's own `timeout` for the
+        // streaming budget (the member's `timeout` still governs its
+        // non-streaming deadline). LiteLLM resolves the same way — the
+        // stream chain is exhausted before the non-stream chain starts.
+        let group = model_with_timeouts(None, Some(700));
+        let t = effective_timeouts(
+            &model_with_timeouts(Some(5_000), None),
+            Some(&group),
+            defaults_ms(Some(9_000), None),
+        );
+        assert_eq!(t.request, ms(5_000));
+        assert_eq!(t.stream, ms(700));
+        assert!(t.stream_configured);
+        // ...including a member that opted OUT of the request deadline:
+        // `timeout: 0` cannot cancel a group's explicit stream budget —
+        // only the dedicated knob governs the dedicated budget.
+        let t = effective_timeouts(
+            &model_with_timeouts(Some(0), None),
+            Some(&group),
+            defaults_ms(Some(9_000), None),
+        );
+        assert_eq!(t.request, None);
+        assert_eq!(t.stream, ms(700));
+        assert!(t.stream_configured);
     }
 
     #[test]

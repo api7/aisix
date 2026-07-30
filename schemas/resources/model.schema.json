@@ -962,7 +962,7 @@
       "description": "Semantic-routing configuration. When set, the gateway embeds the request and dispatches to the route whose examples it matches best, using that route's target Model for upstream dispatch."
     },
     "stream_timeout": {
-      "description": "Maximum gap in milliseconds between upstream streaming chunks. `0` or absent falls back to the group's `stream_timeout`, then to the deployment-wide `upstream.stream_timeout_ms` default, then to the resolved `timeout`.",
+      "description": "Maximum gap in milliseconds between upstream streaming chunks. `0` or absent falls back to the group's `stream_timeout`, then to the model's (or group's) `timeout`, then to the deployment-wide `upstream.stream_timeout_ms` / `timeout_ms` defaults.",
       "format": "uint64",
       "minimum": 0.0,
       "type": "integer"

@@ -232,7 +232,7 @@ pub struct Model {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<u64>,
 
-    /// Maximum gap in milliseconds between upstream streaming chunks. `0` or absent falls back to the group's `stream_timeout`, then to the deployment-wide `upstream.stream_timeout_ms` default, then to the resolved `timeout`.
+    /// Maximum gap in milliseconds between upstream streaming chunks. `0` or absent falls back to the group's `stream_timeout`, then to the model's (or group's) `timeout`, then to the deployment-wide `upstream.stream_timeout_ms` / `timeout_ms` defaults.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_timeout: Option<u64>,
 
