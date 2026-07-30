@@ -99,8 +99,10 @@ docker run -d --name aisix \
   -v "$(pwd)/config.yaml:/etc/aisix/config.yaml:ro" \
   -v "$(pwd)/resources.yaml:/etc/aisix/resources.yaml:ro" \
   -e OPENAI_API_KEY -e CALLER_API_KEY \
-  -p 3000:3000 -p 9090:9090 \
+  -p 3000:3000 -p 127.0.0.1:9090:9090 \
   ghcr.io/api7/aisix:latest        # proxy → :3000, metrics + status → :9090
+#                                  ^ the metrics/status listener is unauthenticated;
+#                                    keep it on loopback or a private network
 ```
 
 Then call the gateway exactly like OpenAI:
@@ -191,8 +193,10 @@ Covered by 165 end-to-end test files (426 cases) that run against real gateway p
 - **Operational endpoints** — `/livez` and `/readyz` on the proxy listener; `/status/config`,
   `/status/ready`, `/status/models`, and Prometheus `/metrics` on a dedicated metrics
   listener (`:9090`). The admin listener (`:3001`) additionally serves a resource read
-  surface, OpenAPI 3 with a Scalar UI, and a playground — its resource **write** endpoints
-  still work but are deprecated in favor of declarative configuration.
+  surface, OpenAPI 3 with a Scalar UI, and a playground. Its resource **write** endpoints
+  are deprecated in favor of declarative configuration: on a `resources_file` gateway they
+  are rejected with `409`, and on a store-backed gateway they still work but every mutating
+  response carries an RFC 9745 `Deprecation` header.
 
 ## 🔌 Supported providers
 
@@ -271,7 +275,7 @@ Hybrid Cloud or On-Premises, or **[book a demo](https://api7.ai/contact?utm_sour
 A single Cargo workspace; the `aisix-server` crate builds one binary named `aisix` that
 wires the crates together.
 
-```
+```text
 crates/
 ├── aisix-core           Config, snapshot, resource model, resources.yaml source, errors
 ├── aisix-etcd           Config provider + watch supervisor
@@ -317,8 +321,9 @@ cargo test --workspace
 # Coverage (matches the CI gate)
 cargo llvm-cov --workspace --lcov --output-path lcov.info
 
-# Run locally against a resources.yaml (no etcd needed — see the Quickstart above)
-cargo run -p aisix-server --bin aisix -- --config config.yaml
+# Run locally against a resources.yaml (no etcd needed). Copy the Quickstart's two files
+# and change resources_file to the local path, e.g. resources_file: ./resources.yaml
+cargo run -p aisix-server --bin aisix -- --config config.local.yaml
 
 # Check a resources file without starting a listener
 cargo run -p aisix-server --bin aisix -- validate --resources resources.yaml
