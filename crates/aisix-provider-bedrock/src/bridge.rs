@@ -355,17 +355,21 @@ fn build_client(
     );
     // The SDK enforces the deadlines the other bridges get from
     // `tokio::time::timeout` wrappers: the shared `upstream.connect_timeout`
-    // bounds the dial, and the resolved per-request deadline cancels the
-    // whole operation (SdkError::TimeoutError → BridgeError::Timeout in
-    // `map_sdk_error`). Without these the SDK client has NO timeouts and a
-    // silent upstream holds the request open past the model's `timeout` —
-    // the deadline used to matter only for post-hoc error relabelling.
-    // `operation_timeout` covers send + response headers; a converse_stream
-    // body is bounded per-chunk by the proxy's read-timeout wrapper, same
-    // as every other bridge.
+    // bounds the dial (explicitly disabled when the operator set `0`, or
+    // the SDK's default plugins would quietly restore their own 3.1 s),
+    // and the resolved per-request deadline cancels the whole operation
+    // (SdkError::TimeoutError → BridgeError::Timeout in `map_sdk_error`).
+    // Without an operation timeout nothing bounds the call after connect —
+    // a silent upstream holds the request open past the model's `timeout`,
+    // which used to matter only for post-hoc error relabelling.
+    // `operation_timeout` covers send + response headers for
+    // converse_stream (the event-stream body is bounded per-chunk by the
+    // proxy's read-timeout wrapper, same as every other bridge) and the
+    // full body read for non-streaming operations.
     let mut timeouts = aws_smithy_types::timeout::TimeoutConfig::builder();
-    if let Some(d) = aisix_gateway::upstream_http::config().connect_timeout {
-        timeouts = timeouts.connect_timeout(d);
+    match aisix_gateway::upstream_http::config().connect_timeout {
+        Some(d) => timeouts = timeouts.connect_timeout(d),
+        None => timeouts = timeouts.disable_connect_timeout(),
     }
     if let Some(d) = deadline {
         timeouts = timeouts.operation_timeout(d);
@@ -2285,6 +2289,43 @@ mod tests {
             started.elapsed() < std::time::Duration::from_secs(4),
             "deadline did not cancel the call: took {:?}",
             started.elapsed()
+        );
+    }
+
+    /// A retryable upstream failure must reach the gateway's routing
+    /// budget after exactly ONE wire attempt. Before
+    /// `RetryConfig::disabled()` the SDK's standard mode re-hit the
+    /// upstream up to 3 times transparently — invisible to per-attempt
+    /// telemetry and stacked under the gateway's own retry budget.
+    #[tokio::test]
+    async fn sdk_does_not_retry_on_its_own() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/model/.+/invoke$"))
+            .respond_with(
+                ResponseTemplate::new(500)
+                    .set_body_json(serde_json::json!({"message": "internal failure"})),
+            )
+            .mount(&server)
+            .await;
+
+        let bridge = BedrockBridge::new().with_endpoint_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-retry",
+            sample_model_with("anthropic.claude-3-5-sonnet-20241022-v2:0"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let req = ChatFormat::new("my-claude", vec![ChatMessage::user("hi")]);
+
+        let err = bridge.chat(&req, &ctx).await.unwrap_err();
+        assert!(
+            matches!(err, BridgeError::UpstreamStatus { status: 500, .. }),
+            "expected UpstreamStatus 500, got {err:?}"
+        );
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            1,
+            "the SDK must not retry on its own",
         );
     }
 
