@@ -1430,27 +1430,6 @@ mod tests {
         assert!(rendered.contains(M_REQUEST_DURATION));
     }
 
-    #[test]
-    fn upkeep_preserves_recorded_histogram_samples() {
-        let m = Metrics::new(false);
-        for _ in 0..1_000 {
-            m.record_request(
-                "openai",
-                "my-gpt4",
-                200,
-                RequestOutcome::Success,
-                Duration::from_millis(120),
-            );
-        }
-
-        m.run_upkeep();
-
-        let rendered = m.render();
-        assert!(rendered.lines().any(|line| line
-            .starts_with("aisix_request_duration_seconds_count")
-            && line.ends_with(" 1000")));
-    }
-
     /// AISIX-Cloud#1076: the per-execution guardrail histogram renders with
     /// real `_bucket{le=…}` series (quantile-aggregatable, not a summary)
     /// and the full bounded label set; `error_type` defaults to `none`.

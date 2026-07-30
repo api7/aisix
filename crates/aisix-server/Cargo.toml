@@ -54,3 +54,4 @@ hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
 [dev-dependencies]
 tempfile = "3"
 wiremock = "0.6"
+tokio = { workspace = true, features = ["test-util"] }
