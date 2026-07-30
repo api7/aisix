@@ -24,9 +24,12 @@ use metrics_exporter_prometheus::{
     Matcher, PrometheusBuilder, PrometheusHandle, PrometheusRecorder,
 };
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
+
+use parking_lot::RwLock;
 
 /// Metric names (public so the admin `/metrics` handler and tests can
 /// refer to them without typo risk).
@@ -198,6 +201,7 @@ struct MetricsInner {
     recorder: PrometheusRecorder,
     handle: PrometheusHandle,
     proxy_in_flight: Mutex<HashMap<(String, String), i64>>,
+    request_series: RwLock<RequestSeriesCache>,
     /// Constant `env_id` label for the SLO latency histograms — one DP
     /// process serves exactly one environment. `"unknown"` when the DP
     /// runs standalone (no control plane).
@@ -213,6 +217,110 @@ struct MetricsInner {
 struct ConfigLabelState {
     last_hash: Option<String>,
     last_rejected_kinds: std::collections::HashSet<String>,
+}
+
+const REQUEST_SERIES_CACHE_CAPACITY: usize = 1024;
+
+#[derive(Default)]
+struct RequestSeriesCache {
+    entries: HashMap<u64, Vec<CachedRequestSeries>>,
+    len: usize,
+}
+
+struct CachedRequestSeries {
+    labels: RequestLabelsOwned,
+    handles: RequestSeriesHandles,
+}
+
+struct RequestSeriesHandles {
+    proxy_requests: metrics::Counter,
+    proxy_failed_requests: Option<metrics::Counter>,
+    proxy_duration: metrics::Histogram,
+    llm_requests: metrics::Counter,
+    llm_duration: metrics::Histogram,
+}
+
+struct RequestLabelsOwned {
+    endpoint: String,
+    inbound_protocol: String,
+    provider: String,
+    model: String,
+    upstream_model: String,
+    provider_key_id: String,
+    provider_key_name: String,
+    api_key_id: String,
+    team_id: String,
+    user_id: String,
+    user_name: String,
+    stream: bool,
+    is_fallback: bool,
+    status: u16,
+    outcome: RequestOutcome,
+}
+
+impl RequestLabelsOwned {
+    fn new(labels: RequestLabels<'_>) -> Self {
+        Self {
+            endpoint: labels.endpoint.to_string(),
+            inbound_protocol: labels.inbound_protocol.to_string(),
+            provider: labels.provider.to_string(),
+            model: labels.model.to_string(),
+            upstream_model: labels.upstream_model.to_string(),
+            provider_key_id: labels.provider_key_id.to_string(),
+            provider_key_name: labels.provider_key_name.to_string(),
+            api_key_id: labels.api_key_id.to_string(),
+            team_id: labels.team_id.to_string(),
+            user_id: labels.user_id.to_string(),
+            user_name: labels.user_name.to_string(),
+            stream: labels.stream,
+            is_fallback: labels.is_fallback,
+            status: labels.status,
+            outcome: labels.outcome,
+        }
+    }
+
+    fn matches(&self, labels: RequestLabels<'_>) -> bool {
+        self.endpoint == labels.endpoint
+            && self.inbound_protocol == labels.inbound_protocol
+            && self.provider == labels.provider
+            && self.model == labels.model
+            && self.upstream_model == labels.upstream_model
+            && self.provider_key_id == labels.provider_key_id
+            && self.provider_key_name == labels.provider_key_name
+            && self.api_key_id == labels.api_key_id
+            && self.team_id == labels.team_id
+            && self.user_id == labels.user_id
+            && self.user_name == labels.user_name
+            && self.stream == labels.stream
+            && self.is_fallback == labels.is_fallback
+            && self.status == labels.status
+            && self.outcome == labels.outcome
+    }
+}
+
+impl RequestSeriesCache {
+    fn get(&self, hash: u64, labels: RequestLabels<'_>) -> Option<&RequestSeriesHandles> {
+        self.entries
+            .get(&hash)?
+            .iter()
+            .find(|entry| entry.labels.matches(labels))
+            .map(|entry| &entry.handles)
+    }
+
+    fn insert(&mut self, hash: u64, labels: RequestLabelsOwned, handles: RequestSeriesHandles) {
+        if self.len >= REQUEST_SERIES_CACHE_CAPACITY {
+            if let Some(evicted_hash) = self.entries.keys().next().copied() {
+                if let Some(evicted) = self.entries.remove(&evicted_hash) {
+                    self.len -= evicted.len();
+                }
+            }
+        }
+        self.entries
+            .entry(hash)
+            .or_default()
+            .push(CachedRequestSeries { labels, handles });
+        self.len += 1;
+    }
 }
 
 impl std::fmt::Debug for Metrics {
@@ -260,6 +368,7 @@ impl Metrics {
                 recorder,
                 handle,
                 proxy_in_flight: Mutex::new(HashMap::new()),
+                request_series: RwLock::new(RequestSeriesCache::default()),
                 env_id: if env_id.is_empty() {
                     "unknown".to_string()
                 } else {
@@ -508,54 +617,100 @@ impl Metrics {
         });
     }
 
+    fn request_series_hash(labels: RequestLabels<'_>) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        labels.endpoint.hash(&mut hasher);
+        labels.inbound_protocol.hash(&mut hasher);
+        labels.provider.hash(&mut hasher);
+        labels.model.hash(&mut hasher);
+        labels.upstream_model.hash(&mut hasher);
+        labels.provider_key_id.hash(&mut hasher);
+        labels.provider_key_name.hash(&mut hasher);
+        labels.api_key_id.hash(&mut hasher);
+        labels.team_id.hash(&mut hasher);
+        labels.user_id.hash(&mut hasher);
+        labels.user_name.hash(&mut hasher);
+        labels.stream.hash(&mut hasher);
+        labels.is_fallback.hash(&mut hasher);
+        labels.status.hash(&mut hasher);
+        labels.outcome.as_str().hash(&mut hasher);
+        hasher.finish()
+    }
+
+    fn register_request_series(&self, labels: RequestLabels<'_>) -> RequestSeriesHandles {
+        metrics::with_local_recorder(&self.inner.recorder, || RequestSeriesHandles {
+            proxy_requests: labels.request_counter(M_PROXY_REQUESTS_TOTAL),
+            proxy_failed_requests: (labels.outcome != RequestOutcome::Success)
+                .then(|| labels.request_counter(M_PROXY_FAILED_REQUESTS_TOTAL)),
+            proxy_duration: labels.request_duration_histogram(M_PROXY_REQUEST_DURATION),
+            llm_requests: labels.request_counter(M_LLM_REQUESTS_TOTAL),
+            llm_duration: labels.request_duration_histogram(M_LLM_REQUEST_DURATION),
+        })
+    }
+
+    fn with_request_series(
+        &self,
+        labels: RequestLabels<'_>,
+        record: impl FnOnce(&RequestSeriesHandles),
+    ) {
+        let hash = Self::request_series_hash(labels);
+        {
+            let cache = self.inner.request_series.read();
+            if let Some(handles) = cache.get(hash, labels) {
+                record(handles);
+                return;
+            }
+        }
+
+        let handles = self.register_request_series(labels);
+        let mut cache = self.inner.request_series.write();
+        if let Some(existing) = cache.get(hash, labels) {
+            record(existing);
+            return;
+        }
+        cache.insert(hash, RequestLabelsOwned::new(labels), handles);
+        record(
+            cache
+                .get(hash, labels)
+                .expect("request series was just inserted"),
+        );
+    }
+
     pub fn record_proxy_request(&self, labels: RequestLabels<'_>, duration: Duration) {
         metrics::with_local_recorder(&self.inner.recorder, || {
-            labels.record_request_counter(M_PROXY_REQUESTS_TOTAL);
-            metrics::histogram!(
-                M_PROXY_REQUEST_DURATION,
-                "endpoint" => labels.endpoint.to_string(),
-                "inbound_protocol" => labels.inbound_protocol.to_string(),
-                "provider" => labels.provider.to_string(),
-                "model" => labels.model.to_string(),
-                "upstream_model" => labels.upstream_model.to_string(),
-                "provider_key_id" => labels.provider_key_id.to_string(),
-                "provider_key_name" => labels.provider_key_name.to_string(),
-                "api_key_id" => labels.api_key_id.to_string(),
-                "team_id" => labels.team_id.to_string(),
-                "user_id" => labels.user_id.to_string(),
-                "user_name" => labels.user_name.to_string(),
-                "stream" => bool_str(labels.stream),
-                "status" => labels.status.to_string(),
-                "outcome" => labels.outcome.as_str().to_string(),
-            )
-            .record(duration.as_secs_f64());
+            labels.request_counter(M_PROXY_REQUESTS_TOTAL).increment(1);
+            labels
+                .request_duration_histogram(M_PROXY_REQUEST_DURATION)
+                .record(duration.as_secs_f64());
             if labels.outcome != RequestOutcome::Success {
-                labels.record_request_counter(M_PROXY_FAILED_REQUESTS_TOTAL);
+                labels
+                    .request_counter(M_PROXY_FAILED_REQUESTS_TOTAL)
+                    .increment(1);
             }
         });
     }
 
     pub fn record_llm_request(&self, labels: RequestLabels<'_>, duration: Duration) {
         metrics::with_local_recorder(&self.inner.recorder, || {
-            labels.record_request_counter(M_LLM_REQUESTS_TOTAL);
-            metrics::histogram!(
-                M_LLM_REQUEST_DURATION,
-                "endpoint" => labels.endpoint.to_string(),
-                "inbound_protocol" => labels.inbound_protocol.to_string(),
-                "provider" => labels.provider.to_string(),
-                "model" => labels.model.to_string(),
-                "upstream_model" => labels.upstream_model.to_string(),
-                "provider_key_id" => labels.provider_key_id.to_string(),
-                "provider_key_name" => labels.provider_key_name.to_string(),
-                "api_key_id" => labels.api_key_id.to_string(),
-                "team_id" => labels.team_id.to_string(),
-                "user_id" => labels.user_id.to_string(),
-                "user_name" => labels.user_name.to_string(),
-                "stream" => bool_str(labels.stream),
-                "status" => labels.status.to_string(),
-                "outcome" => labels.outcome.as_str().to_string(),
-            )
-            .record(duration.as_secs_f64());
+            labels.request_counter(M_LLM_REQUESTS_TOTAL).increment(1);
+            labels
+                .request_duration_histogram(M_LLM_REQUEST_DURATION)
+                .record(duration.as_secs_f64());
+        });
+    }
+
+    /// Record the paired proxy and LLM request series with one cache lookup.
+    /// All request handlers emit these together with the same end-to-end
+    /// duration.
+    pub fn record_proxy_and_llm_request(&self, labels: RequestLabels<'_>, duration: Duration) {
+        self.with_request_series(labels, |handles| {
+            handles.proxy_requests.increment(1);
+            handles.proxy_duration.record(duration.as_secs_f64());
+            handles.llm_requests.increment(1);
+            handles.llm_duration.record(duration.as_secs_f64());
+            if let Some(failed) = &handles.proxy_failed_requests {
+                failed.increment(1);
+            }
         });
     }
 
@@ -1155,7 +1310,7 @@ impl Default for RequestLabels<'_> {
 }
 
 impl RequestLabels<'_> {
-    fn record_request_counter(&self, metric: &'static str) {
+    fn request_counter(&self, metric: &'static str) -> metrics::Counter {
         metrics::counter!(
             metric,
             "endpoint" => self.endpoint.to_string(),
@@ -1174,7 +1329,26 @@ impl RequestLabels<'_> {
             "status" => self.status.to_string(),
             "outcome" => self.outcome.as_str().to_string(),
         )
-        .increment(1);
+    }
+
+    fn request_duration_histogram(&self, metric: &'static str) -> metrics::Histogram {
+        metrics::histogram!(
+            metric,
+            "endpoint" => self.endpoint.to_string(),
+            "inbound_protocol" => self.inbound_protocol.to_string(),
+            "provider" => self.provider.to_string(),
+            "model" => self.model.to_string(),
+            "upstream_model" => self.upstream_model.to_string(),
+            "provider_key_id" => self.provider_key_id.to_string(),
+            "provider_key_name" => self.provider_key_name.to_string(),
+            "api_key_id" => self.api_key_id.to_string(),
+            "team_id" => self.team_id.to_string(),
+            "user_id" => self.user_id.to_string(),
+            "user_name" => self.user_name.to_string(),
+            "stream" => bool_str(self.stream),
+            "status" => self.status.to_string(),
+            "outcome" => self.outcome.as_str().to_string(),
+        )
     }
 }
 
@@ -1560,8 +1734,14 @@ mod tests {
             user_id: "user-1",
             user_name: "alice",
         };
-        m.record_proxy_request(labels, Duration::from_millis(25));
-        m.record_llm_request(labels, Duration::from_millis(20));
+        assert_eq!(m.inner.request_series.read().len, 0);
+        m.record_proxy_and_llm_request(labels, Duration::from_millis(25));
+        m.record_proxy_and_llm_request(labels, Duration::from_millis(20));
+        assert_eq!(
+            m.inner.request_series.read().len,
+            1,
+            "repeated labels must reuse one registered handle set"
+        );
         m.record_llm_usage(
             usage_labels,
             LlmUsage {
@@ -1576,6 +1756,14 @@ mod tests {
         let rendered = m.render();
         assert!(rendered.contains(M_PROXY_REQUESTS_TOTAL));
         assert!(rendered.contains(M_LLM_REQUESTS_TOTAL));
+        assert!(rendered
+            .lines()
+            .filter(|line| line.starts_with(M_PROXY_REQUESTS_TOTAL))
+            .all(|line| line.ends_with(" 2")));
+        assert!(rendered
+            .lines()
+            .filter(|line| line.starts_with(M_LLM_REQUESTS_TOTAL))
+            .all(|line| line.ends_with(" 2")));
         assert!(rendered.contains(M_LLM_INPUT_TOKENS_TOTAL));
         assert!(rendered.contains(M_LLM_OUTPUT_TOKENS_TOTAL));
         assert!(rendered.contains(M_LLM_TOTAL_TOKENS_TOTAL));
@@ -1603,6 +1791,207 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn request_series_handle_cache_is_bounded() {
+        let metrics = Metrics::new(false);
+        for index in 0..=REQUEST_SERIES_CACHE_CAPACITY {
+            let model = format!("model-{index}");
+            metrics.record_proxy_and_llm_request(
+                RequestLabels {
+                    model: &model,
+                    ..RequestLabels::default()
+                },
+                Duration::from_millis(1),
+            );
+        }
+
+        assert_eq!(
+            metrics.inner.request_series.read().len,
+            REQUEST_SERIES_CACHE_CAPACITY,
+            "request series handle cache must stay at its fixed capacity"
+        );
+
+        let evicted_model = (0..=REQUEST_SERIES_CACHE_CAPACITY)
+            .map(|index| format!("model-{index}"))
+            .find(|model| {
+                let labels = RequestLabels {
+                    model,
+                    ..RequestLabels::default()
+                };
+                let hash = Metrics::request_series_hash(labels);
+                metrics
+                    .inner
+                    .request_series
+                    .read()
+                    .get(hash, labels)
+                    .is_none()
+            })
+            .expect("one series must have been evicted");
+        metrics.record_proxy_and_llm_request(
+            RequestLabels {
+                model: &evicted_model,
+                ..RequestLabels::default()
+            },
+            Duration::from_millis(1),
+        );
+
+        assert_eq!(
+            metrics.inner.request_series.read().len,
+            REQUEST_SERIES_CACHE_CAPACITY,
+            "re-registering an evicted series must not grow the cache"
+        );
+        let rendered = metrics.render();
+        assert!(
+            rendered.lines().any(|line| {
+                line.starts_with(M_PROXY_REQUESTS_TOTAL)
+                    && line.contains(&format!("model=\"{evicted_model}\""))
+                    && line.ends_with(" 2")
+            }),
+            "re-registering an evicted handle must continue the existing Prometheus series"
+        );
+    }
+
+    #[test]
+    fn paired_request_metrics_increment_the_failure_counter_once() {
+        let metrics = Metrics::new(false);
+        metrics.record_proxy_and_llm_request(
+            RequestLabels {
+                status: 502,
+                outcome: RequestOutcome::UpstreamError,
+                ..RequestLabels::default()
+            },
+            Duration::from_millis(10),
+        );
+
+        let rendered = metrics.render();
+        assert!(
+            rendered
+                .lines()
+                .any(|line| line.starts_with(M_PROXY_FAILED_REQUESTS_TOTAL)
+                    && line.ends_with(" 1")),
+            "failed request counter was not incremented:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn request_series_cache_distinguishes_hash_collisions() {
+        let metrics = Metrics::new(false);
+        let labels_a = RequestLabels {
+            model: "collision-a",
+            outcome: RequestOutcome::Success,
+            ..RequestLabels::default()
+        };
+        let labels_b = RequestLabels {
+            model: "collision-b",
+            outcome: RequestOutcome::Success,
+            ..RequestLabels::default()
+        };
+        let handles_a = metrics.register_request_series(labels_a);
+        let handles_b = metrics.register_request_series(labels_b);
+        let forced_hash = 7;
+        {
+            let mut cache = metrics.inner.request_series.write();
+            cache.insert(forced_hash, RequestLabelsOwned::new(labels_a), handles_a);
+            cache.insert(forced_hash, RequestLabelsOwned::new(labels_b), handles_b);
+            cache
+                .get(forced_hash, labels_a)
+                .expect("first colliding label set must remain addressable")
+                .proxy_requests
+                .increment(1);
+            cache
+                .get(forced_hash, labels_b)
+                .expect("second colliding label set must remain addressable")
+                .proxy_requests
+                .increment(2);
+        }
+
+        let rendered = metrics.render();
+        assert!(rendered.lines().any(|line| {
+            line.starts_with(M_PROXY_REQUESTS_TOTAL)
+                && line.contains("model=\"collision-a\"")
+                && line.ends_with(" 1")
+        }));
+        assert!(rendered.lines().any(|line| {
+            line.starts_with(M_PROXY_REQUESTS_TOTAL)
+                && line.contains("model=\"collision-b\"")
+                && line.ends_with(" 2")
+        }));
+    }
+
+    #[test]
+    fn concurrent_request_series_misses_register_once_and_record_every_call() {
+        const THREADS: usize = 16;
+
+        let metrics = Metrics::new(false);
+        let barrier = Arc::new(std::sync::Barrier::new(THREADS));
+        let threads = (0..THREADS)
+            .map(|_| {
+                let metrics = metrics.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    metrics.record_proxy_and_llm_request(
+                        RequestLabels::default(),
+                        Duration::from_millis(1),
+                    );
+                })
+            })
+            .collect::<Vec<_>>();
+        for thread in threads {
+            thread.join().expect("metric recording thread panicked");
+        }
+
+        assert_eq!(
+            metrics.inner.request_series.read().len,
+            1,
+            "concurrent first misses must converge on one cached handle set"
+        );
+        let rendered = metrics.render();
+        for metric in [
+            M_PROXY_REQUESTS_TOTAL,
+            M_LLM_REQUESTS_TOTAL,
+            M_PROXY_FAILED_REQUESTS_TOTAL,
+        ] {
+            assert!(
+                rendered
+                    .lines()
+                    .any(|line| line.starts_with(metric) && line.ends_with(" 16")),
+                "{metric} did not record every concurrent call:\n{rendered}"
+            );
+        }
+        for metric in [M_PROXY_REQUEST_DURATION, M_LLM_REQUEST_DURATION] {
+            let count = format!("{metric}_count");
+            assert!(
+                rendered
+                    .lines()
+                    .any(|line| line.starts_with(&count) && line.ends_with(" 16")),
+                "{metric} did not record every concurrent call:\n{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn individual_request_recorders_do_not_create_unrelated_metric_families() {
+        let proxy_only = Metrics::new(false);
+        proxy_only.record_proxy_request(
+            RequestLabels {
+                outcome: RequestOutcome::Success,
+                ..RequestLabels::default()
+            },
+            Duration::from_millis(1),
+        );
+        let rendered = proxy_only.render();
+        assert!(!rendered.contains(M_LLM_REQUESTS_TOTAL));
+        assert!(!rendered.contains(M_LLM_REQUEST_DURATION));
+
+        let llm_only = Metrics::new(false);
+        llm_only.record_llm_request(RequestLabels::default(), Duration::from_millis(1));
+        let rendered = llm_only.render();
+        assert!(!rendered.contains(M_PROXY_REQUESTS_TOTAL));
+        assert!(!rendered.contains(M_PROXY_FAILED_REQUESTS_TOTAL));
+        assert!(!rendered.contains(M_PROXY_REQUEST_DURATION));
     }
 
     #[test]

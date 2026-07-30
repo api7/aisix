@@ -203,8 +203,7 @@ pub async fn messages(
                 status,
                 outcome,
             };
-            state.metrics.record_proxy_request(labels, elapsed);
-            state.metrics.record_llm_request(labels, elapsed);
+            state.metrics.record_proxy_and_llm_request(labels, elapsed);
             // SLO e2e histogram (AISIX-Cloud#1011): non-streaming only —
             // a stream records its full duration at completion instead.
             if !stream_requested {
@@ -330,8 +329,9 @@ pub async fn messages(
                 status,
                 outcome: RequestOutcome::from_status(status),
             };
-            state.metrics.record_proxy_request(fail_labels, elapsed);
-            state.metrics.record_llm_request(fail_labels, elapsed);
+            state
+                .metrics
+                .record_proxy_and_llm_request(fail_labels, elapsed);
             state.metrics.record_request_e2e_latency(
                 LatencyLabels {
                     endpoint: "/v1/messages",
