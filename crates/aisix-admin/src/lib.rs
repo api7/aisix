@@ -114,7 +114,7 @@ const ADMIN_WRITE_DEPRECATION: &str = "@1783929480";
 /// RFC 9745 — human-readable documentation covering the declarative
 /// configuration paths that replace Admin API writes.
 const ADMIN_WRITE_DEPRECATION_LINK: &str =
-    "<https://docs.api7.ai/ai-gateway/getting-started/self-hosted-quickstart>; rel=\"deprecation\"";
+    "<https://docs.api7.ai/ai-gateway/reference/resources-file>; rel=\"deprecation\"";
 
 pub fn build_router(state: AdminState) -> Router {
     // Eagerly build the merged OpenAPI doc so any panic in schema

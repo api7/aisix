@@ -3,7 +3,7 @@
 New to AISIX? Get the gateway running and route your first LLM request in minutes:
 
 - 📖 **Documentation** — https://docs.api7.ai/ai-gateway/
-- ⚡ **Self-hosted quickstart** (gateway + etcd via Docker Compose) — https://docs.api7.ai/ai-gateway/getting-started/self-hosted-quickstart
+- ⚡ **Gateway quickstart** (one container, declarative `resources.yaml`) — https://docs.api7.ai/ai-gateway/getting-started/gateway-quickstart
 
 ## 📦 Download
 
