@@ -3796,8 +3796,10 @@ data: [DONE]\n\n";
 
         let memory: Arc<dyn Cache> = Arc::new(MemoryCache::with_defaults());
         let redis_standin: Arc<dyn Cache> = Arc::new(MemoryCache::with_defaults());
-        let state = build_state_with_cache(snap, hub).with_cache_backends(Some(
-            CacheBackends::new(memory.clone(), Some(redis_standin.clone())),
+        let mut state = build_state_with_cache(snap, hub);
+        state.cache = Some(CacheBackends::new(
+            memory.clone(),
+            Some(redis_standin.clone()),
         ));
 
         let body = serde_json::json!({

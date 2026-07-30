@@ -179,6 +179,12 @@ impl std::ops::Deref for ProxyState {
     }
 }
 
+impl std::ops::DerefMut for ProxyState {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        Arc::make_mut(&mut self.inner)
+    }
+}
+
 impl ProxyState {
     pub fn new(snapshot: SnapshotHandle<AisixSnapshot>, hub: Arc<Hub>, cfg: &ProxyConfig) -> Self {
         let metrics = Arc::new(Metrics::new(false));
@@ -304,12 +310,6 @@ impl ProxyState {
         self
     }
 
-    #[cfg(test)]
-    pub(crate) fn with_cache_backends(mut self, cache: Option<CacheBackends>) -> Self {
-        Arc::make_mut(&mut self.inner).cache = cache;
-        self
-    }
-
     /// Replace the guardrail index. Used by the server bootstrap to
     /// wire a live snapshot-backed index; tests can substitute a
     /// deterministic one via `LiveGuardrailIndex::new(stub_handle, None)`.
@@ -374,13 +374,46 @@ impl ProxyState {
 #[cfg(test)]
 mod tests {
     use super::ProxyState;
+    use aisix_core::snapshot::SnapshotHandle;
+    use aisix_core::{AisixSnapshot, ProxyConfig};
+    use aisix_gateway::Hub;
     use std::sync::Arc;
 
+    fn test_state() -> ProxyState {
+        ProxyState::new(
+            SnapshotHandle::new(AisixSnapshot::new()),
+            Arc::new(Hub::new()),
+            &ProxyConfig {
+                addr: "127.0.0.1:0".into(),
+                request_body_limit_bytes: 1_048_576,
+                tls: None,
+                real_ip: Default::default(),
+            },
+        )
+    }
+
     #[test]
-    fn proxy_state_clone_is_one_shared_pointer() {
+    fn proxy_state_clone_shares_one_inner_and_mutation_is_copy_on_write() {
         assert_eq!(
             std::mem::size_of::<ProxyState>(),
             std::mem::size_of::<Arc<()>>()
         );
+
+        let original = test_state();
+        assert_eq!(Arc::strong_count(&original.inner), 1);
+
+        let mut cloned = original.clone();
+        assert!(Arc::ptr_eq(&original.inner, &cloned.inner));
+        assert_eq!(Arc::strong_count(&original.inner), 2);
+
+        cloned.cache = None;
+        assert!(!Arc::ptr_eq(&original.inner, &cloned.inner));
+        assert!(original.cache.is_some());
+        assert!(cloned.cache.is_none());
+
+        let configured = original.clone().with_default_retries(99);
+        assert!(!Arc::ptr_eq(&original.inner, &configured.inner));
+        assert_ne!(original.default_retries, 99);
+        assert_eq!(configured.default_retries, 99);
     }
 }
