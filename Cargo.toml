@@ -150,6 +150,13 @@ lto = "thin"
 codegen-units = 1
 strip = "symbols"
 
+# Release-equivalent codegen with readable stacks, for on-CPU flame graphs
+# (cargo flamegraph --profile profiling). Never use for release artifacts.
+[profile.profiling]
+inherits = "release"
+debug = "line-tables-only"
+strip = "none"
+
 [profile.coverage]
 inherits = "dev"
 opt-level = 0
