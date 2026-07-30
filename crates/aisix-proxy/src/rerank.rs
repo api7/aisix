@@ -411,7 +411,9 @@ async fn dispatch(
         match crate::routing::retrying_dispatch(state, model, "/v1/rerank", || {
             let mut req = client.post(&url).headers(headers.clone()).json(body);
             // #554: rerank is non-streaming; apply the E2E request timeout.
-            if let Some(d) = model.request_timeout() {
+            if let Some(d) =
+                crate::routing::effective_timeouts(model, None, state.default_timeouts).request
+            {
                 req = req.timeout(d);
             }
             async move {

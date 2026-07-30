@@ -402,7 +402,8 @@ async fn dispatch(
         Arc::new(pk_entry.value.clone()),
         Some(client_ctx),
     );
-    if let Some(d) = model.request_timeout() {
+    if let Some(d) = crate::routing::effective_timeouts(model, None, state.default_timeouts).request
+    {
         ctx = ctx.with_deadline(d);
     }
 

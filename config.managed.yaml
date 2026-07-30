@@ -107,6 +107,8 @@ cache:
 # the gateway expires them — the symptom is intermittent transport
 # errors against an otherwise healthy upstream.
 upstream:
+  # timeout_ms: 6000000
+  # stream_timeout_ms: 0
   # connect_timeout_ms: 5000
   # tcp_keepalive_secs: 60
   # tcp_keepalive_interval_secs: 30

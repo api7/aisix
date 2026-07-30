@@ -784,6 +784,24 @@ pub enum RateLimitBackend {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct UpstreamConfig {
+    /// Deployment-wide default for `Model.timeout`: the end-to-end deadline
+    /// in milliseconds for non-streaming upstream calls (and the fallback
+    /// budget for streaming ones, below). Applies to every model that sets
+    /// neither its own `timeout` nor a group-level one. `0` restores the
+    /// pre-default behaviour: no deadline at all.
+    ///
+    /// The default matches the LiteLLM proxy's `request_timeout` (6000 s).
+    /// It is a backstop against an upstream that accepted the connection
+    /// and then goes silent forever — not a responsiveness target, which
+    /// is what per-model `timeout` is for. Deliberately generous so it can
+    /// never cut down a legitimate long request (deep-reasoning calls run
+    /// past 10 minutes).
+    pub timeout_ms: u64,
+    /// Deployment-wide default for `Model.stream_timeout`: the maximum gap
+    /// in milliseconds between upstream streaming chunks. `0` (the
+    /// default) falls back to `timeout_ms`, mirroring how an unset
+    /// `Model.stream_timeout` falls back to `Model.timeout`.
+    pub stream_timeout_ms: u64,
     /// Max time for DNS + TCP + TLS before an attempt fails. Without it a
     /// black-holed upstream is bounded only by the model's overall timeout.
     pub connect_timeout_ms: u64,
@@ -818,6 +836,8 @@ pub struct UpstreamConfig {
 impl Default for UpstreamConfig {
     fn default() -> Self {
         Self {
+            timeout_ms: DEFAULT_UPSTREAM_TIMEOUT_MS,
+            stream_timeout_ms: 0,
             connect_timeout_ms: 5_000,
             tcp_keepalive_secs: 60,
             tcp_keepalive_interval_secs: 30,
@@ -833,6 +853,10 @@ impl Default for UpstreamConfig {
 /// which is also what the LiteLLM router falls back to when neither
 /// `router_settings.num_retries` nor `litellm_settings.num_retries` is set.
 pub const DEFAULT_UPSTREAM_RETRIES: u32 = 2;
+
+/// Deployment-wide request-timeout default: 6000 s, matching the LiteLLM
+/// proxy's `request_timeout`. See [`UpstreamConfig::timeout_ms`].
+pub const DEFAULT_UPSTREAM_TIMEOUT_MS: u64 = 6_000_000;
 
 /// Connection-layer settings for the inbound side — the client (or the
 /// gateway in front of this one) talking to the proxy and admin listeners.
@@ -1372,6 +1396,8 @@ admin:
 "#,
         );
         let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert_eq!(cfg.upstream.timeout_ms, 6_000_000);
+        assert_eq!(cfg.upstream.stream_timeout_ms, 0);
         assert_eq!(cfg.upstream.connect_timeout_ms, 5_000);
         assert_eq!(cfg.upstream.tcp_keepalive_secs, 60);
         assert_eq!(cfg.upstream.tcp_keepalive_interval_secs, 30);
@@ -1395,6 +1421,8 @@ admin:
   addr: "127.0.0.1:3001"
   admin_keys: ["k1"]
 upstream:
+  timeout_ms: 0
+  stream_timeout_ms: 30000
   connect_timeout_ms: 2000
   pool_idle_timeout_secs: 10
   tcp_keepalive_secs: 0
@@ -1402,6 +1430,8 @@ upstream:
 "#,
         );
         let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert_eq!(cfg.upstream.timeout_ms, 0);
+        assert_eq!(cfg.upstream.stream_timeout_ms, 30_000);
         assert_eq!(cfg.upstream.connect_timeout_ms, 2_000);
         assert_eq!(cfg.upstream.pool_idle_timeout_secs, 10);
         assert_eq!(cfg.upstream.tcp_keepalive_secs, 0);

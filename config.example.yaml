@@ -160,6 +160,21 @@ ratelimit:
 # The values below are the defaults; uncomment to override. Every
 # duration accepts 0 to switch that knob off.
 upstream:
+  # Deployment-wide default for `Model.timeout`: the end-to-end deadline
+  # for non-streaming calls, and the fallback streaming budget (below),
+  # for every model that does not set its own. A backstop against an
+  # upstream that accepted the connection and then goes silent forever —
+  # not a responsiveness target (set per-model `timeout` for that), so it
+  # is deliberately generous: deep-reasoning calls can run past 10
+  # minutes. A model opts out with `timeout: 0`; setting 0 here restores
+  # the old "no deadline unless configured" behaviour.
+  # timeout_ms: 6000000
+
+  # Deployment-wide default for `Model.stream_timeout`: the maximum gap
+  # between streaming chunks. 0 falls back to `timeout_ms`, mirroring how
+  # an unset `Model.stream_timeout` falls back to `Model.timeout`.
+  # stream_timeout_ms: 0
+
   # Max time for DNS + TCP + TLS before an attempt fails. Without it a
   # black-holed upstream is bounded only by the model's own timeout.
   # connect_timeout_ms: 5000

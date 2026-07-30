@@ -157,6 +157,11 @@ pub struct ProxyState {
     /// dispatch falls back to when neither the target Model nor its model
     /// group sets one. See `routing::effective_retries`.
     pub default_retries: u32,
+    /// Deployment-wide timeout defaults (`upstream.timeout_ms` /
+    /// `upstream.stream_timeout_ms`) — the floor every dispatch falls back
+    /// to when neither the target Model nor its model group sets one. See
+    /// `routing::effective_timeouts`.
+    pub default_timeouts: crate::routing::TimeoutDefaults,
 }
 
 impl ProxyState {
@@ -185,6 +190,7 @@ impl ProxyState {
             billed_batches: Arc::new(dashmap::DashSet::new()),
             client_classifier: Arc::new(ClientTypeClassifier::builtin()),
             default_retries: aisix_core::config::DEFAULT_UPSTREAM_RETRIES,
+            default_timeouts: crate::routing::TimeoutDefaults::default(),
         }
     }
 
@@ -220,6 +226,7 @@ impl ProxyState {
             billed_batches: Arc::new(dashmap::DashSet::new()),
             client_classifier: Arc::new(ClientTypeClassifier::builtin()),
             default_retries: aisix_core::config::DEFAULT_UPSTREAM_RETRIES,
+            default_timeouts: crate::routing::TimeoutDefaults::default(),
         }
     }
 
@@ -265,6 +272,7 @@ impl ProxyState {
             billed_batches: Arc::new(dashmap::DashSet::new()),
             client_classifier: Arc::new(ClientTypeClassifier::builtin()),
             default_retries: aisix_core::config::DEFAULT_UPSTREAM_RETRIES,
+            default_timeouts: crate::routing::TimeoutDefaults::default(),
         }
     }
 
@@ -295,6 +303,18 @@ impl ProxyState {
     /// [`aisix_core::config::DEFAULT_UPSTREAM_RETRIES`].
     pub fn with_default_retries(mut self, retries: u32) -> Self {
         self.default_retries = retries;
+        self
+    }
+
+    /// Apply the deployment-wide `upstream.timeout_ms` /
+    /// `upstream.stream_timeout_ms` defaults, with `0` meaning "no
+    /// default at that slot".
+    pub fn with_default_timeouts(mut self, timeout_ms: u64, stream_timeout_ms: u64) -> Self {
+        self.default_timeouts = crate::routing::TimeoutDefaults {
+            request: (timeout_ms > 0).then(|| std::time::Duration::from_millis(timeout_ms)),
+            stream: (stream_timeout_ms > 0)
+                .then(|| std::time::Duration::from_millis(stream_timeout_ms)),
+        };
         self
     }
 

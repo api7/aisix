@@ -1277,14 +1277,20 @@ async fn dispatch(
                 Arc::new(pk_entry.value.clone()),
                 Some(client),
             );
-            if let Some(d) = model.stream_timeout_effective() {
+            // Effective streaming budget, resolved target → group →
+            // `upstream.stream_timeout_ms`/`timeout_ms`. Used for the
+            // connect deadline (above) AND the per-chunk read timeout +
+            // first-chunk peek below, so the budget is applied
+            // consistently.
+            let timeouts = crate::routing::effective_timeouts(
+                model,
+                Some(&virtual_entry.value),
+                state.default_timeouts,
+            );
+            let stream_budget = timeouts.stream;
+            if let Some(d) = stream_budget {
                 ctx = ctx.with_deadline(d);
             }
-            // Effective streaming budget: `stream_timeout`, falling back to
-            // `timeout`. Used for the connect deadline (above) AND the
-            // per-chunk read timeout + first-chunk peek below, so the budget
-            // is applied consistently.
-            let stream_budget = model.stream_timeout_effective();
 
             // How many times to re-hit the SAME target (with backoff) on a
             // retryable failure before failing over to the next one.
@@ -1351,19 +1357,20 @@ async fn dispatch(
                     }
                 };
                 let attempt_started = Instant::now();
-                // Connect, then — only when a streaming budget is configured —
-                // peek the first chunk so a slow or erroring first token fails
-                // over before the 200 is committed. Without a budget there is
-                // nothing to gate on, so the stream is committed directly (a
-                // first-chunk error then surfaces in-band, exactly like the
-                // pre-#554 behavior). The read-timeout wrapper is a no-op when
-                // the budget is None.
+                // Connect, then — only when a streaming budget is configured
+                // ON THE RESOURCES — peek the first chunk so a slow or
+                // erroring first token fails over before the 200 is
+                // committed. The deployment-default budget does not peek
+                // (see `TimeoutBudget::stream_configured`): it stays a read
+                // timeout, so the 200 commits directly and the SSE
+                // heartbeats cover the wait for the first token. The
+                // read-timeout wrapper is a no-op when the budget is None.
                 let attempt_stream: Result<aisix_gateway::ChatChunkStream, BridgeError> =
                     match bridge.chat_stream(req, &ctx).await {
                         Err(e) => Err(e),
                         Ok(up) => {
                             let up = crate::stream_timeout::with_read_timeout(up, stream_budget);
-                            if stream_budget.is_some() {
+                            if timeouts.stream_configured {
                                 let mut up = up;
                                 match up.next().await {
                                     // Re-prepend the peeked chunk so the SSE pump
@@ -2175,7 +2182,13 @@ async fn dispatch(
             Arc::new(pk_entry.value.clone()),
             Some(client),
         );
-        if let Some(d) = model.request_timeout() {
+        if let Some(d) = crate::routing::effective_timeouts(
+            model,
+            Some(&virtual_entry.value),
+            state.default_timeouts,
+        )
+        .request
+        {
             ctx = ctx.with_deadline(d);
         }
         // Per-target retry budget — see the streaming loop above.
@@ -2870,7 +2883,9 @@ async fn dispatch_ensemble(
             Arc::new(judge_pk.value.clone()),
             Some(client),
         );
-        if let Some(deadline) = judge_model.request_timeout() {
+        if let Some(deadline) =
+            crate::routing::effective_timeouts(judge_model, None, state.default_timeouts).request
+        {
             judge_ctx = judge_ctx.with_deadline(deadline);
         }
 

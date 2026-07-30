@@ -1194,7 +1194,13 @@ async fn provider_call(
                     .header(header::CONTENT_TYPE, "application/json")
                     .json(b);
             }
-            if let Some(d) = target.model_entry.value.request_timeout() {
+            if let Some(d) = crate::routing::effective_timeouts(
+                &target.model_entry.value,
+                None,
+                state.default_timeouts,
+            )
+            .request
+            {
                 builder = builder.timeout(d);
             }
             async move {
@@ -1296,7 +1302,9 @@ async fn proxy_content(
     }
     let builder = client.get(url).headers(headers);
 
-    let stream_budget = target.model_entry.value.stream_timeout_effective();
+    let stream_budget =
+        crate::routing::effective_timeouts(&target.model_entry.value, None, state.default_timeouts)
+            .stream;
     let started = Instant::now();
     let note = |e: aisix_gateway::BridgeError| {
         crate::cooldown::note_failure(

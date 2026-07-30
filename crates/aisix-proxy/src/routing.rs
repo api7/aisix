@@ -223,6 +223,95 @@ impl RetryBudget {
     }
 }
 
+/// Request/stream deadlines for one dispatch target, resolved across the
+/// same levels as [`effective_retries`]: the target model, then its group,
+/// then the deployment-wide `upstream.timeout_ms` /
+/// `upstream.stream_timeout_ms` defaults from the DP config.
+#[derive(Debug, Clone, Copy)]
+pub struct TimeoutBudget {
+    /// End-to-end deadline for a non-streaming call. `None` = unbounded.
+    pub request: Option<std::time::Duration>,
+    /// Streaming budget: bounds the connect phase and the gap between
+    /// chunks. `None` = unbounded.
+    pub stream: Option<std::time::Duration>,
+    /// True when `stream` came from the target/group resources rather than
+    /// the deployment defaults. Gates the pre-200 first-chunk peek: an
+    /// operator who configured a streaming budget on the resource asked
+    /// for slow-first-token FAILOVER (#554), which requires withholding
+    /// the 200 until the first chunk arrives. The deployment default must
+    /// NOT do that — it is a backstop, and withholding headers for its
+    /// (long) duration would also silence the SSE heartbeats that exist
+    /// precisely to cover a slow first token (AISIX-Cloud#1126). With the
+    /// default budget, a first-chunk stall surfaces as an in-band timeout
+    /// after the 200 instead of failing over. Same shape as
+    /// [`RetryBudget::covers`]: explicit config opts into the sharper
+    /// behaviour, the deployment default stays conservative.
+    pub stream_configured: bool,
+}
+
+/// Deployment-wide timeout defaults (`upstream.timeout_ms` /
+/// `upstream.stream_timeout_ms`) with the `0` = "no default" sentinel
+/// already folded to `None`.
+#[derive(Debug, Clone, Copy)]
+pub struct TimeoutDefaults {
+    pub request: Option<std::time::Duration>,
+    pub stream: Option<std::time::Duration>,
+}
+
+impl Default for TimeoutDefaults {
+    /// Mirrors `UpstreamConfig::default()` so an embedded ProxyState built
+    /// without config wiring behaves like a default deployment.
+    fn default() -> Self {
+        Self {
+            request: Some(std::time::Duration::from_millis(
+                aisix_core::config::DEFAULT_UPSTREAM_TIMEOUT_MS,
+            )),
+            stream: None,
+        }
+    }
+}
+
+/// Resolve the request/stream deadlines for one dispatch target.
+///
+/// `timeout` resolves model → group → deployment default, first level that
+/// says anything wins. An explicit `0` at model or group level resolves to
+/// "no deadline" and STOPS the chain — that is how an operator opts a
+/// long-running model out of the deployment backstop.
+///
+/// The streaming budget resolves the RESOURCE levels first — the model /
+/// group `stream_timeout` (`0` defers, its historical semantics), then the
+/// resource-resolved `timeout` (so a model with only `timeout` gets that
+/// value as its streaming budget too, and `timeout: 0` opts the stream out
+/// as well) — and only then the deployment defaults, `stream_timeout_ms`
+/// falling back to `timeout_ms`. Resource config always beats deployment
+/// config, mirroring how the LiteLLM router resolves `stream_timeout`
+/// before ever consulting the global `request_timeout`.
+pub fn effective_timeouts(
+    target: &Model,
+    group: Option<&Model>,
+    defaults: TimeoutDefaults,
+) -> TimeoutBudget {
+    let request_level = target
+        .request_timeout_level()
+        .or_else(|| group.and_then(|g| g.request_timeout_level()));
+    let request = request_level.unwrap_or(defaults.request);
+    let resource_stream = target
+        .stream_read_timeout()
+        .or_else(|| group.and_then(|g| g.stream_read_timeout()));
+    let (stream, stream_configured) = if let Some(d) = resource_stream {
+        (Some(d), true)
+    } else if let Some(r) = request_level {
+        (r, r.is_some())
+    } else {
+        (defaults.stream.or(defaults.request), false)
+    };
+    TimeoutBudget {
+        request,
+        stream,
+        stream_configured,
+    }
+}
+
 /// Drive one single-model upstream call under that model's retry budget.
 ///
 /// The group-capable endpoints (chat, messages, responses, count_tokens)
@@ -1496,6 +1585,172 @@ mod tests {
         // same-target retries gets them even with fallbacks queued up.
         assert_eq!(budget(Some(3), None, 2, true).attempts, 3);
         assert_eq!(budget(None, Some(Some(3)), 2, true).attempts, 3);
+    }
+
+    // ── effective_timeouts ────────────────────────────────────────
+    fn model_with_timeouts(timeout: Option<u64>, stream_timeout: Option<u64>) -> Model {
+        let mut m: Model = serde_json::from_str(
+            r#"{"display_name":"m","provider":"openai","model_name":"gpt-4o","provider_key_id":"pk"}"#,
+        )
+        .unwrap();
+        m.timeout = timeout;
+        m.stream_timeout = stream_timeout;
+        m
+    }
+
+    fn defaults_ms(request: Option<u64>, stream: Option<u64>) -> TimeoutDefaults {
+        TimeoutDefaults {
+            request: request.map(std::time::Duration::from_millis),
+            stream: stream.map(std::time::Duration::from_millis),
+        }
+    }
+
+    fn ms(v: u64) -> Option<std::time::Duration> {
+        Some(std::time::Duration::from_millis(v))
+    }
+
+    #[test]
+    fn effective_timeouts_prefers_the_target_then_the_group_then_the_default() {
+        let group = model_with_timeouts(Some(2_000), Some(1_500));
+        // Target wins over group and default.
+        let t = effective_timeouts(
+            &model_with_timeouts(Some(1_000), Some(500)),
+            Some(&group),
+            defaults_ms(Some(9_000), Some(8_000)),
+        );
+        assert_eq!(t.request, ms(1_000));
+        assert_eq!(t.stream, ms(500));
+        // Group applies when the target is silent.
+        let t = effective_timeouts(
+            &model_with_timeouts(None, None),
+            Some(&group),
+            defaults_ms(Some(9_000), Some(8_000)),
+        );
+        assert_eq!(t.request, ms(2_000));
+        assert_eq!(t.stream, ms(1_500));
+        // Deployment default applies when both are silent — the case that
+        // used to mean "no deadline at all".
+        let silent_group = model_with_timeouts(None, None);
+        let t = effective_timeouts(
+            &model_with_timeouts(None, None),
+            Some(&silent_group),
+            defaults_ms(Some(9_000), Some(8_000)),
+        );
+        assert_eq!(t.request, ms(9_000));
+        assert_eq!(t.stream, ms(8_000));
+        // A direct model has no group at all.
+        let t = effective_timeouts(
+            &model_with_timeouts(None, None),
+            None,
+            defaults_ms(Some(9_000), None),
+        );
+        assert_eq!(t.request, ms(9_000));
+    }
+
+    #[test]
+    fn effective_timeouts_explicit_zero_disables_and_stops_the_chain() {
+        // `timeout: 0` on the model is an opt-out of the deployment
+        // backstop, not "unset" — a long-running model must be able to
+        // escape the default.
+        let t = effective_timeouts(
+            &model_with_timeouts(Some(0), None),
+            None,
+            defaults_ms(Some(9_000), None),
+        );
+        assert_eq!(t.request, None);
+        assert_eq!(t.stream, None);
+        // Same at group level.
+        let group_zero = model_with_timeouts(Some(0), None);
+        let t = effective_timeouts(
+            &model_with_timeouts(None, None),
+            Some(&group_zero),
+            defaults_ms(Some(9_000), None),
+        );
+        assert_eq!(t.request, None);
+        // `upstream.timeout_ms: 0` restores the pre-default behaviour.
+        let t = effective_timeouts(
+            &model_with_timeouts(None, None),
+            None,
+            defaults_ms(None, None),
+        );
+        assert_eq!(t.request, None);
+        assert_eq!(t.stream, None);
+    }
+
+    #[test]
+    fn effective_timeouts_stream_zero_defers_and_falls_back_to_request() {
+        // `stream_timeout: 0`/absent defers (its historical semantics),
+        // ending at the resource-resolved request timeout.
+        let t = effective_timeouts(
+            &model_with_timeouts(Some(5_000), Some(0)),
+            None,
+            defaults_ms(Some(9_000), None),
+        );
+        assert_eq!(t.stream, ms(5_000));
+        // Resource config beats deployment config: a model `timeout` wins
+        // over the deployment stream default.
+        let t = effective_timeouts(
+            &model_with_timeouts(Some(5_000), None),
+            None,
+            defaults_ms(Some(9_000), Some(700)),
+        );
+        assert_eq!(t.stream, ms(5_000));
+        // With no resource-level timeouts, the deployment stream default
+        // applies, falling back to the deployment request default.
+        let t = effective_timeouts(
+            &model_with_timeouts(None, None),
+            None,
+            defaults_ms(Some(9_000), Some(700)),
+        );
+        assert_eq!(t.stream, ms(700));
+        let t = effective_timeouts(
+            &model_with_timeouts(None, None),
+            None,
+            defaults_ms(Some(9_000), None),
+        );
+        assert_eq!(t.stream, ms(9_000));
+    }
+
+    #[test]
+    fn effective_timeouts_only_resource_config_arms_the_first_chunk_peek() {
+        // Deployment-default budgets must not withhold the 200 waiting for
+        // the first chunk — that would silence the SSE heartbeats that
+        // cover a slow first token (AISIX-Cloud#1126).
+        let t = effective_timeouts(
+            &model_with_timeouts(None, None),
+            None,
+            defaults_ms(Some(9_000), Some(700)),
+        );
+        assert!(!t.stream_configured);
+        // A model/group streaming budget — or a model `timeout` acting as
+        // one — is an explicit ask for slow-first-token failover (#554).
+        let t = effective_timeouts(
+            &model_with_timeouts(None, Some(700)),
+            None,
+            defaults_ms(Some(9_000), None),
+        );
+        assert!(t.stream_configured);
+        let t = effective_timeouts(
+            &model_with_timeouts(Some(5_000), None),
+            None,
+            defaults_ms(None, None),
+        );
+        assert!(t.stream_configured);
+        let group = model_with_timeouts(None, Some(700));
+        let t = effective_timeouts(
+            &model_with_timeouts(None, None),
+            Some(&group),
+            defaults_ms(Some(9_000), None),
+        );
+        assert!(t.stream_configured);
+        // `timeout: 0` disarms everything.
+        let t = effective_timeouts(
+            &model_with_timeouts(Some(0), None),
+            None,
+            defaults_ms(Some(9_000), None),
+        );
+        assert!(!t.stream_configured);
+        assert_eq!(t.stream, None);
     }
 
     #[test]

@@ -393,7 +393,10 @@ async fn send_upstream(
         UpstreamBody::Multipart(form) => builder.multipart(form),
     };
 
-    if let Some(d) = target.model_entry.value.request_timeout() {
+    if let Some(d) =
+        crate::routing::effective_timeouts(&target.model_entry.value, None, state.default_timeouts)
+            .request
+    {
         builder = builder.timeout(d);
     }
 

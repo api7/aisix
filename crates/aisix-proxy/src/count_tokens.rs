@@ -267,6 +267,11 @@ async fn dispatch(
                 body,
                 &target.model,
                 &target.id,
+                crate::routing::effective_timeouts(
+                    &target.model,
+                    Some(&model_entry.value),
+                    state.default_timeouts,
+                ),
                 request_id,
                 client,
             )
@@ -319,6 +324,9 @@ async fn count_tokens_to_target(
     body: &Value,
     model: &aisix_core::Model,
     model_id: &str,
+    // Deadlines resolved by the caller across target → group → deployment
+    // default (`routing::effective_timeouts`); this fn only applies them.
+    timeouts: crate::routing::TimeoutBudget,
     request_id: &str,
     client: &ClientContext,
 ) -> Result<Response, ProxyError> {
@@ -402,7 +410,7 @@ async fn count_tokens_to_target(
     let client = crate::http_client::client();
     let mut req = client.post(&url).headers(headers).json(&body);
     // #554: count_tokens is non-streaming; apply the E2E request timeout.
-    if let Some(d) = model.request_timeout() {
+    if let Some(d) = timeouts.request {
         req = req.timeout(d);
     }
     let send_started = Instant::now();

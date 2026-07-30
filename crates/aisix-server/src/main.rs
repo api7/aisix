@@ -713,6 +713,8 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!(e))?;
     proxy_state = proxy_state.with_client_classifier(Arc::new(client_classifier));
     proxy_state = proxy_state.with_default_retries(cfg.upstream.retries);
+    proxy_state =
+        proxy_state.with_default_timeouts(cfg.upstream.timeout_ms, cfg.upstream.stream_timeout_ms);
     if let Some(client) = budget_client {
         proxy_state = proxy_state.with_budget_client(client);
     }

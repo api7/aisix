@@ -577,6 +577,13 @@ async fn dispatch(
             state.default_retries,
             target_idx + 1 < attempt_models.len(),
         );
+        // Deadlines resolved target → group → deployment default, next to
+        // the retry budget so the two knobs stay in lockstep.
+        let timeouts = crate::routing::effective_timeouts(
+            &target.model,
+            Some(&model_entry.value),
+            state.default_timeouts,
+        );
         for attempt_idx in 0..=budget.attempts {
             // Upstream `Retry-After` when the last failure carried one, else
             // exponential backoff + jitter, before re-hitting the SAME target
@@ -643,6 +650,7 @@ async fn dispatch(
                     body,
                     &target.model,
                     &target.id,
+                    timeouts,
                     request_id,
                     resolved_chain.clone(),
                     started,
@@ -664,6 +672,7 @@ async fn dispatch(
                     body,
                     &target.model,
                     &target.id,
+                    timeouts,
                     request_id,
                     resolved_chain.clone(),
                     started,
@@ -883,6 +892,9 @@ async fn responses_to_target(
     body: &Value,
     model: &aisix_core::Model,
     model_id: &str,
+    // Deadlines resolved by the caller across target → group → deployment
+    // default (`routing::effective_timeouts`); this fn only applies them.
+    timeouts: crate::routing::TimeoutBudget,
     request_id: &str,
     // Arc so the live-forward streaming path can carry the chain into its
     // end-of-stream observation (AISIX-Cloud#1010).
@@ -1010,7 +1022,7 @@ async fn responses_to_target(
     // whole stream); the streaming branch below enforces the per-chunk
     // read timeout instead.
     if !is_stream {
-        if let Some(d) = model.request_timeout() {
+        if let Some(d) = timeouts.request {
             req = req.timeout(d);
         }
     }
@@ -1024,11 +1036,7 @@ async fn responses_to_target(
     // Streaming bounds the connect by the stream deadline (reqwest's
     // request-level timeout can't be used — it would cap the whole stream);
     // non-streaming relies on the request-level timeout set above.
-    let connect_deadline = if is_stream {
-        model.stream_timeout_effective()
-    } else {
-        None
-    };
+    let connect_deadline = if is_stream { timeouts.stream } else { None };
     let upstream_resp =
         crate::stream_timeout::send_with_deadline(req, connect_deadline, send_started)
             .await
@@ -1098,10 +1106,9 @@ async fn responses_to_target(
             };
             let stream = upstream_resp.bytes_stream();
             futures::pin_mut!(stream);
-            // Effective streaming budget: `stream_timeout`, falling back to
-            // `timeout` — applied to every buffered read, consistent with the
-            // verbatim branch and the connect deadline.
-            let read_to = model.stream_timeout_effective();
+            // Effective streaming budget — applied to every buffered read,
+            // consistent with the verbatim branch and the connect deadline.
+            let read_to = timeouts.stream;
             let mut buf: Vec<u8> = Vec::new();
             let mut saw_chunk = false;
             loop {
@@ -1283,7 +1290,7 @@ async fn responses_to_target(
         // without one, forward directly (pre-#554 behavior). A mid-stream
         // stall truncates the forwarded stream (no in-band error frame for
         // an opaque byte passthrough).
-        let stream_budget = model.stream_timeout_effective();
+        let stream_budget = timeouts.stream;
         let wrapped: std::pin::Pin<
             Box<dyn futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>,
         > = Box::pin(crate::stream_timeout::with_read_timeout_bytes(
@@ -1292,7 +1299,7 @@ async fn responses_to_target(
         ));
         let body_stream: std::pin::Pin<
             Box<dyn futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>,
-        > = if stream_budget.is_some() {
+        > = if timeouts.stream_configured {
             let mut wrapped = wrapped;
             let first_bytes = match wrapped.next().await {
                 Some(Ok(b)) => b,
@@ -1644,6 +1651,9 @@ async fn responses_cross_provider_to_target(
     body: &Value,
     model: &aisix_core::Model,
     model_id: &str,
+    // Deadlines resolved by the caller across target → group → deployment
+    // default (`routing::effective_timeouts`); this fn only applies them.
+    timeouts: crate::routing::TimeoutBudget,
     request_id: &str,
     chain: Arc<aisix_guardrails::GuardrailChain>,
     started: Instant,
@@ -1709,9 +1719,9 @@ async fn responses_cross_provider_to_target(
         Some(client_ctx),
     );
     let connect_deadline = if is_stream {
-        model.stream_timeout_effective()
+        timeouts.stream
     } else {
-        model.request_timeout()
+        timeouts.request
     };
     if let Some(d) = connect_deadline {
         ctx = ctx.with_deadline(d);
@@ -1737,9 +1747,9 @@ async fn responses_cross_provider_to_target(
         // #554: peek the first chunk so a slow/erroring first token fails
         // over before the 200 is committed (when a stream budget is set);
         // the wrapper keeps enforcing the per-chunk read timeout either way.
-        let stream_budget = model.stream_timeout_effective();
+        let stream_budget = timeouts.stream;
         let upstream = crate::stream_timeout::with_read_timeout(upstream, stream_budget);
-        let upstream: aisix_gateway::ChatChunkStream = if stream_budget.is_some() {
+        let upstream: aisix_gateway::ChatChunkStream = if timeouts.stream_configured {
             let mut upstream = upstream;
             let first_chunk = match upstream.next().await {
                 Some(Ok(chunk)) => chunk,
