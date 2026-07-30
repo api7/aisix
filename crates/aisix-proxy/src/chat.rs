@@ -404,8 +404,9 @@ pub async fn chat_completions(
                 status,
                 outcome: RequestOutcome::from_status(status),
             };
-            state.metrics.record_proxy_request(fail_labels, elapsed);
-            state.metrics.record_llm_request(fail_labels, elapsed);
+            state
+                .metrics
+                .record_proxy_and_llm_request(fail_labels, elapsed);
             state.metrics.record_request_e2e_latency(
                 LatencyLabels {
                     endpoint: "/v1/chat/completions",
@@ -3549,8 +3550,7 @@ fn record_success(
         status,
         outcome,
     };
-    metrics.record_proxy_request(request_labels, elapsed);
-    metrics.record_llm_request(request_labels, elapsed);
+    metrics.record_proxy_and_llm_request(request_labels, elapsed);
     // SLO e2e histogram (AISIX-Cloud#1011): non-streaming only here —
     // `elapsed` for a stream is time-to-response-start; the stream's
     // on_complete records the full duration instead.
