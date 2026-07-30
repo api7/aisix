@@ -59,6 +59,8 @@ every dynamic resource from one declarative `resources.yaml`.
 resources_file: /etc/aisix/resources.yaml
 proxy:
   addr: "0.0.0.0:3000"
+admin:
+  enabled: false          # a declarative gateway needs no admin listener
 observability:
   metrics:
     prometheus:
