@@ -93,18 +93,30 @@
         ]
       },
       "then": {
-        "dependencies": {
-          "api_key_header": {
-            "properties": {
-              "auth_type": {
-                "const": "api_key"
-              }
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "api_key_header": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "api_key_header"
+              ]
             },
-            "required": [
-              "auth_type"
-            ]
+            "then": {
+              "properties": {
+                "auth_type": {
+                  "const": "api_key"
+                }
+              },
+              "required": [
+                "auth_type"
+              ]
+            }
           }
-        },
+        ],
         "properties": {
           "api_key_header": {
             "pattern": "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"

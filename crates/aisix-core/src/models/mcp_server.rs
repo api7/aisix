@@ -245,12 +245,22 @@ pub fn mcp_server_credential_coupling() -> Value {
                     },
                     "api_key_header": { "pattern": "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$" }
                 },
-                "dependencies": {
-                    "api_key_header": {
-                        "properties": { "auth_type": { "const": "api_key" } },
-                        "required": ["auth_type"]
+                // Value-sensitive, not presence-based: `api_key_header` is an
+                // `Option<String>`, so an explicit `null` means "absent" and must
+                // not drag in the `auth_type` requirement. `dependencies` keys off
+                // presence alone and would reject `api_key_header: null`.
+                "allOf": [
+                    {
+                        "if": {
+                            "properties": { "api_key_header": { "type": "string" } },
+                            "required": ["api_key_header"]
+                        },
+                        "then": {
+                            "properties": { "auth_type": { "const": "api_key" } },
+                            "required": ["auth_type"]
+                        }
                     }
-                }
+                ]
             }
         },
         // A plain MCP server has neither. `spec`/`api_key_header` are
@@ -286,6 +296,79 @@ mod tests {
     use super::*;
 
     #[test]
+    fn schema_pins_each_mcp_obligation_individually() {
+        // Baseline: valid openapi-backed server with api-key auth.
+        let base = json!({
+            "name": "erp",
+            "url": "https://erp.internal/api",
+            "type": "openapi",
+            "spec": {"openapi": "3.0.0", "paths": {"/a": {"get": {"operationId": "list_a"}}}},
+            "auth_type": "api_key",
+            "secret": "k",
+            "api_key_header": "X-Key"
+        });
+        crate::models::schema::validate_mcp_server(&base).expect("baseline must be valid");
+
+        // `spec` must be an object — pinned independently of the swagger check,
+        // so a non-object that is NOT a swagger document still fails.
+        let mut v = base.clone();
+        v["spec"] = json!("just a string");
+        crate::models::schema::validate_mcp_server(&v)
+            .expect_err("a non-object spec must be rejected on its own");
+        let mut v = base.clone();
+        v["spec"] = json!([{"openapi": "3.0.0"}]);
+        crate::models::schema::validate_mcp_server(&v)
+            .expect_err("an array spec must be rejected on its own");
+
+        // oauth2: each of the three obligations pinned separately.
+        for omit in ["secret", "client_id", "token_url"] {
+            let mut v = json!({
+                "name": "erp", "url": "https://x/mcp", "auth_type": "oauth2",
+                "secret": "cs", "client_id": "cid", "token_url": "https://auth/token"
+            });
+            v.as_object_mut().unwrap().remove(omit);
+            crate::models::schema::validate_mcp_server(&v)
+                .expect_err(&format!("oauth2 missing only {omit} must be rejected"));
+        }
+
+        // Credential fields: empty and null are as bad as missing.
+        for bad in [json!(""), json!(null)] {
+            let mut v = json!({"name": "s", "url": "https://x/mcp", "auth_type": "bearer"});
+            v["secret"] = bad.clone();
+            crate::models::schema::validate_mcp_server(&v)
+                .expect_err("bearer with an empty or null secret must be rejected");
+        }
+
+        // openapi-only fields rejected on an EXPLICIT type: mcp, not just a
+        // defaulted one.
+        for field in ["spec", "api_key_header"] {
+            let mut v = json!({"name": "gh", "url": "https://x/mcp", "type": "mcp"});
+            v[field] = if field == "spec" {
+                json!({"openapi": "3.0.0"})
+            } else {
+                json!("X-Key")
+            };
+            crate::models::schema::validate_mcp_server(&v).expect_err(&format!(
+                "{field} on an explicit type: mcp must be rejected"
+            ));
+        }
+
+        // api_key_header requires api_key auth specifically — `none` is not enough.
+        let mut v = base.clone();
+        v["auth_type"] = json!("none");
+        v.as_object_mut().unwrap().remove("secret");
+        crate::models::schema::validate_mcp_server(&v)
+            .expect_err("a header with auth_type none must be rejected");
+
+        // …but an explicit null header is "absent" and must stay valid.
+        let mut v = base.clone();
+        v["api_key_header"] = json!(null);
+        v["auth_type"] = json!("none");
+        v.as_object_mut().unwrap().remove("secret");
+        crate::models::schema::validate_mcp_server(&v).expect("api_key_header: null means absent");
+    }
+
+    #[test]
     fn schema_rejects_tool_namespace_separator_in_name() {
         // Tools are exposed as `<name>__<tool>`, so `__` inside the name makes
         // the split ambiguous.
@@ -314,7 +397,7 @@ mod tests {
 
     #[test]
     fn schema_enforces_openapi_field_coupling() {
-        let spec = json!({"openapi": "3.0.0"});
+        let spec = json!({"openapi": "3.0.0", "paths": {"/a": {"get": {"operationId": "list_a"}}}});
 
         // `openapi` type requires a `spec`, and it must be an OpenAPI 3.x object.
         for bad in [

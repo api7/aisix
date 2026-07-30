@@ -165,6 +165,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn schema_pins_each_a2a_obligation_individually() {
+        // Every excluded character is pinned, under both accepted spellings, so
+        // narrowing the pattern back to `^[^/]+$` fails here.
+        for bad in ["a/b", "a?b", "a#b", "a%2Fb", "a b", "a\tb", "a\nb"] {
+            for key in ["name", "display_name"] {
+                let doc = json!({key: bad, "url": "https://x/a2a"});
+                crate::models::schema::validate_a2a_agent(&doc)
+                    .expect_err(&format!("{key}={bad:?} must be rejected"));
+            }
+        }
+        // A plain name is still fine under both spellings.
+        for key in ["name", "display_name"] {
+            let doc = json!({key: "invoice-processor", "url": "https://x/a2a"});
+            crate::models::schema::validate_a2a_agent(&doc).expect("plain name is valid");
+        }
+        // Credential obligations: missing, empty and null all fail.
+        for bad in [None, Some(json!("")), Some(json!(null))] {
+            let mut doc = json!({"name": "a", "url": "https://x/a2a", "auth_type": "bearer"});
+            if let Some(v) = bad {
+                doc["secret"] = v;
+            }
+            crate::models::schema::validate_a2a_agent(&doc)
+                .expect_err("bearer needs a non-empty string secret");
+        }
+    }
+
+    #[test]
     fn schema_rejects_slash_in_name() {
         // The name is the `/a2a/<name>` path segment, so a slash would split
         // into two segments and route somewhere else entirely.

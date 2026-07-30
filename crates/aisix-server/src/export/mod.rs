@@ -100,8 +100,19 @@ pub async fn run(args: ExportArgs) -> anyhow::Result<()> {
     report_secrets(&document, args.reveal_secrets);
 
     // The file is written for inspection either way, but a scripted
-    // migration must not mistake a non-loadable export for a finished one:
-    // exit non-zero when a collision or dangling reference means the file
+    // migration must not mistake an incomplete export for a finished one.
+    // A row the loader rejected is silently absent from the output: the file
+    // loads, so `blocking` is empty, yet the migration lost a resource. That
+    // is a failed export, not a warning — exit non-zero for it too.
+    if !stats.rejections.is_empty() {
+        anyhow::bail!(
+            "export omitted {} rejected entr(ies); the resources file is incomplete. \
+             Fix them in the source and re-export — the written file is for inspection only",
+            stats.rejections.len()
+        );
+    }
+
+    // Exit non-zero when a collision or dangling reference means the file
     // cannot be loaded back as-is.
     if !document.blocking.is_empty() {
         eprintln!(
