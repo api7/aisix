@@ -101,6 +101,12 @@ fn validate_resource_url(settings: &McpAuthSettings) -> Option<DiscoveryIdentity
     if !matches!(parsed.scheme(), "http" | "https") {
         return None;
     }
+    // Userinfo would be published verbatim on the unauthenticated PRM
+    // endpoint — a credential pasted into the URL must never activate
+    // the surface (audit finding on #859).
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return None;
+    }
     if parsed.query().is_some() || parsed.fragment().is_some() {
         return None;
     }
@@ -147,22 +153,42 @@ fn prm_document(snapshot: &AisixSnapshot, identity: &DiscoveryIdentity) -> serde
 
 /// `GET /.well-known/oauth-protected-resource` and its RFC 9728
 /// path-insertion sibling `…/mcp`. Unauthenticated by design (discovery
-/// must precede auth); 404 with an empty body while the surface is
-/// dormant — indistinguishable from the route not existing.
-pub(crate) async fn protected_resource_metadata(State(state): State<ProxyState>) -> Response {
+/// must precede auth). Registered with `any(...)` and the method check
+/// done here, AFTER the dormancy check: a dormant environment answers a
+/// bare empty 404 for EVERY method — byte-identical to the route not
+/// existing (axum's pre-#1143 fallback) — while an active one answers
+/// 405 + `Allow` for non-GET/HEAD.
+pub(crate) async fn protected_resource_metadata(
+    method: axum::http::Method,
+    State(state): State<ProxyState>,
+) -> Response {
     let snapshot = state.snapshot.load();
     let Some(identity) = discovery_identity(&snapshot) else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    if method != axum::http::Method::GET && method != axum::http::Method::HEAD {
+        let mut response = StatusCode::METHOD_NOT_ALLOWED.into_response();
+        response
+            .headers_mut()
+            .insert(header::ALLOW, HeaderValue::from_static("GET, HEAD"));
+        return response;
+    }
     Json(prm_document(&snapshot, &identity)).into_response()
 }
 
 /// The `WWW-Authenticate` value for one challenge classification.
-/// Values interpolated into the header are defensively stripped of
-/// `"` and `\` so a config value can never break out of the quoted
-/// attribute (the CP validates both upstream; this is depth).
+/// Values interpolated into the header are filtered to RFC 6750 NQCHAR
+/// (visible ASCII minus `"` and `\`) so a config value can neither
+/// break out of the quoted attribute nor corrupt the space-separated
+/// scope list, and `HeaderValue::from_str` cannot fail on them — a
+/// stray control byte must lose one character, never the whole header
+/// (the CP validates upstream; this is depth).
 fn challenge_header_value(challenge: &AuthChallenge, challenge_url: &str) -> Option<HeaderValue> {
-    let quote = |s: &str| -> String { s.chars().filter(|c| *c != '"' && *c != '\\').collect() };
+    let quote = |s: &str| -> String {
+        s.chars()
+            .filter(|c| matches!(*c, '\x21' | '\x23'..='\x5B' | '\x5D'..='\x7E'))
+            .collect()
+    };
     let url = quote(challenge_url);
     let value = match challenge {
         AuthChallenge::MissingCredentials => {
@@ -191,6 +217,11 @@ fn challenge_header_value(challenge: &AuthChallenge, challenge_url: &str) -> Opt
 /// renderer) and the surface is active, attach the `WWW-Authenticate`
 /// header. Everything else — inactive environments, non-auth errors,
 /// success responses — passes through untouched.
+///
+/// The snapshot is loaded here a second time (the auth decision loaded
+/// its own copy), so a config swap mid-request can attach a challenge
+/// reflecting newer config than the 401 was produced under. Accepted
+/// eventual consistency: the client re-runs discovery and self-heals.
 pub(crate) async fn challenge_middleware(
     State(state): State<ProxyState>,
     request: Request,
@@ -276,6 +307,10 @@ mod tests {
             "https://gw.example.com/mcp?x=1",
             "https://gw.example.com/mcp#frag",
             "https://gw.example.com/",
+            // Userinfo would be served verbatim on the unauthenticated
+            // PRM endpoint — never activate on it.
+            "https://user:s3cret@gw.example.com/mcp",
+            "https://user@gw.example.com/mcp",
         ] {
             let snap = AisixSnapshot::new();
             snap.mcp_auth_settings.insert(settings_entry("env-1", bad));
@@ -295,6 +330,18 @@ mod tests {
             identity.challenge_url,
             "https://gw.example.com/.well-known/oauth-protected-resource/mcp"
         );
+    }
+
+    #[test]
+    fn multiple_rows_pick_the_smallest_id_deterministically() {
+        // The CP keys the row by the environment id so a second row
+        // should be impossible; if one ever appears the pick must be
+        // stable across processes, not insertion-ordered.
+        let snap = active_snapshot(); // row id "env-1"
+        snap.mcp_auth_settings
+            .insert(settings_entry("env-0", "http://first.example.com/mcp"));
+        let identity = discovery_identity(&snap).expect("active");
+        assert_eq!(identity.resource_url, "http://first.example.com/mcp");
     }
 
     #[test]
@@ -398,5 +445,21 @@ mod tests {
         )
         .unwrap();
         assert!(h.to_str().unwrap().contains("scope=\"abc\""));
+    }
+
+    #[test]
+    fn challenge_value_survives_space_and_control_bytes_in_scopes() {
+        // A space would corrupt the RFC 6750 space-separated scope list
+        // and a control byte would previously make HeaderValue::from_str
+        // fail — dropping the WHOLE header, resource_metadata included.
+        // The NQCHAR filter must lose only the offending characters.
+        let h = challenge_header_value(
+            &AuthChallenge::InsufficientScope {
+                required_scopes: vec!["mcp tools".into(), "a\u{7}b".into()],
+            },
+            "https://gw.example.com/.well-known/oauth-protected-resource/mcp",
+        )
+        .expect("header must survive hostile scope values");
+        assert!(h.to_str().unwrap().contains("scope=\"mcptools ab\""));
     }
 }

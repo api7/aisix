@@ -609,6 +609,21 @@ pub fn load_from_str(
         }
     }
 
+    // Same rule for the MCP OAuth resource URL: it is published verbatim
+    // on the unauthenticated protected-resource-metadata endpoint, so an
+    // embedded credential would be world-readable.
+    for (_, scope, settings) in &mcp_auth_settings {
+        if url_has_credentials(&settings.resource_url) {
+            errors.push(LoadError {
+                scope: scope.clone(),
+                message: "mcp_auth_settings resource_url must not embed credentials (user \
+                          info or a token query parameter) — protected resource metadata \
+                          is public"
+                    .into(),
+            });
+        }
+    }
+
     // An explicit `provider_key_id` must also resolve: in file mode every
     // provider-key id is derived from its name, so any other value is
     // guaranteed dangling and would only surface per-request.

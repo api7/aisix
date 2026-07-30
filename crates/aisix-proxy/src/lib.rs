@@ -161,14 +161,17 @@ pub fn build_router(state: ProxyState) -> Router {
         // precede auth; 404 while the surface is dormant. Both the root
         // and the path-insertion form are served: spec-strict clients
         // resolve the latter, while several mainstream clients ignore
-        // path segments and fetch the former.
+        // path segments and fetch the former. `any(...)` — not `get` —
+        // so a dormant environment keeps answering the bare 404 axum's
+        // fallback produced before these routes existed, for every
+        // method; the handler does the GET/HEAD gate itself.
         .route(
             "/.well-known/oauth-protected-resource",
-            get(mcp_auth::protected_resource_metadata),
+            any(mcp_auth::protected_resource_metadata),
         )
         .route(
             "/.well-known/oauth-protected-resource/mcp",
-            get(mcp_auth::protected_resource_metadata),
+            any(mcp_auth::protected_resource_metadata),
         )
         // Downstream-facing MCP gateway. Authentication (AISIX API key or,
         // with trust providers configured, an IdP-issued JWT) is enforced
@@ -812,14 +815,38 @@ mod tests {
             "/.well-known/oauth-protected-resource",
             "/.well-known/oauth-protected-resource/mcp",
         ] {
-            let req = Request::builder()
-                .method("GET")
-                .uri(path)
-                .body(Body::empty())
-                .unwrap();
-            let resp = run(app.clone(), req).await;
-            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{path}");
+            // Every method — not just GET — must keep answering the bare
+            // 404 the axum fallback produced before these routes existed.
+            for method in ["GET", "POST", "PUT", "DELETE"] {
+                let req = Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .body(Body::empty())
+                    .unwrap();
+                let resp = run(app.clone(), req).await;
+                assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{method} {path}");
+            }
         }
+    }
+
+    #[tokio::test]
+    async fn prm_endpoints_reject_non_get_methods_when_active() {
+        let hub = Arc::new(Hub::new());
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
+        seed_oauth_discovery(&snap);
+        let app = build_router(build_state(snap, hub));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/.well-known/oauth-protected-resource")
+            .body(Body::empty())
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(
+            resp.headers().get("allow").and_then(|v| v.to_str().ok()),
+            Some("GET, HEAD")
+        );
     }
 
     #[tokio::test]

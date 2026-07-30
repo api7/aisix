@@ -304,17 +304,7 @@ pub(crate) async fn authenticate_jwt(
     // (AISIX-Cloud#1143), a policy denial never does. Both render the
     // same 403 on the wire.
     if let Err(rejection) = check_provider_claims(&claims, prov) {
-        let (reason, err) = match rejection {
-            ClaimsRejection::Scope => (
-                "jwt_scope_missing",
-                ProxyError::JwtInsufficientScope {
-                    required_scopes: prov.required_scopes.clone(),
-                },
-            ),
-            ClaimsRejection::BoundClaim => {
-                ("jwt_bound_claim_mismatch", ProxyError::JwtClaimsRejected)
-            }
-        };
+        let (reason, err) = claims_rejection_error(rejection, prov);
         return Err(deny(state, reason, &iss, kid.as_deref(), err));
     }
 
@@ -494,6 +484,26 @@ fn validate_with_keys(
 enum ClaimsRejection {
     Scope,
     BoundClaim,
+}
+
+/// Map a claims-rejection class onto its deny-reason string and
+/// caller-visible error. Split out of `authenticate_jwt` so the single
+/// construction site of [`ProxyError::JwtInsufficientScope`] — the
+/// error that carries the `/mcp` `insufficient_scope` challenge — is
+/// unit-testable (audit finding on #859).
+fn claims_rejection_error(
+    rejection: ClaimsRejection,
+    prov: &OidcProvider,
+) -> (&'static str, ProxyError) {
+    match rejection {
+        ClaimsRejection::Scope => (
+            "jwt_scope_missing",
+            ProxyError::JwtInsufficientScope {
+                required_scopes: prov.required_scopes.clone(),
+            },
+        ),
+        ClaimsRejection::BoundClaim => ("jwt_bound_claim_mismatch", ProxyError::JwtClaimsRejected),
+    }
 }
 
 /// Enforce the provider's `required_scopes` and `bound_claims`. Returns
@@ -1164,6 +1174,36 @@ jyxumGxNpoIV8LlzsMsaWQ==
         let mut c = valid_claims();
         c["exp"] = serde_json::json!(chrono::Utc::now().timestamp() - 30);
         assert!(validate_with_keys(&sign(&c), Algorithm::RS256, &prov, &decoding_keys()).is_ok());
+    }
+
+    #[test]
+    fn claims_rejection_error_maps_scope_to_insufficient_scope_with_provider_scopes() {
+        let prov = test_provider(
+            r#"{
+              "name": "test-idp",
+              "issuer": "https://idp.test/realms/agents",
+              "audiences": ["aisix"],
+              "required_scopes": ["ai.access", "mcp:tools"]
+            }"#,
+        );
+
+        let (reason, err) = claims_rejection_error(ClaimsRejection::Scope, &prov);
+        assert_eq!(reason, "jwt_scope_missing");
+        match err {
+            ProxyError::JwtInsufficientScope { required_scopes } => {
+                assert_eq!(
+                    required_scopes,
+                    vec!["ai.access".to_string(), "mcp:tools".to_string()],
+                    "the challenge must name the provider's required scopes",
+                );
+            }
+            other => panic!("scope failure must map to JwtInsufficientScope, got {other:?}"),
+        }
+
+        // A bound-claims policy denial keeps the challenge-less variant.
+        let (reason, err) = claims_rejection_error(ClaimsRejection::BoundClaim, &prov);
+        assert_eq!(reason, "jwt_bound_claim_mismatch");
+        assert!(matches!(err, ProxyError::JwtClaimsRejected));
     }
 
     #[test]

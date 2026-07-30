@@ -550,6 +550,24 @@ mcp_auth_settings:
 }
 
 #[test]
+fn mcp_auth_settings_resource_url_with_credentials_is_a_load_error() {
+    // The resource URL is served verbatim on the unauthenticated PRM
+    // endpoint, so embedded credentials must fail the load — same rule
+    // as OIDC issuer/jwks_uri.
+    let contents = r#"
+_format_version: "1"
+mcp_auth_settings:
+  - resource_url: https://user:s3cret@gw.example.com/mcp
+"#;
+    let errs = errors_of(load(contents, &env_of(&[])));
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("must not embed credentials")),
+        "{errs:?}"
+    );
+}
+
+#[test]
 fn duplicate_mcp_auth_settings_is_a_load_error() {
     // The kind is a per-environment singleton: its fixed identity makes
     // any second entry a pass-1 duplicate (AISIX-Cloud#1143).
