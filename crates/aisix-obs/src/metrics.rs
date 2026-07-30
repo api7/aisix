@@ -275,6 +275,15 @@ impl Metrics {
         self.inner.handle.render()
     }
 
+    /// Drain pending histogram samples into their distributions.
+    ///
+    /// `PrometheusBuilder::build_recorder` does not start the exporter's
+    /// background upkeep task, so the server must call this periodically
+    /// even when no Prometheus server is scraping the metrics endpoint.
+    pub fn run_upkeep(&self) {
+        self.inner.handle.run_upkeep();
+    }
+
     /// Reflect the config load-observability state into the recorder. Called
     /// at scrape time by the metrics/status listener so `aisix_config_*`
     /// series always mirror the live [`aisix_core::ConfigStatus`]. Idempotent

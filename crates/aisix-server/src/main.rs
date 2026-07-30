@@ -307,6 +307,27 @@ fn select_managed_boot_path(bundle_on_disk: bool, bundle_provided: bool) -> Mana
     }
 }
 
+async fn run_metrics_upkeep<F>(mut cancel: watch::Receiver<bool>, period: Duration, upkeep: F)
+where
+    F: Fn(),
+{
+    let mut interval = tokio::time::interval(period);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        if *cancel.borrow() {
+            break;
+        }
+        tokio::select! {
+            _ = interval.tick() => upkeep(),
+            changed = cancel.changed() => {
+                if changed.is_err() || *cancel.borrow() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
 /// Factored out of `main` so the integration tests can drive the full
 /// startup with a real config struct and still use `#[tokio::test]`.
 async fn run(mut cfg: Config) -> anyhow::Result<()> {
@@ -662,6 +683,14 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     // above); it becomes the constant `env_id` label on the SLO latency
     // histograms. Standalone DPs leave it empty → "unknown".
     let metrics = Arc::new(Metrics::new_with_env_id(&cfg.etcd.env_id));
+    let metrics_upkeep_task = {
+        let metrics = metrics.clone();
+        tokio::spawn(run_metrics_upkeep(
+            cancel_rx.clone(),
+            Duration::from_secs(5),
+            move || metrics.run_upkeep(),
+        ))
+    };
     // Cache backends (#519 B.8). The memory cache is always built
     // (in-process, cheap); the redis cache is built iff `cache.redis`
     // is configured. Which instance serves a request is selected by
@@ -984,6 +1013,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     if let Some(task) = telemetry_task {
         let _ = task.await;
     }
+    let _ = metrics_upkeep_task.await;
     let _ = background_check_task.await;
     tracing::info!("aisix shut down cleanly");
     Ok(())
@@ -1459,6 +1489,33 @@ async fn wait_for_signal(
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[tokio::test(start_paused = true)]
+    async fn metrics_upkeep_runs_periodically_and_stops_on_cancel() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let task = tokio::spawn(run_metrics_upkeep(
+            cancel_rx,
+            Duration::from_secs(5),
+            move || {
+                observed.fetch_add(1, Ordering::SeqCst);
+            },
+        ));
+
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        cancel_tx.send(true).unwrap();
+        task.await.unwrap();
+        tokio::time::advance(Duration::from_secs(10)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
 
     #[test]
     fn supplied_certs_take_precedence_over_persisted_bundle() {
