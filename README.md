@@ -48,24 +48,69 @@ for a managed control plane with team governance, budgets, audit, and a dashboar
 
 ## ⚡ Quickstart
 
-AISIX is etcd-backed, so the fastest local run is Docker Compose (gateway + etcd). Grab the
-ready-to-run `docker-compose.yml` and example `config.yaml` from the
-[self-hosted quickstart](https://docs.api7.ai/ai-gateway/getting-started/self-hosted-quickstart), then:
+One container, one file, no configuration store. Declare every gateway resource in
+`resources.yaml`:
 
-```bash
-docker compose up          # proxy → :3000, admin API → :3001
+```yaml
+_format_version: "1"
+
+provider_keys:
+  - display_name: openai-main
+    provider: openai
+    adapter: openai
+    api_key: ${OPENAI_API_KEY}      # resolved from the environment at load
+    api_base: https://api.openai.com/v1
+
+models:
+  - display_name: gpt-4o-mini
+    provider: openai
+    model_name: gpt-4o-mini
+    provider_key: openai-main
+
+api_keys:
+  - display_name: my-app
+    key_env: CALLER_API_KEY         # hashed at load; only the hash is stored
+    allowed_models: [gpt-4o-mini]
 ```
 
-Configure a model and an API key through the admin API on `:3001`
-([quickstart](https://docs.api7.ai/ai-gateway/getting-started/self-hosted-quickstart)),
-then call the gateway exactly like OpenAI:
+Point a `config.yaml` at it:
+
+```yaml
+resources_file: /etc/aisix/resources.yaml
+
+proxy:
+  addr: "0.0.0.0:3000"
+
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["change-me"]
+```
+
+Then start the gateway and call it exactly like OpenAI:
 
 ```bash
+export OPENAI_API_KEY="sk-..."        # your upstream provider key
+export CALLER_API_KEY="my-app-key"    # the key your clients will send
+
+docker run -d --name aisix \
+  -v "$(pwd)/config.yaml:/etc/aisix/config.yaml:ro" \
+  -v "$(pwd)/resources.yaml:/etc/aisix/resources.yaml:ro" \
+  -e OPENAI_API_KEY -e CALLER_API_KEY \
+  -p 3000:3000 ghcr.io/api7/aisix:latest
+
 curl http://localhost:3000/v1/chat/completions \
-  -H "Authorization: Bearer $AISIX_API_KEY" \
+  -H "Authorization: Bearer $CALLER_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"model":"my-model","messages":[{"role":"user","content":"hello"}]}'
+  -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hello"}]}'
 ```
+
+Guardrails, MCP servers, A2A agents, cache policies, rate-limit policies, and observability
+exporters are declared in the same file, and are re-read on `SIGHUP`. An invalid file fails
+at boot with the offending entries and fields listed together. Validate without booting via
+`aisix validate --resources resources.yaml`.
+
+To manage several gateways from one place, run AISIX against etcd or a control plane
+instead — see the [deployment docs](https://docs.api7.ai/ai-gateway/).
 
 ## ✨ Why AISIX
 
