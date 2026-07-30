@@ -103,8 +103,7 @@ impl EnsembleConfig {
     }
 
     /// Per-call upstream deadline applied to each panel member and the
-    /// judge call. Folds the `0`/absent sentinel into `None` like
-    /// [`Model::request_timeout`](super::Model::request_timeout) so callers
+    /// judge call. Folds the `0`/absent sentinel into `None` so callers
     /// can apply it unconditionally.
     pub fn timeout(&self) -> Option<std::time::Duration> {
         self.timeout_ms

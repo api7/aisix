@@ -167,8 +167,7 @@ impl Semantic {
     }
 
     /// Per-call embedding deadline. Folds the `0`/absent sentinel into
-    /// `None` like [`Model::request_timeout`](super::Model::request_timeout)
-    /// so callers can apply it unconditionally.
+    /// `None` so callers can apply it unconditionally.
     pub fn embedding_timeout(&self) -> Option<std::time::Duration> {
         self.embedding_timeout_ms
             .filter(|&ms| ms > 0)

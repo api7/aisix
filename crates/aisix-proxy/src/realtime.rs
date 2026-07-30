@@ -461,10 +461,12 @@ async fn run_session(
     // (`downstream_remote_disconnect` and friends) the issue asks for
     // separately, which needs its own status decision.
     let mut session_error: Option<ProxyError> = None;
-    // Operator-configured stream idle deadline (stream_timeout on the
-    // Model). Absent → no idle cap; realtime sessions are long-lived by
-    // design.
-    let idle_cap = model_entry.value.stream_timeout_effective();
+    // Stream idle deadline, resolved model → `upstream.stream_timeout_ms`
+    // / `timeout_ms`. Realtime sessions are long-lived by design, so the
+    // deployment default (6000 s) only reaps sessions with no traffic in
+    // either direction for that long; `timeout: 0` on the model lifts it.
+    let idle_cap =
+        crate::routing::effective_timeouts(&model_entry.value, None, state.default_timeouts).stream;
 
     loop {
         let next = async {

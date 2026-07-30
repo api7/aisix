@@ -136,7 +136,9 @@ impl ModelCaller for ProxyModelCaller<'_> {
             Arc::new(pk_entry.value.clone()),
             Some(self.client),
         );
-        if let Some(deadline) = model.request_timeout() {
+        if let Some(deadline) =
+            crate::routing::effective_timeouts(model, None, self.state.default_timeouts).request
+        {
             ctx = ctx.with_deadline(deadline);
         }
 

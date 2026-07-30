@@ -527,7 +527,9 @@ async fn dispatch(
             // request timeout, matching the first-class non-streaming paths.
             // Without it a slow/blackholed upstream could pin a passthrough
             // connection open indefinitely regardless of the model's timeout.
-            if let Some(d) = model.request_timeout() {
+            if let Some(d) =
+                crate::routing::effective_timeouts(model, None, state.default_timeouts).request
+            {
                 builder = builder.timeout(d);
             }
 
