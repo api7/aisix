@@ -55,7 +55,8 @@ for a managed control plane with team governance, budgets, audit, and a dashboar
 One container. No control plane, no database, no configuration store — the gateway reads
 every dynamic resource from one declarative `resources.yaml`.
 
-```yaml title="config.yaml"
+```yaml
+# config.yaml
 resources_file: /etc/aisix/resources.yaml
 proxy:
   addr: "0.0.0.0:3000"
@@ -68,7 +69,8 @@ observability:
       addr: "0.0.0.0:9090"
 ```
 
-```yaml title="resources.yaml"
+```yaml
+# resources.yaml
 _format_version: "1"
 
 provider_keys:
@@ -93,6 +95,7 @@ export OPENAI_API_KEY="YOUR_PROVIDER_KEY"
 export CALLER_API_KEY="YOUR_CALLER_KEY"
 
 docker run -d --name aisix \
+  --platform linux/amd64 \
   -v "$(pwd)/config.yaml:/etc/aisix/config.yaml:ro" \
   -v "$(pwd)/resources.yaml:/etc/aisix/resources.yaml:ro" \
   -e OPENAI_API_KEY -e CALLER_API_KEY \
@@ -139,7 +142,7 @@ Covered by 165 end-to-end test files (426 cases) that run against real gateway p
 - **OpenAI-compatible proxy** (`:3000`) — `chat/completions`, `completions`, `responses`,
   `embeddings`, `rerank`, `images/generations`, `audio/{speech,transcriptions,translations}`,
   `videos` (submit → poll → fetch), `files`, `batches`, `fine_tuning/jobs`, `realtime`,
-  `GET /v1/models`, and a `passthrough/:provider/*` escape hatch. Native SSE streaming,
+  `GET /v1/models`, plus a root-level `/passthrough/:provider/*` escape hatch. Native SSE streaming,
   tool/function calling, JSON mode, vision/multimodal input, and reasoning-content support.
 - **Anthropic Messages API** — `POST /v1/messages` as a first-class route, working against
   **any** configured upstream: requests and responses (including streaming) are translated
@@ -165,8 +168,8 @@ Covered by 165 end-to-end test files (426 cases) that run against real gateway p
   monitor mode records what would have happened without blocking.
 - **Caching** — exact-match response cache with per-policy TTL and model/key scope matchers;
   memory and Redis backends; cost-saved telemetry on every hit. Separately, **automatic
-  prompt caching** injects Anthropic cache breakpoints so callers get provider-side prompt
-  discounts without changing their requests.
+  prompt caching** can be enabled per direct Anthropic model to inject cache breakpoints, so
+  callers get provider-side prompt discounts without changing their requests.
 - **MCP gateway** — register upstream MCP servers as first-class resources and front them
   all behind one endpoint (`/mcp`), with the gateway holding each server's upstream
   credential, namespacing tools per server, and enforcing per-caller tool access. Also
@@ -207,8 +210,7 @@ OpenAI-shaped.
 
 Plus specialized handling for vendor quirks (e.g. DeepSeek reasoning content) and dedicated
 **rerank / embeddings** vendors (Cohere, Jina). Details in
-[adapter protocol families](https://docs.api7.ai/ai-gateway/providers/adapters). More providers on the
-[roadmap](ROADMAP.md).
+[adapter protocol families](https://docs.api7.ai/ai-gateway/providers/adapters).
 
 ## ☁️ Open source vs AISIX Cloud
 
@@ -253,7 +255,7 @@ Same gateway binary, same proxy API — in every form the gateway runs in your e
 | Configuration | Declarative `resources.yaml`, or etcd for a cluster | Dashboard + Cloud Admin API, multi-environment |
 | Tenancy | Single instance / namespace | Org → Team → Member → Environment |
 | Provider keys | In the resources file as `${VAR}` env references, or in etcd | Envelope-encrypted at rest, write-only, in-place rotation |
-| Caller keys | SHA-256 hashed, model allowlists, expiry, rotation | Hashed + masked reveal, rotation, ownership, PATs |
+| Inbound auth | Caller keys (SHA-256 hashed, model allowlists, expiry), or OIDC/JWT bearers | Same, plus masked reveal, key ownership, and PATs |
 | Budgets | — (rate and token limits only) | Per key / provider / env / org / team, hard-stop & alerts |
 | RBAC | Admin key = full access | Org roles (owner / admin / member), invites |
 | Audit log | — | Full org-scoped audit with diff viewer |
