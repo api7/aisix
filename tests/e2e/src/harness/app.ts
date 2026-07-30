@@ -43,6 +43,14 @@ export interface AppOverrides {
     header?: string;
   };
   /**
+   * `proxy.request_body_limit_bytes`. A dedicated override (like
+   * `realIp`) because `extra` replaces whole top-level blocks and the
+   * proxy block carries the harness-picked listener addr. `0` disables
+   * the cap — the shipped default; the harness pins 10 MiB unless a
+   * test overrides it so the existing 413 suite keeps its subject.
+   */
+  requestBodyLimitBytes?: number;
+  /**
    * Extra environment variables for the spawned binary, applied AFTER the
    * `AISIX_*` strip. Use for non-config secrets the DP reads from its own
    * environment rather than from the kine config — e.g.
@@ -189,7 +197,7 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
         }),
     proxy: {
       addr: `127.0.0.1:${proxyPort}`,
-      request_body_limit_bytes: 10485760,
+      request_body_limit_bytes: overrides.requestBodyLimitBytes ?? 10485760,
       ...(overrides.realIp ? { real_ip: overrides.realIp } : {}),
     },
     admin: adminEnabled

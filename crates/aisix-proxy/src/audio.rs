@@ -282,8 +282,20 @@ pub async fn speech(
     State(state): State<ProxyState>,
     auth: AuthenticatedKey,
     client: ClientContext,
-    Json(body): Json<Value>,
+    // Result-wrapped so an extractor-layer 413 maps to the OpenAI
+    // envelope — see completions.rs.
+    body: Result<Json<Value>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
+    let Json(body) = match body {
+        Ok(json) => json,
+        Err(rej) => {
+            return crate::error::proxy_error_from_json_rejection(
+                rej,
+                state.request_body_limit_bytes,
+            )
+            .into_response();
+        }
+    };
     let started = Instant::now();
     let request_id = client.request_id.clone();
     let api_key_id = auth.entry.id.clone();
@@ -407,18 +419,23 @@ async fn multipart_dispatch(
     // outgoing reqwest multipart.
     let mut fields: Vec<(String, Option<String>, Option<String>, Bytes)> = Vec::new();
 
-    while let Some(field) = multipart
-        .next_field()
-        .await
-        .map_err(|e| ProxyError::InvalidRequest(format!("multipart read error: {e}")))?
-    {
+    while let Some(field) = multipart.next_field().await.map_err(|e| {
+        crate::error::proxy_error_from_multipart(
+            e,
+            state.request_body_limit_bytes,
+            "multipart read error",
+        )
+    })? {
         let name = field.name().unwrap_or("").to_string();
         let file_name = field.file_name().map(|s| s.to_string());
         let content_type = field.content_type().map(|s| s.to_string());
-        let data = field
-            .bytes()
-            .await
-            .map_err(|e| ProxyError::InvalidRequest(format!("multipart field read error: {e}")))?;
+        let data = field.bytes().await.map_err(|e| {
+            crate::error::proxy_error_from_multipart(
+                e,
+                state.request_body_limit_bytes,
+                "multipart field read error",
+            )
+        })?;
         fields.push((name, file_name, content_type, data));
     }
 

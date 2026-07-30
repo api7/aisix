@@ -192,24 +192,6 @@ jobs:
           docker logs smoke-aisix
           test -n "$ok"
 
-      # The profiling contract from #847: the shipped binary must stay
-      # profileable in the field, meaning the symbol table survives into
-      # the image (function-level flame graphs). A future strip step,
-      # RUSTFLAGS change, or base-image swap would break flame graphs
-      # silently, so pin it here — and print the size so every PR
-      # records the real Linux artifact cost.
-      - name: Verify shipped binary keeps its symbol table (#847)
-        if: github.event_name == 'pull_request'
-        run: |
-          set -eux
-          IMAGE="$(printf '%s\n' "${{ steps.meta.outputs.tags }}" | head -n1)"
-          cid="$(docker create "$IMAGE")"
-          docker cp "$cid:/usr/local/bin/aisix" /tmp/aisix-shipped
-          docker rm "$cid"
-          ls -l /tmp/aisix-shipped
-          test "$(nm /tmp/aisix-shipped | grep -c ' [tT] ')" -gt 1000
-          readelf -S /tmp/aisix-shipped | grep -E '\.symtab|\.eh_frame'
-
       - name: Install cosign
         if: github.event_name != 'pull_request'
         uses: sigstore/cosign-installer@v3

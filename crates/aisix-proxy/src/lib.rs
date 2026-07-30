@@ -177,7 +177,14 @@ pub fn build_router(state: ProxyState) -> Router {
         // catches the Content-Length-known case ahead of the
         // extractor; this layer catches chunked / size-mismatched
         // bodies once their actual byte count exceeds the cap.
-        .layer(axum::extract::DefaultBodyLimit::max(body_limit))
+        // `0` = no cap — `disable()` rather than omitting the layer,
+        // because omitting it would fall back to axum's 2 MiB, not to
+        // "unlimited".
+        .layer(if body_limit > 0 {
+            axum::extract::DefaultBodyLimit::max(body_limit)
+        } else {
+            axum::extract::DefaultBodyLimit::disable()
+        })
         .layer(middleware::from_fn_with_state(
             state.clone(),
             enforce_request_body_limit,
@@ -362,11 +369,14 @@ async fn enforce_request_body_limit(
             "conflicting Content-Length headers".into(),
         ));
     }
+    // `0` = the cap is disabled; the duplicate-Content-Length rejection
+    // above still applies — that one is request-smuggling hygiene, not a
+    // size limit.
     if let Some(declared) = first
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<usize>().ok())
     {
-        if declared > state.request_body_limit_bytes {
+        if state.request_body_limit_bytes > 0 && declared > state.request_body_limit_bytes {
             // Drain the inbound body so hyper can flush the 413 response
             // on the same HTTP/1.1 connection. Without this, hyper closes
             // the socket while the client is still writing, and the client
@@ -1434,6 +1444,209 @@ mod tests {
         assert!(
             message.contains("Content-Length"),
             "smuggling-rejection message should mention Content-Length; got {message:?}"
+        );
+    }
+
+    fn build_state_with_limit(snapshot: AisixSnapshot, hub: Arc<Hub>, limit: usize) -> ProxyState {
+        let handle = SnapshotHandle::new(snapshot);
+        let cfg = ProxyConfig {
+            addr: "127.0.0.1:0".into(),
+            request_body_limit_bytes: limit,
+            real_ip: Default::default(),
+            tls: None,
+        };
+        ProxyState::new(handle, hub, &cfg).without_cache()
+    }
+
+    /// `request_body_limit_bytes: 0` (the default) disables the cap
+    /// entirely. The load-bearing detail is axum's BUILT-IN 2 MiB
+    /// `DefaultBodyLimit`: merely skipping our `max(limit)` layer would
+    /// still reject bodies over 2 MiB with a stock rejection, so the
+    /// router must install `DefaultBodyLimit::disable()`. A 2.5 MiB body
+    /// — over axum's built-in cap — must reach the handler on both the
+    /// declared-Content-Length path and the chunked path.
+    #[tokio::test]
+    async fn zero_limit_admits_bodies_over_axums_builtin_cap() {
+        let hub = Arc::new(Hub::new());
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
+        let app = build_router(build_state_with_limit(snap, hub, 0));
+
+        let filler = "x".repeat(2 * 1024 * 1024 + 512 * 1024); // 2.5 MiB
+        let body =
+            format!(r#"{{"model":"my-gpt4","messages":[{{"role":"user","content":"{filler}"}}]}}"#);
+
+        // Declared Content-Length path (the middleware's early check).
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .header("content-length", body.len().to_string())
+            .body(Body::from(body.clone()))
+            .unwrap();
+        let resp = run(app.clone(), req).await;
+        assert_ne!(
+            resp.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "limit 0 must not reject on declared size"
+        );
+        // The body parsed and dispatch ran (and failed on the unusable
+        // upstream) — proving the request got PAST the extractor.
+        assert!(
+            resp.status().is_server_error(),
+            "expected an upstream dispatch failure, got {}",
+            resp.status()
+        );
+
+        // Chunked path (no Content-Length): this is the one axum's
+        // built-in 2 MiB default would kill without `disable()`.
+        let chunks: Vec<_> = body
+            .into_bytes()
+            .chunks(200 * 1024)
+            .map(|c| c.to_vec())
+            .collect();
+        let stream = futures::stream::iter(chunks.into_iter().map(Ok::<_, std::io::Error>));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from_stream(stream))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_ne!(
+            resp.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "limit 0 must not cap a chunked body at axum's 2 MiB default"
+        );
+        assert!(resp.status().is_server_error());
+    }
+
+    /// The duplicate-Content-Length rejection is smuggling hygiene, not
+    /// a size limit — it must keep firing when the cap is disabled.
+    #[tokio::test]
+    async fn zero_limit_still_rejects_duplicate_content_length() {
+        let hub = Arc::new(Hub::new());
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
+        let app = build_router(build_state_with_limit(snap, hub, 0));
+
+        let body = r#"{"model":"my-gpt4","messages":[{"role":"user","content":"hi"}]}"#;
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        req.headers_mut().append(
+            axum::http::header::CONTENT_LENGTH,
+            axum::http::HeaderValue::from(body.len()),
+        );
+        req.headers_mut().append(
+            axum::http::header::CONTENT_LENGTH,
+            axum::http::HeaderValue::from(body.len() + 1),
+        );
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Chunked oversize on a handler that used to take a bare
+    /// `Json<Value>` extractor: the rejection must be the OpenAI
+    /// envelope, not axum's stock `text/plain` 413. (The
+    /// Content-Length path was already correct via the middleware;
+    /// the chunked path leaked the stock rejection.)
+    #[tokio::test]
+    async fn chunked_oversize_on_v1_completions_returns_openai_envelope() {
+        let hub = Arc::new(Hub::new());
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
+        let app = build_router(build_state(snap, hub));
+
+        let chunk = vec![b'x'; 200 * 1024];
+        let stream =
+            futures::stream::iter((0..10).map(move |_| Ok::<_, std::io::Error>(chunk.clone())));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from_stream(stream))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes)
+            .expect("413 must carry the JSON envelope, not axum's text/plain rejection");
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+    }
+
+    /// Same contract for the raw-`Bytes` handlers (batches /
+    /// fine-tuning).
+    #[tokio::test]
+    async fn chunked_oversize_on_v1_batches_returns_openai_envelope() {
+        let hub = Arc::new(Hub::new());
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
+        let app = build_router(build_state(snap, hub));
+
+        let chunk = vec![b'x'; 200 * 1024];
+        let stream =
+            futures::stream::iter((0..10).map(move |_| Ok::<_, std::io::Error>(chunk.clone())));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/batches")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from_stream(stream))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes)
+            .expect("413 must carry the JSON envelope, not axum's text/plain rejection");
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+    }
+
+    /// Chunked oversize multipart upload: axum's `MultipartError`
+    /// classifies the cap hit as 413, and the handlers must preserve
+    /// that instead of folding every multipart error into 400.
+    #[tokio::test]
+    async fn chunked_oversize_multipart_returns_413_envelope() {
+        let hub = Arc::new(Hub::new());
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
+        let app = build_router(build_state(snap, hub));
+
+        let boundary = "aisix-test-boundary-413";
+        let mut body = Vec::new();
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; \
+                 filename=\"a.wav\"\r\nContent-Type: audio/wav\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend(vec![b'x'; 2 * 1024 * 1024]); // over the 1 MiB test cap
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let chunks: Vec<_> = body.chunks(200 * 1024).map(|c| c.to_vec()).collect();
+        let stream = futures::stream::iter(chunks.into_iter().map(Ok::<_, std::io::Error>));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/audio/transcriptions")
+            .header("authorization", "Bearer sk-caller")
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from_stream(stream))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        let message = v["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("limit"),
+            "413 message should reference the limit; got {message:?}"
         );
     }
 

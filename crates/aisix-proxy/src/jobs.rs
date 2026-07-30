@@ -790,15 +790,21 @@ pub(crate) async fn create_file(
         let mut form_model: Option<String> = None;
         let mut file_bytes: Option<Bytes> = None;
 
-        while let Some(field) = multipart
-            .next_field()
-            .await
-            .map_err(|e| ProxyError::InvalidRequest(format!("malformed multipart body: {e}")))?
-        {
+        while let Some(field) = multipart.next_field().await.map_err(|e| {
+            crate::error::proxy_error_from_multipart(
+                e,
+                state.request_body_limit_bytes,
+                "malformed multipart body",
+            )
+        })? {
             let name = field.name().unwrap_or_default().to_string();
             if name == "model" {
                 let v = field.text().await.map_err(|e| {
-                    ProxyError::InvalidRequest(format!("malformed multipart field: {e}"))
+                    crate::error::proxy_error_from_multipart(
+                        e,
+                        state.request_body_limit_bytes,
+                        "malformed multipart field",
+                    )
                 })?;
                 if !v.trim().is_empty() {
                     form_model = Some(v.trim().to_string());
@@ -809,7 +815,11 @@ pub(crate) async fn create_file(
                 let file_name = field.file_name().unwrap_or("file").to_string();
                 let content_type = field.content_type().map(str::to_string);
                 let bytes = field.bytes().await.map_err(|e| {
-                    ProxyError::InvalidRequest(format!("failed to read file field: {e}"))
+                    crate::error::proxy_error_from_multipart(
+                        e,
+                        state.request_body_limit_bytes,
+                        "failed to read file field",
+                    )
                 })?;
                 let mut part = reqwest::multipart::Part::bytes(bytes.to_vec()).file_name(file_name);
                 if let Some(ct) = content_type {
@@ -822,7 +832,11 @@ pub(crate) async fn create_file(
                 continue;
             }
             let v = field.text().await.map_err(|e| {
-                ProxyError::InvalidRequest(format!("malformed multipart field: {e}"))
+                crate::error::proxy_error_from_multipart(
+                    e,
+                    state.request_body_limit_bytes,
+                    "malformed multipart field",
+                )
             })?;
             form = form.text(name, v);
         }
@@ -1008,8 +1022,21 @@ pub(crate) async fn create_batch(
     client: ClientContext,
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
-    body: Bytes,
+    // Result-wrapped so an extractor-layer 413 (chunked body over the
+    // cap) maps to the OpenAI envelope instead of axum's stock
+    // text/plain rejection — see completions.rs.
+    body: Result<Bytes, axum::extract::rejection::BytesRejection>,
 ) -> Response {
+    let body = match body {
+        Ok(bytes) => bytes,
+        Err(rej) => {
+            return crate::error::proxy_error_from_bytes_rejection(
+                rej,
+                state.request_body_limit_bytes,
+            )
+            .into_response();
+        }
+    };
     let started = Instant::now();
     let request_id = client.request_id.clone();
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
@@ -1235,8 +1262,21 @@ pub(crate) async fn create_ft_job(
     client: ClientContext,
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
-    body: Bytes,
+    // Result-wrapped so an extractor-layer 413 (chunked body over the
+    // cap) maps to the OpenAI envelope instead of axum's stock
+    // text/plain rejection — see completions.rs.
+    body: Result<Bytes, axum::extract::rejection::BytesRejection>,
 ) -> Response {
+    let body = match body {
+        Ok(bytes) => bytes,
+        Err(rej) => {
+            return crate::error::proxy_error_from_bytes_rejection(
+                rej,
+                state.request_body_limit_bytes,
+            )
+            .into_response();
+        }
+    };
     let started = Instant::now();
     let request_id = client.request_id.clone();
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();

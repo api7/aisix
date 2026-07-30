@@ -122,8 +122,22 @@ async fn dispatch(
     // Buffer the body so the JSON-RPC method can be inspected, then rebuilt for
     // the gateway. The global body-limit layer has already capped the size.
     let (parts, body) = request.into_parts();
-    let bytes = match to_bytes(body, state.request_body_limit_bytes).await {
+    let bytes = match to_bytes(
+        body,
+        crate::error::body_read_cap(state.request_body_limit_bytes),
+    )
+    .await
+    {
         Ok(bytes) => bytes,
+        // A cap hit is a 413 in the standard envelope — consistent with
+        // what the Content-Length middleware already answers on this
+        // route; anything else reading the body is a client fault.
+        Err(err) if crate::error::is_length_limit_error(&err) => {
+            return crate::error::ProxyError::RequestTooLarge {
+                limit_bytes: state.request_body_limit_bytes,
+            }
+            .into_response();
+        }
         Err(_) => return (StatusCode::BAD_REQUEST, "invalid request body").into_response(),
     };
 
@@ -250,7 +264,12 @@ async fn dispatch(
     // body is only buffered when a guardrail chain is attached.
     let response = if let Some(chain) = &guardrail_chain {
         let (resp_parts, resp_body) = response.into_parts();
-        let resp_bytes = match to_bytes(resp_body, state.request_body_limit_bytes).await {
+        let resp_bytes = match to_bytes(
+            resp_body,
+            crate::error::body_read_cap(state.request_body_limit_bytes),
+        )
+        .await
+        {
             Ok(bytes) => bytes,
             Err(_) => {
                 return (StatusCode::BAD_GATEWAY, "invalid upstream response").into_response()

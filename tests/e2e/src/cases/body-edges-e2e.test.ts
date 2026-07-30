@@ -278,3 +278,96 @@ describe("body edges e2e: multi-turn, oversize body, empty messages", () => {
     expect(upstreamChatHitsAfter).toBe(upstreamChatHitsBefore);
   });
 });
+
+// The shipped default is `request_body_limit_bytes: 0` — NO cap, matching
+// the reference LLM proxy's out-of-box behaviour (its request-size guard
+// defaults to off): providers accept larger requests than any fixed
+// gateway default, so a gateway-side cap rejects requests the upstream
+// would have served. The suite above pins the behaviour WITH a cap (the
+// harness sets 10 MiB); this suite pins the default.
+describe("body edges e2e: unlimited default (request_body_limit_bytes: 0)", () => {
+  let app: SpawnedApp | undefined;
+  let upstream: OpenAiUpstream | undefined;
+  let etcdReachable = false;
+
+  beforeAll(async () => {
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
+    if (!etcdReachable) return;
+
+    upstream = await startOpenAiUpstream();
+    app = await spawnApp({ requestBodyLimitBytes: 0 });
+    const seed = new SeedClient(etcd, app.etcdPrefix);
+
+    const pk = await seed.createProviderKey({
+      display_name: "body-unlimited-pk",
+      secret: "sk-mock",
+      api_base: `${upstream.baseUrl}/v1`,
+    });
+    await seed.createModel({
+      display_name: "body-unlimited",
+      provider: "openai",
+      model_name: "gpt-4o-mini",
+      provider_key_id: pk.id,
+    });
+    await seed.createApiKey({
+      key_hash: CALLER_KEY_HASH,
+      allowed_models: ["body-unlimited"],
+    });
+
+    const client = new OpenAI({
+      apiKey: CALLER_PLAINTEXT,
+      baseURL: `${app.proxyUrl}/v1`,
+      maxRetries: 0,
+    });
+    await waitConfigPropagation(async () => {
+      try {
+        const r = await client.chat.completions.create({
+          model: "body-unlimited",
+          messages: [{ role: "user", content: "ready-probe" }],
+        });
+        return r.choices[0]?.message.role === "assistant";
+      } catch {
+        return false;
+      }
+    });
+  });
+
+  afterAll(async () => {
+    await app?.exit();
+    await upstream?.close();
+  });
+
+  test("a 12 MiB body sails through to the upstream", async (ctx) => {
+    if (!etcdReachable || !app || !upstream) {
+      ctx.skip();
+      return;
+    }
+
+    // Comfortably above both the old 10 MiB default and axum's
+    // built-in 2 MiB extractor fallback — proving the cap is OFF,
+    // not merely raised.
+    const filler = "x".repeat(12 * 1024 * 1024);
+    const upstreamHitsBefore = upstream.receivedRequests.length;
+    const res = await fetch(`${app.proxyUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${CALLER_PLAINTEXT}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "body-unlimited",
+        messages: [{ role: "user", content: filler }],
+      }),
+    });
+
+    expect(res.status).toBe(200);
+    await res.json();
+    expect(upstream.receivedRequests.length).toBe(upstreamHitsBefore + 1);
+    const sent = upstream.receivedRequests[upstreamHitsBefore]!;
+    const sentBody = JSON.parse(sent.body) as {
+      messages?: Array<{ content?: string }>;
+    };
+    expect(sentBody.messages?.[0]?.content?.length).toBe(filler.length);
+  }, 60_000);
+});

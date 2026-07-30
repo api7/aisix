@@ -375,6 +375,14 @@ impl EtcdConfig {
 #[serde(deny_unknown_fields)]
 pub struct ProxyConfig {
     pub addr: String,
+    /// Cap on inbound request bodies across the whole proxy surface
+    /// (JSON, multipart, passthrough, MCP, A2A). `0` — the default —
+    /// disables the cap, matching the reference LLM proxy's
+    /// out-of-box behaviour: providers accept larger requests than any
+    /// fixed gateway default (Anthropic takes 32 MB), so a gateway-side
+    /// cap rejects requests the upstream would have served. Set a value
+    /// to bound per-request memory; over-limit requests get a 413 in
+    /// the caller's error envelope.
     #[serde(default = "ProxyConfig::default_body_limit")]
     pub request_body_limit_bytes: usize,
     #[serde(default)]
@@ -389,7 +397,7 @@ pub struct ProxyConfig {
 
 impl ProxyConfig {
     const fn default_body_limit() -> usize {
-        10 * 1024 * 1024
+        0
     }
 }
 
@@ -1082,7 +1090,9 @@ admin:
         );
         let cfg = Config::load_from_path(Some(f.path())).unwrap();
         assert_eq!(cfg.etcd.endpoints, vec!["http://127.0.0.1:2379"]);
-        assert_eq!(cfg.proxy.request_body_limit_bytes, 10 * 1024 * 1024);
+        // `0` = no request-body cap, the out-of-box behaviour of the
+        // reference LLM proxy.
+        assert_eq!(cfg.proxy.request_body_limit_bytes, 0);
         assert!(cfg.observability.metrics.prometheus.enabled);
         // The dedicated metrics listener defaults to 0.0.0.0:9090 in
         // every mode — no admin-listener fallback to fall out of sync with.

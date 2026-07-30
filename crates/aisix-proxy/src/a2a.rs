@@ -128,8 +128,21 @@ async fn dispatch(
     let upstream = upstream_from_a2a_agent(&entry.value);
 
     let (_parts, body) = request.into_parts();
-    let bytes = match to_bytes(body, state.request_body_limit_bytes).await {
+    let bytes = match to_bytes(
+        body,
+        crate::error::body_read_cap(state.request_body_limit_bytes),
+    )
+    .await
+    {
         Ok(bytes) => bytes,
+        // Cap hit → 413 in the standard envelope, matching the
+        // Content-Length middleware's answer on this route.
+        Err(err) if crate::error::is_length_limit_error(&err) => {
+            return crate::error::ProxyError::RequestTooLarge {
+                limit_bytes: state.request_body_limit_bytes,
+            }
+            .into_response();
+        }
         Err(_) => return (StatusCode::BAD_REQUEST, "invalid request body").into_response(),
     };
     let value: serde_json::Value = match serde_json::from_slice(&bytes) {
