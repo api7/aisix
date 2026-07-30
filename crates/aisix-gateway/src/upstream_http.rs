@@ -259,13 +259,15 @@ mod tests {
                 Some(i) => &src[..i],
                 None => &src[..],
             };
+            // `shared_http_client()` in aisix-mcp is the sanctioned
+            // counterpart of `client_builder()` for rmcp's own reqwest
+            // line (rmcp pins 0.13; it gets the same
+            // `upstream_http::config()` values applied). The exemption is
+            // scoped to that one file so a bare rmcp client anywhere else
+            // still gets flagged.
+            let sanctioned_rmcp_site = file.ends_with("aisix-mcp/src/bridge.rs");
             for (n, line) in production.lines().enumerate() {
-                // `rmcp_reqwest::Client::*` is aisix-mcp's sanctioned
-                // counterpart of `client_builder()`: rmcp pins its own
-                // reqwest line, so `shared_http_client()` there applies
-                // the same `upstream_http::config()` values to that crate
-                // version instead of building on defaults.
-                if line.contains("rmcp_reqwest::Client::") {
+                if sanctioned_rmcp_site && line.contains("rmcp_reqwest::Client::") {
                     continue;
                 }
                 if line.contains("reqwest::Client::builder()")

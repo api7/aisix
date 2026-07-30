@@ -40,11 +40,24 @@ pub const DEFAULT_UPSTREAM_TIMEOUT: Duration = Duration::from_secs(30);
 /// `aisix_gateway::client_builder()` (workspace reqwest) cannot be handed
 /// to it directly; this is the sanctioned second construction site that
 /// applies the SAME `upstream_http::config()` values to rmcp's reqwest.
-/// Without it the transport ran on bare library defaults: no connect
-/// timeout (kernel SYN retries, worst case ≈127 s), a 90 s pool idle
-/// lifetime, TCP keepalive off — the exact gaps `upstream.*` exists to
-/// close. One client for all MCP upstreams = one shared pool, matching
-/// how the provider bridges share theirs.
+///
+/// What this changes vs rmcp's `default_http_client()`:
+/// - a connect timeout exists at all (rmcp sets none, so a black-holed
+///   upstream was bounded only by the coarse per-operation deadline —
+///   the actual bug this fixes);
+/// - connection POOLING turns ON. rmcp deliberately disables idle
+///   pooling (`pool_max_idle_per_host(0)`) to dodge ~40 ms delayed-ACK
+///   stalls on reused connections; here reuse wins — every other
+///   outbound path pools under `upstream.*` management, and per-call
+///   TCP+TLS handshakes to a remote MCP server cost far more than the
+///   stall rmcp avoids. An operator can restore rmcp's behaviour with
+///   `upstream.pool_max_idle_per_host: 0`;
+/// - the TCP keepalive triple moves from reqwest's default 15 s/15 s/3
+///   to the deployment's 60 s/30 s/5.
+///
+/// One client for all MCP upstreams = one shared pool, matching how the
+/// provider bridges share theirs (auth is injected per-request by the
+/// transport, never client-wide).
 fn shared_http_client() -> rmcp_reqwest::Client {
     static CLIENT: std::sync::OnceLock<rmcp_reqwest::Client> = std::sync::OnceLock::new();
     CLIENT
