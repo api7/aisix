@@ -662,6 +662,24 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     // above); it becomes the constant `env_id` label on the SLO latency
     // histograms. Standalone DPs leave it empty → "unknown".
     let metrics = Arc::new(Metrics::new_with_env_id(&cfg.etcd.env_id));
+    let metrics_upkeep_task = {
+        let metrics = metrics.clone();
+        let mut cancel = cancel_rx.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(5));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => metrics.run_upkeep(),
+                    changed = cancel.changed() => {
+                        if changed.is_err() || *cancel.borrow() {
+                            break;
+                        }
+                    }
+                }
+            }
+        })
+    };
     // Cache backends (#519 B.8). The memory cache is always built
     // (in-process, cheap); the redis cache is built iff `cache.redis`
     // is configured. Which instance serves a request is selected by
@@ -984,6 +1002,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     if let Some(task) = telemetry_task {
         let _ = task.await;
     }
+    let _ = metrics_upkeep_task.await;
     let _ = background_check_task.await;
     tracing::info!("aisix shut down cleanly");
     Ok(())

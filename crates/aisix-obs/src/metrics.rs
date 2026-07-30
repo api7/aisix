@@ -275,6 +275,15 @@ impl Metrics {
         self.inner.handle.render()
     }
 
+    /// Drain pending histogram samples into their distributions.
+    ///
+    /// `PrometheusBuilder::build_recorder` does not start the exporter's
+    /// background upkeep task, so the server must call this periodically
+    /// even when no Prometheus server is scraping the metrics endpoint.
+    pub fn run_upkeep(&self) {
+        self.inner.handle.run_upkeep();
+    }
+
     /// Reflect the config load-observability state into the recorder. Called
     /// at scrape time by the metrics/status listener so `aisix_config_*`
     /// series always mirror the live [`aisix_core::ConfigStatus`]. Idempotent
@@ -1419,6 +1428,27 @@ mod tests {
         assert!(rendered.contains("provider=\"openai\""));
         assert!(rendered.contains("outcome=\"success\""));
         assert!(rendered.contains(M_REQUEST_DURATION));
+    }
+
+    #[test]
+    fn upkeep_preserves_recorded_histogram_samples() {
+        let m = Metrics::new(false);
+        for _ in 0..1_000 {
+            m.record_request(
+                "openai",
+                "my-gpt4",
+                200,
+                RequestOutcome::Success,
+                Duration::from_millis(120),
+            );
+        }
+
+        m.run_upkeep();
+
+        let rendered = m.render();
+        assert!(rendered.lines().any(|line| line
+            .starts_with("aisix_request_duration_seconds_count")
+            && line.ends_with(" 1000")));
     }
 
     /// AISIX-Cloud#1076: the per-execution guardrail histogram renders with
