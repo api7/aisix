@@ -122,8 +122,22 @@ async fn dispatch(
     // Buffer the body so the JSON-RPC method can be inspected, then rebuilt for
     // the gateway. The global body-limit layer has already capped the size.
     let (parts, body) = request.into_parts();
-    let bytes = match to_bytes(body, state.request_body_limit_bytes).await {
+    let bytes = match to_bytes(
+        body,
+        crate::error::body_read_cap(state.request_body_limit_bytes),
+    )
+    .await
+    {
         Ok(bytes) => bytes,
+        // A cap hit is a 413 in the standard envelope — consistent with
+        // what the Content-Length middleware already answers on this
+        // route; anything else reading the body is a client fault.
+        Err(err) if crate::error::is_length_limit_error(&err) => {
+            return crate::error::ProxyError::RequestTooLarge {
+                limit_bytes: state.request_body_limit_bytes,
+            }
+            .into_response();
+        }
         Err(_) => return (StatusCode::BAD_REQUEST, "invalid request body").into_response(),
     };
 
@@ -250,7 +264,12 @@ async fn dispatch(
     // body is only buffered when a guardrail chain is attached.
     let response = if let Some(chain) = &guardrail_chain {
         let (resp_parts, resp_body) = response.into_parts();
-        let resp_bytes = match to_bytes(resp_body, state.request_body_limit_bytes).await {
+        let resp_bytes = match to_bytes(
+            resp_body,
+            crate::error::body_read_cap(state.request_body_limit_bytes),
+        )
+        .await
+        {
             Ok(bytes) => bytes,
             Err(_) => {
                 return (StatusCode::BAD_GATEWAY, "invalid upstream response").into_response()
@@ -890,6 +909,33 @@ mod tests {
         let resp = router.oneshot(req).await.expect("router responds");
         let status = resp.status();
         assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "got {status}");
+    }
+
+    #[tokio::test]
+    async fn chunked_oversized_body_returns_enveloped_413() {
+        // No Content-Length: the middleware can't pre-check, so the
+        // handler's own capped read fires. The length-limit error must
+        // surface as the enveloped 413 — matching what the middleware
+        // answers on this route — not the bare-400 "invalid request
+        // body" it used to fold into.
+        let router = router_with(snapshot_with_key());
+        let chunk = vec![b'a'; 200 * 1024];
+        let stream =
+            futures::stream::iter((0..10).map(move |_| Ok::<_, std::io::Error>(chunk.clone())));
+        let req = HttpRequest::post("/mcp")
+            .header("host", "mcp.aisix.example.com")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {TOKEN}"))
+            .body(Body::from_stream(stream))
+            .unwrap();
+        let resp = router.oneshot(req).await.expect("router responds");
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .expect("read body");
+        let v: serde_json::Value =
+            serde_json::from_slice(&body).expect("413 must carry the JSON envelope");
+        assert_eq!(v["error"]["type"], "invalid_request_error");
     }
 
     #[tokio::test]

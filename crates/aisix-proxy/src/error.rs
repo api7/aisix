@@ -617,6 +617,65 @@ pub(crate) fn proxy_error_from_json_rejection(
     }
 }
 
+/// [`proxy_error_from_json_rejection`]'s sibling for handlers that take
+/// the raw `Bytes` extractor (batches / fine-tuning): same 413-vs-400
+/// discrimination, no JSON layer.
+pub(crate) fn proxy_error_from_bytes_rejection(
+    rej: axum::extract::rejection::BytesRejection,
+    limit_bytes: usize,
+) -> ProxyError {
+    if rej.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        ProxyError::RequestTooLarge { limit_bytes }
+    } else {
+        ProxyError::InvalidRequest("failed to read request body".into())
+    }
+}
+
+/// Map a multipart read failure, preserving axum's 413 discrimination:
+/// an over-cap stream or part is a real `RequestTooLarge` (axum's
+/// `MultipartError::status()` already classifies it 413); everything
+/// else stays the 400 the call site describes via `context`. Without
+/// this, an over-limit chunked upload surfaced as a generic 400
+/// `invalid_request_error` instead of `request_too_large`.
+pub(crate) fn proxy_error_from_multipart(
+    err: axum::extract::multipart::MultipartError,
+    limit_bytes: usize,
+    context: &str,
+) -> ProxyError {
+    if err.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        ProxyError::RequestTooLarge { limit_bytes }
+    } else {
+        ProxyError::InvalidRequest(format!("{context}: {err}"))
+    }
+}
+
+/// Cap for manual `axum::body::to_bytes` reads: the configured
+/// `request_body_limit_bytes` with the `0` = "no cap" sentinel widened to
+/// `usize::MAX`, mirroring what `DefaultBodyLimit::disable()` does on the
+/// extractor path.
+pub(crate) fn body_read_cap(limit_bytes: usize) -> usize {
+    if limit_bytes == 0 {
+        usize::MAX
+    } else {
+        limit_bytes
+    }
+}
+
+/// Whether a manual body read failed because it hit the length cap
+/// (→ 413) rather than a transport fault (→ 400). `axum::body::to_bytes`
+/// folds both into one opaque `axum::Error`; the cap case carries
+/// `http_body_util::LengthLimitError` in its source chain.
+pub(crate) fn is_length_limit_error(err: &axum::Error) -> bool {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = source {
+        if e.is::<http_body_util::LengthLimitError>() {
+            return true;
+        }
+        source = e.source();
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

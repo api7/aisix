@@ -41,7 +41,9 @@ etcd:
 
 proxy:
   addr: "0.0.0.0:3000"
-  request_body_limit_bytes: 10485760
+  # 0 = no request-body cap (the default); set a value to bound
+  # per-request memory.
+  # request_body_limit_bytes: 0
 
 admin:
   # Bind to an unbindable port so even if managed mode somehow
