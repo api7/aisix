@@ -46,8 +46,9 @@ use yaml_rust2::{Yaml, YamlLoader};
 
 use crate::models::{
     validate_a2a_agent, validate_apikey, validate_cache_policy, validate_guardrail,
-    validate_mcp_server, validate_model, validate_observability_exporter, validate_oidc_provider,
-    validate_provider_key, validate_rate_limit_policy, A2aAgent, ApiKey, CachePolicy, Guardrail,
+    validate_mcp_auth_settings, validate_mcp_server, validate_model,
+    validate_observability_exporter, validate_oidc_provider, validate_provider_key,
+    validate_rate_limit_policy, A2aAgent, ApiKey, CachePolicy, Guardrail, McpAuthSettings,
     McpServer, Model, ObservabilityExporter, OidcProvider, ProviderKey, RateLimitPolicy,
     SchemaError,
 };
@@ -130,8 +131,8 @@ pub(crate) fn url_has_credentials(url: &str) -> bool {
     false
 }
 
-/// Fixed processing order for the ten resource collections.
-const KINDS: [(&str, IdentityField); 10] = [
+/// Fixed processing order for the eleven resource collections.
+const KINDS: [(&str, IdentityField); 11] = [
     ("provider_keys", IdentityField::DisplayName),
     ("models", IdentityField::DisplayName),
     ("api_keys", IdentityField::DisplayName),
@@ -142,6 +143,12 @@ const KINDS: [(&str, IdentityField); 10] = [
     ("observability_exporters", IdentityField::Name),
     ("rate_limit_policies", IdentityField::Name),
     ("oidc_providers", IdentityField::Name),
+    // Singleton: the fixed identity makes a second entry a duplicate
+    // at pass 1, enforcing at-most-one row per file.
+    (
+        "mcp_auth_settings",
+        IdentityField::Fixed("mcp_auth_settings"),
+    ),
 ];
 
 /// Load `path` into a fresh [`AisixSnapshot`], resolving `${VAR}`
@@ -346,6 +353,7 @@ pub fn load_from_str(
     let mut observability_exporters: Vec<(String, String, ObservabilityExporter)> = Vec::new();
     let mut rate_limit_policies: Vec<(String, String, RateLimitPolicy)> = Vec::new();
     let mut oidc_providers: Vec<(String, String, OidcProvider)> = Vec::new();
+    let mut mcp_auth_settings: Vec<(String, String, McpAuthSettings)> = Vec::new();
 
     for mut entry in prepared {
         let id = derive_id(entry.kind, &entry.identity);
@@ -434,6 +442,12 @@ pub fn load_from_str(
             "oidc_providers" => {
                 if let Some(t) = finish(&scope, &entry.doc, validate_oidc_provider, &mut errors) {
                     oidc_providers.push((id, scope, t));
+                }
+            }
+            "mcp_auth_settings" => {
+                if let Some(t) = finish(&scope, &entry.doc, validate_mcp_auth_settings, &mut errors)
+                {
+                    mcp_auth_settings.push((id, scope, t));
                 }
             }
             other => unreachable!("kind {other} is not in KINDS"),
@@ -669,6 +683,11 @@ pub fn load_from_str(
     for (id, _, v) in oidc_providers {
         snapshot
             .oidc_providers
+            .insert(ResourceEntry::new(id, v, revision));
+    }
+    for (id, _, v) in mcp_auth_settings {
+        snapshot
+            .mcp_auth_settings
             .insert(ResourceEntry::new(id, v, revision));
     }
     Ok(snapshot)

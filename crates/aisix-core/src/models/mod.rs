@@ -21,6 +21,7 @@ pub mod cache_policy;
 pub mod embedding;
 pub mod ensemble;
 pub mod guardrail;
+pub mod mcp_auth_settings;
 pub mod mcp_policy;
 pub mod mcp_server;
 pub mod model;
@@ -47,6 +48,7 @@ pub use guardrail::{
     GuardrailScopeType, KeywordConfig, KeywordPattern, LakeraConfig, OpenaiModerationConfig,
     PiiConfig, PiiCustomPattern, PiiDetectorConfig, PresidioConfig, PresidioEntityConfig,
 };
+pub use mcp_auth_settings::McpAuthSettings;
 pub use mcp_policy::{McpAccess, McpAccessMode, McpPolicy, McpPolicyMode, McpPolicyScope};
 pub use mcp_server::{McpAuthType, McpServer, McpServerType, McpTransport};
 pub use model::{
@@ -66,9 +68,9 @@ pub use rate_limit_policy::{PolicyScope, PolicyWindow, RateLimitPolicy};
 pub use routing::{Routing, RoutingStrategy, RoutingTarget, WhenAllUnavailablePolicy};
 pub use schema::{
     validate_a2a_agent, validate_apikey, validate_cache_policy, validate_guardrail,
-    validate_guardrail_attachment, validate_mcp_policy, validate_mcp_server, validate_model,
-    validate_observability_exporter, validate_oidc_provider, validate_provider_key,
-    validate_rate_limit_policy, SchemaError,
+    validate_guardrail_attachment, validate_mcp_auth_settings, validate_mcp_policy,
+    validate_mcp_server, validate_model, validate_observability_exporter, validate_oidc_provider,
+    validate_provider_key, validate_rate_limit_policy, SchemaError,
 };
 pub use semantic::{
     Aggregation, DistanceMetric, EmbeddingFailureMode, OnEmbeddingFailure, Semantic, SemanticMatch,

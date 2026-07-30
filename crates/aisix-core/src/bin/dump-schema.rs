@@ -70,6 +70,11 @@ fn main() {
         "oidc_provider",
         schema::oidc_provider_root_schema(),
     );
+    dump_value(
+        &out_dir,
+        "mcp_auth_settings",
+        schema::mcp_auth_settings_root_schema(),
+    );
 
     dump::<EnsembleConfig>(&out_dir, "ensemble");
     dump::<RateLimit>(&out_dir, "rate_limit");
