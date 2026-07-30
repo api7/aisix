@@ -260,6 +260,14 @@ mod tests {
                 None => &src[..],
             };
             for (n, line) in production.lines().enumerate() {
+                // `rmcp_reqwest::Client::*` is aisix-mcp's sanctioned
+                // counterpart of `client_builder()`: rmcp pins its own
+                // reqwest line, so `shared_http_client()` there applies
+                // the same `upstream_http::config()` values to that crate
+                // version instead of building on defaults.
+                if line.contains("rmcp_reqwest::Client::") {
+                    continue;
+                }
                 if line.contains("reqwest::Client::builder()")
                     || line.contains("reqwest::Client::new()")
                 {
