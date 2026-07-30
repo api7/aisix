@@ -145,16 +145,12 @@ wiremock = "0.6"
 testcontainers = "0.23"
 tempfile = "3.13"
 
+# Shipped binaries must stay profileable in the field (perf / cargo
+# flamegraph against the very build a user runs), so keep the symbol
+# table and DWARF line tables in release artifacts. See issue #847.
 [profile.release]
 lto = "thin"
 codegen-units = 1
-strip = "symbols"
-
-# Release-equivalent codegen with readable stacks, for sampling profilers
-# (cargo flamegraph --profile profiling). Never use for release artifacts.
-# See issue #847.
-[profile.profiling]
-inherits = "release"
 debug = "line-tables-only"
 strip = "none"
 
