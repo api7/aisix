@@ -26,8 +26,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use aisix_admin::{build_router, AdminState, ConfigStore, EtcdConfigStore};
 use aisix_core::snapshot::SnapshotHandle;
 use aisix_core::{AdminConfig, AisixSnapshot};
+use aisix_etcd::provider::ConfigProvider as EtcdConfigProviderTrait;
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
+use futures::StreamExt;
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
@@ -445,16 +447,17 @@ async fn admin_write_survives_token_expiry() {
         std::env::var("ADMIN_TEST_ETCD_PASSWORD").expect("ADMIN_TEST_ETCD_PASSWORD required");
 
     let prefix = unique_prefix();
-    let options = etcd_client::ConnectOptions::new().with_user(user, password);
+    let options = etcd_client::ConnectOptions::new().with_user(user.clone(), password.clone());
     let client = etcd_client::Client::connect([url.as_str()], Some(options))
         .await
         .expect("etcd connect with auth");
     // Mirrors main.rs's production bootstrap call, but with a 2s refresh
     // interval — well under the 5s --auth-token-ttl the local-run etcd is
     // started with above, so the loop refreshes before expiry.
-    let store: Arc<dyn ConfigStore> = Arc::new(EtcdConfigStore::new(client, prefix, Some(2)));
+    let store: Arc<dyn ConfigStore> = Arc::new(EtcdConfigStore::new(client, &prefix, Some(2)));
     let handle = SnapshotHandle::new(AisixSnapshot::new());
     let cfg = AdminConfig {
+        enabled: true,
         addr: "127.0.0.1:0".into(),
         admin_keys: vec![ADMIN_KEY.into()],
         tls: None,
@@ -465,7 +468,7 @@ async fn admin_write_survives_token_expiry() {
     // without refresh this POST would 401.
     tokio::time::sleep(std::time::Duration::from_secs(6)).await;
 
-    let app = build_router(state);
+    let app = build_router(state.clone());
     let resp = app
         .oneshot(auth_post(
             "/admin/v1/models",
@@ -484,4 +487,75 @@ async fn admin_write_survives_token_expiry() {
         "admin write after token-TTL window should succeed; a non-OK \
          status here means the auth-token refresh loop isn't running",
     );
+
+    let app = build_router(state.clone());
+    let resp = app.oneshot(auth_get("/admin/v1/models")).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "admin list after token-TTL window should succeed"
+    );
+    let listed = body_json(resp).await;
+    let arr = listed.as_array().expect("list array");
+    assert_eq!(arr.len(), 1, "should have the post-expiry model");
+    assert_eq!(arr[0]["display_name"], "post-expiry");
+
+    // `ConfigStore` doesn't expose `watch` (that's `aisix-etcd`'s
+    // `ConfigProvider` side), so exercise it through a second client on the
+    // same account/prefix past the same TTL window this test already
+    // waited out. This is the load-bearing check for the PR's claimed watch
+    // fix — a passing POST/GET above only proves range/get requests survive
+    // refresh, not that `EtcdWatchStream`'s ownership change keeps a watch
+    // gRPC stream alive and authenticated.
+    let watch_options = etcd_client::ConnectOptions::new().with_user(user, password);
+    let watch_provider = aisix_etcd::EtcdConfigProvider::connect(
+        std::slice::from_ref(&url),
+        prefix.clone(),
+        Some(watch_options),
+        Some(2),
+    )
+    .await
+    .expect("watch-side etcd connect with auth");
+    let (_entries, rev) = watch_provider
+        .load_all()
+        .await
+        .expect("watch-side load_all for start revision");
+    let mut stream = watch_provider
+        .watch(rev + 1)
+        .await
+        .expect("watch should succeed after token refresh");
+
+    let app = build_router(state.clone());
+    let resp = app
+        .oneshot(auth_post(
+            "/admin/v1/models",
+            json!({
+                "display_name": "post-expiry-watch",
+                "provider": "openai",
+                "model_name": "gpt-4o",
+                "provider_key_id": "11111111-1111-1111-1111-111111111111"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "second admin write to trigger a watch event"
+    );
+
+    let event = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+        .await
+        .expect("timed out — watch stream did not deliver an event after token refresh")
+        .expect("watch stream ended unexpectedly");
+    match event.expect("watch error after token refresh") {
+        aisix_etcd::WatchEvent::Put(entry) => {
+            assert!(
+                entry.key.starts_with(&format!("{prefix}/models/")),
+                "unexpected watch key: {}",
+                entry.key
+            );
+        }
+        other => panic!("expected Put after token refresh, got {other:?}"),
+    }
 }

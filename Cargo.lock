@@ -65,6 +65,7 @@ dependencies = [
  "chrono",
  "dashmap",
  "etcd-client",
+ "futures",
  "http 1.4.0",
  "serde",
  "serde_json",

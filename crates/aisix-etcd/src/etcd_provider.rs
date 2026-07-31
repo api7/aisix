@@ -81,6 +81,16 @@ impl std::fmt::Debug for EtcdConfigProvider {
 /// Override via `EtcdConfig.auth_token_refresh_secs` for a shorter TTL.
 const DEFAULT_TOKEN_REFRESH_SECS: u64 = 240;
 
+/// Bounded retry on a failed refresh, so a transient error doesn't leave
+/// the client unauthenticated until the next full `refresh_interval` tick.
+const TOKEN_REFRESH_MAX_RETRIES: u32 = 3;
+/// First retry delay; doubles each attempt (5s, 10s for the default 3
+/// retries — 15s worst case). Comfortably inside the 60s margin
+/// `DEFAULT_TOKEN_REFRESH_SECS` leaves before etcd's default TTL; an
+/// operator who configures a much shorter `auth_token_refresh_secs` is
+/// responsible for leaving enough margin for this to fit inside it too.
+const TOKEN_REFRESH_RETRY_BASE_SECS: u64 = 5;
+
 /// `config_secs` is `EtcdConfig.auth_token_refresh_secs`; `None` or `0`
 /// (an operator-supplied 0, or the pre-migration config default) falls
 /// back to the hardcoded default.
@@ -99,6 +109,11 @@ fn resolve_refresh_secs(config_secs: Option<u64>) -> u64 {
 /// `Client` is `Clone`-cheap (internally `Arc`'d) and shares its
 /// auth-token cell across clones, so this works on any clone of the
 /// caller's client.
+///
+/// A failed refresh is retried up to `TOKEN_REFRESH_MAX_RETRIES` times
+/// with exponential backoff before giving up until the next interval tick
+/// — a single transient failure no longer leaves the client unauthenticated
+/// for a full `refresh_interval`.
 ///
 /// No-ops outside a Tokio runtime (e.g. a sync unit test building a
 /// `Client`/store via `Runtime::block_on` and returning it) — `tokio::spawn`
@@ -128,17 +143,54 @@ pub fn start_token_refresh_task(client: Client, config_secs: Option<u64>) {
         interval.tick().await;
         loop {
             interval.tick().await;
-            match client.refresh_token().await {
-                Ok(()) => {
-                    tracing::debug!("etcd auth token refreshed");
+
+            // Try refresh with bounded retry on failure.
+            let mut attempt = 0;
+            let mut success = false;
+
+            while attempt < TOKEN_REFRESH_MAX_RETRIES {
+                match client.refresh_token().await {
+                    Ok(()) => {
+                        if attempt == 0 {
+                            tracing::debug!("etcd auth token refreshed");
+                        } else {
+                            tracing::info!(attempt, "etcd auth token refreshed after retry");
+                        }
+                        success = true;
+                        break;
+                    }
+                    Err(e) => {
+                        attempt += 1;
+                        if attempt < TOKEN_REFRESH_MAX_RETRIES {
+                            let backoff = Duration::from_secs(
+                                TOKEN_REFRESH_RETRY_BASE_SECS * 2u64.pow(attempt - 1),
+                            );
+                            tracing::warn!(
+                                error = %format_error_chain(&e),
+                                attempt,
+                                max_retries = TOKEN_REFRESH_MAX_RETRIES,
+                                backoff_secs = backoff.as_secs(),
+                                "etcd auth token refresh failed — retrying after backoff",
+                            );
+                            tokio::time::sleep(backoff).await;
+                        } else {
+                            tracing::error!(
+                                error = %format_error_chain(&e),
+                                attempt,
+                                "etcd auth token refresh failed after all retries — \
+                                 watch may see UNAUTHENTICATED on next expiry",
+                            );
+                        }
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %format_error_chain(&e),
-                        "etcd auth token refresh failed — watch may see \
-                         UNAUTHENTICATED on next expiry",
-                    );
-                }
+            }
+
+            // If all retries failed, continue to next interval rather than crash.
+            if !success {
+                tracing::warn!(
+                    "will retry token refresh at next interval ({}s)",
+                    refresh_interval.as_secs()
+                );
             }
         }
     });
@@ -355,6 +407,18 @@ mod tests {
         let p = ConnectPolicy::default();
         assert_eq!(p.interval, CONNECT_RETRY_INTERVAL);
         assert_eq!(p.attempts, CONNECT_MAX_ATTEMPTS);
+    }
+
+    #[test]
+    fn token_refresh_retry_backoff_stays_well_under_ttl_margin() {
+        // 3 retries at 5s/10s (base doubling each attempt) = 15s worst
+        // case, comfortably inside the 60s margin DEFAULT_TOKEN_REFRESH_SECS
+        // leaves before the 300s etcd default --auth-token-ttl.
+        let worst_case_secs: u64 = (0..TOKEN_REFRESH_MAX_RETRIES - 1)
+            .map(|attempt| TOKEN_REFRESH_RETRY_BASE_SECS * 2u64.pow(attempt))
+            .sum();
+        assert_eq!(worst_case_secs, 15);
+        assert!(worst_case_secs < DEFAULT_TOKEN_REFRESH_SECS);
     }
 
     #[tokio::test]

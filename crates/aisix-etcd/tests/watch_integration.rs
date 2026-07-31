@@ -126,7 +126,7 @@ async fn token_refresh_prevents_auth_expiry() {
 
     let prefix = unique_prefix();
     let endpoints = vec![auth_url];
-    let options = ConnectOptions::new().with_user(user, password);
+    let options = ConnectOptions::new().with_user(user.clone(), password.clone());
 
     // Refresh every 2s — well under the 5s --auth-token-ttl the local-run
     // etcd is started with above, so the loop refreshes before expiry.
@@ -137,11 +137,52 @@ async fn token_refresh_prevents_auth_expiry() {
     // Wait past the 5s TTL window (1s margin absorbs scheduler jitter);
     // without refresh this load_all would 401.
     tokio::time::sleep(Duration::from_secs(6)).await;
-    let (entries, _rev) = provider
+    let (entries, rev) = provider
         .load_all()
         .await
         .expect("load_all should succeed after token refresh");
     assert_eq!(entries.len(), 0, "unique prefix should be empty");
+
+    // Exercise the authenticated watch path: create a watch stream after
+    // the TTL window, write an event, and assert it arrives. This verifies
+    // the refresh also keeps watch operations authenticated (the PR changes
+    // WatchStream ownership, so this is load-bearing).
+    let mut stream = provider
+        .watch(rev + 1)
+        .await
+        .expect("watch should succeed after token refresh");
+
+    // Write a key via a separate authenticated client.
+    let write_options = ConnectOptions::new().with_user(user, password);
+    let mut writer = Client::connect(&endpoints, Some(write_options))
+        .await
+        .expect("writer connect");
+    let test_key = format!("{prefix}/models/watch-auth-test");
+    let test_value = br#"{"display_name":"post-ttl","provider":"openai","model_name":"gpt-4o","provider_key_id":"11111111-1111-1111-1111-111111111111"}"#;
+    writer
+        .put(test_key.as_bytes(), test_value.as_ref(), None)
+        .await
+        .expect("put after TTL");
+
+    // The watch stream must deliver the event within a reasonable window
+    let event = timeout(Duration::from_secs(5), stream.next())
+        .await
+        .expect("timed out — watch stream did not deliver event after token refresh")
+        .expect("stream ended unexpectedly");
+
+    match event.expect("watch error after token refresh") {
+        aisix_etcd::WatchEvent::Put(entry) => {
+            assert_eq!(entry.key, test_key);
+            assert_eq!(entry.value, test_value);
+        }
+        other => panic!("expected Put after TTL, got {other:?}"),
+    }
+
+    // Cleanup
+    writer
+        .delete(test_key.as_bytes(), None)
+        .await
+        .expect("cleanup delete");
 }
 
 /// #519 B.3: the supervisor's applied revision (read by the heartbeat as
