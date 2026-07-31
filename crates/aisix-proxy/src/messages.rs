@@ -1361,7 +1361,15 @@ async fn anthropic_passthrough_dispatch(
                     team_id_c.as_deref(),
                     user_id_c.as_deref(),
                     user_name_c.as_deref(),
-                    200,
+                    // A stream the consumer abandoned mid-flight is reported
+                    // as 499, matching LiteLLM. The upstream work still
+                    // happened, so the event is emitted either way — only
+                    // its outcome differs.
+                    if usage.reached_end {
+                        200
+                    } else {
+                        crate::CLIENT_CLOSED_REQUEST
+                    },
                     // Attempt-scoped, unlike the e2e histogram above: any
                     // failed attempt before this one emitted its own event.
                     attempt_started.elapsed(),
@@ -1998,7 +2006,13 @@ async fn cross_provider_dispatch(
                     team_id_for_telem.as_deref(),
                     user_id_for_telem.as_deref(),
                     user_name_for_telem.as_deref(),
-                    200,
+                    // See the sibling passthrough path: an abandoned stream
+                    // is reported as 499, matching LiteLLM.
+                    if comp.reached_end {
+                        200
+                    } else {
+                        crate::CLIENT_CLOSED_REQUEST
+                    },
                     // Attempt-scoped — see the sibling passthrough path.
                     attempt_started_for_telem.elapsed(),
                     metrics,
@@ -2353,6 +2367,10 @@ fn build_anthropic_sse_stream(
                 }
             }
         }
+        // Upstream stream over — the response was received in full. Record
+        // it before the scan below, which awaits a remote provider and is a
+        // routine drop point for clients that close on the terminal event.
+        guard.comp().reached_end = true;
         // End-of-stream output guardrail (#448): scan the accumulated
         // assistant text and, on a block, emit a terminal Anthropic
         // `error` event instead of completing the stream cleanly.
@@ -2511,6 +2529,11 @@ fn finish_reason_label(reason: &aisix_gateway::FinishReason) -> String {
 
 #[derive(Default)]
 struct AnthropicStreamCompletion {
+    /// `true` once the upstream stream reached its end, i.e. the response
+    /// was received in full. Stays `false` when the consumer went away
+    /// first — the generator is dropped at a suspension point and the tail
+    /// never runs — which the telemetry closure reports as `499`.
+    reached_end: bool,
     prompt_tokens: u32,
     completion_tokens: u32,
     cache_creation_tokens: u32,
@@ -2862,6 +2885,11 @@ pub(crate) const MAX_SSE_FRAME_BUF_BYTES: usize = 1 << 20; // 1 MiB
 /// corresponding frame.
 #[derive(Default)]
 struct AnthropicStreamUsage {
+    /// `true` once the upstream stream reached its end, i.e. the response
+    /// was forwarded in full. Stays `false` when the consumer went away
+    /// first — the generator is dropped at a suspension point and the tail
+    /// never runs — which the telemetry closure reports as `499`.
+    reached_end: bool,
     prompt_tokens: u32,
     completion_tokens: u32,
     cache_creation_tokens: u32,
@@ -3327,6 +3355,10 @@ where
                 return;
             }
         }
+        // Upstream stream over — the response was forwarded in full. Record
+        // it before the scan below, which awaits a remote provider and is a
+        // routine drop point for clients that close on the terminal event.
+        guard.usage().reached_end = true;
         // End-of-stream output guardrail (#448): scan the accumulated
         // assistant text. On a block, emit a terminal Anthropic `error`
         // event. On the hold-back path (BufferFull) nothing has been

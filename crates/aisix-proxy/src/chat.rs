@@ -1661,7 +1661,15 @@ async fn dispatch(
                     &model_id_for_telem,
                     &model_for_metrics,
                     &api_key_id_for_telem,
-                    /* status_code */ 200,
+                    // A stream the consumer abandoned mid-flight is reported
+                    // as 499, matching what LiteLLM records for the same
+                    // event. The upstream work still happened, so the event
+                    // is emitted either way — only its outcome differs.
+                    if comp.reached_end {
+                        200
+                    } else {
+                        crate::CLIENT_CLOSED_REQUEST
+                    },
                     // Scoped to the winning attempt, not the request: the
                     // failed attempts before it emit their own events and
                     // `started` would double-count them (plus the pre-dispatch
@@ -4091,6 +4099,18 @@ struct StreamCompletion {
     /// output checks (AISIX-Cloud#562). Merged with the input-side hits
     /// by the on_complete telemetry closure.
     monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
+    /// `true` once the generator reached its own end — upstream EOF, an
+    /// error frame, or an output-guardrail block. It stays `false` only
+    /// when the consumer went away first, because `async_stream::stream!`
+    /// then simply stops resuming the body and the tail never runs. That
+    /// makes it the one signal at the Drop site that distinguishes a
+    /// delivered response from an abandoned one, which the telemetry
+    /// closure turns into `499` (see `CLIENT_CLOSED_REQUEST`).
+    ///
+    /// Distinct from `chunks_delivered`: a stream can deliver chunks and
+    /// still be abandoned midway, and a zero-chunk stream can still
+    /// legitimately reach its end (an immediate error frame).
+    reached_end: bool,
 }
 
 /// Parameters needed to run output-guardrail evaluation at
@@ -4674,6 +4694,15 @@ where
             // a post-yield increment under-counts by 1 on every
             // abort path (#419, audit follow-up).
         }
+        // Upstream EOF — the response was delivered in full. Record it here,
+        // BEFORE the end-of-stream guardrail work below, which awaits remote
+        // provider calls and is a routine drop point: SDK clients close on
+        // the terminal frame, and a flag set after the scan would report a
+        // fully-delivered response as abandoned. This also keeps it ahead of
+        // the final `[DONE]` yield, since `async_stream::stream!` resumes the
+        // body only when the consumer pulls again. Same placement as the
+        // sibling streams in messages.rs and responses_bridge.rs.
+        guard.comp().reached_end = true;
         // Per #204: run the output guardrail on the accumulated
         // assistant content BEFORE emitting `[DONE]`. Buffer-then-
         // check is the right cadence for a blocking guardrail:
@@ -4921,7 +4950,7 @@ where
         // `guard` drops here. On client disconnect, the generator
         // drops at the suspension point inside the loop; Drop fires
         // there with whatever StreamCompletion has been captured up
-        // to that point.
+        // to that point — `reached_end` still false.
     };
     // Hyper polls this generator after the request-id middleware has
     // returned, so re-attach the request span here — while we're still

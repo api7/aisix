@@ -61,6 +61,17 @@ pub const M_PROXY_IN_FLIGHT: &str = "aisix_proxy_in_flight_requests";
 pub const M_PROXY_REQUESTS_TOTAL: &str = "aisix_proxy_requests_total";
 pub const M_PROXY_FAILED_REQUESTS_TOTAL: &str = "aisix_proxy_failed_requests_total";
 pub const M_PROXY_REQUEST_DURATION: &str = "aisix_proxy_request_duration_seconds";
+/// Requests the client abandoned before the response head was written.
+/// Every other proxy series is emitted at the end of a handler, which a
+/// cancelled request never reaches — without this one those requests are
+/// absent from the metrics entirely, not counted as failures.
+///
+/// The label set is `endpoint` ONLY. A cancelled request has no resolved
+/// model / provider key / team (the body may not even be parsed yet), so
+/// the `RequestLabels` families cannot represent it; and `endpoint`
+/// arrives already collapsed to a bounded route template by the proxy
+/// layer, keeping this series low-cardinality by construction (#451).
+pub const M_PROXY_CLIENT_CANCELLED_TOTAL: &str = "aisix_proxy_client_cancelled_requests_total";
 pub const M_DEPLOYMENT_REQUESTS_TOTAL: &str = "aisix_deployment_requests_total";
 pub const M_DEPLOYMENT_SUCCESS_TOTAL: &str = "aisix_deployment_success_responses_total";
 pub const M_DEPLOYMENT_FAILURE_TOTAL: &str = "aisix_deployment_failure_responses_total";
@@ -653,6 +664,19 @@ impl Metrics {
             metrics::counter!(
                 M_RATELIMIT_REJECTIONS,
                 "scope" => scope.to_string(),
+            )
+            .increment(1);
+        });
+    }
+
+    /// Count a request the client abandoned before it produced a response
+    /// head. `endpoint` must already be a bounded route template — see
+    /// [`M_PROXY_CLIENT_CANCELLED_TOTAL`].
+    pub fn record_client_cancelled(&self, endpoint: &str) {
+        metrics::with_local_recorder(&self.inner.recorder, || {
+            metrics::counter!(
+                M_PROXY_CLIENT_CANCELLED_TOTAL,
+                "endpoint" => endpoint.to_string(),
             )
             .increment(1);
         });

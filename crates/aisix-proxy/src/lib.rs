@@ -75,6 +75,7 @@ pub use health::{
 };
 pub use state::{CacheBackends, ProxyState};
 
+use aisix_obs::AccessLog;
 use axum::extract::State;
 use axum::http::{header, HeaderValue, Request};
 use axum::middleware::{self, Next};
@@ -193,6 +194,16 @@ pub fn build_router(state: ProxyState) -> Router {
             state.clone(),
             record_in_flight_request,
         ))
+        // Record requests the caller abandoned before any response head
+        // existed. Sits outside `record_in_flight_request` so a hang-up
+        // during body upload (which the body-limit layers above are
+        // awaiting) is captured too, and inside `ensure_request_id` so
+        // the emitted line carries the same request id the caller was
+        // handed. See `record_client_cancel`.
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            record_client_cancel,
+        ))
         // Identify the data plane on every response, including error
         // envelopes and short-circuited responses from the layers
         // above. `overriding` (vs `if_not_present`) ensures the
@@ -307,6 +318,114 @@ impl Drop for InFlightGuard {
     fn drop(&mut self) {
         self.metrics
             .decrement_proxy_in_flight(&self.endpoint, &self.inbound_protocol);
+    }
+}
+
+/// nginx's non-standard "client closed request" status, used here purely
+/// as a recorded outcome — nothing is ever sent to a caller that already
+/// hung up. LiteLLM reports the same event as 499, so an operator running
+/// both reads one number.
+pub(crate) const CLIENT_CLOSED_REQUEST: u16 = 499;
+
+/// `error_kind` for an abandoned request, mirroring LiteLLM's
+/// `ClientDisconnected` error class.
+const CLIENT_DISCONNECTED_KIND: &str = "client_disconnected";
+
+/// Record a request whose caller hung up before the response head was
+/// written.
+///
+/// Every endpoint logs and meters itself at the end of its own handler —
+/// 29 `emit_access_log` call sites across 12 modules. When the client
+/// disconnects first, axum drops the handler future and *none* of that
+/// code runs: the request leaves no access-log line, no usage event and
+/// no metric. It is invisible exactly where an operator most needs it,
+/// because the usual reason a caller gives up is a long
+/// time-to-first-token.
+///
+/// A cancelled future is only observable from `Drop`, so arm a guard,
+/// disarm it once the inner service yields a response, and emit from
+/// `Drop` when it is still armed. Doing it in one layer rather than in
+/// each handler also keeps the endpoint family from drifting the way the
+/// request-id header did before `ensure_request_id` (see request_id.rs).
+///
+/// This is NOT the streaming-disconnect path: once SSE bytes flow the
+/// response head is already committed, so the handler has logged and the
+/// per-stream `Drop` guard emits the usage event (see
+/// `chat::build_sse_stream`). Response bodies are polled after this
+/// middleware has returned, so a mid-stream hang-up leaves the guard
+/// disarmed and is not double-counted here.
+async fn record_client_cancel(
+    State(state): State<ProxyState>,
+    request: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    let mut guard = ClientCancelGuard {
+        armed: true,
+        metrics: state.metrics.clone(),
+        endpoint: normalize_endpoint_label(request.uri().path()),
+        method: request.method().clone(),
+        uri: request.uri().clone(),
+        request_id: request
+            .extensions()
+            .get::<request_id::RequestId>()
+            .map(|id| id.0.clone())
+            .unwrap_or_default(),
+        started: std::time::Instant::now(),
+    };
+    let response = next.run(request).await;
+    guard.armed = false;
+    response
+}
+
+struct ClientCancelGuard {
+    /// Cleared when the inner service returns. Still set at drop time
+    /// means the future was cancelled rather than completed.
+    armed: bool,
+    metrics: std::sync::Arc<aisix_obs::Metrics>,
+    /// Bounded route template — safe as a metric label (#451).
+    endpoint: &'static str,
+    method: axum::http::Method,
+    /// `Uri` clones are reference-counted internally; the path is only
+    /// read on the cancel path, so the happy path pays no formatting.
+    uri: axum::http::Uri,
+    request_id: String,
+    started: std::time::Instant,
+}
+
+impl Drop for ClientCancelGuard {
+    fn drop(&mut self) {
+        // A panicking handler also leaves the guard armed — its future is
+        // dropped mid-unwind exactly like a cancelled one. Attributing that
+        // to the caller would be wrong twice over: it fabricates a client
+        // disconnect that never happened, and it buries the panic under a
+        // benign-looking 499. A panic has its own signal (tokio surfaces the
+        // task failure and hyper drops the connection), so stay silent and
+        // let that stand. Emitting here would also risk a double panic,
+        // which aborts the process.
+        if !self.armed || std::thread::panicking() {
+            return;
+        }
+        let latency = self.started.elapsed();
+        AccessLog {
+            method: self.method.as_str(),
+            path: self.uri.path(),
+            status: CLIENT_CLOSED_REQUEST,
+            latency,
+            provider: None,
+            model: None,
+            api_key_id: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            total_tokens: None,
+            request_id: &self.request_id,
+            served_by_model: None,
+            routing_attempt_count: None,
+            routing_fallback_count: None,
+            error_kind: Some(CLIENT_DISCONNECTED_KIND),
+            error: Some("client closed the request before the response head was written"),
+        }
+        .emit();
+        self.metrics.record_client_cancelled(self.endpoint);
     }
 }
 
@@ -6204,8 +6323,351 @@ data: [DONE]\n\n";
         // simply that an event fires; counts are best-effort. Pin
         // the structural fields to confirm we didn't grab some
         // unrelated event.
-        assert_eq!(event.status_code, 200);
+        assert_eq!(
+            event.status_code, CLIENT_CLOSED_REQUEST,
+            "an abandoned stream must be recorded as a client cancel, not as a success"
+        );
         assert!(!event.guardrail_blocked);
+    }
+
+    /// The counterpart to the test above: a stream the consumer reads to
+    /// completion must stay `200`. Without this, the `reached_end` flag
+    /// could be wired to something that is never set and every streamed
+    /// request would silently be reported as abandoned.
+    #[tokio::test]
+    async fn streaming_chat_telemetry_reports_200_when_fully_consumed() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        let sse = "\
+data: {\"id\":\"cmpl-full\",\"model\":\"gpt-4o-2024-08-06\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"cmpl-full\",\"model\":\"gpt-4o-2024-08-06\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"cmpl-full\",\"model\":\"gpt-4o-2024-08-06\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+data: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&upstream)
+            .await;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
+        let state = build_state(snap, hub).with_usage_sink(UsageSink::new(tx));
+        let app = build_router(state);
+
+        let body = serde_json::json!({
+            "model": "my-gpt4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Drain to the end, the way a client that wants the whole answer does.
+        let mut body_stream = resp.into_body().into_data_stream();
+        while body_stream.next().await.is_some() {}
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("usage event was never emitted")
+            .expect("sender dropped without sending");
+        assert_eq!(
+            event.status_code, 200,
+            "a fully consumed stream must not be reported as a client cancel"
+        );
+    }
+
+    /// Same contract, but with an output guardrail attached — the shape that
+    /// puts an awaiting end-of-stream scan between the upstream's last chunk
+    /// and `[DONE]`. `reached_end` must be set before that scan, so pin the
+    /// outcome with one configured.
+    ///
+    /// This fixes the placement contract; it cannot reproduce the race
+    /// itself. A keyword guardrail scans locally, so its await completes
+    /// immediately and a consumer cannot realistically be dropped inside it.
+    /// The actual protection is that all five stream paths mark the flag at
+    /// upstream EOF, ahead of any scan.
+    #[tokio::test]
+    async fn streaming_chat_with_output_guardrail_reports_200_when_fully_consumed() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        let sse = "\
+data: {\"id\":\"cmpl-guard\",\"model\":\"gpt-4o-2024-08-06\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"cmpl-guard\",\"model\":\"gpt-4o-2024-08-06\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"all clear\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"cmpl-guard\",\"model\":\"gpt-4o-2024-08-06\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+data: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&upstream)
+            .await;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
+        let state = build_state(snap, hub).with_usage_sink(UsageSink::new(tx));
+        // The literal never appears in the response above, so the scan runs
+        // to completion and allows — the stream is delivered in full.
+        seed_guardrail(
+            &state.snapshot,
+            "g-eos-scan",
+            r#"{"name":"eos-scan-guard","kind":"keyword","hook_point":"output","patterns":[{"kind":"literal","value":"never-present-literal"}]}"#,
+        );
+        let app = build_router(state);
+
+        let body = serde_json::json!({
+            "model": "my-gpt4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let mut body_stream = resp.into_body().into_data_stream();
+        while body_stream.next().await.is_some() {}
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("usage event was never emitted")
+            .expect("sender dropped without sending");
+        assert_eq!(
+            event.status_code, 200,
+            "a fully consumed stream with an output guardrail must not be reported as a cancel"
+        );
+    }
+
+    const CANCEL_METRIC: &str = "aisix_proxy_client_cancelled_requests_total";
+
+    /// A caller that hangs up before the response head exists must still
+    /// leave a trace. Every endpoint logs and meters from the tail of its
+    /// own handler, which a cancelled future never reaches — so such a
+    /// request used to be absent from the access log, the usage events
+    /// AND the metrics simultaneously. That made "the client says it sent
+    /// N requests but the gateway only logged M" unaccountable, and it
+    /// hid exactly the case operators care about: a caller giving up
+    /// during a long time-to-first-token.
+    #[tokio::test]
+    async fn client_cancel_before_response_head_is_recorded() {
+        let upstream = MockServer::start().await;
+        // Outlives the patience window below, so the handler is still
+        // awaiting the upstream when its future is dropped.
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_secs(30))
+                    .set_body_json(serde_json::json!({
+                        "id": "cmpl-never",
+                        "model": "gpt-4o",
+                        "choices": []
+                    })),
+            )
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
+        let state = build_state(snap, hub);
+        let metrics = state.metrics.clone();
+        let app = build_router(state);
+
+        assert!(!metrics.render().contains(CANCEL_METRIC));
+
+        let body = serde_json::json!({
+            "model": "my-gpt4",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+
+        // Dropping the in-flight future is precisely what axum does when
+        // the client's connection goes away before the handler produced a
+        // response head.
+        let outcome =
+            tokio::time::timeout(std::time::Duration::from_millis(300), app.oneshot(req)).await;
+        assert!(
+            outcome.is_err(),
+            "upstream answered too fast to model a cancel"
+        );
+
+        let rendered = metrics.render();
+        assert!(
+            rendered.contains(CANCEL_METRIC),
+            "cancelled request left no metric: {rendered}"
+        );
+        assert!(
+            rendered.contains("endpoint=\"/v1/chat/completions\""),
+            "cancel metric lost its endpoint label: {rendered}"
+        );
+    }
+
+    /// The guard must stay silent on the happy path. A completed request
+    /// is already logged and metered by its own handler; counting it as a
+    /// client cancel too would make the new series useless for alerting.
+    #[tokio::test]
+    async fn completed_request_is_not_counted_as_client_cancel() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-ok",
+                "model": "gpt-4o",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })))
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
+        let state = build_state(snap, hub);
+        let metrics = state.metrics.clone();
+        let app = build_router(state);
+
+        let body = serde_json::json!({
+            "model": "my-gpt4",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let rendered = metrics.render();
+        assert!(
+            !rendered.contains(CANCEL_METRIC),
+            "a completed request was miscounted as a client cancel: {rendered}"
+        );
+    }
+
+    /// A panicking handler drops the guard mid-unwind with `armed` still
+    /// set, which looks identical to a cancel from `Drop`'s point of view.
+    /// Recording it would invent a client disconnect that never happened and
+    /// bury the panic under a benign 499, so the guard must stay silent and
+    /// let the panic's own signal stand.
+    #[test]
+    fn cancel_guard_stays_silent_during_unwind() {
+        let metrics = std::sync::Arc::new(aisix_obs::Metrics::new(false));
+        let probe = metrics.clone();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = ClientCancelGuard {
+                armed: true,
+                metrics: metrics.clone(),
+                endpoint: "/v1/chat/completions",
+                method: axum::http::Method::POST,
+                uri: "/v1/chat/completions".parse().unwrap(),
+                request_id: "req-unwind".to_string(),
+                started: std::time::Instant::now(),
+            };
+            panic!("handler blew up");
+        }));
+
+        assert!(result.is_err(), "the test's own panic must have unwound");
+        assert!(
+            !probe.render().contains(CANCEL_METRIC),
+            "a panicking handler was miscounted as a client cancel: {}",
+            probe.render()
+        );
+    }
+
+    /// A mid-stream hang-up is NOT a head-phase cancel. By the time SSE
+    /// bytes flow the response head is committed, the handler has already
+    /// written its access log, and the per-stream Drop guard emits the
+    /// usage event (see `streaming_chat_telemetry_fires_on_client_disconnect`).
+    /// Counting it here as well would report one disconnect twice under
+    /// two different outcomes.
+    #[tokio::test]
+    async fn mid_stream_disconnect_is_not_counted_as_head_phase_cancel() {
+        let upstream = MockServer::start().await;
+        let sse = "\
+data: {\"id\":\"cmpl-mid\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"cmpl-mid\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n\
+data: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
+        let state = build_state(snap, hub);
+        let metrics = state.metrics.clone();
+        let app = build_router(state);
+
+        let body = serde_json::json!({
+            "model": "my-gpt4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Read one chunk, then hang up mid-stream.
+        let mut body_stream = resp.into_body().into_data_stream();
+        let _first = body_stream.next().await;
+        drop(body_stream);
+
+        let rendered = metrics.render();
+        assert!(
+            !rendered.contains(CANCEL_METRIC),
+            "mid-stream disconnect was double-counted as a head-phase cancel: {rendered}"
+        );
     }
 
     /// Regression for #225: streaming chat must read the terminal SSE
