@@ -58,7 +58,9 @@ describe("body edges e2e: multi-turn, oversize body, empty messages", () => {
     if (!etcdReachable) return;
 
     upstream = await startOpenAiUpstream();
-    app = await spawnApp();
+    // `info` so the oversize case can assert on the access-log line the
+    // gateway emits for the request it refuses.
+    app = await spawnApp({ logLevel: "info" });
     seed = new SeedClient(etcd, app.etcdPrefix);
 
     const pk = await seed.createProviderKey({
@@ -218,6 +220,66 @@ describe("body edges e2e: multi-turn, oversize body, empty messages", () => {
     // protect the upstream from oversized payloads, not pre-route
     // them.
     expect(upstream.receivedRequests.length).toBe(upstreamHitsBefore);
+  });
+
+  test("oversize body: the gateway records the request it refused", async (ctx) => {
+    if (!etcdReachable || !app) {
+      ctx.skip();
+      return;
+    }
+
+    // The 413 above is answered by the body-cap middleware, which
+    // short-circuits BEFORE any handler runs — and the access log is
+    // emitted BY the handlers. That left an operator with nothing to
+    // look at: a caller reporting a 413 the gateway had no record of is
+    // indistinguishable from the request never arriving.
+    //
+    // (`observability.access_log` in the harness config is the reserved
+    // field nothing reads today — the access log is gated by the log
+    // level alone, which is why this suite raises it to `info`.)
+    const filler = "x".repeat(10 * 1024 * 1024 + 512 * 1024);
+    const res = await fetch(`${app.proxyUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${CALLER_PLAINTEXT}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "body-edges",
+        messages: [{ role: "user", content: filler }],
+      }),
+    });
+    expect(res.status).toBe(413);
+
+    // Join the log line to THIS request instead of grepping for a bare
+    // `413` any other case in the suite could also have produced.
+    const requestId = res.headers.get("x-aisix-request-id");
+    expect(requestId).toBeTruthy();
+
+    let line: string | undefined;
+    await waitConfigPropagation(async () => {
+      line = app!
+        .output()
+        .split("\n")
+        .find(
+          (l) =>
+            l.includes(requestId!) && l.includes("proxy request completed"),
+        );
+      return line !== undefined;
+    });
+    expect(line).toMatch(/status=413/);
+    expect(line).toContain("/v1/chat/completions");
+    // The reason, not just the status: `error_kind` carries the OpenAI
+    // envelope's coarse `invalid_request_error`, so a cap hit is only
+    // nameable through the message.
+    expect(line).toMatch(/request body exceeds/);
+
+    // Same blindness on the metrics plane — no handler ran, so nothing
+    // counted the refusal either.
+    const scrape = await fetch(`${app.metricsUrl}/metrics`).then((r) =>
+      r.text(),
+    );
+    expect(scrape).toMatch(/aisix_requests_total\{[^}]*status="413"/);
   });
 
   test("empty messages array: 4xx with OpenAI-shape error envelope, upstream untouched", async (ctx) => {

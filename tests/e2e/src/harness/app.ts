@@ -59,6 +59,18 @@ export interface AppOverrides {
    */
   extraEnv?: Record<string, string>;
   /**
+   * Log level for the spawned binary. Defaults to `warn` — quiet enough
+   * that the suite's output stays readable. Tests that assert on a line
+   * the gateway emits at `info` (the access log) raise it here.
+   *
+   * Applied to BOTH `observability.log_level` and `RUST_LOG`: the DP's
+   * `init_tracing` tries `EnvFilter::try_from_default_env()` first, so
+   * the env var wins and setting the config key alone would silently do
+   * nothing. It also outranks an ambient `RUST_LOG`, so a developer
+   * debugging with `RUST_LOG=error` can't turn a test's subject off.
+   */
+  logLevel?: string;
+  /**
    * `observability.metrics.client_type_rules` (AISIX-Cloud#1045): operator
    * UA→client_type regex rules, tried before the built-in allowlist.
    * A dedicated override because `extra` replaces whole top-level blocks
@@ -205,7 +217,7 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
       : { addr: `127.0.0.1:${adminPort}`, enabled: false },
     observability: {
       service_name: "aisix-e2e",
-      log_level: "warn",
+      log_level: overrides.logLevel ?? "warn",
       access_log: false,
       metrics: {
         prometheus: {
@@ -233,7 +245,7 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
   for (const [k, v] of Object.entries(process.env)) {
     if (v !== undefined && !k.startsWith("AISIX_")) childEnv[k] = v;
   }
-  childEnv.RUST_LOG = process.env.RUST_LOG ?? "warn";
+  childEnv.RUST_LOG = overrides.logLevel ?? process.env.RUST_LOG ?? "warn";
   childEnv.HTTP_PROXY = "";
   childEnv.HTTPS_PROXY = "";
   childEnv.ALL_PROXY = "";

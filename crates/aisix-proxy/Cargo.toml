@@ -73,6 +73,9 @@ ipnet.workspace = true
 [dev-dependencies]
 # `test-util` drives the SSE-heartbeat tests on a paused clock.
 tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
+# Captures the access log so the pre-dispatch rejection tests can assert
+# on the line itself, not just on the response status.
+tracing-subscriber.workspace = true
 # aisix-provider-anthropic + aisix-provider-openai moved to
 # [dependencies] so the /v1/messages handler can use their primitives
 # in non-test builds too.

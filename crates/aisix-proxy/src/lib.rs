@@ -53,6 +53,7 @@ mod passthrough;
 mod quota;
 mod realtime;
 mod redact;
+mod reject;
 mod render;
 mod request_id;
 mod rerank;
@@ -78,7 +79,7 @@ pub use state::{CacheBackends, ProxyState};
 use axum::extract::State;
 use axum::http::{header, HeaderValue, Request};
 use axum::middleware::{self, Next};
-use axum::response::{IntoResponse, Response};
+use axum::response::Response;
 use axum::routing::{any, get, post};
 use axum::Router;
 use tower_http::set_header::SetResponseHeaderLayer;
@@ -326,11 +327,18 @@ impl Drop for InFlightGuard {
 /// `fetch` both set Content-Length for non-streamed POSTs, and
 /// without this middleware they see ECONNRESET (indistinguishable
 /// from a network failure or a gateway crash) instead of 413.
+///
+/// Both short-circuits answer through [`crate::reject`], so a request
+/// refused here still produces the access-log line and request metrics
+/// every other terminal path emits — the handler it never reached can't
+/// do it. The logged latency spans the body drain below, which is what
+/// an oversize request actually costs the gateway.
 async fn enforce_request_body_limit(
     State(state): State<ProxyState>,
     request: Request<axum::body::Body>,
     next: Next,
 ) -> Response {
+    let started = std::time::Instant::now();
     // /v1/messages must emit the Anthropic-shape error envelope
     // (closes #336). The middleware runs BEFORE the handler so the
     // handler's `into_anthropic_response()` would never see the
@@ -349,12 +357,10 @@ async fn enforce_request_body_limit(
     let path = request.uri().path();
     let is_anthropic_path =
         path == "/v1/messages" || path == "/v1/messages/" || path == "/v1/messages/count_tokens";
-    let render = |e: ProxyError| -> Response {
-        if is_anthropic_path {
-            e.into_anthropic_response()
-        } else {
-            e.into_response()
-        }
+    let envelope = if is_anthropic_path {
+        reject::Envelope::Anthropic
+    } else {
+        reject::Envelope::OpenAi
     };
     // RFC 9110 §8.6 — a server SHOULD reject a request that carries
     // duplicate or conflicting `Content-Length` values rather than
@@ -365,9 +371,16 @@ async fn enforce_request_body_limit(
         .iter();
     let first = content_lengths.next();
     if content_lengths.next().is_some() {
-        return render(ProxyError::InvalidRequest(
-            "conflicting Content-Length headers".into(),
-        ));
+        return reject::reject_before_dispatch(
+            &state,
+            request.method().as_str(),
+            request.uri().path(),
+            &request_id_of(&request),
+            None,
+            started,
+            envelope,
+            ProxyError::InvalidRequest("conflicting Content-Length headers".into()),
+        );
     }
     // `0` = the cap is disabled; the duplicate-Content-Length rejection
     // above still applies — that one is request-smuggling hygiene, not a
@@ -377,17 +390,43 @@ async fn enforce_request_body_limit(
         .and_then(|s| s.parse::<usize>().ok())
     {
         if state.request_body_limit_bytes > 0 && declared > state.request_body_limit_bytes {
+            // Capture what the access log needs before the body move
+            // below consumes the request.
+            let method = request.method().clone();
+            let path = request.uri().path().to_string();
+            let request_id = request_id_of(&request);
             // Drain the inbound body so hyper can flush the 413 response
             // on the same HTTP/1.1 connection. Without this, hyper closes
             // the socket while the client is still writing, and the client
             // sees EPIPE/ECONNRESET instead of the 413.
             drain_body(request.into_body()).await;
-            return render(ProxyError::RequestTooLarge {
-                limit_bytes: state.request_body_limit_bytes,
-            });
+            return reject::reject_before_dispatch(
+                &state,
+                method.as_str(),
+                &path,
+                &request_id,
+                None,
+                started,
+                envelope,
+                ProxyError::RequestTooLarge {
+                    limit_bytes: state.request_body_limit_bytes,
+                },
+            );
         }
     }
     next.run(request).await
+}
+
+/// The id `ensure_request_id` (the outermost layer) minted for this
+/// request, so a rejection logged here joins the `x-aisix-request-id` the
+/// caller was handed. The fallback only covers a router assembled without
+/// that layer — every shipped path has it.
+fn request_id_of(request: &Request<axum::body::Body>) -> String {
+    request
+        .extensions()
+        .get::<request_id::RequestId>()
+        .map(|r| r.0.clone())
+        .unwrap_or_else(request_id::new_request_id)
 }
 
 /// Read and discard the inbound body, bounded by both bytes and time.
@@ -1520,6 +1559,138 @@ mod tests {
             "limit 0 must not cap a chunked body at axum's 2 MiB default"
         );
         assert!(resp.status().is_server_error());
+    }
+
+    /// Collects log output so a test can assert on the emitted line.
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl LogCapture {
+        fn contents(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+        type Writer = LogCapture;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Route every log event on THIS thread into `capture` for as long as
+    /// the returned guard lives. `#[tokio::test]` drives a current-thread
+    /// runtime, so the awaited router runs on the same thread.
+    fn capture_logs(capture: &LogCapture) -> tracing::subscriber::DefaultGuard {
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .with_target(false)
+            .with_env_filter(tracing_subscriber::EnvFilter::new("info"))
+            .finish();
+        tracing::subscriber::set_default(subscriber)
+    }
+
+    /// A body-cap rejection short-circuits BEFORE any handler runs, and
+    /// the access log is emitted BY the handlers — so pre-fix a caller
+    /// got a 413 while the gateway kept no record of the request at all
+    /// (no access-log line, no `aisix_requests_total` sample). "Client
+    /// reports 413, gateway shows nothing" was indistinguishable from the
+    /// request never arriving.
+    #[tokio::test]
+    async fn body_cap_short_circuit_is_visible_in_the_access_log_and_metrics() {
+        let capture = LogCapture::default();
+        let _guard = capture_logs(&capture);
+
+        let hub = Arc::new(Hub::new());
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
+        let state = build_state(snap, hub); // 1 MiB cap from cfg()
+        let app = build_router(state.clone());
+
+        let oversized = 2 * 1024 * 1024;
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .header("content-length", oversized.to_string())
+            .body(Body::from(
+                r#"{"model":"my-gpt4","messages":[{"role":"user","content":"hi"}]}"#,
+            ))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        let logs = capture.contents();
+        assert!(
+            logs.contains("proxy request completed"),
+            "the 413 must produce an access-log line, got: {logs}"
+        );
+        assert!(logs.contains("status=413"), "{logs}");
+        assert!(logs.contains("/v1/chat/completions"), "{logs}");
+        // The reason, not just the status: `error_kind` is the OpenAI
+        // envelope's coarse `invalid_request_error` (a pinned wire
+        // contract, #327), so the cap hit is only nameable in `error`.
+        assert!(logs.contains("request body exceeds"), "{logs}");
+
+        let scrape = state.metrics.render();
+        assert!(
+            scrape.contains("aisix_requests_total") && scrape.contains(r#"status="413""#),
+            "the 413 must be counted, got: {scrape}"
+        );
+    }
+
+    /// The chunked path reaches the handler, which rejects at its body
+    /// extractor and returns before the dispatch tail that emits the
+    /// access log — so it was silent for the same reason, one layer
+    /// further in. Locks the handler-side half of the fix.
+    #[tokio::test]
+    async fn chunked_oversize_rejection_is_visible_in_the_access_log_and_metrics() {
+        let capture = LogCapture::default();
+        let _guard = capture_logs(&capture);
+
+        let hub = Arc::new(Hub::new());
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
+        let state = build_state(snap, hub);
+        let app = build_router(state.clone());
+
+        let chunk = vec![b'x'; 200 * 1024];
+        let stream =
+            futures::stream::iter((0..10).map(move |_| Ok::<_, std::io::Error>(chunk.clone())));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from_stream(stream))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        let logs = capture.contents();
+        assert!(
+            logs.contains("proxy request completed"),
+            "the handler-side 413 must produce an access-log line, got: {logs}"
+        );
+        assert!(logs.contains("status=413"), "{logs}");
+        assert!(logs.contains("/v1/completions"), "{logs}");
+        assert!(logs.contains("request body exceeds"), "{logs}");
+        // Auth ran before the body extractor, so the caller IS attributable
+        // here — unlike the middleware short-circuit above.
+        assert!(logs.contains("api_key_id"), "{logs}");
+
+        let scrape = state.metrics.render();
+        assert!(scrape.contains(r#"status="413""#), "{scrape}");
     }
 
     /// The duplicate-Content-Length rejection is smuggling hygiene, not
