@@ -143,20 +143,25 @@ impl ConnectionLike for RedisConnHandle {
 /// rather than per request. Assumes [`RedisConnConfig::validate`] already
 /// passed (the boot path validates before calling this).
 pub async fn connect(cfg: &RedisConnConfig) -> RedisResult<RedisConn> {
+    let tls = load_tls(cfg)?;
     match cfg.mode {
         RedisMode::Single => {
-            let url = cfg.url.as_deref().unwrap_or_default();
-            let client = redis::Client::open(url)?;
+            let url = insecure_url(cfg.url.as_deref().unwrap_or_default(), cfg);
+            let client = match &tls {
+                Some(certs) => redis::Client::build_with_tls(url.as_str(), certs.clone())?,
+                None => redis::Client::open(url.as_str())?,
+            };
             let conn = ConnectionManager::new(client).await?;
             tracing::info!(target: "aisix::redis", mode = "single", "connected");
             Ok(RedisConn::Single(conn))
         }
         RedisMode::Cluster => {
-            let nodes: Vec<&str> = cfg
+            let nodes: Vec<String> = cfg
                 .nodes
                 .iter()
                 .map(|s| s.trim())
                 .filter(|s| !s.is_empty())
+                .map(|s| insecure_url(s, cfg))
                 .collect();
             // ACL creds for the nodes can travel in the node URLs, or be
             // set explicitly here (applied to every node). Cluster has no
@@ -167,6 +172,9 @@ pub async fn connect(cfg: &RedisConnConfig) -> RedisResult<RedisConn> {
             }
             if let Some(p) = &cfg.password {
                 builder = builder.password(p.clone());
+            }
+            if let Some(certs) = &tls {
+                builder = builder.certs(certs.clone());
             }
             let client = builder.build()?;
             let conn = client.get_async_connection().await?;
@@ -182,8 +190,9 @@ pub async fn connect(cfg: &RedisConnConfig) -> RedisResult<RedisConn> {
             let sentinels: Vec<String> = cfg
                 .sentinels
                 .iter()
-                .map(|s| s.trim().to_string())
+                .map(|s| s.trim())
                 .filter(|s| !s.is_empty())
+                .map(|s| insecure_url(s, cfg))
                 .collect();
             let master_name = cfg.master_name.clone().unwrap_or_default();
             // The master/data node may need its own auth and TLS; the
@@ -193,7 +202,26 @@ pub async fn connect(cfg: &RedisConnConfig) -> RedisResult<RedisConn> {
             let tls_mode = sentinels
                 .first()
                 .filter(|u| u.starts_with("rediss://"))
-                .map(|_| redis::TlsMode::Secure);
+                .map(|_| {
+                    if cfg.tls.verify {
+                        redis::TlsMode::Secure
+                    } else {
+                        redis::TlsMode::Insecure
+                    }
+                });
+            // `SentinelClient::build` takes no `TlsCertificates`, so the
+            // master connection redis-rs opens after discovery can only
+            // use the built-in trust store. Say so rather than let a
+            // configured CA look applied — `SSL_CERT_FILE` is the working
+            // alternative in this one mode.
+            if tls_mode.is_some() && cfg.tls.ca_file.is_some() {
+                tracing::warn!(
+                    target: "aisix::redis",
+                    "redis.tls.ca_file is not applied in sentinel mode: the client library \
+                     accepts no custom trust roots for the sentinel-discovered master. Put \
+                     the CA in the system trust store, or point SSL_CERT_FILE at it."
+                );
+            }
             // Auth/DB for the discovered master. It has no URL of its own,
             // so ACL username/password and the DB index are configured
             // here; this is independent of the sentinels' own auth.
@@ -235,9 +263,146 @@ pub async fn connect(cfg: &RedisConnConfig) -> RedisResult<RedisConn> {
     }
 }
 
+/// Read the `redis.tls` PEM files into the shape redis-rs wants, or
+/// `None` when the operator configured no custom trust material (the
+/// built-in root set, plus `SSL_CERT_FILE`, then applies).
+fn load_tls(cfg: &RedisConnConfig) -> RedisResult<Option<redis::TlsCertificates>> {
+    let read = |path: &str, field: &str| -> RedisResult<Vec<u8>> {
+        std::fs::read(path).map_err(|e| {
+            redis::RedisError::from((
+                redis::ErrorKind::InvalidClientConfig,
+                "redis TLS material could not be read",
+                format!("redis.tls.{field}: read {path}: {e}"),
+            ))
+        })
+    };
+
+    let root_cert = match &cfg.tls.ca_file {
+        Some(path) => Some(read(path, "ca_file")?),
+        None => None,
+    };
+    let client_tls = match (&cfg.tls.client_cert_file, &cfg.tls.client_key_file) {
+        // The mismatched pairs are rejected by `RedisConnConfig::validate`.
+        (Some(cert), Some(key)) => Some(redis::ClientTlsConfig {
+            client_cert: read(cert, "client_cert_file")?,
+            client_key: read(key, "client_key_file")?,
+        }),
+        _ => None,
+    };
+
+    if root_cert.is_none() && client_tls.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(redis::TlsCertificates {
+        client_tls,
+        root_cert,
+    }))
+}
+
+/// redis-rs carries "do not verify the server certificate" in the URL
+/// rather than in a builder option, as the `#insecure` fragment on a
+/// `rediss://` URL. Translate `redis.tls.verify: false` into that.
+///
+/// Left alone for a plaintext `redis://` URL, where the fragment is
+/// rejected outright, and for a URL that already carries a fragment,
+/// which the operator set deliberately.
+fn insecure_url(url: &str, cfg: &RedisConnConfig) -> String {
+    if cfg.tls.verify || !url.starts_with("rediss://") || url.contains('#') {
+        return url.to_string();
+    }
+    // The fragment must follow a path segment: redis-rs parses the URL
+    // with the `url` crate, and `rediss://host:6379#insecure` leaves the
+    // fragment attached to an empty path, which it then reads as a
+    // database index.
+    if url.rsplit('/').next().is_some_and(|s| s.contains(':')) {
+        format!("{url}/#insecure")
+    } else {
+        format!("{url}#insecure")
+    }
+}
+
 /// Re-export so dependents don't need a direct `redis` dependency just to
 /// name the connect error.
 pub use redis::RedisError as ConnectError;
+
+#[cfg(test)]
+mod tls_tests {
+    use super::*;
+    use aisix_core::config::OutboundTlsConfig;
+
+    fn cfg_with(url: &str, verify: bool) -> RedisConnConfig {
+        RedisConnConfig {
+            mode: RedisMode::Single,
+            url: Some(url.to_string()),
+            tls: OutboundTlsConfig {
+                verify,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn verify_true_leaves_the_url_alone() {
+        let cfg = cfg_with("rediss://redis.internal:6379", true);
+        assert_eq!(
+            insecure_url("rediss://redis.internal:6379", &cfg),
+            "rediss://redis.internal:6379"
+        );
+    }
+
+    /// redis-rs reads the fragment only after a path separator; without
+    /// the trailing slash it parses `6379#insecure` as the database
+    /// index and the connection fails to open at all.
+    #[test]
+    fn verify_false_appends_the_insecure_fragment_after_a_path_separator() {
+        let cfg = cfg_with("rediss://redis.internal:6379", false);
+        assert_eq!(
+            insecure_url("rediss://redis.internal:6379", &cfg),
+            "rediss://redis.internal:6379/#insecure"
+        );
+    }
+
+    #[test]
+    fn verify_false_keeps_an_existing_path() {
+        let cfg = cfg_with("rediss://redis.internal:6379/2", false);
+        assert_eq!(
+            insecure_url("rediss://redis.internal:6379/2", &cfg),
+            "rediss://redis.internal:6379/2#insecure"
+        );
+    }
+
+    /// A plaintext connection never negotiates TLS, and redis-rs rejects
+    /// any fragment on a `redis://` URL — adding one would turn "verify
+    /// is off" into "the backend does not connect".
+    #[test]
+    fn verify_false_does_not_touch_a_plaintext_url() {
+        let cfg = cfg_with("redis://redis.internal:6379", false);
+        assert_eq!(
+            insecure_url("redis://redis.internal:6379", &cfg),
+            "redis://redis.internal:6379"
+        );
+    }
+
+    #[test]
+    fn no_tls_material_configured_leaves_the_default_trust_store() {
+        let cfg = cfg_with("rediss://redis.internal:6379", true);
+        assert!(load_tls(&cfg).unwrap().is_none());
+    }
+
+    #[test]
+    fn an_unreadable_ca_file_names_the_field_and_the_path() {
+        let mut cfg = cfg_with("rediss://redis.internal:6379", true);
+        cfg.tls.ca_file = Some("/nonexistent/redis-ca.pem".into());
+        // `TlsCertificates` is not `Debug`, so `unwrap_err` is out.
+        let Err(err) = load_tls(&cfg) else {
+            panic!("an unreadable ca_file must fail the connect")
+        };
+        let err = err.to_string();
+        assert!(err.contains("redis.tls.ca_file"), "{err}");
+        assert!(err.contains("/nonexistent/redis-ca.pem"), "{err}");
+    }
+}
 
 #[cfg(test)]
 mod tests {

@@ -30,6 +30,7 @@ pub mod hub;
 pub mod sse;
 pub mod upstream_headers;
 pub mod upstream_http;
+pub mod upstream_tls;
 
 pub use bridge::{
     capture_upstream_error_http, content_type_is_json, parse_retry_after, read_body_capped,
@@ -50,3 +51,4 @@ pub use upstream_headers::{
 pub use upstream_http::{
     client_builder, error_with_causes, transport_error_message, UpstreamHttpConfig,
 };
+pub use upstream_tls::TlsSettings;

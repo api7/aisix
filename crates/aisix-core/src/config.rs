@@ -699,6 +699,14 @@ pub struct RedisConnConfig {
     /// Database index for the Sentinel-discovered master (default 0).
     /// Not applicable to `cluster` (Redis Cluster only has DB 0).
     pub database: Option<i64>,
+    /// Trust settings for a `rediss://` connection. Independent of
+    /// `upstream.tls` because the cache/rate-limit backend sits inside
+    /// the deployment and is usually issued by a different authority
+    /// than the model endpoints.
+    ///
+    /// Only consulted for `rediss://` URLs; a plaintext `redis://`
+    /// connection never negotiates TLS regardless of what is set here.
+    pub tls: OutboundTlsConfig,
 }
 
 impl RedisConnConfig {
@@ -731,6 +739,19 @@ impl RedisConnConfig {
                     ));
                 }
             }
+        }
+        match (&self.tls.client_cert_file, &self.tls.client_key_file) {
+            (Some(_), None) => {
+                return Err(format!(
+                    "{ctx}.tls.client_cert_file requires {ctx}.tls.client_key_file"
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(format!(
+                    "{ctx}.tls.client_key_file requires {ctx}.tls.client_cert_file"
+                ));
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -789,7 +810,7 @@ pub enum RateLimitBackend {
 /// here, and the request fails with an opaque transport error.
 ///
 /// Every duration accepts `0` to disable that individual knob.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct UpstreamConfig {
     /// Deployment-wide default for `Model.timeout`: the end-to-end deadline
@@ -839,6 +860,9 @@ pub struct UpstreamConfig {
     /// each retry re-sends the full request body, and stacks on top of any
     /// retry the provider's own edge performs.
     pub retries: u32,
+    /// Trust settings for the TLS handshake with every upstream peer —
+    /// see [`OutboundTlsConfig`].
+    pub tls: OutboundTlsConfig,
 }
 
 impl Default for UpstreamConfig {
@@ -853,7 +877,78 @@ impl Default for UpstreamConfig {
             pool_idle_timeout_secs: 30,
             pool_max_idle_per_host: None,
             retries: DEFAULT_UPSTREAM_RETRIES,
+            tls: OutboundTlsConfig::default(),
         }
+    }
+}
+
+/// Trust settings for a class of TLS connections the gateway *opens*.
+///
+/// Used twice, because the two peer classes are issued certificates by
+/// different authorities and must be configurable apart: `upstream.tls`
+/// covers everything the gateway calls out to on a request path — the
+/// provider bridges, guardrail services, MCP and A2A upstreams, the
+/// OIDC/JWKS fetches, the Realtime WebSocket, Bedrock, and the
+/// log-export object stores — while a `redis.tls` block covers the
+/// shared cache / rate-limit backend.
+///
+/// Scope note: this is the connection the gateway makes as a *client*.
+/// The certificate the gateway *presents* on its own listeners is
+/// `proxy.tls` / `admin.tls`, and the etcd channel keeps its own
+/// [`EtcdTlsConfig`] because it is a control-plane link whose bundle is
+/// issued by the control plane rather than configured by the operator.
+///
+/// Without any of this set, the trust store is the platform's: the
+/// built-in root set plus whatever `SSL_CERT_FILE` / `SSL_CERT_DIR`
+/// point at. Those environment variables keep working and stay
+/// additive, but they are process-wide and cannot be expressed per
+/// peer class, which is what `ca_file` is for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct OutboundTlsConfig {
+    /// Path to a PEM file holding one or more certificates to trust as
+    /// issuers, for upstreams whose certificate is signed by a private
+    /// or enterprise CA.
+    ///
+    /// **Additive**: these are trusted *in addition to* the built-in
+    /// roots, so adding a private CA never stops a public provider from
+    /// being reachable. Every certificate in the file is loaded, so a
+    /// full chain in one bundle works.
+    pub ca_file: Option<String>,
+    /// Path to a PEM client certificate presented to upstreams that
+    /// require mutual TLS. Must be set together with `client_key_file`.
+    pub client_cert_file: Option<String>,
+    /// Path to the PEM private key for `client_cert_file`.
+    pub client_key_file: Option<String>,
+    /// Whether the upstream's certificate is verified at all.
+    ///
+    /// Setting this to `false` accepts any certificate, including an
+    /// expired one, one issued for a different host, and one presented
+    /// by an interceptor — which removes the only protection against a
+    /// machine-in-the-middle reading and rewriting every prompt,
+    /// response, and upstream API key that crosses the connection.
+    /// Intended for a test environment where the alternative is not
+    /// running at all; prefer `ca_file` everywhere else.
+    pub verify: bool,
+}
+
+impl Default for OutboundTlsConfig {
+    fn default() -> Self {
+        Self {
+            ca_file: None,
+            client_cert_file: None,
+            client_key_file: None,
+            verify: true,
+        }
+    }
+}
+
+impl OutboundTlsConfig {
+    /// Whether anything here departs from the platform default trust
+    /// behaviour. Used to keep the "no TLS config" path building exactly
+    /// the client it built before this block existed.
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
     }
 }
 
@@ -1058,6 +1153,25 @@ impl Config {
             redis
                 .validate("cache.redis")
                 .map_err(BootstrapError::Config)?;
+        }
+        // A half-configured client identity would otherwise be silently
+        // dropped and surface much later as an upstream 4xx from a peer
+        // that wanted mutual TLS.
+        match (
+            &self.upstream.tls.client_cert_file,
+            &self.upstream.tls.client_key_file,
+        ) {
+            (Some(_), None) => {
+                return Err(BootstrapError::Config(
+                    "upstream.tls.client_cert_file requires upstream.tls.client_key_file".into(),
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(BootstrapError::Config(
+                    "upstream.tls.client_key_file requires upstream.tls.client_cert_file".into(),
+                ));
+            }
+            _ => {}
         }
         Ok(())
     }

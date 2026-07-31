@@ -53,7 +53,12 @@ pub const DEFAULT_UPSTREAM_TIMEOUT: Duration = Duration::from_secs(30);
 ///   stall rmcp avoids. An operator can restore rmcp's behaviour with
 ///   `upstream.pool_max_idle_per_host: 0`;
 /// - the TCP keepalive triple moves from reqwest's default 15 s/15 s/3
-///   to the deployment's 60 s/30 s/5.
+///   to the deployment's 60 s/30 s/5;
+/// - the deployment's `upstream.tls` trust decision applies here too. An
+///   MCP server behind an enterprise CA is exactly as common as a model
+///   endpoint behind one, and the PEM has to be re-parsed rather than
+///   reused because rmcp's `Certificate` is a different crate version's
+///   type than the one `upstream_tls` caches for the workspace line.
 ///
 /// One client for all MCP upstreams = one shared pool, matching how the
 /// provider bridges share theirs (auth is injected per-request by the
@@ -77,6 +82,35 @@ fn shared_http_client() -> rmcp_reqwest::Client {
             }
             if let Some(n) = cfg.pool_max_idle_per_host {
                 b = b.pool_max_idle_per_host(n);
+            }
+            if let Some(pem) = &cfg.tls.extra_ca_pem {
+                // Already validated at boot by `TlsSettings::load`; a
+                // failure here would mean rmcp's reqwest disagrees with
+                // ours about the same bytes, which is worth a loud line
+                // rather than a silently untrusting client.
+                match rmcp_reqwest::Certificate::from_pem_bundle(pem) {
+                    Ok(roots) => {
+                        for root in roots {
+                            b = b.add_root_certificate(root);
+                        }
+                    }
+                    Err(e) => tracing::error!(
+                        error = %e,
+                        "upstream.tls.ca_file not applied to MCP upstream connections"
+                    ),
+                }
+            }
+            if let Some(configured) = &cfg.tls.client_identity {
+                match rmcp_reqwest::Identity::from_pem(&configured.joined()) {
+                    Ok(identity) => b = b.identity(identity),
+                    Err(e) => tracing::error!(
+                        error = %e,
+                        "upstream.tls client identity not applied to MCP upstream connections"
+                    ),
+                }
+            }
+            if !cfg.tls.verify {
+                b = b.danger_accept_invalid_certs(true);
             }
             b.build().unwrap_or_else(|_| rmcp_reqwest::Client::new())
         })

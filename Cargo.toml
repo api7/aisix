@@ -54,11 +54,24 @@ aliyun-log-sdk-protobuf = "0.1"
 aliyun-log-sdk-sign = "0.2"
 lz4_flex = "0.11"
 
-# HTTP client
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "gzip", "multipart"] }
+# HTTP client.
+#
+# `rustls-tls-native-roots` is load-bearing and must stay declared here:
+# it is what makes `SSL_CERT_FILE` / `SSL_CERT_DIR` work at all, and what
+# makes the platform trust store additive to the compiled-in Mozilla set.
+# It used to arrive only by feature unification from `object_store`'s
+# `aws` feature, so dropping the log-export sink would have silently
+# stopped the gateway trusting anything the operating system trusts
+# (api7/aisix#860).
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "rustls-tls-native-roots", "gzip", "multipart"] }
 
-# TLS
+# TLS. The root-store crates are direct dependencies because the
+# outbound paths that are not reqwest — the Realtime WebSocket — have to
+# assemble the same trust store by hand (aisix-gateway::upstream_tls).
 rustls = "0.23"
+rustls-native-certs = "0.8"
+rustls-pemfile = "2"
+webpki-roots = "0.26"
 
 # Serialization / validation
 serde = { version = "1", features = ["derive"] }
@@ -118,7 +131,13 @@ hex = "0.4"
 
 # Caching / storage backends
 moka = { version = "0.12", features = ["future"] }
-redis = { version = "0.27", features = ["tokio-comp", "connection-manager", "cluster-async", "sentinel"] }
+# The TLS features are what make a `rediss://` URL connect at all: without
+# them redis-rs rejects the scheme at parse time with "can't connect with
+# TLS, the feature is not enabled", so every TLS Redis deployment failed at
+# boot (api7/aisix#860). `webpki-roots` gives the same built-in root set the
+# HTTP clients trust, and `insecure` is what `redis.tls.verify: false`
+# lowers to.
+redis = { version = "0.27", features = ["tokio-comp", "tokio-rustls-comp", "connection-manager", "cluster-async", "sentinel", "tls-rustls-webpki-roots", "tls-rustls-insecure"] }
 
 # Object-storage observability sink (aisix-obs): ONE crate covering S3 / GCS /
 # Azure Blob (+ S3-compatible MinIO/R2) behind a single `ObjectStore` trait, so
@@ -139,6 +158,11 @@ aws-credential-types = "1"
 aws-smithy-async = { version = "1", features = ["rt-tokio"] }
 aws-smithy-runtime-api = "1"
 aws-smithy-types = "1"
+# Lets the Bedrock clients be built on an HTTP stack that carries
+# `upstream.tls.ca_file`, instead of the SDK's own default trust store
+# (api7/aisix#860). aws-lc matches the process-wide rustls provider
+# installed in main().
+aws-smithy-http-client = { version = "1", default-features = false, features = ["rustls-aws-lc"] }
 
 # Test-only
 wiremock = "0.6"

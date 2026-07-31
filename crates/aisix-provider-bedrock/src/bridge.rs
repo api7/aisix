@@ -379,6 +379,10 @@ fn build_client(
         .region(Region::new(creds.region.clone()))
         .credentials_provider(SharedCredentialsProvider::new(aws_creds))
         .timeout_config(timeouts.build())
+        // Shared HTTP stack carrying `upstream.tls.ca_file`, so a
+        // Bedrock-compatible endpoint behind a private CA is reachable
+        // on the same setting every other upstream uses.
+        .http_client(aisix_gateway::upstream_tls::aws_http_client())
         // Retries belong to the gateway's own budget
         // (`routing::effective_retries`), which emits per-attempt telemetry
         // and honours per-model config. Left at its default the SDK would

@@ -18,6 +18,8 @@
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use crate::upstream_tls::TlsSettings;
+
 /// Suffixes marking a query parameter whose value is a credential and must
 /// be redacted out of logged URLs. Vertex/Gemini accept `?key=` and
 /// `?access_token=`, and an operator can put either directly in a
@@ -85,6 +87,11 @@ pub struct UpstreamHttpConfig {
     /// Cap on idle connections kept per upstream host. `None` leaves
     /// reqwest's default (unbounded).
     pub pool_max_idle_per_host: Option<usize>,
+    /// Trust material for the TLS handshake — see [`TlsSettings`]. Lives
+    /// here rather than beside each client so the private-CA / mTLS /
+    /// verification decision is made once and reaches every outbound
+    /// stack, not just the ones someone remembered to wire.
+    pub tls: TlsSettings,
 }
 
 impl Default for UpstreamHttpConfig {
@@ -96,6 +103,7 @@ impl Default for UpstreamHttpConfig {
             tcp_keepalive_retries: Some(5),
             pool_idle_timeout: Some(Duration::from_secs(30)),
             pool_max_idle_per_host: None,
+            tls: TlsSettings::default(),
         }
     }
 }
@@ -106,8 +114,14 @@ static CONFIG: OnceLock<UpstreamHttpConfig> = OnceLock::new();
 /// during boot, before any bridge builds its client. Later calls are
 /// ignored — the pools are already built, so a second set would silently
 /// not apply.
-pub fn init(cfg: UpstreamHttpConfig) {
+///
+/// Fails when the configured TLS material does not parse, which is the
+/// point at which a wrong `upstream.tls.ca_file` should stop the boot
+/// rather than become a transport error on the first upstream call.
+pub fn init(cfg: UpstreamHttpConfig) -> Result<(), String> {
+    crate::upstream_tls::init_reqwest_material(&cfg.tls)?;
     let _ = CONFIG.set(cfg);
+    Ok(())
 }
 
 /// The active settings, defaulting when [`init`] was never called (tests,
@@ -116,8 +130,9 @@ pub fn config() -> &'static UpstreamHttpConfig {
     CONFIG.get_or_init(UpstreamHttpConfig::default)
 }
 
-/// A `reqwest::ClientBuilder` with the connection settings applied. Callers
-/// add their own `user_agent` / TLS options and `build()`.
+/// A `reqwest::ClientBuilder` with the connection settings **and the
+/// deployment's outbound TLS trust** applied. Callers add their own
+/// `user_agent` and `build()`.
 pub fn client_builder() -> reqwest::ClientBuilder {
     let cfg = config();
     let mut b = reqwest::Client::builder()
@@ -134,6 +149,26 @@ pub fn client_builder() -> reqwest::ClientBuilder {
     }
     if let Some(n) = cfg.pool_max_idle_per_host {
         b = b.pool_max_idle_per_host(n);
+    }
+    apply_tls(b, &cfg.tls)
+}
+
+/// Layer the outbound trust decision onto a builder. Split out so the
+/// per-ProviderKey clients get byte-for-byte the same treatment as the
+/// shared one.
+pub(crate) fn apply_tls(
+    mut b: reqwest::ClientBuilder,
+    tls: &TlsSettings,
+) -> reqwest::ClientBuilder {
+    let material = crate::upstream_tls::reqwest_material();
+    for root in &material.roots {
+        b = b.add_root_certificate(root.clone());
+    }
+    if let Some(identity) = &material.identity {
+        b = b.identity(identity.clone());
+    }
+    if !tls.verify {
+        b = b.danger_accept_invalid_certs(true);
     }
     b
 }
