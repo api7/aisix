@@ -652,6 +652,42 @@ async fn dispatch(
                     continue 'targets;
                 }
             };
+            // From here the request reaches the upstream, so an abandoned
+            // caller must still leave a usage event: the provider may have
+            // generated and charged for a response nobody read. Disarmed
+            // below once the attempt yields a result and the normal emit
+            // path owns the telemetry.
+            let cancel = crate::CancelOnDrop::new({
+                let state = state.clone();
+                let request_id = request_id.to_string();
+                let model_id = target.id.clone();
+                let requested_model = model_name.clone();
+                let api_key_id = auth.entry.id.clone();
+                let provider_key_id = pk_id.clone();
+                let attempt = attempt.clone();
+                let client = client.clone();
+                move || {
+                    emit_usage_event(
+                        &state,
+                        &request_id,
+                        &model_id,
+                        &requested_model,
+                        &api_key_id,
+                        &provider_key_id,
+                        crate::CLIENT_CLOSED_REQUEST,
+                        attempt_started.elapsed(),
+                        // No response arrived, so there is nothing to report
+                        // but the fact that the attempt happened.
+                        &ResponseUsage::default(),
+                        &client,
+                        attempt,
+                        /* guardrail_blocked */ false,
+                        crate::redact::RedactionCounts::new(),
+                        Vec::new(),
+                        None,
+                    );
+                }
+            });
             let result = if target.model.provider.as_deref() == Some("openai") {
                 responses_to_target(
                     state,
@@ -697,6 +733,7 @@ async fn dispatch(
                 )
                 .await
             };
+            cancel.disarm();
             match result {
                 Ok(mut success) => {
                     let latency_ms = ms_since(attempt_started);

@@ -324,6 +324,48 @@ pub(crate) const CLIENT_CLOSED_REQUEST: u16 = 499;
 /// `ClientDisconnected` error class.
 const CLIENT_DISCONNECTED_KIND: &str = "client_disconnected";
 
+/// Runs a closure when the surrounding future is dropped before finishing.
+///
+/// An upstream attempt that the caller abandons mid-flight still has to leave
+/// a usage event: the request already reached the provider, which may have
+/// generated — and charged for — a response nobody read. The handler future
+/// is gone by then, so the only place left to emit from is a `Drop`.
+///
+/// Call [`CancelOnDrop::disarm`] once the attempt yields a result; from that
+/// point the normal telemetry path owns the event and this guard must stay
+/// quiet. An attempt that never reached the upstream is deliberately not
+/// wrapped — nothing was spent, and the access log already records it.
+pub(crate) struct CancelOnDrop<F: FnOnce()> {
+    slot: Option<F>,
+}
+
+impl<F: FnOnce()> CancelOnDrop<F> {
+    pub(crate) fn new(f: F) -> Self {
+        Self { slot: Some(f) }
+    }
+
+    /// The attempt produced a result; its own emit path takes over.
+    pub(crate) fn disarm(mut self) {
+        self.slot.take();
+    }
+}
+
+impl<F: FnOnce()> Drop for CancelOnDrop<F> {
+    fn drop(&mut self) {
+        // A panicking handler unwinds through here with the slot still set,
+        // which is indistinguishable from a cancel. Emitting would invent a
+        // client disconnect that never happened and bury the panic under it,
+        // and a panic inside the emit path during an unwind aborts the
+        // process. Same reasoning as `ClientCancelGuard`.
+        if std::thread::panicking() {
+            return;
+        }
+        if let Some(f) = self.slot.take() {
+            f();
+        }
+    }
+}
+
 /// Record a request whose caller hung up before the response head was
 /// written.
 ///
