@@ -1660,7 +1660,15 @@ async fn dispatch(
                     &model_id_for_telem,
                     &model_for_metrics,
                     &api_key_id_for_telem,
-                    /* status_code */ 200,
+                    // A stream the consumer abandoned mid-flight is reported
+                    // as 499, matching what LiteLLM records for the same
+                    // event. The upstream work still happened, so the event
+                    // is emitted either way — only its outcome differs.
+                    if comp.reached_end {
+                        200
+                    } else {
+                        crate::CLIENT_CLOSED_REQUEST
+                    },
                     // Scoped to the winning attempt, not the request: the
                     // failed attempts before it emit their own events and
                     // `started` would double-count them (plus the pre-dispatch
@@ -4091,6 +4099,18 @@ struct StreamCompletion {
     /// output checks (AISIX-Cloud#562). Merged with the input-side hits
     /// by the on_complete telemetry closure.
     monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
+    /// `true` once the generator reached its own end — upstream EOF, an
+    /// error frame, or an output-guardrail block. It stays `false` only
+    /// when the consumer went away first, because `async_stream::stream!`
+    /// then simply stops resuming the body and the tail never runs. That
+    /// makes it the one signal at the Drop site that distinguishes a
+    /// delivered response from an abandoned one, which the telemetry
+    /// closure turns into `499` (see `CLIENT_CLOSED_REQUEST`).
+    ///
+    /// Distinct from `chunks_delivered`: a stream can deliver chunks and
+    /// still be abandoned midway, and a zero-chunk stream can still
+    /// legitimately reach its end (an immediate error frame).
+    reached_end: bool,
 }
 
 /// Parameters needed to run output-guardrail evaluation at
@@ -4915,13 +4935,19 @@ where
         // consumers can detect truncation. The `errored` flag is
         // set by the loop above whenever an error event is yielded
         // OR by the output-guardrail check above on a Block verdict.
+        // Mark BEFORE the final yield, not after: `async_stream::stream!`
+        // resumes the body only when the consumer pulls again, and plenty
+        // of SSE clients stop reading the moment they see `[DONE]`. A flag
+        // set after the yield would therefore stay unset for a perfectly
+        // normal request and report it as abandoned.
+        guard.comp().reached_end = true;
         if !errored {
             yield Ok::<_, Infallible>(Event::default().data("[DONE]"));
         }
         // `guard` drops here. On client disconnect, the generator
         // drops at the suspension point inside the loop; Drop fires
         // there with whatever StreamCompletion has been captured up
-        // to that point.
+        // to that point — `reached_end` still false.
     };
     // Hyper polls this generator after the request-id middleware has
     // returned, so re-attach the request span here — while we're still

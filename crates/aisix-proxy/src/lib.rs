@@ -318,7 +318,7 @@ impl Drop for InFlightGuard {
 /// as a recorded outcome — nothing is ever sent to a caller that already
 /// hung up. LiteLLM reports the same event as 499, so an operator running
 /// both reads one number.
-const CLIENT_CLOSED_REQUEST: u16 = 499;
+pub(crate) const CLIENT_CLOSED_REQUEST: u16 = 499;
 
 /// `error_kind` for an abandoned request, mirroring LiteLLM's
 /// `ClientDisconnected` error class.
@@ -6046,8 +6046,71 @@ data: [DONE]\n\n";
         // simply that an event fires; counts are best-effort. Pin
         // the structural fields to confirm we didn't grab some
         // unrelated event.
-        assert_eq!(event.status_code, 200);
+        assert_eq!(
+            event.status_code, CLIENT_CLOSED_REQUEST,
+            "an abandoned stream must be recorded as a client cancel, not as a success"
+        );
         assert!(!event.guardrail_blocked);
+    }
+
+    /// The counterpart to the test above: a stream the consumer reads to
+    /// completion must stay `200`. Without this, the `reached_end` flag
+    /// could be wired to something that is never set and every streamed
+    /// request would silently be reported as abandoned.
+    #[tokio::test]
+    async fn streaming_chat_telemetry_reports_200_when_fully_consumed() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        let sse = "\
+data: {\"id\":\"cmpl-full\",\"model\":\"gpt-4o-2024-08-06\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"cmpl-full\",\"model\":\"gpt-4o-2024-08-06\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"cmpl-full\",\"model\":\"gpt-4o-2024-08-06\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+data: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&upstream)
+            .await;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
+        let state = build_state(snap, hub).with_usage_sink(UsageSink::new(tx));
+        let app = build_router(state);
+
+        let body = serde_json::json!({
+            "model": "my-gpt4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Drain to the end, the way a client that wants the whole answer does.
+        let mut body_stream = resp.into_body().into_data_stream();
+        while body_stream.next().await.is_some() {}
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("usage event was never emitted")
+            .expect("sender dropped without sending");
+        assert_eq!(
+            event.status_code, 200,
+            "a fully consumed stream must not be reported as a client cancel"
+        );
     }
 
     const CANCEL_METRIC: &str = "aisix_proxy_client_cancelled_requests_total";

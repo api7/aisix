@@ -114,6 +114,15 @@ impl From<ProxyError> for ResponsesDispatchError {
 /// the ones below.
 #[derive(Default, Clone)]
 struct ResponseUsage {
+    /// `true` once the upstream stream reached EOF, i.e. the response was
+    /// delivered in full. Stays `false` when the consumer went away first,
+    /// which is what the telemetry closure turns into `499`.
+    ///
+    /// Set at upstream EOF rather than after the end-of-stream guardrail
+    /// scan: SDK clients routinely close right after the terminal frame and
+    /// drop this generator at that await, and such a request was delivered
+    /// in full — marking it later would report it as abandoned.
+    reached_end: bool,
     prompt_tokens: u32,
     completion_tokens: u32,
     /// True when any token counter was filled by the local estimator
@@ -1457,7 +1466,15 @@ async fn responses_to_target(
                     &requested_model_c,
                     &api_key_id_c,
                     &provider_key_id_c,
-                    200,
+                    // A stream the consumer abandoned mid-flight is reported
+                    // as 499, matching LiteLLM. The upstream work still
+                    // happened, so the event is emitted either way — only
+                    // its outcome differs.
+                    if usage.reached_end {
+                        200
+                    } else {
+                        crate::CLIENT_CLOSED_REQUEST
+                    },
                     // Attempt-scoped, unlike the e2e histogram above: any
                     // failed attempt before this one emitted its own event.
                     attempt_started.elapsed(),
@@ -1875,6 +1892,7 @@ async fn responses_cross_provider_to_target(
                 // in-flight.
                 drop(in_flight);
                 let usage = ResponseUsage {
+                    reached_end: comp.reached_end,
                     prompt_tokens: comp.prompt_tokens,
                     completion_tokens: comp.completion_tokens,
                     reasoning_tokens: comp.reasoning_tokens,
@@ -1986,6 +2004,9 @@ async fn responses_cross_provider_to_target(
 
     let usage = {
         let mut u = ResponseUsage {
+            // Non-streaming: the response was received in full or this code
+            // would not run.
+            reached_end: true,
             prompt_tokens: resp.usage.prompt_tokens,
             completion_tokens: resp.usage.completion_tokens,
             reasoning_tokens: resp.usage.reasoning_tokens,
@@ -2157,6 +2178,9 @@ fn extract_response_usage(body: &Value) -> Option<ResponseUsage> {
         .and_then(|v| v.as_u64())
         .unwrap_or(0) as u32;
     Some(ResponseUsage {
+        // Parsed from a fully buffered response body, so by definition the
+        // response was delivered in full.
+        reached_end: true,
         prompt_tokens,
         completion_tokens,
         usage_estimated: false,
@@ -2540,6 +2564,13 @@ where
                 }
             }
             yield item;
+        }
+        // Upstream EOF — the response was delivered in full. Record that
+        // before the scan below, which awaits a remote provider and is a
+        // routine drop point for clients that close on the terminal frame.
+        {
+            let (usage_acc, _) = guard.parts();
+            usage_acc.get_or_insert_with(Default::default).reached_end = true;
         }
         // Clean end-of-stream: run the monitor observation (needs async, so
         // it can't live in the Drop guard), then complete explicitly. The
