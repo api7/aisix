@@ -1561,57 +1561,19 @@ mod tests {
         assert!(resp.status().is_server_error());
     }
 
-    /// Collects log output so a test can assert on the emitted line.
-    #[derive(Clone, Default)]
-    struct LogCapture(Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl LogCapture {
-        fn contents(&self) -> String {
-            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
-        }
-    }
-
-    impl std::io::Write for LogCapture {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
-        type Writer = LogCapture;
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
-    /// Route every log event on THIS thread into `capture` for as long as
-    /// the returned guard lives. `#[tokio::test]` drives a current-thread
-    /// runtime, so the awaited router runs on the same thread.
-    fn capture_logs(capture: &LogCapture) -> tracing::subscriber::DefaultGuard {
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(capture.clone())
-            .with_ansi(false)
-            .with_target(false)
-            .with_env_filter(tracing_subscriber::EnvFilter::new("info"))
-            .finish();
-        tracing::subscriber::set_default(subscriber)
-    }
-
     /// A body-cap rejection short-circuits BEFORE any handler runs, and
-    /// the access log is emitted BY the handlers — so pre-fix a caller
-    /// got a 413 while the gateway kept no record of the request at all
-    /// (no access-log line, no `aisix_requests_total` sample). "Client
-    /// reports 413, gateway shows nothing" was indistinguishable from the
-    /// request never arriving.
+    /// both the access log and the request metrics are emitted BY the
+    /// handlers — so pre-fix a caller got a 413 the gateway kept no
+    /// record of: nothing in the log, no `aisix_requests_total` sample.
+    /// "Client reports 413, gateway shows nothing" was indistinguishable
+    /// from the request never arriving.
+    ///
+    /// The metric is what this asserts, because it is per-`ProxyState`
+    /// and so unaffected by whatever else the suite is doing; the log
+    /// line — process-global tracing state, not safely assertable from a
+    /// parallel unit test — is pinned end-to-end in the `body-edges` E2E.
     #[tokio::test]
-    async fn body_cap_short_circuit_is_visible_in_the_access_log_and_metrics() {
-        let capture = LogCapture::default();
-        let _guard = capture_logs(&capture);
-
+    async fn body_cap_short_circuit_is_counted_like_any_other_terminal_path() {
         let hub = Arc::new(Hub::new());
         let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
         let state = build_state(snap, hub); // 1 MiB cap from cfg()
@@ -1631,18 +1593,6 @@ mod tests {
         let resp = run(app, req).await;
         assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
 
-        let logs = capture.contents();
-        assert!(
-            logs.contains("proxy request completed"),
-            "the 413 must produce an access-log line, got: {logs}"
-        );
-        assert!(logs.contains("status=413"), "{logs}");
-        assert!(logs.contains("/v1/chat/completions"), "{logs}");
-        // The reason, not just the status: `error_kind` is the OpenAI
-        // envelope's coarse `invalid_request_error` (a pinned wire
-        // contract, #327), so the cap hit is only nameable in `error`.
-        assert!(logs.contains("request body exceeds"), "{logs}");
-
         let scrape = state.metrics.render();
         assert!(
             scrape.contains("aisix_requests_total") && scrape.contains(r#"status="413""#),
@@ -1651,14 +1601,10 @@ mod tests {
     }
 
     /// The chunked path reaches the handler, which rejects at its body
-    /// extractor and returns before the dispatch tail that emits the
-    /// access log — so it was silent for the same reason, one layer
-    /// further in. Locks the handler-side half of the fix.
+    /// extractor and returns before the dispatch tail — silent for the
+    /// same reason, one layer further in. Locks the handler-side half.
     #[tokio::test]
-    async fn chunked_oversize_rejection_is_visible_in_the_access_log_and_metrics() {
-        let capture = LogCapture::default();
-        let _guard = capture_logs(&capture);
-
+    async fn chunked_oversize_rejection_is_counted_like_any_other_terminal_path() {
         let hub = Arc::new(Hub::new());
         let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
         let state = build_state(snap, hub);
@@ -1677,20 +1623,11 @@ mod tests {
         let resp = run(app, req).await;
         assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
 
-        let logs = capture.contents();
-        assert!(
-            logs.contains("proxy request completed"),
-            "the handler-side 413 must produce an access-log line, got: {logs}"
-        );
-        assert!(logs.contains("status=413"), "{logs}");
-        assert!(logs.contains("/v1/completions"), "{logs}");
-        assert!(logs.contains("request body exceeds"), "{logs}");
-        // Auth ran before the body extractor, so the caller IS attributable
-        // here — unlike the middleware short-circuit above.
-        assert!(logs.contains("api_key_id"), "{logs}");
-
         let scrape = state.metrics.render();
-        assert!(scrape.contains(r#"status="413""#), "{scrape}");
+        assert!(
+            scrape.contains(r#"status="413""#),
+            "the 413 must be counted, got: {scrape}"
+        );
     }
 
     /// The duplicate-Content-Length rejection is smuggling hygiene, not

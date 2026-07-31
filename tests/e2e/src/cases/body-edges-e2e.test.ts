@@ -46,6 +46,15 @@ const CALLER_KEY_HASH = createHash("sha256")
   .update(CALLER_PLAINTEXT)
   .digest("hex");
 
+/** An access-log line for a `/v1/completions` request the gateway refused. */
+const isRefusal = (line: string): boolean =>
+  line.includes("proxy request completed") &&
+  line.includes('path="/v1/completions"') &&
+  line.includes("status=413");
+
+const countRefusals = (output: string): number =>
+  output.split("\n").filter(isRefusal).length;
+
 describe("body edges e2e: multi-turn, oversize body, empty messages", () => {
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
@@ -280,6 +289,53 @@ describe("body edges e2e: multi-turn, oversize body, empty messages", () => {
       r.text(),
     );
     expect(scrape).toMatch(/aisix_requests_total\{[^}]*status="413"/);
+  });
+
+  test("chunked oversize body: the handler that rejected it records the refusal", async (ctx) => {
+    if (!etcdReachable || !app) {
+      ctx.skip();
+      return;
+    }
+
+    // No Content-Length, so the middleware can't judge the request up
+    // front: it reaches the handler, whose body extractor rejects once
+    // the cap is crossed. Same blindness one layer further in, so it
+    // needs its own coverage. `/v1/completions` isolates the count —
+    // nothing else in this suite calls it.
+    const before = countRefusals(app.output());
+
+    const chunk = "x".repeat(512 * 1024);
+    const body = new ReadableStream({
+      start(controller) {
+        for (let i = 0; i < 22; i++) controller.enqueue(new TextEncoder().encode(chunk));
+        controller.close();
+      },
+    });
+    // A client streaming into a cap can legitimately lose the connection
+    // mid-write instead of reading the 413 — the failure mode the
+    // Content-Length path exists to avoid and this one cannot. The
+    // gateway's record is the subject here, so tolerate either outcome.
+    await fetch(`${app.proxyUrl}/v1/completions`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${CALLER_PLAINTEXT}`,
+        "content-type": "application/json",
+      },
+      body,
+      duplex: "half",
+    } as RequestInit & { duplex: "half" }).catch(() => undefined);
+
+    await waitConfigPropagation(async () => countRefusals(app!.output()) > before);
+    const line = app
+      .output()
+      .split("\n")
+      .filter((l) => isRefusal(l))
+      .at(-1)!;
+    expect(line).toMatch(/status=413/);
+    expect(line).toMatch(/request body exceeds/);
+    // Auth ran before the body extractor here, so unlike the
+    // middleware's short-circuit the refusal is attributable to a caller.
+    expect(line).toMatch(/api_key_id/);
   });
 
   test("empty messages array: 4xx with OpenAI-shape error envelope, upstream untouched", async (ctx) => {
