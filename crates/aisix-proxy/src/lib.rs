@@ -6113,6 +6113,78 @@ data: [DONE]\n\n";
         );
     }
 
+    /// Same contract, but with an output guardrail attached — the shape that
+    /// puts an awaiting end-of-stream scan between the upstream's last chunk
+    /// and `[DONE]`. `reached_end` must be set before that scan, so pin the
+    /// outcome with one configured.
+    ///
+    /// This fixes the placement contract; it cannot reproduce the race
+    /// itself. A keyword guardrail scans locally, so its await completes
+    /// immediately and a consumer cannot realistically be dropped inside it.
+    /// The actual protection is that all five stream paths mark the flag at
+    /// upstream EOF, ahead of any scan.
+    #[tokio::test]
+    async fn streaming_chat_with_output_guardrail_reports_200_when_fully_consumed() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        let sse = "\
+data: {\"id\":\"cmpl-guard\",\"model\":\"gpt-4o-2024-08-06\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"cmpl-guard\",\"model\":\"gpt-4o-2024-08-06\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"all clear\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"cmpl-guard\",\"model\":\"gpt-4o-2024-08-06\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+data: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&upstream)
+            .await;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
+        let state = build_state(snap, hub).with_usage_sink(UsageSink::new(tx));
+        // The literal never appears in the response above, so the scan runs
+        // to completion and allows — the stream is delivered in full.
+        seed_guardrail(
+            &state.snapshot,
+            "g-eos-scan",
+            r#"{"name":"eos-scan-guard","kind":"keyword","hook_point":"output","patterns":[{"kind":"literal","value":"never-present-literal"}]}"#,
+        );
+        let app = build_router(state);
+
+        let body = serde_json::json!({
+            "model": "my-gpt4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let mut body_stream = resp.into_body().into_data_stream();
+        while body_stream.next().await.is_some() {}
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("usage event was never emitted")
+            .expect("sender dropped without sending");
+        assert_eq!(
+            event.status_code, 200,
+            "a fully consumed stream with an output guardrail must not be reported as a cancel"
+        );
+    }
+
     const CANCEL_METRIC: &str = "aisix_proxy_client_cancelled_requests_total";
 
     /// A caller that hangs up before the response head exists must still

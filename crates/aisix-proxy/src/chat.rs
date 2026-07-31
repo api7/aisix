@@ -4694,6 +4694,15 @@ where
             // a post-yield increment under-counts by 1 on every
             // abort path (#419, audit follow-up).
         }
+        // Upstream EOF — the response was delivered in full. Record it here,
+        // BEFORE the end-of-stream guardrail work below, which awaits remote
+        // provider calls and is a routine drop point: SDK clients close on
+        // the terminal frame, and a flag set after the scan would report a
+        // fully-delivered response as abandoned. This also keeps it ahead of
+        // the final `[DONE]` yield, since `async_stream::stream!` resumes the
+        // body only when the consumer pulls again. Same placement as the
+        // sibling streams in messages.rs and responses_bridge.rs.
+        guard.comp().reached_end = true;
         // Per #204: run the output guardrail on the accumulated
         // assistant content BEFORE emitting `[DONE]`. Buffer-then-
         // check is the right cadence for a blocking guardrail:
@@ -4935,12 +4944,6 @@ where
         // consumers can detect truncation. The `errored` flag is
         // set by the loop above whenever an error event is yielded
         // OR by the output-guardrail check above on a Block verdict.
-        // Mark BEFORE the final yield, not after: `async_stream::stream!`
-        // resumes the body only when the consumer pulls again, and plenty
-        // of SSE clients stop reading the moment they see `[DONE]`. A flag
-        // set after the yield would therefore stay unset for a perfectly
-        // normal request and report it as abandoned.
-        guard.comp().reached_end = true;
         if !errored {
             yield Ok::<_, Infallible>(Event::default().data("[DONE]"));
         }
