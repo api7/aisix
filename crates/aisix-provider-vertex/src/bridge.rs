@@ -121,6 +121,18 @@ impl VertexBridge {
         }
     }
 
+    /// The client this dispatch runs on: the bridge's shared one, unless
+    /// the resolved Provider Key carries its own TLS settings. The token
+    /// minter deliberately keeps the shared client — it talks to the
+    /// identity provider, not to the key's `api_base`, and a private CA
+    /// declared for the model endpoint says nothing about that host.
+    fn client_for(&self, ctx: &BridgeContext) -> Client {
+        aisix_gateway::upstream_tls::client_for_provider_key(
+            &self.client,
+            ctx.provider_key.tls.as_ref(),
+        )
+    }
+
     /// Test-only seam: replace the canonical Vertex host with this
     /// URL (e.g. a wiremock URI). Credentials, project, region,
     /// SDK-equivalent URL stitching all run normally; only the
@@ -685,7 +697,7 @@ impl Bridge for VertexBridge {
 
         let access_token = creds.resolve_access_token(&self.token_minter).await?;
         let headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
-        let client = self.client.clone();
+        let client = self.client_for(ctx);
         let started = Instant::now();
         let model_echo = req.model.clone();
 
@@ -810,7 +822,7 @@ impl VertexBridge {
         // surfaces as a Config error (operator-actionable).
         let access_token = creds.resolve_access_token(&self.token_minter).await?;
         let headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
-        let client = self.client.clone();
+        let client = self.client_for(ctx);
         let started = Instant::now();
 
         with_deadline(ctx.deadline, started, async move {
@@ -902,7 +914,7 @@ impl VertexBridge {
 
         let access_token = creds.resolve_access_token(&self.token_minter).await?;
         let headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
-        let client = self.client.clone();
+        let client = self.client_for(ctx);
         let started = Instant::now();
 
         with_deadline(ctx.deadline, started, async move {
@@ -986,7 +998,7 @@ impl VertexBridge {
         // token-mint error surfaces as a direct Err, not mid-stream.
         let access_token = creds.resolve_access_token(&self.token_minter).await?;
         let headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
-        let client = self.client.clone();
+        let client = self.client_for(ctx);
         let started = Instant::now();
 
         let resp = with_deadline(ctx.deadline, started, async move {
@@ -1094,7 +1106,7 @@ impl VertexBridge {
 
         let access_token = creds.resolve_access_token(&self.token_minter).await?;
         let headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
-        let client = self.client.clone();
+        let client = self.client_for(ctx);
         let started = Instant::now();
 
         with_deadline(ctx.deadline, started, async move {
@@ -1147,7 +1159,7 @@ impl VertexBridge {
         // token-mint error surfaces as a direct Err, not mid-stream.
         let access_token = creds.resolve_access_token(&self.token_minter).await?;
         let headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
-        let client = self.client.clone();
+        let client = self.client_for(ctx);
         let started = Instant::now();
 
         let resp = with_deadline(ctx.deadline, started, async move {
@@ -1280,7 +1292,7 @@ impl VertexBridge {
 
         let access_token = creds.resolve_access_token(&self.token_minter).await?;
         let headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
-        let client = self.client.clone();
+        let client = self.client_for(ctx);
         let started = Instant::now();
 
         with_deadline(ctx.deadline, started, async move {
@@ -1346,7 +1358,7 @@ impl VertexBridge {
         // token-mint error surfaces as a direct Err, not mid-stream.
         let access_token = creds.resolve_access_token(&self.token_minter).await?;
         let headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
-        let client = self.client.clone();
+        let client = self.client_for(ctx);
         let started = Instant::now();
 
         let resp = with_deadline(ctx.deadline, started, async move {
@@ -1457,7 +1469,7 @@ impl VertexBridge {
         // as a direct Err return rather than being yielded mid-stream.
         let access_token = creds.resolve_access_token(&self.token_minter).await?;
         let headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
-        let client = self.client.clone();
+        let client = self.client_for(ctx);
         let started = Instant::now();
 
         let resp = with_deadline(ctx.deadline, started, async move {

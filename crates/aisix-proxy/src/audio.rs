@@ -655,7 +655,7 @@ async fn multipart_dispatch(
         ),
     );
 
-    let client = crate::http_client::client();
+    let client = crate::http_client::client_for(pk_entry.value.tls.as_ref());
     let tracker = &state.runtime_status;
     let model_id: &str = &model_entry.id;
     let cooldown_cfg = model.cooldown.as_ref();
@@ -1043,7 +1043,7 @@ async fn speech_dispatch(
         ),
     );
 
-    let client = crate::http_client::client();
+    let client = crate::http_client::client_for(pk_entry.value.tls.as_ref());
     let speech_url = crate::dispatch::build_v1_url(&base, "/audio/speech");
     let tracker = &state.runtime_status;
     let model_id: &str = &model_entry.id;

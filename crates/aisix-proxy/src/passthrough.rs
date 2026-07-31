@@ -417,7 +417,7 @@ async fn dispatch(
     let model_rl = body_model_rate_limit(&snapshot, &provider_lower, &body_bytes);
     let _reservation = crate::quota::enforce(&state, auth, model_rl.as_ref()).await?;
 
-    let client = crate::http_client::client();
+    let client = crate::http_client::client_for(pk_entry.value.tls.as_ref());
 
     // Inject upstream Authorization; strip the incoming proxy auth.
     //
