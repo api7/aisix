@@ -505,10 +505,9 @@ async fn admin_write_survives_token_expiry() {
     // `ConfigStore` doesn't expose `watch` (that's `aisix-etcd`'s
     // `ConfigProvider` side), so exercise it through a second client on the
     // same account/prefix past the same TTL window this test already
-    // waited out. This is the load-bearing check for the PR's claimed watch
-    // fix — a passing POST/GET above only proves range/get requests survive
-    // refresh, not that `EtcdWatchStream`'s ownership change keeps a watch
-    // gRPC stream alive and authenticated.
+    // waited out. A passing POST/GET above only proves range/get requests
+    // survive refresh; this verifies that `EtcdWatchStream`'s ownership
+    // change also keeps a watch gRPC stream alive and authenticated.
     let watch_options = etcd_client::ConnectOptions::new().with_user(user, password);
     let watch_provider = aisix_etcd::EtcdConfigProvider::connect(
         std::slice::from_ref(&url),
