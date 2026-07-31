@@ -487,6 +487,8 @@ async fn admin_write_survives_token_expiry() {
         "admin write after token-TTL window should succeed; a non-OK \
          status here means the auth-token refresh loop isn't running",
     );
+    let created = body_json(resp).await;
+    let post_expiry_id = created["id"].as_str().expect("created.id").to_string();
 
     let app = build_router(state.clone());
     let resp = app.oneshot(auth_get("/admin/v1/models")).await.unwrap();
@@ -498,7 +500,7 @@ async fn admin_write_survives_token_expiry() {
     let listed = body_json(resp).await;
     let arr = listed.as_array().expect("list array");
     assert_eq!(arr.len(), 1, "should have the post-expiry model");
-    assert_eq!(arr[0]["display_name"], "post-expiry");
+    assert_eq!(arr[0]["id"], post_expiry_id);
 
     // `ConfigStore` doesn't expose `watch` (that's `aisix-etcd`'s
     // `ConfigProvider` side), so exercise it through a second client on the
