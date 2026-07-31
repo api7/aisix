@@ -119,8 +119,9 @@ cache:
   # `redis` block below (validated at boot).
   backend: "memory"   # memory | redis
   # redis:
-  #   # mode picks the topology. Credentials and TLS (rediss://) travel
-  #   # inside the URLs, as in single mode.
+  #   # mode picks the topology. Credentials travel inside the URLs, as
+  #   # in single mode; a `rediss://` URL turns TLS on and the `tls` block
+  #   # below configures what it trusts.
   #   mode: "single"   # single | cluster | sentinel
   #   # mode: single  → one endpoint:
   #   url: "redis://127.0.0.1:6379"
@@ -136,6 +137,19 @@ cache:
   #   # username: "default"      # Redis ACL user (cluster nodes / sentinel master)
   #   # password: "s3cret"
   #   # database: 0              # DB index for the sentinel master (not used by cluster)
+  #   # Trust settings for a `rediss://` URL, ignored on plaintext
+  #   # `redis://`. Separate from `upstream.tls` because an in-cluster
+  #   # Redis is normally issued by a different authority than the model
+  #   # endpoints. Same fields and same meanings.
+  #   # tls:
+  #   #   ca_file: "/etc/aisix/tls/redis-ca.pem"
+  #   #   client_cert_file: "/etc/aisix/tls/redis-client.crt"
+  #   #   client_key_file:  "/etc/aisix/tls/redis-client.key"
+  #   #   verify: true
+  #   # NOTE: in sentinel mode the client library accepts no custom trust
+  #   # roots for the master it discovers, so ca_file does not apply there
+  #   # (it is logged at startup). Use SSL_CERT_FILE or the system trust
+  #   # store for that one case; `verify` does apply.
 
 # Rate-limit counter backend (api7/AISIX-Cloud#798).
 #
@@ -155,6 +169,7 @@ ratelimit:
   #   # nodes: ["redis://10.0.0.1:6379"]        # mode: cluster
   #   # sentinels: ["redis://10.0.0.1:26379"]   # mode: sentinel
   #   # master_name: "mymaster"                  # mode: sentinel
+  #   # tls: { ca_file: "/etc/aisix/tls/redis-ca.pem" }   # for rediss://
   # Seconds before an unreleased concurrency slot (crashed replica /
   # hung upstream) is reclaimed. Redis backend only.
   # concurrency_ttl_secs: 300
@@ -214,6 +229,38 @@ upstream:
   # the provider's own edge performs, so raising this multiplies the load a
   # struggling upstream sees.
   # retries: 2
+
+  # Trust settings for the TLS handshake with every upstream: the provider
+  # bridges, guardrail services, MCP and A2A upstreams, OIDC/JWKS fetches,
+  # the Realtime WebSocket, Bedrock, and the log-export object stores.
+  #
+  # Unset, the trust store is the platform's — the built-in root set plus
+  # whatever SSL_CERT_FILE / SSL_CERT_DIR point at. Those environment
+  # variables keep working and stay additive; ca_file is the same idea
+  # expressed in config instead of in the process environment.
+  # tls:
+  #   # PEM file of one or more certificates to trust as issuers, for an
+  #   # upstream whose certificate is signed by a private or enterprise CA.
+  #   # ADDITIVE: public providers stay reachable. A full chain in one
+  #   # bundle works — every certificate in the file is loaded.
+  #   ca_file: "/etc/aisix/tls/private-ca.pem"
+  #
+  #   # Client certificate for upstreams that require mutual TLS. Both
+  #   # fields are required together.
+  #   # client_cert_file: "/etc/aisix/tls/client.crt"
+  #   # client_key_file:  "/etc/aisix/tls/client.key"
+  #
+  #   # false accepts ANY certificate — expired, issued for another host,
+  #   # or presented by an interceptor — which removes the only thing
+  #   # stopping a machine-in-the-middle from reading and rewriting every
+  #   # prompt, response, and upstream API key on the connection. For a
+  #   # test environment where the alternative is not running at all;
+  #   # prefer ca_file everywhere else.
+  #   #
+  #   # Two paths cannot honour it and log so at startup: Bedrock (the AWS
+  #   # SDK's HTTP stack cannot disable verification, and cannot present a
+  #   # client certificate either), and Redis in sentinel mode.
+  #   # verify: true
 
 # Connection-layer settings for the inbound side — the clients, or the
 # gateway in front of this one, talking to the listeners above. The

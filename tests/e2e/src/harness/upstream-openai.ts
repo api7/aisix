@@ -1,4 +1,5 @@
 import { createServer, type Server } from "node:http";
+import { createServer as createTlsServer } from "node:https";
 import { pickFreePort } from "./ports.js";
 
 export interface OpenAiUpstreamOptions {
@@ -49,6 +50,13 @@ export interface OpenAiUpstreamOptions {
    * from the upstream when computing the cooldown TTL.
    */
   responseHeaders?: Record<string, string>;
+  /**
+   * Serve HTTPS with this key/cert pair (PEM) instead of plain HTTP, so
+   * `baseUrl` is `https://…`. Used by the outbound-TLS specs to stand up
+   * an upstream whose certificate is signed by a private CA the gateway
+   * does not trust out of the box.
+   */
+  tls?: { key: string | Buffer; cert: string | Buffer };
 }
 
 export interface OpenAiUpstreamStep {
@@ -97,7 +105,10 @@ export async function startOpenAiUpstream(
   const received: ReceivedRequest[] = [];
   let requestIndex = 0;
 
-  const server: Server = createServer((req, res) => {
+  const handler = (
+    req: import("node:http").IncomingMessage,
+    res: import("node:http").ServerResponse,
+  ) => {
     // When the gateway abandons a slow upstream (e.g. a #554 request/stream
     // timeout fires and the client connection is dropped), a later
     // `res.write`/`res.end` here would emit an error on a closed socket.
@@ -208,13 +219,17 @@ export async function startOpenAiUpstream(
         ),
       );
     });
-  });
+  };
+
+  const server: Server = opts.tls
+    ? createTlsServer({ key: opts.tls.key, cert: opts.tls.cert }, handler)
+    : createServer(handler);
 
   const port = await pickFreePort();
   await new Promise<void>((resolve) =>
     server.listen(port, "127.0.0.1", resolve),
   );
-  const baseUrl = `http://127.0.0.1:${port}`;
+  const baseUrl = `${opts.tls ? "https" : "http"}://127.0.0.1:${port}`;
 
   return {
     baseUrl,

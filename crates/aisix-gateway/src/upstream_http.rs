@@ -290,10 +290,7 @@ mod tests {
             let src = std::fs::read_to_string(&file).expect("read source");
             // Tests build throwaway clients on purpose; only the
             // production half of each file is in scope.
-            let production = match src.find("#[cfg(test)]") {
-                Some(i) => &src[..i],
-                None => &src[..],
-            };
+            let production = production_half(&src);
             // `shared_http_client()` in aisix-mcp is the sanctioned
             // counterpart of `client_builder()` for rmcp's own reqwest
             // line (rmcp pins 0.13; it gets the same
@@ -320,6 +317,105 @@ mod tests {
              `aisix_gateway::client_builder()`:\n{}",
             offenders.join("\n"),
         );
+    }
+
+    /// The outbound stacks that are *not* reqwest each have exactly one
+    /// sanctioned construction site, and each of those sites is the only
+    /// thing standing between `upstream.tls` and a client that quietly
+    /// trusts the wrong set of roots.
+    ///
+    /// Nothing else catches a regression here: a client built without the
+    /// shared trust material works perfectly against every public
+    /// provider and fails only against the private CA the setting exists
+    /// for — which is to say, only in the customer's environment.
+    ///
+    /// Each entry is (probe, what the file must also mention, why).
+    #[test]
+    fn every_non_reqwest_outbound_stack_applies_the_shared_tls_settings() {
+        const RULES: &[(&str, &str, &str)] = &[
+            (
+                // Catches a *new* WebSocket call site: `connect_async`
+                // builds its own connector over webpki roots only.
+                "tokio_tungstenite::connect_async(",
+                "rustls_client_config",
+                "the Realtime WebSocket must dial through the shared rustls config \
+                 (`connect_async` builds its own connector over webpki roots only)",
+            ),
+            (
+                // Catches the existing call site being weakened — passing
+                // `Connector::Plain` or `None` still compiles and still
+                // connects, just to a different set of roots.
+                "connect_async_tls_with_config",
+                "rustls_client_config",
+                "the Realtime WebSocket connector must come from \
+                 `upstream_tls::rustls_client_config()`",
+            ),
+            (
+                "aws_config::SdkConfig::builder()",
+                "aws_http_client",
+                "Bedrock SDK clients must be built on `upstream_tls::aws_http_client()`",
+            ),
+            (
+                "AmazonS3Builder::",
+                "tls_client_options",
+                "object-store exporters must pass `tls_client_options()` as client options",
+            ),
+            (
+                "MicrosoftAzureBuilder::",
+                "tls_client_options",
+                "object-store exporters must pass `tls_client_options()` as client options",
+            ),
+            (
+                "GoogleCloudStorageBuilder::",
+                "tls_client_options",
+                "object-store exporters must pass `tls_client_options()` as client options",
+            ),
+        ];
+
+        let crates_dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/.."));
+        let mut offenders = Vec::new();
+        for file in rust_sources(crates_dir) {
+            let src = std::fs::read_to_string(&file).expect("read source");
+            let production = production_half(&src);
+            for (probe, required, why) in RULES {
+                if production.contains(probe) && !production.contains(required) {
+                    offenders.push(format!("{}: {}", file.display(), why));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "these reach an external service without the deployment's outbound TLS \
+             trust:\n{}",
+            offenders.join("\n"),
+        );
+    }
+
+    /// The part of a source file that is not the test module.
+    ///
+    /// Cuts at the top-level `#[cfg(test)] mod …` specifically, not at
+    /// the first `#[cfg(test)]` anywhere: that attribute is also used on
+    /// struct fields and match arms, several of which appear near the
+    /// top of a file, and cutting there silently excused everything
+    /// below from every scan in this module.
+    fn production_half(src: &str) -> &str {
+        const MARKER: &str = "\n#[cfg(test)]\nmod ";
+        match src.find(MARKER) {
+            Some(i) => &src[..i],
+            None => src,
+        }
+    }
+
+    /// The scans above are only worth their runtime if they actually see
+    /// the whole file — an early `#[cfg(test)]` field attribute used to
+    /// hide every call site under it.
+    #[test]
+    fn production_half_cuts_at_the_test_module_not_a_field_attribute() {
+        let src = "struct S {\n    #[cfg(test)]\n    probe: bool,\n}\nfn f() {}\n\
+                   #[cfg(test)]\nmod tests {\n    fn t() {}\n}\n";
+        let production = production_half(src);
+        assert!(production.contains("fn f()"), "{production}");
+        assert!(!production.contains("fn t()"), "{production}");
     }
 
     fn rust_sources(dir: &std::path::Path) -> Vec<std::path::PathBuf> {

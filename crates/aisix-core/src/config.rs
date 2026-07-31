@@ -1853,6 +1853,112 @@ observability:
         assert_eq!(cfg.observability.metrics.prometheus.addr, "0.0.0.0:9090");
     }
 
+    /// The block the issue reports as missing. `AISIX_UPSTREAM_SSL_VERIFY`
+    /// used to be rejected at boot with "unknown field", and the error
+    /// listed every section *except* a place to put a CA.
+    #[test]
+    fn loads_the_upstream_tls_block() {
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+upstream:
+  tls:
+    ca_file: "/etc/aisix/tls/private-ca.pem"
+    client_cert_file: "/etc/aisix/tls/client.crt"
+    client_key_file: "/etc/aisix/tls/client.key"
+    verify: false
+"#,
+        );
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert_eq!(
+            cfg.upstream.tls.ca_file.as_deref(),
+            Some("/etc/aisix/tls/private-ca.pem")
+        );
+        assert!(!cfg.upstream.tls.verify);
+    }
+
+    /// Verification must stay on for a deployment that never mentions
+    /// TLS — the block is `#[serde(default)]`, and a derived `Default`
+    /// would have made `verify` false.
+    #[test]
+    fn omitting_the_tls_block_keeps_verification_on() {
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+"#,
+        );
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert!(cfg.upstream.tls.verify);
+        assert!(cfg.upstream.tls.is_default());
+    }
+
+    /// Half an identity is silently dropped by every TLS stack and then
+    /// surfaces much later as a 4xx from a peer that wanted mutual TLS.
+    #[test]
+    fn a_client_certificate_without_its_key_is_rejected_at_boot() {
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+upstream:
+  tls:
+    client_cert_file: "/etc/aisix/tls/client.crt"
+"#,
+        );
+        let err = Config::load_from_path(Some(f.path()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("client_key_file"), "{err}");
+    }
+
+    #[test]
+    fn redis_carries_its_own_tls_block() {
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+ratelimit:
+  backend: redis
+  redis:
+    mode: single
+    url: "rediss://redis.internal:6379"
+    tls:
+      ca_file: "/etc/aisix/tls/redis-ca.pem"
+"#,
+        );
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        let redis = cfg.ratelimit.redis.as_ref().unwrap();
+        assert_eq!(
+            redis.tls.ca_file.as_deref(),
+            Some("/etc/aisix/tls/redis-ca.pem")
+        );
+        // Independent of the upstream block: the two peers are issued by
+        // different authorities in every real deployment.
+        assert!(cfg.upstream.tls.is_default());
+    }
+
     #[test]
     fn rejects_unknown_fields() {
         let f = write_yaml(
