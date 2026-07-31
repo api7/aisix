@@ -69,18 +69,24 @@ pub async fn count_tokens(
         Ok(a) => a,
         Err(e) => return e.into_anthropic_response(),
     };
+    let started = Instant::now();
     let Json(body) = match body {
         Ok(j) => j,
+        // Answer through `reject` — see messages.rs.
         Err(rej) => {
-            return crate::error::proxy_error_from_json_rejection(
-                rej,
-                state.request_body_limit_bytes,
-            )
-            .into_anthropic_response();
+            return crate::reject::reject_before_dispatch(
+                &state,
+                "POST",
+                "/v1/messages/count_tokens",
+                &client.request_id,
+                Some(&auth.entry.id),
+                started,
+                crate::reject::Envelope::Anthropic,
+                crate::error::proxy_error_from_json_rejection(rej, state.request_body_limit_bytes),
+            );
         }
     };
 
-    let started = Instant::now();
     let request_id = client.request_id.clone();
     let api_key_id = auth.entry.id.clone();
 

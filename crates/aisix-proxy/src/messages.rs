@@ -84,22 +84,28 @@ pub async fn messages(
         Ok(a) => a,
         Err(e) => return e.into_anthropic_response(),
     };
+    let started = Instant::now();
     let Json(mut body) = match body {
         Ok(j) => j,
         Err(rej) => {
             // Classify the body-extractor failure (malformed JSON vs
             // 413 cap vs transport read error) via the shared helper so
             // /v1/messages and /v1/messages/count_tokens stay in lockstep
-            // on the discrimination rules, then render the Anthropic-
-            // shape envelope the Claude SDK can parse (#336).
-            return crate::error::proxy_error_from_json_rejection(
-                rej,
-                state.request_body_limit_bytes,
-            )
-            .into_anthropic_response();
+            // on the discrimination rules, then answer through `reject`,
+            // which renders the Anthropic-shape envelope the Claude SDK
+            // can parse (#336) and emits the access log + metrics.
+            return crate::reject::reject_before_dispatch(
+                &state,
+                "POST",
+                "/v1/messages",
+                &client.request_id,
+                Some(&auth.entry.id),
+                started,
+                crate::reject::Envelope::Anthropic,
+                crate::error::proxy_error_from_json_rejection(rej, state.request_body_limit_bytes),
+            );
         }
     };
-    let started = Instant::now();
     let request_id = client.request_id.clone();
     let api_key_id = auth.entry.id.clone();
 

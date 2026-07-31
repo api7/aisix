@@ -94,30 +94,21 @@ pub async fn chat_completions(
     let path = "/v1/chat/completions";
     let mut req = match body {
         Ok(Json(r)) => r,
+        // Classify the body-extractor failure (malformed JSON vs 413 cap
+        // vs transport read error) via the shared helper, then answer
+        // through `reject` so the rejection lands in the access log and
+        // the request metrics like every other terminal path here.
         Err(rej) => {
-            use axum::extract::rejection::JsonRejection;
-            use axum::http::StatusCode;
-            // BytesRejection → distinguish 413 (PAYLOAD_TOO_LARGE,
-            // real per-extractor cap exceeded) from 400 (transport-
-            // side read failure). `JsonRejection` is `#[non_exhaustive]`
-            // so the fallback `_` arm catches today's JsonDataError
-            // (the #324 case) / JsonSyntaxError / MissingJsonContentType
-            // AND any future variant axum adds, defaulting to 400
-            // until each new variant gets an explicit policy decision.
-            return match rej {
-                JsonRejection::BytesRejection(inner)
-                    if inner.status() == StatusCode::PAYLOAD_TOO_LARGE =>
-                {
-                    ProxyError::RequestTooLarge {
-                        limit_bytes: state.request_body_limit_bytes,
-                    }
-                }
-                JsonRejection::BytesRejection(_) => {
-                    ProxyError::InvalidRequest("failed to read request body".into())
-                }
-                _ => ProxyError::InvalidRequest("invalid JSON request body".into()),
-            }
-            .into_response();
+            return crate::reject::reject_before_dispatch(
+                &state,
+                method,
+                path,
+                &client.request_id,
+                Some(&auth.entry.id),
+                started,
+                crate::reject::Envelope::OpenAi,
+                crate::error::proxy_error_from_json_rejection(rej, state.request_body_limit_bytes),
+            );
         }
     };
     let request_id = client.request_id.clone();

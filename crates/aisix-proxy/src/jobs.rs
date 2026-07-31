@@ -1027,17 +1027,23 @@ pub(crate) async fn create_batch(
     // text/plain rejection — see completions.rs.
     body: Result<Bytes, axum::extract::rejection::BytesRejection>,
 ) -> Response {
+    let started = Instant::now();
     let body = match body {
         Ok(bytes) => bytes,
+        // Answer through `reject` — see completions.rs.
         Err(rej) => {
-            return crate::error::proxy_error_from_bytes_rejection(
-                rej,
-                state.request_body_limit_bytes,
-            )
-            .into_response();
+            return crate::reject::reject_before_dispatch(
+                &state,
+                "POST",
+                "/v1/batches",
+                &client.request_id,
+                Some(&auth.entry.id),
+                started,
+                crate::reject::Envelope::OpenAi,
+                crate::error::proxy_error_from_bytes_rejection(rej, state.request_body_limit_bytes),
+            );
         }
     };
-    let started = Instant::now();
     let request_id = client.request_id.clone();
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
 
@@ -1267,17 +1273,23 @@ pub(crate) async fn create_ft_job(
     // text/plain rejection — see completions.rs.
     body: Result<Bytes, axum::extract::rejection::BytesRejection>,
 ) -> Response {
+    let started = Instant::now();
     let body = match body {
         Ok(bytes) => bytes,
+        // Answer through `reject` — see completions.rs.
         Err(rej) => {
-            return crate::error::proxy_error_from_bytes_rejection(
-                rej,
-                state.request_body_limit_bytes,
-            )
-            .into_response();
+            return crate::reject::reject_before_dispatch(
+                &state,
+                "POST",
+                "/v1/fine_tuning/jobs",
+                &client.request_id,
+                Some(&auth.entry.id),
+                started,
+                crate::reject::Envelope::OpenAi,
+                crate::error::proxy_error_from_bytes_rejection(rej, state.request_body_limit_bytes),
+            );
         }
     };
-    let started = Instant::now();
     let request_id = client.request_id.clone();
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
 

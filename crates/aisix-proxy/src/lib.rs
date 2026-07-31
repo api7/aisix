@@ -53,6 +53,7 @@ mod passthrough;
 mod quota;
 mod realtime;
 mod redact;
+mod reject;
 mod render;
 mod request_id;
 mod rerank;
@@ -79,7 +80,7 @@ use aisix_obs::AccessLog;
 use axum::extract::State;
 use axum::http::{header, HeaderValue, Request};
 use axum::middleware::{self, Next};
-use axum::response::{IntoResponse, Response};
+use axum::response::Response;
 use axum::routing::{any, get, post};
 use axum::Router;
 use tower_http::set_header::SetResponseHeaderLayer;
@@ -445,11 +446,18 @@ impl Drop for ClientCancelGuard {
 /// `fetch` both set Content-Length for non-streamed POSTs, and
 /// without this middleware they see ECONNRESET (indistinguishable
 /// from a network failure or a gateway crash) instead of 413.
+///
+/// Both short-circuits answer through [`crate::reject`], so a request
+/// refused here still produces the access-log line and request metrics
+/// every other terminal path emits — the handler it never reached can't
+/// do it. The logged latency spans the body drain below, which is what
+/// an oversize request actually costs the gateway.
 async fn enforce_request_body_limit(
     State(state): State<ProxyState>,
     request: Request<axum::body::Body>,
     next: Next,
 ) -> Response {
+    let started = std::time::Instant::now();
     // /v1/messages must emit the Anthropic-shape error envelope
     // (closes #336). The middleware runs BEFORE the handler so the
     // handler's `into_anthropic_response()` would never see the
@@ -468,12 +476,10 @@ async fn enforce_request_body_limit(
     let path = request.uri().path();
     let is_anthropic_path =
         path == "/v1/messages" || path == "/v1/messages/" || path == "/v1/messages/count_tokens";
-    let render = |e: ProxyError| -> Response {
-        if is_anthropic_path {
-            e.into_anthropic_response()
-        } else {
-            e.into_response()
-        }
+    let envelope = if is_anthropic_path {
+        reject::Envelope::Anthropic
+    } else {
+        reject::Envelope::OpenAi
     };
     // RFC 9110 §8.6 — a server SHOULD reject a request that carries
     // duplicate or conflicting `Content-Length` values rather than
@@ -484,9 +490,16 @@ async fn enforce_request_body_limit(
         .iter();
     let first = content_lengths.next();
     if content_lengths.next().is_some() {
-        return render(ProxyError::InvalidRequest(
-            "conflicting Content-Length headers".into(),
-        ));
+        return reject::reject_before_dispatch(
+            &state,
+            request.method().as_str(),
+            request.uri().path(),
+            &request_id_of(&request),
+            None,
+            started,
+            envelope,
+            ProxyError::InvalidRequest("conflicting Content-Length headers".into()),
+        );
     }
     // `0` = the cap is disabled; the duplicate-Content-Length rejection
     // above still applies — that one is request-smuggling hygiene, not a
@@ -496,17 +509,43 @@ async fn enforce_request_body_limit(
         .and_then(|s| s.parse::<usize>().ok())
     {
         if state.request_body_limit_bytes > 0 && declared > state.request_body_limit_bytes {
+            // Capture what the access log needs before the body move
+            // below consumes the request.
+            let method = request.method().clone();
+            let path = request.uri().path().to_string();
+            let request_id = request_id_of(&request);
             // Drain the inbound body so hyper can flush the 413 response
             // on the same HTTP/1.1 connection. Without this, hyper closes
             // the socket while the client is still writing, and the client
             // sees EPIPE/ECONNRESET instead of the 413.
             drain_body(request.into_body()).await;
-            return render(ProxyError::RequestTooLarge {
-                limit_bytes: state.request_body_limit_bytes,
-            });
+            return reject::reject_before_dispatch(
+                &state,
+                method.as_str(),
+                &path,
+                &request_id,
+                None,
+                started,
+                envelope,
+                ProxyError::RequestTooLarge {
+                    limit_bytes: state.request_body_limit_bytes,
+                },
+            );
         }
     }
     next.run(request).await
+}
+
+/// The id `ensure_request_id` (the outermost layer) minted for this
+/// request, so a rejection logged here joins the `x-aisix-request-id` the
+/// caller was handed. The fallback only covers a router assembled without
+/// that layer — every shipped path has it.
+fn request_id_of(request: &Request<axum::body::Body>) -> String {
+    request
+        .extensions()
+        .get::<request_id::RequestId>()
+        .map(|r| r.0.clone())
+        .unwrap_or_else(request_id::new_request_id)
 }
 
 /// Read and discard the inbound body, bounded by both bytes and time.
@@ -1639,6 +1678,75 @@ mod tests {
             "limit 0 must not cap a chunked body at axum's 2 MiB default"
         );
         assert!(resp.status().is_server_error());
+    }
+
+    /// A body-cap rejection short-circuits BEFORE any handler runs, and
+    /// both the access log and the request metrics are emitted BY the
+    /// handlers — so pre-fix a caller got a 413 the gateway kept no
+    /// record of: nothing in the log, no `aisix_requests_total` sample.
+    /// "Client reports 413, gateway shows nothing" was indistinguishable
+    /// from the request never arriving.
+    ///
+    /// The metric is what this asserts, because it is per-`ProxyState`
+    /// and so unaffected by whatever else the suite is doing; the log
+    /// line — process-global tracing state, not safely assertable from a
+    /// parallel unit test — is pinned end-to-end in the `body-edges` E2E.
+    #[tokio::test]
+    async fn body_cap_short_circuit_is_counted_like_any_other_terminal_path() {
+        let hub = Arc::new(Hub::new());
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
+        let state = build_state(snap, hub); // 1 MiB cap from cfg()
+        let app = build_router(state.clone());
+
+        let oversized = 2 * 1024 * 1024;
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .header("content-length", oversized.to_string())
+            .body(Body::from(
+                r#"{"model":"my-gpt4","messages":[{"role":"user","content":"hi"}]}"#,
+            ))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        let scrape = state.metrics.render();
+        assert!(
+            scrape.contains("aisix_requests_total") && scrape.contains(r#"status="413""#),
+            "the 413 must be counted, got: {scrape}"
+        );
+    }
+
+    /// The chunked path reaches the handler, which rejects at its body
+    /// extractor and returns before the dispatch tail — silent for the
+    /// same reason, one layer further in. Locks the handler-side half.
+    #[tokio::test]
+    async fn chunked_oversize_rejection_is_counted_like_any_other_terminal_path() {
+        let hub = Arc::new(Hub::new());
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
+        let state = build_state(snap, hub);
+        let app = build_router(state.clone());
+
+        let chunk = vec![b'x'; 200 * 1024];
+        let stream =
+            futures::stream::iter((0..10).map(move |_| Ok::<_, std::io::Error>(chunk.clone())));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from_stream(stream))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        let scrape = state.metrics.render();
+        assert!(
+            scrape.contains(r#"status="413""#),
+            "the 413 must be counted, got: {scrape}"
+        );
     }
 
     /// The duplicate-Content-Length rejection is smuggling hygiene, not

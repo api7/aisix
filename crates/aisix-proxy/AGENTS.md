@@ -28,6 +28,29 @@ interval) so a model that is slow to its first token doesn't look like an
 abandoned connection to a proxy in front. Only for SSE: the same wrapper on an
 opaque binary passthrough (audio, images) corrupts it.
 
+## Every terminal path emits the access log — including the ones that give up early
+
+The access log and `record_request` are emitted **by the handler**, at the end of
+dispatch, because that is the only place that knows the provider, model and token
+counts. A path that returns before reaching that tail therefore logs nothing, and
+nothing errors: the caller gets a correct status while the gateway keeps no record
+of the request, which is indistinguishable from the request never arriving.
+
+Two shapes give up early, and both must answer through
+`reject::reject_before_dispatch` (it renders the envelope *and* emits the
+telemetry, so the two can't drift apart):
+
+- **Middleware short-circuits** — anything that returns instead of calling
+  `next.run(request)` (see `enforce_request_body_limit`). These run ahead of
+  authentication, so they pass `api_key_id: None`.
+- **Extractor rejections a handler unwraps at its top** — the
+  `Result<Json<T>, JsonRejection>` / `Result<Bytes, BytesRejection>` parameters.
+  Auth already ran here, so pass the key id.
+
+A handler that instead wraps its whole dispatch and logs the wrapper's status
+(`/mcp`, `/a2a`, `/passthrough`, `/v1/videos`, `/v1/files`) is already covered —
+don't add a second emit to those, or the request logs twice.
+
 ## A per-model gate must say whether it binds the requested entry or each target
 
 `resolve_attempt_models` expands a routing model into targets, so `model_entry` /

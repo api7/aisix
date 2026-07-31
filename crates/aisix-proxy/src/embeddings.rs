@@ -98,29 +98,20 @@ pub async fn embeddings(
     let api_key_id = auth.entry.id.clone();
     let body = match body {
         Ok(Json(b)) => b,
+        // Classification stays in the shared helper so this route can't
+        // drift from its siblings on the 413-vs-400 rules; `reject` gives
+        // the refusal the same access log + metrics a served request gets.
         Err(rej) => {
-            use axum::extract::rejection::JsonRejection;
-            // BytesRejection → distinguish 413 (PAYLOAD_TOO_LARGE,
-            // real per-extractor cap exceeded) from 400 (transport-
-            // side read failure). `JsonRejection` is `#[non_exhaustive]`
-            // so the fallback `_` arm catches today's JsonDataError
-            // (the #401 case) / JsonSyntaxError / MissingJsonContentType
-            // AND any future variant axum adds, defaulting to 400
-            // until each new variant gets an explicit policy decision.
-            return match rej {
-                JsonRejection::BytesRejection(inner)
-                    if inner.status() == StatusCode::PAYLOAD_TOO_LARGE =>
-                {
-                    ProxyError::RequestTooLarge {
-                        limit_bytes: state.request_body_limit_bytes,
-                    }
-                }
-                JsonRejection::BytesRejection(_) => {
-                    ProxyError::InvalidRequest("failed to read request body".into())
-                }
-                _ => ProxyError::InvalidRequest("invalid JSON request body".into()),
-            }
-            .into_response();
+            return crate::reject::reject_before_dispatch(
+                &state,
+                "POST",
+                "/v1/embeddings",
+                &request_id,
+                Some(&api_key_id),
+                started,
+                crate::reject::Envelope::OpenAi,
+                crate::error::proxy_error_from_json_rejection(rej, state.request_body_limit_bytes),
+            );
         }
     };
     let model_name = body.model.clone();
