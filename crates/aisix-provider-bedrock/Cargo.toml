@@ -10,7 +10,7 @@ description = "aisix: AWS Bedrock runtime provider bridge (skeleton — multi-pu
 
 [dependencies]
 aisix-core = { path = "../aisix-core" }
-aisix-gateway = { path = "../aisix-gateway" }
+aisix-gateway = { path = "../aisix-gateway", features = ["aws"] }
 # Reuse Anthropic Messages request/response wire types for the
 # `anthropic.*` Bedrock publisher (Claude on Bedrock) non-stream
 # /invoke path. The body shape is the Anthropic Messages API minus

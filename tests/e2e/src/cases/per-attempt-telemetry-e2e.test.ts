@@ -35,11 +35,19 @@ interface OtlpReceiver {
   url: string;
   /** All span attribute maps recorded across every posted batch. */
   spanAttrs: Array<Record<string, string>>;
+  /**
+   * Same spans, plus the emitted `latency_ms`. The sink derives a span's
+   * start from `occurred_at - latency_ms`, so `end - start` recovers the
+   * UsageEvent's `latency_ms` exactly (`occurred_at`'s second-level
+   * precision cancels out in the subtraction).
+   */
+  spans: Array<{ attrs: Record<string, string>; latencyMs: number }>;
   close(): Promise<void>;
 }
 
 async function startOtlpReceiver(): Promise<OtlpReceiver> {
   const spanAttrs: Array<Record<string, string>> = [];
+  const spans: Array<{ attrs: Record<string, string>; latencyMs: number }> = [];
   const server: Server = createServer((req, res) => {
     let raw = "";
     req.on("data", (c: Buffer) => (raw += c.toString("utf8")));
@@ -56,6 +64,12 @@ async function startOtlpReceiver(): Promise<OtlpReceiver> {
                   v.stringValue ?? String(v.intValue ?? v.boolValue ?? "");
               }
               spanAttrs.push(attrs);
+              const latencyMs = Number(
+                (BigInt(span.endTimeUnixNano ?? 0) -
+                  BigInt(span.startTimeUnixNano ?? 0)) /
+                  1_000_000n,
+              );
+              spans.push({ attrs, latencyMs });
             }
           }
         }
@@ -71,6 +85,7 @@ async function startOtlpReceiver(): Promise<OtlpReceiver> {
   return {
     url: `http://127.0.0.1:${port}/v1/traces`,
     spanAttrs,
+    spans,
     async close() {
       await new Promise<void>((resolve, reject) => {
         server.close((err) => (err ? reject(err) : resolve()));
@@ -96,6 +111,33 @@ async function waitForAttempts(
   throw new Error(
     `expected ${count} attempt spans for request_id=${requestId}, ` +
       `saw ${recv.spanAttrs.filter((a) => a["aisix.request_id"] === requestId).length}`,
+  );
+}
+
+/** Like `waitForAttempts`, but keeps each span's recovered `latency_ms`. */
+async function waitForAttemptSpans(
+  recv: OtlpReceiver,
+  requestId: string,
+  count: number,
+  timeoutMs = 10_000,
+): Promise<Array<{ attrs: Record<string, string>; latencyMs: number }>> {
+  const deadline = Date.now() + timeoutMs;
+  const matching = () =>
+    recv.spans.filter((s) => s.attrs["aisix.request_id"] === requestId);
+  while (Date.now() < deadline) {
+    const hits = matching();
+    if (hits.length >= count) {
+      return hits.sort(
+        (a, b) =>
+          Number(a.attrs["aisix.attempt_index"]) -
+          Number(b.attrs["aisix.attempt_index"]),
+      );
+    }
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  throw new Error(
+    `expected ${count} attempt spans for request_id=${requestId}, ` +
+      `saw ${matching().length}`,
   );
 }
 
@@ -249,5 +291,194 @@ describe("per-attempt telemetry e2e (#655): one UsageEvent per upstream attempt"
     expect(attempts[1]["http.response.status_code"]).toBe("200");
     expect(attempts[1]["gen_ai.usage.input_tokens"]).toBe("3");
     expect(attempts[1]["gen_ai.usage.output_tokens"]).toBe("4");
+  });
+
+  // `latency_ms` is documented (usage.rs) as scoped to ONE attempt, which
+  // is what makes the events summable. The winning attempt used to report
+  // the whole request instead — it measured from request entry, so it
+  // swallowed every preceding failed attempt (plus parsing, guardrails and
+  // the retry backoff) and double-counted them against the failed events'
+  // own latency.
+  //
+  // Both tests make the FAILING attempt the slow one: a correctly scoped
+  // winner is then far faster than the loser, while a request-scoped
+  // winner is necessarily slower (it contains the loser).
+  const SLOW_PRIMARY_MS = 700;
+
+  // Non-streaming coverage runs against /v1/responses: the /v1/chat/completions
+  // handler already scoped its winner correctly, while the `/v1/responses` and
+  // `/v1/messages` handlers passed the request-level elapsed through.
+  test("the winning attempt's latency_ms covers that attempt only, not the whole request", async (ctx) => {
+    if (!etcdReachable || !app || !seed || !otlp) {
+      ctx.skip();
+      return;
+    }
+
+    const primary = await startOpenAiUpstream({
+      status: 502,
+      responseDelayMs: SLOW_PRIMARY_MS,
+      errorBody: { error: { message: "slow then down", type: "server_error" } },
+    });
+    const secondary = await startOpenAiUpstream({
+      nonStreamBody: {
+        id: "resp_latency_scope",
+        object: "response",
+        status: "completed",
+        model: "gpt-4o-mini",
+        output: [
+          {
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text: "fast winner" }],
+          },
+        ],
+        usage: { input_tokens: 3, output_tokens: 4, total_tokens: 7 },
+      },
+    });
+    upstreams.push(primary, secondary);
+
+    await createOpenAiModel("latency-scope-primary", primary);
+    await createOpenAiModel("latency-scope-secondary", secondary);
+    await seed.createModel({
+      display_name: "latency-scope-virtual",
+      routing: {
+        strategy: "failover",
+        targets: [
+          { model: "latency-scope-primary" },
+          { model: "latency-scope-secondary" },
+        ],
+        retries: 0,
+        max_fallbacks: 1,
+      },
+    });
+
+    const canary = `sk-canary-latency-${Date.now()}`;
+    await seed.createApiKey({
+      key_hash: createHash("sha256").update(canary).digest("hex"),
+      allowed_models: ["*"],
+    });
+    await waitConfigPropagation(async () => {
+      const res = await fetch(`${app!.proxyUrl}/v1/models`, {
+        headers: { authorization: `Bearer ${canary}` },
+      });
+      return res.status === 200;
+    });
+
+    const res = await fetch(`${app.proxyUrl}/v1/responses`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${CALLER_PLAINTEXT}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "latency-scope-virtual",
+        input: "measure me",
+      }),
+    });
+    expect(res.status).toBe(200);
+    // The Responses passthrough labels the response `x-aisix-request-id`.
+    const requestId = res.headers.get("x-aisix-request-id");
+    expect(requestId).toBeTruthy();
+    await res.text();
+
+    const spans = await waitForAttemptSpans(otlp, requestId!, 2);
+    expect(spans[0].attrs["aisix.attempt_kind"]).toBe("initial");
+    expect(spans[1].attrs["aisix.attempt_kind"]).toBe("fallback");
+
+    // The failed initial paid the upstream's delay.
+    expect(spans[0].latencyMs).toBeGreaterThanOrEqual(SLOW_PRIMARY_MS - 100);
+    // The winner talked to a fast upstream, so its own latency is small.
+    // Request-scoped it would be >= the primary's delay instead.
+    expect(spans[1].latencyMs).toBeLessThan(SLOW_PRIMARY_MS / 2);
+    expect(spans[1].latencyMs).toBeLessThan(spans[0].latencyMs);
+  });
+
+  test("a streamed winner's latency_ms is attempt-scoped too (end-of-stream emit)", async (ctx) => {
+    if (!etcdReachable || !app || !seed || !otlp) {
+      ctx.skip();
+      return;
+    }
+
+    const primary = await startOpenAiUpstream({
+      status: 502,
+      responseDelayMs: SLOW_PRIMARY_MS,
+      errorBody: { error: { message: "slow then down", type: "server_error" } },
+    });
+    const secondary = await startOpenAiUpstream({
+      streamEvents: [
+        JSON.stringify({
+          id: "chatcmpl-latency-stream",
+          object: "chat.completion.chunk",
+          created: Math.floor(Date.now() / 1000),
+          model: "gpt-4o-mini",
+          choices: [{ index: 0, delta: { content: "hi" }, finish_reason: null }],
+        }),
+        JSON.stringify({
+          id: "chatcmpl-latency-stream",
+          object: "chat.completion.chunk",
+          created: Math.floor(Date.now() / 1000),
+          model: "gpt-4o-mini",
+          choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+          usage: { prompt_tokens: 3, completion_tokens: 4, total_tokens: 7 },
+        }),
+        "[DONE]",
+      ],
+    });
+    upstreams.push(primary, secondary);
+
+    await createOpenAiModel("latency-stream-primary", primary);
+    await createOpenAiModel("latency-stream-secondary", secondary);
+    await seed.createModel({
+      display_name: "latency-stream-virtual",
+      routing: {
+        strategy: "failover",
+        targets: [
+          { model: "latency-stream-primary" },
+          { model: "latency-stream-secondary" },
+        ],
+        retries: 0,
+        max_fallbacks: 1,
+      },
+    });
+
+    const canary = `sk-canary-latency-stream-${Date.now()}`;
+    await seed.createApiKey({
+      key_hash: createHash("sha256").update(canary).digest("hex"),
+      allowed_models: ["*"],
+    });
+    await waitConfigPropagation(async () => {
+      const res = await fetch(`${app!.proxyUrl}/v1/models`, {
+        headers: { authorization: `Bearer ${canary}` },
+      });
+      return res.status === 200;
+    });
+
+    const res = await fetch(`${app.proxyUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${CALLER_PLAINTEXT}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "latency-stream-virtual",
+        messages: [{ role: "user", content: "stream me" }],
+        stream: true,
+      }),
+    });
+    expect(res.status).toBe(200);
+    const requestId = res.headers.get("x-aisix-call-id");
+    expect(requestId).toBeTruthy();
+    // Drain: the winner's UsageEvent is emitted at end-of-stream.
+    await res.text();
+
+    const spans = await waitForAttemptSpans(otlp, requestId!, 2);
+    expect(spans[0].attrs["aisix.attempt_kind"]).toBe("initial");
+    expect(spans[0].attrs["http.response.status_code"]).toBe("502");
+    expect(spans[1].attrs["aisix.attempt_kind"]).toBe("fallback");
+    expect(spans[1].attrs["http.response.status_code"]).toBe("200");
+
+    expect(spans[0].latencyMs).toBeGreaterThanOrEqual(SLOW_PRIMARY_MS - 100);
+    expect(spans[1].latencyMs).toBeLessThan(SLOW_PRIMARY_MS / 2);
+    expect(spans[1].latencyMs).toBeLessThan(spans[0].latencyMs);
   });
 });

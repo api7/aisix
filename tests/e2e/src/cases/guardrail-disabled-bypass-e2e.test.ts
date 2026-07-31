@@ -2,7 +2,6 @@ import { createHash } from "node:crypto";
 import OpenAI, { APIError } from "openai";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
   SeedClient,
   spawnApp,
@@ -49,7 +48,6 @@ const FORBIDDEN_WORD = "supersecret";
 describe("guardrail disabled-bypass e2e: enabled:false → no block", () => {
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
-  let admin: AdminClient | undefined;
   let seed: SeedClient | undefined;
   let etcdReachable = false;
 
@@ -59,8 +57,9 @@ describe("guardrail disabled-bypass e2e: enabled:false → no block", () => {
     if (!etcdReachable) return;
 
     upstream = await startOpenAiUpstream();
-    app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    // No admin listener: resources are seeded to etcd and load-state is
+    // read from the metrics/status listener.
+    app = await spawnApp({ admin: false });
     seed = new SeedClient(etcd, app.etcdPrefix);
 
     const pk = await seed.createProviderKey({
@@ -113,33 +112,28 @@ describe("guardrail disabled-bypass e2e: enabled:false → no block", () => {
       // Readiness probe — two gates so the test cannot pass
       // vacuously.
       //
-      // Gate A: confirm the Guardrail row IS in the snapshot. Without
-      // this, the "forbidden literal arrives at upstream" assertion
-      // below would also pass if the rule simply hadn't propagated
-      // yet — indistinguishable from a real `enabled:false` bypass.
-      // Reading admin /v1/guardrails via the typed JSON helper is
-      // the cheapest way to verify the resource exists in the store
-      // the snapshot is built from.
+      // Gate A: confirm the Guardrail row IS in the applied snapshot.
+      // Without this, the "forbidden literal arrives at upstream"
+      // assertion below would also pass if the rule simply hadn't
+      // propagated yet — indistinguishable from a real `enabled:false`
+      // bypass. `/status/config`'s `resource_counts` reflects what the
+      // DP has LOADED (not merely what was written to etcd), served on
+      // the metrics listener — the admin-off equivalent of the old
+      // admin `/v1/guardrails` read.
       //
       // Gate B: confirm Model + ApiKey + ProviderKey are loaded by
       // driving a benign chat completion through the proxy. A 200
       // response means the dispatcher is ready.
       await waitConfigPropagation(async () => {
         try {
-          const list = (await admin!.json(
-            "GET",
-            "/admin/v1/guardrails",
-          )) as unknown as Array<Record<string, unknown>>;
-          const hasRule = list.some((entry) => {
-            // Admin list endpoints variably return bare values or
-            // {value: ...} wrappers; handle either shape generically.
-            const inner = (entry?.value ?? entry) as Record<
-              string,
-              unknown
-            >;
-            return inner?.name === "gr-disabled-keyword";
-          });
-          if (!hasRule) return false;
+          const res = await fetch(`${app!.metricsUrl}/status/config`);
+          if (!res.ok) return false;
+          const cfg = (await res.json()) as {
+            applied?: { resource_counts?: Record<string, number> };
+          };
+          if ((cfg.applied?.resource_counts?.guardrails ?? 0) < 1) {
+            return false;
+          }
           await client.chat.completions.create({
             model: "gr-disabled-model",
             messages: [{ role: "user", content: "ready-probe" }],

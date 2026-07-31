@@ -20,10 +20,11 @@
 //! Azure OpenAI request — replacing the `api-key:` header used by the
 //! resource-key scheme.
 //!
-//! Cache is keyed by `(tenant_id, client_id)` because two distinct
-//! AAD app registrations under the same tenant must NOT share a
-//! token slot. Refresh ~60s before upstream-reported expiry so an
-//! in-flight request never lands on an expired token.
+//! Cache is keyed by a fingerprint of the whole credential: two
+//! distinct AAD app registrations under the same tenant must NOT share
+//! a token slot, and neither must a rotated `client_secret` and the
+//! secret it replaced. Refresh ~60s before upstream-reported expiry so
+//! an in-flight request never lands on an expired token.
 //!
 //! 5xx from the token endpoint surfaces as `BridgeError::UpstreamStatus`
 //! with `Retry-After` propagated (transient AAD outage should hit the
@@ -42,7 +43,7 @@
 //! - OAuth2 `client_credentials` spec (RFC 6749 §4.4):
 //!   <https://www.rfc-editor.org/rfc/rfc6749#section-4.4>
 
-use aisix_gateway::BridgeError;
+use aisix_gateway::{credential_fingerprint, BridgeError};
 use reqwest::Client;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -173,6 +174,20 @@ impl AadCredentials {
         }
         Ok(())
     }
+
+    /// Token-cache key. Every field of the credential feeds the
+    /// fingerprint — add new fields here when the struct grows, or a
+    /// rotation that only touches the new field will serve the stale
+    /// token for its full TTL. `authority_host` is in scope because it
+    /// selects which AAD cloud minted the token.
+    fn cache_key(&self) -> String {
+        credential_fingerprint(&[
+            &self.tenant_id,
+            &self.client_id,
+            &self.client_secret,
+            self.authority_host.as_deref().unwrap_or(""),
+        ])
+    }
 }
 
 /// Token-endpoint response shape per OAuth2 spec.
@@ -189,12 +204,15 @@ struct CachedToken {
 }
 
 /// In-process token cache + minter. One instance per
-/// `AzureOpenAiBridge`. Cache is keyed by `(tenant_id, client_id)`
-/// so multiple ProviderKeys backed by the same AAD app share a slot,
-/// but distinct apps under the same tenant don't collide.
+/// `AzureOpenAiBridge`. Cache is keyed by a fingerprint of the whole
+/// credential, so ProviderKeys backed by the same app registration
+/// share a slot while distinct apps — and a rotated `client_secret`
+/// under one app — get their own. Keying by `(tenant_id, client_id)`
+/// alone would pin the pre-rotation token for its full TTL, since
+/// rotation issues a new secret under the same app registration.
 pub(crate) struct TokenMinter {
     client: Client,
-    cache: Arc<RwLock<HashMap<(String, String), CachedToken>>>,
+    cache: Arc<RwLock<HashMap<String, CachedToken>>>,
     /// Test-only override for the AAD token endpoint. In production
     /// the URL is derived from the tenant id; tests substitute a
     /// wiremock URI here.
@@ -226,7 +244,7 @@ impl TokenMinter {
     /// when one exists and is unexpired; otherwise mints a fresh one
     /// and caches it.
     pub async fn get_token(&self, creds: &AadCredentials) -> Result<String, BridgeError> {
-        let key = (creds.tenant_id.clone(), creds.client_id.clone());
+        let key = creds.cache_key();
         {
             let cache = self.cache.read().await;
             if let Some(cached) = cache.get(&key) {
@@ -437,6 +455,81 @@ mod tests {
         // Repeat — both must come from cache, not re-mint.
         assert_eq!(minter.get_token(&app_a).await.unwrap(), "token-for-app-A");
         assert_eq!(minter.get_token(&app_b).await.unwrap(), "token-for-app-B");
+    }
+
+    #[tokio::test]
+    async fn cache_remints_after_the_client_secret_is_rotated() {
+        // Rotating an AAD client secret keeps the app registration —
+        // same tenant_id + client_id — so a cache keyed on those alone
+        // serves the pre-rotation token for its full hour. The gateway
+        // would keep authenticating with the secret the operator just
+        // replaced, and report success while doing it.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("client_secret=secret-old"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "token-from-old-secret",
+                "expires_in": 3600,
+                "token_type": "Bearer"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("client_secret=secret-new"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "token-from-new-secret",
+                "expires_in": 3600,
+                "token_type": "Bearer"
+            })))
+            .mount(&server)
+            .await;
+
+        let minter = TokenMinter::new(Client::new()).with_token_endpoint_override(server.uri());
+        let before = AadCredentials {
+            client_secret: "secret-old".into(),
+            ..sample_creds()
+        };
+        let after = AadCredentials {
+            client_secret: "secret-new".into(),
+            ..sample_creds()
+        };
+        assert_eq!(
+            minter.get_token(&before).await.unwrap(),
+            "token-from-old-secret"
+        );
+        assert_eq!(
+            minter.get_token(&after).await.unwrap(),
+            "token-from-new-secret",
+            "rotated client_secret must mint a fresh token, not reuse the app's cached one"
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_separates_the_same_app_across_authority_hosts() {
+        // authority_host selects which AAD cloud minted the token, so a
+        // public-cloud token must never be served to a sovereign-cloud
+        // request that happens to share tenant_id + client_id.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "token-per-authority",
+                "expires_in": 3600,
+                "token_type": "Bearer"
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let minter = TokenMinter::new(Client::new()).with_token_endpoint_override(server.uri());
+        let public = sample_creds();
+        let sovereign = AadCredentials {
+            authority_host: Some("https://login.microsoftonline.us".into()),
+            ..sample_creds()
+        };
+        minter.get_token(&public).await.unwrap();
+        minter.get_token(&sovereign).await.unwrap();
+        // `.expect(2)` above is the assertion: two distinct authority
+        // hosts must not collapse into one cache slot.
     }
 
     #[tokio::test]

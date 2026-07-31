@@ -77,9 +77,68 @@ pub struct ProviderKey {
     )]
     pub strip_headers: Vec<String>,
 
+    /// TLS settings for connections to this key's `api_base`. Omit to use the
+    /// gateway's deployment-wide trust settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<ProviderKeyTls>,
+
     /// Filled in by the snapshot loader from the etcd key path.
     #[serde(skip)]
     pub(crate) runtime_id: String,
+}
+
+/// TLS settings for connections to one Provider Key's `api_base`.
+///
+/// Use this when a single upstream endpoint needs trust settings that
+/// differ from the gateway's deployment-wide ones — typically a
+/// self-hosted model endpoint whose certificate is signed by a private
+/// certificate authority.
+///
+/// The certificate is supplied inline rather than as a file path, because
+/// the endpoint is declared here rather than in the gateway's own
+/// configuration file. For a certificate authority that applies to every
+/// upstream, prefer the gateway's `upstream.tls.ca_file` setting.
+// `Default` is written out rather than derived: a derived one would make
+// `verify` false, so a `tls: {}` block — or any future code path that
+// reaches for the default — would silently stop checking certificates.
+// `Hash` so the data plane can key its per-key client cache on the
+// settings themselves, sharing one connection pool across every Provider
+// Key configured the same way.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq, Hash)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderKeyTls {
+    /// PEM-encoded certificate authority certificates trusted as issuers for
+    /// this endpoint, in addition to the gateway's default trust store. A
+    /// bundle containing several certificates is accepted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_cert: Option<String>,
+
+    /// Whether the endpoint's certificate is verified. Setting this to `false`
+    /// accepts any certificate, including one presented by an intercepting
+    /// party, and is intended only for test environments.
+    #[serde(default = "default_verify")]
+    pub verify: bool,
+}
+
+fn default_verify() -> bool {
+    true
+}
+
+impl Default for ProviderKeyTls {
+    fn default() -> Self {
+        Self {
+            ca_cert: None,
+            verify: true,
+        }
+    }
+}
+
+impl ProviderKeyTls {
+    /// Whether this leaves the connection exactly as the deployment-wide
+    /// settings would build it, so the shared client can be reused.
+    pub fn is_noop(&self) -> bool {
+        self.ca_cert.as_ref().is_none_or(|p| p.trim().is_empty()) && self.verify
+    }
 }
 
 /// Default header-strip list for a freshly-created ProviderKey
@@ -195,12 +254,24 @@ pub struct RequestOverrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub param_constraints: Option<ParamConstraints>,
 
-    /// `apply_default_headers` input. Top-level headers added to the
-    /// outbound request when the caller did not set them. Reserved
-    /// auth headers are dropped by `apply_default_headers` as
-    /// defense-in-depth.
+    /// Top-level headers added to the outbound request when the caller did
+    /// not set them. Values may reference the request context with `${...}`
+    /// variables, such as `"${request.api_key.team_id}"`; a header whose
+    /// variables do not all resolve is dropped rather than sent blank. See
+    /// [`crate::header_template`] for the closed variable vocabulary.
+    /// Reserved auth headers are dropped as defense-in-depth.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub default_headers: HashMap<String, String>,
+
+    /// Inbound client headers forwarded to the upstream provider, as
+    /// single-`*` glob patterns matched case-insensitively against the
+    /// header name (`"anthropic-beta"`, `"x-trace-*"`). Empty — the
+    /// default — forwards nothing, which is the behavior of every
+    /// standard-protocol endpoint before AISIX-Cloud#1167. Auth,
+    /// transport, and gateway-owned headers are never forwarded whatever
+    /// the patterns say.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forward_client_headers: Vec<String>,
 
     /// `apply_default_body_fields` input. Top-level body fields added
     /// when the caller did not set them. `serde_json::Map` preserves
@@ -475,11 +546,50 @@ mod tests {
             request: None,
             response: None,
             strip_headers: default_strip_headers(),
+            tls: None,
             runtime_id: String::new(),
         };
         let s = serde_json::to_string(&original).unwrap();
         let back: ProviderKey = serde_json::from_str(&s).unwrap();
         assert_eq!(original, back);
+    }
+
+    /// A stored document written before `tls` existed must keep loading,
+    /// and must land on "verify, no extra roots" rather than on a derived
+    /// `Default` that would leave `verify` false.
+    #[test]
+    fn a_document_without_tls_loads_with_no_override() {
+        let pk: ProviderKey = serde_json::from_str(
+            r#"{"display_name":"legacy","api_key":"sk-x","strip_headers":[]}"#,
+        )
+        .unwrap();
+        assert!(pk.tls.is_none());
+    }
+
+    /// `tls: {}` and `tls: {"ca_cert": ...}` both have to verify unless
+    /// the operator says otherwise, since `verify` is the one field whose
+    /// absent value is dangerous.
+    #[test]
+    fn tls_verify_defaults_to_on_when_the_block_omits_it() {
+        let pk: ProviderKey = serde_json::from_str(
+            r#"{"display_name":"n","api_key":"k","strip_headers":[],"tls":{}}"#,
+        )
+        .unwrap();
+        let tls = pk.tls.expect("tls block present");
+        assert!(tls.verify);
+        assert!(
+            tls.is_noop(),
+            "an empty block must not split the client pool"
+        );
+
+        let pk: ProviderKey = serde_json::from_str(
+            r#"{"display_name":"n","api_key":"k","strip_headers":[],
+                "tls":{"ca_cert":"-----BEGIN CERTIFICATE-----\nx\n-----END CERTIFICATE-----\n"}}"#,
+        )
+        .unwrap();
+        let tls = pk.tls.expect("tls block present");
+        assert!(tls.verify);
+        assert!(!tls.is_noop());
     }
 
     // ---- issue #302 Phase A2.5: ProviderKey.request / .response ----

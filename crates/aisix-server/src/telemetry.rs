@@ -239,7 +239,7 @@ fn build_client(mtls: &MtlsBundle) -> anyhow::Result<reqwest::Client> {
 
     let ca = reqwest::Certificate::from_pem(&ca_pem).context("parse CA certificate")?;
 
-    let mut builder = reqwest::Client::builder()
+    let mut builder = aisix_gateway::client_builder()
         .timeout(Duration::from_secs(10))
         .user_agent(format!("aisix-dp/{}", &*crate::heartbeat::BUILD_VERSION))
         .identity(identity)
@@ -312,7 +312,7 @@ mod tests {
             api_key_id: "ak-uuid".into(),
             prompt_tokens: 10,
             completion_tokens: 20,
-            latency_ms: 30,
+            upstream_latency_ms: 30,
             status_code: 200,
             cost_usd: 0.001,
             guardrail_blocked: false,

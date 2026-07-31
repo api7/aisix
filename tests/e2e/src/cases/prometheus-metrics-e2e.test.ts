@@ -30,7 +30,11 @@ describe("prometheus metrics e2e", () => {
     upstream = await startOpenAiUpstream({
       nonStreamBody: responseBody(),
     });
-    app = await spawnApp();
+    // Held-back: the "admin listener does not serve /metrics" test fetches
+    // `${app.adminUrl}/metrics` and expects 404, which needs the admin
+    // listener bound (unbound → connection refused, never a 404). The suite
+    // default is now admin-off, so this test opts back in.
+    app = await spawnApp({ admin: true });
     seed = new SeedClient(etcd, app.etcdPrefix);
 
     await configureOpenAi(seed, upstream, "prometheus-gpt");

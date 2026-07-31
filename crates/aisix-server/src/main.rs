@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 mod cert_bundle;
+mod export;
 mod heartbeat;
 mod managed_bundle;
 mod telemetry;
@@ -26,10 +27,11 @@ use aisix_cache::{Cache, MemoryCache, RedisCache};
 use aisix_core::models::Adapter;
 use aisix_core::snapshot::SnapshotHandle;
 use aisix_core::{
-    AisixSnapshot, CacheBackend, Config, EtcdConfig, EtcdTlsConfig, RateLimitBackend,
+    AisixSnapshot, CacheBackend, Config, ConfigStatus, EtcdConfig, EtcdTlsConfig, RateLimitBackend,
+    SourceKind,
 };
 use aisix_etcd::{EtcdConfigProvider, SnapshotCache, Supervisor};
-use aisix_gateway::Hub;
+use aisix_gateway::{Hub, UpstreamHttpConfig};
 use aisix_obs::{init_tracing, install_otlp_tracer, Metrics};
 use aisix_provider_anthropic::AnthropicBridge;
 use aisix_provider_azure_openai::AzureOpenAiBridge;
@@ -42,6 +44,7 @@ use aisix_proxy::{CacheBackends, ProxyState};
 use aisix_ratelimit::{Limiter, RedisStore};
 use clap::Parser;
 use etcd_client::{Certificate, ConnectOptions, Identity, TlsOptions};
+use std::time::Duration;
 use tokio::sync::watch;
 
 #[derive(Debug, Parser)]
@@ -72,6 +75,30 @@ enum CliCommand {
         #[arg(long)]
         resources: PathBuf,
     },
+    /// Export the resources currently stored in etcd as a `resources.yaml`
+    /// the file source (`resources_file`) can load back — the migration /
+    /// backup path for a standalone deployment moving from the Admin API
+    /// plus etcd to the declarative file. References are resugared to
+    /// names, ids are dropped (the file derives them), and live
+    /// credentials are replaced with `${VAR}` placeholders unless
+    /// `--reveal-secrets` is given.
+    Export {
+        /// etcd endpoints to read from (comma-separated or repeated).
+        #[arg(long, value_delimiter = ',', required = true)]
+        etcd: Vec<String>,
+        /// Key prefix the resources are stored under. Defaults to the same
+        /// canonical prefix the gateway reads from (`etcd.prefix`).
+        #[arg(long, default_value_t = EtcdConfig::default().prefix)]
+        prefix: String,
+        /// Emit real stored credential values inline instead of `${VAR}`
+        /// placeholders. UNSAFE — the output then contains live secrets;
+        /// intended only for air-gapped, same-host migration.
+        #[arg(long)]
+        reveal_secrets: bool,
+        /// Write the resources file here instead of stdout.
+        #[arg(short = 'o', long)]
+        output: Option<PathBuf>,
+    },
 }
 
 #[tokio::main]
@@ -92,8 +119,23 @@ async fn main() -> anyhow::Result<()> {
 
     // Subcommands run without loading the bootstrap config or booting
     // any listener.
-    if let Some(CliCommand::Validate { resources }) = cli.command {
-        return run_validate(&resources);
+    match cli.command {
+        Some(CliCommand::Validate { resources }) => return run_validate(&resources),
+        Some(CliCommand::Export {
+            etcd,
+            prefix,
+            reveal_secrets,
+            output,
+        }) => {
+            return export::run(export::ExportArgs {
+                endpoints: etcd,
+                prefix,
+                reveal_secrets,
+                output,
+            })
+            .await;
+        }
+        None => {}
     }
 
     let config_path = cli
@@ -108,6 +150,11 @@ async fn main() -> anyhow::Result<()> {
     init_tracing(&cfg.observability).map_err(|e| anyhow::anyhow!("tracing init failed: {e}"))?;
     let _otlp = install_otlp_tracer(&cfg.observability)
         .map_err(|e| anyhow::anyhow!("otlp init failed: {e}"))?;
+
+    // Before any bridge builds its `reqwest::Client` — the connection
+    // pools are constructed once and can't be reconfigured afterwards.
+    aisix_gateway::upstream_http::init(upstream_http_config(&cfg.upstream)?)
+        .map_err(|e| anyhow::anyhow!("upstream TLS init failed: {e}"))?;
 
     run(cfg).await
 }
@@ -145,6 +192,7 @@ fn run_validate(resources: &Path) -> anyhow::Result<()> {
 async fn file_reload_loop(
     path: PathBuf,
     handle: SnapshotHandle<AisixSnapshot>,
+    config_status: ConfigStatus,
     mut cancel: watch::Receiver<bool>,
 ) {
     #[cfg(unix)]
@@ -168,8 +216,14 @@ async fn file_reload_loop(
                     // large file can't stall in-flight requests.
                     let load_path = path.clone();
                     let next_generation = generation + 1;
+                    let reload_status = config_status.clone();
                     let loaded = tokio::task::spawn_blocking(move || {
-                        aisix_core::filesource::load_resources_file(&load_path, next_generation)
+                        aisix_core::filesource::load_resources_file_tracked(
+                            &load_path,
+                            next_generation,
+                            true,
+                            &reload_status,
+                        )
                     })
                     .await;
                     let loaded = match loaded {
@@ -254,9 +308,42 @@ fn select_managed_boot_path(bundle_on_disk: bool, bundle_provided: bool) -> Mana
     }
 }
 
+async fn run_metrics_upkeep<F>(mut cancel: watch::Receiver<bool>, period: Duration, upkeep: F)
+where
+    F: Fn(),
+{
+    let mut interval = tokio::time::interval(period);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        if *cancel.borrow() {
+            break;
+        }
+        tokio::select! {
+            _ = interval.tick() => upkeep(),
+            changed = cancel.changed() => {
+                if changed.is_err() || *cancel.borrow() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
 /// Factored out of `main` so the integration tests can drive the full
 /// startup with a real config struct and still use `#[tokio::test]`.
 async fn run(mut cfg: Config) -> anyhow::Result<()> {
+    // Applied to every listener. `0` (the default) keeps idle client
+    // connections open until the peer closes them.
+    let downstream_idle_timeout = (cfg.downstream.idle_timeout_secs > 0)
+        .then(|| Duration::from_secs(cfg.downstream.idle_timeout_secs));
+    // Here rather than in `main` so anything that drives `run` directly —
+    // the integration tests — gets the configured interval instead of
+    // silently falling back to the default.
+    aisix_proxy::sse_keepalive::init(
+        (cfg.downstream.sse_keepalive_interval_secs > 0)
+            .then(|| Duration::from_secs(cfg.downstream.sse_keepalive_interval_secs)),
+    );
+
     // Operator-supplied extra trust root, threaded into every
     // outbound mTLS client (etcd, heartbeat, telemetry, BudgetClient).
     // Needed for e2e / on-prem deployments where the
@@ -418,13 +505,15 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     // file (`resources_file` in config) or etcd + watch supervisor.
     // Config validation already guaranteed exactly one is selected.
     let file_source_path = cfg.resources_file.clone().map(PathBuf::from);
-    let (snapshot_handle, supervisor, watch_task, admin_client) =
+    let (snapshot_handle, supervisor, watch_task, admin_client, config_status) =
         if let Some(path) = &file_source_path {
             // FILE MODE: load once at boot, fail fast with the aggregated
             // error report on any problem. SIGHUP re-runs the identical
             // pipeline; a failed reload keeps the last-good snapshot.
-            let snapshot = aisix_core::filesource::load_resources_file(path, 1)
-                .map_err(|report| anyhow::anyhow!("{report}"))?;
+            let config_status = ConfigStatus::new(SourceKind::File);
+            let snapshot =
+                aisix_core::filesource::load_resources_file_tracked(path, 1, true, &config_status)
+                    .map_err(|report| anyhow::anyhow!("{report}"))?;
             tracing::info!(
                 file = %path.display(),
                 resources = snapshot.total_entries(),
@@ -434,9 +523,10 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
             let reload_task = tokio::spawn(file_reload_loop(
                 path.clone(),
                 handle.clone(),
+                config_status.clone(),
                 cancel_rx.clone(),
             ));
-            (handle, None, reload_task, None)
+            (handle, None, reload_task, None, config_status)
         } else {
             // ETCD MODE (unchanged behavior).
             //
@@ -472,8 +562,11 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
             // admin surface is bound. We could share a single underlying
             // connection via `Client::clone()` but keeping two is cleaner:
             // writes and the watch stream don't contend on the same mutex.
-            // In managed mode this client is simply skipped.
-            let admin_client = if cfg.managed.is_managed() {
+            // Skipped whenever the admin listener is not bound — managed mode,
+            // or `admin.enabled = false` — so admin-off doesn't pay for (or
+            // fail boot on) a connection it immediately drops; `/status/models`
+            // then reads through the snapshot, as it does in managed mode.
+            let admin_client = if cfg.managed.is_managed() || !cfg.admin.enabled {
                 None
             } else {
                 Some((
@@ -503,9 +596,16 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
             // proxy is ready to serve from cached config the moment the watch
             // task takes its first iteration.
             supervisor.restore_from_cache();
+            let config_status = supervisor.config_status();
             let handle = supervisor.handle();
             let watch_task = tokio::spawn(supervisor.clone().run(cancel_rx.clone()));
-            (handle, Some(supervisor), watch_task, admin_client)
+            (
+                handle,
+                Some(supervisor),
+                watch_task,
+                admin_client,
+                config_status,
+            )
         };
     // Spawn heartbeat worker if we have a config for it. The
     // JoinHandle is awaited after graceful shutdown below so the
@@ -585,6 +685,14 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     // above); it becomes the constant `env_id` label on the SLO latency
     // histograms. Standalone DPs leave it empty → "unknown".
     let metrics = Arc::new(Metrics::new_with_env_id(&cfg.etcd.env_id));
+    let metrics_upkeep_task = {
+        let metrics = metrics.clone();
+        tokio::spawn(run_metrics_upkeep(
+            cancel_rx.clone(),
+            Duration::from_secs(5),
+            move || metrics.run_upkeep(),
+        ))
+    };
     // Cache backends (#519 B.8). The memory cache is always built
     // (in-process, cheap); the redis cache is built iff `cache.redis`
     // is configured. Which instance serves a request is selected by
@@ -629,6 +737,15 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     // so a real DP scrape surfaces UsageEvent throughput without
     // needing cp-api or an OTLP receiver in the loop.
     proxy_state = proxy_state.with_usage_sink(usage_sink.with_metrics((*metrics).clone()));
+    // AISIX-Cloud#1045: operator UA→client_type rules. Compile errors are
+    // boot-fatal — a dropped rule would silently misattribute traffic.
+    let client_classifier =
+        aisix_obs::ClientTypeClassifier::compile(&cfg.observability.metrics.client_type_rules)
+            .map_err(|e| anyhow::anyhow!(e))?;
+    proxy_state = proxy_state.with_client_classifier(Arc::new(client_classifier));
+    proxy_state = proxy_state.with_default_retries(cfg.upstream.retries);
+    proxy_state =
+        proxy_state.with_default_timeouts(cfg.upstream.timeout_ms, cfg.upstream.stream_timeout_ms);
     if let Some(client) = budget_client {
         proxy_state = proxy_state.with_budget_client(client);
     }
@@ -645,16 +762,22 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     // `None` so a `docker run -e AISIX_BEDROCK_ENDPOINT_URL=`
     // doesn't accidentally redirect Bedrock calls into thin air.
     let bedrock_endpoint_url = cfg.bedrock_endpoint_url.clone().filter(|s| !s.is_empty());
-    proxy_state = proxy_state.with_guardrail_index(aisix_guardrails::LiveGuardrailIndex::new(
-        snapshot_handle.clone(),
-        bedrock_endpoint_url,
-    ));
+    let guardrail_metrics_sink = proxy_state.metrics.clone();
+    proxy_state =
+        proxy_state.with_guardrail_index(aisix_guardrails::LiveGuardrailIndex::new_with_sink(
+            snapshot_handle.clone(),
+            bedrock_endpoint_url,
+            Some(guardrail_metrics_sink),
+        ));
     // Heartbeat worker — spawned after proxy_state exists so it can read
     // the exporter fan-out's delivery counters. Each tick reports:
     //   - rejected_resources: the supervisor's loader rejections (#115)
     //   - applied_revision: the highest etcd revision the supervisor has
     //     applied, so cp-api can show "propagating…" until the DP catches
     //     up with a kine write (#519 B.3)
+    //   - config_hash: the hash of the applied (served) config set, so
+    //     cp-api can diff the hash a node reports against the hash it
+    //     expects that node to be serving (#774)
     //   - supported_guardrail_kinds + exporter_health (#519 B.6 / D.2)
     let heartbeat_task = heartbeat_cfg.map(|mut h| {
         // Heartbeat only exists in managed mode, which config
@@ -669,6 +792,10 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
         }));
         let watch_status = supervisor.watch_status();
         h = h.with_applied_revision_fetcher(Arc::new(move || watch_status.snapshot().revision));
+        let config_status_for_heartbeat = supervisor.config_status();
+        h = h.with_config_hash_fetcher(Arc::new(move || {
+            config_status_for_heartbeat.applied_config_hash()
+        }));
         let fan_out = proxy_state.otlp_fan_out.clone();
         h = h.with_exporter_health_fetcher(Arc::new(move || fan_out.exporter_stats()));
         heartbeat::spawn(h, cancel_rx.clone())
@@ -745,7 +872,24 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
         ))),
         _ => None,
     };
-    let admin_serve_handle = if let Some(admin_store) = admin_store {
+    // Per-model runtime health as an operational read on the metrics/status
+    // listener (`GET /status/models`). Standalone mode shares the admin
+    // surface's store handle, so the status-listener view and
+    // `GET /admin/v1/models/status` read the very same source; managed mode
+    // has no admin store and serves the applied snapshot through the same
+    // read-only view file mode uses (the path only appears in write
+    // rejections, which the read-only status listener never issues).
+    let status_models_state = aisix_admin::ModelsStatusState {
+        store: match &admin_store {
+            Some(store) => Arc::clone(store),
+            None => Arc::new(FileManagedStore::new(
+                snapshot_handle.clone(),
+                "the control plane",
+            )),
+        },
+        runtime_status_tracker: Some(runtime_status_tracker.clone()),
+    };
+    let admin_serve_handle = if let Some(admin_store) = admin_store.filter(|_| cfg.admin.enabled) {
         let mut admin_state = AdminState::new(snapshot_handle.clone(), admin_store, &cfg.admin)
             // Share the health tracker so /admin/v1/health reflects live
             // per-model upstream failure counts.
@@ -777,15 +921,20 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
             admin_addr,
             admin_router,
             admin_tls,
+            downstream_idle_timeout,
             cancel_rx.clone(),
             "admin",
         )))
     } else {
         // Drop unused shared components so the compiler can see they
-        // don't escape managed mode. The health tracker exists on
+        // don't escape the admin-less paths. The health tracker exists on
         // proxy_state and keeps working regardless.
         let _ = (&health_tracker, &livez_state, &runtime_status_tracker);
-        tracing::info!("managed mode enabled — admin surface not bound");
+        if cfg.managed.is_managed() {
+            tracing::info!("managed mode enabled — admin surface not bound");
+        } else {
+            tracing::info!("admin.enabled = false — admin surface not bound");
+        }
         None
     };
 
@@ -807,11 +956,17 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
             // probe.
             std::net::TcpListener::bind(metrics_addr)
                 .map_err(|e| anyhow::anyhow!("metrics listener bind {metrics_addr} failed: {e}"))?;
-            let metrics_router = aisix_admin::metrics_router(metrics.clone(), prom);
+            let metrics_router = aisix_admin::metrics_router(
+                metrics.clone(),
+                config_status.clone(),
+                prom,
+                status_models_state,
+            );
             Some(tokio::spawn(serve_http(
                 metrics_addr,
                 metrics_router,
                 None,
+                downstream_idle_timeout,
                 cancel_rx.clone(),
                 "metrics",
             )))
@@ -827,6 +982,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
         proxy_addr,
         proxy_router,
         proxy_tls,
+        downstream_idle_timeout,
         cancel_rx.clone(),
         "proxy",
     );
@@ -863,6 +1019,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     if let Some(task) = telemetry_task {
         let _ = task.await;
     }
+    let _ = metrics_upkeep_task.await;
     let _ = background_check_task.await;
     tracing::info!("aisix shut down cleanly");
     Ok(())
@@ -1122,6 +1279,43 @@ fn load_heartbeat_config_from_disk(
 /// <https://docs.cohere.com/reference/chat>). Cohere's `/v1/rerank`
 /// native surface is keyed off `Model.provider == "cohere"` in
 /// `crates/aisix-proxy/src/rerank.rs` and bypasses the Bridge.
+/// Translate the `upstream:` config block into the gateway's client
+/// settings. Every duration treats `0` as "leave this knob off".
+///
+/// Fails when `upstream.tls` names a file that cannot be read or does
+/// not hold the PEM it claims to — the boot is where an operator can
+/// still act on that, and it is a far better signal than the generic
+/// `UnknownIssuer` transport error the misconfiguration otherwise
+/// produces on every upstream call.
+fn upstream_http_config(
+    cfg: &aisix_core::config::UpstreamConfig,
+) -> anyhow::Result<UpstreamHttpConfig> {
+    fn ms(v: u64) -> Option<Duration> {
+        (v > 0).then(|| Duration::from_millis(v))
+    }
+    fn secs(v: u64) -> Option<Duration> {
+        (v > 0).then(|| Duration::from_secs(v))
+    }
+    let tls = aisix_gateway::TlsSettings::load("upstream.tls", &cfg.tls)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    if !tls.verify {
+        tracing::warn!(
+            "upstream.tls.verify is false: upstream certificates are NOT checked, so any \
+             peer able to intercept the connection can read and rewrite prompts, responses, \
+             and upstream API keys"
+        );
+    }
+    Ok(UpstreamHttpConfig {
+        connect_timeout: ms(cfg.connect_timeout_ms),
+        tcp_keepalive: secs(cfg.tcp_keepalive_secs),
+        tcp_keepalive_interval: secs(cfg.tcp_keepalive_interval_secs),
+        tcp_keepalive_retries: (cfg.tcp_keepalive_retries > 0).then_some(cfg.tcp_keepalive_retries),
+        pool_idle_timeout: secs(cfg.pool_idle_timeout_secs),
+        pool_max_idle_per_host: cfg.pool_max_idle_per_host,
+        tls,
+    })
+}
+
 fn build_hub() -> Hub {
     let hub = Hub::new();
 
@@ -1178,54 +1372,97 @@ fn background_check_interval(snapshot: &aisix_core::AisixSnapshot) -> std::time:
 /// rest of the process. Wired for #473: `proxy.tls` / `admin.tls` were
 /// parsed but never reached the listener, so the documented config silently
 /// served plain HTTP.
+///
+/// Both variants run on `axum_server` rather than `axum::serve` because
+/// only the former exposes the hyper connection builder, which is where
+/// `downstream.idle_timeout_secs` has to be applied (AISIX-Cloud#1126).
 async fn serve_http(
     addr: std::net::SocketAddr,
     router: axum::Router,
     tls: Option<aisix_core::TlsConfig>,
+    idle_timeout: Option<Duration>,
     cancel: watch::Receiver<bool>,
     label: &'static str,
 ) -> anyhow::Result<()> {
-    match tls {
+    // Resolved before binding so a bad cert path still fails with the
+    // same error it always did, before a port is taken.
+    let tls_config = match tls {
+        Some(tls) => Some(
+            axum_server::tls_rustls::RustlsConfig::from_pem_file(&tls.cert_file, &tls.key_file)
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "{label}.tls: failed to load cert_file={:?} / key_file={:?}: {e}",
+                        tls.cert_file,
+                        tls.key_file
+                    )
+                })?,
+        ),
+        None => None,
+    };
+
+    let listener = std::net::TcpListener::bind(addr)
+        .map_err(|e| anyhow::anyhow!("{label} listener bind {addr} failed: {e}"))?;
+    listener.set_nonblocking(true)?;
+
+    let handle = axum_server::Handle::new();
+    tokio::spawn({
+        let handle = handle.clone();
+        async move {
+            shutdown_signal(cancel, label).await;
+            // `None` = drain without a deadline: an in-flight LLM stream
+            // can run for minutes, and the platform (k8s
+            // terminationGracePeriodSeconds, systemd TimeoutStopSec)
+            // already caps how long that may take. Idle connections are
+            // closed immediately either way.
+            handle.graceful_shutdown(None);
+        }
+    });
+
+    // ConnectInfo<SocketAddr> exposes the TCP peer to the proxy's real-ip
+    // resolver (#492). Harmless for the admin listener, which ignores it.
+    let make_service = router.into_make_service_with_connect_info::<std::net::SocketAddr>();
+
+    match tls_config {
         None => {
-            let listener = tokio::net::TcpListener::bind(addr).await?;
             tracing::info!(%addr, label, "aisix listening (http)");
-            // ConnectInfo<SocketAddr> exposes the TCP peer to the proxy's
-            // real-ip resolver (#492). Harmless for the admin listener,
-            // which ignores it.
-            axum::serve(
-                listener,
-                router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-            )
-            .with_graceful_shutdown(shutdown_signal(cancel, label))
-            .await?;
-            Ok(())
+            let mut server = axum_server::from_tcp(listener).handle(handle);
+            apply_idle_timeout(server.http_builder(), idle_timeout);
+            server.serve(make_service).await?;
         }
-        Some(tls) => {
-            let tls_config =
-                axum_server::tls_rustls::RustlsConfig::from_pem_file(&tls.cert_file, &tls.key_file)
-                    .await
-                    .map_err(|e| {
-                        anyhow::anyhow!(
-                            "{label}.tls: failed to load cert_file={:?} / key_file={:?}: {e}",
-                            tls.cert_file,
-                            tls.key_file
-                        )
-                    })?;
-            let handle = axum_server::Handle::new();
-            tokio::spawn({
-                let handle = handle.clone();
-                async move {
-                    shutdown_signal(cancel, label).await;
-                    handle.graceful_shutdown(Some(std::time::Duration::from_secs(10)));
-                }
-            });
+        Some(tls_config) => {
             tracing::info!(%addr, label, "aisix listening (https)");
-            axum_server::bind_rustls(addr, tls_config)
-                .handle(handle)
-                .serve(router.into_make_service_with_connect_info::<std::net::SocketAddr>())
-                .await?;
-            Ok(())
+            let mut server = axum_server::from_tcp_rustls(listener, tls_config).handle(handle);
+            apply_idle_timeout(server.http_builder(), idle_timeout);
+            server.serve(make_service).await?;
         }
+    }
+    Ok(())
+}
+
+/// Close an accepted HTTP/1.1 connection that sits idle for `idle_timeout`.
+///
+/// hyper arms this timer only when it is waiting for a request head, and
+/// it only waits for one once the previous response has been fully written
+/// (`Conn::can_read_head` requires the read half to be back at `Init`,
+/// which `try_keep_alive` reaches only when reading *and* writing are
+/// done). So a slow model or a long SSE stream is never interrupted — the
+/// timer covers exactly the between-requests window.
+///
+/// hyper defaults this to 30s but drops the default unless a timer is
+/// installed, and neither axum nor axum_server installs one — which is why
+/// the gateway held idle connections forever before this.
+///
+/// HTTP/2 has no equivalent knob in hyper; h2 connections are unaffected.
+fn apply_idle_timeout(
+    builder: &mut hyper_util::server::conn::auto::Builder<hyper_util::rt::TokioExecutor>,
+    idle_timeout: Option<Duration>,
+) {
+    if let Some(d) = idle_timeout {
+        builder
+            .http1()
+            .timer(hyper_util::rt::TokioTimer::new())
+            .header_read_timeout(d);
     }
 }
 
@@ -1276,6 +1513,33 @@ async fn wait_for_signal(
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[tokio::test(start_paused = true)]
+    async fn metrics_upkeep_runs_periodically_and_stops_on_cancel() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let task = tokio::spawn(run_metrics_upkeep(
+            cancel_rx,
+            Duration::from_secs(5),
+            move || {
+                observed.fetch_add(1, Ordering::SeqCst);
+            },
+        ));
+
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        cancel_tx.send(true).unwrap();
+        task.await.unwrap();
+        tokio::time::advance(Duration::from_secs(10)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
 
     #[test]
     fn supplied_certs_take_precedence_over_persisted_bundle() {

@@ -891,7 +891,11 @@ pub struct ResponsesStreamCompletion {
     pub cache_creation_tokens: u32,
     pub cache_read_tokens: u32,
     pub finish_reason: String,
-    pub ttft_ms: u32,
+    /// Attempt-scoped time to the upstream's first generated chunk.
+    pub upstream_ttft_ms: u32,
+    /// Request-scoped time until the caller got its first response bytes.
+    /// Trails `upstream_ttft_ms` by any hold-back guardrail scan.
+    pub downstream_latency_ms: u32,
     /// Set when an output guardrail blocked the streamed response (a content
     /// block or a fail-closed buffer overflow). The upstream still billed, so
     /// the usage event carries the tokens but is marked blocked — matching
@@ -910,10 +914,21 @@ pub struct ResponsesStreamCompletion {
     /// wants full content (bounded to the capture cap). Empty otherwise.
     /// Read by the on_complete telemetry closure; never reaches the CP sink.
     pub response_text: String,
+    /// True when the Drop guard filled any token counter from the local
+    /// estimator (AISIX-Cloud#1074).
+    pub usage_estimated: bool,
+    /// Generated output (content + reasoning + tool-call text) accumulated
+    /// for the token-estimation fallback (AISIX-Cloud#1074). Always on,
+    /// bounded to `token_estimate::OUTPUT_ACCUMULATION_CAP`; never leaves
+    /// the process.
+    est_output_text: String,
 }
 
 struct CompleteOnDrop<F: FnOnce(ResponsesStreamCompletion)> {
     slot: Option<(F, ResponsesStreamCompletion)>,
+    /// Token-estimation fallback (AISIX-Cloud#1074); fills counters the
+    /// upstream never reported before `on_complete` runs.
+    estimator: Option<crate::token_estimate::Estimator>,
 }
 
 impl<F: FnOnce(ResponsesStreamCompletion)> CompleteOnDrop<F> {
@@ -928,7 +943,23 @@ impl<F: FnOnce(ResponsesStreamCompletion)> CompleteOnDrop<F> {
 
 impl<F: FnOnce(ResponsesStreamCompletion)> Drop for CompleteOnDrop<F> {
     fn drop(&mut self) {
-        if let Some((f, comp)) = self.slot.take() {
+        if let Some((f, mut comp)) = self.slot.take() {
+            // Token-estimation fallback (AISIX-Cloud#1074): fill the
+            // counters the upstream never reported from the request +
+            // the accumulated output text.
+            if let Some(est) = self.estimator.take() {
+                let filled = crate::token_estimate::fill_missing(
+                    &est,
+                    comp.prompt_tokens,
+                    comp.completion_tokens,
+                    Some(comp.est_output_text.as_str()),
+                );
+                if filled.estimated {
+                    comp.prompt_tokens = filled.prompt_tokens;
+                    comp.completion_tokens = filled.completion_tokens;
+                    comp.usage_estimated = true;
+                }
+            }
             f(comp);
         }
     }
@@ -956,7 +987,10 @@ impl<F: FnOnce(ResponsesStreamCompletion)> Drop for CompleteOnDrop<F> {
 pub fn build_responses_bridge_stream(
     upstream: ChatChunkStream,
     encoder: ResponsesSseEncoder,
+    // Request clock — what the CALLER waited for.
     started: Instant,
+    // Attempt clock — how the UPSTREAM behaved on this call.
+    attempt_started: Instant,
     output_guardrail: Option<Arc<aisix_guardrails::GuardrailChain>>,
     hold_back: bool,
     max_buffer_bytes: usize,
@@ -964,13 +998,29 @@ pub fn build_responses_bridge_stream(
     // Largest content cap any content-capturing exporter wants
     // (AISIX-Cloud#947); `None` skips response-text accumulation entirely.
     content_cap: Option<u32>,
+    // Token-estimation fallback context (AISIX-Cloud#1074); see
+    // `CompleteOnDrop::estimator`.
+    estimator: Option<crate::token_estimate::Estimator>,
     on_complete: impl FnOnce(ResponsesStreamCompletion) + Send + 'static,
 ) -> axum::body::Body {
     use futures::StreamExt;
 
     let mut encoder = encoder;
     let stream = async_stream::stream! {
-        let mut guard = CompleteOnDrop { slot: Some((on_complete, ResponsesStreamCompletion::default())) };
+        let mut guard = CompleteOnDrop {
+            slot: Some((on_complete, ResponsesStreamCompletion::default())),
+            estimator,
+        };
+        // Stamped on the first bytes that actually leave for the client —
+        // under hold-back that is the release, not the upstream chunk.
+        macro_rules! downstream_mark {
+            () => {
+                if guard.comp().downstream_latency_ms == 0 {
+                    guard.comp().downstream_latency_ms =
+                        started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+                }
+            };
+        }
         let mut upstream = upstream;
         let mut first_chunk_seen = false;
         let buffering = output_guardrail.is_some() && hold_back;
@@ -986,8 +1036,8 @@ pub fn build_responses_bridge_stream(
                         && (chunk.delta.content.is_some() || chunk.delta.tool_calls.is_some())
                     {
                         first_chunk_seen = true;
-                        guard.comp().ttft_ms =
-                            started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+                        guard.comp().upstream_ttft_ms =
+                            attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
                     }
                     {
                         let comp = guard.comp();
@@ -1004,6 +1054,35 @@ pub fn build_responses_bridge_stream(
                         {
                             if comp.response_text.len() < cap as usize {
                                 comp.response_text.push_str(text);
+                            }
+                        }
+                        // Token-estimation accumulator (AISIX-Cloud#1074):
+                        // all generated output, always on (whether the
+                        // fallback is needed is only known at end-of-stream),
+                        // bounded.
+                        {
+                            use crate::token_estimate::push_capped;
+                            if let Some(text) = chunk.delta.content.as_deref() {
+                                push_capped(&mut comp.est_output_text, text);
+                            }
+                            if let Some(text) = chunk.delta.reasoning_content.as_deref() {
+                                push_capped(&mut comp.est_output_text, text);
+                            }
+                            if let Some(tcs) = chunk.delta.tool_calls.as_ref() {
+                                for tc in tcs {
+                                    if let Some(f) = tc.get("function") {
+                                        if let Some(n) =
+                                            f.get("name").and_then(|v| v.as_str())
+                                        {
+                                            push_capped(&mut comp.est_output_text, n);
+                                        }
+                                        if let Some(a) =
+                                            f.get("arguments").and_then(|v| v.as_str())
+                                        {
+                                            push_capped(&mut comp.est_output_text, a);
+                                        }
+                                    }
+                                }
                             }
                         }
                         if let Some(u) = chunk.usage.as_ref() {
@@ -1025,6 +1104,7 @@ pub fn build_responses_bridge_stream(
                             }
                             held.push(b);
                         } else {
+                            downstream_mark!();
                             yield Ok::<_, std::io::Error>(b);
                         }
                     }
@@ -1054,6 +1134,7 @@ pub fn build_responses_bridge_stream(
                     }
                     held.push(b);
                 } else {
+                    downstream_mark!();
                     yield Ok(b);
                 }
             }
@@ -1220,16 +1301,24 @@ pub fn build_responses_bridge_stream(
                     &mut guard.comp().redacted_entity_counts,
                     counts,
                 );
+                downstream_mark!();
                 yield Ok(bytes::Bytes::from(rewritten));
                 return;
             }
         }
         // Release the held events verbatim.
         for b in held {
+            downstream_mark!();
             yield Ok(b);
         }
     };
-    axum::body::Body::from_stream(stream)
+    // Re-attach the request span: the body is polled after the request-id
+    // middleware returns, so the end-of-stream output-guardrail check
+    // would otherwise log without a `request_id` (AISIX-Cloud#1060).
+    axum::body::Body::from_stream(crate::sse_keepalive::with_heartbeat(
+        crate::request_id::in_request_span(stream),
+        crate::sse_keepalive::interval(),
+    ))
 }
 
 /// Responses-API SSE `error` frame for an output-guardrail block. Carries the

@@ -50,7 +50,9 @@ describe("auth baseline e2e: missing/malformed/unknown bearer all fail closed", 
     if (!etcdReachable) return;
 
     upstream = await startOpenAiUpstream();
-    app = await spawnApp();
+    // Held-back: this test drives the Admin API surface itself, so it
+    // keeps the admin listener bound (the suite default is now admin-off).
+    app = await spawnApp({ admin: true });
     seed = new SeedClient(etcd, app.etcdPrefix);
 
     // A single Model + ProviderKey + ApiKey configured. The valid

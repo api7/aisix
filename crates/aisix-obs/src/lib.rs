@@ -22,13 +22,16 @@ pub mod otlp_http_sink;
 pub mod sink;
 pub mod usage;
 
+use std::io::IsTerminal as _;
+
 use aisix_core::ObservabilityConfig;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 pub use access_log::AccessLog;
 pub use metrics::{
-    client_type_from_user_agent, BudgetGauges, BudgetLabels, DeploymentLabels, DeploymentState,
-    LatencyLabels, LlmUsage, Metrics, RequestLabels, RequestOutcome, UsageLabels,
+    client_type_from_user_agent, BudgetGauges, BudgetLabels, ClientTypeClassifier,
+    DeploymentLabels, DeploymentState, LatencyLabels, LlmUsage, Metrics, RequestLabels,
+    RequestOutcome, UsageLabels,
 };
 pub use otlp::{install_otlp_tracer, shutdown_otlp, OtlpError, OtlpHandle};
 pub use otlp_http_sink::{content_capture_cap, OtlpHttpFanOut, OtlpSink};
@@ -61,7 +64,17 @@ pub fn init_tracing(cfg: &ObservabilityConfig) -> Result<(), ObsError> {
             source,
         })?;
 
-    let fmt_layer = fmt::layer().with_target(true).with_writer(std::io::stderr);
+    // Colorize only for a human at a terminal. When stderr is a pipe or a
+    // file — every real deployment, where logs go to a container runtime and
+    // on to a log store — the escapes land BETWEEN a field's name and its
+    // value, so `grep 'aliyun_request_id=<id>'` matches nothing and the
+    // structured fields are only searchable by bare value
+    // (AISIX-Cloud#1060). tracing-subscriber's `ansi` default feature is on
+    // and it does not probe the writer itself.
+    let fmt_layer = fmt::layer()
+        .with_target(true)
+        .with_ansi(std::io::stderr().is_terminal())
+        .with_writer(std::io::stderr);
 
     tracing_subscriber::registry()
         .with(filter)

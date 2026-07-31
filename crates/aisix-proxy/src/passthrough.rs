@@ -164,6 +164,7 @@ pub async fn passthrough(
                 status,
                 elapsed,
                 &request_id,
+                None,
             );
             state.metrics.record_request(
                 &provider_label,
@@ -203,6 +204,7 @@ pub async fn passthrough(
                 status,
                 elapsed,
                 &request_id,
+                Some(&err),
             );
             state.metrics.record_request(
                 &provider,
@@ -351,11 +353,18 @@ async fn dispatch(
     // chunked / no-Content-Length / Content-Length-lying case once
     // the actual byte count exceeds the cap.
     let body_limit = state.request_body_limit_bytes;
-    let body_bytes: Bytes = axum::body::to_bytes(req.into_body(), body_limit)
-        .await
-        .map_err(|_| ProxyError::RequestTooLarge {
-            limit_bytes: body_limit,
-        })?;
+    let body_bytes: Bytes =
+        axum::body::to_bytes(req.into_body(), crate::error::body_read_cap(body_limit))
+            .await
+            .map_err(|err| {
+                if crate::error::is_length_limit_error(&err) {
+                    ProxyError::RequestTooLarge {
+                        limit_bytes: body_limit,
+                    }
+                } else {
+                    ProxyError::InvalidRequest("failed to read request body".into())
+                }
+            })?;
 
     // #911 [6]: run INPUT guardrails on the passthrough request body BEFORE it
     // reaches the upstream. The tunnel forwards arbitrary provider endpoints
@@ -392,12 +401,23 @@ async fn dispatch(
     }
 
     // Reserve the rate-limit layers AFTER the input guardrail so a content
-    // block doesn't burn an RPM slot, matching the typed endpoints. Passthrough
-    // has no resolved model, so only the api-key/team/member layers apply.
-    let _reservation = crate::quota::enforce(&state, auth, None).await?;
+    // block doesn't burn an RPM slot, matching the typed endpoints.
+    //
+    // api7/AISIX-Cloud#1116: provider-native JSON envelopes carry the target
+    // model in a top-level `model` field (the shape shared by OpenAI-compatible
+    // and DashScope-style bodies). When that name is a configured Model of the
+    // addressed provider, reserve its model-level layers (inline `rate_limit`
+    // + `model`-scope policies) exactly like the typed endpoints — pre-fix the
+    // raw tunnel skipped them entirely, so e.g. a video model reachable only
+    // through passthrough had no enforceable model rate limit anywhere.
+    // Non-JSON bodies, bodies without a `model` field, and unregistered names
+    // keep the previous behavior: request-level layers only. The tunnel never
+    // parses usage (tokens stay 0), so only the request-count dimensions
+    // (rps/rpm/rph) ever draw from the model buckets here.
+    let model_rl = body_model_rate_limit(&snapshot, &provider_lower, &body_bytes);
+    let _reservation = crate::quota::enforce(&state, auth, model_rl.as_ref()).await?;
 
-    let client = crate::http_client::client();
-    let mut builder = client.request(method.clone(), &url);
+    let client = crate::http_client::client_for(pk_entry.value.tls.as_ref());
 
     // Inject upstream Authorization; strip the incoming proxy auth.
     //
@@ -443,76 +463,116 @@ async fn dispatch(
         .chain(ALWAYS_STRIP.iter().map(|s| (*s).to_string()))
         .collect();
 
-    for (name, value) in &incoming_headers {
-        let n = name.as_str().to_ascii_lowercase();
-        if strip_set.contains(&n) {
-            continue;
-        }
-        builder = builder.header(name, value);
-    }
-
-    // Gateway's own auth — set AFTER the strip loop. This guarantees
-    // the upstream sees exactly one `Authorization` (or `x-api-key`
-    // + `anthropic-version`) line in the default case, even when
-    // the client sent one of those headers — the client's value
-    // was filtered out in the loop above.
-    if api_key.is_empty() {
-        // Provider key has no secret configured. Nothing to inject —
-        // explicit blank-Authorization rather than fall-through-to-
-        // Bearer-of-empty-string keeps the wire clean.
-    } else if provider_lower == "anthropic" {
-        builder = builder.header("x-api-key", &api_key);
-        builder = builder.header("anthropic-version", "2023-06-01");
-    } else {
-        builder = builder.header(header::AUTHORIZATION, format!("Bearer {api_key}"));
-    }
-
-    builder = builder.header("x-aisix-request-id", request_id);
-
-    if !body_bytes.is_empty() {
-        builder = builder.body(body_bytes);
-    }
-
-    // #554/#911: bound the raw tunnel by the selected model's E2E request
-    // timeout, matching the first-class non-streaming paths. Without it a
-    // slow/blackholed upstream could pin a passthrough connection open
-    // indefinitely regardless of the model's configured timeout.
-    if let Some(d) = model.request_timeout() {
-        builder = builder.timeout(d);
-    }
-
     // #701: transport/decode failures against the shared upstream mark the
     // borrowed model's runtime status (same borrowed-model basis as the
     // #911 [6] guardrail chain), so a dead upstream reached only via the raw
     // tunnel still trips the cooldown. Forwarded HTTP statuses stay the
     // caller's business — the tunnel relays them verbatim.
-    let upstream_resp = builder
-        .send()
-        .await
-        .map_err(|e| {
-            crate::cooldown::note_failure(
-                &state.runtime_status,
-                &model_entry.id,
-                model.cooldown.as_ref(),
-                aisix_gateway::BridgeError::Transport(e.to_string()),
-            )
-        })
-        .map_err(ProxyError::Bridge)?;
+    //
+    // That contract is also what scopes the retry budget here: an upstream
+    // 5xx never becomes a `BridgeError` on this path, so it is relayed
+    // untouched (re-sending it would both break verbatim relay and stack on
+    // top of the provider edge's own retries — see AISIX-Cloud#1121). Only
+    // transport and decode faults are retried, and decode faults only for
+    // idempotent methods: a body-read failure means the upstream already
+    // returned its status — the operation committed and only the response
+    // was lost — so replaying a tunneled POST would duplicate a write this
+    // gateway does not understand (a second file upload, a second
+    // fine-tune). Send-phase transport failures stay retryable for every
+    // method: whether the request reached the upstream is unknowable, and
+    // the provider SDKs accept that ambiguity too. The whole request is
+    // rebuilt per attempt because `RequestBuilder::send` consumes it.
+    let tracker = &state.runtime_status;
+    let model_id: &str = &model_entry.id;
+    let cooldown_cfg = model.cooldown.as_ref();
+    // RFC 9110 §9.2.2 idempotent methods.
+    let idempotent = matches!(
+        method,
+        Method::GET | Method::HEAD | Method::OPTIONS | Method::TRACE | Method::PUT | Method::DELETE
+    );
+    let retry_permit = |e: &aisix_gateway::BridgeError| {
+        idempotent || !matches!(e, aisix_gateway::BridgeError::UpstreamDecode(_))
+    };
+    let (status, resp_headers, resp_body) = match crate::routing::retrying_dispatch_gated(
+        &state,
+        model,
+        "passthrough",
+        retry_permit,
+        || {
+            let mut builder = client.request(method.clone(), &url);
+            for (name, value) in &incoming_headers {
+                let n = name.as_str().to_ascii_lowercase();
+                if strip_set.contains(&n) {
+                    continue;
+                }
+                builder = builder.header(name, value);
+            }
 
-    let status = upstream_resp.status();
-    let resp_headers = upstream_resp.headers().clone();
-    let resp_body = upstream_resp
-        .bytes()
-        .await
-        .map_err(|e| {
-            crate::cooldown::note_failure(
-                &state.runtime_status,
-                &model_entry.id,
-                model.cooldown.as_ref(),
-                aisix_gateway::BridgeError::UpstreamDecode(e.to_string()),
-            )
-        })
-        .map_err(ProxyError::Bridge)?;
+            // Gateway's own auth — set AFTER the strip loop. This guarantees
+            // the upstream sees exactly one `Authorization` (or `x-api-key`
+            // + `anthropic-version`) line in the default case, even when
+            // the client sent one of those headers — the client's value
+            // was filtered out in the loop above.
+            if api_key.is_empty() {
+                // Provider key has no secret configured. Nothing to inject —
+                // explicit blank-Authorization rather than fall-through-to-
+                // Bearer-of-empty-string keeps the wire clean.
+            } else if provider_lower == "anthropic" {
+                builder = builder.header("x-api-key", &api_key);
+                builder = builder.header("anthropic-version", "2023-06-01");
+            } else {
+                builder = builder.header(header::AUTHORIZATION, format!("Bearer {api_key}"));
+            }
+
+            builder = builder.header("x-aisix-request-id", request_id);
+
+            if !body_bytes.is_empty() {
+                builder = builder.body(body_bytes.clone());
+            }
+
+            // #554/#911: bound the raw tunnel by the selected model's E2E
+            // request timeout, matching the first-class non-streaming paths.
+            // Without it a slow/blackholed upstream could pin a passthrough
+            // connection open indefinitely regardless of the model's timeout.
+            if let Some(d) =
+                crate::routing::effective_timeouts(model, None, state.default_timeouts).request
+            {
+                builder = builder.timeout(d);
+            }
+
+            async move {
+                // See audio.rs: an elapsed `timeout` must surface as
+                // `BridgeError::Timeout`, not as a generic transport fault,
+                // so the retry budget can tell the two apart.
+                let send_started = std::time::Instant::now();
+                let upstream_resp = builder.send().await.map_err(|e| {
+                    crate::cooldown::note_failure(
+                        tracker,
+                        model_id,
+                        cooldown_cfg,
+                        crate::dispatch::reqwest_error_to_bridge(&e, send_started),
+                    )
+                })?;
+
+                let status = upstream_resp.status();
+                let resp_headers = upstream_resp.headers().clone();
+                let resp_body = upstream_resp.bytes().await.map_err(|e| {
+                    crate::cooldown::note_failure(
+                        tracker,
+                        model_id,
+                        cooldown_cfg,
+                        aisix_gateway::BridgeError::UpstreamDecode(e.to_string()),
+                    )
+                })?;
+                Ok((status, resp_headers, resp_body))
+            }
+        },
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(err) => return Err(ProxyError::Bridge(err)),
+    };
 
     // #911 [6]: run OUTPUT guardrails on the passthrough response body — the
     // same whole-body text scan as the input hook, so forbidden model output
@@ -566,6 +626,66 @@ async fn dispatch(
     Ok((response, provider_lower, pk_entry.id.to_string()))
 }
 
+/// Model-level rate-limit identity for a passthrough request, resolved from
+/// the JSON body's top-level `model` field (api7/AISIX-Cloud#1116).
+///
+/// The name is matched against the addressed provider's configured Models
+/// twice over: an exact `display_name` hit first (the gateway alias), then
+/// the provider-native `model_name` — the tunnel forwards bodies verbatim,
+/// so callers typically name the upstream id, not the gateway alias. Either
+/// way the reservation is keyed by the entry's `display_name`, so tunnel
+/// and typed traffic to the same Model draw from one bucket.
+///
+/// Returns `None` when the body is not JSON, carries no string `model`
+/// field, or nothing matches within the addressed provider — the request
+/// then reserves only the request-level layers, mirroring the pre-fix
+/// behavior. A same-named Model of a different provider never matches.
+/// Wildcard (`*`) display names are a typed-endpoint resolution feature,
+/// not replicated here.
+fn body_model_rate_limit(
+    snapshot: &aisix_core::AisixSnapshot,
+    provider_lower: &str,
+    body: &[u8],
+) -> Option<crate::quota::ModelRateLimit> {
+    // Field probe, not a full `Value` DOM: unknown fields are skipped
+    // without allocating, so a large tunnel body costs one `String` here,
+    // not a parsed copy of itself. A non-string `model` fails the whole
+    // deserialize and lands on the same `None` fallback.
+    #[derive(serde::Deserialize)]
+    struct BodyModelProbe {
+        model: Option<String>,
+    }
+    let name = serde_json::from_slice::<BodyModelProbe>(body).ok()?.model?;
+    let matches_provider = |m: &aisix_core::Model| {
+        m.provider
+            .as_deref()
+            .is_some_and(|p| p.eq_ignore_ascii_case(provider_lower))
+    };
+    let entry = snapshot
+        .models
+        .get_by_name(&name)
+        .filter(|e| matches_provider(&e.value))
+        .or_else(|| {
+            // Provider-native id fallback. `min_by_key` keeps the pick
+            // deterministic when several Models pin the same upstream id.
+            snapshot
+                .models
+                .entries()
+                .into_iter()
+                .filter(|e| {
+                    matches_provider(&e.value)
+                        && e.value.model_name.as_deref() == Some(name.as_str())
+                        && !e.value.display_name.contains('*')
+                })
+                .min_by_key(|e| e.id.clone())
+        })?;
+    Some(crate::quota::ModelRateLimit::from_model(
+        &entry.value.display_name,
+        &entry.id,
+        &entry.value,
+    ))
+}
+
 /// #699: push one zero-token `UsageEvent` per passthrough request onto the
 /// CP sink and the exporter fan-out. The raw tunnel parses neither request
 /// nor response, so there are no tokens or model fields — the event records
@@ -589,7 +709,10 @@ fn emit_usage_event(
         occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         api_key_id: api_key_id.to_string(),
         status_code,
-        latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
+        // Single-attempt endpoint: the attempt spans the whole request, so
+        // the upstream figure and what the caller waited for coincide.
+        upstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
+        downstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
         inbound_protocol: "passthrough".to_string(),
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),
@@ -626,6 +749,7 @@ fn copy_safe_headers(src: &HeaderMap, dst: &mut HeaderMap) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_access_log(
     method: &Method,
     path: &str,
@@ -634,7 +758,15 @@ fn emit_access_log(
     status: u16,
     elapsed: Duration,
     request_id: &str,
+    error: Option<&ProxyError>,
 ) {
+    let (error_kind, error) = match error {
+        Some(e) => {
+            let (kind, msg) = crate::attempt::access_log_error(e);
+            (Some(kind), Some(msg))
+        }
+        None => (None, None),
+    };
     AccessLog {
         method: method.as_str(),
         path,
@@ -650,6 +782,8 @@ fn emit_access_log(
         served_by_model: None,
         routing_attempt_count: None,
         routing_fallback_count: None,
+        error_kind,
+        error: error.as_deref(),
     }
     .emit();
 }

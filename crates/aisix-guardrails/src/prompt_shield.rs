@@ -98,12 +98,12 @@ impl PromptShieldGuardrail {
         hook_point: GuardrailHookPoint,
         fail_open: bool,
     ) -> Self {
-        let client = reqwest::Client::builder()
-            // Per-call timeout is enforced via tokio::time::timeout in
-            // call_api(); the connection pool uses reqwest's default idle
-            // timeout (90 s). No pool customisation is needed here.
+        // Per-call timeout is enforced via tokio::time::timeout in
+        // call_api(); the connection layer is the shared one, so a pooled
+        // connection expires before a hop in front of the service reaps it.
+        let client = aisix_gateway::client_builder()
             .build()
-            .expect("reqwest::Client::builder() failed; this should never happen");
+            .expect("guardrail http client builds");
         Self {
             row_name: row_name.into(),
             // Strip trailing slash so we can always append SHIELD_PATH with
@@ -174,9 +174,11 @@ impl PromptShieldGuardrail {
             // silently bypasses the guardrail on every request until
             // the operator notices. A persistent error-level log is
             // the only signal they get.
+            let response_body = crate::read_error_body_capped(resp).await;
             tracing::error!(
                 row = %self.row_name,
                 http_status = status.as_u16(),
+                response_body = %response_body,
                 "azure content safety returned 4xx — check endpoint and api_key configuration",
             );
             return Err(AcsFailure::ConfigError);

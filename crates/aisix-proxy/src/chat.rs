@@ -18,7 +18,7 @@
 
 use aisix_cache::{Cache, CacheKey};
 use aisix_core::AppliedGuardrail;
-use aisix_gateway::{BridgeContext, BridgeError, ChatFormat};
+use aisix_gateway::{BridgeError, ChatFormat};
 use aisix_guardrails::GuardrailVerdict;
 use aisix_obs::{
     content_capture_cap, AccessLog, CapturedContent, LatencyLabels, LlmUsage, Metrics,
@@ -157,7 +157,7 @@ pub async fn chat_completions(
                 let snap = state.snapshot.load();
                 crate::usage_attr::provider_key_metric_name(&snap, &success.provider_key_id)
             };
-            let client_type = aisix_obs::client_type_from_user_agent(&client.user_agent);
+            let client_type = state.client_classifier.classify(&client.user_agent);
             record_success(
                 &state.metrics,
                 &success.provider,
@@ -187,6 +187,7 @@ pub async fn chat_completions(
                 success.total_tokens,
                 &request_id,
                 &success.routing,
+                None,
             );
             // Per #655: emit a zero-token event for each failed attempt
             // that preceded the winner (non-streaming fallover). No-op for
@@ -241,6 +242,7 @@ pub async fn chat_completions(
                         reasoning_tokens: success.reasoning_tokens,
                         cache_creation_tokens: success.cache_creation_tokens,
                         cache_read_tokens: success.cache_read_tokens,
+                        usage_estimated: success.usage_estimated,
                         provider_request_id: success.provider_request_id.clone(),
                         provider_model_version: success.provider_model_version.clone(),
                         finish_reason: success.finish_reason.clone(),
@@ -248,7 +250,11 @@ pub async fn chat_completions(
                         cache_status: success.cache_status.as_str().to_string(),
                         cache_hit_saved_input_tokens: success.cache_hit_saved_input_tokens,
                         cache_hit_saved_output_tokens: success.cache_hit_saved_output_tokens,
-                        ttft_ms: 0,
+                        // Non-streaming: nothing was streamed, so there is no
+                        // upstream TTFT; the caller waited for the whole
+                        // response, which is the request clock.
+                        upstream_ttft_ms: 0,
+                        downstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
                         attempt_index: winner.map(|w| w.index).unwrap_or(0),
                         attempt_kind: winner.map(|w| w.kind).unwrap_or("initial").to_string(),
                         attempt_model: winner.map(|w| w.target_model.clone()).unwrap_or_default(),
@@ -398,8 +404,9 @@ pub async fn chat_completions(
                 status,
                 outcome: RequestOutcome::from_status(status),
             };
-            state.metrics.record_proxy_request(fail_labels, elapsed);
-            state.metrics.record_llm_request(fail_labels, elapsed);
+            state
+                .metrics
+                .record_proxy_and_llm_request(fail_labels, elapsed);
             state.metrics.record_request_e2e_latency(
                 LatencyLabels {
                     endpoint: "/v1/chat/completions",
@@ -423,6 +430,7 @@ pub async fn chat_completions(
                 al_total,
                 &request_id,
                 &routing,
+                Some(&err),
             );
             // `resolved_model_id` is populated by `dispatch` once
             // `req.model` resolves against the snapshot, so a guardrail /
@@ -493,6 +501,12 @@ pub async fn chat_completions(
                     let event_model_id = winner
                         .map(|w| w.target_model_id.as_str())
                         .unwrap_or(model_id_str);
+                    // ...and its own latency, for the same reason the success
+                    // path uses `winner_latency`: the preceding failed attempts
+                    // already emitted theirs.
+                    let winner_latency = winner
+                        .map(|w| Duration::from_millis(u64::from(w.latency_ms)))
+                        .unwrap_or(elapsed);
                     emit_usage_event(
                         &state,
                         &request_id,
@@ -500,7 +514,7 @@ pub async fn chat_completions(
                         &model_name,
                         &api_key_id,
                         status,
-                        elapsed,
+                        winner_latency,
                         c.prompt_tokens,
                         c.completion_tokens,
                         UsageExtras {
@@ -508,6 +522,7 @@ pub async fn chat_completions(
                             reasoning_tokens: c.reasoning_tokens,
                             cache_creation_tokens: c.cache_creation_tokens,
                             cache_read_tokens: c.cache_read_tokens,
+                            usage_estimated: c.usage_estimated,
                             provider_request_id: c.provider_request_id,
                             provider_model_version: c.provider_model_version,
                             finish_reason: c.finish_reason,
@@ -515,7 +530,8 @@ pub async fn chat_completions(
                             cache_status: c.cache_status.as_str().to_string(),
                             cache_hit_saved_input_tokens: 0,
                             cache_hit_saved_output_tokens: 0,
-                            ttft_ms: 0,
+                            upstream_ttft_ms: 0,
+                            downstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
                             attempt_index: winner.map(|w| w.index).unwrap_or(0),
                             attempt_kind: winner.map(|w| w.kind).unwrap_or("initial").to_string(),
                             attempt_model: winner
@@ -592,6 +608,10 @@ struct Success {
     prompt_tokens: Option<u64>,
     completion_tokens: Option<u64>,
     total_tokens: Option<u64>,
+    /// True when the token counters were filled by the local estimator
+    /// because the upstream response carried no usage block
+    /// (AISIX-Cloud#1074). Lands on `UsageEvent::usage_estimated`.
+    usage_estimated: bool,
     /// Provider-specific cache + reasoning token counters. Default 0
     /// for providers that don't expose them; cp-api falls back to the
     /// standard prompt / completion rate when these are 0.
@@ -704,6 +724,78 @@ impl CacheStatus {
 /// message's text. `ChatMessage::content` already carries the
 /// concatenated text of multimodal content blocks, so this also covers
 /// vision/array-shaped messages (non-text blocks are skipped upstream).
+/// Generated output text for the token-estimation fallback
+/// (AISIX-Cloud#1074) — the non-streaming analog of the stream loop's
+/// `est_output_text` accumulation: message content + reasoning +
+/// tool-call name/argument text. Only built when estimation runs.
+pub(crate) fn estimation_output_text(resp: &aisix_gateway::ChatResponse) -> String {
+    let mut out = resp.message.content.clone().unwrap_or_default();
+    if let Some(s) = resp
+        .message
+        .extra
+        .get("reasoning_content")
+        .and_then(|v| v.as_str())
+    {
+        out.push_str(s);
+    }
+    if let Some(tcs) = resp
+        .message
+        .extra
+        .get("tool_calls")
+        .and_then(|v| v.as_array())
+    {
+        for tc in tcs {
+            if let Some(f) = tc.get("function") {
+                if let Some(n) = f.get("name").and_then(|v| v.as_str()) {
+                    out.push_str(n);
+                }
+                if let Some(a) = f.get("arguments").and_then(|v| v.as_str()) {
+                    out.push_str(a);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// #1074 ensemble sub-call token fallback. A sub-call backend (a panel
+/// member, or the judge) that reports no usage would otherwise record
+/// silent zeros; estimate the prompt from that sub-call's own request
+/// (`req`: the client request for a panel member — every member shares the
+/// inbound messages — or the synthesis request for the judge) and the
+/// completion from the sub-call's answer text. `model` is the sub-call's
+/// resolved **upstream** model (not the operator alias) so the tokenizer
+/// encoding matches the real backend, consistent with the direct and
+/// streaming-judge paths. Returns `(prompt, completion, usage_estimated)`
+/// under the #794 or-semantics: a non-zero upstream value always wins,
+/// estimation fills only zeros. One helper so every sub-call emit site
+/// (non-streaming panel + judge, streaming panel) can't drift apart.
+fn estimate_subcall_tokens(
+    req: &ChatFormat,
+    model: &str,
+    usage: &aisix_gateway::chat::UsageStats,
+    output_text: &str,
+) -> (u32, u32, bool) {
+    if usage.prompt_tokens != 0 && usage.completion_tokens != 0 {
+        return (usage.prompt_tokens, usage.completion_tokens, false);
+    }
+    let est = crate::token_estimate::Estimator::new(
+        model,
+        crate::token_estimate::PromptInput::Chat(Box::new(req.clone())),
+    );
+    let filled = crate::token_estimate::fill_missing(
+        &est,
+        usage.prompt_tokens,
+        usage.completion_tokens,
+        Some(output_text),
+    );
+    (
+        filled.prompt_tokens,
+        filled.completion_tokens,
+        filled.estimated,
+    )
+}
+
 fn last_user_message_text(req: &ChatFormat) -> Option<String> {
     req.messages
         .iter()
@@ -801,6 +893,10 @@ struct UpstreamCharge {
     provider_key_id: String,
     prompt_tokens: u32,
     completion_tokens: u32,
+    /// True when the counters above were filled by the local estimator
+    /// (AISIX-Cloud#1074) — the billed-then-blocked upstream response
+    /// carried no usage block.
+    usage_estimated: bool,
     cached_prompt_tokens: u32,
     reasoning_tokens: u32,
     cache_creation_tokens: u32,
@@ -1029,6 +1125,7 @@ async fn dispatch(
                             .as_deref()
                             .unwrap_or(auth.entry.id.as_str()),
                     ),
+                    source_ip: &client.source_ip,
                 },
             )
             .map_err(&with_model)?;
@@ -1058,12 +1155,14 @@ async fn dispatch(
     }
 
     // Multi-layer rate-limit reservation (api_key inline + model inline + policies).
+    // `mut` so a routing dispatch can fold the winning target's model-layer
+    // reservation into it once the winner is known (AISIX-Cloud#1087).
     let model_rl = crate::quota::ModelRateLimit::from_model(
         &req.model,
         &virtual_entry.id,
         &virtual_entry.value,
     );
-    let reservation = crate::quota::enforce_rate_limit(state, auth, Some(&model_rl))
+    let mut reservation = crate::quota::enforce_rate_limit(state, auth, Some(&model_rl))
         .await
         .map_err(&with_model)?;
 
@@ -1136,10 +1235,20 @@ async fn dispatch(
             upstream: aisix_gateway::ChatChunkStream,
             idx: u32,
             kind: &'static str,
+            /// When this attempt began. The end-of-stream UsageEvent
+            /// reports `attempt_started.elapsed()` so `latency_ms` covers
+            /// this attempt alone, matching the failed-attempt events and
+            /// the non-streaming winner (#655 contract in `usage.rs`).
+            attempt_started: Instant,
         }
         let mut won: Option<StreamWin> = None;
+        // The winning target's own model-layer reservation (routing dispatch
+        // only) — folded into `reservation` after the loop so the stream hold
+        // and post-stream token accounting cover the member's limits too
+        // (AISIX-Cloud#1087).
+        let mut won_member_reservation: Option<aisix_ratelimit::MultiReservation> = None;
 
-        'targets: for attempt in &attempt_models {
+        'targets: for (target_idx, attempt) in attempt_models.iter().enumerate() {
             let model = &attempt.model;
             let Ok(provider) = crate::dispatch::require_provider(model) else {
                 last_err = Some(BridgeError::Config("model has no provider".into()));
@@ -1157,124 +1266,224 @@ async fn dispatch(
                 ));
                 continue 'targets;
             };
-            let (idx, kind) = stream_routing.begin_attempt(&model.display_name);
-            let target_model = if is_routing_request {
-                model.display_name.clone()
-            } else {
-                String::new()
-            };
-            let model_arc = Arc::new(model.clone());
-            let pk_arc = Arc::new(pk_entry.value.clone());
+
             // Streaming deadline (#554): bound the connect by the effective
             // stream timeout; the read-timeout wrapper below enforces the
             // same budget on the first and subsequent chunks.
-            let mut ctx = BridgeContext::new(request_id, model_arc, pk_arc);
-            if let Some(d) = model.stream_timeout_effective() {
+            let mut ctx = crate::dispatch::bridge_ctx(
+                request_id,
+                &attempt.id,
+                Arc::new(model.clone()),
+                &pk_entry.id,
+                Arc::new(pk_entry.value.clone()),
+                Some(client),
+            );
+            // Effective streaming budget, resolved target → group →
+            // `upstream.stream_timeout_ms`/`timeout_ms`. Used for the
+            // connect deadline (above) AND the per-chunk read timeout +
+            // first-chunk peek below, so the budget is applied
+            // consistently.
+            let timeouts = crate::routing::effective_timeouts(
+                model,
+                Some(&virtual_entry.value),
+                state.default_timeouts,
+            );
+            let stream_budget = timeouts.stream;
+            if let Some(d) = stream_budget {
                 ctx = ctx.with_deadline(d);
             }
-            let attempt_started = Instant::now();
-            // Effective streaming budget: `stream_timeout`, falling back to
-            // `timeout`. Used for the connect deadline (above) AND the
-            // per-chunk read timeout + first-chunk peek here, so the budget
-            // is applied consistently.
-            let stream_budget = model.stream_timeout_effective();
-            // Connect, then — only when a streaming budget is configured —
-            // peek the first chunk so a slow or erroring first token fails
-            // over before the 200 is committed. Without a budget there is
-            // nothing to gate on, so the stream is committed directly (a
-            // first-chunk error then surfaces in-band, exactly like the
-            // pre-#554 behavior). The read-timeout wrapper is a no-op when
-            // the budget is None.
-            let attempt_stream: Result<aisix_gateway::ChatChunkStream, BridgeError> =
-                match bridge.chat_stream(req, &ctx).await {
-                    Err(e) => Err(e),
-                    Ok(up) => {
-                        let up = crate::stream_timeout::with_read_timeout(up, stream_budget);
-                        if stream_budget.is_some() {
-                            let mut up = up;
-                            match up.next().await {
-                                // Re-prepend the peeked chunk so the SSE pump
-                                // sees the whole stream (and records TTFT on
-                                // the first content chunk); the wrapper keeps
-                                // enforcing the read timeout on the rest.
-                                Some(Ok(chunk)) => Ok(Box::pin(
-                                    futures::stream::once(std::future::ready(
-                                        Ok::<_, BridgeError>(chunk),
-                                    ))
-                                    .chain(up),
-                                )
-                                    as aisix_gateway::ChatChunkStream),
-                                Some(Err(e)) => Err(e),
-                                None => Err(BridgeError::StreamAborted),
-                            }
-                        } else {
-                            Ok(up)
-                        }
+
+            // How many times to re-hit the SAME target (with backoff) on a
+            // retryable failure before failing over to the next one.
+            // Resolved per target, not once per request: the budget belongs
+            // to the upstream being hit, so a group may mix a target that
+            // tolerates three retries with one that tolerates none.
+            // Streaming used to skip `retries` entirely (AISIX-Cloud#1119);
+            // a direct model used to be pinned at zero because the knob only
+            // existed on the group.
+            let budget = crate::routing::effective_retries(
+                model,
+                virtual_entry.value.routing.as_ref(),
+                state.default_retries,
+                target_idx + 1 < attempt_models.len(),
+            );
+
+            for attempt_idx in 0..=budget.attempts {
+                let (idx, kind) = stream_routing.begin_attempt(&model.display_name);
+                let target_model = if is_routing_request {
+                    model.display_name.clone()
+                } else {
+                    String::new()
+                };
+                // Reserve THIS target's own model rate-limit layers before
+                // dispatching to it (AISIX-Cloud#1087). Over-limit → record a
+                // 429 attempt and move on to the remaining targets in strategy
+                // order (same-target retries can't help — the window won't
+                // reset mid-loop).
+                let member_reservation = match crate::quota::reserve_routing_target(
+                    state,
+                    is_routing_request,
+                    &model.display_name,
+                    &attempt.id,
+                    model,
+                )
+                .await
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        stream_routing.attempts.push(AttemptRecord {
+                            index: idx,
+                            kind,
+                            target_model,
+                            target_model_id: attempt.id.clone(),
+                            provider_key_id: pk_entry.id.clone(),
+                            status: 429,
+                            success: false,
+                            error_class: "rate_limit_exceeded".to_string(),
+                            error_message: e.to_string(),
+                            latency_ms: 0,
+                        });
+                        // Keep the limiter's own Retry-After hint on the wire:
+                        // when every target is exhausted this error becomes the
+                        // client's 429, and SDKs back off on that header.
+                        last_err = Some(BridgeError::upstream_status_with_retry_after(
+                            429,
+                            format!(
+                                "routing target {:?} is over its model rate limit: {e}",
+                                model.display_name
+                            ),
+                            crate::quota::retry_after_of(&e).map(Duration::from_secs),
+                        ));
+                        continue 'targets;
                     }
                 };
-            let latency_ms = attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
-            match attempt_stream {
-                Ok(upstream) => {
-                    state.health.record_success(&model.display_name);
-                    state.runtime_status.mark_healthy(&attempt.id);
-                    // Feed the least_latency EWMA. For streaming this is
-                    // time-to-first-response (upstream stream established) —
-                    // the routing-relevant latency signal.
-                    state.runtime_status.record_latency(&attempt.id, latency_ms);
-                    stream_routing.attempts.push(AttemptRecord {
-                        index: idx,
-                        kind,
-                        target_model,
-                        target_model_id: attempt.id.clone(),
-                        provider_key_id: pk_entry.id.clone(),
-                        status: 200,
-                        success: true,
-                        error_class: String::new(),
-                        error_message: String::new(),
-                        latency_ms,
-                    });
-                    won = Some(StreamWin {
-                        model: model.clone(),
-                        target_id: attempt.id.clone(),
-                        provider_lc: provider.to_ascii_lowercase(),
-                        pk_id: pk_entry.id.clone(),
-                        upstream,
-                        idx,
-                        kind,
-                    });
-                    break 'targets;
-                }
-                Err(err) => {
-                    stream_routing.attempts.push(AttemptRecord {
-                        index: idx,
-                        kind,
-                        target_model,
-                        target_model_id: attempt.id.clone(),
-                        provider_key_id: pk_entry.id.clone(),
-                        status: err.http_status(),
-                        success: false,
-                        error_class: routing_error_class(&err).to_string(),
-                        error_message: attempt_error_message(&err),
-                        latency_ms,
-                    });
-                    let retryable = is_retryable(&err, retry_on_429, fallback_statuses);
-                    tracing::warn!(
-                        target_model = %model.display_name,
-                        error = %err,
-                        retryable,
-                        "streaming routing target attempt failed",
-                    );
-                    if retryable {
-                        state.health.record_failure(&model.display_name);
-                    }
-                    if let Some((ttl, reason)) =
-                        decide_cooldown(&err, attempt.model.cooldown.as_ref())
-                    {
-                        state.runtime_status.mark_cooldown(&attempt.id, ttl, reason);
-                    }
-                    last_err = Some(err);
-                    if !retryable {
+                let attempt_started = Instant::now();
+                // Connect, then — only when a streaming budget is configured
+                // ON THE RESOURCES — peek the first chunk so a slow or
+                // erroring first token fails over before the 200 is
+                // committed. The deployment-default budget does not peek
+                // (see `TimeoutBudget::stream_configured`): it stays a read
+                // timeout, so the 200 commits directly and the SSE
+                // heartbeats cover the wait for the first token. The
+                // read-timeout wrapper is a no-op when the budget is None.
+                let attempt_stream: Result<aisix_gateway::ChatChunkStream, BridgeError> =
+                    match bridge.chat_stream(req, &ctx).await {
+                        Err(e) => Err(e),
+                        Ok(up) => {
+                            let up = crate::stream_timeout::with_read_timeout(up, stream_budget);
+                            if timeouts.stream_configured {
+                                let mut up = up;
+                                match up.next().await {
+                                    // Re-prepend the peeked chunk so the SSE pump
+                                    // sees the whole stream (and records TTFT on
+                                    // the first content chunk); the wrapper keeps
+                                    // enforcing the read timeout on the rest.
+                                    Some(Ok(chunk)) => Ok(Box::pin(
+                                        futures::stream::once(std::future::ready(Ok::<
+                                            _,
+                                            BridgeError,
+                                        >(
+                                            chunk
+                                        )))
+                                        .chain(up),
+                                    )
+                                        as aisix_gateway::ChatChunkStream),
+                                    Some(Err(e)) => Err(e),
+                                    None => Err(BridgeError::StreamAborted),
+                                }
+                            } else {
+                                Ok(up)
+                            }
+                        }
+                    };
+                let latency_ms = attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+                match attempt_stream {
+                    Ok(upstream) => {
+                        state.health.record_success(&model.display_name);
+                        state.runtime_status.mark_healthy(&attempt.id);
+                        // Feed the least_latency EWMA. For streaming this is
+                        // time-to-first-response (upstream stream established) —
+                        // the routing-relevant latency signal.
+                        state.runtime_status.record_latency(&attempt.id, latency_ms);
+                        stream_routing.attempts.push(AttemptRecord {
+                            index: idx,
+                            kind,
+                            target_model,
+                            target_model_id: attempt.id.clone(),
+                            provider_key_id: pk_entry.id.clone(),
+                            status: 200,
+                            success: true,
+                            error_class: String::new(),
+                            error_message: String::new(),
+                            latency_ms,
+                        });
+                        won = Some(StreamWin {
+                            model: model.clone(),
+                            target_id: attempt.id.clone(),
+                            provider_lc: provider.to_ascii_lowercase(),
+                            pk_id: pk_entry.id.clone(),
+                            upstream,
+                            idx,
+                            kind,
+                            attempt_started,
+                        });
+                        won_member_reservation = member_reservation;
                         break 'targets;
+                    }
+                    Err(err) => {
+                        stream_routing.attempts.push(AttemptRecord {
+                            index: idx,
+                            kind,
+                            target_model,
+                            target_model_id: attempt.id.clone(),
+                            provider_key_id: pk_entry.id.clone(),
+                            status: err.http_status(),
+                            success: false,
+                            error_class: routing_error_class(&err).to_string(),
+                            error_message: attempt_error_message(&err),
+                            latency_ms,
+                        });
+                        let retryable = is_retryable(&err, retry_on_429, fallback_statuses);
+                        tracing::warn!(
+                            target_model = %model.display_name,
+                            target_attempt = attempt_idx + 1,
+                            error = %err,
+                            retryable,
+                            "streaming routing target attempt failed",
+                        );
+                        if retryable {
+                            state.health.record_failure(&model.display_name);
+                        }
+                        if let Some((ttl, reason)) =
+                            decide_cooldown(&err, attempt.model.cooldown.as_ref())
+                        {
+                            state.runtime_status.mark_cooldown(&attempt.id, ttl, reason);
+                        }
+                        let retry_after = crate::routing::retry_after_hint(&err);
+                        // An unconfigured budget does not spend itself on a
+                        // timeout — see `RetryBudget::covers`. Fail-over is
+                        // unaffected: the outer loop still moves on.
+                        let budget_covers = budget.covers(&err);
+                        last_err = Some(err);
+                        if !retryable {
+                            break 'targets;
+                        }
+                        if attempt_idx == budget.attempts || !budget_covers {
+                            break;
+                        }
+                        // Upstream `Retry-After` when it gave one, else
+                        // exponential backoff + jitter, before re-hitting the
+                        // SAME target (#788 P2); cross-target fail-over (the
+                        // outer loop) stays immediate.
+                        let backoff =
+                            crate::routing::retry_backoff((attempt_idx + 1) as u32, retry_after);
+                        tracing::debug!(
+                            target_model = %model.display_name,
+                            next_attempt = attempt_idx + 2,
+                            backoff_ms = backoff.as_millis() as u64,
+                            "backing off before same-target retry",
+                        );
+                        tokio::time::sleep(backoff).await;
                     }
                 }
             }
@@ -1294,6 +1503,7 @@ async fn dispatch(
             upstream,
             idx: winner_idx,
             kind: winner_kind,
+            attempt_started: winner_attempt_started,
         } = won;
         let model = &model;
         // Hold concurrency for the stream's full lifetime instead of
@@ -1306,6 +1516,13 @@ async fn dispatch(
         // which the CompleteOnDrop guard fires on both paths). Pre-fix the
         // permit was released here, letting a key capped at N run far more
         // than N simultaneous streams (#450).
+        //
+        // Fold the winning target's model-layer reservation in first, so the
+        // stream hold keeps its concurrency slot(s) and `post_stream_keys`
+        // bills its TPM/TPD at stream end too (AISIX-Cloud#1087).
+        if let Some(member) = won_member_reservation.take() {
+            reservation.merge(member);
+        }
         let post_stream_keys = reservation.keys();
         let stream_concurrency_hold = reservation.into_stream_hold();
         // least_busy: keep this target counted as in-flight for the stream's
@@ -1342,7 +1559,10 @@ async fn dispatch(
             crate::usage_attr::provider_key_metric_name(&snap, &pk_id)
         };
         let user_name_for_metrics = auth.key().user_name.clone();
-        let client_type_for_metrics = aisix_obs::client_type_from_user_agent(&client.user_agent);
+        let client_type_for_metrics = state
+            .client_classifier
+            .classify(&client.user_agent)
+            .to_string();
         // Captured for the stream-end telemetry closure so
         // emit_usage_event can look up `telemetry_tags` for per-PK
         // attribution (#302 M17 / AISIX-Cloud#436). The metrics
@@ -1406,16 +1626,26 @@ async fn dispatch(
             .and_then(|so| so.get("include_usage"))
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        // Token-estimation fallback context (AISIX-Cloud#1074): the
+        // request is cloned here because the stream owns it until an
+        // end-of-stream Drop — where the borrow is long gone. Tokenized
+        // only if the upstream never reports usage.
+        let estimator = crate::token_estimate::Estimator::new(
+            &upstream_model_for_metrics,
+            crate::token_estimate::PromptInput::Chat(Box::new(req.clone())),
+        );
         let sse_stream = build_sse_stream(
             upstream,
             now,
             stream_guardrail,
             started,
+            winner_attempt_started,
             req.model.clone(),
             content_cap,
             client_requested_usage,
             // Single upstream: nothing pre-incurred, so no usage to fold in.
             aisix_gateway::chat::UsageStats::default(),
+            Some(estimator),
             move |comp: StreamCompletion| {
                 // Rate-limit accounting (TPM cap) for all layers.
                 for key in &post_stream_keys {
@@ -1432,7 +1662,12 @@ async fn dispatch(
                     &model_for_metrics,
                     &api_key_id_for_telem,
                     /* status_code */ 200,
-                    started.elapsed(),
+                    // Scoped to the winning attempt, not the request: the
+                    // failed attempts before it emit their own events and
+                    // `started` would double-count them (plus the pre-dispatch
+                    // work and the retry backoff). The access log keeps the
+                    // request-level figure.
+                    winner_attempt_started.elapsed(),
                     comp.prompt_tokens,
                     comp.completion_tokens,
                     UsageExtras {
@@ -1440,6 +1675,7 @@ async fn dispatch(
                         reasoning_tokens: comp.reasoning_tokens,
                         cache_creation_tokens: comp.cache_creation_tokens,
                         cache_read_tokens: comp.cache_read_tokens,
+                        usage_estimated: comp.usage_estimated,
                         provider_request_id: comp.provider_request_id,
                         provider_model_version: comp.provider_model_version,
                         finish_reason: comp.finish_reason,
@@ -1463,7 +1699,8 @@ async fn dispatch(
                         cache_status: CacheStatus::Disabled.as_str().to_string(),
                         cache_hit_saved_input_tokens: 0,
                         cache_hit_saved_output_tokens: 0,
-                        ttft_ms: comp.ttft_ms,
+                        upstream_ttft_ms: comp.upstream_ttft_ms,
+                        downstream_latency_ms: comp.downstream_latency_ms,
                         // #554: the winning attempt may be a fallback target,
                         // not the initial one — record the real index/kind.
                         attempt_index: winner_idx,
@@ -1523,8 +1760,11 @@ async fn dispatch(
                 // #1002: comp.total_tokens is the cache-inclusive total (an
                 // Anthropic upstream bridged to an OpenAI-shape client folds
                 // cache tokens into total_tokens per #679).
+                // AISIX-Cloud#1044: same requested logical model as the
+                // UsageLabels above.
                 metrics_for_stream.record_llm_tokens_by_client(
-                    client_type_for_metrics,
+                    &client_type_for_metrics,
+                    &model_for_metrics,
                     u64::from(comp.prompt_tokens),
                     u64::from(comp.completion_tokens),
                     comp.total_tokens,
@@ -1547,7 +1787,7 @@ async fn dispatch(
                         status: 200,
                         streaming: true,
                     },
-                    Duration::from_millis(u64::from(comp.ttft_ms)),
+                    Duration::from_millis(u64::from(comp.upstream_ttft_ms)),
                 );
                 metrics_for_stream.record_time_to_first_token(
                     UsageLabels {
@@ -1563,7 +1803,7 @@ async fn dispatch(
                         user_id: user_id_for_metrics.as_deref().unwrap_or("unknown"),
                         user_name: user_name_for_metrics.as_deref().unwrap_or("unknown"),
                     },
-                    Duration::from_millis(u64::from(comp.ttft_ms)),
+                    Duration::from_millis(u64::from(comp.upstream_ttft_ms)),
                 );
                 // Release the concurrency permit(s) now that the stream has
                 // completed (or was cancelled). on_complete is fired by the
@@ -1574,8 +1814,10 @@ async fn dispatch(
                 drop(in_flight_hold);
             },
         );
-        let response =
-            Sse::new(sse_stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)));
+        let mut response = Sse::new(sse_stream);
+        if let Some(d) = crate::sse_keepalive::interval() {
+            response = response.keep_alive(KeepAlive::new().interval(d));
+        }
         return Ok(Success {
             response: response.into_response(),
             provider: provider.to_ascii_lowercase(),
@@ -1585,6 +1827,7 @@ async fn dispatch(
             // top-level handler skips its own `emit_usage_event` for
             // streaming via `telemetry_handled_by_stream` below.
             prompt_tokens: None,
+            usage_estimated: false,
             completion_tokens: None,
             total_tokens: None,
             cost_usd: 0.0,
@@ -1766,6 +2009,42 @@ async fn dispatch(
                     .upstream_model()
                     .unwrap_or("unknown")
                     .to_string();
+                // Token-estimation fallback (AISIX-Cloud#1074): a stored
+                // response whose original upstream never reported usage
+                // replays zeros — fill them like the fresh-response path
+                // so hit rows (and their saved-token stats) don't record
+                // silent zeros.
+                let (prompt, completion, total, usage_estimated) = if prompt == 0 || completion == 0
+                {
+                    let est = crate::token_estimate::Estimator::new(
+                        &upstream_model,
+                        crate::token_estimate::PromptInput::Chat(Box::new(req.clone())),
+                    );
+                    let filled = crate::token_estimate::fill_missing(
+                        &est,
+                        prompt as u32,
+                        completion as u32,
+                        Some(&estimation_output_text(&cached)),
+                    );
+                    if filled.estimated {
+                        let total = crate::usage_attr::total_tokens_with_cache(
+                            filled.prompt_tokens,
+                            filled.completion_tokens,
+                            cache_creation_tokens,
+                            cache_read_tokens,
+                        );
+                        (
+                            filled.prompt_tokens as u64,
+                            filled.completion_tokens as u64,
+                            total,
+                            true,
+                        )
+                    } else {
+                        (prompt, completion, total, false)
+                    }
+                } else {
+                    (prompt, completion, total, false)
+                };
                 // Capture the prompt + cached response for content-capturing
                 // exporters (gated). A cache hit still served content to the
                 // caller, so it's logged like a fresh response.
@@ -1787,6 +2066,7 @@ async fn dispatch(
                     prompt_tokens: Some(prompt),
                     completion_tokens: Some(completion),
                     total_tokens: Some(total),
+                    usage_estimated,
                     cached_prompt_tokens,
                     reasoning_tokens,
                     cache_creation_tokens,
@@ -1843,12 +2123,6 @@ async fn dispatch(
     // requests (AISIX-Cloud#410). Stays `None` until an attempt wins.
     let mut chosen_target_display_name: Option<String> = None;
     let mut upstream: Option<aisix_gateway::ChatResponse> = None;
-    let retries = virtual_entry
-        .value
-        .routing
-        .as_ref()
-        .map(|routing| routing.retries_or_default())
-        .unwrap_or(0);
     let retry_on_429 = virtual_entry
         .value
         .routing
@@ -1864,8 +2138,13 @@ async fn dispatch(
     let is_routing_request =
         virtual_entry.value.routing.is_some() || virtual_entry.value.is_semantic();
     let mut routing = RoutingTelemetry::default();
+    // The winning target's own model-layer reservation (routing dispatch
+    // only) — folded into `reservation` at the commit point below so the
+    // member's TPM/TPD bills with the request-level layers
+    // (AISIX-Cloud#1087).
+    let mut won_member_reservation: Option<aisix_ratelimit::MultiReservation> = None;
 
-    for attempt in &attempt_models {
+    'targets: for (target_idx, attempt) in attempt_models.iter().enumerate() {
         let model = &attempt.model;
         let Some(provider) = model.provider.as_deref() else {
             last_err = Some(BridgeError::Config("model has no provider".into()));
@@ -1892,17 +2171,36 @@ async fn dispatch(
             )));
             continue;
         };
-        let model_arc = Arc::new(model.clone());
-        let pk_arc = Arc::new(pk_entry.value.clone());
+
         // Per-attempt non-streaming deadline (#554): an elapsed `timeout`
         // surfaces as a retryable `BridgeError::Timeout`, so a slow target
         // fails over to the next one via the loop below.
-        let mut ctx = BridgeContext::new(request_id, model_arc, pk_arc);
-        if let Some(d) = model.request_timeout() {
+        let mut ctx = crate::dispatch::bridge_ctx(
+            request_id,
+            &attempt.id,
+            Arc::new(model.clone()),
+            &pk_entry.id,
+            Arc::new(pk_entry.value.clone()),
+            Some(client),
+        );
+        if let Some(d) = crate::routing::effective_timeouts(
+            model,
+            Some(&virtual_entry.value),
+            state.default_timeouts,
+        )
+        .request
+        {
             ctx = ctx.with_deadline(d);
         }
+        // Per-target retry budget — see the streaming loop above.
+        let budget = crate::routing::effective_retries(
+            model,
+            virtual_entry.value.routing.as_ref(),
+            state.default_retries,
+            target_idx + 1 < attempt_models.len(),
+        );
 
-        for attempt_idx in 0..=retries {
+        for attempt_idx in 0..=budget.attempts {
             // Per-attempt telemetry kind (#655): the first attempt overall
             // is "initial"; a different target than the previous attempt is
             // a "fallback"; the same target again is a "retry".
@@ -1913,6 +2211,49 @@ async fn dispatch(
                 model.display_name.clone()
             } else {
                 String::new()
+            };
+
+            // Reserve THIS target's own model rate-limit layers before
+            // dispatching to it (AISIX-Cloud#1087). Over-limit → record a
+            // 429 attempt and move on to the remaining targets in strategy
+            // order (same-target retries can't help — the window won't
+            // reset mid-loop).
+            let member_reservation = match crate::quota::reserve_routing_target(
+                state,
+                is_routing_request,
+                &model.display_name,
+                &attempt.id,
+                model,
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    routing.attempts.push(AttemptRecord {
+                        index: attempt_index,
+                        kind,
+                        target_model,
+                        target_model_id: attempt.id.clone(),
+                        provider_key_id: pk_entry.id.clone(),
+                        status: 429,
+                        success: false,
+                        error_class: "rate_limit_exceeded".to_string(),
+                        error_message: e.to_string(),
+                        latency_ms: 0,
+                    });
+                    // Keep the limiter's own Retry-After hint on the wire:
+                    // when every target is exhausted this error becomes the
+                    // client's 429, and SDKs back off on that header.
+                    last_err = Some(BridgeError::upstream_status_with_retry_after(
+                        429,
+                        format!(
+                            "routing target {:?} is over its model rate limit: {e}",
+                            model.display_name
+                        ),
+                        crate::quota::retry_after_of(&e).map(Duration::from_secs),
+                    ));
+                    continue 'targets;
+                }
             };
 
             let attempt_started = Instant::now();
@@ -1950,6 +2291,7 @@ async fn dispatch(
                         error_message: String::new(),
                         latency_ms: attempt_latency_ms,
                     });
+                    won_member_reservation = member_reservation;
                     upstream = Some(resp);
                     break;
                 }
@@ -1987,18 +2329,25 @@ async fn dispatch(
                     {
                         state.runtime_status.mark_cooldown(&attempt.id, ttl, reason);
                     }
+                    let retry_after = crate::routing::retry_after_hint(&err);
+                    // See `RetryBudget::covers`: a default budget skips
+                    // same-target retries for timeouts. Fail-over is
+                    // unaffected.
+                    let budget_covers = budget.covers(&err);
                     last_err = Some(err);
                     if !retryable {
                         break;
                     }
-                    if attempt_idx == retries {
+                    if attempt_idx == budget.attempts || !budget_covers {
                         break;
                     }
-                    // #788 P2: exponential backoff + jitter before retrying
-                    // the SAME target, so a transiently-failing upstream gets
-                    // a pause instead of being hammered. Cross-target fallover
-                    // (the outer loop) stays immediate.
-                    let backoff = crate::routing::retry_backoff((attempt_idx + 1) as u32);
+                    // #788 P2: upstream `Retry-After` when supplied, else
+                    // exponential backoff + jitter, before retrying the SAME
+                    // target, so a transiently-failing upstream gets a pause
+                    // instead of being hammered. Cross-target fallover (the
+                    // outer loop) stays immediate.
+                    let backoff =
+                        crate::routing::retry_backoff((attempt_idx + 1) as u32, retry_after);
                     tracing::debug!(
                         target_model = %model.display_name,
                         next_attempt = attempt_idx + 2,
@@ -2033,9 +2382,50 @@ async fn dispatch(
     // Output guardrail. Tokens still count against quota — the upstream
     // already burned them — so commit before the check, and refuse the
     // refusal-write to the cache so a re-request gets a fresh chance.
-    let prompt = upstream.usage.prompt_tokens as u64;
-    let completion = upstream.usage.completion_tokens as u64;
-    let total = upstream.usage.total_tokens as u64;
+    //
+    // Token-estimation fallback (AISIX-Cloud#1074): when the upstream
+    // response carries no usage block, fill the missing counters locally
+    // BEFORE the quota commit and telemetry below so neither records
+    // silent zeros. Local variables only — `render_response` serialises
+    // the upstream body untouched, so the client never sees synthesised
+    // usage presented as the provider's.
+    let (prompt_tokens_u32, completion_tokens_u32, usage_estimated) = {
+        let (p, c) = (
+            upstream.usage.prompt_tokens,
+            upstream.usage.completion_tokens,
+        );
+        if p == 0 || c == 0 {
+            let est = crate::token_estimate::Estimator::new(
+                &upstream_model,
+                crate::token_estimate::PromptInput::Chat(Box::new(req.clone())),
+            );
+            let filled = crate::token_estimate::fill_missing(
+                &est,
+                p,
+                c,
+                Some(&estimation_output_text(&upstream)),
+            );
+            (
+                filled.prompt_tokens,
+                filled.completion_tokens,
+                filled.estimated,
+            )
+        } else {
+            (p, c, false)
+        }
+    };
+    let prompt = prompt_tokens_u32 as u64;
+    let completion = completion_tokens_u32 as u64;
+    let total = if usage_estimated {
+        crate::usage_attr::total_tokens_with_cache(
+            prompt_tokens_u32,
+            completion_tokens_u32,
+            upstream.usage.cache_creation_tokens,
+            upstream.usage.cache_read_tokens,
+        )
+    } else {
+        upstream.usage.total_tokens as u64
+    };
     // Snapshot the cache / reasoning counters + provider identity before
     // the upstream gets moved into render_response below — we need them
     // on the Success struct for telemetry.
@@ -2046,6 +2436,12 @@ async fn dispatch(
     let provider_request_id = upstream.id.clone();
     let provider_model_version = upstream.model.clone();
     let finish_reason = finish_reason_label(&upstream.finish_reason);
+    // Fold the winning target's model-layer reservation in so one commit
+    // bills the member's TPM/TPD alongside the request-level layers
+    // (AISIX-Cloud#1087).
+    if let Some(member) = won_member_reservation.take() {
+        reservation.merge(member);
+    }
     reservation.commit_tokens(total).await;
 
     // cp-api recomputes cost server-side from its pricing catalog when
@@ -2086,8 +2482,9 @@ async fn dispatch(
             // output-blocked requests.
             let charge = UpstreamCharge {
                 provider_key_id: provider_key_id.clone(),
-                prompt_tokens: upstream.usage.prompt_tokens,
-                completion_tokens: upstream.usage.completion_tokens,
+                prompt_tokens: prompt_tokens_u32,
+                completion_tokens: completion_tokens_u32,
+                usage_estimated,
                 cached_prompt_tokens,
                 reasoning_tokens,
                 cache_creation_tokens,
@@ -2199,6 +2596,7 @@ async fn dispatch(
         prompt_tokens: Some(prompt),
         completion_tokens: Some(completion),
         total_tokens: Some(total),
+        usage_estimated,
         cached_prompt_tokens,
         reasoning_tokens,
         cache_creation_tokens,
@@ -2294,16 +2692,26 @@ async fn dispatch_ensemble(
         ))
     })?;
 
-    // Resolve a sub-call's target by display_name → (model_id, provider_key_id)
-    // for telemetry; empty pair if the target was deleted between dispatch and
-    // emit (cp-api stores NULL). Shared by both the success and 502 paths.
-    let resolve_sub = |display_name: &str| -> (String, String) {
+    // Resolve a sub-call's target by display_name → (model_id, provider_key_id,
+    // upstream_model). The first two are telemetry attribution; the third is
+    // the tokenizer key for the #1074 estimation fallback — the estimator keys
+    // off the real upstream model, not the operator alias, exactly as the
+    // direct and streaming-judge paths do (a `gpt-4o` alias must select
+    // o200k_base, not the cl100k default an unrecognised alias falls back to).
+    // Empty ids if the target was deleted between dispatch and emit (cp-api
+    // stores NULL); the tokenizer then degrades to the display name.
+    let resolve_sub = |display_name: &str| -> (String, String, String) {
         match snapshot.models.get_by_name(display_name) {
             Some(entry) => (
                 entry.id.clone(),
                 entry.value.provider_key_id.clone().unwrap_or_default(),
+                entry
+                    .value
+                    .upstream_model()
+                    .unwrap_or(display_name)
+                    .to_string(),
             ),
-            None => (String::new(), String::new()),
+            None => (String::new(), String::new(), display_name.to_string()),
         }
     };
     // Emit one usage event for a single (already-billed) panel member.
@@ -2314,7 +2722,18 @@ async fn dispatch_ensemble(
     // 0-based slot; `blocked` sets the event's `guardrail_blocked` flag.
     let emit_panel_member =
         |member: &crate::ensemble::PanelOutcome, index: usize, blocked: bool, bypass: &str| {
-            let (sub_model_id, sub_provider_key_id) = resolve_sub(&member.model);
+            let (sub_model_id, sub_provider_key_id, sub_upstream_model) =
+                resolve_sub(&member.model);
+            // #1074: a member backend that omitted usage gets its prompt
+            // estimated from the shared client request and its completion
+            // from the member's own answer text, tokenized with the member's
+            // resolved upstream model.
+            let (prompt_tokens, completion_tokens, usage_estimated) = estimate_subcall_tokens(
+                req,
+                &sub_upstream_model,
+                &member.usage,
+                &member.est_output_text,
+            );
             emit_usage_event(
                 state,
                 request_id,
@@ -2323,13 +2742,14 @@ async fn dispatch_ensemble(
                 api_key_id,
                 200,
                 started.elapsed(),
-                member.usage.prompt_tokens,
-                member.usage.completion_tokens,
+                prompt_tokens,
+                completion_tokens,
                 UsageExtras {
                     cached_prompt_tokens: member.usage.cached_prompt_tokens,
                     reasoning_tokens: member.usage.reasoning_tokens,
                     cache_creation_tokens: member.usage.cache_creation_tokens,
                     cache_read_tokens: member.usage.cache_read_tokens,
+                    usage_estimated,
                     bypass_reason: bypass.to_string(),
                     cache_status: CacheStatus::Disabled.as_str().to_string(),
                     attempt_index: index as u32,
@@ -2350,6 +2770,7 @@ async fn dispatch_ensemble(
         state,
         snapshot,
         request_id,
+        client,
     };
 
     // Streaming ensemble (OPTION A): the panel must be buffered to synthesize,
@@ -2455,12 +2876,17 @@ async fn dispatch_ensemble(
                 )),
             ));
         };
-        let mut judge_ctx = BridgeContext::new(
+        let mut judge_ctx = crate::dispatch::bridge_ctx(
             request_id,
+            &judge_entry.id,
             Arc::new(judge_model.clone()),
+            &judge_pk.id,
             Arc::new(judge_pk.value.clone()),
+            Some(client),
         );
-        if let Some(deadline) = judge_model.request_timeout() {
+        if let Some(deadline) =
+            crate::routing::effective_timeouts(judge_model, None, state.default_timeouts).request
+        {
             judge_ctx = judge_ctx.with_deadline(deadline);
         }
 
@@ -2493,6 +2919,10 @@ async fn dispatch_ensemble(
             }
         };
 
+        // The judge is this response's upstream call, so its own clock is
+        // what `upstream_ttft_ms` should be measured against — `started`
+        // additionally covers the whole panel that ran before it.
+        let judge_started = Instant::now();
         let judge_stream = match judge_bridge.chat_stream(&judge_req, &judge_ctx).await {
             Ok(s) => s,
             // Judge connect failed AFTER the panel round-tripped: bill the
@@ -2514,19 +2944,31 @@ async fn dispatch_ensemble(
             provider_key_id: String,
             attempt_model: String,
             usage: aisix_gateway::chat::UsageStats,
+            est_output_text: String,
+            /// Resolved upstream model — the tokenizer key for the #1074
+            /// estimate, pre-resolved here because the `'static` closure
+            /// can't reach the snapshot (mirrors `model_id`).
+            est_model: String,
         }
         let panel_telem: Vec<PanelTelem> = panel
             .iter()
             .map(|p| {
-                let (model_id, provider_key_id) = resolve_sub(&p.model);
+                let (model_id, provider_key_id, est_model) = resolve_sub(&p.model);
                 PanelTelem {
                     model_id,
                     provider_key_id,
                     attempt_model: p.model.clone(),
                     usage: p.usage.clone(),
+                    est_output_text: p.est_output_text.clone(),
+                    est_model,
                 }
             })
             .collect();
+        // #1074: the `'static` on_complete closure cannot borrow `req`, so
+        // capture one clone for the panel-member prompt estimate (used only
+        // when a member backend omits usage — the guard in
+        // `estimate_subcall_tokens` skips the tokenizer otherwise).
+        let req_for_panel_est = req.clone();
         let panel_total: u64 = panel.iter().map(|p| u64::from(p.usage.total_tokens)).sum();
         // #614: field-wise panel usage sum (not just total_tokens) folded into
         // the client-facing terminal usage chunk via build_sse_stream's
@@ -2537,7 +2979,9 @@ async fn dispatch_ensemble(
             .fold(aisix_gateway::chat::UsageStats::default(), |acc, p| {
                 acc.saturating_add(&p.usage)
             });
-        let (judge_model_id, judge_provider_key_id) = resolve_sub(&ensemble_cfg.judge.model);
+        // The streamed judge estimator keys off `judge_model.upstream_model()`
+        // directly (below), so resolve_sub's upstream_model is unused here.
+        let (judge_model_id, judge_provider_key_id, _) = resolve_sub(&ensemble_cfg.judge.model);
         let judge_attempt_model = ensemble_cfg.judge.model.clone();
         let judge_attempt_index = panel.len() as u32;
 
@@ -2592,17 +3036,27 @@ async fn dispatch_ensemble(
         let judge_concurrency_hold = judge_reservation.into_stream_hold();
         let limiter = Arc::clone(&state.limiter);
 
+        // Token-estimation fallback (AISIX-Cloud#1074) for the streamed
+        // judge: `comp` carries the JUDGE's stream-only counts, so the
+        // estimator gets the judge's own request (panel members buffered
+        // their usage separately).
+        let judge_estimator = crate::token_estimate::Estimator::new(
+            judge_model.upstream_model().unwrap_or("unknown"),
+            crate::token_estimate::PromptInput::Chat(Box::new(judge_req)),
+        );
         let sse_stream = build_sse_stream(
             judge_stream,
             created_ts,
             stream_guardrail,
             started,
+            judge_started,
             // Re-stamp the client-facing ensemble model name (e.g. "council")
             // onto every chunk — never the judge's upstream model id.
             req.model.clone(),
             content_cap,
             client_requested_usage,
             panel_usage_sum,
+            Some(judge_estimator),
             move |comp: StreamCompletion| {
                 // Rate-limit accounting: the panel tokens (already round-tripped)
                 // plus the streamed judge's final total, against every layer.
@@ -2622,6 +3076,17 @@ async fn dispatch_ensemble(
                 // moved into on_complete because the judge counts only land on
                 // the terminal SSE chunk.
                 for (index, member) in panel_telem.iter().enumerate() {
+                    // #1074: same or-semantics fallback as the non-streaming
+                    // panel emit — estimate a member's tokens when its backend
+                    // omitted usage (members were buffered, so their answer
+                    // text is available even though the judge is streamed).
+                    let (prompt_tokens, completion_tokens, usage_estimated) =
+                        estimate_subcall_tokens(
+                            &req_for_panel_est,
+                            &member.est_model,
+                            &member.usage,
+                            &member.est_output_text,
+                        );
                     emit_usage_event(
                         &state_for_telem,
                         &request_id_for_telem,
@@ -2630,13 +3095,14 @@ async fn dispatch_ensemble(
                         &api_key_id_for_telem,
                         200,
                         started.elapsed(),
-                        member.usage.prompt_tokens,
-                        member.usage.completion_tokens,
+                        prompt_tokens,
+                        completion_tokens,
                         UsageExtras {
                             cached_prompt_tokens: member.usage.cached_prompt_tokens,
                             reasoning_tokens: member.usage.reasoning_tokens,
                             cache_creation_tokens: member.usage.cache_creation_tokens,
                             cache_read_tokens: member.usage.cache_read_tokens,
+                            usage_estimated,
                             bypass_reason: bypass_for_telem.clone(),
                             cache_status: CacheStatus::Disabled.as_str().to_string(),
                             attempt_index: index as u32,
@@ -2667,6 +3133,7 @@ async fn dispatch_ensemble(
                         reasoning_tokens: comp.reasoning_tokens,
                         cache_creation_tokens: comp.cache_creation_tokens,
                         cache_read_tokens: comp.cache_read_tokens,
+                        usage_estimated: comp.usage_estimated,
                         provider_request_id: comp.provider_request_id,
                         provider_model_version: comp.provider_model_version,
                         finish_reason: comp.finish_reason,
@@ -2676,7 +3143,11 @@ async fn dispatch_ensemble(
                             comp.bypass_reason
                         },
                         cache_status: CacheStatus::Disabled.as_str().to_string(),
-                        ttft_ms: comp.ttft_ms,
+                        upstream_ttft_ms: comp.upstream_ttft_ms,
+                        // The judge's stream is what the caller sees, so its
+                        // event carries the request-scoped figure; the panel
+                        // members' sub-call events leave it 0.
+                        downstream_latency_ms: comp.downstream_latency_ms,
                         attempt_index: judge_attempt_index,
                         attempt_kind: "judge".to_string(),
                         attempt_model: judge_attempt_model.clone(),
@@ -2722,7 +3193,7 @@ async fn dispatch_ensemble(
                         status: 200,
                         streaming: true,
                     },
-                    Duration::from_millis(u64::from(comp.ttft_ms)),
+                    Duration::from_millis(u64::from(comp.upstream_ttft_ms)),
                 );
                 // Release the concurrency permit(s) now the stream is done
                 // (or was cancelled) — on_complete fires on both paths (#450).
@@ -2730,8 +3201,10 @@ async fn dispatch_ensemble(
                 drop(judge_concurrency_hold);
             },
         );
-        let response =
-            Sse::new(sse_stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)));
+        let mut response = Sse::new(sse_stream);
+        if let Some(d) = crate::sse_keepalive::interval() {
+            response = response.keep_alive(KeepAlive::new().interval(d));
+        }
         return Ok(Success {
             response: response.into_response(),
             // No single provider/model/key governs an ensemble response.
@@ -2743,6 +3216,7 @@ async fn dispatch_ensemble(
             prompt_tokens: None,
             completion_tokens: None,
             total_tokens: None,
+            usage_estimated: false,
             cost_usd: 0.0,
             cached_prompt_tokens: 0,
             reasoning_tokens: 0,
@@ -2848,7 +3322,19 @@ async fn dispatch_ensemble(
         for (index, member) in outcome.panel.iter().enumerate() {
             emit_panel_member(member, index, blocked, bypass);
         }
-        let (judge_model_id, judge_provider_key_id) = resolve_sub(&outcome.judge_model);
+        let (judge_model_id, judge_provider_key_id, judge_upstream_model) =
+            resolve_sub(&outcome.judge_model);
+        // #1074: estimate the judge sub-call when its backend omitted usage —
+        // prompt from the judge's synthesis request, completion from the
+        // synthesized answer text (read post-mask; token count is
+        // mask-invariant to within placeholder length), tokenized with the
+        // judge's resolved upstream model.
+        let (judge_prompt, judge_completion, judge_estimated) = estimate_subcall_tokens(
+            &outcome.judge_req,
+            &judge_upstream_model,
+            &judge_usage,
+            &estimation_output_text(&outcome.response),
+        );
         emit_usage_event(
             state,
             request_id,
@@ -2857,13 +3343,14 @@ async fn dispatch_ensemble(
             api_key_id,
             200,
             started.elapsed(),
-            judge_usage.prompt_tokens,
-            judge_usage.completion_tokens,
+            judge_prompt,
+            judge_completion,
             UsageExtras {
                 cached_prompt_tokens: judge_usage.cached_prompt_tokens,
                 reasoning_tokens: judge_usage.reasoning_tokens,
                 cache_creation_tokens: judge_usage.cache_creation_tokens,
                 cache_read_tokens: judge_usage.cache_read_tokens,
+                usage_estimated: judge_estimated,
                 provider_request_id: outcome.response.id.clone(),
                 provider_model_version: outcome.response.model.clone(),
                 finish_reason: finish_reason_label(&outcome.response.finish_reason),
@@ -2986,6 +3473,7 @@ async fn dispatch_ensemble(
         prompt_tokens: None,
         completion_tokens: None,
         total_tokens: None,
+        usage_estimated: false,
         cached_prompt_tokens: 0,
         reasoning_tokens: 0,
         cache_creation_tokens: 0,
@@ -3036,7 +3524,7 @@ fn record_success(
     // #890 req-3 readable name + req-4 client type + req-1/req-2 dimensions.
     user_name: Option<&str>,
     provider_key_name: &str,
-    client_type: &'static str,
+    client_type: &str,
     stream: bool,
     is_fallback: bool,
     status: u16,
@@ -3062,8 +3550,7 @@ fn record_success(
         status,
         outcome,
     };
-    metrics.record_proxy_request(request_labels, elapsed);
-    metrics.record_llm_request(request_labels, elapsed);
+    metrics.record_proxy_and_llm_request(request_labels, elapsed);
     // SLO e2e histogram (AISIX-Cloud#1011): non-streaming only here —
     // `elapsed` for a stream is time-to-response-start; the stream's
     // on_complete records the full duration instead.
@@ -3107,8 +3594,11 @@ fn record_success(
     // streaming tokens arrive in the SSE on_complete and are recorded there).
     // No-op when all counts are zero (e.g. the streaming branch here).
     // #1002: s.total_tokens is the cache-inclusive canonical total.
+    // AISIX-Cloud#1044: `model` is the same requested logical model recorded
+    // on the UsageLabels above.
     metrics.record_llm_tokens_by_client(
         client_type,
+        model,
         s.prompt_tokens.unwrap_or(0),
         s.completion_tokens.unwrap_or(0),
         s.total_tokens.unwrap_or(0),
@@ -3190,7 +3680,9 @@ fn emit_usage_event(
         reasoning_tokens: extras.reasoning_tokens,
         cache_creation_tokens: extras.cache_creation_tokens,
         cache_read_tokens: extras.cache_read_tokens,
-        latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
+        usage_estimated: extras.usage_estimated,
+        upstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
+        downstream_latency_ms: extras.downstream_latency_ms,
         status_code,
         provider_request_id: extras.provider_request_id,
         provider_model_version: extras.provider_model_version,
@@ -3204,7 +3696,7 @@ fn emit_usage_event(
         cache_status: extras.cache_status,
         cache_hit_saved_input_tokens: extras.cache_hit_saved_input_tokens,
         cache_hit_saved_output_tokens: extras.cache_hit_saved_output_tokens,
-        ttft_ms: extras.ttft_ms,
+        upstream_ttft_ms: extras.upstream_ttft_ms,
         // chat.rs is the OpenAI-shape /v1/chat/completions handler.
         // /v1/responses / /v1/embeddings / /v1/audio* / /v1/images* /
         // /v1/rerank don't emit UsageEvents today; when they do they
@@ -3297,6 +3789,10 @@ struct UsageExtras {
     reasoning_tokens: u32,
     cache_creation_tokens: u32,
     cache_read_tokens: u32,
+    /// True when any token counter was filled by the local estimator
+    /// because the upstream reported no usage (AISIX-Cloud#1074). Lands
+    /// on `UsageEvent::usage_estimated`.
+    usage_estimated: bool,
     provider_request_id: String,
     provider_model_version: String,
     finish_reason: String,
@@ -3315,7 +3811,12 @@ struct UsageExtras {
     /// ingest from these + its pricing catalog (see #88).
     cache_hit_saved_input_tokens: u32,
     cache_hit_saved_output_tokens: u32,
-    ttft_ms: u32,
+    /// Attempt-scoped time to the upstream's first generated chunk.
+    upstream_ttft_ms: u32,
+    /// Request-scoped time until the caller got its first usable byte.
+    /// Set only on the attempt that delivered the terminal response;
+    /// left 0 on the others so a request carries exactly one figure.
+    downstream_latency_ms: u32,
     // ─── Per-attempt telemetry (#655) ───
     /// 0-based attempt index within the request.
     attempt_index: u32,
@@ -3440,7 +3941,15 @@ fn emit_access_log(
     total_tokens: Option<u64>,
     request_id: &str,
     routing: &RoutingTelemetry,
+    error: Option<&ProxyError>,
 ) {
+    let (error_kind, error) = match error {
+        Some(e) => {
+            let (kind, msg) = crate::attempt::access_log_error(e);
+            (Some(kind), Some(msg))
+        }
+        None => (None, None),
+    };
     // Per #655 the access log stays ONE line per request (the transport
     // plane), carrying user-perceived `latency` + the final status plus a
     // routing summary. The per-attempt detail lives in telemetry only.
@@ -3466,6 +3975,8 @@ fn emit_access_log(
             0 => None,
             n => Some(n),
         },
+        error_kind,
+        error: error.as_deref(),
     }
     .emit();
 }
@@ -3533,9 +4044,14 @@ struct StreamCompletion {
     /// fail-opened on a streamed response. Empty string = no bypass.
     /// First-bypass-wins matches the non-streaming convention.
     bypass_reason: String,
-    /// Time to first token in milliseconds. Set once when the first
-    /// Ok(chunk) arrives in `build_sse_stream`.
-    ttft_ms: u32,
+    /// Attempt-scoped time to the UPSTREAM's first generated chunk.
+    /// Set once when that chunk arrives in `build_sse_stream`.
+    upstream_ttft_ms: u32,
+    /// Request-scoped time until the first chunk was handed DOWNSTREAM.
+    /// Under a hold-back output guardrail this trails
+    /// `upstream_ttft_ms` by the scan; without one they nearly coincide.
+    /// 0 when the stream ended before any content reached the client.
+    downstream_latency_ms: u32,
     /// Count of SSE events the **consumer actually pulled** from the
     /// stream — incremented on the post-yield resume in
     /// `build_sse_stream`. `async_stream::stream!` semantics: code
@@ -3554,6 +4070,19 @@ struct StreamCompletion {
     /// capture cap). Empty otherwise. Read by the on_complete telemetry
     /// closure; never reaches the CP sink.
     response_text: String,
+    /// Generated output (content + reasoning + tool-call text) accumulated
+    /// for the token-estimation fallback (AISIX-Cloud#1074). Always on —
+    /// the terminal usage chunk that would make it unnecessary arrives
+    /// only at end-of-stream — but bounded to
+    /// `token_estimate::OUTPUT_ACCUMULATION_CAP`. Unlike `response_text`
+    /// this never leaves the process: it is tokenized in
+    /// `CompleteOnDrop::drop` when the upstream reported no usage, then
+    /// discarded.
+    est_output_text: String,
+    /// True when `CompleteOnDrop::drop` filled any token counter from the
+    /// local estimator because the upstream never reported it. Threaded
+    /// into `UsageEvent::usage_estimated` by the on_complete closure.
+    usage_estimated: bool,
     /// Per-detector PII mask counts applied to the held stream at release
     /// (#932). Merged with the input-side counts by the on_complete
     /// telemetry closure. Detector names only, never matched values.
@@ -3610,6 +4139,11 @@ struct CompleteOnDrop<F: FnOnce(StreamCompletion)> {
     /// returning `Ready(Some(_))` is exact — that's the moment the
     /// item handed to the consumer.
     delivered: Arc<AtomicU32>,
+    /// Token-estimation fallback (AISIX-Cloud#1074): when the stream
+    /// ends with no upstream-reported usage, Drop fills the missing
+    /// counters from this estimator (prompt from the captured request,
+    /// completion from `est_output_text`) and sets `usage_estimated`.
+    estimator: Option<crate::token_estimate::Estimator>,
 }
 
 impl<F: FnOnce(StreamCompletion)> CompleteOnDrop<F> {
@@ -3645,6 +4179,36 @@ impl<F: FnOnce(StreamCompletion)> Drop for CompleteOnDrop<F> {
                 c.cache_read_tokens = 0;
                 c.total_tokens = c.prompt_tokens as u64;
             }
+            // Token-estimation fallback (AISIX-Cloud#1074), after the #419
+            // gate so a zero-delivered disconnect never bills estimated
+            // completion tokens (the prompt still fills — upstream processed
+            // it regardless, same "prompts always billed" contract). Runs
+            // only for counters the upstream left at zero; a stream with a
+            // real usage chunk is untouched.
+            if let Some(est) = self.estimator.take() {
+                let output = (delivered > 0).then_some(c.est_output_text.as_str());
+                let filled = crate::token_estimate::fill_missing(
+                    &est,
+                    c.prompt_tokens,
+                    c.completion_tokens,
+                    output,
+                );
+                if filled.estimated {
+                    c.prompt_tokens = filled.prompt_tokens;
+                    c.completion_tokens = filled.completion_tokens;
+                    c.usage_estimated = true;
+                    // Estimation only fills counters the upstream never
+                    // reported, so the cache adders are zero or upstream-
+                    // authoritative — the recompute stays consistent with
+                    // `total_tokens_with_cache`.
+                    c.total_tokens = crate::usage_attr::total_tokens_with_cache(
+                        c.prompt_tokens,
+                        c.completion_tokens,
+                        c.cache_creation_tokens,
+                        c.cache_read_tokens,
+                    );
+                }
+            }
             f(c);
         }
     }
@@ -3655,7 +4219,13 @@ fn build_sse_stream<F>(
     upstream: aisix_gateway::ChatChunkStream,
     created: i64,
     output_guardrail: Option<StreamGuardrailContext>,
+    // Request clock — when the gateway received the request. Measures
+    // what the CALLER waited for (`downstream_latency_ms`).
     started: Instant,
+    // Attempt clock — when this upstream attempt began. Measures how the
+    // UPSTREAM behaved (`upstream_ttft_ms`), so retries and pre-dispatch
+    // work don't inflate it.
+    attempt_started: Instant,
     // Customer-facing model name (alias / routing group), re-stamped
     // onto every SSE chunk's `model` field per AISIX-Cloud#410. Owned
     // so it can move into the `async_stream::stream!` closure.
@@ -3673,6 +4243,9 @@ fn build_sse_stream<F>(
     // `on_complete` (`comp`) counts stay stream-only. Zero for single-upstream
     // callers, where the fold is a no-op.
     base_usage: aisix_gateway::chat::UsageStats,
+    // Token-estimation fallback context (AISIX-Cloud#1074); see
+    // `CompleteOnDrop::estimator`.
+    estimator: Option<crate::token_estimate::Estimator>,
     on_complete: F,
 ) -> impl Stream<Item = Result<Event, Infallible>>
 where
@@ -3694,6 +4267,7 @@ where
         let mut guard = CompleteOnDrop {
             slot: Some((on_complete, StreamCompletion::default())),
             delivered: delivered_for_drop,
+            estimator,
         };
         futures::pin_mut!(upstream);
         // Per #204: accumulate the assistant's content across chunks
@@ -3761,6 +4335,17 @@ where
         // the Err arm mirrors the pre-hold-back defensive error frame.
         macro_rules! chunk_event {
             ($chunk:expr) => {{
+                // The caller's wait ends here — not when the upstream chunk
+                // arrived; a hold-back guardrail can sit between the two.
+                // Every content chunk is rendered through this macro, on
+                // both the live-forward and the hold-back release paths, so
+                // this catches the first one either way. Written straight
+                // into the accumulator rather than a local so a client that
+                // disconnects mid-stream still reports what it waited for.
+                if guard.comp().downstream_latency_ms == 0 {
+                    guard.comp().downstream_latency_ms =
+                        started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+                }
                 let rendered = render_chunk(created, $chunk, &client_facing_model);
                 match serde_json::to_string(&rendered) {
                     Ok(json) => Event::default().data(json),
@@ -3783,8 +4368,8 @@ where
                         && (chunk.delta.content.is_some() || chunk.delta.tool_calls.is_some())
                     {
                         first_chunk_seen = true;
-                        guard.comp().ttft_ms =
-                            started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+                        guard.comp().upstream_ttft_ms =
+                            attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
                     }
                     let comp = guard.comp();
                     if !chunk.id.is_empty() {
@@ -3816,6 +4401,33 @@ where
                         if let Some(cap) = content_cap {
                             if comp.response_text.len() < cap as usize {
                                 comp.response_text.push_str(text);
+                            }
+                        }
+                    }
+                    // Token-estimation accumulator (AISIX-Cloud#1074): all
+                    // generated output — content, reasoning, tool-call text —
+                    // bounded to its own cap. Always on: whether the fallback
+                    // is needed is only known at end-of-stream.
+                    {
+                        use crate::token_estimate::push_capped;
+                        if let Some(text) = chunk.delta.content.as_deref() {
+                            push_capped(&mut comp.est_output_text, text);
+                        }
+                        if let Some(text) = chunk.delta.reasoning_content.as_deref() {
+                            push_capped(&mut comp.est_output_text, text);
+                        }
+                        if let Some(tcs) = chunk.delta.tool_calls.as_ref() {
+                            for tc in tcs {
+                                if let Some(f) = tc.get("function") {
+                                    if let Some(n) = f.get("name").and_then(|v| v.as_str()) {
+                                        push_capped(&mut comp.est_output_text, n);
+                                    }
+                                    if let Some(a) =
+                                        f.get("arguments").and_then(|v| v.as_str())
+                                    {
+                                        push_capped(&mut comp.est_output_text, a);
+                                    }
+                                }
                             }
                         }
                     }
@@ -4311,10 +4923,16 @@ where
         // there with whatever StreamCompletion has been captured up
         // to that point.
     };
-    DeliveryCounter {
+    // Hyper polls this generator after the request-id middleware has
+    // returned, so re-attach the request span here — while we're still
+    // on the handler's stack and it is current. Without it the
+    // end-of-stream output-guardrail checks below log without a
+    // `request_id` and can't be traced back to the caller's
+    // `x-aisix-request-id` (AISIX-Cloud#1060).
+    crate::request_id::in_request_span(DeliveryCounter {
         inner: Box::pin(inner),
         delivered,
-    }
+    })
 }
 
 /// Stream wrapper that increments `delivered` on every `poll_next ->
@@ -4433,7 +5051,14 @@ mod cooldown_tests {
 
     #[test]
     fn default_config_cooldowns_timeout_and_transport_errors() {
-        assert!(decide_cooldown(&BridgeError::Timeout { elapsed_ms: 30_000 }, None).is_some());
+        assert!(decide_cooldown(
+            &BridgeError::Timeout {
+                cause: String::new(),
+                elapsed_ms: 30_000
+            },
+            None
+        )
+        .is_some());
         assert!(decide_cooldown(&BridgeError::Transport("conn refused".into()), None).is_some());
         assert!(decide_cooldown(&BridgeError::StreamAborted, None).is_some());
         assert!(decide_cooldown(&BridgeError::UpstreamDecode("bad json".into()), None).is_some());
@@ -4497,7 +5122,14 @@ mod cooldown_tests {
             trigger_on_timeout: Some(false),
             ..Default::default()
         };
-        assert!(decide_cooldown(&BridgeError::Timeout { elapsed_ms: 1 }, Some(&cfg)).is_none());
+        assert!(decide_cooldown(
+            &BridgeError::Timeout {
+                cause: String::new(),
+                elapsed_ms: 1
+            },
+            Some(&cfg)
+        )
+        .is_none());
     }
 
     #[test]
@@ -4571,7 +5203,7 @@ mod complete_on_drop_tests {
     //! StreamCompletion, set the shared atomic to simulate "N
     //! chunks delivered to the consumer", drop, observe the
     //! callback args.
-    use super::{AtomicU32, CompleteOnDrop, StreamCompletion};
+    use super::{estimate_subcall_tokens, AtomicU32, CompleteOnDrop, StreamCompletion};
     use std::sync::{Arc, Mutex};
 
     /// Build the guard with `delivered_count` pre-set on the
@@ -4589,11 +5221,172 @@ mod complete_on_drop_tests {
                     comp,
                 )),
                 delivered,
+                estimator: None,
             };
             drop(guard);
         }
         let out = captured.lock().unwrap().take().expect("on_complete fired");
         out
+    }
+
+    /// Same as [`drop_and_capture`] but with a token estimator armed
+    /// (AISIX-Cloud#1074) — the request is one user message "Hello".
+    fn drop_and_capture_with_estimator(
+        comp: StreamCompletion,
+        delivered_count: u32,
+    ) -> StreamCompletion {
+        let captured: Arc<Mutex<Option<StreamCompletion>>> = Arc::new(Mutex::new(None));
+        let cap = captured.clone();
+        let delivered = Arc::new(AtomicU32::new(delivered_count));
+        let req = aisix_gateway::chat::ChatFormat::new(
+            "relay-model",
+            vec![aisix_gateway::chat::ChatMessage {
+                role: aisix_gateway::chat::Role::User,
+                content: Some("Hello".into()),
+                content_blocks: None,
+                name: None,
+                tool_call_id: None,
+                extra: serde_json::Map::new(),
+            }],
+        );
+        {
+            let guard = CompleteOnDrop {
+                slot: Some((
+                    move |c: StreamCompletion| {
+                        *cap.lock().unwrap() = Some(c);
+                    },
+                    comp,
+                )),
+                delivered,
+                estimator: Some(crate::token_estimate::Estimator::new(
+                    "relay-model",
+                    crate::token_estimate::PromptInput::Chat(Box::new(req)),
+                )),
+            };
+            drop(guard);
+        }
+        let out = captured.lock().unwrap().take().expect("on_complete fired");
+        out
+    }
+
+    /// AISIX-Cloud#1074: a stream that ended with no upstream usage
+    /// fills prompt + completion from the estimator and flags the
+    /// completion. Expected prompt: 3 per-message + "user" (1) +
+    /// "Hello" (1) + 3 reply priming = 8 (cl100k fallback encoding);
+    /// completion: "Hello world" = 2.
+    #[test]
+    fn estimator_fills_missing_usage_at_drop() {
+        let comp = StreamCompletion {
+            est_output_text: "Hello world".into(),
+            chunks_delivered: 0, // set by Drop, ignored on input
+            ..Default::default()
+        };
+        let out = drop_and_capture_with_estimator(comp, 3);
+        assert_eq!(out.prompt_tokens, 8);
+        assert_eq!(out.completion_tokens, 2);
+        assert_eq!(out.total_tokens, 10);
+        assert!(out.usage_estimated);
+    }
+
+    /// AISIX-Cloud#1074 × #419: a zero-delivered disconnect still
+    /// estimates the prompt (prompts are always billed) but must NOT
+    /// bill estimated completion tokens for content that never
+    /// crossed the wire.
+    #[test]
+    fn estimator_respects_zero_delivered_gate() {
+        let comp = StreamCompletion {
+            est_output_text: "Hello world".into(),
+            ..Default::default()
+        };
+        let out = drop_and_capture_with_estimator(comp, 0);
+        assert_eq!(out.prompt_tokens, 8);
+        assert_eq!(
+            out.completion_tokens, 0,
+            "nothing delivered → nothing billed"
+        );
+        assert_eq!(out.total_tokens, 8);
+        assert!(out.usage_estimated);
+    }
+
+    /// AISIX-Cloud#1074: upstream-reported usage wins — the armed
+    /// estimator must not touch a stream that carried a real usage
+    /// block, and the event stays unflagged.
+    #[test]
+    fn estimator_leaves_upstream_usage_untouched() {
+        let comp = StreamCompletion {
+            prompt_tokens: 17,
+            completion_tokens: 23,
+            total_tokens: 40,
+            est_output_text: "Hello world".into(),
+            ..Default::default()
+        };
+        let out = drop_and_capture_with_estimator(comp, 5);
+        assert_eq!(out.prompt_tokens, 17);
+        assert_eq!(out.completion_tokens, 23);
+        assert_eq!(out.total_tokens, 40);
+        assert!(!out.usage_estimated);
+    }
+
+    fn subcall_req(user: &str) -> aisix_gateway::chat::ChatFormat {
+        aisix_gateway::chat::ChatFormat::new(
+            "relay-model",
+            vec![aisix_gateway::chat::ChatMessage {
+                role: aisix_gateway::chat::Role::User,
+                content: Some(user.into()),
+                content_blocks: None,
+                name: None,
+                tool_call_id: None,
+                extra: serde_json::Map::new(),
+            }],
+        )
+    }
+
+    /// #796: the shared ensemble sub-call estimator fills a fully-missing
+    /// usage block — prompt from the sub-call's request (one user "Hello"
+    /// = 8 in the cl100k fallback), completion from its answer text
+    /// ("Hello world" = 2) — and flags it.
+    #[test]
+    fn estimate_subcall_fills_missing_usage() {
+        let usage = aisix_gateway::chat::UsageStats::default();
+        let (prompt, completion, estimated) =
+            estimate_subcall_tokens(&subcall_req("Hello"), "relay-model", &usage, "Hello world");
+        assert_eq!(prompt, 8);
+        assert_eq!(completion, 2);
+        assert!(estimated);
+    }
+
+    /// #796: a sub-call whose backend DID report usage is returned
+    /// verbatim and unflagged — the answer text is ignored.
+    #[test]
+    fn estimate_subcall_preserves_reported_usage() {
+        let usage = aisix_gateway::chat::UsageStats {
+            prompt_tokens: 17,
+            completion_tokens: 23,
+            total_tokens: 40,
+            ..Default::default()
+        };
+        let (prompt, completion, estimated) =
+            estimate_subcall_tokens(&subcall_req("Hello"), "relay-model", &usage, "Hello world");
+        assert_eq!(prompt, 17);
+        assert_eq!(completion, 23);
+        assert!(!estimated);
+    }
+
+    /// #796: per-field or-semantics — a reported prompt is kept while a
+    /// missing completion is estimated (and the record is flagged).
+    #[test]
+    fn estimate_subcall_fills_only_missing_side() {
+        let usage = aisix_gateway::chat::UsageStats {
+            prompt_tokens: 17,
+            completion_tokens: 0,
+            total_tokens: 17,
+            ..Default::default()
+        };
+        let (prompt, completion, estimated) =
+            estimate_subcall_tokens(&subcall_req("Hello"), "relay-model", &usage, "Hello world");
+        assert_eq!(prompt, 17, "reported prompt preserved");
+        assert_eq!(completion, 2, "missing completion estimated");
+        assert!(estimated);
     }
 
     #[test]
@@ -4740,6 +5533,7 @@ mod delivery_counter_tests {
                     },
                 )),
                 delivered: delivered_for_drop,
+                estimator: None,
             };
             // Silence unused-field warning on the test side; guard
             // is held by the body for its full lifetime.

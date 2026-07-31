@@ -74,8 +74,10 @@ describe("cooldown contract (H1) — 401 cools down despite being non-retryable"
       },
     });
 
-    app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    // Admin listener off; `admin` reads only /status/models on the metrics
+    // listener, and every resource is seeded to etcd via `seed`.
+    app = await spawnApp({ admin: false });
+    admin = new AdminClient(app.adminUrl, app.adminKey, app.metricsUrl);
     seed = new SeedClient(etcd, app.etcdPrefix);
 
     const failPk = await seed.createProviderKey({
@@ -225,8 +227,10 @@ describe("cooldown contract (M1) — 429 cools down even when retry_on_429=false
       },
     });
 
-    app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    // Admin listener off; `admin` reads only /status/models on the metrics
+    // listener, and every resource is seeded to etcd via `seed`.
+    app = await spawnApp({ admin: false });
+    admin = new AdminClient(app.adminUrl, app.adminKey, app.metricsUrl);
     seed = new SeedClient(etcd, app.etcdPrefix);
 
     const rateLimitedPk = await seed.createProviderKey({
@@ -378,8 +382,10 @@ describe("cooldown contract (H2) — Retry-After header from upstream drives TTL
       },
     });
 
-    app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    // Admin listener off; `admin` reads only /status/models on the metrics
+    // listener, and every resource is seeded to etcd via `seed`.
+    app = await spawnApp({ admin: false });
+    admin = new AdminClient(app.adminUrl, app.adminKey, app.metricsUrl);
     seed = new SeedClient(etcd, app.etcdPrefix);
 
     const upstreamPk = await seed.createProviderKey({
@@ -516,8 +522,10 @@ describe("filter contract (H3) — all candidates unhealthy returns 503", () => 
       errorBody: { error: { message: "all-down B", type: "server_error" } },
     });
 
-    app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    // Admin listener off; `admin` reads only /status/models on the metrics
+    // listener, and every resource is seeded to etcd via `seed`.
+    app = await spawnApp({ admin: false });
+    admin = new AdminClient(app.adminUrl, app.adminKey, app.metricsUrl);
     seed = new SeedClient(etcd, app.etcdPrefix);
 
     const aPk = await seed.createProviderKey({
@@ -646,8 +654,10 @@ describe("filter contract (H3 escape hatch) — try_anyway sends to known-bad", 
       errorBody: { error: { message: "still down", type: "server_error" } },
     });
 
-    app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    // Admin listener off; `admin` reads only /status/models on the metrics
+    // listener, and every resource is seeded to etcd via `seed`.
+    app = await spawnApp({ admin: false });
+    admin = new AdminClient(app.adminUrl, app.adminKey, app.metricsUrl);
     seed = new SeedClient(etcd, app.etcdPrefix);
 
     const pk = await seed.createProviderKey({
@@ -724,7 +734,16 @@ describe("filter contract (H3 escape hatch) — try_anyway sends to known-bad", 
     // mapping in BridgeError::http_status, but the upstream request
     // is what we're verifying here).
     expect([502, 503]).toContain(resp.status);
-    expect(downUpstream.receivedRequests.length - baseline).toBe(1);
+    // 3 = the initial attempt + the deployment default retry budget (2).
+    // This group holds a single target, so there is nothing to fall over to
+    // and the default budget applies rather than deferring — and a 503 is
+    // exactly the transient class the budget exists for. What this test
+    // actually pins is that a request *was sent* to the unhealthy target at
+    // all, which is the `try_anyway` contract.
+    expect(
+      downUpstream.receivedRequests.length - baseline,
+    ).toBeGreaterThanOrEqual(1);
+    expect(downUpstream.receivedRequests.length - baseline).toBe(3);
   });
 });
 
@@ -765,8 +784,10 @@ describe("cooldown observability — a cooldown transition emits aisix_deploymen
       },
     });
 
-    app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    // Admin listener off; `admin` reads only /status/models on the metrics
+    // listener, and every resource is seeded to etcd via `seed`.
+    app = await spawnApp({ admin: false });
+    admin = new AdminClient(app.adminUrl, app.adminKey, app.metricsUrl);
     seed = new SeedClient(etcd, app.etcdPrefix);
 
     const failPk = await seed.createProviderKey({
@@ -958,8 +979,10 @@ describe("cooldown observability — the state gauge follows a target back into 
       },
     });
 
-    app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    // Admin listener off; `admin` reads only /status/models on the metrics
+    // listener, and every resource is seeded to etcd via `seed`.
+    app = await spawnApp({ admin: false });
+    admin = new AdminClient(app.adminUrl, app.adminKey, app.metricsUrl);
     seed = new SeedClient(etcd, app.etcdPrefix);
 
     const flakyPk = await seed.createProviderKey({

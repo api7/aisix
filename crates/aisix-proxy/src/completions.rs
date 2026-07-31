@@ -14,9 +14,7 @@
 //! 7. Call `bridge.complete(body, ctx)` → JSON response.
 //! 8. Providers that don't support completions return 501.
 
-use aisix_gateway::{
-    BridgeContext, BridgeError, ChatMessage, ChatResponse, FinishReason, UsageStats,
-};
+use aisix_gateway::{BridgeError, ChatMessage, ChatResponse, FinishReason, UsageStats};
 use aisix_obs::{content_capture_cap, AccessLog, CapturedContent, RequestOutcome, UsageEvent};
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -79,14 +77,31 @@ struct CompletionDispatchSuccess {
 struct CompletionUsage {
     prompt_tokens: u32,
     completion_tokens: u32,
+    /// True when any counter was filled by the local estimator because
+    /// the upstream reported no usage (AISIX-Cloud#1074).
+    usage_estimated: bool,
 }
 
 pub async fn completions(
     State(state): State<ProxyState>,
     auth: AuthenticatedKey,
     client: ClientContext,
-    Json(body): Json<Value>,
+    // Result-wrapped so an extractor-layer 413 (chunked body over the
+    // cap) maps to the OpenAI envelope instead of axum's stock
+    // text/plain rejection — same discriminate-then-map pattern as
+    // chat.rs / messages.rs.
+    body: Result<Json<Value>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
+    let Json(body) = match body {
+        Ok(json) => json,
+        Err(rej) => {
+            return crate::error::proxy_error_from_json_rejection(
+                rej,
+                state.request_body_limit_bytes,
+            )
+            .into_response();
+        }
+    };
     let started = Instant::now();
     let request_id = client.request_id.clone();
     let api_key_id = auth.entry.id.clone();
@@ -96,7 +111,7 @@ pub async fn completions(
         .unwrap_or("unknown")
         .to_string();
 
-    match dispatch(&state, &auth, body, &request_id, &client.source_ip).await {
+    match dispatch(&state, &auth, body, &request_id, &client).await {
         Ok(success) => {
             let elapsed = started.elapsed();
             // Audit MEDIUM-2 on PR #426: use the actual response
@@ -114,6 +129,7 @@ pub async fn completions(
                 status,
                 elapsed,
                 &request_id,
+                None,
             );
             state.metrics.record_request(
                 &success.provider,
@@ -158,6 +174,7 @@ pub async fn completions(
                 status,
                 elapsed,
                 &request_id,
+                Some(&err),
             );
             let snap = state.snapshot.load();
             let metric_model = crate::usage_attr::metric_model_label(&snap, &model_name);
@@ -212,7 +229,7 @@ async fn dispatch(
     auth: &AuthenticatedKey,
     mut body: Value,
     request_id: &str,
-    source_ip: &str,
+    client_ctx: &ClientContext,
 ) -> Result<CompletionDispatchSuccess, ProxyError> {
     let model_name = body
         .get("model")
@@ -231,7 +248,7 @@ async fn dispatch(
     }
 
     // Client-IP allowlist gate (#557): reject before guardrails / upstream.
-    crate::dispatch::check_ip_access(&model_entry.value, source_ip)?;
+    crate::dispatch::check_ip_access(&model_entry.value, &client_ctx.source_ip)?;
 
     // #545: /v1/completions must run input guardrails. Before this it
     // forwarded the user `prompt` to the upstream with no configured
@@ -311,17 +328,38 @@ async fn dispatch(
     let bridge = crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value)
         .ok_or(ProxyError::ProviderUnavailable)?;
 
-    let model_arc = Arc::new(model.clone());
-    let pk_arc = Arc::new(pk_entry.value.clone());
     // #554: apply the configured request `timeout` as the upstream deadline.
-    let mut ctx = BridgeContext::new(request_id, model_arc, pk_arc);
-    if let Some(d) = model.request_timeout() {
+    let mut ctx = crate::dispatch::bridge_ctx(
+        request_id,
+        &model_entry.id,
+        Arc::new(model.clone()),
+        &pk_entry.id,
+        Arc::new(pk_entry.value.clone()),
+        Some(client_ctx),
+    );
+    if let Some(d) = crate::routing::effective_timeouts(model, None, state.default_timeouts).request
+    {
         ctx = ctx.with_deadline(d);
     }
 
     let provider_label = provider.to_ascii_lowercase();
 
-    match bridge.complete(&body, &ctx).await {
+    // #701: mark each failed attempt on the runtime status INSIDE the retry
+    // loop, so the cooldown / circuit-breaker sees flapping upstreams even
+    // when a later retry recovers the request — same per-attempt semantics
+    // as chat.rs, where the cooldown decision is independent of the retry
+    // decision. `note_failure` is a no-op for non-triggering categories.
+    let tracker = &state.runtime_status;
+    let cooldown_model_id: &str = &model_entry.id;
+    let cooldown_cfg = model.cooldown.as_ref();
+    match crate::routing::retrying_dispatch(state, model, "/v1/completions", || async {
+        bridge
+            .complete(&body, &ctx)
+            .await
+            .map_err(|e| crate::cooldown::note_failure(tracker, cooldown_model_id, cooldown_cfg, e))
+    })
+    .await
+    {
         Ok(resp_json) => {
             // #701: clear any cooldown/unhealthy mark now the upstream
             // answered — same recovery signal as rerank/audio/chat.
@@ -330,7 +368,39 @@ async fn dispatch(
             // Extract usage BEFORE moving resp_json into the Response
             // so the success struct carries typed counters rather
             // than re-parsing JSON downstream.
-            let usage = extract_completion_usage(&resp_json);
+            //
+            // Token-estimation fallback (AISIX-Cloud#1074): a missing or
+            // zero usage block fills locally — legacy completions is plain
+            // text on both sides, so the plain-text counting rule applies
+            // to each. The 200-without-usage edge previously skipped the
+            // event entirely; it now emits an estimated record instead.
+            // Telemetry only — the response body forwards untouched.
+            let usage = {
+                let mut u = extract_completion_usage(&resp_json).unwrap_or(CompletionUsage {
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    usage_estimated: false,
+                });
+                let est_model = model.upstream_model().unwrap_or("unknown");
+                if u.prompt_tokens == 0 {
+                    let n = count_completion_prompt(est_model, body.get("prompt"));
+                    if n > 0 {
+                        u.prompt_tokens = n;
+                        u.usage_estimated = true;
+                    }
+                }
+                if u.completion_tokens == 0 {
+                    let n = crate::token_estimate::count_text(
+                        est_model,
+                        &completion_output_text(&resp_json),
+                    );
+                    if n > 0 {
+                        u.completion_tokens = n;
+                        u.usage_estimated = true;
+                    }
+                }
+                Some(u)
+            };
             // #911 [21]: commit the actual token cost so TPM/TPD is enforced
             // for /v1/completions the same way chat + embeddings enforce it.
             // Pre-fix the reservation dropped uncommitted, so the token
@@ -467,16 +537,7 @@ async fn dispatch(
         }
         Err(e) => {
             reservation.commit_tokens(0).await;
-            // #701: mark the failure on the runtime status so the cooldown /
-            // circuit-breaker sees flapping upstreams reached only via this
-            // endpoint — same policy as rerank/audio/chat. `note_failure` is
-            // a no-op for non-triggering categories (e.g. Config errors).
-            let e = crate::cooldown::note_failure(
-                &state.runtime_status,
-                &model_entry.id,
-                model.cooldown.as_ref(),
-                e,
-            );
+            // Cooldown was already noted per attempt inside the retry loop.
             Err(ProxyError::Bridge(e))
         }
     }
@@ -510,7 +571,27 @@ fn extract_completion_usage(body: &Value) -> Option<CompletionUsage> {
     Some(CompletionUsage {
         prompt_tokens,
         completion_tokens,
+        usage_estimated: false,
     })
+}
+
+/// Count the legacy /v1/completions `prompt` for the token-estimation
+/// fallback (AISIX-Cloud#1074): a plain string, an array of strings, an
+/// array of token ids (exact count), or an array of token-id arrays.
+/// Plain-text counting — the legacy surface has no message overhead.
+fn count_completion_prompt(model: &str, prompt: Option<&Value>) -> u32 {
+    match prompt {
+        Some(Value::String(s)) => crate::token_estimate::count_text(model, s),
+        Some(Value::Array(items)) => items.iter().fold(0u32, |acc, item| {
+            acc.saturating_add(match item {
+                Value::String(s) => crate::token_estimate::count_text(model, s),
+                Value::Number(_) => 1,
+                Value::Array(tokens) => tokens.len().min(u32::MAX as usize) as u32,
+                _ => 0,
+            })
+        }),
+        _ => 0,
+    }
 }
 
 /// Concatenate the `text` of every choice in a /v1/completions response for
@@ -571,7 +652,11 @@ fn emit_usage_event(
         requested_model: requested_model.to_string(),
         prompt_tokens: usage.prompt_tokens,
         completion_tokens: usage.completion_tokens,
-        latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
+        usage_estimated: usage.usage_estimated,
+        // Single-attempt endpoint: the attempt spans the whole request, so
+        // the upstream figure and what the caller waited for coincide.
+        upstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
+        downstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
         status_code,
         inbound_protocol: "openai".to_string(),
         client_source_ip: client.source_ip.clone(),
@@ -598,7 +683,15 @@ fn emit_access_log(
     status: u16,
     latency: Duration,
     request_id: &str,
+    error: Option<&ProxyError>,
 ) {
+    let (error_kind, error) = match error {
+        Some(e) => {
+            let (kind, msg) = crate::attempt::access_log_error(e);
+            (Some(kind), Some(msg))
+        }
+        None => (None, None),
+    };
     let _now_ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -618,6 +711,8 @@ fn emit_access_log(
         served_by_model: None,
         routing_attempt_count: None,
         routing_fallback_count: None,
+        error_kind,
+        error: error.as_deref(),
     }
     .emit();
 }
@@ -960,12 +1055,13 @@ mod tests {
 
     /// Companion: an upstream 200 with `usage: {}` (malformed —
     /// `prompt_tokens` is a required field on every legitimate
-    /// completion response) must NOT emit a zero-everything noise
-    /// row. Per audit MEDIUM-1 on PR #425 — applied preemptively
-    /// here so /v1/completions and /v1/responses share the same
-    /// edge-case gate.
+    /// completion response) now emits an ESTIMATED usage event
+    /// (AISIX-Cloud#1074) instead of dropping the record: the tokens
+    /// are counted locally and the event is marked `usage_estimated`.
+    /// (Pre-#1074 this dropped the event entirely — per audit MEDIUM-1
+    /// on PR #425 — which left the request invisible to billing.)
     #[tokio::test]
-    async fn skips_usage_event_when_upstream_usage_block_is_empty() {
+    async fn estimates_usage_event_when_upstream_usage_block_is_empty() {
         use aisix_obs::UsageSink;
 
         let upstream = MockServer::start().await;
@@ -1000,14 +1096,18 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        let recv = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await;
-        if let Ok(Some(ev)) = recv {
-            panic!(
-                "no UsageEvent should be emitted when upstream usage block is malformed, \
-                 but got prompt_tokens={}",
-                ev.prompt_tokens,
-            );
-        }
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("estimated UsageEvent must be emitted when usage block is malformed")
+            .expect("usage_sink sender dropped");
+        // prompt "x" = 1 token; the upstream body has no choices text, so
+        // the completion side stays 0 (nothing to count).
+        assert_eq!(event.prompt_tokens, 1);
+        assert_eq!(event.completion_tokens, 0);
+        assert!(
+            event.usage_estimated,
+            "locally-counted tokens must be flagged"
+        );
     }
 
     /// #429 follow-up: a 200 whose `usage` carries
@@ -1180,13 +1280,13 @@ mod tests {
         }
     }
 
-    /// Issue #403 audit LOW-1: a 200 response with NO `usage` block
-    /// at all (vs `usage: {}` which is empty-but-present) must not
-    /// emit. Pins the outer `body.get("usage")?` short-circuit in
-    /// `extract_completion_usage` distinctly from the inner empty
-    /// case.
+    /// A 200 response with NO `usage` block at all (vs `usage: {}`
+    /// which is empty-but-present) emits an ESTIMATED usage event
+    /// (AISIX-Cloud#1074) — the request must not stay invisible to
+    /// billing. (Pre-#1074, per issue #403 audit LOW-1, this dropped
+    /// the event entirely.)
     #[tokio::test]
-    async fn skips_usage_event_when_upstream_omits_usage_block_entirely() {
+    async fn estimates_usage_event_when_upstream_omits_usage_block_entirely() {
         use aisix_obs::UsageSink;
 
         let upstream = MockServer::start().await;
@@ -1221,14 +1321,17 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        let recv = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await;
-        if let Ok(Some(ev)) = recv {
-            panic!(
-                "no UsageEvent when `usage` key is entirely absent, \
-                 got prompt_tokens={}",
-                ev.prompt_tokens,
-            );
-        }
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("estimated UsageEvent must be emitted when `usage` is absent")
+            .expect("usage_sink sender dropped");
+        // prompt "x" = 1 token; no choices text → completion stays 0.
+        assert_eq!(event.prompt_tokens, 1);
+        assert_eq!(event.completion_tokens, 0);
+        assert!(
+            event.usage_estimated,
+            "locally-counted tokens must be flagged"
+        );
     }
 
     /// AISIX-Cloud#867 parity: a successful /v1/completions 200 must stamp

@@ -36,43 +36,103 @@ where
     type Rejection = ProxyError;
 
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
-        let token = extract_bearer(parts)?;
         let proxy_state = ProxyState::from_ref(state);
-        authenticate_token(&proxy_state, &token)
+        let token = match extract_bearer(parts) {
+            Ok(t) => t,
+            Err(e) => {
+                // No credential at all: metric only — logging every
+                // scanner probe would be noise (AISIX-Cloud#1081).
+                proxy_state
+                    .metrics
+                    .record_auth_decision("none", false, "missing_credentials");
+                return Err(e);
+            }
+        };
+        let authed = authenticate_token(&proxy_state, &token).await?;
+        // Publish the resolved key so extractors that run after this one can
+        // see who is calling without re-authenticating. `ClientContext` reads
+        // it for the `${request.api_key.*}` header templates
+        // (AISIX-Cloud#1112) — which is why every handler declares
+        // `auth: AuthenticatedKey` before `client: ClientContext`.
+        parts.extensions.insert(authed.entry.clone());
+        Ok(authed)
     }
 }
 
-/// Look a plaintext bearer up in the snapshot and enforce key lifecycle.
-/// The single auth choke point behind the [`AuthenticatedKey`] extractor;
-/// also called directly by surfaces whose credentials arrive outside the
+/// Authenticate a plaintext bearer and enforce key lifecycle. The single
+/// auth choke point behind the [`AuthenticatedKey`] extractor; also
+/// called directly by surfaces whose credentials arrive outside the
 /// standard headers (WebSocket subprotocol auth on `/v1/realtime`).
-pub(crate) fn authenticate_token(
+///
+/// A JWT-shaped bearer takes the OIDC path (`crate::jwt`) whenever the
+/// environment has an enabled trust provider — with no fallback to the
+/// key lookup on failure, so a rejected JWT can never be retried as a
+/// key. Everything else is looked up as an API key by hash.
+pub(crate) async fn authenticate_token(
     state: &ProxyState,
     token: &str,
 ) -> Result<AuthenticatedKey, ProxyError> {
     let snapshot = state.snapshot.load();
+    if crate::jwt::looks_like_jwt(token) && crate::jwt::any_enabled_provider(&snapshot) {
+        return crate::jwt::authenticate_jwt(state, &snapshot, token).await;
+        // No enabled trust provider: fall through to the key path so a
+        // custom-imported key that happens to look like a JWT keeps
+        // authenticating on deployments that never enable JWT auth.
+    }
     // Self-hosted CP (prd-09a §9A.7B.4): the snapshot stores
     // SHA-256 hashes of the plaintext bearer, never the plaintext
     // itself. Hash the incoming token via the canonical helper
     // and look up by the hex digest. cp-api hashes with the same
     // function before persistence, so the two sides agree byte
     // for byte.
-    let entry = snapshot
-        .apikeys
-        .get_by_name(&ApiKey::hash_bearer(token))
-        .ok_or(ProxyError::InvalidApiKey)?;
+    let Some(entry) = snapshot.apikeys.get_by_name(&ApiKey::hash_bearer(token)) else {
+        return Err(deny_key(state, "unknown_key", ProxyError::InvalidApiKey));
+    };
     // Lifecycle enforcement (#933): a known key that is disabled or
     // past its expiry deadline must be rejected here, at the single
     // auth choke point, so every proxy surface (chat, messages,
     // responses, embeddings, audio, passthrough, MCP, …) inherits
     // the same 401 without per-handler checks.
     if entry.value.disabled {
-        return Err(ProxyError::ApiKeyDisabled);
+        return Err(deny_key(state, "key_disabled", ProxyError::ApiKeyDisabled));
     }
     if entry.value.is_expired_at(chrono::Utc::now()) {
-        return Err(ProxyError::ApiKeyExpired);
+        return Err(deny_key(state, "key_expired", ProxyError::ApiKeyExpired));
     }
+    state.metrics.record_auth_decision("api_key", true, "");
     Ok(AuthenticatedKey { entry })
+}
+
+/// Record an API-key denial on the decision metric + log
+/// (AISIX-Cloud#1081 — before this, a 401 was invisible: the extractor
+/// short-circuits ahead of every handler, so neither the request
+/// counter nor the access log ever fired). The token itself is never
+/// logged.
+///
+/// `unknown_key` is the scanner-probe shape (`Bearer <junk>`) and
+/// carries no operator signal beyond the metric — same reasoning as the
+/// extractor's `missing_credentials`, which is also metric-only. It logs
+/// at `debug` so an internet-facing DP is not flooded. `key_disabled` /
+/// `key_expired` name a real key an operator provisioned, so they stay
+/// at `warn`.
+fn deny_key(state: &ProxyState, reason: &'static str, err: ProxyError) -> ProxyError {
+    state.metrics.record_auth_decision("api_key", false, reason);
+    if reason == "unknown_key" {
+        tracing::debug!(
+            target: "aisix::auth",
+            method = "api_key",
+            reason = %reason,
+            "rejected inbound credential",
+        );
+    } else {
+        tracing::warn!(
+            target: "aisix::auth",
+            method = "api_key",
+            reason = %reason,
+            "rejected inbound credential",
+        );
+    }
+    err
 }
 
 fn extract_bearer(parts: &Parts) -> Result<String, ProxyError> {

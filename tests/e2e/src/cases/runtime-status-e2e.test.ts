@@ -74,8 +74,11 @@ describe("runtime status e2e", () => {
       },
     });
 
-    app = await spawnApp();
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    // The admin listener is off; `admin` here is used only for
+    // listModelStatuses, which reads GET /status/models on the metrics
+    // listener. Resources are seeded straight to etcd via `seed`.
+    app = await spawnApp({ admin: false });
+    admin = new AdminClient(app.adminUrl, app.adminKey, app.metricsUrl);
     seed = new SeedClient(etcd, app.etcdPrefix);
 
     const flakyPk = await seed.createProviderKey({

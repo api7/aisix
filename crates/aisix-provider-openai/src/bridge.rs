@@ -21,8 +21,9 @@
 
 use aisix_core::{RequestOverrides, ResponseOverrides, StreamDoneMarker};
 use aisix_gateway::{
-    Bridge, BridgeContext, BridgeError, ChatChunk, ChatChunkStream, ChatFormat, ChatResponse,
-    EmbeddingRequest, EmbeddingResponse, SseDecoder, SseEvent,
+    apply_request_headers, Bridge, BridgeContext, BridgeError, ChatChunk, ChatChunkStream,
+    ChatFormat, ChatResponse, EmbeddingRequest, EmbeddingResponse, SseDecoder, SseEvent,
+    UpstreamHeaderContext,
 };
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -35,9 +36,9 @@ use serde_json::Value;
 use std::time::{Duration, Instant};
 
 use crate::overrides::{
-    apply_content_list_to_string, apply_default_body_fields, apply_default_headers,
-    apply_param_constraints, apply_param_renames, apply_stream_done_marker_policy,
-    extract_reasoning_field, StreamDoneOutcome,
+    apply_content_list_to_string, apply_default_body_fields, apply_param_constraints,
+    apply_param_renames, apply_stream_done_marker_policy, extract_reasoning_field,
+    StreamDoneOutcome,
 };
 use crate::wire::{
     build_request, embed_request_body, embed_response_into, messages_from,
@@ -77,6 +78,15 @@ impl OpenAiBridge {
 
     pub fn with_client(client: Client) -> Self {
         Self { client }
+    }
+
+    /// The client this dispatch runs on: the bridge's shared one, unless
+    /// the resolved Provider Key carries its own TLS settings.
+    fn client_for(&self, ctx: &BridgeContext) -> Client {
+        aisix_gateway::upstream_tls::client_for_provider_key(
+            &self.client,
+            ctx.provider_key.tls.as_ref(),
+        )
     }
 
     /// Resolve `ProviderKey.api_base` into the canonical base URL the
@@ -148,7 +158,7 @@ impl Default for OpenAiBridge {
 }
 
 fn default_client() -> Client {
-    Client::builder()
+    aisix_gateway::client_builder()
         .user_agent("aisix/0.1")
         .build()
         .unwrap_or_else(|_| Client::new())
@@ -282,6 +292,7 @@ where
             Ok(r) => r,
             Err(_) => Err(BridgeError::Timeout {
                 elapsed_ms: started.elapsed().as_millis() as u64,
+                cause: String::new(),
             }),
         },
     }
@@ -319,11 +330,10 @@ fn prepare_outbound_body<T: serde::Serialize>(
 /// x-aisix-request-id, and optionally Accept: text/event-stream
 /// for streaming calls), then merge any `default_headers` the PK carries.
 /// Bridge-owned headers are inserted before the merge so
-/// [`apply_default_headers`] cannot overwrite them — the
-/// `if headers.contains_key(&parsed_name)` guard inside
-/// `apply_default_headers` plus the [`RESERVED_DEFAULT_HEADERS`] list
-/// gives two layers of defense against an operator-supplied
-/// `default_headers` accidentally clobbering auth.
+/// [`apply_request_headers`] cannot overwrite them — its skip-if-present
+/// rule plus `RESERVED_UPSTREAM_HEADERS` gives two layers of defense
+/// against an operator-supplied `default_headers` entry (or a forwarded
+/// client header) clobbering auth.
 ///
 /// The previous `bridge_name` parameter + `X-Aisix-Bridge` outbound
 /// header was removed in AISIX-Cloud#468: after the Phase A clean
@@ -339,7 +349,7 @@ fn build_request_headers(
     api_key_str: &str,
     request_id: &str,
     sse: bool,
-    request: Option<&RequestOverrides>,
+    hdr: &UpstreamHeaderContext<'_>,
 ) -> Result<HeaderMap, BridgeError> {
     let mut headers = HeaderMap::new();
     let auth = HeaderValue::from_str(&format!("Bearer {api_key_str}")).map_err(|e| {
@@ -362,9 +372,7 @@ fn build_request_headers(
             HeaderValue::from_static("text/event-stream"),
         );
     }
-    if let Some(r) = request {
-        apply_default_headers(&mut headers, &r.default_headers);
-    }
+    apply_request_headers(&mut headers, hdr);
     Ok(headers)
 }
 
@@ -390,14 +398,9 @@ impl Bridge for OpenAiBridge {
             ctx.provider_key.request.as_ref(),
             ctx.provider_key.response.as_ref(),
         )?;
-        let headers = build_request_headers(
-            key,
-            &ctx.request_id,
-            false,
-            ctx.provider_key.request.as_ref(),
-        )?;
+        let headers = build_request_headers(key, &ctx.request_id, false, &ctx.header_ctx())?;
         let url = format!("{base}/chat/completions");
-        let client = self.client.clone();
+        let client = self.client_for(ctx);
         let started = Instant::now();
 
         with_deadline(ctx.deadline, started, async move {
@@ -407,7 +410,7 @@ impl Bridge for OpenAiBridge {
                 .json(&body)
                 .send()
                 .await
-                .map_err(|e| BridgeError::Transport(e.to_string()))?;
+                .map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
 
             let status = resp.status();
             if !status.is_success() {
@@ -441,14 +444,9 @@ impl Bridge for OpenAiBridge {
             ctx.provider_key.request.as_ref(),
             ctx.provider_key.response.as_ref(),
         )?;
-        let headers = build_request_headers(
-            key,
-            &ctx.request_id,
-            false,
-            ctx.provider_key.request.as_ref(),
-        )?;
+        let headers = build_request_headers(key, &ctx.request_id, false, &ctx.header_ctx())?;
         let url = format!("{base}/embeddings");
-        let client = self.client.clone();
+        let client = self.client_for(ctx);
         let started = Instant::now();
         with_deadline(ctx.deadline, started, async move {
             let resp = client
@@ -457,7 +455,7 @@ impl Bridge for OpenAiBridge {
                 .json(&body)
                 .send()
                 .await
-                .map_err(|e| BridgeError::Transport(e.to_string()))?;
+                .map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
 
             let status = resp.status();
             if !status.is_success() {
@@ -497,15 +495,10 @@ impl Bridge for OpenAiBridge {
             ctx.provider_key.request.as_ref(),
             ctx.provider_key.response.as_ref(),
         )?;
-        let headers = build_request_headers(
-            key,
-            &ctx.request_id,
-            false,
-            ctx.provider_key.request.as_ref(),
-        )?;
+        let headers = build_request_headers(key, &ctx.request_id, false, &ctx.header_ctx())?;
 
         let url = format!("{base}/completions");
-        let client = self.client.clone();
+        let client = self.client_for(ctx);
         let started = Instant::now();
         with_deadline(ctx.deadline, started, async move {
             let resp = client
@@ -514,7 +507,7 @@ impl Bridge for OpenAiBridge {
                 .json(&outbound)
                 .send()
                 .await
-                .map_err(|e| BridgeError::Transport(e.to_string()))?;
+                .map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
 
             let status = resp.status();
             if !status.is_success() {
@@ -552,15 +545,10 @@ impl Bridge for OpenAiBridge {
             ctx.provider_key.request.as_ref(),
             ctx.provider_key.response.as_ref(),
         )?;
-        let headers = build_request_headers(
-            key,
-            &ctx.request_id,
-            false,
-            ctx.provider_key.request.as_ref(),
-        )?;
+        let headers = build_request_headers(key, &ctx.request_id, false, &ctx.header_ctx())?;
 
         let url = format!("{base}/images/generations");
-        let client = self.client.clone();
+        let client = self.client_for(ctx);
         let started = Instant::now();
         with_deadline(ctx.deadline, started, async move {
             let resp = client
@@ -569,7 +557,7 @@ impl Bridge for OpenAiBridge {
                 .json(&outbound)
                 .send()
                 .await
-                .map_err(|e| BridgeError::Transport(e.to_string()))?;
+                .map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
 
             let status = resp.status();
             if !status.is_success() {
@@ -599,14 +587,9 @@ impl Bridge for OpenAiBridge {
             ctx.provider_key.request.as_ref(),
             ctx.provider_key.response.as_ref(),
         )?;
-        let headers = build_request_headers(
-            key,
-            &ctx.request_id,
-            true,
-            ctx.provider_key.request.as_ref(),
-        )?;
+        let headers = build_request_headers(key, &ctx.request_id, true, &ctx.header_ctx())?;
         let url = format!("{base}/chat/completions");
-        let client = self.client.clone();
+        let client = self.client_for(ctx);
         let started = Instant::now();
 
         let resp = with_deadline(ctx.deadline, started, async move {
@@ -616,7 +599,7 @@ impl Bridge for OpenAiBridge {
                 .json(&body)
                 .send()
                 .await
-                .map_err(|e| BridgeError::Transport(e.to_string()))
+                .map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))
         })
         .await?;
 
@@ -668,7 +651,7 @@ where
         let mut stream = Box::pin(byte_stream);
         let mut done_marker_seen = false;
         'outer: while let Some(next) = stream.next().await {
-            let chunk = next.map_err(|e| BridgeError::Transport(e.to_string()))?;
+            let chunk = next.map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
             for event in decoder.feed(chunk.as_ref()) {
                 match event {
                     SseEvent::Done => {

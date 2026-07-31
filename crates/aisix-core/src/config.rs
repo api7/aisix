@@ -61,6 +61,17 @@ pub struct Config {
     /// one global window instead of one-per-replica (api7/AISIX-Cloud#798).
     #[serde(default)]
     pub ratelimit: RateLimitConfig,
+    /// Connection-layer tuning for outbound calls to LLM providers.
+    /// Defaults bound the connect phase, keep TCP keepalive on, and expire
+    /// pooled connections well before a typical LB/NAT/proxy hop would —
+    /// see [`UpstreamConfig`].
+    #[serde(default)]
+    pub upstream: UpstreamConfig,
+    /// Connection-layer tuning for the inbound side: how long an idle
+    /// client connection is held, and how often a stalled SSE response
+    /// emits a heartbeat — see [`DownstreamConfig`].
+    #[serde(default)]
+    pub downstream: DownstreamConfig,
     /// Optional managed-mode configuration. When `managed.enabled = true`
     /// the admin API and Playground endpoints are **not** bound — the DP
     /// is a pure etcd reader driven by the aisix.cloud control plane.
@@ -374,6 +385,14 @@ impl EtcdConfig {
 #[serde(deny_unknown_fields)]
 pub struct ProxyConfig {
     pub addr: String,
+    /// Cap on inbound request bodies across the whole proxy surface
+    /// (JSON, multipart, passthrough, MCP, A2A). `0` — the default —
+    /// disables the cap, matching the reference LLM proxy's
+    /// out-of-box behaviour: providers accept larger requests than any
+    /// fixed gateway default (Anthropic takes 32 MB), so a gateway-side
+    /// cap rejects requests the upstream would have served. Set a value
+    /// to bound per-request memory; over-limit requests get a 413 in
+    /// the caller's error envelope.
     #[serde(default = "ProxyConfig::default_body_limit")]
     pub request_body_limit_bytes: usize,
     #[serde(default)]
@@ -388,7 +407,7 @@ pub struct ProxyConfig {
 
 impl ProxyConfig {
     const fn default_body_limit() -> usize {
-        10 * 1024 * 1024
+        0
     }
 }
 
@@ -444,6 +463,15 @@ impl RealIpConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AdminConfig {
+    /// When `false`, the admin listener is not bound even in standalone
+    /// (etcd or file) mode. The proxy and the metrics/status listener are
+    /// unaffected, so resources are managed declaratively — a resources
+    /// file, or direct writes to the configuration store — with
+    /// `GET /status/config` and the proxy `GET /livez` as the operational
+    /// feedback. Managed mode never binds the admin listener regardless.
+    /// Defaults to `true`.
+    #[serde(default = "AdminConfig::default_enabled")]
+    pub enabled: bool,
     #[serde(default = "AdminConfig::default_addr")]
     pub addr: String,
     /// Statically-provisioned admin keys. A request is authorised if it
@@ -461,11 +489,16 @@ impl AdminConfig {
         // if they leave it at the default without overriding.
         "127.0.0.1:0".into()
     }
+
+    fn default_enabled() -> bool {
+        true
+    }
 }
 
 impl Default for AdminConfig {
     fn default() -> Self {
         Self {
+            enabled: Self::default_enabled(),
             addr: Self::default_addr(),
             admin_keys: Vec::new(),
             tls: None,
@@ -510,6 +543,26 @@ impl ObservabilityConfig {
 pub struct MetricsConfig {
     pub prometheus: PrometheusConfig,
     pub otlp: OtlpConfig,
+    /// Operator-defined User-Agent → `client_type` mapping rules
+    /// (AISIX-Cloud#1045), consulted BEFORE the built-in allowlist so a
+    /// deployment can classify in-house tools (or re-bucket a built-in
+    /// match). Deployment-scoped on purpose: the labels these rules mint
+    /// go to this DP's own Prometheus scrape surface, so the operator who
+    /// owns the scrape owns the label set. Order matters (first match
+    /// wins); compiled + validated at boot (fail-fast), never hot-reloaded.
+    pub client_type_rules: Vec<ClientTypeRule>,
+}
+
+/// One `client_type_rules` entry: a regex tried against the raw inbound
+/// `User-Agent` (case-insensitive, unanchored — anchor with `^` yourself),
+/// and the bounded label value emitted on match. The label — not the UA —
+/// becomes the Prometheus `client_type` value, so cardinality stays capped
+/// by the rule count.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClientTypeRule {
+    pub pattern: String,
+    pub client: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -656,6 +709,14 @@ pub struct RedisConnConfig {
     /// Database index for the Sentinel-discovered master (default 0).
     /// Not applicable to `cluster` (Redis Cluster only has DB 0).
     pub database: Option<i64>,
+    /// Trust settings for a `rediss://` connection. Independent of
+    /// `upstream.tls` because the cache/rate-limit backend sits inside
+    /// the deployment and is usually issued by a different authority
+    /// than the model endpoints.
+    ///
+    /// Only consulted for `rediss://` URLs; a plaintext `redis://`
+    /// connection never negotiates TLS regardless of what is set here.
+    pub tls: OutboundTlsConfig,
 }
 
 impl RedisConnConfig {
@@ -688,6 +749,19 @@ impl RedisConnConfig {
                     ));
                 }
             }
+        }
+        match (&self.tls.client_cert_file, &self.tls.client_key_file) {
+            (Some(_), None) => {
+                return Err(format!(
+                    "{ctx}.tls.client_cert_file requires {ctx}.tls.client_key_file"
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(format!(
+                    "{ctx}.tls.client_key_file requires {ctx}.tls.client_cert_file"
+                ));
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -729,6 +803,214 @@ impl Default for RateLimitConfig {
 pub enum RateLimitBackend {
     Memory,
     Redis,
+}
+
+/// Deployment-wide behaviour for outbound calls to LLM providers: the
+/// connection layer, plus the retry budget every dispatch starts from.
+///
+/// These are deployment properties of the network path to the upstream, not
+/// per-tenant configuration, so they live in the DP config file rather than
+/// on a Model or ProviderKey resource. A tenant that needs a different
+/// budget for one model overrides it with `Model.retries`.
+///
+/// The defaults exist because reqwest's own are wrong for a gateway sitting
+/// behind an LB/NAT/proxy hop: no connect timeout, TCP keepalive off, and a
+/// 90s pooled-connection lifetime that outlives the idle timeout of a
+/// typical hop — so a connection reaped upstream can still be handed out
+/// here, and the request fails with an opaque transport error.
+///
+/// Every duration accepts `0` to disable that individual knob.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct UpstreamConfig {
+    /// Deployment-wide default for `Model.timeout`: the end-to-end deadline
+    /// in milliseconds for non-streaming upstream calls (and the fallback
+    /// budget for streaming ones, below). Applies to every model that sets
+    /// neither its own `timeout` nor a group-level one. `0` restores the
+    /// pre-default behaviour: no deadline at all.
+    ///
+    /// The default matches the LiteLLM proxy's `request_timeout` (6000 s).
+    /// It is a backstop against an upstream that accepted the connection
+    /// and then goes silent forever — not a responsiveness target, which
+    /// is what per-model `timeout` is for. Deliberately generous so it can
+    /// never cut down a legitimate long request (deep-reasoning calls run
+    /// past 10 minutes).
+    pub timeout_ms: u64,
+    /// Deployment-wide default for `Model.stream_timeout`: the maximum gap
+    /// in milliseconds between upstream streaming chunks. `0` (the
+    /// default) falls back to `timeout_ms`, mirroring how an unset
+    /// `Model.stream_timeout` falls back to `Model.timeout`.
+    pub stream_timeout_ms: u64,
+    /// Max time for DNS + TCP + TLS before an attempt fails. Without it a
+    /// black-holed upstream is bounded only by the model's overall timeout.
+    pub connect_timeout_ms: u64,
+    /// Idle seconds before the kernel sends its first TCP keepalive probe.
+    /// Keeps a long wait for a slow first token from being reaped by a NAT
+    /// or LB idle timer.
+    pub tcp_keepalive_secs: u64,
+    /// Seconds between subsequent keepalive probes.
+    pub tcp_keepalive_interval_secs: u64,
+    /// Unacknowledged probes before the kernel drops the connection.
+    pub tcp_keepalive_retries: u32,
+    /// How long an idle connection may sit in the pool before it is
+    /// discarded. **Keep this below the shortest idle timeout on the path
+    /// to the provider** (LB, NAT gateway, corporate proxy, service mesh),
+    /// or the pool will hand out connections the far end already closed.
+    pub pool_idle_timeout_secs: u64,
+    /// Cap on idle connections kept per upstream host. `null` (the
+    /// default) leaves reqwest's unbounded behaviour.
+    pub pool_max_idle_per_host: Option<usize>,
+    /// Retry attempts after a retryable upstream failure, applied to every
+    /// dispatch that does not override it via `Model.retries` or a model
+    /// group's `routing.retries`. `0` disables retrying deployment-wide.
+    ///
+    /// The default matches the OpenAI SDK / LiteLLM router default (2), so
+    /// a transient upstream fault is absorbed instead of surfacing to the
+    /// caller. Raising it multiplies the load a failing upstream sees:
+    /// each retry re-sends the full request body, and stacks on top of any
+    /// retry the provider's own edge performs.
+    pub retries: u32,
+    /// Trust settings for the TLS handshake with every upstream peer —
+    /// see [`OutboundTlsConfig`].
+    pub tls: OutboundTlsConfig,
+}
+
+impl Default for UpstreamConfig {
+    fn default() -> Self {
+        Self {
+            timeout_ms: DEFAULT_UPSTREAM_TIMEOUT_MS,
+            stream_timeout_ms: 0,
+            connect_timeout_ms: 5_000,
+            tcp_keepalive_secs: 60,
+            tcp_keepalive_interval_secs: 30,
+            tcp_keepalive_retries: 5,
+            pool_idle_timeout_secs: 30,
+            pool_max_idle_per_host: None,
+            retries: DEFAULT_UPSTREAM_RETRIES,
+            tls: OutboundTlsConfig::default(),
+        }
+    }
+}
+
+/// Trust settings for a class of TLS connections the gateway *opens*.
+///
+/// Used twice, because the two peer classes are issued certificates by
+/// different authorities and must be configurable apart: `upstream.tls`
+/// covers everything the gateway calls out to on a request path — the
+/// provider bridges, guardrail services, MCP and A2A upstreams, the
+/// OIDC/JWKS fetches, the Realtime WebSocket, Bedrock, and the
+/// log-export object stores — while a `redis.tls` block covers the
+/// shared cache / rate-limit backend.
+///
+/// Scope note: this is the connection the gateway makes as a *client*.
+/// The certificate the gateway *presents* on its own listeners is
+/// `proxy.tls` / `admin.tls`, and the etcd channel keeps its own
+/// [`EtcdTlsConfig`] because it is a control-plane link whose bundle is
+/// issued by the control plane rather than configured by the operator.
+///
+/// Without any of this set, the trust store is the platform's: the
+/// built-in root set plus whatever `SSL_CERT_FILE` / `SSL_CERT_DIR`
+/// point at. Those environment variables keep working and stay
+/// additive, but they are process-wide and cannot be expressed per
+/// peer class, which is what `ca_file` is for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct OutboundTlsConfig {
+    /// Path to a PEM file holding one or more certificates to trust as
+    /// issuers, for upstreams whose certificate is signed by a private
+    /// or enterprise CA.
+    ///
+    /// **Additive**: these are trusted *in addition to* the built-in
+    /// roots, so adding a private CA never stops a public provider from
+    /// being reachable. Every certificate in the file is loaded, so a
+    /// full chain in one bundle works.
+    pub ca_file: Option<String>,
+    /// Path to a PEM client certificate presented to upstreams that
+    /// require mutual TLS. Must be set together with `client_key_file`.
+    pub client_cert_file: Option<String>,
+    /// Path to the PEM private key for `client_cert_file`.
+    pub client_key_file: Option<String>,
+    /// Whether the upstream's certificate is verified at all.
+    ///
+    /// Setting this to `false` accepts any certificate, including an
+    /// expired one, one issued for a different host, and one presented
+    /// by an interceptor — which removes the only protection against a
+    /// machine-in-the-middle reading and rewriting every prompt,
+    /// response, and upstream API key that crosses the connection.
+    /// Intended for a test environment where the alternative is not
+    /// running at all; prefer `ca_file` everywhere else.
+    pub verify: bool,
+}
+
+impl Default for OutboundTlsConfig {
+    fn default() -> Self {
+        Self {
+            ca_file: None,
+            client_cert_file: None,
+            client_key_file: None,
+            verify: true,
+        }
+    }
+}
+
+impl OutboundTlsConfig {
+    /// Whether anything here departs from the platform default trust
+    /// behaviour. Used to keep the "no TLS config" path building exactly
+    /// the client it built before this block existed.
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+/// Deployment-wide retry default. Matches `openai.DEFAULT_MAX_RETRIES`,
+/// which is also what the LiteLLM router falls back to when neither
+/// `router_settings.num_retries` nor `litellm_settings.num_retries` is set.
+pub const DEFAULT_UPSTREAM_RETRIES: u32 = 2;
+
+/// Deployment-wide request-timeout default: 6000 s, matching the LiteLLM
+/// proxy's `request_timeout`. See [`UpstreamConfig::timeout_ms`].
+pub const DEFAULT_UPSTREAM_TIMEOUT_MS: u64 = 6_000_000;
+
+/// Connection-layer settings for the inbound side — the client (or the
+/// gateway in front of this one) talking to the proxy and admin listeners.
+///
+/// The mirror image of [`UpstreamConfig`]: that one governs the pool the
+/// gateway *dials out* with, this one governs the connections it *accepts*.
+/// Both matter in a multi-hop chain, where the rule is that every node's
+/// client-side idle timeout must stay below the next node's server-side one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct DownstreamConfig {
+    /// How long an accepted connection may sit idle — response fully
+    /// written, no next request started — before the gateway closes it.
+    /// Applies to both listeners, and to HTTP/1.1 only.
+    ///
+    /// `0` (the default) never closes an idle connection, leaving that to
+    /// the peer. That default is deliberate: a gateway in front of this one
+    /// pools its own connections (Envoy's upstream idle default is an hour),
+    /// and closing first is exactly what hands *it* a stale connection. Set
+    /// this **above** the pool idle timeout of whatever sits in front, and
+    /// only when idle connections need reclaiming.
+    ///
+    /// An in-flight request is never interrupted, however long it runs: the
+    /// timer only arms once the connection is between requests.
+    pub idle_timeout_secs: u64,
+    /// Interval between SSE heartbeat comments (`:\n\n`) sent on a
+    /// streaming response while the upstream produces nothing.
+    ///
+    /// Keeps a proxy between the client and the gateway from treating a
+    /// model that is slow to its first token as an abandoned connection.
+    /// `0` disables the heartbeat.
+    pub sse_keepalive_interval_secs: u64,
+}
+
+impl Default for DownstreamConfig {
+    fn default() -> Self {
+        Self {
+            idle_timeout_secs: 0,
+            sse_keepalive_interval_secs: 15,
+        }
+    }
 }
 
 impl Config {
@@ -817,11 +1099,12 @@ impl Config {
                     .into(),
             ));
         }
-        // In managed mode the admin listener is not bound, so requiring
-        // admin_keys or a valid admin.addr would be punishing the user
-        // for fields that aren't going to be used. In standalone mode
-        // we keep the original invariants.
-        if !self.managed.is_managed() {
+        // The admin listener is not bound in managed mode, nor when
+        // `admin.enabled = false`, so requiring admin_keys or a valid
+        // admin.addr in those cases would be punishing the user for
+        // fields that aren't going to be used. When it will bind, keep
+        // the original invariants.
+        if !self.managed.is_managed() && self.admin.enabled {
             if self.admin.admin_keys.is_empty() {
                 return Err(BootstrapError::Config(
                     "admin.admin_keys must contain at least one key \
@@ -881,6 +1164,25 @@ impl Config {
                 .validate("cache.redis")
                 .map_err(BootstrapError::Config)?;
         }
+        // A half-configured client identity would otherwise be silently
+        // dropped and surface much later as an upstream 4xx from a peer
+        // that wanted mutual TLS.
+        match (
+            &self.upstream.tls.client_cert_file,
+            &self.upstream.tls.client_key_file,
+        ) {
+            (Some(_), None) => {
+                return Err(BootstrapError::Config(
+                    "upstream.tls.client_cert_file requires upstream.tls.client_key_file".into(),
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(BootstrapError::Config(
+                    "upstream.tls.client_key_file requires upstream.tls.client_cert_file".into(),
+                ));
+            }
+            _ => {}
+        }
         Ok(())
     }
 }
@@ -913,7 +1215,9 @@ admin:
         let cfg = Config::load_from_path(Some(f.path())).unwrap();
         assert_eq!(cfg.etcd.endpoints, vec!["http://127.0.0.1:2379"]);
         assert_eq!(cfg.etcd.auth_token_refresh_secs, 240);
-        assert_eq!(cfg.proxy.request_body_limit_bytes, 10 * 1024 * 1024);
+        // `0` = no request-body cap, the out-of-box behaviour of the
+        // reference LLM proxy.
+        assert_eq!(cfg.proxy.request_body_limit_bytes, 0);
         assert!(cfg.observability.metrics.prometheus.enabled);
         // The dedicated metrics listener defaults to 0.0.0.0:9090 in
         // every mode — no admin-listener fallback to fall out of sync with.
@@ -1118,6 +1422,65 @@ admin:
     }
 
     #[test]
+    fn admin_enabled_defaults_to_true() {
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+  prefix: "/aisix"
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+"#,
+        );
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert!(cfg.admin.enabled);
+    }
+
+    #[test]
+    fn admin_disabled_relaxes_admin_key_requirement() {
+        // With the admin listener switched off, there is no bound surface
+        // to authenticate, so an empty admin_keys is no longer an error —
+        // resources are managed declaratively (etcd here).
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+  prefix: "/aisix"
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  enabled: false
+"#,
+        );
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert!(!cfg.admin.enabled);
+        assert!(cfg.admin.admin_keys.is_empty());
+    }
+
+    #[test]
+    fn admin_disabled_relaxes_admin_key_requirement_in_file_mode() {
+        // File mode routes through a distinct admin store variant, and it
+        // too binds a read-only admin surface by default. With the admin
+        // listener switched off, the same relaxation applies — no
+        // admin_keys required.
+        let f = write_yaml(
+            r#"
+resources_file: "/etc/aisix/resources.yaml"
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  enabled: false
+"#,
+        );
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert!(!cfg.admin.enabled);
+        assert!(cfg.admin.admin_keys.is_empty());
+    }
+
+    #[test]
     fn rejects_empty_etcd_endpoints() {
         let f = write_yaml(
             r#"
@@ -1168,6 +1531,110 @@ admin:
         assert_eq!(cfg.ratelimit.backend, RateLimitBackend::Memory);
         assert!(cfg.ratelimit.redis.is_none());
         assert_eq!(cfg.ratelimit.concurrency_ttl_secs, 300);
+    }
+
+    /// An `upstream:` block is optional; the defaults must still bound the
+    /// connect phase, keep TCP keepalive on, and expire pooled connections
+    /// sooner than reqwest's own 90s (AISIX-Cloud#1122).
+    #[test]
+    fn upstream_defaults_apply_when_the_block_is_absent() {
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://localhost:2379"]
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+"#,
+        );
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert_eq!(cfg.upstream.timeout_ms, 6_000_000);
+        assert_eq!(cfg.upstream.stream_timeout_ms, 0);
+        assert_eq!(cfg.upstream.connect_timeout_ms, 5_000);
+        assert_eq!(cfg.upstream.tcp_keepalive_secs, 60);
+        assert_eq!(cfg.upstream.tcp_keepalive_interval_secs, 30);
+        assert_eq!(cfg.upstream.tcp_keepalive_retries, 5);
+        assert!(cfg.upstream.pool_idle_timeout_secs < 90);
+        assert!(cfg.upstream.pool_max_idle_per_host.is_none());
+    }
+
+    /// Operators behind a proxy with a short idle timeout need to lower
+    /// `pool_idle_timeout_secs`; every knob must be individually settable
+    /// and `0` must round-trip (it means "leave this one off").
+    #[test]
+    fn upstream_block_overrides_individual_knobs() {
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://localhost:2379"]
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+upstream:
+  timeout_ms: 0
+  stream_timeout_ms: 30000
+  connect_timeout_ms: 2000
+  pool_idle_timeout_secs: 10
+  tcp_keepalive_secs: 0
+  pool_max_idle_per_host: 16
+"#,
+        );
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert_eq!(cfg.upstream.timeout_ms, 0);
+        assert_eq!(cfg.upstream.stream_timeout_ms, 30_000);
+        assert_eq!(cfg.upstream.connect_timeout_ms, 2_000);
+        assert_eq!(cfg.upstream.pool_idle_timeout_secs, 10);
+        assert_eq!(cfg.upstream.tcp_keepalive_secs, 0);
+        assert_eq!(cfg.upstream.pool_max_idle_per_host, Some(16));
+        // Unspecified knobs keep their defaults.
+        assert_eq!(cfg.upstream.tcp_keepalive_interval_secs, 30);
+    }
+
+    /// The inbound side defaults to today's behaviour: idle connections are
+    /// held until the peer closes them (closing first is what hands the
+    /// node in front a stale connection), and SSE responses heartbeat every
+    /// 15s (AISIX-Cloud#1126).
+    #[test]
+    fn downstream_defaults_hold_idle_connections_and_keep_the_sse_heartbeat() {
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://localhost:2379"]
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+"#,
+        );
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert_eq!(cfg.downstream.idle_timeout_secs, 0);
+        assert_eq!(cfg.downstream.sse_keepalive_interval_secs, 15);
+    }
+
+    #[test]
+    fn downstream_block_overrides_individual_knobs() {
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://localhost:2379"]
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+downstream:
+  idle_timeout_secs: 90
+"#,
+        );
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert_eq!(cfg.downstream.idle_timeout_secs, 90);
+        // Unspecified knobs keep their defaults.
+        assert_eq!(cfg.downstream.sse_keepalive_interval_secs, 15);
     }
 
     #[test]
@@ -1414,6 +1881,112 @@ observability:
             Config::load_from_path(Some(Path::new(path))).expect("config.example.yaml must load");
         assert!(cfg.observability.metrics.prometheus.enabled);
         assert_eq!(cfg.observability.metrics.prometheus.addr, "0.0.0.0:9090");
+    }
+
+    /// The block the issue reports as missing. `AISIX_UPSTREAM_SSL_VERIFY`
+    /// used to be rejected at boot with "unknown field", and the error
+    /// listed every section *except* a place to put a CA.
+    #[test]
+    fn loads_the_upstream_tls_block() {
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+upstream:
+  tls:
+    ca_file: "/etc/aisix/tls/private-ca.pem"
+    client_cert_file: "/etc/aisix/tls/client.crt"
+    client_key_file: "/etc/aisix/tls/client.key"
+    verify: false
+"#,
+        );
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert_eq!(
+            cfg.upstream.tls.ca_file.as_deref(),
+            Some("/etc/aisix/tls/private-ca.pem")
+        );
+        assert!(!cfg.upstream.tls.verify);
+    }
+
+    /// Verification must stay on for a deployment that never mentions
+    /// TLS — the block is `#[serde(default)]`, and a derived `Default`
+    /// would have made `verify` false.
+    #[test]
+    fn omitting_the_tls_block_keeps_verification_on() {
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+"#,
+        );
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert!(cfg.upstream.tls.verify);
+        assert!(cfg.upstream.tls.is_default());
+    }
+
+    /// Half an identity is silently dropped by every TLS stack and then
+    /// surfaces much later as a 4xx from a peer that wanted mutual TLS.
+    #[test]
+    fn a_client_certificate_without_its_key_is_rejected_at_boot() {
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+upstream:
+  tls:
+    client_cert_file: "/etc/aisix/tls/client.crt"
+"#,
+        );
+        let err = Config::load_from_path(Some(f.path()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("client_key_file"), "{err}");
+    }
+
+    #[test]
+    fn redis_carries_its_own_tls_block() {
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+ratelimit:
+  backend: redis
+  redis:
+    mode: single
+    url: "rediss://redis.internal:6379"
+    tls:
+      ca_file: "/etc/aisix/tls/redis-ca.pem"
+"#,
+        );
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        let redis = cfg.ratelimit.redis.as_ref().unwrap();
+        assert_eq!(
+            redis.tls.ca_file.as_deref(),
+            Some("/etc/aisix/tls/redis-ca.pem")
+        );
+        // Independent of the upstream block: the two peers are issued by
+        // different authorities in every real deployment.
+        assert!(cfg.upstream.tls.is_default());
     }
 
     #[test]

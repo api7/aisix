@@ -33,6 +33,90 @@ use crate::error::McpError;
 /// indefinitely. Overridable per upstream via [`McpUpstream::with_timeout`].
 pub const DEFAULT_UPSTREAM_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Shared HTTP client for every rmcp streamable-http transport, with the
+/// deployment's `upstream.*` connection settings applied.
+///
+/// rmcp pins its own reqwest line (0.13 — see Cargo.toml), so the shared
+/// `aisix_gateway::client_builder()` (workspace reqwest) cannot be handed
+/// to it directly; this is the sanctioned second construction site that
+/// applies the SAME `upstream_http::config()` values to rmcp's reqwest.
+///
+/// What this changes vs rmcp's `default_http_client()`:
+/// - a connect timeout exists at all (rmcp sets none, so a black-holed
+///   upstream was bounded only by the coarse per-operation deadline —
+///   the actual bug this fixes);
+/// - connection POOLING turns ON. rmcp deliberately disables idle
+///   pooling (`pool_max_idle_per_host(0)`) to dodge ~40 ms delayed-ACK
+///   stalls on reused connections; here reuse wins — every other
+///   outbound path pools under `upstream.*` management, and per-call
+///   TCP+TLS handshakes to a remote MCP server cost far more than the
+///   stall rmcp avoids. An operator can restore rmcp's behaviour with
+///   `upstream.pool_max_idle_per_host: 0`;
+/// - the TCP keepalive triple moves from reqwest's default 15 s/15 s/3
+///   to the deployment's 60 s/30 s/5;
+/// - the deployment's `upstream.tls` trust decision applies here too. An
+///   MCP server behind an enterprise CA is exactly as common as a model
+///   endpoint behind one, and the PEM has to be re-parsed rather than
+///   reused because rmcp's `Certificate` is a different crate version's
+///   type than the one `upstream_tls` caches for the workspace line.
+///
+/// One client for all MCP upstreams = one shared pool, matching how the
+/// provider bridges share theirs (auth is injected per-request by the
+/// transport, never client-wide).
+fn shared_http_client() -> rmcp_reqwest::Client {
+    static CLIENT: std::sync::OnceLock<rmcp_reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            let cfg = aisix_gateway::upstream_http::config();
+            let mut b = rmcp_reqwest::Client::builder()
+                .pool_idle_timeout(cfg.pool_idle_timeout)
+                .tcp_keepalive(cfg.tcp_keepalive);
+            if let Some(d) = cfg.connect_timeout {
+                b = b.connect_timeout(d);
+            }
+            if let Some(d) = cfg.tcp_keepalive_interval {
+                b = b.tcp_keepalive_interval(d);
+            }
+            if let Some(n) = cfg.tcp_keepalive_retries {
+                b = b.tcp_keepalive_retries(n);
+            }
+            if let Some(n) = cfg.pool_max_idle_per_host {
+                b = b.pool_max_idle_per_host(n);
+            }
+            if let Some(pem) = &cfg.tls.extra_ca_pem {
+                // Already validated at boot by `TlsSettings::load`; a
+                // failure here would mean rmcp's reqwest disagrees with
+                // ours about the same bytes, which is worth a loud line
+                // rather than a silently untrusting client.
+                match rmcp_reqwest::Certificate::from_pem_bundle(pem) {
+                    Ok(roots) => {
+                        for root in roots {
+                            b = b.add_root_certificate(root);
+                        }
+                    }
+                    Err(e) => tracing::error!(
+                        error = %e,
+                        "upstream.tls.ca_file not applied to MCP upstream connections"
+                    ),
+                }
+            }
+            if let Some(configured) = &cfg.tls.client_identity {
+                match rmcp_reqwest::Identity::from_pem(&configured.joined()) {
+                    Ok(identity) => b = b.identity(identity),
+                    Err(e) => tracing::error!(
+                        error = %e,
+                        "upstream.tls client identity not applied to MCP upstream connections"
+                    ),
+                }
+            }
+            if !cfg.tls.verify {
+                b = b.danger_accept_invalid_certs(true);
+            }
+            b.build().unwrap_or_else(|_| rmcp_reqwest::Client::new())
+        })
+        .clone()
+}
+
 /// Header carrying the gateway-held key for `api_key` upstream auth.
 const API_KEY_HEADER: &str = "x-api-key";
 
@@ -223,9 +307,17 @@ impl RmcpBridge {
     /// timeout.
     pub async fn connect(upstream: &McpUpstream) -> Result<Self, McpError> {
         let establish = async {
+            // Every arm goes through `with_client(shared_http_client(), ..)`
+            // so the transport inherits the deployment's `upstream.*`
+            // connection settings — `from_uri`/`from_config` would build
+            // rmcp's own default client with none of them.
             let transport = match &upstream.auth {
-                McpAuth::None => StreamableHttpClientTransport::from_uri(upstream.url.clone()),
-                McpAuth::Bearer(token) => StreamableHttpClientTransport::from_config(
+                McpAuth::None => StreamableHttpClientTransport::with_client(
+                    shared_http_client(),
+                    StreamableHttpClientTransportConfig::with_uri(upstream.url.clone()),
+                ),
+                McpAuth::Bearer(token) => StreamableHttpClientTransport::with_client(
+                    shared_http_client(),
                     StreamableHttpClientTransportConfig::with_uri(upstream.url.clone())
                         .auth_header(token.clone()),
                 ),
@@ -241,14 +333,16 @@ impl RmcpBridge {
                     // header map, mirroring this module's redaction posture.
                     value.set_sensitive(true);
                     let headers = HashMap::from([(HeaderName::from_static(API_KEY_HEADER), value)]);
-                    StreamableHttpClientTransport::from_config(
+                    StreamableHttpClientTransport::with_client(
+                        shared_http_client(),
                         StreamableHttpClientTransportConfig::with_uri(upstream.url.clone())
                             .custom_headers(headers),
                     )
                 }
                 McpAuth::OAuth2(cfg) => {
                     let token = crate::oauth::get_or_fetch(cfg).await?;
-                    StreamableHttpClientTransport::from_config(
+                    StreamableHttpClientTransport::with_client(
+                        shared_http_client(),
                         StreamableHttpClientTransportConfig::with_uri(upstream.url.clone())
                             .auth_header(token),
                     )
@@ -284,7 +378,7 @@ impl RmcpBridge {
 /// Bound an upstream-derived error message for logging: control characters
 /// (log-injection vectors) are stripped and the text is truncated, since a
 /// bare non-success response embeds the upstream's body verbatim.
-fn sanitize_error_message(message: &str) -> String {
+pub(crate) fn sanitize_error_message(message: &str) -> String {
     const MAX_LEN: usize = 256;
     let cleaned: String = message
         .chars()
@@ -458,6 +552,31 @@ impl McpBridge for EphemeralBridge {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The dial to an upstream that swallows SYNs must be cut by the
+    /// shared client's `upstream.connect_timeout_ms` (default 5 s) —
+    /// before the transport ran on rmcp's default reqwest, which has no
+    /// connect timeout, so the dial hung until the OUTER
+    /// `upstream.timeout` (12 s here; kernel SYN retries run ≈127 s).
+    /// 203.0.113.1 (TEST-NET-3) is reserved and unrouted, the standard
+    /// black-hole address; on networks that answer with an immediate
+    /// "unreachable" the call fails fast either way — the assertion is
+    /// the upper bound, which only the connect timeout guarantees.
+    #[tokio::test]
+    async fn connect_timeout_bounds_an_unreachable_upstream() {
+        let mut upstream = McpUpstream::new("http://203.0.113.1:81/mcp");
+        upstream.timeout = Duration::from_secs(12);
+        let started = std::time::Instant::now();
+        let err = RmcpBridge::connect(&upstream)
+            .await
+            .err()
+            .expect("dial to a black-holed upstream must fail");
+        assert!(
+            started.elapsed() < Duration::from_secs(8),
+            "dial was not bounded by connect_timeout: took {:?} ({err})",
+            started.elapsed()
+        );
+    }
 
     /// The hand-written Debug impls are the only guard between a credential
     /// and the logs; pin them so a `#[derive(Debug)]` regression fails loudly

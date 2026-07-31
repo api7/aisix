@@ -72,10 +72,10 @@ use aisix_provider_openai::wire::{
 // targeted keys are absent, so they are safe to call uniformly across the
 // five publisher rails (the Gemini `contents` shape simply does not match the
 // OpenAI-style top-level keys the request transforms look for).
-use aisix_core::RequestOverrides;
+use aisix_gateway::{apply_request_headers, UpstreamHeaderContext};
 use aisix_provider_openai::overrides::{
-    apply_content_list_to_string, apply_default_body_fields, apply_default_headers,
-    apply_param_constraints, apply_param_renames,
+    apply_content_list_to_string, apply_default_body_fields, apply_param_constraints,
+    apply_param_renames,
 };
 
 /// `anthropic_version` value Vertex's Claude `:rawPredict` endpoint
@@ -119,6 +119,18 @@ impl VertexBridge {
             #[cfg(test)]
             api_base_override: None,
         }
+    }
+
+    /// The client this dispatch runs on: the bridge's shared one, unless
+    /// the resolved Provider Key carries its own TLS settings. The token
+    /// minter deliberately keeps the shared client — it talks to the
+    /// identity provider, not to the key's `api_base`, and a private CA
+    /// declared for the model endpoint says nothing about that host.
+    fn client_for(&self, ctx: &BridgeContext) -> Client {
+        aisix_gateway::upstream_tls::client_for_provider_key(
+            &self.client,
+            ctx.provider_key.tls.as_ref(),
+        )
     }
 
     /// Test-only seam: replace the canonical Vertex host with this
@@ -245,7 +257,7 @@ impl Default for VertexBridge {
 }
 
 fn default_client() -> Client {
-    Client::builder()
+    aisix_gateway::client_builder()
         .user_agent("aisix/0.1")
         .build()
         .unwrap_or_else(|_| Client::new())
@@ -520,6 +532,7 @@ where
             Ok(r) => r,
             Err(_) => Err(BridgeError::Timeout {
                 elapsed_ms: started.elapsed().as_millis() as u64,
+                cause: String::new(),
             }),
         },
     }
@@ -683,12 +696,8 @@ impl Bridge for VertexBridge {
         apply_body_overrides(&mut body, ctx);
 
         let access_token = creds.resolve_access_token(&self.token_minter).await?;
-        let headers = build_request_headers(
-            &access_token,
-            &ctx.request_id,
-            ctx.provider_key.request.as_ref(),
-        )?;
-        let client = self.client.clone();
+        let headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
+        let client = self.client_for(ctx);
         let started = Instant::now();
         let model_echo = req.model.clone();
 
@@ -699,7 +708,7 @@ impl Bridge for VertexBridge {
                 .json(&body)
                 .send()
                 .await
-                .map_err(|e| BridgeError::Transport(e.to_string()))?;
+                .map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
             let status = resp.status();
             if !status.is_success() {
                 return Err(map_http_error(status, resp).await);
@@ -812,12 +821,8 @@ impl VertexBridge {
         // via the in-process token minter from SA JSON. Failure
         // surfaces as a Config error (operator-actionable).
         let access_token = creds.resolve_access_token(&self.token_minter).await?;
-        let headers = build_request_headers(
-            &access_token,
-            &ctx.request_id,
-            ctx.provider_key.request.as_ref(),
-        )?;
-        let client = self.client.clone();
+        let headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
+        let client = self.client_for(ctx);
         let started = Instant::now();
 
         with_deadline(ctx.deadline, started, async move {
@@ -827,7 +832,7 @@ impl VertexBridge {
                 .json(&body)
                 .send()
                 .await
-                .map_err(|e| BridgeError::Transport(e.to_string()))?;
+                .map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
 
             let status = resp.status();
             if !status.is_success() {
@@ -908,12 +913,8 @@ impl VertexBridge {
         }
 
         let access_token = creds.resolve_access_token(&self.token_minter).await?;
-        let headers = build_request_headers(
-            &access_token,
-            &ctx.request_id,
-            ctx.provider_key.request.as_ref(),
-        )?;
-        let client = self.client.clone();
+        let headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
+        let client = self.client_for(ctx);
         let started = Instant::now();
 
         with_deadline(ctx.deadline, started, async move {
@@ -923,7 +924,7 @@ impl VertexBridge {
                 .json(&body_value)
                 .send()
                 .await
-                .map_err(|e| BridgeError::Transport(e.to_string()))?;
+                .map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
 
             let status = resp.status();
             if !status.is_success() {
@@ -996,12 +997,8 @@ impl VertexBridge {
         // Resolve bearer BEFORE entering the stream future so a
         // token-mint error surfaces as a direct Err, not mid-stream.
         let access_token = creds.resolve_access_token(&self.token_minter).await?;
-        let headers = build_request_headers(
-            &access_token,
-            &ctx.request_id,
-            ctx.provider_key.request.as_ref(),
-        )?;
-        let client = self.client.clone();
+        let headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
+        let client = self.client_for(ctx);
         let started = Instant::now();
 
         let resp = with_deadline(ctx.deadline, started, async move {
@@ -1011,7 +1008,7 @@ impl VertexBridge {
                 .json(&body_value)
                 .send()
                 .await
-                .map_err(|e| BridgeError::Transport(e.to_string()))
+                .map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))
         })
         .await?;
 
@@ -1033,7 +1030,7 @@ impl VertexBridge {
             let mut byte_stream = Box::pin(byte_stream);
 
             while let Some(item) = byte_stream.next().await {
-                let bytes: Bytes = item.map_err(|e| BridgeError::Transport(e.to_string()))?;
+                let bytes: Bytes = item.map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
                 for event in decoder.feed(bytes.as_ref()) {
                     let SseEvent::Data(data) = event else { continue };
                     let parsed: AnthropicStreamEvent =
@@ -1108,12 +1105,8 @@ impl VertexBridge {
         apply_body_overrides(&mut body, ctx);
 
         let access_token = creds.resolve_access_token(&self.token_minter).await?;
-        let headers = build_request_headers(
-            &access_token,
-            &ctx.request_id,
-            ctx.provider_key.request.as_ref(),
-        )?;
-        let client = self.client.clone();
+        let headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
+        let client = self.client_for(ctx);
         let started = Instant::now();
 
         with_deadline(ctx.deadline, started, async move {
@@ -1123,7 +1116,7 @@ impl VertexBridge {
                 .json(&body)
                 .send()
                 .await
-                .map_err(|e| BridgeError::Transport(e.to_string()))?;
+                .map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
             let status = resp.status();
             if !status.is_success() {
                 return Err(map_http_error(status, resp).await);
@@ -1165,12 +1158,8 @@ impl VertexBridge {
         // Resolve bearer BEFORE entering the stream future so a
         // token-mint error surfaces as a direct Err, not mid-stream.
         let access_token = creds.resolve_access_token(&self.token_minter).await?;
-        let headers = build_request_headers(
-            &access_token,
-            &ctx.request_id,
-            ctx.provider_key.request.as_ref(),
-        )?;
-        let client = self.client.clone();
+        let headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
+        let client = self.client_for(ctx);
         let started = Instant::now();
 
         let resp = with_deadline(ctx.deadline, started, async move {
@@ -1180,7 +1169,7 @@ impl VertexBridge {
                 .json(&body)
                 .send()
                 .await
-                .map_err(|e| BridgeError::Transport(e.to_string()))
+                .map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))
         })
         .await?;
 
@@ -1195,7 +1184,7 @@ impl VertexBridge {
             let mut byte_stream = Box::pin(byte_stream);
 
             while let Some(item) = byte_stream.next().await {
-                let bytes: Bytes = item.map_err(|e| BridgeError::Transport(e.to_string()))?;
+                let bytes: Bytes = item.map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
                 for event in decoder.feed(bytes.as_ref()) {
                     match event {
                         SseEvent::Data(data) => {
@@ -1302,12 +1291,8 @@ impl VertexBridge {
         apply_body_overrides(&mut body, ctx);
 
         let access_token = creds.resolve_access_token(&self.token_minter).await?;
-        let headers = build_request_headers(
-            &access_token,
-            &ctx.request_id,
-            ctx.provider_key.request.as_ref(),
-        )?;
-        let client = self.client.clone();
+        let headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
+        let client = self.client_for(ctx);
         let started = Instant::now();
 
         with_deadline(ctx.deadline, started, async move {
@@ -1317,7 +1302,7 @@ impl VertexBridge {
                 .json(&body)
                 .send()
                 .await
-                .map_err(|e| BridgeError::Transport(e.to_string()))?;
+                .map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
             let status = resp.status();
             if !status.is_success() {
                 return Err(map_http_error(status, resp).await);
@@ -1372,12 +1357,8 @@ impl VertexBridge {
         // Resolve bearer BEFORE entering the stream future so a
         // token-mint error surfaces as a direct Err, not mid-stream.
         let access_token = creds.resolve_access_token(&self.token_minter).await?;
-        let headers = build_request_headers(
-            &access_token,
-            &ctx.request_id,
-            ctx.provider_key.request.as_ref(),
-        )?;
-        let client = self.client.clone();
+        let headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
+        let client = self.client_for(ctx);
         let started = Instant::now();
 
         let resp = with_deadline(ctx.deadline, started, async move {
@@ -1387,7 +1368,7 @@ impl VertexBridge {
                 .json(&body)
                 .send()
                 .await
-                .map_err(|e| BridgeError::Transport(e.to_string()))
+                .map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))
         })
         .await?;
 
@@ -1402,7 +1383,7 @@ impl VertexBridge {
             let mut byte_stream = Box::pin(byte_stream);
 
             while let Some(item) = byte_stream.next().await {
-                let bytes: Bytes = item.map_err(|e| BridgeError::Transport(e.to_string()))?;
+                let bytes: Bytes = item.map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
                 for event in decoder.feed(bytes.as_ref()) {
                     match event {
                         SseEvent::Data(data) => {
@@ -1487,12 +1468,8 @@ impl VertexBridge {
         // entering the stream future so token-mint errors surface
         // as a direct Err return rather than being yielded mid-stream.
         let access_token = creds.resolve_access_token(&self.token_minter).await?;
-        let headers = build_request_headers(
-            &access_token,
-            &ctx.request_id,
-            ctx.provider_key.request.as_ref(),
-        )?;
-        let client = self.client.clone();
+        let headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
+        let client = self.client_for(ctx);
         let started = Instant::now();
 
         let resp = with_deadline(ctx.deadline, started, async move {
@@ -1502,7 +1479,7 @@ impl VertexBridge {
                 .json(&body)
                 .send()
                 .await
-                .map_err(|e| BridgeError::Transport(e.to_string()))
+                .map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))
         })
         .await?;
 
@@ -1524,7 +1501,7 @@ impl VertexBridge {
             let mut byte_stream = Box::pin(byte_stream);
 
             while let Some(item) = byte_stream.next().await {
-                let bytes: Bytes = item.map_err(|e| BridgeError::Transport(e.to_string()))?;
+                let bytes: Bytes = item.map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
                 for event in decoder.feed(bytes.as_ref()) {
                     if let SseEvent::Data(data) = event {
                         let parsed: GeminiGenerateContentResponse =
@@ -1675,14 +1652,14 @@ fn gemini_chunk_into_chat_chunks(
 /// reproduce locally without us echoing them back.
 ///
 /// When the `ProviderKey` carries `request.default_headers`, they are
-/// applied last via [`apply_default_headers`], which refuses to overwrite
+/// applied last via [`apply_request_headers`], which refuses to overwrite
 /// any header already set here (the Bearer auth, content-type, and request
 /// id) and additionally drops reserved auth headers — so a misconfigured
 /// `default_headers` block can never clobber the Vertex OAuth Bearer.
 fn build_request_headers(
     access_token: &str,
     request_id: &str,
-    request: Option<&RequestOverrides>,
+    hdr: &UpstreamHeaderContext<'_>,
 ) -> Result<HeaderMap, BridgeError> {
     if access_token.is_empty() {
         return Err(BridgeError::Config(
@@ -1701,9 +1678,7 @@ fn build_request_headers(
     let rid = HeaderValue::from_str(request_id)
         .map_err(|_| BridgeError::Config("request_id contains invalid header characters".into()))?;
     headers.insert(HeaderName::from_static("x-aisix-request-id"), rid);
-    if let Some(r) = request {
-        apply_default_headers(&mut headers, &r.default_headers);
-    }
+    apply_request_headers(&mut headers, hdr);
     Ok(headers)
 }
 
@@ -3903,8 +3878,12 @@ mod tests {
         // Newline in the access token would let it inject an extra
         // header — header builder must reject AND must not echo the
         // bad bytes back to the customer.
-        let err = build_request_headers("ya29.X-DISTINCTIVE-LEAK-Y\nX-Evil: 1", "req-1", None)
-            .unwrap_err();
+        let err = build_request_headers(
+            "ya29.X-DISTINCTIVE-LEAK-Y\nX-Evil: 1",
+            "req-1",
+            &UpstreamHeaderContext::default(),
+        )
+        .unwrap_err();
         match err {
             BridgeError::Config(msg) => {
                 assert!(
@@ -3924,8 +3903,12 @@ mod tests {
 
     #[test]
     fn header_invalid_request_id_error_does_not_leak_bytes() {
-        let err = build_request_headers("ya29.legit", "req-X-DISTINCTIVE-RID-LEAK-Y\nfoo", None)
-            .unwrap_err();
+        let err = build_request_headers(
+            "ya29.legit",
+            "req-X-DISTINCTIVE-RID-LEAK-Y\nfoo",
+            &UpstreamHeaderContext::default(),
+        )
+        .unwrap_err();
         match err {
             BridgeError::Config(msg) => {
                 assert!(

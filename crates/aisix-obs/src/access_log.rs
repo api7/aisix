@@ -29,6 +29,15 @@ pub struct AccessLog<'a> {
     /// per-attempt detail lives in telemetry (per-attempt UsageEvents),
     /// not in this one-line-per-request access log.
     pub routing_fallback_count: Option<u32>,
+    /// Stable failure class (`ProxyError::kind`) — `None` on success.
+    /// Machine-readable so an operator can filter or alert on a class
+    /// without parsing the free-text message below.
+    pub error_kind: Option<&'a str>,
+    /// Why the request failed — `None` on success. Without it a 5xx line
+    /// carries only `status` + `latency_ms`, which is the same shape for a
+    /// kernel-level connect timeout, an upstream 500, and a blocked
+    /// guardrail (AISIX-Cloud#1093).
+    pub error: Option<&'a str>,
 }
 
 impl AccessLog<'_> {
@@ -52,6 +61,8 @@ impl AccessLog<'_> {
             served_by_model = self.served_by_model,
             routing_attempt_count = self.routing_attempt_count,
             routing_fallback_count = self.routing_fallback_count,
+            error_kind = self.error_kind,
+            error = self.error,
             "proxy request completed",
         );
     }
@@ -116,6 +127,8 @@ mod tests {
                 served_by_model: Some("fallback-target"),
                 routing_attempt_count: Some(2),
                 routing_fallback_count: Some(1),
+                error_kind: None,
+                error: None,
             }
             .emit();
         });
@@ -134,6 +147,56 @@ mod tests {
         );
         assert!(out.contains("routing_attempt_count=2"));
         assert!(out.contains("routing_fallback_count=1"));
+        // A success line must not carry failure fields at all — an
+        // always-present `error=""` would defeat filtering on it.
+        assert!(!out.contains("error_kind"), "{out}");
+        assert!(!out.contains("error="), "{out}");
+    }
+
+    /// The gap this field closes: without it a failed request's only trace
+    /// is `status=502 latency_ms=…`, identical for every cause.
+    #[test]
+    fn emit_carries_the_failure_class_and_reason() {
+        let writer = VecWriter::default();
+        let subscriber = fmt()
+            .with_writer(writer.clone())
+            .with_ansi(false)
+            .with_target(false)
+            .with_env_filter(EnvFilter::new("info"))
+            .finish();
+
+        with_default(subscriber, || {
+            AccessLog {
+                method: "POST",
+                path: "/v1/messages",
+                status: 504,
+                latency: Duration::from_millis(7167),
+                provider: None,
+                model: Some("claude-sonnet-4"),
+                api_key_id: Some("key-id-1"),
+                prompt_tokens: None,
+                completion_tokens: None,
+                total_tokens: None,
+                request_id: "req-fail",
+                served_by_model: None,
+                routing_attempt_count: Some(1),
+                routing_fallback_count: None,
+                error_kind: Some("timeout"),
+                error: Some("upstream request timed out after 7167ms"),
+            }
+            .emit();
+        });
+
+        let out = writer.contents();
+        assert!(out.contains("status=504"));
+        assert!(
+            out.contains("error_kind=\"timeout\"") || out.contains("error_kind=timeout"),
+            "{out}"
+        );
+        assert!(
+            out.contains("upstream request timed out after 7167ms"),
+            "{out}"
+        );
     }
 
     #[test]
@@ -162,6 +225,8 @@ mod tests {
                 served_by_model: None,
                 routing_attempt_count: None,
                 routing_fallback_count: None,
+                error_kind: None,
+                error: None,
             }
             .emit();
         });

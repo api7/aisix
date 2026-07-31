@@ -65,6 +65,8 @@ function seriesValue(text: string, tokenType: string): number | undefined {
     if (
       line.startsWith("aisix_llm_tokens_by_client_total{") &&
       line.includes(`client_type="${CLIENT_TYPE}"`) &&
+      // AISIX-Cloud#1044: the series carries the requested logical model.
+      line.includes(`model="${MODEL}"`) &&
       line.includes(`token_type="${tokenType}"`)
     ) {
       return Number(line.trim().split(/\s+/).pop());

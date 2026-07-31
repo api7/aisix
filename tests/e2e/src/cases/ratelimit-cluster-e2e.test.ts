@@ -7,6 +7,7 @@ import {
   ProxyClient,
   spawnApp,
   startOpenAiUpstream,
+  awaitWindowHeadroom,
   waitConfigPropagation,
   type OpenAiUpstream,
   type SpawnedApp,
@@ -153,6 +154,10 @@ describe("rate limit is shared across replicas with backend=redis (#798)", () =>
       return;
     }
 
+    // The limiter buckets on fixed wall-clock minutes, so a burst that
+    // straddles a boundary gets a fresh allowance and the 429 assertion
+    // below flaps. Keep the whole burst inside one window.
+    await awaitWindowHeadroom();
     const first = await chatRequest(appA.proxyUrl, model);
     expect(first.status).toBe(200);
     await first.body?.cancel();

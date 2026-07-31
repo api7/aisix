@@ -7,6 +7,7 @@ import {
   ProxyClient,
   spawnApp,
   startOpenAiUpstream,
+  awaitWindowHeadroom,
   waitConfigPropagation,
   type OpenAiUpstream,
   type SpawnedApp,
@@ -133,6 +134,10 @@ describe("rate limit e2e: team_member per-member default buckets", () => {
       }
     };
 
+    // The limiter buckets on fixed wall-clock minutes, so a burst that
+    // straddles a boundary gets a fresh allowance and the 429 assertion
+    // below flaps. Keep the whole burst inside one window.
+    await awaitWindowHeadroom();
     // Member A burns their single slot, then is throttled.
     expect(await callStatus(KEY_A1)).toBe(200);
     expect(await callStatus(KEY_A1)).toBe(429);

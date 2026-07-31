@@ -14,8 +14,10 @@
 //! 2. Keep the successful responses; require at least
 //!    [`EnsembleConfig::min_responses_or_default`] of them, else error.
 //! 3. Ask the judge model to synthesize a single answer from the labeled
-//!    candidate answers, at a fixed low temperature. Retry the judge once
-//!    on a transient failure.
+//!    candidate answers, at a fixed low temperature.
+//!
+//! Retrying a transient sub-call failure — panel member or judge alike — is
+//! the [`ModelCaller`]'s job, using that member model's own retry budget.
 
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -26,7 +28,7 @@ use futures::future::join_all;
 
 use aisix_core::models::{EnsembleConfig, Judge, PanelMember};
 use aisix_core::AisixSnapshot;
-use aisix_gateway::bridge::{BridgeContext, BridgeError};
+use aisix_gateway::bridge::BridgeError;
 use aisix_gateway::chat::{ChatFormat, ChatMessage, ChatResponse, Role, UsageStats};
 
 use crate::state::ProxyState;
@@ -84,6 +86,10 @@ pub(crate) struct ProxyModelCaller<'a> {
     pub state: &'a ProxyState,
     pub snapshot: &'a AisixSnapshot,
     pub request_id: &'a str,
+    /// The originating request's context. Member calls are dispatched on
+    /// the caller's behalf, so they carry the same caller identity and
+    /// forwardable client headers as a single-upstream dispatch would.
+    pub client: &'a crate::client_ip::ClientContext,
 }
 
 #[async_trait]
@@ -122,12 +128,17 @@ impl ModelCaller for ProxyModelCaller<'_> {
             })?;
 
         // Per-member request deadline from the member Model's own `timeout`.
-        let mut ctx = BridgeContext::new(
+        let mut ctx = crate::dispatch::bridge_ctx(
             self.request_id,
+            &entry.id,
             Arc::new(model.clone()),
+            &pk_entry.id,
             Arc::new(pk_entry.value.clone()),
+            Some(self.client),
         );
-        if let Some(deadline) = model.request_timeout() {
+        if let Some(deadline) =
+            crate::routing::effective_timeouts(model, None, self.state.default_timeouts).request
+        {
             ctx = ctx.with_deadline(deadline);
         }
 
@@ -147,7 +158,18 @@ impl ModelCaller for ProxyModelCaller<'_> {
         // On a bridge error the reservation drops here → concurrency slots
         // release and no tokens are counted. On success we commit the member's
         // own token cost to its model bucket.
-        let response = bridge.chat(req, &ctx).await?;
+        //
+        // Retries use the MEMBER model's own budget, so a flaky panel member
+        // is absorbed instead of silently shrinking the panel toward
+        // `min_responses`. The reservation is deliberately outside the retry
+        // loop (one sub-call bills once, however many attempts it took), and
+        // `ctx`'s deadline is per attempt while the ensemble's own
+        // `config.timeout()` — applied by the caller — remains the ceiling on
+        // the whole attempt sequence.
+        let response = crate::routing::retrying_dispatch(self.state, model, "ensemble", || {
+            bridge.chat(req, &ctx)
+        })
+        .await?;
         reservation
             .commit_tokens(u64::from(response.usage.total_tokens))
             .await;
@@ -161,6 +183,11 @@ impl ModelCaller for ProxyModelCaller<'_> {
 pub struct PanelOutcome {
     pub model: String,
     pub usage: UsageStats,
+    /// The member's answer text (content + reasoning + tool-call text),
+    /// captured so the dispatch layer can estimate this sub-call's
+    /// completion tokens when the member backend reports no usage
+    /// (AISIX-Cloud#1074). Never billed directly — only a fallback.
+    pub est_output_text: String,
 }
 
 /// Everything the dispatch layer needs after an ensemble run: the judge's
@@ -172,6 +199,12 @@ pub struct EnsembleOutcome {
     pub response: ChatResponse,
     pub panel: Vec<PanelOutcome>,
     pub judge_model: String,
+    /// The judge's synthesis request, kept so the dispatch layer can
+    /// estimate the judge sub-call's prompt tokens when the judge backend
+    /// reports no usage (AISIX-Cloud#1074). The streaming path builds its
+    /// own judge estimator from `run_ensemble_panel`'s `judge_req`; this
+    /// field carries the same request out of the buffered path.
+    pub judge_req: ChatFormat,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -255,6 +288,7 @@ pub(crate) async fn run_ensemble_panel(
                 panel.push(PanelOutcome {
                     model,
                     usage: resp.usage.clone(),
+                    est_output_text: crate::chat::estimation_output_text(&resp),
                 });
                 candidates.push(resp);
             }
@@ -289,28 +323,29 @@ pub async fn run_ensemble(
     // Phases 1-2 + judge-request construction.
     let (panel, _candidates, judge_req) = run_ensemble_panel(req, config, caller).await?;
 
-    // Phase 3: synthesize via the judge, retrying once on a transient error.
-    // The judge call gets the same per-call timeout as each panel member
-    // (`config.timeout()`), so the ensemble-level deadline applies uniformly
-    // across the whole fan-out.
-    let response = match call_judge_with_retry(
-        caller,
-        &config.judge.model,
-        &judge_req,
-        config.timeout(),
-    )
-    .await
-    {
-        Ok(r) => r,
-        // Carry the (already-billed) panel survivors out on the judge
-        // failure so the dispatch layer commits + emits them too.
-        Err(source) => return Err(EnsembleError::Judge { source, panel }),
-    };
+    // Phase 3: synthesize via the judge. The judge call gets the same
+    // per-call timeout as each panel member (`config.timeout()`), so the
+    // ensemble-level deadline applies uniformly across the whole fan-out.
+    //
+    // Retrying a transient judge failure is the ModelCaller's job now, using
+    // the judge model's own retry budget — it used to be a hardcoded single
+    // retry here, which both ignored the operator's configuration and would
+    // have stacked on top of the caller-level budget.
+    let response =
+        match call_with_optional_timeout(caller, &config.judge.model, &judge_req, config.timeout())
+            .await
+        {
+            Ok(r) => r,
+            // Carry the (already-billed) panel survivors out on the judge
+            // failure so the dispatch layer commits + emits them too.
+            Err(source) => return Err(EnsembleError::Judge { source, panel }),
+        };
 
     Ok(EnsembleOutcome {
         response,
         panel,
         judge_model: config.judge.model.clone(),
+        judge_req,
     })
 }
 
@@ -409,45 +444,10 @@ async fn call_with_optional_timeout(
             Ok(result) => result,
             Err(_) => Err(BridgeError::Timeout {
                 elapsed_ms: d.as_millis() as u64,
+                cause: String::new(),
             }),
         },
         None => caller.call(target, req).await,
-    }
-}
-
-/// Call the judge, retrying once if the first failure is transient
-/// (resolved decision: judge failure → 5xx after one in-process retry; no
-/// silent fallback to a raw panel answer). Each attempt is bound by the
-/// same per-call `timeout` as the panel members; a timed-out judge call
-/// surfaces as a transient [`BridgeError::Timeout`] and so is retried once.
-async fn call_judge_with_retry(
-    caller: &dyn ModelCaller,
-    target: &str,
-    req: &ChatFormat,
-    timeout: Option<Duration>,
-) -> Result<ChatResponse, BridgeError> {
-    match call_with_optional_timeout(caller, target, req, timeout).await {
-        Ok(resp) => Ok(resp),
-        Err(first) if is_transient(&first) => {
-            call_with_optional_timeout(caller, target, req, timeout).await
-        }
-        Err(err) => Err(err),
-    }
-}
-
-/// Conservative transient-failure classification for the judge retry:
-/// timeouts, transport faults, mid-stream aborts, and upstream 5xx are
-/// retryable; everything else (4xx, config, credentials, decode) is not.
-fn is_transient(err: &BridgeError) -> bool {
-    match err {
-        BridgeError::Timeout { .. } | BridgeError::Transport(_) | BridgeError::StreamAborted => {
-            true
-        }
-        BridgeError::UpstreamStatus { status, .. } => *status >= 500,
-        BridgeError::UpstreamDecode(_)
-        | BridgeError::Config(_)
-        | BridgeError::InvalidUpstreamConfig(_)
-        | BridgeError::InvalidUpstreamCredentials(_) => false,
     }
 }
 
@@ -618,26 +618,34 @@ mod tests {
         assert!(!judge_prompt.contains("reset"));
     }
 
+    /// Retrying a transient judge failure belongs to the `ModelCaller`, which
+    /// applies the judge model's own retry budget. `run_ensemble` used to
+    /// wrap the judge in a hardcoded single retry on top of that; this pins
+    /// that it no longer does, so the two layers can't multiply (a judge with
+    /// `retries: 2` would otherwise have cost up to six upstream calls).
     #[tokio::test]
-    async fn retries_judge_once_on_transient_failure() {
+    async fn does_not_itself_retry_a_transient_judge_failure() {
         let caller = MockCaller::new()
             .on("a", vec![ok("a", "x")])
             .on("b", vec![ok("b", "y")])
             .on(
                 "judge",
                 vec![
-                    Err(BridgeError::Timeout { elapsed_ms: 1 }),
+                    Err(BridgeError::Timeout {
+                        cause: String::new(),
+                        elapsed_ms: 1,
+                    }),
                     ok("judge", "second attempt wins"),
                 ],
             );
         let cfg = config(r#"{"panel":[{"model":"a"},{"model":"b"}],"judge":{"model":"judge"}}"#);
 
-        let out = run_ensemble(&user_request("hi"), &cfg, &caller)
+        let err = run_ensemble(&user_request("hi"), &cfg, &caller)
             .await
-            .unwrap();
+            .unwrap_err();
 
-        assert_eq!(out.response.message.content_str(), "second attempt wins");
-        assert_eq!(caller.calls_to("judge").len(), 2); // retried once
+        assert_eq!(caller.calls_to("judge").len(), 1);
+        assert!(matches!(err, EnsembleError::Judge { .. }));
     }
 
     #[tokio::test]

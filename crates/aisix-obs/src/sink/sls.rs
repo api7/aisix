@@ -487,7 +487,7 @@ mod tests {
             status_code: 200,
             prompt_tokens: 5,
             completion_tokens: 7,
-            latency_ms: 123,
+            upstream_latency_ms: 123,
             ..UsageEvent::default()
         };
         let ack = sink
@@ -559,7 +559,10 @@ mod tests {
             contents.get("completion_tokens").map(String::as_str),
             Some("7")
         );
-        assert_eq!(contents.get("latency_ms").map(String::as_str), Some("123"));
+        assert_eq!(
+            contents.get("upstream_latency_ms").map(String::as_str),
+            Some("123")
+        );
         // Empty metadata is omitted uniformly: `api_key_id` (serde `default`
         // only, would serialize as "") and `finish_reason` (`skip_serializing_if`)
         // both drop out, so the SLS log carries no blank columns.

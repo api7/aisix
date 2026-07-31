@@ -161,7 +161,7 @@ pub struct Routing {
     /// Ordered set of direct models available to this routing model.
     #[schemars(length(min = 1))]
     pub targets: Vec<RoutingTarget>,
-    /// Retry attempts on the current target before failing over.
+    /// Retry attempts on the current target before failing over, applied to every target that does not set its own `retries`. Absent falls back to the deployment-wide `upstream.retries` default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retries: Option<u32>,
     /// Max number of later targets to attempt after the initial target fails permanently. When omitted, all later targets may be attempted.
@@ -189,9 +189,10 @@ pub struct Routing {
 }
 
 impl Routing {
-    pub fn retries_or_default(&self) -> usize {
-        self.retries.unwrap_or(0) as usize
-    }
+    // No `retries_or_default()`: an unset group budget no longer means
+    // zero, it means "defer to the target, then to the deployment default".
+    // Resolving that needs the target Model and the DP config, so it lives
+    // in `aisix_proxy::routing::effective_retries`.
 
     pub fn sticky_or_default(&self) -> bool {
         self.sticky.unwrap_or(false)
@@ -245,7 +246,7 @@ mod tests {
         assert_eq!(r.targets.len(), 2);
         assert_eq!(r.targets[0].model, "primary");
         assert_eq!(r.targets[0].weight_or_default(), 90);
-        assert_eq!(r.retries_or_default(), 2);
+        assert_eq!(r.retries, Some(2));
         assert_eq!(r.max_fallbacks_or_default(), 1);
         assert!(r.retry_on_429_or_default());
     }
@@ -255,7 +256,8 @@ mod tests {
         let r: Routing =
             serde_json::from_str(r#"{"targets":[{"model":"a"},{"model":"b"}]}"#).unwrap();
         assert_eq!(r.strategy, RoutingStrategy::Failover);
-        assert_eq!(r.retries_or_default(), 0);
+        // Absent means "defer" now, not zero — see `effective_retries`.
+        assert_eq!(r.retries, None);
         assert_eq!(r.max_fallbacks_or_default(), 1);
         assert!(!r.retry_on_429_or_default());
     }

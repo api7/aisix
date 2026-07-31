@@ -97,9 +97,12 @@ impl TextModerationGuardrail {
         hook_point: GuardrailHookPoint,
         fail_open: bool,
     ) -> Self {
-        let client = reqwest::Client::builder()
+        // Same connection-layer settings as every provider call: a bound
+        // connect phase, TCP keepalive on, and pooled connections expired
+        // before a hop in front of the guardrail service reaps them.
+        let client = aisix_gateway::client_builder()
             .build()
-            .expect("reqwest::Client::builder() failed; this should never happen");
+            .expect("guardrail http client builds");
         Self {
             row_name: row_name.into(),
             endpoint: cfg.endpoint.trim_end_matches('/').to_owned(),
@@ -173,9 +176,11 @@ impl TextModerationGuardrail {
             return Err(AcsFailure::ServerError);
         }
         if !status.is_success() {
+            let response_body = crate::read_error_body_capped(resp).await;
             tracing::error!(
                 row = %self.row_name,
                 http_status = status.as_u16(),
+                response_body = %response_body,
                 "azure content safety text:analyze returned 4xx — check endpoint and api_key configuration",
             );
             return Err(AcsFailure::ConfigError);

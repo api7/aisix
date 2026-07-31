@@ -98,9 +98,12 @@ impl LakeraGuardrail {
         hook_point: GuardrailHookPoint,
         fail_open: bool,
     ) -> Self {
-        let client = reqwest::Client::builder()
+        // Same connection-layer settings as every provider call: a bound
+        // connect phase, TCP keepalive on, and pooled connections expired
+        // before a hop in front of the guardrail service reaps them.
+        let client = aisix_gateway::client_builder()
             .build()
-            .expect("reqwest::Client::builder() failed; this should never happen");
+            .expect("guardrail http client builds");
         Self {
             row_name: row_name.into(),
             endpoint: cfg
@@ -167,9 +170,11 @@ impl LakeraGuardrail {
             // (bad api_key / project_id / endpoint). Error level: with
             // fail_open=true this silently bypasses the guardrail on every
             // request until the operator notices.
+            let response_body = crate::read_error_body_capped(resp).await;
             tracing::error!(
                 row = %self.row_name,
                 http_status = status.as_u16(),
+                response_body = %response_body,
                 "lakera guard returned 4xx — check endpoint, api_key, and project_id configuration",
             );
             return Err(LakeraFailure::ConfigError);

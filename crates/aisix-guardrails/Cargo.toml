@@ -59,6 +59,9 @@ bedrock = [
     "dep:aws-credential-types",
     "dep:aws-smithy-async",
     "dep:aws-smithy-runtime-api",
+    # So the guardrail's Bedrock client trusts the same roots the
+    # provider bridge's does.
+    "aisix-gateway/aws",
 ]
 azure-content-safety = ["dep:reqwest"]
 aliyun-text-moderation = [
@@ -78,3 +81,4 @@ presidio = ["dep:reqwest"]
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }
 wiremock.workspace = true
+tracing-subscriber.workspace = true

@@ -49,6 +49,7 @@ pub(crate) fn with_read_timeout(
                 Err(_) => {
                     yield Err(BridgeError::Timeout {
                         elapsed_ms: d.as_millis() as u64,
+                        cause: String::new(),
                     });
                     break;
                 }
@@ -102,6 +103,7 @@ pub(crate) async fn send_with_deadline(
             Ok(res) => res.map_err(|e| crate::dispatch::reqwest_error_to_bridge(&e, started)),
             Err(_) => Err(BridgeError::Timeout {
                 elapsed_ms: started.elapsed().as_millis() as u64,
+                cause: String::new(),
             }),
         },
         None => req

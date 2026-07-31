@@ -19,7 +19,7 @@
 use aisix_gateway::{
     Bridge, BridgeContext, BridgeError, ChatChunk, ChatChunkStream, ChatDelta, ChatFormat,
     ChatMessage, ChatResponse, EmbeddingObject, EmbeddingRequest, EmbeddingResponse,
-    EmbeddingUsage, EmbeddingVector, FinishReason, Role, UsageStats,
+    EmbeddingUsage, EmbeddingVector, FinishReason, Role, UpstreamHeaderContext, UsageStats,
 };
 use async_trait::async_trait;
 use aws_credential_types::provider::SharedCredentialsProvider;
@@ -48,10 +48,11 @@ use aisix_provider_anthropic::wire::{
 
 // Per-`ProviderKey` request override pipeline (#302 §5 / #340). The JSON-body
 // transforms reuse the shared primitives the OpenAI / Vertex bridges call;
-// `default_headers` ride a pre-signing interceptor (see
-// [`DefaultHeadersInterceptor`]) so they land inside the SigV4-signed
-// canonical request rather than being appended after the signature is computed.
-use aisix_core::{ParamConstraints, RequestOverrides};
+// `default_headers` and forwarded client headers ride a pre-signing
+// interceptor (see [`DefaultHeadersInterceptor`]) so they land inside the
+// SigV4-signed canonical request rather than being appended after the
+// signature is computed.
+use aisix_core::ParamConstraints;
 use aisix_provider_openai::overrides::{
     apply_content_list_to_string, apply_default_body_fields, apply_param_constraints,
     apply_param_renames,
@@ -335,7 +336,8 @@ impl BedrockSecret {
 fn build_client(
     creds: &BedrockSecret,
     endpoint_url: Option<&str>,
-    request: Option<&RequestOverrides>,
+    hdr: &UpstreamHeaderContext<'_>,
+    deadline: Option<std::time::Duration>,
 ) -> Result<BedrockClient, BridgeError> {
     if creds.region.trim().is_empty() {
         return Err(BridgeError::InvalidUpstreamConfig(
@@ -351,10 +353,43 @@ fn build_client(
         None,
         "aisix-provider-bedrock",
     );
+    // The SDK enforces the deadlines the other bridges get from
+    // `tokio::time::timeout` wrappers: the shared `upstream.connect_timeout`
+    // bounds the dial (explicitly disabled when the operator set `0`, or
+    // the SDK's default plugins would quietly restore their own 3.1 s),
+    // and the resolved per-request deadline cancels the whole operation
+    // (SdkError::TimeoutError → BridgeError::Timeout in `map_sdk_error`).
+    // Without an operation timeout nothing bounds the call after connect —
+    // a silent upstream holds the request open past the model's `timeout`,
+    // which used to matter only for post-hoc error relabelling.
+    // `operation_timeout` covers send + response headers for
+    // converse_stream (the event-stream body is bounded per-chunk by the
+    // proxy's read-timeout wrapper, same as every other bridge) and the
+    // full body read for non-streaming operations.
+    let mut timeouts = aws_smithy_types::timeout::TimeoutConfig::builder();
+    match aisix_gateway::upstream_http::config().connect_timeout {
+        Some(d) => timeouts = timeouts.connect_timeout(d),
+        None => timeouts = timeouts.disable_connect_timeout(),
+    }
+    if let Some(d) = deadline {
+        timeouts = timeouts.operation_timeout(d);
+    }
     let mut builder = aws_config::SdkConfig::builder()
         .behavior_version(BehaviorVersion::latest())
         .region(Region::new(creds.region.clone()))
         .credentials_provider(SharedCredentialsProvider::new(aws_creds))
+        .timeout_config(timeouts.build())
+        // Shared HTTP stack carrying `upstream.tls.ca_file`, so a
+        // Bedrock-compatible endpoint behind a private CA is reachable
+        // on the same setting every other upstream uses.
+        .http_client(aisix_gateway::upstream_tls::aws_http_client())
+        // Retries belong to the gateway's own budget
+        // (`routing::effective_retries`), which emits per-attempt telemetry
+        // and honours per-model config. Left at its default the SDK would
+        // add a hidden standard-mode retry layer (3 attempts) underneath,
+        // grinding the upstream invisibly — no other bridge's HTTP client
+        // retries on its own.
+        .retry_config(aws_smithy_types::retry::RetryConfig::disabled())
         .sleep_impl(aws_smithy_async::rt::sleep::SharedAsyncSleep::new(
             aws_smithy_async::rt::sleep::TokioSleep::new(),
         ));
@@ -363,38 +398,37 @@ fn build_client(
     }
     let sdk_cfg = builder.build();
 
-    // Register the default-headers interceptor only when the PK actually
-    // carries (non-reserved) default_headers, so the common no-override path
+    // Register the extra-headers interceptor only when the PK actually
+    // contributes (non-SigV4-owned) headers, so the common no-override path
     // builds the client byte-for-byte as before. The interceptor injects at
     // `modify_before_signing`, so the headers are covered by the SigV4
     // signature (#340).
     let mut conf = aws_sdk_bedrockruntime::config::Builder::from(&sdk_cfg);
-    if let Some(r) = request {
-        let headers = filtered_default_headers(&r.default_headers);
-        if !headers.is_empty() {
-            conf = conf.interceptor(DefaultHeadersInterceptor { headers });
-        }
+    let headers = filtered_extra_headers(hdr);
+    if !headers.is_empty() {
+        conf = conf.interceptor(DefaultHeadersInterceptor { headers });
     }
     Ok(BedrockClient::from_conf(conf.build()))
 }
 
-/// Drop SigV4-owned headers ([`wire::reserved_sigv4_headers`]) from an
-/// operator-supplied `default_headers` block before they reach the signing
-/// interceptor. cp-api SHOULD reject these at write time (#302 §5), but the DP
+/// Resolve the ProviderKey's extra headers (rendered `default_headers` plus
+/// allowlisted client headers) and drop the SigV4-owned names
+/// ([`wire::reserved_sigv4_headers`]) before they reach the signing
+/// interceptor. cp-api SHOULD reject those at write time (#302 §5), but the DP
 /// enforces it again here as defense-in-depth — an override naming e.g.
 /// `x-amz-date` or `authorization` must never perturb the signature. Matching
 /// is case-insensitive (HTTP header names are).
-fn filtered_default_headers(
-    defaults: &std::collections::HashMap<String, String>,
-) -> Vec<(String, String)> {
+fn filtered_extra_headers(hdr: &UpstreamHeaderContext<'_>) -> Vec<(String, String)> {
     let reserved = wire::reserved_sigv4_headers();
-    defaults
-        .iter()
-        .filter(|(name, _)| {
-            let lower = name.to_ascii_lowercase();
-            !reserved.contains(&lower.as_str())
+    aisix_gateway::resolve_extra_headers(hdr)
+        .into_iter()
+        .filter(|(name, _)| !reserved.contains(&name.as_str()))
+        .map(|(name, value)| {
+            (
+                name.as_str().to_string(),
+                String::from_utf8_lossy(value.as_bytes()).into_owned(),
+            )
         })
-        .map(|(name, value)| (name.clone(), value.clone()))
         .collect()
 }
 
@@ -505,6 +539,7 @@ fn map_sdk_error(
             };
             BridgeError::Timeout {
                 elapsed_ms: reported,
+                cause: String::new(),
             }
         }
         SdkError::DispatchFailure(_) => BridgeError::Transport("upstream dispatch failed".into()),
@@ -855,7 +890,7 @@ impl BedrockBridge {
         };
         // Converse paths carry no JSON body, but default_headers still apply
         // (header-level, publisher-agnostic) via the signing interceptor.
-        build_client(&creds, endpoint_url, ctx.provider_key.request.as_ref())
+        build_client(&creds, endpoint_url, &ctx.header_ctx(), ctx.deadline)
     }
 
     /// Dispatch Bedrock chat via the unified Converse API.
@@ -1501,6 +1536,7 @@ where
         if started.elapsed() >= d {
             return BridgeError::Timeout {
                 elapsed_ms: started.elapsed().as_millis() as u64,
+                cause: String::new(),
             };
         }
     }
@@ -1508,6 +1544,7 @@ where
         SdkError::ServiceError(svc) => bedrock_service_error_to_upstream_status(svc),
         SdkError::TimeoutError(_) => BridgeError::Timeout {
             elapsed_ms: started.elapsed().as_millis() as u64,
+            cause: String::new(),
         },
         other => BridgeError::Transport(format!("{other}")),
     }
@@ -2217,6 +2254,83 @@ mod tests {
         let chat = bridge.chat(&req, &ctx).await.unwrap();
         assert_eq!(chat.message.content_str(), "hello from bedrock");
         assert_eq!(chat.usage.total_tokens, 9);
+    }
+
+    /// The model's deadline must CANCEL a silent Bedrock call, not just
+    /// relabel an error after the fact. Before the SDK `timeout_config`
+    /// wiring, this call sat through the upstream's full 8 s delay and
+    /// came back `Ok` — the deadline was consulted only inside
+    /// `map_sdk_error`, which never ran on success.
+    #[tokio::test]
+    async fn chat_deadline_cancels_a_silent_upstream() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/model/.+/invoke$"))
+            .respond_with(
+                default_anthropic_response_template().set_delay(std::time::Duration::from_secs(8)),
+            )
+            .mount(&server)
+            .await;
+
+        let bridge = BedrockBridge::new().with_endpoint_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-deadline",
+            sample_model_with("anthropic.claude-3-5-sonnet-20241022-v2:0"),
+            sample_pk_with_secret(valid_secret_json()),
+        )
+        .with_deadline(std::time::Duration::from_millis(300));
+        let req = ChatFormat::new("my-claude", vec![ChatMessage::user("hi")]);
+
+        let started = std::time::Instant::now();
+        let err = bridge.chat(&req, &ctx).await.unwrap_err();
+        assert!(
+            matches!(err, BridgeError::Timeout { .. }),
+            "expected Timeout, got {err:?}"
+        );
+        // Generous CI margin, but far below the 8 s the upstream stalls:
+        // proves cancellation, not post-hoc relabelling.
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(4),
+            "deadline did not cancel the call: took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A retryable upstream failure must reach the gateway's routing
+    /// budget after exactly ONE wire attempt. Before
+    /// `RetryConfig::disabled()` the SDK's standard mode re-hit the
+    /// upstream up to 3 times transparently — invisible to per-attempt
+    /// telemetry and stacked under the gateway's own retry budget.
+    #[tokio::test]
+    async fn sdk_does_not_retry_on_its_own() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/model/.+/invoke$"))
+            .respond_with(
+                ResponseTemplate::new(500)
+                    .set_body_json(serde_json::json!({"message": "internal failure"})),
+            )
+            .mount(&server)
+            .await;
+
+        let bridge = BedrockBridge::new().with_endpoint_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-retry",
+            sample_model_with("anthropic.claude-3-5-sonnet-20241022-v2:0"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let req = ChatFormat::new("my-claude", vec![ChatMessage::user("hi")]);
+
+        let err = bridge.chat(&req, &ctx).await.unwrap_err();
+        assert!(
+            matches!(err, BridgeError::UpstreamStatus { status: 500, .. }),
+            "expected UpstreamStatus 500, got {err:?}"
+        );
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            1,
+            "the SDK must not retry on its own",
+        );
     }
 
     #[tokio::test]

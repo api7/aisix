@@ -158,6 +158,47 @@ impl CooldownConfig {
     }
 }
 
+/// Cache lifetime for gateway-injected prompt-cache breakpoints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub enum CacheTtl {
+    #[serde(rename = "5m")]
+    FiveMinutes,
+    #[serde(rename = "1h")]
+    OneHour,
+}
+
+impl CacheTtl {
+    /// The value emitted on the upstream `cache_control.ttl` field.
+    pub fn as_wire_str(self) -> &'static str {
+        match self {
+            CacheTtl::FiveMinutes => "5m",
+            CacheTtl::OneHour => "1h",
+        }
+    }
+}
+
+/// Automatic prompt-cache breakpoint injection for a direct Anthropic
+/// model. When enabled, the gateway adds cache-control markers to
+/// requests that carry none of their own, so callers get provider-side
+/// prompt-cache discounts without changing their requests. Requests that
+/// already set their own cache-control markers are forwarded unchanged.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AutoPromptCaching {
+    /// Whether automatic prompt-cache injection is active for this model.
+    pub enabled: bool,
+    /// Cache lifetime for injected breakpoints: `5m` (default when omitted) or `1h`. A `1h` cache write costs 2x the base input rate versus 1.25x for `5m`, so it pays off only when the cached prefix is reused across a longer session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<CacheTtl>,
+}
+
+impl AutoPromptCaching {
+    /// Effective TTL — operator override or the built-in 5-minute default.
+    pub fn ttl_or_default(&self) -> CacheTtl {
+        self.ttl.unwrap_or(CacheTtl::FiveMinutes)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Model {
@@ -187,13 +228,17 @@ pub struct Model {
     #[schemars(length(min = 1))]
     pub provider_key_id: Option<String>,
 
-    /// End-to-end timeout in milliseconds for non-streaming upstream calls. `0` or absent disables the non-streaming timeout.
+    /// End-to-end timeout in milliseconds for non-streaming upstream calls. Absent falls back to the group's `timeout`, then to the deployment-wide `upstream.timeout_ms` default. `0` disables the non-streaming timeout for this model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<u64>,
 
-    /// Maximum gap in milliseconds between upstream streaming chunks. `0` or absent falls back to `timeout`.
+    /// Maximum gap in milliseconds between upstream streaming chunks. `0` or absent falls back to the group's `stream_timeout`, then to the model's (or group's) `timeout`, then to the deployment-wide `upstream.stream_timeout_ms` / `timeout_ms` defaults.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_timeout: Option<u64>,
+
+    /// Retry attempts against this model after a retryable upstream failure, before the request gives up (or, inside a model group, fails over to the next target). Absent falls back to the group's `routing.retries`, then to the deployment-wide `upstream.retries` default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retries: Option<u32>,
 
     /// Request, token, and concurrency limits for this model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -238,6 +283,10 @@ pub struct Model {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cooldown: Option<CooldownConfig>,
 
+    /// Automatic prompt-cache breakpoint injection for direct Anthropic models. Omit to leave injection off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_prompt_caching: Option<AutoPromptCaching>,
+
     /// Non-schema runtime id. Not part of the JSON payload — filled in by
     /// the snapshot loader from the etcd key path. Kept here so `Resource`
     /// can return a `&str` id.
@@ -276,35 +325,25 @@ impl Model {
         self.model_name.as_deref()
     }
 
-    /// Non-streaming request deadline derived from `timeout`. Folds the
-    /// `0`/absent "no timeout" sentinel into `None` so callers can apply
-    /// it unconditionally with `if let Some(d) = ...`.
-    pub fn request_timeout(&self) -> Option<std::time::Duration> {
+    /// This resource's own non-streaming deadline, as one level of the
+    /// model → group → `upstream.timeout_ms` resolution performed by the
+    /// proxy's `effective_timeouts`. Tri-state: `None` defers to the next
+    /// level, `Some(None)` is an explicit `0` ("no deadline, stop
+    /// resolving"), `Some(Some(d))` is a configured deadline.
+    pub fn request_timeout_level(&self) -> Option<Option<std::time::Duration>> {
         self.timeout
-            .filter(|&ms| ms > 0)
-            .map(std::time::Duration::from_millis)
+            .map(|ms| (ms > 0).then(|| std::time::Duration::from_millis(ms)))
     }
 
-    /// Streaming per-chunk read deadline derived from `stream_timeout`.
-    /// Same `0`/absent → `None` folding as [`Model::request_timeout`].
+    /// This resource's own streaming per-chunk deadline, as one level of
+    /// the model → group → `upstream.stream_timeout_ms` → resolved
+    /// `timeout` chain. Unlike [`Model::request_timeout_level`], `0` and
+    /// absent both defer — `stream_timeout` has always used `0` as "fall
+    /// back", not "disable".
     pub fn stream_read_timeout(&self) -> Option<std::time::Duration> {
         self.stream_timeout
             .filter(|&ms| ms > 0)
             .map(std::time::Duration::from_millis)
-    }
-
-    /// Effective deadline for a streaming request: a positive
-    /// `stream_timeout`, otherwise the non-streaming `timeout`. Applied to the
-    /// connect phase, the per-chunk read timeout, and the first-chunk
-    /// failover gate. Because `stream_read_timeout()` folds `0` to `None`,
-    /// `stream_timeout: 0` is treated the same as absent — it falls back to
-    /// `timeout` rather than disabling the streaming timeout. `None` (both
-    /// unset or `0`) = no streaming timeout. Note: a model that sets only a
-    /// small `timeout` therefore also gets that value as its streaming
-    /// budget.
-    pub fn stream_timeout_effective(&self) -> Option<std::time::Duration> {
-        self.stream_read_timeout()
-            .or_else(|| self.request_timeout())
     }
 
     /// Whether a client at `source_ip` may access this model (#557).
@@ -451,59 +490,30 @@ mod tests {
         .unwrap();
         assert_eq!(m.stream_timeout, Some(2_500));
         assert_eq!(
-            m.request_timeout(),
-            Some(std::time::Duration::from_millis(30_000))
+            m.request_timeout_level(),
+            Some(Some(std::time::Duration::from_millis(30_000)))
         );
         assert_eq!(
             m.stream_read_timeout(),
             Some(std::time::Duration::from_millis(2_500))
         );
 
-        // Absent → None.
+        // Absent → defer to the next resolution level.
         let none: Model = serde_json::from_str(
             r#"{"display_name":"x","provider":"openai","model_name":"g","provider_key_id":"pk-1"}"#,
         )
         .unwrap();
-        assert_eq!(none.request_timeout(), None);
+        assert_eq!(none.request_timeout_level(), None);
         assert_eq!(none.stream_read_timeout(), None);
 
-        // Explicit 0 is the "no timeout" sentinel → None.
+        // Explicit `timeout: 0` resolves to "no deadline" and stops the
+        // chain; explicit `stream_timeout: 0` defers like absent.
         let zero: Model = serde_json::from_str(
             r#"{"display_name":"x","provider":"openai","model_name":"g","provider_key_id":"pk-1","timeout":0,"stream_timeout":0}"#,
         )
         .unwrap();
-        assert_eq!(zero.request_timeout(), None);
+        assert_eq!(zero.request_timeout_level(), Some(None));
         assert_eq!(zero.stream_read_timeout(), None);
-
-        // stream_timeout_effective cascade: prefer stream_timeout when set.
-        assert_eq!(
-            m.stream_timeout_effective(),
-            Some(std::time::Duration::from_millis(2_500))
-        );
-        // Falls back to `timeout` when stream_timeout is absent.
-        let timeout_only: Model = serde_json::from_str(
-            r#"{"display_name":"x","provider":"openai","model_name":"g","provider_key_id":"pk-1","timeout":5000}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            timeout_only.stream_timeout_effective(),
-            Some(std::time::Duration::from_millis(5_000))
-        );
-        // None when neither is set, and when both are the 0 sentinel.
-        assert_eq!(none.stream_timeout_effective(), None);
-        assert_eq!(zero.stream_timeout_effective(), None);
-
-        // Explicit `stream_timeout: 0` folds to absent → falls back to
-        // `timeout`, not "disable streaming".
-        let stream_zero_timeout_set: Model = serde_json::from_str(
-            r#"{"display_name":"x","provider":"openai","model_name":"g","provider_key_id":"pk-1","timeout":5000,"stream_timeout":0}"#,
-        )
-        .unwrap();
-        assert_eq!(stream_zero_timeout_set.stream_read_timeout(), None);
-        assert_eq!(
-            stream_zero_timeout_set.stream_timeout_effective(),
-            Some(std::time::Duration::from_millis(5_000))
-        );
     }
 
     #[test]

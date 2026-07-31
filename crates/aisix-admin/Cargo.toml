@@ -11,6 +11,9 @@ description = "aisix: Admin API + Playground + OpenAPI"
 [dependencies]
 aisix-core = { path = "../aisix-core" }
 aisix-etcd = { path = "../aisix-etcd" }
+# Strict OpenAPI-spec validation (`validate_spec`) for `type: openapi`
+# mcp_server writes.
+aisix-mcp = { path = "../aisix-mcp" }
 aisix-proxy = { path = "../aisix-proxy" }
 tokio.workspace = true
 axum.workspace = true
@@ -28,7 +31,7 @@ etcd-client.workspace = true
 aisix-obs = { path = "../aisix-obs" }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt"] }
+tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
 testcontainers.workspace = true
 aisix-gateway = { path = "../aisix-gateway" }
 aisix-provider-openai = { path = "../aisix-provider-openai" }

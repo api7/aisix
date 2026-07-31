@@ -16,12 +16,14 @@
 //! The trait is deliberately `async_trait` rather than GATs — ergonomic
 //! wins outweigh the boxing cost on the provider path.
 
-use aisix_core::{Model, ProviderKey};
+use aisix_core::{HeaderVars, Model, ProviderKey};
 use async_trait::async_trait;
 use futures::stream::BoxStream;
+use http::HeaderMap;
 use std::time::Duration;
 
 use crate::chat::{ChatChunk, ChatFormat, ChatResponse, EmbeddingRequest, EmbeddingResponse};
+use crate::upstream_headers::{CallerIdentity, UpstreamHeaderContext};
 
 /// Maximum number of bytes read from an upstream error response body
 /// before attempting JSON envelope parse. Bounds memory and parser cost
@@ -99,6 +101,22 @@ pub struct BridgeContext {
     /// Deadline for the entire upstream call. Bridges are expected to
     /// honour this by cancelling any in-flight HTTP request.
     pub deadline: Option<Duration>,
+    /// The authenticated caller, for `${request.api_key.*}` header
+    /// templates. Default (all-empty) on calls with no caller behind
+    /// them — a background job poll, an internal embedding lookup.
+    pub caller: CallerIdentity,
+    /// The inbound request's headers, source for the ProviderKey's
+    /// `request.forward_client_headers` allowlist. `None` on the same
+    /// caller-less paths as above.
+    pub client_headers: Option<std::sync::Arc<HeaderMap>>,
+    /// Snapshot ids of the resolved Model and ProviderKey, for the
+    /// `${model.id}` / `${provider_key.id}` header templates. They are
+    /// carried separately because a `Model` / `ProviderKey` value does not
+    /// know its own etcd id at runtime — the id lives on the enclosing
+    /// `ResourceEntry`, and `Resource::id()` on the value reads an
+    /// unpopulated field outside tests.
+    pub model_id: String,
+    pub provider_key_id: String,
 }
 
 impl BridgeContext {
@@ -112,12 +130,72 @@ impl BridgeContext {
             model,
             provider_key,
             deadline: None,
+            caller: CallerIdentity::default(),
+            client_headers: None,
+            model_id: String::new(),
+            provider_key_id: String::new(),
         }
     }
 
     pub fn with_deadline(mut self, deadline: Duration) -> Self {
         self.deadline = Some(deadline);
         self
+    }
+
+    /// Attach the caller identity and inbound headers the outbound-header
+    /// pipeline reads. Dispatch paths with a real client request call this;
+    /// leaving it off means no client header is ever forwarded and
+    /// `${request.api_key.*}` templates do not resolve.
+    pub fn with_client(
+        mut self,
+        caller: CallerIdentity,
+        client_headers: Option<std::sync::Arc<HeaderMap>>,
+    ) -> Self {
+        self.caller = caller;
+        self.client_headers = client_headers;
+        self
+    }
+
+    /// Attach the snapshot ids of the resolved Model / ProviderKey. See
+    /// the field docs for why they cannot be read off the values.
+    pub fn with_resource_ids(
+        mut self,
+        model_id: impl Into<String>,
+        provider_key_id: impl Into<String>,
+    ) -> Self {
+        self.model_id = model_id.into();
+        self.provider_key_id = provider_key_id.into();
+        self
+    }
+
+    /// The context [`crate::upstream_headers::apply_request_headers`] needs
+    /// to render `default_headers` templates and forward client headers.
+    pub fn header_ctx(&self) -> UpstreamHeaderContext<'_> {
+        UpstreamHeaderContext {
+            overrides: self.provider_key.request.as_ref(),
+            vars: HeaderVars {
+                request_id: Some(&self.request_id),
+                api_key_id: Some(&self.caller.api_key_id),
+                api_key_name: self.caller.api_key_name.as_deref(),
+                api_key_team_id: self.caller.team_id.as_deref(),
+                api_key_user_id: self.caller.user_id.as_deref(),
+                model_id: Some(&self.model_id),
+                model_name: Some(&self.model.display_name),
+                provider_key_id: Some(&self.provider_key_id),
+                provider_key_name: Some(&self.provider_key.display_name),
+            },
+            client_headers: self.client_headers.as_deref(),
+        }
+    }
+}
+
+/// `": {cause}"` when a transport-layer cause is known, otherwise empty —
+/// keeps the timeout message unchanged for the gateway's own deadlines.
+fn timeout_cause_suffix(cause: &str) -> String {
+    if cause.is_empty() {
+        String::new()
+    } else {
+        format!(": {cause}")
     }
 }
 
@@ -126,8 +204,17 @@ impl BridgeContext {
 /// layer can translate without further inspection.
 #[derive(Debug, thiserror::Error)]
 pub enum BridgeError {
-    #[error("upstream request timed out after {elapsed_ms}ms")]
-    Timeout { elapsed_ms: u64 },
+    /// An upstream call exceeded a time budget.
+    ///
+    /// `cause` names the transport-layer reason when reqwest reported one,
+    /// and is empty when one of the gateway's own deadlines elapsed. Three
+    /// unrelated conditions all satisfy `reqwest::Error::is_timeout()` — a
+    /// `connect_timeout`, hyper's request timeout, and the kernel's own
+    /// `ETIMEDOUT` on an unanswered SYN — so without the cause they render
+    /// as the same sentence and an operator cannot tell "the upstream is
+    /// slow" from "we never reached it" (AISIX-Cloud#1093).
+    #[error("upstream request timed out after {elapsed_ms}ms{}", timeout_cause_suffix(.cause))]
+    Timeout { elapsed_ms: u64, cause: String },
     /// Upstream returned a non-2xx HTTP status. `retry_after` carries
     /// the upstream's `Retry-After` header parsed to a Duration when
     /// present — used by the cooldown layer to honor provider-supplied
@@ -485,7 +572,43 @@ mod tests {
 
     #[test]
     fn timeout_maps_to_504() {
-        let e = BridgeError::Timeout { elapsed_ms: 30_000 };
+        let e = BridgeError::Timeout {
+            cause: String::new(),
+            elapsed_ms: 30_000,
+        };
+        assert_eq!(e.http_status(), 504);
+        assert_eq!(e.error_type(), "timeout");
+    }
+
+    /// A gateway-owned deadline has no transport cause, and its message
+    /// must stay byte-identical to what it was before `cause` existed —
+    /// operators and log queries key on this sentence.
+    #[test]
+    fn timeout_without_cause_renders_unchanged() {
+        let e = BridgeError::Timeout {
+            elapsed_ms: 30_000,
+            cause: String::new(),
+        };
+        assert_eq!(e.to_string(), "upstream request timed out after 30000ms");
+    }
+
+    /// With a transport cause the message names it, so an expired
+    /// `connect_timeout` and an expired request budget stop looking
+    /// identical (AISIX-Cloud#1093).
+    #[test]
+    fn timeout_with_cause_appends_it() {
+        let e = BridgeError::Timeout {
+            elapsed_ms: 5_001,
+            cause: "error sending request: client error (Connect): tcp connect error: \
+                    Connection timed out (os error 110)"
+                .to_string(),
+        };
+        assert_eq!(
+            e.to_string(),
+            "upstream request timed out after 5001ms: error sending request: \
+             client error (Connect): tcp connect error: Connection timed out (os error 110)"
+        );
+        // Status and telemetry class are unaffected by the added detail.
         assert_eq!(e.http_status(), 504);
         assert_eq!(e.error_type(), "timeout");
     }

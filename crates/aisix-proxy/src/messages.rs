@@ -171,6 +171,7 @@ pub async fn messages(
                 elapsed,
                 &request_id,
                 &routing,
+                None,
             );
             state.metrics.record_request(
                 &provider_label,
@@ -202,8 +203,7 @@ pub async fn messages(
                 status,
                 outcome,
             };
-            state.metrics.record_proxy_request(labels, elapsed);
-            state.metrics.record_llm_request(labels, elapsed);
+            state.metrics.record_proxy_and_llm_request(labels, elapsed);
             // SLO e2e histogram (AISIX-Cloud#1011): non-streaming only —
             // a stream records its full duration at completion instead.
             if !stream_requested {
@@ -250,6 +250,18 @@ pub async fn messages(
                     .map(|w| w.target_model_id.as_str())
                     .unwrap_or(&model_id);
                 let attempt = winner.map(AttemptInfo::from_record).unwrap_or_default();
+                // `latency_ms` is scoped to the winning attempt: the failed
+                // attempts before it emitted their own events above, so
+                // `elapsed` (whole request) would double-count them. The
+                // access log carries the user-perceived total.
+                let winner_latency = winner
+                    .map(|w| Duration::from_millis(u64::from(w.latency_ms)))
+                    .unwrap_or(elapsed);
+                // Non-streaming: the caller waited for the complete response,
+                // which is exactly the request clock. (The streaming paths
+                // stamp this from inside the stream and skip this branch.)
+                let mut metrics = metrics;
+                metrics.downstream_latency_ms = elapsed.as_millis().min(u32::MAX as u128) as u32;
                 emit_anthropic_usage_event(
                     &state,
                     &request_id,
@@ -263,7 +275,7 @@ pub async fn messages(
                     auth.key().user_id.as_deref(),
                     auth.key().user_name.as_deref(),
                     status,
-                    elapsed,
+                    winner_latency,
                     metrics,
                     &client,
                     attempt,
@@ -286,6 +298,7 @@ pub async fn messages(
                 elapsed,
                 &request_id,
                 &routing,
+                Some(&err),
             );
             let snap = state.snapshot.load();
             let metric_model = crate::usage_attr::metric_model_label(&snap, &model_name);
@@ -316,8 +329,9 @@ pub async fn messages(
                 status,
                 outcome: RequestOutcome::from_status(status),
             };
-            state.metrics.record_proxy_request(fail_labels, elapsed);
-            state.metrics.record_llm_request(fail_labels, elapsed);
+            state
+                .metrics
+                .record_proxy_and_llm_request(fail_labels, elapsed);
             state.metrics.record_request_e2e_latency(
                 LatencyLabels {
                     endpoint: "/v1/messages",
@@ -638,6 +652,7 @@ async fn dispatch(
                     .as_deref()
                     .unwrap_or(auth.entry.id.as_str()),
             ),
+            source_ip: &client.source_ip,
         },
     )?;
 
@@ -659,17 +674,6 @@ async fn dispatch(
     let is_routing_request = model_entry.value.routing.is_some();
     let mut routing = RoutingTelemetry::default();
 
-    // `routing.retries` — how many times to re-hit the SAME target (with
-    // backoff) on a retryable failure before failing over to the next target.
-    // Honoured here exactly like chat.rs (#641); 0 (the default) keeps the
-    // fail-over-only behaviour. /v1/messages previously ignored it entirely.
-    let retries = model_entry
-        .value
-        .routing
-        .as_ref()
-        .map(|r| r.retries_or_default())
-        .unwrap_or(0);
-
     // Walk targets, failing over to the next only on a retryable upstream
     // failure. A 4xx / config error is returned as-is — retrying other
     // targets won't help. Streaming and non-streaming share this loop:
@@ -685,11 +689,34 @@ async fn dispatch(
         let pk_id = crate::dispatch::resolve_provider_key(&snapshot, &target.model)
             .map(|e| e.id.clone())
             .unwrap_or_default();
-        for attempt_idx in 0..=retries {
-            // Exponential backoff + jitter before re-hitting the SAME target
+        // How many times to re-hit the SAME target (with backoff) on a
+        // retryable failure before failing over to the next target.
+        // Honoured here exactly like chat.rs (#641), and resolved per target
+        // so a direct model gets a budget too — it used to be pinned at zero
+        // because the knob only existed on the group.
+        let budget = crate::routing::effective_retries(
+            &target.model,
+            model_entry.value.routing.as_ref(),
+            state.default_retries,
+            i + 1 < n,
+        );
+        // Deadlines resolved target → group → deployment default, next to
+        // the retry budget so the two knobs stay in lockstep.
+        let timeouts = crate::routing::effective_timeouts(
+            &target.model,
+            Some(&model_entry.value),
+            state.default_timeouts,
+        );
+        for attempt_idx in 0..=budget.attempts {
+            // Upstream `Retry-After` when the last failure carried one, else
+            // exponential backoff + jitter, before re-hitting the SAME target
             // (#641); cross-target fall-over (the outer loop) stays immediate.
             if attempt_idx > 0 {
-                tokio::time::sleep(crate::routing::retry_backoff(attempt_idx as u32)).await;
+                let hint = last_err.as_ref().and_then(|e| match e {
+                    ProxyError::Bridge(be) => crate::routing::retry_after_hint(be),
+                    _ => None,
+                });
+                tokio::time::sleep(crate::routing::retry_backoff(attempt_idx as u32, hint)).await;
             }
             let (idx, kind) = routing.begin_attempt(&target.model.display_name);
             let target_model = if is_routing_request {
@@ -697,15 +724,49 @@ async fn dispatch(
             } else {
                 String::new()
             };
+            // Reserve THIS target's own model rate-limit layers before
+            // dispatching to it (AISIX-Cloud#1087). Over-limit → record a
+            // 429 attempt and move on to the remaining targets in strategy
+            // order (same-target retries can't help — the window won't
+            // reset mid-loop).
+            let mut member_reservation = match crate::quota::reserve_routing_target(
+                state,
+                is_routing_request,
+                &target.model.display_name,
+                &target.id,
+                &target.model,
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    routing.attempts.push(AttemptRecord {
+                        index: idx,
+                        kind,
+                        target_model,
+                        target_model_id: target.id.clone(),
+                        provider_key_id: pk_id.clone(),
+                        status: 429,
+                        success: false,
+                        error_class: "rate_limit_exceeded".to_string(),
+                        error_message: e.to_string(),
+                        latency_ms: 0,
+                    });
+                    last_err = Some(e);
+                    continue 'targets;
+                }
+            };
             let attempt_started = Instant::now();
             match dispatch_to_target(
                 state,
                 &snapshot,
                 body,
                 target,
+                timeouts,
                 &model_name,
                 request_id,
                 started,
+                attempt_started,
                 &auth.entry.id,
                 auth.key().team_id.clone(),
                 auth.key().user_id.clone(),
@@ -719,6 +780,7 @@ async fn dispatch(
                     ..Default::default()
                 },
                 &mut reservation,
+                &mut member_reservation,
                 redactions_out.clone(),
                 monitor_hits_out.clone(),
             )
@@ -749,7 +811,14 @@ async fn dispatch(
                     // end-of-stream guard (#688), so `reservation` is `None` and
                     // this is skipped.
                     if !outcome.usage_handled_by_stream {
-                        if let Some(r) = reservation.take() {
+                        if let Some(mut r) = reservation.take() {
+                            // Fold this target's model-layer reservation in
+                            // (AISIX-Cloud#1087) so one commit bills the
+                            // member's TPM/TPD too. Already `None` when the
+                            // streaming path folded it into the guard.
+                            if let Some(member) = member_reservation.take() {
+                                r.merge(member);
+                            }
                             let total = total_tokens_with_cache(
                                 outcome.metrics.prompt_tokens,
                                 outcome.metrics.completion_tokens,
@@ -779,6 +848,12 @@ async fn dispatch(
                         error_message,
                         latency_ms: ms_since(attempt_started),
                     });
+                    // See `RetryBudget::covers`: a default budget skips
+                    // same-target retries for timeouts; fail-over is unaffected.
+                    let budget_covers = match &e {
+                        ProxyError::Bridge(be) => budget.covers(be),
+                        _ => true,
+                    };
                     last_err = Some(e);
                     // Non-retryable → stop entirely (retrying or failing over
                     // won't help). Retryable → re-hit the same target until
@@ -787,7 +862,7 @@ async fn dispatch(
                     if !retryable {
                         break 'targets;
                     }
-                    if attempt_idx == retries {
+                    if attempt_idx == budget.attempts || !budget_covers {
                         if i + 1 >= n {
                             break 'targets;
                         }
@@ -812,9 +887,17 @@ async fn dispatch_to_target(
     snapshot: &aisix_core::AisixSnapshot,
     body: &Value,
     target: &crate::routing::AttemptModel,
+    // Deadlines resolved by the caller across target → group → deployment
+    // default (`routing::effective_timeouts`); this fn only applies them.
+    timeouts: crate::routing::TimeoutBudget,
     model_name: &str,
     request_id: &str,
     started: Instant,
+    // When THIS attempt began. The streaming paths' end-of-stream
+    // UsageEvent reports `attempt_started.elapsed()` so `latency_ms` stays
+    // scoped to the attempt, matching the failed-attempt events and the
+    // non-streaming winner (`usage.rs` #655 contract).
+    attempt_started: Instant,
     api_key_id: &str,
     team_id: Option<String>,
     user_id: Option<String>,
@@ -829,6 +912,12 @@ async fn dispatch_to_target(
     // post-stream token accounting into the end-of-stream guard. Left in place
     // on the non-streaming / error paths for the handler to commit or retry.
     reservation: &mut Option<aisix_ratelimit::MultiReservation>,
+    // This target's own model-layer reservation (routing dispatch only,
+    // AISIX-Cloud#1087). The streaming path folds it into `reservation`
+    // before the take above so the end-of-stream guard covers the member's
+    // limits; the non-streaming path leaves it for the handler to commit
+    // alongside `reservation`.
+    member_reservation: &mut Option<aisix_ratelimit::MultiReservation>,
     // Input-side PII mask counts (#932) — the streaming paths merge these
     // into their end-of-stream telemetry emit (the non-streaming emit
     // happens in `messages()`, which already holds them).
@@ -846,10 +935,13 @@ async fn dispatch_to_target(
             body,
             model,
             &target.id,
+            timeouts,
             &pk_entry.value,
+            &pk_entry.id,
             model_name,
             request_id,
             started,
+            attempt_started,
             api_key_id,
             team_id,
             user_id,
@@ -858,6 +950,7 @@ async fn dispatch_to_target(
             client,
             attempt,
             reservation,
+            member_reservation,
             input_redactions,
             input_monitor_hits,
         )
@@ -869,11 +962,13 @@ async fn dispatch_to_target(
         body,
         model,
         &target.id,
+        timeouts,
         &pk_entry.value,
         &pk_entry.id,
         model_name,
         request_id,
         started,
+        attempt_started,
         api_key_id,
         team_id,
         user_id,
@@ -882,6 +977,7 @@ async fn dispatch_to_target(
         client,
         attempt,
         reservation,
+        member_reservation,
         input_redactions,
         input_monitor_hits,
     )
@@ -898,11 +994,14 @@ async fn anthropic_passthrough_dispatch(
     body: &Value,
     model: &aisix_core::Model,
     model_id: &str,
+    timeouts: crate::routing::TimeoutBudget,
     pk_value: &aisix_core::ProviderKey,
     pk_id: &str,
     model_name: &str,
     request_id: &str,
     started: Instant,
+    // When THIS attempt began — see `dispatch_to_target`.
+    attempt_started: Instant,
     api_key_id: &str,
     team_id: Option<String>,
     user_id: Option<String>,
@@ -911,6 +1010,10 @@ async fn anthropic_passthrough_dispatch(
     client_ctx: &ClientContext,
     attempt: AttemptInfo,
     reservation: &mut Option<aisix_ratelimit::MultiReservation>,
+    // This target's own model-layer reservation (AISIX-Cloud#1087); folded
+    // into `reservation` before the streaming take so the end-of-stream
+    // guard covers the member's limits.
+    member_reservation: &mut Option<aisix_ratelimit::MultiReservation>,
     input_redactions: crate::redact::RedactionCounts,
     input_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
 ) -> Result<DispatchOutcome, ProxyError> {
@@ -960,13 +1063,14 @@ async fn anthropic_passthrough_dispatch(
         .unwrap_or(false);
 
     // Build the outbound HeaderMap explicitly so the PK's
-    // `request.default_headers` block can inject operator-supplied
-    // headers via the shared apply pipeline. The bridge-owned
-    // headers (x-api-key, anthropic-version, content-type,
-    // x-aisix-request-id) are inserted FIRST — `apply_default_headers`
-    // skips keys already present + the reserved auth-header blacklist
-    // (`x-api-key` is in `RESERVED_DEFAULT_HEADERS`), so operator
-    // headers can never clobber auth here (ai-gateway#337).
+    // `request.default_headers` / `request.forward_client_headers` can
+    // inject operator-supplied and allowlisted client headers via the
+    // shared apply pipeline. The bridge-owned headers (x-api-key,
+    // anthropic-version, content-type, x-aisix-request-id) are inserted
+    // FIRST — `apply_request_headers` skips keys already present + the
+    // reserved auth-header blacklist (`x-api-key` is in
+    // `RESERVED_UPSTREAM_HEADERS`), so neither source can clobber auth
+    // here (ai-gateway#337).
     let mut headers = axum::http::HeaderMap::new();
     let api_key_hv = HeaderValue::from_str(api_key).map_err(|e| {
         ProxyError::Bridge(aisix_gateway::BridgeError::Config(format!(
@@ -988,18 +1092,19 @@ async fn anthropic_passthrough_dispatch(
         )))
     })?;
     headers.insert(HeaderName::from_static("x-aisix-request-id"), rid_hv);
-    if let Some(r) = pk_value.request.as_ref() {
-        aisix_provider_openai::overrides::apply_default_headers(&mut headers, &r.default_headers);
-    }
+    aisix_gateway::apply_request_headers(
+        &mut headers,
+        &crate::dispatch::upstream_header_ctx(pk_value, pk_id, model, model_id, client_ctx),
+    );
 
-    let client = crate::http_client::client();
+    let client = crate::http_client::client_for(pk_value.tls.as_ref());
     let mut req_builder = client.post(&url).headers(headers).json(&body);
     // #554: non-streaming gets the E2E request timeout via reqwest's
     // request-level timeout. Streaming must NOT use it (it would cap the
     // whole stream); the streaming branch below enforces the per-chunk
     // read timeout instead.
     if !is_stream {
-        if let Some(d) = model.request_timeout() {
+        if let Some(d) = timeouts.request {
             req_builder = req_builder.timeout(d);
         }
     }
@@ -1013,11 +1118,7 @@ async fn anthropic_passthrough_dispatch(
     // Streaming bounds the connect by the stream deadline (reqwest's
     // request-level timeout can't be used — it would cap the whole stream);
     // non-streaming relies on the request-level timeout set above.
-    let connect_deadline = if is_stream {
-        model.stream_timeout_effective()
-    } else {
-        None
-    };
+    let connect_deadline = if is_stream { timeouts.stream } else { None };
     let upstream_resp =
         crate::stream_timeout::send_with_deadline(req_builder, connect_deadline, send_started)
             .await
@@ -1076,14 +1177,14 @@ async fn anthropic_passthrough_dispatch(
         // target) before the 200 is committed; without one, forward directly
         // (pre-#554 behavior). A mid-stream stall truncates the forwarded
         // stream — there is no in-band error frame for an opaque passthrough.
-        let stream_budget = model.stream_timeout_effective();
+        let stream_budget = timeouts.stream;
         let wrapped: std::pin::Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>> =
             Box::pin(crate::stream_timeout::with_read_timeout_bytes(
                 upstream_resp.bytes_stream(),
                 stream_budget,
             ));
         let body_stream: std::pin::Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>> =
-            if stream_budget.is_some() {
+            if timeouts.stream_configured {
                 let mut wrapped = wrapped;
                 let first_bytes = match wrapped.next().await {
                     Some(Ok(b)) => b,
@@ -1173,15 +1274,35 @@ async fn anthropic_passthrough_dispatch(
         // TPM/TPD accounting and `into_stream_hold` keeps the concurrency slot(s)
         // until the stream ends (mirrors chat.rs). `take()` leaves the handler's
         // `reservation` as `None`, so it won't also `commit_tokens`.
+        //
+        // Fold this target's model-layer reservation in first (AISIX-Cloud#1087)
+        // so the guard covers the member's limits too; `take()` leaves it `None`
+        // for the same reason.
+        if let Some(member) = member_reservation.take() {
+            match reservation.as_mut() {
+                Some(main) => main.merge(member),
+                None => *reservation = Some(member),
+            }
+        }
         let post_stream_keys = reservation.as_ref().map(|r| r.keys()).unwrap_or_default();
         let stream_hold = reservation.take().map(|r| r.into_stream_hold());
         let limiter_c = std::sync::Arc::clone(&state.limiter);
+        // Token-estimation fallback context (AISIX-Cloud#1074): the inbound
+        // Anthropic request body is cloned because the stream owns it until
+        // an end-of-stream Drop. Tokenized only if the upstream never
+        // reports usage.
+        let estimator = crate::token_estimate::Estimator::new(
+            &upstream_model,
+            crate::token_estimate::PromptInput::Anthropic(body.clone()),
+        );
         let parsed_stream = build_anthropic_passthrough_stream(
             body_stream,
             started,
+            attempt_started,
             stream_guardrail,
             model_name.to_string(),
             content_cap,
+            Some(estimator),
             move |usage| {
                 // Streaming responses that got this far are 200 — the
                 // !status.is_success() guard above returned early on
@@ -1211,10 +1332,12 @@ async fn anthropic_passthrough_dispatch(
                     completion_tokens: usage.completion_tokens,
                     cache_creation_tokens: usage.cache_creation_tokens,
                     cache_read_tokens: usage.cache_read_tokens,
+                    usage_estimated: usage.usage_estimated,
                     provider_request_id: usage.provider_request_id,
                     provider_model_version: usage.provider_model_version,
                     finish_reason: usage.finish_reason,
-                    ttft_ms: usage.ttft_ms,
+                    upstream_ttft_ms: usage.upstream_ttft_ms,
+                    downstream_latency_ms: usage.downstream_latency_ms,
                 };
                 state_c.metrics.record_request_e2e_latency(
                     LatencyLabels {
@@ -1239,7 +1362,9 @@ async fn anthropic_passthrough_dispatch(
                     user_id_c.as_deref(),
                     user_name_c.as_deref(),
                     200,
-                    started.elapsed(),
+                    // Attempt-scoped, unlike the e2e histogram above: any
+                    // failed attempt before this one emitted its own event.
+                    attempt_started.elapsed(),
                     metrics,
                     &client_ctx_c,
                     attempt_c.clone(),
@@ -1270,8 +1395,9 @@ async fn anthropic_passthrough_dispatch(
             },
         );
 
-        let mut response =
-            axum::response::Response::new(axum::body::Body::from_stream(parsed_stream));
+        let mut response = axum::response::Response::new(axum::body::Body::from_stream(
+            crate::sse_keepalive::with_heartbeat(parsed_stream, crate::sse_keepalive::interval()),
+        ));
 
         // Copy content-type from upstream (should be text/event-stream).
         if let Some(ct) = headers.get("content-type") {
@@ -1330,7 +1456,14 @@ async fn anthropic_passthrough_dispatch(
             })
             .map_err(ProxyError::Bridge)?;
 
-        let metrics = anthropic_metrics_from_response_json(&json_body);
+        let mut metrics = anthropic_metrics_from_response_json(&json_body);
+        // Token-estimation fallback (AISIX-Cloud#1074): an
+        // Anthropic-compatible relay may omit `usage` entirely — fill
+        // the missing counters locally before the emit below. The
+        // response body is forwarded verbatim, untouched.
+        fill_missing_anthropic_metrics(&mut metrics, &upstream_model, &body, || {
+            anthropic_estimation_output_text(&json_body)
+        });
 
         // #448 (#22): run output guardrails on the passthrough response.
         // The body is forwarded verbatim, so extract its text (content
@@ -1448,6 +1581,74 @@ async fn anthropic_passthrough_dispatch(
     }
 }
 
+/// Token-estimation fallback for a non-streaming `/v1/messages` response
+/// (AISIX-Cloud#1074): fill token counters the upstream never reported
+/// and mark the metrics estimated. `output_text` is built lazily — only
+/// when estimation actually runs.
+fn fill_missing_anthropic_metrics(
+    metrics: &mut AnthropicUsageMetrics,
+    upstream_model: &str,
+    body: &Value,
+    output_text: impl FnOnce() -> String,
+) {
+    if metrics.prompt_tokens != 0 && metrics.completion_tokens != 0 {
+        return;
+    }
+    let est = crate::token_estimate::Estimator::new(
+        upstream_model,
+        crate::token_estimate::PromptInput::Anthropic(body.clone()),
+    );
+    let filled = crate::token_estimate::fill_missing(
+        &est,
+        metrics.prompt_tokens,
+        metrics.completion_tokens,
+        Some(&output_text()),
+    );
+    if filled.estimated {
+        metrics.prompt_tokens = filled.prompt_tokens;
+        metrics.completion_tokens = filled.completion_tokens;
+        metrics.usage_estimated = true;
+    }
+}
+
+/// Generated output text for the token-estimation fallback: text blocks
+/// plus `tool_use` name/input and `thinking` — the response-side analog
+/// of the streaming accumulation. (`anthropic_response_text` below stays
+/// text-only: it feeds content capture, whose shape is an established
+/// contract.)
+fn anthropic_estimation_output_text(body: &Value) -> String {
+    let Some(blocks) = body.get("content").and_then(Value::as_array) else {
+        return String::new();
+    };
+    let mut out = String::new();
+    for block in blocks {
+        match block.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                if let Some(t) = block.get("text").and_then(Value::as_str) {
+                    out.push_str(t);
+                }
+            }
+            Some("thinking") => {
+                if let Some(t) = block.get("thinking").and_then(Value::as_str) {
+                    out.push_str(t);
+                }
+            }
+            Some("tool_use") => {
+                if let Some(n) = block.get("name").and_then(Value::as_str) {
+                    out.push_str(n);
+                }
+                if let Some(input) = block.get("input") {
+                    if !input.is_null() {
+                        out.push_str(&input.to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 /// Concatenate the text from an Anthropic response's `content` blocks — the
 /// assistant's assembled output text, for content-capturing exporters.
 fn anthropic_response_text(body: &Value) -> String {
@@ -1470,6 +1671,7 @@ fn anthropic_response_text(body: &Value) -> String {
 fn anthropic_metrics_from_response_json(body: &Value) -> AnthropicUsageMetrics {
     let usage = body.get("usage");
     AnthropicUsageMetrics {
+        usage_estimated: false,
         prompt_tokens: usage
             .and_then(|u| u.get("input_tokens"))
             .and_then(Value::as_u64)
@@ -1501,7 +1703,9 @@ fn anthropic_metrics_from_response_json(body: &Value) -> AnthropicUsageMetrics {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string(),
-        ttft_ms: 0,
+        upstream_ttft_ms: 0,
+        // Non-streaming: stamped by the handler, which holds the request clock.
+        downstream_latency_ms: 0,
     }
 }
 
@@ -1523,10 +1727,14 @@ async fn cross_provider_dispatch(
     body: &Value,
     model: &aisix_core::Model,
     model_id: &str,
+    timeouts: crate::routing::TimeoutBudget,
     provider_key: &aisix_core::ProviderKey,
+    provider_key_id: &str,
     model_name: &str,
     request_id: &str,
     started: Instant,
+    // When THIS attempt began — see `dispatch_to_target`.
+    attempt_started: Instant,
     api_key_id: &str,
     team_id: Option<String>,
     user_id: Option<String>,
@@ -1535,10 +1743,14 @@ async fn cross_provider_dispatch(
     client: &ClientContext,
     attempt: AttemptInfo,
     reservation: &mut Option<aisix_ratelimit::MultiReservation>,
+    // This target's own model-layer reservation (AISIX-Cloud#1087); folded
+    // into `reservation` before the streaming take so the end-of-stream
+    // guard covers the member's limits.
+    member_reservation: &mut Option<aisix_ratelimit::MultiReservation>,
     input_redactions: crate::redact::RedactionCounts,
     input_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
 ) -> Result<DispatchOutcome, ProxyError> {
-    use aisix_gateway::{Bridge, BridgeContext};
+    use aisix_gateway::Bridge;
     use aisix_provider_anthropic::{
         chat_response_into_anthropic_json, parse_inbound_request, translate_extras_to_openai_shape,
         AnthropicSseEncoder,
@@ -1574,17 +1786,23 @@ async fn cross_provider_dispatch(
     translate_extras_to_openai_shape(&mut chat.extra);
 
     let is_stream = chat.is_streaming();
-    let model_arc = Arc::new(model.clone());
-    let pk_arc = Arc::new(provider_key.clone());
+
     // #554: bound the upstream connect with the appropriate deadline —
     // the streaming read budget for stream calls, the E2E request timeout
     // otherwise. The streaming path additionally enforces the per-chunk
     // read timeout below.
-    let mut ctx = BridgeContext::new(request_id, model_arc, pk_arc);
+    let mut ctx = crate::dispatch::bridge_ctx(
+        request_id,
+        model_id,
+        Arc::new(model.clone()),
+        provider_key_id,
+        Arc::new(provider_key.clone()),
+        Some(client),
+    );
     let connect_deadline = if is_stream {
-        model.stream_timeout_effective()
+        timeouts.stream
     } else {
-        model.request_timeout()
+        timeouts.request
     };
     if let Some(d) = connect_deadline {
         ctx = ctx.with_deadline(d);
@@ -1616,9 +1834,9 @@ async fn cross_provider_dispatch(
         // (pre-#554 behavior; a first-chunk error then surfaces in-band). The
         // wrapper keeps enforcing the read timeout on the remaining chunks
         // either way (no-op when unset).
-        let stream_budget = model.stream_timeout_effective();
+        let stream_budget = timeouts.stream;
         let upstream = crate::stream_timeout::with_read_timeout(upstream, stream_budget);
-        let upstream: aisix_gateway::ChatChunkStream = if stream_budget.is_some() {
+        let upstream: aisix_gateway::ChatChunkStream = if timeouts.stream_configured {
             let mut upstream = upstream;
             let first_chunk = match upstream.next().await {
                 Some(Ok(chunk)) => chunk,
@@ -1668,6 +1886,7 @@ async fn cross_provider_dispatch(
         let user_id_for_telem = user_id;
         let user_name_for_telem = user_name;
         let started_for_telem = started;
+        let attempt_started_for_telem = attempt_started;
         // #492: log the same client IP/UA on streamed responses.
         let client_for_telem = client.clone();
         // Winning-attempt classification (#655) for the stream-end emit.
@@ -1697,16 +1916,35 @@ async fn cross_provider_dispatch(
         // keys drive post-stream TPM/TPD accounting, the hold keeps the
         // concurrency slot(s) until the stream ends. `take()` leaves the
         // handler's `reservation` as `None` so it won't also `commit_tokens`.
+        //
+        // Fold this target's model-layer reservation in first (AISIX-Cloud#1087)
+        // so the guard covers the member's limits too; `take()` leaves it `None`
+        // so the handler won't also commit it.
+        if let Some(member) = member_reservation.take() {
+            match reservation.as_mut() {
+                Some(main) => main.merge(member),
+                None => *reservation = Some(member),
+            }
+        }
         let post_stream_keys = reservation.as_ref().map(|r| r.keys()).unwrap_or_default();
         let stream_hold = reservation.take().map(|r| r.into_stream_hold());
         let limiter_for_stream = std::sync::Arc::clone(&state.limiter);
+        // Token-estimation fallback context (AISIX-Cloud#1074): the inbound
+        // Anthropic request body is cloned because the stream owns it until
+        // an end-of-stream Drop.
+        let estimator = crate::token_estimate::Estimator::new(
+            &upstream_model,
+            crate::token_estimate::PromptInput::Anthropic(body.clone()),
+        );
         let sse_body = build_anthropic_sse_stream(
             upstream,
             encoder,
             started,
+            attempt_started,
             stream_guardrail,
             model_name.to_string(),
             content_cap,
+            Some(estimator),
             move |comp| {
                 // #688: apply the terminal token cost to TPM/TPD and release the
                 // concurrency hold now the stream has ended (sync analog of the
@@ -1731,10 +1969,12 @@ async fn cross_provider_dispatch(
                     completion_tokens: comp.completion_tokens,
                     cache_creation_tokens: comp.cache_creation_tokens,
                     cache_read_tokens: comp.cache_read_tokens,
+                    usage_estimated: comp.usage_estimated,
                     provider_request_id: comp.provider_request_id,
                     provider_model_version: comp.provider_model_version,
                     finish_reason: comp.finish_reason,
-                    ttft_ms: comp.ttft_ms,
+                    upstream_ttft_ms: comp.upstream_ttft_ms,
+                    downstream_latency_ms: comp.downstream_latency_ms,
                 };
                 state_for_telem.metrics.record_request_e2e_latency(
                     LatencyLabels {
@@ -1759,7 +1999,8 @@ async fn cross_provider_dispatch(
                     user_id_for_telem.as_deref(),
                     user_name_for_telem.as_deref(),
                     200,
-                    started_for_telem.elapsed(),
+                    // Attempt-scoped — see the sibling passthrough path.
+                    attempt_started_for_telem.elapsed(),
                     metrics,
                     &client_for_telem,
                     attempt_for_telem.clone(),
@@ -1875,16 +2116,25 @@ async fn cross_provider_dispatch(
         crate::redact::redact_chat_response(resolved_chain.as_ref(), &mut resp);
     crate::redact::merge_counts(&mut output_redactions, output_seg_counts);
 
-    let metrics = AnthropicUsageMetrics {
+    let mut metrics = AnthropicUsageMetrics {
         prompt_tokens: resp.usage.prompt_tokens,
         completion_tokens: resp.usage.completion_tokens,
         cache_creation_tokens: resp.usage.cache_creation_tokens,
         cache_read_tokens: resp.usage.cache_read_tokens,
+        usage_estimated: false,
         provider_request_id: resp.id.clone(),
         provider_model_version: resp.model.clone(),
         finish_reason: finish_reason_label(&resp.finish_reason),
-        ttft_ms: 0,
+        upstream_ttft_ms: 0,
+        // Non-streaming: stamped by the handler, which holds the request clock.
+        downstream_latency_ms: 0,
     };
+    // Token-estimation fallback (AISIX-Cloud#1074): fill counters the
+    // bridged upstream never reported. Telemetry only — the rendered
+    // Anthropic JSON below carries the upstream's own usage.
+    fill_missing_anthropic_metrics(&mut metrics, &upstream_model, body, || {
+        crate::chat::estimation_output_text(&resp)
+    });
     // Capture the prompt (the Anthropic request body) + assembled assistant
     // text for content-capturing exporters (gated); threaded to `fan_out` via
     // `DispatchOutcome`, never to the CP sink.
@@ -1924,20 +2174,42 @@ async fn cross_provider_dispatch(
 /// Errors in the stream surface as a final `event: error` frame so
 /// SSE clients see something actionable rather than a half-complete
 /// stream.
+#[allow(clippy::too_many_arguments)]
 fn build_anthropic_sse_stream(
     upstream: aisix_gateway::ChatChunkStream,
     encoder: aisix_provider_anthropic::AnthropicSseEncoder,
+    // Request clock — what the CALLER waited for
+    // (`downstream_latency_ms`), spanning every earlier attempt.
     started: Instant,
+    // Attempt clock — how the UPSTREAM behaved on this call
+    // (`upstream_ttft_ms`).
+    attempt_started: Instant,
     output_guardrail: Option<std::sync::Arc<aisix_guardrails::GuardrailChain>>,
     model_label: String,
     // Largest content cap any content-capturing exporter wants, or `None` to
     // skip response accumulation (the common, content-free path).
     content_cap: Option<u32>,
+    // Token-estimation fallback context (AISIX-Cloud#1074); see
+    // `CompleteAnthropicStreamOnDrop::estimator`.
+    estimator: Option<crate::token_estimate::Estimator>,
     on_complete: impl FnOnce(AnthropicStreamCompletion) + Send + 'static,
 ) -> axum::body::Body {
     use futures::StreamExt;
 
     let mut encoder = encoder;
+    // Stamp the caller-facing figure on the first SSE bytes that actually
+    // leave for the client. Wrapping the encoder output here covers both
+    // the live-forward drain and the hold-back release; putting it on the
+    // outermost stream instead would misfire on a keep-alive heartbeat.
+    macro_rules! downstream_bytes {
+        ($guard:expr, $ev:expr) => {{
+            if $guard.comp().downstream_latency_ms == 0 {
+                $guard.comp().downstream_latency_ms =
+                    started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+            }
+            bytes::Bytes::from($ev.to_sse_string())
+        }};
+    }
     // #932 / #466-class: when the chain's streamed-output policy is the
     // whole-response hold-back (BufferFull — keyword/pii/bedrock output
     // guardrails), chunks are withheld from the encoder until the
@@ -1956,6 +2228,7 @@ fn build_anthropic_sse_stream(
     let stream = async_stream::stream! {
         let mut guard = CompleteAnthropicStreamOnDrop {
             slot: Some((on_complete, AnthropicStreamCompletion::default())),
+            estimator,
         };
         let mut upstream = upstream;
         let mut first_chunk_seen = false;
@@ -1980,8 +2253,8 @@ fn build_anthropic_sse_stream(
                         && (chunk.delta.content.is_some() || chunk.delta.tool_calls.is_some())
                     {
                         first_chunk_seen = true;
-                        guard.comp().ttft_ms =
-                            started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+                        guard.comp().upstream_ttft_ms =
+                            attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
                     }
                     let comp = guard.comp();
                     if !chunk.id.is_empty() {
@@ -2017,6 +2290,32 @@ fn build_anthropic_sse_stream(
                             }
                         }
                     }
+                    // Token-estimation accumulator (AISIX-Cloud#1074): all
+                    // generated output, always on (whether the fallback is
+                    // needed is only known at end-of-stream), bounded.
+                    {
+                        use crate::token_estimate::push_capped;
+                        if let Some(t) = chunk.delta.content.as_deref() {
+                            push_capped(&mut comp.est_output_text, t);
+                        }
+                        if let Some(t) = chunk.delta.reasoning_content.as_deref() {
+                            push_capped(&mut comp.est_output_text, t);
+                        }
+                        if let Some(tcs) = chunk.delta.tool_calls.as_ref() {
+                            for tc in tcs {
+                                if let Some(f) = tc.get("function") {
+                                    if let Some(n) = f.get("name").and_then(|v| v.as_str()) {
+                                        push_capped(&mut comp.est_output_text, n);
+                                    }
+                                    if let Some(a) =
+                                        f.get("arguments").and_then(|v| v.as_str())
+                                    {
+                                        push_capped(&mut comp.est_output_text, a);
+                                    }
+                                }
+                            }
+                        }
+                    }
                     if let Some(max_hold) = hold_policy {
                         // Hold-back: withhold the chunk until the end-of-
                         // stream scan clears it. Overflow fails closed —
@@ -2035,7 +2334,7 @@ fn build_anthropic_sse_stream(
                         continue;
                     }
                     for ev in encoder.next_events(&chunk) {
-                        yield Ok::<_, std::io::Error>(bytes::Bytes::from(ev.to_sse_string()));
+                        yield Ok::<_, std::io::Error>(downstream_bytes!(guard, ev));
                     }
                     if encoder.is_finished() {
                         break;
@@ -2160,7 +2459,7 @@ fn build_anthropic_sse_stream(
             }
             for chunk in held_chunks.drain(..) {
                 for ev in encoder.next_events(&chunk) {
-                    yield Ok::<_, std::io::Error>(bytes::Bytes::from(ev.to_sse_string()));
+                    yield Ok::<_, std::io::Error>(downstream_bytes!(guard, ev));
                 }
                 if encoder.is_finished() {
                     break;
@@ -2169,11 +2468,17 @@ fn build_anthropic_sse_stream(
         }
         if !encoder.is_finished() {
             for ev in encoder.force_finish() {
-                yield Ok(bytes::Bytes::from(ev.to_sse_string()));
+                yield Ok(downstream_bytes!(guard, ev));
             }
         }
     };
-    axum::body::Body::from_stream(stream)
+    // Re-attach the request span: the body is polled after the request-id
+    // middleware returns, so the end-of-stream output-guardrail check
+    // would otherwise log without a `request_id` (AISIX-Cloud#1060).
+    axum::body::Body::from_stream(crate::sse_keepalive::with_heartbeat(
+        crate::request_id::in_request_span(stream),
+        crate::sse_keepalive::interval(),
+    ))
 }
 
 /// Anthropic-shape SSE error frame for a streaming guardrail block. Built
@@ -2210,10 +2515,23 @@ struct AnthropicStreamCompletion {
     completion_tokens: u32,
     cache_creation_tokens: u32,
     cache_read_tokens: u32,
+    /// True when the Drop guard filled any token counter from the local
+    /// estimator (AISIX-Cloud#1074).
+    usage_estimated: bool,
     provider_request_id: String,
     provider_model_version: String,
     finish_reason: String,
-    ttft_ms: u32,
+    /// Attempt-scoped time to the upstream's first generated chunk.
+    upstream_ttft_ms: u32,
+    /// Request-scoped time until the caller got its first response
+    /// bytes. Trails `upstream_ttft_ms` by whatever the gateway did
+    /// in between — most visibly a hold-back output guardrail.
+    downstream_latency_ms: u32,
+    /// Generated output (content + reasoning + tool-call text) accumulated
+    /// for the token-estimation fallback (AISIX-Cloud#1074). Always on,
+    /// bounded to `token_estimate::OUTPUT_ACCUMULATION_CAP`; never leaves
+    /// the process.
+    est_output_text: String,
     /// Assembled assistant text for content-capturing exporters, accumulated
     /// across chunks ONLY when an exporter wants full content (bounded to the
     /// capture cap). Empty otherwise. Read by the on_complete closure; never
@@ -2230,6 +2548,9 @@ struct AnthropicStreamCompletion {
 
 struct CompleteAnthropicStreamOnDrop<F: FnOnce(AnthropicStreamCompletion)> {
     slot: Option<(F, AnthropicStreamCompletion)>,
+    /// Token-estimation fallback (AISIX-Cloud#1074); fills counters the
+    /// upstream never reported before `on_complete` runs.
+    estimator: Option<crate::token_estimate::Estimator>,
 }
 
 impl<F: FnOnce(AnthropicStreamCompletion)> CompleteAnthropicStreamOnDrop<F> {
@@ -2244,7 +2565,25 @@ impl<F: FnOnce(AnthropicStreamCompletion)> CompleteAnthropicStreamOnDrop<F> {
 
 impl<F: FnOnce(AnthropicStreamCompletion)> Drop for CompleteAnthropicStreamOnDrop<F> {
     fn drop(&mut self) {
-        if let Some((f, c)) = self.slot.take() {
+        if let Some((f, mut c)) = self.slot.take() {
+            // Token-estimation fallback (AISIX-Cloud#1074): fill the
+            // counters the upstream never reported. This surface has no
+            // delivered-count gate (unlike chat.rs / the passthrough
+            // guard), so the estimate covers whatever the bridge produced
+            // before the stream ended.
+            if let Some(est) = self.estimator.take() {
+                let filled = crate::token_estimate::fill_missing(
+                    &est,
+                    c.prompt_tokens,
+                    c.completion_tokens,
+                    Some(c.est_output_text.as_str()),
+                );
+                if filled.estimated {
+                    c.prompt_tokens = filled.prompt_tokens;
+                    c.completion_tokens = filled.completion_tokens;
+                    c.usage_estimated = true;
+                }
+            }
             f(c);
         }
     }
@@ -2314,10 +2653,14 @@ struct AnthropicUsageMetrics {
     completion_tokens: u32,
     cache_creation_tokens: u32,
     cache_read_tokens: u32,
+    /// True when any token counter was filled by the local estimator
+    /// because the upstream reported no usage (AISIX-Cloud#1074).
+    usage_estimated: bool,
     provider_request_id: String,
     provider_model_version: String,
     finish_reason: String,
-    ttft_ms: u32,
+    upstream_ttft_ms: u32,
+    downstream_latency_ms: u32,
 }
 
 /// Emit a UsageEvent for a `/v1/messages` request. Mirrors
@@ -2388,12 +2731,14 @@ fn emit_anthropic_usage_event(
         completion_tokens: metrics.completion_tokens,
         cache_creation_tokens: metrics.cache_creation_tokens,
         cache_read_tokens: metrics.cache_read_tokens,
-        latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
+        usage_estimated: metrics.usage_estimated,
+        upstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
+        downstream_latency_ms: metrics.downstream_latency_ms,
         status_code,
         provider_request_id: metrics.provider_request_id,
         provider_model_version: metrics.provider_model_version,
         finish_reason: metrics.finish_reason,
-        ttft_ms: metrics.ttft_ms,
+        upstream_ttft_ms: metrics.upstream_ttft_ms,
         inbound_protocol: "anthropic".to_string(),
         attempt_index: attempt.index,
         attempt_kind: attempt.kind,
@@ -2453,13 +2798,15 @@ fn emit_anthropic_usage_event(
     // #890 req-4: token volume by inbound client type (covers streaming and
     // non-streaming — every /v1/messages usage event flows through here).
     // #1002: total_tokens_all folds in the Anthropic cache counters.
+    // AISIX-Cloud#1044: same requested logical model as the UsageLabels above.
     state.metrics.record_llm_tokens_by_client(
-        aisix_obs::client_type_from_user_agent(&client.user_agent),
+        state.client_classifier.classify(&client.user_agent),
+        model,
         u64::from(metrics.prompt_tokens),
         u64::from(metrics.completion_tokens),
         total_tokens_all,
     );
-    if metrics.ttft_ms > 0 {
+    if metrics.upstream_ttft_ms > 0 {
         state.metrics.record_request_ttft(
             LatencyLabels {
                 endpoint: "/v1/messages",
@@ -2468,7 +2815,7 @@ fn emit_anthropic_usage_event(
                 status: status_code,
                 streaming: true,
             },
-            Duration::from_millis(u64::from(metrics.ttft_ms)),
+            Duration::from_millis(u64::from(metrics.upstream_ttft_ms)),
         );
         state.metrics.record_time_to_first_token(
             UsageLabels {
@@ -2484,7 +2831,7 @@ fn emit_anthropic_usage_event(
                 user_id: user_id.unwrap_or("unknown"),
                 user_name: user_name.unwrap_or("unknown"),
             },
-            Duration::from_millis(u64::from(metrics.ttft_ms)),
+            Duration::from_millis(u64::from(metrics.upstream_ttft_ms)),
         );
     }
 }
@@ -2519,16 +2866,38 @@ struct AnthropicStreamUsage {
     completion_tokens: u32,
     cache_creation_tokens: u32,
     cache_read_tokens: u32,
+    /// True once a `message_delta` carried a numeric `output_tokens`.
+    /// Without it, `completion_tokens` holds only the `message_start`
+    /// placeholder floor (often 1) — the token-estimation fallback
+    /// treats that floor as "missing" so an aborted stream estimates
+    /// from the delivered text instead of recording the placeholder.
+    output_tokens_from_delta: bool,
+    /// True when `AnthropicStreamGuard::drop` filled any token counter
+    /// from the local estimator (AISIX-Cloud#1074).
+    usage_estimated: bool,
     provider_request_id: String,
     provider_model_version: String,
     finish_reason: String,
-    ttft_ms: u32,
+    /// Attempt-scoped time to the upstream's first content frame.
+    upstream_ttft_ms: u32,
+    /// Request-scoped time until the caller got its first response
+    /// bytes. Trails `upstream_ttft_ms` by whatever the gateway did
+    /// in between — most visibly a hold-back output guardrail.
+    downstream_latency_ms: u32,
     /// Count of upstream byte-chunks actually delivered to the client
     /// (read by the Drop guard for the #419 cost-leak gate).
     chunks_delivered: u32,
     /// Assistant text accumulated from `content_block_delta` frames, for
     /// the end-of-stream output guardrail (#448).
     response_text: String,
+    /// Generated output (text + thinking + tool name/arguments)
+    /// accumulated for the token-estimation fallback (AISIX-Cloud#1074).
+    /// Separate from `response_text`, which belongs to the guardrail
+    /// scan: the scan `take`s that buffer (so estimation would read "")
+    /// and pads it with newline separators (which inflate per-frame
+    /// counts). Bounded to `token_estimate::OUTPUT_ACCUMULATION_CAP`;
+    /// never leaves the process.
+    est_output_text: String,
     /// Per-detector PII mask counts applied to the held stream at release
     /// (#932). Merged with the input-side counts by the on_complete emit.
     redacted_entity_counts: crate::redact::RedactionCounts,
@@ -2539,12 +2908,14 @@ struct AnthropicStreamUsage {
 }
 
 /// Update the accumulator from one parsed SSE `data:` JSON object.
-/// Best-effort: unrecognised `type` values are ignored. `started` +
-/// `first_token_seen` drive the TTFT measurement (first content frame).
+/// Best-effort: unrecognised `type` values are ignored. The TTFT
+/// measurement (first content frame) is driven by `attempt_started` and
+/// `first_token_seen`, and is attempt-scoped — see
+/// `UsageEvent::upstream_ttft_ms`.
 fn update_anthropic_usage(
     acc: &mut AnthropicStreamUsage,
     json: &Value,
-    started: Instant,
+    attempt_started: Instant,
     first_token_seen: &mut bool,
 ) {
     match json.get("type").and_then(Value::as_str) {
@@ -2582,7 +2953,8 @@ fn update_anthropic_usage(
             // First content frame → record time-to-first-token.
             if !*first_token_seen {
                 *first_token_seen = true;
-                acc.ttft_ms = started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+                acc.upstream_ttft_ms =
+                    attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
             }
             // Accumulate assistant output for the end-of-stream output
             // guardrail (#448). text streams as `delta.text`; tool_use
@@ -2610,12 +2982,34 @@ fn update_anthropic_usage(
                     }
                 }
             }
+            // Token-estimation accumulator (AISIX-Cloud#1074): raw
+            // concatenation (no separators — a separator per frame would
+            // inflate the count), plus `thinking` deltas, which are
+            // billed output but out of guardrail scope.
+            {
+                use crate::token_estimate::push_capped;
+                if let Some(delta) = json.get("delta") {
+                    for key in ["text", "thinking", "partial_json"] {
+                        if let Some(t) = delta.get(key).and_then(Value::as_str) {
+                            push_capped(&mut acc.est_output_text, t);
+                        }
+                    }
+                }
+                if let Some(name) = json
+                    .get("content_block")
+                    .and_then(|cb| cb.get("name"))
+                    .and_then(Value::as_str)
+                {
+                    push_capped(&mut acc.est_output_text, name);
+                }
+            }
         }
         Some("message_delta") => {
             if let Some(usage) = json.get("usage") {
                 if let Some(v) = usage.get("output_tokens") {
                     if let Some(t) = v.as_u64() {
                         acc.completion_tokens = acc.completion_tokens.max(t as u32);
+                        acc.output_tokens_from_delta = true;
                     } else {
                         // PR #436 audit LOW-1: a `usage` object present but
                         // with a non-numeric `output_tokens` leaves
@@ -2667,7 +3061,7 @@ fn update_anthropic_usage(
 fn drain_anthropic_sse_frames(
     buf: &mut Vec<u8>,
     acc: &mut AnthropicStreamUsage,
-    started: Instant,
+    attempt_started: Instant,
     first_token_seen: &mut bool,
 ) {
     // SSE event delimiter is a blank line. Anthropic emits `\n\n`;
@@ -2676,7 +3070,7 @@ fn drain_anthropic_sse_frames(
         let frame: Vec<u8> = buf.drain(..end).collect();
         if let Some(data) = extract_sse_data_line(&frame) {
             if let Ok(json) = serde_json::from_slice::<Value>(data) {
-                update_anthropic_usage(acc, &json, started, first_token_seen);
+                update_anthropic_usage(acc, &json, attempt_started, first_token_seen);
             }
         }
     }
@@ -2730,6 +3124,10 @@ pub(crate) fn extract_sse_data_line(frame: &[u8]) -> Option<&[u8]> {
 struct AnthropicStreamGuard<F: FnOnce(AnthropicStreamUsage)> {
     slot: Option<(F, AnthropicStreamUsage)>,
     delivered: Arc<AtomicU32>,
+    /// Token-estimation fallback (AISIX-Cloud#1074): fills counters the
+    /// upstream never reported. Prompt from the captured request body,
+    /// completion from the accumulated `response_text`.
+    estimator: Option<crate::token_estimate::Estimator>,
 }
 
 impl<F: FnOnce(AnthropicStreamUsage)> AnthropicStreamGuard<F> {
@@ -2755,6 +3153,30 @@ impl<F: FnOnce(AnthropicStreamUsage)> Drop for AnthropicStreamGuard<F> {
                 usage.completion_tokens = 0;
                 usage.cache_creation_tokens = 0;
                 usage.cache_read_tokens = 0;
+            }
+            // Token-estimation fallback (AISIX-Cloud#1074), after the #419
+            // gate. A floor-only completion count (message_start placeholder,
+            // no message_delta) is treated as missing so an aborted stream
+            // estimates from the delivered text; max() keeps the floor when
+            // the estimate has nothing to add.
+            if let Some(est) = self.estimator.take() {
+                let upstream_completion = if usage.output_tokens_from_delta {
+                    usage.completion_tokens
+                } else {
+                    0
+                };
+                let output = (delivered > 0).then_some(usage.est_output_text.as_str());
+                let filled = crate::token_estimate::fill_missing(
+                    &est,
+                    usage.prompt_tokens,
+                    upstream_completion,
+                    output,
+                );
+                if filled.estimated {
+                    usage.prompt_tokens = filled.prompt_tokens;
+                    usage.completion_tokens = filled.completion_tokens.max(usage.completion_tokens);
+                    usage.usage_estimated = true;
+                }
             }
             f(usage);
         }
@@ -2787,14 +3209,23 @@ impl<T> Stream for AnthropicDeliveryCounter<T> {
 /// in-flight and `on_complete` fires once at end-of-stream (or
 /// client-disconnect) with the accumulated counts. Bytes are forwarded
 /// verbatim — the client sees the exact upstream SSE wire shape.
+#[allow(clippy::too_many_arguments)]
 fn build_anthropic_passthrough_stream<S, F>(
     upstream: S,
+    // Request clock — what the CALLER waited for
+    // (`downstream_latency_ms`), spanning every earlier attempt.
     started: Instant,
+    // Attempt clock — how the UPSTREAM behaved on this call
+    // (`upstream_ttft_ms`).
+    attempt_started: Instant,
     output_guardrail: Option<std::sync::Arc<aisix_guardrails::GuardrailChain>>,
     model_label: String,
     // When `Some`, the assembled `response_text` is preserved (not taken by the
     // guardrail scan) so the on_complete content capture can read it.
     content_cap: Option<u32>,
+    // Token-estimation fallback context (AISIX-Cloud#1074); see
+    // `AnthropicStreamGuard::estimator`.
+    estimator: Option<crate::token_estimate::Estimator>,
     on_complete: F,
 ) -> AnthropicDeliveryCounter<reqwest::Result<Bytes>>
 where
@@ -2822,6 +3253,7 @@ where
         let mut guard = AnthropicStreamGuard {
             slot: Some((on_complete, AnthropicStreamUsage::default())),
             delivered: delivered_for_drop,
+            estimator,
         };
         futures::pin_mut!(upstream);
         let mut buf: Vec<u8> = Vec::new();
@@ -2837,7 +3269,7 @@ where
                 drain_anthropic_sse_frames(
                     &mut buf,
                     guard.usage(),
-                    started,
+                    attempt_started,
                     &mut first_token_seen,
                 );
                 // Bound the frame buffer (PR #436 audit MEDIUM-2). The
@@ -2886,6 +3318,10 @@ where
             // hold-back mode an Err lands here too: it is forwarded and
             // the held (unscanned) content is dropped — fail closed.
             let errored = item.is_err();
+            if !errored && guard.usage().downstream_latency_ms == 0 {
+                guard.usage().downstream_latency_ms =
+                    started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+            }
             yield item;
             if errored && hold_policy.is_some() {
                 return;
@@ -3002,9 +3438,17 @@ where
                         &mut guard.usage().redacted_entity_counts,
                         counts,
                     );
+                    if guard.usage().downstream_latency_ms == 0 {
+                        guard.usage().downstream_latency_ms =
+                            started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+                    }
                     yield Ok(Bytes::from(rewritten));
                 }
                 None => {
+                    if guard.usage().downstream_latency_ms == 0 {
+                        guard.usage().downstream_latency_ms =
+                            started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+                    }
                     yield Ok(Bytes::from(std::mem::take(&mut held)));
                 }
             }
@@ -3012,11 +3456,16 @@ where
         // guard drops here → on_complete fires (delivery-gated).
     };
     AnthropicDeliveryCounter {
-        inner: Box::pin(inner),
+        // Re-attach the request span: the body is polled after the
+        // request-id middleware returns, so the end-of-stream
+        // output-guardrail check would otherwise log without a
+        // `request_id` (AISIX-Cloud#1060).
+        inner: Box::pin(crate::request_id::in_request_span(inner)),
         delivered,
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_access_log(
     model: &str,
     provider: &str,
@@ -3025,7 +3474,15 @@ fn emit_access_log(
     latency: Duration,
     request_id: &str,
     routing: &RoutingTelemetry,
+    error: Option<&ProxyError>,
 ) {
+    let (error_kind, error) = match error {
+        Some(e) => {
+            let (kind, msg) = crate::attempt::access_log_error(e);
+            (Some(kind), Some(msg))
+        }
+        None => (None, None),
+    };
     // Per #655 the access log stays ONE line per request, carrying the
     // user-perceived `latency` + final status plus a routing summary; the
     // per-attempt detail lives in telemetry.
@@ -3054,6 +3511,8 @@ fn emit_access_log(
             0 => None,
             n => Some(n),
         },
+        error_kind,
+        error: error.as_deref(),
     }
     .emit();
 }
@@ -3275,7 +3734,7 @@ mod tests {
     //
     // Issue refs: ai-gateway#335 (`apply_param_constraints` not wired
     // on /v1/messages), ai-gateway#337 (same gap for
-    // `apply_default_headers`). Same site / same fix covers
+    // `apply_request_headers`). Same site / same fix covers
     // `param_renames` and `default_body_fields`.
 
     /// Build an Anthropic ProviderKey JSON with the given request
@@ -3463,7 +3922,7 @@ mod tests {
     #[tokio::test]
     async fn anthropic_passthrough_default_headers_cannot_overwrite_x_api_key() {
         // Defense-in-depth: `x-api-key` is in
-        // `aisix_provider_openai::overrides::RESERVED_DEFAULT_HEADERS`
+        // `aisix_gateway::upstream_headers::RESERVED_UPSTREAM_HEADERS`
         // — even if cp-api validation slips and lets the operator
         // register a default_headers entry with `x-api-key`, the apply
         // function MUST drop it so the PK's secret remains the auth
@@ -3808,7 +4267,7 @@ data: [DONE]\n\n";
         assert_eq!(event.provider_model_version, "gpt-4o-2024-08-06");
         assert_eq!(event.finish_reason, "stop");
         assert!(
-            event.ttft_ms > 0,
+            event.upstream_ttft_ms > 0,
             "streaming /v1/messages telemetry must record TTFT"
         );
         assert!(rx.try_recv().is_err(), "usage event should be emitted once");
@@ -4250,7 +4709,7 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
         assert_eq!(event.finish_reason, "end_turn");
         assert_eq!(event.status_code, 200);
         assert!(
-            event.ttft_ms > 0,
+            event.upstream_ttft_ms > 0,
             "streaming /v1/messages telemetry must record TTFT",
         );
         assert!(rx.try_recv().is_err(), "usage event should be emitted once");
@@ -4418,6 +4877,7 @@ event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"
                         usage,
                     )),
                     delivered,
+                    estimator: None,
                 };
                 drop(guard);
             }
@@ -4455,6 +4915,145 @@ event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"
             "completion kept when delivered>0"
         );
         assert_eq!(out.chunks_delivered, 5);
+    }
+
+    /// AISIX-Cloud#1074: the passthrough guard's estimation fallback and
+    /// its `message_start` floor normalization. The floor (a placeholder
+    /// `output_tokens`, often 1, with no `message_delta` ever arriving)
+    /// must count as "missing" so an aborted stream estimates from the
+    /// delivered text — but a real `message_delta` count must win
+    /// untouched, and an empty estimate must not clobber the floor.
+    #[test]
+    fn stream_guard_estimates_missing_usage_with_floor_normalization() {
+        use super::{AnthropicStreamGuard, AnthropicStreamUsage, AtomicU32};
+        use std::sync::{Arc, Mutex};
+
+        fn drop_with_estimator(
+            usage: AnthropicStreamUsage,
+            delivered_count: u32,
+        ) -> AnthropicStreamUsage {
+            let captured: Arc<Mutex<Option<AnthropicStreamUsage>>> = Arc::new(Mutex::new(None));
+            let cap = captured.clone();
+            let delivered = Arc::new(AtomicU32::new(delivered_count));
+            let body = serde_json::json!({
+                "model": "relay-claude",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "Hello"}]
+            });
+            {
+                let guard = AnthropicStreamGuard {
+                    slot: Some((
+                        move |u: AnthropicStreamUsage| {
+                            *cap.lock().unwrap() = Some(u);
+                        },
+                        usage,
+                    )),
+                    delivered,
+                    estimator: Some(crate::token_estimate::Estimator::new(
+                        "relay-claude",
+                        crate::token_estimate::PromptInput::Anthropic(body),
+                    )),
+                };
+                drop(guard);
+            }
+            let out = captured.lock().unwrap().take().expect("on_complete fired");
+            out
+        }
+
+        // Expected prompt for one user message "Hello" (cl100k fallback):
+        // 3 per-message + "user" (1) + "Hello" (1) + 3 reply priming = 8.
+        // Floor-only (message_start placeholder, no message_delta) with
+        // delivered text: the floor counts as missing, the estimate wins.
+        let out = drop_with_estimator(
+            AnthropicStreamUsage {
+                completion_tokens: 1,
+                output_tokens_from_delta: false,
+                est_output_text: "Hello world".into(),
+                ..Default::default()
+            },
+            3,
+        );
+        assert_eq!(out.prompt_tokens, 8);
+        assert_eq!(out.completion_tokens, 2, "estimate supersedes the floor");
+        assert!(out.usage_estimated);
+
+        // Floor-only with NO delivered text: nothing to estimate on the
+        // completion side — the floor is retained, prompt still fills.
+        let out = drop_with_estimator(
+            AnthropicStreamUsage {
+                completion_tokens: 1,
+                output_tokens_from_delta: false,
+                ..Default::default()
+            },
+            3,
+        );
+        assert_eq!(out.prompt_tokens, 8);
+        assert_eq!(out.completion_tokens, 1, "empty estimate keeps the floor");
+        assert!(out.usage_estimated, "prompt side was estimated");
+
+        // Real message_delta count: upstream wins untouched, unflagged.
+        let out = drop_with_estimator(
+            AnthropicStreamUsage {
+                prompt_tokens: 37,
+                completion_tokens: 52,
+                output_tokens_from_delta: true,
+                est_output_text: "Hello world".into(),
+                ..Default::default()
+            },
+            3,
+        );
+        assert_eq!(out.prompt_tokens, 37);
+        assert_eq!(out.completion_tokens, 52);
+        assert!(!out.usage_estimated);
+    }
+
+    /// AISIX-Cloud#1074: the non-streaming fill helper and its output
+    /// extraction — zero counters fill from the estimator and flag the
+    /// metrics; upstream-reported counters stay untouched. The output
+    /// extractor covers text + thinking + tool_use name/input.
+    #[test]
+    fn fill_missing_anthropic_metrics_fills_zeros_only() {
+        use super::{
+            anthropic_estimation_output_text, fill_missing_anthropic_metrics, AnthropicUsageMetrics,
+        };
+
+        let body = serde_json::json!({
+            "model": "relay-claude",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "Hello"}]
+        });
+        let resp = serde_json::json!({
+            "content": [
+                {"type": "text", "text": "Hello"},
+                {"type": "thinking", "thinking": " world"},
+                {"type": "tool_use", "id": "tu_1", "name": "f", "input": {}}
+            ]
+        });
+        // Output extraction: text + thinking + tool name + input JSON.
+        let text = anthropic_estimation_output_text(&resp);
+        assert_eq!(text, "Hello worldf{}");
+
+        // Both sides missing → both fill, flagged. Prompt = 8 (see the
+        // floor test above for the arithmetic).
+        let mut m = AnthropicUsageMetrics::default();
+        fill_missing_anthropic_metrics(&mut m, "relay-claude", &body, || {
+            anthropic_estimation_output_text(&resp)
+        });
+        assert_eq!(m.prompt_tokens, 8);
+        assert!(m.completion_tokens > 0);
+        assert!(m.usage_estimated);
+
+        // Upstream-reported → untouched, unflagged, extractor never runs.
+        let mut m = AnthropicUsageMetrics {
+            prompt_tokens: 11,
+            completion_tokens: 7,
+            ..Default::default()
+        };
+        fill_missing_anthropic_metrics(&mut m, "relay-claude", &body, || {
+            panic!("output extractor must not run when usage is complete")
+        });
+        assert_eq!((m.prompt_tokens, m.completion_tokens), (11, 7));
+        assert!(!m.usage_estimated);
     }
 
     /// Helper for the streaming variants of (Anthropic inbound) ×

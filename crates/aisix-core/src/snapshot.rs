@@ -108,6 +108,38 @@ impl<T: Resource> ResourceTable<T> {
     pub fn entries(&self) -> Vec<Arc<ResourceEntry<T>>> {
         self.by_id.iter().map(|kv| kv.value().clone()).collect()
     }
+
+    /// True when any entry satisfies `pred`, without materialising the
+    /// table into a `Vec`. Cheaper than `entries().iter().any(...)` on the
+    /// hot path (no allocation, no per-row `Arc` clone). A DashMap shard
+    /// guard is held during the scan, so `pred` must not call back into
+    /// this table.
+    pub fn any(&self, pred: impl Fn(&ResourceEntry<T>) -> bool) -> bool {
+        self.by_id.iter().any(|kv| pred(kv.value()))
+    }
+
+    /// The single entry satisfying `pred`, without materialising the
+    /// table. Returns `(None, true)` when more than one entry matches so
+    /// the caller can fail closed on an ambiguous lookup and log the
+    /// misconfiguration — a security-sensitive resolver must never pick
+    /// one of several matches silently. `(Some(_), false)` on exactly
+    /// one match; `(None, false)` on none.
+    pub fn find_unique_by(
+        &self,
+        pred: impl Fn(&ResourceEntry<T>) -> bool,
+    ) -> (Option<Arc<ResourceEntry<T>>>, bool) {
+        let mut found: Option<Arc<ResourceEntry<T>>> = None;
+        for kv in self.by_id.iter() {
+            if !pred(kv.value()) {
+                continue;
+            }
+            if found.is_some() {
+                return (None, true);
+            }
+            found = Some(kv.value().clone());
+        }
+        (found, false)
+    }
 }
 
 /// Handle consumers clone to reach the current snapshot.

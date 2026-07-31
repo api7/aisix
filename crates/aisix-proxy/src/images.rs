@@ -11,7 +11,7 @@
 //! 8. Providers that don't support image generation return 501.
 
 use aisix_core::AppliedGuardrail;
-use aisix_gateway::{BridgeContext, BridgeError};
+use aisix_gateway::BridgeError;
 use aisix_obs::{content_capture_cap, AccessLog, CapturedContent, RequestOutcome, UsageEvent};
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -66,8 +66,20 @@ pub async fn image_generations(
     State(state): State<ProxyState>,
     auth: AuthenticatedKey,
     client: ClientContext,
-    Json(body): Json<Value>,
+    // Result-wrapped so an extractor-layer 413 maps to the OpenAI
+    // envelope — see completions.rs.
+    body: Result<Json<Value>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
+    let Json(body) = match body {
+        Ok(json) => json,
+        Err(rej) => {
+            return crate::error::proxy_error_from_json_rejection(
+                rej,
+                state.request_body_limit_bytes,
+            )
+            .into_response();
+        }
+    };
     let started = Instant::now();
     let request_id = client.request_id.clone();
     let api_key_id = auth.entry.id.clone();
@@ -77,7 +89,7 @@ pub async fn image_generations(
         .unwrap_or("unknown")
         .to_string();
 
-    match dispatch(&state, &auth, body, &request_id, &client.source_ip).await {
+    match dispatch(&state, &auth, body, &request_id, &client).await {
         Ok(success) => {
             let elapsed = started.elapsed();
             emit_access_log(
@@ -87,6 +99,7 @@ pub async fn image_generations(
                 200,
                 elapsed,
                 &request_id,
+                None,
             );
             state.metrics.record_request(
                 &success.provider,
@@ -136,6 +149,7 @@ pub async fn image_generations(
                 status,
                 elapsed,
                 &request_id,
+                Some(&err),
             );
             let snap = state.snapshot.load();
             let metric_model = crate::usage_attr::metric_model_label(&snap, &model_name);
@@ -180,7 +194,7 @@ async fn dispatch(
     auth: &AuthenticatedKey,
     mut body: Value,
     request_id: &str,
-    source_ip: &str,
+    client_ctx: &ClientContext,
 ) -> Result<ImageDispatchSuccess, ProxyError> {
     // Owned so the #696 in-place prompt masking below can borrow `body`
     // mutably.
@@ -201,7 +215,7 @@ async fn dispatch(
     }
 
     // Client-IP allowlist gate (#557): reject before guardrails / upstream.
-    crate::dispatch::check_ip_access(&model_entry.value, source_ip)?;
+    crate::dispatch::check_ip_access(&model_entry.value, &client_ctx.source_ip)?;
 
     // #545: /v1/images/generations must run input guardrails. Before this it
     // forwarded the user `prompt` with no configured content/DLP check, so a
@@ -291,17 +305,34 @@ async fn dispatch(
     let bridge = crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value)
         .ok_or(ProxyError::ProviderUnavailable)?;
 
-    let model_arc = Arc::new(model.clone());
-    let pk_arc = Arc::new(pk_entry.value.clone());
     // #554: apply the configured request `timeout` as the upstream deadline.
-    let mut ctx = BridgeContext::new(request_id, model_arc, pk_arc);
-    if let Some(d) = model.request_timeout() {
+    let mut ctx = crate::dispatch::bridge_ctx(
+        request_id,
+        &model_entry.id,
+        Arc::new(model.clone()),
+        &pk_entry.id,
+        Arc::new(pk_entry.value.clone()),
+        Some(client_ctx),
+    );
+    if let Some(d) = crate::routing::effective_timeouts(model, None, state.default_timeouts).request
+    {
         ctx = ctx.with_deadline(d);
     }
 
     let provider_label = provider.to_ascii_lowercase();
 
-    match bridge.generate_image(&body, &ctx).await {
+    // #701: per-attempt cooldown accounting — see completions.rs.
+    let tracker = &state.runtime_status;
+    let cooldown_model_id: &str = &model_entry.id;
+    let cooldown_cfg = model.cooldown.as_ref();
+    match crate::routing::retrying_dispatch(state, model, "/v1/images/generations", || async {
+        bridge
+            .generate_image(&body, &ctx)
+            .await
+            .map_err(|e| crate::cooldown::note_failure(tracker, cooldown_model_id, cooldown_cfg, e))
+    })
+    .await
+    {
         Ok(resp_json) => {
             // #701: clear any cooldown/unhealthy mark now the upstream
             // answered — same recovery signal as rerank/audio/chat.
@@ -361,16 +392,7 @@ async fn dispatch(
         }
         Err(e) => {
             reservation.commit_tokens(0).await;
-            // #701: mark the failure on the runtime status so the cooldown /
-            // circuit-breaker sees flapping upstreams reached only via this
-            // endpoint — same policy as rerank/audio/chat. `note_failure` is
-            // a no-op for non-triggering categories (e.g. Config errors).
-            let e = crate::cooldown::note_failure(
-                &state.runtime_status,
-                &model_entry.id,
-                model.cooldown.as_ref(),
-                e,
-            );
+            // Cooldown was already noted per attempt inside the retry loop.
             Err(ProxyError::Bridge(e))
         }
     }
@@ -434,7 +456,10 @@ fn emit_usage_event(
         requested_model: requested_model.to_string(),
         prompt_tokens,
         completion_tokens,
-        latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
+        // Single-attempt endpoint: the attempt spans the whole request, so
+        // the upstream figure and what the caller waited for coincide.
+        upstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
+        downstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
         status_code,
         inbound_protocol: "openai".to_string(),
         applied_guardrails: applied_guardrails.to_vec(),
@@ -460,7 +485,15 @@ fn emit_access_log(
     status: u16,
     latency: Duration,
     request_id: &str,
+    error: Option<&ProxyError>,
 ) {
+    let (error_kind, error) = match error {
+        Some(e) => {
+            let (kind, msg) = crate::attempt::access_log_error(e);
+            (Some(kind), Some(msg))
+        }
+        None => (None, None),
+    };
     AccessLog {
         method: "POST",
         path: "/v1/images/generations",
@@ -476,6 +509,8 @@ fn emit_access_log(
         served_by_model: None,
         routing_attempt_count: None,
         routing_fallback_count: None,
+        error_kind,
+        error: error.as_deref(),
     }
     .emit();
 }

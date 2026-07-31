@@ -123,9 +123,12 @@ impl PresidioGuardrail {
         entity_actions: BTreeMap<String, PiiAction>,
         operator: serde_json::Value,
     ) -> Self {
-        let client = reqwest::Client::builder()
+        // Same connection-layer settings as every provider call: a bound
+        // connect phase, TCP keepalive on, and pooled connections expired
+        // before a hop in front of the guardrail service reaps them.
+        let client = aisix_gateway::client_builder()
             .build()
-            .expect("reqwest::Client::builder() failed; this should never happen");
+            .expect("guardrail http client builds");
         Self {
             row_name: row_name.into(),
             analyzer_url: cfg.analyzer_url.trim_end_matches('/').to_owned(),
@@ -216,10 +219,12 @@ impl PresidioGuardrail {
         if !status.is_success() {
             // 4xx other than 429 — almost always a misconfiguration
             // (bad URL path, unsupported language, malformed entity list).
+            let response_body = crate::read_error_body_capped(resp).await;
             tracing::error!(
                 row = %self.row_name,
                 http_status = status.as_u16(),
                 url = %url,
+                response_body = %response_body,
                 "presidio returned 4xx — check analyzer_url/anonymizer_url, language, and entities configuration",
             );
             return Err(PresidioFailure::ConfigError);

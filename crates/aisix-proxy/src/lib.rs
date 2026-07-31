@@ -44,6 +44,7 @@ pub mod health;
 mod http_client;
 mod images;
 mod jobs;
+mod jwt;
 mod mcp;
 mod messages;
 mod model_resolve;
@@ -59,10 +60,13 @@ mod responses;
 mod responses_bridge;
 mod routing;
 mod semantic;
+pub mod sse_keepalive;
 mod state;
 mod stream_timeout;
+mod token_estimate;
 mod usage_attr;
 mod util;
+mod videos;
 
 pub use auth::AuthenticatedKey;
 pub use error::{ErrorEnvelope, ProxyError};
@@ -111,6 +115,13 @@ pub fn build_router(state: ProxyState) -> Router {
         .route("/v1/audio/transcriptions", post(audio::transcriptions))
         .route("/v1/audio/translations", post(audio::translations))
         .route("/v1/audio/speech", post(audio::speech))
+        // Unified video-generation surface (AISIX-Cloud#1118 Phase 1):
+        // submit → poll → fetch. Auth/ACL/quota enforced inside the
+        // handlers; the GET routes are exempt from model-level rate
+        // limits by design (see videos.rs).
+        .route("/v1/videos", post(videos::create_video))
+        .route("/v1/videos/:id", get(videos::get_video))
+        .route("/v1/videos/:id/content", get(videos::video_content))
         // OpenAI Realtime WebSocket relay (#721). Auth/ACL/quota are
         // enforced pre-upgrade inside the handler.
         .route("/v1/realtime", get(realtime::realtime))
@@ -166,7 +177,14 @@ pub fn build_router(state: ProxyState) -> Router {
         // catches the Content-Length-known case ahead of the
         // extractor; this layer catches chunked / size-mismatched
         // bodies once their actual byte count exceeds the cap.
-        .layer(axum::extract::DefaultBodyLimit::max(body_limit))
+        // `0` = no cap — `disable()` rather than omitting the layer,
+        // because omitting it would fall back to axum's 2 MiB, not to
+        // "unlimited".
+        .layer(if body_limit > 0 {
+            axum::extract::DefaultBodyLimit::max(body_limit)
+        } else {
+            axum::extract::DefaultBodyLimit::disable()
+        })
         .layer(middleware::from_fn_with_state(
             state.clone(),
             enforce_request_body_limit,
@@ -351,11 +369,14 @@ async fn enforce_request_body_limit(
             "conflicting Content-Length headers".into(),
         ));
     }
+    // `0` = the cap is disabled; the duplicate-Content-Length rejection
+    // above still applies — that one is request-smuggling hygiene, not a
+    // size limit.
     if let Some(declared) = first
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<usize>().ok())
     {
-        if declared > state.request_body_limit_bytes {
+        if state.request_body_limit_bytes > 0 && declared > state.request_body_limit_bytes {
             // Drain the inbound body so hyper can flush the 413 response
             // on the same HTTP/1.1 connection. Without this, hyper closes
             // the socket while the client is still writing, and the client
@@ -930,6 +951,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn readyz_503s_when_the_config_probe_reports_no_apply_yet() {
+        // Pins the config_apply_age plumbing through the router: a wired
+        // probe reporting "no apply yet" must gate readiness with a 503.
+        // Without this, dropping the probe wiring would leave readyz
+        // reporting `[+]config ok` unconditionally (the field-None path),
+        // byte-identical to wired-and-fresh — a silent downgrade of
+        // readiness to shutdown-only that no other test would notice.
+        let hub = Arc::new(Hub::new());
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
+        let state = build_state(snap, hub).with_config_apply_age(Arc::new(|| None));
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/readyz?verbose")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(text.contains("[-]config failed: not ready"));
+    }
+
+    #[tokio::test]
+    async fn readyz_stays_200_when_no_config_event_has_arrived_in_hours() {
+        // A gateway whose environment is not changing receives no config
+        // events, so the apply age grows without bound while the gateway is
+        // perfectly healthy. Readiness must not read that as a fault: it
+        // used to 503 past five minutes, which emptied the Kubernetes
+        // Service of every replica once a deployment went idle.
+        let hub = Arc::new(Hub::new());
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
+        let state = build_state(snap, hub)
+            .with_config_apply_age(Arc::new(|| Some(std::time::Duration::from_secs(7200))));
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/readyz?verbose")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(text.contains("[+]config ok"));
+    }
+
+    #[tokio::test]
     async fn health_route_is_not_found() {
         let hub = Arc::new(Hub::new());
         let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
@@ -1371,6 +1444,273 @@ mod tests {
         assert!(
             message.contains("Content-Length"),
             "smuggling-rejection message should mention Content-Length; got {message:?}"
+        );
+    }
+
+    fn build_state_with_limit(snapshot: AisixSnapshot, hub: Arc<Hub>, limit: usize) -> ProxyState {
+        let handle = SnapshotHandle::new(snapshot);
+        let cfg = ProxyConfig {
+            addr: "127.0.0.1:0".into(),
+            request_body_limit_bytes: limit,
+            real_ip: Default::default(),
+            tls: None,
+        };
+        ProxyState::new(handle, hub, &cfg).without_cache()
+    }
+
+    /// `request_body_limit_bytes: 0` (the default) disables the cap
+    /// entirely. The load-bearing detail is axum's BUILT-IN 2 MiB
+    /// `DefaultBodyLimit`: merely skipping our `max(limit)` layer would
+    /// still reject bodies over 2 MiB with a stock rejection, so the
+    /// router must install `DefaultBodyLimit::disable()`. A 2.5 MiB body
+    /// — over axum's built-in cap — must reach the handler on both the
+    /// declared-Content-Length path and the chunked path.
+    #[tokio::test]
+    async fn zero_limit_admits_bodies_over_axums_builtin_cap() {
+        let hub = Arc::new(Hub::new());
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
+        let app = build_router(build_state_with_limit(snap, hub, 0));
+
+        let filler = "x".repeat(2 * 1024 * 1024 + 512 * 1024); // 2.5 MiB
+        let body =
+            format!(r#"{{"model":"my-gpt4","messages":[{{"role":"user","content":"{filler}"}}]}}"#);
+
+        // Declared Content-Length path (the middleware's early check).
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .header("content-length", body.len().to_string())
+            .body(Body::from(body.clone()))
+            .unwrap();
+        let resp = run(app.clone(), req).await;
+        assert_ne!(
+            resp.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "limit 0 must not reject on declared size"
+        );
+        // The body parsed and dispatch ran (and failed on the unusable
+        // upstream) — proving the request got PAST the extractor.
+        assert!(
+            resp.status().is_server_error(),
+            "expected an upstream dispatch failure, got {}",
+            resp.status()
+        );
+
+        // Chunked path (no Content-Length): this is the one axum's
+        // built-in 2 MiB default would kill without `disable()`.
+        let chunks: Vec<_> = body
+            .into_bytes()
+            .chunks(200 * 1024)
+            .map(|c| c.to_vec())
+            .collect();
+        let stream = futures::stream::iter(chunks.into_iter().map(Ok::<_, std::io::Error>));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from_stream(stream))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_ne!(
+            resp.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "limit 0 must not cap a chunked body at axum's 2 MiB default"
+        );
+        assert!(resp.status().is_server_error());
+    }
+
+    /// The duplicate-Content-Length rejection is smuggling hygiene, not
+    /// a size limit — it must keep firing when the cap is disabled.
+    #[tokio::test]
+    async fn zero_limit_still_rejects_duplicate_content_length() {
+        let hub = Arc::new(Hub::new());
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
+        let app = build_router(build_state_with_limit(snap, hub, 0));
+
+        let body = r#"{"model":"my-gpt4","messages":[{"role":"user","content":"hi"}]}"#;
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        req.headers_mut().append(
+            axum::http::header::CONTENT_LENGTH,
+            axum::http::HeaderValue::from(body.len()),
+        );
+        req.headers_mut().append(
+            axum::http::header::CONTENT_LENGTH,
+            axum::http::HeaderValue::from(body.len() + 1),
+        );
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Chunked oversize on a handler that used to take a bare
+    /// `Json<Value>` extractor: the rejection must be the OpenAI
+    /// envelope, not axum's stock `text/plain` 413. (The
+    /// Content-Length path was already correct via the middleware;
+    /// the chunked path leaked the stock rejection.)
+    #[tokio::test]
+    async fn chunked_oversize_on_v1_completions_returns_openai_envelope() {
+        let hub = Arc::new(Hub::new());
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
+        let app = build_router(build_state(snap, hub));
+
+        let chunk = vec![b'x'; 200 * 1024];
+        let stream =
+            futures::stream::iter((0..10).map(move |_| Ok::<_, std::io::Error>(chunk.clone())));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from_stream(stream))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes)
+            .expect("413 must carry the JSON envelope, not axum's text/plain rejection");
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+    }
+
+    /// Same contract for the raw-`Bytes` handlers (batches /
+    /// fine-tuning).
+    #[tokio::test]
+    async fn chunked_oversize_on_v1_batches_returns_openai_envelope() {
+        let hub = Arc::new(Hub::new());
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
+        let app = build_router(build_state(snap, hub));
+
+        let chunk = vec![b'x'; 200 * 1024];
+        let stream =
+            futures::stream::iter((0..10).map(move |_| Ok::<_, std::io::Error>(chunk.clone())));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/batches")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from_stream(stream))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes)
+            .expect("413 must carry the JSON envelope, not axum's text/plain rejection");
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+    }
+
+    /// Chunked oversize multipart upload: axum's `MultipartError`
+    /// classifies the cap hit as 413, and the handlers must preserve
+    /// that instead of folding every multipart error into 400.
+    #[tokio::test]
+    async fn chunked_oversize_multipart_returns_413_envelope() {
+        let hub = Arc::new(Hub::new());
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
+        let app = build_router(build_state(snap, hub));
+
+        let boundary = "aisix-test-boundary-413";
+        let mut body = Vec::new();
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; \
+                 filename=\"a.wav\"\r\nContent-Type: audio/wav\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend(vec![b'x'; 2 * 1024 * 1024]); // over the 1 MiB test cap
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let chunks: Vec<_> = body.chunks(200 * 1024).map(|c| c.to_vec()).collect();
+        let stream = futures::stream::iter(chunks.into_iter().map(Ok::<_, std::io::Error>));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/audio/transcriptions")
+            .header("authorization", "Bearer sk-caller")
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from_stream(stream))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        let message = v["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("limit"),
+            "413 message should reference the limit; got {message:?}"
+        );
+    }
+
+    /// The passthrough tunnel reads its body manually (`to_bytes`), so
+    /// the `0` sentinel has to be widened there too — this is the site
+    /// the first audit round caught unconverted, where every POST got
+    /// `413 request body exceeds 0-byte limit` on the new default.
+    #[tokio::test]
+    async fn zero_limit_passthrough_post_is_not_rejected() {
+        let hub = Arc::new(Hub::new());
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
+        let app = build_router(build_state_with_limit(snap, hub, 0));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/passthrough/openai/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"model":"gpt-4o","input":"hi"}"#))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_ne!(
+            resp.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "limit 0 must not reject the passthrough body"
+        );
+        // Past the body read; the dispatch then failed on the unusable
+        // upstream.
+        assert!(
+            resp.status().is_server_error(),
+            "expected an upstream dispatch failure, got {}",
+            resp.status()
+        );
+    }
+
+    /// With a configured cap, a chunked over-limit passthrough body is
+    /// a 413 in the envelope — and a transport fault stays a 400, no
+    /// longer mislabelled as `RequestTooLarge`.
+    #[tokio::test]
+    async fn chunked_oversize_on_passthrough_returns_openai_envelope() {
+        let hub = Arc::new(Hub::new());
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
+        let app = build_router(build_state(snap, hub));
+
+        let chunk = vec![b'x'; 200 * 1024];
+        let stream =
+            futures::stream::iter((0..10).map(move |_| Ok::<_, std::io::Error>(chunk.clone())));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/passthrough/openai/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from_stream(stream))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let v: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("413 must carry the JSON envelope");
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        let message = v["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("limit"),
+            "413 message should reference the limit; got {message:?}"
         );
     }
 
@@ -2536,6 +2876,319 @@ data: [DONE]\n\n"
         let body_bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
         assert_eq!(v["error"]["type"], "rate_limit_exceeded");
+    }
+
+    // ---- regression coverage for api7/AISIX-Cloud#1116 --------------
+    // Pre-fix the passthrough tunnel passed `None` to quota::enforce, so
+    // a Model's inline rate_limit (and model-scope policies) never
+    // applied to passthrough traffic — for provider endpoints with no
+    // typed surface (e.g. video generation) the model limit was
+    // unenforceable everywhere. Post-fix the top-level `model` field of
+    // a JSON passthrough body is matched against the addressed
+    // provider's configured Models and its limits reserved like the
+    // typed endpoints.
+
+    fn model_entry_with_rate_limit(
+        name: &str,
+        rate_limit: serde_json::Value,
+    ) -> ResourceEntry<Model> {
+        model_entry_named(name, "gpt-4o", rate_limit)
+    }
+
+    fn model_entry_named(
+        display_name: &str,
+        model_name: &str,
+        rate_limit: serde_json::Value,
+    ) -> ResourceEntry<Model> {
+        let cfg = format!(
+            r#"{{
+                "display_name": "{display_name}",
+                "provider": "openai",
+                "model_name": "{model_name}",
+                "provider_key_id": "{PK_ID}",
+                "rate_limit": {rate_limit}
+            }}"#
+        );
+        let model: Model = serde_json::from_str(&cfg).unwrap();
+        ResourceEntry::new("model-id-1", model, 1)
+    }
+
+    #[tokio::test]
+    async fn passthrough_enforces_model_rate_limit_from_body_model_field() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(
+                "/api/v1/services/aigc/video-generation/video-synthesis",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "output": {"task_id": "t-1", "task_status": "PENDING"}
+            })))
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry_with_rate_limit(
+            "my-video-model",
+            serde_json::json!({"rpm": 1}),
+        ));
+        snap.apikeys
+            .insert(apikey_entry("sk-caller", &["my-video-model"]));
+        let state = build_state(snap, hub);
+
+        let body = serde_json::json!({
+            "model": "my-video-model",
+            "input": {"prompt": "a cardboard city at night"},
+            "parameters": {"resolution": "720P"}
+        });
+        let make_req = || {
+            Request::builder()
+                .method("POST")
+                .uri("/passthrough/openai/api/v1/services/aigc/video-generation/video-synthesis")
+                .header("authorization", "Bearer sk-caller")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+
+        // First request consumes the model's only RPM slot.
+        let resp = run(build_router(state.clone()), make_req()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Pre-fix: 200 again (model layer skipped on passthrough).
+        // Post-fix: 429 — the body's `model` resolved the configured
+        // Model and its rpm=1 cap now gates the tunnel.
+        let resp = run(build_router(state.clone()), make_req()).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "passthrough must enforce the body model's rate limit (api7/AISIX-Cloud#1116)",
+        );
+        let body_bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(v["error"]["type"], "rate_limit_exceeded");
+    }
+
+    #[tokio::test]
+    async fn passthrough_unregistered_or_absent_body_model_keeps_key_layer_only() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/anything"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        // Model has rpm=1, but requests below never name it — its bucket
+        // must stay untouched. The API key carries rpm=2 to pin that the
+        // key layer still gates the tunnel (and 429s on the 3rd call).
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry_with_rate_limit(
+            "my-video-model",
+            serde_json::json!({"rpm": 1}),
+        ));
+        snap.apikeys.insert(apikey_entry_with_limits(
+            "sk-caller",
+            &["my-video-model"],
+            Some(serde_json::json!({"rpm": 2})),
+        ));
+        let state = build_state(snap, hub);
+
+        let make_req = |body: &'static str| {
+            Request::builder()
+                .method("POST")
+                .uri("/passthrough/openai/anything")
+                .header("authorization", "Bearer sk-caller")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap()
+        };
+
+        // Unregistered model name → no model-layer reservation, passes.
+        let resp = run(
+            build_router(state.clone()),
+            make_req(r#"{"model":"not-a-configured-model","input":"x"}"#),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Non-JSON body → tolerated, no model-layer reservation.
+        let resp = run(build_router(state.clone()), make_req("plain text body")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Third call trips the KEY-level rpm=2 — the request-level
+        // layers keep gating the tunnel exactly as before the fix.
+        let resp = run(
+            build_router(state.clone()),
+            make_req(r#"{"model":"not-a-configured-model","input":"x"}"#),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "key-level rate limit must keep applying to passthrough",
+        );
+    }
+
+    /// A `model`-scope RateLimitPolicy row (no inline rate_limit on the
+    /// Model) must gate the tunnel too — the policy path matches by the
+    /// resolved entry id, which is only exercised when the body model
+    /// lookup propagates it.
+    #[tokio::test]
+    async fn passthrough_enforces_model_scope_policy_from_body_model_field() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/anything"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("my-video-model"));
+        snap.rate_limit_policies.insert(ResourceEntry::new(
+            "pol-1",
+            serde_json::from_value(serde_json::json!({
+                "name": "video-cap",
+                "scope": "model",
+                "scope_ref": "model-id-1",
+                "window": "minute",
+                "max_requests": 1
+            }))
+            .unwrap(),
+            1,
+        ));
+        snap.apikeys
+            .insert(apikey_entry("sk-caller", &["my-video-model"]));
+        let state = build_state(snap, hub);
+
+        let make_req = || {
+            Request::builder()
+                .method("POST")
+                .uri("/passthrough/openai/anything")
+                .header("authorization", "Bearer sk-caller")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"model":"my-video-model","input":"x"}"#))
+                .unwrap()
+        };
+
+        let resp = run(build_router(state.clone()), make_req()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = run(build_router(state.clone()), make_req()).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "model-scope policy must gate passthrough via the body model",
+        );
+    }
+
+    /// The tunnel forwards bodies verbatim, so callers typically name the
+    /// provider-native id (`model_name`), not the gateway alias
+    /// (`display_name`). The limit must bind either way, and the bucket is
+    /// keyed by the alias so tunnel and typed traffic share one budget.
+    #[tokio::test]
+    async fn passthrough_matches_provider_native_model_name_for_rate_limit() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/anything"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry_named(
+            "ali-video-alias",
+            "happyhorse-1.1-t2v",
+            serde_json::json!({"rpm": 1}),
+        ));
+        snap.apikeys
+            .insert(apikey_entry("sk-caller", &["ali-video-alias"]));
+        let state = build_state(snap, hub);
+
+        // Caller names the upstream id, not the alias — the alias's cap
+        // must still bind.
+        let make_req = || {
+            Request::builder()
+                .method("POST")
+                .uri("/passthrough/openai/anything")
+                .header("authorization", "Bearer sk-caller")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"model":"happyhorse-1.1-t2v","input":"x"}"#))
+                .unwrap()
+        };
+
+        let resp = run(build_router(state.clone()), make_req()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = run(build_router(state.clone()), make_req()).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "provider-native model_name must resolve the Model's rate limit",
+        );
+    }
+
+    /// A same-named Model registered under a DIFFERENT provider must not
+    /// be charged for this tunnel's traffic: the body name only matches
+    /// within the addressed provider.
+    #[tokio::test]
+    async fn passthrough_same_named_model_of_other_provider_is_not_limited() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/anything"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = new_snap(&upstream.uri());
+        // Credential-lending model for the addressed provider — unlimited.
+        snap.models.insert(model_entry("openai-lender"));
+        // Same body-name model under another provider, rpm=1. Its bucket
+        // must stay untouched by /passthrough/openai traffic.
+        let cross: Model = serde_json::from_str(&format!(
+            r#"{{
+                "display_name": "cross-model",
+                "provider": "anthropic",
+                "model_name": "cross-model",
+                "provider_key_id": "{PK_ID}",
+                "rate_limit": {{"rpm": 1}}
+            }}"#
+        ))
+        .unwrap();
+        snap.models
+            .insert(ResourceEntry::new("model-id-cross", cross, 1));
+        snap.apikeys
+            .insert(apikey_entry("sk-caller", &["openai-lender", "cross-model"]));
+        let state = build_state(snap, hub);
+
+        let make_req = || {
+            Request::builder()
+                .method("POST")
+                .uri("/passthrough/openai/anything")
+                .header("authorization", "Bearer sk-caller")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"model":"cross-model","input":"x"}"#))
+                .unwrap()
+        };
+
+        // Both calls pass: the anthropic model's rpm=1 bucket is never
+        // drawn from by the openai tunnel.
+        for _ in 0..2 {
+            let resp = run(build_router(state.clone()), make_req()).await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "cross-provider same-named model must not gate this tunnel",
+            );
+        }
     }
 
     /// Regression for issue #108: streaming chat used to commit
@@ -3727,6 +4380,151 @@ data: [DONE]\n\n";
         );
     }
 
+    /// A direct (non-group) model retries a transient upstream failure.
+    ///
+    /// The retry budget used to live only on `routing`, so a model without a
+    /// model group was pinned at zero attempts-after-the-first: a single 502
+    /// went straight back to the caller with no second try, no matter what
+    /// the operator configured. Nothing could be configured — there was no
+    /// field to set.
+    #[tokio::test]
+    async fn direct_model_retries_a_transient_failure_then_succeeds() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(502).set_body_string("upstream down"))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-ok",
+                "model": "gpt-4o",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "recovered"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })))
+            .with_priority(2)
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = new_snap(&upstream.uri());
+        snap.models
+            .insert(direct_model_entry("m-solo", "solo", "gpt-4o"));
+        snap.apikeys.insert(apikey_entry("sk-caller", &["solo"]));
+        let app = build_router(build_state(snap, hub));
+
+        let body = serde_json::json!({
+            "model": "solo",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+
+        let resp = run(app, req).await;
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the retry must recover the request: {}",
+            String::from_utf8_lossy(&bytes)
+        );
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["choices"][0]["message"]["content"], "recovered");
+        // The `.expect(1)` on both mocks asserts exactly two upstream calls.
+    }
+
+    /// `Model.retries` overrides the group budget for that target only.
+    /// `Some(0)` is an explicit opt-out and must not fall through to the
+    /// group's larger budget.
+    #[tokio::test]
+    async fn model_retries_overrides_the_group_budget() {
+        let bad_upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(502).set_body_string("upstream down"))
+            // Exactly one attempt on this target despite `routing.retries: 5`.
+            .expect(1)
+            .mount(&bad_upstream)
+            .await;
+
+        let good_upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-good",
+                "model": "gpt-4o",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "fallback worked"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })))
+            .expect(1)
+            .mount(&good_upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = AisixSnapshot::new();
+        snap.provider_keys
+            .insert(pk_entry_with_id("pk-bad", &bad_upstream.uri()));
+        snap.provider_keys
+            .insert(pk_entry_with_id("pk-good", &good_upstream.uri()));
+        let mut no_retry: Model = serde_json::from_str(
+            r#"{"display_name":"primary","provider":"openai","model_name":"gpt-4o",
+                "provider_key_id":"pk-bad","retries":0}"#,
+        )
+        .unwrap();
+        no_retry.retries = Some(0);
+        snap.models.insert(ResourceEntry::new("m-bad", no_retry, 1));
+        snap.models
+            .insert(model_entry_with_id("m-good", "secondary", "pk-good"));
+        snap.models.insert(routing_entry(
+            "smart",
+            "failover",
+            &["primary", "secondary"],
+            Some(5),
+            None,
+            None,
+        ));
+        snap.apikeys.insert(apikey_entry("sk-caller", &["smart"]));
+        let app = build_router(build_state(snap, hub));
+
+        let body = serde_json::json!({
+            "model": "smart",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        // The `.expect(1)` on the bad upstream is the real assertion: the
+        // target's own `retries: 0` beat the group's `retries: 5`.
+    }
+
     #[tokio::test]
     async fn routing_retries_current_target_before_failover() {
         use aisix_obs::UsageSink;
@@ -3889,7 +4687,10 @@ data: [DONE]\n\n";
             "smart",
             "failover",
             &["primary"],
-            None,
+            // Single-target group: there is nothing to fall over to, so the
+            // default budget WOULD apply here. Pin it off — this test asserts
+            // the attempt record for one failed try, not the retry policy.
+            Some(0),
             None,
             None,
         ));
@@ -3913,8 +4714,8 @@ data: [DONE]\n\n";
         let resp = run(app, req).await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
 
-        // Streaming attempts only the first target (#655): the single
-        // failed initial attempt is emitted as one per-attempt event.
+        // Single target, `retries` unset (defaults to 0): exactly one
+        // attempt, emitted as one per-attempt event (#655).
         let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
             .await
             .expect("usage event was never emitted")
@@ -3942,6 +4743,193 @@ data: [DONE]\n\n";
                 extra.error_class
             );
         }
+    }
+
+    /// AISIX-Cloud#1119: the streaming path must honour `routing.retries`
+    /// exactly like the non-streaming one. Before the fix the streaming
+    /// loop walked targets once and never re-hit the same target, so a
+    /// retryable failure fell straight over — the operator saw
+    /// `initial → fallback` with the configured `retry #1` missing.
+    /// `retries=1` on an always-502 primary must make TWO attempts on it
+    /// before the secondary is tried.
+    #[tokio::test]
+    async fn streaming_routing_honors_same_target_retries() {
+        use aisix_obs::UsageSink;
+
+        let flaky_upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(502).set_body_string("try again"))
+            // initial + one same-target retry. Pre-fix this was 1.
+            .expect(2)
+            .mount(&flaky_upstream)
+            .await;
+
+        let good_upstream = MockServer::start().await;
+        let sse = "\
+data: {\"id\":\"up-1\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"after retries\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"up-1\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+data: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .expect(1)
+            .mount(&good_upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+
+        let snap = AisixSnapshot::new();
+        snap.provider_keys
+            .insert(pk_entry_with_id("pk-flaky", &flaky_upstream.uri()));
+        snap.provider_keys
+            .insert(pk_entry_with_id("pk-good", &good_upstream.uri()));
+        snap.models
+            .insert(model_entry_with_id("m-flaky", "primary", "pk-flaky"));
+        snap.models
+            .insert(model_entry_with_id("m-good", "secondary", "pk-good"));
+        snap.models.insert(routing_entry(
+            "smart",
+            "failover",
+            &["primary", "secondary"],
+            Some(1),
+            Some(1),
+            None,
+        ));
+        snap.apikeys.insert(apikey_entry("sk-caller", &["smart"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = build_router(build_state(snap, hub).with_usage_sink(UsageSink::new(tx)));
+        let body = serde_json::json!({
+            "model": "smart",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Drain the stream — the winning attempt's UsageEvent is emitted
+        // by the end-of-stream Drop guard, so it isn't observable until
+        // the body is fully consumed.
+        let mut body_stream = resp.into_body().into_data_stream();
+        let mut decoder = SseDecoder::new();
+        let mut sse_events = Vec::new();
+        while let Some(chunk) = body_stream.next().await {
+            sse_events.extend(decoder.feed(chunk.unwrap().as_ref()));
+        }
+        assert!(sse_events.contains(&SseEvent::Done), "missing [DONE]");
+
+        // initial (primary 502) → retry (primary 502) → fallback (secondary 200)
+        let mut events = Vec::new();
+        for _ in 0..3 {
+            let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+                .await
+                .expect("usage event was never emitted")
+                .expect("sender dropped");
+            events.push(ev);
+        }
+        events.sort_by_key(|e| e.attempt_index);
+
+        assert_eq!(events[0].attempt_kind, "initial");
+        assert_eq!(events[0].attempt_model, "primary");
+        assert_eq!(events[0].status_code, 502);
+
+        // The attempt the operator reported missing in #1119.
+        assert_eq!(
+            events[1].attempt_kind, "retry",
+            "same-target retry must precede fail-over"
+        );
+        assert_eq!(events[1].attempt_model, "primary");
+        assert_eq!(events[1].model_id, "m-flaky");
+        assert_eq!(events[1].status_code, 502);
+
+        assert_eq!(events[2].attempt_kind, "fallback");
+        assert_eq!(events[2].attempt_model, "secondary");
+        assert_eq!(events[2].status_code, 200);
+    }
+
+    /// AISIX-Cloud#1119 / #1122: with a SINGLE target there is nothing to
+    /// fail over to, so `routing.retries` is the only thing standing
+    /// between a transient upstream blip and a failed request. The
+    /// streaming path used to attempt once and give up.
+    #[tokio::test]
+    async fn streaming_routing_retries_single_target_before_failing() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(502).set_body_string("transient"))
+            // initial + two same-target retries. Pre-fix this was 1.
+            .expect(3)
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+
+        let snap = AisixSnapshot::new();
+        snap.provider_keys
+            .insert(pk_entry_with_id("pk-only", &upstream.uri()));
+        snap.models
+            .insert(model_entry_with_id("m-only", "primary", "pk-only"));
+        snap.models.insert(routing_entry(
+            "smart",
+            "failover",
+            &["primary"],
+            Some(2),
+            None,
+            None,
+        ));
+        snap.apikeys.insert(apikey_entry("sk-caller", &["smart"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = build_router(build_state(snap, hub).with_usage_sink(UsageSink::new(tx)));
+        let body = serde_json::json!({
+            "model": "smart",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+
+        let mut events = Vec::new();
+        for _ in 0..3 {
+            let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+                .await
+                .expect("usage event was never emitted")
+                .expect("sender dropped");
+            events.push(ev);
+        }
+        events.sort_by_key(|e| e.attempt_index);
+        assert_eq!(events[0].attempt_kind, "initial");
+        assert_eq!(events[1].attempt_kind, "retry");
+        assert_eq!(events[2].attempt_kind, "retry");
+        assert!(
+            events.iter().all(|e| e.attempt_model == "primary"),
+            "all attempts stay on the single configured target"
+        );
     }
 
     #[tokio::test]
@@ -3993,6 +4981,9 @@ data: [DONE]\n\n";
             "smart",
             "failover",
             &["primary", "secondary"],
+            // Unset on purpose: with a fallback target queued, the default
+            // budget defers to it, so the sequence is initial -> fallback
+            // with no same-target grinding in between.
             None,
             None,
             None,
@@ -4118,6 +5109,9 @@ data: [DONE]\n\n";
             "smart",
             "failover",
             &["primary", "secondary"],
+            // Unset on purpose: with a fallback target queued, the default
+            // budget defers to it, so the sequence is initial -> fallback
+            // with no same-target grinding in between.
             None,
             None,
             None,
@@ -5852,12 +6846,17 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
         upstream_model: &str,
         rate_limit: serde_json::Value,
     ) -> ResourceEntry<Model> {
+        // `retries: 0` — the rate-limit tests that use this helper assert on
+        // reservation accounting, and want one upstream call per dispatch.
+        // Under the default budget a single mocked failure would be retried
+        // into a success and the assertion would test nothing.
         let cfg = format!(
             r#"{{
                 "display_name": "{name}",
                 "provider": "openai",
                 "model_name": "{upstream_model}",
                 "provider_key_id": "{PK_ID}",
+                "retries": 0,
                 "rate_limit": {rate_limit}
             }}"#
         );

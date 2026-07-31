@@ -10,6 +10,20 @@ import { EtcdClient } from "./etcd.js";
 import { harnessRequest } from "./http.js";
 
 export interface AppOverrides {
+  /**
+   * Whether to bind the admin listener. **Defaults to `false`** — the
+   * gateway runs with `admin.enabled = false`, no admin listener bound,
+   * mirroring the post-removal world; readiness gates on the proxy
+   * `/livez` plus the metrics listener, and `adminUrl`/`adminKey` are
+   * still returned but point at an unbound port. Resources are seeded
+   * through `SeedClient`/`EtcdClient`, never the Admin API.
+   *
+   * Only tests whose subject IS the Admin API surface (the held-back set —
+   * admin auth, write-rejection, deprecation headers, status-equivalence,
+   * key rotation) opt back in with `admin: true`; they stay admin-on until
+   * the Admin API is removed, then get deleted.
+   */
+  admin?: boolean;
   /** Inserted into `admin.admin_keys`. Defaults to a fresh random key. */
   adminKey?: string;
   /** Whether to enable the Prometheus scrape endpoint. Defaults to true. */
@@ -29,6 +43,14 @@ export interface AppOverrides {
     header?: string;
   };
   /**
+   * `proxy.request_body_limit_bytes`. A dedicated override (like
+   * `realIp`) because `extra` replaces whole top-level blocks and the
+   * proxy block carries the harness-picked listener addr. `0` disables
+   * the cap — the shipped default; the harness pins 10 MiB unless a
+   * test overrides it so the existing 413 suite keeps its subject.
+   */
+  requestBodyLimitBytes?: number;
+  /**
    * Extra environment variables for the spawned binary, applied AFTER the
    * `AISIX_*` strip. Use for non-config secrets the DP reads from its own
    * environment rather than from the kine config — e.g.
@@ -36,6 +58,13 @@ export interface AppOverrides {
    * AccessKey deliberately never travels on the config path.
    */
   extraEnv?: Record<string, string>;
+  /**
+   * `observability.metrics.client_type_rules` (AISIX-Cloud#1045): operator
+   * UA→client_type regex rules, tried before the built-in allowlist.
+   * A dedicated override because `extra` replaces whole top-level blocks
+   * and the observability block carries the harness-picked metrics port.
+   */
+  clientTypeRules?: Array<{ pattern: string; client: string }>;
   /**
    * FILE MODE: contents of a standalone `resources.yaml`. When set, the
    * generated config carries `resources_file` (pointing at this content
@@ -132,6 +161,17 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
   }
 
   const prometheusEnabled = overrides.prometheus ?? true;
+  const adminEnabled = overrides.admin ?? false;
+  // `extra` is spread over the generated config at the top level, so an
+  // `extra.admin` would replace the generated admin block and could bind
+  // the listener while readiness still keys off `adminEnabled` and skips
+  // the admin health gate. Keep the `admin` boolean the single source of
+  // truth for the admin listener.
+  if (overrides.extra && "admin" in overrides.extra) {
+    throw new Error(
+      "spawnApp: control the admin listener with the `admin` boolean override, not `extra.admin`",
+    );
+  }
   const [proxyPort, adminPort, metricsPort] = await pickFreePorts(3);
   const adminKey = overrides.adminKey ?? `admin-${randomUUID()}`;
   const etcdPrefix = `/aisix-e2e-${randomUUID()}`;
@@ -157,10 +197,12 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
         }),
     proxy: {
       addr: `127.0.0.1:${proxyPort}`,
-      request_body_limit_bytes: 10485760,
+      request_body_limit_bytes: overrides.requestBodyLimitBytes ?? 10485760,
       ...(overrides.realIp ? { real_ip: overrides.realIp } : {}),
     },
-    admin: { addr: `127.0.0.1:${adminPort}`, admin_keys: [adminKey] },
+    admin: adminEnabled
+      ? { addr: `127.0.0.1:${adminPort}`, admin_keys: [adminKey] }
+      : { addr: `127.0.0.1:${adminPort}`, enabled: false },
     observability: {
       service_name: "aisix-e2e",
       log_level: "warn",
@@ -172,6 +214,9 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
           addr: `127.0.0.1:${metricsPort}`,
         },
         otlp: { enabled: false, endpoint: "http://127.0.0.1:4317" },
+        ...(overrides.clientTypeRules
+          ? { client_type_rules: overrides.clientTypeRules }
+          : {}),
       },
       tracing: { otlp: { enabled: false, endpoint: "http://127.0.0.1:4317", sample_ratio: 1 } },
     },
@@ -237,7 +282,15 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
     await Promise.race([
       Promise.all([
         waitForReady(`${proxyUrl}/livez`, READY_TIMEOUT_MS),
-        waitForReady(`${adminUrl}/admin/v1/health`, READY_TIMEOUT_MS, adminKey),
+        // The admin health endpoint only exists when the admin listener is
+        // bound; with `admin: false` there is no admin surface, so gate on
+        // the proxy `/livez` and the metrics listener alone. (If both
+        // `admin` and `prometheus` are off, readiness reduces to the proxy
+        // `/livez` — liveness only; a case that needs config-propagation
+        // readiness should keep prometheus on, as the default does.)
+        ...(adminEnabled
+          ? [waitForReady(`${adminUrl}/admin/v1/health`, READY_TIMEOUT_MS, adminKey)]
+          : []),
         // Gate on the dedicated metrics listener too, so scrapes in the test
         // never race the listener coming up. Skipped when prometheus is
         // disabled — nothing binds the metrics port then.

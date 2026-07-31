@@ -9,10 +9,13 @@
 //! looks up by the hash. Net security win: no plaintext API key
 //! ever sits in the DB or KV.
 
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use super::rate_limit::RateLimit;
+use super::mcp_policy::McpAccess;
+use super::rate_limit::{McpRateLimit, RateLimit};
 use crate::resource::Resource;
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -22,6 +25,12 @@ pub struct ApiKey {
     /// incoming bearer tokens before lookup.
     #[schemars(length(min = 1))]
     pub key_hash: String,
+
+    /// Operator-facing label for this key, as shown in the dashboard.
+    /// Read only by the `${request.api_key.name}` header template
+    /// (AISIX-Cloud#1112); never used for authentication or routing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
 
     /// Model identifiers this key may use. An empty array denies access to every model.
     pub allowed_models: Vec<String>,
@@ -48,6 +57,27 @@ pub struct ApiKey {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_name: Option<String>,
 
+    /// External identity bound to this key for JWT authentication.
+    /// When a request presents a valid JWT issued by the
+    /// `oidc_providers` entry named in `jwt_provider`, the value of
+    /// that provider's `identity_claim` selects the key whose
+    /// `jwt_subject` equals it, and the request proceeds with this
+    /// key's permissions, rate limits, and budget. The `(jwt_provider,
+    /// jwt_subject)` pair is unique within the environment. When
+    /// omitted, the key is never selected by JWT authentication.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
+    pub jwt_subject: Option<String>,
+
+    /// Name of the `oidc_providers` entry permitted to assert this
+    /// key's `jwt_subject`. A subject is only ever resolved for the
+    /// trust provider named here, so a second trusted provider cannot
+    /// mint a token impersonating this provider's identity of the same
+    /// name. Required whenever `jwt_subject` is set; ignored otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
+    pub jwt_provider: Option<String>,
+
     /// MCP tools this key may call, as namespaced `<server>__<tool>` names
     /// (the form the gateway exposes). Entries are matched as single-`*`
     /// globs, mirroring `allowed_models`: `"*"` grants every tool and
@@ -57,6 +87,26 @@ pub struct ApiKey {
     /// access is granted explicitly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_tools: Option<Vec<String>>,
+
+    /// Policy-driven MCP access for this key. When present, it supersedes
+    /// `allowed_tools`: the key's grant is computed from the environment's
+    /// and its team's MCP access policies according to `mode` (`inherit`,
+    /// `restrict`, or `deny`), and `allowed_tools` is not consulted. When
+    /// omitted, the key keeps the explicit `allowed_tools` behavior — with
+    /// policy `deny` patterns still subtracted, since deny applies to every
+    /// key the policy covers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_access: Option<McpAccess>,
+
+    /// Per-MCP-server limits for this key, keyed by the registered MCP server
+    /// name — the `<server>` half of the `<server>__<tool>` names the gateway
+    /// exposes. A `tools/call` is metered against the entry for the server it
+    /// targets **and** the key's own `rate_limit`, each in its own counter, so
+    /// a burst against one server never consumes another's budget. A server
+    /// with no entry here is bounded by `rate_limit` alone. Only tool calls
+    /// are metered; the `initialize` / `tools/list` handshake is not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_rate_limits: Option<BTreeMap<String, McpRateLimit>>,
 
     /// A2A agents this key may reach, named by their registered names. Entries
     /// are matched as single-`*` globs, mirroring `allowed_tools`: `"*"` grants
@@ -126,9 +176,12 @@ impl ApiKey {
     /// A key with no `allowed_tools` (or an empty list) may call no MCP tools —
     /// access is granted explicitly, matching [`ApiKey::can_access`].
     ///
-    /// Currently exercised only by tests: the live MCP enforcement path builds
-    /// an `aisix_mcp::ToolAcl` from `allowed_tools` and uses the identical
-    /// matcher, so this method is kept in lockstep as the documented mirror.
+    /// This mirrors only the legacy allow side (a key without an `mcp_access`
+    /// block and ignoring policy `deny` overlays). Currently exercised only by
+    /// tests: the live MCP enforcement path builds an `aisix_mcp::ToolAcl`
+    /// resolved against the key **and** the environment/team MCP policies,
+    /// using the identical matcher; this method is kept in lockstep as the
+    /// documented mirror of its legacy component.
     pub fn can_access_tool(&self, tool: &str) -> bool {
         match &self.allowed_tools {
             None => false,
@@ -136,6 +189,13 @@ impl ApiKey {
                 .iter()
                 .any(|t| crate::wildcard::wildcard_matches(t, tool)),
         }
+    }
+
+    /// The limits this key carries for one MCP server, named as it is
+    /// registered (the `<server>` namespace of a `<server>__<tool>` call).
+    /// `None` when the key sets no limit for that server.
+    pub fn mcp_rate_limit(&self, server: &str) -> Option<&McpRateLimit> {
+        self.mcp_rate_limits.as_ref()?.get(server)
     }
 
     /// True if this key may reach the given A2A agent, named by its registered
@@ -230,12 +290,17 @@ mod tests {
     fn empty_allowed_models_denies_everything() {
         let k = ApiKey {
             key_hash: "abc".into(),
+            display_name: None,
             allowed_models: vec![],
             rate_limit: None,
             team_id: None,
             user_id: None,
             user_name: None,
+            jwt_subject: None,
+            jwt_provider: None,
             allowed_tools: None,
+            mcp_access: None,
+            mcp_rate_limits: None,
             allowed_agents: None,
             expires_at: None,
             disabled: false,
@@ -301,6 +366,40 @@ mod tests {
         assert!(any_server.can_access_tool("slack__readonly"));
         // The suffix still anchors — a longer tool name doesn't match.
         assert!(!any_server.can_access_tool("github__readonly_admin"));
+    }
+
+    #[test]
+    fn mcp_access_block_roundtrips_and_defaults_absent() {
+        // Every pre-existing key payload lacks `mcp_access`; it must load
+        // as None so the legacy allowed_tools behavior keeps applying.
+        let legacy = sample();
+        assert!(legacy.mcp_access.is_none());
+        let v = serde_json::to_value(&legacy).unwrap();
+        assert!(v.get("mcp_access").is_none());
+
+        let k: ApiKey = serde_json::from_str(
+            r#"{
+              "key_hash": "h",
+              "allowed_models": [],
+              "mcp_access": {"mode": "restrict", "allow": ["github__*"], "deny": ["github__delete_repo"]}
+            }"#,
+        )
+        .unwrap();
+        let access = k.mcp_access.as_ref().unwrap();
+        assert_eq!(access.mode, crate::models::McpAccessMode::Restrict);
+        assert_eq!(access.allow, vec!["github__*"]);
+        assert_eq!(access.deny, vec!["github__delete_repo"]);
+        // Round-trip preserves the block.
+        let v = serde_json::to_value(&k).unwrap();
+        assert_eq!(v["mcp_access"]["mode"], "restrict");
+    }
+
+    #[test]
+    fn mcp_access_rejects_unknown_inner_fields() {
+        let r: Result<ApiKey, _> = serde_json::from_str(
+            r#"{"key_hash":"h","allowed_models":[],"mcp_access":{"mode":"inherit","widen":["*"]}}"#,
+        );
+        assert!(r.is_err());
     }
 
     #[test]
@@ -430,6 +529,27 @@ mod tests {
         assert!(k.team_id.is_none());
         assert!(k.user_id.is_none());
         assert!(k.user_name.is_none());
+    }
+
+    #[test]
+    fn jwt_subject_roundtrips_and_defaults_absent() {
+        // Every pre-existing key payload lacks `jwt_subject`; it must load
+        // as None and stay off the wire so mixed-fleet DPs keep accepting
+        // the row.
+        let legacy = sample();
+        assert!(legacy.jwt_subject.is_none());
+        let v = serde_json::to_value(&legacy).unwrap();
+        assert!(v.get("jwt_subject").is_none());
+
+        let k: ApiKey = serde_json::from_str(
+            r#"{"key_hash":"h","allowed_models":[],"jwt_subject":"agent-billing-01","jwt_provider":"corp-idp"}"#,
+        )
+        .unwrap();
+        assert_eq!(k.jwt_subject.as_deref(), Some("agent-billing-01"));
+        assert_eq!(k.jwt_provider.as_deref(), Some("corp-idp"));
+        let v = serde_json::to_value(&k).unwrap();
+        assert_eq!(v["jwt_subject"], "agent-billing-01");
+        assert_eq!(v["jwt_provider"], "corp-idp");
     }
 
     #[test]

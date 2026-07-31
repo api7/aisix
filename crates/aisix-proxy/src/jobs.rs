@@ -114,10 +114,15 @@ pub(crate) fn decode_routed_id(id: &str) -> Option<(String, String)> {
 
 /// Charset guard for ids interpolated into upstream URL paths. A decoded
 /// (attacker-suppliable) id must never smuggle path separators or query
-/// metacharacters into the upstream URL.
-fn require_safe_upstream_id(raw: &str) -> Result<(), ProxyError> {
+/// metacharacters into the upstream URL. `pub(crate)`: the videos
+/// surface applies the same guard to decoded upstream task ids.
+pub(crate) fn require_safe_upstream_id(raw: &str) -> Result<(), ProxyError> {
     let ok = !raw.is_empty()
         && raw.len() <= 256
+        // `.` / `..` are valid under the charset but are path-segment
+        // aliases some upstream routers normalise — never forward them.
+        && raw != "."
+        && raw != ".."
         && raw
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'));
@@ -138,6 +143,11 @@ pub(crate) struct JobTarget {
     pub pk_entry: Arc<ResourceEntry<ProviderKey>>,
     pub secret: String,
     pub adapter: Adapter,
+    /// The ProviderKey's rendered `default_headers` plus the client headers
+    /// its `forward_client_headers` allowlist admits, resolved once when the
+    /// target is resolved so every round-trip on this surface (upload, poll,
+    /// download) sends the same set (AISIX-Cloud#1112 / #1167).
+    pub extra_headers: Vec<(axum::http::HeaderName, axum::http::HeaderValue)>,
 }
 
 impl JobTarget {
@@ -180,7 +190,7 @@ pub(crate) fn resolve_target(
     state: &ProxyState,
     auth: &AuthenticatedKey,
     wanted: Option<&str>,
-    source_ip: &str,
+    client_ctx: &ClientContext,
 ) -> Result<JobTarget, ProxyError> {
     let snapshot = state.snapshot.load();
 
@@ -228,7 +238,7 @@ pub(crate) fn resolve_target(
     };
 
     let model = &model_entry.value;
-    crate::dispatch::check_ip_access(model, source_ip)?;
+    crate::dispatch::check_ip_access(model, &client_ctx.source_ip)?;
 
     let pk_entry = crate::dispatch::resolve_provider_key(&snapshot, model)?;
     let adapter = supported_adapter(&pk_entry.value).ok_or_else(|| {
@@ -241,11 +251,20 @@ pub(crate) fn resolve_target(
     })?;
     let secret = crate::dispatch::require_api_key(&pk_entry.value, model)?.to_string();
 
+    let extra_headers =
+        aisix_gateway::resolve_extra_headers(&crate::dispatch::upstream_header_ctx(
+            &pk_entry.value,
+            &pk_entry.id,
+            model,
+            &model_entry.id,
+            client_ctx,
+        ));
     Ok(JobTarget {
         model_entry,
         pk_entry,
         secret,
         adapter,
+        extra_headers,
     })
 }
 
@@ -333,18 +352,38 @@ async fn send_upstream(
     body: UpstreamBody,
     request_id: &str,
 ) -> Result<(StatusCode, HeaderMap, Bytes), ProxyError> {
-    let client = crate::http_client::client();
+    let client = crate::http_client::client_for(target.pk_entry.value.tls.as_ref());
     let mut builder = client.request(
         reqwest::Method::from_bytes(method.as_str().as_bytes())
             .map_err(|_| ProxyError::InvalidRequest("unsupported method".into()))?,
         url,
     );
 
-    builder = match target.adapter {
-        Adapter::AzureOpenai => builder.header("api-key", &target.secret),
-        _ => builder.header(header::AUTHORIZATION, format!("Bearer {}", target.secret)),
+    // Gateway-owned headers go into the map first; the operator / client set
+    // is merged on top and skips any name already there.
+    // `RequestBuilder::header` APPENDS on a repeat name, so building the map
+    // is what keeps a colliding operator header from putting two values of
+    // e.g. `x-aisix-request-id` on the wire.
+    let mut headers = HeaderMap::new();
+    let (auth_name, auth_value) = match target.adapter {
+        Adapter::AzureOpenai => (
+            axum::http::HeaderName::from_static("api-key"),
+            target.secret.clone(),
+        ),
+        _ => (header::AUTHORIZATION, format!("Bearer {}", target.secret)),
     };
-    builder = builder.header("x-aisix-request-id", request_id);
+    if let Ok(v) = axum::http::HeaderValue::from_str(&auth_value) {
+        headers.insert(auth_name, v);
+    }
+    if let Ok(v) = axum::http::HeaderValue::from_str(request_id) {
+        headers.insert(axum::http::HeaderName::from_static("x-aisix-request-id"), v);
+    }
+    for (name, value) in &target.extra_headers {
+        if !headers.contains_key(name) {
+            headers.insert(name.clone(), value.clone());
+        }
+    }
+    builder = builder.headers(headers);
 
     builder = match body {
         UpstreamBody::Empty => builder,
@@ -354,7 +393,10 @@ async fn send_upstream(
         UpstreamBody::Multipart(form) => builder.multipart(form),
     };
 
-    if let Some(d) = target.model_entry.value.request_timeout() {
+    if let Some(d) =
+        crate::routing::effective_timeouts(&target.model_entry.value, None, state.default_timeouts)
+            .request
+    {
         builder = builder.timeout(d);
     }
 
@@ -366,7 +408,7 @@ async fn send_upstream(
                 &state.runtime_status,
                 &target.model_entry.id,
                 target.model_entry.value.cooldown.as_ref(),
-                aisix_gateway::BridgeError::Transport(e.to_string()),
+                aisix_gateway::BridgeError::Transport(aisix_gateway::transport_error_message(&e)),
             )
         })
         .map_err(ProxyError::Bridge)?;
@@ -542,7 +584,10 @@ fn emit_job_usage_event(
         api_key_id: auth.entry.id.clone(),
         requested_model: target.display_name().to_string(),
         status_code,
-        latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
+        // Single-attempt endpoint: the attempt spans the whole request, so
+        // the upstream figure and what the caller waited for coincide.
+        upstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
+        downstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
         inbound_protocol: "openai".to_string(),
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),
@@ -557,6 +602,7 @@ fn emit_job_usage_event(
         .fan_out(&event, None, exporters.iter().map(|e| &e.value));
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_access_log(
     method: &Method,
     path: &str,
@@ -565,7 +611,15 @@ fn emit_access_log(
     status: u16,
     elapsed: Duration,
     request_id: &str,
+    error: Option<&ProxyError>,
 ) {
+    let (error_kind, error) = match error {
+        Some(e) => {
+            let (kind, msg) = crate::attempt::access_log_error(e);
+            (Some(kind), Some(msg))
+        }
+        None => (None, None),
+    };
     AccessLog {
         method: method.as_str(),
         path,
@@ -581,6 +635,8 @@ fn emit_access_log(
         served_by_model: None,
         routing_attempt_count: None,
         routing_fallback_count: None,
+        error_kind,
+        error: error.as_deref(),
     }
     .emit();
 }
@@ -612,6 +668,7 @@ fn finish(
                 status,
                 elapsed,
                 &request_id,
+                None,
             );
             state.metrics.record_request(
                 target.provider_label(),
@@ -646,6 +703,7 @@ fn finish(
                 status,
                 elapsed,
                 &request_id,
+                Some(&err),
             );
             state.metrics.record_request(
                 "",
@@ -732,15 +790,21 @@ pub(crate) async fn create_file(
         let mut form_model: Option<String> = None;
         let mut file_bytes: Option<Bytes> = None;
 
-        while let Some(field) = multipart
-            .next_field()
-            .await
-            .map_err(|e| ProxyError::InvalidRequest(format!("malformed multipart body: {e}")))?
-        {
+        while let Some(field) = multipart.next_field().await.map_err(|e| {
+            crate::error::proxy_error_from_multipart(
+                e,
+                state.request_body_limit_bytes,
+                "malformed multipart body",
+            )
+        })? {
             let name = field.name().unwrap_or_default().to_string();
             if name == "model" {
                 let v = field.text().await.map_err(|e| {
-                    ProxyError::InvalidRequest(format!("malformed multipart field: {e}"))
+                    crate::error::proxy_error_from_multipart(
+                        e,
+                        state.request_body_limit_bytes,
+                        "malformed multipart field",
+                    )
                 })?;
                 if !v.trim().is_empty() {
                     form_model = Some(v.trim().to_string());
@@ -751,7 +815,11 @@ pub(crate) async fn create_file(
                 let file_name = field.file_name().unwrap_or("file").to_string();
                 let content_type = field.content_type().map(str::to_string);
                 let bytes = field.bytes().await.map_err(|e| {
-                    ProxyError::InvalidRequest(format!("failed to read file field: {e}"))
+                    crate::error::proxy_error_from_multipart(
+                        e,
+                        state.request_body_limit_bytes,
+                        "failed to read file field",
+                    )
                 })?;
                 let mut part = reqwest::multipart::Part::bytes(bytes.to_vec()).file_name(file_name);
                 if let Some(ct) = content_type {
@@ -764,7 +832,11 @@ pub(crate) async fn create_file(
                 continue;
             }
             let v = field.text().await.map_err(|e| {
-                ProxyError::InvalidRequest(format!("malformed multipart field: {e}"))
+                crate::error::proxy_error_from_multipart(
+                    e,
+                    state.request_body_limit_bytes,
+                    "malformed multipart field",
+                )
             })?;
             form = form.text(name, v);
         }
@@ -774,7 +846,7 @@ pub(crate) async fn create_file(
         })?;
 
         let wanted = form_model.or_else(|| explicit_model(&params, &headers));
-        let target = resolve_target(&state, &auth, wanted.as_deref(), &client.source_ip)?;
+        let target = resolve_target(&state, &auth, wanted.as_deref(), &client)?;
 
         // Batch/fine-tune input files carry end-user content — scan them
         // like any other inbound payload.
@@ -950,8 +1022,21 @@ pub(crate) async fn create_batch(
     client: ClientContext,
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
-    body: Bytes,
+    // Result-wrapped so an extractor-layer 413 (chunked body over the
+    // cap) maps to the OpenAI envelope instead of axum's stock
+    // text/plain rejection — see completions.rs.
+    body: Result<Bytes, axum::extract::rejection::BytesRejection>,
 ) -> Response {
+    let body = match body {
+        Ok(bytes) => bytes,
+        Err(rej) => {
+            return crate::error::proxy_error_from_bytes_rejection(
+                rej,
+                state.request_body_limit_bytes,
+            )
+            .into_response();
+        }
+    };
     let started = Instant::now();
     let request_id = client.request_id.clone();
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
@@ -984,7 +1069,7 @@ pub(crate) async fn create_batch(
         let wanted = embedded
             .or(body_model)
             .or_else(|| explicit_model(&params, &headers));
-        let target = resolve_target(&state, &auth, wanted.as_deref(), &client.source_ip)?;
+        let target = resolve_target(&state, &auth, wanted.as_deref(), &client)?;
 
         // Forward the provider wire shape: raw file id, no gateway-only
         // routing fields.
@@ -1056,7 +1141,7 @@ pub(crate) async fn get_batch(
     let result = async {
         require_safe_upstream_id(&raw)?;
         let wanted = embedded.or_else(|| explicit_model(&params, &headers));
-        let target = resolve_target(&state, &auth, wanted.as_deref(), &client.source_ip)?;
+        let target = resolve_target(&state, &auth, wanted.as_deref(), &client)?;
         let _reservation = crate::quota::enforce(
             &state,
             &auth,
@@ -1177,8 +1262,21 @@ pub(crate) async fn create_ft_job(
     client: ClientContext,
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
-    body: Bytes,
+    // Result-wrapped so an extractor-layer 413 (chunked body over the
+    // cap) maps to the OpenAI envelope instead of axum's stock
+    // text/plain rejection — see completions.rs.
+    body: Result<Bytes, axum::extract::rejection::BytesRejection>,
 ) -> Response {
+    let body = match body {
+        Ok(bytes) => bytes,
+        Err(rej) => {
+            return crate::error::proxy_error_from_bytes_rejection(
+                rej,
+                state.request_body_limit_bytes,
+            )
+            .into_response();
+        }
+    };
     let started = Instant::now();
     let request_id = client.request_id.clone();
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
@@ -1205,7 +1303,7 @@ pub(crate) async fn create_ft_job(
             .unwrap_or((training_file.clone(), None));
         require_safe_upstream_id(&raw_training)?;
         let wanted = embedded.or_else(|| explicit_model(&params, &headers));
-        let target = resolve_target(&state, &auth, wanted.as_deref(), &client.source_ip)?;
+        let target = resolve_target(&state, &auth, wanted.as_deref(), &client)?;
 
         if let Some(obj) = req_json.as_object_mut() {
             obj.insert("training_file".into(), Value::String(raw_training));
@@ -1395,7 +1493,7 @@ async fn forward_simple(
             None => None,
         };
         let wanted = embedded.or_else(|| explicit_model(&params, &headers));
-        let target = resolve_target(&state, &auth, wanted.as_deref(), &client.source_ip)?;
+        let target = resolve_target(&state, &auth, wanted.as_deref(), &client)?;
 
         if let Some(body) = &spec.body {
             scan_input_blob(&state, &auth, &target, body, &mut monitor_hits).await?;
@@ -1510,6 +1608,7 @@ fn maybe_attribute_batch(
     let secret = target.secret.clone();
     let adapter = target.adapter;
     let api_base = target.pk_entry.value.api_base.clone();
+    let pk_tls = target.pk_entry.value.tls.clone();
     let raw_batch_id = raw_batch_id.to_string();
 
     tokio::spawn(async move {
@@ -1523,6 +1622,7 @@ fn maybe_attribute_batch(
             &secret,
             adapter,
             api_base.as_deref(),
+            pk_tls.as_ref(),
             &raw_batch_id,
             &output_file_id,
         )
@@ -1553,6 +1653,7 @@ async fn attribute_batch_usage(
     secret: &str,
     adapter: Adapter,
     api_base: Option<&str>,
+    tls: Option<&aisix_core::models::provider_key::ProviderKeyTls>,
     raw_batch_id: &str,
     output_file_id: &str,
 ) -> Result<(), String> {
@@ -1579,7 +1680,7 @@ async fn attribute_batch_usage(
         }
     };
 
-    let client = crate::http_client::client();
+    let client = crate::http_client::client_for(tls);
     let mut builder = client.get(&url).timeout(BATCH_ATTRIBUTION_TIMEOUT);
     builder = match adapter {
         Adapter::AzureOpenai => builder.header("api-key", secret),
@@ -1795,6 +1896,10 @@ mod tests {
             "file#frag",
             "file abc",
             "file&x=1",
+            // Bare path-segment aliases: valid charset, but some
+            // upstream routers normalise them into the parent path.
+            ".",
+            "..",
         ] {
             assert!(
                 require_safe_upstream_id(bad).is_err(),

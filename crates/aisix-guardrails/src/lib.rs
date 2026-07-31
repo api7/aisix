@@ -20,6 +20,8 @@
 
 #[cfg(feature = "aliyun-text-moderation")]
 mod aliyun;
+#[cfg(feature = "aliyun-text-moderation")]
+mod aliyun_ai_guardrail;
 #[cfg(feature = "bedrock")]
 mod bedrock;
 mod build;
@@ -42,30 +44,110 @@ use aisix_core::models::GuardrailMonitorHit;
 use aisix_gateway::{ChatFormat, ChatMessage, ChatResponse};
 use async_trait::async_trait;
 
+/// Max bytes of an upstream guardrail-provider error body to echo into a log
+/// line. Mirrors nginx's single-error-line cap (`NGX_MAX_ERROR_STR` = 2048) so
+/// a verbose HTML error page or stack trace can't blow up the log.
+pub(crate) const MAX_ERROR_BODY_LOG_BYTES: usize = 2048;
+
+/// Truncate a guardrail-provider error body for logging: at most
+/// [`MAX_ERROR_BODY_LOG_BYTES`] bytes, cut on a UTF-8 char boundary so a
+/// multi-byte character is never split. Returned verbatim otherwise — the
+/// whole point is to surface the provider's actual reason (e.g. Aliyun's
+/// `InvalidAccessKeyId.NotFound`) that a bare status code hides.
+pub(crate) fn truncate_error_body_for_log(body: &str) -> &str {
+    if body.len() <= MAX_ERROR_BODY_LOG_BYTES {
+        return body;
+    }
+    let mut end = MAX_ERROR_BODY_LOG_BYTES;
+    while end > 0 && !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    &body[..end]
+}
+
+/// Read a guardrail provider's error-response body for logging, stopping once
+/// [`MAX_ERROR_BODY_LOG_BYTES`] have arrived. We only ever log a snippet, so a
+/// broken provider returning a huge 4xx body can't make us buffer the whole
+/// thing. Reads chunk-by-chunk and gives up on the first read error — this is
+/// best-effort diagnostics on a path that's already returning an error.
+#[cfg(any(
+    feature = "azure-content-safety",
+    feature = "aliyun-text-moderation",
+    feature = "lakera",
+    feature = "openai-moderation",
+    feature = "presidio",
+))]
+pub(crate) async fn read_error_body_capped(mut resp: reqwest::Response) -> String {
+    truncate_error_body_for_log(&read_body_capped(&mut resp, MAX_ERROR_BODY_LOG_BYTES).await)
+        .to_owned()
+}
+
+/// Read at most `cap` bytes of a response body, chunk by chunk, giving up on
+/// the first read error.
+///
+/// Split out from [`read_error_body_capped`] because a caller that PARSES the
+/// body needs a different budget from one that logs a snippet of it: a snippet
+/// can stop anywhere, whereas a truncated body may simply not contain the field
+/// being looked for. See `aliyun::MAX_ERROR_BODY_PARSE_BYTES`.
+#[cfg(any(
+    feature = "azure-content-safety",
+    feature = "aliyun-text-moderation",
+    feature = "lakera",
+    feature = "openai-moderation",
+    feature = "presidio",
+))]
+pub(crate) async fn read_body_capped(resp: &mut reqwest::Response, cap: usize) -> String {
+    let mut buf: Vec<u8> = Vec::new();
+    while buf.len() < cap {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => buf.extend_from_slice(&chunk),
+            Ok(None) | Err(_) => break,
+        }
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
 /// The text a guardrail should scan for one message.
 ///
-/// Prefers the flat `content` string; when it's empty, falls back to
-/// concatenating the `text`-type entries of `content_blocks`. A caller
-/// that sends the OpenAI content-block shape
-/// (`content: [{ "type": "text", "text": "…" }]`) with an empty
-/// top-level string would otherwise bypass moderation entirely (#465).
-/// Non-text blocks (image/audio) are out of scope — multimodal
+/// Scans every text surface the provider bridges can forward upstream, so
+/// a caller can't hide a payload in one field while a benign value sits in
+/// another. These are independent wire fields and the bridges forward
+/// whichever is present:
+///   * flat `content`;
+///   * the `text`-type entries of `content_blocks` (empty `content` with
+///     the text only in blocks is the round-trip shape, #465; a benign
+///     `content` plus a payload in blocks is the split-field bypass);
+///   * `extra["tool_calls"]` — history-replay tool calls travel upstream
+///     verbatim through `extra` (the OpenAI bridge flattens them, the
+///     Anthropic bridge translates them into `tool_use` blocks). The whole
+///     payload is serialized so neither a function name nor an argument
+///     can hide a banned token, matching `ChatResponse::guardrail_output_text`
+///     and `redact_chat_format`, which already cover this surface.
+///
+/// Non-text content blocks (image/audio) are out of scope — multimodal
 /// moderation is a separate feature. Every guardrail's input/output
 /// collector goes through this so the families can't drift.
 pub(crate) fn message_scan_text(m: &ChatMessage) -> String {
+    let mut parts: Vec<String> = Vec::new();
     let content = m.content_str();
     if !content.is_empty() {
-        return content.to_string();
+        parts.push(content.to_string());
     }
-    match m.content_blocks.as_ref() {
-        Some(blocks) => blocks
-            .iter()
-            .filter(|b| b.get("type").and_then(serde_json::Value::as_str) == Some("text"))
-            .filter_map(|b| b.get("text").and_then(serde_json::Value::as_str))
-            .collect::<Vec<_>>()
-            .join("\n"),
-        None => String::new(),
+    if let Some(blocks) = m.content_blocks.as_ref() {
+        parts.extend(
+            blocks
+                .iter()
+                .filter(|b| b.get("type").and_then(serde_json::Value::as_str) == Some("text"))
+                .filter_map(|b| b.get("text").and_then(serde_json::Value::as_str))
+                .map(str::to_string),
+        );
     }
+    if let Some(tool_calls) = m.extra.get("tool_calls") {
+        if !tool_calls.is_null() {
+            parts.push(tool_calls.to_string());
+        }
+    }
+    parts.join("\n")
 }
 
 /// The guardrail `kind` discriminators compiled into this binary.
@@ -87,6 +169,8 @@ pub fn supported_kinds() -> &'static [&'static str] {
         "azure_content_safety_text_moderation",
         #[cfg(feature = "aliyun-text-moderation")]
         "aliyun_text_moderation",
+        #[cfg(feature = "aliyun-text-moderation")]
+        "aliyun_ai_guardrail",
         #[cfg(feature = "bedrock")]
         "bedrock",
         #[cfg(feature = "lakera")]
@@ -100,6 +184,8 @@ pub fn supported_kinds() -> &'static [&'static str] {
 
 #[cfg(feature = "aliyun-text-moderation")]
 pub use aliyun::AliyunTextModerationGuardrail;
+#[cfg(feature = "aliyun-text-moderation")]
+pub use aliyun_ai_guardrail::AliyunAiGuardrail;
 #[cfg(feature = "bedrock")]
 pub use bedrock::BedrockGuardrail;
 pub use build::{
@@ -546,9 +632,52 @@ pub trait Guardrail: Send + Sync + 'static {
     }
 }
 
+/// Serializes the tests (across modules) that install a log-capturing
+/// tracing subscriber. `set_default` is thread-local, but tracing's
+/// GLOBAL max-level hint is recomputed when any dispatcher is dropped —
+/// a concurrently finishing capture test can lower it to OFF and make
+/// this thread's `tracing::info!` fast-path away before reaching the
+/// thread-local subscriber. One capture test at a time, process-wide.
+/// A tokio mutex because the guard spans the captured async body.
+#[cfg(test)]
+pub(crate) static TRACING_CAPTURE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncate_error_body_short_passes_through() {
+        assert_eq!(truncate_error_body_for_log("boom"), "boom");
+        // Exactly at the cap is not truncated.
+        let at_cap = "a".repeat(MAX_ERROR_BODY_LOG_BYTES);
+        assert_eq!(truncate_error_body_for_log(&at_cap), at_cap);
+    }
+
+    #[test]
+    fn truncate_error_body_caps_length() {
+        let big = "a".repeat(MAX_ERROR_BODY_LOG_BYTES + 500);
+        let out = truncate_error_body_for_log(&big);
+        assert_eq!(out.len(), MAX_ERROR_BODY_LOG_BYTES);
+    }
+
+    #[test]
+    fn truncate_error_body_never_splits_a_char() {
+        // '€' is 3 bytes; place a run of them so the byte cap lands mid-char.
+        // The result must stay ≤ cap AND be valid UTF-8 (no split), i.e. end
+        // on a char boundary just below the cap.
+        let s = "€".repeat(MAX_ERROR_BODY_LOG_BYTES); // 3 * cap bytes
+        let out = truncate_error_body_for_log(&s);
+        assert!(out.len() <= MAX_ERROR_BODY_LOG_BYTES);
+        assert!(
+            out.len() > MAX_ERROR_BODY_LOG_BYTES - 3,
+            "should fill the budget to within one char"
+        );
+        assert!(
+            out.chars().all(|c| c == '€'),
+            "must not emit a partial char"
+        );
+    }
 
     #[test]
     fn message_scan_text_falls_back_to_content_blocks() {
@@ -586,6 +715,54 @@ mod tests {
         let empty: ChatMessage =
             serde_json::from_value(serde_json::json!({"role": "user", "content": ""})).unwrap();
         assert_eq!(message_scan_text(&empty), "");
+    }
+
+    #[test]
+    fn message_scan_text_scans_content_blocks_even_when_flat_content_is_nonempty() {
+        // Guardrail bypass: `content` and `content_blocks` are independent
+        // wire fields, and the provider bridges forward `content_blocks`
+        // when present. A caller that puts benign text in `content` and a
+        // payload in `content_blocks` would slip the payload past a scan
+        // that only reads `content`. The scanned text must be the UNION so
+        // it is a superset of everything a bridge can forward upstream.
+        let split: ChatMessage = serde_json::from_value(serde_json::json!({
+            "role": "user",
+            "content": "benign cover text",
+            "content_blocks": [{"type": "text", "text": "hidden payload"}]
+        }))
+        .unwrap();
+        let scanned = message_scan_text(&split);
+        assert!(
+            scanned.contains("benign cover text") && scanned.contains("hidden payload"),
+            "scan must cover both content and content_blocks, got {scanned:?}"
+        );
+    }
+
+    #[test]
+    fn message_scan_text_scans_tool_call_payload() {
+        // Same bypass class via `extra["tool_calls"]`: history-replay tool
+        // calls are forwarded upstream verbatim, so a payload in a
+        // function name or arguments must be scanned. The whole payload is
+        // serialized (matching guardrail_output_text), so both surfaces are
+        // covered.
+        let msg: ChatMessage = serde_json::from_value(serde_json::json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{
+                "id": "c1",
+                "type": "function",
+                "function": {
+                    "name": "lookup_evilname",
+                    "arguments": "{\"q\":\"hidden arg payload\"}"
+                }
+            }]
+        }))
+        .unwrap();
+        let scanned = message_scan_text(&msg);
+        assert!(
+            scanned.contains("hidden arg payload") && scanned.contains("lookup_evilname"),
+            "scan must cover tool_call name and arguments, got {scanned:?}"
+        );
     }
 
     struct DefaultPolicyGuardrail;
@@ -637,6 +814,7 @@ mod tests {
                 "azure_content_safety",
                 "azure_content_safety_text_moderation",
                 "aliyun_text_moderation",
+                "aliyun_ai_guardrail",
                 "bedrock",
                 "lakera",
                 "openai_moderation",
@@ -669,6 +847,12 @@ mod tests {
                 "aliyun_text_moderation" => serde_json::json!({
                     "kind": "aliyun_text_moderation",
                     "region": "ap-southeast-1",
+                    "access_key_id": "ak",
+                    "access_key_secret": "sk",
+                }),
+                "aliyun_ai_guardrail" => serde_json::json!({
+                    "kind": "aliyun_ai_guardrail",
+                    "region": "cn-shanghai",
                     "access_key_id": "ak",
                     "access_key_secret": "sk",
                 }),

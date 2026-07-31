@@ -1,0 +1,87 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "additionalProperties": false,
+  "definitions": {
+    "BoundClaimExpect": {
+      "anyOf": [
+        {
+          "description": "The claim must equal (or, for array claims, contain) this value.",
+          "type": "string"
+        },
+        {
+          "description": "The claim must equal (or, for array claims, contain) at least one of these values.",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": "array"
+        }
+      ],
+      "description": "Expected value(s) for one bound claim: a single string, or a list matched as any-of."
+    }
+  },
+  "properties": {
+    "audiences": {
+      "description": "Accepted `aud` values. The token's audience (a string or an array) must contain at least one of these. Every token must carry an audience claim.",
+      "items": {
+        "type": "string"
+      },
+      "minItems": 1,
+      "type": "array"
+    },
+    "bound_claims": {
+      "additionalProperties": {
+        "$ref": "#/definitions/BoundClaimExpect"
+      },
+      "description": "Additional claim requirements, all of which must hold. Keys name claims (dots traverse nested objects, e.g. `\"realm_access.roles\"`); each requirement is satisfied when the claim equals — or, for array claims, contains — one of the expected values.",
+      "type": "object"
+    },
+    "enabled": {
+      "default": true,
+      "description": "Whether the provider participates in JWT authentication. A disabled provider is kept but ignored. Treated as `true` when omitted.",
+      "type": "boolean"
+    },
+    "identity_claim": {
+      "default": "sub",
+      "description": "Claim whose value selects the API key to act as: the request is bound to the key whose `jwt_subject` equals this claim's value. Dots traverse nested objects (e.g. `\"resource_access.account\"`). Defaults to `sub`.",
+      "minLength": 1,
+      "type": "string"
+    },
+    "issuer": {
+      "description": "Expected `iss` claim, compared byte-for-byte against the token's issuer. A JWT whose issuer matches no enabled provider is rejected.",
+      "minLength": 1,
+      "type": "string"
+    },
+    "jwks_uri": {
+      "description": "JWKS endpoint URL the signing keys are fetched from. When omitted, the endpoint is resolved once from the issuer's OIDC discovery document (`<issuer>/.well-known/openid-configuration`) and cached.",
+      "minLength": 1,
+      "type": "string"
+    },
+    "leeway_secs": {
+      "description": "Clock-skew allowance in seconds applied to time-based claims (`exp`, `nbf`). Defaults to 0.",
+      "format": "uint64",
+      "maximum": 300.0,
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "name": {
+      "description": "Human-readable provider name, unique within the environment (e.g. `\"corp-keycloak\"`).",
+      "minLength": 1,
+      "type": "string"
+    },
+    "required_scopes": {
+      "description": "Scopes that must all be present in the token's `scope` claim (a space-delimited string or an array of strings). An empty list requires nothing.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "audiences",
+    "issuer",
+    "name"
+  ],
+  "title": "OidcProvider",
+  "type": "object"
+}

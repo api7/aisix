@@ -9,7 +9,9 @@ describe("livez e2e: public liveness route is /livez and /health is gone", () =>
   beforeAll(async () => {
     etcdReachable = await new EtcdClient().ping();
     if (!etcdReachable) return;
-    app = await spawnApp();
+    // Held-back: this test drives the admin listener's health endpoint,
+    // so it keeps admin bound (the suite default is now admin-off).
+    app = await spawnApp({ admin: true });
   });
 
   afterAll(async () => {

@@ -184,6 +184,37 @@ pub enum ObjectStoreCredentials {
     },
 }
 
+/// HTTP client options carrying the deployment's outbound TLS trust, so
+/// an on-prem object store — a MinIO or an internal S3-compatible host
+/// behind an enterprise CA — is reachable on the same `upstream.tls`
+/// setting the provider bridges use.
+///
+/// Applied first in every builder chain: `with_client_options` replaces
+/// the whole options value, so a later `with_allow_http` layers onto
+/// this rather than the other way round.
+fn tls_client_options() -> object_store::ClientOptions {
+    let tls = &aisix_gateway::upstream_http::config().tls;
+    let mut options = object_store::ClientOptions::new();
+    if let Some(pem) = &tls.extra_ca_pem {
+        // Validated at boot by `TlsSettings::load`.
+        match object_store::Certificate::from_pem_bundle(pem) {
+            Ok(roots) => {
+                for root in roots {
+                    options = options.with_root_certificate(root);
+                }
+            }
+            Err(e) => tracing::error!(
+                error = %e,
+                "upstream.tls.ca_file not applied to object-store exports"
+            ),
+        }
+    }
+    if !tls.verify {
+        options = options.with_allow_invalid_certificates(true);
+    }
+    options
+}
+
 /// Build the provider-agnostic [`ObjectStore`] handle for a configured
 /// exporter. **This is the only provider-specific code** — each arm picks the
 /// matching `object_store` builder, which owns that cloud's signing. An
@@ -206,6 +237,7 @@ pub fn build_object_store(
             },
         ) => {
             let mut b = object_store::aws::AmazonS3Builder::new()
+                .with_client_options(tls_client_options())
                 .with_bucket_name(bucket)
                 .with_access_key_id(access_key_id)
                 .with_secret_access_key(secret_access_key);
@@ -241,6 +273,7 @@ pub fn build_object_store(
             // the service-account JSON's `gcs_base_url` field instead, so the
             // `endpoint` config is intentionally not applied for GCS.
             let b = object_store::gcp::GoogleCloudStorageBuilder::new()
+                .with_client_options(tls_client_options())
                 .with_bucket_name(bucket)
                 .with_service_account_key(service_account_key);
             let store = b
@@ -256,6 +289,7 @@ pub fn build_object_store(
             },
         ) => {
             let mut b = object_store::azure::MicrosoftAzureBuilder::new()
+                .with_client_options(tls_client_options())
                 .with_container_name(bucket)
                 .with_account(account)
                 .with_access_key(access_key);
@@ -310,7 +344,9 @@ pub fn build_object_store_ambient(
                         .to_string(),
                 ));
             }
-            let mut b = object_store::aws::AmazonS3Builder::from_env().with_bucket_name(bucket);
+            let mut b = object_store::aws::AmazonS3Builder::from_env()
+                .with_client_options(tls_client_options())
+                .with_bucket_name(bucket);
             if let Some(r) = region {
                 b = b.with_region(r);
             }
@@ -323,6 +359,7 @@ pub fn build_object_store_ambient(
             // No service-account key set → `object_store` sources Application
             // Default Credentials (GKE Workload Identity / GCE metadata).
             let store = object_store::gcp::GoogleCloudStorageBuilder::new()
+                .with_client_options(tls_client_options())
                 .with_bucket_name(bucket)
                 .build()
                 .map_err(|e| {

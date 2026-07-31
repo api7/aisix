@@ -35,18 +35,26 @@ aisix-guardrails = { path = "../aisix-guardrails" }
 tokio.workspace = true
 axum.workspace = true
 reqwest.workspace = true
+# Inbound OIDC/JWT verification on the proxy auth path (jwt.rs). Same
+# major as the vertex provider's service-account signer.
+jsonwebtoken = "9"
 tower.workspace = true
 tower-http.workspace = true
 http-body-util.workspace = true
 bytes.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# Token-estimation fallback for usage telemetry (token_estimate.rs).
+tiktoken-rs.workspace = true
 futures.workspace = true
 tokio-tungstenite.workspace = true
 async-trait.workspace = true
 async-stream = "0.3"
 dashmap.workspace = true
 base64.workspace = true
+# Scheme validation of provider-supplied redirect targets on
+# `GET /v1/videos/:id/content` (already in the tree via reqwest).
+url.workspace = true
 # Per-request weighted-random target selection in `routing::weighted_pick`.
 # `thread_rng()` gives proper per-request entropy that converges to the
 # configured weights over a finite sample (fix for #197 — the prior
@@ -63,7 +71,8 @@ uuid.workspace = true
 ipnet.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt"] }
+# `test-util` drives the SSE-heartbeat tests on a paused clock.
+tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
 # aisix-provider-anthropic + aisix-provider-openai moved to
 # [dependencies] so the /v1/messages handler can use their primitives
 # in non-test builds too.

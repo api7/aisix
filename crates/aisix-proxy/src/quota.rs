@@ -4,7 +4,10 @@
 //! 1. Budget pre-check (cp-api cached decision)
 //! 2. API-key inline rate limit (`auth.entry.id`)
 //! 3. Model inline rate limit (`model:<name>`) — when the resolved Model has one
-//! 4. Policy-based rate limits — looked up from the snapshot's
+//! 4. MCP-server rate limit (`mcp:<api_key_id>:<server>`) — on an MCP
+//!    `tools/call`, the key's `mcp_rate_limits` entry for the server the
+//!    call targets
+//! 5. Policy-based rate limits — looked up from the snapshot's
 //!    `rate_limit_policies` table, matched by scope
 //!    (api_key/model/team/member/team_member). `team_member` is a
 //!    per-member default for a team: it matches every key in the team
@@ -119,11 +122,14 @@ fn policy_bucket_key(policy: &RateLimitPolicy, entry_id: &str, auth: &Authentica
     base
 }
 
-/// Reserve across all applicable rate-limit layers (api_key, model, policies).
+/// Reserve across all applicable rate-limit layers (api_key, model,
+/// mcp_server, policies). `mcp_server` is the MCP server an in-flight
+/// `tools/call` targets; `None` for every non-MCP endpoint.
 async fn reserve_layers(
     state: &ProxyState,
     auth: &AuthenticatedKey,
     model_rl: Option<&ModelRateLimit>,
+    mcp_server: Option<&str>,
 ) -> Result<MultiReservation, ProxyError> {
     let mut reservations = Vec::with_capacity(8);
 
@@ -151,7 +157,25 @@ async fn reserve_layers(
         }
     }
 
-    // Layer 3+: Rate limit policies from snapshot.
+    // Layer 3: per-MCP-server limit carried by this key. Bucketed on
+    // `mcp:<api_key_id>:<server>` so each server the key reaches counts
+    // independently — of the other servers, and of every other key.
+    if let Some(server) = mcp_server {
+        if let Some(limits) = auth.key().mcp_rate_limit(server) {
+            let rl = RateLimit::from(limits);
+            if !rl.is_unrestricted() {
+                let key = format!("mcp:{}:{}", auth.entry.id, server);
+                let r = state
+                    .limiter
+                    .pre_commit(&key, &rl)
+                    .await
+                    .map_err(ProxyError::from)?;
+                reservations.push(r);
+            }
+        }
+    }
+
+    // Layer 4+: Rate limit policies from snapshot.
     let snap = state.snapshot.load();
     for entry in snap.rate_limit_policies.entries() {
         let policy = &entry.value;
@@ -196,6 +220,27 @@ pub(crate) async fn enforce(
     auth: &AuthenticatedKey,
     model_rl: Option<&ModelRateLimit>,
 ) -> Result<MultiReservation, ProxyError> {
+    check_budget(state, auth).await?;
+    reserve_layers(state, auth, model_rl, None).await
+}
+
+/// Apply budget + multi-layer rate-limit checks for one MCP `tools/call`
+/// against `mcp_server`, the server the called tool belongs to. Same gate
+/// as [`enforce`] plus the key's per-server layer; MCP resolves no model,
+/// so the model layers are never engaged.
+pub(crate) async fn enforce_mcp(
+    state: &ProxyState,
+    auth: &AuthenticatedKey,
+    mcp_server: &str,
+) -> Result<MultiReservation, ProxyError> {
+    check_budget(state, auth).await?;
+    reserve_layers(state, auth, None, Some(mcp_server)).await
+}
+
+/// Budget pre-check shared by the enforce entry points: refreshes the
+/// budget gauges from the cached cp-api decision and rejects the request
+/// when the key is over budget.
+async fn check_budget(state: &ProxyState, auth: &AuthenticatedKey) -> Result<(), ProxyError> {
     let decision = state.budgets.check(&auth.entry.id).await;
     let budget_labels = aisix_obs::BudgetLabels {
         api_key_id: &auth.entry.id,
@@ -222,8 +267,7 @@ pub(crate) async fn enforce(
             }),
         )));
     }
-
-    reserve_layers(state, auth, model_rl).await
+    Ok(())
 }
 
 /// Rate-limit-only enforcement (no budget check). Used by `chat.rs`
@@ -233,7 +277,7 @@ pub(crate) async fn enforce_rate_limit(
     auth: &AuthenticatedKey,
     model_rl: Option<&ModelRateLimit>,
 ) -> Result<MultiReservation, ProxyError> {
-    reserve_layers(state, auth, model_rl).await
+    reserve_layers(state, auth, model_rl, None).await
 }
 
 /// Reserve ONLY the model-scoped layers (a model's inline `rate_limit` plus
@@ -291,6 +335,42 @@ pub(crate) async fn reserve_model_only(
     }
 
     Ok(MultiReservation::new(reservations))
+}
+
+/// Reserve the model-scoped layers for one routing-dispatch target (Model
+/// Group / semantic-router member), mirroring the ensemble per-sub-call
+/// reservation (#620). Returns `Ok(None)` for a direct (non-routing)
+/// dispatch: there the target IS the requested entry, whose model layers
+/// were already reserved pre-dispatch by [`enforce`]/[`enforce_rate_limit`],
+/// so reserving again would double-count the request (AISIX-Cloud#1087).
+///
+/// An `Err` means this target is over one of its own limits right now —
+/// the dispatch loops treat that as a failed 429 attempt and continue with
+/// the remaining targets (matching LiteLLM, which filters rate-limited
+/// deployments out of the candidate set).
+pub(crate) async fn reserve_routing_target(
+    state: &ProxyState,
+    is_routing_request: bool,
+    target_name: &str,
+    target_entry_id: &str,
+    target: &aisix_core::Model,
+) -> Result<Option<MultiReservation>, ProxyError> {
+    if !is_routing_request {
+        return Ok(None);
+    }
+    reserve_model_only(state, target_name, target_entry_id, target)
+        .await
+        .map(Some)
+}
+
+/// Seconds until the offending window reopens, for a
+/// [`reserve_routing_target`] rejection. `chat.rs` funnels its rejection
+/// through a `BridgeError`, which would otherwise drop the hint the
+/// `/v1/messages` and `/v1/responses` loops keep by carrying the
+/// `ProxyError::RateLimit` itself — so every endpoint's all-targets-exhausted
+/// 429 lands with the same `Retry-After`.
+pub(crate) fn retry_after_of(err: &ProxyError) -> Option<u64> {
+    err.retry_after_secs()
 }
 
 #[cfg(test)]

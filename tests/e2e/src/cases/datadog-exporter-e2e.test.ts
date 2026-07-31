@@ -3,8 +3,8 @@ import { createServer, type IncomingMessage, type Server } from "node:http";
 import { gunzipSync } from "node:zlib";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   pickFreePort,
   spawnApp,
   startOpenAiUpstream,
@@ -126,19 +126,19 @@ async function startMockDatadog(): Promise<MockDatadog> {
   };
 }
 
-async function seedRouting(admin: AdminClient, upstream: OpenAiUpstream, model: string) {
-  const pk = await admin.createProviderKey({
+async function seedRouting(seed: SeedClient, upstream: OpenAiUpstream, model: string) {
+  const pk = await seed.createProviderKey({
     display_name: `${model}-pk`,
     secret: PROVIDER_SECRET,
     api_base: `${upstream.baseUrl}/v1`,
   });
-  await admin.createModel({
+  await seed.createModel({
     display_name: model,
     provider: "openai",
     model_name: "gpt-4o-mini",
     provider_key_id: pk.id,
   });
-  await admin.createApiKey({
+  await seed.createApiKey({
     key_hash: CALLER_KEY_HASH,
     allowed_models: [model],
   });
@@ -184,12 +184,14 @@ function asRecord(log: unknown): Record<string, unknown> {
 
 describe("datadog exporter e2e (#688): DP delivers a gzip JSON intake to Datadog", () => {
   let etcdReachable = false;
+  let etcd: EtcdClient | undefined;
   let upstream: OpenAiUpstream | undefined;
   let dd: MockDatadog | undefined;
   const apps: SpawnedApp[] = [];
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
     // Plant the response token in the mock upstream's assistant content so the
     // content-capture test can search for it in the `full` log body.
@@ -226,15 +228,15 @@ describe("datadog exporter e2e (#688): DP delivers a gzip JSON intake to Datadog
         return;
       }
       const app = await spawnApp({
+        admin: false,
         // The API key rides the DP's own env, never the kine config.
         extraEnv: {
           [`DD_CRED_${CREDENTIAL_REF.toUpperCase()}_API_KEY`]: DD_API_KEY,
         },
       });
       apps.push(app);
-      // Deliberately seeds via the Admin API: deprecation-window coverage.
-      const admin = new AdminClient(app.adminUrl, app.adminKey);
-      await admin.createObservabilityExporter({
+      const seed = new SeedClient(etcd!, app.etcdPrefix);
+      await seed.createObservabilityExporter({
         name: "mock-datadog",
         enabled: true,
         kind: "datadog",
@@ -245,7 +247,7 @@ describe("datadog exporter e2e (#688): DP delivers a gzip JSON intake to Datadog
         // Default privacy posture: operational metadata only, never content.
         content_mode: "metadata_only",
       });
-      await seedRouting(admin, upstream, "datadog-exporter-model");
+      await seedRouting(seed, upstream, "datadog-exporter-model");
 
       await waitConfigPropagation(async () => {
         try {
@@ -315,15 +317,16 @@ describe("datadog exporter e2e (#688): DP delivers a gzip JSON intake to Datadog
       const ddFull = await startMockDatadog();
       const ddMeta = await startMockDatadog();
       const app = await spawnApp({
+        admin: false,
         extraEnv: {
           [`DD_CRED_${CREDENTIAL_REF.toUpperCase()}_API_KEY`]: DD_API_KEY,
         },
       });
       apps.push(app);
       try {
-        const admin = new AdminClient(app.adminUrl, app.adminKey);
+        const seed = new SeedClient(etcd!, app.etcdPrefix);
         // Two exporters on the same DP: one captures content, one does not.
-        await admin.createObservabilityExporter({
+        await seed.createObservabilityExporter({
           name: "datadog-full",
           enabled: true,
           kind: "datadog",
@@ -332,7 +335,7 @@ describe("datadog exporter e2e (#688): DP delivers a gzip JSON intake to Datadog
           service: DD_SERVICE,
           content_mode: "full",
         });
-        await admin.createObservabilityExporter({
+        await seed.createObservabilityExporter({
           name: "datadog-meta",
           enabled: true,
           kind: "datadog",
@@ -341,7 +344,7 @@ describe("datadog exporter e2e (#688): DP delivers a gzip JSON intake to Datadog
           service: DD_SERVICE,
           content_mode: "metadata_only",
         });
-        await seedRouting(admin, upstream, "datadog-content-model");
+        await seedRouting(seed, upstream, "datadog-content-model");
 
         await waitConfigPropagation(async () => {
           try {

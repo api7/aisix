@@ -1,11 +1,15 @@
-//! `GET /admin/v1/models/status` — runtime per-model status.
+//! Runtime per-model status: the render shared by
+//! `GET /admin/v1/models/status` (admin listener) and
+//! `GET /status/models` (metrics/status listener).
 
 use axum::extract::State;
 use axum::Json;
 use serde::Serialize;
 use std::time::Duration;
 
-use aisix_proxy::{RuntimeStatus, RuntimeStatusSnapshot};
+use aisix_core::resource::ResourceEntry;
+use aisix_core::Model;
+use aisix_proxy::{ModelRuntimeStatusTracker, RuntimeStatus, RuntimeStatusSnapshot};
 
 use crate::auth::AdminAuth;
 use crate::error::AdminError;
@@ -34,9 +38,21 @@ pub async fn get_models_status(
     State(state): State<AdminState>,
 ) -> Result<Json<Vec<ModelStatusView>>, AdminError> {
     let all_models = state.store.list_models().await?;
-    let tracker = state.runtime_status_tracker.as_ref();
+    Ok(Json(render_models_status(
+        all_models,
+        state.runtime_status_tracker.as_deref(),
+    )))
+}
 
-    let models = all_models
+/// Render the per-model runtime status view from a resource listing plus
+/// the proxy's runtime tracker. The single render behind both serving
+/// endpoints — admin listener and metrics/status listener — so the two
+/// responses cannot drift while both exist.
+pub(crate) fn render_models_status(
+    all_models: Vec<ResourceEntry<Model>>,
+    tracker: Option<&ModelRuntimeStatusTracker>,
+) -> Vec<ModelStatusView> {
+    all_models
         .into_iter()
         .map(|entry| {
             // Virtual routers (routing / ensemble / semantic) have no
@@ -80,7 +96,5 @@ pub async fn get_models_status(
                 }
             }
         })
-        .collect();
-
-    Ok(Json(models))
+        .collect()
 }

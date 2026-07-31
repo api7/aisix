@@ -26,18 +26,25 @@ use aisix_gateway::{Bridge, BridgeError, Hub};
 
 /// Map a `reqwest` transport error from a raw-passthrough dispatch
 /// (`/v1/responses`, `/v1/messages` Anthropic, `/v1/messages/count_tokens`)
-/// into the gateway's [`BridgeError`]. A timed-out request (the per-request
-/// `.timeout(model.request_timeout())` budget elapsed) becomes
+/// into the gateway's [`BridgeError`]. A timed-out request becomes
 /// [`BridgeError::Timeout`] so it surfaces as 504, classifies as `"timeout"`
 /// in telemetry, and participates in routing failover exactly like the
 /// Bridge-trait path (#554). Everything else stays a transport error.
+///
+/// `is_timeout()` is satisfied by three unrelated conditions — the
+/// configured request budget expiring in hyper, the `connect_timeout`
+/// expiring, and the kernel returning `ETIMEDOUT` for an unanswered SYN —
+/// so the reqwest cause chain is carried onto the error. Without it all
+/// three render as one sentence and an operator cannot tell a slow
+/// upstream from one that was never reached (AISIX-Cloud#1093).
 pub(crate) fn reqwest_error_to_bridge(e: &reqwest::Error, started: Instant) -> BridgeError {
     if e.is_timeout() {
         BridgeError::Timeout {
             elapsed_ms: started.elapsed().as_millis() as u64,
+            cause: aisix_gateway::transport_error_message(e),
         }
     } else {
-        BridgeError::Transport(e.to_string())
+        BridgeError::Transport(aisix_gateway::transport_error_message(e))
     }
 }
 
@@ -262,10 +269,139 @@ pub(crate) fn require_api_key<'a>(
     Ok(provider_key.api_key.as_str())
 }
 
+/// Build the [`BridgeContext`] for one upstream call.
+///
+/// The single chokepoint for wiring a Bridge dispatch: it carries the
+/// snapshot ids (which a `Model` / `ProviderKey` value does not know about
+/// itself) and, for a call made on behalf of a caller, that caller's
+/// identity and inbound headers. Both feed
+/// [`aisix_gateway::BridgeContext::header_ctx`], so a site that skipped
+/// either would silently stop rendering `${...}` header templates or
+/// forwarding allowlisted client headers, with no compiler signal —
+/// hence one constructor rather than a chain every caller must remember.
+///
+/// `client` is `None` for calls with no client request behind them: the
+/// semantic-router's embedding lookup and the background health prober.
+/// Those forward no client header and resolve no `${request.api_key.*}`
+/// variable, but still resolve the model / provider-key ones.
+pub(crate) fn bridge_ctx(
+    request_id: &str,
+    model_id: &str,
+    model: Arc<Model>,
+    provider_key_id: &str,
+    provider_key: Arc<ProviderKey>,
+    client: Option<&crate::client_ip::ClientContext>,
+) -> aisix_gateway::BridgeContext {
+    let ctx = aisix_gateway::BridgeContext::new(request_id, model, provider_key)
+        .with_resource_ids(model_id, provider_key_id);
+    match client {
+        Some(c) => ctx.with_client(c.caller.clone(), Some(c.headers.clone())),
+        None => ctx,
+    }
+}
+
+/// Build the outbound-header context for a dispatch path that constructs
+/// its upstream request directly instead of going through a `Bridge`
+/// (`/v1/messages`, `/v1/responses`, `/v1/messages/count_tokens`, audio,
+/// rerank, videos, jobs).
+///
+/// The Bridge paths get the same thing from
+/// [`aisix_gateway::BridgeContext::header_ctx`]; both must resolve the
+/// same variables from the same sources, so keep them in step.
+pub(crate) fn upstream_header_ctx<'a>(
+    pk: &'a ProviderKey,
+    pk_id: &'a str,
+    model: &'a Model,
+    model_id: &'a str,
+    client: &'a crate::client_ip::ClientContext,
+) -> aisix_gateway::UpstreamHeaderContext<'a> {
+    let caller = &client.caller;
+    aisix_gateway::UpstreamHeaderContext::from_overrides(pk.request.as_ref())
+        .with_vars(aisix_core::HeaderVars {
+            request_id: Some(&client.request_id),
+            api_key_id: Some(&caller.api_key_id),
+            api_key_name: caller.api_key_name.as_deref(),
+            api_key_team_id: caller.team_id.as_deref(),
+            api_key_user_id: caller.user_id.as_deref(),
+            model_id: Some(model_id),
+            model_name: Some(&model.display_name),
+            provider_key_id: Some(pk_id),
+            provider_key_name: Some(&pk.display_name),
+        })
+        .with_client_headers(&client.headers)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use aisix_core::resource::ResourceEntry;
+
+    /// AISIX-Cloud#1093: `reqwest::Error::is_timeout()` is satisfied by an
+    /// expired request budget, an expired `connect_timeout`, and the
+    /// kernel's `ETIMEDOUT`. The mapped error must carry the cause chain so
+    /// those are distinguishable — otherwise every one of them renders as
+    /// the same "timed out after Nms" sentence.
+    #[tokio::test]
+    async fn timeout_mapping_carries_the_transport_cause() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(5)))
+            .mount(&server)
+            .await;
+
+        let started = Instant::now();
+        let err = reqwest::Client::new()
+            .post(server.uri())
+            .timeout(std::time::Duration::from_millis(50))
+            .send()
+            .await
+            .expect_err("the 50ms budget must expire against a 5s upstream");
+        assert!(err.is_timeout(), "precondition: reqwest reports a timeout");
+
+        let mapped = reqwest_error_to_bridge(&err, started);
+        match &mapped {
+            BridgeError::Timeout { cause, .. } => {
+                assert!(!cause.is_empty(), "timeout must carry its cause chain");
+            }
+            other => panic!("expected Timeout, got {other:?}"),
+        }
+        // The rendered message keeps the elapsed budget AND names the cause.
+        let rendered = mapped.to_string();
+        assert!(
+            rendered.contains("upstream request timed out"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.len() > "upstream request timed out after 50ms".len(),
+            "cause must widen the message: {rendered}"
+        );
+    }
+
+    /// A non-timeout transport failure still maps to `Transport`, so the
+    /// two stay distinguishable by variant as well as by message.
+    #[tokio::test]
+    async fn non_timeout_transport_error_stays_transport() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let err = reqwest::Client::new()
+            .post(format!("http://{addr}/"))
+            .send()
+            .await
+            .expect_err("connect to a closed port must fail");
+        assert!(!err.is_timeout());
+
+        match reqwest_error_to_bridge(&err, Instant::now()) {
+            BridgeError::Transport(msg) => {
+                assert!(msg.to_lowercase().contains("refused"), "{msg}");
+            }
+            other => panic!("expected Transport, got {other:?}"),
+        }
+    }
 
     fn snapshot_with(provider_key_id: &str) -> AisixSnapshot {
         let snap = AisixSnapshot::new();

@@ -34,7 +34,13 @@ etcd:
 
 proxy:
   addr: "0.0.0.0:3000"
-  request_body_limit_bytes: 10485760   # 10 MiB
+  # Cap on inbound request bodies (JSON, multipart, passthrough, MCP,
+  # A2A). 0 — the default — disables the cap: providers accept larger
+  # requests than any fixed gateway default (Anthropic takes 32 MB), so
+  # a gateway-side cap rejects requests the upstream would have served.
+  # Set a value to bound per-request memory; over-limit requests get a
+  # 413 in the caller's error envelope.
+  # request_body_limit_bytes: 0
   # tls:
   #   cert_file: "/etc/aisix/tls/proxy.crt"
   #   key_file:  "/etc/aisix/tls/proxy.key"
@@ -73,6 +79,21 @@ observability:
     otlp:
       enabled: false
       endpoint: "http://127.0.0.1:4317"
+    # Optional User-Agent -> client_type mapping rules for the
+    # aisix_llm_tokens_by_client_total metric. Tried in order (first match
+    # wins) BEFORE the built-in client allowlist, so you can classify
+    # in-house tools or re-bucket a built-in match. `pattern` is a regex
+    # (max 512 bytes), matched case-insensitively and unanchored against
+    # the raw User-Agent; `client` is the fixed label value emitted on
+    # match ([a-z0-9][a-z0-9._-]*, max 64 chars; max 64 rules). Validated at
+    # boot; changes require a restart. The metric label set stays bounded:
+    # only these fixed values (plus built-ins / "other" / "unknown") are
+    # ever emitted — never the raw User-Agent.
+    # client_type_rules:
+    #   - pattern: "^py-billing-batcher/"
+    #     client: billing-batcher
+    #   - pattern: "internal-eval-harness"
+    #     client: eval-harness
   tracing:
     otlp:
       enabled: false
@@ -99,8 +120,9 @@ cache:
   # `redis` block below (validated at boot).
   backend: "memory"   # memory | redis
   # redis:
-  #   # mode picks the topology. Credentials and TLS (rediss://) travel
-  #   # inside the URLs, as in single mode.
+  #   # mode picks the topology. Credentials travel inside the URLs, as
+  #   # in single mode; a `rediss://` URL turns TLS on and the `tls` block
+  #   # below configures what it trusts.
   #   mode: "single"   # single | cluster | sentinel
   #   # mode: single  → one endpoint:
   #   url: "redis://127.0.0.1:6379"
@@ -116,6 +138,19 @@ cache:
   #   # username: "default"      # Redis ACL user (cluster nodes / sentinel master)
   #   # password: "s3cret"
   #   # database: 0              # DB index for the sentinel master (not used by cluster)
+  #   # Trust settings for a `rediss://` URL, ignored on plaintext
+  #   # `redis://`. Separate from `upstream.tls` because an in-cluster
+  #   # Redis is normally issued by a different authority than the model
+  #   # endpoints. Same fields and same meanings.
+  #   # tls:
+  #   #   ca_file: "/etc/aisix/tls/redis-ca.pem"
+  #   #   client_cert_file: "/etc/aisix/tls/redis-client.crt"
+  #   #   client_key_file:  "/etc/aisix/tls/redis-client.key"
+  #   #   verify: true
+  #   # NOTE: in sentinel mode the client library accepts no custom trust
+  #   # roots for the master it discovers, so ca_file does not apply there
+  #   # (it is logged at startup). Use SSL_CERT_FILE or the system trust
+  #   # store for that one case; `verify` does apply.
 
 # Rate-limit counter backend (api7/AISIX-Cloud#798).
 #
@@ -135,9 +170,121 @@ ratelimit:
   #   # nodes: ["redis://10.0.0.1:6379"]        # mode: cluster
   #   # sentinels: ["redis://10.0.0.1:26379"]   # mode: sentinel
   #   # master_name: "mymaster"                  # mode: sentinel
+  #   # tls: { ca_file: "/etc/aisix/tls/redis-ca.pem" }   # for rediss://
   # Seconds before an unreleased concurrency slot (crashed replica /
   # hung upstream) is reclaimed. Redis backend only.
   # concurrency_ttl_secs: 300
+
+# Connection-layer settings for outbound calls to LLM providers. These
+# describe the network path to the upstream, so they are deployment
+# config rather than per-model or per-provider-key fields.
+#
+# The values below are the defaults; uncomment to override. Every
+# duration accepts 0 to switch that knob off.
+upstream:
+  # Deployment-wide default for `Model.timeout`: the end-to-end deadline
+  # for non-streaming calls, and the fallback streaming budget (below),
+  # for every model that does not set its own. A backstop against an
+  # upstream that accepted the connection and then goes silent forever —
+  # not a responsiveness target (set per-model `timeout` for that), so it
+  # is deliberately generous: deep-reasoning calls can run past 10
+  # minutes. A model opts out with `timeout: 0`; setting 0 here restores
+  # the old "no deadline unless configured" behaviour.
+  # timeout_ms: 6000000
+
+  # Deployment-wide default for `Model.stream_timeout`: the maximum gap
+  # between streaming chunks. 0 falls back to `timeout_ms`, mirroring how
+  # an unset `Model.stream_timeout` falls back to `Model.timeout`.
+  # stream_timeout_ms: 0
+
+  # Max time for DNS + TCP + TLS before an attempt fails. Without it a
+  # black-holed upstream is bounded only by the model's own timeout.
+  # connect_timeout_ms: 5000
+
+  # TCP keepalive. Idle time before the first probe, the interval
+  # between probes, and how many unacknowledged probes end the
+  # connection. Keeps a NAT / LB idle timer from reaping a connection
+  # while a slow model is still producing its first token.
+  # tcp_keepalive_secs: 60
+  # tcp_keepalive_interval_secs: 30
+  # tcp_keepalive_retries: 5
+
+  # How long an idle connection may sit in the pool before being
+  # discarded. KEEP THIS BELOW the shortest idle timeout on the path to
+  # the provider (load balancer, NAT gateway, corporate proxy, service
+  # mesh). If it is longer, the pool eventually hands out a connection
+  # the far end has already closed and the request fails with a
+  # transport error. Lower it if you see intermittent transport errors
+  # against an otherwise healthy provider.
+  pool_idle_timeout_secs: 30
+
+  # Cap on idle connections kept per upstream host. Unset = unbounded.
+  # pool_max_idle_per_host: 32
+
+  # Retry attempts after a retryable upstream failure (5xx, timeout,
+  # transport). Applies to every model that does not set its own `retries`,
+  # and to every model group that does not set `routing.retries`. Set to 0
+  # to disable retrying deployment-wide.
+  #
+  # Each retry re-sends the full request body and stacks on top of any retry
+  # the provider's own edge performs, so raising this multiplies the load a
+  # struggling upstream sees.
+  # retries: 2
+
+  # Trust settings for the TLS handshake with every upstream: the provider
+  # bridges, guardrail services, MCP and A2A upstreams, OIDC/JWKS fetches,
+  # the Realtime WebSocket, Bedrock, and the log-export object stores.
+  #
+  # Unset, the trust store is the platform's — the built-in root set plus
+  # whatever SSL_CERT_FILE / SSL_CERT_DIR point at. Those environment
+  # variables keep working and stay additive; ca_file is the same idea
+  # expressed in config instead of in the process environment.
+  # tls:
+  #   # PEM file of one or more certificates to trust as issuers, for an
+  #   # upstream whose certificate is signed by a private or enterprise CA.
+  #   # ADDITIVE: public providers stay reachable. A full chain in one
+  #   # bundle works — every certificate in the file is loaded.
+  #   ca_file: "/etc/aisix/tls/private-ca.pem"
+  #
+  #   # Client certificate for upstreams that require mutual TLS. Both
+  #   # fields are required together.
+  #   # client_cert_file: "/etc/aisix/tls/client.crt"
+  #   # client_key_file:  "/etc/aisix/tls/client.key"
+  #
+  #   # false accepts ANY certificate — expired, issued for another host,
+  #   # or presented by an interceptor — which removes the only thing
+  #   # stopping a machine-in-the-middle from reading and rewriting every
+  #   # prompt, response, and upstream API key on the connection. For a
+  #   # test environment where the alternative is not running at all;
+  #   # prefer ca_file everywhere else.
+  #   #
+  #   # Two paths cannot honour it and log so at startup: Bedrock (the AWS
+  #   # SDK's HTTP stack cannot disable verification, and cannot present a
+  #   # client certificate either), and Redis in sentinel mode.
+  #   # verify: true
+
+# Connection-layer settings for the inbound side — the clients, or the
+# gateway in front of this one, talking to the listeners above. The
+# mirror image of `upstream:`.
+downstream:
+  # How long an accepted connection may sit idle — response written, no
+  # next request started — before the gateway closes it. HTTP/1.1 only.
+  # An in-flight request or SSE stream is never interrupted, however long
+  # it runs; the timer only arms between requests.
+  #
+  # 0 (the default) never closes an idle connection and leaves that to
+  # the peer. Whatever sits in front pools its own connections, and
+  # closing first is what hands *it* a connection it thinks is still
+  # usable — the same failure this gateway avoids upstream by keeping
+  # pool_idle_timeout_secs low. If you set this, keep it ABOVE the pool
+  # idle timeout of the node in front.
+  idle_timeout_secs: 0
+
+  # Interval between SSE heartbeat comments (":\n\n") sent while a
+  # streaming response has produced nothing. Keeps a proxy in front from
+  # treating a model that is slow to its first token as an abandoned
+  # connection. 0 disables the heartbeat.
+  # sse_keepalive_interval_secs: 15
 
 # Models, API keys, provider keys, guardrails, cache policies, and
 # observability exporters are NOT defined in this file. They are stored

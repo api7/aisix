@@ -155,8 +155,48 @@ pub enum ProxyError {
     /// (#933). Same disclosure reasoning as [`Self::ApiKeyExpired`].
     #[error("API key has been disabled")]
     ApiKeyDisabled,
+    /// The bearer was a JWT whose validation failed: malformed token,
+    /// untrusted issuer, bad signature, audience mismatch, or an
+    /// unresolvable signing key. Deliberately collapsed into one
+    /// caller-visible reason so a probe cannot use the taxonomy as an
+    /// oracle for which issuers this gateway trusts; the detailed
+    /// reason goes to the auth decision log only.
+    #[error("invalid JWT")]
+    JwtInvalid,
+    /// The JWT's `exp` deadline has passed. Caller-visible as
+    /// "expired" for the same reason as [`Self::ApiKeyExpired`]: the
+    /// caller already holds the token, and naming the reason tells
+    /// them to fetch a fresh one from their identity provider instead
+    /// of debugging a rejection.
+    #[error("JWT has expired")]
+    JwtExpired,
+    /// The JWT verified but does not satisfy the trust provider's
+    /// `required_scopes` / `bound_claims` requirements. 403: the
+    /// caller is authenticated, just not entitled.
+    #[error("JWT does not satisfy the required scopes or claims")]
+    JwtClaimsRejected,
+    /// The JWT verified but no API key carries a `jwt_subject` equal
+    /// to its identity claim. Named explicitly (not a generic invalid
+    /// credential) because the fix — binding a key to the identity —
+    /// belongs to the gateway operator, and the caller-visible code is
+    /// what they'll be shown when onboarding a fleet of agents.
+    #[error("no API key is bound to this JWT identity")]
+    JwtIdentityUnmapped,
+    /// The signing keys for the matched trust provider could not be
+    /// fetched (identity provider unreachable and nothing cached).
+    /// 503 rather than 401: the token was not judged invalid, the
+    /// gateway just cannot verify it right now — retryable.
+    #[error("unable to fetch the identity provider's signing keys")]
+    JwksUnavailable,
     #[error("model {0:?} not found")]
     ModelNotFound(String),
+    /// A `/v1/videos/{video_id}` id that this gateway could not have
+    /// minted — undecodable, or referencing a Model entry that no longer
+    /// exists in the snapshot. 404, mirroring how the upstream videos
+    /// API treats unknown job ids. The id echoes back verbatim: the
+    /// caller supplied it, so it leaks nothing.
+    #[error("video {0:?} not found")]
+    VideoNotFound(String),
     #[error("API key is not allowed to use model {0:?}")]
     ModelForbidden(String),
     /// The resolved client IP is outside the model's `allowed_cidrs`
@@ -236,10 +276,16 @@ impl ProxyError {
             ProxyError::MissingAuth
             | ProxyError::InvalidApiKey
             | ProxyError::ApiKeyExpired
-            | ProxyError::ApiKeyDisabled => StatusCode::UNAUTHORIZED,
+            | ProxyError::ApiKeyDisabled
+            | ProxyError::JwtInvalid
+            | ProxyError::JwtExpired
+            | ProxyError::JwtIdentityUnmapped => StatusCode::UNAUTHORIZED,
+            ProxyError::JwtClaimsRejected => StatusCode::FORBIDDEN,
+            ProxyError::JwksUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             ProxyError::ModelForbidden(_) => StatusCode::FORBIDDEN,
             ProxyError::ModelIpRestricted(_) => StatusCode::FORBIDDEN,
             ProxyError::ModelNotFound(_) => StatusCode::NOT_FOUND,
+            ProxyError::VideoNotFound(_) => StatusCode::NOT_FOUND,
             ProxyError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
             ProxyError::ProviderUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             ProxyError::AllCandidatesUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
@@ -258,10 +304,18 @@ impl ProxyError {
             ProxyError::MissingAuth
             | ProxyError::InvalidApiKey
             | ProxyError::ApiKeyExpired
-            | ProxyError::ApiKeyDisabled => "invalid_api_key",
+            | ProxyError::ApiKeyDisabled
+            | ProxyError::JwtInvalid
+            | ProxyError::JwtExpired
+            | ProxyError::JwtIdentityUnmapped => "invalid_api_key",
+            ProxyError::JwtClaimsRejected => "permission_denied",
+            // Auth infrastructure fault, not a credential judgment — the
+            // generic server-fault family, like a 5xx from dispatch.
+            ProxyError::JwksUnavailable => "api_error",
             ProxyError::ModelForbidden(_) => "permission_denied",
             ProxyError::ModelIpRestricted(_) => "permission_denied",
             ProxyError::ModelNotFound(_) => "model_not_found",
+            ProxyError::VideoNotFound(_) => "video_not_found",
             ProxyError::InvalidRequest(_) => "invalid_request_error",
             ProxyError::RequestTooLarge { .. } => "invalid_request_error",
             ProxyError::ProviderUnavailable => "provider_unavailable",
@@ -320,6 +374,18 @@ impl ProxyError {
         {
             return render_bridge_upstream_envelope(*status, message, parsed.as_deref(), *wire);
         }
+        // A timeout's transport cause names the upstream host and the
+        // connection-layer fault it hit. Same rule as the 5xx body below:
+        // that is operator diagnostics, so it reaches the logs and the
+        // per-attempt telemetry through `Display`, while the caller keeps
+        // the bare sentence it has always had — an `api_base` is internal
+        // topology and does not belong in a customer-facing envelope.
+        if let ProxyError::Bridge(aisix_gateway::BridgeError::Timeout { elapsed_ms, .. }) = self {
+            return ErrorEnvelope::new(
+                format!("upstream request timed out after {elapsed_ms}ms"),
+                self.kind(),
+            );
+        }
         let env = ErrorEnvelope::new(self.to_string(), self.kind());
         match self {
             ProxyError::BudgetExceeded(r) => env.with_code("budget_exceeded").with_budget(r),
@@ -332,6 +398,18 @@ impl ProxyError {
             // `error.type` stays the family-wide `invalid_api_key`.
             ProxyError::ApiKeyExpired => env.with_code("api_key_expired"),
             ProxyError::ApiKeyDisabled => env.with_code("api_key_disabled"),
+            // Same stable-code convention for the JWT auth path
+            // (AISIX-Cloud#1080/#1081): SDKs and agent frameworks branch
+            // on `error.code` to decide between refreshing the token
+            // (`jwt_expired`), fixing the token request
+            // (`jwt_invalid` / `jwt_claims_rejected`), and asking the
+            // gateway operator to bind the identity to a key
+            // (`jwt_identity_unmapped`).
+            ProxyError::JwtInvalid => env.with_code("jwt_invalid"),
+            ProxyError::JwtExpired => env.with_code("jwt_expired"),
+            ProxyError::JwtClaimsRejected => env.with_code("jwt_claims_rejected"),
+            ProxyError::JwtIdentityUnmapped => env.with_code("jwt_identity_unmapped"),
+            ProxyError::JwksUnavailable => env.with_code("jwks_unavailable"),
             _ => env,
         }
     }
@@ -539,9 +617,99 @@ pub(crate) fn proxy_error_from_json_rejection(
     }
 }
 
+/// [`proxy_error_from_json_rejection`]'s sibling for handlers that take
+/// the raw `Bytes` extractor (batches / fine-tuning): same 413-vs-400
+/// discrimination, no JSON layer.
+pub(crate) fn proxy_error_from_bytes_rejection(
+    rej: axum::extract::rejection::BytesRejection,
+    limit_bytes: usize,
+) -> ProxyError {
+    if rej.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        ProxyError::RequestTooLarge { limit_bytes }
+    } else {
+        ProxyError::InvalidRequest("failed to read request body".into())
+    }
+}
+
+/// Map a multipart read failure, preserving axum's 413 discrimination:
+/// an over-cap stream or part is a real `RequestTooLarge` (axum's
+/// `MultipartError::status()` already classifies it 413); everything
+/// else stays the 400 the call site describes via `context`. Without
+/// this, an over-limit chunked upload surfaced as a generic 400
+/// `invalid_request_error` instead of `request_too_large`.
+pub(crate) fn proxy_error_from_multipart(
+    err: axum::extract::multipart::MultipartError,
+    limit_bytes: usize,
+    context: &str,
+) -> ProxyError {
+    if err.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        ProxyError::RequestTooLarge { limit_bytes }
+    } else {
+        ProxyError::InvalidRequest(format!("{context}: {err}"))
+    }
+}
+
+/// Cap for manual `axum::body::to_bytes` reads: the configured
+/// `request_body_limit_bytes` with the `0` = "no cap" sentinel widened to
+/// `usize::MAX`, mirroring what `DefaultBodyLimit::disable()` does on the
+/// extractor path.
+pub(crate) fn body_read_cap(limit_bytes: usize) -> usize {
+    if limit_bytes == 0 {
+        usize::MAX
+    } else {
+        limit_bytes
+    }
+}
+
+/// Whether a manual body read failed because it hit the length cap
+/// (→ 413) rather than a transport fault (→ 400). `axum::body::to_bytes`
+/// folds both into one opaque `axum::Error`; the cap case carries
+/// `http_body_util::LengthLimitError` in its source chain.
+pub(crate) fn is_length_limit_error(err: &axum::Error) -> bool {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = source {
+        if e.is::<http_body_util::LengthLimitError>() {
+            return true;
+        }
+        source = e.source();
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// AISIX-Cloud#1093 carries the transport cause on a timeout so an
+    /// operator can tell a `connect_timeout` from an expired request
+    /// budget. That cause names the upstream host, so it must reach the
+    /// logs and telemetry (`Display`) but NOT the caller's envelope —
+    /// same split the 5xx path already enforces.
+    #[test]
+    fn timeout_cause_reaches_logs_but_not_the_caller() {
+        let err = ProxyError::Bridge(aisix_gateway::BridgeError::Timeout {
+            elapsed_ms: 5_002,
+            cause: "error sending request for url (http://10.1.2.3:8080/v1/messages): \
+                    client error (Connect): tcp connect error: deadline has elapsed"
+                .to_string(),
+        });
+
+        // Operator-facing: the full chain, which is what the WARN log line
+        // and the per-attempt `error_message` are built from.
+        let logged = err.to_string();
+        assert!(logged.contains("deadline has elapsed"), "{logged}");
+        assert!(logged.contains("10.1.2.3"), "{logged}");
+
+        // Customer-facing: the bare sentence, byte-identical to what it
+        // was before `cause` existed, with no internal topology in it.
+        let envelope = err.envelope();
+        assert_eq!(
+            envelope.error.message,
+            "upstream request timed out after 5002ms"
+        );
+        assert!(!envelope.error.message.contains("10.1.2.3"));
+        assert_eq!(err.status(), StatusCode::GATEWAY_TIMEOUT);
+    }
 
     #[test]
     fn missing_auth_maps_to_401_invalid_api_key() {

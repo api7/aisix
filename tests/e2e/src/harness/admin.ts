@@ -8,6 +8,12 @@ export class AdminClient {
   constructor(
     private readonly baseUrl: string,
     private readonly adminKey: string,
+    /**
+     * Base URL of the dedicated metrics/status listener
+     * (`app.metricsUrl`). Required by `listModelStatuses`, which reads
+     * the per-model runtime health view from `GET /status/models` there.
+     */
+    private readonly metricsBaseUrl?: string,
   ) {}
 
   async createModel(
@@ -58,7 +64,25 @@ export class AdminClient {
   }
 
   async listModelStatuses(): Promise<Array<Record<string, unknown>>> {
-    return this.json<Array<Record<string, unknown>>>("GET", "/admin/v1/models/status");
+    // Per-model runtime health is an operational read served by the
+    // metrics/status listener (`GET /status/models`, unauthenticated —
+    // same trust domain as `/status/config`). Same JSON as the admin
+    // listener's `GET /admin/v1/models/status`; consumers keep their
+    // assertions while exercising the status-listener endpoint.
+    if (!this.metricsBaseUrl) {
+      throw new Error(
+        "listModelStatuses reads GET /status/models on the metrics/status listener — " +
+          "construct AdminClient with the metricsBaseUrl argument (app.metricsUrl)",
+      );
+    }
+    const res = await harnessRequest(`${this.metricsBaseUrl}/status/models`, {
+      method: "GET",
+    });
+    const text = await res.body.text();
+    if (res.statusCode >= 300) {
+      throw new Error(`GET /status/models → ${res.statusCode}: ${text.slice(0, 512)}`);
+    }
+    return JSON.parse(text) as Array<Record<string, unknown>>;
   }
 
   async json<T = Record<string, unknown>>(
@@ -115,4 +139,26 @@ export async function waitConfigPropagation(
     await new Promise((r) => setTimeout(r, 50));
   }
   throw new Error(`waitConfigPropagation: condition not met within ${timeoutMs}ms`);
+}
+
+/**
+ * Sleep until the current wall-clock minute has at least `headroomSecs`
+ * left.
+ *
+ * The rate limiter buckets on **fixed wall-clock windows** — see
+ * `roll_if_stale` in `crates/aisix-ratelimit/src/window.rs`, which
+ * computes `bucket_start = (now / window_secs) * window_secs`. A burst
+ * that straddles a boundary therefore lands in two different buckets and
+ * the later request silently gets a fresh allowance, so any "the next
+ * call must be 429" assertion flaps depending on when in the minute CI
+ * happened to run it.
+ *
+ * Call this immediately before a burst that must land inside one window.
+ * Nothing else in the test needs to change: the wait only happens in the
+ * last few seconds of a minute, so the usual run pays nothing.
+ */
+export async function awaitWindowHeadroom(headroomSecs = 10): Promise<void> {
+  const secondsLeft = 60 - (Math.floor(Date.now() / 1000) % 60);
+  if (secondsLeft >= headroomSecs) return;
+  await new Promise((r) => setTimeout(r, secondsLeft * 1000 + 100));
 }

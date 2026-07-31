@@ -116,6 +116,9 @@ impl From<ProxyError> for ResponsesDispatchError {
 struct ResponseUsage {
     prompt_tokens: u32,
     completion_tokens: u32,
+    /// True when any token counter was filled by the local estimator
+    /// because the upstream reported no usage (AISIX-Cloud#1074).
+    usage_estimated: bool,
     /// o1/o3/GPT-5 class models surface reasoning tokens as a
     /// subset of `completion_tokens` via
     /// `usage.output_tokens_details.reasoning_tokens`. Zero for
@@ -133,14 +136,34 @@ struct ResponseUsage {
     /// verbatim OpenAI path (OpenAI surfaces cache hits via
     /// `cached_prompt_tokens` instead).
     cache_read_tokens: u32,
+    /// Attempt-scoped time to the upstream's first content delta. 0 on the
+    /// non-streaming paths. Before this existed `/v1/responses` reported no
+    /// TTFT at all, so codex-class clients showed blank.
+    upstream_ttft_ms: u32,
+    /// Request-scoped time until the caller got its first response bytes.
+    /// 0 until the stream forwards something (or the handler stamps it on
+    /// the non-streaming paths).
+    downstream_latency_ms: u32,
 }
 
 pub async fn responses(
     State(state): State<ProxyState>,
     auth: AuthenticatedKey,
     client: ClientContext,
-    Json(mut body): Json<Value>,
+    // Result-wrapped so an extractor-layer 413 maps to the OpenAI
+    // envelope — see completions.rs.
+    body: Result<Json<Value>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
+    let Json(mut body) = match body {
+        Ok(json) => json,
+        Err(rej) => {
+            return crate::error::proxy_error_from_json_rejection(
+                rej,
+                state.request_body_limit_bytes,
+            )
+            .into_response();
+        }
+    };
     let started = Instant::now();
     let request_id = client.request_id.clone();
     let api_key_id = auth.entry.id.clone();
@@ -184,6 +207,7 @@ pub async fn responses(
                 elapsed,
                 &request_id,
                 &success.routing,
+                None,
             );
             state.metrics.record_request(
                 &success.provider,
@@ -235,14 +259,23 @@ pub async fn responses(
                     },
                     elapsed,
                 );
-                if let Some(usage) = success.usage {
+                if let Some(mut usage) = success.usage {
+                    // Non-streaming: the caller waited for the complete
+                    // response, which is exactly the request clock. Streamed
+                    // responses stamp this from inside the stream and never
+                    // reach this branch (`usage` is None there).
+                    usage.downstream_latency_ms = elapsed.as_millis().min(u32::MAX as u128) as u32;
                     // Winning-attempt classification (#655). Direct models
                     // have no recorded attempt → AttemptInfo defaults.
-                    let attempt = success
-                        .routing
-                        .winner()
-                        .map(AttemptInfo::from_record)
-                        .unwrap_or_default();
+                    let winner = success.routing.winner();
+                    let attempt = winner.map(AttemptInfo::from_record).unwrap_or_default();
+                    // `latency_ms` is scoped to the winning attempt — the
+                    // failed ones before it emitted their own events, so
+                    // `elapsed` would double-count them. Access log keeps the
+                    // request-level total.
+                    let winner_latency = winner
+                        .map(|w| Duration::from_millis(u64::from(w.latency_ms)))
+                        .unwrap_or(elapsed);
                     emit_usage_event(
                         &state,
                         &request_id,
@@ -251,7 +284,7 @@ pub async fn responses(
                         &api_key_id,
                         &success.provider_key_id,
                         status,
-                        elapsed,
+                        winner_latency,
                         &usage,
                         &client,
                         attempt,
@@ -275,6 +308,7 @@ pub async fn responses(
                 elapsed,
                 &request_id,
                 &routing,
+                Some(&err),
             );
             let snap = state.snapshot.load();
             let metric_model = crate::usage_attr::metric_model_label(&snap, &model_name);
@@ -517,6 +551,7 @@ async fn dispatch(
                     .as_deref()
                     .unwrap_or(auth.entry.id.as_str()),
             ),
+            source_ip: &client.source_ip,
         },
     )?;
     let retry_on_429 = model_entry
@@ -533,33 +568,44 @@ async fn dispatch(
         .unwrap_or(&[]);
     let is_routing_request = model_entry.value.routing.is_some();
     let mut routing = RoutingTelemetry::default();
-    // `routing.retries` — same-target retries (with backoff) before failing
-    // over, honoured exactly like chat.rs / messages.rs (#641). 0 (default)
-    // keeps fail-over-only; /v1/responses previously ignored it entirely.
-    let retries = model_entry
-        .value
-        .routing
-        .as_ref()
-        .map(|r| r.retries_or_default())
-        .unwrap_or(0);
-
     // Walk the targets, failing over on a retryable failure. Streaming and
     // non-streaming share this loop: the per-target dispatch branches
     // internally and, for streaming, only returns Ok once the first chunk
     // has arrived under `stream_timeout` (#554) — so the 200 is committed to
     // exactly one target and a slow first chunk fails over.
     let mut last_err: Option<ProxyError> = None;
-    'targets: for target in &attempt_models {
+    'targets: for (target_idx, target) in attempt_models.iter().enumerate() {
         // Resolved ProviderKey UUID for this target — feeds the per-PK
         // telemetry attribution tags on the emitted UsageEvent
         // (AISIX-Cloud#867). Recorded on the AttemptRecord (success + failure)
         // so both the winner and each failed-attempt event can attribute it.
         let pk_id = target.model.provider_key_id.clone().unwrap_or_default();
-        for attempt_idx in 0..=retries {
-            // Exponential backoff + jitter before re-hitting the SAME target
+        // Same-target retries before failing over, honoured exactly like
+        // chat.rs / messages.rs (#641) and resolved per target so a direct
+        // model gets a budget too.
+        let budget = crate::routing::effective_retries(
+            &target.model,
+            model_entry.value.routing.as_ref(),
+            state.default_retries,
+            target_idx + 1 < attempt_models.len(),
+        );
+        // Deadlines resolved target → group → deployment default, next to
+        // the retry budget so the two knobs stay in lockstep.
+        let timeouts = crate::routing::effective_timeouts(
+            &target.model,
+            Some(&model_entry.value),
+            state.default_timeouts,
+        );
+        for attempt_idx in 0..=budget.attempts {
+            // Upstream `Retry-After` when the last failure carried one, else
+            // exponential backoff + jitter, before re-hitting the SAME target
             // (#641); cross-target fall-over (the outer loop) stays immediate.
             if attempt_idx > 0 {
-                tokio::time::sleep(crate::routing::retry_backoff(attempt_idx as u32)).await;
+                let hint = last_err.as_ref().and_then(|e| match e {
+                    ProxyError::Bridge(be) => crate::routing::retry_after_hint(be),
+                    _ => None,
+                });
+                tokio::time::sleep(crate::routing::retry_backoff(attempt_idx as u32, hint)).await;
             }
             let (idx, kind) = routing.begin_attempt(&target.model.display_name);
             let target_model = if is_routing_request {
@@ -577,6 +623,38 @@ async fn dispatch(
                 model: target_model.clone(),
                 ..Default::default()
             };
+            // Reserve THIS target's own model rate-limit layers before
+            // dispatching to it (AISIX-Cloud#1087). Over-limit → record a
+            // 429 attempt and move on to the remaining targets in strategy
+            // order (same-target retries can't help — the window won't
+            // reset mid-loop).
+            let mut member_reservation = match crate::quota::reserve_routing_target(
+                state,
+                is_routing_request,
+                &target.model.display_name,
+                &target.id,
+                &target.model,
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    routing.attempts.push(AttemptRecord {
+                        index: idx,
+                        kind,
+                        target_model,
+                        target_model_id: target.id.clone(),
+                        provider_key_id: pk_id.clone(),
+                        status: 429,
+                        success: false,
+                        error_class: "rate_limit_exceeded".to_string(),
+                        error_message: e.to_string(),
+                        latency_ms: 0,
+                    });
+                    last_err = Some(e);
+                    continue 'targets;
+                }
+            };
             let result = if target.model.provider.as_deref() == Some("openai") {
                 responses_to_target(
                     state,
@@ -584,14 +662,17 @@ async fn dispatch(
                     body,
                     &target.model,
                     &target.id,
+                    timeouts,
                     request_id,
                     resolved_chain.clone(),
                     started,
+                    attempt_started,
                     &model_name,
                     &auth.entry.id,
                     client,
                     attempt,
                     &mut reservation,
+                    &mut member_reservation,
                     redactions_out.clone(),
                     monitor_hits_out.clone(),
                 )
@@ -603,14 +684,17 @@ async fn dispatch(
                     body,
                     &target.model,
                     &target.id,
+                    timeouts,
                     request_id,
                     resolved_chain.clone(),
                     started,
+                    attempt_started,
                     &model_name,
                     &auth.entry.id,
                     client,
                     attempt,
                     &mut reservation,
+                    &mut member_reservation,
                     redactions_out.clone(),
                     monitor_hits_out.clone(),
                 )
@@ -642,7 +726,14 @@ async fn dispatch(
                     // guard (#688), so `reservation` is `None` and this is
                     // skipped.
                     if !success.usage_handled_by_stream {
-                        if let Some(r) = reservation.take() {
+                        if let Some(mut r) = reservation.take() {
+                            // Fold this target's model-layer reservation in
+                            // (AISIX-Cloud#1087) so one commit bills the
+                            // member's TPM/TPD too. Already `None` when the
+                            // streaming path folded it into the guard.
+                            if let Some(member) = member_reservation.take() {
+                                r.merge(member);
+                            }
                             let total = success
                                 .usage
                                 .as_ref()
@@ -678,6 +769,12 @@ async fn dispatch(
                         error_message,
                         latency_ms: ms_since(attempt_started),
                     });
+                    // See `RetryBudget::covers`: a default budget skips
+                    // same-target retries for timeouts; fail-over is unaffected.
+                    let budget_covers = match &e {
+                        ProxyError::Bridge(be) => budget.covers(be),
+                        _ => true,
+                    };
                     last_err = Some(e);
                     // Non-retryable → stop entirely. Retryable → re-hit the
                     // same target until `retries` is exhausted, then fall over
@@ -685,7 +782,7 @@ async fn dispatch(
                     if !retryable {
                         break 'targets;
                     }
-                    if attempt_idx == retries {
+                    if attempt_idx == budget.attempts || !budget_covers {
                         break;
                     }
                 }
@@ -807,6 +904,9 @@ async fn responses_to_target(
     body: &Value,
     model: &aisix_core::Model,
     model_id: &str,
+    // Deadlines resolved by the caller across target → group → deployment
+    // default (`routing::effective_timeouts`); this fn only applies them.
+    timeouts: crate::routing::TimeoutBudget,
     request_id: &str,
     // Arc so the live-forward streaming path can carry the chain into its
     // end-of-stream observation (AISIX-Cloud#1010).
@@ -815,11 +915,20 @@ async fn responses_to_target(
     // path's Drop guard. Unused by the non-streaming / buffered paths,
     // which emit from the handler.
     started: Instant,
+    // When THIS attempt began. The end-of-stream UsageEvent reports
+    // `attempt_started.elapsed()` so `latency_ms` stays scoped to the
+    // attempt (`started` spans the whole request — see `usage.rs`).
+    attempt_started: Instant,
     requested_model: &str,
     api_key_id: &str,
     client_ctx: &ClientContext,
     attempt: AttemptInfo,
     reservation: &mut Option<aisix_ratelimit::MultiReservation>,
+    // This target's own model-layer reservation (routing dispatch only,
+    // AISIX-Cloud#1087). The streaming path folds it into `reservation`
+    // before the take below; the non-streaming path leaves it for the
+    // handler to commit alongside `reservation`.
+    member_reservation: &mut Option<aisix_ratelimit::MultiReservation>,
     // Input-side PII mask counts (#932) for the verbatim streaming path's
     // end-of-stream emit; the non-streaming/buffered emits happen in the
     // handler, which already holds them.
@@ -885,10 +994,11 @@ async fn responses_to_target(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    // Build headers explicitly so the PK's `request.default_headers` can inject
-    // operator headers. Bridge-owned headers go in FIRST; `apply_default_headers`
-    // skips already-present keys + the reserved auth blacklist, so an operator
-    // header can never clobber auth.
+    // Build headers explicitly so the PK's `request.default_headers` and
+    // `request.forward_client_headers` can inject operator/client headers.
+    // Bridge-owned headers go in FIRST; `apply_request_headers` skips
+    // already-present keys + the reserved auth blacklist, so neither can
+    // clobber auth.
     let mut headers = axum::http::HeaderMap::new();
     let auth_hv = HeaderValue::from_str(&format!("Bearer {api_key}")).map_err(|e| {
         ProxyError::Bridge(aisix_gateway::BridgeError::Config(format!(
@@ -906,18 +1016,25 @@ async fn responses_to_target(
         )))
     })?;
     headers.insert(HeaderName::from_static("x-aisix-request-id"), rid_hv);
-    if let Some(r) = pk_entry.value.request.as_ref() {
-        aisix_provider_openai::overrides::apply_default_headers(&mut headers, &r.default_headers);
-    }
+    aisix_gateway::apply_request_headers(
+        &mut headers,
+        &crate::dispatch::upstream_header_ctx(
+            &pk_entry.value,
+            &pk_entry.id,
+            model,
+            model_id,
+            client_ctx,
+        ),
+    );
 
-    let client = crate::http_client::client();
+    let client = crate::http_client::client_for(pk_entry.value.tls.as_ref());
     let mut req = client.post(&url).headers(headers).json(&body);
     // #554: non-streaming gets the E2E request timeout via reqwest's
     // request-level timeout. Streaming must NOT use it (it would cap the
     // whole stream); the streaming branch below enforces the per-chunk
     // read timeout instead.
     if !is_stream {
-        if let Some(d) = model.request_timeout() {
+        if let Some(d) = timeouts.request {
             req = req.timeout(d);
         }
     }
@@ -931,11 +1048,7 @@ async fn responses_to_target(
     // Streaming bounds the connect by the stream deadline (reqwest's
     // request-level timeout can't be used — it would cap the whole stream);
     // non-streaming relies on the request-level timeout set above.
-    let connect_deadline = if is_stream {
-        model.stream_timeout_effective()
-    } else {
-        None
-    };
+    let connect_deadline = if is_stream { timeouts.stream } else { None };
     let upstream_resp =
         crate::stream_timeout::send_with_deadline(req, connect_deadline, send_started)
             .await
@@ -1005,10 +1118,9 @@ async fn responses_to_target(
             };
             let stream = upstream_resp.bytes_stream();
             futures::pin_mut!(stream);
-            // Effective streaming budget: `stream_timeout`, falling back to
-            // `timeout` — applied to every buffered read, consistent with the
-            // verbatim branch and the connect deadline.
-            let read_to = model.stream_timeout_effective();
+            // Effective streaming budget — applied to every buffered read,
+            // consistent with the verbatim branch and the connect deadline.
+            let read_to = timeouts.stream;
             let mut buf: Vec<u8> = Vec::new();
             let mut saw_chunk = false;
             loop {
@@ -1025,6 +1137,7 @@ async fn responses_to_target(
                                 model.cooldown.as_ref(),
                                 aisix_gateway::BridgeError::Timeout {
                                     elapsed_ms: d.as_millis() as u64,
+                                    cause: String::new(),
                                 },
                             )
                         })
@@ -1130,7 +1243,31 @@ async fn responses_to_target(
             // #808: the whole SSE response is buffered here, so parse its
             // terminal event for usage and let the handler emit (the body is
             // a single complete chunk now, not a live stream).
-            let usage = responses_sse_usage(&buf);
+            //
+            // Token-estimation fallback (AISIX-Cloud#1074): a buffered
+            // stream with zero/missing usage fills the counters locally —
+            // telemetry only, the buffered bytes forward untouched.
+            let usage = {
+                let mut u = responses_sse_usage(&buf).unwrap_or_default();
+                if u.prompt_tokens == 0 || u.completion_tokens == 0 {
+                    let est = crate::token_estimate::Estimator::new(
+                        &upstream_model,
+                        crate::token_estimate::PromptInput::Responses(body.clone()),
+                    );
+                    let filled = crate::token_estimate::fill_missing(
+                        &est,
+                        u.prompt_tokens,
+                        u.completion_tokens,
+                        Some(&responses_sse_output_text(&buf)),
+                    );
+                    if filled.estimated {
+                        u.prompt_tokens = filled.prompt_tokens;
+                        u.completion_tokens = filled.completion_tokens;
+                        u.usage_estimated = true;
+                    }
+                }
+                Some(u)
+            };
             // Content capture (AISIX-Cloud#947): the assembled output text,
             // read from the POST-redaction buffer so masked PII stays masked
             // in the exported content.
@@ -1165,7 +1302,7 @@ async fn responses_to_target(
         // without one, forward directly (pre-#554 behavior). A mid-stream
         // stall truncates the forwarded stream (no in-band error frame for
         // an opaque byte passthrough).
-        let stream_budget = model.stream_timeout_effective();
+        let stream_budget = timeouts.stream;
         let wrapped: std::pin::Pin<
             Box<dyn futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>,
         > = Box::pin(crate::stream_timeout::with_read_timeout_bytes(
@@ -1174,7 +1311,7 @@ async fn responses_to_target(
         ));
         let body_stream: std::pin::Pin<
             Box<dyn futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>,
-        > = if stream_budget.is_some() {
+        > = if timeouts.stream_configured {
             let mut wrapped = wrapped;
             let first_bytes = match wrapped.next().await {
                 Some(Ok(b)) => b,
@@ -1226,6 +1363,15 @@ async fn responses_to_target(
         // post-stream TPM/TPD accounting, the hold keeps the concurrency slot(s)
         // until the stream ends. `take()` leaves the handler's `reservation` as
         // `None` so it won't also `commit_tokens`.
+        // Fold this target's model-layer reservation in first (AISIX-Cloud#1087)
+        // so the guard covers the member's limits too; `take()` leaves it `None`
+        // so the handler won't also commit it.
+        if let Some(member) = member_reservation.take() {
+            match reservation.as_mut() {
+                Some(main) => main.merge(member),
+                None => *reservation = Some(member),
+            }
+        }
         let post_stream_keys = reservation.as_ref().map(|r| r.keys()).unwrap_or_default();
         let stream_hold = reservation.take().map(|r| r.into_stream_hold());
         let limiter_c = std::sync::Arc::clone(&state.limiter);
@@ -1238,14 +1384,41 @@ async fn responses_to_target(
             chain: Arc::clone(&chain_arc),
             upstream_model: upstream_model.clone(),
         });
+        // Token-estimation fallback context (AISIX-Cloud#1074): the request
+        // body is cloned because the closure runs at end-of-stream Drop.
+        // Tokenized only if the upstream never reports usage.
+        let estimator_c = crate::token_estimate::Estimator::new(
+            &upstream_model,
+            crate::token_estimate::PromptInput::Responses(body.clone()),
+        );
         let parsed_stream = build_responses_passthrough_stream(
             body_stream,
+            started,
+            attempt_started,
             content_cap,
             eos_scan,
-            move |usage, out_text, output_hits| {
+            move |mut usage, out_text, output_hits| {
                 // Streams that reach here are committed 200s — the
                 // `!status.is_success()` guard above returned early on errors.
                 //
+                // Token-estimation fallback (AISIX-Cloud#1074): a stream that
+                // ends without a terminal usage event (client abort, relay
+                // that omits usage) fills the missing counters from the
+                // request + the assembled output text, BEFORE the TPM
+                // accounting and the emit below.
+                if usage.prompt_tokens == 0 || usage.completion_tokens == 0 {
+                    let filled = crate::token_estimate::fill_missing(
+                        &estimator_c,
+                        usage.prompt_tokens,
+                        usage.completion_tokens,
+                        Some(&out_text),
+                    );
+                    if filled.estimated {
+                        usage.prompt_tokens = filled.prompt_tokens;
+                        usage.completion_tokens = filled.completion_tokens;
+                        usage.usage_estimated = true;
+                    }
+                }
                 // #688: apply the terminal token cost to TPM/TPD and release the
                 // concurrency hold now the stream has ended (sync analog of the
                 // reservation's async `commit_tokens`, which this closure can't await).
@@ -1297,7 +1470,9 @@ async fn responses_to_target(
                     &api_key_id_c,
                     &provider_key_id_c,
                     200,
-                    started.elapsed(),
+                    // Attempt-scoped, unlike the e2e histogram above: any
+                    // failed attempt before this one emitted its own event.
+                    attempt_started.elapsed(),
                     &usage,
                     &client_c,
                     attempt,
@@ -1308,8 +1483,12 @@ async fn responses_to_target(
                 );
             },
         );
-        let mut response =
-            axum::response::Response::new(axum::body::Body::from_stream(Box::pin(parsed_stream)));
+        let mut response = axum::response::Response::new(axum::body::Body::from_stream(
+            crate::sse_keepalive::with_heartbeat(
+                Box::pin(parsed_stream),
+                crate::sse_keepalive::interval(),
+            ),
+        ));
         apply_passthrough_headers(&mut response, &headers, request_id);
 
         Ok(ResponseDispatchSuccess {
@@ -1346,7 +1525,31 @@ async fn responses_to_target(
         // emission. Pulled here (before the response is moved into
         // `Json::into_response`) so the success struct can carry
         // typed counters rather than re-parsing JSON downstream.
-        let usage = extract_response_usage(&json_body);
+        // Token-estimation fallback (AISIX-Cloud#1074): a body with zero or
+        // missing usage fills the counters locally — telemetry only, the
+        // response body is forwarded untouched. A body with no `usage`
+        // object at all becomes a wholly-estimated record instead of None.
+        let usage = {
+            let mut u = extract_response_usage(&json_body).unwrap_or_default();
+            if u.prompt_tokens == 0 || u.completion_tokens == 0 {
+                let est = crate::token_estimate::Estimator::new(
+                    &upstream_model,
+                    crate::token_estimate::PromptInput::Responses(body.clone()),
+                );
+                let filled = crate::token_estimate::fill_missing(
+                    &est,
+                    u.prompt_tokens,
+                    u.completion_tokens,
+                    Some(&responses_output_text(&json_body)),
+                );
+                if filled.estimated {
+                    u.prompt_tokens = filled.prompt_tokens;
+                    u.completion_tokens = filled.completion_tokens;
+                    u.usage_estimated = true;
+                }
+            }
+            Some(u)
+        };
 
         // #719: run the output guardrail chain on the assistant's text so a
         // configured output block isn't bypassable by calling /v1/responses
@@ -1460,14 +1663,24 @@ async fn responses_cross_provider_to_target(
     body: &Value,
     model: &aisix_core::Model,
     model_id: &str,
+    // Deadlines resolved by the caller across target → group → deployment
+    // default (`routing::effective_timeouts`); this fn only applies them.
+    timeouts: crate::routing::TimeoutBudget,
     request_id: &str,
     chain: Arc<aisix_guardrails::GuardrailChain>,
     started: Instant,
+    // When THIS attempt began — see `responses_to_target`.
+    attempt_started: Instant,
     requested_model: &str,
     api_key_id: &str,
     client_ctx: &ClientContext,
     attempt: AttemptInfo,
     reservation: &mut Option<aisix_ratelimit::MultiReservation>,
+    // This target's own model-layer reservation (routing dispatch only,
+    // AISIX-Cloud#1087). The streaming path folds it into `reservation`
+    // before the take below; the non-streaming path leaves it for the
+    // handler to commit alongside `reservation`.
+    member_reservation: &mut Option<aisix_ratelimit::MultiReservation>,
     // Input-side PII mask counts (#932), merged into the streamed judge
     // path's end-of-stream emit; non-streaming emits happen in the handler.
     input_redactions: crate::redact::RedactionCounts,
@@ -1475,7 +1688,7 @@ async fn responses_cross_provider_to_target(
     // `input_redactions`.
     input_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
 ) -> Result<ResponseDispatchSuccess, ProxyError> {
-    use aisix_gateway::{Bridge, BridgeContext};
+    use aisix_gateway::Bridge;
 
     // Content capture (AISIX-Cloud#947), same contract as the verbatim
     // target: prompt = the client-facing Responses request body
@@ -1509,13 +1722,18 @@ async fn responses_cross_provider_to_target(
     let chat = crate::responses_bridge::responses_request_to_chat(requested_model, body);
 
     let is_stream = chat.is_streaming();
-    let model_arc = Arc::new(model.clone());
-    let pk_arc = Arc::new(pk_entry.value.clone());
-    let mut ctx = BridgeContext::new(request_id, model_arc, pk_arc);
+    let mut ctx = crate::dispatch::bridge_ctx(
+        request_id,
+        model_id,
+        Arc::new(model.clone()),
+        &provider_key_id,
+        Arc::new(pk_entry.value.clone()),
+        Some(client_ctx),
+    );
     let connect_deadline = if is_stream {
-        model.stream_timeout_effective()
+        timeouts.stream
     } else {
-        model.request_timeout()
+        timeouts.request
     };
     if let Some(d) = connect_deadline {
         ctx = ctx.with_deadline(d);
@@ -1541,9 +1759,9 @@ async fn responses_cross_provider_to_target(
         // #554: peek the first chunk so a slow/erroring first token fails
         // over before the 200 is committed (when a stream budget is set);
         // the wrapper keeps enforcing the per-chunk read timeout either way.
-        let stream_budget = model.stream_timeout_effective();
+        let stream_budget = timeouts.stream;
         let upstream = crate::stream_timeout::with_read_timeout(upstream, stream_budget);
-        let upstream: aisix_gateway::ChatChunkStream = if stream_budget.is_some() {
+        let upstream: aisix_gateway::ChatChunkStream = if timeouts.stream_configured {
             let mut upstream = upstream;
             let first_chunk = match upstream.next().await {
                 Some(Ok(chunk)) => chunk,
@@ -1619,19 +1837,37 @@ async fn responses_cross_provider_to_target(
         // post-stream TPM/TPD accounting, the hold keeps the concurrency slot(s)
         // until the stream ends. `take()` leaves the handler's `reservation` as
         // `None` so it won't also `commit_tokens`.
+        // Fold this target's model-layer reservation in first (AISIX-Cloud#1087)
+        // so the guard covers the member's limits too; `take()` leaves it `None`
+        // so the handler won't also commit it.
+        if let Some(member) = member_reservation.take() {
+            match reservation.as_mut() {
+                Some(main) => main.merge(member),
+                None => *reservation = Some(member),
+            }
+        }
         let post_stream_keys = reservation.as_ref().map(|r| r.keys()).unwrap_or_default();
         let stream_hold = reservation.take().map(|r| r.into_stream_hold());
         let limiter_c = std::sync::Arc::clone(&state.limiter);
         let captured_prompt_c = captured_prompt.clone();
+        // Token-estimation fallback context (AISIX-Cloud#1074): the request
+        // body is cloned because the stream owns it until an end-of-stream
+        // Drop. Tokenized only if the bridged upstream never reports usage.
+        let estimator = crate::token_estimate::Estimator::new(
+            model.upstream_model().unwrap_or("unknown"),
+            crate::token_estimate::PromptInput::Responses(body.clone()),
+        );
         let sse_body = crate::responses_bridge::build_responses_bridge_stream(
             upstream,
             encoder,
             started,
+            attempt_started,
             output_guardrail,
             hold_back,
             max_buffer_bytes,
             requested_model.to_string(),
             content_cap,
+            Some(estimator),
             move |comp| {
                 // #688: apply the terminal token cost to TPM/TPD and release the
                 // concurrency hold now the stream has ended (sync analog of the
@@ -1657,6 +1893,9 @@ async fn responses_cross_provider_to_target(
                     cached_prompt_tokens: comp.cached_prompt_tokens,
                     cache_creation_tokens: comp.cache_creation_tokens,
                     cache_read_tokens: comp.cache_read_tokens,
+                    usage_estimated: comp.usage_estimated,
+                    upstream_ttft_ms: comp.upstream_ttft_ms,
+                    downstream_latency_ms: comp.downstream_latency_ms,
                 };
                 // A clean stream is a committed 200; an output-guardrail block
                 // (or fail-closed overflow) bills the upstream tokens but is
@@ -1693,7 +1932,8 @@ async fn responses_cross_provider_to_target(
                     &api_key_id_c,
                     &provider_key_id_c,
                     status,
-                    started.elapsed(),
+                    // Attempt-scoped — see the sibling verbatim path.
+                    attempt_started.elapsed(),
                     &usage,
                     &client_c,
                     attempt_c,
@@ -1756,13 +1996,39 @@ async fn responses_cross_provider_to_target(
     state.health.record_success(&model.display_name);
     state.runtime_status.mark_healthy(model_id);
 
-    let usage = ResponseUsage {
-        prompt_tokens: resp.usage.prompt_tokens,
-        completion_tokens: resp.usage.completion_tokens,
-        reasoning_tokens: resp.usage.reasoning_tokens,
-        cached_prompt_tokens: resp.usage.cached_prompt_tokens,
-        cache_creation_tokens: resp.usage.cache_creation_tokens,
-        cache_read_tokens: resp.usage.cache_read_tokens,
+    let usage = {
+        let mut u = ResponseUsage {
+            prompt_tokens: resp.usage.prompt_tokens,
+            completion_tokens: resp.usage.completion_tokens,
+            reasoning_tokens: resp.usage.reasoning_tokens,
+            cached_prompt_tokens: resp.usage.cached_prompt_tokens,
+            cache_creation_tokens: resp.usage.cache_creation_tokens,
+            cache_read_tokens: resp.usage.cache_read_tokens,
+            usage_estimated: false,
+            upstream_ttft_ms: 0,
+            downstream_latency_ms: 0,
+        };
+        // Token-estimation fallback (AISIX-Cloud#1074): fill counters the
+        // bridged upstream never reported. Telemetry only — the re-encoded
+        // Responses JSON below carries the upstream's own usage.
+        if u.prompt_tokens == 0 || u.completion_tokens == 0 {
+            let est = crate::token_estimate::Estimator::new(
+                model.upstream_model().unwrap_or("unknown"),
+                crate::token_estimate::PromptInput::Responses(body.clone()),
+            );
+            let filled = crate::token_estimate::fill_missing(
+                &est,
+                u.prompt_tokens,
+                u.completion_tokens,
+                Some(&crate::chat::estimation_output_text(&resp)),
+            );
+            if filled.estimated {
+                u.prompt_tokens = filled.prompt_tokens;
+                u.completion_tokens = filled.completion_tokens;
+                u.usage_estimated = true;
+            }
+        }
+        u
     };
 
     // #719: run output guardrails on the bridged response before re-encoding
@@ -1905,11 +2171,16 @@ fn extract_response_usage(body: &Value) -> Option<ResponseUsage> {
     Some(ResponseUsage {
         prompt_tokens,
         completion_tokens,
+        usage_estimated: false,
         reasoning_tokens,
         cached_prompt_tokens,
         // OpenAI verbatim path: no Anthropic-style cache counters.
         cache_creation_tokens: 0,
         cache_read_tokens: 0,
+        // Carried across by the caller (`drain_responses_sse_frames`), which
+        // measured these before this terminal frame arrived.
+        upstream_ttft_ms: 0,
+        downstream_latency_ms: 0,
     })
 }
 
@@ -1961,10 +2232,27 @@ fn responses_sse_usage(bytes: &[u8]) -> Option<ResponseUsage> {
 /// an incomplete trailing frame is left in `buf` for the next chunk. Reuses
 /// the shared SSE framing helpers from the `/v1/messages` passthrough so the
 /// two surfaces parse identically.
+/// Whether this SSE event carries generated output. Mirrors the set
+/// `SseTextCapture::observe` accumulates, so TTFT lands on the same frame
+/// the capture considers the first real token.
+fn is_responses_content_delta(json: &Value) -> bool {
+    matches!(
+        json.get("type").and_then(Value::as_str),
+        Some(
+            "response.output_text.delta"
+                | "response.function_call_arguments.delta"
+                | "response.mcp_call_arguments.delta"
+                | "response.custom_tool_call_input.delta"
+        )
+    )
+}
+
 fn drain_responses_sse_frames(
     buf: &mut Vec<u8>,
     acc: &mut Option<ResponseUsage>,
     mut capture: Option<&mut SseTextCapture>,
+    attempt_started: Instant,
+    first_token_seen: &mut bool,
 ) {
     while let Some(end) = crate::messages::find_frame_end(buf) {
         let frame: Vec<u8> = buf.drain(..end).collect();
@@ -1973,8 +2261,26 @@ fn drain_responses_sse_frames(
                 continue;
             }
             if let Ok(json) = serde_json::from_slice::<Value>(data) {
+                // First content delta → upstream TTFT. `/v1/responses`
+                // reported none at all before this, so codex-class clients
+                // showed a blank figure.
+                if !*first_token_seen && is_responses_content_delta(&json) {
+                    *first_token_seen = true;
+                    acc.get_or_insert_with(Default::default).upstream_ttft_ms =
+                        attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+                }
                 if let Some(u) = parse_responses_terminal_usage(&json) {
-                    *acc = Some(u);
+                    // The terminal frame replaces the token counters; carry
+                    // the two latency figures measured before it across.
+                    let (ttft, down) = acc
+                        .as_ref()
+                        .map(|a| (a.upstream_ttft_ms, a.downstream_latency_ms))
+                        .unwrap_or_default();
+                    *acc = Some(ResponseUsage {
+                        upstream_ttft_ms: ttft,
+                        downstream_latency_ms: down,
+                        ..u
+                    });
                 }
                 if let Some(c) = capture.as_deref_mut() {
                     c.observe(&json);
@@ -2159,6 +2465,10 @@ impl EosOutputScan {
 /// SSE wire shape.
 fn build_responses_passthrough_stream<S, F>(
     upstream: S,
+    // Request clock — what the CALLER waited for.
+    started: Instant,
+    // Attempt clock — how the UPSTREAM behaved.
+    attempt_started: Instant,
     content_cap: Option<u32>,
     eos_scan: Option<EosOutputScan>,
     on_complete: F,
@@ -2167,22 +2477,32 @@ where
     S: futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send + 'static,
     F: FnOnce(ResponseUsage, String, Vec<aisix_core::GuardrailMonitorHit>) + Send + 'static,
 {
-    // The scan reads the same assembled output text the capture produces, so
-    // an attached scan forces the accumulator on even when no exporter wants
-    // content. The cap bounds delta accumulation; a terminal event's full
-    // output text is instead bounded by MAX_SSE_FRAME_BUF_BYTES (an oversized
-    // frame never parses) and re-truncated by both consumers —
-    // `CapturedContent::new` at the exporter cap and `EosOutputScan::observe`
-    // at the scan bound — so neither sees beyond its own limit.
-    let capture_cap = match (content_cap, eos_scan.is_some()) {
-        (Some(cap), true) => {
-            Some((cap as usize).max(aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES))
-        }
-        (Some(cap), false) => Some(cap as usize),
-        (None, true) => Some(aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES),
-        (None, false) => None,
-    };
-    async_stream::stream! {
+    // The scan and the token-estimation fallback read the same assembled
+    // output text the capture produces, so the accumulator is now ALWAYS
+    // on (AISIX-Cloud#1074) — whether estimation is needed is only known
+    // at end-of-stream — with the estimation cap as the floor. The cap
+    // bounds delta accumulation; a terminal event's full output text is
+    // instead bounded by MAX_SSE_FRAME_BUF_BYTES (an oversized frame
+    // never parses) and re-truncated by each consumer —
+    // `CapturedContent::new` at the exporter cap and
+    // `EosOutputScan::observe` at the scan bound — so none sees beyond
+    // its own limit.
+    let capture_cap = Some(
+        content_cap
+            .map(|cap| cap as usize)
+            .unwrap_or(0)
+            .max(if eos_scan.is_some() {
+                aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES
+            } else {
+                0
+            })
+            .max(crate::token_estimate::OUTPUT_ACCUMULATION_CAP),
+    );
+    // Re-attach the request span: the body is polled after the request-id
+    // middleware returns, so the end-of-stream output-guardrail scan
+    // (`EosOutputScan::observe`) would otherwise log without a
+    // `request_id` (AISIX-Cloud#1060).
+    crate::request_id::in_request_span(async_stream::stream! {
         let mut guard = ResponsesUsageGuard {
             slot: Some((
                 on_complete,
@@ -2192,13 +2512,20 @@ where
         };
         futures::pin_mut!(upstream);
         let mut buf: Vec<u8> = Vec::new();
+        let mut first_token_seen = false;
         while let Some(item) = upstream.next().await {
             if let Ok(bytes) = &item {
                 // Side-channel parse: copy into the frame buffer (the original
                 // `bytes` is yielded unchanged below) and drain complete frames.
                 buf.extend_from_slice(bytes);
                 let (usage_acc, capture) = guard.parts();
-                drain_responses_sse_frames(&mut buf, usage_acc, capture);
+                drain_responses_sse_frames(
+                    &mut buf,
+                    usage_acc,
+                    capture,
+                    attempt_started,
+                    &mut first_token_seen,
+                );
                 // Bound the frame buffer: the happy path drains complete frames
                 // above so `buf` only holds a partial trailing frame. A
                 // non-conformant upstream streaming bytes without a blank-line
@@ -2215,6 +2542,15 @@ where
                 }
             }
             // Forward the original item verbatim (Ok bytes OR a mid-stream Err).
+            // The first successful forward is what the caller waited for.
+            if item.is_ok() {
+                let (usage_acc, _) = guard.parts();
+                let acc = usage_acc.get_or_insert_with(Default::default);
+                if acc.downstream_latency_ms == 0 {
+                    acc.downstream_latency_ms =
+                        started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+                }
+            }
             yield item;
         }
         // Clean end-of-stream: run the monitor observation (needs async, so
@@ -2240,7 +2576,7 @@ where
                 hits,
             );
         }
-    }
+    })
 }
 
 /// Collect the assistant's output text from a Responses-API response object
@@ -2450,7 +2786,10 @@ fn emit_usage_event(
         // verbatim OpenAI path.
         cache_creation_tokens: usage.cache_creation_tokens,
         cache_read_tokens: usage.cache_read_tokens,
-        latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
+        usage_estimated: usage.usage_estimated,
+        upstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
+        upstream_ttft_ms: usage.upstream_ttft_ms,
+        downstream_latency_ms: usage.downstream_latency_ms,
         status_code,
         inbound_protocol: "openai".to_string(),
         attempt_index: attempt.index,
@@ -2475,6 +2814,28 @@ fn emit_usage_event(
     state
         .otlp_fan_out
         .fan_out(&event, content, exporters.iter().map(|e| &e.value));
+    // AISIX-Cloud#1044: token volume by inbound client type × model. Codex
+    // traffic arrives on /v1/responses, so leaving this endpoint out of the
+    // by-client series made an allowlisted client invisible in it. All three
+    // usage-bearing paths (non-streaming, verbatim streaming, bridge
+    // streaming) funnel through here. `requested_model` resolved at dispatch
+    // on every path that reaches this emit, so the label is bounded by the
+    // configured model set. The per-key `aisix_llm_*_tokens_total` family
+    // intentionally stays chat/messages-scoped (cross-API audit #646-652).
+    // #1002: cache-inclusive total via the shared helper — cache counters are
+    // non-zero only on the #825 Anthropic bridge path.
+    state.metrics.record_llm_tokens_by_client(
+        state.client_classifier.classify(&client.user_agent),
+        requested_model,
+        u64::from(usage.prompt_tokens),
+        u64::from(usage.completion_tokens),
+        total_tokens_with_cache(
+            usage.prompt_tokens,
+            usage.completion_tokens,
+            usage.cache_creation_tokens,
+            usage.cache_read_tokens,
+        ),
+    );
 }
 
 /// Emit a zero-token `UsageEvent` for a failed / pre-dispatch attempt
@@ -2511,7 +2872,7 @@ fn emit_zero_token_event(
         requested_model: requested_model.to_string(),
         redacted_entity_counts,
         guardrail_monitor_hits,
-        latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
+        upstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
         status_code,
         inbound_protocol: "openai".to_string(),
         attempt_index: attempt.index,
@@ -2585,6 +2946,7 @@ fn emit_failed_attempts(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_access_log(
     model: &str,
     provider: &str,
@@ -2593,7 +2955,15 @@ fn emit_access_log(
     elapsed: Duration,
     request_id: &str,
     routing: &RoutingTelemetry,
+    error: Option<&ProxyError>,
 ) {
+    let (error_kind, error) = match error {
+        Some(e) => {
+            let (kind, msg) = crate::attempt::access_log_error(e);
+            (Some(kind), Some(msg))
+        }
+        None => (None, None),
+    };
     // Per #655 the access log stays ONE line per request, carrying the
     // user-perceived `latency` + final status plus a routing summary.
     let served_by = routing
@@ -2621,6 +2991,8 @@ fn emit_access_log(
             0 => None,
             n => Some(n),
         },
+        error_kind,
+        error: error.as_deref(),
     }
     .emit();
 }
@@ -4355,14 +4727,13 @@ mod tests {
         );
     }
 
-    /// Companion: an upstream response missing the `usage` block
-    /// entirely (some edge / error response shapes) must NOT emit
-    /// — there's nothing meaningful to attribute. Pre-#404 the
-    /// handler emitted nothing; we keep that behaviour for this
-    /// edge so the api_key isn't credited with zero-everything
-    /// noise rows.
+    /// Companion: an upstream 200 missing the `usage` block entirely
+    /// (some relay / compat backends) now emits an ESTIMATED usage
+    /// event (AISIX-Cloud#1074) — the call must not stay invisible to
+    /// billing. (Pre-#1074 this edge kept the pre-#404 no-emit
+    /// behaviour.)
     #[tokio::test]
-    async fn skips_usage_event_when_upstream_omits_usage_block() {
+    async fn estimates_usage_event_when_upstream_omits_usage_block() {
         use aisix_obs::UsageSink;
 
         let upstream = MockServer::start().await;
@@ -4401,18 +4772,19 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        // Wait briefly — no event should arrive. `Ok(None)` means
-        // the channel closed (state dropped) without sending; `Err`
-        // means timeout. Both are acceptable "no event" outcomes;
-        // only `Ok(Some(_))` would be a real failure.
-        let recv = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await;
-        if let Ok(Some(ev)) = recv {
-            panic!(
-                "expected NO event when usage block absent, but got: \
-                 prompt_tokens={}, completion_tokens={}, status_code={}",
-                ev.prompt_tokens, ev.completion_tokens, ev.status_code,
-            );
-        }
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("estimated UsageEvent must be emitted when `usage` is absent")
+            .expect("usage_sink sender dropped");
+        // input "hello" per the cookbook message scheme: 3 per-message
+        // + "user" (1) + "hello" (1) + 3 reply priming = 8. Empty
+        // `output` → completion stays 0.
+        assert_eq!(event.prompt_tokens, 8);
+        assert_eq!(event.completion_tokens, 0);
+        assert!(
+            event.usage_estimated,
+            "locally-counted tokens must be flagged"
+        );
     }
 
     /// #808: a streaming `/v1/responses` 200 (e.g. all Codex traffic, which
@@ -4661,38 +5033,57 @@ data: [DONE]\n\n";
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
 
-        let recv = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await;
-        let ev = recv
-            .expect("a failed-attempt UsageEvent must be emitted within the timeout")
-            .expect("the usage sink channel must not be closed");
-        assert_eq!(ev.status_code, 502, "failed attempt records the mapped 502");
-        assert_eq!(ev.prompt_tokens, 0, "failed attempt has zero tokens");
-        assert_eq!(ev.completion_tokens, 0, "failed attempt has zero tokens");
-        assert_eq!(ev.attempt_index, 0, "single direct-model attempt");
-        assert_eq!(ev.attempt_kind, "initial");
+        // A direct model now carries the deployment default retry budget (2),
+        // so a persistent 5xx produces three attempts — initial + two retries
+        // — each its own zero-token event. Before the per-model budget landed
+        // the knob only existed on a model group, so this was one attempt.
+        let mut events = Vec::new();
+        for _ in 0..3 {
+            let ev = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .expect("a failed-attempt UsageEvent must be emitted within the timeout")
+                .expect("the usage sink channel must not be closed");
+            events.push(ev);
+        }
+        events.sort_by_key(|e| e.attempt_index);
+        for ev in &events {
+            assert_eq!(ev.status_code, 502, "failed attempt records the mapped 502");
+            assert_eq!(ev.prompt_tokens, 0, "failed attempt has zero tokens");
+            assert_eq!(ev.completion_tokens, 0, "failed attempt has zero tokens");
+            assert_eq!(
+                ev.error_class, "upstream_status",
+                "500 upstream maps to an upstream_status error class",
+            );
+        }
         assert_eq!(
-            ev.error_class, "upstream_status",
-            "500 upstream maps to an upstream_status error class",
+            events
+                .iter()
+                .map(|e| e.attempt_kind.as_str())
+                .collect::<Vec<_>>(),
+            vec!["initial", "retry", "retry"],
+            "the retries re-hit the SAME model, so they are retries not fallbacks",
         );
-        // Exactly one event — a direct model has no further attempts and no
-        // separate terminal event (the attempt itself is terminal).
+
+        // No further events — the budget is exhausted and there is no
+        // separate terminal event (the last attempt itself is terminal).
         let extra = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await;
         if let Ok(Some(ev)) = extra {
             panic!(
-                "expected exactly one event for a single failed attempt, got a second: \
+                "expected exactly three events for an exhausted budget, got a fourth: \
                  attempt_index={} status_code={}",
                 ev.attempt_index, ev.status_code,
             );
         }
     }
 
-    /// Issue #404 audit MEDIUM-1: a 200 with `usage: {}` (malformed
-    /// — `input_tokens` is required by the Responses-API spec) must
-    /// NOT emit a zero-everything noise row. Same edge as the
-    /// `skips_usage_event_when_upstream_omits_usage_block` test but
-    /// the gate is one layer deeper — `usage` exists but is empty.
+    /// A 200 with `usage: {}` (malformed — `input_tokens` is required
+    /// by the Responses-API spec) now emits an ESTIMATED usage event
+    /// (AISIX-Cloud#1074) instead of dropping the record. Same edge as
+    /// the omitted-usage test but the gate is one layer deeper —
+    /// `usage` exists but is empty. (Pre-#1074, per issue #404 audit
+    /// MEDIUM-1, this dropped the event entirely.)
     #[tokio::test]
-    async fn skips_usage_event_when_usage_block_is_empty_audit_m1() {
+    async fn estimates_usage_event_when_usage_block_is_empty() {
         use aisix_obs::UsageSink;
 
         let upstream = MockServer::start().await;
@@ -4730,14 +5121,18 @@ data: [DONE]\n\n";
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        let recv = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await;
-        if let Ok(Some(ev)) = recv {
-            panic!(
-                "no UsageEvent should be emitted for malformed `usage: {{}}`, \
-                 got prompt_tokens={}",
-                ev.prompt_tokens,
-            );
-        }
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("estimated UsageEvent must be emitted for malformed `usage: {}`")
+            .expect("usage_sink sender dropped");
+        // input "hi" counts per the cookbook message scheme: 3 per-message
+        // + "user" (1) + "hi" (1) + 3 reply priming = 8. Empty output → 0.
+        assert_eq!(event.prompt_tokens, 8);
+        assert_eq!(event.completion_tokens, 0);
+        assert!(
+            event.usage_estimated,
+            "locally-counted tokens must be flagged"
+        );
     }
 
     /// #429 follow-up: a 200 whose `usage` carries

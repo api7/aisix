@@ -42,7 +42,9 @@ etcd:
 
 proxy:
   addr: "0.0.0.0:3000"
-  request_body_limit_bytes: 10485760
+  # 0 = no request-body cap (the default); set a value to bound
+  # per-request memory.
+  # request_body_limit_bytes: 0
 
 admin:
   # Bind to an unbindable port so even if managed mode somehow
@@ -67,6 +69,13 @@ observability:
       addr: "0.0.0.0:9090"
     otlp:
       enabled: false
+    # Optional User-Agent -> client_type mapping rules for the
+    # aisix_llm_tokens_by_client_total metric (first match wins, tried
+    # before the built-in allowlist; regex, case-insensitive). See
+    # config.example.yaml for the full annotation.
+    # client_type_rules:
+    #   - pattern: "^py-billing-batcher/"
+    #     client: billing-batcher
   tracing:
     otlp:
       enabled: false
@@ -93,3 +102,36 @@ managed:
 
 cache:
   backend: "memory"
+
+# Connection-layer settings for outbound calls to LLM providers. Shown
+# with their defaults; uncomment to override. `pool_idle_timeout_secs`
+# is the one to lower when a load balancer, NAT gateway, or service mesh
+# between this DP and the provider closes idle connections sooner than
+# the gateway expires them — the symptom is intermittent transport
+# errors against an otherwise healthy upstream.
+upstream:
+  # timeout_ms: 6000000
+  # stream_timeout_ms: 0
+  # connect_timeout_ms: 5000
+  # tcp_keepalive_secs: 60
+  # tcp_keepalive_interval_secs: 30
+  # tcp_keepalive_retries: 5
+  pool_idle_timeout_secs: 30
+  # pool_max_idle_per_host: 32
+  # Trust settings for every upstream TLS handshake — model endpoints,
+  # guardrail services, MCP / A2A upstreams, OIDC discovery, Realtime,
+  # Bedrock, log-export object stores. `ca_file` is additive to the
+  # platform trust store, so trusting a private CA leaves the public
+  # providers reachable. See config.example.yaml for the full block.
+  # tls:
+  #   ca_file: "/etc/aisix/tls/private-ca.pem"
+  #   # client_cert_file / client_key_file for mutual TLS
+  #   # verify: true   # false accepts ANY certificate — test use only
+
+# Connection-layer settings for the inbound side. `idle_timeout_secs: 0`
+# (the default) never closes an idle client connection, leaving that to
+# the peer — set it only when a node in front pools connections for a
+# known, shorter time, and keep it above that value.
+downstream:
+  idle_timeout_secs: 0
+  # sse_keepalive_interval_secs: 15

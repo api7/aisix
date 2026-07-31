@@ -81,6 +81,10 @@ pub async fn a2a_endpoint(
         completion_tokens: None,
         total_tokens: None,
         request_id: &request_id,
+        // Same as `/mcp`: `dispatch` returns an already-rendered `Response`,
+        // so no typed error reaches this point.
+        error_kind: None,
+        error: None,
         served_by_model: None,
         routing_attempt_count: None,
         routing_fallback_count: None,
@@ -124,8 +128,21 @@ async fn dispatch(
     let upstream = upstream_from_a2a_agent(&entry.value);
 
     let (_parts, body) = request.into_parts();
-    let bytes = match to_bytes(body, state.request_body_limit_bytes).await {
+    let bytes = match to_bytes(
+        body,
+        crate::error::body_read_cap(state.request_body_limit_bytes),
+    )
+    .await
+    {
         Ok(bytes) => bytes,
+        // Cap hit → 413 in the standard envelope, matching the
+        // Content-Length middleware's answer on this route.
+        Err(err) if crate::error::is_length_limit_error(&err) => {
+            return crate::error::ProxyError::RequestTooLarge {
+                limit_bytes: state.request_body_limit_bytes,
+            }
+            .into_response();
+        }
         Err(_) => return (StatusCode::BAD_REQUEST, "invalid request body").into_response(),
     };
     let value: serde_json::Value = match serde_json::from_slice(&bytes) {
@@ -290,7 +307,10 @@ fn emit_a2a_usage(
         occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         api_key_id: auth.entry.id.clone(),
         status_code,
-        latency_ms: latency.as_millis().min(u32::MAX as u128) as u32,
+        // Single-attempt endpoint: the attempt spans the whole request, so
+        // the upstream figure and what the caller waited for coincide.
+        upstream_latency_ms: latency.as_millis().min(u32::MAX as u128) as u32,
+        downstream_latency_ms: latency.as_millis().min(u32::MAX as u128) as u32,
         inbound_protocol: "a2a".to_string(),
         a2a_agent_name: agent.to_string(),
         a2a_method: method.to_string(),
@@ -402,6 +422,35 @@ mod tests {
             b = b.header("authorization", format!("Bearer {TOKEN}"));
         }
         b.body(Body::from(body.to_string())).unwrap()
+    }
+
+    #[tokio::test]
+    async fn chunked_oversized_body_returns_enveloped_413() {
+        // Same contract as /mcp: a chunked body over the cap surfaces as
+        // the enveloped 413 from the handler's capped read, not the old
+        // bare 400.
+        let app = router_with(snapshot_with(
+            "http://127.0.0.1:1/a2a",
+            true,
+            serde_json::json!(["invoice"]),
+        ));
+        let chunk = vec![b'a'; 200 * 1024];
+        let stream =
+            futures::stream::iter((0..10).map(move |_| Ok::<_, std::io::Error>(chunk.clone())));
+        let req = HttpRequest::post("/a2a/invoice")
+            .header("host", "a2a.aisix.example.com")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {TOKEN}"))
+            .body(Body::from_stream(stream))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .expect("read body");
+        let v: serde_json::Value =
+            serde_json::from_slice(&body).expect("413 must carry the JSON envelope");
+        assert_eq!(v["error"]["type"], "invalid_request_error");
     }
 
     #[tokio::test]

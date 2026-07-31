@@ -31,7 +31,9 @@ pub struct Schemas {
     pub observability_exporter: Validator,
     pub rate_limit_policy: Validator,
     pub mcp_server: Validator,
+    pub mcp_policy: Validator,
     pub a2a_agent: Validator,
+    pub oidc_provider: Validator,
 }
 
 pub static SCHEMAS: Lazy<Arc<Schemas>> = Lazy::new(|| Arc::new(Schemas::compile()));
@@ -66,9 +68,15 @@ impl Schemas {
             mcp_server: jsonschema::options()
                 .build(&mcp_server_root_schema())
                 .expect("mcp_server schema is well-formed"),
+            mcp_policy: jsonschema::options()
+                .build(&mcp_policy_root_schema())
+                .expect("mcp_policy schema is well-formed"),
             a2a_agent: jsonschema::options()
                 .build(&a2a_agent_root_schema())
                 .expect("a2a_agent schema is well-formed"),
+            oidc_provider: jsonschema::options()
+                .build(&oidc_provider_root_schema())
+                .expect("oidc_provider schema is well-formed"),
         }
     }
 }
@@ -137,6 +145,14 @@ pub fn validate_mcp_server(value: &Value) -> Result<(), SchemaError> {
 
 pub fn validate_a2a_agent(value: &Value) -> Result<(), SchemaError> {
     validate(&SCHEMAS.a2a_agent, value)
+}
+
+pub fn validate_mcp_policy(value: &Value) -> Result<(), SchemaError> {
+    validate(&SCHEMAS.mcp_policy, value)
+}
+
+pub fn validate_oidc_provider(value: &Value) -> Result<(), SchemaError> {
+    validate(&SCHEMAS.oidc_provider, value)
 }
 
 /// Build a resource's canonical JSON Schema from its struct via `schemars`,
@@ -297,6 +313,14 @@ pub fn mcp_server_root_schema() -> Value {
             "McpTransport",
             &[("streamable_http", "Streamable HTTP")],
         );
+        title_single_value_enum_variants(
+            defs,
+            "McpServerType",
+            &[
+                ("mcp", "Upstream MCP server"),
+                ("openapi", "REST API described by an OpenAPI document"),
+            ],
+        );
     }
     schema
 }
@@ -360,6 +384,64 @@ fn title_single_value_enum_variants(
                 .or_insert_with(|| Value::String((*title).to_string()));
         }
     }
+}
+
+/// Canonical JSON Schema for the `oidc_provider` resource, derived from the
+/// [`OidcProvider`](crate::models::OidcProvider) struct. Uses the
+/// plain-but-absent `Option` representation (`false`): the control plane
+/// omits unset fields (`jwks_uri`, `bound_claims`) rather than sending an
+/// explicit `null`.
+pub fn oidc_provider_root_schema() -> Value {
+    let mut schema = struct_root_schema::<crate::models::OidcProvider>(false);
+    // schemars does not propagate the `#[schemars(length(min = 1))]` on
+    // the `BoundClaimExpect::Any(Vec<String>)` variant into the untagged
+    // enum's array branch, so the generated schema would accept an empty
+    // `bound_claims` value list. Re-assert `minItems: 1` to match the
+    // model's non-empty contract.
+    if let Some(any_of) = schema
+        .get_mut("definitions")
+        .and_then(|d| d.get_mut("BoundClaimExpect"))
+        .and_then(|b| b.get_mut("anyOf"))
+        .and_then(Value::as_array_mut)
+    {
+        for branch in any_of.iter_mut() {
+            if branch.get("type").and_then(Value::as_str) == Some("array") {
+                if let Some(obj) = branch.as_object_mut() {
+                    obj.insert("minItems".to_string(), json!(1));
+                }
+            }
+        }
+    }
+    schema
+}
+
+/// Canonical JSON Schema for the `mcp_policy` resource, derived from the
+/// [`McpPolicy`](crate::models::McpPolicy) struct. Uses the nullable `Option`
+/// representation (`true`) so `scope_ref` accepts an explicit `null` as
+/// well as being absent. The `scope`/`mode` closed sets come from
+/// the [`McpPolicyScope`](crate::models::McpPolicyScope) /
+/// [`McpPolicyMode`](crate::models::McpPolicyMode) enums, plus the one
+/// cross-field invariant `schemars` cannot express: a `team`-scoped policy
+/// must name its team in `scope_ref` (otherwise the row could shadow the
+/// environment default).
+pub fn mcp_policy_root_schema() -> Value {
+    let mut schema = struct_root_schema::<crate::models::McpPolicy>(true);
+    schema
+        .as_object_mut()
+        .expect("mcp_policy root schema is a JSON object")
+        .insert(
+            "allOf".to_string(),
+            json!([{
+                "if": {
+                    "properties": { "scope": { "const": "team" } }
+                },
+                "then": {
+                    "required": ["scope_ref"],
+                    "properties": { "scope_ref": { "type": "string", "minLength": 1 } }
+                }
+            }]),
+        );
+    schema
 }
 
 /// Canonical JSON Schema for the `guardrail` resource, derived from the
@@ -1416,6 +1498,70 @@ mod tests {
             "rate_limit": {"rps": 5, "rph": 500}
         });
         validate_apikey(&v).unwrap();
+    }
+
+    #[test]
+    fn apikey_mcp_access_block_passes() {
+        let v = json!({
+            "key_hash":"9df37f5e7cbc3c391d872742b5f286c242e733a09add9eeaa4d26a599bd90b20",
+            "allowed_models":["gpt-4o"],
+            "mcp_access": {"mode": "inherit"}
+        });
+        validate_apikey(&v).unwrap();
+        let v = json!({
+            "key_hash":"9df37f5e7cbc3c391d872742b5f286c242e733a09add9eeaa4d26a599bd90b20",
+            "allowed_models":["gpt-4o"],
+            "mcp_access": {"mode": "restrict", "allow": ["github__*"], "deny": ["github__delete_repo"]}
+        });
+        validate_apikey(&v).unwrap();
+    }
+
+    #[test]
+    fn apikey_mcp_access_rejects_unknown_mode() {
+        let v = json!({
+            "key_hash":"9df37f5e7cbc3c391d872742b5f286c242e733a09add9eeaa4d26a599bd90b20",
+            "allowed_models":[],
+            "mcp_access": {"mode": "legacy"}
+        });
+        assert!(validate_apikey(&v).is_err());
+    }
+
+    #[test]
+    fn mcp_policy_env_and_team_forms_pass() {
+        validate_mcp_policy(&json!({
+            "scope": "env",
+            "mode": "selected",
+            "allow": ["github__*"],
+            "deny": ["github__delete_repo"]
+        }))
+        .unwrap();
+        validate_mcp_policy(&json!({
+            "scope": "team",
+            "scope_ref": "team-uuid-1",
+            "mode": "all",
+            "enabled": true
+        }))
+        .unwrap();
+    }
+
+    #[test]
+    fn mcp_policy_team_scope_requires_scope_ref() {
+        // A team row without its team id could shadow the environment
+        // default; the cross-field guard rejects it at the schema gate.
+        assert!(validate_mcp_policy(&json!({"scope": "team", "mode": "all"})).is_err());
+        assert!(
+            validate_mcp_policy(&json!({"scope": "team", "scope_ref": null, "mode": "all"}))
+                .is_err()
+        );
+        // The environment default carries no scope_ref.
+        validate_mcp_policy(&json!({"scope": "env", "mode": "none"})).unwrap();
+    }
+
+    #[test]
+    fn mcp_policy_rejects_unknown_fields_and_values() {
+        assert!(validate_mcp_policy(&json!({"scope": "org", "mode": "all"})).is_err());
+        assert!(validate_mcp_policy(&json!({"scope": "env", "mode": "open"})).is_err());
+        assert!(validate_mcp_policy(&json!({"scope": "env", "mode": "all", "rogue": 1})).is_err());
     }
 
     #[test]

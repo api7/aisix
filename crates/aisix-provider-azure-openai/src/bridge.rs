@@ -16,8 +16,8 @@
 
 use aisix_core::{RequestOverrides, ResponseOverrides, StreamDoneMarker};
 use aisix_gateway::{
-    Bridge, BridgeContext, BridgeError, ChatChunk, ChatChunkStream, ChatFormat, ChatResponse,
-    SseDecoder, SseEvent,
+    apply_request_headers, Bridge, BridgeContext, BridgeError, ChatChunk, ChatChunkStream,
+    ChatFormat, ChatResponse, SseDecoder, SseEvent, UpstreamHeaderContext,
 };
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -30,9 +30,9 @@ use serde_json::Value;
 use std::time::{Duration, Instant};
 
 use aisix_provider_openai::overrides::{
-    apply_content_list_to_string, apply_default_body_fields, apply_default_headers,
-    apply_param_constraints, apply_param_renames, apply_stream_done_marker_policy,
-    extract_reasoning_field, StreamDoneOutcome,
+    apply_content_list_to_string, apply_default_body_fields, apply_param_constraints,
+    apply_param_renames, apply_stream_done_marker_policy, extract_reasoning_field,
+    StreamDoneOutcome,
 };
 use aisix_provider_openai::wire::{
     build_request, messages_from, response_into_chat_response, stream_chunk_into_chat_chunk,
@@ -87,6 +87,18 @@ impl AzureOpenAiBridge {
             #[cfg(test)]
             url_override: None,
         }
+    }
+
+    /// The client this dispatch runs on: the bridge's shared one, unless
+    /// the resolved Provider Key carries its own TLS settings. The token
+    /// minter deliberately keeps the shared client — it talks to the
+    /// identity provider, not to the key's `api_base`, and a private CA
+    /// declared for the model endpoint says nothing about that host.
+    fn client_for(&self, ctx: &BridgeContext) -> Client {
+        aisix_gateway::upstream_tls::client_for_provider_key(
+            &self.client,
+            ctx.provider_key.tls.as_ref(),
+        )
     }
 
     /// Test-only seam: replace the AAD token endpoint host on the
@@ -151,7 +163,7 @@ impl Default for AzureOpenAiBridge {
 }
 
 fn default_client() -> Client {
-    Client::builder()
+    aisix_gateway::client_builder()
         .user_agent("aisix/0.1")
         .build()
         .unwrap_or_else(|_| Client::new())
@@ -545,6 +557,7 @@ where
             Ok(r) => r,
             Err(_) => Err(BridgeError::Timeout {
                 elapsed_ms: started.elapsed().as_millis() as u64,
+                cause: String::new(),
             }),
         },
     }
@@ -586,17 +599,17 @@ fn prepare_outbound_body<T: serde::Serialize>(
 /// In both branches the bridge also sets `Content-Type: application/json`,
 /// `x-aisix-request-id: <ctx.request_id>`, and (for streaming)
 /// `Accept: text/event-stream`. Bridge-owned headers are inserted
-/// before `apply_default_headers` so the reserved-headers list in
-/// `aisix-provider-openai::overrides` (which already covers
-/// `api-key`, `authorization`, `x-api-key`, plus hop-by-hop /
-/// proxy-auth headers) cannot overwrite them. Defense in depth: the
-/// reserved-list blocks even before the `headers.contains_key` guard
-/// inside `apply_default_headers`.
+/// before `apply_request_headers` so the reserved-headers list in
+/// `aisix-gateway::upstream_headers` (which already covers `api-key`,
+/// `authorization`, `x-api-key`, plus proxy-auth / session headers)
+/// cannot overwrite them. Defense in depth: the reserved-list blocks
+/// even before the skip-if-present guard inside
+/// `apply_request_headers`.
 fn build_request_headers(
     auth: &AzureAuth,
     request_id: &str,
     sse: bool,
-    request: Option<&RequestOverrides>,
+    hdr: &UpstreamHeaderContext<'_>,
 ) -> Result<HeaderMap, BridgeError> {
     let mut headers = HeaderMap::new();
     match (&auth.api_key, &auth.bearer_token) {
@@ -643,9 +656,7 @@ fn build_request_headers(
             HeaderValue::from_static("text/event-stream"),
         );
     }
-    if let Some(r) = request {
-        apply_default_headers(&mut headers, &r.default_headers);
-    }
+    apply_request_headers(&mut headers, hdr);
     Ok(headers)
 }
 
@@ -683,14 +694,9 @@ impl Bridge for AzureOpenAiBridge {
             ctx.provider_key.request.as_ref(),
             ctx.provider_key.response.as_ref(),
         )?;
-        let headers = build_request_headers(
-            &auth,
-            &ctx.request_id,
-            false,
-            ctx.provider_key.request.as_ref(),
-        )?;
+        let headers = build_request_headers(&auth, &ctx.request_id, false, &ctx.header_ctx())?;
         let url = self.resolve_url(&upstream);
-        let client = self.client.clone();
+        let client = self.client_for(ctx);
         let started = Instant::now();
 
         with_deadline(ctx.deadline, started, async move {
@@ -700,7 +706,7 @@ impl Bridge for AzureOpenAiBridge {
                 .json(&body)
                 .send()
                 .await
-                .map_err(|e| BridgeError::Transport(e.to_string()))?;
+                .map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
 
             let status = resp.status();
             if !status.is_success() {
@@ -740,14 +746,9 @@ impl Bridge for AzureOpenAiBridge {
             ctx.provider_key.request.as_ref(),
             ctx.provider_key.response.as_ref(),
         )?;
-        let headers = build_request_headers(
-            &auth,
-            &ctx.request_id,
-            true,
-            ctx.provider_key.request.as_ref(),
-        )?;
+        let headers = build_request_headers(&auth, &ctx.request_id, true, &ctx.header_ctx())?;
         let url = self.resolve_url(&upstream);
-        let client = self.client.clone();
+        let client = self.client_for(ctx);
         let started = Instant::now();
 
         let resp = with_deadline(ctx.deadline, started, async move {
@@ -757,7 +758,7 @@ impl Bridge for AzureOpenAiBridge {
                 .json(&body)
                 .send()
                 .await
-                .map_err(|e| BridgeError::Transport(e.to_string()))
+                .map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))
         })
         .await?;
 
@@ -781,11 +782,13 @@ impl Bridge for AzureOpenAiBridge {
         let bridge_name = self.name;
         let request_id_for_log = ctx.request_id.clone();
 
-        // Audit H2: thread the deadline into the streaming loop so a
-        // slow / hanging upstream body can't wedge the connection
-        // after headers arrive. The post-headers POST already covered
-        // the initial wait; this covers the per-chunk wait too.
-        let stream_deadline = ctx.deadline.map(|d| started + d);
+        // Audit H2: thread the budget into the streaming loop so a slow /
+        // hanging upstream body can't wedge the connection after headers
+        // arrive. It bounds the wait for EACH chunk and resets after every
+        // successful read — `stream_timeout` is defined as the maximum gap
+        // *between* chunks, so a long-but-healthy response must not be cut
+        // off just because its total duration exceeds one gap's budget.
+        let per_chunk_timeout = ctx.deadline;
 
         let byte_stream = resp.bytes_stream();
         let stream = build_chunk_stream(
@@ -794,8 +797,7 @@ impl Bridge for AzureOpenAiBridge {
             done_marker_policy,
             bridge_name,
             request_id_for_log,
-            stream_deadline,
-            started,
+            per_chunk_timeout,
         );
         Ok(Box::pin(stream))
     }
@@ -807,8 +809,7 @@ fn build_chunk_stream<S>(
     done_marker_policy: Option<StreamDoneMarker>,
     bridge_name: &'static str,
     request_id: String,
-    deadline: Option<Instant>,
-    started: Instant,
+    per_chunk_timeout: Option<Duration>,
 ) -> impl futures::Stream<Item = Result<ChatChunk, BridgeError>> + Send
 where
     S: futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send + 'static,
@@ -818,15 +819,17 @@ where
         let mut stream = Box::pin(byte_stream);
         let mut done_marker_seen = false;
         'outer: loop {
-            // Audit H2: enforce deadline on each per-chunk wait. The
-            // first POST is already covered upstream; this covers the
-            // body-streaming phase. `None` deadline disables timeout.
-            let next = match deadline {
-                Some(d) => match tokio::time::timeout_at(d.into(), stream.next()).await {
+            // Audit H2: bound each individual chunk wait. `tokio::time::timeout`
+            // (not `timeout_at`) so the budget restarts on every chunk — the
+            // configured value is the maximum inter-chunk gap, not a ceiling on
+            // the response as a whole. `None` disables the timeout.
+            let next = match per_chunk_timeout {
+                Some(d) => match tokio::time::timeout(d, stream.next()).await {
                     Ok(item) => item,
                     Err(_) => {
                         Err(BridgeError::Timeout {
-                            elapsed_ms: started.elapsed().as_millis() as u64,
+                            elapsed_ms: d.as_millis() as u64,
+                            cause: String::new(),
                         })?;
                         unreachable!()
                     }
@@ -834,7 +837,7 @@ where
                 None => stream.next().await,
             };
             let Some(next) = next else { break 'outer; };
-            let chunk = next.map_err(|e| BridgeError::Transport(e.to_string()))?;
+            let chunk = next.map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
             for event in decoder.feed(chunk.as_ref()) {
                 match event {
                     SseEvent::Done => {
@@ -1253,8 +1256,13 @@ mod tests {
     fn build_request_headers_uses_api_key_not_bearer() {
         // Critical Azure-vs-OpenAI distinction: the auth header is
         // literally `api-key`, NOT `Authorization: Bearer`.
-        let headers =
-            build_request_headers(&api_key_auth("az-secret-key"), "req-1", false, None).unwrap();
+        let headers = build_request_headers(
+            &api_key_auth("az-secret-key"),
+            "req-1",
+            false,
+            &UpstreamHeaderContext::default(),
+        )
+        .unwrap();
         assert_eq!(headers.get("api-key").unwrap(), "az-secret-key");
         assert!(
             !headers.contains_key("authorization"),
@@ -1270,7 +1278,13 @@ mod tests {
 
     #[test]
     fn build_request_headers_sets_sse_accept_when_streaming() {
-        let headers = build_request_headers(&api_key_auth("az-key"), "req-1", true, None).unwrap();
+        let headers = build_request_headers(
+            &api_key_auth("az-key"),
+            "req-1",
+            true,
+            &UpstreamHeaderContext::default(),
+        )
+        .unwrap();
         assert_eq!(headers.get("accept").unwrap(), "text/event-stream");
     }
 
@@ -1286,16 +1300,14 @@ mod tests {
         default_headers.insert("api-key".to_string(), "ATTACKER-KEY".to_string());
         default_headers.insert("authorization".to_string(), "Bearer ATTACKER".to_string());
         let request_overrides = RequestOverrides {
-            param_renames: HashMap::new(),
-            param_constraints: None,
-            default_body_fields: Default::default(),
             default_headers,
+            ..Default::default()
         };
         let headers = build_request_headers(
             &api_key_auth("legit-key"),
             "req-1",
             false,
-            Some(&request_overrides),
+            &UpstreamHeaderContext::from_overrides(Some(&request_overrides)),
         )
         .unwrap();
         assert_eq!(
@@ -1315,14 +1327,16 @@ mod tests {
         let mut default_headers = HashMap::new();
         default_headers.insert("x-custom-trace".to_string(), "trace-123".to_string());
         let request_overrides = RequestOverrides {
-            param_renames: HashMap::new(),
-            param_constraints: None,
-            default_body_fields: Default::default(),
             default_headers,
+            ..Default::default()
         };
-        let headers =
-            build_request_headers(&api_key_auth("k"), "req-1", false, Some(&request_overrides))
-                .unwrap();
+        let headers = build_request_headers(
+            &api_key_auth("k"),
+            "req-1",
+            false,
+            &UpstreamHeaderContext::from_overrides(Some(&request_overrides)),
+        )
+        .unwrap();
         assert_eq!(headers.get("x-custom-trace").unwrap(), "trace-123");
     }
 
@@ -1330,16 +1344,26 @@ mod tests {
     fn build_request_headers_rejects_invalid_api_key_chars() {
         // A secret with a newline would let an operator inject extra
         // headers via the api-key value.
-        let err = build_request_headers(&api_key_auth("legit\nx-evil: 1"), "req-1", false, None)
-            .unwrap_err();
+        let err = build_request_headers(
+            &api_key_auth("legit\nx-evil: 1"),
+            "req-1",
+            false,
+            &UpstreamHeaderContext::default(),
+        )
+        .unwrap_err();
         assert!(matches!(err, BridgeError::InvalidUpstreamCredentials(_)));
         assert_eq!(err.http_status(), 401);
     }
 
     #[test]
     fn build_request_headers_rejects_invalid_request_id_chars() {
-        let err =
-            build_request_headers(&api_key_auth("legit"), "req\nbad", false, None).unwrap_err();
+        let err = build_request_headers(
+            &api_key_auth("legit"),
+            "req\nbad",
+            false,
+            &UpstreamHeaderContext::default(),
+        )
+        .unwrap_err();
         assert!(matches!(err, BridgeError::Config(_)));
     }
 
@@ -2003,6 +2027,184 @@ mod tests {
                 // Acceptable: initial POST already timed out.
             }
             Err(other) => panic!("expected Timeout, got {other:?}"),
+        }
+    }
+
+    /// AISIX-Cloud#1122: `stream_timeout` is defined as the maximum gap
+    /// *between* chunks (see `Model::stream_timeout`), but the budget was
+    /// applied as `timeout_at(started + d)` — one absolute instant reused
+    /// for every chunk, i.e. a ceiling on the whole response. A long but
+    /// perfectly healthy stream was cut off with a Timeout once its total
+    /// duration passed a single gap's budget.
+    ///
+    /// Here every gap (80ms) is comfortably inside the budget (250ms)
+    /// while the total (~320ms) is past it. Per-chunk semantics deliver
+    /// the whole stream; the absolute deadline truncated it.
+    #[tokio::test]
+    async fn stream_budget_bounds_each_chunk_gap_not_the_whole_response() {
+        use futures::stream::StreamExt as _;
+
+        let gap = Duration::from_millis(80);
+        let budget = Duration::from_millis(250);
+        let frames: Vec<bytes::Bytes> = vec![
+            bytes::Bytes::from(
+                "data: {\"id\":\"x\",\"model\":\"m\",\"choices\":[{\"delta\":{\"content\":\"a\"},\"finish_reason\":null}]}\n\n",
+            ),
+            bytes::Bytes::from(
+                "data: {\"id\":\"x\",\"model\":\"m\",\"choices\":[{\"delta\":{\"content\":\"b\"},\"finish_reason\":null}]}\n\n",
+            ),
+            bytes::Bytes::from(
+                "data: {\"id\":\"x\",\"model\":\"m\",\"choices\":[{\"delta\":{\"content\":\"c\"},\"finish_reason\":\"stop\"}]}\n\n",
+            ),
+            bytes::Bytes::from("data: [DONE]\n\n"),
+        ];
+        let byte_stream = futures::stream::iter(frames).then(move |b| async move {
+            tokio::time::sleep(gap).await;
+            Ok::<bytes::Bytes, reqwest::Error>(b)
+        });
+
+        let started = Instant::now();
+        let mut stream = Box::pin(build_chunk_stream(
+            byte_stream,
+            None,
+            None,
+            "azure-openai",
+            "req-per-chunk".to_string(),
+            Some(budget),
+        ));
+
+        let mut content = String::new();
+        while let Some(item) = stream.next().await {
+            let chunk = item.expect("no chunk may time out — every gap is within budget");
+            if let Some(text) = chunk.delta.content.as_deref() {
+                content.push_str(text);
+            }
+        }
+
+        assert_eq!(content, "abc", "the whole stream must be delivered");
+        assert!(
+            started.elapsed() > budget,
+            "the test is only meaningful if the total run outlasts one gap's \
+             budget (elapsed {:?}, budget {budget:?})",
+            started.elapsed()
+        );
+    }
+
+    /// The same contract as the test above, but driven through the public
+    /// `chat_stream` entry point instead of `build_chunk_stream`, so it
+    /// also covers `chat_stream` actually forwarding `ctx.deadline` — the
+    /// helper-level test alone would still pass if that wiring were
+    /// dropped.
+    ///
+    /// Needs an upstream that emits frames on a schedule, which wiremock
+    /// cannot do (`set_delay` delays the response as a whole, which is
+    /// exactly the distinction under test), so this hand-rolls a one-shot
+    /// SSE server: no `content-length`, `connection: close`, body framed
+    /// by EOF.
+    #[tokio::test]
+    async fn chat_stream_delivers_a_long_stream_whose_gaps_stay_within_budget() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let gap = Duration::from_millis(80);
+        let budget = Duration::from_millis(250);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            // Drain the request headers so the client's write completes.
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            sock.write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+            sock.flush().await.unwrap();
+            for text in ["a", "b", "c"] {
+                tokio::time::sleep(gap).await;
+                let frame = format!(
+                    "data: {{\"id\":\"x\",\"model\":\"m\",\"choices\":[{{\"delta\":{{\"content\":\"{text}\"}},\"finish_reason\":null}}]}}\n\n"
+                );
+                sock.write_all(frame.as_bytes()).await.unwrap();
+                sock.flush().await.unwrap();
+            }
+            tokio::time::sleep(gap).await;
+            sock.write_all(b"data: [DONE]\n\n").await.unwrap();
+            sock.flush().await.unwrap();
+            sock.shutdown().await.unwrap();
+        });
+
+        let bridge = AzureOpenAiBridge::new()
+            .with_url_override(mock_chat_url(&format!("http://{addr}"), "gpt4o-prod"));
+        let mut ctx = canonical_test_ctx();
+        ctx.deadline = Some(budget);
+        let req = ChatFormat::new("my-azure-gpt4", vec![ChatMessage::user("hi")]);
+
+        let started = Instant::now();
+        let mut stream = bridge.chat_stream(&req, &ctx).await.expect("stream opens");
+        let mut content = String::new();
+        while let Some(item) = stream.next().await {
+            let chunk = item.expect("no chunk may time out — every gap is within budget");
+            if let Some(text) = chunk.delta.content.as_deref() {
+                content.push_str(text);
+            }
+        }
+
+        assert_eq!(content, "abc", "the whole stream must be delivered");
+        assert!(
+            started.elapsed() > budget,
+            "the test is only meaningful if the total run outlasts one gap's \
+             budget (elapsed {:?}, budget {budget:?})",
+            started.elapsed()
+        );
+    }
+
+    /// The counterpart that actually pins the wiring: response headers
+    /// arrive immediately, so the connect-phase `with_deadline` is already
+    /// satisfied, and only then does a single gap exceed the budget. The
+    /// per-chunk timeout is therefore the only thing that can fire — so
+    /// this test fails if `chat_stream` ever stops forwarding
+    /// `ctx.deadline` into the stream, which the delivery test above
+    /// (and a helper-level test) would not catch.
+    #[tokio::test]
+    async fn chat_stream_times_out_when_one_gap_exceeds_the_budget() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let budget = Duration::from_millis(150);
+        let stall = Duration::from_millis(700);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            // Headers first and flushed, so the bridge commits the stream.
+            sock.write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+            sock.flush().await.unwrap();
+            // ...then stall well past the budget before the first frame.
+            tokio::time::sleep(stall).await;
+            let _ = sock.write_all(b"data: [DONE]\n\n").await;
+        });
+
+        let bridge = AzureOpenAiBridge::new()
+            .with_url_override(mock_chat_url(&format!("http://{addr}"), "gpt4o-prod"));
+        let mut ctx = canonical_test_ctx();
+        ctx.deadline = Some(budget);
+        let req = ChatFormat::new("my-azure-gpt4", vec![ChatMessage::user("hi")]);
+
+        let mut stream = bridge
+            .chat_stream(&req, &ctx)
+            .await
+            .expect("headers arrive within the budget, so the stream opens");
+        match stream.next().await {
+            Some(Err(BridgeError::Timeout { .. })) => {}
+            other => panic!("expected a per-chunk Timeout, got {other:?}"),
         }
     }
 

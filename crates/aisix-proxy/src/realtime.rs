@@ -57,12 +57,37 @@ use crate::auth::AuthenticatedKey;
 use crate::client_ip::ClientContext;
 use crate::error::ProxyError;
 use crate::state::ProxyState;
+use aisix_gateway::BridgeError;
 
 /// Azure Realtime GA api-version (see the jobs surface twin constant).
 const AZURE_REALTIME_API_VERSION: &str = "2024-10-01-preview";
 
 /// Subprotocol item carrying the caller's API key in the browser flow.
 const SUBPROTOCOL_KEY_PREFIX: &str = "openai-insecure-api-key.";
+
+/// Dial the upstream Realtime endpoint under the deployment's outbound
+/// TLS trust.
+///
+/// `connect_async` would build its own connector over the compiled-in
+/// root set only, which leaves this the one upstream path that ignores
+/// `upstream.tls` *and* `SSL_CERT_FILE` — a self-hosted Realtime
+/// endpoint behind an enterprise CA would fail here while the same
+/// provider's `/v1/chat/completions` worked.
+async fn connect_upstream(
+    request: tokio_tungstenite::tungstenite::handshake::client::Request,
+) -> Result<
+    (
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        tokio_tungstenite::tungstenite::handshake::client::Response,
+    ),
+    tokio_tungstenite::tungstenite::Error,
+> {
+    let connector =
+        tokio_tungstenite::Connector::Rustls(aisix_gateway::upstream_tls::rustls_client_config());
+    tokio_tungstenite::connect_async_tls_with_config(request, None, false, Some(connector)).await
+}
 
 pub(crate) async fn realtime(
     State(state): State<ProxyState>,
@@ -78,14 +103,29 @@ pub(crate) async fn realtime(
         Ok(prep) => {
             let state2 = state.clone();
             let client2 = client.clone();
-            ws.protocols(["realtime"])
-                .on_upgrade(move |socket| async move {
+            // `on_upgrade` runs the session on a detached task, so the
+            // request span has to be attached to the future rather than
+            // inherited — without it the session's guardrail checks log
+            // without a `request_id` (AISIX-Cloud#1060).
+            let span = tracing::Span::current();
+            ws.protocols(["realtime"]).on_upgrade(move |socket| {
+                use tracing::Instrument as _;
+                async move {
                     run_session(state2, prep, socket, client2, request_id, started).await;
-                })
+                }
+                .instrument(span)
+            })
         }
         Err(err) => {
             let status = err.status().as_u16();
-            emit_access_log(&Method::GET, status, started.elapsed(), &request_id, None);
+            emit_access_log(
+                &Method::GET,
+                status,
+                started.elapsed(),
+                &request_id,
+                None,
+                Some(&err),
+            );
             crate::usage_attr::emit_error_usage_event(
                 &state,
                 "realtime",
@@ -119,7 +159,7 @@ async fn prepare(
     headers: &HeaderMap,
     client: &ClientContext,
 ) -> Result<Prepared, ProxyError> {
-    let auth = authenticate(state, headers)?;
+    let auth = authenticate(state, headers).await?;
 
     let requested_model = params
         .get("model")
@@ -242,28 +282,31 @@ async fn prepare(
 
 /// Header bearer (`Authorization` / `x-api-key`) first, then the browser
 /// subprotocol credential.
-fn authenticate(state: &ProxyState, headers: &HeaderMap) -> Result<AuthenticatedKey, ProxyError> {
+async fn authenticate(
+    state: &ProxyState,
+    headers: &HeaderMap,
+) -> Result<AuthenticatedKey, ProxyError> {
     if let Some(auth) = headers.get(axum::http::header::AUTHORIZATION) {
         let s = auth.to_str().map_err(|_| ProxyError::MissingAuth)?;
         let token = s.strip_prefix("Bearer ").map(str::trim).unwrap_or("");
         if token.is_empty() {
             return Err(ProxyError::MissingAuth);
         }
-        return crate::auth::authenticate_token(state, token);
+        return crate::auth::authenticate_token(state, token).await;
     }
     if let Some(raw) = headers.get("x-api-key") {
         let token = raw.to_str().map_err(|_| ProxyError::MissingAuth)?.trim();
         if token.is_empty() {
             return Err(ProxyError::MissingAuth);
         }
-        return crate::auth::authenticate_token(state, token);
+        return crate::auth::authenticate_token(state, token).await;
     }
     if let Some(proto) = headers.get("sec-websocket-protocol") {
         let s = proto.to_str().map_err(|_| ProxyError::MissingAuth)?;
         for item in s.split(',') {
             if let Some(token) = item.trim().strip_prefix(SUBPROTOCOL_KEY_PREFIX) {
                 if !token.is_empty() {
-                    return crate::auth::authenticate_token(state, token);
+                    return crate::auth::authenticate_token(state, token).await;
                 }
             }
         }
@@ -371,7 +414,7 @@ async fn run_session(
 
     let (mut client_tx, mut client_rx) = client_ws.split();
 
-    let upstream = match tokio_tungstenite::connect_async(upstream_request).await {
+    let upstream = match connect_upstream(upstream_request).await {
         Ok((ws, _resp)) => ws,
         Err(e) => {
             tracing::warn!(error = %e, model = %requested_model, "realtime upstream connect failed");
@@ -393,18 +436,22 @@ async fn run_session(
                     reason: "upstream connect failed".into(),
                 })))
                 .await;
-            crate::cooldown::note_failure(
+            // `note_failure` hands the error back, so the same value that
+            // drove the cooldown decision also names the failure in the
+            // access log instead of being rebuilt.
+            let connect_err = ProxyError::Bridge(crate::cooldown::note_failure(
                 &state.runtime_status,
                 &model_entry.id,
                 model_entry.value.cooldown.as_ref(),
-                aisix_gateway::BridgeError::Transport(e.to_string()),
-            );
+                aisix_gateway::BridgeError::Transport(aisix_gateway::error_with_causes(&e)),
+            ));
             emit_access_log(
                 &Method::GET,
                 502,
                 started.elapsed(),
                 &request_id,
                 Some((&provider_label, &requested_model)),
+                Some(&connect_err),
             );
             crate::usage_attr::emit_error_usage_event(
                 &state,
@@ -425,10 +472,25 @@ async fn run_session(
     let mut usage = SessionUsage::default();
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
     let mut close_status: u16 = 200;
-    // Operator-configured stream idle deadline (stream_timeout on the
-    // Model). Absent → no idle cap; realtime sessions are long-lived by
-    // design.
-    let idle_cap = model_entry.value.stream_timeout_effective();
+    // Paired with `close_status`: every branch that sets a FAILING status
+    // also names the failure, so the access log can say why a session
+    // ended (AISIX-Cloud#1093).
+    //
+    // A client-side transport error (`Some(Err(_))` on the receive half)
+    // is deliberately not one of them: it keeps `close_status` 200 and
+    // stays `None`. Reclassifying it is a behaviour change, not a logging
+    // one — `RequestOutcome::from_status` would flip that session from
+    // `success` to `client_error` and move every operator's realtime
+    // success rate. That belongs with the termination-reason taxonomy
+    // (`downstream_remote_disconnect` and friends) the issue asks for
+    // separately, which needs its own status decision.
+    let mut session_error: Option<ProxyError> = None;
+    // Stream idle deadline, resolved model → `upstream.stream_timeout_ms`
+    // / `timeout_ms`. Realtime sessions are long-lived by design, so the
+    // deployment default (6000 s) only reaps sessions with no traffic in
+    // either direction for that long; `timeout: 0` on the model lifts it.
+    let idle_cap =
+        crate::routing::effective_timeouts(&model_entry.value, None, state.default_timeouts).stream;
 
     loop {
         let next = async {
@@ -448,6 +510,10 @@ async fn run_session(
                         })))
                         .await;
                     close_status = 504;
+                    session_error = Some(ProxyError::Bridge(BridgeError::Timeout {
+                        elapsed_ms: cap.as_millis() as u64,
+                        cause: "no realtime frame within the stream idle budget".into(),
+                    }));
                     break;
                 }
             },
@@ -475,6 +541,9 @@ async fn run_session(
                                 })))
                                 .await;
                             close_status = 400;
+                            session_error = Some(ProxyError::ContentFiltered(
+                                "realtime frame blocked by a guardrail".into(),
+                            ));
                             break;
                         }
                     }
@@ -518,6 +587,9 @@ async fn run_session(
                                 })))
                                 .await;
                             close_status = 400;
+                            session_error = Some(ProxyError::ContentFiltered(
+                                "realtime frame blocked by a guardrail".into(),
+                            ));
                             break;
                         }
                     }
@@ -549,6 +621,9 @@ async fn run_session(
                         })))
                         .await;
                     close_status = 502;
+                    session_error = Some(ProxyError::Bridge(BridgeError::Transport(
+                        aisix_gateway::error_with_causes(&e),
+                    )));
                     break;
                 }
                 None => {
@@ -569,6 +644,7 @@ async fn run_session(
         elapsed,
         &request_id,
         Some((&provider_label, &requested_model)),
+        session_error.as_ref(),
     );
     state.metrics.record_request(
         &provider_label,
@@ -589,7 +665,10 @@ async fn run_session(
         completion_tokens: usage.output_tokens.min(u32::MAX as u64) as u32,
         cached_prompt_tokens: usage.cached_tokens.min(u32::MAX as u64) as u32,
         status_code: close_status,
-        latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
+        // Single-attempt endpoint: the attempt spans the whole request, so
+        // the upstream figure and what the caller waited for coincide.
+        upstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
+        downstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
         cost_usd: model_entry
             .value
             .cost
@@ -673,7 +752,15 @@ fn emit_access_log(
     elapsed: Duration,
     request_id: &str,
     target: Option<(&str, &str)>,
+    error: Option<&ProxyError>,
 ) {
+    let (error_kind, error) = match error {
+        Some(e) => {
+            let (kind, msg) = crate::attempt::access_log_error(e);
+            (Some(kind), Some(msg))
+        }
+        None => (None, None),
+    };
     AccessLog {
         method: method.as_str(),
         path: "/v1/realtime",
@@ -689,6 +776,8 @@ fn emit_access_log(
         served_by_model: None,
         routing_attempt_count: None,
         routing_fallback_count: None,
+        error_kind,
+        error: error.as_deref(),
     }
     .emit();
 }

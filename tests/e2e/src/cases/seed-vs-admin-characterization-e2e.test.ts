@@ -65,7 +65,9 @@ describe("seed-vs-admin characterization: direct etcd writes ≡ Admin API write
     if (!etcdReachable) return;
 
     upstream = await startOpenAiUpstream();
-    app = await spawnApp();
+    // Held-back: this test's subject is seed-vs-admin equivalence, so it
+    // keeps the admin listener bound (the suite default is now admin-off).
+    app = await spawnApp({ admin: true });
     admin = new AdminClient(app.adminUrl, app.adminKey);
     seed = new SeedClient(etcd, app.etcdPrefix);
 

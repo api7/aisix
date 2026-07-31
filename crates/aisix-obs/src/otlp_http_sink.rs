@@ -105,7 +105,7 @@ fn exporter_pipeline_config() -> PipelineConfig {
 
 impl OtlpHttpFanOut {
     pub fn new() -> Self {
-        let client = reqwest::Client::builder()
+        let client = aisix_gateway::client_builder()
             .timeout(REQUEST_TIMEOUT)
             .user_agent(USER_AGENT)
             .build()
@@ -592,8 +592,11 @@ fn build_otlp_span(record: &SinkRecord, exporter_name: &str) -> Value {
     // "now" so the span isn't silently dropped.
     let end_unix_nano =
         parse_rfc3339_to_unix_nano(&event.occurred_at).unwrap_or_else(now_unix_nano);
+    // The span represents this ATTEMPT, so its duration is the
+    // attempt-scoped upstream latency (the request-scoped
+    // `downstream_latency_ms` rides along as an attribute instead).
     // Latency landed in milliseconds; widen + multiply.
-    let latency_nanos = (event.latency_ms as u128).saturating_mul(1_000_000);
+    let latency_nanos = (event.upstream_latency_ms as u128).saturating_mul(1_000_000);
     let start_unix_nano = end_unix_nano.saturating_sub(latency_nanos);
 
     // Status: OK (1) for 2xx, ERROR (2) otherwise.
@@ -653,8 +656,20 @@ fn build_otlp_span(record: &SinkRecord, exporter_name: &str) -> Value {
     }
     attributes.push(attr_string("aisix.exporter_name", exporter_name));
     attributes.push(attr_string("aisix.request_id", &event.request_id));
-    if event.ttft_ms > 0 {
-        attributes.push(attr_int("aisix.ttft_ms", event.ttft_ms as i64));
+    if event.upstream_ttft_ms > 0 {
+        attributes.push(attr_int(
+            "aisix.upstream_ttft_ms",
+            event.upstream_ttft_ms as i64,
+        ));
+    }
+    // Request-scoped: present only on the attempt that delivered the
+    // terminal response, so consumers read a request's caller-facing
+    // latency off that one span rather than summing the group.
+    if event.downstream_latency_ms > 0 {
+        attributes.push(attr_int(
+            "aisix.downstream_latency_ms",
+            event.downstream_latency_ms as i64,
+        ));
     }
     // Per-attempt telemetry (#655). `request_id` is the trace/group key; a
     // failover request emits one span per attempt sharing it, ordered by
@@ -892,7 +907,7 @@ mod tests {
             api_key_id: "ak-uuid".into(),
             prompt_tokens: 10,
             completion_tokens: 5,
-            latency_ms: 250,
+            upstream_latency_ms: 250,
             status_code: 200,
             provider_request_id: "chatcmpl-abc".into(),
             provider_model_version: "gpt-4o-2024-08-06".into(),
@@ -1468,19 +1483,22 @@ mod tests {
         assert!(!keys.contains(&"gen_ai.response.model"));
         assert!(!keys.contains(&"gen_ai.response.finish_reasons"));
         // ttft_ms = 0 (default) → omitted
-        assert!(!keys.contains(&"aisix.ttft_ms"));
+        assert!(!keys.contains(&"aisix.upstream_ttft_ms"));
     }
 
     #[test]
     fn payload_includes_ttft_when_set() {
         let mut ev = sample_event();
-        ev.ttft_ms = 42;
+        ev.upstream_ttft_ms = 42;
         let body = build_otlp_traces_payload(&ev, "test-exp");
         let attrs = body["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["attributes"]
             .as_array()
             .unwrap();
-        let ttft_attr = attrs.iter().find(|a| a["key"] == "aisix.ttft_ms");
-        assert!(ttft_attr.is_some(), "aisix.ttft_ms should be present");
+        let ttft_attr = attrs.iter().find(|a| a["key"] == "aisix.upstream_ttft_ms");
+        assert!(
+            ttft_attr.is_some(),
+            "aisix.upstream_ttft_ms should be present"
+        );
         assert_eq!(ttft_attr.unwrap()["value"]["intValue"], "42");
     }
 

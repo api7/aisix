@@ -10,9 +10,9 @@
 //!
 //! A `tools/call` is governed by the SAME pipeline as an LLM request, keyed on
 //! the caller's API key: per-tool access control (the key's `allowed_tools`),
-//! rate-limit + budget (`quota::enforce`), guardrails on both the tool
-//! arguments (input) and the tool result (output), and a usage event into the
-//! shared sink.
+//! rate-limit + budget (`quota::enforce_mcp`, which adds the key's per-MCP-server
+//! limit to the shared layers), guardrails on both the tool arguments (input)
+//! and the tool result (output), and a usage event into the shared sink.
 
 use std::time::{Duration, Instant};
 
@@ -93,6 +93,11 @@ pub async fn mcp_endpoint(
         completion_tokens: None,
         total_tokens: None,
         request_id: &request_id,
+        // `dispatch` renders its own `Response` rather than surfacing a
+        // `ProxyError`, so there is no typed error to name here. The status
+        // code is all this endpoint can attribute a failure to.
+        error_kind: None,
+        error: None,
         served_by_model: None,
         routing_attempt_count: None,
         routing_fallback_count: None,
@@ -117,8 +122,22 @@ async fn dispatch(
     // Buffer the body so the JSON-RPC method can be inspected, then rebuilt for
     // the gateway. The global body-limit layer has already capped the size.
     let (parts, body) = request.into_parts();
-    let bytes = match to_bytes(body, state.request_body_limit_bytes).await {
+    let bytes = match to_bytes(
+        body,
+        crate::error::body_read_cap(state.request_body_limit_bytes),
+    )
+    .await
+    {
         Ok(bytes) => bytes,
+        // A cap hit is a 413 in the standard envelope — consistent with
+        // what the Content-Length middleware already answers on this
+        // route; anything else reading the body is a client fault.
+        Err(err) if crate::error::is_length_limit_error(&err) => {
+            return crate::error::ProxyError::RequestTooLarge {
+                limit_bytes: state.request_body_limit_bytes,
+            }
+            .into_response();
+        }
         Err(_) => return (StatusCode::BAD_REQUEST, "invalid request body").into_response(),
     };
 
@@ -137,13 +156,15 @@ async fn dispatch(
         (String::new(), String::new())
     };
 
-    // Reuse the LLM path's rate-limit + budget gate on the unit of work. The
-    // reservation is held for the duration of the call and dropped after (no
-    // tokens to commit — a tool call carries no token cost), which releases the
-    // concurrency slot. On 429 / budget-exceeded this returns before any
-    // upstream is contacted — and the rejected call is still recorded.
+    // Reuse the LLM path's rate-limit + budget gate on the unit of work, plus
+    // the key's own limit for the MCP server this tool belongs to
+    // (AISIX-Cloud#1079). The reservation is held for the duration of the call
+    // and dropped after (no tokens to commit — a tool call carries no token
+    // cost), which releases the concurrency slot. On 429 / budget-exceeded this
+    // returns before any upstream is contacted — and the rejected call is still
+    // recorded.
     let _reservation = if is_tool_call {
-        match crate::quota::enforce(state, &auth, None).await {
+        match crate::quota::enforce_mcp(state, &auth, &mcp_server).await {
             Ok(reservation) => Some(reservation),
             Err(err) => {
                 let response = err.into_response();
@@ -223,9 +244,10 @@ async fn dispatch(
     }
 
     let snapshot = state.snapshot.load();
-    // Scope the gateway to the tools this caller's key permits, so MCP tool
-    // access is governed by the same key object as LLM access.
-    let acl = aisix_mcp::ToolAcl::from_allowed(auth.key().allowed_tools.as_deref());
+    // Scope the gateway to the tools this caller's key permits — resolved
+    // from the key together with the environment/team MCP access policies —
+    // so MCP tool access is governed by the same key object as LLM access.
+    let acl = aisix_mcp::ToolAcl::resolve(&snapshot, auth.key());
     let gateway = aisix_mcp::McpGateway::from_snapshot(&snapshot).with_tool_acl(acl);
     let service = aisix_mcp::streamable_http_service(gateway);
     let request = Request::from_parts(parts, Body::from(bytes));
@@ -242,7 +264,12 @@ async fn dispatch(
     // body is only buffered when a guardrail chain is attached.
     let response = if let Some(chain) = &guardrail_chain {
         let (resp_parts, resp_body) = response.into_parts();
-        let resp_bytes = match to_bytes(resp_body, state.request_body_limit_bytes).await {
+        let resp_bytes = match to_bytes(
+            resp_body,
+            crate::error::body_read_cap(state.request_body_limit_bytes),
+        )
+        .await
+        {
             Ok(bytes) => bytes,
             Err(_) => {
                 return (StatusCode::BAD_GATEWAY, "invalid upstream response").into_response()
@@ -374,7 +401,10 @@ fn emit_tool_call_usage(
         occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         api_key_id: auth.entry.id.clone(),
         status_code,
-        latency_ms: latency.as_millis().min(u32::MAX as u128) as u32,
+        // Single-attempt endpoint: the attempt spans the whole request, so
+        // the upstream figure and what the caller waited for coincide.
+        upstream_latency_ms: latency.as_millis().min(u32::MAX as u128) as u32,
+        downstream_latency_ms: latency.as_millis().min(u32::MAX as u128) as u32,
         inbound_protocol: "mcp".to_string(),
         mcp_server_name: mcp_server.to_string(),
         mcp_tool_name: mcp_tool.to_string(),
@@ -540,6 +570,128 @@ mod tests {
         )
     }
 
+    /// A `tools/call` for `<server>__tool`, authenticated with `token`.
+    fn tools_call_on(token: &str, server: &str) -> HttpRequest<Body> {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": format!("{server}__tool"), "arguments": {} }
+        });
+        HttpRequest::post("/mcp")
+            .header("host", "mcp.aisix.example.com")
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    /// A snapshot carrying one key per `(id, token, mcp_rate_limits)` triple.
+    /// No key-level `rate_limit`, so any 429 can only come from the
+    /// per-MCP-server layer.
+    fn snapshot_with_mcp_server_limits(keys: &[(&str, &str, serde_json::Value)]) -> AisixSnapshot {
+        let snapshot = AisixSnapshot::new();
+        for (id, token, limits) in keys {
+            let apikey: ApiKey = serde_json::from_value(serde_json::json!({
+                "key_hash": ApiKey::hash_bearer(token),
+                "allowed_models": ["*"],
+                "allowed_tools": ["*"],
+                "mcp_rate_limits": limits,
+            }))
+            .expect("valid apikey");
+            snapshot.apikeys.insert(ResourceEntry::new(*id, apikey, 1));
+        }
+        snapshot
+    }
+
+    #[tokio::test]
+    async fn mcp_server_rate_limit_counts_per_server() {
+        // The key may call `alpha` once a minute; `beta` is uncapped.
+        let router = router_with(snapshot_with_mcp_server_limits(&[(
+            "ak-1",
+            TOKEN,
+            serde_json::json!({ "alpha": { "rpm": 1 } }),
+        )]));
+
+        let first = router
+            .clone()
+            .oneshot(tools_call_on(TOKEN, "alpha"))
+            .await
+            .expect("router responds");
+        assert_ne!(
+            first.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "first alpha tool call should pass the gate"
+        );
+
+        let second = router
+            .clone()
+            .oneshot(tools_call_on(TOKEN, "alpha"))
+            .await
+            .expect("router responds");
+        assert_eq!(
+            second.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "second alpha tool call in the window should be rate-limited"
+        );
+
+        // A server the key sets no limit for keeps its own (unlimited)
+        // counter — alpha's burst must not spend beta's budget.
+        for _ in 0..3 {
+            let other = router
+                .clone()
+                .oneshot(tools_call_on(TOKEN, "beta"))
+                .await
+                .expect("router responds");
+            assert_ne!(
+                other.status(),
+                StatusCode::TOO_MANY_REQUESTS,
+                "an unlimited server must not be limited by another server's burst"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_server_rate_limit_counts_per_key() {
+        // Two keys, each capped at one `alpha` call per minute. Exhausting
+        // one must leave the other's quota intact.
+        const OTHER_TOKEN: &str = "sk-mcp-endpoint-test-2";
+        let limits = serde_json::json!({ "alpha": { "rpm": 1 } });
+        let router = router_with(snapshot_with_mcp_server_limits(&[
+            ("ak-1", TOKEN, limits.clone()),
+            ("ak-2", OTHER_TOKEN, limits),
+        ]));
+
+        for _ in 0..2 {
+            router
+                .clone()
+                .oneshot(tools_call_on(TOKEN, "alpha"))
+                .await
+                .expect("router responds");
+        }
+        let exhausted = router
+            .clone()
+            .oneshot(tools_call_on(TOKEN, "alpha"))
+            .await
+            .expect("router responds");
+        assert_eq!(
+            exhausted.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "the first key should be at its alpha limit"
+        );
+
+        let other_key = router
+            .oneshot(tools_call_on(OTHER_TOKEN, "alpha"))
+            .await
+            .expect("router responds");
+        assert_ne!(
+            other_key.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "a second key must not be limited by the first key's burst"
+        );
+    }
+
     #[tokio::test]
     async fn rate_limit_applies_to_tool_calls_but_not_handshake() {
         // rpm=1: the key may make one tools/call per minute.
@@ -591,6 +743,103 @@ mod tests {
             listed.status(),
             StatusCode::TOO_MANY_REQUESTS,
             "tools/list must not be rate-limited"
+        );
+    }
+
+    /// Read a JSON-RPC response body (the endpoint is configured for JSON
+    /// responses, not SSE).
+    async fn body_json(resp: axum::response::Response) -> serde_json::Value {
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.expect("body");
+        serde_json::from_slice(&bytes).expect("JSON-RPC body")
+    }
+
+    #[tokio::test]
+    async fn mcp_access_deny_mode_rejects_tool_calls_at_the_acl() {
+        // The key's legacy allowlist grants everything, but its mcp_access
+        // block says deny — the policy layer must win. The rejection is the
+        // ACL's neutral "not available" (reached before upstream routing),
+        // not the router's "unknown MCP server", which proves the endpoint
+        // resolves the ACL from the key + policies rather than allowed_tools
+        // alone.
+        let key_hash = ApiKey::hash_bearer(TOKEN);
+        let apikey: ApiKey = serde_json::from_value(serde_json::json!({
+            "key_hash": key_hash,
+            "allowed_models": ["*"],
+            "allowed_tools": ["*"],
+            "mcp_access": { "mode": "deny" },
+        }))
+        .expect("valid apikey");
+        let snapshot = AisixSnapshot::new();
+        snapshot
+            .apikeys
+            .insert(ResourceEntry::new("ak-1", apikey, 1));
+
+        let router = router_with(snapshot);
+        let resp = router
+            .oneshot(tools_call_request())
+            .await
+            .expect("router responds");
+        let body = body_json(resp).await;
+        let message = body["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("not available"),
+            "deny-mode key must be rejected by the ACL, got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn env_policy_deny_overlays_legacy_key_at_the_endpoint() {
+        // A legacy key (no mcp_access block) with a wildcard allowlist, plus
+        // an env policy that denies exactly one tool: the denied tool is
+        // rejected by the ACL while any other name still reaches routing
+        // (and fails as "unknown MCP server" — no upstreams are registered).
+        let key_hash = ApiKey::hash_bearer(TOKEN);
+        let apikey: ApiKey = serde_json::from_value(serde_json::json!({
+            "key_hash": key_hash,
+            "allowed_models": ["*"],
+            "allowed_tools": ["*"],
+        }))
+        .expect("valid apikey");
+        let policy: aisix_core::models::McpPolicy = serde_json::from_value(serde_json::json!({
+            "scope": "env",
+            "mode": "none",
+            "deny": ["ghost__tool"],
+        }))
+        .expect("valid policy");
+        let snapshot = AisixSnapshot::new();
+        snapshot
+            .apikeys
+            .insert(ResourceEntry::new("ak-1", apikey, 1));
+        snapshot
+            .mcp_policies
+            .insert(ResourceEntry::new("p-env", policy, 1));
+
+        let router = router_with(snapshot);
+
+        let denied = router
+            .clone()
+            .oneshot(tools_call_request()) // calls ghost__tool
+            .await
+            .expect("router responds");
+        let body = body_json(denied).await;
+        let message = body["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("not available"),
+            "env-policy deny must subtract from a legacy key, got: {body}"
+        );
+
+        let other = router
+            .oneshot(mcp_request(
+                "tools/call",
+                serde_json::json!({ "name": "other__tool", "arguments": {} }),
+            ))
+            .await
+            .expect("router responds");
+        let body = body_json(other).await;
+        let message = body["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("unknown MCP server"),
+            "a non-denied tool must still pass the ACL for a wildcard legacy key, got: {body}"
         );
     }
 
@@ -660,6 +909,33 @@ mod tests {
         let resp = router.oneshot(req).await.expect("router responds");
         let status = resp.status();
         assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "got {status}");
+    }
+
+    #[tokio::test]
+    async fn chunked_oversized_body_returns_enveloped_413() {
+        // No Content-Length: the middleware can't pre-check, so the
+        // handler's own capped read fires. The length-limit error must
+        // surface as the enveloped 413 — matching what the middleware
+        // answers on this route — not the bare-400 "invalid request
+        // body" it used to fold into.
+        let router = router_with(snapshot_with_key());
+        let chunk = vec![b'a'; 200 * 1024];
+        let stream =
+            futures::stream::iter((0..10).map(move |_| Ok::<_, std::io::Error>(chunk.clone())));
+        let req = HttpRequest::post("/mcp")
+            .header("host", "mcp.aisix.example.com")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {TOKEN}"))
+            .body(Body::from_stream(stream))
+            .unwrap();
+        let resp = router.oneshot(req).await.expect("router responds");
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .expect("read body");
+        let v: serde_json::Value =
+            serde_json::from_slice(&body).expect("413 must carry the JSON envelope");
+        assert_eq!(v["error"]["type"], "invalid_request_error");
     }
 
     #[tokio::test]

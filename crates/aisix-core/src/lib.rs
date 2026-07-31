@@ -17,8 +17,10 @@
 #![deny(rust_2018_idioms)]
 
 pub mod config;
+pub mod config_status;
 pub mod error;
 pub mod filesource;
+pub mod header_template;
 pub mod models;
 pub mod resource;
 pub mod snapshot;
@@ -26,23 +28,29 @@ pub mod version;
 pub mod wildcard;
 
 pub use config::{
-    AdminConfig, CacheBackend, CacheConfig, Config, EtcdConfig, EtcdTlsConfig, ManagedConfig,
-    ObservabilityConfig, ProxyConfig, RateLimitBackend, RateLimitConfig, RealIpConfig,
-    RedisConnConfig, RedisMode, TlsConfig,
+    AdminConfig, CacheBackend, CacheConfig, ClientTypeRule, Config, EtcdConfig, EtcdTlsConfig,
+    ManagedConfig, ObservabilityConfig, ProxyConfig, RateLimitBackend, RateLimitConfig,
+    RealIpConfig, RedisConnConfig, RedisMode, TlsConfig,
+};
+pub use config_status::{
+    hash_bytes, hash_entries, AppliedSnapshot, ConfigMetricsView, ConfigState, ConfigStatus,
+    ConfigStatusView, IncomingRejection, LoadObservation, RejectedResource, SourceKind,
 };
 pub use error::{
     AdminError, AdminErrorEnvelope, BootstrapError, ProxyError, ProxyErrorEnvelope, RateLimitScope,
 };
+pub use header_template::{render_header_template, HeaderVars, HEADER_TEMPLATE_VARS};
 pub use models::{
     validate_a2a_agent, validate_apikey, validate_cache_policy, validate_guardrail,
     validate_mcp_server, validate_model, validate_observability_exporter, validate_provider_key,
     validate_rate_limit_policy, A2aAgent, A2aAuthType, A2aProtocolVersion, Adapter, AisixSnapshot,
     ApiKey, AppliedGuardrail, CachePolicy, CooldownConfig, ExporterKind, Guardrail,
-    GuardrailHookPoint, GuardrailKind, GuardrailMonitorHit, KeywordConfig, KeywordPattern,
-    McpAuthType, McpServer, McpTransport, Model, ObservabilityExporter, ParamConstraints,
-    PolicyScope, PolicyWindow, ProviderKey, RateLimit, RateLimitPolicy, RequestOverrides,
-    ResponseOverrides, Routing, RoutingStrategy, RoutingTarget, SchemaError, StreamDoneMarker,
-    TelemetryKind, TelemetryTags, WhenAllUnavailablePolicy, DEFAULT_COOLDOWN_TRIGGER_STATUSES,
+    GuardrailExecution, GuardrailHookPoint, GuardrailKind, GuardrailMetricsSink,
+    GuardrailMonitorHit, KeywordConfig, KeywordPattern, McpAuthType, McpRateLimit, McpServer,
+    McpServerType, McpTransport, Model, ObservabilityExporter, ParamConstraints, PolicyScope,
+    PolicyWindow, ProviderKey, RateLimit, RateLimitPolicy, RequestOverrides, ResponseOverrides,
+    Routing, RoutingStrategy, RoutingTarget, SchemaError, StreamDoneMarker, TelemetryKind,
+    TelemetryTags, WhenAllUnavailablePolicy, DEFAULT_COOLDOWN_TRIGGER_STATUSES,
 };
 pub use resource::{Resource, ResourceEntry};
 pub use snapshot::{ResourceTable, SnapshotHandle};

@@ -54,7 +54,9 @@ describe("api key lifecycle e2e: expired/disabled keys fail closed, rotate swaps
     if (!etcdReachable) return;
 
     upstream = await startOpenAiUpstream();
-    app = await spawnApp();
+    // Held-back: this test drives the Admin API surface itself, so it
+    // keeps the admin listener bound (the suite default is now admin-off).
+    app = await spawnApp({ admin: true });
     admin = new AdminClient(app.adminUrl, app.adminKey);
     seed = new SeedClient(etcd, app.etcdPrefix);
 

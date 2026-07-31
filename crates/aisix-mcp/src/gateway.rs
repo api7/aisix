@@ -35,9 +35,13 @@ use rmcp::transport::streamable_http_server::session::local::LocalSessionManager
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{RoleServer, ServerHandler};
 
-use aisix_core::AisixSnapshot;
+use aisix_core::models::{
+    ApiKey, McpAccessMode, McpPolicy, McpPolicyMode, McpPolicyScope, McpServerType,
+};
+use aisix_core::{AisixSnapshot, ResourceEntry};
 
 use crate::bridge::{upstream_from_mcp_server, EphemeralBridge, McpBridge};
+use crate::openapi::OpenApiBridge;
 
 /// Separator between an upstream server's registered name and a tool name in
 /// the aggregated namespace, e.g. `github__create_issue`. Server names must
@@ -51,41 +55,170 @@ struct NamedUpstream {
 }
 
 /// Which tools a gateway instance may expose and call, in the namespaced
-/// `<server>__<tool>` form. Built per request from the caller's API key so MCP
-/// tool access is governed by the same key object as LLM access.
+/// `<server>__<tool>` form. Built per request from the caller's API key and
+/// the environment's / the key's team's MCP access policies, so MCP tool
+/// access is governed by the same key object as LLM access.
+///
+/// A tool is permitted only when **every** allow layer admits it and **no**
+/// deny pattern matches it. A legacy key (no `mcp_access` block) carries a
+/// single allow layer built from its `allowed_tools`; a policy-driven key
+/// carries the inherited policy grant and, in `restrict` mode, its own
+/// `allow` patterns as a second conjunctive layer — a key can narrow the
+/// inherited grant but never widen it. Deny patterns are unioned across the
+/// environment policy, the team policy, and the key, and always win.
 #[derive(Clone)]
-pub enum ToolAcl {
-    /// No restriction — every aggregated tool is exposed.
-    AllowAll,
-    /// Only these namespaced tool names are exposed; any other is hidden from
-    /// `tools/list` and rejected by `tools/call`.
-    Allow(std::collections::HashSet<String>),
+pub struct ToolAcl {
+    /// Conjunctive allow layers: a tool must match every layer.
+    allow: Vec<AllowLayer>,
+    /// Deny patterns; any match rejects the tool, overriding every allow
+    /// layer.
+    deny: Vec<String>,
 }
 
-impl ToolAcl {
-    /// Build an ACL from an API key's `allowed_tools` list: `None` or an empty
-    /// list grants no tools; a list containing `"*"` grants all; otherwise the
-    /// listed patterns. Entries are matched as single-`*` globs (see
-    /// [`ToolAcl::permits`]), mirroring `ApiKey::can_access_tool`.
-    pub fn from_allowed(allowed: Option<&[String]>) -> Self {
-        match allowed {
-            Some(list) if list.iter().any(|t| t == "*") => Self::AllowAll,
-            Some(list) => Self::Allow(list.iter().cloned().collect()),
-            None => Self::Allow(std::collections::HashSet::new()),
+#[derive(Clone)]
+enum AllowLayer {
+    /// The layer admits every tool.
+    All,
+    /// The layer admits tools matching any of these single-`*` glob patterns.
+    Patterns(Vec<String>),
+}
+
+impl AllowLayer {
+    /// A bare `"*"` entry is folded into [`AllowLayer::All`]; every other
+    /// list stays a pattern set (including the empty list, which admits
+    /// nothing).
+    fn from_patterns(patterns: &[String]) -> Self {
+        if patterns.iter().any(|p| p == "*") {
+            Self::All
+        } else {
+            Self::Patterns(patterns.to_vec())
         }
     }
 
-    /// Whether `namespaced_tool` is permitted. Patterns are single-`*` globs:
-    /// `"<server>__*"` grants every tool on that server, a pattern without a
-    /// `*` matches exactly. (A bare `"*"` is folded into [`Self::AllowAll`] at
-    /// construction.) Uses the same matcher as `ApiKey::can_access_tool`.
-    fn permits(&self, namespaced_tool: &str) -> bool {
+    fn admits(&self, namespaced_tool: &str) -> bool {
         match self {
-            Self::AllowAll => true,
-            Self::Allow(patterns) => patterns
+            Self::All => true,
+            Self::Patterns(patterns) => patterns
                 .iter()
                 .any(|p| aisix_core::wildcard::wildcard_matches(p, namespaced_tool)),
         }
+    }
+}
+
+impl ToolAcl {
+    /// The unrestricted ACL — every aggregated tool is exposed. Gateways
+    /// start here until scoped with [`McpGateway::with_tool_acl`].
+    fn allow_all() -> Self {
+        Self {
+            allow: vec![AllowLayer::All],
+            deny: Vec::new(),
+        }
+    }
+
+    /// Build a legacy ACL from an API key's `allowed_tools` list alone:
+    /// `None` or an empty list grants no tools; a list containing `"*"`
+    /// grants all; otherwise the listed patterns. Entries are matched as
+    /// single-`*` globs (see [`ToolAcl::permits`]), mirroring
+    /// `ApiKey::can_access_tool`. Policy deny overlays are NOT applied here —
+    /// any caller serving external traffic uses [`ToolAcl::resolve`].
+    pub fn from_allowed(allowed: Option<&[String]>) -> Self {
+        Self {
+            allow: vec![AllowLayer::from_patterns(allowed.unwrap_or(&[]))],
+            deny: Vec::new(),
+        }
+    }
+
+    /// Resolve the effective ACL for `key` from the `mcp_policies` in
+    /// `snapshot`.
+    ///
+    /// - A key without an `mcp_access` block keeps its legacy allow side
+    ///   (`allowed_tools`, no inheritance) — with enabled policies' `deny`
+    ///   patterns still subtracted, since deny applies to every key a policy
+    ///   covers.
+    /// - `deny` mode grants nothing.
+    /// - `inherit` / `restrict` take the base grant from the key's team
+    ///   policy when one is enabled, else the environment-default policy,
+    ///   else nothing; `restrict` intersects the key's own `allow` patterns
+    ///   on top.
+    /// - Deny patterns are unioned across the environment policy, the team
+    ///   policy, and the key — an environment-level deny holds even when a
+    ///   team policy replaces the environment's grant.
+    ///
+    /// Disabled policies neither grant nor deny.
+    pub fn resolve(snapshot: &AisixSnapshot, key: &ApiKey) -> Self {
+        // Grant side: pick the governing row per scope deterministically
+        // (lowest id wins) so a duplicated row — the writer enforces
+        // uniqueness — can only ever produce a stable outcome. Deny side:
+        // union across EVERY enabled row that applies to this key, so a
+        // deny pattern can never disappear by losing a duplicate-row
+        // tie-break.
+        let mut env_policy: Option<Arc<ResourceEntry<McpPolicy>>> = None;
+        let mut team_policy: Option<Arc<ResourceEntry<McpPolicy>>> = None;
+        let mut deny: Vec<String> = Vec::new();
+        for entry in snapshot.mcp_policies.entries() {
+            if !entry.value.enabled {
+                continue;
+            }
+            let slot = match entry.value.scope {
+                McpPolicyScope::Env => &mut env_policy,
+                McpPolicyScope::Team => {
+                    let targets_key_team = key.team_id.is_some()
+                        && key.team_id.as_deref() == entry.value.scope_ref.as_deref();
+                    if !targets_key_team {
+                        continue;
+                    }
+                    &mut team_policy
+                }
+            };
+            deny.extend(entry.value.deny.iter().cloned());
+            match slot {
+                Some(current) if current.id <= entry.id => {}
+                _ => *slot = Some(entry),
+            }
+        }
+
+        let Some(access) = &key.mcp_access else {
+            return Self {
+                allow: vec![AllowLayer::from_patterns(
+                    key.allowed_tools.as_deref().unwrap_or(&[]),
+                )],
+                deny,
+            };
+        };
+
+        match access.mode {
+            McpAccessMode::Deny => Self {
+                allow: vec![AllowLayer::Patterns(Vec::new())],
+                deny: Vec::new(),
+            },
+            mode @ (McpAccessMode::Inherit | McpAccessMode::Restrict) => {
+                let governing = team_policy.as_ref().or(env_policy.as_ref());
+                let base = match governing.map(|p| (p.value.mode, &p.value.allow)) {
+                    None | Some((McpPolicyMode::None, _)) => AllowLayer::Patterns(Vec::new()),
+                    Some((McpPolicyMode::All, _)) => AllowLayer::All,
+                    Some((McpPolicyMode::Selected, allow)) => AllowLayer::from_patterns(allow),
+                };
+                let mut allow = vec![base];
+                if mode == McpAccessMode::Restrict {
+                    allow.push(AllowLayer::from_patterns(&access.allow));
+                }
+                deny.extend(access.deny.iter().cloned());
+                Self { allow, deny }
+            }
+        }
+    }
+
+    /// Whether `namespaced_tool` is permitted: every allow layer must admit
+    /// it and no deny pattern may match it. Patterns are single-`*` globs:
+    /// `"<server>__*"` covers every tool on that server, a pattern without a
+    /// `*` matches exactly, and a bare `"*"` covers everything. Uses the same
+    /// matcher as `ApiKey::can_access_tool`.
+    pub fn permits(&self, namespaced_tool: &str) -> bool {
+        self.allow.iter().all(|layer| layer.admits(namespaced_tool))
+            && !self
+                .deny
+                .iter()
+                .any(|p| aisix_core::wildcard::wildcard_matches(p, namespaced_tool))
     }
 }
 
@@ -107,10 +240,10 @@ impl McpGateway {
     /// later one and emitting duplicate tool names on the wire. Server names
     /// must not contain [`TOOL_NAMESPACE_SEPARATOR`].
     ///
-    /// The gateway is **unrestricted** ([`ToolAcl::AllowAll`]) until scoped with
-    /// [`McpGateway::with_tool_acl`]. Any caller that serves external traffic
-    /// MUST scope it to the caller's key — the proxy `/mcp` mount is the single
-    /// enforcement point and always does.
+    /// The gateway is **unrestricted** (every tool permitted) until scoped
+    /// with [`McpGateway::with_tool_acl`]. Any caller that serves external
+    /// traffic MUST scope it to the caller's key — the proxy `/mcp` mount is
+    /// the single enforcement point and always does, via [`ToolAcl::resolve`].
     pub fn new(upstreams: impl IntoIterator<Item = (String, Arc<dyn McpBridge>)>) -> Self {
         let mut seen = std::collections::HashSet::new();
         let mut deduped = Vec::new();
@@ -131,7 +264,7 @@ impl McpGateway {
         }
         Self {
             upstreams: deduped.into(),
-            tool_acl: ToolAcl::AllowAll,
+            tool_acl: ToolAcl::allow_all(),
         }
     }
 
@@ -144,11 +277,12 @@ impl McpGateway {
     }
 
     /// Build a gateway whose upstreams are the **enabled** `mcp_servers` in the
-    /// snapshot, each reached through an [`EphemeralBridge`] (connect per
-    /// request). Disabled servers are skipped. Registration order follows the
-    /// snapshot's iteration order; duplicate names are deduped (first
-    /// wins) by [`McpGateway::new`], though the Admin API already enforces
-    /// uniqueness.
+    /// snapshot: a `type: mcp` server is reached through an [`EphemeralBridge`]
+    /// (connect per request), a `type: openapi` server through an
+    /// [`OpenApiBridge`] that serves tools generated from its spec. Disabled
+    /// servers are skipped. Registration order follows the snapshot's
+    /// iteration order; duplicate names are deduped (first wins) by
+    /// [`McpGateway::new`], though the Admin API already enforces uniqueness.
     pub fn from_snapshot(snapshot: &AisixSnapshot) -> Self {
         let upstreams = snapshot
             .mcp_servers
@@ -156,9 +290,15 @@ impl McpGateway {
             .into_iter()
             .filter(|entry| entry.value.enabled)
             .map(|entry| {
-                let upstream = upstream_from_mcp_server(&entry.value);
-                let bridge: Arc<dyn McpBridge> = Arc::new(EphemeralBridge::new(upstream));
-                (entry.value.name.clone(), bridge)
+                let name = entry.value.name.clone();
+                let bridge: Arc<dyn McpBridge> = match entry.value.server_type {
+                    McpServerType::Mcp => {
+                        let upstream = upstream_from_mcp_server(&entry.value);
+                        Arc::new(EphemeralBridge::new(upstream))
+                    }
+                    McpServerType::Openapi => Arc::new(OpenApiBridge::new(entry)),
+                };
+                (name, bridge)
             });
         McpGateway::new(upstreams)
     }

@@ -101,6 +101,7 @@ pub async fn count_tokens(
                 status,
                 elapsed,
                 &request_id,
+                None,
             );
             state.metrics.record_request(
                 &provider,
@@ -121,6 +122,7 @@ pub async fn count_tokens(
                 status,
                 elapsed,
                 &request_id,
+                Some(&err),
             );
             let snap = state.snapshot.load();
             let metric_model = crate::usage_attr::metric_model_label(&snap, &model_name);
@@ -185,6 +187,7 @@ async fn dispatch(
                     .as_deref()
                     .unwrap_or(auth.entry.id.as_str()),
             ),
+            source_ip: &client.source_ip,
         },
     )?;
     let retry_on_429 = model_entry
@@ -200,9 +203,10 @@ async fn dispatch(
         .map(|r| r.fallback_on_statuses_or_default())
         .unwrap_or(&[]);
 
+    let is_routing_request = model_entry.value.routing.is_some();
     let mut last_err: Option<ProxyError> = None;
     let mut any_anthropic = false;
-    for target in &attempt_models {
+    for (target_idx, target) in attempt_models.iter().enumerate() {
         // count_tokens has no upstream equivalent for non-Anthropic
         // providers; skip foreign targets in a mixed group rather than
         // dispatching to an upstream that would 404.
@@ -210,25 +214,89 @@ async fn dispatch(
             continue;
         }
         any_anthropic = true;
-        match count_tokens_to_target(
+        // Reserve THIS target's own model rate-limit layers before
+        // dispatching to it (AISIX-Cloud#1087); over-limit → skip it and
+        // try the remaining targets. Like the handler-level `_reservation` it is
+        // never token-committed — count_tokens burns no generation tokens;
+        // the drop at scope end releases the concurrency slot.
+        let _member_reservation = match crate::quota::reserve_routing_target(
             state,
-            &snapshot,
-            body,
-            &target.model,
+            is_routing_request,
+            &target.model.display_name,
             &target.id,
-            request_id,
+            &target.model,
         )
         .await
         {
-            Ok(resp) => return Ok((resp, "anthropic".to_string())),
+            Ok(r) => r,
             Err(e) => {
-                let retryable = matches!(
-                    &e,
-                    ProxyError::Bridge(be) if crate::routing::is_retryable(be, retry_on_429, fallback_statuses)
-                );
                 last_err = Some(e);
-                if !retryable {
-                    break;
+                continue;
+            }
+        };
+        // Same-target retries before failing over, like the other
+        // group-capable endpoints. This loop had fail-over only: a
+        // transient 502 on the sole Anthropic target failed the request
+        // outright even with a retry budget configured.
+        //
+        // "Another target queued" counts only Anthropic targets: the loop
+        // `continue`s past everything else, so in a mixed group like
+        // [anthropic, openai] the openai entry is not a real fallback —
+        // treating it as one would suppress the default budget on the only
+        // target that can actually serve the request.
+        let has_usable_fallback = attempt_models[target_idx + 1..]
+            .iter()
+            .any(|t| t.model.provider.as_deref() == Some("anthropic"));
+        let budget = crate::routing::effective_retries(
+            &target.model,
+            model_entry.value.routing.as_ref(),
+            state.default_retries,
+            has_usable_fallback,
+        );
+        for attempt_idx in 0..=budget.attempts {
+            if attempt_idx > 0 {
+                let hint = last_err.as_ref().and_then(|e| match e {
+                    ProxyError::Bridge(be) => crate::routing::retry_after_hint(be),
+                    _ => None,
+                });
+                tokio::time::sleep(crate::routing::retry_backoff(attempt_idx as u32, hint)).await;
+            }
+            match count_tokens_to_target(
+                state,
+                &snapshot,
+                body,
+                &target.model,
+                &target.id,
+                crate::routing::effective_timeouts(
+                    &target.model,
+                    Some(&model_entry.value),
+                    state.default_timeouts,
+                ),
+                request_id,
+                client,
+            )
+            .await
+            {
+                Ok(resp) => return Ok((resp, "anthropic".to_string())),
+                Err(e) => {
+                    let retryable = matches!(
+                        &e,
+                        ProxyError::Bridge(be) if crate::routing::is_retryable(be, retry_on_429, fallback_statuses)
+                    );
+                    // See `RetryBudget::covers`: a default budget skips
+                    // same-target retries for timeouts; fail-over is
+                    // unaffected (the outer loop still moves on).
+                    let budget_covers = match &e {
+                        ProxyError::Bridge(be) => budget.covers(be),
+                        _ => true,
+                    };
+                    last_err = Some(e);
+                    if !retryable {
+                        return Err(last_err.unwrap_or(ProxyError::ProviderUnavailable));
+                    }
+                    if !budget_covers {
+                        break;
+                    }
                 }
             }
         }
@@ -249,13 +317,18 @@ async fn dispatch(
 /// Dispatch one concrete Anthropic target's count_tokens passthrough to
 /// `{api_base}/v1/messages/count_tokens`. The caller has already
 /// confirmed `model.provider == anthropic`.
+#[allow(clippy::too_many_arguments)]
 async fn count_tokens_to_target(
     state: &ProxyState,
     snapshot: &aisix_core::AisixSnapshot,
     body: &Value,
     model: &aisix_core::Model,
     model_id: &str,
+    // Deadlines resolved by the caller across target → group → deployment
+    // default (`routing::effective_timeouts`); this fn only applies them.
+    timeouts: crate::routing::TimeoutBudget,
     request_id: &str,
+    client: &ClientContext,
 ) -> Result<Response, ProxyError> {
     let mut body = body.clone();
     let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
@@ -293,13 +366,14 @@ async fn count_tokens_to_target(
     let url = crate::dispatch::build_v1_url(&base, "/messages/count_tokens");
 
     // Build the outbound HeaderMap explicitly so the PK's
-    // `request.default_headers` block can inject operator-supplied
-    // headers (e.g. `anthropic-beta`) via the shared apply pipeline.
-    // The bridge-owned headers (x-api-key, anthropic-version,
-    // content-type, x-aisix-request-id) are inserted FIRST;
-    // `apply_default_headers` skips keys already present + the reserved
-    // auth-header blacklist (`x-api-key`), so operator headers can never
-    // clobber auth here (ai-gateway#337). Anthropic auth shape:
+    // `request.default_headers` / `request.forward_client_headers` can
+    // inject operator-supplied and allowlisted client headers (e.g.
+    // `anthropic-beta`) via the shared apply pipeline. The bridge-owned
+    // headers (x-api-key, anthropic-version, content-type,
+    // x-aisix-request-id) are inserted FIRST; `apply_request_headers`
+    // skips keys already present + the reserved auth-header blacklist
+    // (`x-api-key`), so neither source can clobber auth here
+    // (ai-gateway#337). Anthropic auth shape:
     // `x-api-key` + `anthropic-version`, NOT `Authorization: Bearer`.
     let mut headers = axum::http::HeaderMap::new();
     let api_key_hv = HeaderValue::from_str(api_key).map_err(|e| {
@@ -322,14 +396,21 @@ async fn count_tokens_to_target(
         )))
     })?;
     headers.insert(HeaderName::from_static("x-aisix-request-id"), rid_hv);
-    if let Some(r) = pk_entry.value.request.as_ref() {
-        aisix_provider_openai::overrides::apply_default_headers(&mut headers, &r.default_headers);
-    }
+    aisix_gateway::apply_request_headers(
+        &mut headers,
+        &crate::dispatch::upstream_header_ctx(
+            &pk_entry.value,
+            &pk_entry.id,
+            model,
+            model_id,
+            client,
+        ),
+    );
 
-    let client = crate::http_client::client();
+    let client = crate::http_client::client_for(pk_entry.value.tls.as_ref());
     let mut req = client.post(&url).headers(headers).json(&body);
     // #554: count_tokens is non-streaming; apply the E2E request timeout.
-    if let Some(d) = model.request_timeout() {
+    if let Some(d) = timeouts.request {
         req = req.timeout(d);
     }
     let send_started = Instant::now();
@@ -409,7 +490,15 @@ fn emit_access_log(
     status: u16,
     elapsed: Duration,
     request_id: &str,
+    error: Option<&ProxyError>,
 ) {
+    let (error_kind, error) = match error {
+        Some(e) => {
+            let (kind, msg) = crate::attempt::access_log_error(e);
+            (Some(kind), Some(msg))
+        }
+        None => (None, None),
+    };
     AccessLog {
         method: "POST",
         path: "/v1/messages/count_tokens",
@@ -425,6 +514,8 @@ fn emit_access_log(
         served_by_model: None,
         routing_attempt_count: None,
         routing_fallback_count: None,
+        error_kind,
+        error: error.as_deref(),
     }
     .emit();
 }
@@ -509,6 +600,75 @@ mod tests {
             .header("content-type", "application/json")
             .body(axum::body::Body::from(body.to_string()))
             .unwrap()
+    }
+
+    /// Mixed group [anthropic, openai]: the openai target is `continue`d
+    /// past (count_tokens has no upstream there), so it is NOT a usable
+    /// fallback — the default retry budget must apply on the anthropic
+    /// target as if it were the last one. Counting the skipped target as
+    /// a fallback would have suppressed the budget and failed the request
+    /// on the first transient 502.
+    #[tokio::test]
+    async fn mixed_group_spends_the_default_budget_on_the_only_anthropic_target() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages/count_tokens"))
+            .respond_with(ResponseTemplate::new(502).set_body_string("upstream down"))
+            .up_to_n_times(2)
+            .with_priority(1)
+            .mount(&upstream)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages/count_tokens"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"input_tokens": 7})),
+            )
+            .with_priority(2)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        let claude = {
+            let json = format!(
+                r#"{{"display_name":"ct-claude","provider":"anthropic","model_name":"claude-haiku-4-5-20251001","provider_key_id":"{PK_ID}"}}"#
+            );
+            let m: Model = serde_json::from_str(&json).unwrap();
+            ResourceEntry::new("m-ct-claude", m, 1)
+        };
+        let gpt = {
+            let json = format!(
+                r#"{{"display_name":"ct-gpt","provider":"openai","model_name":"gpt-4o","provider_key_id":"{PK_ID}"}}"#
+            );
+            let m: Model = serde_json::from_str(&json).unwrap();
+            ResourceEntry::new("m-ct-gpt", m, 1)
+        };
+        let group = {
+            let json = r#"{"display_name":"ct-mixed","routing":{"strategy":"failover","targets":[{"model":"ct-claude"},{"model":"ct-gpt"}]}}"#;
+            let m: Model = serde_json::from_str(json).unwrap();
+            ResourceEntry::new("m-ct-mixed", m, 1)
+        };
+        snap.models.insert(claude);
+        snap.models.insert(gpt);
+        snap.models.insert(group);
+        snap.apikeys.insert(apikey_entry(&["ct-mixed"]));
+
+        let app = build_app(snap);
+        let resp = app
+            .oneshot(make_req(serde_json::json!({
+                "model": "ct-mixed",
+                "messages": [{"role": "user", "content": "hi"}]
+            })))
+            .await
+            .unwrap();
+
+        // Two 502s absorbed by the default budget, third attempt wins.
+        assert_eq!(resp.status(), StatusCode::OK);
+        let received = upstream.received_requests().await.unwrap();
+        assert_eq!(
+            received.len(),
+            3,
+            "initial + 2 retries on the sole anthropic target",
+        );
     }
 
     #[tokio::test]
@@ -786,7 +946,7 @@ mod tests {
 
     /// Operator `default_headers` must NOT be able to overwrite the
     /// gateway-owned `x-api-key` auth header (ai-gateway#337) — the
-    /// reserved blacklist in `apply_default_headers` protects it.
+    /// reserved blacklist in `apply_request_headers` protects it.
     #[tokio::test]
     async fn default_headers_cannot_overwrite_x_api_key() {
         let upstream = MockServer::start().await;

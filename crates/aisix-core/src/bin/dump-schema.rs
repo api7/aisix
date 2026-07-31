@@ -63,7 +63,13 @@ fn main() {
         schema::guardrail_attachment_root_schema(),
     );
     dump_value(&out_dir, "mcp_server", schema::mcp_server_root_schema());
+    dump_value(&out_dir, "mcp_policy", schema::mcp_policy_root_schema());
     dump_value(&out_dir, "a2a_agent", schema::a2a_agent_root_schema());
+    dump_value(
+        &out_dir,
+        "oidc_provider",
+        schema::oidc_provider_root_schema(),
+    );
 
     dump::<EnsembleConfig>(&out_dir, "ensemble");
     dump::<RateLimit>(&out_dir, "rate_limit");

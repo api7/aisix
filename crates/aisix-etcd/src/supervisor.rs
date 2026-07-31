@@ -15,10 +15,14 @@
 //! snapshot into a new one, mutate, and `store` it. That keeps the
 //! read path reading a fully-formed `Arc<Snapshot>` the whole time.
 
+use aisix_core::config_status::{
+    hash_entries, AppliedSnapshot, ConfigStatus, IncomingRejection, LoadObservation, SourceKind,
+};
 use aisix_core::snapshot::SnapshotHandle;
 use aisix_core::AisixSnapshot;
+use chrono::{DateTime, Utc};
 use futures::StreamExt;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -146,6 +150,12 @@ pub struct Supervisor<P: ConfigProvider> {
     /// admin handler.
     status: WatchStatus,
 
+    /// Load-observability signal exposed on the metrics/status listener
+    /// (`/status/config`, `/status/ready`, `aisix_config_*` series).
+    /// Recomputed from `state` / `rejections` / the published snapshot after
+    /// every apply so operators can answer "did my config take effect".
+    config_status: ConfigStatus,
+
     /// Most recent loader rejections, capped at
     /// [`MAX_RETAINED_REJECTIONS`]. Read by the heartbeat path so the
     /// CP can surface "your DP rejected these resources" in the
@@ -187,6 +197,7 @@ impl<P: ConfigProvider> Supervisor<P> {
             revision: Mutex::new(0),
             cache,
             status: WatchStatus::new(),
+            config_status: ConfigStatus::new(SourceKind::Etcd),
             rejections: Mutex::new(Vec::new()),
             pending_writes: Mutex::new(Vec::new()),
         }
@@ -197,6 +208,84 @@ impl<P: ConfigProvider> Supervisor<P> {
     /// "snapshot age" metrics. See [`WatchStatus`].
     pub fn watch_status(&self) -> WatchStatus {
         self.status.clone()
+    }
+
+    /// Cheap clonable handle to the load-observability state. Read by the
+    /// metrics/status listener to serve `/status/config`, `/status/ready`,
+    /// and the `aisix_config_*` series.
+    pub fn config_status(&self) -> ConfigStatus {
+        self.config_status.clone()
+    }
+
+    /// Recompute the load-observability view from the supervisor's
+    /// authoritative in-memory state (the raw entry map, the retained
+    /// rejection buffer, the published snapshot, and the revision floor) and
+    /// publish it to [`Self::config_status`]. Idempotent: safe to call after
+    /// every apply. `is_reload` counts a config reload for
+    /// `aisix_config_reloads_total` — set only on full (re)syncs, not on
+    /// incremental watch events.
+    fn sync_config_status(&self, is_reload: bool) {
+        let source_hash;
+        let config_hash;
+        let rejected: Vec<IncomingRejection>;
+        {
+            let state = self.state.lock().unwrap();
+            let rejections = self.rejections.lock().unwrap();
+            // `state` is the raw entry map the DP holds. A full resync inserts
+            // every entry (including rejected ones), so on that path source_hash
+            // covers the whole observed snapshot. A live watch Put that is
+            // rejected never enters `state`, so it is reported only via
+            // `rejected[]` and folds into source_hash at the next resync — see
+            // the `config_status` module docs.
+            source_hash =
+                hash_entries(state.values().map(|e| (e.key.as_str(), e.value.as_slice())));
+            let rejected_keys: HashSet<&str> = rejections.iter().map(|r| r.key.as_str()).collect();
+            config_hash = hash_entries(
+                state
+                    .values()
+                    .filter(|e| !rejected_keys.contains(e.key.as_str()))
+                    .map(|e| (e.key.as_str(), e.value.as_slice())),
+            );
+            rejected = rejections.iter().map(|r| self.map_rejection(r)).collect();
+        }
+        let revision = *self.revision.lock().unwrap();
+        let resource_counts = resource_counts(&self.handle.load());
+
+        self.config_status.record_load(LoadObservation {
+            source_hash,
+            observed_revision: Some(revision),
+            applied: Some(AppliedSnapshot {
+                config_hash,
+                revision: Some(revision),
+                resource_counts,
+            }),
+            rejected,
+            is_reload,
+            // etcd always publishes the accepted subset (even an empty one);
+            // it never retains a previous snapshot wholesale, so a wholly-
+            // rejected resync is captured by the empty accepted set instead.
+            wholly_rejected: false,
+        });
+    }
+
+    /// Map a loader [`RejectedEntry`] to the source-agnostic wire shape. The
+    /// key is split into `<kind>/<id>` via [`key::parse`]; an unparseable key
+    /// (the `bad_key` path) reports empty kind/id, mirroring the control
+    /// plane's rejected-resources surface.
+    fn map_rejection(&self, r: &RejectedEntry) -> IncomingRejection {
+        let (kind, id) = match key::parse(&self.prefix, &r.key) {
+            Ok(parsed) => (parsed.kind.to_string(), parsed.id.to_string()),
+            Err(_) => (String::new(), String::new()),
+        };
+        IncomingRejection {
+            identity: r.key.clone(),
+            resource_kind: kind,
+            resource_id: id,
+            last_error_kind: r.kind.as_str().to_string(),
+            last_error: r.error.clone(),
+            seen_at: DateTime::from_timestamp(r.timestamp_unix_secs as i64, 0)
+                .unwrap_or_else(Utc::now),
+        }
     }
 
     /// Snapshot of the most recent loader rejections (capped). Used by
@@ -273,6 +362,9 @@ impl<P: ConfigProvider> Supervisor<P> {
         // may have compacted past it; load_all + watch from latest is
         // always safer.
         *self.revision.lock().unwrap() = revision;
+        // Reflect the cached revision on the status view (apply_resync above
+        // synced with the entry-max revision).
+        self.sync_config_status(false);
         tracing::info!(
             accepted = stats.accepted,
             revision,
@@ -313,11 +405,17 @@ impl<P: ConfigProvider> Supervisor<P> {
     /// `WatchStatus.last_apply_at` so `/admin/v1/health` reflects the
     /// successful round-trip with etcd even on an empty config.
     fn set_revision_floor(&self, revision: i64) {
-        let mut rev = self.revision.lock().unwrap();
-        if revision > *rev {
-            *rev = revision;
+        {
+            let mut rev = self.revision.lock().unwrap();
+            if revision > *rev {
+                *rev = revision;
+            }
         }
         self.status.record_apply(revision);
+        // Reflect the finalised revision on the status view (the preceding
+        // apply_resync synced with the entry-max revision; this corrects it to
+        // the load/watch header revision). Not itself a reload event.
+        self.sync_config_status(false);
     }
 
     /// Apply a single Put event on top of the current snapshot.
@@ -333,6 +431,9 @@ impl<P: ConfigProvider> Supervisor<P> {
             for r in stats.rejections.drain(..) {
                 self.push_rejection(r);
             }
+            // A rejected watch event still changes the reported state
+            // (rejected[] gains this entry; last_reload flips unsuccessful).
+            self.sync_config_status(false);
             return false;
         }
 
@@ -379,8 +480,14 @@ impl<P: ConfigProvider> Supervisor<P> {
             for e in tiny.mcp_servers.entries() {
                 new.mcp_servers.insert(clone_entry(&e));
             }
+            for e in tiny.mcp_policies.entries() {
+                new.mcp_policies.insert(clone_entry(&e));
+            }
             for e in tiny.a2a_agents.entries() {
                 new.a2a_agents.insert(clone_entry(&e));
+            }
+            for e in tiny.oidc_providers.entries() {
+                new.oidc_providers.insert(clone_entry(&e));
             }
             new
         });
@@ -402,6 +509,7 @@ impl<P: ConfigProvider> Supervisor<P> {
         // /admin/v1/health reads this — record the apply so `last_apply_age`
         // resets on every event we successfully process.
         self.status.record_apply(entry.revision);
+        self.sync_config_status(false);
         self.flush_cache();
         true
     }
@@ -437,7 +545,9 @@ impl<P: ConfigProvider> Supervisor<P> {
             }
             "rate_limit_policies" => snap.rate_limit_policies.get_by_id(parsed.id).is_some(),
             "mcp_servers" => snap.mcp_servers.get_by_id(parsed.id).is_some(),
+            "mcp_policies" => snap.mcp_policies.get_by_id(parsed.id).is_some(),
             "a2a_agents" => snap.a2a_agents.get_by_id(parsed.id).is_some(),
+            "oidc_providers" => snap.oidc_providers.get_by_id(parsed.id).is_some(),
             _ => false,
         };
         let removed_rejection = self.remove_rejection_for_key(key_str);
@@ -446,6 +556,8 @@ impl<P: ConfigProvider> Supervisor<P> {
             if removed_rejection {
                 let cur_rev = *self.revision.lock().unwrap();
                 self.status.record_apply(cur_rev);
+                // Clearing a rejected key changes the reported state.
+                self.sync_config_status(false);
             }
             return removed_rejection;
         }
@@ -486,8 +598,14 @@ impl<P: ConfigProvider> Supervisor<P> {
                 "mcp_servers" => {
                     new.mcp_servers.remove(parsed.id);
                 }
+                "mcp_policies" => {
+                    new.mcp_policies.remove(parsed.id);
+                }
                 "a2a_agents" => {
                     new.a2a_agents.remove(parsed.id);
+                }
+                "oidc_providers" => {
+                    new.oidc_providers.remove(parsed.id);
                 }
                 _ => {}
             }
@@ -501,6 +619,7 @@ impl<P: ConfigProvider> Supervisor<P> {
         // resets even if the revision number doesn't move.
         let cur_rev = *self.revision.lock().unwrap();
         self.status.record_apply(cur_rev);
+        self.sync_config_status(false);
         self.flush_cache();
         true
     }
@@ -537,6 +656,9 @@ impl<P: ConfigProvider> Supervisor<P> {
         // per-key rejection list is no longer accurate — replace it
         // wholesale with what this build produced (issue #115).
         self.set_rejections(stats.rejections.clone());
+        // A full resync is a config reload — publish the observability view
+        // (source/config hashes, counts, rejected list) and count it.
+        self.sync_config_status(true);
         self.flush_cache();
         stats
     }
@@ -591,6 +713,10 @@ impl<P: ConfigProvider> Supervisor<P> {
                 }
                 Err(SupervisorError::Cancelled) => return,
                 Err(SupervisorError::Provider(err)) => {
+                    // Surface the source outage on /status/config: connected
+                    // flips false and a fetch-reason reload failure is counted.
+                    // The last-good applied snapshot keeps serving.
+                    self.config_status.record_fetch_failure();
                     let delay = backoff.next_delay();
                     tracing::warn!(
                         error = %err,
@@ -725,10 +851,45 @@ fn clone_snapshot(src: &AisixSnapshot) -> AisixSnapshot {
     for e in src.mcp_servers.entries() {
         out.mcp_servers.insert(clone_entry(&e));
     }
+    for e in src.mcp_policies.entries() {
+        out.mcp_policies.insert(clone_entry(&e));
+    }
     for e in src.a2a_agents.entries() {
         out.a2a_agents.insert(clone_entry(&e));
     }
+    for e in src.oidc_providers.entries() {
+        out.oidc_providers.insert(clone_entry(&e));
+    }
     out
+}
+
+/// Per-kind counts of the served snapshot, keyed by the plural etcd resource
+/// kind (matching the `<prefix>/<kind>/<id>` key segment). Only non-empty
+/// kinds are included, so an empty snapshot yields an empty map.
+fn resource_counts(snap: &AisixSnapshot) -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::new();
+    for (kind, n) in [
+        ("models", snap.models.len()),
+        ("api_keys", snap.apikeys.len()),
+        ("provider_keys", snap.provider_keys.len()),
+        ("guardrails", snap.guardrails.len()),
+        ("guardrail_attachments", snap.guardrail_attachments.len()),
+        ("cache_policies", snap.cache_policies.len()),
+        (
+            "observability_exporters",
+            snap.observability_exporters.len(),
+        ),
+        ("rate_limit_policies", snap.rate_limit_policies.len()),
+        ("mcp_servers", snap.mcp_servers.len()),
+        ("mcp_policies", snap.mcp_policies.len()),
+        ("a2a_agents", snap.a2a_agents.len()),
+        ("oidc_providers", snap.oidc_providers.len()),
+    ] {
+        if n > 0 {
+            counts.insert(kind.to_string(), n);
+        }
+    }
+    counts
 }
 
 fn clone_entry<T: Clone>(src: &Arc<aisix_core::ResourceEntry<T>>) -> aisix_core::ResourceEntry<T> {
@@ -865,6 +1026,15 @@ mod tests {
             "scope_id": "m-1",
             "priority": 100
         }"#;
+        // An OIDC trust provider created mid-run (AISIX-Cloud#1080).
+        // Same trap as #826: the kind existed in the loader but was
+        // initially missing from apply_put's merge loop, so enabling
+        // JWT auth via watch silently never took effect until resync.
+        const VALID_OIDC_PROVIDER: &[u8] = br#"{
+            "name": "watch-idp",
+            "issuer": "https://idp.example.com/realms/agents",
+            "audiences": ["aisix-gateway"]
+        }"#;
 
         let provider = Arc::new(FakeProvider::new(vec![], 0));
         let sup = Supervisor::new(provider, "/aisix");
@@ -888,6 +1058,11 @@ mod tests {
                 VALID_OBSERVABILITY_EXPORTER,
                 "ObservabilityExporter",
             ),
+            (
+                "/aisix/oidc_providers/op-1",
+                VALID_OIDC_PROVIDER,
+                "OidcProvider",
+            ),
         ] {
             assert!(
                 sup.apply_put(&entry(key, body, 2)),
@@ -909,6 +1084,7 @@ mod tests {
             1,
             "ObservabilityExporter not merged"
         );
+        assert_eq!(snap.oidc_providers.len(), 1, "OidcProvider not merged");
     }
 
     #[tokio::test]
@@ -928,6 +1104,13 @@ mod tests {
                     br#"{"guardrail_id":"g-1","scope_type":"model","scope_id":"m-1","priority":100}"#,
                     1,
                 ),
+                // AISIX-Cloud#1080: deleting a trust provider must reach
+                // the snapshot, or revoking JWT auth never takes effect.
+                entry(
+                    "/aisix/oidc_providers/op-1",
+                    br#"{"name":"idp","issuer":"https://idp.example.com","audiences":["aisix"]}"#,
+                    1,
+                ),
             ],
             1,
         ));
@@ -935,10 +1118,13 @@ mod tests {
         sup.load_once().await.unwrap();
         assert_eq!(sup.handle().load().provider_keys.len(), 1);
         assert_eq!(sup.handle().load().guardrail_attachments.len(), 1);
+        assert_eq!(sup.handle().load().oidc_providers.len(), 1);
         assert!(sup.apply_delete("/aisix/provider_keys/pk-1"));
         assert!(sup.handle().load().provider_keys.is_empty());
         assert!(sup.apply_delete("/aisix/guardrail_attachments/ga-1"));
         assert!(sup.handle().load().guardrail_attachments.is_empty());
+        assert!(sup.apply_delete("/aisix/oidc_providers/op-1"));
+        assert!(sup.handle().load().oidc_providers.is_empty());
     }
 
     #[tokio::test]

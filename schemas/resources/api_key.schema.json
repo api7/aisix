@@ -2,6 +2,116 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "additionalProperties": false,
   "definitions": {
+    "McpAccess": {
+      "additionalProperties": false,
+      "description": "Policy-driven MCP access configuration on an API key. When present, this block supersedes the key's `allowed_tools` list: the allow side of the key's effective grant is computed from the applicable MCP access policies and `mode`, and `allowed_tools` is not consulted.",
+      "properties": {
+        "allow": {
+          "description": "Namespaced `<server>__<tool>` patterns intersected with the inherited grant when `mode` is `restrict`, using the same single-`*` glob matching as `allowed_tools`. Ignored for the other modes.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "deny": {
+          "description": "Namespaced `<server>__<tool>` patterns subtracted from the key's effective grant, using the same single-`*` glob matching as `allow`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "mode": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/McpAccessMode"
+            }
+          ],
+          "description": "How the key combines with the applicable policies: `inherit`, `restrict`, or `deny`."
+        }
+      },
+      "required": [
+        "mode"
+      ],
+      "type": "object"
+    },
+    "McpAccessMode": {
+      "description": "How an API key combines with the applicable MCP access policies: `inherit`, `restrict`, or `deny`.",
+      "oneOf": [
+        {
+          "description": "The key uses the inherited grant unchanged: its team's enabled policy when one exists, otherwise the environment-default policy.",
+          "enum": [
+            "inherit"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The key uses the intersection of the inherited grant and its own `allow` patterns — a restriction can only narrow what the policies grant, never widen it.",
+          "enum": [
+            "restrict"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The key has no MCP tool access at all.",
+          "enum": [
+            "deny"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "McpRateLimit": {
+      "additionalProperties": false,
+      "description": "Limits for one API key's calls to one MCP server (`ApiKey::mcp_rate_limits`).\n\nCarries only the request-count dimensions of [`RateLimit`]: an MCP `tools/call` commits no tokens, so a token-rate cap here would never be consumed — the shape leaves `tpm`/`tpd` out rather than accepting a knob that is silently inert.",
+      "properties": {
+        "concurrency": {
+          "description": "Max concurrent in-flight tool calls.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "rpd": {
+          "description": "Tool calls per 86,400-second window.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "rph": {
+          "description": "Tool calls per 3,600-second window.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "rpm": {
+          "description": "Tool calls per 60-second window.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "rps": {
+          "description": "Tool calls per 1-second window.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "RateLimit": {
       "additionalProperties": false,
       "properties": {
@@ -104,9 +214,32 @@
       "description": "Administratively disabled. A disabled key is rejected with `401` until it is enabled again; the key itself is preserved. Treated as `false` when omitted.",
       "type": "boolean"
     },
+    "display_name": {
+      "description": "Operator-facing label for this key, as shown in the dashboard. Read only by the `${request.api_key.name}` header template (AISIX-Cloud#1112); never used for authentication or routing.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "expires_at": {
       "description": "RFC 3339 timestamp after which the key stops authenticating. Requests presenting an expired key are rejected with `401`. When omitted or set to `null`, the key never expires.",
       "format": "date-time",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "jwt_provider": {
+      "description": "Name of the `oidc_providers` entry permitted to assert this key's `jwt_subject`. A subject is only ever resolved for the trust provider named here, so a second trusted provider cannot mint a token impersonating this provider's identity of the same name. Required whenever `jwt_subject` is set; ignored otherwise.",
+      "minLength": 1,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "jwt_subject": {
+      "description": "External identity bound to this key for JWT authentication. When a request presents a valid JWT issued by the `oidc_providers` entry named in `jwt_provider`, the value of that provider's `identity_claim` selects the key whose `jwt_subject` equals it, and the request proceeds with this key's permissions, rate limits, and budget. The `(jwt_provider, jwt_subject)` pair is unique within the environment. When omitted, the key is never selected by JWT authentication.",
+      "minLength": 1,
       "type": [
         "string",
         "null"
@@ -116,6 +249,27 @@
       "description": "SHA-256 hexadecimal hash of the plaintext bearer. The proxy hashes incoming bearer tokens before lookup.",
       "minLength": 1,
       "type": "string"
+    },
+    "mcp_access": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/McpAccess"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Policy-driven MCP access for this key. When present, it supersedes `allowed_tools`: the key's grant is computed from the environment's and its team's MCP access policies according to `mode` (`inherit`, `restrict`, or `deny`), and `allowed_tools` is not consulted. When omitted, the key keeps the explicit `allowed_tools` behavior — with policy `deny` patterns still subtracted, since deny applies to every key the policy covers."
+    },
+    "mcp_rate_limits": {
+      "additionalProperties": {
+        "$ref": "#/definitions/McpRateLimit"
+      },
+      "description": "Per-MCP-server limits for this key, keyed by the registered MCP server name — the `<server>` half of the `<server>__<tool>` names the gateway exposes. A `tools/call` is metered against the entry for the server it targets **and** the key's own `rate_limit`, each in its own counter, so a burst against one server never consumes another's budget. A server with no entry here is bounded by `rate_limit` alone. Only tool calls are metered; the `initialize` / `tools/list` handshake is not.",
+      "type": [
+        "object",
+        "null"
+      ]
     },
     "rate_limit": {
       "anyOf": [
