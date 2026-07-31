@@ -117,6 +117,15 @@ upstream:
   # tcp_keepalive_retries: 5
   pool_idle_timeout_secs: 30
   # pool_max_idle_per_host: 32
+  # Trust settings for every upstream TLS handshake — model endpoints,
+  # guardrail services, MCP / A2A upstreams, OIDC discovery, Realtime,
+  # Bedrock, log-export object stores. `ca_file` is additive to the
+  # platform trust store, so trusting a private CA leaves the public
+  # providers reachable. See config.example.yaml for the full block.
+  # tls:
+  #   ca_file: "/etc/aisix/tls/private-ca.pem"
+  #   # client_cert_file / client_key_file for mutual TLS
+  #   # verify: true   # false accepts ANY certificate — test use only
 
 # Connection-layer settings for the inbound side. `idle_timeout_secs: 0`
 # (the default) never closes an idle client connection, leaving that to

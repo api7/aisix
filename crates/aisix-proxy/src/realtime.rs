@@ -65,6 +65,30 @@ const AZURE_REALTIME_API_VERSION: &str = "2024-10-01-preview";
 /// Subprotocol item carrying the caller's API key in the browser flow.
 const SUBPROTOCOL_KEY_PREFIX: &str = "openai-insecure-api-key.";
 
+/// Dial the upstream Realtime endpoint under the deployment's outbound
+/// TLS trust.
+///
+/// `connect_async` would build its own connector over the compiled-in
+/// root set only, which leaves this the one upstream path that ignores
+/// `upstream.tls` *and* `SSL_CERT_FILE` — a self-hosted Realtime
+/// endpoint behind an enterprise CA would fail here while the same
+/// provider's `/v1/chat/completions` worked.
+async fn connect_upstream(
+    request: tokio_tungstenite::tungstenite::handshake::client::Request,
+) -> Result<
+    (
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        tokio_tungstenite::tungstenite::handshake::client::Response,
+    ),
+    tokio_tungstenite::tungstenite::Error,
+> {
+    let connector =
+        tokio_tungstenite::Connector::Rustls(aisix_gateway::upstream_tls::rustls_client_config());
+    tokio_tungstenite::connect_async_tls_with_config(request, None, false, Some(connector)).await
+}
+
 pub(crate) async fn realtime(
     State(state): State<ProxyState>,
     Query(params): Query<HashMap<String, String>>,
@@ -390,7 +414,7 @@ async fn run_session(
 
     let (mut client_tx, mut client_rx) = client_ws.split();
 
-    let upstream = match tokio_tungstenite::connect_async(upstream_request).await {
+    let upstream = match connect_upstream(upstream_request).await {
         Ok((ws, _resp)) => ws,
         Err(e) => {
             tracing::warn!(error = %e, model = %requested_model, "realtime upstream connect failed");

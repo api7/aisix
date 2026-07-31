@@ -153,7 +153,8 @@ async fn main() -> anyhow::Result<()> {
 
     // Before any bridge builds its `reqwest::Client` — the connection
     // pools are constructed once and can't be reconfigured afterwards.
-    aisix_gateway::upstream_http::init(upstream_http_config(&cfg.upstream));
+    aisix_gateway::upstream_http::init(upstream_http_config(&cfg.upstream)?)
+        .map_err(|e| anyhow::anyhow!("upstream TLS init failed: {e}"))?;
 
     run(cfg).await
 }
@@ -1275,21 +1276,39 @@ fn load_heartbeat_config_from_disk(
 /// `crates/aisix-proxy/src/rerank.rs` and bypasses the Bridge.
 /// Translate the `upstream:` config block into the gateway's client
 /// settings. Every duration treats `0` as "leave this knob off".
-fn upstream_http_config(cfg: &aisix_core::config::UpstreamConfig) -> UpstreamHttpConfig {
+///
+/// Fails when `upstream.tls` names a file that cannot be read or does
+/// not hold the PEM it claims to — the boot is where an operator can
+/// still act on that, and it is a far better signal than the generic
+/// `UnknownIssuer` transport error the misconfiguration otherwise
+/// produces on every upstream call.
+fn upstream_http_config(
+    cfg: &aisix_core::config::UpstreamConfig,
+) -> anyhow::Result<UpstreamHttpConfig> {
     fn ms(v: u64) -> Option<Duration> {
         (v > 0).then(|| Duration::from_millis(v))
     }
     fn secs(v: u64) -> Option<Duration> {
         (v > 0).then(|| Duration::from_secs(v))
     }
-    UpstreamHttpConfig {
+    let tls = aisix_gateway::TlsSettings::load("upstream.tls", &cfg.tls)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    if !tls.verify {
+        tracing::warn!(
+            "upstream.tls.verify is false: upstream certificates are NOT checked, so any \
+             peer able to intercept the connection can read and rewrite prompts, responses, \
+             and upstream API keys"
+        );
+    }
+    Ok(UpstreamHttpConfig {
         connect_timeout: ms(cfg.connect_timeout_ms),
         tcp_keepalive: secs(cfg.tcp_keepalive_secs),
         tcp_keepalive_interval: secs(cfg.tcp_keepalive_interval_secs),
         tcp_keepalive_retries: (cfg.tcp_keepalive_retries > 0).then_some(cfg.tcp_keepalive_retries),
         pool_idle_timeout: secs(cfg.pool_idle_timeout_secs),
         pool_max_idle_per_host: cfg.pool_max_idle_per_host,
-    }
+        tls,
+    })
 }
 
 fn build_hub() -> Hub {
