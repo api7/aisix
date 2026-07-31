@@ -23,6 +23,7 @@
 use std::sync::{Arc, OnceLock};
 
 use aisix_core::config::OutboundTlsConfig;
+use aisix_core::models::provider_key::ProviderKeyTls;
 
 /// PEM material and verification policy shared by every outbound client.
 ///
@@ -190,6 +191,85 @@ pub(crate) fn init_reqwest_material(settings: &TlsSettings) -> Result<(), String
 pub fn reqwest_material() -> &'static ReqwestTlsMaterial {
     REQWEST_TLS.get_or_init(ReqwestTlsMaterial::default)
 }
+
+// ─── per-ProviderKey overrides ───────────────────────────────────────
+
+/// Clients built for a `ProviderKey.tls` override, keyed by the override
+/// itself so every key with the same settings shares one connection
+/// pool.
+///
+/// A client is the unit reqwest attaches trust to, so an override cannot
+/// be applied per request — it needs its own client, and therefore its
+/// own pool. Building one per dispatch would pay a TLS handshake on
+/// every call, which is precisely what the shared pool exists to avoid;
+/// the cache keeps it to one per distinct override.
+///
+/// Unbounded on purpose. The key space is the set of distinct TLS
+/// settings across the Provider Keys an operator has configured — a
+/// handful in the deployments this exists for, and each entry is one
+/// idle connection pool.
+static PK_CLIENTS: OnceLock<dashmap::DashMap<ProviderKeyTls, reqwest::Client>> = OnceLock::new();
+
+/// The client to dispatch this Provider Key's request on.
+///
+/// Returns `shared` unchanged whenever the key sets no override, which
+/// is the overwhelmingly common case and the one that must keep sharing
+/// the bridge's pool.
+///
+/// A malformed `ca_cert` falls back to `shared` with a logged error
+/// rather than to a client that trusts less than the operator asked
+/// for — the request then fails against the private endpoint, which is
+/// the same visible outcome as not having configured anything, and is
+/// preferable to quietly proceeding.
+pub fn client_for_provider_key(
+    shared: &reqwest::Client,
+    tls: Option<&ProviderKeyTls>,
+) -> reqwest::Client {
+    let Some(tls) = tls.filter(|t| !t.is_noop()) else {
+        return shared.clone();
+    };
+    let cache = PK_CLIENTS.get_or_init(dashmap::DashMap::new);
+    if let Some(existing) = cache.get(tls) {
+        return existing.clone();
+    }
+    match build_provider_key_client(tls) {
+        Ok(client) => cache.entry(tls.clone()).or_insert(client).clone(),
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "provider_key.tls could not be applied; falling back to the \
+                 deployment's trust settings"
+            );
+            shared.clone()
+        }
+    }
+}
+
+fn build_provider_key_client(tls: &ProviderKeyTls) -> Result<reqwest::Client, String> {
+    // Layer the key's override ON TOP of the deployment settings rather
+    // than replacing them: a deployment CA and a per-key CA are both
+    // trust roots, and a client presenting the deployment's mTLS
+    // identity must keep presenting it.
+    let mut builder = crate::upstream_http::client_builder().user_agent(PROVIDER_KEY_USER_AGENT);
+    if let Some(pem) = tls.ca_cert.as_ref().filter(|p| !p.trim().is_empty()) {
+        let roots = reqwest::Certificate::from_pem_bundle(pem.as_bytes())
+            .map_err(|e| format!("provider_key.tls.ca_cert: {e}"))?;
+        if roots.is_empty() {
+            return Err("provider_key.tls.ca_cert contains no certificate".into());
+        }
+        for root in roots {
+            builder = builder.add_root_certificate(root);
+        }
+    }
+    if !tls.verify {
+        builder = builder.danger_accept_invalid_certs(true);
+    }
+    builder.build().map_err(|e| e.to_string())
+}
+
+/// Matches the agent every bridge sets on its shared client, so a
+/// per-key client is indistinguishable upstream from the shared one.
+const PROVIDER_KEY_USER_AGENT: &str = "aisix/0.1";
 
 // ─── raw rustls (Realtime WebSocket) ─────────────────────────────────
 
@@ -525,5 +605,105 @@ mod tests {
     fn verify_true_builds_a_config_over_the_built_in_roots() {
         let cfg = build_rustls_client_config(&TlsSettings::default());
         assert_eq!(cfg.alpn_protocols, vec![b"http/1.1".to_vec()]);
+    }
+
+    fn shared_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .user_agent("aisix-test-shared")
+            .build()
+            .unwrap()
+    }
+
+    /// `reqwest::Client` exposes no identity, so "did this get its own
+    /// client (and therefore its own connection pool)?" is asserted
+    /// through the cache: an entry exists exactly when a dedicated client
+    /// was built.
+    fn cached(tls: &ProviderKeyTls) -> bool {
+        PK_CLIENTS
+            .get()
+            .is_some_and(|cache| cache.contains_key(tls))
+    }
+
+    /// `tls: {}` — every field left at its default — is not an override,
+    /// and treating it as one would split the connection pool for
+    /// nothing.
+    #[test]
+    fn an_empty_override_is_treated_as_no_override() {
+        assert!(ProviderKeyTls::default().is_noop());
+        assert!(ProviderKeyTls {
+            ca_cert: Some("   ".into()),
+            verify: true,
+        }
+        .is_noop());
+        assert!(!ProviderKeyTls {
+            ca_cert: None,
+            verify: false,
+        }
+        .is_noop());
+    }
+
+    /// The overwhelmingly common case: a key with no override keeps
+    /// dispatching on the bridge's own client, so nothing is cached.
+    #[test]
+    fn a_key_without_an_override_builds_no_dedicated_client() {
+        let noop = ProviderKeyTls::default();
+        let _ = client_for_provider_key(&shared_client(), None);
+        let _ = client_for_provider_key(&shared_client(), Some(&noop));
+        assert!(!cached(&noop));
+    }
+
+    /// Two keys configured identically land on one client, so a
+    /// deployment with several keys behind the same private CA keeps one
+    /// connection pool rather than one per key.
+    #[test]
+    fn identical_overrides_share_one_client() {
+        let tls = ProviderKeyTls {
+            ca_cert: Some(String::from_utf8(ca_pem()).unwrap()),
+            verify: true,
+        };
+        assert!(!cached(&tls));
+        let _ = client_for_provider_key(&shared_client(), Some(&tls));
+        let _ = client_for_provider_key(&shared_client(), Some(&tls.clone()));
+
+        // Counted per-CA rather than over the whole map: the tests in
+        // this module share the static and run concurrently, so a total
+        // is not a stable number. Each test generates its own CA, which
+        // makes this count exactly "clients built for these settings".
+        let for_this_ca = PK_CLIENTS
+            .get()
+            .unwrap()
+            .iter()
+            .filter(|e| e.key().ca_cert == tls.ca_cert)
+            .count();
+        assert_eq!(
+            for_this_ca, 1,
+            "two keys with equal TLS settings must share one client, and one pool"
+        );
+    }
+
+    /// A `ca_cert` that is not a certificate must not silently become a
+    /// client that trusts *less* than was asked for. Falling back to the
+    /// shared client makes the request fail exactly as it would have
+    /// without any configuration, which is the honest outcome.
+    #[test]
+    fn a_malformed_ca_cert_falls_back_instead_of_caching_a_weaker_client() {
+        let tls = ProviderKeyTls {
+            ca_cert: Some("-----BEGIN CERTIFICATE-----\nnope\n-----END CERTIFICATE-----\n".into()),
+            verify: true,
+        };
+        let _ = client_for_provider_key(&shared_client(), Some(&tls));
+        assert!(!cached(&tls));
+    }
+
+    /// `verify: false` alone is a real override — no CA, but a different
+    /// trust decision — so it must get its own client.
+    #[test]
+    fn verify_false_alone_builds_a_dedicated_client() {
+        let tls = ProviderKeyTls {
+            ca_cert: None,
+            verify: false,
+        };
+        let _ = client_for_provider_key(&shared_client(), Some(&tls));
+        assert!(cached(&tls));
     }
 }

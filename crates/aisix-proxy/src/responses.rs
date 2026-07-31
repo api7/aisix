@@ -1027,7 +1027,7 @@ async fn responses_to_target(
         ),
     );
 
-    let client = crate::http_client::client();
+    let client = crate::http_client::client_for(pk_entry.value.tls.as_ref());
     let mut req = client.post(&url).headers(headers).json(&body);
     // #554: non-streaming gets the E2E request timeout via reqwest's
     // request-level timeout. Streaming must NOT use it (it would cap the

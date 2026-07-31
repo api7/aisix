@@ -89,6 +89,18 @@ impl AzureOpenAiBridge {
         }
     }
 
+    /// The client this dispatch runs on: the bridge's shared one, unless
+    /// the resolved Provider Key carries its own TLS settings. The token
+    /// minter deliberately keeps the shared client — it talks to the
+    /// identity provider, not to the key's `api_base`, and a private CA
+    /// declared for the model endpoint says nothing about that host.
+    fn client_for(&self, ctx: &BridgeContext) -> Client {
+        aisix_gateway::upstream_tls::client_for_provider_key(
+            &self.client,
+            ctx.provider_key.tls.as_ref(),
+        )
+    }
+
     /// Test-only seam: replace the AAD token endpoint host on the
     /// internal minter (without touching the chat-completions URL
     /// override on `url_override`). Used by AAD-flow tests so
@@ -684,7 +696,7 @@ impl Bridge for AzureOpenAiBridge {
         )?;
         let headers = build_request_headers(&auth, &ctx.request_id, false, &ctx.header_ctx())?;
         let url = self.resolve_url(&upstream);
-        let client = self.client.clone();
+        let client = self.client_for(ctx);
         let started = Instant::now();
 
         with_deadline(ctx.deadline, started, async move {
@@ -736,7 +748,7 @@ impl Bridge for AzureOpenAiBridge {
         )?;
         let headers = build_request_headers(&auth, &ctx.request_id, true, &ctx.header_ctx())?;
         let url = self.resolve_url(&upstream);
-        let client = self.client.clone();
+        let client = self.client_for(ctx);
         let started = Instant::now();
 
         let resp = with_deadline(ctx.deadline, started, async move {

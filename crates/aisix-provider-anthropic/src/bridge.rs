@@ -55,6 +55,15 @@ impl AnthropicBridge {
         }
     }
 
+    /// The client this dispatch runs on: the bridge's shared one, unless
+    /// the resolved Provider Key carries its own TLS settings.
+    fn client_for(&self, ctx: &BridgeContext) -> Client {
+        aisix_gateway::upstream_tls::client_for_provider_key(
+            &self.client,
+            ctx.provider_key.tls.as_ref(),
+        )
+    }
+
     pub fn with_api_version(mut self, v: &'static str) -> Self {
         self.api_version = v;
         self
@@ -271,7 +280,7 @@ impl Bridge for AnthropicBridge {
         let mut body = build_request(req, upstream, system, messages, false);
         maybe_inject_cache_breakpoints(&mut body, ctx);
         let url = format!("{base}/v1/messages");
-        let client = self.client.clone();
+        let client = self.client_for(ctx);
         let api_version = self.api_version;
         let started = Instant::now();
         let request_id = ctx.request_id.clone();
@@ -316,7 +325,7 @@ impl Bridge for AnthropicBridge {
         let mut body = build_request(req, upstream, system, messages, true);
         maybe_inject_cache_breakpoints(&mut body, ctx);
         let url = format!("{base}/v1/messages");
-        let client = self.client.clone();
+        let client = self.client_for(ctx);
         let api_version = self.api_version;
         let started = Instant::now();
         let request_id = ctx.request_id.clone();

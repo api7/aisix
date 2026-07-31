@@ -1025,6 +1025,10 @@ struct VideoTarget {
     provider_label: String,
     base_url: String,
     secret: String,
+    /// The ProviderKey's TLS override, resolved with the target so every
+    /// round-trip on this surface (submit, poll, content fetch) dials the
+    /// endpoint under the same trust settings.
+    tls: Option<aisix_core::models::provider_key::ProviderKeyTls>,
     /// The ProviderKey's rendered `default_headers` plus the client headers
     /// its `forward_client_headers` allowlist admits, resolved once when the
     /// target is resolved so every round-trip on this surface (submit, poll,
@@ -1094,6 +1098,7 @@ fn resolve_video_target(
         ));
     Ok(Ok(VideoTarget {
         pk_id: pk_entry.id.to_string(),
+        tls: pk_entry.value.tls.clone(),
         provider: video_provider,
         provider_label: provider.to_ascii_lowercase(),
         base_url,
@@ -1120,7 +1125,7 @@ async fn provider_call(
     body: Option<&serde_json::Value>,
     request_id: &str,
 ) -> Result<serde_json::Value, ProxyError> {
-    let client = crate::http_client::client();
+    let client = crate::http_client::client_for(target.tls.as_ref());
     let note = |e: aisix_gateway::BridgeError| {
         crate::cooldown::note_failure(
             &state.runtime_status,
@@ -1275,7 +1280,7 @@ async fn proxy_content(
     url: &str,
     request_id: &str,
 ) -> Result<Response, ProxyError> {
-    let client = crate::http_client::client();
+    let client = crate::http_client::client_for(target.tls.as_ref());
     // Same map-then-merge shape as `provider_call` — see the comment there
     // on why the gateway-owned names cannot be appended to.
     let mut headers = axum::http::HeaderMap::new();

@@ -80,6 +80,15 @@ impl OpenAiBridge {
         Self { client }
     }
 
+    /// The client this dispatch runs on: the bridge's shared one, unless
+    /// the resolved Provider Key carries its own TLS settings.
+    fn client_for(&self, ctx: &BridgeContext) -> Client {
+        aisix_gateway::upstream_tls::client_for_provider_key(
+            &self.client,
+            ctx.provider_key.tls.as_ref(),
+        )
+    }
+
     /// Resolve `ProviderKey.api_base` into the canonical base URL the
     /// request handlers append paths onto. Tolerates common operator
     /// mistakes:
@@ -391,7 +400,7 @@ impl Bridge for OpenAiBridge {
         )?;
         let headers = build_request_headers(key, &ctx.request_id, false, &ctx.header_ctx())?;
         let url = format!("{base}/chat/completions");
-        let client = self.client.clone();
+        let client = self.client_for(ctx);
         let started = Instant::now();
 
         with_deadline(ctx.deadline, started, async move {
@@ -437,7 +446,7 @@ impl Bridge for OpenAiBridge {
         )?;
         let headers = build_request_headers(key, &ctx.request_id, false, &ctx.header_ctx())?;
         let url = format!("{base}/embeddings");
-        let client = self.client.clone();
+        let client = self.client_for(ctx);
         let started = Instant::now();
         with_deadline(ctx.deadline, started, async move {
             let resp = client
@@ -489,7 +498,7 @@ impl Bridge for OpenAiBridge {
         let headers = build_request_headers(key, &ctx.request_id, false, &ctx.header_ctx())?;
 
         let url = format!("{base}/completions");
-        let client = self.client.clone();
+        let client = self.client_for(ctx);
         let started = Instant::now();
         with_deadline(ctx.deadline, started, async move {
             let resp = client
@@ -539,7 +548,7 @@ impl Bridge for OpenAiBridge {
         let headers = build_request_headers(key, &ctx.request_id, false, &ctx.header_ctx())?;
 
         let url = format!("{base}/images/generations");
-        let client = self.client.clone();
+        let client = self.client_for(ctx);
         let started = Instant::now();
         with_deadline(ctx.deadline, started, async move {
             let resp = client
@@ -580,7 +589,7 @@ impl Bridge for OpenAiBridge {
         )?;
         let headers = build_request_headers(key, &ctx.request_id, true, &ctx.header_ctx())?;
         let url = format!("{base}/chat/completions");
-        let client = self.client.clone();
+        let client = self.client_for(ctx);
         let started = Instant::now();
 
         let resp = with_deadline(ctx.deadline, started, async move {
