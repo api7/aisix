@@ -46,6 +46,11 @@ http-body-util = "0.1"
 # Trusted-proxy CIDR matching for real-ip resolution (#492)
 ipnet = "2"
 
+# Audio properties (duration) for the transcription cost basis. Reads
+# container/codec headers only — no decoding, no C dependency — and
+# default-features-off drops the id3v2 zlib support we never exercise.
+lofty = { version = "0.24", default-features = false }
+
 # Aliyun SLS sink (aisix-obs): the official protobuf + signature sub-crates
 # ONLY — not the full `aliyun-log-rust-sdk`, which forces reqwest native-tls
 # (OpenSSL) + ~13 C/TLS crates. Transport is our own rustls reqwest, so these

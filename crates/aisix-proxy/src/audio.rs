@@ -51,6 +51,9 @@ struct AudioDispatchSuccess {
     /// whisper-1 (no usage block) — those still emit a zero-token event
     /// so the request is visible + attributed.
     usage: Option<(u32, u32)>,
+    /// Audio length in seconds — the cost basis for the duration-billed
+    /// models (whisper-1), which report no tokens at all (#457).
+    duration_seconds: f64,
     /// The `{kind, hook}` set of guardrails that governed this request
     /// (#379 parity, wired with #696) — surfaced on the emitted UsageEvent.
     applied_guardrails: Vec<AppliedGuardrail>,
@@ -358,6 +361,9 @@ pub async fn speech(
                 elapsed,
                 0,
                 0,
+                // TTS is billed per input character, not by the length of
+                // the audio it produced — no duration cost basis here.
+                0.0,
                 &client,
                 redactions,
                 monitor_hits,
@@ -749,6 +755,18 @@ async fn multipart_dispatch(
         .as_ref()
         .and_then(extract_token_usage);
 
+    // Duration cost basis (#457): what the upstream reported, else what
+    // the uploaded file says. The probe runs only when the response
+    // carried nothing, so the common `json` path never pays for it.
+    let duration_seconds = upstream_duration_seconds(&body_bytes)
+        .or_else(|| {
+            fields
+                .iter()
+                .find(|(name, ..)| name == "file")
+                .and_then(|(.., data)| probe_audio_duration_seconds(data))
+        })
+        .unwrap_or(0.0);
+
     // #911 [21]: commit the actual token cost so TPM/TPD is enforced for the
     // audio transcription/translation endpoints like chat + embeddings.
     // Pre-fix the reservation dropped uncommitted and the counter never moved.
@@ -799,6 +817,7 @@ async fn multipart_dispatch(
                     model_id: model_entry.id.to_string(),
                     provider_key_id: pk_entry.id.to_string(),
                     usage,
+                    duration_seconds,
                     applied_guardrails,
                     redactions,
                     monitor_hits: monitor_hits.clone(),
@@ -843,6 +862,7 @@ async fn multipart_dispatch(
         model_id: model_entry.id.to_string(),
         provider_key_id: pk_entry.id.to_string(),
         usage,
+        duration_seconds,
         applied_guardrails,
         redactions,
         monitor_hits,
@@ -1161,6 +1181,49 @@ fn extract_token_usage(body: &Value) -> Option<(u32, u32)> {
     Some((input, output))
 }
 
+/// Audio length in seconds as the upstream reported it.
+///
+/// Two shapes, both from OpenAI's transcription object: the default
+/// `json` format carries `usage: {type: "duration", seconds: N}`, and
+/// `verbose_json` carries a top-level `duration`. Neither is present on
+/// the `text` / `srt` / `vtt` formats — those response bodies are not
+/// JSON at all — which is what `probe_audio_duration_seconds` covers.
+/// <https://platform.openai.com/docs/api-reference/audio/json-object>
+fn upstream_duration_seconds(body: &[u8]) -> Option<f64> {
+    let json = serde_json::from_slice::<Value>(body).ok()?;
+    let from_usage = json
+        .get("usage")
+        .and_then(|u| u.get("seconds"))
+        .and_then(Value::as_f64);
+    let seconds = from_usage.or_else(|| json.get("duration").and_then(Value::as_f64))?;
+    (seconds.is_finite() && seconds > 0.0).then_some(seconds)
+}
+
+/// Audio length in seconds read off the uploaded file.
+///
+/// The fallback for every response format that carries no duration. Cost
+/// basis must not depend on which `response_format` the caller picked —
+/// otherwise `response_format=text` is an unmetered channel, the same
+/// shape of bypass as an unbilled stream.
+///
+/// Header/metadata parse only: `lofty` reads container and codec
+/// properties without decoding audio, so an arbitrary caller upload
+/// costs microseconds and cannot pull in a decode path. Anything it
+/// cannot identify yields `None` → a zero cost basis, never an error:
+/// the transcript already succeeded and the upstream already billed.
+fn probe_audio_duration_seconds(audio: &[u8]) -> Option<f64> {
+    use lofty::file::AudioFile;
+    use lofty::probe::Probe;
+
+    let probed = Probe::new(std::io::Cursor::new(audio))
+        .guess_file_type()
+        .ok()?
+        .read()
+        .ok()?;
+    let seconds = probed.properties().duration().as_secs_f64();
+    (seconds > 0.0).then_some(seconds)
+}
+
 /// Emit a UsageEvent for a successful transcription/translation. Tokens
 /// come from the upstream `usage` block when present (gpt-4o-transcribe);
 /// zero otherwise (whisper-1) — the request is still visible/attributed.
@@ -1186,6 +1249,7 @@ fn emit_audio_usage(
         elapsed,
         prompt_tokens,
         completion_tokens,
+        success.duration_seconds,
         client,
         success.redactions.clone(),
         success.monitor_hits.clone(),
@@ -1214,6 +1278,9 @@ fn emit_usage_event(
     elapsed: Duration,
     prompt_tokens: u32,
     completion_tokens: u32,
+    // Cost basis for the duration-billed models (#457); 0 when neither
+    // the upstream nor the uploaded file yielded a length.
+    audio_duration_seconds: f64,
     client: &ClientContext,
     // Per-detector PII mask counts (#932/#696). Empty = no redaction.
     redacted_entity_counts: crate::redact::RedactionCounts,
@@ -1234,6 +1301,7 @@ fn emit_usage_event(
         requested_model: requested_model.to_string(),
         prompt_tokens,
         completion_tokens,
+        audio_duration_seconds,
         // Single-attempt endpoint: the attempt spans the whole request, so
         // the upstream figure and what the caller waited for coincide.
         upstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
@@ -1727,6 +1795,200 @@ mod tests {
         assert_eq!(event.api_key_id, "k-1");
         assert_eq!(event.model_id, "m-1");
         assert_eq!(event.inbound_protocol, "openai");
+    }
+
+    /// A minimal RIFF/WAVE container holding `seconds` of 8 kHz 16-bit
+    /// mono PCM — a real audio file for the probe path, small enough to
+    /// build inline.
+    fn wav_bytes(seconds: u32) -> Vec<u8> {
+        let samples = 8000usize * 2 * seconds as usize;
+        let mut wav = Vec::with_capacity(44 + samples);
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&((36 + samples) as u32).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&8000u32.to_le_bytes());
+        wav.extend_from_slice(&16000u32.to_le_bytes());
+        wav.extend_from_slice(&2u16.to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&(samples as u32).to_le_bytes());
+        wav.resize(44 + samples, 0);
+        wav
+    }
+
+    /// A multipart body whose `file` part is a real WAV, so the handler's
+    /// fallback probe has something to read.
+    fn transcription_multipart_wav(model: &str, seconds: u32) -> (String, axum::body::Body) {
+        let mut body = Vec::new();
+        body.extend_from_slice(
+            format!(
+                "--b\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n{model}\r\n\
+                 --b\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\n\
+                 Content-Type: audio/wav\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(&wav_bytes(seconds));
+        body.extend_from_slice(b"\r\n--b--\r\n");
+        (
+            "multipart/form-data; boundary=b".to_string(),
+            axum::body::Body::from(body),
+        )
+    }
+
+    /// AISIX-Cloud#1138: whisper-1 bills by audio length and reports no
+    /// tokens, so the emitted event must carry the duration or cp-api has
+    /// nothing to price the request with.
+    #[tokio::test]
+    async fn whisper_response_emits_the_duration_cost_basis() {
+        let upstream = MockServer::start().await;
+        let body = serde_json::json!({
+            "text": "hello world",
+            "usage": {"type": "duration", "seconds": 11.0}
+        });
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/transcriptions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(whisper_model("my-transcribe"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = build_app_with_sink(snap, tx);
+        let (ct, body) = transcription_multipart("my-transcribe");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/audio/transcriptions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", ct)
+            .body(body)
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted")
+            .expect("usage_sink sender dropped");
+        assert_eq!(event.audio_duration_seconds, 11.0);
+        assert_eq!(
+            (event.prompt_tokens, event.completion_tokens),
+            (0, 0),
+            "whisper-1 reports no tokens — duration is the whole cost basis"
+        );
+    }
+
+    /// AISIX-Cloud#1138: `response_format=text` answers with a body that
+    /// carries no usage at all. The cost basis must not depend on which
+    /// response format the caller asked for, so the handler falls back to
+    /// the uploaded file's own length.
+    #[tokio::test]
+    async fn text_format_falls_back_to_the_uploaded_file_duration() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/transcriptions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw("hello world", "text/plain"))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(whisper_model("my-transcribe"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = build_app_with_sink(snap, tx);
+        let (ct, body) = transcription_multipart_wav("my-transcribe", 3);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/audio/transcriptions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", ct)
+            .body(body)
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted")
+            .expect("usage_sink sender dropped");
+        assert!(
+            (event.audio_duration_seconds - 3.0).abs() < 0.05,
+            "3s of uploaded audio must be the cost basis, got {}",
+            event.audio_duration_seconds
+        );
+    }
+
+    /// The default `json` transcription reports its length under
+    /// `usage.seconds` (the duration variant of OpenAI's usage oneOf),
+    /// which is the cost basis for whisper-1 — a model that reports no
+    /// tokens at all.
+    #[test]
+    fn duration_reads_the_usage_seconds_variant() {
+        let body = br#"{"text":"hi","usage":{"type":"duration","seconds":11.0}}"#;
+        assert_eq!(super::upstream_duration_seconds(body), Some(11.0));
+    }
+
+    /// `verbose_json` puts the same figure at the top level instead.
+    #[test]
+    fn duration_reads_the_verbose_json_field() {
+        let body = br#"{"task":"transcribe","duration":2.66,"text":"hi"}"#;
+        assert_eq!(super::upstream_duration_seconds(body), Some(2.66));
+    }
+
+    /// A token-usage response carries no duration — the caller must fall
+    /// back to the file probe rather than read a zero off `usage`.
+    #[test]
+    fn duration_absent_from_a_token_usage_response() {
+        let body =
+            br#"{"text":"hi","usage":{"type":"tokens","input_tokens":26,"output_tokens":12}}"#;
+        assert_eq!(super::upstream_duration_seconds(body), None);
+    }
+
+    /// AISIX-Cloud#1138: `response_format=text` (and `srt`/`vtt`) answers
+    /// with a body that is not JSON at all, so the cost basis has to come
+    /// off the uploaded audio — otherwise the caller picks whether the
+    /// request is metered by picking a response format.
+    #[test]
+    fn duration_falls_back_to_probing_the_uploaded_file() {
+        // 1 second of 8 kHz 16-bit mono PCM in a minimal RIFF/WAVE container.
+        let samples = 8000usize * 2;
+        let mut wav = Vec::with_capacity(44 + samples);
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&((36 + samples) as u32).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes()); // PCM fmt chunk size
+        wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        wav.extend_from_slice(&1u16.to_le_bytes()); // mono
+        wav.extend_from_slice(&8000u32.to_le_bytes()); // sample rate
+        wav.extend_from_slice(&16000u32.to_le_bytes()); // byte rate
+        wav.extend_from_slice(&2u16.to_le_bytes()); // block align
+        wav.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&(samples as u32).to_le_bytes());
+        wav.resize(44 + samples, 0);
+
+        let probed = super::probe_audio_duration_seconds(&wav)
+            .expect("a well-formed WAV must yield a duration");
+        assert!(
+            (probed - 1.0).abs() < 0.05,
+            "1s of 8kHz mono PCM should probe as ~1s, got {probed}"
+        );
+    }
+
+    /// Caller uploads are arbitrary bytes. An unrecognised file must
+    /// degrade to "no cost basis", never to an error — the transcript
+    /// already succeeded and the upstream already billed for it.
+    #[test]
+    fn probing_unrecognised_bytes_yields_no_duration() {
+        assert_eq!(super::probe_audio_duration_seconds(b"ID3fakeaudio"), None);
+        assert_eq!(super::probe_audio_duration_seconds(&[]), None);
     }
 
     /// AISIX-Cloud#867 parity: a successful audio request must carry the
