@@ -744,10 +744,16 @@ async fn multipart_dispatch(
     // `text`/`srt`/`vtt` response_formats aren't JSON at all). Parse
     // failure or absence → None → zero-token emit. Done before the
     // bytes move into the Body.
+    //
+    // A `stream=true` transcription answers with SSE instead of a JSON
+    // object, so the parse above finds nothing — the counts ride the
+    // terminal `transcript.text.done` event. Without the second read the
+    // whole streaming surface bills zero and never moves TPM/TPD.
     let usage = serde_json::from_slice::<Value>(&body_bytes)
         .ok()
         .as_ref()
-        .and_then(extract_token_usage);
+        .and_then(extract_token_usage)
+        .or_else(|| extract_sse_token_usage(&upstream_headers, &body_bytes));
 
     // #911 [21]: commit the actual token cost so TPM/TPD is enforced for the
     // audio transcription/translation endpoints like chat + embeddings.
@@ -1151,6 +1157,38 @@ async fn speech_dispatch(
 /// whisper-1 (and the `text`/`srt`/`vtt` response formats) return no
 /// token block → `None`. Spec:
 /// <https://platform.openai.com/docs/api-reference/audio/json-object>
+/// `(prompt, completion)` from a *streamed* transcription body.
+///
+/// `stream=true` on the transcribe models answers `text/event-stream`:
+/// a run of `transcript.text.delta` events and a terminal
+/// `transcript.text.done` that carries the same `usage` block the
+/// non-streaming response would have returned. The body is already
+/// buffered here, so decode it and take the last event that carries
+/// usage — the shape stays the same whether the provider puts it on
+/// `transcript.text.done` or on a later event.
+///
+/// Gated on the upstream content type so a `text`/`srt`/`vtt` transcript
+/// that happens to contain a `data:` line is never mistaken for a stream.
+fn extract_sse_token_usage(headers: &HeaderMap, body: &[u8]) -> Option<(u32, u32)> {
+    let is_sse = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.starts_with("text/event-stream"));
+    if !is_sse {
+        return None;
+    }
+    let mut decoder = aisix_gateway::SseDecoder::new();
+    let mut events = decoder.feed(body);
+    events.extend(decoder.finish());
+    events.iter().rev().find_map(|event| match event {
+        aisix_gateway::SseEvent::Data(payload) => serde_json::from_str::<Value>(payload)
+            .ok()
+            .as_ref()
+            .and_then(extract_token_usage),
+        aisix_gateway::SseEvent::Done => None,
+    })
+}
+
 fn extract_token_usage(body: &Value) -> Option<(u32, u32)> {
     let usage = body.get("usage")?;
     let input = usage.get("input_tokens").and_then(Value::as_u64)? as u32;
@@ -1727,6 +1765,79 @@ mod tests {
         assert_eq!(event.api_key_id, "k-1");
         assert_eq!(event.model_id, "m-1");
         assert_eq!(event.inbound_protocol, "openai");
+    }
+
+    /// AISIX-Cloud#1138: a `stream=true` transcription answers
+    /// `text/event-stream`, so the usage block rides the terminal
+    /// `transcript.text.done` event instead of a JSON body. Pre-fix the
+    /// JSON parse found nothing and the whole streaming surface emitted
+    /// zero tokens — unbilled spend that also never moved TPM/TPD, while
+    /// the identical non-streaming request billed normally.
+    /// <https://platform.openai.com/docs/api-reference/audio/create-transcription>
+    #[tokio::test]
+    async fn streamed_transcription_bills_the_terminal_event_usage() {
+        let upstream = MockServer::start().await;
+        let sse = concat!(
+            "data: {\"type\":\"transcript.text.delta\",\"delta\":\"hello\"}\n\n",
+            "data: {\"type\":\"transcript.text.delta\",\"delta\":\" world\"}\n\n",
+            "data: {\"type\":\"transcript.text.done\",\"text\":\"hello world\",",
+            "\"usage\":{\"type\":\"tokens\",\"total_tokens\":38,\"input_tokens\":26,",
+            "\"input_token_details\":{\"text_tokens\":0,\"audio_tokens\":26},",
+            "\"output_tokens\":12}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/transcriptions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(whisper_model("my-transcribe"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = build_app_with_sink(snap, tx);
+        let (ct, body) = transcription_multipart("my-transcribe");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/audio/transcriptions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", ct)
+            .body(body)
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted for a streamed transcription")
+            .expect("usage_sink sender dropped");
+        assert_eq!(
+            (event.prompt_tokens, event.completion_tokens),
+            (26, 12),
+            "the terminal transcript.text.done usage must be billed"
+        );
+    }
+
+    /// The SSE read is content-type gated: a `srt`/`vtt` transcript is
+    /// `text/plain` and may legitimately contain a line starting with
+    /// `data:`, which must never be decoded as a usage-bearing event.
+    #[test]
+    fn plain_text_transcript_is_not_read_as_a_stream() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("text/plain; charset=utf-8"),
+        );
+        let body = concat!(
+            "1\n00:00:00,000 --> 00:00:02,000\n",
+            "data: {\"usage\":{\"input_tokens\":999,\"output_tokens\":999}}\n\n",
+        );
+        assert_eq!(
+            super::extract_sse_token_usage(&headers, body.as_bytes()),
+            None
+        );
     }
 
     /// AISIX-Cloud#867 parity: a successful audio request must carry the
