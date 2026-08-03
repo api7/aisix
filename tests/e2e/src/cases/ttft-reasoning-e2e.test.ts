@@ -242,6 +242,7 @@ describe("upstream TTFT stops on the first generated-output frame", () => {
 
     const span = await waitForSpan(otlp, requestId!);
     const ttft = Number(span["aisix.upstream_ttft_ms"]);
+    const downstream = Number(span["aisix.downstream_latency_ms"]);
 
     // The first reasoning frame is a token arriving, so the clock stops
     // near LEAD_MS — not at CONTENT_STARTS_MS, which is what a
@@ -249,6 +250,12 @@ describe("upstream TTFT stops on the first generated-output frame", () => {
     expect(Number.isFinite(ttft)).toBe(true);
     expect(ttft).toBeGreaterThan(0);
     expect(ttft).toBeLessThan(CONTENT_STARTS_MS / 2);
+
+    // The caller-facing figure can never precede the upstream TTFT it
+    // waited on. Skipping reasoning frames broke exactly that: the
+    // gateway forwarded them (so downstream marked the first one) while
+    // TTFT held out for content a whole thinking phase later.
+    expect(downstream).toBeGreaterThanOrEqual(ttft);
   });
 
   test("an empty role-only frame does not stop the clock", async (ctx) => {
