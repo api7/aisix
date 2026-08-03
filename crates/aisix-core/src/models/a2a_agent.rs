@@ -35,7 +35,10 @@ pub struct A2aAgent {
     // lives in `schema::a2a_agent_root_schema`). Re-serialization always
     // emits `name`.
     #[serde(alias = "display_name")]
-    #[schemars(regex(pattern = "^[^/?#%\\s\\x00-\\x1f\\x7f]+$"), length(min = 1))]
+    #[schemars(
+        regex(pattern = "^[^/?#%\\s\\x00-\\x1f\\x7f\u{0080}-\u{009f}]+$"),
+        length(min = 1)
+    )]
     pub name: String,
 
     /// The upstream agent's base URL, such as `https://agents.example.com/a2a`.
@@ -169,7 +172,7 @@ mod tests {
         // Every excluded character is pinned, under both accepted spellings, so
         // narrowing the pattern back to `^[^/]+$` fails here.
         for bad in [
-            "a/b", "a?b", "a#b", "a%2Fb", "a b", "a\tb", "a\nb", "a\x7fb",
+            "a/b", "a?b", "a#b", "a%2Fb", "a b", "a\tb", "a\nb", "a\x7fb", "a\u{80}b", "a\u{9f}b",
         ] {
             for key in ["name", "display_name"] {
                 let doc = json!({key: bad, "url": "https://x/a2a"});
