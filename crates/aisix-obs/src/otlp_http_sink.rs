@@ -654,6 +654,14 @@ fn build_otlp_span(record: &SinkRecord, exporter_name: &str) -> Value {
     if !event.model_id.is_empty() {
         attributes.push(attr_string("aisix.model_id", &event.model_id));
     }
+    // Duration cost basis (#457): only the duration-billed audio models
+    // carry it, so it stays off every other span.
+    if event.audio_duration_seconds > 0.0 {
+        attributes.push(attr_double(
+            "aisix.audio.duration_seconds",
+            event.audio_duration_seconds,
+        ));
+    }
     attributes.push(attr_string("aisix.exporter_name", exporter_name));
     attributes.push(attr_string("aisix.request_id", &event.request_id));
     if event.upstream_ttft_ms > 0 {
@@ -766,6 +774,13 @@ fn attr_int(key: &str, value: i64) -> Value {
         "key": key,
         // OTLP/JSON encodes int as a string to avoid JS Number precision loss.
         "value": { "intValue": value.to_string() },
+    })
+}
+
+fn attr_double(key: &str, value: f64) -> Value {
+    json!({
+        "key": key,
+        "value": { "doubleValue": value },
     })
 }
 

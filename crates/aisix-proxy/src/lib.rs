@@ -36,6 +36,7 @@ mod completions;
 pub(crate) mod cooldown;
 mod count_tokens;
 mod dispatch;
+mod ebml;
 mod embeddings;
 mod ensemble;
 mod error;
