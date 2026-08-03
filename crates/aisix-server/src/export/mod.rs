@@ -100,20 +100,12 @@ pub async fn run(args: ExportArgs) -> anyhow::Result<()> {
     report_secrets(&document, args.reveal_secrets);
 
     // The file is written for inspection either way, but a scripted
-    // migration must not mistake an incomplete export for a finished one.
-    // A row the loader rejected is silently absent from the output: the file
-    // loads, so `blocking` is empty, yet the migration lost a resource. That
-    // is a failed export, not a warning — exit non-zero for it too.
-    if !stats.rejections.is_empty() {
-        anyhow::bail!(
-            "export omitted {} rejected entr(ies); the resources file is incomplete. \
-             Fix them in the source and re-export — the written file is for inspection only",
-            stats.rejections.len()
-        );
-    }
-
-    // Exit non-zero when a collision or dangling reference means the file
-    // cannot be loaded back as-is.
+    // migration must not mistake an incomplete or non-loadable export for a
+    // finished one. Report every failure class before exiting, so an operator
+    // sees the full list in one run: a row the loader rejected is silently
+    // absent from the output (the file loads, yet the migration lost a
+    // resource), and a collision or dangling reference means the file cannot
+    // be loaded back as-is.
     if !document.blocking.is_empty() {
         eprintln!(
             "\n{} issue(s) leave the exported file non-loadable — fix them in the source and \
@@ -126,6 +118,14 @@ pub async fn run(args: ExportArgs) -> anyhow::Result<()> {
         anyhow::bail!(
             "export completed with {} blocking issue(s); the resources file will not load as-is",
             document.blocking.len()
+        );
+    }
+
+    if !stats.rejections.is_empty() {
+        anyhow::bail!(
+            "export omitted {} rejected entr(ies); the resources file is incomplete. \
+             Fix them in the source and re-export — the written file is for inspection only",
+            stats.rejections.len()
         );
     }
 

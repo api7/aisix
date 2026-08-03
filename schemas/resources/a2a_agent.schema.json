@@ -128,7 +128,7 @@
     "display_name": {
       "description": "Accepted as an alternative spelling of `name`. Provide the label under exactly one of the two names.",
       "minLength": 1,
-      "pattern": "^[^/?#%\\s\\x00-\\x1f]+$",
+      "pattern": "^[^/?#%\\s\\x00-\\x1f\\x7f]+$",
       "type": "string"
     },
     "enabled": {
@@ -139,7 +139,7 @@
     "name": {
       "description": "Operator-facing label, unique within the gateway. It is the path segment under which the agent is exposed to callers as `/a2a/<name>`, so it must be a single non-empty URL path segment. The name is interpolated into the advertised agent-card URL without percent-encoding, so `/`, `?`, `#`, `%` and whitespace are rejected: `a?b` would advertise a URL whose path is just `/a2a/a`, and the lookup is an exact match on the stored name.",
       "minLength": 1,
-      "pattern": "^[^/?#%\\s\\x00-\\x1f]+$",
+      "pattern": "^[^/?#%\\s\\x00-\\x1f\\x7f]+$",
       "type": "string"
     },
     "protocol_version": {
