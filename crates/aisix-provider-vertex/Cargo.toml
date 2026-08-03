@@ -26,7 +26,7 @@ async-trait.workspace = true
 async-stream = "0.3"
 bytes.workspace = true
 futures.workspace = true
-jsonwebtoken = "9"
+jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
