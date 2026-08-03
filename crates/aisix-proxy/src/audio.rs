@@ -1253,6 +1253,13 @@ fn probe_audio_duration_seconds(audio: &[u8]) -> Option<f64> {
     use lofty::file::AudioFile;
     use lofty::probe::Probe;
 
+    // WebM/Matroska first: `lofty` does not read EBML, and WebM is what
+    // a browser's MediaRecorder uploads by default — leaving it out
+    // would keep the most common web-app upload unbilled.
+    if audio.starts_with(&crate::ebml::EBML_MAGIC) {
+        return crate::ebml::duration_seconds(audio);
+    }
+
     let probed = Probe::new(std::io::Cursor::new(audio))
         .guess_file_type()
         .ok()?
@@ -1960,6 +1967,23 @@ mod tests {
             (event.audio_duration_seconds - 3.0).abs() < 0.05,
             "3s of uploaded audio must be the cost basis, got {}",
             event.audio_duration_seconds
+        );
+    }
+
+    /// AISIX-Cloud#1138: `MediaRecorder` uploads `audio/webm`, which
+    /// `lofty` cannot read — so a WebM transcription asked for as `text`
+    /// would have reported no length and billed nothing, which is the
+    /// exact bypass the file probe exists to close. Uses the header of a
+    /// file ffmpeg produced (see `ebml::tests`), whose declared length is
+    /// 7.008s.
+    #[test]
+    fn probing_reads_a_webm_upload() {
+        let webm = crate::ebml::tests::REAL_FFMPEG_WEBM_HEADER;
+        let probed =
+            super::probe_audio_duration_seconds(webm).expect("a webm upload must be measurable");
+        assert!(
+            (probed - 7.008).abs() < 0.01,
+            "webm should probe as ~7.008s, got {probed}"
         );
     }
 
