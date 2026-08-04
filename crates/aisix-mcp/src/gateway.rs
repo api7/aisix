@@ -327,6 +327,10 @@ impl McpGateway {
             .into_iter()
             .filter(|entry| entry.value.enabled)
             .map(|entry| {
+                // Here, not inside one bridge constructor: `type: mcp` and
+                // `type: openapi` rows share the credential fields, so the
+                // cleartext warning covers both.
+                crate::bridge::warn_cleartext_credential(&entry.value);
                 let name = entry.value.name.clone();
                 let bridge: Arc<dyn McpBridge> = match entry.value.server_type {
                     McpServerType::Mcp => {
@@ -350,6 +354,7 @@ impl McpGateway {
         if !entry.value.enabled {
             return None;
         }
+        crate::bridge::warn_cleartext_credential(&entry.value);
         let name = entry.value.name.clone();
         let bridge: Arc<dyn McpBridge> = match entry.value.server_type {
             McpServerType::Mcp => {
