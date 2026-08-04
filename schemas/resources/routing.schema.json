@@ -60,6 +60,17 @@
         }
       ]
     },
+    "stream_failure": {
+      "description": "What to do when a streaming response fails AFTER its first chunk was already delivered to the client (the HTTP 200 is committed and cannot be revised). Omitted keeps the historical behavior: terminate the stream with an in-band error frame and no `[DONE]`.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/StreamFailure"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "targets": {
       "description": "Ordered set of direct models available to this routing model.",
       "type": "array",
@@ -162,6 +173,95 @@
         }
       },
       "additionalProperties": false
+    },
+    "StreamFailure": {
+      "description": "Mid-stream failure policy for streaming responses (AISIX-Cloud#1222).\n\nApplies only to failures that occur after the response head (and possibly some chunks) reached the client; failures before the first chunk keep using the regular retry/failover loop.",
+      "type": "object",
+      "properties": {
+        "max_fallbacks": {
+          "description": "Max fallback targets tried for one mid-stream failure. Defaults to 1 — mid-stream recovery burns client-visible latency per attempt, so the default is deliberately tighter than the pre-stream `max_fallbacks`.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "mode": {
+          "description": "`terminate` (default) keeps the current behavior. `continue` lets the router call the remaining fallback targets and resume the SAME client stream with a best-effort continuation of the partial text.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/StreamFailureMode"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "on": {
+          "description": "Which mid-stream error classes trigger the fallback. Omitted = all of them. Non-retryable errors (an in-band 4xx other than 429, unless listed in `fallback_on_statuses`) never trigger regardless.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/definitions/StreamFailureTrigger"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "StreamFailureMode": {
+      "description": "See [`StreamFailure::mode`].",
+      "oneOf": [
+        {
+          "description": "Terminate the stream: in-band error frame, no `[DONE]` (the historical behavior).",
+          "type": "string",
+          "enum": [
+            "terminate"
+          ]
+        },
+        {
+          "description": "Continue on a fallback target inside the same client stream.",
+          "type": "string",
+          "enum": [
+            "continue"
+          ]
+        }
+      ]
+    },
+    "StreamFailureTrigger": {
+      "description": "Mid-stream error classes eligible for [`StreamFailureMode::Continue`].",
+      "oneOf": [
+        {
+          "description": "The upstream connection broke mid-stream (reset, premature close).",
+          "type": "string",
+          "enum": [
+            "transport_error"
+          ]
+        },
+        {
+          "description": "The gap between chunks exceeded the effective `stream_timeout`.",
+          "type": "string",
+          "enum": [
+            "read_timeout"
+          ]
+        },
+        {
+          "description": "A frame failed to parse as a chunk (and was not a recognizable in-band error envelope).",
+          "type": "string",
+          "enum": [
+            "upstream_decode_error"
+          ]
+        },
+        {
+          "description": "The provider reported an error inside the committed 200 stream (an SSE error frame / event-stream modeled exception).",
+          "type": "string",
+          "enum": [
+            "upstream_in_band_error"
+          ]
+        }
+      ]
     },
     "WhenAllUnavailablePolicy": {
       "description": "Behavior when every routing target is unavailable because of runtime health or cooldown state.",

@@ -64,6 +64,7 @@ mod routing;
 mod semantic;
 pub mod sse_keepalive;
 mod state;
+mod stream_failover;
 mod stream_timeout;
 mod token_estimate;
 mod usage_attr;
@@ -4633,6 +4634,358 @@ data: [DONE]\n\n";
         });
         let model: Model = serde_json::from_value(cfg).unwrap();
         ResourceEntry::new(format!("router-{name}"), model, 1)
+    }
+
+    /// Like [`routing_entry`] but with a `stream_failure` block —
+    /// the AISIX-Cloud#1222 mid-stream failover knob.
+    fn routing_entry_with_stream_failure(
+        name: &str,
+        targets: &[&str],
+        stream_failure: serde_json::Value,
+    ) -> ResourceEntry<Model> {
+        let target_objs: Vec<serde_json::Value> = targets
+            .iter()
+            .map(|t| serde_json::json!({"model": t}))
+            .collect();
+        let cfg = serde_json::json!({
+            "display_name": name,
+            "routing": {
+                "strategy": "failover",
+                "targets": target_objs,
+                "stream_failure": stream_failure,
+            }
+        });
+        let model: Model = serde_json::from_value(cfg).unwrap();
+        ResourceEntry::new(format!("router-{name}"), model, 1)
+    }
+
+    /// SSE body: role preamble + one content delta + an in-band error
+    /// frame — a provider failing inside its committed 200 stream.
+    const MID_STREAM_FAILING_SSE: &str = "\
+data: {\"id\":\"up-1\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"up-1\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Once upon\"},\"finish_reason\":null}]}\n\n\
+data: {\"error\":{\"message\":\"The server had an error\",\"type\":\"server_error\"}}\n\n";
+
+    fn mid_stream_snapshot(
+        primary_uri: &str,
+        secondary_uri: &str,
+        stream_failure: Option<serde_json::Value>,
+    ) -> AisixSnapshot {
+        let snap = AisixSnapshot::new();
+        snap.provider_keys
+            .insert(pk_entry_with_id("pk-primary", primary_uri));
+        snap.provider_keys
+            .insert(pk_entry_with_id("pk-secondary", secondary_uri));
+        snap.models
+            .insert(model_entry_with_id("m-primary", "primary", "pk-primary"));
+        snap.models.insert(model_entry_with_id(
+            "m-secondary",
+            "secondary",
+            "pk-secondary",
+        ));
+        match stream_failure {
+            Some(sf) => snap.models.insert(routing_entry_with_stream_failure(
+                "smart",
+                &["primary", "secondary"],
+                sf,
+            )),
+            None => snap.models.insert(routing_entry(
+                "smart",
+                "failover",
+                &["primary", "secondary"],
+                None,
+                None,
+                None,
+            )),
+        }
+        snap.apikeys.insert(apikey_entry("sk-caller", &["smart"]));
+        snap
+    }
+
+    async fn streaming_chat_wire(app: axum::Router, model: &str) -> String {
+        let body = serde_json::json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "tell me a story"}],
+            "stream": true
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let mut body_stream = resp.into_body().into_data_stream();
+        let mut wire = Vec::new();
+        while let Some(chunk) = body_stream.next().await {
+            wire.extend_from_slice(chunk.unwrap().as_ref());
+        }
+        String::from_utf8(wire).expect("SSE bytes are utf8")
+    }
+
+    /// AISIX-Cloud#1222 core acceptance: with `stream_failure: continue`,
+    /// a provider error inside the committed 200 stream moves the SAME
+    /// client stream onto the fallback target; the fallback gets the
+    /// original messages + the continuation instruction + the partial
+    /// text as an assistant message; the client sees primary content,
+    /// then fallback content, then exactly one `[DONE]` and no error
+    /// frame.
+    #[tokio::test]
+    async fn mid_stream_failure_continues_on_fallback_target_in_same_stream() {
+        let primary = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(MID_STREAM_FAILING_SSE),
+            )
+            .mount(&primary)
+            .await;
+        let secondary = MockServer::start().await;
+        let recovery_sse = "\
+data: {\"id\":\"up-2\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"up-2\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" a time\"},\"finish_reason\":\"stop\"}]}\n\n\
+data: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(recovery_sse),
+            )
+            .mount(&secondary)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = mid_stream_snapshot(
+            &primary.uri(),
+            &secondary.uri(),
+            Some(serde_json::json!({"mode": "continue"})),
+        );
+        let app = build_router(build_state(snap, hub));
+
+        let wire = streaming_chat_wire(app, "smart").await;
+        assert!(
+            wire.contains("Once upon"),
+            "primary partial must reach the client:\n{wire}"
+        );
+        assert!(
+            wire.contains(" a time"),
+            "fallback continuation must reach the client:\n{wire}"
+        );
+        assert!(
+            !wire.contains("event: error"),
+            "recovered stream must not carry an error frame:\n{wire}"
+        );
+        assert_eq!(
+            wire.matches("data: [DONE]").count(),
+            1,
+            "exactly one [DONE] on recovery:\n{wire}"
+        );
+
+        // The fallback target received the continuation request: the
+        // original user message, then the continuation instruction,
+        // then the partial as an assistant message (LiteLLM shape).
+        let reqs = secondary.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 1, "secondary called exactly once");
+        let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3, "user + continuation system + partial");
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[1]["role"], "system");
+        assert!(messages[1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("Do not repeat the same content"));
+        assert_eq!(messages[2]["role"], "assistant");
+        assert_eq!(messages[2]["content"], "Once upon");
+    }
+
+    /// Default config (no `stream_failure`) keeps the historical
+    /// terminate behavior: in-band error frame, no `[DONE]`, and the
+    /// fallback target is never contacted.
+    #[tokio::test]
+    async fn mid_stream_failure_without_config_terminates_and_never_calls_fallback() {
+        let primary = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(MID_STREAM_FAILING_SSE),
+            )
+            .mount(&primary)
+            .await;
+        let secondary = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&secondary)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = mid_stream_snapshot(&primary.uri(), &secondary.uri(), None);
+        let app = build_router(build_state(snap, hub));
+
+        let wire = streaming_chat_wire(app, "smart").await;
+        assert!(wire.contains("Once upon"));
+        assert!(
+            wire.contains("event: error"),
+            "terminate mode keeps the in-band error frame:\n{wire}"
+        );
+        assert!(
+            wire.contains("upstream_in_band_error"),
+            "error frame carries the in-band error type:\n{wire}"
+        );
+        assert!(
+            !wire.contains("data: [DONE]"),
+            "no [DONE] after abnormal termination:\n{wire}"
+        );
+        let reqs = secondary.received_requests().await.unwrap();
+        assert!(reqs.is_empty(), "fallback target must not be contacted");
+    }
+
+    /// Fallback exhaustion: the fallback target fails mid-stream too
+    /// (and `max_fallbacks` defaults to 1) — the client gets the
+    /// in-band error frame and no `[DONE]`, never a fabricated clean
+    /// completion.
+    #[tokio::test]
+    async fn mid_stream_fallback_exhaustion_surfaces_error_without_done() {
+        let primary = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(MID_STREAM_FAILING_SSE),
+            )
+            .mount(&primary)
+            .await;
+        let secondary = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(MID_STREAM_FAILING_SSE),
+            )
+            .mount(&secondary)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = mid_stream_snapshot(
+            &primary.uri(),
+            &secondary.uri(),
+            Some(serde_json::json!({"mode": "continue"})),
+        );
+        let app = build_router(build_state(snap, hub));
+
+        let wire = streaming_chat_wire(app, "smart").await;
+        assert!(
+            wire.contains("event: error"),
+            "exhausted fallback surfaces the error:\n{wire}"
+        );
+        assert!(
+            !wire.contains("data: [DONE]"),
+            "no fabricated [DONE] when the fallback also fails:\n{wire}"
+        );
+        let reqs = secondary.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 1, "fallback was attempted once");
+    }
+
+    /// Safety boundary: a stream that already emitted tool-call deltas
+    /// must terminate even with `continue` configured — a fallback
+    /// model cannot safely continue half-emitted tool-call arguments
+    /// (the LiteLLM gap this design deliberately closes).
+    #[tokio::test]
+    async fn mid_stream_fallback_skipped_after_tool_call_delta() {
+        let primary = MockServer::start().await;
+        let tool_call_sse = "\
+data: {\"id\":\"up-1\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"up-1\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"ci\"}}]},\"finish_reason\":null}]}\n\n\
+data: {\"error\":{\"message\":\"The server had an error\",\"type\":\"server_error\"}}\n\n";
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(tool_call_sse),
+            )
+            .mount(&primary)
+            .await;
+        let secondary = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&secondary)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = mid_stream_snapshot(
+            &primary.uri(),
+            &secondary.uri(),
+            Some(serde_json::json!({"mode": "continue"})),
+        );
+        let app = build_router(build_state(snap, hub));
+
+        let wire = streaming_chat_wire(app, "smart").await;
+        assert!(
+            wire.contains("event: error"),
+            "tool-call streams terminate, not continue:\n{wire}"
+        );
+        assert!(!wire.contains("data: [DONE]"));
+        let reqs = secondary.received_requests().await.unwrap();
+        assert!(
+            reqs.is_empty(),
+            "no fallback dispatch after a tool-call delta"
+        );
+    }
+
+    /// `on` narrows the trigger set: a config listing only
+    /// `read_timeout` must NOT fall back on an in-band error.
+    #[tokio::test]
+    async fn mid_stream_fallback_respects_on_trigger_list() {
+        let primary = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(MID_STREAM_FAILING_SSE),
+            )
+            .mount(&primary)
+            .await;
+        let secondary = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&secondary)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = mid_stream_snapshot(
+            &primary.uri(),
+            &secondary.uri(),
+            Some(serde_json::json!({"mode": "continue", "on": ["read_timeout"]})),
+        );
+        let app = build_router(build_state(snap, hub));
+
+        let wire = streaming_chat_wire(app, "smart").await;
+        assert!(wire.contains("event: error"));
+        assert!(!wire.contains("data: [DONE]"));
+        let reqs = secondary.received_requests().await.unwrap();
+        assert!(
+            reqs.is_empty(),
+            "in-band error is not in the configured trigger set"
+        );
     }
 
     #[tokio::test]
