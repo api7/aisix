@@ -44,6 +44,14 @@ proxy:
   # 0 = no request-body cap (the default); set a value to bound
   # per-request memory.
   # request_body_limit_bytes: 0
+  # Entry-level URL rewriting (first matching rule wins; `rewrite`
+  # replaces the matched portion of the path, $1 = capture group; the
+  # query string is preserved). Lets clients keep legacy URL shapes,
+  # e.g. per-server MCP paths served on the /mcp/{server} endpoint.
+  # url_rewrites:
+  #   - name: per-server-mcp-compat
+  #     match: "^/mcp-servers/([^/]+)/mcp$"
+  #     rewrite: "/mcp/$1"
 
 admin:
   # Bind to an unbindable port so even if managed mode somehow

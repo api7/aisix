@@ -393,12 +393,42 @@ pub struct ProxyConfig {
     /// an L7 LB / ingress that sets `x-forwarded-for`.
     #[serde(default)]
     pub real_ip: RealIpConfig,
+    /// Entry-level URL rewrite rules, applied to every proxy-listener
+    /// request **before** routing (the admin and metrics listeners are
+    /// unaffected). The first rule whose `match` regex matches the request
+    /// path rewrites it — once, no cascading — and the request then flows
+    /// through the normal endpoint (auth, ACL, quota, …) as if the client
+    /// had sent the rewritten path. Lets operators map legacy URL shapes
+    /// onto AISIX endpoints, e.g. per-server MCP paths onto
+    /// `/mcp/{server}`. Empty (the default) = no rewriting.
+    #[serde(default)]
+    pub url_rewrites: Vec<UrlRewriteRule>,
 }
 
 impl ProxyConfig {
     const fn default_body_limit() -> usize {
         0
     }
+}
+
+/// One entry-level URL rewrite rule (see [`ProxyConfig::url_rewrites`]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UrlRewriteRule {
+    /// Optional name, used in logs when the rule fires.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Regex matched against the request path (never the query string).
+    /// Anchor with `^`/`$` to match the whole path; an unanchored pattern
+    /// matches anywhere in it.
+    #[serde(rename = "match")]
+    pub pattern: String,
+    /// Replacement for the matched portion of the path. Capture groups are
+    /// available as `$1`… / `${name}`; use `${1}x` (braced) when a literal
+    /// character follows a group reference. The query string is preserved
+    /// as sent.
+    #[serde(rename = "rewrite")]
+    pub replacement: String,
 }
 
 /// nginx `set_real_ip_from` + `real_ip_recursive` equivalent. Resolves
@@ -1094,6 +1124,20 @@ impl Config {
     }
 
     fn validate(&self) -> Result<(), BootstrapError> {
+        // Fail fast on a rewrite rule that can never compile: it would
+        // otherwise surface as every legacy-path request 404ing, which is
+        // much harder to trace back to a typo in one regex.
+        for (i, rule) in self.proxy.url_rewrites.iter().enumerate() {
+            if let Err(e) = regex::Regex::new(&rule.pattern) {
+                let ctx = rule
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| format!("proxy.url_rewrites[{i}]"));
+                return Err(BootstrapError::Config(format!(
+                    "{ctx}: invalid match regex: {e}"
+                )));
+            }
+        }
         if let Some(path) = self.resources_file.as_deref() {
             // File source selected: exactly one resource source may be
             // active. A configured etcd endpoint list alongside the file
@@ -1304,6 +1348,50 @@ admin:
         let nets = cfg.proxy.real_ip.parse_trusted().unwrap();
         assert_eq!(nets.len(), 2);
         assert!(nets.iter().any(|n| n.to_string() == "10.0.0.0/8"));
+    }
+
+    #[test]
+    fn loads_url_rewrites_and_rejects_an_invalid_regex() {
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+  prefix: "/aisix"
+proxy:
+  addr: "0.0.0.0:3000"
+  url_rewrites:
+    - name: per-server-mcp-compat
+      match: "^/mcp-servers/([^/]+)/mcp$"
+      rewrite: "/mcp/$1"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+"#,
+        );
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert_eq!(cfg.proxy.url_rewrites.len(), 1);
+        assert_eq!(cfg.proxy.url_rewrites[0].replacement, "/mcp/$1");
+
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+  prefix: "/aisix"
+proxy:
+  addr: "0.0.0.0:3000"
+  url_rewrites:
+    - match: "^/mcp-servers/([^/+/mcp$"
+      rewrite: "/mcp/$1"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+"#,
+        );
+        let err = Config::load_from_path(Some(f.path())).unwrap_err();
+        assert!(
+            format!("{err}").contains("url_rewrites"),
+            "error should name the bad rule: {err}"
+        );
     }
 
     #[test]

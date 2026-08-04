@@ -145,6 +145,9 @@ pub struct ProxyStateInner {
     /// client IP on each request (#492). Default = trust nothing → the
     /// logged source IP is the immediate TCP peer.
     pub real_ip: Arc<ResolvedRealIp>,
+    /// Boot-compiled `proxy.url_rewrites` rules, applied in order to every
+    /// request before routing (first match wins). Empty = layer no-ops.
+    pub url_rewrites: Arc<[crate::rewrite::CompiledRewrite]>,
     /// Optional config-freshness probe for `GET /readyz`: returns the time
     /// since the etcd watch last applied config (`None` = never applied).
     /// Wired from the watch supervisor in aisix-server; `None` here means
@@ -208,6 +211,7 @@ impl ProxyState {
             otlp_fan_out: OtlpHttpFanOut::new(),
             request_body_limit_bytes: cfg.request_body_limit_bytes,
             real_ip: Arc::new(ResolvedRealIp::from_config(&cfg.real_ip)),
+            url_rewrites: crate::rewrite::compile(&cfg.url_rewrites),
             billed_batches: Arc::new(dashmap::DashSet::new()),
             client_classifier: Arc::new(ClientTypeClassifier::builtin()),
             default_retries: aisix_core::config::DEFAULT_UPSTREAM_RETRIES,
@@ -244,6 +248,7 @@ impl ProxyState {
             otlp_fan_out: OtlpHttpFanOut::new(),
             request_body_limit_bytes: cfg.request_body_limit_bytes,
             real_ip: Arc::new(ResolvedRealIp::from_config(&cfg.real_ip)),
+            url_rewrites: crate::rewrite::compile(&cfg.url_rewrites),
             billed_batches: Arc::new(dashmap::DashSet::new()),
             client_classifier: Arc::new(ClientTypeClassifier::builtin()),
             default_retries: aisix_core::config::DEFAULT_UPSTREAM_RETRIES,
@@ -290,6 +295,7 @@ impl ProxyState {
             otlp_fan_out: OtlpHttpFanOut::new(),
             request_body_limit_bytes: cfg.request_body_limit_bytes,
             real_ip: Arc::new(ResolvedRealIp::from_config(&cfg.real_ip)),
+            url_rewrites: crate::rewrite::compile(&cfg.url_rewrites),
             billed_batches: Arc::new(dashmap::DashSet::new()),
             client_classifier: Arc::new(ClientTypeClassifier::builtin()),
             default_retries: aisix_core::config::DEFAULT_UPSTREAM_RETRIES,
@@ -388,6 +394,7 @@ mod tests {
                 request_body_limit_bytes: 1_048_576,
                 tls: None,
                 real_ip: Default::default(),
+                url_rewrites: Vec::new(),
             },
         )
     }

@@ -17,6 +17,7 @@ thiserror.workspace = true
 anyhow.workspace = true
 config.workspace = true
 jsonschema.workspace = true
+regex.workspace = true
 schemars = { workspace = true, features = ["chrono"] }
 # ApiKey::expires_at parses RFC 3339 timestamps for key-expiry
 # enforcement in the proxy auth path (#933).

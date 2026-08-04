@@ -43,6 +43,13 @@ export interface AppOverrides {
     header?: string;
   };
   /**
+   * `proxy.url_rewrites` block. Merged into the base proxy config (like
+   * `realIp`) so the listener addr is preserved. Entry-level path
+   * rewriting: first matching rule wins, `rewrite` replaces the matched
+   * portion of the path.
+   */
+  urlRewrites?: Array<{ name?: string; match: string; rewrite: string }>;
+  /**
    * `proxy.request_body_limit_bytes`. A dedicated override (like
    * `realIp`) because `extra` replaces whole top-level blocks and the
    * proxy block carries the harness-picked listener addr. `0` disables
@@ -211,6 +218,7 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
       addr: `127.0.0.1:${proxyPort}`,
       request_body_limit_bytes: overrides.requestBodyLimitBytes ?? 10485760,
       ...(overrides.realIp ? { real_ip: overrides.realIp } : {}),
+      ...(overrides.urlRewrites ? { url_rewrites: overrides.urlRewrites } : {}),
     },
     admin: adminEnabled
       ? { addr: `127.0.0.1:${adminPort}`, admin_keys: [adminKey] }
