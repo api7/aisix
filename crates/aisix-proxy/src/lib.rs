@@ -622,6 +622,14 @@ mod tests {
         // Arbitrary unauthenticated paths bucket to a single label.
         assert_eq!(normalize_endpoint_label("/random/x"), "other");
         assert_eq!(normalize_endpoint_label("/random/y"), "other");
+        // The scoped MCP endpoint collapses to one label regardless of the
+        // server segment; the aggregated endpoint (with and without the
+        // trailing slash) keeps its own — the exact `"/mcp/"` arm must stay
+        // ahead of the `/mcp/` prefix arm.
+        assert_eq!(normalize_endpoint_label("/mcp/alpha"), "/mcp/{server}");
+        assert_eq!(normalize_endpoint_label("/mcp/unique-xyz"), "/mcp/{server}");
+        assert_eq!(normalize_endpoint_label("/mcp"), "/mcp");
+        assert_eq!(normalize_endpoint_label("/mcp/"), "/mcp");
     }
 
     use aisix_core::resource::ResourceEntry;

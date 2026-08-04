@@ -59,6 +59,17 @@ struct NamedUpstream {
     bridge: Arc<dyn McpBridge>,
 }
 
+/// Strip `server`'s namespace prefix from `name`: `Some(bare)` when `name`
+/// is `<server>__<bare>`, `None` otherwise. The one primitive both the
+/// scoped gateway and the proxy's attribution peek use to interpret a tool
+/// name on `/mcp/{server}`, so the two can never drift. Prefix matching is
+/// by whole-string prefix (not first-separator split), so a server name
+/// that itself ends in `_` still namespaces cleanly.
+pub fn strip_server_prefix<'a>(server: &str, name: &'a str) -> Option<&'a str> {
+    name.strip_prefix(server)
+        .and_then(|rest| rest.strip_prefix(TOOL_NAMESPACE_SEPARATOR))
+}
+
 /// Which tools a gateway instance may expose and call, in the namespaced
 /// `<server>__<tool>` form. Built per request from the caller's API key and
 /// the environment's / the key's team's MCP access policies, so MCP tool
@@ -402,12 +413,22 @@ impl ServerHandler for McpGateway {
         // A scoped gateway serves its single upstream's tools under their
         // original names — the namespace prefix exists to disambiguate the
         // aggregate, and a single-server endpoint has nothing to disambiguate.
-        // ACL filtering above ran on the namespaced form.
+        // ACL filtering above ran on the namespaced form. Strip only when the
+        // bare name round-trips through `call_tool`'s parsing: a literal
+        // upstream name that itself starts with a registered server's prefix
+        // would be re-stripped (or fail closed) if advertised bare, so those
+        // stay namespaced — that spelling is the one `call_tool` accepts.
         if let Some(scoped) = &self.scoped {
-            let prefix = format!("{}{TOOL_NAMESPACE_SEPARATOR}", scoped.name);
             for tool in &mut tools {
-                if let Some(bare) = tool.name.strip_prefix(&prefix) {
-                    tool.name = Cow::Owned(bare.to_string());
+                if let Some(bare) = strip_server_prefix(&scoped.name, tool.name.as_ref()) {
+                    let round_trips = strip_server_prefix(&scoped.name, bare).is_none()
+                        && !scoped
+                            .foreign
+                            .iter()
+                            .any(|f| strip_server_prefix(f, bare).is_some());
+                    if round_trips {
+                        tool.name = Cow::Owned(bare.to_string());
+                    }
                 }
             }
         }
@@ -424,19 +445,24 @@ impl ServerHandler for McpGateway {
         // sends the namespaced form anyway (an aggregated-endpoint client
         // pointed at the scoped URL) keeps working — `<scope>__x` reduces to
         // `x`. (An upstream tool literally named `<scope>__x` is therefore
-        // only callable as `<scope>__<scope>__x` — prefix-stripping takes
-        // precedence, pinned by test.) A name prefixed with a *different*
-        // registered server's name fails closed: the scoped endpoint never
-        // cross-routes, and silently serving it as a bare name would mask the
-        // caller's mistake. An unregistered prefix stays a bare name, since
-        // tool names may legitimately contain the separator.
+        // only callable as `<scope>__<scope>__x` — one strip, own prefix
+        // first; `tools/list` advertises exactly that spelling.) A name
+        // prefixed with a *different* registered server's name fails closed:
+        // the scoped endpoint never cross-routes, and silently serving it as
+        // a bare name would mask the caller's mistake. An unregistered
+        // prefix stays a bare name, since tool names may legitimately
+        // contain the separator.
         let request_name = request.name.as_ref();
         let (server, tool, namespaced): (&str, &str, Cow<'_, str>) = match &self.scoped {
             Some(scoped) => {
                 let scope = scoped.name.as_str();
-                let bare = match request_name.split_once(TOOL_NAMESPACE_SEPARATOR) {
-                    Some((prefix, rest)) if prefix == scope => rest,
-                    Some((prefix, _)) if scoped.foreign.contains(prefix) => {
+                let bare = match strip_server_prefix(scope, request_name) {
+                    Some(rest) => rest,
+                    None if scoped
+                        .foreign
+                        .iter()
+                        .any(|f| strip_server_prefix(f, request_name).is_some()) =>
+                    {
                         // Same neutral wording as the ACL reject: don't
                         // confirm what the other server serves.
                         return Err(ErrorData::invalid_params(
@@ -444,7 +470,7 @@ impl ServerHandler for McpGateway {
                             None,
                         ));
                     }
-                    _ => request_name,
+                    None => request_name,
                 };
                 (
                     scope,
