@@ -777,10 +777,29 @@ pub(crate) async fn create_file(
     client: ClientContext,
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
-    mut multipart: Multipart,
+    multipart: Result<Multipart, axum::extract::multipart::MultipartRejection>,
 ) -> Response {
     let started = Instant::now();
     let request_id = client.request_id.clone();
+
+    // Same silent class as the body-extractor rejections #863 collected: a
+    // non-multipart content-type answered axum's bare 400 with no access
+    // log, metrics, or envelope.
+    let mut multipart = match multipart {
+        Ok(multipart) => multipart,
+        Err(_) => {
+            return crate::reject::reject_before_dispatch(
+                &state,
+                "POST",
+                "/v1/files",
+                &request_id,
+                Some(&auth.entry.id),
+                started,
+                crate::reject::Envelope::OpenAi,
+                ProxyError::InvalidRequest("invalid multipart form data".into()),
+            );
+        }
+    };
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
 
     let result = async {

@@ -74,6 +74,30 @@ describe("path-param rejection e2e: :param routes answer the envelope", () => {
     }
   });
 
+  test("multipart content-type mismatch answers the envelope too", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+
+    // Same silent class one extractor over: JSON sent to a multipart
+    // endpoint used to get axum's bare 400.
+    for (const path of [
+      "/v1/audio/transcriptions",
+      "/v1/audio/translations",
+      "/v1/files",
+    ]) {
+      const res = await fetch(`${app.proxyUrl}${path}`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${KEY}`,
+          "content-type": "application/json",
+        },
+        body: "{}",
+      });
+      expect(res.status, path).toBe(400);
+      const body = (await res.json()) as { error?: { type?: string } };
+      expect(body.error?.type, path).toBe("invalid_request_error");
+    }
+  });
+
   test("an unauthenticated malformed :param is still 401 first", async (ctx) => {
     if (!etcdReachable || !app) return ctx.skip();
 

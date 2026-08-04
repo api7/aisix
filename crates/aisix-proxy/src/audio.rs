@@ -86,11 +86,30 @@ pub async fn transcriptions(
     State(state): State<ProxyState>,
     auth: AuthenticatedKey,
     client: ClientContext,
-    multipart: Multipart,
+    multipart: Result<Multipart, axum::extract::multipart::MultipartRejection>,
 ) -> Response {
     let started = Instant::now();
     let request_id = client.request_id.clone();
     let api_key_id = auth.entry.id.clone();
+
+    // Same silent class as the body-extractor rejections #863 collected: a
+    // non-multipart content-type answered axum's bare 400 with no access
+    // log, metrics, or envelope.
+    let multipart = match multipart {
+        Ok(multipart) => multipart,
+        Err(_) => {
+            return crate::reject::reject_before_dispatch(
+                &state,
+                "POST",
+                "/v1/audio/transcriptions",
+                &request_id,
+                Some(&api_key_id),
+                started,
+                crate::reject::Envelope::OpenAi,
+                ProxyError::InvalidRequest("invalid multipart form data".into()),
+            );
+        }
+    };
 
     match multipart_dispatch(
         &state,
@@ -186,11 +205,28 @@ pub async fn translations(
     State(state): State<ProxyState>,
     auth: AuthenticatedKey,
     client: ClientContext,
-    multipart: Multipart,
+    multipart: Result<Multipart, axum::extract::multipart::MultipartRejection>,
 ) -> Response {
     let started = Instant::now();
     let request_id = client.request_id.clone();
     let api_key_id = auth.entry.id.clone();
+
+    // See `transcriptions`: the rejection is recorded, not silently bare.
+    let multipart = match multipart {
+        Ok(multipart) => multipart,
+        Err(_) => {
+            return crate::reject::reject_before_dispatch(
+                &state,
+                "POST",
+                "/v1/audio/translations",
+                &request_id,
+                Some(&api_key_id),
+                started,
+                crate::reject::Envelope::OpenAi,
+                ProxyError::InvalidRequest("invalid multipart form data".into()),
+            );
+        }
+    };
 
     match multipart_dispatch(
         &state,

@@ -127,7 +127,18 @@ where
     ) -> Result<Self, Self::Rejection> {
         match axum::extract::Path::<T>::from_request_parts(parts, state).await {
             Ok(axum::extract::Path(value)) => Ok(Self(value)),
-            Err(_) => {
+            Err(rejection) => {
+                // axum classifies wrong parameter arity / unsupported types
+                // as 500 — a server wiring bug, not caller input. Keep that
+                // loud and unenveloped; only caller-caused 400s are recorded
+                // as refused requests below.
+                let axum_response = rejection.into_response();
+                if axum_response.status() != axum::http::StatusCode::BAD_REQUEST {
+                    return Err(axum_response);
+                }
+                // Fallback mirrors the handlers' own idiom (see mcp.rs /
+                // a2a.rs); unreachable in the real router, where
+                // `ensure_request_id` runs before routing.
                 let request_id = parts
                     .extensions
                     .get::<RequestId>()
@@ -168,7 +179,7 @@ mod tests {
 
     const TOKEN: &str = "sk-path-reject-test";
 
-    fn router() -> axum::Router {
+    fn state() -> ProxyState {
         let apikey: ApiKey = serde_json::from_value(serde_json::json!({
             "key_hash": ApiKey::hash_bearer(TOKEN),
             "allowed_models": ["*"],
@@ -185,13 +196,16 @@ mod tests {
             real_ip: Default::default(),
             url_rewrites: Vec::new(),
         };
-        let state = ProxyState::new(
+        ProxyState::new(
             SnapshotHandle::new(snapshot),
             Arc::new(aisix_gateway::Hub::new()),
             &cfg,
         )
-        .without_cache();
-        crate::build_router(state)
+        .without_cache()
+    }
+
+    fn router() -> axum::Router {
+        crate::build_router(state())
     }
 
     async fn send(
@@ -222,12 +236,14 @@ mod tests {
         // text; every `:param` route must now answer the caller envelope
         // (and, mechanically via `reject_before_dispatch`, emit the access
         // log + metrics every other pre-dispatch rejection gets).
-        let router = router();
+        let state = state();
+        let router = crate::build_router(state.clone());
         for (method, path) in [
             ("POST", "/a2a/%ff"),
             ("GET", "/a2a/%ff/.well-known/agent-card.json"),
             ("GET", "/mcp/%ff"),
             ("GET", "/v1/files/%ff"),
+            ("DELETE", "/v1/files/%ff"),
             ("GET", "/v1/files/%ff/content"),
             ("GET", "/v1/batches/%ff"),
             ("POST", "/v1/batches/%ff/cancel"),
@@ -242,6 +258,70 @@ mod tests {
             assert!(
                 body.contains("invalid_request_error"),
                 "{method} {path} must answer the OpenAI envelope, got: {body}"
+            );
+        }
+
+        // The refusals are RECORDED, not just enveloped: the chokepoint
+        // counts them with the unresolved labels.
+        let scrape = state.metrics.render();
+        assert!(
+            scrape.contains(r#"status="400""#) && scrape.contains(r#"provider="unknown""#),
+            "the 400s must be counted with unresolved labels, got: {scrape}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wiring_bugs_keep_their_500_instead_of_blaming_the_caller() {
+        // A handler whose tuple arity doesn't match the route's captures is
+        // a server wiring bug — axum classifies it 500, and the extractor
+        // must pass that through rather than record a caller-caused 400.
+        async fn miswired(
+            crate::reject::AisixPath(_x): crate::reject::AisixPath<String>,
+            axum::extract::State(_): axum::extract::State<ProxyState>,
+        ) -> &'static str {
+            "unreachable"
+        }
+        let router = axum::Router::new()
+            .route("/wired/:a/:b", axum::routing::get(miswired))
+            .with_state(state());
+        let (status, body) = send(router, "GET", "/wired/x/y", false).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        assert!(
+            !body.contains("invalid_request_error"),
+            "a wiring bug must not wear the caller envelope: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn multipart_content_type_mismatch_answers_the_envelope() {
+        // Sending JSON to a multipart endpoint is a common client mistake —
+        // the same silent bare-400 class, one extractor over (#880 review
+        // follow-up). Every multipart route must answer the envelope.
+        let router = router();
+        for path in [
+            "/v1/audio/transcriptions",
+            "/v1/audio/translations",
+            "/v1/files",
+        ] {
+            let request = HttpRequest::post(path)
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap();
+            let response = router
+                .clone()
+                .oneshot(request)
+                .await
+                .expect("router responds");
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), 1 << 16)
+                .await
+                .unwrap_or_default();
+            let body = String::from_utf8_lossy(&bytes);
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {body}");
+            assert!(
+                body.contains("invalid_request_error"),
+                "{path} must answer the OpenAI envelope, got: {body}"
             );
         }
     }
