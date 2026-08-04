@@ -16,6 +16,9 @@
 //! - `rate_limit_policies[].scope_ref` — for `scope: api_key` /
 //!   `scope: model`, a *name* resolved to the referenced entry's derived
 //!   id; other scopes pass through verbatim.
+//! - `rate_limit_policies[].conditions[]` — leaves on the `api_key` /
+//!   `model` dimensions resolve their value name(s) the same way,
+//!   recursively through group nodes; other dimensions pass through.
 //!
 //! Everything this module emits must be exactly a canonical resource
 //! document: the caller then runs the same JSON-Schema validators and
