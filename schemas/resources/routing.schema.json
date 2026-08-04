@@ -175,7 +175,7 @@
       "additionalProperties": false
     },
     "StreamFailure": {
-      "description": "Mid-stream failure policy for streaming responses (AISIX-Cloud#1222).\n\nApplies only to failures that occur after the response head (and possibly some chunks) reached the client; failures before the first chunk keep using the regular retry/failover loop.",
+      "description": "Mid-stream failure policy for streaming responses. Applies only to failures that occur after the response head (and possibly some chunks) reached the client; failures before the first chunk keep using the regular retry/failover loop.",
       "type": "object",
       "properties": {
         "max_fallbacks": {
@@ -212,7 +212,7 @@
       "additionalProperties": false
     },
     "StreamFailureMode": {
-      "description": "See [`StreamFailure::mode`].",
+      "description": "How a mid-stream failure is handled once the response is already streaming to the client.",
       "oneOf": [
         {
           "description": "Terminate the stream: in-band error frame, no `[DONE]` (the historical behavior).",

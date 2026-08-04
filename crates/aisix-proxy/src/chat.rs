@@ -1639,10 +1639,7 @@ async fn dispatch(
                 attempt_started: winner_attempt_started,
             },
         ));
-        let mid_stream_fallbacks = Arc::new(AtomicU32::new(0));
-        let mid_stream_extra = Arc::new(std::sync::Mutex::new(
-            aisix_gateway::chat::UsageStats::default(),
-        ));
+        let mid_stream_shared = crate::stream_failover::MidStreamShared::new();
         let stream_failure_cfg = virtual_entry
             .value
             .routing
@@ -1670,15 +1667,14 @@ async fn dispatch(
                         api_key_id: auth.entry.id.clone(),
                         applied_guardrails: applied_guardrails.clone(),
                         serving: Arc::clone(&serving),
-                        fallbacks_attempted: Arc::clone(&mid_stream_fallbacks),
-                        extra_usage: Arc::clone(&mid_stream_extra),
+                        shared: mid_stream_shared.clone(),
                     },
                 )
             }
             _ => upstream,
         };
         let serving_for_telem = Arc::clone(&serving);
-        let mid_stream_fallbacks_for_telem = Arc::clone(&mid_stream_fallbacks);
+        let mid_stream_shared_for_telem = mid_stream_shared.clone();
         let sse_stream = build_sse_stream(
             upstream,
             now,
@@ -1690,7 +1686,7 @@ async fn dispatch(
             client_requested_usage,
             // Single upstream: nothing pre-incurred, so no usage to fold in.
             aisix_gateway::chat::UsageStats::default(),
-            Some(mid_stream_extra),
+            Some(mid_stream_shared),
             Some(estimator),
             move |comp: StreamCompletion| {
                 // Mid-stream failover may have moved the stream onto a
@@ -1723,7 +1719,9 @@ async fn dispatch(
                     let snap = state_for_telem.snapshot.load();
                     crate::usage_attr::provider_key_metric_name(&snap, &provider_key_id_for_metrics)
                 };
-                let mid_stream_fallbacks = mid_stream_fallbacks_for_telem.load(Ordering::Relaxed);
+                let mid_stream_fallbacks = mid_stream_shared_for_telem
+                    .attempt_seq
+                    .load(Ordering::Relaxed);
                 // Logical stream outcome (AISIX-Cloud#1222): the HTTP
                 // status froze at 200 when the head committed, so this is
                 // the only signal that separates "delivered in full" from
@@ -1739,13 +1737,27 @@ async fn dispatch(
                     "success"
                 };
                 if mid_stream_fallbacks > 0 {
-                    metrics_for_stream.record_mid_stream_fallback(
-                        &model_for_metrics,
-                        stream_outcome == "partial_recovered",
-                    );
+                    // Recovered = the fallback kept the stream alive
+                    // (no terminal stream error). A client that
+                    // disconnects after a successful switch, or a
+                    // guardrail block on the recovered content, is
+                    // still a working failover — only a terminal
+                    // upstream error counts as failed.
+                    metrics_for_stream
+                        .record_mid_stream_fallback(&model_for_metrics, !comp.stream_failed);
                 }
-                // Rate-limit accounting (TPM cap) for all layers.
+                // Rate-limit accounting (TPM cap) for all layers,
+                // including any mid-stream fallback targets that
+                // served part of this stream.
                 for key in &post_stream_keys {
+                    limiter.add_tokens_post_stream(key, comp.total_tokens);
+                }
+                for key in mid_stream_shared_for_telem
+                    .extra_post_stream_keys
+                    .lock()
+                    .expect("extra keys lock")
+                    .iter()
+                {
                     limiter.add_tokens_post_stream(key, comp.total_tokens);
                 }
                 // Telemetry: emit with the actual upstream-reported counts.
@@ -4438,12 +4450,13 @@ fn build_sse_stream<F>(
     // `on_complete` (`comp`) counts stay stream-only. Zero for single-upstream
     // callers, where the fold is a no-op.
     base_usage: aisix_gateway::chat::UsageStats,
-    // Estimated spend of mid-stream-failed partial attempts, written by the
-    // failover combinator at switch time and folded into the client-facing
-    // usage frames alongside `base_usage` (LiteLLM merges partial + fallback
-    // usage the same way; AISIX-Cloud#1222). Shared because the value is
-    // only known mid-stream; `None` on paths without mid-stream failover.
-    mid_stream_extra: Option<Arc<std::sync::Mutex<aisix_gateway::chat::UsageStats>>>,
+    // Mid-stream failover shared state (AISIX-Cloud#1222): the failed
+    // partial attempts' estimated usage (folded into client-facing usage
+    // frames alongside `base_usage` — LiteLLM merges partial + fallback
+    // usage the same way) and the attempt sequence the pump watches to
+    // reset its accumulators on a serving-attempt switch. `None` on paths
+    // without mid-stream failover.
+    mid_stream: Option<crate::stream_failover::MidStreamShared>,
     // Token-estimation fallback context (AISIX-Cloud#1074); see
     // `CompleteOnDrop::estimator`.
     estimator: Option<crate::token_estimate::Estimator>,
@@ -4531,6 +4544,16 @@ where
         // the truncated response as a successful one.
         let mut errored = false;
         let mut first_chunk_seen = false;
+        // Serving-attempt sequence snapshot (mid-stream failover). When
+        // the combinator switches targets, the usage accumulated from
+        // the failed attempt must not max-wins-mix into the serving
+        // attempt's counters (a per-chunk-usage provider like Gemini
+        // would otherwise leak partial counters into the terminal
+        // event and double-fold with the estimated partial).
+        let mut mid_stream_seq = mid_stream
+            .as_ref()
+            .map(|ms| ms.attempt_seq.load(Ordering::Relaxed))
+            .unwrap_or(0);
         // Render + serialise one held/live chunk into an SSE Event.
         // Serialisation of these plain structs can't realistically fail;
         // the Err arm mirrors the pre-hold-back defensive error frame.
@@ -4562,6 +4585,20 @@ where
         while let Some(item) = upstream.next().await {
             let maybe_chunk = match item {
                 Ok(mut chunk) => {
+                    if let Some(ms) = mid_stream.as_ref() {
+                        let seq = ms.attempt_seq.load(Ordering::Relaxed);
+                        if seq != mid_stream_seq {
+                            mid_stream_seq = seq;
+                            let comp = guard.comp();
+                            comp.prompt_tokens = 0;
+                            comp.completion_tokens = 0;
+                            comp.total_tokens = 0;
+                            comp.cached_prompt_tokens = 0;
+                            comp.reasoning_tokens = 0;
+                            comp.cache_creation_tokens = 0;
+                            comp.cache_read_tokens = 0;
+                        }
+                    }
                     // Record TTFT on the first chunk carrying generated
                     // output — reasoning text included, role-only frames
                     // excluded. See `ChatDelta::carries_generated_output`.
@@ -4708,8 +4745,12 @@ where
                         // attempts' estimated spend into the client-facing
                         // usage frame, AFTER `comp` captured the
                         // serving-attempt-only counts (AISIX-Cloud#1222).
-                        if let Some(extra) = mid_stream_extra.as_ref() {
-                            let extra = extra.lock().expect("mid-stream extra lock").clone();
+                        if let Some(ms) = mid_stream.as_ref() {
+                            let extra = ms
+                                .extra_usage
+                                .lock()
+                                .expect("mid-stream extra lock")
+                                .clone();
                             *u = u.saturating_add(&extra);
                         }
                     }

@@ -84,14 +84,41 @@ pub(crate) struct MidStreamPlan {
     pub applied_guardrails: Vec<aisix_core::AppliedGuardrail>,
     /// Shared with the pump's completion closure.
     pub serving: Arc<Mutex<ServingAttempt>>,
-    /// Count of mid-stream fallback targets attempted; the completion
-    /// closure derives `partial_recovered` and the fallback metric
-    /// from it.
-    pub fallbacks_attempted: Arc<AtomicU32>,
+    /// Cross-task state shared with the SSE pump and its completion
+    /// closure.
+    pub shared: MidStreamShared,
+}
+
+/// State the failover combinator shares with `build_sse_stream` and the
+/// completion closure. Cheap to clone (all `Arc`s).
+#[derive(Clone)]
+pub(crate) struct MidStreamShared {
     /// Estimated usage of failed partial attempts, folded into the
     /// final stream's client-facing usage frames by the pump (LiteLLM
     /// merges partial + fallback usage the same way).
     pub extra_usage: Arc<Mutex<aisix_gateway::UsageStats>>,
+    /// Bumped on every fallback dispatch. The pump watches it to reset
+    /// its usage accumulators when the serving attempt changes —
+    /// max-wins folding across attempts would otherwise mix a
+    /// per-chunk-usage provider's (e.g. Gemini) partial counters into
+    /// the serving attempt's totals. The completion closure reads it
+    /// as the fallbacks-attempted count.
+    pub attempt_seq: Arc<AtomicU32>,
+    /// Rate-limit keys of fallback targets that served this stream —
+    /// the completion closure bills their TPM post-stream the same way
+    /// it bills the pre-stream reservation's keys (#450 / #1087
+    /// family).
+    pub extra_post_stream_keys: Arc<Mutex<Vec<String>>>,
+}
+
+impl MidStreamShared {
+    pub fn new() -> Self {
+        Self {
+            extra_usage: Arc::new(Mutex::new(aisix_gateway::UsageStats::default())),
+            attempt_seq: Arc::new(AtomicU32::new(0)),
+            extra_post_stream_keys: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
 }
 
 /// Classify a mid-stream [`BridgeError`] into the configurable trigger
@@ -163,6 +190,11 @@ pub(crate) fn wrap(
         let mut used: u32 = 0;
         let mut cursor = 0usize;
         let max = plan.cfg.max_fallbacks_or_default();
+        // The serving fallback target's rate-limit hold (concurrency
+        // slot). Replaced on every switch — releasing the previous
+        // fallback's slot — and released when the generator drops at
+        // stream end or client cancellation (#450 semantics).
+        let mut _fallback_hold: Option<aisix_ratelimit::StreamConcurrencyGuard> = None;
         loop {
             match current.next().await {
                 Some(Ok(chunk)) => {
@@ -200,7 +232,10 @@ pub(crate) fn wrap(
                     match acquire_fallback_stream(&plan, &mut cursor, &mut used, err, &partial)
                         .await
                     {
-                        Ok(next) => current = next,
+                        Ok((next, hold)) => {
+                            current = next;
+                            _fallback_hold = hold;
+                        }
                         Err(last) => {
                             yield Err(last);
                             return;
@@ -269,7 +304,7 @@ fn finalize_failed_attempt(plan: &MidStreamPlan, err: &BridgeError, partial: &st
         est.count_output(partial)
     };
     {
-        let mut extra = plan.extra_usage.lock().expect("extra_usage lock");
+        let mut extra = plan.shared.extra_usage.lock().expect("extra_usage lock");
         *extra = extra.saturating_add(&aisix_gateway::UsageStats::new(
             prompt_tokens,
             completion_tokens,
@@ -310,7 +345,13 @@ async fn acquire_fallback_stream(
     used: &mut u32,
     original_err: BridgeError,
     partial: &str,
-) -> Result<aisix_gateway::ChatChunkStream, BridgeError> {
+) -> Result<
+    (
+        aisix_gateway::ChatChunkStream,
+        Option<aisix_ratelimit::StreamConcurrencyGuard>,
+    ),
+    BridgeError,
+> {
     finalize_failed_attempt(plan, &original_err, partial);
     let max = plan.cfg.max_fallbacks_or_default();
     let mut last_err = original_err;
@@ -355,8 +396,56 @@ async fn acquire_fallback_stream(
         let Some(bridge) = crate::dispatch::resolve_bridge(&plan.state.hub, &pk_entry.value) else {
             continue;
         };
+        // Reserve the fallback target's own rate-limit layers before
+        // dispatching to it, exactly like the pre-stream loop
+        // (AISIX-Cloud#1087) — without this a mid-stream continuation
+        // would be invisible to the target model's rpm/concurrency
+        // caps. A refused reservation skips the candidate (recorded as
+        // a 429 attempt) without burning fallback budget: nothing was
+        // dispatched upstream.
+        let member_reservation = match crate::quota::reserve_routing_target(
+            &plan.state,
+            true,
+            &model.display_name,
+            &attempt.id,
+            model,
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                let rec = AttemptRecord {
+                    index: {
+                        let mut serving = plan.serving.lock().expect("serving lock");
+                        serving.attempt_index += 1;
+                        serving.attempt_index
+                    },
+                    kind: "mid_stream_fallback",
+                    target_model: model.display_name.clone(),
+                    target_model_id: attempt.id.clone(),
+                    provider_key_id: pk_entry.id.clone(),
+                    status: 429,
+                    success: false,
+                    error_class: "rate_limit_exceeded".to_string(),
+                    error_message: e.to_string(),
+                    latency_ms: 0,
+                };
+                crate::chat::emit_mid_stream_failed_attempt(
+                    &plan.state,
+                    &plan.request_id,
+                    &plan.requested_model,
+                    &plan.api_key_id,
+                    &plan.client,
+                    &plan.applied_guardrails,
+                    &rec,
+                    0,
+                    0,
+                );
+                continue;
+            }
+        };
         *used += 1;
-        plan.fallbacks_attempted.fetch_add(1, Ordering::Relaxed);
+        plan.shared.attempt_seq.fetch_add(1, Ordering::Relaxed);
         let attempt_started = Instant::now();
         let mut ctx = crate::dispatch::bridge_ctx(
             &plan.request_id,
@@ -379,6 +468,17 @@ async fn acquire_fallback_stream(
                 let up = crate::stream_timeout::with_read_timeout(up, timeouts.stream);
                 plan.state.health.record_success(&model.display_name);
                 plan.state.runtime_status.mark_healthy(&attempt.id);
+                // Convert the reservation into a stream-lifetime hold
+                // and register its keys so the completion closure bills
+                // this target's TPM post-stream too.
+                let hold = member_reservation.map(|r| {
+                    plan.shared
+                        .extra_post_stream_keys
+                        .lock()
+                        .expect("extra keys lock")
+                        .extend(r.keys());
+                    r.into_stream_hold()
+                });
                 {
                     let mut serving = plan.serving.lock().expect("serving lock");
                     serving.attempt_index += 1;
@@ -398,11 +498,13 @@ async fn acquire_fallback_stream(
                     continuation_bytes = partial.len(),
                     "mid-stream fallback target streaming; continuing client response",
                 );
-                return Ok(up);
+                return Ok((up, hold));
             }
             Err(err) => {
-                // The candidate never produced a stream — record it as
-                // its own failed attempt (zero tokens) and move on.
+                // The candidate never produced a stream — the refused
+                // reservation drops here, rolling its counters back.
+                // Record it as a failed attempt (zero tokens) and move
+                // on.
                 let rec = AttemptRecord {
                     index: {
                         let mut serving = plan.serving.lock().expect("serving lock");

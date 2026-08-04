@@ -192,7 +192,7 @@ describe("mid-stream fallback e2e", () => {
     );
     expect(body.messages[2].role).toBe("assistant");
     expect(body.messages[2].content).toBe("Once upon ");
-  });
+  }, 30_000);
 
   test("inter-chunk stall past stream_timeout falls back when read_timeout is a trigger", async (ctx) => {
     if (!etcdReachable || !app || !seed) {

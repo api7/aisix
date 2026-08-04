@@ -192,11 +192,10 @@ pub struct Routing {
     pub stream_failure: Option<StreamFailure>,
 }
 
-/// Mid-stream failure policy for streaming responses (AISIX-Cloud#1222).
-///
-/// Applies only to failures that occur after the response head (and
-/// possibly some chunks) reached the client; failures before the first
-/// chunk keep using the regular retry/failover loop.
+/// Mid-stream failure policy for streaming responses. Applies only to
+/// failures that occur after the response head (and possibly some
+/// chunks) reached the client; failures before the first chunk keep
+/// using the regular retry/failover loop.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct StreamFailure {
     /// `terminate` (default) keeps the current behavior. `continue` lets
@@ -240,7 +239,8 @@ impl StreamFailure {
     }
 }
 
-/// See [`StreamFailure::mode`].
+/// How a mid-stream failure is handled once the response is already
+/// streaming to the client.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
 )]
