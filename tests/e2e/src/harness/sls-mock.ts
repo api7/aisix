@@ -93,9 +93,23 @@ export async function startMockSls(): Promise<MockSls> {
   };
 }
 
-/** Decompress every PutLogs body for a logstore and join as one searchable string. */
-export function decodedTextFor(sls: MockSls, logstore: string): string {
+/**
+ * Decompress PutLogs bodies for a logstore and join as one searchable string.
+ *
+ * `fromIndex` skips everything the mock had already received at that point.
+ * A test that drives warm-up traffic to wait for config propagation exports
+ * those warm-up requests too, and they were served by whatever config was
+ * live at the time — asserting over them means asserting about a
+ * deliberately-unconverged gateway. Snapshot `sls.requests.length` once the
+ * config is confirmed live and pass it here.
+ */
+export function decodedTextFor(
+  sls: MockSls,
+  logstore: string,
+  fromIndex = 0,
+): string {
   return sls.requests
+    .slice(fromIndex)
     .filter((r) => r.logstore === logstore && r.rawSize > 0 && r.body.length > 0)
     .map((r) => lz4DecompressBlock(r.body, r.rawSize).toString("utf8"))
     .join(" ");
@@ -114,16 +128,20 @@ export async function waitForLogstore(
   throw new Error(`no PutLogs to logstore '${logstore}' within ${timeoutMs}ms`);
 }
 
-/** Poll until the decoded logstore text contains `token` (or time out). */
+/**
+ * Poll until the decoded logstore text contains `token` (or time out).
+ * `fromIndex` has the same meaning as in [`decodedTextFor`].
+ */
 export async function waitForToken(
   sls: MockSls,
   logstore: string,
   token: string,
   timeoutMs = 10_000,
+  fromIndex = 0,
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (decodedTextFor(sls, logstore).includes(token)) return;
+    if (decodedTextFor(sls, logstore, fromIndex).includes(token)) return;
     await new Promise((r) => setTimeout(r, 50));
   }
   throw new Error(`token '${token}' not seen in logstore '${logstore}' within ${timeoutMs}ms`);
