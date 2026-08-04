@@ -406,9 +406,7 @@ impl<P: ConfigProvider> Supervisor<P> {
     /// The retained partially-compatible state in the two wire shapes
     /// [`LoadObservation`] carries: the per-(kind, field) aggregate and
     /// the per-kind row counts.
-    fn partial_compat_observation(
-        &self,
-    ) -> (Vec<PartialCompatResource>, BTreeMap<String, usize>) {
+    fn partial_compat_observation(&self) -> (Vec<PartialCompatResource>, BTreeMap<String, usize>) {
         let guard = self.partial_compat.lock().unwrap();
         let rows: Vec<PartialCompatRow> = guard.values().cloned().collect();
         drop(guard);

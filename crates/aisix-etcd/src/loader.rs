@@ -149,7 +149,9 @@ pub fn aggregate_partial_compat(rows: &[PartialCompatRow]) -> Vec<PartialCompatE
     let mut counts: std::collections::BTreeMap<(&str, &str), usize> = Default::default();
     for row in rows {
         for field in &row.fields {
-            *counts.entry((row.kind.as_str(), field.as_str())).or_insert(0) += 1;
+            *counts
+                .entry((row.kind.as_str(), field.as_str()))
+                .or_insert(0) += 1;
         }
     }
     counts

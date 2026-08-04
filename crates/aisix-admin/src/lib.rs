@@ -843,9 +843,7 @@ mod tests {
                 field: "quota_profile".into(),
                 count: 2,
             }],
-            partially_compatible_rows_by_kind: [("api_keys".to_string(), 2)]
-                .into_iter()
-                .collect(),
+            partially_compatible_rows_by_kind: [("api_keys".to_string(), 2)].into_iter().collect(),
             is_reload: true,
             wholly_rejected: false,
         });
