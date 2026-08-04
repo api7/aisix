@@ -9,8 +9,11 @@
 //!
 //! Replacement substitutes the **matched portion** of the path, with
 //! `$1`/`${name}` expanding capture groups; the query string is preserved as
-//! sent. Rules were syntax-checked at config load (`Config::validate`), so
-//! compiling them here cannot fail on operator input.
+//! sent. Patterns are matched against the **raw, percent-encoded** request
+//! path — no decoding, no normalization — unlike gateways that match a
+//! decoded `$uri`. Rules were validated at config load (`Config::validate`:
+//! regex syntax, template group references, forbidden template characters),
+//! so compiling them here cannot fail on operator input.
 
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -70,9 +73,6 @@ pub async fn rewrite_request_uri(
     mut request: Request,
     next: Next,
 ) -> Response {
-    if state.url_rewrites.is_empty() {
-        return next.run(request).await;
-    }
     let fired = state.url_rewrites.iter().find_map(|rule| {
         let path = request.uri().path();
         rule.apply(path).map(|to| (rule, path.to_owned(), to))
@@ -223,5 +223,33 @@ mod tests {
         let router = router_with_rules(Vec::new());
         assert_eq!(get(router.clone(), "/livez").await, 200);
         assert_eq!(get(router, "/legacy/health").await, 404);
+    }
+
+    #[tokio::test]
+    async fn runtime_invalid_rewrite_leaves_the_request_unrewritten() {
+        // Bypasses Config::validate on purpose (ProxyState::new takes the
+        // config directly): a template that assembles an invalid path must
+        // warn and serve the ORIGINAL path — here /livez still routes.
+        let router = router_with_rules(vec![rule("^/livez$", "/livez x")]);
+        assert_eq!(get(router, "/livez").await, 200);
+    }
+
+    #[tokio::test]
+    async fn router_matches_the_raw_percent_encoded_path() {
+        // No decoding, no normalization: an encoded variant of a matching
+        // path does not match and passes through to a 404.
+        let router = router_with_rules(vec![rule("^/legacy/health$", "/livez")]);
+        assert_eq!(get(router.clone(), "/legacy/health").await, 200);
+        assert_eq!(get(router.clone(), "/legacy%2Fhealth").await, 404);
+        assert_eq!(get(router, "/legac%79/health").await, 404);
+    }
+
+    #[test]
+    fn apply_replaces_only_the_first_occurrence() {
+        let compiled = compile(&[rule("/legacy", "/cur")]);
+        assert_eq!(
+            compiled[0].apply("/legacy/legacy").as_deref(),
+            Some("/cur/legacy")
+        );
     }
 }

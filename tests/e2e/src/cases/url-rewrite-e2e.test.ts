@@ -194,8 +194,10 @@ describe("url rewrite e2e: proxy.url_rewrites", () => {
     const res = await fetch(`${app.proxyUrl}/compat/health`);
     expect(res.status).toBe(200);
 
-    // The query string survives the rewrite (the endpoint ignores it, but
-    // a broken rewrite would 404 or drop it before routing).
+    // A request carrying a query string still matches and routes (`match`
+    // never sees the query). Preservation of the query itself is pinned by
+    // the `with_path_preserves_the_query_string` unit test — no proxy
+    // endpoint echoes its query back for an e2e-level assertion.
     const withQuery = await fetch(`${app.proxyUrl}/compat/health?probe=1`);
     expect(withQuery.status).toBe(200);
   });

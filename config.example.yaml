@@ -55,10 +55,15 @@ proxy:
   # before routing. The first rule whose `match` regex matches the request
   # path rewrites it (once, no cascading); the request then flows through
   # the normal endpoint — auth, ACL, quota — as if the client had sent the
-  # rewritten path. `rewrite` replaces the matched portion of the path
-  # ($1/${name} expand capture groups); the query string is preserved. An
-  # invalid regex fails startup. Example: serve per-server MCP URLs like
-  # /mcp-servers/github/mcp on the /mcp/{server} endpoint.
+  # rewritten path. `match` runs against the RAW, percent-encoded path (no
+  # decoding or normalization); `rewrite` replaces the matched portion
+  # ($1/${name} expand capture groups; use ${1}text to follow a group with
+  # literal text); the query string is preserved. Invalid regexes, unknown
+  # group references, and `?`/`#`/whitespace in the template fail startup.
+  # In env-only deployments set the whole list as one JSON array:
+  # AISIX_PROXY__URL_REWRITES='[{"match":"...","rewrite":"..."}]'
+  # Example: serve per-server MCP URLs like /mcp-servers/github/mcp on
+  # the /mcp/{server} endpoint.
   # url_rewrites:
   #   - name: per-server-mcp-compat
   #     match: "^/mcp-servers/([^/]+)/mcp$"

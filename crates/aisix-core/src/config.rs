@@ -401,7 +401,12 @@ pub struct ProxyConfig {
     /// had sent the rewritten path. Lets operators map legacy URL shapes
     /// onto AISIX endpoints, e.g. per-server MCP paths onto
     /// `/mcp/{server}`. Empty (the default) = no rewriting.
-    #[serde(default)]
+    ///
+    /// Env-only deployments (the chart injects config purely through
+    /// `AISIX_*` vars, which cannot express a structured list) set the
+    /// whole list as one JSON array:
+    /// `AISIX_PROXY__URL_REWRITES='[{"match":"^/x$","rewrite":"/y"}]'`.
+    #[serde(default, deserialize_with = "deserialize_url_rewrites")]
     pub url_rewrites: Vec<UrlRewriteRule>,
 }
 
@@ -418,17 +423,109 @@ pub struct UrlRewriteRule {
     /// Optional name, used in logs when the rule fires.
     #[serde(default)]
     pub name: Option<String>,
-    /// Regex matched against the request path (never the query string).
-    /// Anchor with `^`/`$` to match the whole path; an unanchored pattern
-    /// matches anywhere in it.
+    /// Regex matched against the **raw, percent-encoded** request path
+    /// (never the query string) — no decoding, no normalization. Anchor
+    /// with `^`/`$` to match the whole path; an unanchored pattern matches
+    /// anywhere in it. Must not match the empty string.
     #[serde(rename = "match")]
     pub pattern: String,
     /// Replacement for the matched portion of the path. Capture groups are
     /// available as `$1`… / `${name}`; use `${1}x` (braced) when a literal
-    /// character follows a group reference. The query string is preserved
-    /// as sent.
+    /// character follows a group reference (`$1x` reads as the group named
+    /// `1x`). The query string is preserved as sent, so the template must
+    /// not contain `?`, `#`, whitespace, or control characters.
     #[serde(rename = "rewrite")]
     pub replacement: String,
+}
+
+/// Accept `url_rewrites` either as a structured sequence (config file) or
+/// as a JSON array carried in one string — the only shape an env var can
+/// hold, and env vars are the sole config channel in chart-driven
+/// deployments.
+fn deserialize_url_rewrites<'de, D>(deserializer: D) -> Result<Vec<UrlRewriteRule>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum SeqOrJsonString {
+        Seq(Vec<UrlRewriteRule>),
+        JsonString(String),
+    }
+    match SeqOrJsonString::deserialize(deserializer)? {
+        SeqOrJsonString::Seq(rules) => Ok(rules),
+        SeqOrJsonString::JsonString(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return Ok(Vec::new());
+            }
+            serde_json::from_str(trimmed)
+                .map_err(|e| serde::de::Error::custom(format!("url_rewrites JSON string: {e}")))
+        }
+    }
+}
+
+/// Reject a rewrite template that references capture groups its pattern
+/// does not define — the regex engine expands unknown references to the
+/// empty string, which would silently rewrite traffic to the wrong
+/// endpoint. Mirrors the engine's replacement syntax: `$$` is a literal
+/// `$`, `${name}` is a braced reference, and a bare `$name` reference
+/// spans the longest run of `[0-9A-Za-z_]` (so `$1x` reads as a group
+/// named `1x`, not group 1 followed by `x`).
+fn validate_rewrite_template_refs(regex: &regex::Regex, template: &str) -> Result<(), String> {
+    let names: std::collections::HashSet<&str> = regex.capture_names().flatten().collect();
+    let group_count = regex.captures_len(); // includes group 0 (the whole match)
+    let ref_ok = |name: &str| {
+        if name.chars().all(|c| c.is_ascii_digit()) {
+            name.parse::<usize>().is_ok_and(|idx| idx < group_count)
+        } else {
+            names.contains(name)
+        }
+    };
+    let bytes = template.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'$' {
+            i += 1;
+            continue;
+        }
+        if bytes.get(i + 1) == Some(&b'$') {
+            i += 2;
+            continue;
+        }
+        if bytes.get(i + 1) == Some(&b'{') {
+            let Some(end) = template[i + 2..].find('}') else {
+                return Err("rewrite has an unterminated `${…}` group reference".to_string());
+            };
+            let name = &template[i + 2..i + 2 + end];
+            if name.is_empty() || !ref_ok(name) {
+                return Err(format!(
+                    "rewrite references unknown capture group `${{{name}}}`"
+                ));
+            }
+            i += 2 + end + 1;
+            continue;
+        }
+        let start = i + 1;
+        let mut end = start;
+        while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+            end += 1;
+        }
+        if end == start {
+            // A bare trailing `$`: the engine treats it as a literal.
+            i += 1;
+            continue;
+        }
+        let name = &template[start..end];
+        if !ref_ok(name) {
+            return Err(format!(
+                "rewrite references unknown capture group `${name}` \
+                 (write `${{N}}text` to follow group N with literal text)"
+            ));
+        }
+        i = end;
+    }
+    Ok(())
 }
 
 /// nginx `set_real_ip_from` + `real_ip_recursive` equivalent. Resolves
@@ -1124,18 +1221,52 @@ impl Config {
     }
 
     fn validate(&self) -> Result<(), BootstrapError> {
-        // Fail fast on a rewrite rule that can never compile: it would
-        // otherwise surface as every legacy-path request 404ing, which is
-        // much harder to trace back to a typo in one regex.
+        // Fail fast on an unusable rewrite rule: a broken rule would
+        // otherwise surface at runtime as silently mis-routed or 404ing
+        // legacy traffic, which is much harder to trace back to a typo in
+        // one line of config.
         for (i, rule) in self.proxy.url_rewrites.iter().enumerate() {
-            if let Err(e) = regex::Regex::new(&rule.pattern) {
-                let ctx = rule
-                    .name
+            let ctx = || {
+                rule.name
                     .clone()
-                    .unwrap_or_else(|| format!("proxy.url_rewrites[{i}]"));
+                    .unwrap_or_else(|| format!("proxy.url_rewrites[{i}]"))
+            };
+            let regex = match regex::Regex::new(&rule.pattern) {
+                Ok(regex) => regex,
+                Err(e) => {
+                    return Err(BootstrapError::Config(format!(
+                        "{}: invalid match regex: {e}",
+                        ctx()
+                    )));
+                }
+            };
+            // A pattern that matches the empty string would fire on every
+            // request (zero-width match at position 0) and prepend the
+            // template to every path.
+            if regex.find("").is_some() {
                 return Err(BootstrapError::Config(format!(
-                    "{ctx}: invalid match regex: {e}"
+                    "{}: match must not match the empty string",
+                    ctx()
                 )));
+            }
+            // The template lands inside a URI path; a `?` would absorb the
+            // caller's query into itself and a `#` would truncate the path
+            // as a fragment — both silently. Reject them (and unprintables)
+            // up front; capture-group expansions are safe because a request
+            // path can never contain these characters raw.
+            if let Some(bad) = rule
+                .replacement
+                .chars()
+                .find(|c| matches!(c, '?' | '#') || c.is_whitespace() || c.is_control())
+            {
+                return Err(BootstrapError::Config(format!(
+                    "{}: rewrite must not contain {bad:?} (the template is a path; \
+                     the query string is preserved automatically)",
+                    ctx()
+                )));
+            }
+            if let Err(e) = validate_rewrite_template_refs(&regex, &rule.replacement) {
+                return Err(BootstrapError::Config(format!("{}: {e}", ctx())));
             }
         }
         if let Some(path) = self.resources_file.as_deref() {
@@ -1392,6 +1523,118 @@ admin:
             format!("{err}").contains("url_rewrites"),
             "error should name the bad rule: {err}"
         );
+    }
+
+    #[test]
+    fn url_rewrites_accepts_a_json_string_for_env_only_deployments() {
+        // Chart-driven deployments inject config purely through AISIX_* env
+        // vars, which cannot express a structured list — the whole list
+        // rides in one JSON string. A YAML string scalar takes the same
+        // code path as the env source.
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+  prefix: "/aisix"
+proxy:
+  addr: "0.0.0.0:3000"
+  url_rewrites: '[{"name":"compat","match":"^/mcp-servers/([^/]+)/mcp$","rewrite":"/mcp/$1"}]'
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+"#,
+        );
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert_eq!(cfg.proxy.url_rewrites.len(), 1);
+        assert_eq!(cfg.proxy.url_rewrites[0].name.as_deref(), Some("compat"));
+
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+  prefix: "/aisix"
+proxy:
+  addr: "0.0.0.0:3000"
+  url_rewrites: '[{"match": broken'
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+"#,
+        );
+        let err = Config::load_from_path(Some(f.path())).unwrap_err();
+        assert!(
+            format!("{err}").contains("url_rewrites"),
+            "error should name the field: {err}"
+        );
+    }
+
+    #[test]
+    fn url_rewrites_rejects_silent_template_mistakes() {
+        let case = |rule_yaml: &str, expect: &str| {
+            let f = write_yaml(&format!(
+                r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+  prefix: "/aisix"
+proxy:
+  addr: "0.0.0.0:3000"
+  url_rewrites:
+{rule_yaml}
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+"#
+            ));
+            let err = Config::load_from_path(Some(f.path())).unwrap_err();
+            assert!(
+                format!("{err}").contains(expect),
+                "expected {expect:?} in: {err}"
+            );
+        };
+
+        // An unknown group reference expands to the empty string at runtime
+        // — every legacy request would silently land on the wrong endpoint.
+        case(
+            "    - match: \"^/mcp-servers/([^/]+)/mcp$\"\n      rewrite: \"/mcp/$2\"",
+            "unknown capture group",
+        );
+        case(
+            "    - match: \"^/gw/(?P<server>[^/]+)$\"\n      rewrite: \"/mcp/${srv}\"",
+            "unknown capture group",
+        );
+        // `?` would absorb the caller's query; `#` would truncate the path.
+        case(
+            "    - match: \"^/a$\"\n      rewrite: \"/v1/chat?model=x\"",
+            "must not contain",
+        );
+        case(
+            "    - match: \"^/a$\"\n      rewrite: \"/v1/models#frag\"",
+            "must not contain",
+        );
+        // A pattern matching the empty string fires on every request.
+        case(
+            "    - match: \"(x)?\"\n      rewrite: \"/y\"",
+            "empty string",
+        );
+
+        // The braced form with literal text after a group is the valid way
+        // to write what `$1x` cannot mean.
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+  prefix: "/aisix"
+proxy:
+  addr: "0.0.0.0:3000"
+  url_rewrites:
+    - match: "^/gw/(?P<server>[^/]+)/v(\\d+)$"
+      rewrite: "/mcp/${server}-v${2}"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+"#,
+        );
+        Config::load_from_path(Some(f.path())).expect("braced references are valid");
     }
 
     #[test]
