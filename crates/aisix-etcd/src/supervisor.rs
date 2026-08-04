@@ -767,13 +767,21 @@ impl<P: ConfigProvider> Supervisor<P> {
         // retention (#871): the pin must never outlive the etcd key.
         self.update_partial_row(key_str, None);
         self.stale_serving.lock().unwrap().remove(key_str);
+        // The observed-state map drops the key on BOTH branches below.
+        // A key can be absent from the snapshot yet present in `state`:
+        // a rejected put mirrors its bytes there even when the row never
+        // served. Leaving those bytes behind would keep the deleted key
+        // in source_hash until the next resync and persist the deleted
+        // document in the cache file.
+        let removed_state = self.state.lock().unwrap().remove(key_str).is_some();
         drop(snap);
         if !present {
-            if removed_rejection {
+            if removed_rejection || removed_state {
                 let cur_rev = *self.revision.lock().unwrap();
                 self.status.record_apply(cur_rev);
                 // Clearing a rejected key changes the reported state.
                 self.sync_config_status(false);
+                self.flush_cache();
             }
             return removed_rejection;
         }
@@ -827,7 +835,6 @@ impl<P: ConfigProvider> Supervisor<P> {
             }
             new
         });
-        self.state.lock().unwrap().remove(key_str);
         // Stamp /admin/v1/health freshness on a successful delete. We
         // don't have a per-event revision on the wire delete
         // (the etcd watch revision is held at the cycle level);
@@ -1140,65 +1147,95 @@ fn clone_snapshot(src: &AisixSnapshot) -> AisixSnapshot {
 }
 
 /// Insert every entry of `src` into `dst` (replacing same-id entries).
-/// Must cover every ResourceTable on [`AisixSnapshot`] — a missing kind
-/// here means entries of that kind silently drop on the floor when a
-/// watch put merges or a last-known-good row is re-injected on resync.
+/// The exhaustive destructuring makes adding a ResourceTable to
+/// [`AisixSnapshot`] a compile error here — a missing kind would mean
+/// entries silently drop on the floor when a watch put merges or a
+/// last-known-good row is re-injected on resync.
 fn merge_snapshot(dst: &AisixSnapshot, src: &AisixSnapshot) {
-    for e in src.models.entries() {
+    let AisixSnapshot {
+        models,
+        apikeys,
+        provider_keys,
+        guardrails,
+        guardrail_attachments,
+        cache_policies,
+        observability_exporters,
+        rate_limit_policies,
+        mcp_servers,
+        mcp_policies,
+        a2a_agents,
+        oidc_providers,
+    } = src;
+    for e in models.entries() {
         dst.models.insert(clone_entry(&e));
     }
-    for e in src.apikeys.entries() {
+    for e in apikeys.entries() {
         dst.apikeys.insert(clone_entry(&e));
     }
-    for e in src.provider_keys.entries() {
+    for e in provider_keys.entries() {
         dst.provider_keys.insert(clone_entry(&e));
     }
-    for e in src.guardrails.entries() {
+    for e in guardrails.entries() {
         dst.guardrails.insert(clone_entry(&e));
     }
-    for e in src.guardrail_attachments.entries() {
+    for e in guardrail_attachments.entries() {
         dst.guardrail_attachments.insert(clone_entry(&e));
     }
-    for e in src.cache_policies.entries() {
+    for e in cache_policies.entries() {
         dst.cache_policies.insert(clone_entry(&e));
     }
-    for e in src.observability_exporters.entries() {
+    for e in observability_exporters.entries() {
         dst.observability_exporters.insert(clone_entry(&e));
     }
-    for e in src.rate_limit_policies.entries() {
+    for e in rate_limit_policies.entries() {
         dst.rate_limit_policies.insert(clone_entry(&e));
     }
-    for e in src.mcp_servers.entries() {
+    for e in mcp_servers.entries() {
         dst.mcp_servers.insert(clone_entry(&e));
     }
-    for e in src.mcp_policies.entries() {
+    for e in mcp_policies.entries() {
         dst.mcp_policies.insert(clone_entry(&e));
     }
-    for e in src.a2a_agents.entries() {
+    for e in a2a_agents.entries() {
         dst.a2a_agents.insert(clone_entry(&e));
     }
-    for e in src.oidc_providers.entries() {
+    for e in oidc_providers.entries() {
         dst.oidc_providers.insert(clone_entry(&e));
     }
 }
 
-/// Whether the snapshot holds an entry for `(kind, id)`. Mirrors the
-/// kind dispatch of [`Supervisor::apply_delete`]'s presence probe; an
-/// unknown kind reads as absent.
+/// Whether the snapshot holds an entry for `(kind, id)`. An unknown
+/// kind reads as absent. Exhaustively destructured for the same
+/// drift-guard reason as [`merge_snapshot`]: a kind added to the
+/// snapshot but missed here would silently never pin a last known good.
 fn snapshot_has(snap: &AisixSnapshot, kind: &str, id: &str) -> bool {
+    let AisixSnapshot {
+        models,
+        apikeys,
+        provider_keys,
+        guardrails,
+        guardrail_attachments,
+        cache_policies,
+        observability_exporters,
+        rate_limit_policies,
+        mcp_servers,
+        mcp_policies,
+        a2a_agents,
+        oidc_providers,
+    } = snap;
     match kind {
-        "models" => snap.models.get_by_id(id).is_some(),
-        "api_keys" => snap.apikeys.get_by_id(id).is_some(),
-        "provider_keys" => snap.provider_keys.get_by_id(id).is_some(),
-        "guardrails" => snap.guardrails.get_by_id(id).is_some(),
-        "guardrail_attachments" => snap.guardrail_attachments.get_by_id(id).is_some(),
-        "cache_policies" => snap.cache_policies.get_by_id(id).is_some(),
-        "observability_exporters" => snap.observability_exporters.get_by_id(id).is_some(),
-        "rate_limit_policies" => snap.rate_limit_policies.get_by_id(id).is_some(),
-        "mcp_servers" => snap.mcp_servers.get_by_id(id).is_some(),
-        "mcp_policies" => snap.mcp_policies.get_by_id(id).is_some(),
-        "a2a_agents" => snap.a2a_agents.get_by_id(id).is_some(),
-        "oidc_providers" => snap.oidc_providers.get_by_id(id).is_some(),
+        "models" => models.get_by_id(id).is_some(),
+        "api_keys" => apikeys.get_by_id(id).is_some(),
+        "provider_keys" => provider_keys.get_by_id(id).is_some(),
+        "guardrails" => guardrails.get_by_id(id).is_some(),
+        "guardrail_attachments" => guardrail_attachments.get_by_id(id).is_some(),
+        "cache_policies" => cache_policies.get_by_id(id).is_some(),
+        "observability_exporters" => observability_exporters.get_by_id(id).is_some(),
+        "rate_limit_policies" => rate_limit_policies.get_by_id(id).is_some(),
+        "mcp_servers" => mcp_servers.get_by_id(id).is_some(),
+        "mcp_policies" => mcp_policies.get_by_id(id).is_some(),
+        "a2a_agents" => a2a_agents.get_by_id(id).is_some(),
+        "oidc_providers" => oidc_providers.get_by_id(id).is_some(),
         _ => false,
     }
 }
@@ -2056,6 +2093,40 @@ mod tests {
                 "the rejection signal must survive the restart too",
             );
         }
+    }
+
+    #[tokio::test]
+    async fn deleting_a_rejected_never_serving_key_clears_observed_state() {
+        // Audit finding on #871 PR2: a rejected put now mirrors its
+        // bytes into the observed-state map even when the row never
+        // served (no pin). Deleting that key takes the `!present` early
+        // return in apply_delete, which must still drop the bytes from
+        // `state` — otherwise the deleted key haunts source_hash until
+        // the next resync and its document persists in the cache file.
+        let provider = Arc::new(FakeProvider::new(vec![], 0));
+        let sup = Supervisor::new(provider, "/aisix");
+        sup.load_once().await.unwrap();
+        let clean_hash = sup.config_status().view().source.source_hash;
+
+        // Never served: the very first put for the key is rejected.
+        assert!(!sup.apply_put(&entry("/aisix/models/m-bad", BAD_PROVIDER_MODEL, 1)));
+        assert!(sup.handle().load().models.is_empty());
+        assert_ne!(
+            sup.config_status().view().source.source_hash,
+            clean_hash,
+            "the rejected bytes are part of the observed etcd state",
+        );
+
+        // The delete finds nothing in the snapshot but must still clear
+        // the observed-state entry (and the rejection — clearing it is
+        // "something removed", so the call reports true).
+        assert!(sup.apply_delete("/aisix/models/m-bad"));
+        assert!(sup.recent_rejections().is_empty());
+        assert_eq!(
+            sup.config_status().view().source.source_hash,
+            clean_hash,
+            "a deleted key must leave the observed etcd state immediately",
+        );
     }
 
     #[tokio::test]

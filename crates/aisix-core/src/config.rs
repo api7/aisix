@@ -264,7 +264,8 @@ pub struct ManagedConfig {
     /// enables the cache in either mode — self-hosted etcd deployments
     /// gain the same offline resilience by opting in. Empty string
     /// disables persistence everywhere — useful for ephemeral test runs
-    /// where you don't want a stale cache to mask a real failure.
+    /// where you don't want a stale cache to mask a real failure. A
+    /// bare `snapshot_cache_path:` (YAML null) is treated as omitted.
     #[serde(default)]
     pub snapshot_cache_path: Option<String>,
 
