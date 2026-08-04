@@ -804,6 +804,10 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
         h = h.with_config_hash_fetcher(Arc::new(move || {
             config_status_for_heartbeat.applied_config_hash()
         }));
+        let supervisor_for_partial = Arc::clone(supervisor);
+        h = h.with_partial_compat_fetcher(Arc::new(move || {
+            supervisor_for_partial.recent_partial_compat()
+        }));
         let fan_out = proxy_state.otlp_fan_out.clone();
         h = h.with_exporter_health_fetcher(Arc::new(move || fan_out.exporter_stats()));
         heartbeat::spawn(h, cancel_rx.clone())

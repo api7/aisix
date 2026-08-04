@@ -178,6 +178,12 @@ pub const M_CONFIG_LAST_RELOAD_SUCCESS_TIMESTAMP: &str =
 pub const M_CONFIG_RELOADS_TOTAL: &str = "aisix_config_reloads_total";
 pub const M_CONFIG_RELOAD_FAILURES_TOTAL: &str = "aisix_config_reload_failures_total";
 pub const M_CONFIG_REJECTED_RESOURCES: &str = "aisix_config_rejected_resources";
+/// Served resources per kind carrying fields this gateway version does not
+/// know (loaded with those fields ignored — partially compatible, #871).
+/// Non-zero typically means a newer control plane is writing ahead of this
+/// data plane's rollout.
+pub const M_CONFIG_PARTIALLY_COMPATIBLE_RESOURCES: &str =
+    "aisix_config_partially_compatible_resources";
 pub const M_CONFIG_OBSERVED_REVISION: &str = "aisix_config_observed_revision";
 pub const M_CONFIG_APPLIED_REVISION: &str = "aisix_config_applied_revision";
 pub const M_CONFIG_HASH_INFO: &str = "aisix_config_hash_info";
@@ -343,6 +349,7 @@ struct MetricsInner {
 struct ConfigLabelState {
     last_hash: Option<String>,
     last_rejected_kinds: std::collections::HashSet<String>,
+    last_partial_kinds: std::collections::HashSet<String>,
 }
 
 const REQUEST_SERIES_CACHE_CAPACITY: usize = 1024;
@@ -693,6 +700,21 @@ impl Metrics {
                     .set(*count as f64);
             }
             labels.last_rejected_kinds = view.rejected_by_kind.keys().cloned().collect();
+
+            // Partially-compatible gauge per kind, same zeroing discipline.
+            // Per-field detail deliberately stays off the labels (field paths
+            // are not a bounded set) — it lives in `/status/config`.
+            for kind in &labels.last_partial_kinds {
+                if !view.partially_compatible_by_kind.contains_key(kind) {
+                    metrics::gauge!(M_CONFIG_PARTIALLY_COMPATIBLE_RESOURCES, "kind" => kind.clone())
+                        .set(0.0);
+                }
+            }
+            for (kind, count) in &view.partially_compatible_by_kind {
+                metrics::gauge!(M_CONFIG_PARTIALLY_COMPATIBLE_RESOURCES, "kind" => kind.clone())
+                    .set(*count as f64);
+            }
+            labels.last_partial_kinds = view.partially_compatible_by_kind.keys().cloned().collect();
         });
     }
 
@@ -3027,6 +3049,7 @@ mod tests {
             reloads_total: 3,
             reload_failures: std::collections::BTreeMap::new(),
             rejected_by_kind: std::collections::BTreeMap::new(),
+            partially_compatible_by_kind: std::collections::BTreeMap::new(),
             observed_revision: Some(42),
             applied_revision: Some(42),
             config_hash: Some("abc123".into()),
@@ -3041,6 +3064,8 @@ mod tests {
         view.last_reload_successful = false;
         view.reload_failures.insert("validate", 2);
         view.rejected_by_kind.insert("models".to_string(), 1);
+        view.partially_compatible_by_kind
+            .insert("api_keys".to_string(), 3);
         m.sync_config_status(&view);
         let out = m.render();
 
@@ -3052,6 +3077,9 @@ mod tests {
         )));
         assert!(out.contains(&format!(
             "{M_CONFIG_REJECTED_RESOURCES}{{kind=\"models\"}} 1"
+        )));
+        assert!(out.contains(&format!(
+            "{M_CONFIG_PARTIALLY_COMPATIBLE_RESOURCES}{{kind=\"api_keys\"}} 3"
         )));
         assert!(out.contains(&format!("{M_CONFIG_OBSERVED_REVISION} 42")));
         assert!(out.contains(&format!("{M_CONFIG_APPLIED_REVISION} 42")));
@@ -3080,6 +3108,9 @@ mod tests {
         let mut first = config_metrics_view(aisix_core::SourceKind::Etcd);
         first.config_hash = Some("hash-A".into());
         first.rejected_by_kind.insert("models".to_string(), 2);
+        first
+            .partially_compatible_by_kind
+            .insert("api_keys".to_string(), 1);
         m.sync_config_status(&first);
 
         // The applied config changes and the models rejection clears.
@@ -3095,6 +3126,10 @@ mod tests {
         // The cleared kind is zeroed, not left at its stale count.
         assert!(out.contains(&format!(
             "{M_CONFIG_REJECTED_RESOURCES}{{kind=\"models\"}} 0"
+        )));
+        // Same zeroing discipline for the partially-compatible gauge.
+        assert!(out.contains(&format!(
+            "{M_CONFIG_PARTIALLY_COMPATIBLE_RESOURCES}{{kind=\"api_keys\"}} 0"
         )));
     }
 

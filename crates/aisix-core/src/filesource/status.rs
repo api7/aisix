@@ -64,6 +64,8 @@ pub fn load_resources_file_tracked(
                     resource_counts: resource_counts(snapshot),
                 }),
                 rejected: vec![],
+                partially_compatible: Vec::new(),
+                partially_compatible_rows_by_kind: Default::default(),
                 is_reload,
                 wholly_rejected: false,
             });
@@ -81,6 +83,8 @@ pub fn load_resources_file_tracked(
                 // No snapshot applied — the previous one keeps serving.
                 applied: None,
                 rejected,
+                partially_compatible: Vec::new(),
+                partially_compatible_rows_by_kind: Default::default(),
                 is_reload,
                 // The whole file was rejected; last-good retained.
                 wholly_rejected: true,
