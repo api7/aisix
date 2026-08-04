@@ -1522,6 +1522,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn apply_put_rejects_semantically_invalid_policy_and_keeps_last_good() {
+        // A conditional policy row that passes the JSON Schema but fails
+        // the semantic gate (uncompilable regex) must behave exactly
+        // like a schema failure on the watch path: apply_put returns
+        // false, the previously-served row keeps serving, and the
+        // rejection lands in the retained buffer for the heartbeat
+        // (AISIX-Cloud#892 + #115).
+        let good = br#"{
+            "name": "premium",
+            "conditions": [
+                { "dimension": "model_name", "operator": "~~", "value": "^gpt-4" }
+            ],
+            "limits": { "rpm": 5 }
+        }"#;
+        let provider = Arc::new(FakeProvider::new(
+            vec![entry("/aisix/rate_limit_policies/rlp-1", good, 1)],
+            1,
+        ));
+        let sup = Supervisor::new(provider, "/aisix");
+        sup.load_once().await.unwrap();
+
+        let bad = br#"{
+            "name": "premium",
+            "conditions": [
+                { "dimension": "model_name", "operator": "~~", "value": "(unclosed" }
+            ],
+            "limits": { "rpm": 5 }
+        }"#;
+        assert!(!sup.apply_put(&entry("/aisix/rate_limit_policies/rlp-1", bad, 2)));
+
+        // Last-good value keeps serving with its original tree.
+        let snap = sup.handle().load();
+        let served = snap.rate_limit_policies.get_by_id("rlp-1").unwrap();
+        let tree = serde_json::to_value(served.value.conditions.as_ref().unwrap()).unwrap();
+        assert_eq!(tree[0]["value"], "^gpt-4");
+        // The rejection is retained for the next heartbeat.
+        let rejected = sup.recent_rejections();
+        assert!(
+            rejected
+                .iter()
+                .any(|r| r.key == "/aisix/rate_limit_policies/rlp-1"
+                    && r.error.contains("does not compile")),
+            "{rejected:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn apply_delete_removes_entry() {
         let provider = Arc::new(FakeProvider::new(
             vec![entry("/aisix/models/m-1", VALID_MODEL, 1)],

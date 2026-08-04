@@ -1031,29 +1031,54 @@ fn branch_kind(branch: &serde_json::Map<String, Value>) -> Option<&str> {
 
 /// Canonical JSON Schema for the `rate_limit_policy` resource, derived from the
 /// [`RateLimitPolicy`](crate::models::RateLimitPolicy) struct (the `scope`/
-/// `window` closed sets come from the `PolicyScope`/`PolicyWindow` enums) plus
-/// the one cross-field invariant `schemars` can't express: at least one of
-/// `max_requests`/`max_tokens` must be set
-/// ([`super::rate_limit_policy::rate_limit_policy_any_of`]).
+/// `window`/dimension/operator closed sets come from their enums) plus the
+/// cross-field invariants `schemars` can't express:
+///
+/// - the classic/conditional form XOR
+///   ([`super::rate_limit_policy::rate_limit_policy_form_one_of`]), which also
+///   carries the classic form's "at least one of `max_requests`/`max_tokens`";
+/// - the `PolicySchedule` day-selector XOR;
+/// - closing the `ConditionNode` object variants in **both** validator sets:
+///   the node is `#[serde(untagged)]`, so serde buffers its content and
+///   silently swallows unknown fields inside it, invisible to the write
+///   path's serde step and the loader's `serde_ignored` reporting alike — the
+///   schema closure is the only non-silent guard (same reasoning as
+///   `OnEmbeddingFailure` in [`model_root_schema`]).
+///
+/// The tree caps (depth/leaf counts), the operator×dimension admission
+/// matrix and regex compilability are beyond draft-07 — those live in
+/// [`RateLimitPolicy::validate_semantics`], applied by the loader and the
+/// file source after parse.
+///
+/// [`RateLimitPolicy::validate_semantics`]: crate::models::RateLimitPolicy::validate_semantics
 pub fn rate_limit_policy_root_schema() -> Value {
     let mut schema = struct_root_schema::<crate::models::RateLimitPolicy>(false);
     let obj = schema
         .as_object_mut()
         .expect("rate_limit_policy root schema is a JSON object");
     obj.insert(
-        "anyOf".to_string(),
-        super::rate_limit_policy::rate_limit_policy_any_of(),
+        "oneOf".to_string(),
+        super::rate_limit_policy::rate_limit_policy_form_one_of(),
     );
+    let defs = obj
+        .get_mut("definitions")
+        .and_then(Value::as_object_mut)
+        .expect("rate_limit_policy schema has definitions");
     // The schedule day-selector XOR is the same kind of cross-field
     // invariant, one level down in the definitions.
-    obj.get_mut("definitions")
-        .and_then(|d| d.get_mut("PolicySchedule"))
+    defs.get_mut("PolicySchedule")
         .and_then(Value::as_object_mut)
         .expect("rate_limit_policy schema defines PolicySchedule")
         .insert(
             "oneOf".to_string(),
             super::rate_limit_policy::policy_schedule_one_of(),
         );
+    for def in ["PolicyCondition", "ConditionGroup"] {
+        defs.get_mut(def)
+            .and_then(Value::as_object_mut)
+            .unwrap_or_else(|| panic!("rate_limit_policy schema defines {def}"))
+            .insert("additionalProperties".to_string(), json!(false));
+    }
     schema
 }
 
@@ -2781,6 +2806,103 @@ mod tests {
             "window": "minute"
         });
         assert!(validate_rate_limit_policy(&v).is_err());
+    }
+
+    // ---- rate_limit_policy conditional form (AISIX-Cloud#892) ----
+
+    #[test]
+    fn rate_limit_policy_conditional_form_passes_both_validator_sets() {
+        let v = json!({
+            "name": "algo-team-premium",
+            "conditions": [
+                { "dimension": "team", "operator": "in", "value": ["t-1"] },
+                { "logic": "or", "children": [
+                    { "dimension": "model_name", "operator": "~~", "value": "^gpt-4\\.1" },
+                    { "dimension": "provider", "operator": "==", "value": "anthropic" }
+                ]}
+            ],
+            "group_by": ["team"],
+            "limits": { "rpm": 1000, "tpm": 1000000 },
+            "action": "reject"
+        });
+        validate_rate_limit_policy(&v).unwrap();
+        validate_rate_limit_policy_lenient(&v).unwrap();
+    }
+
+    #[test]
+    fn rate_limit_policy_conditional_minimal_is_just_limits() {
+        // conditions/group_by/action are all optional — `limits` alone
+        // is a valid "cap every request in the env" policy.
+        let v = json!({
+            "name": "env-wide",
+            "limits": { "concurrency": 10 }
+        });
+        validate_rate_limit_policy(&v).unwrap();
+    }
+
+    #[test]
+    fn rate_limit_policy_rejects_mixed_forms() {
+        // A row carrying both a classic field and a conditional field
+        // fails the injected oneOf in BOTH validator sets — an old DP
+        // must never half-enforce such a row.
+        let v = json!({
+            "name": "mixed",
+            "scope": "team",
+            "scope_ref": "x",
+            "window": "minute",
+            "max_requests": 10,
+            "limits": { "rpm": 5 }
+        });
+        assert!(validate_rate_limit_policy(&v).is_err());
+        assert!(validate_rate_limit_policy_lenient(&v).is_err());
+    }
+
+    #[test]
+    fn rate_limit_policy_rejects_unknown_field_inside_condition_node() {
+        // ConditionNode is #[serde(untagged)]: serde silently swallows
+        // unknown fields inside untagged content, so the schema closure
+        // on the node definitions is the only guard — in both sets.
+        let v = json!({
+            "name": "sneaky",
+            "conditions": [
+                { "dimension": "team", "operator": "==", "value": "t-1", "extra": 1 }
+            ],
+            "limits": { "rpm": 5 }
+        });
+        assert!(validate_rate_limit_policy(&v).is_err());
+        assert!(validate_rate_limit_policy_lenient(&v).is_err());
+    }
+
+    #[test]
+    fn rate_limit_policy_rejects_unknown_dimension_and_operator() {
+        let bad_dim = json!({
+            "name": "bad",
+            "conditions": [ { "dimension": "region", "operator": "==", "value": "us" } ],
+            "limits": { "rpm": 5 }
+        });
+        assert!(validate_rate_limit_policy(&bad_dim).is_err());
+        let bad_op = json!({
+            "name": "bad",
+            "conditions": [ { "dimension": "team", "operator": "matches", "value": "t" } ],
+            "limits": { "rpm": 5 }
+        });
+        assert!(validate_rate_limit_policy(&bad_op).is_err());
+    }
+
+    #[test]
+    fn rate_limit_policy_classic_rows_unchanged_by_892() {
+        // The exact pre-#892 shape keeps validating — stored rows are
+        // never rewritten, so the classic branch must stay byte-stable.
+        let v = json!({
+            "name": "team-acme-tpm",
+            "scope": "team",
+            "scope_ref": "11111111-1111-1111-1111-111111111111",
+            "window": "minute",
+            "max_requests": 1000,
+            "max_tokens": 1000000
+        });
+        validate_rate_limit_policy(&v).unwrap();
+        validate_rate_limit_policy_lenient(&v).unwrap();
     }
 
     // ---- provider_key schema (issue #302 Phase A skeleton) ----

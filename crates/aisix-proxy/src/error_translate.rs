@@ -86,6 +86,7 @@ pub(crate) fn render_openai_envelope(
             _ => derived_code,
         },
         budget: None,
+        policy: None,
     }
 }
 
@@ -100,6 +101,7 @@ fn generic(message: &str) -> ErrorBody {
         param: None,
         code: None,
         budget: None,
+        policy: None,
     }
 }
 

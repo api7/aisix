@@ -80,6 +80,19 @@ pub struct ErrorBody {
     /// {message,type,param,code} shape is preserved everywhere else.
     #[serde(flatten, skip_serializing_if = "Option::is_none")]
     pub budget: Option<BudgetErrorFields>,
+    /// Identity of the rate-limit policy that rejected the request —
+    /// present on policy-layer 429s only (AISIX-Cloud#892: with several
+    /// policies live, an unattributed 429 is undebuggable). Same
+    /// additive convention as `budget`: absent everywhere else.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy: Option<PolicyErrorRef>,
+}
+
+/// The `error.policy` block on a policy-layer 429.
+#[derive(Debug, Serialize, Clone)]
+pub struct PolicyErrorRef {
+    pub id: String,
+    pub name: String,
 }
 
 /// The structured budget fields that `budget_exceeded` 429s lift from
@@ -113,12 +126,23 @@ impl ErrorEnvelope {
                 param: None,
                 code: None,
                 budget: None,
+                policy: None,
             },
         }
     }
 
     pub fn with_code(mut self, code: impl Into<String>) -> Self {
         self.error.code = Some(code.into());
+        self
+    }
+
+    /// Attach the offending policy's identity to the error block. Only
+    /// the policy-layer 429 path calls this.
+    pub fn with_policy(mut self, id: impl Into<String>, name: impl Into<String>) -> Self {
+        self.error.policy = Some(PolicyErrorRef {
+            id: id.into(),
+            name: name.into(),
+        });
         self
     }
 
@@ -259,6 +283,19 @@ pub enum ProxyError {
     RequestTooLarge { limit_bytes: usize },
     #[error(transparent)]
     RateLimit(#[from] RateLimitError),
+    /// A policy-layer rate-limit rejection carrying the offending
+    /// policy's identity (AISIX-Cloud#892). Same status/type/headers as
+    /// [`Self::RateLimit`]; the envelope adds `error.policy` so a
+    /// caller hitting one of several live policies can tell which. The
+    /// Display form names the policy too, so every path that flattens
+    /// this error into a message (routing attempt records, mid-stream
+    /// failover, ensemble logs) keeps the attribution.
+    #[error("{source} (policy '{policy_name}')")]
+    PolicyRateLimit {
+        source: RateLimitError,
+        policy_id: String,
+        policy_name: String,
+    },
     #[error(transparent)]
     Bridge(#[from] BridgeError),
 }
@@ -303,6 +340,7 @@ impl ProxyError {
             ProxyError::BudgetExceeded(_) => StatusCode::TOO_MANY_REQUESTS,
             ProxyError::RequestTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
             ProxyError::RateLimit(_) => StatusCode::TOO_MANY_REQUESTS,
+            ProxyError::PolicyRateLimit { .. } => StatusCode::TOO_MANY_REQUESTS,
             ProxyError::Bridge(b) => {
                 StatusCode::from_u16(b.http_status()).unwrap_or(StatusCode::BAD_GATEWAY)
             }
@@ -334,6 +372,7 @@ impl ProxyError {
             ProxyError::ContentFiltered(_) => "content_filter",
             ProxyError::BudgetExceeded(_) => "billing_error",
             ProxyError::RateLimit(_) => "rate_limit_exceeded",
+            ProxyError::PolicyRateLimit { .. } => "rate_limit_exceeded",
             ProxyError::Bridge(b) => b.error_type(),
         }
     }
@@ -344,6 +383,7 @@ impl ProxyError {
     pub fn retry_after_secs(&self) -> Option<u64> {
         match self {
             ProxyError::RateLimit(e) => e.retry_after_secs(),
+            ProxyError::PolicyRateLimit { source, .. } => source.retry_after_secs(),
             ProxyError::AllCandidatesUnavailable { retry_after_secs } => *retry_after_secs,
             // Source the Retry-After header from the same value the 429
             // body carries (prd-09b §5.8 retry_after_seconds), so the
@@ -419,6 +459,14 @@ impl ProxyError {
         let env = ErrorEnvelope::new(self.to_string(), self.kind());
         match self {
             ProxyError::BudgetExceeded(r) => env.with_code("budget_exceeded").with_budget(r),
+            // Attribution for policy-layer 429s (AISIX-Cloud#892): the
+            // OpenAI envelope names the offending policy. The Anthropic
+            // envelope keeps its strict {type,message} shape.
+            ProxyError::PolicyRateLimit {
+                policy_id,
+                policy_name,
+                ..
+            } => env.with_policy(policy_id, policy_name),
             // Stable machine-readable code for SDKs to branch on, distinct
             // from the generic `permission_denied` type shared with
             // ModelForbidden (#557 AC-1).
