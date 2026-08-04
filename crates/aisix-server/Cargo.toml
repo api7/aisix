@@ -46,6 +46,9 @@ rcgen.workspace = true
 uuid.workspace = true
 hostname.workspace = true
 x509-parser = "0.16"
+# Bench-only (BENCH_RT_TPC): SO_REUSEPORT listener setup for the
+# thread-per-core A/B path in main.rs. Not used in production serving.
+socket2 = "0.5"
 # Only for the hyper connection builder `axum_server::Server::http_builder()`
 # hands back — where `downstream.idle_timeout_secs` is applied. Same 0.1.x
 # axum-server itself depends on, so the builder types unify.

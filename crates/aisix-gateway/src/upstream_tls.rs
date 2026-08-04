@@ -210,6 +210,30 @@ pub fn reqwest_material() -> &'static ReqwestTlsMaterial {
 /// idle connection pool.
 static PK_CLIENTS: OnceLock<dashmap::DashMap<ProviderKeyTls, reqwest::Client>> = OnceLock::new();
 
+/// Bench-only (BENCH_THREAD_LOCAL_CLIENT): see `client_for_provider_key`.
+fn bench_thread_local_client() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("BENCH_THREAD_LOCAL_CLIENT").is_ok_and(|v| v == "1"))
+}
+
+/// One client per OS thread, built with the deployment's connection and
+/// trust settings. Bench-only.
+fn thread_local_bench_client() -> reqwest::Client {
+    thread_local! {
+        static CLIENT: std::cell::OnceCell<reqwest::Client> =
+            const { std::cell::OnceCell::new() };
+    }
+    CLIENT.with(|c| {
+        c.get_or_init(|| {
+            crate::upstream_http::client_builder()
+                .user_agent("aisix-bench-thread-local")
+                .build()
+                .expect("bench thread-local client build failed")
+        })
+        .clone()
+    })
+}
+
 /// The client to dispatch this Provider Key's request on.
 ///
 /// Returns `shared` unchanged whenever the key sets no override, which
@@ -226,6 +250,14 @@ pub fn client_for_provider_key(
     tls: Option<&ProviderKeyTls>,
 ) -> reqwest::Client {
     let Some(tls) = tls.filter(|t| !t.is_noop()) else {
+        // Bench-only: BENCH_THREAD_LOCAL_CLIENT=1 hands every OS thread its
+        // own client/pool so a thread-per-core worker's upstream
+        // connections are driven by its own runtime — no cross-thread
+        // wakeups on response arrival. Keys with a TLS override keep the
+        // normal path.
+        if bench_thread_local_client() {
+            return thread_local_bench_client();
+        }
         return shared.clone();
     };
     let cache = PK_CLIENTS.get_or_init(dashmap::DashMap::new);

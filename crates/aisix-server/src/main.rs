@@ -101,8 +101,19 @@ enum CliCommand {
     },
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    // Bench-only: BENCH_RT_WORKERS=N pins the tokio worker-thread count so
+    // saturation A/B runs control parallelism explicitly. Named without the
+    // AISIX_ prefix because that namespace is claimed by the config env
+    // override layer.
+    let mut rt = tokio::runtime::Builder::new_multi_thread();
+    if let Ok(n) = std::env::var("BENCH_RT_WORKERS") {
+        rt.worker_threads(n.parse().expect("BENCH_RT_WORKERS must be a number"));
+    }
+    rt.enable_all().build()?.block_on(async_main())
+}
+
+async fn async_main() -> anyhow::Result<()> {
     // Install the process-level rustls CryptoProvider before anything
     // else touches TLS. rustls 0.23 dropped implicit provider selection
     // and panics at first use when both `aws-lc-rs` and `ring` features
@@ -1392,6 +1403,20 @@ async fn serve_http(
     cancel: watch::Receiver<bool>,
     label: &'static str,
 ) -> anyhow::Result<()> {
+    // Bench-only: BENCH_RT_TPC=N short-circuits the plain-HTTP proxy
+    // listener into N thread-per-core workers (one OS thread + one
+    // current_thread runtime + one listener each). BENCH_RT_TPC_MODE
+    // picks the listener layout: "reuseport" (default) binds every worker
+    // to the same port with SO_REUSEPORT so the kernel spreads accepted
+    // connections by 4-tuple hash; "stride" binds port, port+1, ... like
+    // the macOS phase did.
+    if label == "proxy" && tls.is_none() {
+        if let Ok(n) = std::env::var("BENCH_RT_TPC") {
+            let workers: usize = n.parse().expect("BENCH_RT_TPC must be a number");
+            return serve_http_tpc(addr, router, idle_timeout, cancel, label, workers).await;
+        }
+    }
+
     // Resolved before binding so a bad cert path still fails with the
     // same error it always did, before a port is taken.
     let tls_config = match tls {
@@ -1446,6 +1471,101 @@ async fn serve_http(
         }
     }
     Ok(())
+}
+
+/// Bench-only (BENCH_RT_TPC): serve the proxy from N OS threads, each with
+/// its own current_thread runtime and its own listener. The router (and so
+/// the shared AppState / reqwest client) is cloned per thread, matching the
+/// macOS-phase experiment semantics.
+async fn serve_http_tpc(
+    addr: std::net::SocketAddr,
+    router: axum::Router,
+    idle_timeout: Option<Duration>,
+    cancel: watch::Receiver<bool>,
+    label: &'static str,
+    workers: usize,
+) -> anyhow::Result<()> {
+    let mode = std::env::var("BENCH_RT_TPC_MODE").unwrap_or_else(|_| "reuseport".to_string());
+    let reuseport = match mode.as_str() {
+        "reuseport" => true,
+        "stride" => false,
+        other => anyhow::bail!("BENCH_RT_TPC_MODE must be reuseport|stride, got {other}"),
+    };
+    let mut threads = Vec::with_capacity(workers);
+    for i in 0..workers {
+        let bind_addr = if reuseport {
+            addr
+        } else {
+            std::net::SocketAddr::new(addr.ip(), addr.port() + u16::try_from(i)?)
+        };
+        // Bound on the parent thread so a bind failure aborts startup
+        // before any worker begins serving.
+        let listener = bind_tpc_listener(bind_addr, reuseport)
+            .map_err(|e| anyhow::anyhow!("{label} tpc listener bind {bind_addr} failed: {e}"))?;
+        listener.set_nonblocking(true)?;
+        let router = router.clone();
+        let cancel = cancel.clone();
+        let thread = std::thread::Builder::new().name(format!("tpc-{i}")).spawn(
+            move || -> anyhow::Result<()> {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+                rt.block_on(async move {
+                    let handle = axum_server::Handle::new();
+                    tokio::spawn({
+                        let handle = handle.clone();
+                        async move {
+                            shutdown_signal(cancel, label).await;
+                            handle.graceful_shutdown(None);
+                        }
+                    });
+                    tracing::info!(
+                        %bind_addr,
+                        label,
+                        worker = i,
+                        reuseport,
+                        "aisix listening (http, tpc)"
+                    );
+                    let make_service =
+                        router.into_make_service_with_connect_info::<std::net::SocketAddr>();
+                    let mut server = axum_server::from_tcp(listener).handle(handle);
+                    apply_idle_timeout(server.http_builder(), idle_timeout);
+                    server.serve(make_service).await?;
+                    Ok(())
+                })
+            },
+        )?;
+        threads.push(thread);
+    }
+    tokio::task::spawn_blocking(move || {
+        for t in threads {
+            t.join()
+                .map_err(|_| anyhow::anyhow!("tpc worker thread panicked"))??;
+        }
+        Ok(())
+    })
+    .await?
+}
+
+/// Listener for the bench-only TPC path: plain bind for "stride" mode,
+/// SO_REUSEPORT (set before bind) for same-port kernel load balancing.
+fn bind_tpc_listener(
+    addr: std::net::SocketAddr,
+    reuseport: bool,
+) -> std::io::Result<std::net::TcpListener> {
+    let domain = if addr.is_ipv4() {
+        socket2::Domain::IPV4
+    } else {
+        socket2::Domain::IPV6
+    };
+    let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+    socket.set_reuse_address(true)?;
+    if reuseport {
+        socket.set_reuse_port(true)?;
+    }
+    socket.bind(&addr.into())?;
+    socket.listen(1024)?;
+    Ok(socket.into())
 }
 
 /// Close an accepted HTTP/1.1 connection that sits idle for `idle_timeout`.
