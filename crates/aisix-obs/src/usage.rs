@@ -195,6 +195,22 @@ pub struct UsageEvent {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub finish_reason: String,
 
+    /// Logical outcome of a STREAMING response, set on the serving
+    /// attempt's event only (AISIX-Cloud#1222). The HTTP status is
+    /// committed at 200 before the stream runs, so it cannot express a
+    /// mid-stream failure; this field can:
+    /// - `success` — the stream completed normally;
+    /// - `partial_failed` — the stream terminated after the 200 with an
+    ///   in-band error frame (`[DONE]` withheld);
+    /// - `partial_recovered` — a mid-stream failure was recovered by
+    ///   `routing.stream_failure: continue` on a fallback target and the
+    ///   stream then completed normally.
+    ///
+    /// Empty on non-streaming events, failed-attempt events, and
+    /// client-abandoned streams (those keep `status_code: 499`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub stream_outcome: String,
+
     /// Cost the DP computed for this request in US dollars. Zero when
     /// the request never reached cost calculation (e.g. blocked by a
     /// guardrail before dispatch). cp-api recomputes this server-side

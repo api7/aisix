@@ -898,6 +898,7 @@ mod tests {
             fallback_on_statuses: None,
             when_all_unavailable: None,
             sticky: None,
+            stream_failure: None,
         }
     }
 

@@ -4343,6 +4343,19 @@ fn add_variant_titles(doc: &mut Value) {
             "/components/schemas/StreamDoneMarker/oneOf",
             &["Required", "Optional", "None"],
         ),
+        (
+            "/components/schemas/StreamFailureMode/oneOf",
+            &["Terminate", "Continue"],
+        ),
+        (
+            "/components/schemas/StreamFailureTrigger/oneOf",
+            &[
+                "Transport error",
+                "Read timeout",
+                "Upstream decode error",
+                "Upstream in-band error",
+            ],
+        ),
     ];
 
     for (pointer, titles) in variant_titles {
