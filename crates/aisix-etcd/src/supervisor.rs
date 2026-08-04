@@ -285,12 +285,11 @@ impl<P: ConfigProvider> Supervisor<P> {
         {
             let state = self.state.lock().unwrap();
             let rejections = self.rejections.lock().unwrap();
-            // `state` is the raw entry map the DP holds. A full resync inserts
-            // every entry (including rejected ones), so on that path source_hash
-            // covers the whole observed snapshot. A live watch Put that is
-            // rejected never enters `state`, so it is reported only via
-            // `rejected[]` and folds into source_hash at the next resync — see
-            // the `config_status` module docs.
+            // `state` is the raw entry map the DP holds — every observed
+            // etcd write lands here, including rejected ones (a resync
+            // inserts them wholesale; a rejected live Put mirrors its
+            // bytes in too, #871), so source_hash always covers the
+            // observed etcd state.
             source_hash =
                 hash_entries(state.values().map(|e| (e.key.as_str(), e.value.as_slice())));
             let rejected_keys: HashSet<&str> = rejections.iter().map(|r| r.key.as_str()).collect();
@@ -616,9 +615,10 @@ impl<P: ConfigProvider> Supervisor<P> {
     ///
     /// The serving bytes are read from `state[key]`: the invariant is
     /// that a key present in the served snapshot and NOT stale-tracked
-    /// has its served bytes in `state` (a rejected put never touches
-    /// `state`, and a resync that rejects a key either stale-tracks it
-    /// or drops it from the snapshot).
+    /// has its served bytes in `state` (a rejected put pins here BEFORE
+    /// mirroring the rejected bytes into `state`, and a resync that
+    /// rejects a key either stale-tracks it or drops it from the
+    /// snapshot).
     fn capture_last_good(&self, key_str: &str) {
         if self.stale_serving.lock().unwrap().contains_key(key_str) {
             return;
@@ -652,8 +652,27 @@ impl<P: ConfigProvider> Supervisor<P> {
         if stats.accepted == 0 {
             // The previous good value keeps serving. Pin it now (#871):
             // the next resync rebuilds from the rejected etcd bytes and
-            // needs the pinned bytes to keep this row alive.
+            // needs the pinned bytes to keep this row alive. Must run
+            // BEFORE the state-map update below, which overwrites the
+            // serving bytes with the rejected ones.
             self.capture_last_good(&entry.key);
+            // Mirror the rejected bytes into the observed-state map and
+            // the cache like any other observed etcd write: source_hash
+            // reflects the observed etcd state immediately, and a
+            // restart inside this window restores the same
+            // rejected-bytes + pinned-value shape a post-resync restart
+            // would — keeping the staleness clock continuous instead of
+            // resetting it at the next boot.
+            {
+                let mut state = self.state.lock().unwrap();
+                state.insert(entry.key.clone(), entry.clone());
+            }
+            {
+                let mut rev = self.revision.lock().unwrap();
+                if entry.revision > *rev {
+                    *rev = entry.revision;
+                }
+            }
             // Note: a previously retained partially-compatible entry for
             // this key is deliberately kept — the row's last-good value
             // (loaded with those fields ignored) is still what serves.
@@ -667,6 +686,7 @@ impl<P: ConfigProvider> Supervisor<P> {
             // A rejected watch event still changes the reported state
             // (rejected[] gains this entry; last_reload flips unsuccessful).
             self.sync_config_status(false);
+            self.flush_cache();
             return false;
         }
 
@@ -2034,6 +2054,50 @@ mod tests {
                 sup.recent_rejections().len(),
                 1,
                 "the rejection signal must survive the restart too",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_put_persists_pin_for_immediate_restart() {
+        // A restart INSIDE the rejected-put window (before any resync
+        // fixed the state to disk) must behave like a post-resync
+        // restart: the rejected bytes and the pinned last-good ride the
+        // cache together, so the value keeps serving AND the staleness
+        // clock stays continuous instead of resetting at boot.
+        let dir = tempfile::tempdir().unwrap();
+        let cache_path = dir.path().join("snap.json");
+        let since_before;
+
+        {
+            let provider = Arc::new(FakeProvider::new(
+                vec![entry("/aisix/models/m-1", VALID_MODEL, 1)],
+                1,
+            ));
+            let sup = Supervisor::with_cache(provider, "/aisix", SnapshotCache::new(&cache_path));
+            sup.load_once().await.unwrap();
+            assert!(!sup.apply_put(&entry("/aisix/models/m-1", BAD_PROVIDER_MODEL, 2)));
+            since_before = sup.recent_rejections()[0]
+                .stale_serving_since_unix_secs
+                .expect("rejected put with a serving value must report stale-since");
+            sup.await_pending_cache_writes().await;
+        }
+
+        {
+            let provider = Arc::new(FakeProvider::new(vec![], 0));
+            let sup = Supervisor::with_cache(provider, "/aisix", SnapshotCache::new(&cache_path));
+            sup.restore_from_cache();
+            assert_eq!(
+                sup.handle().load().models.len(),
+                1,
+                "restart in the rejected-put window must restore the pinned value",
+            );
+            let rejections = sup.recent_rejections();
+            assert_eq!(rejections.len(), 1);
+            assert_eq!(
+                rejections[0].stale_serving_since_unix_secs,
+                Some(since_before),
+                "the staleness clock must be continuous across the restart",
             );
         }
     }

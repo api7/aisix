@@ -30,15 +30,15 @@
 //!   `key '\0' canonical_json_value '\n'`, concatenated in ascending key
 //!   order. `canonical_json_value` recursively sorts object keys and drops
 //!   insignificant whitespace ([`canonical_json`]); a value that is not JSON
-//!   is hashed as its raw bytes. `source_hash` covers every entry in the last
-//!   observed full snapshot; `config_hash` covers only the accepted subset
-//!   (the entries actually served). When a full snapshot is applied with no
-//!   rejections the two are equal. A resource rejected on a *live watch event*
-//!   is surfaced via `rejected[]` and does not enter `source_hash` until the
-//!   next full resync (the watch delta never carries the bad bytes into the
-//!   served entry map) — so `source_hash == config_hash` can hold while the
-//!   state is `degraded`; `rejected[]` is the authoritative partial-rejection
-//!   signal, not a hash diff.
+//!   is hashed as its raw bytes. `source_hash` covers every entry the DP has
+//!   observed from etcd — full snapshots and live watch events alike,
+//!   including rejected writes. `config_hash` covers the bytes each key
+//!   actually *serves*: the observed bytes for accepted keys, the pinned
+//!   last-known-good bytes for keys serving stale (#871, see
+//!   `serving_stale_since` on `rejected[]`), and nothing for a rejected key
+//!   with no last good. When everything is accepted the two hashes are
+//!   equal; a rejection makes them diverge, with `rejected[]` as the
+//!   authoritative per-resource explanation.
 //! - **file**: `sha256` over the raw file bytes. On a clean load the applied
 //!   `config_hash` equals `source_hash` (the whole file is applied); on a
 //!   rejected reload the applied hash stays at the last-good file's hash.
