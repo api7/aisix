@@ -137,6 +137,7 @@ pub(crate) fn routing_error_class(err: &BridgeError) -> &'static str {
         BridgeError::Timeout { .. } => "timeout",
         BridgeError::UpstreamStatus { .. } => "upstream_status",
         BridgeError::UpstreamDecode(_) => "upstream_decode",
+        BridgeError::UpstreamInBand { .. } => "upstream_in_band",
         BridgeError::Config(_) => "config",
         BridgeError::InvalidUpstreamConfig(_) => "invalid_config",
         BridgeError::InvalidUpstreamCredentials(_) => "invalid_credentials",

@@ -373,6 +373,9 @@ where
                 let SseEvent::Data(payload) = event else { continue };
                 let parsed: AnthropicStreamEvent = serde_json::from_str(&payload)
                     .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?;
+                if let AnthropicStreamEvent::Error { error } = &parsed {
+                    Err(crate::wire::stream_error_into_bridge_error(error))?;
+                }
                 state.update(&parsed);
                 if let Some(c) = state.to_chunk(&parsed) {
                     yield c;
@@ -868,6 +871,63 @@ data: {\"type\":\"message_stop\"}\n\n";
             Err(BridgeError::UpstreamStatus { status: 500, .. }) => {}
             Err(other) => panic!("unexpected: {other:?}"),
         }
+    }
+
+    /// AISIX-Cloud#1222 scenario 3: Anthropic reports mid-stream
+    /// failures as an in-band `event: error` frame inside the 200
+    /// stream. Pre-fix the frame deserialized into the `Other`
+    /// catch-all and was silently swallowed — the truncated stream
+    /// then looked like a clean completion.
+    #[tokio::test]
+    async fn streaming_in_band_error_event_surfaces_as_typed_error() {
+        let server = MockServer::start().await;
+        let sse = "\
+event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_stream\",\"model\":\"claude-sonnet-4-5\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":1}}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hel\"}}\n\n\
+event: error\n\
+data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n";
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&server)
+            .await;
+
+        let bridge = AnthropicBridge::new();
+        let ctx = sample_ctx(&server.uri());
+        let mut stream = bridge.chat_stream(&req(), &ctx).await.unwrap();
+
+        let first = stream.next().await.expect("delta before the error");
+        assert_eq!(first.unwrap().delta.content.as_deref(), Some("hel"));
+        let err = stream
+            .next()
+            .await
+            .expect("error event must surface, not be swallowed")
+            .unwrap_err();
+        match err {
+            BridgeError::UpstreamInBand {
+                status,
+                message,
+                parsed,
+                wire,
+            } => {
+                // 529 is the documented HTTP status for overloaded_error.
+                assert_eq!(status, Some(529));
+                assert_eq!(message, "Overloaded");
+                assert_eq!(
+                    parsed.expect("view").kind.as_deref(),
+                    Some("overloaded_error")
+                );
+                assert!(matches!(wire, aisix_gateway::UpstreamWire::Anthropic));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert!(stream.next().await.is_none(), "stream ends after the error");
     }
 
     #[test]

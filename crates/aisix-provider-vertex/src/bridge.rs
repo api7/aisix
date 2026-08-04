@@ -601,6 +601,43 @@ fn parse_vertex_error_status(body: &[u8]) -> Option<String> {
     outer.error.status
 }
 
+/// Parse one OpenAI-shaped SSE `data:` payload from a Vertex shim /
+/// partner stream, surfacing an in-band `{"error":...}` frame as the
+/// typed [`BridgeError::UpstreamInBand`] instead of a decode failure.
+/// `context` prefixes the decode-error message exactly as before.
+fn parse_vertex_openai_stream_payload(
+    data: &str,
+    context: &str,
+) -> Result<OpenAiStreamChunk, BridgeError> {
+    serde_json::from_str(data).map_err(|e| {
+        aisix_gateway::capture_in_band_error(data, aisix_gateway::UpstreamWire::Vertex)
+            .unwrap_or_else(|| BridgeError::UpstreamDecode(format!("{context}: {e}")))
+    })
+}
+
+/// Same probe for a Gemini `streamGenerateContent?alt=sse` payload —
+/// Google reports mid-stream failures as a `{"error":{code,message,
+/// status}}` frame inside the committed 200 stream.
+///
+/// Unlike the OpenAI chunk shape, [`GeminiGenerateContentResponse`] is
+/// fully defaultable, so an error frame would *successfully* parse as
+/// an empty response and be silently swallowed — the probe must run
+/// before the chunk parse, not on its failure. The `contains` guard
+/// keeps the extra parse off the hot path.
+fn parse_vertex_gemini_stream_payload(
+    data: &str,
+    context: &str,
+) -> Result<GeminiGenerateContentResponse, BridgeError> {
+    if data.contains("\"error\"") {
+        if let Some(e) =
+            aisix_gateway::capture_in_band_error(data, aisix_gateway::UpstreamWire::Vertex)
+        {
+            return Err(e);
+        }
+    }
+    serde_json::from_str(data).map_err(|e| BridgeError::UpstreamDecode(format!("{context}: {e}")))
+}
+
 #[async_trait]
 impl Bridge for VertexBridge {
     fn name(&self) -> &'static str {
@@ -1039,6 +1076,9 @@ impl VertexBridge {
                                 "vertex anthropic stream chunk parse: {e}"
                             ))
                         })?;
+                    if let AnthropicStreamEvent::Error { error } = &parsed {
+                        Err(aisix_provider_anthropic::wire::stream_error_into_bridge_error(error))?;
+                    }
                     state.update(&parsed);
                     if let Some(chunk) = state.to_chunk(&parsed) {
                         yield chunk;
@@ -1188,12 +1228,10 @@ impl VertexBridge {
                 for event in decoder.feed(bytes.as_ref()) {
                     match event {
                         SseEvent::Data(data) => {
-                            let parsed: OpenAiStreamChunk =
-                                serde_json::from_str(&data).map_err(|e| {
-                                    BridgeError::UpstreamDecode(format!(
-                                        "vertex openai-shim stream chunk parse: {e}"
-                                    ))
-                                })?;
+                            let parsed = parse_vertex_openai_stream_payload(
+                                &data,
+                                "vertex openai-shim stream chunk parse",
+                            )?;
                             yield openai_stream_chunk_into_chat_chunk(parsed);
                         }
                         // OpenAI shim terminates with `data: [DONE]`;
@@ -1205,11 +1243,10 @@ impl VertexBridge {
             // Flush a partial trailing chunk if the connection drops
             // without a final blank line.
             if let Some(SseEvent::Data(data)) = decoder.finish() {
-                let parsed: OpenAiStreamChunk = serde_json::from_str(&data).map_err(|e| {
-                    BridgeError::UpstreamDecode(format!(
-                        "vertex openai-shim stream tail parse: {e}"
-                    ))
-                })?;
+                let parsed = parse_vertex_openai_stream_payload(
+                    &data,
+                    "vertex openai-shim stream tail parse",
+                )?;
                 yield openai_stream_chunk_into_chat_chunk(parsed);
             }
         };
@@ -1387,12 +1424,10 @@ impl VertexBridge {
                 for event in decoder.feed(bytes.as_ref()) {
                     match event {
                         SseEvent::Data(data) => {
-                            let parsed: OpenAiStreamChunk =
-                                serde_json::from_str(&data).map_err(|e| {
-                                    BridgeError::UpstreamDecode(format!(
-                                        "vertex partner :streamRawPredict chunk parse: {e}"
-                                    ))
-                                })?;
+                            let parsed = parse_vertex_openai_stream_payload(
+                                &data,
+                                "vertex partner :streamRawPredict chunk parse",
+                            )?;
                             yield openai_stream_chunk_into_chat_chunk(parsed);
                         }
                         // OpenAI-compatible upstreams (Mistral / AI21)
@@ -1402,11 +1437,10 @@ impl VertexBridge {
                 }
             }
             if let Some(SseEvent::Data(data)) = decoder.finish() {
-                let parsed: OpenAiStreamChunk = serde_json::from_str(&data).map_err(|e| {
-                    BridgeError::UpstreamDecode(format!(
-                        "vertex partner :streamRawPredict tail parse: {e}"
-                    ))
-                })?;
+                let parsed = parse_vertex_openai_stream_payload(
+                    &data,
+                    "vertex partner :streamRawPredict tail parse",
+                )?;
                 yield openai_stream_chunk_into_chat_chunk(parsed);
             }
         };
@@ -1504,12 +1538,10 @@ impl VertexBridge {
                 let bytes: Bytes = item.map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
                 for event in decoder.feed(bytes.as_ref()) {
                     if let SseEvent::Data(data) = event {
-                        let parsed: GeminiGenerateContentResponse =
-                            serde_json::from_str(&data).map_err(|e| {
-                                BridgeError::UpstreamDecode(format!(
-                                    "vertex stream chunk parse: {e}"
-                                ))
-                            })?;
+                        let parsed = parse_vertex_gemini_stream_payload(
+                            &data,
+                            "vertex stream chunk parse",
+                        )?;
                         for chunk in
                             gemini_chunk_into_chat_chunks(parsed, &upstream_id_owned, &mut emitted_role)
                         {
@@ -1527,12 +1559,10 @@ impl VertexBridge {
             // last chunk if the upstream connection drops without a
             // final `\n\n`.
             if let Some(SseEvent::Data(data)) = decoder.finish() {
-                let parsed: GeminiGenerateContentResponse =
-                    serde_json::from_str(&data).map_err(|e| {
-                        BridgeError::UpstreamDecode(format!(
-                            "vertex stream tail parse: {e}"
-                        ))
-                    })?;
+                let parsed = parse_vertex_gemini_stream_payload(
+                    &data,
+                    "vertex stream tail parse",
+                )?;
                 for chunk in
                     gemini_chunk_into_chat_chunks(parsed, &upstream_id_owned, &mut emitted_role)
                 {
@@ -4326,6 +4356,125 @@ mod tests {
             saw_decode_err,
             "expected UpstreamDecode error on invalid JSON chunk"
         );
+    }
+
+    /// AISIX-Cloud#1222 scenario 3: Google reports a mid-stream failure
+    /// as a `{"error":{code,message,status}}` frame inside the
+    /// committed 200 stream. Pre-fix it surfaced as UpstreamDecode and
+    /// the numeric code / gRPC status were lost.
+    #[tokio::test]
+    async fn chat_gemini_stream_in_band_error_frame_surfaces_typed() {
+        let body = "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"hel\"}]}}]}\n\n\
+data: {\"error\":{\"code\":503,\"message\":\"The service is currently unavailable.\",\"status\":\"UNAVAILABLE\"}}\n\n"
+            .to_string();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(body),
+            )
+            .mount(&server)
+            .await;
+
+        let bridge = VertexBridge::new().with_api_base_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("gemini-1.5-pro"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let req = ChatFormat::new("my-gemini", vec![ChatMessage::user("hi")]);
+        let mut stream = bridge.chat_stream(&req, &ctx).await.unwrap();
+        let mut saw_in_band = false;
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(_) => continue,
+                Err(BridgeError::UpstreamInBand {
+                    status,
+                    parsed,
+                    wire,
+                    ..
+                }) => {
+                    assert_eq!(status, Some(503));
+                    assert_eq!(parsed.expect("view").kind.as_deref(), Some("UNAVAILABLE"));
+                    assert!(matches!(wire, aisix_gateway::UpstreamWire::Vertex));
+                    saw_in_band = true;
+                    break;
+                }
+                Err(other) => panic!("unexpected: {other:?}"),
+            }
+        }
+        assert!(saw_in_band, "expected typed in-band error");
+    }
+
+    /// Claude-on-Vertex speaks the Anthropic Messages wire — an
+    /// in-band `event: error` frame must surface typed instead of
+    /// being swallowed by the `Other` catch-all (same fix as the
+    /// native Anthropic bridge, AISIX-Cloud#1222).
+    #[tokio::test]
+    async fn chat_anthropic_stream_in_band_error_event_surfaces_typed() {
+        let body = "event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hel\"}}\n\n\
+event: error\n\
+data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n"
+            .to_string();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(body),
+            )
+            .mount(&server)
+            .await;
+
+        let bridge = VertexBridge::new().with_api_base_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("claude-3-5-sonnet-v2@20241022"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let req = ChatFormat::new("my-claude", vec![ChatMessage::user("hi")]);
+        let mut stream = bridge.chat_stream(&req, &ctx).await.unwrap();
+        let mut saw_in_band = false;
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(_) => continue,
+                Err(BridgeError::UpstreamInBand { status, wire, .. }) => {
+                    assert_eq!(status, Some(529), "documented overloaded_error status");
+                    assert!(
+                        matches!(wire, aisix_gateway::UpstreamWire::Anthropic),
+                        "Anthropic taxonomy applies to Claude-on-Vertex in-band errors"
+                    );
+                    saw_in_band = true;
+                    break;
+                }
+                Err(other) => panic!("unexpected: {other:?}"),
+            }
+        }
+        assert!(saw_in_band, "expected typed in-band error");
+    }
+
+    /// The OpenAI-shim rail probes the same envelope shape.
+    #[test]
+    fn parse_vertex_openai_stream_payload_captures_error_frame() {
+        let err = parse_vertex_openai_stream_payload(
+            r#"{"error":{"message":"upstream broke","code":"500"}}"#,
+            "vertex openai-shim stream chunk parse",
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            BridgeError::UpstreamInBand {
+                status: Some(500),
+                ..
+            }
+        ));
+        // Garbage keeps the decode classification + context prefix.
+        match parse_vertex_openai_stream_payload("{not-json", "ctx-prefix").unwrap_err() {
+            BridgeError::UpstreamDecode(msg) => assert!(msg.starts_with("ctx-prefix")),
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 
     #[tokio::test]
