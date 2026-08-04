@@ -191,6 +191,13 @@ describe("sls content capture e2e: streaming capture is post-mask (#932 × AISIX
         }
       });
 
+      // Everything above is warm-up: those requests were served while the
+      // guardrail was still propagating, so the exporter shipped their
+      // UNMASKED replies — which is correct behaviour for a gateway that had
+      // no masking rule yet, and not what this test is about. Assert only on
+      // what was exported from here on.
+      const afterWarmup = sls.requests.length;
+
       // -- streaming chat (hold-back release path) --
       const chatRes = await postJson(app, "/v1/chat/completions", {
         model: "masked-chat-model",
@@ -202,8 +209,8 @@ describe("sls content capture e2e: streaming capture is post-mask (#932 × AISIX
       expect(chatBody).toContain(MASK); // client got masked text
       expect(chatBody).not.toContain(EMAIL);
 
-      await waitForToken(sls, FULL_LOGSTORE, CHAT_PROMPT_TOKEN);
-      let fullText = decodedTextFor(sls, FULL_LOGSTORE);
+      await waitForToken(sls, FULL_LOGSTORE, CHAT_PROMPT_TOKEN, 10_000, afterWarmup);
+      let fullText = decodedTextFor(sls, FULL_LOGSTORE, afterWarmup);
       expect(fullText).toContain(CHAT_PROMPT_TOKEN);
       expect(fullText).toContain(MASK); // capture carries the masked reply
       expect(fullText).not.toContain(EMAIL); // and never the raw PII
@@ -219,13 +226,13 @@ describe("sls content capture e2e: streaming capture is post-mask (#932 × AISIX
       expect(bridgeBody).toContain(MASK);
       expect(bridgeBody).not.toContain(EMAIL);
 
-      await waitForToken(sls, FULL_LOGSTORE, BRIDGE_PROMPT_TOKEN);
-      fullText = decodedTextFor(sls, FULL_LOGSTORE);
+      await waitForToken(sls, FULL_LOGSTORE, BRIDGE_PROMPT_TOKEN, 10_000, afterWarmup);
+      fullText = decodedTextFor(sls, FULL_LOGSTORE, afterWarmup);
       expect(fullText).toContain(BRIDGE_PROMPT_TOKEN);
       expect(fullText).not.toContain(EMAIL);
 
       // metadata_only exporter never sees content at all.
-      const metaText = decodedTextFor(sls, META_LOGSTORE);
+      const metaText = decodedTextFor(sls, META_LOGSTORE, afterWarmup);
       expect(metaText).not.toContain(EMAIL);
       expect(metaText).not.toContain(MASK);
       expect(metaText).not.toContain(CHAT_PROMPT_TOKEN);
