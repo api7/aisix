@@ -16,7 +16,8 @@
 //! read path reading a fully-formed `Arc<Snapshot>` the whole time.
 
 use aisix_core::config_status::{
-    hash_entries, AppliedSnapshot, ConfigStatus, IncomingRejection, LoadObservation, SourceKind,
+    hash_entries, AppliedSnapshot, ConfigStatus, IncomingRejection, LoadObservation,
+    PartialCompatResource, SourceKind,
 };
 use aisix_core::snapshot::SnapshotHandle;
 use aisix_core::AisixSnapshot;
@@ -31,7 +32,7 @@ use tokio::task::JoinHandle;
 
 use crate::backoff::ExpBackoff;
 use crate::key;
-use crate::loader::{self, BuildStats, RejectedEntry};
+use crate::loader::{self, BuildStats, PartialCompatEntry, PartialCompatRow, RejectedEntry};
 use crate::provider::{ConfigProvider, ProviderError, RawEntry, WatchEvent};
 use crate::snapshot_cache::SnapshotCache;
 
@@ -130,6 +131,13 @@ pub struct WatchStatusSnapshot {
 /// memory. Newest rejection wins on overflow (drops the oldest).
 const MAX_RETAINED_REJECTIONS: usize = 256;
 
+/// Maximum partially-compatible rows the supervisor retains, in its own
+/// buffer so YELLOW volume can never evict RED entries from the rejection
+/// buffer above (#871). Bounded by the number of config rows in practice;
+/// past the cap new rows are still logged by the loader but drop out of
+/// the aggregated report, with a WARN so the truncation is never silent.
+const MAX_RETAINED_PARTIAL_ROWS: usize = 1024;
+
 /// One supervisor instance. Consumers call [`Supervisor::run`] once and
 /// drop the returned handle on shutdown.
 pub struct Supervisor<P: ConfigProvider> {
@@ -166,6 +174,15 @@ pub struct Supervisor<P: ConfigProvider> {
     /// per-event because they only see one row.
     rejections: Mutex<Vec<RejectedEntry>>,
 
+    /// Rows currently served with unknown fields ignored (partially
+    /// compatible, #871), keyed by etcd key so incremental watch events
+    /// merge cleanly: a Put replaces (or clears) the key's entry, a
+    /// Delete removes it, a resync replaces the map wholesale. Reported
+    /// aggregated per (kind, field) on `/status/config` and the
+    /// heartbeat. Separate from `rejections` by design — see
+    /// [`MAX_RETAINED_PARTIAL_ROWS`].
+    partial_compat: Mutex<HashMap<String, PartialCompatRow>>,
+
     // JoinHandles for in-flight `flush_cache` writes. Tests use
     // [`Self::await_pending_cache_writes`] to deterministically wait
     // for these without relying on a wall-clock sleep, which proved
@@ -199,6 +216,7 @@ impl<P: ConfigProvider> Supervisor<P> {
             status: WatchStatus::new(),
             config_status: ConfigStatus::new(SourceKind::Etcd),
             rejections: Mutex::new(Vec::new()),
+            partial_compat: Mutex::new(HashMap::new()),
             pending_writes: Mutex::new(Vec::new()),
         }
     }
@@ -250,6 +268,8 @@ impl<P: ConfigProvider> Supervisor<P> {
         }
         let revision = *self.revision.lock().unwrap();
         let resource_counts = resource_counts(&self.handle.load());
+        let (partially_compatible, partially_compatible_rows_by_kind) =
+            self.partial_compat_observation();
 
         self.config_status.record_load(LoadObservation {
             source_hash,
@@ -260,6 +280,8 @@ impl<P: ConfigProvider> Supervisor<P> {
                 resource_counts,
             }),
             rejected,
+            partially_compatible,
+            partially_compatible_rows_by_kind,
             is_reload,
             // etcd always publishes the accepted subset (even an empty one);
             // it never retains a previous snapshot wholesale, so a wholly-
@@ -326,6 +348,81 @@ impl<P: ConfigProvider> Supervisor<P> {
         let before = guard.len();
         guard.retain(|existing| existing.key != key);
         guard.len() != before
+    }
+
+    /// Aggregated partially-compatible observations for the currently
+    /// served snapshot: one entry per (kind, field) with the number of
+    /// rows carrying it, sorted. Read by the heartbeat path (cloned, no
+    /// lock held across the HTTP call).
+    pub fn recent_partial_compat(&self) -> Vec<PartialCompatEntry> {
+        let guard = self.partial_compat.lock().unwrap();
+        let rows: Vec<PartialCompatRow> = guard.values().cloned().collect();
+        drop(guard);
+        loader::aggregate_partial_compat(&rows)
+    }
+
+    /// Replace the retained partially-compatible state wholesale. Called
+    /// by the resync paths, which re-process every entry.
+    fn set_partial_rows(&self, rows: Vec<PartialCompatRow>) {
+        let mut guard = self.partial_compat.lock().unwrap();
+        guard.clear();
+        for row in rows {
+            if guard.len() >= MAX_RETAINED_PARTIAL_ROWS {
+                tracing::warn!(
+                    cap = MAX_RETAINED_PARTIAL_ROWS,
+                    "partially-compatible rows exceed the retention cap; \
+                     the aggregated report is truncated"
+                );
+                break;
+            }
+            guard.insert(row.key.clone(), row);
+        }
+    }
+
+    /// Merge one apply_put outcome into the retained partially-compatible
+    /// state: the row's new unknown-field set replaces its previous one,
+    /// and a row that now matches exactly clears its entry.
+    fn update_partial_row(&self, key: &str, row: Option<PartialCompatRow>) {
+        let mut guard = self.partial_compat.lock().unwrap();
+        match row {
+            Some(row) => {
+                if !guard.contains_key(key) && guard.len() >= MAX_RETAINED_PARTIAL_ROWS {
+                    tracing::warn!(
+                        key = %key,
+                        cap = MAX_RETAINED_PARTIAL_ROWS,
+                        "partially-compatible rows exceed the retention cap; \
+                         this row is served but missing from the aggregated report"
+                    );
+                    return;
+                }
+                guard.insert(key.to_string(), row);
+            }
+            None => {
+                guard.remove(key);
+            }
+        }
+    }
+
+    /// The retained partially-compatible state in the two wire shapes
+    /// [`LoadObservation`] carries: the per-(kind, field) aggregate and
+    /// the per-kind row counts.
+    fn partial_compat_observation(&self) -> (Vec<PartialCompatResource>, BTreeMap<String, usize>) {
+        let guard = self.partial_compat.lock().unwrap();
+        let rows: Vec<PartialCompatRow> = guard.values().cloned().collect();
+        drop(guard);
+        let aggregated = loader::aggregate_partial_compat(&rows)
+            .into_iter()
+            .map(|e| PartialCompatResource {
+                resource_kind: e.kind,
+                field: e.field,
+                count: e.count,
+            })
+            .collect();
+        let mut rows_by_kind: BTreeMap<String, usize> = BTreeMap::new();
+        for row in &rows {
+            *rows_by_kind.entry(row.kind.clone()).or_insert(0) += 1;
+        }
+        (aggregated, rows_by_kind)
     }
 
     /// Drain the JoinHandles for any in-flight cache writes spawned
@@ -424,6 +521,9 @@ impl<P: ConfigProvider> Supervisor<P> {
         // Build a tiny snapshot out of just the new entry, then merge.
         let (tiny, mut stats) = loader::build_snapshot(&self.prefix, std::slice::from_ref(entry));
         if stats.accepted == 0 {
+            // Note: a previously retained partially-compatible entry for
+            // this key is deliberately kept — the row's last-good value
+            // (loaded with those fields ignored) is still what serves.
             // The loader already attached a RejectedEntry for whatever
             // path failed (bad key / non-JSON / schema / parse). Move
             // them into the supervisor's retained buffer so the next
@@ -492,6 +592,14 @@ impl<P: ConfigProvider> Supervisor<P> {
             new
         });
         self.remove_rejection_for_key(&entry.key);
+        // Refresh this key's partially-compatible signal: replaced when
+        // the new value still carries unknown fields, cleared when it now
+        // matches the schema exactly.
+        let partial = stats
+            .partial_rows
+            .drain(..)
+            .find(|row| row.key == entry.key);
+        self.update_partial_row(&entry.key, partial);
 
         // Mirror the put into the cache-tracking map and flush.
         // Track the highest revision we've observed so the cache file
@@ -551,6 +659,9 @@ impl<P: ConfigProvider> Supervisor<P> {
             _ => false,
         };
         let removed_rejection = self.remove_rejection_for_key(key_str);
+        // A deleted key no longer serves, so its partially-compatible
+        // signal (if any) goes with it.
+        self.update_partial_row(key_str, None);
         drop(snap);
         if !present {
             if removed_rejection {
@@ -654,8 +765,10 @@ impl<P: ConfigProvider> Supervisor<P> {
         self.status.record_apply(cur_rev);
         // Resync re-processes the entire entry set so the prior
         // per-key rejection list is no longer accurate — replace it
-        // wholesale with what this build produced (issue #115).
+        // wholesale with what this build produced (issue #115). Same for
+        // the partially-compatible state (#871).
         self.set_rejections(stats.rejections.clone());
+        self.set_partial_rows(stats.partial_rows.clone());
         // A full resync is a config reload — publish the observability view
         // (source/config hashes, counts, rejected list) and count it.
         self.sync_config_status(true);
@@ -1529,5 +1642,91 @@ mod tests {
             sup.recent_rejections().is_empty(),
             "delete must clear a rejection even when the bad row never entered the snapshot",
         );
+    }
+
+    // ---- partially-compatible retention (issue #871) ----
+
+    /// A model document carrying a field this build does not know: loads
+    /// (YELLOW) with the field reported.
+    const YELLOW_MODEL: &[u8] = br#"{
+        "display_name": "my-gpt4",
+        "provider": "openai",
+        "model_name": "gpt-4o",
+        "provider_key_id": "11111111-1111-1111-1111-111111111111",
+        "future_knob": true
+    }"#;
+
+    #[tokio::test]
+    async fn partial_compat_tracked_on_put_and_cleared_on_exact_match() {
+        let provider = Arc::new(FakeProvider::new(vec![], 0));
+        let sup = Supervisor::new(provider, "/aisix");
+        sup.load_once().await.unwrap();
+
+        assert!(sup.apply_put(&entry("/aisix/models/m-1", YELLOW_MODEL, 1)));
+        assert_eq!(sup.handle().load().models.len(), 1, "YELLOW row serves");
+        let agg = sup.recent_partial_compat();
+        assert_eq!(agg.len(), 1);
+        assert_eq!(agg[0].kind, "models");
+        assert_eq!(agg[0].field, "future_knob");
+        assert_eq!(agg[0].count, 1);
+        // The status view carries the companion list next to rejected[].
+        let view = sup.config_status().view();
+        assert_eq!(view.partially_compatible.len(), 1);
+        assert_eq!(view.partially_compatible[0].resource_kind, "models");
+        assert_eq!(view.partially_compatible[0].field, "future_knob");
+        assert!(view.rejected.is_empty());
+
+        // Re-put with an exact-match document: the signal clears.
+        assert!(sup.apply_put(&entry("/aisix/models/m-1", VALID_MODEL, 2)));
+        assert!(sup.recent_partial_compat().is_empty());
+        assert!(sup.config_status().view().partially_compatible.is_empty());
+    }
+
+    #[tokio::test]
+    async fn partial_compat_cleared_on_delete() {
+        let provider = Arc::new(FakeProvider::new(vec![], 0));
+        let sup = Supervisor::new(provider, "/aisix");
+        sup.load_once().await.unwrap();
+
+        assert!(sup.apply_put(&entry("/aisix/models/m-1", YELLOW_MODEL, 1)));
+        assert_eq!(sup.recent_partial_compat().len(), 1);
+        assert!(sup.apply_delete("/aisix/models/m-1"));
+        assert!(sup.recent_partial_compat().is_empty());
+    }
+
+    #[tokio::test]
+    async fn partial_compat_replaced_wholesale_on_resync() {
+        let provider = Arc::new(FakeProvider::new(vec![], 0));
+        let sup = Supervisor::new(provider, "/aisix");
+        sup.load_once().await.unwrap();
+
+        assert!(sup.apply_put(&entry("/aisix/models/m-1", YELLOW_MODEL, 1)));
+        assert_eq!(sup.recent_partial_compat().len(), 1);
+
+        // Resync to a clean entry set: prior per-key YELLOW state is
+        // no longer accurate and must be dropped, mirroring rejections.
+        sup.apply_resync(&[entry("/aisix/models/m-2", VALID_MODEL, 2)]);
+        assert!(sup.recent_partial_compat().is_empty());
+
+        // Resync back to a YELLOW set repopulates it.
+        sup.apply_resync(&[entry("/aisix/models/m-3", YELLOW_MODEL, 3)]);
+        let agg = sup.recent_partial_compat();
+        assert_eq!(agg.len(), 1);
+        assert_eq!(agg[0].count, 1);
+    }
+
+    #[tokio::test]
+    async fn partial_compat_kept_when_update_for_same_key_is_rejected() {
+        let provider = Arc::new(FakeProvider::new(vec![], 0));
+        let sup = Supervisor::new(provider, "/aisix");
+        sup.load_once().await.unwrap();
+
+        assert!(sup.apply_put(&entry("/aisix/models/m-1", YELLOW_MODEL, 1)));
+        // A rejected update keeps the previous (YELLOW-loaded) value
+        // serving, so the partially-compatible signal must survive too.
+        assert!(!sup.apply_put(&entry("/aisix/models/m-1", BAD_PROVIDER_MODEL, 2)));
+        assert_eq!(sup.handle().load().models.len(), 1);
+        assert_eq!(sup.recent_partial_compat().len(), 1);
+        assert_eq!(sup.recent_rejections().len(), 1);
     }
 }

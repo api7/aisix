@@ -290,6 +290,7 @@
           "description": "`\"default\"` or `\"fail\"`."
         },
         {
+          "additionalProperties": false,
           "description": "`{ \"target\": \"<direct alias>\" }` — route to a specific safe model.",
           "properties": {
             "target": {

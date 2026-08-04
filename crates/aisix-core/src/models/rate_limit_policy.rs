@@ -75,7 +75,6 @@ impl std::fmt::Display for PolicyWindow {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
 pub struct RateLimitPolicy {
     #[schemars(length(min = 1))]
     pub name: String,
@@ -161,8 +160,11 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_fields() {
-        let r: Result<RateLimitPolicy, _> = serde_json::from_str(
+    fn tolerates_unknown_fields_for_forward_compat() {
+        // cp-api may ship new fields ahead of the DP rolling out; serde must
+        // accept them. The write path still rejects them via the strict
+        // schema validator (validate_rate_limit_policy in models/schema.rs).
+        let p: RateLimitPolicy = serde_json::from_str(
             r#"{
               "name": "x",
               "scope": "team",
@@ -170,8 +172,9 @@ mod tests {
               "window": "minute",
               "extra": true
             }"#,
-        );
-        assert!(r.is_err());
+        )
+        .unwrap();
+        assert_eq!(p.name, "x");
     }
 
     #[test]

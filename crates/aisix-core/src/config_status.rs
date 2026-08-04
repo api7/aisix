@@ -157,6 +157,24 @@ pub struct IncomingRejection {
     pub seen_at: DateTime<Utc>,
 }
 
+/// One partially compatible observation, aggregated per (kind, field):
+/// `count` resources of `resource_kind` are currently served with `field`
+/// ignored because this gateway version does not know it — typically a
+/// field added by a newer control plane (issue #871). Shown next to
+/// `rejected[]` on `GET /status/config` so a matching `config_hash` can
+/// never silently hide that enforcement differs from the stored
+/// documents.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PartialCompatResource {
+    /// Plural resource kind (`api_keys`, `provider_keys`, …).
+    pub resource_kind: String,
+    /// Dotted path of the ignored field inside the document, with array
+    /// indices normalized to `[]` (e.g. `routing.targets[].priority`).
+    pub field: String,
+    /// Number of served resources of this kind carrying this field.
+    pub count: usize,
+}
+
 /// The result of a snapshot the gateway actually applied (served).
 #[derive(Debug, Clone)]
 pub struct AppliedSnapshot {
@@ -182,6 +200,13 @@ pub struct LoadObservation {
     pub applied: Option<AppliedSnapshot>,
     /// Rejected entries observed in this snapshot.
     pub rejected: Vec<IncomingRejection>,
+    /// Partially compatible observations for the served snapshot,
+    /// aggregated per (kind, field). Replaces the previous set wholesale.
+    pub partially_compatible: Vec<PartialCompatResource>,
+    /// Served resources per kind that carry at least one ignored field.
+    /// Row-based (a resource with two unknown fields counts once), for
+    /// the `aisix_config_partially_compatible_resources` gauge.
+    pub partially_compatible_rows_by_kind: BTreeMap<String, usize>,
     /// Whether this load counts as a config reload for
     /// `aisix_config_reloads_total` (full (re)syncs and file loads do;
     /// incremental etcd events do not).
@@ -239,6 +264,11 @@ struct ConfigStatusInner {
     // Retained rejections, keyed by source identity to keep first_seen stable.
     rejected: BTreeMap<String, RetainedRejection>,
 
+    // Partially compatible observations for the served snapshot (#871).
+    // Replaced wholesale on every load; the load paths own the retention.
+    partially_compatible: Vec<PartialCompatResource>,
+    partially_compatible_rows_by_kind: BTreeMap<String, usize>,
+
     // Metric counters.
     reloads_total: u64,
     reload_failures: BTreeMap<&'static str, u64>,
@@ -273,6 +303,8 @@ impl ConfigStatus {
                 last_reload_success_at: None,
                 last_failure: None,
                 rejected: BTreeMap::new(),
+                partially_compatible: Vec::new(),
+                partially_compatible_rows_by_kind: BTreeMap::new(),
                 reloads_total: 0,
                 reload_failures: BTreeMap::new(),
             })),
@@ -325,6 +357,8 @@ impl ConfigStatus {
             );
         }
         inner.rejected = merged;
+        inner.partially_compatible = obs.partially_compatible;
+        inner.partially_compatible_rows_by_kind = obs.partially_compatible_rows_by_kind;
 
         let clean = inner.rejected.is_empty();
         inner.last_reload_successful = clean;
@@ -479,6 +513,9 @@ impl ConfigStatusInner {
         rejected.sort_by(|a, b| {
             (&a.resource_kind, &a.resource_id).cmp(&(&b.resource_kind, &b.resource_id))
         });
+        let mut partially_compatible = self.partially_compatible.clone();
+        partially_compatible
+            .sort_by(|a, b| (&a.resource_kind, &a.field).cmp(&(&b.resource_kind, &b.field)));
         ConfigStatusView {
             state: self.derive_state(),
             source,
@@ -486,6 +523,7 @@ impl ConfigStatusInner {
             last_reload,
             last_failure,
             rejected,
+            partially_compatible,
         }
     }
 
@@ -502,6 +540,7 @@ impl ConfigStatusInner {
             reloads_total: self.reloads_total,
             reload_failures: self.reload_failures.iter().map(|(k, v)| (*k, *v)).collect(),
             rejected_by_kind,
+            partially_compatible_by_kind: self.partially_compatible_rows_by_kind.clone(),
             observed_revision: if etcd { self.observed_revision } else { None },
             applied_revision: if etcd { self.applied_revision } else { None },
             config_hash: self.config_hash.clone(),
@@ -522,6 +561,13 @@ pub struct ConfigStatusView {
     /// `null` when no failure has occurred this boot.
     pub last_failure: Option<FailureView>,
     pub rejected: Vec<RejectedResource>,
+    /// Resources served with unknown fields ignored, aggregated per
+    /// (kind, field) and sorted. Empty when every served document matched
+    /// its schema exactly. The companion to `applied.config_hash`: the
+    /// hash covers these rows (they are served), so this list is what
+    /// distinguishes "fully synced" from "synced with fields this
+    /// gateway version does not enforce".
+    pub partially_compatible: Vec<PartialCompatResource>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -570,6 +616,8 @@ pub struct ConfigMetricsView {
     pub reloads_total: u64,
     pub reload_failures: BTreeMap<&'static str, u64>,
     pub rejected_by_kind: BTreeMap<String, usize>,
+    /// Served resources per kind carrying at least one ignored field.
+    pub partially_compatible_by_kind: BTreeMap<String, usize>,
     pub observed_revision: Option<i64>,
     pub applied_revision: Option<i64>,
     pub config_hash: Option<String>,
@@ -706,6 +754,8 @@ mod tests {
             observed_revision: Some(7),
             applied: Some(applied("h", &[("models", 2)])),
             rejected: vec![],
+            partially_compatible: Vec::new(),
+            partially_compatible_rows_by_kind: Default::default(),
             is_reload: true,
             wholly_rejected: false,
         });
@@ -731,6 +781,8 @@ mod tests {
             observed_revision: Some(1),
             applied: Some(applied("applied1", &[("models", 1)])),
             rejected: vec![],
+            partially_compatible: Vec::new(),
+            partially_compatible_rows_by_kind: Default::default(),
             is_reload: true,
             wholly_rejected: false,
         });
@@ -742,6 +794,8 @@ mod tests {
             observed_revision: Some(2),
             applied: Some(applied("applied2", &[("models", 1)])),
             rejected: vec![],
+            partially_compatible: Vec::new(),
+            partially_compatible_rows_by_kind: Default::default(),
             is_reload: true,
             wholly_rejected: false,
         });
@@ -754,6 +808,8 @@ mod tests {
             observed_revision: Some(3),
             applied: None,
             rejected: vec![],
+            partially_compatible: Vec::new(),
+            partially_compatible_rows_by_kind: Default::default(),
             is_reload: true,
             wholly_rejected: true,
         });
@@ -768,6 +824,8 @@ mod tests {
             observed_revision: Some(3),
             applied: Some(applied("h", &[])),
             rejected: vec![],
+            partially_compatible: Vec::new(),
+            partially_compatible_rows_by_kind: Default::default(),
             is_reload: true,
             wholly_rejected: false,
         });
@@ -789,6 +847,8 @@ mod tests {
                 "schema_failed",
                 "schema validation failed at `/display_name`",
             )],
+            partially_compatible: Vec::new(),
+            partially_compatible_rows_by_kind: Default::default(),
             is_reload: true,
             wholly_rejected: false,
         });
@@ -809,6 +869,8 @@ mod tests {
             observed_revision: None,
             applied: Some(applied("good", &[("models", 1)])),
             rejected: vec![],
+            partially_compatible: Vec::new(),
+            partially_compatible_rows_by_kind: Default::default(),
             is_reload: true,
             wholly_rejected: false,
         });
@@ -824,6 +886,8 @@ mod tests {
                 "schema_failed",
                 "boom",
             )],
+            partially_compatible: Vec::new(),
+            partially_compatible_rows_by_kind: Default::default(),
             is_reload: true,
             wholly_rejected: true,
         });
@@ -844,6 +908,8 @@ mod tests {
                 "non_json",
                 "not json",
             )],
+            partially_compatible: Vec::new(),
+            partially_compatible_rows_by_kind: Default::default(),
             is_reload: true,
             wholly_rejected: false,
         });
@@ -858,6 +924,8 @@ mod tests {
             observed_revision: Some(1),
             applied: Some(applied(hash, &[("models", 1)])),
             rejected: vec![],
+            partially_compatible: Vec::new(),
+            partially_compatible_rows_by_kind: Default::default(),
             is_reload: false,
             wholly_rejected: false,
         };
@@ -883,6 +951,8 @@ mod tests {
                 "schema_failed",
                 "boom",
             )],
+            partially_compatible: Vec::new(),
+            partially_compatible_rows_by_kind: Default::default(),
             is_reload: true,
             wholly_rejected: false,
         });
@@ -893,6 +963,8 @@ mod tests {
             observed_revision: Some(2),
             applied: Some(applied("a2", &[("models", 1)])),
             rejected: vec![],
+            partially_compatible: Vec::new(),
+            partially_compatible_rows_by_kind: Default::default(),
             is_reload: true,
             wholly_rejected: false,
         });
@@ -919,6 +991,8 @@ mod tests {
             observed_revision: Some(1),
             applied: Some(applied("a", &[])),
             rejected: vec![r],
+            partially_compatible: Vec::new(),
+            partially_compatible_rows_by_kind: Default::default(),
             is_reload: true,
             wholly_rejected: false,
         });
@@ -937,6 +1011,8 @@ mod tests {
             observed_revision: Some(2),
             applied: Some(applied("a", &[])),
             rejected: vec![r2],
+            partially_compatible: Vec::new(),
+            partially_compatible_rows_by_kind: Default::default(),
             is_reload: true,
             wholly_rejected: false,
         });
@@ -960,6 +1036,8 @@ mod tests {
                 resource_counts: [("models".to_string(), 1)].into_iter().collect(),
             }),
             rejected: vec![],
+            partially_compatible: Vec::new(),
+            partially_compatible_rows_by_kind: Default::default(),
             is_reload: true,
             wholly_rejected: false,
         });
@@ -978,6 +1056,8 @@ mod tests {
             observed_revision: Some(11),
             applied: Some(applied("e", &[("models", 1)])),
             rejected: vec![],
+            partially_compatible: Vec::new(),
+            partially_compatible_rows_by_kind: Default::default(),
             is_reload: true,
             wholly_rejected: false,
         });
@@ -1005,6 +1085,8 @@ mod tests {
                     "y",
                 ),
             ],
+            partially_compatible: Vec::new(),
+            partially_compatible_rows_by_kind: Default::default(),
             is_reload: true,
             wholly_rejected: false,
         });

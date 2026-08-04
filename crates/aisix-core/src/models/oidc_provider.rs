@@ -42,7 +42,6 @@ impl BoundClaimExpect {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
 pub struct OidcProvider {
     /// Human-readable provider name, unique within the environment
     /// (e.g. `"corp-keycloak"`).
@@ -202,11 +201,15 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_fields() {
-        let r: Result<OidcProvider, _> = serde_json::from_str(
+    fn tolerates_unknown_fields_for_forward_compat() {
+        // A newer control plane may ship fields ahead of this DP; serde
+        // must accept them. The write path still rejects them via the
+        // strict schema validator (validate_oidc_provider in models/schema.rs).
+        let p: OidcProvider = serde_json::from_str(
             r#"{"name":"x","issuer":"https://x","audiences":["a"],"extra":1}"#,
-        );
-        assert!(r.is_err());
+        )
+        .unwrap();
+        assert_eq!(p.name, "x");
     }
 
     #[test]

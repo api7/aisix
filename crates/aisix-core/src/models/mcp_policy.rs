@@ -46,7 +46,6 @@ pub enum McpPolicyMode {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
 pub struct McpPolicy {
     /// Which API keys the policy applies to: the whole environment or one
     /// team.
@@ -114,7 +113,6 @@ pub enum McpAccessMode {
 /// key's effective grant is computed from the applicable MCP access policies
 /// and `mode`, and `allowed_tools` is not consulted.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
 pub struct McpAccess {
     /// How the key combines with the applicable policies: `inherit`,
     /// `restrict`, or `deny`.
@@ -192,10 +190,13 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_fields() {
-        let r: Result<McpPolicy, _> =
-            serde_json::from_str(r#"{"scope":"env","mode":"all","extra":1}"#);
-        assert!(r.is_err());
+    fn tolerates_unknown_fields_for_forward_compat() {
+        // cp-api may ship new fields ahead of the DP rolling out; serde must
+        // accept them. The write path still rejects them via the strict
+        // schema validators (validate_mcp_policy in models/schema.rs).
+        let p: McpPolicy =
+            serde_json::from_str(r#"{"scope":"env","mode":"all","extra":1}"#).unwrap();
+        assert_eq!(p.mode, McpPolicyMode::All);
     }
 
     #[test]
@@ -250,8 +251,13 @@ mod tests {
     }
 
     #[test]
-    fn mcp_access_rejects_unknown_fields_and_modes() {
-        assert!(serde_json::from_str::<McpAccess>(r#"{"mode":"inherit","extra":1}"#).is_err());
+    fn mcp_access_tolerates_unknown_fields_for_forward_compat_but_rejects_unknown_modes() {
+        // cp-api may ship new fields ahead of the DP rolling out; serde must
+        // accept them (the write path still rejects them via the strict
+        // schema validators in models/schema.rs). Unknown enum values stay
+        // hard errors.
+        let a: McpAccess = serde_json::from_str(r#"{"mode":"inherit","extra":1}"#).unwrap();
+        assert_eq!(a.mode, McpAccessMode::Inherit);
         assert!(serde_json::from_str::<McpAccess>(r#"{"mode":"legacy"}"#).is_err());
     }
 

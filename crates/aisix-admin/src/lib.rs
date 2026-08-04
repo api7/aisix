@@ -800,6 +800,8 @@ mod tests {
                 resource_counts: Default::default(),
             }),
             rejected: vec![],
+            partially_compatible: Vec::new(),
+            partially_compatible_rows_by_kind: Default::default(),
             is_reload: true,
             wholly_rejected: false,
         });
@@ -836,6 +838,12 @@ mod tests {
                 last_error: "schema validation failed at `/display_name`".into(),
                 seen_at: chrono::Utc::now(),
             }],
+            partially_compatible: vec![aisix_core::config_status::PartialCompatResource {
+                resource_kind: "api_keys".into(),
+                field: "quota_profile".into(),
+                count: 2,
+            }],
+            partially_compatible_rows_by_kind: [("api_keys".to_string(), 2)].into_iter().collect(),
             is_reload: true,
             wholly_rejected: false,
         });
@@ -866,6 +874,12 @@ mod tests {
         assert_eq!(v["applied"]["resource_counts"]["models"], 1);
         assert_eq!(v["rejected"][0]["resource_kind"], "models");
         assert_eq!(v["rejected"][0]["last_error_kind"], "schema_failed");
+        // The partially-compatible companion list (#871) rides next to
+        // rejected[] so a matching config_hash can't hide that some
+        // served rows carry fields this DP does not enforce.
+        assert_eq!(v["partially_compatible"][0]["resource_kind"], "api_keys");
+        assert_eq!(v["partially_compatible"][0]["field"], "quota_profile");
+        assert_eq!(v["partially_compatible"][0]["count"], 2);
     }
 
     #[tokio::test]
@@ -883,6 +897,8 @@ mod tests {
                 resource_counts: [("models".to_string(), 2)].into_iter().collect(),
             }),
             rejected: vec![],
+            partially_compatible: Vec::new(),
+            partially_compatible_rows_by_kind: Default::default(),
             is_reload: true,
             wholly_rejected: false,
         });
