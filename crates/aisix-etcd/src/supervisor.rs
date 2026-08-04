@@ -138,6 +138,25 @@ const MAX_RETAINED_REJECTIONS: usize = 256;
 /// the aggregated report, with a WARN so the truncation is never silent.
 const MAX_RETAINED_PARTIAL_ROWS: usize = 1024;
 
+/// One key whose latest etcd bytes are rejected while its last
+/// successfully loaded value keeps serving (#871, xDS-NACK style).
+/// `entry` pins the last-known-good raw document with the revision it
+/// was accepted at; `since_unix_secs` is the instant stale serving began
+/// (the first rejected replacement observed for the key), reported as
+/// the staleness age and persisted in the snapshot cache so the age
+/// stays continuous across restarts.
+///
+/// Deliberately uncapped, unlike the rejection and partial-compat
+/// buffers: dropping an entry here would take a served resource offline,
+/// not truncate a report. The map is bounded by the number of rows that
+/// ever loaded successfully — a subset of the served snapshot, which is
+/// itself uncapped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaleServing {
+    pub entry: RawEntry,
+    pub since_unix_secs: u64,
+}
+
 /// One supervisor instance. Consumers call [`Supervisor::run`] once and
 /// drop the returned handle on shutdown.
 pub struct Supervisor<P: ConfigProvider> {
@@ -183,6 +202,19 @@ pub struct Supervisor<P: ConfigProvider> {
     /// [`MAX_RETAINED_PARTIAL_ROWS`].
     partial_compat: Mutex<HashMap<String, PartialCompatRow>>,
 
+    /// Last-known-good state, keyed by etcd key: exactly the keys whose
+    /// latest etcd bytes are rejected while a previously accepted value
+    /// keeps serving (#871). A rejected put pins the serving bytes here;
+    /// a successful put or a delete removes the key; a resync drops keys
+    /// that now load or left etcd and re-injects the rest into the fresh
+    /// snapshot. Persisted via [`SnapshotCache`] so retention survives
+    /// restarts. Independent of the capped `rejections` buffer — buffer
+    /// overflow must never take a served resource offline.
+    ///
+    /// Locking: never held together with another supervisor lock; every
+    /// user snapshots or mutates it in its own scope.
+    stale_serving: Mutex<HashMap<String, StaleServing>>,
+
     // JoinHandles for in-flight `flush_cache` writes. Tests use
     // [`Self::await_pending_cache_writes`] to deterministically wait
     // for these without relying on a wall-clock sleep, which proved
@@ -217,6 +249,7 @@ impl<P: ConfigProvider> Supervisor<P> {
             config_status: ConfigStatus::new(SourceKind::Etcd),
             rejections: Mutex::new(Vec::new()),
             partial_compat: Mutex::new(HashMap::new()),
+            stale_serving: Mutex::new(HashMap::new()),
             pending_writes: Mutex::new(Vec::new()),
         }
     }
@@ -243,6 +276,9 @@ impl<P: ConfigProvider> Supervisor<P> {
     /// `aisix_config_reloads_total` — set only on full (re)syncs, not on
     /// incremental watch events.
     fn sync_config_status(&self, is_reload: bool) {
+        // Snapshot the stale-serving state first, in its own lock scope
+        // (see the `stale_serving` field docs for the locking rule).
+        let stale: HashMap<String, StaleServing> = self.stale_serving.lock().unwrap().clone();
         let source_hash;
         let config_hash;
         let rejected: Vec<IncomingRejection>;
@@ -258,18 +294,43 @@ impl<P: ConfigProvider> Supervisor<P> {
             source_hash =
                 hash_entries(state.values().map(|e| (e.key.as_str(), e.value.as_slice())));
             let rejected_keys: HashSet<&str> = rejections.iter().map(|r| r.key.as_str()).collect();
+            // config_hash covers the bytes each key ACTUALLY serves: the
+            // observed etcd bytes for accepted keys, the pinned last-known-
+            // good bytes for stale-serving keys (#871), and nothing for a
+            // rejected key with no last good (it doesn't serve). The stale
+            // map — not the capped rejection buffer — decides which keys
+            // substitute, so buffer overflow can never flip a served key's
+            // hash contribution to the rejected bytes.
             config_hash = hash_entries(
                 state
                     .values()
-                    .filter(|e| !rejected_keys.contains(e.key.as_str()))
-                    .map(|e| (e.key.as_str(), e.value.as_slice())),
+                    .filter(|e| {
+                        !rejected_keys.contains(e.key.as_str()) && !stale.contains_key(&e.key)
+                    })
+                    .map(|e| (e.key.as_str(), e.value.as_slice()))
+                    .chain(
+                        stale
+                            .values()
+                            .map(|s| (s.entry.key.as_str(), s.entry.value.as_slice())),
+                    ),
             );
-            rejected = rejections.iter().map(|r| self.map_rejection(r)).collect();
+            rejected = rejections
+                .iter()
+                .map(|r| self.map_rejection(r, &stale))
+                .collect();
         }
         let revision = *self.revision.lock().unwrap();
         let resource_counts = resource_counts(&self.handle.load());
         let (partially_compatible, partially_compatible_rows_by_kind) =
             self.partial_compat_observation();
+        let mut stale_served_rows_by_kind: BTreeMap<String, usize> = BTreeMap::new();
+        for key_str in stale.keys() {
+            if let Ok(parsed) = key::parse(&self.prefix, key_str) {
+                *stale_served_rows_by_kind
+                    .entry(parsed.kind.to_string())
+                    .or_insert(0) += 1;
+            }
+        }
 
         self.config_status.record_load(LoadObservation {
             source_hash,
@@ -282,6 +343,7 @@ impl<P: ConfigProvider> Supervisor<P> {
             rejected,
             partially_compatible,
             partially_compatible_rows_by_kind,
+            stale_served_rows_by_kind,
             is_reload,
             // etcd always publishes the accepted subset (even an empty one);
             // it never retains a previous snapshot wholesale, so a wholly-
@@ -293,8 +355,13 @@ impl<P: ConfigProvider> Supervisor<P> {
     /// Map a loader [`RejectedEntry`] to the source-agnostic wire shape. The
     /// key is split into `<kind>/<id>` via [`key::parse`]; an unparseable key
     /// (the `bad_key` path) reports empty kind/id, mirroring the control
-    /// plane's rejected-resources surface.
-    fn map_rejection(&self, r: &RejectedEntry) -> IncomingRejection {
+    /// plane's rejected-resources surface. `stale` joins in the instant the
+    /// key began serving its last known good value, if it is (#871).
+    fn map_rejection(
+        &self,
+        r: &RejectedEntry,
+        stale: &HashMap<String, StaleServing>,
+    ) -> IncomingRejection {
         let (kind, id) = match key::parse(&self.prefix, &r.key) {
             Ok(parsed) => (parsed.kind.to_string(), parsed.id.to_string()),
             Err(_) => (String::new(), String::new()),
@@ -307,15 +374,30 @@ impl<P: ConfigProvider> Supervisor<P> {
             last_error: r.error.clone(),
             seen_at: DateTime::from_timestamp(r.timestamp_unix_secs as i64, 0)
                 .unwrap_or_else(Utc::now),
+            serving_stale_since: stale
+                .get(&r.key)
+                .and_then(|s| DateTime::from_timestamp(s.since_unix_secs as i64, 0)),
         }
     }
 
-    /// Snapshot of the most recent loader rejections (capped). Used by
-    /// the heartbeat path to forward "DP rejected these resources" to
+    /// Snapshot of the most recent loader rejections (capped), with the
+    /// stale-serving instant joined in per key (#871). Used by the
+    /// heartbeat path to forward "DP rejected these resources" to
     /// cp-api. Returns a clone so the caller doesn't hold the lock
     /// across the heartbeat HTTP call.
     pub fn recent_rejections(&self) -> Vec<RejectedEntry> {
-        self.rejections.lock().unwrap().clone()
+        let stale: HashMap<String, u64> = {
+            let guard = self.stale_serving.lock().unwrap();
+            guard
+                .iter()
+                .map(|(k, s)| (k.clone(), s.since_unix_secs))
+                .collect()
+        };
+        let mut out = self.rejections.lock().unwrap().clone();
+        for r in &mut out {
+            r.stale_serving_since_unix_secs = stale.get(&r.key).copied();
+        }
+        out
     }
 
     /// Replace the retained rejection buffer wholesale. Called by the
@@ -449,22 +531,33 @@ impl<P: ConfigProvider> Supervisor<P> {
     /// No-op when the cache is disabled or the file is missing /
     /// unparseable.
     pub fn restore_from_cache(&self) {
-        let Some((entries, revision)) = self.cache.load() else {
+        let Some(cached) = self.cache.load() else {
             return;
         };
-        let stats = self.apply_resync(&entries);
+        // Seed the stale-serving state BEFORE the resync so keys whose
+        // cached bytes are rejected recover their pinned last-known-good
+        // values (#871) — apply_resync then re-validates each seed and
+        // drops any whose key now loads cleanly or left the entry set.
+        {
+            let mut stale = self.stale_serving.lock().unwrap();
+            stale.clear();
+            for s in cached.stale {
+                stale.insert(s.entry.key.clone(), s);
+            }
+        }
+        let stats = self.apply_resync(&cached.entries);
         // Track the last cached revision so the first live cycle's
         // resync reflects the right "from where" in logs. We don't
         // try to use it as the watch start revision — the etcd server
         // may have compacted past it; load_all + watch from latest is
         // always safer.
-        *self.revision.lock().unwrap() = revision;
+        *self.revision.lock().unwrap() = cached.revision;
         // Reflect the cached revision on the status view (apply_resync above
         // synced with the entry-max revision).
         self.sync_config_status(false);
         tracing::info!(
             accepted = stats.accepted,
-            revision,
+            revision = cached.revision,
             "snapshot restored from on-disk cache (offline-resilient boot)",
         );
     }
@@ -515,12 +608,52 @@ impl<P: ConfigProvider> Supervisor<P> {
         self.sync_config_status(false);
     }
 
+    /// Pin the currently served bytes for `key` as its last known good
+    /// (#871). Called when a watch put for the key is rejected. No-op
+    /// when the key is already stale-tracked (the original pin and its
+    /// `since` stand) or when nothing serves for the key (it never
+    /// loaded successfully — there is no good value to pin).
+    ///
+    /// The serving bytes are read from `state[key]`: the invariant is
+    /// that a key present in the served snapshot and NOT stale-tracked
+    /// has its served bytes in `state` (a rejected put never touches
+    /// `state`, and a resync that rejects a key either stale-tracks it
+    /// or drops it from the snapshot).
+    fn capture_last_good(&self, key_str: &str) {
+        if self.stale_serving.lock().unwrap().contains_key(key_str) {
+            return;
+        }
+        let Ok(parsed) = key::parse(&self.prefix, key_str) else {
+            return;
+        };
+        if !snapshot_has(&self.handle.load(), parsed.kind, parsed.id) {
+            return;
+        }
+        let Some(good) = self.state.lock().unwrap().get(key_str).cloned() else {
+            return;
+        };
+        // entry().or_insert_with keeps the original pin (and its `since`)
+        // if a concurrent caller won the race after the check above.
+        self.stale_serving
+            .lock()
+            .unwrap()
+            .entry(key_str.to_string())
+            .or_insert_with(|| StaleServing {
+                entry: good,
+                since_unix_secs: now_unix_secs(),
+            });
+    }
+
     /// Apply a single Put event on top of the current snapshot.
     /// Returns `true` if the apply succeeded (schema + parse passed).
     pub fn apply_put(&self, entry: &RawEntry) -> bool {
         // Build a tiny snapshot out of just the new entry, then merge.
         let (tiny, mut stats) = loader::build_snapshot(&self.prefix, std::slice::from_ref(entry));
         if stats.accepted == 0 {
+            // The previous good value keeps serving. Pin it now (#871):
+            // the next resync rebuilds from the rejected etcd bytes and
+            // needs the pinned bytes to keep this row alive.
+            self.capture_last_good(&entry.key);
             // Note: a previously retained partially-compatible entry for
             // this key is deliberately kept — the row's last-good value
             // (loaded with those fields ignored) is still what serves.
@@ -547,51 +680,17 @@ impl<P: ConfigProvider> Supervisor<P> {
         // because the operation is "merge tiny into current".
         self.handle.rcu(|current| {
             let new = clone_snapshot(current);
-
-            // Move any entries from `tiny` into `new`. Must cover every
-            // ResourceTable on AisixSnapshot — a missing kind here
-            // means a watch event silently drops on the floor and the
-            // snapshot never sees the new entry, even though the loader
-            // and the proxy both know about it.
-            for e in tiny.models.entries() {
-                new.models.insert(clone_entry(&e));
-            }
-            for e in tiny.apikeys.entries() {
-                new.apikeys.insert(clone_entry(&e));
-            }
-            for e in tiny.provider_keys.entries() {
-                new.provider_keys.insert(clone_entry(&e));
-            }
-            for e in tiny.guardrails.entries() {
-                new.guardrails.insert(clone_entry(&e));
-            }
-            for e in tiny.guardrail_attachments.entries() {
-                new.guardrail_attachments.insert(clone_entry(&e));
-            }
-            for e in tiny.cache_policies.entries() {
-                new.cache_policies.insert(clone_entry(&e));
-            }
-            for e in tiny.observability_exporters.entries() {
-                new.observability_exporters.insert(clone_entry(&e));
-            }
-            for e in tiny.rate_limit_policies.entries() {
-                new.rate_limit_policies.insert(clone_entry(&e));
-            }
-            for e in tiny.mcp_servers.entries() {
-                new.mcp_servers.insert(clone_entry(&e));
-            }
-            for e in tiny.mcp_policies.entries() {
-                new.mcp_policies.insert(clone_entry(&e));
-            }
-            for e in tiny.a2a_agents.entries() {
-                new.a2a_agents.insert(clone_entry(&e));
-            }
-            for e in tiny.oidc_providers.entries() {
-                new.oidc_providers.insert(clone_entry(&e));
-            }
+            // Move any entries from `tiny` into `new`. `merge_snapshot`
+            // must cover every ResourceTable on AisixSnapshot — a
+            // missing kind there means a watch event silently drops on
+            // the floor and the snapshot never sees the new entry, even
+            // though the loader and the proxy both know about it.
+            merge_snapshot(&new, &tiny);
             new
         });
         self.remove_rejection_for_key(&entry.key);
+        // The key's latest bytes load again — retention ends (#871).
+        self.stale_serving.lock().unwrap().remove(&entry.key);
         // Refresh this key's partially-compatible signal: replaced when
         // the new value still carries unknown fields, cleared when it now
         // matches the schema exactly.
@@ -641,27 +740,13 @@ impl<P: ConfigProvider> Supervisor<P> {
         // delete that wins the race observes the same key already
         // gone, so this caller returns false (nothing left to remove).
         let snap = self.handle.load();
-        let present = match parsed.kind {
-            "models" => snap.models.get_by_id(parsed.id).is_some(),
-            "api_keys" => snap.apikeys.get_by_id(parsed.id).is_some(),
-            "provider_keys" => snap.provider_keys.get_by_id(parsed.id).is_some(),
-            "guardrails" => snap.guardrails.get_by_id(parsed.id).is_some(),
-            "guardrail_attachments" => snap.guardrail_attachments.get_by_id(parsed.id).is_some(),
-            "cache_policies" => snap.cache_policies.get_by_id(parsed.id).is_some(),
-            "observability_exporters" => {
-                snap.observability_exporters.get_by_id(parsed.id).is_some()
-            }
-            "rate_limit_policies" => snap.rate_limit_policies.get_by_id(parsed.id).is_some(),
-            "mcp_servers" => snap.mcp_servers.get_by_id(parsed.id).is_some(),
-            "mcp_policies" => snap.mcp_policies.get_by_id(parsed.id).is_some(),
-            "a2a_agents" => snap.a2a_agents.get_by_id(parsed.id).is_some(),
-            "oidc_providers" => snap.oidc_providers.get_by_id(parsed.id).is_some(),
-            _ => false,
-        };
+        let present = snapshot_has(&snap, parsed.kind, parsed.id);
         let removed_rejection = self.remove_rejection_for_key(key_str);
         // A deleted key no longer serves, so its partially-compatible
-        // signal (if any) goes with it.
+        // signal (if any) goes with it — and so does its last-known-good
+        // retention (#871): the pin must never outlive the etcd key.
         self.update_partial_row(key_str, None);
+        self.stale_serving.lock().unwrap().remove(key_str);
         drop(snap);
         if !present {
             if removed_rejection {
@@ -736,8 +821,96 @@ impl<P: ConfigProvider> Supervisor<P> {
     }
 
     /// Replace the current snapshot with a freshly loaded set (resync).
+    ///
+    /// Rejected keys don't simply vanish (#871): a key whose latest bytes
+    /// are rejected but whose previous good value was serving keeps
+    /// serving that value — the pre-existing "cliff" where a routine
+    /// resync/restart silently took a resource offline days after the
+    /// write that broke it. Retention ends when the key loads cleanly
+    /// again or leaves etcd.
     pub fn apply_resync(&self, entries: &[RawEntry]) -> BuildStats {
-        let (snap, stats) = loader::build_snapshot(&self.prefix, entries);
+        let (snap, mut stats) = loader::build_snapshot(&self.prefix, entries);
+
+        // Reconcile the last-known-good state against this build, then
+        // inject the retained values into the fresh snapshot.
+        let rejected_keys: HashSet<&str> =
+            stats.rejections.iter().map(|r| r.key.as_str()).collect();
+        let entry_keys: HashSet<&str> = entries.iter().map(|e| e.key.as_str()).collect();
+        // Serving bytes for newly rejected keys come from the PRE-resync
+        // state map (see `capture_last_good` for the invariant). Collect
+        // them before `state` is replaced below.
+        let prev_state: HashMap<String, RawEntry> = {
+            let state = self.state.lock().unwrap();
+            stats
+                .rejections
+                .iter()
+                .filter_map(|r| state.get(&r.key).map(|e| (r.key.clone(), e.clone())))
+                .collect()
+        };
+        let prev_snap = self.handle.load();
+        let injected: Vec<RawEntry> = {
+            let mut stale = self.stale_serving.lock().unwrap();
+            // Retention ends for keys that now load cleanly or left etcd
+            // entirely — the delete-side guarantee that a pinned value
+            // never outlives its key.
+            stale.retain(|k, _| {
+                entry_keys.contains(k.as_str()) && rejected_keys.contains(k.as_str())
+            });
+            // Newly rejected keys that were serving up to this resync:
+            // pin their serving bytes now.
+            for r in &stats.rejections {
+                if stale.contains_key(&r.key) {
+                    continue;
+                }
+                let Ok(parsed) = key::parse(&self.prefix, &r.key) else {
+                    continue;
+                };
+                if !snapshot_has(&prev_snap, parsed.kind, parsed.id) {
+                    continue;
+                }
+                if let Some(good) = prev_state.get(&r.key) {
+                    stale.insert(
+                        r.key.clone(),
+                        StaleServing {
+                            entry: good.clone(),
+                            since_unix_secs: now_unix_secs(),
+                        },
+                    );
+                }
+            }
+            stale.values().map(|s| s.entry.clone()).collect()
+        };
+        drop(prev_snap);
+
+        // Re-build each pinned value from its bytes so every derived
+        // signal (typed value, YELLOW ignored-field paths) stays
+        // consistent with what actually serves. A pinned value this
+        // build can no longer parse (e.g. after a DP downgrade) drops
+        // its retention with an ERROR — same contract as any RED row.
+        if !injected.is_empty() {
+            let (lkg_snap, lkg_stats) = loader::build_snapshot(&self.prefix, &injected);
+            if !lkg_stats.rejections.is_empty() {
+                let mut stale = self.stale_serving.lock().unwrap();
+                for r in &lkg_stats.rejections {
+                    tracing::error!(
+                        key = %r.key,
+                        error = %r.error,
+                        "pinned last-known-good value no longer parses; dropping retention",
+                    );
+                    stale.remove(&r.key);
+                }
+            }
+            merge_snapshot(&snap, &lkg_snap);
+            stats.partial_rows.extend(lkg_stats.partial_rows);
+            stats.partially_compatible = loader::aggregate_partial_compat(&stats.partial_rows);
+            if lkg_stats.accepted > 0 {
+                tracing::info!(
+                    count = lkg_stats.accepted,
+                    "serving last-known-good values for rejected keys",
+                );
+            }
+        }
+
         self.handle.store(snap);
 
         // Replace the cache-tracking map wholesale and flush.
@@ -787,6 +960,10 @@ impl<P: ConfigProvider> Supervisor<P> {
             let state = self.state.lock().unwrap();
             state.values().cloned().collect()
         };
+        let stale: Vec<StaleServing> = {
+            let guard = self.stale_serving.lock().unwrap();
+            guard.values().cloned().collect()
+        };
         let revision = *self.revision.lock().unwrap();
         let cache = self.cache.clone();
         // Spawn the actual write so the apply path stays sync. If we
@@ -797,7 +974,8 @@ impl<P: ConfigProvider> Supervisor<P> {
         // raced the spawn (~50ms wasn't enough on heavily loaded
         // GitHub Actions runners).
         if let Ok(rt_handle) = tokio::runtime::Handle::try_current() {
-            let join = rt_handle.spawn(async move { cache.store(&entries, revision).await });
+            let join =
+                rt_handle.spawn(async move { cache.store(&entries, revision, &stale).await });
             self.pending_writes.lock().unwrap().push(join);
         }
     }
@@ -937,43 +1115,80 @@ async fn wait_for_cancel(mut rx: tokio::sync::watch::Receiver<bool>) {
 /// it doesn't materialise a deep copy of the `T` payload.
 fn clone_snapshot(src: &AisixSnapshot) -> AisixSnapshot {
     let out = AisixSnapshot::new();
+    merge_snapshot(&out, src);
+    out
+}
+
+/// Insert every entry of `src` into `dst` (replacing same-id entries).
+/// Must cover every ResourceTable on [`AisixSnapshot`] — a missing kind
+/// here means entries of that kind silently drop on the floor when a
+/// watch put merges or a last-known-good row is re-injected on resync.
+fn merge_snapshot(dst: &AisixSnapshot, src: &AisixSnapshot) {
     for e in src.models.entries() {
-        out.models.insert(clone_entry(&e));
+        dst.models.insert(clone_entry(&e));
     }
     for e in src.apikeys.entries() {
-        out.apikeys.insert(clone_entry(&e));
+        dst.apikeys.insert(clone_entry(&e));
     }
     for e in src.provider_keys.entries() {
-        out.provider_keys.insert(clone_entry(&e));
+        dst.provider_keys.insert(clone_entry(&e));
     }
     for e in src.guardrails.entries() {
-        out.guardrails.insert(clone_entry(&e));
+        dst.guardrails.insert(clone_entry(&e));
     }
     for e in src.guardrail_attachments.entries() {
-        out.guardrail_attachments.insert(clone_entry(&e));
+        dst.guardrail_attachments.insert(clone_entry(&e));
     }
     for e in src.cache_policies.entries() {
-        out.cache_policies.insert(clone_entry(&e));
+        dst.cache_policies.insert(clone_entry(&e));
     }
     for e in src.observability_exporters.entries() {
-        out.observability_exporters.insert(clone_entry(&e));
+        dst.observability_exporters.insert(clone_entry(&e));
     }
     for e in src.rate_limit_policies.entries() {
-        out.rate_limit_policies.insert(clone_entry(&e));
+        dst.rate_limit_policies.insert(clone_entry(&e));
     }
     for e in src.mcp_servers.entries() {
-        out.mcp_servers.insert(clone_entry(&e));
+        dst.mcp_servers.insert(clone_entry(&e));
     }
     for e in src.mcp_policies.entries() {
-        out.mcp_policies.insert(clone_entry(&e));
+        dst.mcp_policies.insert(clone_entry(&e));
     }
     for e in src.a2a_agents.entries() {
-        out.a2a_agents.insert(clone_entry(&e));
+        dst.a2a_agents.insert(clone_entry(&e));
     }
     for e in src.oidc_providers.entries() {
-        out.oidc_providers.insert(clone_entry(&e));
+        dst.oidc_providers.insert(clone_entry(&e));
     }
-    out
+}
+
+/// Whether the snapshot holds an entry for `(kind, id)`. Mirrors the
+/// kind dispatch of [`Supervisor::apply_delete`]'s presence probe; an
+/// unknown kind reads as absent.
+fn snapshot_has(snap: &AisixSnapshot, kind: &str, id: &str) -> bool {
+    match kind {
+        "models" => snap.models.get_by_id(id).is_some(),
+        "api_keys" => snap.apikeys.get_by_id(id).is_some(),
+        "provider_keys" => snap.provider_keys.get_by_id(id).is_some(),
+        "guardrails" => snap.guardrails.get_by_id(id).is_some(),
+        "guardrail_attachments" => snap.guardrail_attachments.get_by_id(id).is_some(),
+        "cache_policies" => snap.cache_policies.get_by_id(id).is_some(),
+        "observability_exporters" => snap.observability_exporters.get_by_id(id).is_some(),
+        "rate_limit_policies" => snap.rate_limit_policies.get_by_id(id).is_some(),
+        "mcp_servers" => snap.mcp_servers.get_by_id(id).is_some(),
+        "mcp_policies" => snap.mcp_policies.get_by_id(id).is_some(),
+        "a2a_agents" => snap.a2a_agents.get_by_id(id).is_some(),
+        "oidc_providers" => snap.oidc_providers.get_by_id(id).is_some(),
+        _ => false,
+    }
+}
+
+/// Wall-clock seconds since the Unix epoch; zero on a pre-epoch clock.
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Per-kind counts of the served snapshot, keyed by the plural etcd resource
@@ -1453,15 +1668,15 @@ mod tests {
         sup.await_pending_cache_writes().await;
 
         let cache = SnapshotCache::new(&cache_path);
-        let (entries, _) = cache.load().expect("cache file present");
-        assert_eq!(entries.len(), 2);
+        let cached = cache.load().expect("cache file present");
+        assert_eq!(cached.entries.len(), 2);
 
         sup.apply_delete("/aisix/models/m-1");
         sup.await_pending_cache_writes().await;
 
-        let (entries, _) = cache.load().expect("cache file present");
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].key, "/aisix/models/m-2");
+        let cached = cache.load().expect("cache file present");
+        assert_eq!(cached.entries.len(), 1);
+        assert_eq!(cached.entries[0].key, "/aisix/models/m-2");
     }
 
     // ---- regression coverage for issue #114 -------------------------
@@ -1728,5 +1943,196 @@ mod tests {
         assert_eq!(sup.handle().load().models.len(), 1);
         assert_eq!(sup.recent_partial_compat().len(), 1);
         assert_eq!(sup.recent_rejections().len(), 1);
+    }
+
+    // ---- RED last-known-good retention across resync/restart (#871 PR2) ----
+    //
+    // A watch put that is rejected already leaves the previous good value
+    // serving (pinned above). But the retention used to end at the next
+    // full resync: `apply_resync` rebuilt the snapshot from accepted rows
+    // only, so a key whose latest etcd bytes are rejected VANISHED — an
+    // api_key would 401 byte-identically to "no such key", days after the
+    // write that caused it. The tests below pin the xDS-NACK-style fix:
+    // the last known good value keeps serving for as long as the etcd key
+    // exists, across resync and restart, with the staleness reported.
+
+    #[tokio::test]
+    async fn rejected_update_keeps_last_good_serving_across_resync() {
+        let provider = Arc::new(FakeProvider::new(vec![], 0));
+        let sup = Supervisor::new(provider, "/aisix");
+        sup.load_once().await.unwrap();
+
+        assert!(sup.apply_put(&entry("/aisix/models/m-1", VALID_MODEL, 1)));
+        assert!(!sup.apply_put(&entry("/aisix/models/m-1", BAD_PROVIDER_MODEL, 2)));
+        assert_eq!(sup.handle().load().models.len(), 1);
+
+        // The next resync re-reads the full etcd state — which still
+        // holds the rejected bytes for this key.
+        sup.apply_resync(&[entry("/aisix/models/m-1", BAD_PROVIDER_MODEL, 2)]);
+        assert_eq!(
+            sup.handle().load().models.len(),
+            1,
+            "resync must keep serving the last known good value for a rejected key",
+        );
+
+        // The rejection signal persists every cycle, and the row is
+        // reported as serving-stale with its age.
+        assert_eq!(sup.recent_rejections().len(), 1);
+        let view = serde_json::to_value(sup.config_status().view()).unwrap();
+        assert_eq!(view["rejected"].as_array().unwrap().len(), 1);
+        assert!(
+            view["rejected"][0]["serving_stale_since"].is_string(),
+            "rejected[] must carry the stale-serving timestamp: {view}",
+        );
+        assert!(
+            view["rejected"][0]["serving_stale_age_seconds"].is_u64(),
+            "rejected[] must carry the staleness age: {view}",
+        );
+        // The served row keeps counting.
+        assert_eq!(view["applied"]["resource_counts"]["models"], 1);
+    }
+
+    #[tokio::test]
+    async fn rejected_update_keeps_last_good_serving_across_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_path = dir.path().join("snap.json");
+
+        // First lifecycle: a good row loads, then a resync observes the
+        // rejected replacement bytes (the etcd state after a newer CP
+        // wrote an update this DP cannot represent). The flushed cache
+        // must carry enough to survive a restart.
+        {
+            let provider = Arc::new(FakeProvider::new(
+                vec![entry("/aisix/models/m-1", VALID_MODEL, 1)],
+                1,
+            ));
+            let sup = Supervisor::with_cache(provider, "/aisix", SnapshotCache::new(&cache_path));
+            sup.load_once().await.unwrap();
+            assert_eq!(sup.handle().load().models.len(), 1);
+            sup.apply_resync(&[entry("/aisix/models/m-1", BAD_PROVIDER_MODEL, 2)]);
+            assert_eq!(
+                sup.handle().load().models.len(),
+                1,
+                "pre-restart: the last known good value serves through the resync",
+            );
+            sup.await_pending_cache_writes().await;
+        }
+
+        // Second lifecycle (process restart, etcd unreachable): restore
+        // from disk. The last known good value must come back — without
+        // it the restart is the cliff where the resource silently dies.
+        {
+            let provider = Arc::new(FakeProvider::new(vec![], 0));
+            let sup = Supervisor::with_cache(provider, "/aisix", SnapshotCache::new(&cache_path));
+            sup.restore_from_cache();
+            assert_eq!(
+                sup.handle().load().models.len(),
+                1,
+                "restart must restore the last known good value for a rejected key",
+            );
+            assert_eq!(
+                sup.recent_rejections().len(),
+                1,
+                "the rejection signal must survive the restart too",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_served_row_dies_with_etcd_delete() {
+        let provider = Arc::new(FakeProvider::new(vec![], 0));
+        let sup = Supervisor::new(provider, "/aisix");
+        sup.load_once().await.unwrap();
+
+        assert!(sup.apply_put(&entry("/aisix/models/m-1", VALID_MODEL, 1)));
+        assert!(!sup.apply_put(&entry("/aisix/models/m-1", BAD_PROVIDER_MODEL, 2)));
+        sup.apply_resync(&[entry("/aisix/models/m-1", BAD_PROVIDER_MODEL, 2)]);
+        assert_eq!(sup.handle().load().models.len(), 1);
+
+        // The admin deletes the resource: the last known good goes with
+        // it — retention must never outlive the etcd key.
+        assert!(sup.apply_delete("/aisix/models/m-1"));
+        assert!(sup.handle().load().models.is_empty());
+        assert!(sup.recent_rejections().is_empty());
+        // A later resync confirming the key's absence keeps it gone.
+        sup.apply_resync(&[]);
+        assert!(sup.handle().load().models.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stale_served_row_dies_when_resync_no_longer_carries_the_key() {
+        // Same zombie guard for the resync-observed deletion: a key that
+        // disappears from the full etcd read (no watch Delete seen, e.g.
+        // reconnect after compaction) must drop its last known good.
+        let provider = Arc::new(FakeProvider::new(vec![], 0));
+        let sup = Supervisor::new(provider, "/aisix");
+        sup.load_once().await.unwrap();
+
+        assert!(sup.apply_put(&entry("/aisix/models/m-1", VALID_MODEL, 1)));
+        assert!(!sup.apply_put(&entry("/aisix/models/m-1", BAD_PROVIDER_MODEL, 2)));
+        sup.apply_resync(&[entry("/aisix/models/m-1", BAD_PROVIDER_MODEL, 2)]);
+        assert_eq!(sup.handle().load().models.len(), 1);
+
+        sup.apply_resync(&[]);
+        assert!(
+            sup.handle().load().models.is_empty(),
+            "a key absent from the resynced etcd state must not keep serving",
+        );
+        assert!(sup.recent_rejections().is_empty());
+    }
+
+    #[tokio::test]
+    async fn stale_last_good_that_was_yellow_keeps_its_partial_compat_signal() {
+        // The value actually serving is itself YELLOW (unknown field
+        // ignored), and the newer update is RED-rejected. Both signals
+        // must coexist across a resync: rejected[] describes the new
+        // bytes, partially_compatible[] describes the served old value.
+        let provider = Arc::new(FakeProvider::new(vec![], 0));
+        let sup = Supervisor::new(provider, "/aisix");
+        sup.load_once().await.unwrap();
+
+        assert!(sup.apply_put(&entry("/aisix/models/m-1", YELLOW_MODEL, 1)));
+        assert!(!sup.apply_put(&entry("/aisix/models/m-1", BAD_PROVIDER_MODEL, 2)));
+        sup.apply_resync(&[entry("/aisix/models/m-1", BAD_PROVIDER_MODEL, 2)]);
+
+        assert_eq!(sup.handle().load().models.len(), 1);
+        assert_eq!(sup.recent_rejections().len(), 1);
+        let agg = sup.recent_partial_compat();
+        assert_eq!(
+            agg.len(),
+            1,
+            "the served YELLOW last-good keeps reporting its ignored fields",
+        );
+        assert_eq!(agg[0].field, "future_knob");
+    }
+
+    #[tokio::test]
+    async fn config_hash_reflects_served_bytes_not_rejected_bytes() {
+        let provider = Arc::new(FakeProvider::new(vec![], 0));
+        let sup = Supervisor::new(provider, "/aisix");
+        sup.load_once().await.unwrap();
+
+        assert!(sup.apply_put(&entry("/aisix/models/m-1", VALID_MODEL, 1)));
+        let good_hash = sup.config_status().view().applied.unwrap().config_hash;
+
+        sup.apply_resync(&[entry("/aisix/models/m-1", BAD_PROVIDER_MODEL, 2)]);
+        let view = sup.config_status().view();
+        let applied = view.applied.unwrap();
+        // What's served didn't change, so the served-config hash must not
+        // change either: the rejected bytes never enter config_hash (the
+        // hash must not claim the new value applied), and the row must
+        // not silently drop out of it (the hash must not claim the row
+        // stopped serving).
+        assert_eq!(
+            applied.config_hash, good_hash,
+            "config_hash must cover the bytes actually served (the last known good)",
+        );
+        // source_hash reflects the observed etcd state (the rejected
+        // bytes), so the two hashes diverge — the honest "not converged"
+        // signal, explained by rejected[].
+        assert_ne!(
+            Some(applied.config_hash.as_str()),
+            view.source.source_hash.as_deref(),
+        );
     }
 }

@@ -258,10 +258,15 @@ pub struct ManagedConfig {
     /// so the proxy can serve traffic from cached config across CP
     /// outages and full container restarts.
     ///
-    /// Empty string disables persistence — useful for ephemeral test
-    /// runs where you don't want a stale cache to mask a real failure.
-    #[serde(default = "ManagedConfig::default_snapshot_cache_path")]
-    pub snapshot_cache_path: String,
+    /// When the field is omitted, managed mode uses
+    /// `/var/lib/aisix/config_cache.json` and self-hosted etcd mode
+    /// leaves persistence off (unchanged defaults). Setting a path
+    /// enables the cache in either mode — self-hosted etcd deployments
+    /// gain the same offline resilience by opting in. Empty string
+    /// disables persistence everywhere — useful for ephemeral test runs
+    /// where you don't want a stale cache to mask a real failure.
+    #[serde(default)]
+    pub snapshot_cache_path: Option<String>,
 
     /// Heartbeat interval, in seconds. The DP POSTs a heartbeat to
     /// dp-manager every `heartbeat_interval_secs`; CP surfaces a DP as
@@ -296,14 +301,27 @@ impl ManagedConfig {
         has_pem || has_file
     }
 
+    /// Resolve the snapshot-cache path per the field docs: an explicit
+    /// path wins in any mode, an explicit empty string disables, and an
+    /// omitted field means "the default path in managed mode, disabled
+    /// in self-hosted etcd mode".
+    pub fn effective_snapshot_cache_path(&self) -> Option<&str> {
+        match self.snapshot_cache_path.as_deref() {
+            Some("") => None,
+            Some(path) => Some(path),
+            None if self.is_managed() => Some(Self::DEFAULT_SNAPSHOT_CACHE_PATH),
+            None => None,
+        }
+    }
+
+    /// Default on-disk snapshot cache location for managed mode.
+    pub const DEFAULT_SNAPSHOT_CACHE_PATH: &'static str = "/var/lib/aisix/config_cache.json";
+
     fn default_mtls_dir() -> String {
         "/var/lib/aisix/mtls".into()
     }
     fn default_dp_id_file() -> String {
         "/var/lib/aisix/dp_id".into()
-    }
-    fn default_snapshot_cache_path() -> String {
-        "/var/lib/aisix/config_cache.json".into()
     }
     const fn default_heartbeat_interval_secs() -> u64 {
         15
@@ -2091,13 +2109,49 @@ managed:
         assert_eq!(cfg.managed.mtls_dir, "/var/lib/aisix/mtls");
         assert_eq!(cfg.managed.dp_id_file, "/var/lib/aisix/dp_id");
         // Default snapshot cache path keeps offline-resilience on by
-        // default; operators opt out by setting the field to "".
+        // default in managed mode; operators opt out by setting the
+        // field to "".
         assert_eq!(
-            cfg.managed.snapshot_cache_path,
-            "/var/lib/aisix/config_cache.json",
+            cfg.managed.effective_snapshot_cache_path(),
+            Some("/var/lib/aisix/config_cache.json"),
         );
         // CP URL comes from env at runtime — empty here is fine.
         assert!(cfg.managed.cp_base_url.is_none());
+    }
+
+    /// #871: the snapshot cache resolves per mode — managed defaults on,
+    /// self-hosted etcd defaults off, an explicit path enables either,
+    /// an explicit "" disables either.
+    #[test]
+    fn snapshot_cache_path_resolution_per_mode() {
+        let mut managed = ManagedConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            managed.effective_snapshot_cache_path(),
+            Some(ManagedConfig::DEFAULT_SNAPSHOT_CACHE_PATH),
+        );
+        managed.snapshot_cache_path = Some(String::new());
+        assert_eq!(managed.effective_snapshot_cache_path(), None);
+        managed.snapshot_cache_path = Some("/tmp/cache.json".into());
+        assert_eq!(
+            managed.effective_snapshot_cache_path(),
+            Some("/tmp/cache.json"),
+        );
+
+        let mut self_hosted = ManagedConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        assert_eq!(self_hosted.effective_snapshot_cache_path(), None);
+        self_hosted.snapshot_cache_path = Some("/tmp/cache.json".into());
+        assert_eq!(
+            self_hosted.effective_snapshot_cache_path(),
+            Some("/tmp/cache.json"),
+        );
+        self_hosted.snapshot_cache_path = Some(String::new());
+        assert_eq!(self_hosted.effective_snapshot_cache_path(), None);
     }
 
     #[test]

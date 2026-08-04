@@ -142,6 +142,17 @@ pub struct RejectedResource {
     pub first_seen_at: String,
     /// RFC3339 UTC timestamp the rejection was most recently observed.
     pub last_seen_at: String,
+    /// RFC3339 UTC timestamp since when this resource has been serving its
+    /// last known good value instead of the rejected bytes (issue #871).
+    /// Absent when nothing is serving for this resource — the row either
+    /// never loaded successfully or its retention was dropped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub serving_stale_since: Option<String>,
+    /// Seconds elapsed since `serving_stale_since`, recomputed on every
+    /// read so the staleness age is reported every cycle. Absent together
+    /// with `serving_stale_since`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub serving_stale_age_seconds: Option<u64>,
 }
 
 /// One rejected entry handed to [`ConfigStatus`] by a load path. `identity`
@@ -155,6 +166,10 @@ pub struct IncomingRejection {
     pub last_error_kind: String,
     pub last_error: String,
     pub seen_at: DateTime<Utc>,
+    /// When set, the resource is still serving its last known good value
+    /// (pinned before this rejection) and this is the instant that stale
+    /// serving began (#871). `None` means nothing serves for this row.
+    pub serving_stale_since: Option<DateTime<Utc>>,
 }
 
 /// One partially compatible observation, aggregated per (kind, field):
@@ -207,6 +222,11 @@ pub struct LoadObservation {
     /// Row-based (a resource with two unknown fields counts once), for
     /// the `aisix_config_partially_compatible_resources` gauge.
     pub partially_compatible_rows_by_kind: BTreeMap<String, usize>,
+    /// Served resources per kind whose latest source bytes are rejected
+    /// and whose last known good value serves instead (#871), for the
+    /// `aisix_config_stale_served_resources` gauge. The per-resource
+    /// detail (which row, since when) rides on `rejected[]`.
+    pub stale_served_rows_by_kind: BTreeMap<String, usize>,
     /// Whether this load counts as a config reload for
     /// `aisix_config_reloads_total` (full (re)syncs and file loads do;
     /// incremental etcd events do not).
@@ -230,6 +250,7 @@ struct RetainedRejection {
     last_error: String,
     first_seen_at: DateTime<Utc>,
     last_seen_at: DateTime<Utc>,
+    serving_stale_since: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug)]
@@ -269,6 +290,10 @@ struct ConfigStatusInner {
     partially_compatible: Vec<PartialCompatResource>,
     partially_compatible_rows_by_kind: BTreeMap<String, usize>,
 
+    // Rows serving their last known good value (#871), per kind. Replaced
+    // wholesale on every load, like the partially-compatible state.
+    stale_served_rows_by_kind: BTreeMap<String, usize>,
+
     // Metric counters.
     reloads_total: u64,
     reload_failures: BTreeMap<&'static str, u64>,
@@ -305,6 +330,7 @@ impl ConfigStatus {
                 rejected: BTreeMap::new(),
                 partially_compatible: Vec::new(),
                 partially_compatible_rows_by_kind: BTreeMap::new(),
+                stale_served_rows_by_kind: BTreeMap::new(),
                 reloads_total: 0,
                 reload_failures: BTreeMap::new(),
             })),
@@ -353,12 +379,14 @@ impl ConfigStatus {
                     last_error: r.last_error,
                     first_seen_at,
                     last_seen_at: r.seen_at,
+                    serving_stale_since: r.serving_stale_since,
                 },
             );
         }
         inner.rejected = merged;
         inner.partially_compatible = obs.partially_compatible;
         inner.partially_compatible_rows_by_kind = obs.partially_compatible_rows_by_kind;
+        inner.stale_served_rows_by_kind = obs.stale_served_rows_by_kind;
 
         let clean = inner.rejected.is_empty();
         inner.last_reload_successful = clean;
@@ -498,6 +526,7 @@ impl ConfigStatusInner {
             last_error_kind: f.last_error_kind.clone(),
             last_error: f.last_error.clone(),
         });
+        let now = Utc::now();
         let mut rejected: Vec<RejectedResource> = self
             .rejected
             .values()
@@ -508,6 +537,12 @@ impl ConfigStatusInner {
                 last_error: r.last_error.clone(),
                 first_seen_at: rfc3339(r.first_seen_at),
                 last_seen_at: rfc3339(r.last_seen_at),
+                serving_stale_since: r.serving_stale_since.map(rfc3339),
+                // Recomputed on every read — the "reported every cycle"
+                // staleness age (#871). Clamped at zero for clock skew.
+                serving_stale_age_seconds: r
+                    .serving_stale_since
+                    .map(|s| now.signed_duration_since(s).num_seconds().max(0) as u64),
             })
             .collect();
         rejected.sort_by(|a, b| {
@@ -541,6 +576,7 @@ impl ConfigStatusInner {
             reload_failures: self.reload_failures.iter().map(|(k, v)| (*k, *v)).collect(),
             rejected_by_kind,
             partially_compatible_by_kind: self.partially_compatible_rows_by_kind.clone(),
+            stale_served_by_kind: self.stale_served_rows_by_kind.clone(),
             observed_revision: if etcd { self.observed_revision } else { None },
             applied_revision: if etcd { self.applied_revision } else { None },
             config_hash: self.config_hash.clone(),
@@ -618,6 +654,9 @@ pub struct ConfigMetricsView {
     pub rejected_by_kind: BTreeMap<String, usize>,
     /// Served resources per kind carrying at least one ignored field.
     pub partially_compatible_by_kind: BTreeMap<String, usize>,
+    /// Served resources per kind running on their last known good value
+    /// because the latest source bytes are rejected (#871).
+    pub stale_served_by_kind: BTreeMap<String, usize>,
     pub observed_revision: Option<i64>,
     pub applied_revision: Option<i64>,
     pub config_hash: Option<String>,
@@ -728,6 +767,7 @@ mod tests {
             last_error_kind: error_kind.to_string(),
             last_error: error.to_string(),
             seen_at: Utc::now(),
+            serving_stale_since: None,
         }
     }
 
@@ -756,6 +796,7 @@ mod tests {
             rejected: vec![],
             partially_compatible: Vec::new(),
             partially_compatible_rows_by_kind: Default::default(),
+            stale_served_rows_by_kind: Default::default(),
             is_reload: true,
             wholly_rejected: false,
         });
@@ -783,6 +824,7 @@ mod tests {
             rejected: vec![],
             partially_compatible: Vec::new(),
             partially_compatible_rows_by_kind: Default::default(),
+            stale_served_rows_by_kind: Default::default(),
             is_reload: true,
             wholly_rejected: false,
         });
@@ -796,6 +838,7 @@ mod tests {
             rejected: vec![],
             partially_compatible: Vec::new(),
             partially_compatible_rows_by_kind: Default::default(),
+            stale_served_rows_by_kind: Default::default(),
             is_reload: true,
             wholly_rejected: false,
         });
@@ -810,6 +853,7 @@ mod tests {
             rejected: vec![],
             partially_compatible: Vec::new(),
             partially_compatible_rows_by_kind: Default::default(),
+            stale_served_rows_by_kind: Default::default(),
             is_reload: true,
             wholly_rejected: true,
         });
@@ -826,6 +870,7 @@ mod tests {
             rejected: vec![],
             partially_compatible: Vec::new(),
             partially_compatible_rows_by_kind: Default::default(),
+            stale_served_rows_by_kind: Default::default(),
             is_reload: true,
             wholly_rejected: false,
         });
@@ -849,6 +894,7 @@ mod tests {
             )],
             partially_compatible: Vec::new(),
             partially_compatible_rows_by_kind: Default::default(),
+            stale_served_rows_by_kind: Default::default(),
             is_reload: true,
             wholly_rejected: false,
         });
@@ -871,6 +917,7 @@ mod tests {
             rejected: vec![],
             partially_compatible: Vec::new(),
             partially_compatible_rows_by_kind: Default::default(),
+            stale_served_rows_by_kind: Default::default(),
             is_reload: true,
             wholly_rejected: false,
         });
@@ -888,6 +935,7 @@ mod tests {
             )],
             partially_compatible: Vec::new(),
             partially_compatible_rows_by_kind: Default::default(),
+            stale_served_rows_by_kind: Default::default(),
             is_reload: true,
             wholly_rejected: true,
         });
@@ -910,6 +958,7 @@ mod tests {
             )],
             partially_compatible: Vec::new(),
             partially_compatible_rows_by_kind: Default::default(),
+            stale_served_rows_by_kind: Default::default(),
             is_reload: true,
             wholly_rejected: false,
         });
@@ -926,6 +975,7 @@ mod tests {
             rejected: vec![],
             partially_compatible: Vec::new(),
             partially_compatible_rows_by_kind: Default::default(),
+            stale_served_rows_by_kind: Default::default(),
             is_reload: false,
             wholly_rejected: false,
         };
@@ -953,6 +1003,7 @@ mod tests {
             )],
             partially_compatible: Vec::new(),
             partially_compatible_rows_by_kind: Default::default(),
+            stale_served_rows_by_kind: Default::default(),
             is_reload: true,
             wholly_rejected: false,
         });
@@ -965,6 +1016,7 @@ mod tests {
             rejected: vec![],
             partially_compatible: Vec::new(),
             partially_compatible_rows_by_kind: Default::default(),
+            stale_served_rows_by_kind: Default::default(),
             is_reload: true,
             wholly_rejected: false,
         });
@@ -973,6 +1025,61 @@ mod tests {
         assert!(v.last_reload.unwrap().successful);
         assert!(v.last_failure.is_some(), "last_failure must be sticky");
         assert!(v.rejected.is_empty());
+    }
+
+    /// #871: a rejection whose key serves its last known good value
+    /// reports the stale-since instant and a freshly computed age on
+    /// every read; one with nothing serving omits both fields.
+    #[test]
+    fn stale_serving_rejections_report_since_and_age() {
+        let cs = ConfigStatus::new(SourceKind::Etcd);
+        let mut stale = incoming(
+            "/aisix/models/stale",
+            "models",
+            "stale",
+            "schema_failed",
+            "boom",
+        );
+        stale.serving_stale_since = Some(Utc::now() - chrono::Duration::seconds(90));
+        let dead = incoming(
+            "/aisix/models/dead",
+            "models",
+            "dead",
+            "schema_failed",
+            "boom",
+        );
+        cs.record_load(LoadObservation {
+            source_hash: "s".into(),
+            observed_revision: Some(1),
+            applied: Some(applied("a", &[("models", 1)])),
+            rejected: vec![stale, dead],
+            partially_compatible: Vec::new(),
+            partially_compatible_rows_by_kind: Default::default(),
+            stale_served_rows_by_kind: [("models".to_string(), 1)].into_iter().collect(),
+            is_reload: true,
+            wholly_rejected: false,
+        });
+
+        let json = serde_json::to_value(cs.view()).unwrap();
+        let rejected = json["rejected"].as_array().unwrap();
+        let dead_row = rejected
+            .iter()
+            .find(|r| r["resource_id"] == "dead")
+            .unwrap();
+        assert!(
+            dead_row.get("serving_stale_since").is_none(),
+            "a rejection with nothing serving must omit the stale fields",
+        );
+        let stale_row = rejected
+            .iter()
+            .find(|r| r["resource_id"] == "stale")
+            .unwrap();
+        assert!(stale_row["serving_stale_since"].is_string());
+        let age = stale_row["serving_stale_age_seconds"].as_u64().unwrap();
+        assert!((90..=95).contains(&age), "age ≈ 90s, got {age}");
+
+        // The per-kind stale row counts flow through to the metrics view.
+        assert_eq!(cs.metrics().stale_served_by_kind.get("models"), Some(&1));
     }
 
     #[test]
@@ -993,6 +1100,7 @@ mod tests {
             rejected: vec![r],
             partially_compatible: Vec::new(),
             partially_compatible_rows_by_kind: Default::default(),
+            stale_served_rows_by_kind: Default::default(),
             is_reload: true,
             wholly_rejected: false,
         });
@@ -1013,6 +1121,7 @@ mod tests {
             rejected: vec![r2],
             partially_compatible: Vec::new(),
             partially_compatible_rows_by_kind: Default::default(),
+            stale_served_rows_by_kind: Default::default(),
             is_reload: true,
             wholly_rejected: false,
         });
@@ -1038,6 +1147,7 @@ mod tests {
             rejected: vec![],
             partially_compatible: Vec::new(),
             partially_compatible_rows_by_kind: Default::default(),
+            stale_served_rows_by_kind: Default::default(),
             is_reload: true,
             wholly_rejected: false,
         });
@@ -1058,6 +1168,7 @@ mod tests {
             rejected: vec![],
             partially_compatible: Vec::new(),
             partially_compatible_rows_by_kind: Default::default(),
+            stale_served_rows_by_kind: Default::default(),
             is_reload: true,
             wholly_rejected: false,
         });
@@ -1087,6 +1198,7 @@ mod tests {
             ],
             partially_compatible: Vec::new(),
             partially_compatible_rows_by_kind: Default::default(),
+            stale_served_rows_by_kind: Default::default(),
             is_reload: true,
             wholly_rejected: false,
         });
