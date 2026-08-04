@@ -190,6 +190,12 @@ pub const M_CONFIG_REJECTED_RESOURCES: &str = "aisix_config_rejected_resources";
 /// data plane's rollout.
 pub const M_CONFIG_PARTIALLY_COMPATIBLE_RESOURCES: &str =
     "aisix_config_partially_compatible_resources";
+/// Served resources per kind whose latest source bytes are rejected and
+/// whose last known good value serves instead (#871). Non-zero means the
+/// gateway is running stale config for those rows; the per-row detail
+/// (which resource, stale since when) lives in `/status/config`
+/// `rejected[]`.
+pub const M_CONFIG_STALE_SERVED_RESOURCES: &str = "aisix_config_stale_served_resources";
 pub const M_CONFIG_OBSERVED_REVISION: &str = "aisix_config_observed_revision";
 pub const M_CONFIG_APPLIED_REVISION: &str = "aisix_config_applied_revision";
 pub const M_CONFIG_HASH_INFO: &str = "aisix_config_hash_info";
@@ -356,6 +362,7 @@ struct ConfigLabelState {
     last_hash: Option<String>,
     last_rejected_kinds: std::collections::HashSet<String>,
     last_partial_kinds: std::collections::HashSet<String>,
+    last_stale_kinds: std::collections::HashSet<String>,
 }
 
 const REQUEST_SERIES_CACHE_CAPACITY: usize = 1024;
@@ -721,6 +728,19 @@ impl Metrics {
                     .set(*count as f64);
             }
             labels.last_partial_kinds = view.partially_compatible_by_kind.keys().cloned().collect();
+
+            // Stale-served gauge per kind (#871), same zeroing discipline.
+            for kind in &labels.last_stale_kinds {
+                if !view.stale_served_by_kind.contains_key(kind) {
+                    metrics::gauge!(M_CONFIG_STALE_SERVED_RESOURCES, "kind" => kind.clone())
+                        .set(0.0);
+                }
+            }
+            for (kind, count) in &view.stale_served_by_kind {
+                metrics::gauge!(M_CONFIG_STALE_SERVED_RESOURCES, "kind" => kind.clone())
+                    .set(*count as f64);
+            }
+            labels.last_stale_kinds = view.stale_served_by_kind.keys().cloned().collect();
         });
     }
 
@@ -3070,6 +3090,7 @@ mod tests {
             reload_failures: std::collections::BTreeMap::new(),
             rejected_by_kind: std::collections::BTreeMap::new(),
             partially_compatible_by_kind: std::collections::BTreeMap::new(),
+            stale_served_by_kind: std::collections::BTreeMap::new(),
             observed_revision: Some(42),
             applied_revision: Some(42),
             config_hash: Some("abc123".into()),
@@ -3086,6 +3107,7 @@ mod tests {
         view.rejected_by_kind.insert("models".to_string(), 1);
         view.partially_compatible_by_kind
             .insert("api_keys".to_string(), 3);
+        view.stale_served_by_kind.insert("models".to_string(), 1);
         m.sync_config_status(&view);
         let out = m.render();
 
@@ -3100,6 +3122,9 @@ mod tests {
         )));
         assert!(out.contains(&format!(
             "{M_CONFIG_PARTIALLY_COMPATIBLE_RESOURCES}{{kind=\"api_keys\"}} 3"
+        )));
+        assert!(out.contains(&format!(
+            "{M_CONFIG_STALE_SERVED_RESOURCES}{{kind=\"models\"}} 1"
         )));
         assert!(out.contains(&format!("{M_CONFIG_OBSERVED_REVISION} 42")));
         assert!(out.contains(&format!("{M_CONFIG_APPLIED_REVISION} 42")));
@@ -3131,6 +3156,7 @@ mod tests {
         first
             .partially_compatible_by_kind
             .insert("api_keys".to_string(), 1);
+        first.stale_served_by_kind.insert("models".to_string(), 1);
         m.sync_config_status(&first);
 
         // The applied config changes and the models rejection clears.
@@ -3150,6 +3176,10 @@ mod tests {
         // Same zeroing discipline for the partially-compatible gauge.
         assert!(out.contains(&format!(
             "{M_CONFIG_PARTIALLY_COMPATIBLE_RESOURCES}{{kind=\"api_keys\"}} 0"
+        )));
+        // And for the stale-served gauge (#871).
+        assert!(out.contains(&format!(
+            "{M_CONFIG_STALE_SERVED_RESOURCES}{{kind=\"models\"}} 0"
         )));
     }
 

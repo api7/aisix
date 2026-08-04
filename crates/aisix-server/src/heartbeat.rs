@@ -413,6 +413,14 @@ struct RejectedResourceWire {
     kind: &'static str,
     error: String,
     timestamp_unix_secs: u64,
+    /// Unix seconds since when this key has been serving its last known
+    /// good value instead of the rejected bytes (#871) — present on
+    /// every beat while stale serving lasts, so cp-api can derive the
+    /// staleness age each cycle. Omitted when nothing serves for the
+    /// key, preserving the historical body shape for older CPs (whose
+    /// heartbeat handler tolerates unknown fields either way).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stale_serving_since_unix_secs: Option<u64>,
 }
 
 impl From<&RejectedEntry> for RejectedResourceWire {
@@ -422,6 +430,7 @@ impl From<&RejectedEntry> for RejectedResourceWire {
             kind: r.kind.as_str(),
             error: r.error.clone(),
             timestamp_unix_secs: r.timestamp_unix_secs,
+            stale_serving_since_unix_secs: r.stale_serving_since_unix_secs,
         }
     }
 }
@@ -790,6 +799,57 @@ mod tests {
         assert!(
             body.get("partially_compatible_resources").is_none(),
             "empty partially_compatible_resources must stay off the wire",
+        );
+    }
+
+    /// #871: a rejection whose key still serves its last known good value
+    /// carries the stale-serving instant on every beat; one with nothing
+    /// serving omits the field (historical body shape).
+    #[tokio::test]
+    async fn send_includes_stale_serving_since_on_rejections() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/dp/heartbeat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true
+            })))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mtls = write_test_bundle(dir.path());
+        let cfg = cfg_with_bundle(format!("{}/dp/heartbeat", server.uri()), mtls)
+            .with_rejection_fetcher(Arc::new(|| {
+                vec![
+                    RejectedEntry {
+                        key: "/aisix/models/stale-served".into(),
+                        kind: aisix_etcd::loader::RejectionKind::SchemaFailed,
+                        error: "schema validation failed".into(),
+                        timestamp_unix_secs: 1_770_000_100,
+                        stale_serving_since_unix_secs: Some(1_770_000_000),
+                    },
+                    RejectedEntry {
+                        key: "/aisix/models/never-loaded".into(),
+                        kind: aisix_etcd::loader::RejectionKind::SchemaFailed,
+                        error: "schema validation failed".into(),
+                        timestamp_unix_secs: 1_770_000_100,
+                        stale_serving_since_unix_secs: None,
+                    },
+                ]
+            }));
+        send(&plain_client(), &cfg, 7).await.unwrap();
+
+        let received = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
+        let rejected = body["rejected_resources"].as_array().unwrap();
+        assert_eq!(rejected.len(), 2);
+        assert_eq!(
+            rejected[0]["stale_serving_since_unix_secs"],
+            1_770_000_000_i64,
+        );
+        assert!(
+            rejected[1].get("stale_serving_since_unix_secs").is_none(),
+            "a rejection with nothing serving must omit the stale field",
         );
     }
 

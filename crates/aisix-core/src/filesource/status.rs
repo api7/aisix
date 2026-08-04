@@ -66,6 +66,7 @@ pub fn load_resources_file_tracked(
                 rejected: vec![],
                 partially_compatible: Vec::new(),
                 partially_compatible_rows_by_kind: Default::default(),
+                stale_served_rows_by_kind: Default::default(),
                 is_reload,
                 wholly_rejected: false,
             });
@@ -85,6 +86,7 @@ pub fn load_resources_file_tracked(
                 rejected,
                 partially_compatible: Vec::new(),
                 partially_compatible_rows_by_kind: Default::default(),
+                stale_served_rows_by_kind: Default::default(),
                 is_reload,
                 // The whole file was rejected; last-good retained.
                 wholly_rejected: true,
@@ -137,6 +139,10 @@ fn map_load_error(e: &LoadError, seen_at: chrono::DateTime<Utc>) -> IncomingReje
         last_error_kind: classify(&e.message).to_string(),
         last_error: e.message.clone(),
         seen_at,
+        // The file source is all-or-nothing: a failed reload keeps the
+        // previous snapshot wholesale (reported via `wholly_rejected`),
+        // so per-row last-known-good retention does not apply.
+        serving_stale_since: None,
     }
 }
 

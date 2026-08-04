@@ -88,6 +88,12 @@ pub struct RejectedEntry {
     pub kind: RejectionKind,
     pub error: String,
     pub timestamp_unix_secs: u64,
+    /// Unix seconds since when this key has been serving its last known
+    /// good value instead of the rejected bytes (#871). Always `None` as
+    /// produced by the loader — the supervisor joins its retained
+    /// stale-serving state in on read, so the heartbeat reports the
+    /// staleness age next to the rejection.
+    pub stale_serving_since_unix_secs: Option<u64>,
 }
 
 impl RejectedEntry {
@@ -101,6 +107,7 @@ impl RejectedEntry {
             kind,
             error: error.into(),
             timestamp_unix_secs: now,
+            stale_serving_since_unix_secs: None,
         }
     }
 }
