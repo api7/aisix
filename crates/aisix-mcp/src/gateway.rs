@@ -14,6 +14,11 @@
 //! - `tools/call` strips the namespace prefix and routes to the owning
 //!   upstream.
 //!
+//! A gateway may instead be **scoped** to a single upstream
+//! ([`McpGateway::from_snapshot_scoped`], mounted at `/mcp/{server}`): it then
+//! serves that server's tools under their original, un-namespaced names while
+//! ACL decisions keep evaluating the namespaced form.
+//!
 //! The aggregator holds no per-request or per-session state, so governance
 //! never depends on a transport session — which keeps it aligned with the
 //! stateless direction of the MCP 2026-07-28 revision.
@@ -52,6 +57,17 @@ pub const TOOL_NAMESPACE_SEPARATOR: &str = "__";
 struct NamedUpstream {
     name: String,
     bridge: Arc<dyn McpBridge>,
+}
+
+/// Strip `server`'s namespace prefix from `name`: `Some(bare)` when `name`
+/// is `<server>__<bare>`, `None` otherwise. The one primitive both the
+/// scoped gateway and the proxy's attribution peek use to interpret a tool
+/// name on `/mcp/{server}`, so the two can never drift. Prefix matching is
+/// by whole-string prefix (not first-separator split), so a server name
+/// that itself ends in `_` still namespaces cleanly.
+pub fn strip_server_prefix<'a>(server: &str, name: &'a str) -> Option<&'a str> {
+    name.strip_prefix(server)
+        .and_then(|rest| rest.strip_prefix(TOOL_NAMESPACE_SEPARATOR))
 }
 
 /// Which tools a gateway instance may expose and call, in the namespaced
@@ -229,6 +245,26 @@ impl ToolAcl {
 pub struct McpGateway {
     upstreams: Arc<[NamedUpstream]>,
     tool_acl: ToolAcl,
+    /// When set, this gateway serves exactly one upstream under its **original**
+    /// tool names: `tools/list` strips the `<server>__` namespace prefix and
+    /// `tools/call` accepts both the bare and the prefixed form. ACL decisions
+    /// still evaluate the namespaced form, so per-tool grants keep one meaning
+    /// across the aggregated and the scoped endpoint.
+    scoped: Option<Arc<ScopedServer>>,
+}
+
+/// The single-server scope of a gateway built by
+/// [`McpGateway::from_snapshot_scoped`].
+struct ScopedServer {
+    /// The scoped upstream's registered name — the namespace every ACL check
+    /// re-applies and the name `initialize` reports.
+    name: String,
+    /// Every **other** registered server name, enabled or not. A `tools/call`
+    /// whose name is prefixed with one of these is a cross-server mistake and
+    /// fails closed rather than being silently served as a bare name.
+    /// Disabled servers stay reserved so this scope's callable name surface
+    /// does not shift when another server's `enabled` flag is toggled.
+    foreign: std::collections::HashSet<String>,
 }
 
 impl McpGateway {
@@ -265,6 +301,7 @@ impl McpGateway {
         Self {
             upstreams: deduped.into(),
             tool_acl: ToolAcl::allow_all(),
+            scoped: None,
         }
     }
 
@@ -301,6 +338,36 @@ impl McpGateway {
                 (name, bridge)
             });
         McpGateway::new(upstreams)
+    }
+
+    /// Build a gateway scoped to the single **enabled** `mcp_servers` entry
+    /// named `server`, serving its tools under their original names (see
+    /// [`McpGateway::scoped`]). Returns `None` when the server is not
+    /// registered or is disabled — a disabled server is treated as absent,
+    /// same as the aggregated endpoint skipping it.
+    pub fn from_snapshot_scoped(snapshot: &AisixSnapshot, server: &str) -> Option<Self> {
+        let entry = snapshot.mcp_servers.get_by_name(server)?;
+        if !entry.value.enabled {
+            return None;
+        }
+        let name = entry.value.name.clone();
+        let bridge: Arc<dyn McpBridge> = match entry.value.server_type {
+            McpServerType::Mcp => {
+                let upstream = upstream_from_mcp_server(&entry.value);
+                Arc::new(EphemeralBridge::new(upstream))
+            }
+            McpServerType::Openapi => Arc::new(OpenApiBridge::new(entry)),
+        };
+        let foreign = snapshot
+            .mcp_servers
+            .entries()
+            .into_iter()
+            .filter(|e| e.value.name != name)
+            .map(|e| e.value.name.clone())
+            .collect();
+        let mut gateway = McpGateway::new([(name.clone(), bridge)]);
+        gateway.scoped = Some(Arc::new(ScopedServer { name, foreign }));
+        Some(gateway)
     }
 
     fn find(&self, server: &str) -> Option<&Arc<dyn McpBridge>> {
@@ -345,6 +412,28 @@ impl ServerHandler for McpGateway {
         }
         // Per-tool ACL: expose only the tools this caller's key permits.
         tools.retain(|tool| self.tool_acl.permits(tool.name.as_ref()));
+        // A scoped gateway serves its single upstream's tools under their
+        // original names — the namespace prefix exists to disambiguate the
+        // aggregate, and a single-server endpoint has nothing to disambiguate.
+        // ACL filtering above ran on the namespaced form. Strip only when the
+        // bare name round-trips through `call_tool`'s parsing: a literal
+        // upstream name that itself starts with a registered server's prefix
+        // would be re-stripped (or fail closed) if advertised bare, so those
+        // stay namespaced — that spelling is the one `call_tool` accepts.
+        if let Some(scoped) = &self.scoped {
+            for tool in &mut tools {
+                if let Some(bare) = strip_server_prefix(&scoped.name, tool.name.as_ref()) {
+                    let round_trips = strip_server_prefix(&scoped.name, bare).is_none()
+                        && !scoped
+                            .foreign
+                            .iter()
+                            .any(|f| strip_server_prefix(f, bare).is_some());
+                    if round_trips {
+                        tool.name = Cow::Owned(bare.to_string());
+                    }
+                }
+            }
+        }
         Ok(ListToolsResult::with_all_items(tools))
     }
 
@@ -353,26 +442,68 @@ impl ServerHandler for McpGateway {
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        let (server, tool) = request
-            .name
-            .split_once(TOOL_NAMESPACE_SEPARATOR)
-            .ok_or_else(|| {
-                ErrorData::invalid_params(
-                    format!(
-                        "tool name '{}' is missing a 'server__tool' prefix",
-                        request.name
-                    ),
-                    None,
+        // Resolve `(server, tool, namespaced)` from the caller's tool name.
+        // Scoped: the name is the upstream's original one, but a caller that
+        // sends the namespaced form anyway (an aggregated-endpoint client
+        // pointed at the scoped URL) keeps working — `<scope>__x` reduces to
+        // `x`. (An upstream tool literally named `<scope>__x` is therefore
+        // only callable as `<scope>__<scope>__x` — one strip, own prefix
+        // first; `tools/list` advertises exactly that spelling.) A name
+        // prefixed with a *different* registered server's name fails closed:
+        // the scoped endpoint never cross-routes, and silently serving it as
+        // a bare name would mask the caller's mistake. An unregistered
+        // prefix stays a bare name, since tool names may legitimately
+        // contain the separator.
+        let request_name = request.name.as_ref();
+        let (server, tool, namespaced): (&str, &str, Cow<'_, str>) = match &self.scoped {
+            Some(scoped) => {
+                let scope = scoped.name.as_str();
+                let bare = match strip_server_prefix(scope, request_name) {
+                    Some(rest) => rest,
+                    None if scoped
+                        .foreign
+                        .iter()
+                        .any(|f| strip_server_prefix(f, request_name).is_some()) =>
+                    {
+                        // Same neutral wording as the ACL reject: don't
+                        // confirm what the other server serves.
+                        return Err(ErrorData::invalid_params(
+                            format!("tool '{request_name}' is not available"),
+                            None,
+                        ));
+                    }
+                    None => request_name,
+                };
+                (
+                    scope,
+                    bare,
+                    Cow::Owned(format!("{scope}{TOOL_NAMESPACE_SEPARATOR}{bare}")),
                 )
-            })?;
+            }
+            None => {
+                let (server, tool) = request_name
+                    .split_once(TOOL_NAMESPACE_SEPARATOR)
+                    .ok_or_else(|| {
+                        ErrorData::invalid_params(
+                            format!(
+                                "tool name '{request_name}' is missing a 'server__tool' prefix"
+                            ),
+                            None,
+                        )
+                    })?;
+                (server, tool, Cow::Borrowed(request_name))
+            }
+        };
 
         // Per-tool ACL: reject a call the caller's key doesn't permit. A
         // disallowed tool is also absent from `tools/list`, so this is
         // defense-in-depth; the message stays neutral and does not reveal
-        // whether the tool exists upstream.
-        if !self.tool_acl.permits(request.name.as_ref()) {
+        // whether the tool exists upstream. The check runs on the namespaced
+        // form so grants mean the same thing on every endpoint; the message
+        // echoes the caller's own spelling.
+        if !self.tool_acl.permits(&namespaced) {
             return Err(ErrorData::invalid_params(
-                format!("tool '{}' is not available", request.name),
+                format!("tool '{request_name}' is not available"),
                 None,
             ));
         }
@@ -407,11 +538,25 @@ impl ServerHandler for McpGateway {
     fn get_info(&self) -> ServerInfo {
         let mut info = ServerInfo::default();
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
-        info.instructions = Some(
-            "AISIX MCP gateway: aggregates tools from registered upstream MCP \
-             servers, namespaced as `server__tool`."
-                .to_string(),
-        );
+        match &self.scoped {
+            // The scoped endpoint presents as the upstream server itself, so
+            // `initialize` reports that server's registered name.
+            Some(scoped) => {
+                info.server_info.name = scoped.name.clone();
+                info.instructions = Some(format!(
+                    "AISIX MCP gateway: serves the tools of MCP server `{}` \
+                     under their original names.",
+                    scoped.name
+                ));
+            }
+            None => {
+                info.instructions = Some(
+                    "AISIX MCP gateway: aggregates tools from registered upstream MCP \
+                     servers, namespaced as `server__tool`."
+                        .to_string(),
+                );
+            }
+        }
         info
     }
 }

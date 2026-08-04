@@ -24,5 +24,7 @@ pub use bridge::{
     McpUpstream, OAuthClientConfig, RmcpBridge,
 };
 pub use error::McpError;
-pub use gateway::{streamable_http_service, McpGateway, ToolAcl, TOOL_NAMESPACE_SEPARATOR};
+pub use gateway::{
+    streamable_http_service, strip_server_prefix, McpGateway, ToolAcl, TOOL_NAMESPACE_SEPARATOR,
+};
 pub use openapi::{validate_spec, OpenApiBridge};
