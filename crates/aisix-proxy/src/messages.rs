@@ -37,8 +37,8 @@
 
 use aisix_core::AppliedGuardrail;
 use aisix_obs::{
-    content_capture_cap, AccessLog, CapturedContent, LatencyLabels, LlmUsage, RequestLabels,
-    RequestOutcome, UsageEvent, UsageLabels,
+    content_capture_cap, AccessLog, CapturedContent, LatencyLabels, LlmUsage, UsageEvent,
+    UsageLabels,
 };
 use axum::extract::State;
 use axum::http::{HeaderName, HeaderValue};
@@ -179,37 +179,21 @@ pub async fn messages(
                 &routing,
                 None,
             );
-            state.metrics.record_request(
-                &provider_label,
-                &model_name,
+            crate::request_metrics::record(
+                &state,
+                "/v1/messages",
+                crate::request_metrics::Caller::new(&auth),
+                crate::request_metrics::Upstream {
+                    provider: &provider_label,
+                    model: &model_name,
+                    upstream_model: &upstream_model,
+                    provider_key_id: &provider_key_id,
+                    stream: stream_requested,
+                    is_fallback: routing.fallback_count() > 0,
+                },
                 status,
-                RequestOutcome::from_status(status),
                 elapsed,
             );
-            let outcome = RequestOutcome::from_status(status);
-            // #890 req-3: readable provider-key name resolved from the snapshot.
-            let provider_key_name = {
-                let snap = state.snapshot.load();
-                crate::usage_attr::provider_key_metric_name(&snap, &provider_key_id)
-            };
-            let labels = RequestLabels {
-                endpoint: "/v1/messages",
-                inbound_protocol: "anthropic",
-                provider: &provider_label,
-                model: &model_name,
-                upstream_model: &upstream_model,
-                provider_key_id: &provider_key_id,
-                provider_key_name: &provider_key_name,
-                api_key_id: &api_key_id,
-                team_id: auth.key().team_id.as_deref().unwrap_or("unknown"),
-                user_id: auth.key().user_id.as_deref().unwrap_or("unknown"),
-                user_name: auth.key().user_name.as_deref().unwrap_or("unknown"),
-                stream: stream_requested,
-                is_fallback: routing.fallback_count() > 0,
-                status,
-                outcome,
-            };
-            state.metrics.record_proxy_and_llm_request(labels, elapsed);
             // SLO e2e histogram (AISIX-Cloud#1011): non-streaming only —
             // a stream records its full duration at completion instead.
             if !stream_requested {
@@ -308,36 +292,22 @@ pub async fn messages(
             );
             let snap = state.snapshot.load();
             let metric_model = crate::usage_attr::metric_model_label(&snap, &model_name);
-            state.metrics.record_request(
-                "unknown",
-                metric_model,
-                status,
-                RequestOutcome::from_status(status),
-                elapsed,
-            );
             // #890 req-2: count the FAILED request on the rich request metrics
             // so a success rate is computable (denominator incl. failures).
             // Provider/upstream/provider_key are unknown on the failure path.
-            let fail_labels = RequestLabels {
-                endpoint: "/v1/messages",
-                inbound_protocol: "anthropic",
-                provider: "unknown",
-                model: metric_model,
-                upstream_model: "unknown",
-                provider_key_id: "unknown",
-                provider_key_name: "unknown",
-                api_key_id: &api_key_id,
-                team_id: auth.key().team_id.as_deref().unwrap_or("unknown"),
-                user_id: auth.key().user_id.as_deref().unwrap_or("unknown"),
-                user_name: auth.key().user_name.as_deref().unwrap_or("unknown"),
-                stream: stream_requested,
-                is_fallback: routing.fallback_count() > 0,
+            crate::request_metrics::record(
+                &state,
+                "/v1/messages",
+                crate::request_metrics::Caller::new(&auth),
+                crate::request_metrics::Upstream {
+                    model: metric_model,
+                    stream: stream_requested,
+                    is_fallback: routing.fallback_count() > 0,
+                    ..Default::default()
+                },
                 status,
-                outcome: RequestOutcome::from_status(status),
-            };
-            state
-                .metrics
-                .record_proxy_and_llm_request(fail_labels, elapsed);
+                elapsed,
+            );
             state.metrics.record_request_e2e_latency(
                 LatencyLabels {
                     endpoint: "/v1/messages",

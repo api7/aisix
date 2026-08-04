@@ -57,6 +57,7 @@ mod redact;
 mod reject;
 mod render;
 mod request_id;
+mod request_metrics;
 mod rerank;
 mod responses;
 mod responses_bridge;
@@ -294,11 +295,16 @@ fn normalize_endpoint_label(path: &str) -> &'static str {
         "/v1/audio/transcriptions" => "/v1/audio/transcriptions",
         "/v1/audio/translations" => "/v1/audio/translations",
         "/v1/audio/speech" => "/v1/audio/speech",
+        "/v1/videos" => "/v1/videos",
         "/mcp" | "/mcp/" => "/mcp",
         "/v1/realtime" => "/v1/realtime",
         "/v1/files" => "/v1/files",
         "/v1/batches" => "/v1/batches",
         "/v1/fine_tuning/jobs" => "/v1/fine_tuning/jobs",
+        // `/v1/videos/:id` and `/v1/videos/:id/content` collapse together:
+        // the id is the only thing that varies and neither is worth its own
+        // series.
+        _ if path.starts_with("/v1/videos/") => "/v1/videos/:id",
         _ if path.starts_with("/v1/files/") => "/v1/files/:id",
         _ if path.starts_with("/v1/batches/") => "/v1/batches/:id",
         _ if path.starts_with("/v1/fine_tuning/jobs/") => "/v1/fine_tuning/jobs/:id",
@@ -309,6 +315,9 @@ fn normalize_endpoint_label(path: &str) -> &'static str {
     }
 }
 
+/// Protocol family a route speaks, keyed off the normalized endpoint label.
+/// Shared by the in-flight gauge and the detailed request families
+/// (`request_metrics`) so the two can't disagree.
 fn inbound_protocol_for_endpoint(endpoint: &str) -> &'static str {
     if endpoint == "/v1/messages" || endpoint == "/v1/messages/count_tokens" {
         "anthropic"

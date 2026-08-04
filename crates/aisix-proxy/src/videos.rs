@@ -70,7 +70,7 @@
 //! design (poll traffic would flood /logs with no billing signal).
 
 use aisix_core::AppliedGuardrail;
-use aisix_obs::{AccessLog, RequestOutcome, UsageEvent};
+use aisix_obs::{AccessLog, UsageEvent};
 use axum::extract::State;
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -1424,7 +1424,12 @@ struct Telemetry<'a> {
     state: &'a ProxyState,
     method: &'static str,
     path: String,
-    api_key_id: String,
+    /// The `endpoint` metric label — the same collapsed route template
+    /// `normalize_endpoint_label` produces, so the request families agree
+    /// with `aisix_proxy_in_flight_requests`. Coarser than `path`, which
+    /// keeps `/content` distinct for the access log.
+    endpoint: &'static str,
+    auth: &'a AuthenticatedKey,
     request_id: String,
     started: Instant,
 }
@@ -1446,7 +1451,7 @@ impl Telemetry<'_> {
             latency: elapsed,
             provider: Some(provider).filter(|p| !p.is_empty()),
             model: Some(model_label),
-            api_key_id: Some(&self.api_key_id),
+            api_key_id: Some(&self.auth.entry.id),
             prompt_tokens: None,
             completion_tokens: None,
             total_tokens: None,
@@ -1458,11 +1463,16 @@ impl Telemetry<'_> {
             error: error.as_deref(),
         }
         .emit();
-        self.state.metrics.record_request(
-            provider,
-            model_label,
+        crate::request_metrics::record(
+            self.state,
+            self.endpoint,
+            crate::request_metrics::Caller::new(self.auth),
+            crate::request_metrics::Upstream {
+                provider,
+                model: model_label,
+                ..Default::default()
+            },
             status,
-            RequestOutcome::from_status(status),
             elapsed,
         );
     }
@@ -1481,7 +1491,8 @@ pub async fn create_video(
         state: &state,
         method: "POST",
         path: "/v1/videos".to_string(),
-        api_key_id: auth.entry.id.clone(),
+        endpoint: "/v1/videos",
+        auth: &auth,
         request_id: client.request_id.clone(),
         started,
     };
@@ -1769,7 +1780,8 @@ pub async fn get_video(
         state: &state,
         method: "GET",
         path: "/v1/videos/:id".to_string(),
-        api_key_id: auth.entry.id.clone(),
+        endpoint: "/v1/videos/:id",
+        auth: &auth,
         request_id: client.request_id.clone(),
         started: Instant::now(),
     };
@@ -1820,7 +1832,10 @@ pub async fn video_content(
         state: &state,
         method: "GET",
         path: "/v1/videos/:id/content".to_string(),
-        api_key_id: auth.entry.id.clone(),
+        // Collapsed with the metadata route, matching how
+        // `normalize_endpoint_label` treats `/v1/files/:id/content`.
+        endpoint: "/v1/videos/:id",
+        auth: &auth,
         request_id: client.request_id.clone(),
         started: Instant::now(),
     };

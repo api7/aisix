@@ -39,7 +39,7 @@
 //!   user-facing passthrough and hit the identical "route missing from
 //!   the list" bug.
 
-use aisix_obs::{AccessLog, RequestOutcome};
+use aisix_obs::AccessLog;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::State;
 use axum::http::{HeaderName, HeaderValue};
@@ -97,26 +97,33 @@ pub async fn count_tokens(
         .to_string();
 
     match dispatch(&state, &auth, &body, &request_id, &client).await {
-        Ok((resp, provider)) => {
+        Ok(success) => {
             let elapsed = started.elapsed();
-            let status = resp.status().as_u16();
+            let status = success.response.status().as_u16();
             emit_access_log(
                 &model_name,
-                &provider,
+                &success.provider,
                 &api_key_id,
                 status,
                 elapsed,
                 &request_id,
                 None,
             );
-            state.metrics.record_request(
-                &provider,
-                &model_name,
+            crate::request_metrics::record(
+                &state,
+                "/v1/messages/count_tokens",
+                crate::request_metrics::Caller::new(&auth),
+                crate::request_metrics::Upstream {
+                    provider: &success.provider,
+                    model: &model_name,
+                    upstream_model: &success.upstream_model,
+                    provider_key_id: &success.provider_key_id,
+                    ..Default::default()
+                },
                 status,
-                RequestOutcome::from_status(status),
                 elapsed,
             );
-            resp
+            success.response
         }
         Err(err) => {
             let status = err.status().as_u16();
@@ -132,11 +139,15 @@ pub async fn count_tokens(
             );
             let snap = state.snapshot.load();
             let metric_model = crate::usage_attr::metric_model_label(&snap, &model_name);
-            state.metrics.record_request(
-                "unknown",
-                metric_model,
+            crate::request_metrics::record(
+                &state,
+                "/v1/messages/count_tokens",
+                crate::request_metrics::Caller::new(&auth),
+                crate::request_metrics::Upstream {
+                    model: metric_model,
+                    ..Default::default()
+                },
                 status,
-                RequestOutcome::from_status(status),
                 elapsed,
             );
             // Anthropic-shape envelope (#336) — count_tokens callers are
@@ -146,13 +157,24 @@ pub async fn count_tokens(
     }
 }
 
+/// What the winning attempt resolved. `/v1/messages/count_tokens` emits no
+/// UsageEvent, so the only consumer is the request-metric label set — which
+/// still has to match what chat / messages / responses report
+/// (AISIX-Cloud#1234).
+struct CountTokensSuccess {
+    response: Response,
+    provider: String,
+    upstream_model: String,
+    provider_key_id: String,
+}
+
 async fn dispatch(
     state: &ProxyState,
     auth: &AuthenticatedKey,
     body: &Value,
     request_id: &str,
     client: &ClientContext,
-) -> Result<(Response, String), ProxyError> {
+) -> Result<CountTokensSuccess, ProxyError> {
     let snapshot = state.snapshot.load();
 
     let model_name = body
@@ -292,7 +314,7 @@ async fn dispatch(
             )
             .await
             {
-                Ok(resp) => return Ok((resp, "anthropic".to_string())),
+                Ok(success) => return Ok(success),
                 Err(e) => {
                     let retryable = matches!(
                         &e,
@@ -344,7 +366,7 @@ async fn count_tokens_to_target(
     timeouts: crate::routing::TimeoutBudget,
     request_id: &str,
     client: &ClientContext,
-) -> Result<Response, ProxyError> {
+) -> Result<CountTokensSuccess, ProxyError> {
     let mut body = body.clone();
     let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
     let api_key = crate::dispatch::require_api_key(&pk_entry.value, model)?;
@@ -495,7 +517,13 @@ async fn count_tokens_to_target(
             .insert(HeaderName::from_static("x-aisix-request-id"), hv);
     }
 
-    Ok(resp)
+    Ok(CountTokensSuccess {
+        response: resp,
+        // The loop above only ever dispatches Anthropic targets.
+        provider: "anthropic".to_string(),
+        upstream_model,
+        provider_key_id: pk_entry.id.to_string(),
+    })
 }
 
 fn emit_access_log(

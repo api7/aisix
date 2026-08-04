@@ -21,8 +21,8 @@ use aisix_core::AppliedGuardrail;
 use aisix_gateway::{BridgeError, ChatFormat};
 use aisix_guardrails::GuardrailVerdict;
 use aisix_obs::{
-    content_capture_cap, AccessLog, CapturedContent, LatencyLabels, LlmUsage, Metrics,
-    RequestLabels, RequestOutcome, UsageEvent, UsageLabels,
+    content_capture_cap, AccessLog, CapturedContent, LatencyLabels, LlmUsage, Metrics, UsageEvent,
+    UsageLabels,
 };
 use axum::extract::State;
 use axum::http::HeaderValue;
@@ -150,13 +150,10 @@ pub async fn chat_completions(
             };
             let client_type = state.client_classifier.classify(&client.user_agent);
             record_success(
-                &state.metrics,
+                &state,
+                &auth,
                 &success.provider,
                 &model_name,
-                &api_key_id,
-                auth.key().team_id.as_deref(),
-                auth.key().user_id.as_deref(),
-                auth.key().user_name.as_deref(),
                 &provider_key_name,
                 client_type,
                 req.is_streaming(),
@@ -350,7 +347,6 @@ pub async fn chat_completions(
             // volume, not label cardinality).
             let snap = state.snapshot.load();
             let metric_model = crate::usage_attr::metric_model_label(&snap, &model_name);
-            record_error(&state.metrics, metric_model, status, elapsed);
             // Access log: surface the upstream-billed counts when the
             // error fired AFTER the upstream call (output-content-filter
             // block). Pre-upstream errors (input filter, budget,
@@ -379,26 +375,19 @@ pub async fn chat_completions(
             // Provider / upstream_model / provider_key are unknown on the
             // failure path; identity + status + outcome + stream + is_fallback
             // are what the success-rate query needs.
-            let fail_labels = RequestLabels {
-                endpoint: "/v1/chat/completions",
-                inbound_protocol: "openai",
-                provider: "unknown",
-                model: metric_model,
-                upstream_model: "unknown",
-                provider_key_id: "unknown",
-                provider_key_name: "unknown",
-                api_key_id: &api_key_id,
-                team_id: auth.key().team_id.as_deref().unwrap_or("unknown"),
-                user_id: auth.key().user_id.as_deref().unwrap_or("unknown"),
-                user_name: auth.key().user_name.as_deref().unwrap_or("unknown"),
-                stream: req.is_streaming(),
-                is_fallback: routing.fallback_count() > 0,
+            crate::request_metrics::record(
+                &state,
+                "/v1/chat/completions",
+                crate::request_metrics::Caller::new(&auth),
+                crate::request_metrics::Upstream {
+                    model: metric_model,
+                    stream: req.is_streaming(),
+                    is_fallback: routing.fallback_count() > 0,
+                    ..Default::default()
+                },
                 status,
-                outcome: RequestOutcome::from_status(status),
-            };
-            state
-                .metrics
-                .record_proxy_and_llm_request(fail_labels, elapsed);
+                elapsed,
+            );
             state.metrics.record_request_e2e_latency(
                 LatencyLabels {
                     endpoint: "/v1/chat/completions",
@@ -3699,14 +3688,11 @@ fn finish_reason_label(reason: &aisix_gateway::FinishReason) -> String {
 
 #[allow(clippy::too_many_arguments)]
 fn record_success(
-    metrics: &Metrics,
+    state: &ProxyState,
+    auth: &AuthenticatedKey,
     provider: &str,
     model: &str,
-    api_key_id: &str,
-    team_id: Option<&str>,
-    user_id: Option<&str>,
     // #890 req-3 readable name + req-4 client type + req-1/req-2 dimensions.
-    user_name: Option<&str>,
     provider_key_name: &str,
     client_type: &str,
     stream: bool,
@@ -3715,26 +3701,23 @@ fn record_success(
     s: &Success,
     elapsed: Duration,
 ) {
-    let outcome = RequestOutcome::from_status(status);
-    metrics.record_request(provider, model, status, outcome, elapsed);
-    let request_labels = RequestLabels {
-        endpoint: "/v1/chat/completions",
-        inbound_protocol: "openai",
-        provider,
-        model,
-        upstream_model: &s.upstream_model,
-        provider_key_id: &s.provider_key_id,
-        provider_key_name,
-        api_key_id,
-        team_id: team_id.unwrap_or("unknown"),
-        user_id: user_id.unwrap_or("unknown"),
-        user_name: user_name.unwrap_or("unknown"),
-        stream,
-        is_fallback,
+    let metrics = &state.metrics;
+    let caller = crate::request_metrics::Caller::new(auth);
+    crate::request_metrics::record(
+        state,
+        "/v1/chat/completions",
+        caller,
+        crate::request_metrics::Upstream {
+            provider,
+            model,
+            upstream_model: &s.upstream_model,
+            provider_key_id: &s.provider_key_id,
+            stream,
+            is_fallback,
+        },
         status,
-        outcome,
-    };
-    metrics.record_proxy_and_llm_request(request_labels, elapsed);
+        elapsed,
+    );
     // SLO e2e histogram (AISIX-Cloud#1011): non-streaming only here —
     // `elapsed` for a stream is time-to-response-start; the stream's
     // on_complete records the full duration instead.
@@ -3762,10 +3745,10 @@ fn record_success(
             upstream_model: &s.upstream_model,
             provider_key_id: &s.provider_key_id,
             provider_key_name,
-            api_key_id,
-            team_id: team_id.unwrap_or("unknown"),
-            user_id: user_id.unwrap_or("unknown"),
-            user_name: user_name.unwrap_or("unknown"),
+            api_key_id: caller.api_key_id,
+            team_id: caller.team_id,
+            user_id: caller.user_id,
+            user_name: caller.user_name,
         },
         LlmUsage {
             input_tokens: s.prompt_tokens.unwrap_or(0).min(u64::from(u32::MAX)) as u32,
@@ -4154,15 +4137,6 @@ pub(crate) fn emit_mid_stream_failed_attempt(
         client,
         None,
     );
-}
-
-fn record_error(metrics: &Metrics, model: &str, status: u16, elapsed: Duration) {
-    let outcome = RequestOutcome::from_status(status);
-    // Provider is unknown for pre-dispatch errors (auth, 404, etc.).
-    metrics.record_request("unknown", model, status, outcome, elapsed);
-    // Rate-limit rejections are counted at the quota gate itself
-    // (`quota::reject`), which covers every endpoint and knows the
-    // offending layer — counting here again would double-book chat.
 }
 
 #[allow(clippy::too_many_arguments)]

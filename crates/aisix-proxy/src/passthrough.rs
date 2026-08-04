@@ -22,7 +22,7 @@
 //! Standard proxy authentication applies (`Authorization: Bearer <key>` or
 //! `x-api-key`). No model-level authorisation is enforced beyond that.
 
-use aisix_obs::{AccessLog, RequestOutcome};
+use aisix_obs::AccessLog;
 use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method};
@@ -39,6 +39,31 @@ use crate::state::ProxyState;
 /// `*rest` suffix is caller-controlled and must never be used directly as
 /// a label (unbounded Prometheus cardinality — #451).
 const PASSTHROUGH_MODEL_LABEL: &str = "passthrough";
+
+/// `provider` label for a passthrough request naming a provider nothing is
+/// configured for.
+const UNRESOLVED_PROVIDER_LABEL: &str = "unresolved";
+
+/// Bound the `provider` metric label to the configured provider set.
+/// `:provider` is a caller-supplied path segment, and the error path used
+/// it verbatim — so `/passthrough/<random>/x` minted one series per random
+/// value. Same guard as `usage_attr::metric_model_label`, on the provider
+/// axis (the success path never needed it: `provider_label` there is the
+/// resolved model's own provider).
+fn provider_metric_label<'a>(snap: &aisix_core::AisixSnapshot, provider: &'a str) -> &'a str {
+    let configured = snap.models.entries().iter().any(|e| {
+        e.value
+            .provider
+            .as_deref()
+            .map(|p| p.eq_ignore_ascii_case(provider))
+            .unwrap_or(false)
+    });
+    if configured {
+        provider
+    } else {
+        UNRESOLVED_PROVIDER_LABEL
+    }
+}
 
 /// Headers that the passthrough endpoint ALWAYS strips before
 /// forwarding to upstream, regardless of customer configuration.
@@ -167,15 +192,21 @@ pub async fn passthrough(
                 &request_id,
                 None,
             );
-            state.metrics.record_request(
-                &provider_label,
-                // The raw `rest` wildcard is caller-controlled; using it as
-                // the `model` label would create unbounded metric
-                // cardinality. Passthrough has no resolved model, so record
-                // a fixed sentinel (#451).
-                PASSTHROUGH_MODEL_LABEL,
+            crate::request_metrics::record(
+                &state,
+                "/passthrough/:provider/*rest",
+                crate::request_metrics::Caller::new(&auth),
+                crate::request_metrics::Upstream {
+                    provider: &provider_label,
+                    // The raw `rest` wildcard is caller-controlled; using it
+                    // as the `model` label would create unbounded metric
+                    // cardinality. Passthrough has no resolved model, so
+                    // record a fixed sentinel (#451).
+                    model: PASSTHROUGH_MODEL_LABEL,
+                    provider_key_id: &provider_key_id,
+                    ..Default::default()
+                },
                 status,
-                RequestOutcome::from_status(status),
                 elapsed,
             );
             // #699: record the passthrough call in the UsageEvent stream —
@@ -207,11 +238,17 @@ pub async fn passthrough(
                 &request_id,
                 Some(&err),
             );
-            state.metrics.record_request(
-                &provider,
-                PASSTHROUGH_MODEL_LABEL,
+            let snap = state.snapshot.load();
+            crate::request_metrics::record(
+                &state,
+                "/passthrough/:provider/*rest",
+                crate::request_metrics::Caller::new(&auth),
+                crate::request_metrics::Upstream {
+                    provider: provider_metric_label(&snap, &provider),
+                    model: PASSTHROUGH_MODEL_LABEL,
+                    ..Default::default()
+                },
                 status,
-                RequestOutcome::from_status(status),
                 elapsed,
             );
             // #699 / #655 parity: surface the failed request in Logs with a

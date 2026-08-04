@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use aisix_core::{ApiKey, ResourceEntry};
-use aisix_obs::{AccessLog, RequestOutcome};
+use aisix_obs::AccessLog;
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
 use axum::response::{IntoResponse, Response};
@@ -85,11 +85,22 @@ pub(crate) fn reject_before_dispatch(
         error: Some(&error),
     }
     .emit();
-    state.metrics.record_request(
-        UNRESOLVED_PROVIDER_LABEL,
-        UNRESOLVED_MODEL_LABEL,
+    // `path` must be normalized, not passed through: `AisixPath` below hands
+    // this the RAW `parts.uri.path()` so the access log can name the
+    // malformed segment, and that string is caller-controlled (#451).
+    // `request_metrics` keys the LLM-vs-proxy split off the result, so a 413
+    // on /v1/chat/completions lands in the same families as the
+    // model-not-found the handler itself records.
+    crate::request_metrics::record(
+        state,
+        crate::normalize_endpoint_label(path),
+        crate::request_metrics::Caller::unattributed(api_key_id),
+        crate::request_metrics::Upstream {
+            provider: UNRESOLVED_PROVIDER_LABEL,
+            model: UNRESOLVED_MODEL_LABEL,
+            ..Default::default()
+        },
         status,
-        RequestOutcome::from_status(status),
         elapsed,
     );
     match envelope {

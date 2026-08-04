@@ -13,9 +13,7 @@
 //! 400 with an explanatory message.
 
 use aisix_gateway::{ChatFormat, ChatMessage, ChatResponse, FinishReason, UsageStats};
-use aisix_obs::{
-    content_capture_cap, AccessLog, CapturedContent, LatencyLabels, RequestOutcome, UsageEvent,
-};
+use aisix_obs::{content_capture_cap, AccessLog, CapturedContent, LatencyLabels, UsageEvent};
 use axum::extract::State;
 use axum::http::{HeaderName, HeaderValue};
 use axum::response::{IntoResponse, Response};
@@ -58,6 +56,11 @@ struct ResponseDispatchSuccess {
     /// pk_label / …) on the emitted UsageEvent (AISIX-Cloud#867). Empty when
     /// the target carried no provider_key_id.
     provider_key_id: String,
+    /// The provider-side model name the winning attempt actually called,
+    /// for the `upstream_model` metric label (AISIX-Cloud#1234). Same value
+    /// chat + messages report, so a query can group all three endpoints by
+    /// the model the provider was billed for rather than the alias.
+    upstream_model: String,
     /// Per-attempt routing telemetry (#655): the failed attempts that
     /// preceded the winner plus the winning attempt itself.
     routing: RoutingTelemetry,
@@ -188,6 +191,13 @@ pub async fn responses(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+    // Read once here rather than off `body` at each terminal emit: dispatch
+    // never rewrites the field, and the failure paths must label the request
+    // with what the caller asked for.
+    let stream_requested = body
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     // Filled by `dispatch` with per-detector PII mask counts (#932); attached
     // to the terminal usage event on both the success and failure paths.
@@ -224,11 +234,19 @@ pub async fn responses(
                 &success.routing,
                 None,
             );
-            state.metrics.record_request(
-                &success.provider,
-                &model_name,
+            crate::request_metrics::record(
+                &state,
+                "/v1/responses",
+                crate::request_metrics::Caller::new(&auth),
+                crate::request_metrics::Upstream {
+                    provider: &success.provider,
+                    model: &model_name,
+                    upstream_model: &success.upstream_model,
+                    provider_key_id: &success.provider_key_id,
+                    stream: stream_requested,
+                    is_fallback: success.routing.fallback_count() > 0,
+                },
                 status,
-                RequestOutcome::from_status(status),
                 elapsed,
             );
             // Per #655: one zero-token UsageEvent per failed attempt that
@@ -267,10 +285,7 @@ pub async fn responses(
                         model: &model_name,
                         provider: &success.provider,
                         status,
-                        streaming: body
-                            .get("stream")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false),
+                        streaming: stream_requested,
                     },
                     elapsed,
                 );
@@ -327,11 +342,21 @@ pub async fn responses(
             );
             let snap = state.snapshot.load();
             let metric_model = crate::usage_attr::metric_model_label(&snap, &model_name);
-            state.metrics.record_request(
-                "unknown",
-                metric_model,
+            // The failed request counts on the detailed families too, so a
+            // success rate over /v1/responses has the failures in its
+            // denominator. Provider / upstream / provider-key never
+            // resolved on this path.
+            crate::request_metrics::record(
+                &state,
+                "/v1/responses",
+                crate::request_metrics::Caller::new(&auth),
+                crate::request_metrics::Upstream {
+                    model: metric_model,
+                    stream: stream_requested,
+                    is_fallback: routing.fallback_count() > 0,
+                    ..Default::default()
+                },
                 status,
-                RequestOutcome::from_status(status),
                 elapsed,
             );
             state.metrics.record_request_e2e_latency(
@@ -340,10 +365,7 @@ pub async fn responses(
                     model: metric_model,
                     provider: "unknown",
                     status,
-                    streaming: body
-                        .get("stream")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false),
+                    streaming: stream_requested,
                 },
                 elapsed,
             );
@@ -1311,6 +1333,7 @@ async fn responses_to_target(
                 usage,
                 model_id: model_id.to_string(),
                 provider_key_id: provider_key_id.clone(),
+                upstream_model: upstream_model.clone(),
                 routing: RoutingTelemetry::default(),
                 guardrail_blocked: false,
                 usage_handled_by_stream: false,
@@ -1530,6 +1553,7 @@ async fn responses_to_target(
             usage: None,
             model_id: model_id.to_string(),
             provider_key_id,
+            upstream_model: upstream_model.clone(),
             routing: RoutingTelemetry::default(),
             guardrail_blocked: false,
             usage_handled_by_stream: true,
@@ -1631,6 +1655,7 @@ async fn responses_to_target(
                     usage,
                     model_id: model_id.to_string(),
                     provider_key_id: provider_key_id.clone(),
+                    upstream_model: upstream_model.clone(),
                     routing: RoutingTelemetry::default(),
                     guardrail_blocked: true,
                     usage_handled_by_stream: false,
@@ -1672,6 +1697,7 @@ async fn responses_to_target(
             usage,
             model_id: model_id.to_string(),
             provider_key_id,
+            upstream_model,
             routing: RoutingTelemetry::default(),
             guardrail_blocked: false,
             usage_handled_by_stream: false,
@@ -2007,6 +2033,7 @@ async fn responses_cross_provider_to_target(
             usage: None,
             model_id: model_id.to_string(),
             provider_key_id,
+            upstream_model: model.upstream_model().unwrap_or("unknown").to_string(),
             routing: RoutingTelemetry::default(),
             guardrail_blocked: false,
             usage_handled_by_stream: true,
@@ -2110,6 +2137,7 @@ async fn responses_cross_provider_to_target(
                 usage: Some(usage),
                 model_id: model_id.to_string(),
                 provider_key_id: provider_key_id.clone(),
+                upstream_model: model.upstream_model().unwrap_or("unknown").to_string(),
                 routing: RoutingTelemetry::default(),
                 guardrail_blocked: true,
                 usage_handled_by_stream: false,
@@ -2162,6 +2190,7 @@ async fn responses_cross_provider_to_target(
         usage: Some(usage),
         model_id: model_id.to_string(),
         provider_key_id,
+        upstream_model: model.upstream_model().unwrap_or("unknown").to_string(),
         routing: RoutingTelemetry::default(),
         guardrail_blocked: false,
         usage_handled_by_stream: false,

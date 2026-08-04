@@ -12,7 +12,7 @@
 
 use aisix_core::AppliedGuardrail;
 use aisix_gateway::BridgeError;
-use aisix_obs::{content_capture_cap, AccessLog, CapturedContent, RequestOutcome, UsageEvent};
+use aisix_obs::{content_capture_cap, AccessLog, CapturedContent, UsageEvent};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -37,6 +37,9 @@ struct ImageDispatchSuccess {
     /// Resolved ProviderKey UUID — feeds per-PK telemetry attribution
     /// (AISIX-Cloud#867 parity).
     provider_key_id: String,
+    /// Provider-side model name, for the `upstream_model` metric label
+    /// (AISIX-Cloud#1234 parity with chat / messages / responses).
+    upstream_model: String,
     /// The `{kind, hook}` set of guardrails that governed this request (#379
     /// parity) — surfaced on the emitted UsageEvent.
     applied_guardrails: Vec<AppliedGuardrail>,
@@ -98,20 +101,33 @@ pub async fn image_generations(
     match dispatch(&state, &auth, body, &request_id, &client).await {
         Ok(success) => {
             let elapsed = started.elapsed();
+            // The actual response status, not a hardcoded 200: the 501
+            // NotImplemented branch also returns `Ok(success)`, and calling
+            // it a 200 both mislabels the access log and books it as
+            // `outcome="success"` on the request metrics. Same fix #426 made
+            // for completions / responses / rerank.
+            let status = success.response.status().as_u16();
             emit_access_log(
                 &model_name,
                 &success.provider,
                 &api_key_id,
-                200,
+                status,
                 elapsed,
                 &request_id,
                 None,
             );
-            state.metrics.record_request(
-                &success.provider,
-                &model_name,
-                200,
-                RequestOutcome::Success,
+            crate::request_metrics::record(
+                &state,
+                "/v1/images/generations",
+                crate::request_metrics::Caller::new(&auth),
+                crate::request_metrics::Upstream {
+                    provider: &success.provider,
+                    model: &model_name,
+                    upstream_model: &success.upstream_model,
+                    provider_key_id: &success.provider_key_id,
+                    ..Default::default()
+                },
+                status,
                 elapsed,
             );
             // Issue #407: emit UsageEvent so cp-api's budget ledger +
@@ -159,11 +175,15 @@ pub async fn image_generations(
             );
             let snap = state.snapshot.load();
             let metric_model = crate::usage_attr::metric_model_label(&snap, &model_name);
-            state.metrics.record_request(
-                "unknown",
-                metric_model,
+            crate::request_metrics::record(
+                &state,
+                "/v1/images/generations",
+                crate::request_metrics::Caller::new(&auth),
+                crate::request_metrics::Upstream {
+                    model: metric_model,
+                    ..Default::default()
+                },
                 status,
-                RequestOutcome::from_status(status),
                 elapsed,
             );
             // Per #655 parity: surface the failed request in Logs with a
@@ -370,6 +390,7 @@ async fn dispatch(
                 provider: provider_label,
                 model_id: model_entry.id.to_string(),
                 provider_key_id: pk_entry.id.to_string(),
+                upstream_model: model.upstream_model().unwrap_or("unknown").to_string(),
                 applied_guardrails: applied_guardrails.clone(),
                 usage,
                 upstream_called: true,
@@ -387,6 +408,7 @@ async fn dispatch(
                 provider: provider_label,
                 model_id: model_entry.id.to_string(),
                 provider_key_id: pk_entry.id.to_string(),
+                upstream_model: model.upstream_model().unwrap_or("unknown").to_string(),
                 applied_guardrails: applied_guardrails.clone(),
                 usage: None,
                 // No upstream call happened → handler skips emit.

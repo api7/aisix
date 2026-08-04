@@ -43,7 +43,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use aisix_core::models::model::Adapter;
-use aisix_obs::{AccessLog, RequestOutcome, UsageEvent};
+use aisix_obs::{AccessLog, UsageEvent};
 use axum::extract::ws::{CloseFrame, Message as AxMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, Method};
@@ -147,12 +147,17 @@ pub(crate) async fn realtime(
             // Count the refusal like every other pre-dispatch rejection
             // (unresolved labels, same as `reject_before_dispatch`) — logs
             // and the request-rate metrics must not disagree about whether
-            // these requests exist.
-            state.metrics.record_request(
-                "unknown",
-                crate::usage_attr::UNRESOLVED_MODEL_LABEL,
+            // these requests exist. Authentication may not have run, so the
+            // caller is attributed only when a key was resolved.
+            crate::request_metrics::record(
+                &state,
+                "/v1/realtime",
+                crate::request_metrics::Caller::unattributed(None),
+                crate::request_metrics::Upstream {
+                    model: crate::usage_attr::UNRESOLVED_MODEL_LABEL,
+                    ..Default::default()
+                },
                 status,
-                RequestOutcome::from_status(status),
                 started.elapsed(),
             );
             crate::usage_attr::emit_error_usage_event(
@@ -675,11 +680,16 @@ async fn run_session(
         Some((&provider_label, &requested_model)),
         session_error.as_ref(),
     );
-    state.metrics.record_request(
-        &provider_label,
-        &model_entry.value.display_name,
+    crate::request_metrics::record(
+        &state,
+        "/v1/realtime",
+        crate::request_metrics::Caller::new(&auth),
+        crate::request_metrics::Upstream {
+            provider: &provider_label,
+            model: &model_entry.value.display_name,
+            ..Default::default()
+        },
         close_status,
-        RequestOutcome::from_status(close_status),
         elapsed,
     );
 
