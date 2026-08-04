@@ -16,7 +16,7 @@
 
 use aisix_core::AppliedGuardrail;
 use aisix_gateway::{BridgeError, ChatFormat, ChatMessage, EmbeddingRequest};
-use aisix_obs::{content_capture_cap, AccessLog, CapturedContent, RequestOutcome, UsageEvent};
+use aisix_obs::{content_capture_cap, AccessLog, CapturedContent, UsageEvent};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -119,7 +119,12 @@ pub async fn embeddings(
     match dispatch(&state, &auth, body, &request_id, &client).await {
         Ok(success) => {
             let elapsed = started.elapsed();
-            let status = 200u16;
+            // The actual response status, not a hardcoded 200: the 501
+            // NotImplemented branch also returns `Ok(success)`, and calling
+            // it a 200 both mislabels the access log and books it as
+            // `outcome="success"` on the request metrics. Same fix #426 made
+            // for completions / responses / rerank.
+            let status = success.response.status().as_u16();
             emit_access_log(
                 &model_name,
                 &success.provider,
@@ -129,11 +134,18 @@ pub async fn embeddings(
                 &request_id,
                 None,
             );
-            state.metrics.record_request(
-                &success.provider,
-                &model_name,
+            crate::request_metrics::record(
+                &state,
+                "/v1/embeddings",
+                crate::request_metrics::Caller::new(&auth),
+                crate::request_metrics::Upstream {
+                    provider: &success.provider,
+                    model: &model_name,
+                    upstream_model: &success.upstream_model,
+                    provider_key_id: &success.provider_key_id,
+                    ..Default::default()
+                },
                 status,
-                RequestOutcome::Success,
                 elapsed,
             );
             // Issue #226: emit UsageEvent so cp-api's budget ledger
@@ -185,11 +197,15 @@ pub async fn embeddings(
             );
             let snap = state.snapshot.load();
             let metric_model = crate::usage_attr::metric_model_label(&snap, &model_name);
-            state.metrics.record_request(
-                "unknown",
-                metric_model,
+            crate::request_metrics::record(
+                &state,
+                "/v1/embeddings",
+                crate::request_metrics::Caller::new(&auth),
+                crate::request_metrics::Upstream {
+                    model: metric_model,
+                    ..Default::default()
+                },
                 status,
-                RequestOutcome::from_status(status),
                 elapsed,
             );
             // Per #655 parity: surface the failed request in Logs with a
@@ -223,6 +239,9 @@ struct EmbedDispatchSuccess {
     /// Resolved ProviderKey UUID — feeds the per-PK telemetry attribution
     /// tags on the emitted UsageEvent (AISIX-Cloud#867 parity).
     provider_key_id: String,
+    /// Provider-side model name, for the `upstream_model` metric label
+    /// (AISIX-Cloud#1234 parity with chat / messages / responses).
+    upstream_model: String,
     /// The `{kind, hook}` set of guardrails that governed this request (#379
     /// parity) — surfaced on the emitted UsageEvent.
     applied_guardrails: Vec<AppliedGuardrail>,
@@ -462,6 +481,7 @@ async fn dispatch(
                 provider: provider_label,
                 model_id: model_entry.id.to_string(),
                 provider_key_id: pk_entry.id.to_string(),
+                upstream_model: model.upstream_model().unwrap_or("unknown").to_string(),
                 applied_guardrails: applied_guardrails.clone(),
                 redactions: redactions.clone(),
                 monitor_hits: monitor_hits.clone(),
@@ -485,6 +505,7 @@ async fn dispatch(
                 provider: provider.to_ascii_lowercase(),
                 model_id: model_entry.id.to_string(),
                 provider_key_id: pk_entry.id.to_string(),
+                upstream_model: model.upstream_model().unwrap_or("unknown").to_string(),
                 applied_guardrails: applied_guardrails.clone(),
                 redactions: redactions.clone(),
                 monitor_hits: monitor_hits.clone(),

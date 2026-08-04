@@ -30,11 +30,12 @@ opaque binary passthrough (audio, images) corrupts it.
 
 ## Every terminal path emits the access log — including the ones that give up early
 
-The access log and `record_request` are emitted **by the handler**, at the end of
-dispatch, because that is the only place that knows the provider, model and token
-counts. A path that returns before reaching that tail therefore logs nothing, and
-nothing errors: the caller gets a correct status while the gateway keeps no record
-of the request, which is indistinguishable from the request never arriving.
+The access log and `request_metrics::record` are emitted **by the handler**, at
+the end of dispatch, because that is the only place that knows the provider, model
+and token counts. A path that returns before reaching that tail therefore logs
+nothing, and nothing errors: the caller gets a correct status while the gateway
+keeps no record of the request, which is indistinguishable from the request never
+arriving.
 
 Two shapes give up early, and both must answer through
 `reject::reject_before_dispatch` (it renders the envelope *and* emits the
@@ -50,6 +51,27 @@ telemetry, so the two can't drift apart):
 A handler that instead wraps its whole dispatch and logs the wrapper's status
 (`/mcp`, `/a2a`, `/passthrough`, `/v1/videos`, `/v1/files`) is already covered —
 don't add a second emit to those, or the request logs twice.
+
+Emit the request metrics through `request_metrics::record` and nothing else. It
+writes the legacy `aisix_requests_total` **and** the detailed `aisix_proxy_*` /
+`aisix_llm_*` families from one call, so calling `Metrics::record_request`
+directly silently produces a request that exists in one family and not the
+others — the bug AISIX-Cloud#1234 fixed across ten endpoints.
+
+## A new proxy route has to be declared in three places
+
+Adding a `.route(…)` in `build_router` is not enough, and nothing fails loudly
+if you stop there:
+
+1. `normalize_endpoint_label` — an unlisted path collapses to `"other"`, so the
+   route is invisible per-endpoint in every request series (how `/v1/videos`
+   shipped).
+2. `request_metrics::LLM_ENDPOINTS` — decides whether the route counts as model
+   inference. Unlisted means proxy-only, which is the safe default but a silent
+   one.
+3. The `ROUTES` table in `request_metrics`' tests — the only thing that makes
+   (1) and (2) fail loudly. It is a hand-maintained list of every route; a route
+   missing from it is a route the tests cannot check.
 
 ## A per-model gate must say whether it binds the requested entry or each target
 

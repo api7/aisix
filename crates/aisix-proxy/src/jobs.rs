@@ -53,7 +53,7 @@ use std::time::{Duration, Instant};
 use aisix_core::models::model::Adapter;
 use aisix_core::resource::ResourceEntry;
 use aisix_core::{Model, ProviderKey};
-use aisix_obs::{AccessLog, RequestOutcome, UsageEvent};
+use aisix_obs::{AccessLog, UsageEvent};
 use axum::body::Body;
 use axum::extract::{Multipart, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
@@ -658,6 +658,8 @@ fn finish(
     monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
 ) -> Response {
     let elapsed = started.elapsed();
+    // `path` carries the real job/file id — bounded route template only.
+    let endpoint = crate::normalize_endpoint_label(&path);
     match result {
         Ok((mut resp, target)) => {
             let status = resp.status().as_u16();
@@ -671,11 +673,16 @@ fn finish(
                 &request_id,
                 None,
             );
-            state.metrics.record_request(
-                target.provider_label(),
-                target.display_name(),
+            crate::request_metrics::record(
+                state,
+                endpoint,
+                crate::request_metrics::Caller::new(auth),
+                crate::request_metrics::Upstream {
+                    provider: target.provider_label(),
+                    model: target.display_name(),
+                    ..Default::default()
+                },
                 status,
-                RequestOutcome::from_status(status),
                 elapsed,
             );
             emit_job_usage_event(
@@ -706,11 +713,16 @@ fn finish(
                 &request_id,
                 Some(&err),
             );
-            state.metrics.record_request(
-                "",
-                label,
+            crate::request_metrics::record(
+                state,
+                endpoint,
+                crate::request_metrics::Caller::new(auth),
+                crate::request_metrics::Upstream {
+                    provider: "",
+                    model: label,
+                    ..Default::default()
+                },
                 status,
-                RequestOutcome::from_status(status),
                 elapsed,
             );
             crate::usage_attr::emit_error_usage_event(

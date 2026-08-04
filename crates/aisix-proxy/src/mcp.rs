@@ -17,7 +17,7 @@
 
 use std::time::{Duration, Instant};
 
-use aisix_obs::{AccessLog, RequestOutcome, UsageEvent};
+use aisix_obs::{AccessLog, UsageEvent};
 use axum::body::{to_bytes, Body};
 use axum::extract::{Request, State};
 use axum::http::StatusCode;
@@ -103,20 +103,24 @@ async fn serve(
         .unwrap_or_else(new_request_id);
     let api_key_id = auth.entry.id.clone();
     let method = request.method().clone();
+    // `dispatch` takes the key by value; the terminal emit below still needs
+    // the caller's team / user labels (the handle is an `Arc` clone).
+    let caller_auth = auth.clone();
 
     let response = dispatch(auth, scope.as_deref(), &state, request, &request_id).await;
 
     let elapsed = started.elapsed();
     let status = response.status().as_u16();
+    // Bounded route template, mirroring `/a2a` (the per-request server is
+    // on the usage event, not the access log).
+    let endpoint = if scope.is_some() {
+        "/mcp/{server}"
+    } else {
+        "/mcp"
+    };
     AccessLog {
         method: method.as_str(),
-        // Bounded route template, mirroring `/a2a` (the per-request server is
-        // on the usage event, not the access log).
-        path: if scope.is_some() {
-            "/mcp/{server}"
-        } else {
-            "/mcp"
-        },
+        path: endpoint,
         status,
         latency: elapsed,
         provider: Some("mcp"),
@@ -136,11 +140,16 @@ async fn serve(
         routing_fallback_count: None,
     }
     .emit();
-    state.metrics.record_request(
-        "mcp",
-        MCP_MODEL_LABEL,
+    crate::request_metrics::record(
+        &state,
+        endpoint,
+        crate::request_metrics::Caller::new(&caller_auth),
+        crate::request_metrics::Upstream {
+            provider: "mcp",
+            model: MCP_MODEL_LABEL,
+            ..Default::default()
+        },
         status,
-        RequestOutcome::from_status(status),
         elapsed,
     );
     response

@@ -43,7 +43,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use aisix_core::models::model::Adapter;
-use aisix_obs::{AccessLog, RequestOutcome, UsageEvent};
+use aisix_obs::{AccessLog, UsageEvent};
 use axum::extract::ws::{CloseFrame, Message as AxMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, Method};
@@ -646,11 +646,16 @@ async fn run_session(
         Some((&provider_label, &requested_model)),
         session_error.as_ref(),
     );
-    state.metrics.record_request(
-        &provider_label,
-        &model_entry.value.display_name,
+    crate::request_metrics::record(
+        &state,
+        "/v1/realtime",
+        crate::request_metrics::Caller::new(&auth),
+        crate::request_metrics::Upstream {
+            provider: &provider_label,
+            model: &model_entry.value.display_name,
+            ..Default::default()
+        },
         close_status,
-        RequestOutcome::from_status(close_status),
         elapsed,
     );
 
