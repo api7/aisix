@@ -3485,12 +3485,24 @@ data: [DONE]\n\n"
             1,
         ));
         let state = build_state(snap, hub);
+        let auth = AuthenticatedKey {
+            entry: Arc::new(ResourceEntry::new(
+                "key-entry-1",
+                serde_json::from_value::<aisix_core::ApiKey>(serde_json::json!({
+                    "key_hash": "h",
+                    "allowed_models": [],
+                }))
+                .unwrap(),
+                1,
+            )),
+        };
 
         // Suspended: max_requests=1 would deny the second reservation
         // (pre_commit counts stick even when the reservation drops
         // uncommitted) — both succeed because nothing is reserved.
         for _ in 0..2 {
-            let r = quota::reserve_model_only(&state, "mg-member", "model-id-1", &target).await;
+            let r =
+                quota::reserve_model_only(&state, &auth, "mg-member", "model-id-1", &target).await;
             assert!(r.is_ok(), "suspended policy must reserve nothing");
         }
 
@@ -3505,12 +3517,12 @@ data: [DONE]\n\n"
             ));
 
         assert!(
-            quota::reserve_model_only(&state, "mg-member", "model-id-1", &target)
+            quota::reserve_model_only(&state, &auth, "mg-member", "model-id-1", &target)
                 .await
                 .is_ok()
         );
         assert!(
-            quota::reserve_model_only(&state, "mg-member", "model-id-1", &target)
+            quota::reserve_model_only(&state, &auth, "mg-member", "model-id-1", &target)
                 .await
                 .is_err(),
             "policy outside its windows must throttle the second reservation",

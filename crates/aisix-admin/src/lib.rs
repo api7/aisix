@@ -802,6 +802,7 @@ mod tests {
             rejected: vec![],
             partially_compatible: Vec::new(),
             partially_compatible_rows_by_kind: Default::default(),
+            stale_served_rows_by_kind: Default::default(),
             is_reload: true,
             wholly_rejected: false,
         });
@@ -837,6 +838,7 @@ mod tests {
                 last_error_kind: "schema_failed".into(),
                 last_error: "schema validation failed at `/display_name`".into(),
                 seen_at: chrono::Utc::now(),
+                serving_stale_since: None,
             }],
             partially_compatible: vec![aisix_core::config_status::PartialCompatResource {
                 resource_kind: "api_keys".into(),
@@ -844,6 +846,7 @@ mod tests {
                 count: 2,
             }],
             partially_compatible_rows_by_kind: [("api_keys".to_string(), 2)].into_iter().collect(),
+            stale_served_rows_by_kind: Default::default(),
             is_reload: true,
             wholly_rejected: false,
         });
@@ -899,6 +902,7 @@ mod tests {
             rejected: vec![],
             partially_compatible: Vec::new(),
             partially_compatible_rows_by_kind: Default::default(),
+            stale_served_rows_by_kind: Default::default(),
             is_reload: true,
             wholly_rejected: false,
         });

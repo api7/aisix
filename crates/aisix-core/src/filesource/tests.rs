@@ -103,6 +103,22 @@ rate_limit_policies:
     scope_ref: team-uuid-1
     window: hour
     max_requests: 1000
+  - name: premium-family
+    conditions:
+      - dimension: team
+        operator: in
+        value: ["team-uuid-1"]
+      - logic: or
+        children:
+          - dimension: model
+            operator: in
+            value: ["gpt-4o"]
+          - dimension: provider
+            operator: "=="
+            value: anthropic
+    group_by: [member]
+    limits:
+      rpm: 20
 
 oidc_providers:
   - name: corp-keycloak
@@ -130,7 +146,7 @@ fn full_valid_file_loads_every_kind() {
     assert_eq!(snap.a2a_agents.len(), 1);
     assert_eq!(snap.cache_policies.len(), 1);
     assert_eq!(snap.observability_exporters.len(), 1);
-    assert_eq!(snap.rate_limit_policies.len(), 3);
+    assert_eq!(snap.rate_limit_policies.len(), 4);
     assert_eq!(snap.oidc_providers.len(), 1);
 
     // The OIDC provider loads with serde defaults filled.
@@ -181,13 +197,61 @@ fn full_valid_file_loads_every_kind() {
     };
     assert_eq!(
         by_policy_name("cap-gpt4o").value.scope_ref,
-        derive_id("models", "gpt-4o"),
+        Some(derive_id("models", "gpt-4o")),
     );
     assert_eq!(
         by_policy_name("cap-ci-bot").value.scope_ref,
-        derive_id("api_keys", "ci-bot"),
+        Some(derive_id("api_keys", "ci-bot")),
     );
-    assert_eq!(by_policy_name("cap-team").value.scope_ref, "team-uuid-1");
+    assert_eq!(
+        by_policy_name("cap-team").value.scope_ref.as_deref(),
+        Some("team-uuid-1")
+    );
+
+    // The conditional form loads with the same name sugar one level
+    // down: a `model` leaf's values resolve to derived ids; `team` and
+    // string-dimension values pass through verbatim (AISIX-Cloud#892).
+    let premium = by_policy_name("premium-family");
+    assert!(premium.value.is_conditional());
+    let conditions = serde_json::to_value(premium.value.conditions.as_ref().unwrap()).unwrap();
+    assert_eq!(conditions[0]["value"][0], "team-uuid-1");
+    assert_eq!(
+        conditions[1]["children"][0]["value"][0],
+        derive_id("models", "gpt-4o")
+    );
+    assert_eq!(conditions[1]["children"][1]["value"], "anthropic");
+}
+
+#[test]
+fn conditional_policy_with_unknown_model_name_is_a_load_error() {
+    // Same contract as scope_ref: a typo in a conditions model
+    // reference must fail the load, never become a silently-dead leaf.
+    let file = r#"
+_format_version: "1"
+
+provider_keys:
+  - display_name: pk
+    provider: openai
+    api_key: sk-x
+models:
+  - display_name: gpt-4o
+    provider: openai
+    model_name: gpt-4o
+    provider_key: pk
+rate_limit_policies:
+  - name: bad-ref
+    conditions:
+      - dimension: model
+        operator: in
+        value: ["no-such-model"]
+    limits:
+      rpm: 5
+"#;
+    let errors = errors_of(load(file, &env_of(&[])));
+    // Exactly one error: the dangling reference itself, so the test
+    // proves the unknown-model leaf alone fails the load.
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].contains("no-such-model"), "{errors:?}");
 }
 
 #[test]

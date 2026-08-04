@@ -1,7 +1,10 @@
 //! `RateLimitPolicy` entity — standalone rate-limit rules stored in etcd
 //! under `rate_limit_policies/<uuid>`.
 //!
-//! Each policy targets a single subject via `(scope, scope_ref)`:
+//! A policy is exactly one of two forms, fixed at creation
+//! (AISIX-Cloud#892):
+//!
+//! **Classic form** — targets a single subject via `(scope, scope_ref)`:
 //! - `api_key`     — matches by API key entry ID
 //! - `model`       — matches by model entry ID
 //! - `team`        — matches by team ID on the API key (one shared bucket)
@@ -10,15 +13,33 @@
 //!   key in the team inherits this default with its own independent
 //!   counter keyed on the API key's user ID
 //!
-//! The proxy iterates all policies on each request, converts the
-//! `window`+`max_requests`/`max_tokens` into a `RateLimit`, and
-//! reserves under `policy:<scope>:<scope_ref>:<policy_id>` — with the
-//! member's `user_id` appended for the `team_member` scope.
+//! The proxy converts `window`+`max_requests`/`max_tokens` into a
+//! `RateLimit` and reserves under `policy:<scope>:<scope_ref>:<policy_id>`
+//! — with the member's `user_id` appended for the `team_member` scope.
+//!
+//! **Conditional form** — matches by a [`ConditionNode`] tree
+//! (`conditions`, lua-resty-expr semantics), buckets by `group_by`, and
+//! caps with the full 7-field [`RateLimit`] (`limits`). The classic
+//! scopes are exact special cases of this form (`team_member` ≡
+//! `conditions=[team in {T}]` + `group_by=[member]`), but stored rows
+//! are never rewritten between forms. Buckets reserve under
+//! `policy:v2:<policy_id>` plus one `:<dim>=<value>` segment per
+//! `group_by` dimension in canonical order.
+//!
+//! The two forms are mutually exclusive on the wire: the schema's
+//! injected `oneOf` ([`rate_limit_policy_form_one_of`]) rejects rows
+//! mixing them, and [`RateLimitPolicy::validate_semantics`] enforces
+//! the caps the schema cannot express (tree depth/leaf counts,
+//! operator×dimension admission, regex compilability).
 
 use chrono::{DateTime, Datelike, NaiveDate, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use super::policy_conditions::{
+    validate_condition_nodes, ConditionNode, GroupByDimension, PolicyAction,
+};
+use super::rate_limit::RateLimit;
 use crate::resource::Resource;
 
 /// Subject a [`RateLimitPolicy`] targets, paired with `scope_ref`.
@@ -215,16 +236,41 @@ impl PolicySchedule {
 pub struct RateLimitPolicy {
     #[schemars(length(min = 1))]
     pub name: String,
-    pub scope: PolicyScope,
+    // —— classic form (absent on conditional rows; a stored classic row
+    // serializes byte-identically to the pre-#892 shape) ——
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<PolicyScope>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(min = 1))]
-    pub scope_ref: String,
-    pub window: PolicyWindow,
+    pub scope_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<PolicyWindow>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1))]
     pub max_requests: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1))]
     pub max_tokens: Option<u64>,
+    // —— conditional form (AISIX-Cloud#892) ——
+    /// Condition node tree the request must satisfy (implicit AND
+    /// across the top level; `[]`/absent = every request in the env).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conditions: Option<Vec<ConditionNode>>,
+    /// Dimensions the counters split on; `[]`/absent = one shared
+    /// bucket for every matched request. A matched request missing a
+    /// `group_by` dimension is not subject to the policy (mirrors
+    /// `team_member` only applying to keys that carry a `user_id`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_by: Option<Vec<GroupByDimension>>,
+    /// Full 7-field limits (`rps/rpm/rph/rpd/tpm/tpd/concurrency`) —
+    /// same shape and storage semantics as the inline model/api_key
+    /// rate limits. Present on every conditional row (it is the form
+    /// discriminator) and carries at least one field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limits: Option<RateLimit>,
+    /// Over-limit action; v1 only `reject` (429), absent = `reject`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<PolicyAction>,
     /// Recurring windows during which this policy is suspended — the
     /// quota gate skips it while `now` falls in any listed window and
     /// enforcement resumes automatically afterwards (AISIX-Cloud#1104).
@@ -246,15 +292,118 @@ impl RateLimitPolicy {
     pub fn suspended_at(&self, now: DateTime<Utc>) -> bool {
         self.schedules.iter().any(|s| s.matches(now))
     }
+
+    /// Whether this row is the conditional form. `limits` is the form
+    /// discriminator: required on every conditional row, rejected on
+    /// classic rows (schema `oneOf` + [`Self::validate_semantics`]).
+    pub fn is_conditional(&self) -> bool {
+        self.limits.is_some()
+    }
+
+    /// Whether any condition leaf or `group_by` dimension names a model
+    /// property (`model` / `model_name` / `provider`). Such policies
+    /// reserve where the concrete model is known — for routing/ensemble
+    /// parents that is the per-target gate, not the request gate.
+    pub fn references_model_property(&self) -> bool {
+        fn node_refs(node: &ConditionNode) -> bool {
+            match node {
+                ConditionNode::Leaf(leaf) => leaf.dimension.is_model_property(),
+                ConditionNode::Group(group) => group.children.iter().any(node_refs),
+            }
+        }
+        self.conditions
+            .as_deref()
+            .is_some_and(|nodes| nodes.iter().any(node_refs))
+            || self.group_by.as_deref().is_some_and(|dims| {
+                dims.iter()
+                    .any(|d| matches!(d, GroupByDimension::Model | GroupByDimension::Provider))
+            })
+    }
+
+    /// Cross-field checks the JSON Schema cannot express, applied by
+    /// the etcd loader and the file source after parse. A failing row
+    /// is rejected whole — a policy is enforced exactly as written or
+    /// not at all (never with part of its tree dropped).
+    pub fn validate_semantics(&self) -> Result<(), String> {
+        let classic = self.scope.is_some()
+            || self.scope_ref.is_some()
+            || self.window.is_some()
+            || self.max_requests.is_some()
+            || self.max_tokens.is_some();
+        let conditional = self.conditions.is_some()
+            || self.group_by.is_some()
+            || self.limits.is_some()
+            || self.action.is_some();
+        if classic && conditional {
+            return Err(
+                "policy mixes the classic (scope/scope_ref/window/max_*) and conditional \
+                 (conditions/group_by/limits/action) forms — a row is exactly one"
+                    .into(),
+            );
+        }
+        if conditional {
+            let Some(limits) = self.limits.as_ref() else {
+                return Err("conditional policy requires `limits`".into());
+            };
+            if limits.is_unrestricted() {
+                return Err("`limits` must set at least one field".into());
+            }
+            if let Some(nodes) = self.conditions.as_deref() {
+                validate_condition_nodes(nodes)?;
+            }
+            if let Some(group_by) = self.group_by.as_deref() {
+                let mut seen = Vec::with_capacity(group_by.len());
+                for dim in group_by {
+                    if seen.contains(dim) {
+                        return Err(format!("`group_by` repeats dimension `{dim}`"));
+                    }
+                    seen.push(*dim);
+                }
+            }
+            return Ok(());
+        }
+        // Classic form: same required set the pre-#892 schema enforced.
+        if self.scope.is_none() || self.scope_ref.is_none() || self.window.is_none() {
+            return Err("classic policy requires `scope`, `scope_ref` and `window`".into());
+        }
+        if self.max_requests.is_none() && self.max_tokens.is_none() {
+            return Err("classic policy requires `max_requests` or `max_tokens`".into());
+        }
+        Ok(())
+    }
 }
 
-/// The one cross-field invariant `schemars` can't derive: a policy must cap at
-/// least one of `max_requests` / `max_tokens`. Injected as a top-level `anyOf`
-/// by [`crate::models::schema::rate_limit_policy_root_schema`].
-pub fn rate_limit_policy_any_of() -> Value {
+/// The form XOR `schemars` can't derive, injected as a top-level `oneOf` by
+/// [`crate::models::schema::rate_limit_policy_root_schema`]: a row is either
+/// the classic form (scope/scope_ref/window required, at least one of
+/// `max_requests`/`max_tokens`, none of the conditional fields) or the
+/// conditional form (`limits` required, none of the classic fields).
+/// Pre-#892 rows satisfy the classic branch byte-for-byte.
+pub fn rate_limit_policy_form_one_of() -> Value {
     json!([
-        { "required": ["max_requests"] },
-        { "required": ["max_tokens"] }
+        {
+            "required": ["scope", "scope_ref", "window"],
+            "anyOf": [
+                { "required": ["max_requests"] },
+                { "required": ["max_tokens"] }
+            ],
+            "not": { "anyOf": [
+                { "required": ["conditions"] },
+                { "required": ["group_by"] },
+                { "required": ["limits"] },
+                { "required": ["action"] }
+            ]}
+        },
+        {
+            "required": ["limits"],
+            "not": { "anyOf": [
+                { "required": ["scope"] },
+                { "required": ["scope_ref"] },
+                { "required": ["window"] },
+                { "required": ["max_requests"] },
+                { "required": ["max_tokens"] }
+            ]}
+        }
     ])
 }
 
@@ -276,7 +425,10 @@ impl Resource for RateLimitPolicy {
 
     #[allow(clippy::misnamed_getters)]
     fn name(&self) -> &str {
-        &self.scope_ref
+        // Classic rows keep reporting their target ref (pre-#892
+        // behavior); conditional rows have no single ref, so they
+        // report the policy name.
+        self.scope_ref.as_deref().unwrap_or(&self.name)
     }
 
     fn kind() -> &'static str {
@@ -302,9 +454,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(p.name, "team-quota");
-        assert_eq!(p.scope, PolicyScope::Team);
-        assert_eq!(p.scope_ref, "team-uuid-1");
-        assert_eq!(p.window, PolicyWindow::Minute);
+        assert_eq!(p.scope, Some(PolicyScope::Team));
+        assert_eq!(p.scope_ref.as_deref(), Some("team-uuid-1"));
+        assert_eq!(p.window, Some(PolicyWindow::Minute));
         assert_eq!(p.max_requests, Some(100));
         assert_eq!(p.max_tokens, Some(50000));
     }
@@ -346,6 +498,155 @@ mod tests {
     #[test]
     fn resource_trait_returns_correct_kind() {
         assert_eq!(RateLimitPolicy::kind(), "rate_limit_policies");
+    }
+
+    // --- dual form (AISIX-Cloud#892) ----------------------------------
+
+    #[test]
+    fn classic_row_serializes_byte_identically_to_pre_892() {
+        // Stored classic rows are never rewritten; when one IS
+        // re-projected (user edit), the wire bytes must not grow
+        // Option-induced nulls or empty conditional fields.
+        let p: RateLimitPolicy = serde_json::from_value(json!({
+            "name": "team-quota",
+            "scope": "team",
+            "scope_ref": "t1",
+            "window": "minute",
+            "max_requests": 100
+        }))
+        .unwrap();
+        let out = serde_json::to_value(&p).unwrap();
+        assert_eq!(
+            out,
+            json!({
+                "name": "team-quota",
+                "scope": "team",
+                "scope_ref": "t1",
+                "window": "minute",
+                "max_requests": 100
+            })
+        );
+    }
+
+    #[test]
+    fn conditional_row_round_trips_and_validates() {
+        let p: RateLimitPolicy = serde_json::from_value(json!({
+            "name": "premium-family",
+            "conditions": [
+                { "dimension": "team", "operator": "in", "value": ["t-1"] },
+                { "logic": "or", "children": [
+                    { "dimension": "model_name", "operator": "~~", "value": "^gpt-4" },
+                    { "dimension": "provider", "operator": "==", "value": "anthropic" }
+                ]}
+            ],
+            "group_by": ["member"],
+            "limits": { "rpm": 20 }
+        }))
+        .unwrap();
+        assert!(p.is_conditional());
+        assert!(p.references_model_property());
+        p.validate_semantics().unwrap();
+        // Wire round-trip: no classic fields materialize.
+        let out = serde_json::to_value(&p).unwrap();
+        assert!(out.get("scope").is_none());
+        assert!(out.get("window").is_none());
+        assert_eq!(out["limits"]["rpm"], 20);
+    }
+
+    #[test]
+    fn validate_semantics_rejects_mixed_and_incomplete_forms() {
+        let mixed: RateLimitPolicy = serde_json::from_value(json!({
+            "name": "mixed",
+            "scope": "team",
+            "scope_ref": "t1",
+            "window": "minute",
+            "max_requests": 10,
+            "limits": { "rpm": 5 }
+        }))
+        .unwrap();
+        assert!(mixed.validate_semantics().unwrap_err().contains("mixes"));
+
+        let incomplete_classic: RateLimitPolicy = serde_json::from_value(json!({
+            "name": "half",
+            "scope": "team",
+            "scope_ref": "t1",
+            "window": "minute"
+        }))
+        .unwrap();
+        assert!(incomplete_classic.validate_semantics().is_err());
+
+        let empty_limits: RateLimitPolicy = serde_json::from_value(json!({
+            "name": "empty",
+            "limits": {}
+        }))
+        .unwrap();
+        assert!(empty_limits.validate_semantics().is_err());
+
+        // Conditional markers without `limits` (the form discriminator).
+        let limitless: RateLimitPolicy = serde_json::from_value(json!({
+            "name": "limitless",
+            "conditions": [
+                { "dimension": "team", "operator": "==", "value": "t-1" }
+            ],
+            "group_by": ["member"]
+        }))
+        .unwrap();
+        assert!(limitless
+            .validate_semantics()
+            .unwrap_err()
+            .contains("requires `limits`"));
+
+        let dup_group_by: RateLimitPolicy = serde_json::from_value(json!({
+            "name": "dup",
+            "group_by": ["team", "team"],
+            "limits": { "rpm": 5 }
+        }))
+        .unwrap();
+        assert!(dup_group_by
+            .validate_semantics()
+            .unwrap_err()
+            .contains("repeats"));
+    }
+
+    #[test]
+    fn conditional_row_without_model_dims_is_request_level() {
+        let p: RateLimitPolicy = serde_json::from_value(json!({
+            "name": "team-pool",
+            "conditions": [
+                { "dimension": "team", "operator": "in", "value": ["t-1"] }
+            ],
+            "group_by": ["api_key"],
+            "limits": { "rpm": 5 }
+        }))
+        .unwrap();
+        assert!(!p.references_model_property());
+        // group_by [model|provider] alone also pins the model phase.
+        let p2: RateLimitPolicy = serde_json::from_value(json!({
+            "name": "per-model",
+            "group_by": ["model"],
+            "limits": { "rpm": 5 }
+        }))
+        .unwrap();
+        assert!(p2.references_model_property());
+    }
+
+    #[test]
+    fn schedules_compose_with_conditional_form() {
+        // `schedules` is form-neutral: a conditional row suspends the
+        // same way a classic one does (AISIX-Cloud#1104).
+        let p: RateLimitPolicy = serde_json::from_value(json!({
+            "name": "cond-sched",
+            "limits": { "rpm": 5 },
+            "schedules": [{
+                "timezone": "UTC",
+                "days_of_week": ["mon","tue","wed","thu","fri","sat","sun"],
+                "start_time": "00:00",
+                "end_time": "24:00"
+            }]
+        }))
+        .unwrap();
+        p.validate_semantics().unwrap();
+        assert!(p.suspended_at(at("2026-08-04T10:00:00Z")));
     }
 
     // --- schedules (AISIX-Cloud#1104) --------------------------------

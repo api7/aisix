@@ -575,17 +575,15 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
                     etcd_prefix.clone(),
                 ))
             };
-            // Snapshot cache: in managed mode persist to disk (default
-            // /var/lib/aisix/config_cache.json) so the DP can serve traffic
+            // Snapshot cache: persist to disk so the DP can serve traffic
             // from the last-known config across CP outages and restarts.
-            // Disabled outside managed mode and when the operator clears the
-            // path explicitly.
-            let snapshot_cache =
-                if cfg.managed.is_managed() && !cfg.managed.snapshot_cache_path.is_empty() {
-                    SnapshotCache::new(&cfg.managed.snapshot_cache_path)
-                } else {
-                    SnapshotCache::disabled()
-                };
+            // Managed mode defaults to /var/lib/aisix/config_cache.json;
+            // self-hosted etcd mode enables it only when the operator sets
+            // a path explicitly; "" disables it in either mode.
+            let snapshot_cache = match cfg.managed.effective_snapshot_cache_path() {
+                Some(path) => SnapshotCache::new(path),
+                None => SnapshotCache::disabled(),
+            };
             let supervisor = Arc::new(Supervisor::with_cache(
                 provider,
                 etcd_prefix,

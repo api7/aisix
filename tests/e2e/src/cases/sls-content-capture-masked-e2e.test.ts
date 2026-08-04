@@ -35,6 +35,7 @@ const EMAIL = "alice@example.com";
 const MASK = "[EMAIL_REDACTED]";
 const CHAT_PROMPT_TOKEN = "masked-chat-prompt-tok-1f2e3d";
 const BRIDGE_PROMPT_TOKEN = "masked-bridge-prompt-tok-4c5b6a";
+const DRAIN_TOKEN = "masked-drain-marker-tok-9a8b7c";
 
 /** OpenAI chat chunks with the email split across two deltas (channel
  * reassembly): neither wire chunk carries the whole value; only the
@@ -191,6 +192,29 @@ describe("sls content capture e2e: streaming capture is post-mask (#932 × AISIX
         }
       });
 
+      // Everything above is warm-up: those requests were served while the
+      // guardrail was still propagating, so the exporter shipped their
+      // UNMASKED replies — which is correct behaviour for a gateway that had
+      // no masking rule yet, and not what this test is about. Assert only on
+      // what was exported from here on.
+      //
+      // An index boundary alone would not separate them: the sink buffers
+      // records and flushes on a 5s tick, so a warm-up record still sitting
+      // in that buffer would ship in the SAME PutLogs body as the requests
+      // below. Send one marker request — masked, since the guardrail is live
+      // now — and wait for it to arrive. The sink flushes its buffer in
+      // order, so the marker being visible proves every warm-up record has
+      // already shipped, and only then does the boundary mean anything.
+      await (
+        await postJson(app, "/v1/chat/completions", {
+          model: "masked-chat-model",
+          stream: true,
+          messages: [{ role: "user", content: `note ${DRAIN_TOKEN}` }],
+        })
+      ).text();
+      await waitForToken(sls, FULL_LOGSTORE, DRAIN_TOKEN, 20_000);
+      const afterWarmup = sls.requests.length;
+
       // -- streaming chat (hold-back release path) --
       const chatRes = await postJson(app, "/v1/chat/completions", {
         model: "masked-chat-model",
@@ -202,8 +226,8 @@ describe("sls content capture e2e: streaming capture is post-mask (#932 × AISIX
       expect(chatBody).toContain(MASK); // client got masked text
       expect(chatBody).not.toContain(EMAIL);
 
-      await waitForToken(sls, FULL_LOGSTORE, CHAT_PROMPT_TOKEN);
-      let fullText = decodedTextFor(sls, FULL_LOGSTORE);
+      await waitForToken(sls, FULL_LOGSTORE, CHAT_PROMPT_TOKEN, 10_000, afterWarmup);
+      let fullText = decodedTextFor(sls, FULL_LOGSTORE, afterWarmup);
       expect(fullText).toContain(CHAT_PROMPT_TOKEN);
       expect(fullText).toContain(MASK); // capture carries the masked reply
       expect(fullText).not.toContain(EMAIL); // and never the raw PII
@@ -219,13 +243,13 @@ describe("sls content capture e2e: streaming capture is post-mask (#932 × AISIX
       expect(bridgeBody).toContain(MASK);
       expect(bridgeBody).not.toContain(EMAIL);
 
-      await waitForToken(sls, FULL_LOGSTORE, BRIDGE_PROMPT_TOKEN);
-      fullText = decodedTextFor(sls, FULL_LOGSTORE);
+      await waitForToken(sls, FULL_LOGSTORE, BRIDGE_PROMPT_TOKEN, 10_000, afterWarmup);
+      fullText = decodedTextFor(sls, FULL_LOGSTORE, afterWarmup);
       expect(fullText).toContain(BRIDGE_PROMPT_TOKEN);
       expect(fullText).not.toContain(EMAIL);
 
       // metadata_only exporter never sees content at all.
-      const metaText = decodedTextFor(sls, META_LOGSTORE);
+      const metaText = decodedTextFor(sls, META_LOGSTORE, afterWarmup);
       expect(metaText).not.toContain(EMAIL);
       expect(metaText).not.toContain(MASK);
       expect(metaText).not.toContain(CHAT_PROMPT_TOKEN);

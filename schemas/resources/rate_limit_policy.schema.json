@@ -1,19 +1,169 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "additionalProperties": false,
-  "anyOf": [
-    {
+  "definitions": {
+    "ConditionGroup": {
+      "additionalProperties": false,
+      "description": "A group node combining child nodes under an explicit AND/OR.",
+      "properties": {
+        "children": {
+          "items": {
+            "$ref": "#/definitions/ConditionNode"
+          },
+          "type": "array"
+        },
+        "logic": {
+          "$ref": "#/definitions/ConditionLogic"
+        },
+        "negate": {
+          "type": "boolean"
+        }
+      },
       "required": [
-        "max_requests"
+        "children",
+        "logic"
+      ],
+      "type": "object"
+    },
+    "ConditionLogic": {
+      "description": "Group combinator — lua-resty-expr `AND`/`OR` (with `negate` for `!AND`/`!OR`).",
+      "enum": [
+        "and",
+        "or"
+      ],
+      "type": "string"
+    },
+    "ConditionNode": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/PolicyCondition"
+        },
+        {
+          "$ref": "#/definitions/ConditionGroup"
+        }
+      ],
+      "description": "A slot in a condition list: leaf or nested group. Untagged — the shapes are disjoint (a leaf requires `dimension`/`operator`/`value`, a group `logic`/`children`), and the schema closes both variants against unknown fields in **both** validator sets because serde silently swallows unknown fields inside untagged content (same reasoning as `OnEmbeddingFailure` in the model schema)."
+    },
+    "ConditionOperator": {
+      "description": "Condition leaf operator — lua-resty-expr tokens, verbatim.",
+      "enum": [
+        "==",
+        "~=",
+        "~~",
+        "~*",
+        "in",
+        "has",
+        ">",
+        ">=",
+        "<",
+        "<=",
+        "ipmatch"
+      ],
+      "type": "string"
+    },
+    "ConditionValue": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      ],
+      "description": "A leaf's comparison value: `in` (and the reserved list operators) carry a string list, every scalar operator a single string."
+    },
+    "GroupByDimension": {
+      "description": "Dimension a policy's counters split on (`group_by`). The subset of [`PolicyDimension`] with a stable per-request value to key a bucket segment on — `model_name` is excluded (it duplicates `model` as a bucket identity, less precisely).",
+      "enum": [
+        "team",
+        "member",
+        "api_key",
+        "model",
+        "provider"
+      ],
+      "type": "string"
+    },
+    "PolicyAction": {
+      "description": "What the policy does past its limits. v1 has the single `reject` (429); the enum reserves the field for `fallback`/`queue`/`alert`.",
+      "enum": [
+        "reject"
+      ],
+      "type": "string"
+    },
+    "PolicyCondition": {
+      "additionalProperties": false,
+      "description": "One condition leaf: `dimension operator value`, with `negate` as the lua-resty-expr `!` prefix.",
+      "properties": {
+        "dimension": {
+          "$ref": "#/definitions/PolicyDimension"
+        },
+        "negate": {
+          "type": "boolean"
+        },
+        "operator": {
+          "$ref": "#/definitions/ConditionOperator"
+        },
+        "value": {
+          "$ref": "#/definitions/ConditionValue"
+        }
+      },
+      "required": [
+        "dimension",
+        "operator",
+        "value"
+      ],
+      "type": "object"
+    },
+    "PolicyDimension": {
+      "description": "Request dimension a condition leaf matches on.",
+      "oneOf": [
+        {
+          "description": "`ApiKey.team_id` (UUID).",
+          "enum": [
+            "team"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "`ApiKey.user_id` (UUID).",
+          "enum": [
+            "member"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Authenticated api_key entry id (UUID).",
+          "enum": [
+            "api_key"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Dispatched model entry id (UUID); routing/model groups match per selected target, never the group entry itself.",
+          "enum": [
+            "model"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Dispatched model display name — the string dimension for regex/prefix matching (\"every gpt-4-family alias\").",
+          "enum": [
+            "model_name"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Dispatched model's `provider` (models.dev catalog id).",
+          "enum": [
+            "provider"
+          ],
+          "type": "string"
+        }
       ]
     },
-    {
-      "required": [
-        "max_tokens"
-      ]
-    }
-  ],
-  "definitions": {
     "PolicySchedule": {
       "additionalProperties": false,
       "description": "One recurring wall-clock window during which the owning policy is suspended (not enforced). Days are selected by `days_of_week` OR by an explicit `dates` list (exactly one selector; the JSON Schema's injected `oneOf` enforces this — see [`crate::models::schema::rate_limit_policy_root_schema`]), evaluated in `timezone`. Time bounds compare as wall-clock minutes: `start_time < end_time` is a same-day window; `start_time > end_time` crosses midnight and belongs to its **start** day (`days_of_week: [fri], 22:00 → 09:00` covers Friday 22:00 through Saturday 09:00); equal times are an empty window that never matches.",
@@ -90,6 +240,54 @@
       ],
       "type": "string"
     },
+    "RateLimit": {
+      "additionalProperties": false,
+      "properties": {
+        "concurrency": {
+          "description": "Max concurrent in-flight requests.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "rpd": {
+          "description": "Requests per 86,400-second window.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "rph": {
+          "description": "Requests per 3,600-second window. There is no per-hour token limit field.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "rpm": {
+          "description": "Requests per 60-second window.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "rps": {
+          "description": "Requests per 1-second window. There is no per-second token limit field.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "tpd": {
+          "description": "Tokens per 86,400-second window.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "tpm": {
+          "description": "Tokens per 60-second window.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
     "ScheduleWeekday": {
       "description": "Day-of-week selector for a [`PolicySchedule`], in the schedule's timezone.",
       "enum": [
@@ -104,7 +302,116 @@
       "type": "string"
     }
   },
+  "oneOf": [
+    {
+      "anyOf": [
+        {
+          "required": [
+            "max_requests"
+          ]
+        },
+        {
+          "required": [
+            "max_tokens"
+          ]
+        }
+      ],
+      "not": {
+        "anyOf": [
+          {
+            "required": [
+              "conditions"
+            ]
+          },
+          {
+            "required": [
+              "group_by"
+            ]
+          },
+          {
+            "required": [
+              "limits"
+            ]
+          },
+          {
+            "required": [
+              "action"
+            ]
+          }
+        ]
+      },
+      "required": [
+        "scope",
+        "scope_ref",
+        "window"
+      ]
+    },
+    {
+      "not": {
+        "anyOf": [
+          {
+            "required": [
+              "scope"
+            ]
+          },
+          {
+            "required": [
+              "scope_ref"
+            ]
+          },
+          {
+            "required": [
+              "window"
+            ]
+          },
+          {
+            "required": [
+              "max_requests"
+            ]
+          },
+          {
+            "required": [
+              "max_tokens"
+            ]
+          }
+        ]
+      },
+      "required": [
+        "limits"
+      ]
+    }
+  ],
   "properties": {
+    "action": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/PolicyAction"
+        }
+      ],
+      "description": "Over-limit action; v1 only `reject` (429), absent = `reject`."
+    },
+    "conditions": {
+      "description": "Condition node tree the request must satisfy (implicit AND across the top level; `[]`/absent = every request in the env).",
+      "items": {
+        "$ref": "#/definitions/ConditionNode"
+      },
+      "type": "array"
+    },
+    "group_by": {
+      "description": "Dimensions the counters split on; `[]`/absent = one shared bucket for every matched request. A matched request missing a `group_by` dimension is not subject to the policy (mirrors `team_member` only applying to keys that carry a `user_id`).",
+      "items": {
+        "$ref": "#/definitions/GroupByDimension"
+      },
+      "type": "array"
+    },
+    "limits": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/RateLimit"
+        }
+      ],
+      "description": "Full 7-field limits (`rps/rpm/rph/rpd/tpm/tpd/concurrency`) — same shape and storage semantics as the inline model/api_key rate limits. Present on every conditional row (it is the form discriminator) and carries at least one field."
+    },
     "max_requests": {
       "format": "uint64",
       "minimum": 1.0,
@@ -138,10 +445,7 @@
     }
   },
   "required": [
-    "name",
-    "scope",
-    "scope_ref",
-    "window"
+    "name"
   ],
   "title": "RateLimitPolicy",
   "type": "object"
