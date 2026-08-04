@@ -34,22 +34,36 @@ etcd key prefix uses the plural `Resource::kind()` value
 deliberately distinct because the schema file is a per-type artifact
 while the etcd prefix groups a collection of instances.
 
-## Forward-compatibility
+## Strictness: these files describe the write contract
+
+The published schemas carry the **write contract**: the Admin API rejects
+a payload that fails them (including unknown fields, where a resource
+closes them) with a 400. They are generated from the same producers the
+write-path validators compile, so the published and enforced shapes
+cannot drift.
+
+The gateway's **etcd read path is deliberately more lenient** (#871): a
+stored document carrying fields outside these schemas still loads, with
+the unknown fields ignored and reported as partially compatible on
+`GET /status/config`, the heartbeat, and the
+`aisix_config_partially_compatible_resources` metric. This keeps an
+older gateway serving documents written by a newer control plane. Every
+other constraint in these files — types, required fields, ranges, closed
+enum value sets — applies on both paths.
 
 Three top-level resources intentionally **omit**
-`additionalProperties: false`:
+`additionalProperties: false` even on the write contract:
 
 - `guardrail.schema.json` — the discriminated-union `kind` field uses
   serde's `flatten + tag` pattern, which is incompatible with a strict
   outer deny; strict typo-rejection happens earlier via
   `aisix-core::models::schema::validate_guardrail`.
-- `cache_policy.schema.json` — cp-api may ship forward-compat fields
-  ahead of a DP rollout, e.g. a new backend variant.
-- `observability_exporter.schema.json` — same forward-compat reason as
-  `cache_policy`.
-
-Downstream consumers that default to strict validation should permit
-unknown keys for these three resources; the other six are strict.
+- `cache_policy.schema.json` — historically open on write as well.
+- `observability_exporter.schema.json` — the top level is open, but the
+  per-`kind` branches stay closed on both paths: an unknown field there
+  could smuggle a plaintext credential past the `credential_ref`
+  indirection, and serde cannot report ignored fields inside the
+  tagged union, so an open branch would be a silent tolerance.
 
 ## Regenerating
 
