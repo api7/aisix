@@ -350,7 +350,7 @@ pub async fn chat_completions(
             // volume, not label cardinality).
             let snap = state.snapshot.load();
             let metric_model = crate::usage_attr::metric_model_label(&snap, &model_name);
-            record_error(&state.metrics, &err, metric_model, status, elapsed);
+            record_error(&state.metrics, metric_model, status, elapsed);
             // Access log: surface the upstream-billed counts when the
             // error fired AFTER the upstream call (output-content-filter
             // block). Pre-upstream errors (input filter, budget,
@@ -1171,6 +1171,7 @@ async fn dispatch(
     if virtual_entry.value.is_ensemble() {
         return dispatch_ensemble(
             state,
+            auth,
             &snapshot,
             &virtual_entry,
             req,
@@ -1318,6 +1319,7 @@ async fn dispatch(
                 // reset mid-loop).
                 let member_reservation = match crate::quota::reserve_routing_target(
                     state,
+                    auth,
                     is_routing_request,
                     &model.display_name,
                     &attempt.id,
@@ -1657,6 +1659,7 @@ async fn dispatch(
                         cfg,
                         remaining: attempt_models[winner_target_idx + 1..].to_vec(),
                         state: state.clone(),
+                        auth: auth.clone(),
                         group: virtual_entry.value.clone(),
                         req: req.clone(),
                         request_id: request_id.to_string(),
@@ -2349,6 +2352,7 @@ async fn dispatch(
             // reset mid-loop).
             let member_reservation = match crate::quota::reserve_routing_target(
                 state,
+                auth,
                 is_routing_request,
                 &model.display_name,
                 &attempt.id,
@@ -2767,6 +2771,7 @@ async fn dispatch(
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_ensemble(
     state: &ProxyState,
+    auth: &AuthenticatedKey,
     snapshot: &aisix_core::AisixSnapshot,
     virtual_entry: &aisix_core::ResourceEntry<aisix_core::Model>,
     req: &ChatFormat,
@@ -2897,6 +2902,7 @@ async fn dispatch_ensemble(
 
     let caller = crate::ensemble::ProxyModelCaller {
         state,
+        auth,
         snapshot,
         request_id,
         client,
@@ -3029,6 +3035,7 @@ async fn dispatch_ensemble(
         // tokens are added post-stream, mirroring the entry reservation below.
         let judge_reservation = match crate::quota::reserve_model_only(
             state,
+            auth,
             &ensemble_cfg.judge.model,
             &judge_entry.id,
             judge_model,
@@ -4103,13 +4110,13 @@ pub(crate) fn emit_mid_stream_failed_attempt(
     );
 }
 
-fn record_error(metrics: &Metrics, err: &ProxyError, model: &str, status: u16, elapsed: Duration) {
+fn record_error(metrics: &Metrics, model: &str, status: u16, elapsed: Duration) {
     let outcome = RequestOutcome::from_status(status);
     // Provider is unknown for pre-dispatch errors (auth, 404, etc.).
     metrics.record_request("unknown", model, status, outcome, elapsed);
-    if let ProxyError::RateLimit(rl) = err {
-        metrics.record_ratelimit_rejection(&rl.scope().to_string());
-    }
+    // Rate-limit rejections are counted at the quota gate itself
+    // (`quota::reject`), which covers every endpoint and knows the
+    // offending layer — counting here again would double-book chat.
 }
 
 #[allow(clippy::too_many_arguments)]

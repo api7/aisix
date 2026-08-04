@@ -208,6 +208,12 @@ pub(crate) fn desugar_api_key(doc: &mut Value, env: EnvLookup<'_>) -> Result<(),
 /// it with the derived id (the proxy matches policies by entry id).
 /// Other scopes (`team`, `member`, `team_member`, or anything the schema
 /// will reject later) pass through verbatim.
+///
+/// Conditional-form rows get the same sugar one level down:
+/// `conditions[]` leaves on the `api_key` / `model` dimensions resolve
+/// their `value` name(s) to derived ids, recursively through group
+/// nodes. `team` / `member` values and the string dimensions
+/// (`model_name`, `provider`) pass through verbatim.
 pub(crate) fn desugar_rate_limit_policy(
     doc: &mut Value,
     maps: &IdentityMaps,
@@ -216,6 +222,9 @@ pub(crate) fn desugar_rate_limit_policy(
         Some(o) => o,
         None => return Ok(()),
     };
+    if let Some(conditions) = obj.get_mut("conditions") {
+        desugar_condition_nodes(conditions, maps, 0)?;
+    }
     let scope_kind = match obj.get("scope").and_then(Value::as_str) {
         Some("api_key") => "api_keys",
         Some("model") => "models",
@@ -225,22 +234,85 @@ pub(crate) fn desugar_rate_limit_policy(
         // Missing / non-string scope_ref: canonical validation reports it.
         return Ok(());
     };
-    let resolved = maps
-        .get(scope_kind)
+    let resolved = resolve_entity_name(maps, scope_kind, name, "`scope_ref`")?;
+    obj.insert("scope_ref".into(), Value::String(resolved));
+    Ok(())
+}
+
+fn resolve_entity_name(
+    maps: &IdentityMaps,
+    kind: &str,
+    name: &str,
+    field: &str,
+) -> Result<String, String> {
+    maps.get(kind)
         .and_then(|m| m.get(name))
         .cloned()
         .ok_or_else(|| {
             format!(
-                "`scope_ref` references unknown {} {name:?} ({})",
-                if scope_kind == "api_keys" {
+                "{field} references unknown {} {name:?} ({})",
+                if kind == "api_keys" {
                     "api key"
                 } else {
                     "model"
                 },
-                known_names(maps, scope_kind)
+                known_names(maps, kind)
             )
-        })?;
-    obj.insert("scope_ref".into(), Value::String(resolved));
+        })
+}
+
+/// Walk a `conditions` node list and resolve leaf values on the
+/// `api_key`/`model` dimensions from names to derived ids. Shapes the
+/// schema will reject later (non-array nodes, non-string values) pass
+/// through untouched; the depth guard only stops runaway recursion on
+/// not-yet-validated input — the real cap is enforced by
+/// `validate_semantics`.
+fn desugar_condition_nodes(
+    nodes: &mut Value,
+    maps: &IdentityMaps,
+    depth: usize,
+) -> Result<(), String> {
+    if depth > 8 {
+        return Ok(());
+    }
+    let Some(items) = nodes.as_array_mut() else {
+        return Ok(());
+    };
+    for node in items {
+        let Some(obj) = node.as_object_mut() else {
+            continue;
+        };
+        if let Some(children) = obj.get_mut("children") {
+            desugar_condition_nodes(children, maps, depth + 1)?;
+            continue;
+        }
+        let kind = match obj.get("dimension").and_then(Value::as_str) {
+            Some("api_key") => "api_keys",
+            Some("model") => "models",
+            _ => continue,
+        };
+        let field = format!(
+            "`conditions` {} value",
+            if kind == "api_keys" {
+                "api_key"
+            } else {
+                "model"
+            }
+        );
+        match obj.get_mut("value") {
+            Some(Value::String(name)) => {
+                *name = resolve_entity_name(maps, kind, name, &field)?;
+            }
+            Some(Value::Array(values)) => {
+                for value in values {
+                    if let Value::String(name) = value {
+                        *name = resolve_entity_name(maps, kind, name, &field)?;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
     Ok(())
 }
 

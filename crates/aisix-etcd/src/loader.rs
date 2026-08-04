@@ -322,7 +322,29 @@ pub fn build_snapshot(prefix: &str, entries: &[RawEntry]) -> (AisixSnapshot, Bui
                     validate_rate_limit_policy_lenient,
                     &mut stats,
                 ) {
-                    snapshot.rate_limit_policies.insert(entry);
+                    // The condition-tree caps, operator×dimension matrix and
+                    // regex compilability are beyond the JSON Schema. A row
+                    // failing them is rejected whole, same RED treatment as
+                    // a schema failure — a policy is enforced exactly as
+                    // written or not at all, never with part of its tree.
+                    match entry.value.validate_semantics() {
+                        Ok(()) => {
+                            snapshot.rate_limit_policies.insert(entry);
+                        }
+                        Err(err) => {
+                            tracing::error!(
+                                key = %raw.key,
+                                error = %err,
+                                "rate limit policy failed semantic validation; skipping (incompatible row)"
+                            );
+                            stats.schema_rejected += 1;
+                            stats.rejections.push(RejectedEntry::new(
+                                raw.key.clone(),
+                                RejectionKind::SchemaFailed,
+                                err,
+                            ));
+                        }
+                    }
                 }
             }
             "mcp_servers" => {
@@ -1084,8 +1106,11 @@ mod tests {
         assert_eq!(snap.rate_limit_policies.len(), 1);
         let entry = snap.rate_limit_policies.get_by_id("rlp-1").unwrap();
         assert_eq!(entry.value.name, "team-quota");
-        assert_eq!(entry.value.scope, aisix_core::models::PolicyScope::Team);
-        assert_eq!(entry.value.scope_ref, "team-uuid-1");
+        assert_eq!(
+            entry.value.scope,
+            Some(aisix_core::models::PolicyScope::Team)
+        );
+        assert_eq!(entry.value.scope_ref.as_deref(), Some("team-uuid-1"));
         assert_eq!(entry.value.max_requests, Some(100));
     }
 }

@@ -68,6 +68,9 @@ pub(crate) struct MidStreamPlan {
     /// Targets after the pre-stream winner, in strategy order.
     pub remaining: Vec<AttemptModel>,
     pub state: ProxyState,
+    /// Caller identity — the per-target quota gate needs the identity
+    /// dimensions for conditional policy rows (AISIX-Cloud#892).
+    pub auth: crate::auth::AuthenticatedKey,
     /// The routing (group) model — resolves group-level timeout
     /// defaults for each fallback target.
     pub group: Model,
@@ -405,6 +408,7 @@ async fn acquire_fallback_stream(
         // dispatched upstream.
         let member_reservation = match crate::quota::reserve_routing_target(
             &plan.state,
+            &plan.auth,
             true,
             &model.display_name,
             &attempt.id,

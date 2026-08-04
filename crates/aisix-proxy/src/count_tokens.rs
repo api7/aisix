@@ -227,6 +227,7 @@ async fn dispatch(
         // the drop at scope end releases the concurrency slot.
         let _member_reservation = match crate::quota::reserve_routing_target(
             state,
+            auth,
             is_routing_request,
             &target.model.display_name,
             &target.id,

@@ -84,6 +84,9 @@ pub trait ModelCaller: Send + Sync {
 /// ensemble run, so it holds no owned state of its own.
 pub(crate) struct ProxyModelCaller<'a> {
     pub state: &'a ProxyState,
+    /// Caller identity — the per-member quota gate needs the identity
+    /// dimensions for conditional policy rows (AISIX-Cloud#892).
+    pub auth: &'a crate::auth::AuthenticatedKey,
     pub snapshot: &'a AisixSnapshot,
     pub request_id: &'a str,
     /// The originating request's context. Member calls are dispatched on
@@ -149,11 +152,15 @@ impl ModelCaller for ProxyModelCaller<'_> {
         // that exceeds its own limit becomes a failed sub-call: the panel drops
         // it toward `min_responses`, and the judge surfaces it as a 429 judge
         // failure. An unlimited member reserves nothing (zero overhead).
-        let reservation = crate::quota::reserve_model_only(self.state, target, &entry.id, model)
-            .await
-            .map_err(|_| {
-                BridgeError::upstream_status(429, "rate limit exceeded for an ensemble sub-call")
-            })?;
+        let reservation =
+            crate::quota::reserve_model_only(self.state, self.auth, target, &entry.id, model)
+                .await
+                .map_err(|_| {
+                    BridgeError::upstream_status(
+                        429,
+                        "rate limit exceeded for an ensemble sub-call",
+                    )
+                })?;
 
         // On a bridge error the reservation drops here → concurrency slots
         // release and no tokens are counted. On success we commit the member's

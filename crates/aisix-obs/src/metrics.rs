@@ -806,11 +806,20 @@ impl Metrics {
         });
     }
 
-    pub fn record_ratelimit_rejection(&self, scope: &str) {
+    /// Count one rate-limit rejection. `scope` is the exceeded
+    /// dimension (`requests`/`tokens`/`concurrency`); `layer` names the
+    /// limit source (`api_key`/`model`/`mcp`/`policy`); `policy_id`
+    /// identifies the offending policy on the `policy` layer (bounded
+    /// by the configured policy count) and is empty elsewhere.
+    /// Recorded at the quota gate, the one point every endpoint funnels
+    /// through (AISIX-Cloud#892).
+    pub fn record_ratelimit_rejection(&self, scope: &str, layer: &str, policy_id: Option<&str>) {
         metrics::with_local_recorder(&self.inner.recorder, || {
             metrics::counter!(
                 M_RATELIMIT_REJECTIONS,
                 "scope" => scope.to_string(),
+                "layer" => layer.to_string(),
+                "policy_id" => policy_id.unwrap_or_default().to_string(),
             )
             .increment(1);
         });
@@ -1965,11 +1974,17 @@ mod tests {
     #[test]
     fn ratelimit_rejection_counter_increments() {
         let m = Metrics::new(false);
-        m.record_ratelimit_rejection("requests");
-        m.record_ratelimit_rejection("requests");
+        m.record_ratelimit_rejection("requests", "api_key", None);
+        m.record_ratelimit_rejection("requests", "api_key", None);
+        m.record_ratelimit_rejection("requests", "policy", Some("pol-1"));
         let rendered = m.render();
         assert!(rendered.contains(M_RATELIMIT_REJECTIONS));
         assert!(rendered.contains("scope=\"requests\""));
+        assert!(rendered.contains("layer=\"api_key\""));
+        // Policy-layer rejections carry the offending policy id; other
+        // layers leave the label empty.
+        assert!(rendered.contains("policy_id=\"pol-1\""));
+        assert!(rendered.contains("policy_id=\"\""));
     }
 
     #[test]
