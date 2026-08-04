@@ -288,6 +288,7 @@ describe("mcp scoped endpoint e2e: /mcp/{server}", () => {
     expect(foreign.names).toEqual([]);
     const rejected = await callTool("/mcp/alpha", KEY_BETA_ONLY, "echo", "hi");
     expect(rejected.ok).toBe(false);
+    expect(rejected.error).toContain("not available");
   });
 
   test("unknown and disabled servers are 404 with no fallback", async (ctx) => {
