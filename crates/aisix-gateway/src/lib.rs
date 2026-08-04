@@ -33,9 +33,10 @@ pub mod upstream_http;
 pub mod upstream_tls;
 
 pub use bridge::{
-    capture_upstream_error_http, content_type_is_json, parse_retry_after, read_body_capped,
-    response_is_json, Bridge, BridgeContext, BridgeError, ChatChunkStream, UpstreamErrorView,
-    UpstreamWire, MAX_UPSTREAM_ERROR_BODY_BYTES, MAX_UPSTREAM_ERROR_MESSAGE_BYTES,
+    capture_in_band_error, capture_upstream_error_http, content_type_is_json, parse_retry_after,
+    read_body_capped, response_is_json, truncate_lossy, Bridge, BridgeContext, BridgeError,
+    ChatChunkStream, UpstreamErrorView, UpstreamWire, MAX_UPSTREAM_ERROR_BODY_BYTES,
+    MAX_UPSTREAM_ERROR_MESSAGE_BYTES,
 };
 pub use chat::{
     ChatChunk, ChatDelta, ChatFormat, ChatMessage, ChatResponse, EmbeddingObject, EmbeddingRequest,

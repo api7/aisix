@@ -240,6 +240,27 @@ pub enum BridgeError {
     },
     #[error("upstream returned an unparseable body: {0}")]
     UpstreamDecode(String),
+    /// A provider-reported error carried *inside* a 2xx streaming
+    /// response body — an OpenAI-family `data: {"error":{...}}` frame,
+    /// an Anthropic `event: error` frame, a Gemini in-stream error
+    /// object, or a Bedrock event-stream modeled exception. By the time
+    /// one arrives the upstream HTTP status was already a success, so
+    /// [`UpstreamStatus`](Self::UpstreamStatus) cannot represent it.
+    /// `status` is the numeric code embedded in (or documented for) the
+    /// error body when the provider supplies one; `None` when the
+    /// envelope carries no numeric code. Distinguishing this from
+    /// [`UpstreamDecode`](Self::UpstreamDecode) keeps the provider's
+    /// own error type/message intact instead of surfacing a serde
+    /// parse failure (AISIX-Cloud#1222 scenario 3).
+    #[error("upstream reported an in-band stream error: {message}")]
+    UpstreamInBand {
+        status: Option<u16>,
+        message: String,
+        /// Boxed for the same `result_large_err` reason as
+        /// [`UpstreamStatus`](Self::UpstreamStatus).
+        parsed: Option<Box<UpstreamErrorView>>,
+        wire: UpstreamWire,
+    },
     #[error("bridge is misconfigured: {0}")]
     Config(String),
     /// Customer-fixable upstream config — the admin's ProviderKey/Model
@@ -380,6 +401,88 @@ pub async fn capture_upstream_error_http(
     }
 }
 
+/// Probe one SSE `data:` payload for a provider in-band error envelope
+/// (`{"error": {...}}` or `{"error": "..."}`) and capture it as a
+/// [`BridgeError::UpstreamInBand`]. Returns `None` when the payload is
+/// not an error envelope — callers fall back to their decode-error
+/// path, so a genuinely malformed frame still surfaces as
+/// [`BridgeError::UpstreamDecode`].
+///
+/// Field handling is tolerant across the OpenAI-compatible family and
+/// Google's error shape:
+/// - `error.type` (OpenAI / Anthropic vocabulary) populates the view's
+///   `kind`; absent that, Google's `error.status` gRPC token
+///   (`UNAVAILABLE`, `RESOURCE_EXHAUSTED`, …) does, so the per-wire
+///   translation tables in `error_translate` apply either way.
+/// - `error.code` may be a JSON number (Google) or a string (OpenAI).
+///   A numeric value in 400..=599 — either form — becomes the embedded
+///   `status`; a non-numeric string stays in the view's `code`.
+/// - a bare-string `error` value becomes the message (LiteLLM accepts
+///   this form from OpenAI-compatible aggregators; so do we).
+///
+/// All captured strings are truncated at
+/// [`MAX_UPSTREAM_ERROR_MESSAGE_BYTES`], same as
+/// [`capture_upstream_error_http`].
+pub fn capture_in_band_error(payload: &str, wire: UpstreamWire) -> Option<BridgeError> {
+    #[derive(serde::Deserialize)]
+    struct Outer {
+        error: ErrorField,
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum ErrorField {
+        Obj(Inner),
+        Str(String),
+    }
+    #[derive(serde::Deserialize)]
+    struct Inner {
+        message: Option<String>,
+        #[serde(rename = "type")]
+        kind: Option<String>,
+        code: Option<serde_json::Value>,
+        param: Option<String>,
+        status: Option<String>,
+    }
+
+    let cap = MAX_UPSTREAM_ERROR_MESSAGE_BYTES;
+    let outer: Outer = serde_json::from_str(payload).ok()?;
+    let (status, message, parsed) = match outer.error {
+        ErrorField::Str(s) => (None, truncate_lossy(&s, cap), None),
+        ErrorField::Obj(inner) => {
+            let numeric_status = match &inner.code {
+                Some(serde_json::Value::Number(n)) => n.as_u64(),
+                Some(serde_json::Value::String(s)) => s.parse::<u64>().ok(),
+                _ => None,
+            }
+            .and_then(|n| u16::try_from(n).ok())
+            .filter(|n| (400..=599).contains(n));
+            let code_str = match &inner.code {
+                Some(serde_json::Value::String(s)) if numeric_status.is_none() => {
+                    Some(truncate_lossy(s, cap))
+                }
+                _ => None,
+            };
+            let view = UpstreamErrorView {
+                kind: inner.kind.or(inner.status).map(|k| truncate_lossy(&k, cap)),
+                message: inner.message.as_deref().map(|m| truncate_lossy(m, cap)),
+                code: code_str,
+                param: inner.param.map(|p| truncate_lossy(&p, cap)),
+            };
+            let message = view
+                .message
+                .clone()
+                .unwrap_or_else(|| truncate_lossy(payload, cap));
+            (numeric_status, message, Some(Box::new(view)))
+        }
+    };
+    Some(BridgeError::UpstreamInBand {
+        status,
+        message,
+        parsed,
+        wire,
+    })
+}
+
 /// Read the response body, stopping after `limit` bytes. Used to bound
 /// upstream-error parsing cost regardless of `Content-Length`. Errors
 /// during read surface as an empty buffer — the caller falls through
@@ -438,8 +541,10 @@ pub fn response_is_json(resp: &reqwest::Response) -> bool {
 
 /// Truncate a string to at most `max` bytes, splitting only on a UTF-8
 /// boundary. Appends an ellipsis when truncation occurred so log
-/// readers can tell the message was cut.
-fn truncate_lossy(s: &str, max: usize) -> String {
+/// readers can tell the message was cut. Public so bridges building
+/// [`BridgeError::UpstreamInBand`] from typed (non-JSON-probe) sources
+/// apply the same cap as [`capture_upstream_error_http`].
+pub fn truncate_lossy(s: &str, max: usize) -> String {
     if s.len() <= max {
         return s.to_string();
     }
@@ -466,6 +571,13 @@ impl BridgeError {
                 }
             }
             BridgeError::UpstreamDecode(_) => 502,
+            // Same forwarding rule as UpstreamStatus: an embedded 4xx is
+            // the provider's judgment of the request and passes through;
+            // 5xx / unknown collapse to 502.
+            BridgeError::UpstreamInBand { status, .. } => match status {
+                Some(s) if (400..500).contains(s) => *s,
+                _ => 502,
+            },
             BridgeError::Config(_) => 500,
             BridgeError::InvalidUpstreamConfig(_) => 400,
             BridgeError::InvalidUpstreamCredentials(_) => 401,
@@ -480,6 +592,7 @@ impl BridgeError {
             BridgeError::Timeout { .. } => "timeout",
             BridgeError::UpstreamStatus { .. } => "upstream_error",
             BridgeError::UpstreamDecode(_) => "upstream_decode_error",
+            BridgeError::UpstreamInBand { .. } => "upstream_in_band_error",
             BridgeError::Config(_) => "config_error",
             BridgeError::InvalidUpstreamConfig(_) => "invalid_request_error",
             BridgeError::InvalidUpstreamCredentials(_) => "authentication_error",
@@ -569,6 +682,136 @@ pub trait Bridge: Send + Sync + 'static {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn in_band_probe_parses_openai_string_code_envelope() {
+        let e = capture_in_band_error(
+            r#"{"error":{"message":"The server is overloaded","type":"server_error","code":"overloaded"}}"#,
+            UpstreamWire::OpenAI,
+        )
+        .expect("error envelope must be captured");
+        match e {
+            BridgeError::UpstreamInBand {
+                status,
+                message,
+                parsed,
+                wire,
+            } => {
+                assert_eq!(status, None, "non-numeric code carries no status");
+                assert_eq!(message, "The server is overloaded");
+                let view = parsed.expect("view");
+                assert_eq!(view.kind.as_deref(), Some("server_error"));
+                assert_eq!(view.code.as_deref(), Some("overloaded"));
+                assert!(matches!(wire, UpstreamWire::OpenAI));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn in_band_probe_parses_google_numeric_code_and_grpc_status() {
+        let e = capture_in_band_error(
+            r#"{"error":{"code":503,"message":"The service is currently unavailable.","status":"UNAVAILABLE"}}"#,
+            UpstreamWire::Vertex,
+        )
+        .expect("google error shape must be captured");
+        match e {
+            BridgeError::UpstreamInBand { status, parsed, .. } => {
+                assert_eq!(status, Some(503));
+                // The gRPC token lands in `kind` so the Vertex
+                // translation table applies.
+                assert_eq!(parsed.expect("view").kind.as_deref(), Some("UNAVAILABLE"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn in_band_probe_parses_numeric_string_code_as_status() {
+        let e = capture_in_band_error(
+            r#"{"error":{"code":"429","message":"rate limited"}}"#,
+            UpstreamWire::OpenAI,
+        )
+        .expect("captured");
+        match e {
+            BridgeError::UpstreamInBand { status, parsed, .. } => {
+                assert_eq!(status, Some(429));
+                // A numeric code became the status; it is not repeated
+                // in the view's string `code`.
+                assert_eq!(parsed.expect("view").code, None);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn in_band_probe_accepts_bare_string_error() {
+        let e = capture_in_band_error(r#"{"error":"boom"}"#, UpstreamWire::OpenAI)
+            .expect("bare-string error form must be captured");
+        match e {
+            BridgeError::UpstreamInBand {
+                status,
+                message,
+                parsed,
+                ..
+            } => {
+                assert_eq!(status, None);
+                assert_eq!(message, "boom");
+                assert!(parsed.is_none());
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn in_band_probe_rejects_non_error_payloads() {
+        assert!(capture_in_band_error(r#"{"id":"chunk-1"}"#, UpstreamWire::OpenAI).is_none());
+        assert!(capture_in_band_error("not json at all", UpstreamWire::OpenAI).is_none());
+        // An out-of-HTTP-range numeric code is not a status…
+        let e = capture_in_band_error(
+            r#"{"error":{"code":200,"message":"odd"}}"#,
+            UpstreamWire::OpenAI,
+        )
+        .expect("still an error envelope");
+        assert!(matches!(
+            e,
+            BridgeError::UpstreamInBand { status: None, .. }
+        ));
+    }
+
+    #[test]
+    fn in_band_probe_caps_oversized_fields() {
+        let long = "x".repeat(4 * MAX_UPSTREAM_ERROR_MESSAGE_BYTES);
+        let payload = format!(r#"{{"error":{{"message":"{long}","type":"{long}"}}}}"#);
+        let e = capture_in_band_error(&payload, UpstreamWire::OpenAI).expect("captured");
+        match e {
+            BridgeError::UpstreamInBand {
+                message, parsed, ..
+            } => {
+                assert!(message.len() <= MAX_UPSTREAM_ERROR_MESSAGE_BYTES + '…'.len_utf8());
+                let view = parsed.expect("view");
+                assert!(
+                    view.kind.unwrap().len() <= MAX_UPSTREAM_ERROR_MESSAGE_BYTES + '…'.len_utf8()
+                );
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn in_band_error_status_forwarding_matches_upstream_status_rule() {
+        let mk = |status: Option<u16>| BridgeError::UpstreamInBand {
+            status,
+            message: "m".into(),
+            parsed: None,
+            wire: UpstreamWire::OpenAI,
+        };
+        assert_eq!(mk(Some(429)).http_status(), 429, "embedded 4xx forwards");
+        assert_eq!(mk(Some(500)).http_status(), 502, "5xx collapses to 502");
+        assert_eq!(mk(Some(529)).http_status(), 502);
+        assert_eq!(mk(None).http_status(), 502);
+        assert_eq!(mk(None).error_type(), "upstream_in_band_error");
+    }
 
     #[test]
     fn timeout_maps_to_504() {

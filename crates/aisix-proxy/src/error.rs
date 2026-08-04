@@ -374,6 +374,25 @@ impl ProxyError {
         {
             return render_bridge_upstream_envelope(*status, message, parsed.as_deref(), *wire);
         }
+        // An in-band stream error (provider error inside a 2xx stream,
+        // caught pre-first-chunk) carries the same parsed view — render
+        // it with the embedded status so a provider's in-band 429 /
+        // overloaded gets the same translated envelope its HTTP twin
+        // would. No embedded status → the generic 502 family.
+        if let ProxyError::Bridge(aisix_gateway::BridgeError::UpstreamInBand {
+            status,
+            message,
+            parsed,
+            wire,
+        }) = self
+        {
+            return render_bridge_upstream_envelope(
+                status.unwrap_or(502),
+                message,
+                parsed.as_deref(),
+                *wire,
+            );
+        }
         // A timeout's transport cause names the upstream host and the
         // connection-layer fault it hit. Same rule as the 5xx body below:
         // that is operator diagnostics, so it reaches the logs and the

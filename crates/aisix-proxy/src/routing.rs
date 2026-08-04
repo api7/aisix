@@ -64,6 +64,23 @@ pub fn is_retryable(err: &BridgeError, retry_on_429: bool, fallback_on_statuses:
             }
             !(400..500).contains(status)
         }
+        // An in-band stream error with an embedded status follows the
+        // same status rules as an HTTP status error (LiteLLM applies
+        // its non-429-4xx filter to in-body stream errors identically).
+        // Without a status the provider reported an unspecified stream
+        // fault — transient by assumption, like Transport.
+        BridgeError::UpstreamInBand { status, .. } => match status {
+            Some(s) => {
+                if fallback_on_statuses.contains(s) {
+                    return true;
+                }
+                if *s == 429 {
+                    return retry_on_429;
+                }
+                !(400..500).contains(s)
+            }
+            None => true,
+        },
         // Customer-fixable config / credentials (#367) is the caller's
         // mistake — retrying or failing over won't help, same as a
         // non-429 4xx.
@@ -1402,6 +1419,28 @@ mod tests {
             false,
             &[]
         ));
+    }
+
+    /// AISIX-Cloud#1222: in-band stream errors follow the same status
+    /// rules as HTTP status errors; a status-less one is treated as a
+    /// transient fault (retryable).
+    #[test]
+    fn is_retryable_classifies_in_band_errors_by_embedded_status() {
+        let in_band = |status: Option<u16>| BridgeError::UpstreamInBand {
+            status,
+            message: "m".into(),
+            parsed: None,
+            wire: aisix_gateway::UpstreamWire::OpenAI,
+        };
+        assert!(is_retryable(&in_band(Some(500)), false, &[]));
+        assert!(is_retryable(&in_band(Some(529)), false, &[]));
+        assert!(!is_retryable(&in_band(Some(400)), false, &[]));
+        assert!(!is_retryable(&in_band(Some(429)), false, &[]));
+        assert!(is_retryable(&in_band(Some(429)), true, &[]));
+        // fallback_on_statuses admits listed in-band codes too.
+        assert!(is_retryable(&in_band(Some(408)), false, &[408]));
+        assert!(!is_retryable(&in_band(Some(408)), false, &[]));
+        assert!(is_retryable(&in_band(None), false, &[]));
     }
 
     /// AISIX-Cloud#1012: `fallback_on_statuses` opts specific upstream
