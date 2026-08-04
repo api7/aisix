@@ -1430,7 +1430,6 @@ struct Telemetry<'a> {
     /// keeps `/content` distinct for the access log.
     endpoint: &'static str,
     auth: &'a AuthenticatedKey,
-    api_key_id: String,
     request_id: String,
     started: Instant,
 }
@@ -1452,7 +1451,7 @@ impl Telemetry<'_> {
             latency: elapsed,
             provider: Some(provider).filter(|p| !p.is_empty()),
             model: Some(model_label),
-            api_key_id: Some(&self.api_key_id),
+            api_key_id: Some(&self.auth.entry.id),
             prompt_tokens: None,
             completion_tokens: None,
             total_tokens: None,
@@ -1494,7 +1493,6 @@ pub async fn create_video(
         path: "/v1/videos".to_string(),
         endpoint: "/v1/videos",
         auth: &auth,
-        api_key_id: auth.entry.id.clone(),
         request_id: client.request_id.clone(),
         started,
     };
@@ -1784,7 +1782,6 @@ pub async fn get_video(
         path: "/v1/videos/:id".to_string(),
         endpoint: "/v1/videos/:id",
         auth: &auth,
-        api_key_id: auth.entry.id.clone(),
         request_id: client.request_id.clone(),
         started: Instant::now(),
     };
@@ -1839,7 +1836,6 @@ pub async fn video_content(
         // `normalize_endpoint_label` treats `/v1/files/:id/content`.
         endpoint: "/v1/videos/:id",
         auth: &auth,
-        api_key_id: auth.entry.id.clone(),
         request_id: client.request_id.clone(),
         started: Instant::now(),
     };
