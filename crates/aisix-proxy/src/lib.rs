@@ -160,8 +160,11 @@ pub fn build_router(state: ProxyState) -> Router {
         )
         // Downstream-facing MCP gateway. Authentication (AISIX API key) is
         // enforced inside the handler via the `AuthenticatedKey` extractor.
+        // `/mcp/{server}` is the single-server variant (original tool names);
+        // the static `/mcp/` route wins over the param route for that path.
         .route("/mcp", any(mcp::mcp_endpoint))
         .route("/mcp/", any(mcp::mcp_endpoint))
+        .route("/mcp/:server", any(mcp::mcp_scoped_endpoint))
         // Downstream-facing A2A gateway. One route per registered agent; the
         // agent's card (with the service URL rewritten to the gateway) is served
         // at the RFC 8615 well-known path under it. Authentication (AISIX API
@@ -275,6 +278,7 @@ fn normalize_endpoint_label(path: &str) -> &'static str {
         _ if path.starts_with("/v1/files/") => "/v1/files/:id",
         _ if path.starts_with("/v1/batches/") => "/v1/batches/:id",
         _ if path.starts_with("/v1/fine_tuning/jobs/") => "/v1/fine_tuning/jobs/:id",
+        _ if path.starts_with("/mcp/") => "/mcp/{server}",
         _ if path.starts_with("/a2a/") => "/a2a",
         _ if path.starts_with("/passthrough/") => "/passthrough/:provider/*rest",
         _ => "other",
@@ -284,7 +288,7 @@ fn normalize_endpoint_label(path: &str) -> &'static str {
 fn inbound_protocol_for_endpoint(endpoint: &str) -> &'static str {
     if endpoint == "/v1/messages" || endpoint == "/v1/messages/count_tokens" {
         "anthropic"
-    } else if endpoint == "/mcp" {
+    } else if endpoint == "/mcp" || endpoint == "/mcp/{server}" {
         "mcp"
     } else if endpoint == "/a2a" {
         "a2a"
