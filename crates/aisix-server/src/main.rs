@@ -683,7 +683,16 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     // env_id is resolved by now (managed provisioning / sidecar restore
     // above); it becomes the constant `env_id` label on the SLO latency
     // histograms. Standalone DPs leave it empty → "unknown".
-    let metrics = Arc::new(Metrics::new_with_env_id(&cfg.etcd.env_id));
+    // AISIX-Cloud#1226: operator bucket overrides. Validation errors are
+    // boot-fatal — a silently ignored override would leave the deployment
+    // reading quantiles off bucket edges it did not choose.
+    let histogram_buckets =
+        aisix_obs::HistogramBuckets::from_config(&cfg.observability.metrics.buckets)
+            .map_err(|e| anyhow::anyhow!(e))?;
+    let metrics = Arc::new(Metrics::new_with_buckets(
+        &cfg.etcd.env_id,
+        &histogram_buckets,
+    ));
     let metrics_upkeep_task = {
         let metrics = metrics.clone();
         tokio::spawn(run_metrics_upkeep(

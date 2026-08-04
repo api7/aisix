@@ -93,6 +93,24 @@ observability:
     #     client: billing-batcher
     #   - pattern: "internal-eval-harness"
     #     client: eval-harness
+    # Optional per-metric histogram bucket edges, in seconds. Each metric
+    # keeps its own default when unset — they differ on purpose, because
+    # the three distributions do: end-to-end latency starts in the
+    # milliseconds (cache hits, requests refused before dispatch) while
+    # time-to-first-token cannot be faster than the upstream, and guardrail
+    # checks run an order of magnitude below both. Edges must be finite,
+    # positive and strictly ascending; do not list `+Inf` (it is added for
+    # you). Validated at boot; changes require a restart.
+    #
+    # Every edge costs one `_bucket` series PER label combination, so
+    # lengthening a list multiplies time series. Changing a list also
+    # changes the metric contract: dashboards and recording rules that
+    # hardcode an `le` value break, and series recorded before the change
+    # are not comparable with those after it.
+    # buckets:
+    #   request_e2e_latency: [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60, 120, 300, 420, 600]
+    #   request_ttft: [0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60, 120, 300]
+    #   guardrail_latency: [0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30]
   tracing:
     otlp:
       enabled: false

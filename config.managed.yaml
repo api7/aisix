@@ -75,6 +75,13 @@ observability:
     # client_type_rules:
     #   - pattern: "^py-billing-batcher/"
     #     client: billing-batcher
+    # Optional per-metric histogram bucket edges, in seconds; each metric
+    # keeps its own default when unset. See config.example.yaml for the
+    # full annotation and the cardinality/contract caveats. Override with
+    # a comma-separated list, e.g.
+    # AISIX_OBSERVABILITY__METRICS__BUCKETS__REQUEST_TTFT=0.1,0.5,1,5,30,300
+    # buckets:
+    #   request_ttft: [0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60, 120, 300]
   tracing:
     otlp:
       enabled: false
