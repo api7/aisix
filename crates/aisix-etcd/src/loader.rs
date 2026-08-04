@@ -2,22 +2,35 @@
 //!
 //! Flow:
 //! 1. parse the key → `(kind, id)`
-//! 2. validate the value against the kind's JSON Schema
-//! 3. deserialise into the typed struct via serde (cheap after schema
-//!    passes)
+//! 2. validate the value against the kind's **lenient** JSON Schema —
+//!    types, required fields, ranges and closed enums are enforced;
+//!    unknown fields are not
+//! 3. deserialise into the typed struct via `serde_ignored`, collecting
+//!    the paths of any fields serde had to ignore
 //! 4. insert into the appropriate [`ResourceTable`]
 //!
-//! Malformed payloads are logged at WARN level and skipped, not fatal —
-//! this matches spec §2: "the gateway does not abort on a single bad
-//! entry; it serves the rest."
+//! Every row lands in one of three compatibility states (issue #871):
+//!
+//! - **incompatible** (RED): step 2 or 3 fails — the row is skipped and
+//!   logged at ERROR, as today's contract genuinely cannot represent it;
+//! - **partially compatible** (YELLOW): the row loaded but carried fields
+//!   this build does not know — typically written by a newer control
+//!   plane. It serves with those fields ignored, and the ignored paths
+//!   are reported through [`BuildStats::partially_compatible`];
+//! - fully compatible (GREEN): exact match, no signal.
+//!
+//! Rejected payloads are skipped, not fatal — this matches spec §2:
+//! "the gateway does not abort on a single bad entry; it serves the
+//! rest."
 
 use aisix_core::models::{
-    validate_a2a_agent, validate_apikey, validate_cache_policy, validate_guardrail,
-    validate_guardrail_attachment, validate_mcp_policy, validate_mcp_server, validate_model,
-    validate_observability_exporter, validate_oidc_provider, validate_provider_key,
-    validate_rate_limit_policy, A2aAgent, ApiKey, CachePolicy, Guardrail, GuardrailAttachment,
-    McpPolicy, McpServer, Model, ObservabilityExporter, OidcProvider, ProviderKey, RateLimitPolicy,
-    SchemaError,
+    validate_a2a_agent_lenient, validate_apikey_lenient, validate_cache_policy_lenient,
+    validate_guardrail_attachment_lenient, validate_guardrail_lenient, validate_mcp_policy_lenient,
+    validate_mcp_server_lenient, validate_model_lenient, validate_observability_exporter_lenient,
+    validate_oidc_provider_lenient, validate_provider_key_lenient,
+    validate_rate_limit_policy_lenient, A2aAgent, ApiKey, CachePolicy, Guardrail,
+    GuardrailAttachment, McpPolicy, McpServer, Model, ObservabilityExporter, OidcProvider,
+    ProviderKey, RateLimitPolicy, SchemaError,
 };
 use aisix_core::resource::ResourceEntry;
 use aisix_core::AisixSnapshot;
@@ -39,8 +52,9 @@ pub enum RejectionKind {
     NonJson,
     /// JSON parsed but failed the kind's JSON Schema.
     SchemaFailed,
-    /// JSON Schema passed but `serde_json::from_value` refused — usually
-    /// a `deny_unknown_fields` mismatch between schema and Rust struct.
+    /// JSON Schema passed but serde deserialization refused — e.g. a
+    /// duplicate field via a rename alias, or an unknown field inside a
+    /// tagged enum whose shape stays closed.
     ParseFailed,
     /// Key referenced a `kind` segment we don't know about. Logged at
     /// debug normally but counted here so unknown kinds show up too.
@@ -97,17 +111,55 @@ impl RejectedEntry {
 /// additive CP change produces one entry per field instead of one per
 /// resource. Kept apart from [`RejectedEntry`] so YELLOW volume can
 /// never evict RED entries from the retained rejection buffer.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PartialCompatEntry {
     /// Resource kind segment as it appears in the etcd key
     /// (e.g. `api_keys`).
     pub kind: String,
     /// Dotted path of the ignored field inside the document
-    /// (e.g. `quota_profile` or `rate_limit.burst`).
+    /// (e.g. `quota_profile` or `rate_limit.burst`). Array indices are
+    /// normalized to `[]` (`routing.targets[].priority`) so the entry
+    /// count is bounded by the document shape, not the data volume; the
+    /// per-row WARN log keeps the exact indexed paths.
     pub field: String,
     /// Number of rows of this kind carrying this unknown field in the
     /// build.
     pub count: usize,
+}
+
+/// The unknown fields one loaded row carried, keyed by its full etcd
+/// key. This is the per-row form the supervisor merges into its
+/// retained YELLOW state on incremental watch events (a re-put of the
+/// same key replaces its entry; a delete removes it); the aggregated
+/// [`PartialCompatEntry`] form is derived from it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartialCompatRow {
+    /// Full etcd key of the row.
+    pub key: String,
+    /// Resource kind segment (e.g. `api_keys`).
+    pub kind: String,
+    /// Ignored field paths, index-normalized and deduplicated, sorted.
+    pub fields: Vec<String>,
+}
+
+/// Aggregate per-row unknown-field observations into the reporting form:
+/// one entry per (kind, field path) with the number of rows carrying it,
+/// sorted by kind then field.
+pub fn aggregate_partial_compat(rows: &[PartialCompatRow]) -> Vec<PartialCompatEntry> {
+    let mut counts: std::collections::BTreeMap<(&str, &str), usize> = Default::default();
+    for row in rows {
+        for field in &row.fields {
+            *counts.entry((row.kind.as_str(), field.as_str())).or_insert(0) += 1;
+        }
+    }
+    counts
+        .into_iter()
+        .map(|((kind, field), count)| PartialCompatEntry {
+            kind: kind.to_string(),
+            field: field.to_string(),
+            count,
+        })
+        .collect()
 }
 
 /// Counts of rejected entries during a build, plus the rejection
@@ -134,6 +186,9 @@ pub struct BuildStats {
     /// aggregated per (kind, field path). Empty when every row matched
     /// its schema exactly.
     pub partially_compatible: Vec<PartialCompatEntry>,
+    /// The same observations in per-row form (etcd key → ignored
+    /// fields), for the supervisor's incremental watch-event merging.
+    pub partial_rows: Vec<PartialCompatRow>,
 }
 
 /// Build a fresh snapshot from raw entries. Never fails — bad rows are
@@ -179,7 +234,7 @@ pub fn build_snapshot(prefix: &str, entries: &[RawEntry]) -> (AisixSnapshot, Bui
                     raw.revision,
                     parsed,
                     &value,
-                    validate_model,
+                    validate_model_lenient,
                     &mut stats,
                 ) {
                     snapshot.models.insert(entry);
@@ -191,7 +246,7 @@ pub fn build_snapshot(prefix: &str, entries: &[RawEntry]) -> (AisixSnapshot, Bui
                     raw.revision,
                     parsed,
                     &value,
-                    validate_apikey,
+                    validate_apikey_lenient,
                     &mut stats,
                 ) {
                     snapshot.apikeys.insert(entry);
@@ -203,7 +258,7 @@ pub fn build_snapshot(prefix: &str, entries: &[RawEntry]) -> (AisixSnapshot, Bui
                     raw.revision,
                     parsed,
                     &value,
-                    validate_provider_key,
+                    validate_provider_key_lenient,
                     &mut stats,
                 ) {
                     snapshot.provider_keys.insert(entry);
@@ -215,7 +270,7 @@ pub fn build_snapshot(prefix: &str, entries: &[RawEntry]) -> (AisixSnapshot, Bui
                     raw.revision,
                     parsed,
                     &value,
-                    validate_guardrail,
+                    validate_guardrail_lenient,
                     &mut stats,
                 ) {
                     snapshot.guardrails.insert(entry);
@@ -227,7 +282,7 @@ pub fn build_snapshot(prefix: &str, entries: &[RawEntry]) -> (AisixSnapshot, Bui
                     raw.revision,
                     parsed,
                     &value,
-                    validate_guardrail_attachment,
+                    validate_guardrail_attachment_lenient,
                     &mut stats,
                 ) {
                     snapshot.guardrail_attachments.insert(entry);
@@ -239,7 +294,7 @@ pub fn build_snapshot(prefix: &str, entries: &[RawEntry]) -> (AisixSnapshot, Bui
                     raw.revision,
                     parsed,
                     &value,
-                    validate_cache_policy,
+                    validate_cache_policy_lenient,
                     &mut stats,
                 ) {
                     snapshot.cache_policies.insert(entry);
@@ -251,7 +306,7 @@ pub fn build_snapshot(prefix: &str, entries: &[RawEntry]) -> (AisixSnapshot, Bui
                     raw.revision,
                     parsed,
                     &value,
-                    validate_observability_exporter,
+                    validate_observability_exporter_lenient,
                     &mut stats,
                 ) {
                     snapshot.observability_exporters.insert(entry);
@@ -263,7 +318,7 @@ pub fn build_snapshot(prefix: &str, entries: &[RawEntry]) -> (AisixSnapshot, Bui
                     raw.revision,
                     parsed,
                     &value,
-                    validate_rate_limit_policy,
+                    validate_rate_limit_policy_lenient,
                     &mut stats,
                 ) {
                     snapshot.rate_limit_policies.insert(entry);
@@ -275,7 +330,7 @@ pub fn build_snapshot(prefix: &str, entries: &[RawEntry]) -> (AisixSnapshot, Bui
                     raw.revision,
                     parsed,
                     &value,
-                    validate_mcp_server,
+                    validate_mcp_server_lenient,
                     &mut stats,
                 ) {
                     snapshot.mcp_servers.insert(entry);
@@ -287,7 +342,7 @@ pub fn build_snapshot(prefix: &str, entries: &[RawEntry]) -> (AisixSnapshot, Bui
                     raw.revision,
                     parsed,
                     &value,
-                    validate_mcp_policy,
+                    validate_mcp_policy_lenient,
                     &mut stats,
                 ) {
                     snapshot.mcp_policies.insert(entry);
@@ -299,7 +354,7 @@ pub fn build_snapshot(prefix: &str, entries: &[RawEntry]) -> (AisixSnapshot, Bui
                     raw.revision,
                     parsed,
                     &value,
-                    validate_a2a_agent,
+                    validate_a2a_agent_lenient,
                     &mut stats,
                 ) {
                     snapshot.a2a_agents.insert(entry);
@@ -311,7 +366,7 @@ pub fn build_snapshot(prefix: &str, entries: &[RawEntry]) -> (AisixSnapshot, Bui
                     raw.revision,
                     parsed,
                     &value,
-                    validate_oidc_provider,
+                    validate_oidc_provider_lenient,
                     &mut stats,
                 ) {
                     snapshot.oidc_providers.insert(entry);
@@ -329,6 +384,7 @@ pub fn build_snapshot(prefix: &str, entries: &[RawEntry]) -> (AisixSnapshot, Bui
         }
     }
 
+    stats.partially_compatible = aggregate_partial_compat(&stats.partial_rows);
     (snapshot, stats)
 }
 
@@ -343,8 +399,13 @@ fn validate_and_parse<T>(
 where
     T: DeserializeOwned,
 {
+    // RED: the lenient schema still enforces types, required fields,
+    // ranges and closed enums — a failure here means this build cannot
+    // represent the row at all, so it is skipped. ERROR, not warn: under
+    // the supported CP-before-DP upgrade order this is the signal that a
+    // resource stopped applying on this instance.
     if let Err(err) = validate(value) {
-        tracing::warn!(key = %key, error = %err, "schema validation failed; skipping");
+        tracing::error!(key = %key, error = %err, "schema validation failed; skipping (incompatible row)");
         stats.schema_rejected += 1;
         stats.rejections.push(RejectedEntry::new(
             key,
@@ -354,15 +415,31 @@ where
         return None;
     }
 
-    match serde_json::from_value::<T>(value.clone()) {
+    let mut ignored: Vec<String> = Vec::new();
+    match serde_ignored::deserialize::<_, _, T>(value, |path| {
+        ignored.push(normalize_ignored_path(&path.to_string()));
+    }) {
         Ok(t) => {
             stats.accepted += 1;
+            if !ignored.is_empty() {
+                // YELLOW: loaded, but fields this build does not know were
+                // ignored — typically written by a newer control plane.
+                ignored.sort_unstable();
+                ignored.dedup();
+                warn_partial_compat_deduped(key, parsed.kind, &ignored);
+                stats.partial_rows.push(PartialCompatRow {
+                    key: key.to_string(),
+                    kind: parsed.kind.to_string(),
+                    fields: ignored,
+                });
+            }
             Some(ResourceEntry::new(parsed.id, t, revision))
         }
         Err(err) => {
-            // Schema passed but serde refused — usually a deny_unknown_fields
-            // mismatch. Treat as schema-rejected for stats purposes.
-            tracing::warn!(key = %key, error = %err, "serde parse failed after schema pass");
+            // RED: schema passed but serde refused — a duplicate field via
+            // a rename alias, or an unknown field inside a tagged enum
+            // whose shape stays closed.
+            tracing::error!(key = %key, error = %err, "serde parse failed after schema pass (incompatible row)");
             stats.parse_rejected += 1;
             stats.rejections.push(RejectedEntry::new(
                 key,
@@ -371,6 +448,60 @@ where
             ));
             None
         }
+    }
+}
+
+/// Normalize a `serde_ignored` path into document terms: array indices
+/// become `[]` so the aggregated report stays bounded by the document
+/// shape (`targets.0.x` and `targets.1.x` are one field, not two), and
+/// the `?` segments serde_ignored emits for `Option` wrapping layers —
+/// invisible in the JSON — are dropped (`rate_limit.?.burst` →
+/// `rate_limit.burst`).
+fn normalize_ignored_path(path: &str) -> String {
+    path.split('.')
+        .filter(|seg| *seg != "?")
+        .map(|seg| {
+            if seg.parse::<usize>().is_ok() {
+                "[]"
+            } else {
+                seg
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+/// WARN once per (kind, field-set) for the process lifetime. Resyncs
+/// rebuild the whole snapshot on a cadence; without dedup every cycle
+/// would re-log every YELLOW row. The set is capped: past the cap new
+/// combinations keep logging (never silently dropped) but are no longer
+/// remembered, so a pathological fleet re-logs on each resync instead
+/// of growing memory without bound.
+fn warn_partial_compat_deduped(key: &str, kind: &str, fields: &[String]) {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+
+    const MAX_REMEMBERED: usize = 1024;
+    static WARNED: OnceLock<Mutex<HashSet<(String, String)>>> = OnceLock::new();
+
+    let fields_joined = fields.join(",");
+    let entry = (kind.to_string(), fields_joined);
+    let mut warned = WARNED
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .expect("partial-compat warn dedup set is never poisoned");
+    if warned.contains(&entry) {
+        return;
+    }
+    tracing::warn!(
+        key = %key,
+        kind = %kind,
+        ignored_fields = %entry.1,
+        "row loaded with unknown fields ignored (partially compatible; \
+         likely written by a newer control plane)"
+    );
+    if warned.len() < MAX_REMEMBERED {
+        warned.insert(entry);
     }
 }
 
@@ -541,60 +672,96 @@ mod tests {
     }
 
     #[test]
-    fn provider_key_aws_region_payload_currently_rejected() {
-        // Documents the current gap: an `amazon-bedrock`
-        // provider_key payload must carry `aws_region` per
-        // adapter_map.yaml:30, but the ProviderKey struct in
-        // `aisix-core::models::provider_key` is
-        // `#[serde(deny_unknown_fields)]` and has no `aws_region`
-        // field. Today the loader REJECTS the entry, so a customer
-        // creating a Bedrock provider_key via cp-api never sees
-        // the row reach the DP. Tracked as a follow-up to Adapter
-        // family e2e coverage (Tier 3 + Tier 4-7 in #398).
-        //
-        // When ProviderKey gains adapter-family extra-config fields
-        // (or an `extra: HashMap<String,Value>` escape hatch), this
-        // test should flip to assert `accepted=1` instead.
+    fn provider_key_aws_region_payload_loads_partially_compatible() {
+        // Flip of the pre-#871 `*_currently_rejected` pin. cp-api's
+        // adapter_map admits Bedrock provider_key payloads carrying a
+        // top-level `aws_region`; the DP adapter never reads that field
+        // — the Bedrock bridge takes its region from the credential JSON
+        // inside `api_key` (`aisix-provider-bedrock/src/bridge.rs`,
+        // `BedrockSecret.region`). So the field stays off the model
+        // (a struct field nothing consumes would be dead config) and the
+        // row loads with the field ignored and reported, instead of the
+        // pre-#871 whole-row rejection that silently kept the key from
+        // ever reaching dispatch.
         let entries = vec![raw(
             "/aisix/provider_keys/pk-bedrock",
             br#"{"display_name":"bedrock-pk","secret":"x","provider":"amazon-bedrock","aws_region":"us-east-1"}"#,
             1,
         )];
-        let (_snap, stats) = build_snapshot("/aisix", &entries);
-        assert_eq!(stats.accepted, 0);
-        assert_eq!(stats.schema_rejected, 1);
-        assert_eq!(stats.rejections.len(), 1);
-        assert_eq!(stats.rejections[0].kind, RejectionKind::SchemaFailed);
+        let (snap, stats) = build_snapshot("/aisix", &entries);
+        assert_eq!(stats.accepted, 1, "rejections: {:?}", stats.rejections);
+        assert!(stats.rejections.is_empty());
+        assert!(snap.provider_keys.get_by_id("pk-bedrock").is_some());
+        assert_eq!(
+            stats.partially_compatible,
+            vec![PartialCompatEntry {
+                kind: "provider_keys".into(),
+                field: "aws_region".into(),
+                count: 1,
+            }]
+        );
     }
 
     #[test]
-    fn provider_key_gcp_project_payload_currently_rejected() {
-        // Same gap as aws_region: `google-vertex` needs
-        // gcp_project + gcp_region per adapter_map.yaml. Today the
-        // loader rejects.
+    fn provider_key_gcp_project_payload_loads_partially_compatible() {
+        // Same decision as aws_region: the Vertex bridge reads project
+        // and region from the credential JSON inside `api_key`
+        // (`VertexSecret.project` / `.region`), never from top-level
+        // fields — YELLOW load, fields reported.
         let entries = vec![raw(
             "/aisix/provider_keys/pk-vertex",
             br#"{"display_name":"vertex-pk","secret":"x","provider":"google-vertex","gcp_project":"my-proj","gcp_region":"us-central1"}"#,
             1,
         )];
-        let (_snap, stats) = build_snapshot("/aisix", &entries);
-        assert_eq!(stats.accepted, 0);
-        assert_eq!(stats.schema_rejected, 1);
+        let (snap, stats) = build_snapshot("/aisix", &entries);
+        assert_eq!(stats.accepted, 1, "rejections: {:?}", stats.rejections);
+        assert!(snap.provider_keys.get_by_id("pk-vertex").is_some());
+        assert_eq!(
+            stats.partially_compatible,
+            vec![
+                PartialCompatEntry {
+                    kind: "provider_keys".into(),
+                    field: "gcp_project".into(),
+                    count: 1,
+                },
+                PartialCompatEntry {
+                    kind: "provider_keys".into(),
+                    field: "gcp_region".into(),
+                    count: 1,
+                },
+            ]
+        );
     }
 
     #[test]
-    fn provider_key_azure_resource_payload_currently_rejected() {
-        // Same gap as aws_region: `azure` needs
-        // azure_resource_name + api_version per adapter_map.yaml.
-        // Today the loader rejects.
+    fn provider_key_azure_resource_payload_loads_partially_compatible() {
+        // Same decision as aws_region: the Azure bridge derives the
+        // resource name from `api_base` and pins its own API version —
+        // neither top-level field is consumed — YELLOW load, fields
+        // reported.
         let entries = vec![raw(
             "/aisix/provider_keys/pk-azure",
             br#"{"display_name":"azure-pk","secret":"x","provider":"azure","azure_resource_name":"my-azure","api_version":"2024-02-01"}"#,
             1,
         )];
-        let (_snap, stats) = build_snapshot("/aisix", &entries);
-        assert_eq!(stats.accepted, 0);
-        assert_eq!(stats.schema_rejected, 1);
+        let (snap, stats) = build_snapshot("/aisix", &entries);
+        assert_eq!(stats.accepted, 1, "rejections: {:?}", stats.rejections);
+        assert!(snap.provider_keys.get_by_id("pk-azure").is_some());
+        assert_eq!(
+            stats.partially_compatible,
+            vec![
+                PartialCompatEntry {
+                    kind: "provider_keys".into(),
+                    field: "api_version".into(),
+                    count: 1,
+                },
+                PartialCompatEntry {
+                    kind: "provider_keys".into(),
+                    field: "azure_resource_name".into(),
+                    count: 1,
+                },
+            ]
+        );
     }
 
     // ---- forward-compat: lenient parse + tri-state (issue #871) ----
@@ -638,6 +805,72 @@ mod tests {
                 count: 1,
             }]
         );
+    }
+
+    #[test]
+    fn nested_unknown_field_reports_dotted_path() {
+        let entries = vec![raw(
+            "/aisix/api_keys/k-nested",
+            br#"{
+                "key_hash": "1460db1b6902f8b1fc2a40d9381a24d0fd22c3bc1b2c6f999c521da73776fbe0",
+                "allowed_models": ["m"],
+                "rate_limit": {"rpm": 60, "burst": 10}
+            }"#,
+            1,
+        )];
+        let (_snap, stats) = build_snapshot("/aisix", &entries);
+        assert_eq!(stats.accepted, 1, "rejections: {:?}", stats.rejections);
+        assert_eq!(
+            stats.partially_compatible,
+            vec![PartialCompatEntry {
+                kind: "api_keys".into(),
+                field: "rate_limit.burst".into(),
+                count: 1,
+            }]
+        );
+    }
+
+    #[test]
+    fn unknown_enum_value_stays_incompatible() {
+        // A value this build cannot interpret has no lenient fallback:
+        // a routing strategy from a newer CP is RED, not YELLOW.
+        let entries = vec![raw(
+            "/aisix/models/m-newstrat",
+            br#"{"display_name":"r","routing":{"strategy":"quantum","targets":[{"model":"a"}]}}"#,
+            1,
+        )];
+        let (_snap, stats) = build_snapshot("/aisix", &entries);
+        assert_eq!(stats.accepted, 0);
+        assert_eq!(stats.schema_rejected, 1);
+        assert_eq!(stats.rejections[0].kind, RejectionKind::SchemaFailed);
+        assert!(stats.partially_compatible.is_empty());
+    }
+
+    #[test]
+    fn partial_compat_aggregates_across_rows_of_a_kind() {
+        let doc = br#"{
+            "key_hash": "1460db1b6902f8b1fc2a40d9381a24d0fd22c3bc1b2c6f999c521da73776fbe0",
+            "allowed_models": ["m"],
+            "quota_profile": "gold"
+        }"#;
+        let entries = vec![
+            raw("/aisix/api_keys/k-1", doc, 1),
+            raw("/aisix/api_keys/k-2", doc, 2),
+        ];
+        let (_snap, stats) = build_snapshot("/aisix", &entries);
+        assert_eq!(stats.accepted, 2);
+        assert_eq!(
+            stats.partially_compatible,
+            vec![PartialCompatEntry {
+                kind: "api_keys".into(),
+                field: "quota_profile".into(),
+                count: 2,
+            }]
+        );
+        // The per-row form keeps one record per etcd key.
+        assert_eq!(stats.partial_rows.len(), 2);
+        assert_eq!(stats.partial_rows[0].key, "/aisix/api_keys/k-1");
+        assert_eq!(stats.partial_rows[1].key, "/aisix/api_keys/k-2");
     }
 
     // ---- renamed-field dual acceptance ----

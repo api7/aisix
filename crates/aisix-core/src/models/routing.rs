@@ -70,7 +70,6 @@ impl RoutingStrategy {
 
 /// One destination in a routing configuration. `model` references a direct model alias.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct RoutingTarget {
     /// Model alias for a direct model that can receive routed traffic.
     #[schemars(length(min = 1))]
@@ -153,7 +152,6 @@ pub enum WhenAllUnavailablePolicy {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
 pub struct Routing {
     /// Strategy used to select a target for each request.
     #[serde(default)]
@@ -382,16 +380,22 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_routing_fields() {
-        let r: Result<Routing, _> =
-            serde_json::from_str(r#"{"strategy":"failover","targets":[{"model":"a"}],"foo":1}"#);
-        assert!(r.is_err());
+    fn tolerates_unknown_routing_fields_for_forward_compat() {
+        // A newer control plane may ship fields ahead of this DP; serde must
+        // accept them. The write path still rejects them via the strict schema
+        // validator of the enclosing resource (validate_model in models/schema.rs).
+        let r: Routing =
+            serde_json::from_str(r#"{"strategy":"failover","targets":[{"model":"a"}],"foo":1}"#)
+                .unwrap();
+        assert_eq!(r.strategy, RoutingStrategy::Failover);
     }
 
     #[test]
-    fn rejects_unknown_target_fields() {
-        let r: Result<RoutingTarget, _> =
-            serde_json::from_str(r#"{"model":"a","weight":2,"extra":true}"#);
-        assert!(r.is_err());
+    fn tolerates_unknown_target_fields_for_forward_compat() {
+        // Same forward-compat contract as above, for the nested target struct.
+        let t: RoutingTarget =
+            serde_json::from_str(r#"{"model":"a","weight":2,"extra":true}"#).unwrap();
+        assert_eq!(t.model, "a");
+        assert_eq!(t.weight, Some(2));
     }
 }

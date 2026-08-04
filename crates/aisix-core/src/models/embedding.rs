@@ -20,7 +20,6 @@ fn default_normalize() -> bool {
 
 /// Embedding-modality metadata for a direct Model.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct EmbeddingConfig {
     /// Output vector dimensionality. Used to validate vectors, key the
     /// example-vector cache, and (for endpoints that support it) request a
@@ -54,9 +53,12 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_field() {
-        let r: Result<EmbeddingConfig, _> =
-            serde_json::from_str(r#"{"dimensions": 1024, "bogus": true}"#);
-        assert!(r.is_err());
+    fn tolerates_unknown_field_for_forward_compat() {
+        // cp-api may ship new fields ahead of the DP rolling out; serde must
+        // accept them. The write path still rejects them via the strict
+        // schema validators (validate_model in models/schema.rs).
+        let e: EmbeddingConfig =
+            serde_json::from_str(r#"{"dimensions": 1024, "bogus": true}"#).unwrap();
+        assert_eq!(e.dimensions, 1024);
     }
 }

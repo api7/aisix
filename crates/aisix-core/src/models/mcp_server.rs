@@ -17,7 +17,6 @@ use crate::resource::Resource;
 // `Eq` is deliberately absent: `spec` holds a `serde_json::Value`, which is
 // only `PartialEq` (JSON numbers are floats).
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
-#[serde(deny_unknown_fields)]
 pub struct McpServer {
     /// Operator-facing label, unique within the gateway. It is used as the
     /// namespace prefix for this server's tools, which are exposed to clients as
@@ -263,10 +262,13 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_fields() {
-        let r: Result<McpServer, _> =
-            serde_json::from_str(r#"{"display_name":"x","url":"u","extra":1}"#);
-        assert!(r.is_err());
+    fn tolerates_unknown_fields_for_forward_compat() {
+        // A newer control plane may ship fields ahead of this DP; serde must
+        // accept them. The write path still rejects them via the strict
+        // `schema::validate_mcp_server`.
+        let s: McpServer =
+            serde_json::from_str(r#"{"display_name":"x","url":"u","extra":1}"#).unwrap();
+        assert_eq!(s.name, "x");
     }
 
     // ---- `display_name` → `name` rename ----

@@ -10,6 +10,26 @@
 //! 5. etcd txn commit
 //! ```
 //!
+//! Two validator sets exist since issue #871 (strict write / lenient read):
+//!
+//! - **Strict** ([`SCHEMAS`], the plain `validate_*` functions): unknown
+//!   fields are rejected. Used by every write path (Admin API, file source)
+//!   so typos keep failing loud with a 400, and published as the resource
+//!   schema files in `schemas/resources/` — the write contract.
+//! - **Lenient** ([`LENIENT_SCHEMAS`], the `validate_*_lenient` functions):
+//!   unknown fields pass; every other constraint (types, required, ranges,
+//!   closed enums) still applies. Used only by the etcd snapshot loader so a
+//!   document written by a newer control plane loads with its extra fields
+//!   ignored — and reported — instead of whole-row rejected.
+//!
+//! Both sets build from the same per-resource producers; strictness is a
+//! mechanical [`close_unknown_fields`] pass over the produced value, so the
+//! two can never drift field-wise. Deliberately closed subschemas (the
+//! `observability_exporter` branches and the guardrail tagged sub-enums,
+//! injected inside the producers) stay closed in BOTH sets: serde silently
+//! ignores unknown fields inside those tagged shapes, so an open schema
+//! there would be an unreportable — silent — tolerance.
+//!
 //! The watch path reuses step 2 on incoming events — malformed payloads are
 //! skipped with a warning and do not take down the gateway.
 
@@ -20,7 +40,8 @@ use std::sync::Arc;
 use thiserror::Error;
 
 /// Cached compiled schemas. Compiling on every write would be wasteful; the
-/// schemas are static, so we build them once.
+/// schemas are static, so we build them once. This is the **strict** set:
+/// unknown fields fail validation wherever the resource model closes them.
 pub struct Schemas {
     pub model: Validator,
     pub apikey: Validator,
@@ -36,47 +57,105 @@ pub struct Schemas {
     pub oidc_provider: Validator,
 }
 
-pub static SCHEMAS: Lazy<Arc<Schemas>> = Lazy::new(|| Arc::new(Schemas::compile()));
+pub static SCHEMAS: Lazy<Arc<Schemas>> = Lazy::new(|| Arc::new(Schemas::compile(true)));
+
+/// The **lenient** twin of [`SCHEMAS`]: same producers, without the
+/// [`close_unknown_fields`] pass. Only the etcd snapshot loader validates
+/// against this set (issue #871); every write path stays on [`SCHEMAS`].
+pub static LENIENT_SCHEMAS: Lazy<Arc<Schemas>> = Lazy::new(|| Arc::new(Schemas::compile(false)));
+
+/// Whether a resource's write contract closes unknown top-level fields.
+/// `cache_policy`, `guardrail`, `guardrail_attachment` and
+/// `observability_exporter` historically ship open root schemas (documented
+/// on their producers), so the strict closing pass skips them. Shared by
+/// [`Schemas::compile`] and the resource schema published by `dump-schema`,
+/// so the enforced write contract and the published one cannot drift.
+fn closes_on_write(resource: &str) -> bool {
+    !matches!(
+        resource,
+        "cache_policy" | "guardrail" | "guardrail_attachment" | "observability_exporter"
+    )
+}
+
+/// The canonical schema of one resource, as enforced on the given path.
+/// `strict` selects the write contract (unknown fields rejected wherever the
+/// resource closes them); `!strict` the etcd read contract (unknown fields
+/// tolerated). This is the single producer both validator sets and the
+/// `dump-schema` binary build from.
+pub fn resource_root_schema(resource: &str, strict: bool) -> Value {
+    let mut schema = match resource {
+        "model" => model_root_schema(),
+        "api_key" => apikey_root_schema(),
+        "provider_key" => provider_key_root_schema(),
+        "guardrail" => guardrail_root_schema(),
+        "guardrail_attachment" => guardrail_attachment_root_schema(),
+        "cache_policy" => cache_policy_root_schema(),
+        "observability_exporter" => observability_exporter_root_schema(),
+        "rate_limit_policy" => rate_limit_policy_root_schema(),
+        "mcp_server" => mcp_server_root_schema(),
+        "mcp_policy" => mcp_policy_root_schema(),
+        "a2a_agent" => a2a_agent_root_schema(),
+        "oidc_provider" => oidc_provider_root_schema(),
+        other => panic!("unknown resource {other:?}"),
+    };
+    if strict && closes_on_write(resource) {
+        close_unknown_fields(&mut schema);
+    }
+    schema
+}
 
 impl Schemas {
-    fn compile() -> Self {
+    fn compile(strict: bool) -> Self {
+        let build = |resource: &str| {
+            jsonschema::options()
+                .build(&resource_root_schema(resource, strict))
+                .unwrap_or_else(|e| panic!("{resource} schema is well-formed: {e}"))
+        };
         Self {
-            model: jsonschema::options()
-                .build(&model_root_schema())
-                .expect("model schema is well-formed"),
-            apikey: jsonschema::options()
-                .build(&apikey_root_schema())
-                .expect("apikey schema is well-formed"),
-            provider_key: jsonschema::options()
-                .build(&provider_key_root_schema())
-                .expect("provider_key schema is well-formed"),
-            guardrail: jsonschema::options()
-                .build(&guardrail_root_schema())
-                .expect("guardrail schema is well-formed"),
-            guardrail_attachment: jsonschema::options()
-                .build(&guardrail_attachment_root_schema())
-                .expect("guardrail_attachment schema is well-formed"),
-            cache_policy: jsonschema::options()
-                .build(&cache_policy_root_schema())
-                .expect("cache_policy schema is well-formed"),
-            observability_exporter: jsonschema::options()
-                .build(&observability_exporter_root_schema())
-                .expect("observability_exporter schema is well-formed"),
-            rate_limit_policy: jsonschema::options()
-                .build(&rate_limit_policy_root_schema())
-                .expect("rate_limit_policy schema is well-formed"),
-            mcp_server: jsonschema::options()
-                .build(&mcp_server_root_schema())
-                .expect("mcp_server schema is well-formed"),
-            mcp_policy: jsonschema::options()
-                .build(&mcp_policy_root_schema())
-                .expect("mcp_policy schema is well-formed"),
-            a2a_agent: jsonschema::options()
-                .build(&a2a_agent_root_schema())
-                .expect("a2a_agent schema is well-formed"),
-            oidc_provider: jsonschema::options()
-                .build(&oidc_provider_root_schema())
-                .expect("oidc_provider schema is well-formed"),
+            model: build("model"),
+            apikey: build("api_key"),
+            provider_key: build("provider_key"),
+            guardrail: build("guardrail"),
+            guardrail_attachment: build("guardrail_attachment"),
+            cache_policy: build("cache_policy"),
+            observability_exporter: build("observability_exporter"),
+            rate_limit_policy: build("rate_limit_policy"),
+            mcp_server: build("mcp_server"),
+            mcp_policy: build("mcp_policy"),
+            a2a_agent: build("a2a_agent"),
+            oidc_provider: build("oidc_provider"),
+        }
+    }
+}
+
+/// Close a produced resource schema against unknown fields: insert
+/// `additionalProperties: false` on the root object and on every
+/// `definitions` entry that is a plain object schema (has `properties`).
+///
+/// This reproduces exactly what `#[serde(deny_unknown_fields)]` made
+/// `schemars` emit before issue #871 moved strictness out of the structs:
+///
+/// - conditional/overlay subschemas (`oneOf`/`anyOf`/`allOf`/`if` branches)
+///   are never touched — closing an `if`/`then` overlay would reject every
+///   field the overlay does not list;
+/// - an existing `additionalProperties` value is preserved, whether the
+///   deliberate `false` on hand-closed branches or the value schema of a
+///   map-typed field;
+/// - enum-shaped definitions (no `properties`) are skipped.
+pub fn close_unknown_fields(schema: &mut Value) {
+    fn close_object(node: &mut Value) {
+        let Some(obj) = node.as_object_mut() else {
+            return;
+        };
+        if obj.contains_key("properties") && !obj.contains_key("additionalProperties") {
+            obj.insert("additionalProperties".to_string(), json!(false));
+        }
+    }
+
+    close_object(schema);
+    if let Some(Value::Object(defs)) = schema.get_mut("definitions") {
+        for def in defs.values_mut() {
+            close_object(def);
         }
     }
 }
@@ -153,6 +232,60 @@ pub fn validate_mcp_policy(value: &Value) -> Result<(), SchemaError> {
 
 pub fn validate_oidc_provider(value: &Value) -> Result<(), SchemaError> {
     validate(&SCHEMAS.oidc_provider, value)
+}
+
+// ---- lenient variants (etcd snapshot loader only, issue #871) ----
+//
+// Unknown fields pass; every other constraint still applies. The loader
+// pairs these with `serde_ignored` so tolerated fields are collected and
+// reported as partially compatible rather than silently dropped.
+
+pub fn validate_model_lenient(value: &Value) -> Result<(), SchemaError> {
+    validate(&LENIENT_SCHEMAS.model, value)
+}
+
+pub fn validate_apikey_lenient(value: &Value) -> Result<(), SchemaError> {
+    validate(&LENIENT_SCHEMAS.apikey, value)
+}
+
+pub fn validate_provider_key_lenient(value: &Value) -> Result<(), SchemaError> {
+    validate(&LENIENT_SCHEMAS.provider_key, value)
+}
+
+pub fn validate_guardrail_lenient(value: &Value) -> Result<(), SchemaError> {
+    validate(&LENIENT_SCHEMAS.guardrail, value)
+}
+
+pub fn validate_cache_policy_lenient(value: &Value) -> Result<(), SchemaError> {
+    validate(&LENIENT_SCHEMAS.cache_policy, value)
+}
+
+pub fn validate_observability_exporter_lenient(value: &Value) -> Result<(), SchemaError> {
+    validate(&LENIENT_SCHEMAS.observability_exporter, value)
+}
+
+pub fn validate_rate_limit_policy_lenient(value: &Value) -> Result<(), SchemaError> {
+    validate(&LENIENT_SCHEMAS.rate_limit_policy, value)
+}
+
+pub fn validate_guardrail_attachment_lenient(value: &Value) -> Result<(), SchemaError> {
+    validate(&LENIENT_SCHEMAS.guardrail_attachment, value)
+}
+
+pub fn validate_mcp_server_lenient(value: &Value) -> Result<(), SchemaError> {
+    validate(&LENIENT_SCHEMAS.mcp_server, value)
+}
+
+pub fn validate_a2a_agent_lenient(value: &Value) -> Result<(), SchemaError> {
+    validate(&LENIENT_SCHEMAS.a2a_agent, value)
+}
+
+pub fn validate_mcp_policy_lenient(value: &Value) -> Result<(), SchemaError> {
+    validate(&LENIENT_SCHEMAS.mcp_policy, value)
+}
+
+pub fn validate_oidc_provider_lenient(value: &Value) -> Result<(), SchemaError> {
+    validate(&LENIENT_SCHEMAS.oidc_provider, value)
 }
 
 /// Build a resource's canonical JSON Schema from its struct via `schemars`,
