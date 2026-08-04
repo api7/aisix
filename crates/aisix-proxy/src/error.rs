@@ -171,10 +171,23 @@ pub enum ProxyError {
     #[error("JWT has expired")]
     JwtExpired,
     /// The JWT verified but does not satisfy the trust provider's
-    /// `required_scopes` / `bound_claims` requirements. 403: the
-    /// caller is authenticated, just not entitled.
+    /// `bound_claims` requirements. 403: the caller is authenticated,
+    /// just not entitled. (Scope failures are the sibling
+    /// [`Self::JwtInsufficientScope`]; both render identically.)
     #[error("JWT does not satisfy the required scopes or claims")]
     JwtClaimsRejected,
+    /// The JWT verified but its granted scopes do not cover the trust
+    /// provider's `required_scopes`. Split from
+    /// [`Self::JwtClaimsRejected`] so the active `/mcp` OAuth surface
+    /// can attach an RFC 6750 `insufficient_scope` challenge naming the
+    /// scopes this operation needs (AISIX-Cloud#1143) — a scope failure
+    /// is curable by re-consenting, a `bound_claims` policy denial is
+    /// not, so only the former may carry a challenge. Renders
+    /// byte-identically to `JwtClaimsRejected` on the wire (same 403,
+    /// `permission_denied` type, `jwt_claims_rejected` code): the `/v1`
+    /// contract is unchanged.
+    #[error("JWT does not satisfy the required scopes or claims")]
+    JwtInsufficientScope { required_scopes: Vec<String> },
     /// The JWT verified but no API key carries a `jwt_subject` equal
     /// to its identity claim. Named explicitly (not a generic invalid
     /// credential) because the fix — binding a key to the identity —
@@ -280,7 +293,9 @@ impl ProxyError {
             | ProxyError::JwtInvalid
             | ProxyError::JwtExpired
             | ProxyError::JwtIdentityUnmapped => StatusCode::UNAUTHORIZED,
-            ProxyError::JwtClaimsRejected => StatusCode::FORBIDDEN,
+            ProxyError::JwtClaimsRejected | ProxyError::JwtInsufficientScope { .. } => {
+                StatusCode::FORBIDDEN
+            }
             ProxyError::JwksUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             ProxyError::ModelForbidden(_) => StatusCode::FORBIDDEN,
             ProxyError::ModelIpRestricted(_) => StatusCode::FORBIDDEN,
@@ -308,7 +323,9 @@ impl ProxyError {
             | ProxyError::JwtInvalid
             | ProxyError::JwtExpired
             | ProxyError::JwtIdentityUnmapped => "invalid_api_key",
-            ProxyError::JwtClaimsRejected => "permission_denied",
+            ProxyError::JwtClaimsRejected | ProxyError::JwtInsufficientScope { .. } => {
+                "permission_denied"
+            }
             // Auth infrastructure fault, not a credential judgment — the
             // generic server-fault family, like a 5xx from dispatch.
             ProxyError::JwksUnavailable => "api_error",
@@ -407,7 +424,9 @@ impl ProxyError {
             // (`jwt_identity_unmapped`).
             ProxyError::JwtInvalid => env.with_code("jwt_invalid"),
             ProxyError::JwtExpired => env.with_code("jwt_expired"),
-            ProxyError::JwtClaimsRejected => env.with_code("jwt_claims_rejected"),
+            ProxyError::JwtClaimsRejected | ProxyError::JwtInsufficientScope { .. } => {
+                env.with_code("jwt_claims_rejected")
+            }
             ProxyError::JwtIdentityUnmapped => env.with_code("jwt_identity_unmapped"),
             ProxyError::JwksUnavailable => env.with_code("jwks_unavailable"),
             _ => env,
@@ -455,8 +474,53 @@ fn render_bridge_upstream_envelope(
     ErrorEnvelope::new(safe_message, "upstream_error")
 }
 
+/// Auth-failure classification attached to the response as an extension
+/// so the `/mcp` challenge middleware (`crate::mcp_auth`) can add the
+/// RFC 9728 `WWW-Authenticate` header. Classification must happen here:
+/// `IntoResponse` has no access to route or snapshot state, and only the
+/// active `/mcp` surface actually renders the header.
+#[derive(Debug, Clone)]
+pub(crate) enum AuthChallenge {
+    /// No usable credential was presented — bare `resource_metadata`.
+    MissingCredentials,
+    /// A credential was presented and rejected — `error="invalid_token"`.
+    InvalidToken,
+    /// A valid token lacks the scopes this operation requires —
+    /// `error="insufficient_scope"` plus the currently-required scopes
+    /// (SEP-2350 semantics: only what this operation needs, never an
+    /// echo of previously granted scopes).
+    InsufficientScope { required_scopes: Vec<String> },
+}
+
+impl ProxyError {
+    /// The challenge classification for this error, when it is an
+    /// auth failure a Bearer challenge can describe. `JwtClaimsRejected`
+    /// (`bound_claims` policy denial) deliberately maps to `None`:
+    /// re-authenticating cannot cure it, so a challenge would only send
+    /// clients into a retry loop. `JwksUnavailable` is a gateway-side
+    /// fault, not a credential judgment.
+    fn auth_challenge(&self) -> Option<AuthChallenge> {
+        match self {
+            ProxyError::MissingAuth => Some(AuthChallenge::MissingCredentials),
+            ProxyError::InvalidApiKey
+            | ProxyError::ApiKeyExpired
+            | ProxyError::ApiKeyDisabled
+            | ProxyError::JwtInvalid
+            | ProxyError::JwtExpired
+            | ProxyError::JwtIdentityUnmapped => Some(AuthChallenge::InvalidToken),
+            ProxyError::JwtInsufficientScope { required_scopes } => {
+                Some(AuthChallenge::InsufficientScope {
+                    required_scopes: required_scopes.clone(),
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
 impl IntoResponse for ProxyError {
     fn into_response(self) -> Response {
+        let challenge = self.auth_challenge();
         let status = self.status();
         let retry_after = self.retry_after_secs();
         let body = self.envelope();
@@ -465,6 +529,9 @@ impl IntoResponse for ProxyError {
             if let Ok(value) = HeaderValue::from_str(&secs.to_string()) {
                 response.headers_mut().insert("retry-after", value);
             }
+        }
+        if let Some(challenge) = challenge {
+            response.extensions_mut().insert(challenge);
         }
         response
     }
@@ -716,6 +783,71 @@ mod tests {
         let e = ProxyError::MissingAuth;
         assert_eq!(e.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(e.kind(), "invalid_api_key");
+    }
+
+    /// AISIX-Cloud#1143: the scope-failure variant split out of
+    /// `JwtClaimsRejected` must stay byte-identical on the wire — same
+    /// 403, `permission_denied` type, `jwt_claims_rejected` code and
+    /// message — so `/v1` callers cannot observe the split. The only
+    /// difference is the challenge classification for the `/mcp`
+    /// middleware.
+    #[test]
+    fn insufficient_scope_renders_identically_to_claims_rejected() {
+        let scope_err = ProxyError::JwtInsufficientScope {
+            required_scopes: vec!["mcp:tools".into()],
+        };
+        let policy_err = ProxyError::JwtClaimsRejected;
+        assert_eq!(scope_err.status(), policy_err.status());
+        assert_eq!(scope_err.kind(), policy_err.kind());
+        let a = serde_json::to_value(scope_err.envelope()).unwrap();
+        let b = serde_json::to_value(policy_err.envelope()).unwrap();
+        assert_eq!(a, b, "wire envelopes must not diverge");
+    }
+
+    #[test]
+    fn auth_challenge_classification_covers_exactly_the_curable_failures() {
+        assert!(matches!(
+            ProxyError::MissingAuth.auth_challenge(),
+            Some(AuthChallenge::MissingCredentials)
+        ));
+        for e in [
+            ProxyError::InvalidApiKey,
+            ProxyError::ApiKeyExpired,
+            ProxyError::ApiKeyDisabled,
+            ProxyError::JwtInvalid,
+            ProxyError::JwtExpired,
+            ProxyError::JwtIdentityUnmapped,
+        ] {
+            assert!(matches!(
+                e.auth_challenge(),
+                Some(AuthChallenge::InvalidToken)
+            ));
+        }
+        let scope_err = ProxyError::JwtInsufficientScope {
+            required_scopes: vec!["mcp:tools".into()],
+        };
+        match scope_err.auth_challenge() {
+            Some(AuthChallenge::InsufficientScope { required_scopes }) => {
+                assert_eq!(required_scopes, vec!["mcp:tools".to_string()]);
+            }
+            other => panic!("expected InsufficientScope, got {other:?}"),
+        }
+        // A bound_claims policy denial is not curable by re-consenting:
+        // no challenge, ever. Same for the gateway-side JWKS fault.
+        assert!(ProxyError::JwtClaimsRejected.auth_challenge().is_none());
+        assert!(ProxyError::JwksUnavailable.auth_challenge().is_none());
+    }
+
+    #[tokio::test]
+    async fn into_response_attaches_the_challenge_extension() {
+        let resp = ProxyError::MissingAuth.into_response();
+        assert!(matches!(
+            resp.extensions().get::<AuthChallenge>(),
+            Some(AuthChallenge::MissingCredentials)
+        ));
+        // Non-auth errors carry no marker.
+        let resp = ProxyError::ModelNotFound("m".into()).into_response();
+        assert!(resp.extensions().get::<AuthChallenge>().is_none());
     }
 
     #[test]

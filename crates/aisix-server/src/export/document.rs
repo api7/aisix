@@ -318,6 +318,21 @@ pub fn build_export_document(snapshot: &AisixSnapshot, reveal_secrets: bool) -> 
         ),
     );
 
+    // mcp_auth_settings — singleton per environment with a fixed
+    // identity; no secrets (the resource URL is public discovery data).
+    push_kind(
+        &mut collections,
+        "mcp_auth_settings",
+        emit_entries(
+            &snapshot.mcp_auth_settings,
+            |_| "mcp_auth_settings".to_string(),
+            "mcp_auth_settings",
+            &mut diag,
+            |_, _, _| {},
+            |_, _| {},
+        ),
+    );
+
     // guardrail_attachments are consumed above to decide which guardrails
     // are gateway-wide; they are not a file collection of their own.
 

@@ -299,14 +299,13 @@ pub(crate) async fn authenticate_jwt(
     };
 
     // ── Provider claim requirements ──────────────────────────────────
-    if let Err(reason) = check_provider_claims(&claims, prov) {
-        return Err(deny(
-            state,
-            reason,
-            &iss,
-            kid.as_deref(),
-            ProxyError::JwtClaimsRejected,
-        ));
+    // Scope and bound-claim failures map to distinct errors: a scope
+    // failure may carry the `/mcp` `insufficient_scope` challenge
+    // (AISIX-Cloud#1143), a policy denial never does. Both render the
+    // same 403 on the wire.
+    if let Err(rejection) = check_provider_claims(&claims, prov) {
+        let (reason, err) = claims_rejection_error(rejection, prov);
+        return Err(deny(state, reason, &iss, kid.as_deref(), err));
     }
 
     // ── Identity mapping ─────────────────────────────────────────────
@@ -477,12 +476,42 @@ fn validate_with_keys(
     Err((reason, err))
 }
 
+/// Which provider requirement a verified token failed. The two map to
+/// different [`ProxyError`]s: a missing scope is curable by requesting
+/// a broader grant (so the `/mcp` surface may challenge for it), a
+/// `bound_claims` mismatch is an operator policy denial.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaimsRejection {
+    Scope,
+    BoundClaim,
+}
+
+/// Map a claims-rejection class onto its deny-reason string and
+/// caller-visible error. Split out of `authenticate_jwt` so the single
+/// construction site of [`ProxyError::JwtInsufficientScope`] — the
+/// error that carries the `/mcp` `insufficient_scope` challenge — is
+/// unit-testable (audit finding on #859).
+fn claims_rejection_error(
+    rejection: ClaimsRejection,
+    prov: &OidcProvider,
+) -> (&'static str, ProxyError) {
+    match rejection {
+        ClaimsRejection::Scope => (
+            "jwt_scope_missing",
+            ProxyError::JwtInsufficientScope {
+                required_scopes: prov.required_scopes.clone(),
+            },
+        ),
+        ClaimsRejection::BoundClaim => ("jwt_bound_claim_mismatch", ProxyError::JwtClaimsRejected),
+    }
+}
+
 /// Enforce the provider's `required_scopes` and `bound_claims`. Returns
-/// the denial reason class on the first unmet requirement.
+/// the rejection class of the first unmet requirement.
 fn check_provider_claims(
     claims: &serde_json::Value,
     prov: &OidcProvider,
-) -> Result<(), &'static str> {
+) -> Result<(), ClaimsRejection> {
     if !prov.required_scopes.is_empty() {
         let scopes = token_scopes(claims);
         if !prov
@@ -490,7 +519,7 @@ fn check_provider_claims(
             .iter()
             .all(|req| scopes.iter().any(|s| s == req))
         {
-            return Err("jwt_scope_missing");
+            return Err(ClaimsRejection::Scope);
         }
     }
     if let Some(bound) = &prov.bound_claims {
@@ -498,7 +527,7 @@ fn check_provider_claims(
             let matched = nested_claim(claims, path)
                 .is_some_and(|actual| bound_claim_matches(actual, expect));
             if !matched {
-                return Err("jwt_bound_claim_mismatch");
+                return Err(ClaimsRejection::BoundClaim);
             }
         }
     }
@@ -1148,6 +1177,36 @@ jyxumGxNpoIV8LlzsMsaWQ==
     }
 
     #[test]
+    fn claims_rejection_error_maps_scope_to_insufficient_scope_with_provider_scopes() {
+        let prov = test_provider(
+            r#"{
+              "name": "test-idp",
+              "issuer": "https://idp.test/realms/agents",
+              "audiences": ["aisix"],
+              "required_scopes": ["ai.access", "mcp:tools"]
+            }"#,
+        );
+
+        let (reason, err) = claims_rejection_error(ClaimsRejection::Scope, &prov);
+        assert_eq!(reason, "jwt_scope_missing");
+        match err {
+            ProxyError::JwtInsufficientScope { required_scopes } => {
+                assert_eq!(
+                    required_scopes,
+                    vec!["ai.access".to_string(), "mcp:tools".to_string()],
+                    "the challenge must name the provider's required scopes",
+                );
+            }
+            other => panic!("scope failure must map to JwtInsufficientScope, got {other:?}"),
+        }
+
+        // A bound-claims policy denial keeps the challenge-less variant.
+        let (reason, err) = claims_rejection_error(ClaimsRejection::BoundClaim, &prov);
+        assert_eq!(reason, "jwt_bound_claim_mismatch");
+        assert!(matches!(err, ProxyError::JwtClaimsRejected));
+    }
+
+    #[test]
     fn scope_and_bound_claim_checks() {
         let prov = test_provider(
             r#"{
@@ -1177,14 +1236,14 @@ jyxumGxNpoIV8LlzsMsaWQ==
         no_scope["scope"] = serde_json::json!("openid");
         assert_eq!(
             check_provider_claims(&no_scope, &prov),
-            Err("jwt_scope_missing")
+            Err(ClaimsRejection::Scope)
         );
 
         let mut wrong_dept = good.clone();
         wrong_dept["department"] = serde_json::json!("finance");
         assert_eq!(
             check_provider_claims(&wrong_dept, &prov),
-            Err("jwt_bound_claim_mismatch")
+            Err(ClaimsRejection::BoundClaim)
         );
 
         // A missing bound claim denies — never a silent pass.
@@ -1192,7 +1251,7 @@ jyxumGxNpoIV8LlzsMsaWQ==
         missing.as_object_mut().unwrap().remove("department");
         assert_eq!(
             check_provider_claims(&missing, &prov),
-            Err("jwt_bound_claim_mismatch")
+            Err(ClaimsRejection::BoundClaim)
         );
 
         // Non-string claim shapes never match.
@@ -1200,7 +1259,7 @@ jyxumGxNpoIV8LlzsMsaWQ==
         numeric["department"] = serde_json::json!(7);
         assert_eq!(
             check_provider_claims(&numeric, &prov),
-            Err("jwt_bound_claim_mismatch")
+            Err(ClaimsRejection::BoundClaim)
         );
     }
 

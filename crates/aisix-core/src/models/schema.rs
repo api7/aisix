@@ -34,6 +34,7 @@ pub struct Schemas {
     pub mcp_policy: Validator,
     pub a2a_agent: Validator,
     pub oidc_provider: Validator,
+    pub mcp_auth_settings: Validator,
 }
 
 pub static SCHEMAS: Lazy<Arc<Schemas>> = Lazy::new(|| Arc::new(Schemas::compile()));
@@ -77,6 +78,9 @@ impl Schemas {
             oidc_provider: jsonschema::options()
                 .build(&oidc_provider_root_schema())
                 .expect("oidc_provider schema is well-formed"),
+            mcp_auth_settings: jsonschema::options()
+                .build(&mcp_auth_settings_root_schema())
+                .expect("mcp_auth_settings schema is well-formed"),
         }
     }
 }
@@ -153,6 +157,10 @@ pub fn validate_mcp_policy(value: &Value) -> Result<(), SchemaError> {
 
 pub fn validate_oidc_provider(value: &Value) -> Result<(), SchemaError> {
     validate(&SCHEMAS.oidc_provider, value)
+}
+
+pub fn validate_mcp_auth_settings(value: &Value) -> Result<(), SchemaError> {
+    validate(&SCHEMAS.mcp_auth_settings, value)
 }
 
 /// Build a resource's canonical JSON Schema from its struct via `schemars`,
@@ -413,6 +421,16 @@ pub fn oidc_provider_root_schema() -> Value {
         }
     }
     schema
+}
+
+/// Canonical JSON Schema for the `mcp_auth_settings` resource, derived
+/// from the [`McpAuthSettings`](crate::models::McpAuthSettings) struct.
+/// One required field (`resource_url`); the singleton-per-environment
+/// invariant is enforced by the writers (cp-api keys the row by the
+/// environment id; the resources file rejects duplicates at load), not
+/// by the document schema.
+pub fn mcp_auth_settings_root_schema() -> Value {
+    struct_root_schema::<crate::models::McpAuthSettings>(false)
 }
 
 /// Canonical JSON Schema for the `mcp_policy` resource, derived from the

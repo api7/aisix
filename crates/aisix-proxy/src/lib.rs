@@ -47,6 +47,7 @@ mod images;
 mod jobs;
 mod jwt;
 mod mcp;
+mod mcp_auth;
 mod messages;
 mod model_resolve;
 mod models;
@@ -158,10 +159,37 @@ pub fn build_router(state: ProxyState) -> Router {
             "/passthrough/:provider/*rest",
             any(passthrough::passthrough),
         )
-        // Downstream-facing MCP gateway. Authentication (AISIX API key) is
-        // enforced inside the handler via the `AuthenticatedKey` extractor.
-        .route("/mcp", any(mcp::mcp_endpoint))
-        .route("/mcp/", any(mcp::mcp_endpoint))
+        // RFC 9728 Protected Resource Metadata for the /mcp OAuth surface
+        // (AISIX-Cloud#1143). Unauthenticated by design — discovery must
+        // precede auth; 404 while the surface is dormant. Both the root
+        // and the path-insertion form are served: spec-strict clients
+        // resolve the latter, while several mainstream clients ignore
+        // path segments and fetch the former. `any(...)` — not `get` —
+        // so a dormant environment keeps answering the bare 404 axum's
+        // fallback produced before these routes existed, for every
+        // method; the handler does the GET/HEAD gate itself.
+        .route(
+            "/.well-known/oauth-protected-resource",
+            any(mcp_auth::protected_resource_metadata),
+        )
+        .route(
+            "/.well-known/oauth-protected-resource/mcp",
+            any(mcp_auth::protected_resource_metadata),
+        )
+        // Downstream-facing MCP gateway. Authentication (AISIX API key or,
+        // with trust providers configured, an IdP-issued JWT) is enforced
+        // inside the handler via the `AuthenticatedKey` extractor. The
+        // nested router scopes the OAuth challenge middleware to the /mcp
+        // surface only (AISIX-Cloud#1143).
+        .merge(
+            Router::new()
+                .route("/mcp", any(mcp::mcp_endpoint))
+                .route("/mcp/", any(mcp::mcp_endpoint))
+                .route_layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    mcp_auth::challenge_middleware,
+                )),
+        )
         // Downstream-facing A2A gateway. One route per registered agent; the
         // agent's card (with the service URL rewritten to the gateway) is served
         // at the RFC 8615 well-known path under it. Authentication (AISIX API
@@ -894,6 +922,197 @@ mod tests {
         let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["error"]["type"], "invalid_api_key");
+    }
+
+    // ─── /mcp OAuth discovery surface (AISIX-Cloud#1143) ─────────────
+
+    /// Activate the discovery surface on a snapshot: a valid
+    /// mcp_auth_settings row plus one enabled trust provider.
+    fn seed_oauth_discovery(snap: &AisixSnapshot) {
+        let settings: aisix_core::models::McpAuthSettings =
+            serde_json::from_str(r#"{"resource_url": "https://gw.example.com/mcp"}"#).unwrap();
+        snap.mcp_auth_settings
+            .insert(ResourceEntry::new("env-1", settings, 1));
+        let provider: aisix_core::models::OidcProvider = serde_json::from_str(
+            r#"{"name":"corp","issuer":"https://sso.example.com/realms/agents",
+                "audiences":["https://gw.example.com/mcp"],
+                "required_scopes":["mcp:tools"]}"#,
+        )
+        .unwrap();
+        snap.oidc_providers
+            .insert(ResourceEntry::new("op-1", provider, 1));
+    }
+
+    #[tokio::test]
+    async fn prm_endpoints_serve_the_document_when_active() {
+        let hub = Arc::new(Hub::new());
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
+        seed_oauth_discovery(&snap);
+        let app = build_router(build_state(snap, hub));
+
+        for path in [
+            "/.well-known/oauth-protected-resource",
+            "/.well-known/oauth-protected-resource/mcp",
+        ] {
+            let req = Request::builder()
+                .method("GET")
+                .uri(path)
+                .body(Body::empty())
+                .unwrap();
+            let resp = run(app.clone(), req).await;
+            assert_eq!(resp.status(), StatusCode::OK, "{path}");
+            let bytes = to_bytes(resp.into_body(), 4096).await.unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(v["resource"], "https://gw.example.com/mcp", "{path}");
+            assert_eq!(
+                v["authorization_servers"],
+                serde_json::json!(["https://sso.example.com/realms/agents"]),
+                "{path}"
+            );
+            assert_eq!(v["scopes_supported"], serde_json::json!(["mcp:tools"]));
+        }
+    }
+
+    #[tokio::test]
+    async fn prm_endpoints_404_while_dormant() {
+        let hub = Arc::new(Hub::new());
+        // No mcp_auth_settings row: pre-#1143 state, byte-identical.
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
+        let app = build_router(build_state(snap, hub));
+
+        for path in [
+            "/.well-known/oauth-protected-resource",
+            "/.well-known/oauth-protected-resource/mcp",
+        ] {
+            // Every method — not just GET — must keep answering the bare
+            // 404 the axum fallback produced before these routes existed.
+            for method in ["GET", "POST", "PUT", "DELETE"] {
+                let req = Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .body(Body::empty())
+                    .unwrap();
+                let resp = run(app.clone(), req).await;
+                assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{method} {path}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn prm_endpoints_reject_non_get_methods_when_active() {
+        let hub = Arc::new(Hub::new());
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
+        seed_oauth_discovery(&snap);
+        let app = build_router(build_state(snap, hub));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/.well-known/oauth-protected-resource")
+            .body(Body::empty())
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(
+            resp.headers().get("allow").and_then(|v| v.to_str().ok()),
+            Some("GET, HEAD")
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_auth_failures_carry_the_challenge_when_active() {
+        let hub = Arc::new(Hub::new());
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
+        seed_oauth_discovery(&snap);
+        let app = build_router(build_state(snap, hub));
+
+        // No credentials: bare resource_metadata.
+        let req = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+            ))
+            .unwrap();
+        let resp = run(app.clone(), req).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let challenge = resp
+            .headers()
+            .get("www-authenticate")
+            .expect("401 on active /mcp must carry WWW-Authenticate")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            challenge,
+            "Bearer resource_metadata=\
+             \"https://gw.example.com/.well-known/oauth-protected-resource/mcp\""
+        );
+
+        // A presented-but-unknown credential adds error="invalid_token".
+        let req = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("authorization", "Bearer sk-wrong")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+            ))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let challenge = resp
+            .headers()
+            .get("www-authenticate")
+            .expect("rejected credential must carry WWW-Authenticate")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(challenge.contains("error=\"invalid_token\""), "{challenge}");
+        assert!(challenge.contains("resource_metadata="), "{challenge}");
+    }
+
+    #[tokio::test]
+    async fn mcp_401_has_no_challenge_while_dormant() {
+        let hub = Arc::new(Hub::new());
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
+        let app = build_router(build_state(snap, hub));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+            ))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            resp.headers().get("www-authenticate").is_none(),
+            "dormant /mcp must stay byte-identical to pre-#1143"
+        );
+    }
+
+    #[tokio::test]
+    async fn v1_auth_failures_never_carry_the_challenge() {
+        let hub = Arc::new(Hub::new());
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
+        seed_oauth_discovery(&snap);
+        let app = build_router(build_state(snap, hub));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"model":"my-gpt4","messages":[]}"#))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            resp.headers().get("www-authenticate").is_none(),
+            "the challenge is scoped to /mcp; /v1 is unchanged"
+        );
     }
 
     #[tokio::test]

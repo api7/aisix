@@ -489,6 +489,9 @@ impl<P: ConfigProvider> Supervisor<P> {
             for e in tiny.oidc_providers.entries() {
                 new.oidc_providers.insert(clone_entry(&e));
             }
+            for e in tiny.mcp_auth_settings.entries() {
+                new.mcp_auth_settings.insert(clone_entry(&e));
+            }
             new
         });
         self.remove_rejection_for_key(&entry.key);
@@ -548,6 +551,7 @@ impl<P: ConfigProvider> Supervisor<P> {
             "mcp_policies" => snap.mcp_policies.get_by_id(parsed.id).is_some(),
             "a2a_agents" => snap.a2a_agents.get_by_id(parsed.id).is_some(),
             "oidc_providers" => snap.oidc_providers.get_by_id(parsed.id).is_some(),
+            "mcp_auth_settings" => snap.mcp_auth_settings.get_by_id(parsed.id).is_some(),
             _ => false,
         };
         let removed_rejection = self.remove_rejection_for_key(key_str);
@@ -606,6 +610,9 @@ impl<P: ConfigProvider> Supervisor<P> {
                 }
                 "oidc_providers" => {
                     new.oidc_providers.remove(parsed.id);
+                }
+                "mcp_auth_settings" => {
+                    new.mcp_auth_settings.remove(parsed.id);
                 }
                 _ => {}
             }
@@ -860,6 +867,9 @@ fn clone_snapshot(src: &AisixSnapshot) -> AisixSnapshot {
     for e in src.oidc_providers.entries() {
         out.oidc_providers.insert(clone_entry(&e));
     }
+    for e in src.mcp_auth_settings.entries() {
+        out.mcp_auth_settings.insert(clone_entry(&e));
+    }
     out
 }
 
@@ -884,6 +894,7 @@ fn resource_counts(snap: &AisixSnapshot) -> BTreeMap<String, usize> {
         ("mcp_policies", snap.mcp_policies.len()),
         ("a2a_agents", snap.a2a_agents.len()),
         ("oidc_providers", snap.oidc_providers.len()),
+        ("mcp_auth_settings", snap.mcp_auth_settings.len()),
     ] {
         if n > 0 {
             counts.insert(kind.to_string(), n);
@@ -1035,6 +1046,12 @@ mod tests {
             "issuer": "https://idp.example.com/realms/agents",
             "audiences": ["aisix-gateway"]
         }"#;
+        // The MCP OAuth discovery settings row (AISIX-Cloud#1143) —
+        // configuring the resource URL mid-run must activate the
+        // discovery surface without a resync.
+        const VALID_MCP_AUTH_SETTINGS: &[u8] = br#"{
+            "resource_url": "https://gw.example.com/mcp"
+        }"#;
 
         let provider = Arc::new(FakeProvider::new(vec![], 0));
         let sup = Supervisor::new(provider, "/aisix");
@@ -1063,6 +1080,11 @@ mod tests {
                 VALID_OIDC_PROVIDER,
                 "OidcProvider",
             ),
+            (
+                "/aisix/mcp_auth_settings/env-1",
+                VALID_MCP_AUTH_SETTINGS,
+                "McpAuthSettings",
+            ),
         ] {
             assert!(
                 sup.apply_put(&entry(key, body, 2)),
@@ -1085,6 +1107,11 @@ mod tests {
             "ObservabilityExporter not merged"
         );
         assert_eq!(snap.oidc_providers.len(), 1, "OidcProvider not merged");
+        assert_eq!(
+            snap.mcp_auth_settings.len(),
+            1,
+            "McpAuthSettings not merged"
+        );
     }
 
     #[tokio::test]
@@ -1111,6 +1138,13 @@ mod tests {
                     br#"{"name":"idp","issuer":"https://idp.example.com","audiences":["aisix"]}"#,
                     1,
                 ),
+                // AISIX-Cloud#1143: clearing the resource URL projects a
+                // delete; it must deactivate the discovery surface.
+                entry(
+                    "/aisix/mcp_auth_settings/env-1",
+                    br#"{"resource_url":"https://gw.example.com/mcp"}"#,
+                    1,
+                ),
             ],
             1,
         ));
@@ -1125,6 +1159,8 @@ mod tests {
         assert!(sup.handle().load().guardrail_attachments.is_empty());
         assert!(sup.apply_delete("/aisix/oidc_providers/op-1"));
         assert!(sup.handle().load().oidc_providers.is_empty());
+        assert!(sup.apply_delete("/aisix/mcp_auth_settings/env-1"));
+        assert!(sup.handle().load().mcp_auth_settings.is_empty());
     }
 
     #[tokio::test]

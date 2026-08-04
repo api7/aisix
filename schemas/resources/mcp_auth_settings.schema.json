@@ -1,0 +1,16 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "additionalProperties": false,
+  "properties": {
+    "resource_url": {
+      "description": "Canonical URI of this environment's `/mcp` endpoint, e.g. `https://gw.example.com/mcp`. Published verbatim as the PRM document's `resource` (never derived from the request Host header) and the value the trust providers' `audiences` must include for OAuth-for-MCP tokens to validate. The URL path must be exactly `/mcp` — the gateway's fixed MCP route.",
+      "minLength": 1,
+      "type": "string"
+    }
+  },
+  "required": [
+    "resource_url"
+  ],
+  "title": "McpAuthSettings",
+  "type": "object"
+}

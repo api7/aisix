@@ -8,6 +8,7 @@ use super::a2a_agent::A2aAgent;
 use super::apikey::ApiKey;
 use super::cache_policy::CachePolicy;
 use super::guardrail::{Guardrail, GuardrailAttachment};
+use super::mcp_auth_settings::McpAuthSettings;
 use super::mcp_policy::McpPolicy;
 use super::mcp_server::McpServer;
 use super::model::Model;
@@ -56,6 +57,12 @@ pub struct AisixSnapshot {
     /// request to the API key whose `jwt_subject` equals the token's
     /// identity claim.
     pub oidc_providers: ResourceTable<OidcProvider>,
+    /// The environment's inbound MCP OAuth discovery identity:
+    /// `/aisix/<env>/mcp_auth_settings/<env-uuid>` — a singleton row
+    /// (cp-api keys it by the environment id). Together with at least
+    /// one enabled `oidc_providers` row it activates the `/mcp`
+    /// RFC 9728 discovery surface (AISIX-Cloud#1143).
+    pub mcp_auth_settings: ResourceTable<McpAuthSettings>,
 }
 
 impl AisixSnapshot {
@@ -78,6 +85,7 @@ impl AisixSnapshot {
             + self.mcp_policies.len()
             + self.a2a_agents.len()
             + self.oidc_providers.len()
+            + self.mcp_auth_settings.len()
     }
 }
 

@@ -61,6 +61,11 @@ pub(crate) enum IdentityField {
     /// `name`, with `display_name` accepted as the alternative spelling
     /// (mcp_servers, a2a_agents — mirroring their schemas).
     NameOrDisplayName,
+    /// A fixed constant — the kind is a per-file singleton
+    /// (mcp_auth_settings) whose entries carry no identity field of
+    /// their own. Every entry shares the constant, so a second entry
+    /// trips the pass-1 duplicate check.
+    Fixed(&'static str),
 }
 
 impl IdentityField {
@@ -70,6 +75,7 @@ impl IdentityField {
             Self::DisplayName => "display_name",
             Self::Name => "name",
             Self::NameOrDisplayName => "name (or display_name)",
+            Self::Fixed(_) => "the singleton identity",
         }
     }
 
@@ -86,6 +92,7 @@ impl IdentityField {
             Self::DisplayName => field("display_name"),
             Self::Name => field("name"),
             Self::NameOrDisplayName => field("name").or_else(|| field("display_name")),
+            Self::Fixed(v) => Some(v.to_string()),
         }
     }
 }
