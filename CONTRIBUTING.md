@@ -59,7 +59,11 @@ different discipline:
   `aisix_config_partially_compatible_resources` metric). Never assume a new
   field is enforced fleet-wide until every data plane runs a version that
   knows it — this matters most for restriction-type fields (an old gateway
-  keeps allowing what the new field would forbid).
+  keeps allowing what the new field would forbid). Two kinds are exempt from
+  this tolerance: `guardrail` and `observability_exporter` documents flatten
+  their fields into closed tagged shapes, so ANY new field there still
+  whole-row rejects on older gateways — treat additions to those two like
+  enum values below.
 - **Adding an enum value** (a routing strategy, an adapter, a guardrail
   `kind`, …) is NOT forward compatible, by design: a value the gateway cannot
   interpret has no old behavior to fall back to, so the whole document stays

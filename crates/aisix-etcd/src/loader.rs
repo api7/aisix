@@ -119,8 +119,7 @@ pub struct PartialCompatEntry {
     /// Dotted path of the ignored field inside the document
     /// (e.g. `quota_profile` or `rate_limit.burst`). Array indices are
     /// normalized to `[]` (`routing.targets[].priority`) so the entry
-    /// count is bounded by the document shape, not the data volume; the
-    /// per-row WARN log keeps the exact indexed paths.
+    /// count is bounded by the document shape, not the data volume.
     pub field: String,
     /// Number of rows of this kind carrying this unknown field in the
     /// build.
@@ -428,6 +427,15 @@ where
                 // ignored — typically written by a newer control plane.
                 ignored.sort_unstable();
                 ignored.dedup();
+                // A single document can carry an arbitrary number of
+                // unknown fields with arbitrary-length names; everything
+                // captured here flows into logs, the retained map, the
+                // status JSON and the heartbeat body. Cap per row — the
+                // sentinel keeps the truncation visible in every report.
+                if ignored.len() > MAX_REPORTED_FIELDS_PER_ROW {
+                    ignored.truncate(MAX_REPORTED_FIELDS_PER_ROW);
+                    ignored.push("...truncated".to_string());
+                }
                 warn_partial_compat_deduped(key, parsed.kind, &ignored);
                 stats.partial_rows.push(PartialCompatRow {
                     key: key.to_string(),
@@ -453,12 +461,23 @@ where
     }
 }
 
+/// Cap on ignored-field paths reported per row. A row over the cap keeps
+/// its first entries (sorted) plus a `...truncated` sentinel, so the
+/// truncation shows up in every downstream report instead of silently
+/// under-counting.
+const MAX_REPORTED_FIELDS_PER_ROW: usize = 64;
+
 /// Normalize a `serde_ignored` path into document terms: array indices
 /// become `[]` so the aggregated report stays bounded by the document
 /// shape (`targets.0.x` and `targets.1.x` are one field, not two), and
 /// the `?` segments serde_ignored emits for `Option` wrapping layers —
 /// invisible in the JSON — are dropped (`rate_limit.?.burst` →
 /// `rate_limit.burst`).
+///
+/// Lossy by design: a map key that is itself all digits (or literally
+/// `?`) aliases with the normalized forms and merges counts, in the
+/// aggregate and in the WARN line alike. The actionable signal is the
+/// field name per kind, not which array element carried it.
 fn normalize_ignored_path(path: &str) -> String {
     path.split('.')
         .filter(|seg| *seg != "?")
@@ -488,10 +507,13 @@ fn warn_partial_compat_deduped(key: &str, kind: &str, fields: &[String]) {
 
     let fields_joined = fields.join(",");
     let entry = (kind.to_string(), fields_joined);
+    // Poison-tolerant: this set only dedupes log lines, so a panic while
+    // the lock was held (e.g. inside a tracing subscriber) must not wedge
+    // every subsequent snapshot build in the supervisor task.
     let mut warned = WARNED
         .get_or_init(|| Mutex::new(HashSet::new()))
         .lock()
-        .expect("partial-compat warn dedup set is never poisoned");
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if warned.contains(&entry) {
         return;
     }
@@ -873,6 +895,62 @@ mod tests {
         assert_eq!(stats.partial_rows.len(), 2);
         assert_eq!(stats.partial_rows[0].key, "/aisix/api_keys/k-1");
         assert_eq!(stats.partial_rows[1].key, "/aisix/api_keys/k-2");
+    }
+
+    #[test]
+    fn guardrail_attachment_in_cp_projection_shape_is_fully_compatible() {
+        // The managed control plane writes `env_id` on every attachment
+        // document (its own tenancy scoping; the gateway does not read
+        // it). The field is declared on the model as known-and-ignored,
+        // so a same-version managed fleet reports ZERO partially
+        // compatible rows — a standing false version-skew alarm here
+        // would train operators to ignore the YELLOW signal entirely.
+        let entries = vec![raw(
+            "/aisix/guardrail_attachments/ga-1",
+            br#"{
+                "guardrail_id": "11111111-1111-1111-1111-111111111111",
+                "scope_type": "env",
+                "scope_id": null,
+                "priority": 0,
+                "enabled": true,
+                "env_id": "22222222-2222-2222-2222-222222222222"
+            }"#,
+            1,
+        )];
+        let (snap, stats) = build_snapshot("/aisix", &entries);
+        assert_eq!(stats.accepted, 1, "rejections: {:?}", stats.rejections);
+        assert_eq!(snap.guardrail_attachments.len(), 1);
+        assert!(
+            stats.partially_compatible.is_empty(),
+            "env_id is a registered cross-plane field, not version skew: {:?}",
+            stats.partially_compatible
+        );
+    }
+
+    #[test]
+    fn per_row_unknown_field_report_is_capped_with_a_visible_sentinel() {
+        // One document can carry arbitrarily many unknown fields with
+        // arbitrary-length names; everything captured flows into logs,
+        // the retained map, the status JSON and the heartbeat body.
+        let mut doc = serde_json::json!({
+            "key_hash": "1460db1b6902f8b1fc2a40d9381a24d0fd22c3bc1b2c6f999c521da73776fbe0",
+            "allowed_models": ["m"]
+        });
+        for i in 0..200 {
+            doc.as_object_mut()
+                .unwrap()
+                .insert(format!("unknown_field_{i:03}"), serde_json::json!(1));
+        }
+        let entries = vec![raw(
+            "/aisix/api_keys/k-flood",
+            doc.to_string().as_bytes(),
+            1,
+        )];
+        let (_snap, stats) = build_snapshot("/aisix", &entries);
+        assert_eq!(stats.accepted, 1);
+        let fields = &stats.partial_rows[0].fields;
+        assert_eq!(fields.len(), 65, "64 fields + the truncation sentinel");
+        assert_eq!(fields.last().map(String::as_str), Some("...truncated"));
     }
 
     // ---- renamed-field dual acceptance ----

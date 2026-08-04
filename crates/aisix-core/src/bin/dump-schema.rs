@@ -97,8 +97,21 @@ fn dump<T: JsonSchema>(out_dir: &Path, name: &str) {
 }
 
 /// Insert `additionalProperties: false` on a struct-shaped schema object
-/// (one that lists `properties`), unless it already pins a value.
+/// (one that lists `properties`), unless it already pins a value. Recurses
+/// into `anyOf` branches so an untagged enum's object variant closes too —
+/// serde silently swallows unknown fields inside untagged content, so the
+/// schema closure is the only non-silent guard there (the resource
+/// producers apply the same rule, e.g. `OnEmbeddingFailure` in `model`).
 fn close_object_schema(schema: &mut schemars::schema::SchemaObject) {
+    if let Some(sub) = schema.subschemas.as_deref_mut() {
+        if let Some(any_of) = sub.any_of.as_mut() {
+            for branch in any_of.iter_mut() {
+                if let schemars::schema::Schema::Object(b) = branch {
+                    close_object_schema(b);
+                }
+            }
+        }
+    }
     let Some(object) = schema.object.as_deref_mut() else {
         return;
     };

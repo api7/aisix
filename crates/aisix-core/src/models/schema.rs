@@ -323,6 +323,27 @@ pub fn model_root_schema() -> Value {
         .as_object_mut()
         .expect("model root schema is a JSON object")
         .insert("oneOf".to_string(), super::model::model_one_of());
+    // `OnEmbeddingFailure` is `#[serde(untagged)]` with an object variant
+    // (`{ "target": … }`): serde buffers untagged content and silently
+    // swallows unknown fields inside it, invisible to both the write
+    // path's serde step and the loader's `serde_ignored` reporting. The
+    // schema closure is therefore the only non-silent guard — same
+    // reasoning as the tagged-enum branch closures below, applied to
+    // both validator sets.
+    if let Some(any_of) = schema
+        .get_mut("definitions")
+        .and_then(|d| d.get_mut("OnEmbeddingFailure"))
+        .and_then(|b| b.get_mut("anyOf"))
+        .and_then(Value::as_array_mut)
+    {
+        for branch in any_of.iter_mut() {
+            if branch.get("type").and_then(Value::as_str) == Some("object") {
+                if let Some(obj) = branch.as_object_mut() {
+                    obj.insert("additionalProperties".to_string(), json!(false));
+                }
+            }
+        }
+    }
     schema
 }
 
@@ -3110,6 +3131,95 @@ mod tests {
             "auth_type": "oauth2"
         });
         validate_mcp_server(&v).unwrap();
+    }
+
+    // ---- strict-write / lenient-read split (issue #871) ----
+
+    #[test]
+    fn lenient_set_tolerates_unknown_fields_strict_set_rejects() {
+        let v = json!({
+            "key_hash": "9df37f5e7cbc3c391d872742b5f286c242e733a09add9eeaa4d26a599bd90b20",
+            "allowed_models": ["a"],
+            "future_field": true
+        });
+        assert!(validate_apikey(&v).is_err(), "write contract stays strict");
+        validate_apikey_lenient(&v).expect("read contract tolerates unknown fields");
+    }
+
+    #[test]
+    fn lenient_set_still_enforces_every_other_constraint() {
+        // Missing required field.
+        assert!(validate_apikey_lenient(&json!({"allowed_models": []})).is_err());
+        // Unknown enum value.
+        let v = json!({
+            "display_name": "r",
+            "routing": {"strategy": "quantum", "targets": [{"model": "a"}]}
+        });
+        assert!(validate_model_lenient(&v).is_err());
+        // Range violation.
+        let v = json!({
+            "display_name": "", "provider": "openai",
+            "model_name": "g", "provider_key_id": "pk"
+        });
+        assert!(validate_model_lenient(&v).is_err());
+    }
+
+    #[test]
+    fn lenient_set_keeps_deliberate_closures_closed() {
+        // The observability-exporter branches guard the credential_ref
+        // indirection against a smuggled plaintext secret, and serde
+        // cannot report ignored fields inside tagged-enum content — so
+        // these closures must hold on the READ path too, or the
+        // tolerance would be silent.
+        let exporter = json!({
+            "name": "o", "kind": "otlp_http",
+            "endpoint": "https://otel.example/v1/traces",
+            "smuggled_secret": "sk-x"
+        });
+        assert!(validate_observability_exporter_lenient(&exporter).is_err());
+
+        // Same for the guardrail tagged sub-enums: serde silently
+        // swallows unknown fields inside inline-tagged variants.
+        let guardrail = json!({
+            "name": "kw", "kind": "keyword",
+            "patterns": [{"kind": "literal", "value": "x", "extra": 1}]
+        });
+        assert!(validate_guardrail_lenient(&guardrail).is_err());
+    }
+
+    #[test]
+    fn on_embedding_failure_object_variant_is_closed_on_both_paths() {
+        // `OnEmbeddingFailure` is untagged with an object variant: serde
+        // buffers untagged content and silently swallows unknown fields
+        // inside it — invisible to serde_ignored too. The producer closes
+        // the object branch so the typo is caught on write AND stays a
+        // loud (RED) rejection on read instead of a silent tolerance.
+        let v = json!({
+            "display_name": "prod-chat",
+            "semantic": {
+                "embedding_model": "e",
+                "routes": [{"name": "a", "target": "m", "examples": ["x"]}],
+                "default": "d",
+                "match": {"threshold": 0.5},
+                "on_embedding_failure": {"target": "t", "sneaky": 1}
+            }
+        });
+        assert!(validate_model(&v).is_err());
+        assert!(validate_model_lenient(&v).is_err());
+
+        // The legitimate shapes keep validating on both paths.
+        let ok = json!({
+            "display_name": "prod-chat",
+            "semantic": {
+                "embedding_model": "e",
+                "routes": [{"name": "a", "target": "m", "examples": ["x"]}],
+                "default": "d",
+                "match": {"threshold": 0.5},
+                "on_embedding_failure": {"target": "t"}
+            }
+        });
+        validate_model(&ok).unwrap();
+        validate_model_lenient(&ok).unwrap();
     }
 
     #[test]

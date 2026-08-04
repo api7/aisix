@@ -58,6 +58,7 @@ describe("config forward-compat: unknown fields from a newer control plane", () 
   let etcd: EtcdClient | undefined;
   let etcdReachable = false;
   let yellowKeyId: string;
+  let pkId: string;
 
   beforeAll(async () => {
     etcd = new EtcdClient();
@@ -73,6 +74,7 @@ describe("config forward-compat: unknown fields from a newer control plane", () 
       secret: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
+    pkId = pk.id;
     await seed.createModel({
       display_name: "fc-model",
       provider: "openai",
@@ -120,14 +122,49 @@ describe("config forward-compat: unknown fields from a newer control plane", () 
     });
     expect(chat.status, JSON.stringify(chat.body)).toBe(200);
 
+    // A second traffic-bearing kind: a model document with an unknown
+    // field must also load and serve chat.
+    const yellowModelId = randomUUID();
+    await etcd.put(
+      `${app.etcdPrefix}/models/${yellowModelId}`,
+      JSON.stringify({
+        display_name: "fc-model-yellow",
+        provider: "openai",
+        model_name: "gpt-4o-mini",
+        provider_key_id: pkId,
+        future_model_knob: true,
+      }),
+    );
+    await etcd.put(
+      `${app.etcdPrefix}/api_keys/${randomUUID()}`,
+      JSON.stringify({
+        key_hash: createHash("sha256").update(`${CALLER_PLAINTEXT}-2`).digest("hex"),
+        allowed_models: ["fc-model-yellow"],
+      }),
+    );
+    await waitConfigPropagation(async () => {
+      cfg = await getStatusConfig(app!);
+      return (cfg.applied?.resource_counts.models ?? 0) >= 2;
+    });
+    const proxy2 = new ProxyClient(app.proxyUrl, `${CALLER_PLAINTEXT}-2`);
+    const chat2 = await proxy2.chat({
+      model: "fc-model-yellow",
+      messages: [{ role: "user", content: "does the forward-compat model serve?" }],
+    });
+    expect(chat2.status, JSON.stringify(chat2.body)).toBe(200);
+    await etcd.delete(`${app.etcdPrefix}/models/${yellowModelId}`);
+
     // The tolerance is reported, not silent: the exact ignored field with
     // a row count, next to an empty rejected[]. The row is served, so the
     // state stays synced rather than degraded.
-    expect(cfg!.state).toBe("synced");
-    expect(cfg!.rejected).toHaveLength(0);
-    expect(cfg!.partially_compatible).toEqual([
-      { resource_kind: "api_keys", field: "quota_profile", count: 1 },
-    ]);
+    cfg = await getStatusConfig(app);
+    expect(cfg.state).toBe("synced");
+    expect(cfg.rejected).toHaveLength(0);
+    expect(cfg.partially_compatible).toContainEqual({
+      resource_kind: "api_keys",
+      field: "quota_profile",
+      count: 1,
+    });
 
     // And on the metrics listener as a per-kind gauge.
     const text = await scrape(app);

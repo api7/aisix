@@ -1000,6 +1000,17 @@ pub struct GuardrailAttachment {
     #[serde(default = "default_enabled")]
     pub enabled: bool,
 
+    /// Environment the attachment belongs to. Written by the managed
+    /// control plane for its own scoping; the gateway does not read it.
+    //
+    // Declared so the field counts as known instead of being reported
+    // as partially compatible on every managed deployment (the CP
+    // writes it unconditionally): every attachment in a gateway's
+    // snapshot already belongs to its environment, so there is nothing
+    // to consume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env_id: Option<String>,
+
     #[serde(skip)]
     pub(crate) runtime_id: String,
 }
