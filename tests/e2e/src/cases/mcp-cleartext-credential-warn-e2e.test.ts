@@ -87,14 +87,19 @@ describe("mcp cleartext credential warning e2e", () => {
     if (!etcdReachable || !app) return ctx.skip();
 
     // The propagation probe already drove at least one request through the
-    // gateway, so the warning is present…
+    // gateway; poll for the line rather than racing the stderr pipe.
+    await waitConfigPropagation(async () => warnCount() >= 1);
     expect(warnCount()).toBe(1);
     expect(app.output()).toContain("alpha");
 
-    // …and stays at one across further requests (per-process dedup), while
-    // the endpoint keeps answering — a warning, not a rejection.
+    // …and it stays at one across further requests (per-process dedup),
+    // while the endpoint keeps answering — a warning, not a rejection. The
+    // short settle lets any (buggy) extra warn line reach the pipe buffer
+    // before the count is read, so a dedup regression can actually fail
+    // this assertion.
     expect(await initialize()).toBe(200);
     expect(await initialize()).toBe(200);
+    await new Promise((resolve) => setTimeout(resolve, 250));
     expect(warnCount()).toBe(1);
   });
 });

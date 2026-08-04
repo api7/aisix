@@ -486,31 +486,55 @@ fn into_mcp_tool(tool: rmcp::model::Tool) -> McpTool {
 /// then fails cleanly at connect time and that server degrades like any
 /// unreachable upstream (its tools drop out of `tools/list`, the failure is
 /// logged), instead of one bad row poisoning snapshot loading.
-/// Whether reaching this server sends a gateway-held credential over
-/// cleartext HTTP: any non-`none` auth type against an `http://` URL (for
-/// `oauth2`, `url` carries the minted access token; a cleartext `token_url`
-/// is flagged separately — it carries the client secret).
-fn sends_credential_over_cleartext(auth_type: McpAuthType, url: &str) -> bool {
-    auth_type != McpAuthType::None && url.starts_with("http://")
+/// Whether a URL sends its traffic over cleartext HTTP. Matches how the
+/// HTTP stack will actually treat it (the URL parser lowercases the scheme
+/// and strips leading whitespace), so `HTTP://` and `" http://"` are
+/// flagged too; `https://` never is.
+fn is_cleartext(url: &str) -> bool {
+    let trimmed = url.trim_start();
+    trimmed
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
 }
 
-/// Warn — once per distinct message per process — that a credential travels
-/// unencrypted. Deliberately a warning, not a rejection: plain-HTTP MCP
-/// servers inside a private network are a lawful, common deployment, and
+/// The cleartext-credential findings for a registered server: which
+/// gateway-held secret travels over plain HTTP, and to which URL. Applies
+/// to every credentialed auth type against an `http://` server URL —
+/// `type: mcp` and `type: openapi` rows share these fields — plus, for
+/// `oauth2`, a cleartext `token_url` (it carries the client secret; a
+/// distinct finding even when `token_url` equals `url`). Pure, so tests
+/// pin the selection.
+pub(crate) fn cleartext_findings(server: &McpServer) -> Vec<(&'static str, String)> {
+    let mut findings = Vec::new();
+    if server.auth_type != McpAuthType::None && is_cleartext(&server.url) {
+        findings.push(("the gateway-held upstream credential", server.url.clone()));
+    }
+    if server.auth_type == McpAuthType::OAuth2 {
+        let token_url = server.token_url.as_deref().unwrap_or_default();
+        if is_cleartext(token_url) {
+            findings.push(("the OAuth client secret", token_url.to_string()));
+        }
+    }
+    findings
+}
+
+/// Warn — once per distinct finding per process — that a credential travels
+/// unencrypted. Deliberately a warning, not a rejection: plain-HTTP
+/// upstreams inside a private network are a lawful, common deployment, and
 /// request behavior (including redirect handling) stays aligned with the
-/// reference SDK baseline (#879). Deduped because the gateway is rebuilt
-/// from the snapshot on every request — an undeduped warn would log per
-/// call.
-fn warn_cleartext_credential(server: &McpServer) {
+/// reference SDK baseline (#879). Deduped on the (server, finding, url)
+/// tuple because the gateway is rebuilt from the snapshot on every request
+/// — an undeduped warn would log per call.
+pub(crate) fn warn_cleartext_credential(server: &McpServer) {
     use std::sync::{Mutex, OnceLock};
-    static WARNED: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
-    let emit = |what: &str, url: &str| {
-        let key = format!("{}|{url}", server.name);
+    type Warned = std::collections::HashSet<(String, &'static str, String)>;
+    static WARNED: OnceLock<Mutex<Warned>> = OnceLock::new();
+    for (what, url) in cleartext_findings(server) {
         let mut warned = WARNED
             .get_or_init(Default::default)
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if warned.insert(key) {
+        if warned.insert((server.name.clone(), what, url.clone())) {
             tracing::warn!(
                 server = %server.name,
                 url = %url,
@@ -518,20 +542,10 @@ fn warn_cleartext_credential(server: &McpServer) {
                  it — serve this upstream over https"
             );
         }
-    };
-    if sends_credential_over_cleartext(server.auth_type, &server.url) {
-        emit("the gateway-held MCP upstream credential", &server.url);
-    }
-    if server.auth_type == McpAuthType::OAuth2 {
-        let token_url = server.token_url.as_deref().unwrap_or_default();
-        if token_url.starts_with("http://") {
-            emit("the OAuth client secret", token_url);
-        }
     }
 }
 
 pub fn upstream_from_mcp_server(server: &McpServer) -> McpUpstream {
-    warn_cleartext_credential(server);
     let auth = match server.auth_type {
         McpAuthType::None => McpAuth::None,
         McpAuthType::Bearer => McpAuth::Bearer(server.secret.clone().unwrap_or_default()),
@@ -600,26 +614,52 @@ mod tests {
 
     #[test]
     fn cleartext_credential_detection() {
-        // A credentialed http:// URL is flagged; https, credential-less
-        // http, and non-URL edge shapes are not (https also starts with
-        // "http", so the scheme match must include the separator).
-        assert!(sends_credential_over_cleartext(
-            McpAuthType::Bearer,
-            "http://mcp.internal/mcp"
+        let server = |auth_type: &str, url: &str, token_url: Option<&str>| -> McpServer {
+            serde_json::from_value(serde_json::json!({
+                "display_name": "s",
+                "url": url,
+                "auth_type": auth_type,
+                "secret": "k",
+                "client_id": "c",
+                "token_url": token_url,
+            }))
+            .expect("valid server")
+        };
+
+        // A credentialed http:// URL is flagged; https and credential-less
+        // http are not (https also starts with "http", so the scheme match
+        // must include the separator). The URL parser lowercases the scheme
+        // and strips leading whitespace, so those shapes flag too.
+        for auth in ["bearer", "api_key"] {
+            assert_eq!(
+                cleartext_findings(&server(auth, "http://mcp.internal/mcp", None)).len(),
+                1,
+                "{auth} over http must be flagged"
+            );
+        }
+        assert!(cleartext_findings(&server("bearer", "https://mcp.internal/mcp", None)).is_empty());
+        assert!(cleartext_findings(&server("none", "http://mcp.internal/mcp", None)).is_empty());
+        assert!(cleartext_findings(&server("bearer", "", None)).is_empty());
+        assert_eq!(
+            cleartext_findings(&server("bearer", "HTTP://mcp.internal/mcp", None)).len(),
+            1
+        );
+        assert_eq!(
+            cleartext_findings(&server("bearer", " http://mcp.internal/mcp", None)).len(),
+            1
+        );
+
+        // oauth2: the server URL carries the minted token, the token URL the
+        // client secret — two distinct findings, even at the same URL.
+        let both = cleartext_findings(&server("oauth2", "http://x/mcp", Some("http://x/mcp")));
+        assert_eq!(both.len(), 2, "token_url == url must still flag twice");
+        let token_only = cleartext_findings(&server(
+            "oauth2",
+            "https://x/mcp",
+            Some("http://idp.internal/token"),
         ));
-        assert!(sends_credential_over_cleartext(
-            McpAuthType::ApiKey,
-            "http://mcp.internal/mcp"
-        ));
-        assert!(!sends_credential_over_cleartext(
-            McpAuthType::Bearer,
-            "https://mcp.internal/mcp"
-        ));
-        assert!(!sends_credential_over_cleartext(
-            McpAuthType::None,
-            "http://mcp.internal/mcp"
-        ));
-        assert!(!sends_credential_over_cleartext(McpAuthType::Bearer, ""));
+        assert_eq!(token_only.len(), 1);
+        assert_eq!(token_only[0].0, "the OAuth client secret");
     }
 
     /// The dial to an upstream that swallows SYNs must be cut by the
