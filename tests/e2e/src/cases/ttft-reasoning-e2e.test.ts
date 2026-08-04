@@ -175,9 +175,17 @@ describe("upstream TTFT stops on the first generated-output frame", () => {
     await otlp?.close();
   });
 
+  /**
+   * `provider` selects the dispatch path under test. `openai` takes the
+   * native routes; any other OpenAI-compatible provider (here `deepseek`)
+   * routes `/v1/messages` through the cross-provider translation and
+   * `/v1/responses` through the chat-completions bridge — the two sites
+   * that share the predicate but never see the native code paths.
+   */
   async function createModel(
     displayName: string,
     upstream: OpenAiUpstream,
+    provider: "openai" | "deepseek" = "openai",
   ): Promise<void> {
     if (!seed) throw new Error("seed client not initialized");
     const pk = await seed.createProviderKey({
@@ -187,8 +195,8 @@ describe("upstream TTFT stops on the first generated-output frame", () => {
     });
     await seed.createModel({
       display_name: displayName,
-      provider: "openai",
-      model_name: "gpt-4o-mini",
+      provider,
+      model_name: provider === "openai" ? "gpt-4o-mini" : "deepseek-reasoner",
       provider_key_id: pk.id,
     });
   }
@@ -303,6 +311,91 @@ describe("upstream TTFT stops on the first generated-output frame", () => {
     // wait for the frame one gap later. Reading the opener put this at ~0.
     expect(Number.isFinite(ttft)).toBe(true);
     expect(ttft).toBeGreaterThan(GAP_MS);
+  });
+
+  test("reasoning text stops the clock on the /v1/messages bridge", async (ctx) => {
+    if (!etcdReachable || !app || !seed || !otlp) {
+      ctx.skip();
+      return;
+    }
+
+    // Anthropic-shaped request, OpenAI-compatible upstream: the
+    // cross-provider translation, not the byte-for-byte passthrough.
+    const upstream = await startOpenAiUpstream({
+      streamEvents: reasoningThenContent(),
+      firstEventDelayMs: LEAD_MS,
+      eventDelayMs: GAP_MS,
+    });
+    upstreams.push(upstream);
+    await createModel("ttft-reasoning-messages", upstream, "deepseek");
+    await awaitPropagation("reasoning-messages");
+
+    const res = await fetch(`${app.proxyUrl}/v1/messages`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${CALLER_PLAINTEXT}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "ttft-reasoning-messages",
+        max_tokens: 128,
+        messages: [{ role: "user", content: "think then answer" }],
+        stream: true,
+      }),
+    });
+    expect(res.status).toBe(200);
+    const requestId = res.headers.get("x-aisix-request-id");
+    expect(requestId).toBeTruthy();
+    await res.text();
+
+    const span = await waitForSpan(otlp, requestId!);
+    const ttft = Number(span["aisix.upstream_ttft_ms"]);
+
+    expect(Number.isFinite(ttft)).toBe(true);
+    expect(ttft).toBeGreaterThan(0);
+    expect(ttft).toBeLessThan(CONTENT_STARTS_MS / 2);
+  });
+
+  test("reasoning text stops the clock on the /v1/responses bridge", async (ctx) => {
+    if (!etcdReachable || !app || !seed || !otlp) {
+      ctx.skip();
+      return;
+    }
+
+    // A non-OpenAI provider serves /v1/responses through the
+    // chat-completions bridge, so the upstream speaks chat SSE.
+    const upstream = await startOpenAiUpstream({
+      streamEvents: reasoningThenContent(),
+      firstEventDelayMs: LEAD_MS,
+      eventDelayMs: GAP_MS,
+    });
+    upstreams.push(upstream);
+    await createModel("ttft-reasoning-resp-bridge", upstream, "deepseek");
+    await awaitPropagation("reasoning-resp-bridge");
+
+    const res = await fetch(`${app.proxyUrl}/v1/responses`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${CALLER_PLAINTEXT}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "ttft-reasoning-resp-bridge",
+        input: "think then answer",
+        stream: true,
+      }),
+    });
+    expect(res.status).toBe(200);
+    const requestId = res.headers.get("x-aisix-request-id");
+    expect(requestId).toBeTruthy();
+    await res.text();
+
+    const span = await waitForSpan(otlp, requestId!);
+    const ttft = Number(span["aisix.upstream_ttft_ms"]);
+
+    expect(Number.isFinite(ttft)).toBe(true);
+    expect(ttft).toBeGreaterThan(0);
+    expect(ttft).toBeLessThan(CONTENT_STARTS_MS / 2);
   });
 
   test("reasoning summaries stop the clock on /v1/responses", async (ctx) => {
