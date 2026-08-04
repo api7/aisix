@@ -270,6 +270,34 @@ async fn scoped_registered_foreign_prefix_fails_closed() {
 }
 
 #[tokio::test]
+async fn scoped_disabled_foreign_prefix_still_fails_closed() {
+    // `dark` is registered but disabled. Its name stays reserved: a scope's
+    // callable name surface must not shift when another server's `enabled`
+    // flag is toggled, so `dark__echo` fails closed on alpha even though the
+    // upstream would serve that literal name.
+    let upstream = spawn_upstream("alpha", "dark__echo").await;
+    let snapshot = snapshot_with_alpha(&upstream);
+    let gateway =
+        McpGateway::from_snapshot_scoped(&snapshot, "alpha").expect("alpha is registered");
+    let client = connect(spawn_gateway(gateway).await).await;
+
+    assert!(
+        client.call_tool(call("dark__echo", "x")).await.is_err(),
+        "a disabled registered server's prefix must still fail closed"
+    );
+    // The literal tool stays reachable through the advertised namespaced
+    // spelling, same as the enabled-foreign case.
+    let tools = client.list_all_tools().await.expect("list tools");
+    let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+    assert_eq!(names, vec!["alpha__dark__echo"]);
+    let escaped = client
+        .call_tool(call("alpha__dark__echo", "hi"))
+        .await
+        .expect("the namespaced spelling reaches the literal tool");
+    assert_eq!(first_text(&escaped), "alpha:hi");
+}
+
+#[tokio::test]
 async fn scoped_server_name_ending_in_underscore_namespaces_cleanly() {
     // `data_` is a legal server name (only `__` inside a name is rejected).
     // Prefix parsing is whole-string based, not first-separator based, so

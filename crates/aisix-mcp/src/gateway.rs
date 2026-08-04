@@ -259,9 +259,11 @@ struct ScopedServer {
     /// The scoped upstream's registered name — the namespace every ACL check
     /// re-applies and the name `initialize` reports.
     name: String,
-    /// The **other** registered, enabled server names. A `tools/call` whose
-    /// name is prefixed with one of these is a cross-server mistake and fails
-    /// closed rather than being silently served as a bare name.
+    /// Every **other** registered server name, enabled or not. A `tools/call`
+    /// whose name is prefixed with one of these is a cross-server mistake and
+    /// fails closed rather than being silently served as a bare name.
+    /// Disabled servers stay reserved so this scope's callable name surface
+    /// does not shift when another server's `enabled` flag is toggled.
     foreign: std::collections::HashSet<String>,
 }
 
@@ -360,7 +362,7 @@ impl McpGateway {
             .mcp_servers
             .entries()
             .into_iter()
-            .filter(|e| e.value.enabled && e.value.name != name)
+            .filter(|e| e.value.name != name)
             .map(|e| e.value.name.clone())
             .collect();
         let mut gateway = McpGateway::new([(name.clone(), bridge)]);
