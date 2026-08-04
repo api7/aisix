@@ -208,6 +208,15 @@ pub enum ProxyError {
     ModelIpRestricted(String),
     #[error("request payload is invalid: {0}")]
     InvalidRequest(String),
+    /// A non-WebSocket request reached the WebSocket-only realtime
+    /// endpoint. Carries the upgrade layer's own classification — 400 for
+    /// malformed upgrade headers, 426 for a connection that cannot
+    /// upgrade, 405 for a HEAD request (axum's `get()` also serves HEAD,
+    /// so the extractor's method check is reachable) — plus its
+    /// per-variant reason, so the refusal keeps both the status and the
+    /// diagnostic the bare rejection used to carry.
+    #[error("this endpoint requires a WebSocket upgrade: {detail}")]
+    WebSocketUpgradeRequired { status: StatusCode, detail: String },
     #[error("no bridge registered for provider")]
     ProviderUnavailable,
     /// Every routing candidate was excluded by the runtime status layer
@@ -287,6 +296,7 @@ impl ProxyError {
             ProxyError::ModelNotFound(_) => StatusCode::NOT_FOUND,
             ProxyError::VideoNotFound(_) => StatusCode::NOT_FOUND,
             ProxyError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
+            ProxyError::WebSocketUpgradeRequired { status, .. } => *status,
             ProxyError::ProviderUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             ProxyError::AllCandidatesUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
             ProxyError::ContentFiltered(_) => StatusCode::UNPROCESSABLE_ENTITY,
@@ -317,6 +327,7 @@ impl ProxyError {
             ProxyError::ModelNotFound(_) => "model_not_found",
             ProxyError::VideoNotFound(_) => "video_not_found",
             ProxyError::InvalidRequest(_) => "invalid_request_error",
+            ProxyError::WebSocketUpgradeRequired { .. } => "websocket_upgrade_required",
             ProxyError::RequestTooLarge { .. } => "invalid_request_error",
             ProxyError::ProviderUnavailable => "provider_unavailable",
             ProxyError::AllCandidatesUnavailable { .. } => "all_candidates_unavailable",
@@ -478,11 +489,31 @@ impl IntoResponse for ProxyError {
     fn into_response(self) -> Response {
         let status = self.status();
         let retry_after = self.retry_after_secs();
+        let upgrade_reject = matches!(self, ProxyError::WebSocketUpgradeRequired { .. });
         let body = self.envelope();
         let mut response = (status, Json(body)).into_response();
         if let Some(secs) = retry_after {
             if let Ok(value) = HeaderValue::from_str(&secs.to_string()) {
                 response.headers_mut().insert("retry-after", value);
+            }
+        }
+        // RFC 9110: a 426 must name the protocol to switch to (§15.5.22)
+        // and a 405 must list the allowed methods (§15.5.6; GET implies
+        // HEAD on this route). axum's bare rejection omitted both, but the
+        // response is the gateway's own now.
+        if upgrade_reject {
+            match status {
+                StatusCode::UPGRADE_REQUIRED => {
+                    response
+                        .headers_mut()
+                        .insert("upgrade", HeaderValue::from_static("websocket"));
+                }
+                StatusCode::METHOD_NOT_ALLOWED => {
+                    response
+                        .headers_mut()
+                        .insert("allow", HeaderValue::from_static("GET, HEAD"));
+                }
+                _ => {}
             }
         }
         response

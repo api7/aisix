@@ -91,16 +91,34 @@ async fn connect_upstream(
 
 pub(crate) async fn realtime(
     State(state): State<ProxyState>,
+    method: Method,
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
     client: ClientContext,
-    ws: WebSocketUpgrade,
+    ws: Result<WebSocketUpgrade, axum::extract::ws::rejection::WebSocketUpgradeRejection>,
 ) -> Response {
     let request_id = client.request_id.clone();
     let started = Instant::now();
 
-    match prepare(&state, &params, &headers, &client).await {
-        Ok(prep) => {
+    // A non-WebSocket request (plain GET, malformed upgrade headers, a
+    // connection that cannot upgrade, or a HEAD — `get()` serves HEAD
+    // too) used to get axum's bare rejection — no access log, no metrics,
+    // no usage event, no envelope; the same silent class #863/#880/#884
+    // collected (#885). Map it into this endpoint's normal error arm,
+    // keeping axum's own status classification (400 / 426 / 405) and its
+    // per-variant diagnostic.
+    let outcome = match ws {
+        Ok(ws) => prepare(&state, &params, &headers, &client)
+            .await
+            .map(|prep| (ws, prep)),
+        Err(rejection) => Err(crate::error::ProxyError::WebSocketUpgradeRequired {
+            status: rejection.status(),
+            detail: rejection.body_text(),
+        }),
+    };
+
+    match outcome {
+        Ok((ws, prep)) => {
             let state2 = state.clone();
             let client2 = client.clone();
             // `on_upgrade` runs the session on a detached task, so the
@@ -119,12 +137,23 @@ pub(crate) async fn realtime(
         Err(err) => {
             let status = err.status().as_u16();
             emit_access_log(
-                &Method::GET,
+                &method,
                 status,
                 started.elapsed(),
                 &request_id,
                 None,
                 Some(&err),
+            );
+            // Count the refusal like every other pre-dispatch rejection
+            // (unresolved labels, same as `reject_before_dispatch`) — logs
+            // and the request-rate metrics must not disagree about whether
+            // these requests exist.
+            state.metrics.record_request(
+                "unknown",
+                crate::usage_attr::UNRESOLVED_MODEL_LABEL,
+                status,
+                RequestOutcome::from_status(status),
+                started.elapsed(),
             );
             crate::usage_attr::emit_error_usage_event(
                 &state,
@@ -1084,5 +1113,137 @@ mod tests {
             .await
             .expect_err("handshake must fail on model ACL");
         assert!(err.to_string().contains("403"), "got: {err}");
+    }
+
+    /// State + router + usage receiver for driving the endpoint's
+    /// REJECTION paths with `oneshot` (no live connection needed — the
+    /// point is that no upgrade happens).
+    fn oneshot_router() -> (
+        axum::Router,
+        crate::ProxyState,
+        tokio::sync::mpsc::Receiver<ObsUsageEvent>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::channel::<ObsUsageEvent>(4);
+        let state = crate::ProxyState::new(
+            SnapshotHandle::new(AisixSnapshot::new()),
+            Arc::new(Hub::new()),
+            &cfg(),
+        )
+        .without_cache()
+        .with_usage_sink(UsageSink::new(tx));
+        (crate::build_router(state.clone()), state, rx)
+    }
+
+    async fn body_json(response: axum::response::Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 16)
+            .await
+            .unwrap_or_default();
+        serde_json::from_slice(&bytes).expect("an error envelope, not a bare rejection body")
+    }
+
+    #[tokio::test]
+    async fn non_websocket_request_is_recorded_and_enveloped() {
+        use tower::ServiceExt as _;
+        // Pre-#885 a plain GET (no upgrade headers) got axum's bare
+        // rejection: nothing in the access log, metrics, or the usage
+        // pipeline. It now takes this endpoint's normal error arm —
+        // envelope + usage event + request metrics — keeping axum's 400
+        // classification for bad/missing upgrade headers.
+        let (router, state, mut rx) = oneshot_router();
+        let response = router
+            .oneshot(
+                axum::http::Request::get("/v1/realtime?model=probe-model")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("router responds");
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+        let json = body_json(response).await;
+        assert_eq!(json["error"]["type"], "websocket_upgrade_required");
+
+        let event = rx.try_recv().expect("the refusal is recorded");
+        assert_eq!(event.status_code, 400);
+        assert_eq!(event.inbound_protocol, "realtime");
+        // Auth runs inside prepare(), which a rejected upgrade never
+        // reaches — no key is attributed; the requested model rides along.
+        assert_eq!(event.api_key_id, "");
+        assert_eq!(event.requested_model, "probe-model");
+
+        // Logs and the request-rate metrics must not disagree about
+        // whether these requests exist.
+        let scrape = state.metrics.render();
+        assert!(
+            scrape.contains(r#"status="400""#) && scrape.contains(r#"model="unresolved""#),
+            "the refusal must be counted, got: {scrape}"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_upgradable_connection_keeps_its_426() {
+        use tower::ServiceExt as _;
+        // Correct WebSocket headers over a connection that cannot upgrade
+        // (a `oneshot` request carries no hyper upgrade extension) is
+        // axum's ConnectionNotUpgradable — 426 Upgrade Required. The
+        // status must survive the envelope mapping rather than being
+        // flattened to 400, and the response must name the protocol to
+        // switch to (RFC 9110 §15.5.22).
+        let (router, _state, mut rx) = oneshot_router();
+        let response = router
+            .oneshot(
+                axum::http::Request::get("/v1/realtime")
+                    .header("connection", "upgrade")
+                    .header("upgrade", "websocket")
+                    .header("sec-websocket-version", "13")
+                    .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("router responds");
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::UPGRADE_REQUIRED,
+            "axum's 426 classification must survive"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("upgrade")
+                .and_then(|v| v.to_str().ok()),
+            Some("websocket")
+        );
+        let json = body_json(response).await;
+        assert_eq!(json["error"]["type"], "websocket_upgrade_required");
+        assert_eq!(rx.try_recv().expect("recorded").status_code, 426);
+    }
+
+    #[tokio::test]
+    async fn head_request_keeps_its_405_and_allow_header() {
+        use tower::ServiceExt as _;
+        // axum's `get()` also serves HEAD, so a HEAD request reaches the
+        // extractor's method check — 405, with the Allow header RFC 9110
+        // §15.5.6 requires, and recorded like every other refusal.
+        let (router, _state, mut rx) = oneshot_router();
+        let response = router
+            .oneshot(
+                axum::http::Request::head("/v1/realtime")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("router responds");
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::METHOD_NOT_ALLOWED
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("allow")
+                .and_then(|v| v.to_str().ok()),
+            Some("GET, HEAD")
+        );
+        assert_eq!(rx.try_recv().expect("recorded").status_code, 405);
     }
 }
