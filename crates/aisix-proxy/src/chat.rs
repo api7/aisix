@@ -4373,11 +4373,9 @@ where
             let maybe_chunk = match item {
                 Ok(mut chunk) => {
                     // Record TTFT on the first chunk carrying generated
-                    // output (content or tool calls). Skip role-only
-                    // chunks that OpenAI emits before actual tokens.
-                    if !first_chunk_seen
-                        && (chunk.delta.content.is_some() || chunk.delta.tool_calls.is_some())
-                    {
+                    // output — reasoning text included, role-only frames
+                    // excluded. See `ChatDelta::carries_generated_output`.
+                    if !first_chunk_seen && chunk.delta.carries_generated_output() {
                         first_chunk_seen = true;
                         guard.comp().upstream_ttft_ms =
                             attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;

@@ -1037,9 +1037,7 @@ pub fn build_responses_bridge_stream(
         while let Some(item) = upstream.next().await {
             match item {
                 Ok(chunk) => {
-                    if !first_chunk_seen
-                        && (chunk.delta.content.is_some() || chunk.delta.tool_calls.is_some())
-                    {
+                    if !first_chunk_seen && chunk.delta.carries_generated_output() {
                         first_chunk_seen = true;
                         guard.comp().upstream_ttft_ms =
                             attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;

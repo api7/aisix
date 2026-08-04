@@ -2265,6 +2265,14 @@ fn responses_sse_usage(bytes: &[u8]) -> Option<ResponseUsage> {
 /// Whether this SSE event carries generated output. Mirrors the set
 /// `SseTextCapture::observe` accumulates, so TTFT lands on the same frame
 /// the capture considers the first real token.
+/// Frames that carry generated output, and so may stop the TTFT clock.
+///
+/// The reasoning arms are the Responses-API counterpart of
+/// [`ChatDelta::carries_generated_output`](aisix_gateway::ChatDelta::carries_generated_output):
+/// a reasoning model streams its summary (or, for models that expose it,
+/// its raw reasoning text) well before the first `output_text` frame, so
+/// leaving them out reports the end of the thinking phase as the first
+/// token — AISIX-Cloud#1225.
 fn is_responses_content_delta(json: &Value) -> bool {
     matches!(
         json.get("type").and_then(Value::as_str),
@@ -2273,6 +2281,8 @@ fn is_responses_content_delta(json: &Value) -> bool {
                 | "response.function_call_arguments.delta"
                 | "response.mcp_call_arguments.delta"
                 | "response.custom_tool_call_input.delta"
+                | "response.reasoning_summary_text.delta"
+                | "response.reasoning_text.delta"
         )
     )
 }
