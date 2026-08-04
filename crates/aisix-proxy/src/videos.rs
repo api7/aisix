@@ -71,7 +71,7 @@
 
 use aisix_core::AppliedGuardrail;
 use aisix_obs::{AccessLog, RequestOutcome, UsageEvent};
-use axum::extract::{Path, State};
+use axum::extract::State;
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -83,6 +83,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::auth::AuthenticatedKey;
 use crate::client_ip::ClientContext;
 use crate::error::{ErrorEnvelope, ProxyError};
+use crate::reject::AisixPath;
 use crate::state::ProxyState;
 
 /// DashScope video-synthesis submit path (relative to the ProviderKey's
@@ -1762,7 +1763,7 @@ pub async fn get_video(
     State(state): State<ProxyState>,
     auth: AuthenticatedKey,
     client: ClientContext,
-    Path(video_id): Path<String>,
+    AisixPath(video_id): AisixPath<String>,
 ) -> Response {
     let telemetry = Telemetry {
         state: &state,
@@ -1813,7 +1814,7 @@ pub async fn video_content(
     State(state): State<ProxyState>,
     auth: AuthenticatedKey,
     client: ClientContext,
-    Path(video_id): Path<String>,
+    AisixPath(video_id): AisixPath<String>,
 ) -> Response {
     let telemetry = Telemetry {
         state: &state,

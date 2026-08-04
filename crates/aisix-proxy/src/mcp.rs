@@ -78,7 +78,7 @@ pub async fn mcp_endpoint(
 /// nothing about which servers exist).
 pub async fn mcp_scoped_endpoint(
     auth: AuthenticatedKey,
-    axum::extract::Path(server): axum::extract::Path<String>,
+    crate::reject::AisixPath(server): crate::reject::AisixPath<String>,
     State(state): State<ProxyState>,
     request: Request,
 ) -> Response {

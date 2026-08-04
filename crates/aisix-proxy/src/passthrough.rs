@@ -24,7 +24,7 @@
 
 use aisix_obs::{AccessLog, RequestOutcome};
 use axum::body::Body;
-use axum::extract::{Path, Request, State};
+use axum::extract::{Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
@@ -32,6 +32,7 @@ use std::time::{Duration, Instant};
 
 use crate::auth::AuthenticatedKey;
 use crate::error::ProxyError;
+use crate::reject::AisixPath;
 use crate::state::ProxyState;
 
 /// Bounded `model` metric label for passthrough requests. The wildcard
@@ -131,7 +132,7 @@ pub async fn passthrough(
     State(state): State<ProxyState>,
     auth: AuthenticatedKey,
     client: crate::client_ip::ClientContext,
-    Path((provider, rest)): Path<(String, String)>,
+    AisixPath((provider, rest)): AisixPath<(String, String)>,
     req: Request,
 ) -> Response {
     let started = Instant::now();

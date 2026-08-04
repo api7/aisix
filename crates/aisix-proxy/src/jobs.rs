@@ -55,7 +55,7 @@ use aisix_core::resource::ResourceEntry;
 use aisix_core::{Model, ProviderKey};
 use aisix_obs::{AccessLog, RequestOutcome, UsageEvent};
 use axum::body::Body;
-use axum::extract::{Multipart, Path, Query, State};
+use axum::extract::{Multipart, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -66,6 +66,7 @@ use serde_json::Value;
 use crate::auth::AuthenticatedKey;
 use crate::client_ip::ClientContext;
 use crate::error::ProxyError;
+use crate::reject::AisixPath;
 use crate::state::ProxyState;
 
 /// Marker prefix for gateway-minted routed ids.
@@ -776,10 +777,29 @@ pub(crate) async fn create_file(
     client: ClientContext,
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
-    mut multipart: Multipart,
+    multipart: Result<Multipart, axum::extract::multipart::MultipartRejection>,
 ) -> Response {
     let started = Instant::now();
     let request_id = client.request_id.clone();
+
+    // Same silent class as the body-extractor rejections #863 collected: a
+    // non-multipart content-type answered axum's bare 400 with no access
+    // log, metrics, or envelope.
+    let mut multipart = match multipart {
+        Ok(multipart) => multipart,
+        Err(_) => {
+            return crate::reject::reject_before_dispatch(
+                &state,
+                "POST",
+                "/v1/files",
+                &request_id,
+                Some(&auth.entry.id),
+                started,
+                crate::reject::Envelope::OpenAi,
+                ProxyError::InvalidRequest("invalid multipart form data".into()),
+            );
+        }
+    };
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
 
     let result = async {
@@ -928,7 +948,7 @@ pub(crate) async fn get_file(
     State(state): State<ProxyState>,
     auth: AuthenticatedKey,
     client: ClientContext,
-    Path(id): Path<String>,
+    AisixPath(id): AisixPath<String>,
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Response {
@@ -958,7 +978,7 @@ pub(crate) async fn delete_file(
     State(state): State<ProxyState>,
     auth: AuthenticatedKey,
     client: ClientContext,
-    Path(id): Path<String>,
+    AisixPath(id): AisixPath<String>,
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Response {
@@ -988,7 +1008,7 @@ pub(crate) async fn file_content(
     State(state): State<ProxyState>,
     auth: AuthenticatedKey,
     client: ClientContext,
-    Path(id): Path<String>,
+    AisixPath(id): AisixPath<String>,
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Response {
@@ -1135,7 +1155,7 @@ pub(crate) async fn get_batch(
     State(state): State<ProxyState>,
     auth: AuthenticatedKey,
     client: ClientContext,
-    Path(id): Path<String>,
+    AisixPath(id): AisixPath<String>,
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Response {
@@ -1205,7 +1225,7 @@ pub(crate) async fn cancel_batch(
     State(state): State<ProxyState>,
     auth: AuthenticatedKey,
     client: ClientContext,
-    Path(id): Path<String>,
+    AisixPath(id): AisixPath<String>,
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Response {
@@ -1378,7 +1398,7 @@ pub(crate) async fn get_ft_job(
     State(state): State<ProxyState>,
     auth: AuthenticatedKey,
     client: ClientContext,
-    Path(id): Path<String>,
+    AisixPath(id): AisixPath<String>,
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Response {
@@ -1408,7 +1428,7 @@ pub(crate) async fn cancel_ft_job(
     State(state): State<ProxyState>,
     auth: AuthenticatedKey,
     client: ClientContext,
-    Path(id): Path<String>,
+    AisixPath(id): AisixPath<String>,
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Response {
