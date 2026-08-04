@@ -464,6 +464,8 @@ mod tests {
             request_body_limit_bytes: 1_048_576,
             real_ip: Default::default(),
             tls: None,
+            thread_per_core: None,
+            workers: None,
         }
     }
 

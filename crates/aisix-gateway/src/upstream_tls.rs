@@ -210,25 +210,67 @@ pub fn reqwest_material() -> &'static ReqwestTlsMaterial {
 /// idle connection pool.
 static PK_CLIENTS: OnceLock<dashmap::DashMap<ProviderKeyTls, reqwest::Client>> = OnceLock::new();
 
-/// Bench-only (BENCH_THREAD_LOCAL_CLIENT): see `client_for_provider_key`.
-fn bench_thread_local_client() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("BENCH_THREAD_LOCAL_CLIENT").is_ok_and(|v| v == "1"))
+// ─── per-worker pools ────────────────────────────────────────────────
+
+/// The user agent every dispatch-path client is built with.
+///
+/// A worker's pool stands in for those clients, so it has to present the
+/// same identity upstream. `every_dispatch_client_presents_the_same_user_agent`
+/// holds them in step.
+pub(crate) const DISPATCH_USER_AGENT: &str = "aisix/0.1";
+
+thread_local! {
+    /// Whether this thread serves proxy traffic on its own runtime.
+    static IS_WORKER_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
+    /// This worker's upstream pool, built on first dispatch. `None` once
+    /// a build failure has been reported for this thread.
+    static WORKER_CLIENT: std::cell::OnceCell<Option<reqwest::Client>> =
+        const { std::cell::OnceCell::new() };
 }
 
-/// One client per OS thread, built with the deployment's connection and
-/// trust settings. Bench-only.
-fn thread_local_bench_client() -> reqwest::Client {
-    thread_local! {
-        static CLIENT: std::cell::OnceCell<reqwest::Client> =
-            const { std::cell::OnceCell::new() };
+/// Declares the calling thread a proxy worker with its own runtime, so
+/// its dispatches use a pool this thread alone polls.
+///
+/// Called once per worker in thread-per-core serving. Left unset
+/// everywhere else — the shared runtime's threads, the blocking pool,
+/// background tasks — so those keep dispatching on the process-wide
+/// pools exactly as before.
+pub fn mark_worker_thread() {
+    IS_WORKER_THREAD.set(true);
+}
+
+/// This worker's pool, or `None` when the thread is not a worker or the
+/// pool could not be built.
+///
+/// One pool per worker rather than per client: the dispatch clients are
+/// all built from the same recipe, so merging them costs nothing but the
+/// per-owner split of `pool_max_idle_per_host`, and keeping them split
+/// would multiply idle connections by the worker count for no gain.
+///
+/// A build failure falls back to the shared pool — which carries the
+/// deployment's trust settings — and is cached so one broken
+/// configuration cannot log per request.
+fn worker_client() -> Option<reqwest::Client> {
+    if !IS_WORKER_THREAD.get() {
+        return None;
     }
-    CLIENT.with(|c| {
-        c.get_or_init(|| {
-            crate::upstream_http::client_builder()
-                .user_agent("aisix-bench-thread-local")
+    WORKER_CLIENT.with(|cell| {
+        cell.get_or_init(|| {
+            match crate::upstream_http::client_builder()
+                .user_agent(DISPATCH_USER_AGENT)
                 .build()
-                .expect("bench thread-local client build failed")
+            {
+                Ok(client) => Some(client),
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        "per-worker upstream pool could not be built; this worker \
+                         dispatches on the shared pool"
+                    );
+                    None
+                }
+            }
         })
         .clone()
     })
@@ -250,15 +292,12 @@ pub fn client_for_provider_key(
     tls: Option<&ProviderKeyTls>,
 ) -> reqwest::Client {
     let Some(tls) = tls.filter(|t| !t.is_noop()) else {
-        // Bench-only: BENCH_THREAD_LOCAL_CLIENT=1 hands every OS thread its
-        // own client/pool so a thread-per-core worker's upstream
-        // connections are driven by its own runtime — no cross-thread
-        // wakeups on response arrival. Keys with a TLS override keep the
-        // normal path.
-        if bench_thread_local_client() {
-            return thread_local_bench_client();
-        }
-        return shared.clone();
+        // On a thread-per-core worker, dispatch on that worker's own
+        // pool: the upstream connection is then read by the same runtime
+        // that is waiting for the response, instead of waking a thread
+        // that has to hand it back. Everywhere else this is `None` and
+        // the shared pool is used, as it always was.
+        return worker_client().unwrap_or_else(|| shared.clone());
     };
     let cache = PK_CLIENTS.get_or_init(dashmap::DashMap::new);
     if let Some(existing) = cache.get(tls) {

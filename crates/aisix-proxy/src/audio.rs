@@ -1440,6 +1440,8 @@ mod tests {
             request_body_limit_bytes: 10_485_760, // 10 MB for audio
             real_ip: Default::default(),
             tls: None,
+            thread_per_core: None,
+            workers: None,
         }
     }
 

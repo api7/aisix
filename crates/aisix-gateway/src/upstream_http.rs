@@ -418,6 +418,48 @@ mod tests {
         assert!(!production.contains("fn t()"), "{production}");
     }
 
+    /// On a thread-per-core worker every dispatch runs on that worker's
+    /// own pool, and that one pool stands in for all of the clients
+    /// below — so it is built with a single user agent
+    /// (`upstream_tls::DISPATCH_USER_AGENT`).
+    ///
+    /// That substitution is only invisible while the clients it replaces
+    /// agree on the user agent. Give one bridge its own and the header
+    /// it sends changes depending on which serving mode the deployment
+    /// runs, which is not something an upstream-facing identity is
+    /// allowed to do. Whoever wants a distinct user agent has to give
+    /// that client a distinct pool as well.
+    #[test]
+    fn every_dispatch_client_presents_the_same_user_agent() {
+        let crates_dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/.."));
+        // Only literals: the telemetry, heartbeat, and OTLP clients build
+        // theirs from a version string or a named constant, and none of
+        // them talks to a model provider or reaches the per-worker pool.
+        const NEEDLE: &str = ".user_agent(\"";
+        let mut offenders = Vec::new();
+        for file in rust_sources(crates_dir) {
+            let src = std::fs::read_to_string(&file).expect("read source");
+            for (n, line) in production_half(&src).lines().enumerate() {
+                let Some(rest) = line.split_once(NEEDLE).map(|(_, r)| r) else {
+                    continue;
+                };
+                let Some((agent, _)) = rest.split_once('"') else {
+                    continue;
+                };
+                if agent != crate::upstream_tls::DISPATCH_USER_AGENT {
+                    offenders.push(format!("{}:{}: {agent}", file.display(), n + 1));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "these dispatch clients present a user agent the per-worker \
+             pool would replace with `{}`:\n{}",
+            crate::upstream_tls::DISPATCH_USER_AGENT,
+            offenders.join("\n"),
+        );
+    }
+
     fn rust_sources(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
         let mut out = Vec::new();
         let Ok(entries) = std::fs::read_dir(dir) else {

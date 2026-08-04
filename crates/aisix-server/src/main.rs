@@ -101,19 +101,17 @@ enum CliCommand {
     },
 }
 
-fn main() -> anyhow::Result<()> {
-    // Bench-only: BENCH_RT_WORKERS=N pins the tokio worker-thread count so
-    // saturation A/B runs control parallelism explicitly. Named without the
-    // AISIX_ prefix because that namespace is claimed by the config env
-    // override layer.
-    let mut rt = tokio::runtime::Builder::new_multi_thread();
-    if let Ok(n) = std::env::var("BENCH_RT_WORKERS") {
-        rt.worker_threads(n.parse().expect("BENCH_RT_WORKERS must be a number"));
-    }
-    rt.enable_all().build()?.block_on(async_main())
-}
+/// Threads left to the control surfaces when the proxy serves from
+/// thread-per-core workers.
+///
+/// The proxy's own runtimes belong to its workers in that mode, so this
+/// runtime is only running the etcd watch, the admin and metrics
+/// listeners, signal handling, and the background exporters. Two threads
+/// keep a config reload from stalling behind a telemetry flush without
+/// taking a core back from the workers.
+const CONTROL_RUNTIME_THREADS: usize = 2;
 
-async fn async_main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     // Install the process-level rustls CryptoProvider before anything
     // else touches TLS. rustls 0.23 dropped implicit provider selection
     // and panics at first use when both `aws-lc-rs` and `ring` features
@@ -138,13 +136,15 @@ async fn async_main() -> anyhow::Result<()> {
             reveal_secrets,
             output,
         }) => {
-            return export::run(export::ExportArgs {
-                endpoints: etcd,
-                prefix,
-                reveal_secrets,
-                output,
-            })
-            .await;
+            return tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?
+                .block_on(export::run(export::ExportArgs {
+                    endpoints: etcd,
+                    prefix,
+                    reveal_secrets,
+                    output,
+                }));
         }
         None => {}
     }
@@ -153,10 +153,24 @@ async fn async_main() -> anyhow::Result<()> {
         .config
         .expect("clap enforces --config unless a subcommand is given");
 
-    // Steps 1-2: config.
+    // Steps 1-2: config. Read before the runtime exists because
+    // `proxy.thread_per_core` and `proxy.workers` decide how many threads
+    // this runtime gets — and, in thread-per-core mode, that it is not
+    // the runtime serving proxy traffic at all.
     let cfg = Config::load_from_path(Some(&config_path))
         .map_err(|e| anyhow::anyhow!("config load failed: {e}"))?;
 
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder.enable_all();
+    builder.worker_threads(if cfg.proxy.thread_per_core_enabled() {
+        CONTROL_RUNTIME_THREADS
+    } else {
+        cfg.proxy.worker_threads()
+    });
+    builder.build()?.block_on(async_main(cfg))
+}
+
+async fn async_main(cfg: Config) -> anyhow::Result<()> {
     // Step 3: tracing + optional OTLP export.
     init_tracing(&cfg.observability).map_err(|e| anyhow::anyhow!("tracing init failed: {e}"))?;
     let _otlp = install_otlp_tracer(&cfg.observability)
@@ -943,6 +957,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
             downstream_idle_timeout,
             cancel_rx.clone(),
             "admin",
+            None,
         )))
     } else {
         // Drop unused shared components so the compiler can see they
@@ -988,6 +1003,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
                 downstream_idle_timeout,
                 cancel_rx.clone(),
                 "metrics",
+                None,
             )))
         } else {
             None
@@ -997,6 +1013,10 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     // Step 9: bind + serve the proxy (always). Admin is handled above.
     let proxy_addr: std::net::SocketAddr = cfg.proxy.addr.parse()?;
     let proxy_tls = cfg.proxy.tls.clone();
+    let proxy_workers = cfg
+        .proxy
+        .thread_per_core_enabled()
+        .then(|| cfg.proxy.worker_threads());
     let proxy_serve = serve_http(
         proxy_addr,
         proxy_router,
@@ -1004,6 +1024,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
         downstream_idle_timeout,
         cancel_rx.clone(),
         "proxy",
+        proxy_workers,
     );
 
     // Step 10: shutdown coordinator. Whichever of (signal, proxy, admin)
@@ -1402,21 +1423,8 @@ async fn serve_http(
     idle_timeout: Option<Duration>,
     cancel: watch::Receiver<bool>,
     label: &'static str,
+    workers: Option<usize>,
 ) -> anyhow::Result<()> {
-    // Bench-only: BENCH_RT_TPC=N short-circuits the plain-HTTP proxy
-    // listener into N thread-per-core workers (one OS thread + one
-    // current_thread runtime + one listener each). BENCH_RT_TPC_MODE
-    // picks the listener layout: "reuseport" (default) binds every worker
-    // to the same port with SO_REUSEPORT so the kernel spreads accepted
-    // connections by 4-tuple hash; "stride" binds port, port+1, ... like
-    // the macOS phase did.
-    if label == "proxy" && tls.is_none() {
-        if let Ok(n) = std::env::var("BENCH_RT_TPC") {
-            let workers: usize = n.parse().expect("BENCH_RT_TPC must be a number");
-            return serve_http_tpc(addr, router, idle_timeout, cancel, label, workers).await;
-        }
-    }
-
     // Resolved before binding so a bad cert path still fails with the
     // same error it always did, before a port is taken.
     let tls_config = match tls {
@@ -1433,6 +1441,21 @@ async fn serve_http(
         ),
         None => None,
     };
+
+    // Thread-per-core serving is the proxy's; the admin and metrics
+    // surfaces are control traffic and keep their single listener.
+    if let Some(workers) = workers {
+        return serve_http_tpc(
+            addr,
+            router,
+            tls_config,
+            idle_timeout,
+            cancel,
+            label,
+            workers,
+        )
+        .await;
+    }
 
     let listener = std::net::TcpListener::bind(addr)
         .map_err(|e| anyhow::anyhow!("{label} listener bind {addr} failed: {e}"))?;
@@ -1473,99 +1496,196 @@ async fn serve_http(
     Ok(())
 }
 
-/// Bench-only (BENCH_RT_TPC): serve the proxy from N OS threads, each with
-/// its own current_thread runtime and its own listener. The router (and so
-/// the shared AppState / reqwest client) is cloned per thread, matching the
-/// macOS-phase experiment semantics.
+/// Serve from `workers` independent threads, each with its own runtime
+/// and its own `SO_REUSEPORT` listener on the same address.
+///
+/// A connection is accepted, read, dispatched, and answered on one
+/// thread, and the upstream call it makes runs on that thread's own
+/// connection pool (see `upstream_tls::mark_worker_thread`). That is the
+/// point of the mode: the shared runtime hands a request between threads
+/// roughly once per request — first when a worker steals the task, again
+/// when the upstream response lands on whichever thread happens to own
+/// that connection — and each handoff costs a wakeup and a context
+/// switch. Here there are none.
+///
+/// The kernel decides which listener gets each connection, hashing the
+/// 4-tuple. That spreads evenly across many client connections and
+/// unevenly across few, which is why the mode is documented as a
+/// throughput setting rather than a latency one.
 async fn serve_http_tpc(
     addr: std::net::SocketAddr,
     router: axum::Router,
+    tls_config: Option<axum_server::tls_rustls::RustlsConfig>,
     idle_timeout: Option<Duration>,
     cancel: watch::Receiver<bool>,
     label: &'static str,
     workers: usize,
 ) -> anyhow::Result<()> {
-    let mode = std::env::var("BENCH_RT_TPC_MODE").unwrap_or_else(|_| "reuseport".to_string());
-    let reuseport = match mode.as_str() {
-        "reuseport" => true,
-        "stride" => false,
-        other => anyhow::bail!("BENCH_RT_TPC_MODE must be reuseport|stride, got {other}"),
-    };
-    let mut threads = Vec::with_capacity(workers);
-    for i in 0..workers {
-        let bind_addr = if reuseport {
-            addr
-        } else {
-            std::net::SocketAddr::new(addr.ip(), addr.port() + u16::try_from(i)?)
-        };
-        // Bound on the parent thread so a bind failure aborts startup
-        // before any worker begins serving.
-        let listener = bind_tpc_listener(bind_addr, reuseport)
-            .map_err(|e| anyhow::anyhow!("{label} tpc listener bind {bind_addr} failed: {e}"))?;
+    // An address someone else already holds has to stay a loud boot
+    // failure. Every socket on a `SO_REUSEPORT` address has to set the
+    // option, so a socket that does not set it fails to bind exactly
+    // when something else is there — which is the check the worker
+    // sockets below deliberately give up, since they must co-bind with
+    // each other. Without this a second gateway would start silently
+    // and split traffic with the first.
+    drop(
+        std::net::TcpListener::bind(addr)
+            .map_err(|e| anyhow::anyhow!("{label} listener bind {addr} failed: {e}"))?,
+    );
+
+    // One slot per worker so no worker blocks reporting its exit.
+    let (exit_tx, exit_rx) = std::sync::mpsc::sync_channel::<anyhow::Result<()>>(workers);
+    for worker in 0..workers {
+        // Bound on this thread so a bind failure aborts startup before
+        // any worker begins serving, exactly as the single listener does.
+        let listener = bind_reuseport_listener(addr)
+            .map_err(|e| anyhow::anyhow!("{label} listener bind {addr} failed: {e}"))?;
         listener.set_nonblocking(true)?;
         let router = router.clone();
         let cancel = cancel.clone();
-        let thread = std::thread::Builder::new().name(format!("tpc-{i}")).spawn(
-            move || -> anyhow::Result<()> {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()?;
-                rt.block_on(async move {
-                    let handle = axum_server::Handle::new();
-                    tokio::spawn({
-                        let handle = handle.clone();
-                        async move {
-                            shutdown_signal(cancel, label).await;
-                            handle.graceful_shutdown(None);
-                        }
-                    });
-                    tracing::info!(
-                        %bind_addr,
-                        label,
-                        worker = i,
-                        reuseport,
-                        "aisix listening (http, tpc)"
-                    );
-                    let make_service =
-                        router.into_make_service_with_connect_info::<std::net::SocketAddr>();
-                    let mut server = axum_server::from_tcp(listener).handle(handle);
-                    apply_idle_timeout(server.http_builder(), idle_timeout);
-                    server.serve(make_service).await?;
-                    Ok(())
-                })
-            },
-        )?;
-        threads.push(thread);
+        let tls_config = tls_config.clone();
+        let exit_tx = exit_tx.clone();
+        std::thread::Builder::new()
+            // Names the mode in `ps -T` / `top -H`: `tpc-N` here,
+            // tokio's own `tokio-rt-worker` on the shared runtime.
+            .name(format!("tpc-{worker}"))
+            .spawn(move || {
+                let mut exit = WorkerExit {
+                    tx: exit_tx,
+                    worker,
+                    outcome: None,
+                };
+                exit.outcome = Some(run_tpc_worker(
+                    addr,
+                    listener,
+                    router,
+                    tls_config,
+                    idle_timeout,
+                    cancel,
+                    label,
+                    worker,
+                ));
+            })?;
     }
+    // Only the workers hold senders from here, so a `RecvError` means
+    // every worker is gone.
+    drop(exit_tx);
+
+    // The first worker to leave decides the outcome for all of them: a
+    // graceful shutdown ends them together, and any other exit — an
+    // accept loop failing, a panic unwinding — has to bring the process
+    // down rather than leave it serving on fewer listeners than it
+    // reported binding.
     tokio::task::spawn_blocking(move || {
-        for t in threads {
-            t.join()
-                .map_err(|_| anyhow::anyhow!("tpc worker thread panicked"))??;
-        }
-        Ok(())
+        exit_rx
+            .recv()
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("no proxy worker reported its exit")))
     })
     .await?
 }
 
-/// Listener for the bench-only TPC path: plain bind for "stride" mode,
-/// SO_REUSEPORT (set before bind) for same-port kernel load balancing.
-fn bind_tpc_listener(
-    addr: std::net::SocketAddr,
-    reuseport: bool,
-) -> std::io::Result<std::net::TcpListener> {
-    let domain = if addr.is_ipv4() {
-        socket2::Domain::IPV4
-    } else {
-        socket2::Domain::IPV6
-    };
-    let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
-    socket.set_reuse_address(true)?;
-    if reuseport {
-        socket.set_reuse_port(true)?;
+/// Reports a worker's exit exactly once, including when a panic unwinds
+/// out of it and there is no return value to send.
+struct WorkerExit {
+    tx: std::sync::mpsc::SyncSender<anyhow::Result<()>>,
+    worker: usize,
+    outcome: Option<anyhow::Result<()>>,
+}
+
+impl Drop for WorkerExit {
+    fn drop(&mut self) {
+        let outcome = self.outcome.take().unwrap_or_else(|| {
+            Err(anyhow::anyhow!(
+                "proxy worker {} panicked; see the panic above",
+                self.worker
+            ))
+        });
+        let _ = self.tx.send(outcome);
     }
-    socket.bind(&addr.into())?;
-    socket.listen(1024)?;
-    Ok(socket.into())
+}
+
+/// One thread-per-core worker: its own current-thread runtime, its own
+/// listener, its own upstream connection pool.
+#[allow(clippy::too_many_arguments)]
+fn run_tpc_worker(
+    addr: std::net::SocketAddr,
+    listener: std::net::TcpListener,
+    router: axum::Router,
+    tls_config: Option<axum_server::tls_rustls::RustlsConfig>,
+    idle_timeout: Option<Duration>,
+    cancel: watch::Receiver<bool>,
+    label: &'static str,
+    worker: usize,
+) -> anyhow::Result<()> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    // Every dispatch from this thread now uses this thread's pool, so an
+    // upstream response is read by the same runtime that is waiting for
+    // it. Marked inside the worker because the marker is per thread.
+    aisix_gateway::upstream_tls::mark_worker_thread();
+    rt.block_on(async move {
+        let handle = axum_server::Handle::new();
+        tokio::spawn({
+            let handle = handle.clone();
+            async move {
+                shutdown_signal(cancel, label).await;
+                // `None` = drain without a deadline, as on the shared
+                // runtime: an in-flight LLM stream can run for minutes.
+                handle.graceful_shutdown(None);
+            }
+        });
+
+        let make_service = router.into_make_service_with_connect_info::<std::net::SocketAddr>();
+        match tls_config {
+            None => {
+                tracing::info!(%addr, label, worker, "aisix listening (http, thread-per-core)");
+                let mut server = axum_server::from_tcp(listener).handle(handle);
+                apply_idle_timeout(server.http_builder(), idle_timeout);
+                server.serve(make_service).await?;
+            }
+            Some(tls_config) => {
+                tracing::info!(%addr, label, worker, "aisix listening (https, thread-per-core)");
+                let mut server = axum_server::from_tcp_rustls(listener, tls_config).handle(handle);
+                apply_idle_timeout(server.http_builder(), idle_timeout);
+                server.serve(make_service).await?;
+            }
+        }
+        Ok(())
+    })
+}
+
+/// A listener that shares `addr` with the other workers' listeners.
+///
+/// `SO_REUSEPORT` has to be set before the bind, and every socket on the
+/// address has to set it, which is why this cannot go through
+/// `TcpListener::bind`.
+fn bind_reuseport_listener(addr: std::net::SocketAddr) -> std::io::Result<std::net::TcpListener> {
+    #[cfg(not(unix))]
+    return Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "thread-per-core serving needs SO_REUSEPORT, which this platform \
+         does not have; set proxy.thread_per_core: false",
+    ));
+
+    #[cfg(unix)]
+    {
+        let domain = if addr.is_ipv4() {
+            socket2::Domain::IPV4
+        } else {
+            socket2::Domain::IPV6
+        };
+        let socket =
+            socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+        socket.set_reuse_address(true)?;
+        socket.set_reuse_port(true)?;
+        socket.bind(&addr.into())?;
+        // Matches the backlog `std::net::TcpListener::bind` requests, so
+        // the two modes queue the same number of pending connections per
+        // socket.
+        socket.listen(128)?;
+        Ok(socket.into())
+    }
 }
 
 /// Close an accepted HTTP/1.1 connection that sits idle for `idle_timeout`.

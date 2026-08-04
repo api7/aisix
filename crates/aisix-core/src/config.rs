@@ -393,11 +393,57 @@ pub struct ProxyConfig {
     /// an L7 LB / ingress that sets `x-forwarded-for`.
     #[serde(default)]
     pub real_ip: RealIpConfig,
+    /// Serve the proxy from independent worker threads — each with its
+    /// own runtime, its own `SO_REUSEPORT` listener on `addr`, and its
+    /// own upstream connection pool — instead of one shared runtime
+    /// whose threads hand work to each other.
+    ///
+    /// Omitted, the default, enables it on Linux and disables it
+    /// elsewhere: the kernel spreads incoming connections across
+    /// same-port listeners on Linux, and other platforms do not.
+    /// Set `false` to serve from one shared runtime on any platform.
+    ///
+    /// A request is handled end to end on the thread that accepted it,
+    /// which removes a cross-thread handoff per request. On a small
+    /// number of client connections (fewer than about four per worker)
+    /// the kernel's per-connection spreading can leave workers unevenly
+    /// loaded; throughput at that size may be lower than with a shared
+    /// runtime.
+    ///
+    /// Applied at startup. Changing it requires a restart.
+    #[serde(default)]
+    pub thread_per_core: Option<bool>,
+    /// Number of proxy worker threads.
+    ///
+    /// Omitted, the default, uses the parallelism available to the
+    /// process, which follows the CPU limits applied by a container
+    /// runtime, cgroup, or `taskset`. Must be at least 1.
+    ///
+    /// Applied at startup. Changing it requires a restart.
+    #[serde(default)]
+    pub workers: Option<usize>,
 }
 
 impl ProxyConfig {
     const fn default_body_limit() -> usize {
         0
+    }
+
+    /// Whether the proxy serves from thread-per-core workers, resolving
+    /// the platform default when unset.
+    pub fn thread_per_core_enabled(&self) -> bool {
+        self.thread_per_core.unwrap_or(cfg!(target_os = "linux"))
+    }
+
+    /// Proxy worker-thread count, resolving the default when unset.
+    ///
+    /// `available_parallelism` reports the CPUs this process may actually
+    /// run on, so a cgroup CPU limit or a `taskset` affinity mask sizes
+    /// the pool correctly without the operator restating it here. Falls
+    /// back to 1 on the platforms that cannot report it.
+    pub fn worker_threads(&self) -> usize {
+        self.workers
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
     }
 }
 
@@ -1154,6 +1200,15 @@ impl Config {
             return Err(BootstrapError::Config(format!(
                 "proxy.real_ip.trusted_proxies invalid CIDR/IP: {bad}"
             )));
+        }
+        // Zero workers would bind no listener at all: the proxy would
+        // boot, report healthy, and refuse every connection.
+        if self.proxy.workers == Some(0) {
+            return Err(BootstrapError::Config(
+                "proxy.workers must be at least 1 (omit it to use the \
+                 parallelism available to the process)"
+                    .into(),
+            ));
         }
         // The dedicated metrics listener address must be a bindable
         // socket address — it is always bound when prometheus is enabled.
@@ -2190,5 +2245,82 @@ admin:
         assert_eq!(tls.client_cert_file, "/c.crt");
         assert_eq!(tls.client_key_file, "/c.key");
         assert_eq!(tls.domain_name.as_deref(), Some("etcd.aisix.cloud"));
+    }
+
+    /// Serving topology is a startup decision, so every existing config
+    /// — none of which names it — has to keep loading and resolve to the
+    /// platform's answer.
+    #[test]
+    fn serving_topology_defaults_to_the_platform_answer() {
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://localhost:2379"]
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+"#,
+        );
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert_eq!(cfg.proxy.thread_per_core, None);
+        assert_eq!(cfg.proxy.workers, None);
+        assert_eq!(
+            cfg.proxy.thread_per_core_enabled(),
+            cfg!(target_os = "linux"),
+            "thread-per-core is the default where the kernel spreads \
+             connections across same-port listeners, and only there"
+        );
+        assert_eq!(
+            cfg.proxy.worker_threads(),
+            std::thread::available_parallelism().map_or(1, |n| n.get()),
+        );
+    }
+
+    /// The fallback an operator reaches for when thread-per-core is the
+    /// wrong shape for their traffic. It has to win on every platform,
+    /// including the one where it is also the default.
+    #[test]
+    fn explicit_serving_topology_overrides_the_platform_default() {
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://localhost:2379"]
+proxy:
+  addr: "0.0.0.0:3000"
+  thread_per_core: false
+  workers: 3
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+"#,
+        );
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert_eq!(cfg.proxy.thread_per_core, Some(false));
+        assert!(!cfg.proxy.thread_per_core_enabled());
+        assert_eq!(cfg.proxy.worker_threads(), 3);
+    }
+
+    /// Zero workers would bind no listener and still report a healthy
+    /// boot, so it has to fail at load naming the field to fix.
+    #[test]
+    fn rejects_zero_proxy_workers() {
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://localhost:2379"]
+proxy:
+  addr: "0.0.0.0:3000"
+  workers: 0
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+"#,
+        );
+        let err = Config::load_from_path(Some(f.path()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("proxy.workers"), "unexpected error: {err}");
     }
 }

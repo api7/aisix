@@ -59,6 +59,17 @@ export interface AppOverrides {
    */
   extraEnv?: Record<string, string>;
   /**
+   * `proxy.thread_per_core`. Omitted, the binary picks its platform
+   * default, which is what the suite should normally exercise.
+   *
+   * Pin it to `false` in a test whose subject is per-connection or
+   * per-pool state: with thread-per-core serving the kernel picks which
+   * worker accepts each connection, and each worker keeps its own
+   * upstream pool, so a count taken across two calls depends on that
+   * choice. Pinning keeps such an assertion measuring its own subject.
+   */
+  threadPerCore?: boolean;
+  /**
    * Log level for the spawned binary. Defaults to `warn` — quiet enough
    * that the suite's output stays readable. Tests that assert on a line
    * the gateway emits at `info` (the access log) raise it here.
@@ -118,6 +129,21 @@ const BIN_PATH =
   process.env.AISIX_BIN ?? join(process.cwd(), "..", "..", "target", "debug", "aisix");
 const READY_TIMEOUT_MS = 10_000;
 const SHUTDOWN_GRACE_MS = 3_000;
+
+/**
+ * Suite-wide `proxy.thread_per_core`, from `E2E_THREAD_PER_CORE`, so CI
+ * can run the whole suite in each serving mode. Unset leaves the binary
+ * on its platform default; a per-test `threadPerCore` still wins over
+ * both.
+ *
+ * Every site that spawns the binary has to read this — a spawn site that
+ * ignores it silently stays on one mode forever, and the leg that was
+ * supposed to cover the other one goes green without ever running it.
+ */
+export const suiteThreadPerCore: boolean | undefined =
+  process.env.E2E_THREAD_PER_CORE === undefined
+    ? undefined
+    : process.env.E2E_THREAD_PER_CORE !== "false";
 
 /**
  * Per-test handle to a spawned `aisix` binary. Each call writes a fresh
@@ -211,6 +237,9 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
       addr: `127.0.0.1:${proxyPort}`,
       request_body_limit_bytes: overrides.requestBodyLimitBytes ?? 10485760,
       ...(overrides.realIp ? { real_ip: overrides.realIp } : {}),
+      ...((overrides.threadPerCore ?? suiteThreadPerCore) !== undefined
+        ? { thread_per_core: overrides.threadPerCore ?? suiteThreadPerCore }
+        : {}),
     },
     admin: adminEnabled
       ? { addr: `127.0.0.1:${adminPort}`, admin_keys: [adminKey] }

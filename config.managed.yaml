@@ -44,6 +44,11 @@ proxy:
   # 0 = no request-body cap (the default); set a value to bound
   # per-request memory.
   # request_body_limit_bytes: 0
+  # Serving topology; on for Linux by default. A managed deployment
+  # reaches these through the environment rather than by editing this
+  # file: AISIX_PROXY__THREAD_PER_CORE, AISIX_PROXY__WORKERS.
+  # thread_per_core: true
+  # workers: 4
 
 admin:
   # Bind to an unbindable port so even if managed mode somehow

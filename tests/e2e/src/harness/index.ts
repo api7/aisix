@@ -1,4 +1,4 @@
-export { spawnApp, type SpawnedApp, type AppOverrides } from "./app.js";
+export { spawnApp, suiteThreadPerCore, type SpawnedApp, type AppOverrides } from "./app.js";
 export { AdminClient, waitConfigPropagation, awaitWindowHeadroom } from "./admin.js";
 export { ProxyClient } from "./proxy.js";
 export { EtcdClient } from "./etcd.js";
