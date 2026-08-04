@@ -1065,13 +1065,16 @@ impl Config {
                 // which blows up secrets that happen to contain a
                 // comma with a serde "invalid type: sequence, expected
                 // a string" error. Opt in only for fields that are
-                // actually Vec<String>.
+                // actually sequences.
+                //
+                // EVERY sequence field belongs on this list: the deployed
+                // chart injects gateway config purely through AISIX_* env
+                // vars, so an unregistered key is not merely awkward from
+                // the environment — it fails to deserialize, leaving the
+                // field unreachable in Kubernetes.
                 .list_separator(",")
                 .with_list_parse_key("etcd.endpoints")
                 .with_list_parse_key("admin.admin_keys")
-                // The deployed chart injects gateway config purely through
-                // AISIX_* env vars, so the bucket overrides are unreachable
-                // in Kubernetes without opting their keys into list parsing.
                 .with_list_parse_key("observability.metrics.buckets.request_e2e_latency")
                 .with_list_parse_key("observability.metrics.buckets.request_ttft")
                 .with_list_parse_key("observability.metrics.buckets.guardrail_latency")
