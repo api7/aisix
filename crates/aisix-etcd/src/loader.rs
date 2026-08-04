@@ -91,6 +91,25 @@ impl RejectedEntry {
     }
 }
 
+/// One unknown-field observation from a row that still loaded — the
+/// YELLOW ("partially compatible") state of issue #871. Aggregated per
+/// (kind, field path) with a row count, never per row, so a fleet-wide
+/// additive CP change produces one entry per field instead of one per
+/// resource. Kept apart from [`RejectedEntry`] so YELLOW volume can
+/// never evict RED entries from the retained rejection buffer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartialCompatEntry {
+    /// Resource kind segment as it appears in the etcd key
+    /// (e.g. `api_keys`).
+    pub kind: String,
+    /// Dotted path of the ignored field inside the document
+    /// (e.g. `quota_profile` or `rate_limit.burst`).
+    pub field: String,
+    /// Number of rows of this kind carrying this unknown field in the
+    /// build.
+    pub count: usize,
+}
+
 /// Counts of rejected entries during a build, plus the rejection
 /// list itself. The counts stay handy for metrics; the list is what
 /// the heartbeat sends upstream so the dashboard can show "your DP
@@ -111,6 +130,10 @@ pub struct BuildStats {
     /// upstream provider feeds in; the supervisor caps its retained
     /// buffer separately.
     pub rejections: Vec<RejectedEntry>,
+    /// Unknown-field observations from rows that loaded anyway,
+    /// aggregated per (kind, field path). Empty when every row matched
+    /// its schema exactly.
+    pub partially_compatible: Vec<PartialCompatEntry>,
 }
 
 /// Build a fresh snapshot from raw entries. Never fails — bad rows are
@@ -572,6 +595,49 @@ mod tests {
         let (_snap, stats) = build_snapshot("/aisix", &entries);
         assert_eq!(stats.accepted, 0);
         assert_eq!(stats.schema_rejected, 1);
+    }
+
+    // ---- forward-compat: lenient parse + tri-state (issue #871) ----
+    //
+    // Under the supported rolling-upgrade order (CP first, DPs
+    // behind), an upgraded CP adds a field to a resource and an older
+    // DP receives the document. The DP must load the row with the
+    // unknown field ignored (YELLOW / partially compatible) and report
+    // exactly which field it ignored — not whole-row reject, which
+    // silently drops the resource on the next resync/restart.
+
+    #[test]
+    fn api_key_unknown_field_is_accepted_and_reported_partially_compatible() {
+        let entries = vec![raw(
+            "/aisix/api_keys/k-forward",
+            br#"{
+                "key_hash": "1460db1b6902f8b1fc2a40d9381a24d0fd22c3bc1b2c6f999c521da73776fbe0",
+                "allowed_models": ["my-gpt4"],
+                "quota_profile": "gold"
+            }"#,
+            1,
+        )];
+        let (snap, stats) = build_snapshot("/aisix", &entries);
+
+        // YELLOW: the row loads and serves with the unknown field ignored.
+        assert_eq!(stats.accepted, 1, "rejections: {:?}", stats.rejections);
+        assert_eq!(stats.schema_rejected, 0);
+        assert_eq!(stats.parse_rejected, 0);
+        assert!(stats.rejections.is_empty());
+        assert_eq!(snap.apikeys.len(), 1);
+        let entry = snap.apikeys.get_by_id("k-forward").unwrap();
+        assert_eq!(entry.value.allowed_models, vec!["my-gpt4"]);
+
+        // ...and the ignored field is reported, aggregated per
+        // (kind, field path) with a row count.
+        assert_eq!(
+            stats.partially_compatible,
+            vec![PartialCompatEntry {
+                kind: "api_keys".into(),
+                field: "quota_profile".into(),
+                count: 1,
+            }]
+        );
     }
 
     // ---- renamed-field dual acceptance ----
