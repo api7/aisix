@@ -42,6 +42,7 @@ tower.workspace = true
 tower-http.workspace = true
 http-body-util.workspace = true
 bytes.workspace = true
+regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 # Token-estimation fallback for usage telemetry (token_estimate.rs).

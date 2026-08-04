@@ -60,6 +60,7 @@ mod request_id;
 mod rerank;
 mod responses;
 mod responses_bridge;
+mod rewrite;
 mod routing;
 mod semantic;
 pub mod sse_keepalive;
@@ -100,7 +101,7 @@ static SERVER_HEADER_VALUE: std::sync::LazyLock<HeaderValue> = std::sync::LazyLo
 /// OpenAI-compatible proxy surface.
 pub fn build_router(state: ProxyState) -> Router {
     let body_limit = state.request_body_limit_bytes;
-    Router::new()
+    let router = Router::new()
         .route("/livez", get(livez))
         .route("/readyz", get(readyz))
         .route("/v1/models", get(models::list_models))
@@ -220,13 +221,35 @@ pub fn build_router(state: ProxyState) -> Router {
             header::SERVER,
             SERVER_HEADER_VALUE.clone(),
         ))
-        // Outermost: mint the request id into the request extensions
-        // before any handler/extractor runs, and stamp it onto every
-        // response (including the short-circuited 4xx from the layers
-        // above) so the whole proxy family carries `x-aisix-request-id`
-        // and it equals the telemetry request_id. See request_id.rs.
-        .layer(middleware::from_fn(request_id::ensure_request_id))
-        .with_state(state)
+        .with_state(state.clone());
+
+    // Pre-routing URL rewriting (`proxy.url_rewrites`). `Router::layer`
+    // middleware runs AFTER route matching, so a URI rewritten there could
+    // never change which route matches. Wrapping the whole router as the
+    // fallback of an outer router — whose "routing" trivially resolves to
+    // that fallback — gives the rewrite layer a genuine pre-routing seat:
+    // it mutates the URI, then the inner router matches on the rewritten
+    // path. Built only when rules are configured, so the default path pays
+    // nothing. See rewrite.rs.
+    let router = if state.url_rewrites.is_empty() {
+        router
+    } else {
+        Router::new()
+            .fallback_service(router)
+            .layer(middleware::from_fn_with_state(
+                state,
+                rewrite::rewrite_request_uri,
+            ))
+    };
+
+    // Outermost: mint the request id into the request extensions
+    // before any handler/extractor runs — including the rewrite layer,
+    // whose fired/failed log lines must carry the request span — and
+    // stamp it onto every response (including the short-circuited 4xx
+    // from the layers above) so the whole proxy family carries
+    // `x-aisix-request-id` and it equals the telemetry request_id. See
+    // request_id.rs.
+    router.layer(middleware::from_fn(request_id::ensure_request_id))
 }
 
 async fn record_in_flight_request(
@@ -651,6 +674,7 @@ mod tests {
             addr: "127.0.0.1:0".into(),
             request_body_limit_bytes: 1_048_576,
             real_ip: Default::default(),
+            url_rewrites: Vec::new(),
             tls: None,
         }
     }
@@ -1624,6 +1648,7 @@ mod tests {
             addr: "127.0.0.1:0".into(),
             request_body_limit_bytes: limit,
             real_ip: Default::default(),
+            url_rewrites: Vec::new(),
             tls: None,
         };
         ProxyState::new(handle, hub, &cfg).without_cache()

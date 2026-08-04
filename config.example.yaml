@@ -51,6 +51,23 @@ proxy:
   #   trusted_proxies: ["10.0.0.0/8", "127.0.0.1/32"]
   #   recursive: true
   #   header: x-forwarded-for
+  # Entry-level URL rewriting: map legacy URL shapes onto AISIX endpoints
+  # before routing. The first rule whose `match` regex matches the request
+  # path rewrites it (once, no cascading); the request then flows through
+  # the normal endpoint — auth, ACL, quota — as if the client had sent the
+  # rewritten path. `match` runs against the RAW, percent-encoded path (no
+  # decoding or normalization); `rewrite` replaces the matched portion
+  # ($1/${name} expand capture groups; use ${1}text to follow a group with
+  # literal text); the query string is preserved. Invalid regexes, unknown
+  # group references, and `?`/`#`/whitespace in the template fail startup.
+  # In env-only deployments set the whole list as one JSON array:
+  # AISIX_PROXY__URL_REWRITES='[{"match":"...","rewrite":"..."}]'
+  # Example: serve per-server MCP URLs like /mcp-servers/github/mcp on
+  # the /mcp/{server} endpoint.
+  # url_rewrites:
+  #   - name: per-server-mcp-compat
+  #     match: "^/mcp-servers/([^/]+)/mcp$"
+  #     rewrite: "/mcp/$1"
 
 admin:
   addr: "127.0.0.1:3001"

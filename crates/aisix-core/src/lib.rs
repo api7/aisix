@@ -30,7 +30,7 @@ pub mod wildcard;
 pub use config::{
     AdminConfig, CacheBackend, CacheConfig, ClientTypeRule, Config, EtcdConfig, EtcdTlsConfig,
     HistogramBucketsConfig, ManagedConfig, ObservabilityConfig, ProxyConfig, RateLimitBackend,
-    RateLimitConfig, RealIpConfig, RedisConnConfig, RedisMode, TlsConfig,
+    RateLimitConfig, RealIpConfig, RedisConnConfig, RedisMode, TlsConfig, UrlRewriteRule,
 };
 pub use config_status::{
     hash_bytes, hash_entries, AppliedSnapshot, ConfigMetricsView, ConfigState, ConfigStatus,
