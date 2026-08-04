@@ -202,9 +202,10 @@ async fn dispatch(
     // Resolve the called (server, tool) up front, owned, so it survives the
     // body being consumed when the request is rebuilt. Aggregated: split the
     // namespaced name. Scoped: the server comes from the path and the name is
-    // the upstream's original one — but strip the scope prefix if the caller
-    // sent the namespaced form anyway, mirroring the gateway's own acceptance
-    // of both, so quota and usage attribute the same tool either way.
+    // the upstream's original one — stripped through the same primitive the
+    // gateway parses with (`strip_server_prefix`), so quota and usage
+    // attribute the same tool for both spellings and can never drift from
+    // what actually dispatches.
     let (mcp_server, mcp_tool) = if is_tool_call {
         let name = peek
             .as_ref()
@@ -213,10 +214,7 @@ async fn dispatch(
             .unwrap_or_default();
         match scope {
             Some(server) => {
-                let bare = name
-                    .strip_prefix(server)
-                    .and_then(|rest| rest.strip_prefix(aisix_mcp::TOOL_NAMESPACE_SEPARATOR))
-                    .unwrap_or(name);
+                let bare = aisix_mcp::strip_server_prefix(server, name).unwrap_or(name);
                 (server.to_string(), bare.to_string())
             }
             None => name
@@ -1565,9 +1563,45 @@ mod tests {
         assert_eq!(first.status(), StatusCode::OK);
 
         let second = router
+            .clone()
             .oneshot(scoped_tools_call("alpha", "tool"))
             .await
             .expect("router responds");
         assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        // The namespaced spelling shares the SAME bucket — a client cannot
+        // double its per-server allowance by switching spellings.
+        let prefixed = router
+            .oneshot(scoped_tools_call("alpha", "alpha__tool"))
+            .await
+            .expect("router responds");
+        assert_eq!(prefixed.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn scoped_and_aggregated_endpoints_share_the_per_server_bucket() {
+        // rpm=1 for `alpha`: one call through the aggregated endpoint must
+        // exhaust the allowance for the scoped endpoint too — switching
+        // endpoints cannot double the limit.
+        let snapshot = snapshot_with_mcp_server_limits(&[(
+            "ak-1",
+            TOKEN,
+            serde_json::json!({ "alpha": { "rpm": 1 } }),
+        )]);
+        insert_mcp_server(&snapshot, "mcp-1", "alpha", true);
+        let router = router_with(snapshot);
+
+        let aggregated = router
+            .clone()
+            .oneshot(tools_call_on(TOKEN, "alpha"))
+            .await
+            .expect("router responds");
+        assert_eq!(aggregated.status(), StatusCode::OK);
+
+        let scoped = router
+            .oneshot(scoped_tools_call("alpha", "tool"))
+            .await
+            .expect("router responds");
+        assert_eq!(scoped.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 }

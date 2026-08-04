@@ -249,18 +249,55 @@ async fn scoped_registered_foreign_prefix_fails_closed() {
         McpGateway::from_snapshot_scoped(&snapshot, "alpha").expect("alpha is registered");
     let client = connect(spawn_gateway(gateway).await).await;
 
+    // tools/list keeps the colliding literal name namespaced: advertising
+    // the bare `beta__echo` would advertise a spelling `tools/call` rejects.
+    let tools = client.list_all_tools().await.expect("list tools");
+    let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+    assert_eq!(names, vec!["alpha__beta__echo"], "list must round-trip");
+
     assert!(
         client.call_tool(call("beta__echo", "x")).await.is_err(),
         "a registered foreign prefix must fail closed, never route or serve"
     );
 
-    // The shadowed literal tool stays reachable through its namespaced
-    // spelling: `alpha__beta__echo` strips alpha's own prefix first.
+    // The advertised spelling reaches the literal tool: `alpha__beta__echo`
+    // strips alpha's own prefix first.
     let escaped = client
         .call_tool(call("alpha__beta__echo", "hi"))
         .await
         .expect("the namespaced spelling reaches the literal tool");
     assert_eq!(first_text(&escaped), "alpha:hi");
+}
+
+#[tokio::test]
+async fn scoped_server_name_ending_in_underscore_namespaces_cleanly() {
+    // `data_` is a legal server name (only `__` inside a name is rejected).
+    // Prefix parsing is whole-string based, not first-separator based, so
+    // the namespaced spelling `data___query` (= `data_` + `__` + `query`)
+    // resolves to `query` even while a server named `data` also exists.
+    let upstream = spawn_upstream("data_", "query").await;
+    let snapshot = AisixSnapshot::new();
+    snapshot
+        .mcp_servers
+        .insert(mcp_entry("e1", "data_", &upstream, true));
+    snapshot
+        .mcp_servers
+        .insert(mcp_entry("e2", "data", &upstream, true));
+    let gateway =
+        McpGateway::from_snapshot_scoped(&snapshot, "data_").expect("data_ is registered");
+    let client = connect(spawn_gateway(gateway).await).await;
+
+    let tools = client.list_all_tools().await.expect("list tools");
+    let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+    assert_eq!(names, vec!["query"]);
+
+    let bare = client.call_tool(call("query", "hi")).await.expect("bare");
+    assert_eq!(first_text(&bare), "data_:hi");
+    let namespaced = client
+        .call_tool(call("data___query", "hi"))
+        .await
+        .expect("namespaced spelling of a trailing-underscore server");
+    assert_eq!(first_text(&namespaced), "data_:hi");
 }
 
 #[tokio::test]
@@ -284,9 +321,10 @@ async fn scoped_unregistered_prefix_is_a_bare_name() {
 #[tokio::test]
 async fn scoped_upstream_tool_spelled_like_the_prefix_keeps_precedence() {
     // Pathological upstream: a tool literally named `alpha__echo` on server
-    // `alpha`. Prefix-stripping takes precedence (documented in `call_tool`):
-    // the tool lists as `alpha__echo` and is callable as `alpha__alpha__echo`;
-    // the spelling `alpha__echo` reduces to `echo`, which does not exist.
+    // `alpha`. Prefix-stripping takes precedence (documented in `call_tool`),
+    // so the bare spelling would not round-trip — tools/list therefore keeps
+    // the namespaced `alpha__alpha__echo`, which IS the callable spelling;
+    // `alpha__echo` reduces to `echo`, which does not exist.
     let upstream = spawn_upstream("alpha", "alpha__echo").await;
     let snapshot = snapshot_with_alpha(&upstream);
     let gateway =
@@ -295,13 +333,17 @@ async fn scoped_upstream_tool_spelled_like_the_prefix_keeps_precedence() {
 
     let tools = client.list_all_tools().await.expect("list tools");
     let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
-    assert_eq!(names, vec!["alpha__echo"], "one strip only: {names:?}");
+    assert_eq!(
+        names,
+        vec!["alpha__alpha__echo"],
+        "a non-round-tripping name stays namespaced: {names:?}"
+    );
 
-    let double = client
+    let advertised = client
         .call_tool(call("alpha__alpha__echo", "hi"))
         .await
-        .expect("double-prefixed spelling reaches the literal tool");
-    assert_eq!(first_text(&double), "alpha:hi");
+        .expect("the advertised spelling reaches the literal tool");
+    assert_eq!(first_text(&advertised), "alpha:hi");
 
     assert!(
         client.call_tool(call("alpha__echo", "x")).await.is_err(),
