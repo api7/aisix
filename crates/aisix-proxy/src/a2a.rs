@@ -24,12 +24,13 @@ use std::time::{Duration, Instant};
 use aisix_a2a::{upstream_from_a2a_agent, A2aBridge, A2aError, HttpBridge};
 use aisix_obs::{AccessLog, RequestOutcome, UsageEvent};
 use axum::body::to_bytes;
-use axum::extract::{Path, Request, State};
+use axum::extract::{Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 
 use crate::auth::AuthenticatedKey;
+use crate::reject::AisixPath;
 use crate::request_id::new_request_id;
 use crate::state::ProxyState;
 
@@ -52,7 +53,7 @@ struct JsonRpcPeek {
 /// emitted either way.
 pub async fn a2a_endpoint(
     auth: AuthenticatedKey,
-    Path(agent): Path<String>,
+    AisixPath(agent): AisixPath<String>,
     State(state): State<ProxyState>,
     request: Request,
 ) -> Response {
@@ -216,7 +217,7 @@ async fn dispatch(
 /// callers discover the agent through `/a2a/<agent>`.
 pub async fn a2a_agent_card(
     auth: AuthenticatedKey,
-    Path(agent): Path<String>,
+    AisixPath(agent): AisixPath<String>,
     State(state): State<ProxyState>,
     headers: HeaderMap,
 ) -> Response {

@@ -55,7 +55,7 @@ use aisix_core::resource::ResourceEntry;
 use aisix_core::{Model, ProviderKey};
 use aisix_obs::{AccessLog, RequestOutcome, UsageEvent};
 use axum::body::Body;
-use axum::extract::{Multipart, Path, Query, State};
+use axum::extract::{Multipart, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -66,6 +66,7 @@ use serde_json::Value;
 use crate::auth::AuthenticatedKey;
 use crate::client_ip::ClientContext;
 use crate::error::ProxyError;
+use crate::reject::AisixPath;
 use crate::state::ProxyState;
 
 /// Marker prefix for gateway-minted routed ids.
@@ -928,7 +929,7 @@ pub(crate) async fn get_file(
     State(state): State<ProxyState>,
     auth: AuthenticatedKey,
     client: ClientContext,
-    Path(id): Path<String>,
+    AisixPath(id): AisixPath<String>,
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Response {
@@ -958,7 +959,7 @@ pub(crate) async fn delete_file(
     State(state): State<ProxyState>,
     auth: AuthenticatedKey,
     client: ClientContext,
-    Path(id): Path<String>,
+    AisixPath(id): AisixPath<String>,
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Response {
@@ -988,7 +989,7 @@ pub(crate) async fn file_content(
     State(state): State<ProxyState>,
     auth: AuthenticatedKey,
     client: ClientContext,
-    Path(id): Path<String>,
+    AisixPath(id): AisixPath<String>,
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Response {
@@ -1135,7 +1136,7 @@ pub(crate) async fn get_batch(
     State(state): State<ProxyState>,
     auth: AuthenticatedKey,
     client: ClientContext,
-    Path(id): Path<String>,
+    AisixPath(id): AisixPath<String>,
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Response {
@@ -1205,7 +1206,7 @@ pub(crate) async fn cancel_batch(
     State(state): State<ProxyState>,
     auth: AuthenticatedKey,
     client: ClientContext,
-    Path(id): Path<String>,
+    AisixPath(id): AisixPath<String>,
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Response {
@@ -1378,7 +1379,7 @@ pub(crate) async fn get_ft_job(
     State(state): State<ProxyState>,
     auth: AuthenticatedKey,
     client: ClientContext,
-    Path(id): Path<String>,
+    AisixPath(id): AisixPath<String>,
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Response {
@@ -1408,7 +1409,7 @@ pub(crate) async fn cancel_ft_job(
     State(state): State<ProxyState>,
     auth: AuthenticatedKey,
     client: ClientContext,
-    Path(id): Path<String>,
+    AisixPath(id): AisixPath<String>,
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Response {
