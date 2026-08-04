@@ -108,9 +108,12 @@ impl ScheduleWeekday {
 /// an explicit `dates` list (exactly one selector; the JSON Schema's
 /// injected `oneOf` enforces this — see
 /// [`crate::models::schema::rate_limit_policy_root_schema`]), evaluated
-/// in `timezone`. A window whose `end_time` ≤ `start_time` crosses
-/// midnight and belongs to its **start** day: `days_of_week: [fri],
-/// 22:00 → 09:00` covers Friday 22:00 through Saturday 09:00.
+/// in `timezone`. Time bounds compare as wall-clock minutes:
+/// `start_time < end_time` is a same-day window; `start_time >
+/// end_time` crosses midnight and belongs to its **start** day
+/// (`days_of_week: [fri], 22:00 → 09:00` covers Friday 22:00 through
+/// Saturday 09:00); equal times are an empty window that never
+/// matches.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PolicySchedule {
     /// IANA timezone the window's wall-clock fields are interpreted in
@@ -130,7 +133,8 @@ pub struct PolicySchedule {
     #[schemars(regex(pattern = r"^([01]\d|2[0-3]):[0-5]\d$"))]
     pub start_time: String,
     /// Window end, `HH:MM` wall clock (exclusive); `24:00` = end of
-    /// day. End ≤ start crosses into the following day.
+    /// day. An end before the start crosses into the following day; an
+    /// end equal to the start is an empty window that never matches.
     #[schemars(regex(pattern = r"^([01]\d|2[0-3]):[0-5]\d$|^24:00$"))]
     pub end_time: String,
 }
@@ -184,7 +188,9 @@ impl PolicySchedule {
                     .is_some_and(|yesterday| self.selects_day(yesterday))
                     && minute < end)
         } else {
-            // start == end: rejected at the write path; empty here.
+            // start == end: an empty window (cp-api rejects the shape;
+            // the DP's own write surface admits it and it matches
+            // nothing).
             false
         }
     }
