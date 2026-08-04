@@ -94,13 +94,27 @@ pub(crate) async fn realtime(
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
     client: ClientContext,
-    ws: WebSocketUpgrade,
+    ws: Result<WebSocketUpgrade, axum::extract::ws::rejection::WebSocketUpgradeRejection>,
 ) -> Response {
     let request_id = client.request_id.clone();
     let started = Instant::now();
 
-    match prepare(&state, &params, &headers, &client).await {
-        Ok(prep) => {
+    // A non-WebSocket request (plain GET, malformed upgrade headers, or a
+    // connection that cannot upgrade) used to get axum's bare rejection —
+    // no access log, no usage event, no envelope; the same silent class
+    // #863/#880/#884 collected (#885). Map it into this endpoint's normal
+    // error arm, keeping axum's own status classification (400 vs 426).
+    let outcome = match ws {
+        Ok(ws) => prepare(&state, &params, &headers, &client)
+            .await
+            .map(|prep| (ws, prep)),
+        Err(rejection) => Err(crate::error::ProxyError::WebSocketUpgradeRequired {
+            status: rejection.into_response().status(),
+        }),
+    };
+
+    match outcome {
+        Ok((ws, prep)) => {
             let state2 = state.clone();
             let client2 = client.clone();
             // `on_upgrade` runs the session on a detached task, so the
@@ -1079,5 +1093,84 @@ mod tests {
             .await
             .expect_err("handshake must fail on model ACL");
         assert!(err.to_string().contains("403"), "got: {err}");
+    }
+
+    /// State + router + usage receiver for driving the endpoint's
+    /// REJECTION paths with `oneshot` (no live connection needed — the
+    /// point is that no upgrade happens).
+    fn oneshot_router() -> (axum::Router, tokio::sync::mpsc::Receiver<ObsUsageEvent>) {
+        let (tx, rx) = tokio::sync::mpsc::channel::<ObsUsageEvent>(4);
+        let state = crate::ProxyState::new(
+            SnapshotHandle::new(AisixSnapshot::new()),
+            Arc::new(Hub::new()),
+            &cfg(),
+        )
+        .without_cache()
+        .with_usage_sink(UsageSink::new(tx));
+        (crate::build_router(state), rx)
+    }
+
+    async fn body_json(response: axum::response::Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 16)
+            .await
+            .unwrap_or_default();
+        serde_json::from_slice(&bytes).expect("an error envelope, not a bare rejection body")
+    }
+
+    #[tokio::test]
+    async fn non_websocket_request_is_recorded_and_enveloped() {
+        use tower::ServiceExt as _;
+        // Pre-#885 a plain GET (no upgrade headers) got axum's bare
+        // rejection: nothing in the access log or the usage pipeline. It
+        // now takes this endpoint's normal error arm — envelope + usage
+        // event — keeping axum's 400 classification for bad/missing
+        // upgrade headers.
+        let (router, mut rx) = oneshot_router();
+        let response = router
+            .oneshot(
+                axum::http::Request::get("/v1/realtime")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("router responds");
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+        let json = body_json(response).await;
+        assert_eq!(json["error"]["type"], "websocket_upgrade_required");
+
+        let event = rx.try_recv().expect("the refusal is recorded");
+        assert_eq!(event.status_code, 400);
+        assert_eq!(event.inbound_protocol, "realtime");
+    }
+
+    #[tokio::test]
+    async fn non_upgradable_connection_keeps_its_426() {
+        use tower::ServiceExt as _;
+        // Correct WebSocket headers over a connection that cannot upgrade
+        // (a `oneshot` request carries no hyper upgrade extension) is
+        // axum's ConnectionNotUpgradable — 426 Upgrade Required. The
+        // status must survive the envelope mapping rather than being
+        // flattened to 400.
+        let (router, mut rx) = oneshot_router();
+        let response = router
+            .oneshot(
+                axum::http::Request::get("/v1/realtime")
+                    .header("connection", "upgrade")
+                    .header("upgrade", "websocket")
+                    .header("sec-websocket-version", "13")
+                    .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("router responds");
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::UPGRADE_REQUIRED,
+            "axum's 426 classification must survive"
+        );
+        let json = body_json(response).await;
+        assert_eq!(json["error"]["type"], "websocket_upgrade_required");
+        assert_eq!(rx.try_recv().expect("recorded").status_code, 426);
     }
 }

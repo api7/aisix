@@ -208,6 +208,12 @@ pub enum ProxyError {
     ModelIpRestricted(String),
     #[error("request payload is invalid: {0}")]
     InvalidRequest(String),
+    /// A non-WebSocket request reached the WebSocket-only realtime
+    /// endpoint. Carries the upgrade layer's own classification — 400 for
+    /// malformed upgrade headers, 426 for a connection that cannot
+    /// upgrade — so the refusal keeps the status the protocol expects.
+    #[error("this endpoint requires a WebSocket upgrade")]
+    WebSocketUpgradeRequired { status: StatusCode },
     #[error("no bridge registered for provider")]
     ProviderUnavailable,
     /// Every routing candidate was excluded by the runtime status layer
@@ -287,6 +293,7 @@ impl ProxyError {
             ProxyError::ModelNotFound(_) => StatusCode::NOT_FOUND,
             ProxyError::VideoNotFound(_) => StatusCode::NOT_FOUND,
             ProxyError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
+            ProxyError::WebSocketUpgradeRequired { status } => *status,
             ProxyError::ProviderUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             ProxyError::AllCandidatesUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
             ProxyError::ContentFiltered(_) => StatusCode::UNPROCESSABLE_ENTITY,
@@ -317,6 +324,7 @@ impl ProxyError {
             ProxyError::ModelNotFound(_) => "model_not_found",
             ProxyError::VideoNotFound(_) => "video_not_found",
             ProxyError::InvalidRequest(_) => "invalid_request_error",
+            ProxyError::WebSocketUpgradeRequired { .. } => "websocket_upgrade_required",
             ProxyError::RequestTooLarge { .. } => "invalid_request_error",
             ProxyError::ProviderUnavailable => "provider_unavailable",
             ProxyError::AllCandidatesUnavailable { .. } => "all_candidates_unavailable",
