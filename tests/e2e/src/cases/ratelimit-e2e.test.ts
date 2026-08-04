@@ -139,3 +139,151 @@ describe("rate limit e2e: RPM=1 second call gets 429", () => {
     expect(retryAfterSeconds).toBeLessThanOrEqual(60);
   });
 });
+
+// E2E: RateLimitPolicy.schedules — recurring suspension windows
+// (AISIX-Cloud#1104), driven through etcd exactly as cp-api writes
+// them. Windows are picked relative to "now" so the test is
+// deterministic without waiting for wall-clock boundaries:
+// - an all-week 00:00–24:00 window is always active → suspended
+// - a fixed past date (2000-01-01) never matches → enforced
+// Also pins the upgrade contract: a pre-`schedules` row (field absent)
+// enforces unchanged, and toggling schedules never touches the bucket,
+// so the window's burned count survives a suspend/resume cycle.
+const SCHED_CALLER = "sk-rlp-sched-e2e-caller";
+const SCHED_KEY_ID = "c0000000-0000-0000-0000-000000000011";
+const SCHED_POLICY_ID = "d0000000-0000-0000-0000-000000000011";
+
+describe("rate limit policy schedules e2e (AISIX-Cloud#1104)", () => {
+  let app: SpawnedApp | undefined;
+  let upstream: OpenAiUpstream | undefined;
+  let seed: SeedClient | undefined;
+  let etcdReachable = false;
+
+  const policyDoc = (
+    schedules?: Array<Record<string, unknown>>,
+  ): Record<string, unknown> => ({
+    name: "sched-cap",
+    scope: "api_key",
+    scope_ref: SCHED_KEY_ID,
+    window: "minute",
+    max_requests: 1,
+    // cp-api omits `schedules` when empty so schedule-less rows stay
+    // parseable by pre-`schedules` strict data planes.
+    ...(schedules ? { schedules } : {}),
+  });
+
+  const alwaysOn = [
+    {
+      timezone: "UTC",
+      days_of_week: ["mon", "tue", "wed", "thu", "fri", "sat", "sun"],
+      start_time: "00:00",
+      end_time: "24:00",
+    },
+  ];
+  const neverOn = [
+    {
+      timezone: "UTC",
+      dates: ["2000-01-01"],
+      start_time: "00:00",
+      end_time: "24:00",
+    },
+  ];
+
+  beforeAll(async () => {
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
+    if (!etcdReachable) return;
+
+    upstream = await startOpenAiUpstream();
+    app = await spawnApp();
+    seed = new SeedClient(etcd, app.etcdPrefix);
+
+    const pk = await seed.createProviderKey({
+      display_name: "rlp-sched-pk",
+      secret: "sk-mock",
+      api_base: `${upstream.baseUrl}/v1`,
+    });
+    await seed.createModel({
+      display_name: "rlp-sched",
+      provider: "openai",
+      model_name: "gpt-4o-mini",
+      provider_key_id: pk.id,
+    });
+    // api_key scope matches on the key's etcd entry id, so the key
+    // needs a fixed id — seed it straight to etcd.
+    await etcd.put(
+      `${app.etcdPrefix}/api_keys/${SCHED_KEY_ID}`,
+      JSON.stringify({
+        key_hash: createHash("sha256").update(SCHED_CALLER).digest("hex"),
+        allowed_models: ["rlp-sched"],
+      }),
+    );
+    // Start from the pre-`schedules` shape (field absent).
+    await seed.update("rate_limit_policies", SCHED_POLICY_ID, policyDoc());
+  });
+
+  afterAll(async () => {
+    await app?.exit();
+    await upstream?.close();
+  });
+
+  test("suspension window pauses the policy; leaving it resumes the same bucket", async (ctx) => {
+    if (!etcdReachable || !app || !seed) {
+      ctx.skip();
+      return;
+    }
+
+    const probe = new ProxyClient(app.proxyUrl, SCHED_CALLER);
+    await waitConfigPropagation(async () => {
+      const res = await probe.listModels();
+      if (res.status !== 200) return false;
+      const data = (res.body as { data?: Array<{ id?: string }> }).data ?? [];
+      return data.some((m) => m.id === "rlp-sched");
+    });
+
+    const client = new OpenAI({
+      apiKey: SCHED_CALLER,
+      baseURL: `${app.proxyUrl}/v1`,
+      maxRetries: 0,
+    });
+    const callStatus = async (): Promise<number> => {
+      try {
+        await client.chat.completions.create({
+          model: "rlp-sched",
+          messages: [{ role: "user", content: "hi" }],
+        });
+        return 200;
+      } catch (e) {
+        if (e instanceof APIError) return e.status ?? -1;
+        throw e;
+      }
+    };
+
+    // Keep the burn → suspend → resume sequence inside one fixed
+    // minute window so the final 429 provably reuses the burned count.
+    await awaitWindowHeadroom(30);
+
+    // Pre-`schedules` row enforces: first call burns the single slot.
+    expect(await callStatus()).toBe(200);
+    expect(await callStatus()).toBe(429);
+
+    // Enter a suspension window → propagation lands when a call passes
+    // again. Suspended probes reserve nothing, so counts stay intact.
+    await seed.update(
+      "rate_limit_policies",
+      SCHED_POLICY_ID,
+      policyDoc(alwaysOn),
+    );
+    await waitConfigPropagation(async () => (await callStatus()) === 200);
+
+    // Leave the window (schedule no longer matches). The bucket still
+    // holds the burned slot from this minute, so enforcement resumes
+    // as 429 — suspension must not reset quotas.
+    await seed.update(
+      "rate_limit_policies",
+      SCHED_POLICY_ID,
+      policyDoc(neverOn),
+    );
+    await waitConfigPropagation(async () => (await callStatus()) === 429);
+  });
+});

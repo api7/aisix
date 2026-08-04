@@ -14,6 +14,62 @@
     }
   ],
   "definitions": {
+    "PolicySchedule": {
+      "additionalProperties": false,
+      "description": "One recurring wall-clock window during which the owning policy is suspended (not enforced). Days are selected by `days_of_week` OR by an explicit `dates` list (exactly one selector; the JSON Schema's injected `oneOf` enforces this — see [`crate::models::schema::rate_limit_policy_root_schema`]), evaluated in `timezone`. A window whose `end_time` ≤ `start_time` crosses midnight and belongs to its **start** day: `days_of_week: [fri], 22:00 → 09:00` covers Friday 22:00 through Saturday 09:00.",
+      "oneOf": [
+        {
+          "required": [
+            "days_of_week"
+          ]
+        },
+        {
+          "required": [
+            "dates"
+          ]
+        }
+      ],
+      "properties": {
+        "dates": {
+          "description": "Explicit calendar dates (`YYYY-MM-DD`, in `timezone`) the window opens on — for holidays and other irregular days.",
+          "items": {
+            "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "days_of_week": {
+          "description": "Recurring weekly selector: the window opens on each listed day.",
+          "items": {
+            "$ref": "#/definitions/ScheduleWeekday"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "end_time": {
+          "description": "Window end, `HH:MM` wall clock (exclusive); `24:00` = end of day. End ≤ start crosses into the following day.",
+          "pattern": "^([01]\\d|2[0-3]):[0-5]\\d$|^24:00$",
+          "type": "string"
+        },
+        "start_time": {
+          "description": "Window start, `HH:MM` wall clock (inclusive).",
+          "pattern": "^([01]\\d|2[0-3]):[0-5]\\d$",
+          "type": "string"
+        },
+        "timezone": {
+          "description": "IANA timezone the window's wall-clock fields are interpreted in (e.g. `Asia/Shanghai`).",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "end_time",
+        "start_time",
+        "timezone"
+      ],
+      "type": "object"
+    },
     "PolicyScope": {
       "description": "Subject a [`RateLimitPolicy`] targets, paired with `scope_ref`.",
       "enum": [
@@ -33,6 +89,19 @@
         "hour"
       ],
       "type": "string"
+    },
+    "ScheduleWeekday": {
+      "description": "Day-of-week selector for a [`PolicySchedule`], in the schedule's timezone.",
+      "enum": [
+        "mon",
+        "tue",
+        "wed",
+        "thu",
+        "fri",
+        "sat",
+        "sun"
+      ],
+      "type": "string"
     }
   },
   "properties": {
@@ -49,6 +118,13 @@
     "name": {
       "minLength": 1,
       "type": "string"
+    },
+    "schedules": {
+      "description": "Recurring windows during which this policy is suspended — the quota gate skips it while `now` falls in any listed window and enforcement resumes automatically afterwards (AISIX-Cloud#1104). The counters' bucket key never changes, so suspension does not reset the surrounding window's counts. Empty/absent = always enforced. cp-api omits the field when empty, keeping schedule-less rows parseable by pre-`schedules` strict data planes.",
+      "items": {
+        "$ref": "#/definitions/PolicySchedule"
+      },
+      "type": "array"
     },
     "scope": {
       "$ref": "#/definitions/PolicyScope"

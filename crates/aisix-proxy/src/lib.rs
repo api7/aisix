@@ -3314,6 +3314,162 @@ data: [DONE]\n\n"
         );
     }
 
+    /// A schedule window that always matches "now" (every weekday, all
+    /// day) so suspension is deterministic under the system clock.
+    fn always_on_schedule() -> serde_json::Value {
+        serde_json::json!([{
+            "timezone": "UTC",
+            "days_of_week": ["mon", "tue", "wed", "thu", "fri", "sat", "sun"],
+            "start_time": "00:00",
+            "end_time": "24:00"
+        }])
+    }
+
+    /// A schedule window that can never match (a fixed past date).
+    fn never_on_schedule() -> serde_json::Value {
+        serde_json::json!([{
+            "timezone": "UTC",
+            "dates": ["2000-01-01"],
+            "start_time": "00:00",
+            "end_time": "24:00"
+        }])
+    }
+
+    /// While inside a scheduled suspension window the policy reserves
+    /// nothing; once the schedule no longer matches, enforcement resumes
+    /// on the unchanged bucket (AISIX-Cloud#1104).
+    #[tokio::test]
+    async fn scheduled_suspension_pauses_policy_until_window_closes() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/anything"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("my-video-model"));
+        let policy_json = |schedules: serde_json::Value| {
+            serde_json::json!({
+                "name": "video-cap",
+                "scope": "model",
+                "scope_ref": "model-id-1",
+                "window": "minute",
+                "max_requests": 1,
+                "schedules": schedules
+            })
+        };
+        snap.rate_limit_policies.insert(ResourceEntry::new(
+            "pol-1",
+            serde_json::from_value(policy_json(always_on_schedule())).unwrap(),
+            1,
+        ));
+        snap.apikeys
+            .insert(apikey_entry("sk-caller", &["my-video-model"]));
+        let state = build_state(snap, hub);
+
+        let make_req = || {
+            Request::builder()
+                .method("POST")
+                .uri("/passthrough/openai/anything")
+                .header("authorization", "Bearer sk-caller")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"model":"my-video-model","input":"x"}"#))
+                .unwrap()
+        };
+
+        // Suspended: max_requests=1 would reject the second call — both pass.
+        for _ in 0..2 {
+            let resp = run(build_router(state.clone()), make_req()).await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "suspended policy must not gate requests",
+            );
+        }
+
+        // Swap in a schedule that no longer matches (as the loader does
+        // when the window closes relative to a fresh evaluation).
+        state
+            .snapshot
+            .load()
+            .rate_limit_policies
+            .insert(ResourceEntry::new(
+                "pol-1",
+                serde_json::from_value(policy_json(never_on_schedule())).unwrap(),
+                2,
+            ));
+
+        let resp = run(build_router(state.clone()), make_req()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = run(build_router(state.clone()), make_req()).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "policy must enforce again outside its suspension windows",
+        );
+    }
+
+    /// The routing/ensemble per-target path (`reserve_model_only`)
+    /// iterates the policy table independently of `reserve_layers`, so
+    /// it must honor scheduled suspensions too (AISIX-Cloud#1104).
+    #[tokio::test]
+    async fn reserve_model_only_honors_scheduled_suspension() {
+        let hub = Arc::new(Hub::new());
+        let snap = new_snap("http://127.0.0.1:1");
+        let model = model_entry("mg-member");
+        let target = model.value.clone();
+        snap.models.insert(model);
+        let policy_json = |schedules: serde_json::Value| {
+            serde_json::json!({
+                "name": "member-cap",
+                "scope": "model",
+                "scope_ref": "model-id-1",
+                "window": "minute",
+                "max_requests": 1,
+                "schedules": schedules
+            })
+        };
+        snap.rate_limit_policies.insert(ResourceEntry::new(
+            "pol-1",
+            serde_json::from_value(policy_json(always_on_schedule())).unwrap(),
+            1,
+        ));
+        let state = build_state(snap, hub);
+
+        // Suspended: max_requests=1 would deny the second reservation
+        // (pre_commit counts stick even when the reservation drops
+        // uncommitted) — both succeed because nothing is reserved.
+        for _ in 0..2 {
+            let r = quota::reserve_model_only(&state, "mg-member", "model-id-1", &target).await;
+            assert!(r.is_ok(), "suspended policy must reserve nothing");
+        }
+
+        state
+            .snapshot
+            .load()
+            .rate_limit_policies
+            .insert(ResourceEntry::new(
+                "pol-1",
+                serde_json::from_value(policy_json(never_on_schedule())).unwrap(),
+                2,
+            ));
+
+        assert!(
+            quota::reserve_model_only(&state, "mg-member", "model-id-1", &target)
+                .await
+                .is_ok()
+        );
+        assert!(
+            quota::reserve_model_only(&state, "mg-member", "model-id-1", &target)
+                .await
+                .is_err(),
+            "policy outside its windows must throttle the second reservation",
+        );
+    }
+
     /// The tunnel forwards bodies verbatim, so callers typically name the
     /// provider-native id (`model_name`), not the gateway alias
     /// (`display_name`). The limit must bind either way, and the bucket is
