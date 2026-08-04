@@ -147,12 +147,17 @@ pub(crate) async fn realtime(
             // Count the refusal like every other pre-dispatch rejection
             // (unresolved labels, same as `reject_before_dispatch`) — logs
             // and the request-rate metrics must not disagree about whether
-            // these requests exist.
-            state.metrics.record_request(
-                "unknown",
-                crate::usage_attr::UNRESOLVED_MODEL_LABEL,
+            // these requests exist. Authentication may not have run, so the
+            // caller is attributed only when a key was resolved.
+            crate::request_metrics::record(
+                &state,
+                "/v1/realtime",
+                crate::request_metrics::Caller::unattributed(None),
+                crate::request_metrics::Upstream {
+                    model: crate::usage_attr::UNRESOLVED_MODEL_LABEL,
+                    ..Default::default()
+                },
                 status,
-                RequestOutcome::from_status(status),
                 started.elapsed(),
             );
             crate::usage_attr::emit_error_usage_event(
