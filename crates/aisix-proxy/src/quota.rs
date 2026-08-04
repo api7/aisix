@@ -177,8 +177,15 @@ async fn reserve_layers(
 
     // Layer 4+: Rate limit policies from snapshot.
     let snap = state.snapshot.load();
+    let now = chrono::Utc::now();
     for entry in snap.rate_limit_policies.entries() {
         let policy = &entry.value;
+        // Inside a scheduled suspension window the policy reserves
+        // nothing; enforcement resumes automatically when the window
+        // closes, on the unchanged bucket (AISIX-Cloud#1104).
+        if policy.suspended_at(now) {
+            continue;
+        }
         let applies = match policy.scope {
             PolicyScope::ApiKey => policy.scope_ref == auth.entry.id,
             PolicyScope::Model => model_rl.is_some_and(|m| policy.scope_ref == m.entry_id),
@@ -316,9 +323,13 @@ pub(crate) async fn reserve_model_only(
     // `model`-scope rate-limit policies for this model. (model scope never
     // buckets per-user, so the base bucket key suffices — no auth needed.)
     let snap = state.snapshot.load();
+    let now = chrono::Utc::now();
     for entry in snap.rate_limit_policies.entries() {
         let policy = &entry.value;
-        if policy.scope != PolicyScope::Model || policy.scope_ref != model_entry_id {
+        if policy.scope != PolicyScope::Model
+            || policy.scope_ref != model_entry_id
+            || policy.suspended_at(now)
+        {
             continue;
         }
         let rl = policy_to_rate_limit(policy);

@@ -1037,12 +1037,22 @@ fn branch_kind(branch: &serde_json::Map<String, Value>) -> Option<&str> {
 /// ([`super::rate_limit_policy::rate_limit_policy_any_of`]).
 pub fn rate_limit_policy_root_schema() -> Value {
     let mut schema = struct_root_schema::<crate::models::RateLimitPolicy>(false);
-    schema
+    let obj = schema
         .as_object_mut()
-        .expect("rate_limit_policy root schema is a JSON object")
+        .expect("rate_limit_policy root schema is a JSON object");
+    obj.insert(
+        "anyOf".to_string(),
+        super::rate_limit_policy::rate_limit_policy_any_of(),
+    );
+    // The schedule day-selector XOR is the same kind of cross-field
+    // invariant, one level down in the definitions.
+    obj.get_mut("definitions")
+        .and_then(|d| d.get_mut("PolicySchedule"))
+        .and_then(Value::as_object_mut)
+        .expect("rate_limit_policy schema defines PolicySchedule")
         .insert(
-            "anyOf".to_string(),
-            super::rate_limit_policy::rate_limit_policy_any_of(),
+            "oneOf".to_string(),
+            super::rate_limit_policy::policy_schedule_one_of(),
         );
     schema
 }
