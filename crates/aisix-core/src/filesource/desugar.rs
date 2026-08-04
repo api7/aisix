@@ -228,16 +228,16 @@ pub(crate) fn desugar_rate_limit_policy(
     if let Some(conditions) = obj.get_mut("conditions") {
         desugar_condition_nodes(conditions, maps, 0)?;
     }
-    let scope_kind = match obj.get("scope").and_then(Value::as_str) {
-        Some("api_key") => "api_keys",
-        Some("model") => "models",
+    let (scope_kind, label) = match obj.get("scope").and_then(Value::as_str) {
+        Some("api_key") => ("api_keys", "api key"),
+        Some("model") => ("models", "model"),
         _ => return Ok(()),
     };
     let Some(name) = obj.get("scope_ref").and_then(Value::as_str) else {
         // Missing / non-string scope_ref: canonical validation reports it.
         return Ok(());
     };
-    let resolved = resolve_entity_name(maps, scope_kind, name, "`scope_ref`")?;
+    let resolved = resolve_entity_name(maps, scope_kind, label, name, "`scope_ref`")?;
     obj.insert("scope_ref".into(), Value::String(resolved));
     Ok(())
 }
@@ -245,6 +245,7 @@ pub(crate) fn desugar_rate_limit_policy(
 fn resolve_entity_name(
     maps: &IdentityMaps,
     kind: &str,
+    label: &str,
     name: &str,
     field: &str,
 ) -> Result<String, String> {
@@ -253,12 +254,7 @@ fn resolve_entity_name(
         .cloned()
         .ok_or_else(|| {
             format!(
-                "{field} references unknown {} {name:?} ({})",
-                if kind == "api_keys" {
-                    "api key"
-                } else {
-                    "model"
-                },
+                "{field} references unknown {label} {name:?} ({})",
                 known_names(maps, kind)
             )
         })
@@ -289,27 +285,20 @@ fn desugar_condition_nodes(
             desugar_condition_nodes(children, maps, depth + 1)?;
             continue;
         }
-        let kind = match obj.get("dimension").and_then(Value::as_str) {
-            Some("api_key") => "api_keys",
-            Some("model") => "models",
+        let (kind, label) = match obj.get("dimension").and_then(Value::as_str) {
+            Some("api_key") => ("api_keys", "api key"),
+            Some("model") => ("models", "model"),
             _ => continue,
         };
-        let field = format!(
-            "`conditions` {} value",
-            if kind == "api_keys" {
-                "api_key"
-            } else {
-                "model"
-            }
-        );
+        let field = format!("`conditions` {label} value");
         match obj.get_mut("value") {
             Some(Value::String(name)) => {
-                *name = resolve_entity_name(maps, kind, name, &field)?;
+                *name = resolve_entity_name(maps, kind, label, name, &field)?;
             }
             Some(Value::Array(values)) => {
                 for value in values {
                     if let Value::String(name) = value {
-                        *name = resolve_entity_name(maps, kind, name, &field)?;
+                        *name = resolve_entity_name(maps, kind, label, name, &field)?;
                     }
                 }
             }

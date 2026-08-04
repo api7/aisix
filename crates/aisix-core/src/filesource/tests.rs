@@ -227,9 +227,12 @@ fn conditional_policy_with_unknown_model_name_is_a_load_error() {
     // Same contract as scope_ref: a typo in a conditions model
     // reference must fail the load, never become a silently-dead leaf.
     let file = r#"
+_format_version: "1"
+
 provider_keys:
   - display_name: pk
-    secret: sk-x
+    provider: openai
+    api_key: sk-x
 models:
   - display_name: gpt-4o
     provider: openai
@@ -244,9 +247,11 @@ rate_limit_policies:
     limits:
       rpm: 5
 "#;
-    let err = load(file, &env_of(&[])).unwrap_err();
-    let msg = format!("{err:?}");
-    assert!(msg.contains("no-such-model"), "{msg}");
+    let errors = errors_of(load(file, &env_of(&[])));
+    // Exactly one error: the dangling reference itself, so the test
+    // proves the unknown-model leaf alone fails the load.
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].contains("no-such-model"), "{errors:?}");
 }
 
 #[test]

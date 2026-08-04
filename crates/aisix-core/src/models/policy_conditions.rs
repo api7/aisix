@@ -22,6 +22,11 @@
 //! - a leaf whose dimension the request does not carry is `false`, even
 //!   under `negate` — a request missing the dimension belongs to
 //!   neither the set nor its complement; OR siblings can still match;
+//!   note this guarantee is leaf-level only: a **negated group** over
+//!   model-property leaves evaluates `true` on model-less requests
+//!   (children all false → `!OR`/`!AND` flips it), exactly like
+//!   lua-resty-expr — "everything except gpt-4" written as `!(...)`
+//!   deliberately includes MCP/A2A traffic;
 //! - groups short-circuit (AND on the first false child, OR on the
 //!   first true child);
 //! - regexes are compiled once per distinct pattern into a process-wide
@@ -473,16 +478,30 @@ fn eval_leaf(leaf: &PolicyCondition, input: &ConditionInput<'_>) -> bool {
     raw != leaf.negate
 }
 
-/// Process-wide compiled-regex cache, keyed by `(pattern,
-/// case_insensitive)`. Bounded in practice by the distinct patterns
+/// Process-wide compiled-regex caches, one per case-sensitivity
+/// variant so the hot-path lookup borrows the pattern (`&str`) without
+/// allocating a key. Bounded in practice by the distinct patterns
 /// across configured policies; entries for retired patterns are
 /// harmless. `None` is cached for uncompilable patterns so a bad
 /// pattern costs one compile attempt, not one per request.
 type CachedRegex = Option<Arc<regex::Regex>>;
-static REGEX_CACHE: Lazy<DashMap<(String, bool), CachedRegex>> = Lazy::new(DashMap::new);
+static REGEX_CACHE_CS: Lazy<DashMap<String, CachedRegex>> = Lazy::new(DashMap::new);
+static REGEX_CACHE_CI: Lazy<DashMap<String, CachedRegex>> = Lazy::new(DashMap::new);
+
+/// Hard cap per cache. Only distinct configured patterns can insert
+/// (request payloads never reach here), so this is a slow-leak backstop
+/// for long-lived processes whose policies churn patterns — same spirit
+/// as OpenResty's `lua_regex_cache_max_entries` (1024). Blowing the cap
+/// clears the map; live patterns recompile once on next use.
+const REGEX_CACHE_MAX_ENTRIES: usize = 1024;
 
 fn compiled_regex(pattern: &str, case_insensitive: bool) -> Option<Arc<regex::Regex>> {
-    if let Some(hit) = REGEX_CACHE.get(&(pattern.to_string(), case_insensitive)) {
+    let cache = if case_insensitive {
+        &REGEX_CACHE_CI
+    } else {
+        &REGEX_CACHE_CS
+    };
+    if let Some(hit) = cache.get(pattern) {
         return hit.clone();
     }
     let compiled = regex::RegexBuilder::new(pattern)
@@ -490,7 +509,10 @@ fn compiled_regex(pattern: &str, case_insensitive: bool) -> Option<Arc<regex::Re
         .build()
         .ok()
         .map(Arc::new);
-    REGEX_CACHE.insert((pattern.to_string(), case_insensitive), compiled.clone());
+    if cache.len() >= REGEX_CACHE_MAX_ENTRIES {
+        cache.clear();
+    }
+    cache.insert(pattern.to_string(), compiled.clone());
     compiled
 }
 

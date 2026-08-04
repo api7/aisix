@@ -194,13 +194,31 @@ fn match_conditional_layer(
             continue;
         }
         let value = input.get_group_by(dim)?;
-        bucket_key = format!("{bucket_key}:{dim}={value}");
+        bucket_key = format!("{bucket_key}:{dim}={}", escape_bucket_segment(value));
     }
     let limits = policy.limits.clone()?;
     if limits.is_unrestricted() {
         return None;
     }
     Some(PolicyLayer { bucket_key, limits })
+}
+
+/// Escape a `group_by` segment value for the bucket key. CP-written
+/// values are UUIDs/catalog ids and pass through untouched; the file
+/// source lets operators pick arbitrary team/member id strings, where
+/// an embedded `:` or `=` could otherwise alias two distinct value
+/// tuples onto one bucket (`team="t:member=x"` vs `member="x"`).
+fn escape_bucket_segment(value: &str) -> std::borrow::Cow<'_, str> {
+    if value.contains([':', '=', '%']) {
+        std::borrow::Cow::Owned(
+            value
+                .replace('%', "%25")
+                .replace(':', "%3A")
+                .replace('=', "%3D"),
+        )
+    } else {
+        std::borrow::Cow::Borrowed(value)
+    }
 }
 
 /// Convert a classic row's `window` + `max_*` into the 7-field
@@ -319,6 +337,22 @@ async fn reserve_layers(
     let phase = PolicyPhase::Request {
         defer_model_properties: model_rl.is_some_and(|m| m.routing_parent),
     };
+    reserve_policy_layers(state, &input, phase, &mut reservations).await?;
+
+    Ok(MultiReservation::new(reservations))
+}
+
+/// Scan the policy table once for the given phase and reserve every
+/// applicable layer. Shared by the request gate ([`reserve_layers`])
+/// and the per-target gate ([`reserve_model_only`]) so the two scans
+/// cannot drift (the schedules gate had to be patched into both loops
+/// once already — AISIX-Cloud#1104).
+async fn reserve_policy_layers(
+    state: &ProxyState,
+    input: &ConditionInput<'_>,
+    phase: PolicyPhase,
+    reservations: &mut Vec<aisix_ratelimit::Reservation>,
+) -> Result<(), ProxyError> {
     let snap = state.snapshot.load();
     let now = chrono::Utc::now();
     for entry in snap.rate_limit_policies.entries() {
@@ -329,7 +363,7 @@ async fn reserve_layers(
         if policy.suspended_at(now) {
             continue;
         }
-        let Some(layer) = match_policy_layer(policy, &entry.id, &input, phase) else {
+        let Some(layer) = match_policy_layer(policy, &entry.id, input, phase) else {
             continue;
         };
         let r = state
@@ -339,8 +373,7 @@ async fn reserve_layers(
             .map_err(|e| reject(state, e, "policy", Some((&entry.id, &policy.name))))?;
         reservations.push(r);
     }
-
-    Ok(MultiReservation::new(reservations))
+    Ok(())
 }
 
 /// Convert a store-level rejection into the surfaced [`ProxyError`],
@@ -480,24 +513,7 @@ pub(crate) async fn reserve_model_only(
 
     // Policies that follow the model to this target.
     let input = condition_input(auth, Some(&mrl));
-    let snap = state.snapshot.load();
-    let now = chrono::Utc::now();
-    for entry in snap.rate_limit_policies.entries() {
-        let policy = &entry.value;
-        if policy.suspended_at(now) {
-            continue;
-        }
-        let Some(layer) = match_policy_layer(policy, &entry.id, &input, PolicyPhase::ModelTarget)
-        else {
-            continue;
-        };
-        let r = state
-            .limiter
-            .pre_commit(&layer.bucket_key, &layer.limits)
-            .await
-            .map_err(|e| reject(state, e, "policy", Some((&entry.id, &policy.name))))?;
-        reservations.push(r);
-    }
+    reserve_policy_layers(state, &input, PolicyPhase::ModelTarget, &mut reservations).await?;
 
     Ok(MultiReservation::new(reservations))
 }

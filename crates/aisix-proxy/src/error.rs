@@ -277,8 +277,11 @@ pub enum ProxyError {
     /// A policy-layer rate-limit rejection carrying the offending
     /// policy's identity (AISIX-Cloud#892). Same status/type/headers as
     /// [`Self::RateLimit`]; the envelope adds `error.policy` so a
-    /// caller hitting one of several live policies can tell which.
-    #[error("{source}")]
+    /// caller hitting one of several live policies can tell which. The
+    /// Display form names the policy too, so every path that flattens
+    /// this error into a message (routing attempt records, mid-stream
+    /// failover, ensemble logs) keeps the attribution.
+    #[error("{source} (policy '{policy_name}')")]
     PolicyRateLimit {
         source: RateLimitError,
         policy_id: String,

@@ -1217,6 +1217,11 @@ async fn dispatch(
             virtual_entry.value.routing.is_some() || virtual_entry.value.is_semantic();
         let mut stream_routing = RoutingTelemetry::default();
         let mut last_err: Option<BridgeError> = None;
+        // The un-flattened per-target quota rejection, kept only while it
+        // is the loop's LATEST failure: on exhaustion it is surfaced
+        // instead of its flattened BridgeError twin so the 429 keeps the
+        // structured `error.policy` attribution (AISIX-Cloud#892).
+        let mut last_reserve_reject: Option<ProxyError> = None;
 
         struct StreamWin {
             model: aisix_core::Model,
@@ -1248,16 +1253,19 @@ async fn dispatch(
         'targets: for (target_idx, attempt) in attempt_models.iter().enumerate() {
             let model = &attempt.model;
             let Ok(provider) = crate::dispatch::require_provider(model) else {
+                last_reserve_reject = None;
                 last_err = Some(BridgeError::Config("model has no provider".into()));
                 continue 'targets;
             };
             let Ok(pk_entry) = crate::dispatch::resolve_provider_key(&snapshot, model) else {
+                last_reserve_reject = None;
                 last_err = Some(BridgeError::Config(
                     "model references unknown provider_key_id".into(),
                 ));
                 continue 'targets;
             };
             let Some(bridge) = crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value) else {
+                last_reserve_reject = None;
                 last_err = Some(BridgeError::Config(
                     "no bridge registered for provider_key".into(),
                 ));
@@ -1327,7 +1335,10 @@ async fn dispatch(
                 )
                 .await
                 {
-                    Ok(r) => r,
+                    Ok(r) => {
+                        last_reserve_reject = None;
+                        r
+                    }
                     Err(e) => {
                         stream_routing.attempts.push(AttemptRecord {
                             index: idx,
@@ -1352,6 +1363,12 @@ async fn dispatch(
                             ),
                             crate::quota::retry_after_of(&e).map(Duration::from_secs),
                         ));
+                        // Only the policy-layer rejection is worth
+                        // surfacing un-flattened (it carries the
+                        // `error.policy` attribution); the inline model
+                        // layer keeps the established flattened shape.
+                        last_reserve_reject =
+                            matches!(e, ProxyError::PolicyRateLimit { .. }).then_some(e);
                         continue 'targets;
                     }
                 };
@@ -1463,6 +1480,7 @@ async fn dispatch(
                         // timeout — see `RetryBudget::covers`. Fail-over is
                         // unaffected: the outer loop still moves on.
                         let budget_covers = budget.covers(&err);
+                        last_reserve_reject = None;
                         last_err = Some(err);
                         if !retryable {
                             break 'targets;
@@ -1489,6 +1507,13 @@ async fn dispatch(
         }
 
         let Some(won) = won else {
+            // When the loop's LAST failure was a per-target quota
+            // rejection, surface the un-flattened ProxyError: same 429 +
+            // Retry-After as the BridgeError twin, plus the structured
+            // `error.policy` attribution (AISIX-Cloud#892).
+            if let Some(e) = last_reserve_reject {
+                return Err(with_model(e).with_routing(stream_routing));
+            }
             let err = last_err.unwrap_or_else(|| {
                 BridgeError::Config("streaming routing exhausted with no targets".into())
             });
@@ -2247,6 +2272,9 @@ async fn dispatch(
     // to later targets only after retries are exhausted. Non-retryable
     // (non-429 4xx) errors stop immediately.
     let mut last_err: Option<BridgeError> = None;
+    // See the streaming loop: latest per-target quota rejection, surfaced
+    // un-flattened on exhaustion for `error.policy` attribution (#892).
+    let mut last_reserve_reject: Option<ProxyError> = None;
     let mut chosen_provider: Option<String> = None;
     let mut chosen_provider_key_id: Option<String> = None;
     let mut chosen_upstream_model: Option<String> = None;
@@ -2279,12 +2307,14 @@ async fn dispatch(
     'targets: for (target_idx, attempt) in attempt_models.iter().enumerate() {
         let model = &attempt.model;
         let Some(provider) = model.provider.as_deref() else {
+            last_reserve_reject = None;
             last_err = Some(BridgeError::Config("model has no provider".into()));
             continue;
         };
         let pk_entry = match crate::dispatch::resolve_provider_key(&snapshot, model) {
             Ok(pk) => pk,
             Err(_) => {
+                last_reserve_reject = None;
                 last_err = Some(BridgeError::Config(
                     "model references unknown provider_key_id".into(),
                 ));
@@ -2297,6 +2327,7 @@ async fn dispatch(
         // is gone after #302 Phase A; a PK that matches neither tier is
         // a misconfiguration and surfaces as 503.
         let Some(bridge) = crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value) else {
+            last_reserve_reject = None;
             last_err = Some(BridgeError::Config(format!(
                 "no bridge registered for provider_key provider={:?} adapter={:?}",
                 pk_entry.value.provider, pk_entry.value.adapter
@@ -2360,7 +2391,10 @@ async fn dispatch(
             )
             .await
             {
-                Ok(r) => r,
+                Ok(r) => {
+                    last_reserve_reject = None;
+                    r
+                }
                 Err(e) => {
                     routing.attempts.push(AttemptRecord {
                         index: attempt_index,
@@ -2385,6 +2419,12 @@ async fn dispatch(
                         ),
                         crate::quota::retry_after_of(&e).map(Duration::from_secs),
                     ));
+                    // Only the policy-layer rejection is worth surfacing
+                    // un-flattened (it carries the `error.policy`
+                    // attribution); the inline model layer keeps the
+                    // established flattened shape.
+                    last_reserve_reject =
+                        matches!(e, ProxyError::PolicyRateLimit { .. }).then_some(e);
                     continue 'targets;
                 }
             };
@@ -2467,6 +2507,7 @@ async fn dispatch(
                     // same-target retries for timeouts. Fail-over is
                     // unaffected.
                     let budget_covers = budget.covers(&err);
+                    last_reserve_reject = None;
                     last_err = Some(err);
                     if !retryable {
                         break;
@@ -2502,6 +2543,11 @@ async fn dispatch(
     }
 
     let Some(mut upstream) = upstream else {
+        // Prefer the un-flattened quota rejection when it was the last
+        // failure — keeps `error.policy` attribution (AISIX-Cloud#892).
+        if let Some(e) = last_reserve_reject {
+            return Err(with_model(e).with_routing(routing));
+        }
         // Bubble the most recent BridgeError through ProxyError::Bridge.
         let err = last_err.unwrap_or_else(|| {
             BridgeError::Config("routing exhausted with no targets attempted".into())

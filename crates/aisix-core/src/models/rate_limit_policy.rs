@@ -582,6 +582,20 @@ mod tests {
         .unwrap();
         assert!(empty_limits.validate_semantics().is_err());
 
+        // Conditional markers without `limits` (the form discriminator).
+        let limitless: RateLimitPolicy = serde_json::from_value(json!({
+            "name": "limitless",
+            "conditions": [
+                { "dimension": "team", "operator": "==", "value": "t-1" }
+            ],
+            "group_by": ["member"]
+        }))
+        .unwrap();
+        assert!(limitless
+            .validate_semantics()
+            .unwrap_err()
+            .contains("requires `limits`"));
+
         let dup_group_by: RateLimitPolicy = serde_json::from_value(json!({
             "name": "dup",
             "group_by": ["team", "team"],

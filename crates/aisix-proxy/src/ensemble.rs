@@ -155,7 +155,12 @@ impl ModelCaller for ProxyModelCaller<'_> {
         let reservation =
             crate::quota::reserve_model_only(self.state, self.auth, target, &entry.id, model)
                 .await
-                .map_err(|_| {
+                .map_err(|e| {
+                    // Client-visible message stays generic; the cause
+                    // (which layer / which policy fired) goes to the
+                    // logs so an operator can attribute the throttled
+                    // member.
+                    tracing::warn!(member = %target, error = %e, "ensemble sub-call rate limited");
                     BridgeError::upstream_status(
                         429,
                         "rate limit exceeded for an ensemble sub-call",
