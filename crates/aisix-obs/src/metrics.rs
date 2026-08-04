@@ -183,22 +183,135 @@ pub const M_CONFIG_APPLIED_REVISION: &str = "aisix_config_applied_revision";
 pub const M_CONFIG_HASH_INFO: &str = "aisix_config_hash_info";
 pub const M_CONFIG_SOURCE_CONNECTED: &str = "aisix_config_source_connected";
 
-/// Bucket edges for the two SLO histograms, spanning LLM latency ranges:
-/// sub-100ms cache hits / TTFT through multi-minute long generations.
-/// 14 edges → 15 `_bucket` series per label combination; keep
+/// Default bucket edges for [`M_REQUEST_E2E_LATENCY_SECONDS`], spanning the
+/// full client-perceived range: a millisecond-scale rejection or cache hit
+/// through a multi-minute generation. The low edges earn their keep here —
+/// requests refused before dispatch and cache hits really do return in
+/// single-digit milliseconds — and the 420/600 s edges keep
+/// `histogram_quantile()` interpolating instead of pinning P99 at the top
+/// edge, since `upstream.timeout_ms` allows far longer requests.
+/// 17 edges → 18 `_bucket` series per label combination; keep
 /// [`LatencyLabels`] lean before adding edges.
-pub const LATENCY_HISTOGRAM_BUCKETS: &[f64] = &[
-    0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0,
+pub const DEFAULT_E2E_LATENCY_BUCKETS: &[f64] = &[
+    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 420.0,
+    600.0,
 ];
 
-/// Bucket edges for [`M_GUARDRAIL_LATENCY_SECONDS`] — shifted an order of
-/// magnitude below the SLO buckets: local (keyword/pii) checks run in
-/// microseconds, the added-latency budget under scrutiny is ~50 ms
-/// (AISIX-Cloud#1076), and remote guardrail timeouts default to 5 s. The
-/// 30 s top edge outlives any configurable guardrail timeout.
-pub const GUARDRAIL_LATENCY_BUCKETS: &[f64] = &[
+/// Default bucket edges for [`M_REQUEST_TTFT_SECONDS`] (AISIX-Cloud#1226).
+/// Deliberately NOT the same set as [`DEFAULT_E2E_LATENCY_BUCKETS`]: this
+/// histogram observes the *upstream* time-to-first-token, so a request the
+/// gateway answers itself (cache hit, pre-dispatch rejection) never lands
+/// here at all and the millisecond edges stay empty forever against a
+/// hosted provider — one dead series per label combination each. The floor
+/// stays at 50 ms rather than higher so a co-located self-hosted upstream
+/// (vLLM / Ollama) remains distinguishable; deployments that only ever call
+/// hosted providers can raise it via `observability.metrics.buckets`.
+/// The top edge stays at 300 s where the e2e set continues to 600 s:
+/// time-to-*first*-token beyond five minutes is not a range worth two more
+/// permanently-empty series.
+pub const DEFAULT_TTFT_BUCKETS: &[f64] = &[
+    0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0,
+];
+
+/// Default bucket edges for [`M_GUARDRAIL_LATENCY_SECONDS`] — shifted an
+/// order of magnitude below the request-latency sets: local (keyword/pii)
+/// checks run in microseconds, the added-latency budget under scrutiny is
+/// ~50 ms (AISIX-Cloud#1076), and remote guardrail timeouts default to 5 s.
+/// The 30 s top edge outlives any configurable guardrail timeout.
+pub const DEFAULT_GUARDRAIL_LATENCY_BUCKETS: &[f64] = &[
     0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
 ];
+
+/// Resolved bucket edges for the three real (non-summary) histograms,
+/// each either the default above or an operator override from
+/// `observability.metrics.buckets` (AISIX-Cloud#1226).
+///
+/// Every edge here costs one `_bucket` time series **per label
+/// combination** on a metric labelled by endpoint × model × provider ×
+/// status_class × streaming, so an override is a cardinality decision as
+/// much as a resolution one.
+#[derive(Debug, Clone)]
+pub struct HistogramBuckets {
+    pub request_e2e_latency: Vec<f64>,
+    pub request_ttft: Vec<f64>,
+    pub guardrail_latency: Vec<f64>,
+}
+
+impl Default for HistogramBuckets {
+    fn default() -> Self {
+        Self {
+            request_e2e_latency: DEFAULT_E2E_LATENCY_BUCKETS.to_vec(),
+            request_ttft: DEFAULT_TTFT_BUCKETS.to_vec(),
+            guardrail_latency: DEFAULT_GUARDRAIL_LATENCY_BUCKETS.to_vec(),
+        }
+    }
+}
+
+impl HistogramBuckets {
+    /// Upper bound on operator-supplied edges. Prometheus wants a bucket
+    /// count in the tens, not the hundreds; the built-in sets use 12–17.
+    pub const MAX_EDGES: usize = 64;
+
+    /// Resolve `observability.metrics.buckets`, falling back to the
+    /// defaults per metric. Errors are boot-fatal by design: a silently
+    /// ignored override would leave the deployment reading quantiles off
+    /// bucket edges it did not choose.
+    pub fn from_config(cfg: &aisix_core::HistogramBucketsConfig) -> Result<Self, String> {
+        Ok(Self {
+            request_e2e_latency: resolve_edges(
+                "request_e2e_latency",
+                cfg.request_e2e_latency.as_deref(),
+                DEFAULT_E2E_LATENCY_BUCKETS,
+            )?,
+            request_ttft: resolve_edges(
+                "request_ttft",
+                cfg.request_ttft.as_deref(),
+                DEFAULT_TTFT_BUCKETS,
+            )?,
+            guardrail_latency: resolve_edges(
+                "guardrail_latency",
+                cfg.guardrail_latency.as_deref(),
+                DEFAULT_GUARDRAIL_LATENCY_BUCKETS,
+            )?,
+        })
+    }
+}
+
+/// Validate one override list, or hand back the default when unset.
+/// `+Inf` is rejected rather than tolerated: the exporter appends it
+/// itself, so accepting one here would emit a duplicate `le="+Inf"`.
+fn resolve_edges(field: &str, edges: Option<&[f64]>, default: &[f64]) -> Result<Vec<f64>, String> {
+    let Some(edges) = edges else {
+        return Ok(default.to_vec());
+    };
+    let ctx = format!("observability.metrics.buckets.{field}");
+    if edges.is_empty() {
+        return Err(format!("{ctx}: must list at least one bucket edge"));
+    }
+    if edges.len() > HistogramBuckets::MAX_EDGES {
+        return Err(format!(
+            "{ctx}: {} edges exceed the limit of {}",
+            edges.len(),
+            HistogramBuckets::MAX_EDGES
+        ));
+    }
+    for (i, &edge) in edges.iter().enumerate() {
+        if !edge.is_finite() || edge <= 0.0 {
+            return Err(format!(
+                "{ctx}[{i}]: {edge} must be a finite positive number of seconds \
+                 (the +Inf bucket is added automatically)"
+            ));
+        }
+        if i > 0 && edge <= edges[i - 1] {
+            return Err(format!(
+                "{ctx}[{i}]: {edge} must be greater than the preceding edge {} \
+                 — bucket edges are cumulative and must strictly ascend",
+                edges[i - 1]
+            ));
+        }
+    }
+    Ok(edges.to_vec())
+}
 
 /// Holds an isolated `PrometheusRecorder` plus its render handle.
 /// `metrics::*` macros talk to whatever recorder is in scope; we use
@@ -447,6 +560,12 @@ impl Metrics {
     /// histograms. Empty ids (standalone DP) collapse to `"unknown"`,
     /// matching the missing-dimension convention used elsewhere.
     pub fn new_with_env_id(env_id: &str) -> Self {
+        Self::new_with_buckets(env_id, &HistogramBuckets::default())
+    }
+
+    /// Like [`Metrics::new_with_env_id`], with operator-supplied histogram
+    /// bucket edges (`observability.metrics.buckets`, AISIX-Cloud#1226).
+    pub fn new_with_buckets(env_id: &str, buckets: &HistogramBuckets) -> Self {
         // Buckets ONLY for the SLO histograms and the guardrail latency
         // histogram: with `metrics-exporter-prometheus`, a distribution
         // without configured buckets renders as a summary — which is what
@@ -454,19 +573,19 @@ impl Metrics {
         let recorder = PrometheusBuilder::new()
             .set_buckets_for_metric(
                 Matcher::Full(M_REQUEST_E2E_LATENCY_SECONDS.to_string()),
-                LATENCY_HISTOGRAM_BUCKETS,
+                &buckets.request_e2e_latency,
             )
-            .expect("static bucket list is non-empty")
+            .expect("bucket lists are validated non-empty")
             .set_buckets_for_metric(
                 Matcher::Full(M_REQUEST_TTFT_SECONDS.to_string()),
-                LATENCY_HISTOGRAM_BUCKETS,
+                &buckets.request_ttft,
             )
-            .expect("static bucket list is non-empty")
+            .expect("bucket lists are validated non-empty")
             .set_buckets_for_metric(
                 Matcher::Full(M_GUARDRAIL_LATENCY_SECONDS.to_string()),
-                GUARDRAIL_LATENCY_BUCKETS,
+                &buckets.guardrail_latency,
             )
-            .expect("static bucket list is non-empty")
+            .expect("bucket lists are validated non-empty")
             .build_recorder();
         let handle = recorder.handle();
         Self {
@@ -2641,10 +2760,7 @@ mod tests {
         assert!(out.contains("aisix_request_e2e_latency_seconds_sum"));
         assert!(out.contains("aisix_request_e2e_latency_seconds_count"));
         assert!(out.contains("aisix_request_ttft_seconds_bucket"));
-        assert!(
-            out.contains("le=\"2.5\""),
-            "configured bucket edges present"
-        );
+        assert!(out.contains("le=\"2\""), "configured bucket edges present");
 
         // The label contract: constant env_id, bucketed status, bounded
         // dims — and none of the per-key/per-user dimensions.
@@ -2662,7 +2778,7 @@ mod tests {
         }
     }
 
-    /// A 1.5s observation lands in the 2.5 bucket but not the 1.0 bucket —
+    /// A 1.5s observation lands in the 2.0 bucket but not the 1.0 bucket —
     /// pins that the configured edges actually apply (a default-bucket
     /// fallback would place them differently or render a summary).
     #[test]
@@ -2690,7 +2806,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("no bucket le={le} in:\n{out}"))
         };
         assert_eq!(bucket_val("1"), 0, "1.5s must not land in le=1");
-        assert_eq!(bucket_val("2.5"), 1, "1.5s must land in le=2.5");
+        assert_eq!(bucket_val("2"), 1, "1.5s must land in le=2");
         // Empty env_id collapses to the missing-dimension convention.
         assert!(out.contains("env_id=\"unknown\""));
         assert!(out.contains("status_class=\"5xx\""));
@@ -2728,6 +2844,179 @@ mod tests {
             "legacy duration series must stay a summary (quantiles), got:\n{out}"
         );
         assert!(out.contains("aisix_request_duration_seconds"));
+    }
+
+    /// Every `le` value exposed for `metric`, in exposition order.
+    fn rendered_edges(out: &str, metric: &str) -> Vec<String> {
+        let prefix = format!("{metric}_bucket");
+        out.lines()
+            .filter(|l| l.starts_with(&prefix))
+            .filter_map(|l| l.split("le=\"").nth(1))
+            .filter_map(|rest| rest.split('"').next())
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// AISIX-Cloud#1226: TTFT no longer borrows the end-to-end latency
+    /// edges. The two sets are pinned here because they are a public
+    /// metric contract — a dashboard that hardcodes an `le` breaks when
+    /// they move, so moving them must be a deliberate edit to this list.
+    #[test]
+    fn ttft_and_e2e_expose_their_own_default_bucket_edges() {
+        let m = Metrics::new_with_env_id("env-1");
+        let labels = LatencyLabels {
+            endpoint: "/v1/chat/completions",
+            model: "gpt-4o",
+            provider: "openai",
+            status: 200,
+            streaming: true,
+        };
+        m.record_request_e2e_latency(labels, Duration::from_millis(1500));
+        m.record_request_ttft(labels, Duration::from_millis(1500));
+        let out = m.render();
+
+        assert_eq!(
+            rendered_edges(&out, "aisix_request_e2e_latency_seconds"),
+            [
+                "0.005", "0.01", "0.025", "0.05", "0.1", "0.25", "0.5", "1", "2", "5", "10", "30",
+                "60", "120", "300", "420", "600", "+Inf",
+            ],
+        );
+        assert_eq!(
+            rendered_edges(&out, "aisix_request_ttft_seconds"),
+            [
+                "0.05", "0.1", "0.25", "0.5", "1", "2", "5", "10", "30", "60", "120", "300",
+                "+Inf",
+            ],
+        );
+    }
+
+    /// The observation-placement contract for TTFT, the metric #1226 is
+    /// about: 1.5s lands in `le=2` and not in the edge below it.
+    #[test]
+    fn ttft_observation_lands_in_the_right_bucket() {
+        let m = Metrics::new_with_env_id("env-1");
+        m.record_request_ttft(
+            LatencyLabels {
+                endpoint: "/v1/messages",
+                model: "claude",
+                provider: "anthropic",
+                status: 200,
+                streaming: true,
+            },
+            Duration::from_millis(1500),
+        );
+        let out = m.render();
+        let bucket_val = |le: &str| -> u64 {
+            out.lines()
+                .find(|l| {
+                    l.starts_with("aisix_request_ttft_seconds_bucket")
+                        && l.contains(&format!("le=\"{le}\""))
+                })
+                .and_then(|l| l.rsplit(' ').next())
+                .and_then(|v| v.parse().ok())
+                .unwrap_or_else(|| panic!("no bucket le={le} in:\n{out}"))
+        };
+        assert_eq!(bucket_val("1"), 0, "1.5s must not land in le=1");
+        assert_eq!(bucket_val("2"), 1, "1.5s must land in le=2");
+        assert_eq!(bucket_val("+Inf"), 1);
+    }
+
+    /// An override replaces only the metric it names; the other two keep
+    /// their defaults. This is the whole point of the per-metric shape —
+    /// tuning TTFT must not silently re-cut the e2e or guardrail series.
+    #[test]
+    fn bucket_override_applies_to_only_the_named_metric() {
+        let buckets = HistogramBuckets::from_config(&aisix_core::HistogramBucketsConfig {
+            request_ttft: Some(vec![0.5, 3.0]),
+            ..Default::default()
+        })
+        .expect("valid override");
+        let m = Metrics::new_with_buckets("env-1", &buckets);
+        let labels = LatencyLabels {
+            endpoint: "/v1/chat/completions",
+            model: "gpt-4o",
+            provider: "openai",
+            status: 200,
+            streaming: true,
+        };
+        m.record_request_e2e_latency(labels, Duration::from_millis(1500));
+        m.record_request_ttft(labels, Duration::from_millis(1500));
+        m.record_guardrail_execution(&aisix_core::GuardrailExecution {
+            guardrail_name: "g",
+            kind: "keyword",
+            phase: "input",
+            result: "passed",
+            error_type: None,
+            elapsed: Duration::from_millis(3),
+        });
+        let out = m.render();
+
+        assert_eq!(
+            rendered_edges(&out, "aisix_request_ttft_seconds"),
+            ["0.5", "3", "+Inf"],
+        );
+        assert_eq!(
+            rendered_edges(&out, "aisix_request_e2e_latency_seconds").first(),
+            Some(&"0.005".to_string()),
+            "e2e keeps its default edges",
+        );
+        assert_eq!(
+            rendered_edges(&out, "aisix_guardrail_latency_seconds").first(),
+            Some(&"0.001".to_string()),
+            "guardrail keeps its default edges",
+        );
+    }
+
+    /// Unset fields fall back to the built-in defaults rather than to an
+    /// empty (summary-rendering) list.
+    #[test]
+    fn empty_bucket_config_resolves_to_the_defaults() {
+        let resolved =
+            HistogramBuckets::from_config(&aisix_core::HistogramBucketsConfig::default())
+                .expect("empty config is valid");
+        assert_eq!(resolved.request_e2e_latency, DEFAULT_E2E_LATENCY_BUCKETS);
+        assert_eq!(resolved.request_ttft, DEFAULT_TTFT_BUCKETS);
+        assert_eq!(
+            resolved.guardrail_latency,
+            DEFAULT_GUARDRAIL_LATENCY_BUCKETS
+        );
+    }
+
+    /// Boot-fatal validation: every shape Prometheus cannot express, or
+    /// that would silently produce a broken exposition, is rejected with
+    /// the offending field named.
+    #[test]
+    fn invalid_bucket_overrides_are_rejected() {
+        let cases: [(Vec<f64>, &str); 6] = [
+            (vec![], "at least one"),
+            (vec![0.1, 0.1], "strictly ascend"),
+            (vec![1.0, 0.5], "strictly ascend"),
+            (vec![0.0, 1.0], "finite positive"),
+            (vec![-1.0, 1.0], "finite positive"),
+            (vec![0.1, f64::INFINITY], "finite positive"),
+        ];
+        for (edges, needle) in cases {
+            let err = HistogramBuckets::from_config(&aisix_core::HistogramBucketsConfig {
+                request_ttft: Some(edges.clone()),
+                ..Default::default()
+            })
+            .expect_err(&format!("{edges:?} must be rejected"));
+            assert!(
+                err.contains(needle) && err.contains("buckets.request_ttft"),
+                "{edges:?} → {err:?} must name the field and mention {needle:?}",
+            );
+        }
+
+        let too_many: Vec<f64> = (1..=HistogramBuckets::MAX_EDGES + 1)
+            .map(|i| i as f64)
+            .collect();
+        let err = HistogramBuckets::from_config(&aisix_core::HistogramBucketsConfig {
+            guardrail_latency: Some(too_many),
+            ..Default::default()
+        })
+        .expect_err("over-long list must be rejected");
+        assert!(err.contains("exceed the limit of 64"), "{err}");
     }
 
     fn config_metrics_view(source_kind: aisix_core::SourceKind) -> aisix_core::ConfigMetricsView {

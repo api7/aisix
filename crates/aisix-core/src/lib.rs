@@ -29,8 +29,8 @@ pub mod wildcard;
 
 pub use config::{
     AdminConfig, CacheBackend, CacheConfig, ClientTypeRule, Config, EtcdConfig, EtcdTlsConfig,
-    ManagedConfig, ObservabilityConfig, ProxyConfig, RateLimitBackend, RateLimitConfig,
-    RealIpConfig, RedisConnConfig, RedisMode, TlsConfig,
+    HistogramBucketsConfig, ManagedConfig, ObservabilityConfig, ProxyConfig, RateLimitBackend,
+    RateLimitConfig, RealIpConfig, RedisConnConfig, RedisMode, TlsConfig,
 };
 pub use config_status::{
     hash_bytes, hash_entries, AppliedSnapshot, ConfigMetricsView, ConfigState, ConfigStatus,
