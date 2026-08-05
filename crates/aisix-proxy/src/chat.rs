@@ -242,7 +242,6 @@ pub async fn chat_completions(
                         attempt_model: winner.map(|w| w.target_model.clone()).unwrap_or_default(),
                         error_class: String::new(),
                         error_message: String::new(),
-                        stream_outcome: String::new(),
                         applied_guardrails: applied_guardrails.clone(),
                         provider_key_id: success.provider_key_id.clone(),
                         redacted_entity_counts: redaction_counts.clone(),
@@ -514,7 +513,6 @@ pub async fn chat_completions(
                                 .unwrap_or_default(),
                             error_class: String::new(),
                             error_message: String::new(),
-                            stream_outcome: String::new(),
                             // The chain governed the request even though it
                             // ultimately blocked on the output filter.
                             applied_guardrails: applied_guardrails.clone(),
@@ -1217,9 +1215,6 @@ async fn dispatch(
             upstream: aisix_gateway::ChatChunkStream,
             idx: u32,
             kind: &'static str,
-            /// Position of the winning target in `attempt_models` — the
-            /// mid-stream failover plan takes the targets after it.
-            target_idx: usize,
             /// When this attempt began. The end-of-stream UsageEvent
             /// reports `attempt_started.elapsed()` so `latency_ms` covers
             /// this attempt alone, matching the failed-attempt events and
@@ -1423,7 +1418,6 @@ async fn dispatch(
                             upstream,
                             idx,
                             kind,
-                            target_idx,
                             attempt_started,
                         });
                         won_member_reservation = member_reservation;
@@ -1510,7 +1504,6 @@ async fn dispatch(
             upstream,
             idx: winner_idx,
             kind: winner_kind,
-            target_idx: winner_target_idx,
             attempt_started: winner_attempt_started,
         } = won;
         let model = &model;
@@ -1558,15 +1551,26 @@ async fn dispatch(
         let user_id_for_metrics = auth.key().user_id.clone();
         let provider_for_metrics = provider.to_ascii_lowercase();
         let model_for_metrics = req.model.clone();
-        // #890 req-3/req-4: the readable provider-key name is resolved
-        // inside the on_complete closure from the SERVING attempt's key
-        // (a mid-stream fallback may have changed it); the normalised
-        // inbound client type is request-scoped and captured here.
+        let provider_key_id_for_metrics = pk_id.clone();
+        // #890 req-3/req-4: readable provider-key name + normalised inbound
+        // client type, captured for the streaming on_complete metric emission
+        // (mirrors the non-streaming `record_success` path).
+        let provider_key_name_for_metrics = {
+            let snap = state.snapshot.load();
+            crate::usage_attr::provider_key_metric_name(&snap, &pk_id)
+        };
         let user_name_for_metrics = auth.key().user_name.clone();
         let client_type_for_metrics = state
             .client_classifier
             .classify(&client.user_agent)
             .to_string();
+        // Captured for the stream-end telemetry closure so
+        // emit_usage_event can look up `telemetry_tags` for per-PK
+        // attribution (#302 M17 / AISIX-Cloud#436). The metrics
+        // variant above is `&str`-scoped to inner scopes that consume
+        // it as a borrow; the telem variant is owned for the move
+        // into the on_complete closure.
+        let provider_key_id_for_telem = pk_id.clone();
         let upstream_model_for_metrics = model.upstream_model().unwrap_or("unknown").to_string();
         let bypass_reason_for_telem = bypass_reason.clone().unwrap_or_default();
         // Applied guardrail set (#379), owned for the move into on_complete so
@@ -1631,61 +1635,6 @@ async fn dispatch(
             &upstream_model_for_metrics,
             crate::token_estimate::PromptInput::Chat(Box::new(req.clone())),
         );
-        // Mid-stream failover (AISIX-Cloud#1222): the serving-attempt
-        // handle starts as the pre-stream winner and is rewritten by the
-        // combinator on every switch, so the completion closure below
-        // attributes the terminal event to whichever target actually
-        // finished the stream.
-        let serving = Arc::new(std::sync::Mutex::new(
-            crate::stream_failover::ServingAttempt {
-                target_id: model_id_for_telem.clone(),
-                target_model: attempt_model_for_telem.clone(),
-                provider: provider_for_metrics.clone(),
-                provider_key_id: pk_id.clone(),
-                upstream_model: upstream_model_for_metrics.clone(),
-                cooldown: model.cooldown.clone(),
-                attempt_index: winner_idx,
-                attempt_kind: winner_kind,
-                attempt_started: winner_attempt_started,
-            },
-        ));
-        let mid_stream_shared = crate::stream_failover::MidStreamShared::new();
-        let stream_failure_cfg = virtual_entry
-            .value
-            .routing
-            .as_ref()
-            .and_then(|r| r.stream_failure.clone())
-            .filter(|cfg| {
-                cfg.mode_or_default() == aisix_core::StreamFailureMode::Continue
-                    && is_routing_request
-            });
-        let upstream = match stream_failure_cfg {
-            Some(cfg) if winner_target_idx + 1 < attempt_models.len() => {
-                crate::stream_failover::wrap(
-                    upstream,
-                    crate::stream_failover::MidStreamPlan {
-                        cfg,
-                        remaining: attempt_models[winner_target_idx + 1..].to_vec(),
-                        state: state.clone(),
-                        auth: auth.clone(),
-                        group: virtual_entry.value.clone(),
-                        req: req.clone(),
-                        request_id: request_id.to_string(),
-                        client: client.clone(),
-                        retry_on_429,
-                        fallback_on_statuses: fallback_statuses.to_vec(),
-                        requested_model: req.model.clone(),
-                        api_key_id: auth.entry.id.clone(),
-                        applied_guardrails: applied_guardrails.clone(),
-                        serving: Arc::clone(&serving),
-                        shared: mid_stream_shared.clone(),
-                    },
-                )
-            }
-            _ => upstream,
-        };
-        let serving_for_telem = Arc::clone(&serving);
-        let mid_stream_shared_for_telem = mid_stream_shared.clone();
         let sse_stream = build_sse_stream(
             upstream,
             now,
@@ -1697,78 +1646,10 @@ async fn dispatch(
             client_requested_usage,
             // Single upstream: nothing pre-incurred, so no usage to fold in.
             aisix_gateway::chat::UsageStats::default(),
-            Some(mid_stream_shared),
             Some(estimator),
             move |comp: StreamCompletion| {
-                // Mid-stream failover may have moved the stream onto a
-                // fallback target — read the SERVING attempt (not the
-                // pre-stream winner) for everything target-scoped.
-                let (
-                    model_id_for_telem,
-                    provider_for_metrics,
-                    provider_key_id_for_telem,
-                    upstream_model_for_metrics,
-                    winner_idx,
-                    winner_kind,
-                    attempt_model_for_telem,
-                    winner_attempt_started,
-                ) = {
-                    let s = serving_for_telem.lock().expect("serving lock");
-                    (
-                        s.target_id.clone(),
-                        s.provider.clone(),
-                        s.provider_key_id.clone(),
-                        s.upstream_model.clone(),
-                        s.attempt_index,
-                        s.attempt_kind,
-                        s.target_model.clone(),
-                        s.attempt_started,
-                    )
-                };
-                let provider_key_id_for_metrics = provider_key_id_for_telem.clone();
-                let provider_key_name_for_metrics = {
-                    let snap = state_for_telem.snapshot.load();
-                    crate::usage_attr::provider_key_metric_name(&snap, &provider_key_id_for_metrics)
-                };
-                let mid_stream_fallbacks = mid_stream_shared_for_telem
-                    .attempt_seq
-                    .load(Ordering::Relaxed);
-                // Logical stream outcome (AISIX-Cloud#1222): the HTTP
-                // status froze at 200 when the head committed, so this is
-                // the only signal that separates "delivered in full" from
-                // "terminated mid-stream". Guardrail blocks and client
-                // aborts keep their own dedicated signals.
-                let stream_outcome = if comp.guardrail_blocked || !comp.reached_end {
-                    ""
-                } else if comp.stream_failed {
-                    "partial_failed"
-                } else if mid_stream_fallbacks > 0 {
-                    "partial_recovered"
-                } else {
-                    "success"
-                };
-                if mid_stream_fallbacks > 0 {
-                    // Recovered = the fallback kept the stream alive
-                    // (no terminal stream error). A client that
-                    // disconnects after a successful switch, or a
-                    // guardrail block on the recovered content, is
-                    // still a working failover — only a terminal
-                    // upstream error counts as failed.
-                    metrics_for_stream
-                        .record_mid_stream_fallback(&model_for_metrics, !comp.stream_failed);
-                }
-                // Rate-limit accounting (TPM cap) for all layers,
-                // including any mid-stream fallback targets that
-                // served part of this stream.
+                // Rate-limit accounting (TPM cap) for all layers.
                 for key in &post_stream_keys {
-                    limiter.add_tokens_post_stream(key, comp.total_tokens);
-                }
-                for key in mid_stream_shared_for_telem
-                    .extra_post_stream_keys
-                    .lock()
-                    .expect("extra keys lock")
-                    .iter()
-                {
                     limiter.add_tokens_post_stream(key, comp.total_tokens);
                 }
                 // Telemetry: emit with the actual upstream-reported counts.
@@ -1834,20 +1715,8 @@ async fn dispatch(
                         attempt_index: winner_idx,
                         attempt_kind: winner_kind.to_string(),
                         attempt_model: attempt_model_for_telem.clone(),
-                        // A stream that terminated mid-flight carries the
-                        // terminal error on its serving attempt — the HTTP
-                        // status can no longer say so (AISIX-Cloud#1222).
-                        error_class: if comp.stream_failed {
-                            comp.stream_error_class.clone()
-                        } else {
-                            String::new()
-                        },
-                        error_message: if comp.stream_failed {
-                            comp.stream_error_message.clone()
-                        } else {
-                            String::new()
-                        },
-                        stream_outcome: stream_outcome.to_string(),
+                        error_class: String::new(),
+                        error_message: String::new(),
                         applied_guardrails: applied_guardrails_for_telem.clone(),
                         provider_key_id: provider_key_id_for_telem.clone(),
                         redacted_entity_counts: {
@@ -1893,7 +1762,10 @@ async fn dispatch(
                         upstream_model: &upstream_model_for_metrics,
                         provider_key_id: &provider_key_id_for_metrics,
                         stream: true,
-                        is_fallback: mid_stream_fallbacks > 0,
+                        // The serving target is fixed once the stream
+                        // commits, so fallback attribution is the
+                        // pre-stream winner's attempt kind.
+                        is_fallback: winner_kind == "fallback",
                     },
                     crate::request_metrics::Tokens {
                         input: comp.prompt_tokens,
@@ -3215,8 +3087,6 @@ async fn dispatch_ensemble(
             content_cap,
             client_requested_usage,
             panel_usage_sum,
-            // Ensembles don't participate in mid-stream failover.
-            None,
             Some(judge_estimator),
             move |comp: StreamCompletion| {
                 // Rate-limit accounting: the panel tokens (already round-tripped)
@@ -3849,7 +3719,6 @@ fn emit_usage_event(
         attempt_model: extras.attempt_model,
         error_class: extras.error_class,
         error_message: extras.error_message,
-        stream_outcome: extras.stream_outcome,
         // Per-PK telemetry attribution (#302 M17 / AISIX-Cloud#436).
         // Source struct is `aisix_core::TelemetryTags`; the wire
         // shape is flat strings + a bool, with skip_serializing_if
@@ -3972,10 +3841,6 @@ struct UsageExtras {
     error_class: String,
     /// Short error message for a failed attempt; empty on success.
     error_message: String,
-    /// Logical streaming outcome (`success` / `partial_failed` /
-    /// `partial_recovered`); empty on non-streaming events
-    /// (AISIX-Cloud#1222).
-    stream_outcome: String,
     /// The `{kind, hook}` set of guardrails that governed this request,
     /// captured at chain-resolve time. Lands on
     /// `dpmgr_usage_events.applied_guardrails` so the dashboard can show
@@ -4063,55 +3928,6 @@ fn emit_failed_attempts(
             content,
         );
     }
-}
-
-/// Per-attempt UsageEvent for a serving attempt that failed
-/// MID-STREAM and is being handed off to a fallback target
-/// (AISIX-Cloud#1222). Unlike [`emit_failed_attempts`] (whose records
-/// are read back at handler return), this fires from inside the
-/// stream-failover combinator at switch time — the routing telemetry
-/// was already finalized when the 200 committed. The partial spend is
-/// estimated (prompt from the original request, completion from the
-/// delivered partial text), matching the "prompts always billed +
-/// generated partial billed" contract.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn emit_mid_stream_failed_attempt(
-    state: &ProxyState,
-    request_id: &str,
-    requested_model: &str,
-    api_key_id: &str,
-    client: &ClientContext,
-    applied_guardrails: &[AppliedGuardrail],
-    rec: &AttemptRecord,
-    prompt_tokens: u32,
-    completion_tokens: u32,
-) {
-    emit_usage_event(
-        state,
-        request_id,
-        &rec.target_model_id,
-        requested_model,
-        api_key_id,
-        rec.status,
-        Duration::from_millis(u64::from(rec.latency_ms)),
-        prompt_tokens,
-        completion_tokens,
-        UsageExtras {
-            usage_estimated: prompt_tokens > 0 || completion_tokens > 0,
-            attempt_index: rec.index,
-            attempt_kind: rec.kind.to_string(),
-            attempt_model: rec.target_model.clone(),
-            error_class: rec.error_class.clone(),
-            error_message: rec.error_message.clone(),
-            applied_guardrails: applied_guardrails.to_vec(),
-            provider_key_id: rec.provider_key_id.clone(),
-            ..UsageExtras::default()
-        },
-        /* cost_usd */ 0.0,
-        /* guardrail_blocked */ false,
-        client,
-        None,
-    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4290,16 +4106,6 @@ struct StreamCompletion {
     /// still be abandoned midway, and a zero-chunk stream can still
     /// legitimately reach its end (an immediate error frame).
     reached_end: bool,
-    /// `true` when the upstream stream terminated with an error frame
-    /// (post-fallback-exhaustion if mid-stream failover was armed). The
-    /// HTTP status is already committed at 200, so this is what the
-    /// telemetry closure turns into `stream_outcome: partial_failed`
-    /// (AISIX-Cloud#1222).
-    stream_failed: bool,
-    /// Attempt-taxonomy class/message of the terminal stream error;
-    /// empty unless `stream_failed`.
-    stream_error_class: String,
-    stream_error_message: String,
 }
 
 /// Parameters needed to run output-guardrail evaluation at
@@ -4452,13 +4258,6 @@ fn build_sse_stream<F>(
     // `on_complete` (`comp`) counts stay stream-only. Zero for single-upstream
     // callers, where the fold is a no-op.
     base_usage: aisix_gateway::chat::UsageStats,
-    // Mid-stream failover shared state (AISIX-Cloud#1222): the failed
-    // partial attempts' estimated usage (folded into client-facing usage
-    // frames alongside `base_usage` — LiteLLM merges partial + fallback
-    // usage the same way) and the attempt sequence the pump watches to
-    // reset its accumulators on a serving-attempt switch. `None` on paths
-    // without mid-stream failover.
-    mid_stream: Option<crate::stream_failover::MidStreamShared>,
     // Token-estimation fallback context (AISIX-Cloud#1074); see
     // `CompleteOnDrop::estimator`.
     estimator: Option<crate::token_estimate::Estimator>,
@@ -4546,16 +4345,6 @@ where
         // the truncated response as a successful one.
         let mut errored = false;
         let mut first_chunk_seen = false;
-        // Serving-attempt sequence snapshot (mid-stream failover). When
-        // the combinator switches targets, the usage accumulated from
-        // the failed attempt must not max-wins-mix into the serving
-        // attempt's counters (a per-chunk-usage provider like Gemini
-        // would otherwise leak partial counters into the terminal
-        // event and double-fold with the estimated partial).
-        let mut mid_stream_seq = mid_stream
-            .as_ref()
-            .map(|ms| ms.attempt_seq.load(Ordering::Relaxed))
-            .unwrap_or(0);
         // Render + serialise one held/live chunk into an SSE Event.
         // Serialisation of these plain structs can't realistically fail;
         // the Err arm mirrors the pre-hold-back defensive error frame.
@@ -4587,20 +4376,6 @@ where
         while let Some(item) = upstream.next().await {
             let maybe_chunk = match item {
                 Ok(mut chunk) => {
-                    if let Some(ms) = mid_stream.as_ref() {
-                        let seq = ms.attempt_seq.load(Ordering::Relaxed);
-                        if seq != mid_stream_seq {
-                            mid_stream_seq = seq;
-                            let comp = guard.comp();
-                            comp.prompt_tokens = 0;
-                            comp.completion_tokens = 0;
-                            comp.total_tokens = 0;
-                            comp.cached_prompt_tokens = 0;
-                            comp.reasoning_tokens = 0;
-                            comp.cache_creation_tokens = 0;
-                            comp.cache_read_tokens = 0;
-                        }
-                    }
                     // Record TTFT on the first chunk carrying generated
                     // output — reasoning text included, role-only frames
                     // excluded. See `ChatDelta::carries_generated_output`.
@@ -4743,29 +4518,11 @@ where
                     // from `comp + base_usage`).
                     if let Some(u) = chunk.usage.as_mut() {
                         *u = u.saturating_add(&base_usage);
-                        // Mid-stream failover: fold the failed partial
-                        // attempts' estimated spend into the client-facing
-                        // usage frame, AFTER `comp` captured the
-                        // serving-attempt-only counts (AISIX-Cloud#1222).
-                        if let Some(ms) = mid_stream.as_ref() {
-                            let extra = ms
-                                .extra_usage
-                                .lock()
-                                .expect("mid-stream extra lock")
-                                .clone();
-                            *u = u.saturating_add(&extra);
-                        }
                     }
                     Some(chunk)
                 }
                 Err(err) => {
                     errored = true;
-                    {
-                        let comp = guard.comp();
-                        comp.stream_failed = true;
-                        comp.stream_error_class = routing_error_class(&err).to_string();
-                        comp.stream_error_message = attempt_error_message(&err);
-                    }
                     let etype = err.error_type();
                     yield Ok::<_, Infallible>(
                         Event::default()

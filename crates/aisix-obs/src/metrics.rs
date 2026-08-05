@@ -92,12 +92,6 @@ pub const M_DEPLOYMENT_STATE: &str = "aisix_deployment_state";
 pub const M_DEPLOYMENT_COOLED_DOWN_TOTAL: &str = "aisix_deployment_cooled_down_total";
 pub const M_ROUTING_SUCCESSFUL_FALLBACKS_TOTAL: &str = "aisix_routing_successful_fallbacks_total";
 pub const M_ROUTING_FAILED_FALLBACKS_TOTAL: &str = "aisix_routing_failed_fallbacks_total";
-/// Mid-stream fallback outcomes (`routing.stream_failure: continue`,
-/// AISIX-Cloud#1222). `outcome` is `recovered` (the client stream
-/// completed on a fallback target) or `failed` (every eligible fallback
-/// target also failed and the stream terminated). Labelled by the
-/// requested (routing) model.
-pub const M_MID_STREAM_FALLBACKS_TOTAL: &str = "aisix_mid_stream_fallbacks_total";
 pub const M_RATELIMIT_REMAINING_REQUESTS: &str = "aisix_ratelimit_remaining_requests";
 pub const M_RATELIMIT_REMAINING_TOKENS: &str = "aisix_ratelimit_remaining_tokens";
 pub const M_BUDGET_LIMIT_USD: &str = "aisix_budget_limit_usd";
@@ -1246,20 +1240,6 @@ impl Metrics {
         };
         metrics::with_local_recorder(&self.inner.recorder, || {
             metrics::counter!(metric, "model" => model.to_string()).increment(1);
-        });
-    }
-
-    /// One mid-stream fallback episode resolved (AISIX-Cloud#1222):
-    /// `recovered` when the client stream completed on a fallback
-    /// target, `failed` when the fallback chain was exhausted.
-    pub fn record_mid_stream_fallback(&self, model: &str, recovered: bool) {
-        metrics::with_local_recorder(&self.inner.recorder, || {
-            metrics::counter!(
-                M_MID_STREAM_FALLBACKS_TOTAL,
-                "model" => model.to_string(),
-                "outcome" => if recovered { "recovered" } else { "failed" },
-            )
-            .increment(1);
         });
     }
 
