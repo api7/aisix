@@ -38,7 +38,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
   "info": {
     "title": "AISIX Admin API",
     "version": "dev",
-    "description": "The AISIX Admin API is the self-hosted management interface for configuring the gateway at runtime. Use it when you operate AISIX directly and need to create or update models, caller API keys, provider credentials, guardrails, cache policies, and observability exporters.\n\nThe write endpoints (POST, PUT, DELETE) are deprecated in favor of declarative configuration: load resources from a `resources_file` (`resources.yaml`) or write them to etcd directly. Write endpoints remain functional, and every mutating response carries a `Deprecation` header (RFC 9745) plus a `Link` header with `rel=\"deprecation\"` pointing at the migration documentation. Read endpoints are not deprecated.\n\nManaged deployments do not expose this listener. Configure managed gateways through the AISIX managed control plane."
+    "description": "The AISIX Admin API configures an open-source AISIX gateway at runtime. Use it when you operate the gateway directly and need to create or update models, caller API keys, provider credentials, guardrails, cache policies, and observability exporters.\n\nThe write endpoints (POST, PUT, DELETE) are deprecated in favor of declarative configuration: load resources from a `resources_file` (`resources.yaml`) or write them to etcd directly. Write endpoints remain functional, and every mutating response carries a `Deprecation` header (RFC 9745) plus a `Link` header with `rel=\"deprecation\"` pointing at the migration documentation. Read endpoints are not deprecated.\n\nGateways connected to AISIX Cloud do not expose this listener. Configure them through AISIX Cloud."
   },
   "paths": {
     "/livez": {
@@ -3947,7 +3947,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
           }
         },
         "additionalProperties": false,
-        "description": "Self-hosted Admin API request body for creating or updating a caller API key. Ownership fields supplied by the managed control plane are not accepted by this API."
+        "description": "AISIX Admin API request body for creating or updating a caller API key on an open-source AISIX gateway. Ownership fields supplied by AISIX Cloud are not accepted by this API."
       }
     }
   },
@@ -4853,7 +4853,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn openapi_uses_self_hosted_apikey_request_schema() {
+    async fn openapi_uses_open_source_gateway_apikey_request_schema() {
         let parsed: serde_json::Value =
             serde_json::from_str(merged_openapi()).expect("merged_openapi must parse");
         for (path, method) in [
@@ -4866,7 +4866,7 @@ mod tests {
                 parsed["paths"][path][method]["requestBody"]["content"]["application/json"]
                     ["schema"]["$ref"],
                 "#/components/schemas/ApiKeyRequest",
-                "{method} {path} should document the self-hosted Admin API request body"
+                "{method} {path} should document the open-source gateway Admin API request body"
             );
         }
 
@@ -4875,33 +4875,33 @@ mod tests {
         assert_eq!(request["required"][1], "allowed_models");
         assert!(
             request["properties"].get("allowed_tools").is_some(),
-            "self-hosted API key requests must document MCP tool access"
+            "open-source gateway API key requests must document MCP tool access"
         );
         let request_allowed_tools = request["properties"]["allowed_tools"]["description"]
             .as_str()
             .unwrap();
         assert!(
             request_allowed_tools.contains("omitted, set to `null`, or set to an empty list"),
-            "self-hosted API key request schema must document no-access tool-list behavior"
+            "open-source gateway API key request schema must document no-access tool-list behavior"
         );
         assert!(
             request_allowed_tools.contains("<server>__*"),
-            "self-hosted API key request schema must document the per-server wildcard"
+            "open-source gateway API key request schema must document the per-server wildcard"
         );
         assert!(
             request["properties"].get("allowed_agents").is_some(),
-            "self-hosted API key requests must document A2A agent access"
+            "open-source gateway API key requests must document A2A agent access"
         );
         let request_allowed_agents = request["properties"]["allowed_agents"]["description"]
             .as_str()
             .unwrap();
         assert!(
             request_allowed_agents.contains("omitted, set to `null`, or set to an empty list"),
-            "self-hosted API key request schema must document no-access agent-list behavior"
+            "open-source gateway API key request schema must document no-access agent-list behavior"
         );
         assert!(
             request_allowed_agents.contains("grants every agent"),
-            "self-hosted API key request schema must document wildcard agent access"
+            "open-source gateway API key request schema must document wildcard agent access"
         );
         let public = &parsed["components"]["schemas"]["PublicApiKey"];
         assert!(

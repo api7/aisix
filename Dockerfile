@@ -17,7 +17,7 @@
 #   docker run --rm -v $(pwd)/config.example.yaml:/etc/aisix/config.yaml \
 #     aisix:dev
 #
-# Run, managed (aisix.cloud tenant — bake config + env-var overrides):
+# Run, managed (connected to AISIX Cloud with env-var overrides):
 #   docker run --rm \
 #     -e AISIX_CONFIG_PATH=/etc/aisix/config.managed.yaml \
 #     -e AISIX_MANAGED__REGISTRATION_TOKEN=$DEPLOYMENT_TOKEN \
@@ -98,7 +98,7 @@ RUN --mount=type=bind,from=builder,source=/usr/local/bin/aisix,target=/mnt/aisix
     && apt-get purge -y --auto-remove libcap2-bin \
     && rm -rf /var/lib/apt/lists/*
 
-# Bake the managed-mode bootstrap config so aisix.cloud tenants can
+# Bake the managed-mode bootstrap config so AISIX Cloud gateways can
 # `docker run` without mounting anything — env vars carry the per-DP
 # secret bits (registration token + CP base URL).
 COPY config.managed.yaml /etc/aisix/config.managed.yaml

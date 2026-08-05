@@ -7,7 +7,7 @@
 #   Standalone — operator mounts their own config:
 #       docker run -v ./config.yaml:/etc/aisix/config.yaml ghcr.io/api7/aisix:dev
 #
-#   Managed (aisix.cloud tenant) — use the baked-in template + env vars:
+#   Managed (connected to AISIX Cloud) — use the baked-in template + env vars:
 #       docker run \
 #         -e AISIX_CONFIG_PATH=/etc/aisix/config.managed.yaml \
 #         -e AISIX_MANAGED__REGISTRATION_TOKEN=$DEPLOYMENT_TOKEN \
