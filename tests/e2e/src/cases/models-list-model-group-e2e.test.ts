@@ -147,8 +147,10 @@ describe("models listing e2e: a Model Group is a discoverable entry point", () =
     const entry = (res.body as ModelListBody).data?.[0];
     expect(entry?.object).toBe("model");
     expect(typeof entry?.created).toBe("number");
-    expect(typeof entry?.owned_by).toBe("string");
-    expect((entry?.owned_by as string).length).toBeGreaterThan(0);
+    // A group has no provider of its own, so it is owned by the gateway.
+    // A target's provider surfacing here would be exactly the target
+    // detail this listing must not disclose.
+    expect(entry?.owned_by).toBe("aisix");
 
     // The discovered name is usable as-is: a client that picked `ml-group`
     // off the listing sends it straight back as `model`.

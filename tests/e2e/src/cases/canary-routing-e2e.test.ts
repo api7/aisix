@@ -101,8 +101,7 @@ describe("sticky (A/B / canary) weighted routing e2e", () => {
     const canary = await startOpenAiUpstream({ nonStreamBody: okBody("canary-served") });
     upstreams.push(stable, canary);
     // Router BEFORE its targets: watch events apply in revision order, so
-    // once /v1/models lists both targets the router is in the snapshot too
-    // (virtual models don't appear in /v1/models themselves).
+    // once /v1/models lists both targets the router is in the snapshot too.
     await seed.createModel({
       display_name: "canary-router",
       routing: {

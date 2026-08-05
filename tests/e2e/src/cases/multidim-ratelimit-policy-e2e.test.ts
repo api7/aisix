@@ -57,12 +57,12 @@ const KEY_MEMBER_A2 = "sk-892-m-a2";
 const KEY_MEMBER_B = "sk-892-m-b";
 const KEY_TPM = "sk-892-tpm";
 const KEY_ROUTE = "sk-892-route";
-// Readiness probe for the routing group: routing models never appear in
-// /v1/models, so group propagation is probed with a key allowed to
-// access NOTHING — 404 while the group is absent from the snapshot, 403
-// once it propagated. The 403 fires at the ACL gate, before any
-// rate-limit reservation, so probing never consumes the buckets under
-// test.
+// Readiness probe for the routing group: this key is allowed to access
+// NOTHING, so its /v1/models listing is always empty and cannot gate on
+// the group — probe with a chat call instead, 404 while the group is
+// absent from the snapshot and 403 once it propagated. The 403 fires at
+// the ACL gate, before any rate-limit reservation, so probing never
+// consumes the buckets under test.
 const KEY_PROBE = "sk-892-probe";
 
 function chatBody(content: string, totalTokens = 8) {
@@ -253,9 +253,9 @@ describe("conditional rate limit policies e2e (AISIX-Cloud#892)", () => {
     });
   }
 
-  // Routing groups are invisible to /v1/models — wait until a chat call
-  // with the no-access probe key flips from 404 (not propagated) to 403
-  // (in snapshot, ACL-rejected before any reservation).
+  // The no-access probe key lists nothing, so wait until a chat call with
+  // it flips from 404 (not propagated) to 403 (in snapshot, ACL-rejected
+  // before any reservation).
   async function waitGroupPropagated(name: string): Promise<void> {
     if (!app) throw new Error("app not initialized");
     const probe = new ProxyClient(app.proxyUrl, KEY_PROBE);
