@@ -4846,7 +4846,7 @@ data: [DONE]\n\n";
         assert!(messages[1]["content"]
             .as_str()
             .unwrap()
-            .contains("Do not repeat the same content"));
+            .contains("do not repeat any of its content"));
         assert_eq!(messages[2]["role"], "assistant");
         assert_eq!(messages[2]["content"], "Once upon");
     }
@@ -5031,6 +5031,441 @@ data: {\"error\":{\"message\":\"The server had an error\",\"type\":\"server_erro
         assert!(
             reqs.is_empty(),
             "in-band error is not in the configured trigger set"
+        );
+    }
+
+    // ── Mid-stream failover on /v1/messages (AISIX-Cloud#1222 phase 2) ──
+
+    fn anthropic_target_model(id: &str, name: &str, pk_id: &str) -> ResourceEntry<Model> {
+        let cfg = serde_json::json!({
+            "display_name": name,
+            "provider": "anthropic",
+            "model_name": "claude-3-5-haiku-20241022",
+            "provider_key_id": pk_id,
+        });
+        ResourceEntry::new(id, serde_json::from_value(cfg).unwrap(), 1)
+    }
+
+    fn anthropic_pk_with(
+        pk_id: &'static str,
+        api_base: &str,
+    ) -> ResourceEntry<aisix_core::ProviderKey> {
+        matrix_pk_entry(pk_id, "sk-ant-test", api_base, "anthropic", "anthropic")
+    }
+
+    /// Anthropic-wire stream head: committed envelope + one text delta,
+    /// then an in-band `error` frame.
+    const MSG_MID_STREAM_HEAD_SSE: &str = "\
+event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_up1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-3-5-haiku-20241022\",\"stop_reason\":null,\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n\n\
+event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Once upon\"}}\n\n\
+event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n";
+
+    /// Anthropic-wire full recovery stream served by the fallback target.
+    const MSG_RECOVERY_SSE: &str = "\
+event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_up2\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-3-5-haiku-20241022\",\"stop_reason\":null,\"usage\":{\"input_tokens\":6,\"output_tokens\":0}}}\n\n\
+event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" a time\"}}\n\n\
+event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":7}}\n\n\
+event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+
+    fn messages_mid_stream_snapshot(
+        primary_uri: &str,
+        secondary_uri: &str,
+        stream_failure: Option<serde_json::Value>,
+    ) -> AisixSnapshot {
+        let snap = AisixSnapshot::new();
+        snap.provider_keys
+            .insert(anthropic_pk_with("pk-ant-primary", primary_uri));
+        snap.provider_keys
+            .insert(anthropic_pk_with("pk-ant-secondary", secondary_uri));
+        snap.models.insert(anthropic_target_model(
+            "m-ant-primary",
+            "primary",
+            "pk-ant-primary",
+        ));
+        snap.models.insert(anthropic_target_model(
+            "m-ant-secondary",
+            "secondary",
+            "pk-ant-secondary",
+        ));
+        match stream_failure {
+            Some(sf) => snap.models.insert(routing_entry_with_stream_failure(
+                "smart",
+                &["primary", "secondary"],
+                sf,
+            )),
+            None => snap.models.insert(routing_entry(
+                "smart",
+                "failover",
+                &["primary", "secondary"],
+                None,
+                None,
+                None,
+            )),
+        }
+        snap.apikeys.insert(apikey_entry("sk-caller", &["smart"]));
+        snap
+    }
+
+    async fn streaming_messages_wire(app: axum::Router, model: &str) -> String {
+        let body = serde_json::json!({
+            "model": model,
+            "max_tokens": 128,
+            "messages": [{"role": "user", "content": "tell me a story"}],
+            "stream": true
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let mut body_stream = resp.into_body().into_data_stream();
+        let mut wire = Vec::new();
+        while let Some(chunk) = body_stream.next().await {
+            wire.extend_from_slice(chunk.unwrap().as_ref());
+        }
+        String::from_utf8(wire).expect("SSE bytes are utf8")
+    }
+
+    /// AISIX-Cloud#1222 phase 2 core acceptance (passthrough leg): an
+    /// Anthropic upstream failing in-band inside its committed stream
+    /// moves the SAME client stream onto the fallback target; the
+    /// resumed encoder continues the client's message envelope — no
+    /// second `message_start`, no new `content_block_start`, text keeps
+    /// flowing in block 0 — and the fallback (an Anthropic-wire target
+    /// reached through the chat bridge) receives the continuation with
+    /// the partial as a native prefill assistant message.
+    #[tokio::test]
+    async fn messages_mid_stream_failover_passthrough_continues_envelope() {
+        use aisix_provider_anthropic::AnthropicBridge;
+
+        let primary = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(MSG_MID_STREAM_HEAD_SSE),
+            )
+            .mount(&primary)
+            .await;
+        let secondary = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(MSG_RECOVERY_SSE),
+            )
+            .mount(&secondary)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+        let snap = messages_mid_stream_snapshot(
+            &primary.uri(),
+            &secondary.uri(),
+            Some(serde_json::json!({"mode": "continue"})),
+        );
+        let app = build_router(build_state(snap, hub));
+
+        let wire = streaming_messages_wire(app, "smart").await;
+        assert_eq!(
+            wire.matches("event: message_start").count(),
+            1,
+            "the client keeps its original message envelope:\n{wire}"
+        );
+        assert_eq!(
+            wire.matches("event: content_block_start").count(),
+            1,
+            "the continuation rides the already-open text block:\n{wire}"
+        );
+        assert!(wire.contains("Once upon"), "primary partial:\n{wire}");
+        assert!(wire.contains(" a time"), "fallback continuation:\n{wire}");
+        assert!(
+            !wire.contains("event: error"),
+            "recovered stream carries no error frame:\n{wire}"
+        );
+        assert_eq!(
+            wire.matches("event: message_stop").count(),
+            1,
+            "exactly one clean terminal:\n{wire}"
+        );
+        assert!(
+            wire.contains("\"output_tokens\""),
+            "closing message_delta carries usage:\n{wire}"
+        );
+
+        // The fallback got the continuation request on the Anthropic
+        // wire: the instruction (a mid-conversation system message
+        // becomes a user turn) and the partial as the trailing
+        // assistant message — native prefill.
+        let reqs = secondary.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 1, "secondary called exactly once");
+        let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
+        let body_str = body.to_string();
+        assert!(
+            body_str.contains("interrupted mid-stream"),
+            "continuation instruction present:\n{body_str}"
+        );
+        let messages = body["messages"].as_array().unwrap();
+        let last = messages.last().unwrap();
+        assert_eq!(last["role"], "assistant", "trailing prefill:\n{body_str}");
+        assert!(
+            last["content"].to_string().contains("Once upon"),
+            "prefill carries the partial:\n{body_str}"
+        );
+    }
+
+    /// Cross-provider leg: /v1/messages served by OpenAI-protocol
+    /// targets (chat bridge + AnthropicSseEncoder). The encoder lives
+    /// outside the combinator, so the spliced fallback chunks continue
+    /// the same synthesized envelope.
+    #[tokio::test]
+    async fn messages_mid_stream_failover_cross_provider_continues_stream() {
+        let primary = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(MID_STREAM_FAILING_SSE),
+            )
+            .mount(&primary)
+            .await;
+        let secondary = MockServer::start().await;
+        let recovery_sse = "\
+data: {\"id\":\"up-2\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"up-2\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" a time\"},\"finish_reason\":\"stop\"}]}\n\n\
+data: {\"id\":\"up-2\",\"model\":\"gpt-4o\",\"choices\":[],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":7,\"total_tokens\":16}}\n\n\
+data: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(recovery_sse),
+            )
+            .mount(&secondary)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = mid_stream_snapshot(
+            &primary.uri(),
+            &secondary.uri(),
+            Some(serde_json::json!({"mode": "continue"})),
+        );
+        let app = build_router(build_state(snap, hub));
+
+        let wire = streaming_messages_wire(app, "smart").await;
+        assert_eq!(
+            wire.matches("event: message_start").count(),
+            1,
+            "one synthesized envelope across the switch:\n{wire}"
+        );
+        assert!(wire.contains("Once upon"), "primary partial:\n{wire}");
+        assert!(wire.contains(" a time"), "fallback continuation:\n{wire}");
+        assert!(
+            !wire.contains("event: error"),
+            "recovered stream carries no error frame:\n{wire}"
+        );
+        assert_eq!(wire.matches("event: message_stop").count(), 1);
+
+        // OpenAI-wire continuation body: original user message + the
+        // continuation instruction + the partial as assistant.
+        let reqs = secondary.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 1, "secondary called exactly once");
+        let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3, "user + instruction + partial");
+        assert_eq!(messages[1]["role"], "system");
+        assert!(messages[1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("do not repeat any of its content"));
+        assert_eq!(messages[2]["role"], "assistant");
+        assert_eq!(messages[2]["content"], "Once upon");
+    }
+
+    /// Without `stream_failure` config the passthrough keeps its
+    /// historical behavior byte-for-byte: the upstream's own error
+    /// frame is forwarded and the fallback target is never contacted.
+    #[tokio::test]
+    async fn messages_mid_stream_default_terminate_forwards_upstream_error_frame() {
+        use aisix_provider_anthropic::AnthropicBridge;
+
+        let primary = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(MSG_MID_STREAM_HEAD_SSE),
+            )
+            .mount(&primary)
+            .await;
+        let secondary = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&secondary)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+        let snap = messages_mid_stream_snapshot(&primary.uri(), &secondary.uri(), None);
+        let app = build_router(build_state(snap, hub));
+
+        let wire = streaming_messages_wire(app, "smart").await;
+        assert!(wire.contains("Once upon"));
+        assert!(
+            wire.contains("overloaded_error"),
+            "upstream error frame forwards verbatim:\n{wire}"
+        );
+        let reqs = secondary.received_requests().await.unwrap();
+        assert!(reqs.is_empty(), "fallback never contacted");
+    }
+
+    /// Output-shape safety gate on the passthrough leg: a thinking
+    /// block on the wire disarms continuation — the withheld upstream
+    /// error frame is released verbatim and no fallback is dispatched.
+    #[tokio::test]
+    async fn messages_mid_stream_fallback_skipped_after_thinking_block() {
+        use aisix_provider_anthropic::AnthropicBridge;
+
+        let thinking_sse = "\
+event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_up1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-3-5-haiku-20241022\",\"stop_reason\":null,\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n\n\
+event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n\
+event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"hmm\"}}\n\n\
+event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n";
+        let primary = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(thinking_sse),
+            )
+            .mount(&primary)
+            .await;
+        let secondary = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&secondary)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+        let snap = messages_mid_stream_snapshot(
+            &primary.uri(),
+            &secondary.uri(),
+            Some(serde_json::json!({"mode": "continue"})),
+        );
+        let app = build_router(build_state(snap, hub));
+
+        let wire = streaming_messages_wire(app, "smart").await;
+        assert!(
+            wire.contains("thinking"),
+            "thinking bytes forwarded:\n{wire}"
+        );
+        assert!(
+            wire.contains("overloaded_error"),
+            "withheld upstream error frame released verbatim:\n{wire}"
+        );
+        let reqs = secondary.received_requests().await.unwrap();
+        assert!(
+            reqs.is_empty(),
+            "no continuation after a thinking block on the wire"
+        );
+    }
+
+    /// Telemetry contract on /v1/messages: the failed serving attempt
+    /// emits its own per-attempt event (estimated partial spend,
+    /// anthropic protocol stamp) and the terminal event is attributed
+    /// to the fallback target with `stream_outcome: partial_recovered`.
+    #[tokio::test]
+    async fn messages_mid_stream_failover_emits_attempt_events_and_outcome() {
+        use aisix_obs::UsageSink;
+
+        let primary = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(MID_STREAM_FAILING_SSE),
+            )
+            .mount(&primary)
+            .await;
+        let secondary = MockServer::start().await;
+        let recovery_sse = "\
+data: {\"id\":\"up-2\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" a time\"},\"finish_reason\":\"stop\"}]}\n\n\
+data: {\"id\":\"up-2\",\"model\":\"gpt-4o\",\"choices\":[],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":7,\"total_tokens\":16}}\n\n\
+data: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(recovery_sse),
+            )
+            .mount(&secondary)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = mid_stream_snapshot(
+            &primary.uri(),
+            &secondary.uri(),
+            Some(serde_json::json!({"mode": "continue"})),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = build_router(build_state(snap, hub).with_usage_sink(UsageSink::new(tx)));
+
+        let wire = streaming_messages_wire(app, "smart").await;
+        assert!(wire.contains(" a time"), "recovered:\n{wire}");
+
+        let mut events = Vec::new();
+        for _ in 0..2 {
+            let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+                .await
+                .expect("usage event was never emitted")
+                .expect("sender dropped");
+            events.push(ev);
+        }
+        events.sort_by_key(|e| e.attempt_index);
+
+        // Failed serving attempt: estimated partial spend, protocol
+        // stamped for this endpoint.
+        assert_eq!(events[0].attempt_index, 0);
+        assert_eq!(events[0].attempt_kind, "initial");
+        assert_eq!(events[0].model_id, "m-primary");
+        assert_eq!(events[0].error_class, "upstream_in_band");
+        assert_eq!(events[0].inbound_protocol, "anthropic");
+        assert_eq!(events[0].requested_model, "smart");
+        assert!(events[0].usage_estimated);
+        assert!(events[0].completion_tokens > 0, "partial text billed");
+
+        // Terminal event: attributed to the serving fallback target.
+        assert_eq!(events[1].attempt_kind, "mid_stream_fallback");
+        assert_eq!(events[1].model_id, "m-secondary");
+        assert_eq!(events[1].attempt_model, "secondary");
+        assert_eq!(events[1].status_code, 200);
+        assert_eq!(events[1].stream_outcome, "partial_recovered");
+        assert_eq!(events[1].inbound_protocol, "anthropic");
+        assert_eq!(
+            events[1].completion_tokens, 7,
+            "serving attempt's own count"
         );
     }
 

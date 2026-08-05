@@ -1744,6 +1744,13 @@ pub struct AnthropicSseEncoder {
     seen_input_tokens: u32,
     seen_output_tokens: u32,
     usage_seen: bool,
+    /// Usage folded ADDITIVELY into the closing pair on top of the
+    /// `seen_*` counters (mid-stream failover, AISIX-Cloud#1222): the
+    /// estimated spend of failed partial attempts. Anthropic wire usage
+    /// is cumulative per message, so the terminal counts must also
+    /// cover the partial text the client received before the switch.
+    extra_input_tokens: u32,
+    extra_output_tokens: u32,
 }
 
 impl AnthropicSseEncoder {
@@ -1770,7 +1777,47 @@ impl AnthropicSseEncoder {
             seen_input_tokens: 0,
             seen_output_tokens: 0,
             usage_seen: false,
+            extra_input_tokens: 0,
+            extra_output_tokens: 0,
         }
+    }
+
+    /// Rebuild an encoder positioned mid-message, for the passthrough
+    /// mid-stream failover (AISIX-Cloud#1222): the client already holds
+    /// the upstream's own `message_start` (and possibly an open text
+    /// block), so the resumed encoder must continue that envelope
+    /// instead of opening its own. `open_text_block` is the index of
+    /// the text content block the upstream left open (`None` → the
+    /// next text delta opens a fresh block at `next_block_index`).
+    pub fn resume(
+        message_id: impl Into<String>,
+        model_display_name: impl Into<String>,
+        open_text_block: Option<usize>,
+        next_block_index: usize,
+    ) -> Self {
+        let mut enc = Self::new(message_id, model_display_name, 0);
+        enc.sent_message_start = true;
+        enc.text_block_index = open_text_block;
+        enc.next_block_index = next_block_index;
+        enc
+    }
+
+    /// Fold failed-attempt usage additively into the closing pair (see
+    /// `extra_input_tokens`). Refreshed by the pump whenever the
+    /// serving attempt changes.
+    pub fn set_extra_usage(&mut self, input_tokens: u32, output_tokens: u32) {
+        self.extra_input_tokens = input_tokens;
+        self.extra_output_tokens = output_tokens;
+    }
+
+    /// Zero the cumulative usage counters when the serving attempt
+    /// changes (mid-stream failover): max-wins folding across attempts
+    /// would otherwise mix the failed attempt's counters into the
+    /// serving attempt's totals.
+    pub fn reset_usage_counters(&mut self) {
+        self.seen_input_tokens = 0;
+        self.seen_output_tokens = 0;
+        self.usage_seen = false;
     }
 
     /// Translate one chunk into the Anthropic SSE events to emit.
@@ -1951,10 +1998,18 @@ impl AnthropicSseEncoder {
     /// place the client can learn the prompt token count.
     fn closing_pair(&mut self, stop_reason: &'static str) -> Vec<AnthropicSseEvent> {
         let mut usage = serde_json::Map::new();
-        if self.seen_input_tokens > 0 {
-            usage.insert("input_tokens".into(), self.seen_input_tokens.into());
+        let input_total = self
+            .seen_input_tokens
+            .saturating_add(self.extra_input_tokens);
+        if input_total > 0 {
+            usage.insert("input_tokens".into(), input_total.into());
         }
-        usage.insert("output_tokens".into(), self.seen_output_tokens.into());
+        usage.insert(
+            "output_tokens".into(),
+            self.seen_output_tokens
+                .saturating_add(self.extra_output_tokens)
+                .into(),
+        );
         self.finished = true;
         vec![
             AnthropicSseEvent {

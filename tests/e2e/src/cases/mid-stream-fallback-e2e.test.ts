@@ -188,7 +188,7 @@ describe("mid-stream fallback e2e", () => {
     expect(body.messages[0].role).toBe("user");
     expect(body.messages[1].role).toBe("system");
     expect(body.messages[1].content).toContain(
-      "Do not repeat the same content",
+      "do not repeat any of its content",
     );
     expect(body.messages[2].role).toBe("assistant");
     expect(body.messages[2].content).toBe("Once upon ");

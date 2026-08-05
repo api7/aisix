@@ -1,5 +1,6 @@
-//! Mid-stream failover for `/v1/chat/completions` streaming
-//! (AISIX-Cloud#1222, `routing.stream_failure: continue`).
+//! Mid-stream failover for streaming responses (AISIX-Cloud#1222,
+//! `routing.stream_failure: continue`) — `/v1/chat/completions`,
+//! `/v1/messages`, and `/v1/responses`.
 //!
 //! Once the first chunk of a streaming response has been committed the
 //! HTTP 200 can no longer be revised, so the pre-stream retry/failover
@@ -12,6 +13,15 @@
 //! continuation system instruction + an assistant message carrying the
 //! partial; Anthropic-wire targets consume the trailing assistant
 //! message as native prefill).
+//!
+//! The endpoints' native-protocol passthrough legs (`/v1/messages` on
+//! an Anthropic target, `/v1/responses` on an OpenAI target) forward
+//! opaque bytes, not [`ChatChunk`]s — their byte-level combinators live
+//! in their endpoint modules and reuse [`acquire_fallback_stream`] +
+//! [`classify_trigger`] from here, re-encoding the fallback's chunks
+//! onto the client's already-committed wire envelope.
+//!
+//! [`ChatChunk`]: aisix_gateway::ChatChunk
 //!
 //! Client-cancel safety is structural: the combinator only makes
 //! progress when the pump polls it, and the pump only advances when
@@ -33,11 +43,41 @@ use crate::routing::AttemptModel;
 use crate::ProxyState;
 
 /// Verbatim LiteLLM continuation instruction (`litellm/router.py`,
-/// `_acompletion_streaming_iterator`) — kept byte-identical so the two
-/// gateways' fallback models receive the same steering. The partial
-/// text is NOT interpolated here; it rides the assistant message that
-/// follows.
-const CONTINUATION_SYSTEM_PROMPT: &str = "You are a helpful assistant. You are given a message and you need to respond to it. You are also given a generated content. You need to respond to the message in continuation of the generated content. Do not repeat the same content. Your response should be in continuation of this text: ";
+/// `_build_responses_continuation_input` — the one continuation surface
+/// LiteLLM still ships after #34627 removed the chat-completions one) —
+/// kept byte-identical so the two gateways' fallback models receive the
+/// same steering. LiteLLM sends it as a `developer` turn on the
+/// Responses input; our internal shape carries it as a system message,
+/// which each provider bridge maps to its own instruction tier. The
+/// partial text is NOT interpolated here; it rides the assistant
+/// message that follows.
+const CONTINUATION_SYSTEM_PROMPT: &str = "The previous assistant response was interrupted mid-stream. Continue exactly where it stopped — do not repeat any of its content. Your response must read as a seamless continuation.";
+
+/// Which endpoint's stream the combinator is serving. Selects the
+/// UsageEvent stamps (`inbound_protocol` + the usage-sink handler
+/// label) for the per-attempt events emitted on a mid-stream switch, so
+/// they land in telemetry alongside the endpoint's own events.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum MidStreamEndpoint {
+    Chat,
+    Messages,
+}
+
+impl MidStreamEndpoint {
+    pub(crate) fn sink_label(self) -> &'static str {
+        match self {
+            Self::Chat => "chat",
+            Self::Messages => "messages",
+        }
+    }
+
+    pub(crate) fn inbound_protocol(self) -> &'static str {
+        match self {
+            Self::Chat => "openai",
+            Self::Messages => "anthropic",
+        }
+    }
+}
 
 /// The serving attempt behind the live client stream. Starts as the
 /// pre-stream winner; rewritten by the combinator on every mid-stream
@@ -65,6 +105,15 @@ pub(crate) struct ServingAttempt {
 /// keep the request's telemetry coherent while doing so.
 pub(crate) struct MidStreamPlan {
     pub cfg: StreamFailure,
+    /// Endpoint stamps for the per-attempt events (see
+    /// [`MidStreamEndpoint`]).
+    pub endpoint: MidStreamEndpoint,
+    /// Whether the request pins the output to a structured shape the
+    /// continuation cannot safely extend. Computed by the caller from
+    /// its own inbound request model (`response_format` on the chat
+    /// shape, `text.format` on the Responses shape; the Anthropic shape
+    /// has no equivalent).
+    pub structured_output: bool,
     /// Targets after the pre-stream winner, in strategy order.
     pub remaining: Vec<AttemptModel>,
     pub state: ProxyState,
@@ -112,6 +161,13 @@ pub(crate) struct MidStreamShared {
     /// it bills the pre-stream reservation's keys (#450 / #1087
     /// family).
     pub extra_post_stream_keys: Arc<Mutex<Vec<String>>>,
+    /// Terminal stream failure `(error_class, error_message)` recorded
+    /// by a byte-level (passthrough) combinator, which ends the wire
+    /// with a synthesized protocol error frame the downstream builder
+    /// cannot distinguish from clean bytes — unlike the typed pumps,
+    /// which observe the `Err` item directly. `None` = no terminal
+    /// failure.
+    pub terminal_failure: Arc<Mutex<Option<(String, String)>>>,
 }
 
 impl MidStreamShared {
@@ -120,6 +176,7 @@ impl MidStreamShared {
             extra_usage: Arc::new(Mutex::new(aisix_gateway::UsageStats::default())),
             attempt_seq: Arc::new(AtomicU32::new(0)),
             extra_post_stream_keys: Arc::new(Mutex::new(Vec::new())),
+            terminal_failure: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -189,7 +246,7 @@ pub(crate) fn wrap(
         // Output shapes a fallback model cannot safely continue:
         // half-emitted tool calls, provider-signed reasoning streams,
         // structured output. Sticky once observed.
-        let mut unsafe_output = expects_structured_output(&plan.req);
+        let mut unsafe_output = plan.structured_output;
         let mut used: u32 = 0;
         let mut cursor = 0usize;
         let max = plan.cfg.max_fallbacks_or_default();
@@ -256,7 +313,7 @@ pub(crate) fn wrap(
 /// Mirrors what the pre-stream loop does for a failed attempt, minus
 /// the pieces that only exist before the 200 (routing telemetry is
 /// already finalized; the access log already went out).
-fn finalize_failed_attempt(plan: &MidStreamPlan, err: &BridgeError, partial: &str) {
+pub(crate) fn finalize_failed_attempt(plan: &MidStreamPlan, err: &BridgeError, partial: &str) {
     let (rec, failed_cooldown, failed_target_id, failed_upstream_model, failed_display);
     {
         let serving = plan.serving.lock().expect("serving lock");
@@ -315,6 +372,7 @@ fn finalize_failed_attempt(plan: &MidStreamPlan, err: &BridgeError, partial: &st
     }
     crate::chat::emit_mid_stream_failed_attempt(
         &plan.state,
+        plan.endpoint,
         &plan.request_id,
         &plan.requested_model,
         &plan.api_key_id,
@@ -342,7 +400,7 @@ fn finalize_failed_attempt(plan: &MidStreamPlan, err: &BridgeError, partial: &st
 /// recent error is returned — the pump then terminates the stream with
 /// it (in-band error frame, no `[DONE]`), same as LiteLLM surfacing
 /// the fallback's own failure.
-async fn acquire_fallback_stream(
+pub(crate) async fn acquire_fallback_stream(
     plan: &MidStreamPlan,
     cursor: &mut usize,
     used: &mut u32,
@@ -436,6 +494,7 @@ async fn acquire_fallback_stream(
                 };
                 crate::chat::emit_mid_stream_failed_attempt(
                     &plan.state,
+                    plan.endpoint,
                     &plan.request_id,
                     &plan.requested_model,
                     &plan.api_key_id,
@@ -538,6 +597,7 @@ async fn acquire_fallback_stream(
                 }
                 crate::chat::emit_mid_stream_failed_attempt(
                     &plan.state,
+                    plan.endpoint,
                     &plan.request_id,
                     &plan.requested_model,
                     &plan.api_key_id,

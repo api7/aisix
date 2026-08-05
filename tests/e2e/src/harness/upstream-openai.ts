@@ -32,6 +32,22 @@ export interface OpenAiUpstreamOptions {
   /** Drop the connection after writing this many SSE events. */
   disconnectAfterEvents?: number;
   /**
+   * Stall (indefinitely, until the peer goes away) after writing this
+   * many SSE events, WITHOUT closing the socket — models a hung
+   * upstream mid-stream, i.e. the read-timeout scenario, as opposed to
+   * `disconnectAfterEvents` (connection drop).
+   */
+  stallAfterEvents?: number;
+  /**
+   * Pre-formed SSE frames written verbatim — each entry must carry its
+   * own `event:`/`data:` lines and trailing blank line. For
+   * Anthropic-wire mocks (`event: message_start` etc.), which the
+   * `data:`-only `streamEvents` shape can't express. Same
+   * `eventDelayMs`/`disconnectAfterEvents` semantics, counted per
+   * frame. Takes precedence over `streamEvents`.
+   */
+  rawStreamFrames?: string[];
+  /**
    * Raw (non-JSON) 200 response body — e.g. MP4 bytes for the `/v1/videos`
    * content-proxy path. When set (and `status` < 400), the reply is these
    * bytes with `rawContentType` (default `application/octet-stream`) and an
@@ -71,6 +87,10 @@ export interface OpenAiUpstreamStep {
   /** Content-Type for the error body (default `application/json`). See #543. */
   errorContentType?: string;
   disconnectAfterEvents?: number;
+  /** See `OpenAiUpstreamOptions.stallAfterEvents`. */
+  stallAfterEvents?: number;
+  /** See `OpenAiUpstreamOptions.rawStreamFrames`. */
+  rawStreamFrames?: string[];
   /** Extra response headers, same semantics as on the top-level options. */
   responseHeaders?: Record<string, string>;
   /** Raw (non-JSON) 200 body — see `OpenAiUpstreamOptions.rawBody`. */
@@ -168,7 +188,7 @@ export async function startOpenAiUpstream(
         return;
       }
 
-      const isStream = !!step.streamEvents;
+      const isStream = !!step.streamEvents || !!step.rawStreamFrames;
       if (isStream) {
         res.statusCode = 200;
         res.setHeader("content-type", "text/event-stream");
@@ -178,8 +198,12 @@ export async function startOpenAiUpstream(
         // first token (TTFT timeout) independently of the headers (#554).
         res.flushHeaders();
         if (step.firstEventDelayMs) await sleep(step.firstEventDelayMs);
-        const events = step.streamEvents ?? [];
-        for (let i = 0; i < events.length; i++) {
+        // Raw frames are written verbatim (they carry their own SSE
+        // framing); `streamEvents` entries get the `data:` framing here.
+        const frames =
+          step.rawStreamFrames ??
+          (step.streamEvents ?? []).map((e) => `data: ${e}\n\n`);
+        for (let i = 0; i < frames.length; i++) {
           // The gateway may have abandoned a stalled stream (#554 read
           // timeout) and closed the connection; stop writing rather than
           // throwing on a dead socket.
@@ -191,7 +215,16 @@ export async function startOpenAiUpstream(
             res.destroy();
             return;
           }
-          res.write(`data: ${events[i]}\n\n`);
+          if (
+            step.stallAfterEvents !== undefined &&
+            i >= step.stallAfterEvents
+          ) {
+            // Hang without closing: the socket stays open until the
+            // gateway abandons it (read timeout) or the test ends.
+            await sleep(600_000);
+            return;
+          }
+          res.write(frames[i]);
           if (step.eventDelayMs) await sleep(step.eventDelayMs);
         }
         if (!res.writableEnded && !res.destroyed) res.end();

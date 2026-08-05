@@ -29,8 +29,8 @@ pub use bridge::{AnthropicBridge, ANTHROPIC_DEFAULT_BASE, ANTHROPIC_VERSION};
 /// - [`AnthropicSseEncoder`] re-encodes the bridge's `ChatChunk`
 ///   stream as Anthropic typed SSE events.
 pub use wire::{
-    chat_response_into_anthropic_json, parse_inbound_request,
+    chat_response_into_anthropic_json, parse_inbound_request, stream_error_into_bridge_error,
     translate_anthropic_tool_choice_to_openai, translate_anthropic_tools_to_openai,
     translate_extras_to_openai_shape, AnthropicInboundError, AnthropicSseEncoder,
-    AnthropicSseEvent,
+    AnthropicSseEvent, AnthropicStreamErrorBody,
 };

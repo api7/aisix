@@ -1665,6 +1665,8 @@ async fn dispatch(
                     upstream,
                     crate::stream_failover::MidStreamPlan {
                         cfg,
+                        endpoint: crate::stream_failover::MidStreamEndpoint::Chat,
+                        structured_output: crate::stream_failover::expects_structured_output(req),
                         remaining: attempt_models[winner_target_idx + 1..].to_vec(),
                         state: state.clone(),
                         auth: auth.clone(),
@@ -3795,6 +3797,50 @@ fn emit_usage_event(
     client: &ClientContext,
     content: Option<CapturedContent>,
 ) {
+    emit_usage_event_stamped(
+        state,
+        "chat",
+        "openai",
+        request_id,
+        model_id,
+        requested_model,
+        api_key_id,
+        status_code,
+        elapsed,
+        prompt_tokens,
+        completion_tokens,
+        extras,
+        cost_usd,
+        guardrail_blocked,
+        client,
+        content,
+    )
+}
+
+/// `emit_usage_event` with the endpoint stamps explicit — the
+/// mid-stream failover per-attempt events reuse chat's emit pipeline
+/// (attribution-tag lookup, guardrail counters, OTLP fan-out) from the
+/// `/v1/messages` and `/v1/responses` combinators, which stamp their
+/// own `inbound_protocol` + usage-sink handler label.
+#[allow(clippy::too_many_arguments)]
+fn emit_usage_event_stamped(
+    state: &ProxyState,
+    sink_label: &'static str,
+    inbound_protocol: &'static str,
+    request_id: &str,
+    model_id: &str,
+    requested_model: &str,
+    api_key_id: &str,
+    status_code: u16,
+    elapsed: Duration,
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    extras: UsageExtras,
+    cost_usd: f64,
+    guardrail_blocked: bool,
+    client: &ClientContext,
+    content: Option<CapturedContent>,
+) {
     // Look up per-PK telemetry attribution tags from the live snapshot.
     // Empty `provider_key_id` (pre-dispatch error paths) → default
     // tags (all empty / false) → wire fields skip-serialize → cp-api
@@ -3839,11 +3885,7 @@ fn emit_usage_event(
         cache_hit_saved_input_tokens: extras.cache_hit_saved_input_tokens,
         cache_hit_saved_output_tokens: extras.cache_hit_saved_output_tokens,
         upstream_ttft_ms: extras.upstream_ttft_ms,
-        // chat.rs is the OpenAI-shape /v1/chat/completions handler.
-        // /v1/responses / /v1/embeddings / /v1/audio* / /v1/images* /
-        // /v1/rerank don't emit UsageEvents today; when they do they
-        // also pass `"openai"` here.
-        inbound_protocol: "openai".to_string(),
+        inbound_protocol: inbound_protocol.to_string(),
         attempt_index: extras.attempt_index,
         attempt_kind: extras.attempt_kind,
         attempt_model: extras.attempt_model,
@@ -3870,10 +3912,10 @@ fn emit_usage_event(
         // MCP attribution does not apply to the chat path.
         ..Default::default()
     };
-    // Handler label "chat" matches the documented enumeration for
+    // Handler labels match the documented enumeration for
     // `aisix_usage_events_emitted_total` (#408). Keep `&'static str`
     // so prometheus cardinality stays bounded.
-    state.usage_sink.try_emit("chat", event.clone());
+    state.usage_sink.try_emit(sink_label, event.clone());
     // Guardrail outcome counters (#379). Recorded here — the one place every
     // chat path (success / error / streaming / cache-hit) funnels through —
     // from the same guardrail fields the UsageEvent carries.
@@ -4077,6 +4119,7 @@ fn emit_failed_attempts(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_mid_stream_failed_attempt(
     state: &ProxyState,
+    endpoint: crate::stream_failover::MidStreamEndpoint,
     request_id: &str,
     requested_model: &str,
     api_key_id: &str,
@@ -4086,8 +4129,10 @@ pub(crate) fn emit_mid_stream_failed_attempt(
     prompt_tokens: u32,
     completion_tokens: u32,
 ) {
-    emit_usage_event(
+    emit_usage_event_stamped(
         state,
+        endpoint.sink_label(),
+        endpoint.inbound_protocol(),
         request_id,
         &rec.target_model_id,
         requested_model,

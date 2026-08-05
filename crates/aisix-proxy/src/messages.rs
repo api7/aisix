@@ -271,6 +271,7 @@ pub async fn messages(
                     applied_guardrails.clone(),
                     redaction_counts.clone(),
                     monitor_hits.clone(),
+                    "",
                     captured_content,
                 );
             }
@@ -394,6 +395,7 @@ pub async fn messages(
                     // Input masking may have fired before the failure.
                     redaction_counts.clone(),
                     monitor_hits.clone(),
+                    "",
                     failure_content.take(),
                 );
             }
@@ -466,9 +468,28 @@ fn emit_failed_attempts_anthropic(
             // terminal (winner / pre-dispatch) event does.
             crate::redact::RedactionCounts::new(),
             Vec::new(),
+            "",
             content,
         );
     }
+}
+
+/// Per-attempt mid-stream failover context (AISIX-Cloud#1222), built by
+/// `dispatch` when `routing.stream_failure` is `mode: continue` and
+/// fallback targets remain after the current one. Threaded into the
+/// streaming sub-paths, which build the [`MidStreamPlan`] from it;
+/// `None` keeps today's terminate behavior.
+///
+/// [`MidStreamPlan`]: crate::stream_failover::MidStreamPlan
+struct MidStreamArm {
+    cfg: aisix_core::StreamFailure,
+    remaining: Vec<crate::routing::AttemptModel>,
+    auth: AuthenticatedKey,
+    group: aisix_core::Model,
+    retry_on_429: bool,
+    fallback_on_statuses: Vec<u16>,
+    winner_attempt_index: u32,
+    winner_attempt_kind: &'static str,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -655,6 +676,16 @@ async fn dispatch(
     // pre-dispatch 4xx); if this endpoint ever grows semantic support,
     // widen this flag or the deferred policies are silently skipped.
     let is_routing_request = model_entry.value.routing.is_some();
+    // Mid-stream failover config (AISIX-Cloud#1222): armed only for
+    // `mode: continue` on a routing request, mirroring chat.rs.
+    let stream_failure_cfg = model_entry
+        .value
+        .routing
+        .as_ref()
+        .and_then(|r| r.stream_failure.clone())
+        .filter(|cfg| {
+            cfg.mode_or_default() == aisix_core::StreamFailureMode::Continue && is_routing_request
+        });
     let mut routing = RoutingTelemetry::default();
 
     // Walk targets, failing over to the next only on a retryable upstream
@@ -741,6 +772,21 @@ async fn dispatch(
                 }
             };
             let attempt_started = Instant::now();
+            // Arm mid-stream failover for this attempt when fallback
+            // targets remain after it (AISIX-Cloud#1222).
+            let mid_stream_arm = stream_failure_cfg.as_ref().and_then(|cfg| {
+                let remaining = &attempt_models[i + 1..];
+                (!remaining.is_empty()).then(|| MidStreamArm {
+                    cfg: cfg.clone(),
+                    remaining: remaining.to_vec(),
+                    auth: auth.clone(),
+                    group: model_entry.value.clone(),
+                    retry_on_429,
+                    fallback_on_statuses: fallback_statuses.to_vec(),
+                    winner_attempt_index: idx,
+                    winner_attempt_kind: kind,
+                })
+            });
             match dispatch_to_target(
                 state,
                 &snapshot,
@@ -767,6 +813,7 @@ async fn dispatch(
                 &mut member_reservation,
                 redactions_out.clone(),
                 monitor_hits_out.clone(),
+                mid_stream_arm,
             )
             .await
             {
@@ -909,6 +956,9 @@ async fn dispatch_to_target(
     // Input-side monitor hits (AISIX-Cloud#562), same lifecycle as
     // `input_redactions`.
     input_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
+    // Mid-stream failover context (AISIX-Cloud#1222); consumed by the
+    // streaming branches of both sub-paths.
+    mid_stream: Option<MidStreamArm>,
 ) -> Result<DispatchOutcome, ProxyError> {
     let model = &target.model;
     let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
@@ -937,6 +987,7 @@ async fn dispatch_to_target(
             member_reservation,
             input_redactions,
             input_monitor_hits,
+            mid_stream,
         )
         .await;
     }
@@ -964,6 +1015,7 @@ async fn dispatch_to_target(
         member_reservation,
         input_redactions,
         input_monitor_hits,
+        mid_stream,
     )
     .await
 }
@@ -1000,6 +1052,9 @@ async fn anthropic_passthrough_dispatch(
     member_reservation: &mut Option<aisix_ratelimit::MultiReservation>,
     input_redactions: crate::redact::RedactionCounts,
     input_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
+    // Mid-stream failover context (AISIX-Cloud#1222); `None` disarms —
+    // a mid-stream failure keeps today's truncate/forward behavior.
+    mid_stream: Option<MidStreamArm>,
 ) -> Result<DispatchOutcome, ProxyError> {
     let mut body = body.clone();
     let api_key = crate::dispatch::require_api_key(pk_value, model)?;
@@ -1155,22 +1210,86 @@ async fn anthropic_passthrough_dispatch(
         // For SSE streaming: pass through the response body as a streaming
         // `text/event-stream` response.
         let headers = upstream_resp.headers().clone();
+        // Mid-stream failover (AISIX-Cloud#1222): built up front because
+        // it decides who owns the read timeout below. The continuation
+        // dispatch runs on the internal ChatFormat — a body the parser
+        // can't map disarms (terminate as before). The parse runs on the
+        // outbound body (post-redaction, model already rewritten), same
+        // source the cross-provider path translates; the client-facing
+        // model name is restored explicitly.
+        let mid_stream_ctx = mid_stream.and_then(|arm| {
+            let mut chat = aisix_provider_anthropic::parse_inbound_request(&body).ok()?;
+            chat.model = model_name.to_string();
+            aisix_provider_anthropic::translate_extras_to_openai_shape(&mut chat.extra);
+            let serving = Arc::new(std::sync::Mutex::new(
+                crate::stream_failover::ServingAttempt {
+                    target_id: model_id.to_string(),
+                    target_model: attempt.model.clone(),
+                    provider: provider_label.clone(),
+                    provider_key_id: pk_id.to_string(),
+                    upstream_model: upstream_model.clone(),
+                    cooldown: model.cooldown.clone(),
+                    attempt_index: arm.winner_attempt_index,
+                    attempt_kind: arm.winner_attempt_kind,
+                    attempt_started,
+                },
+            ));
+            let shared = crate::stream_failover::MidStreamShared::new();
+            let plan = crate::stream_failover::MidStreamPlan {
+                cfg: arm.cfg,
+                endpoint: crate::stream_failover::MidStreamEndpoint::Messages,
+                structured_output: crate::stream_failover::expects_structured_output(&chat),
+                remaining: arm.remaining,
+                state: state.clone(),
+                auth: arm.auth,
+                group: arm.group,
+                req: chat,
+                request_id: request_id.to_string(),
+                client: client_ctx.clone(),
+                retry_on_429: arm.retry_on_429,
+                fallback_on_statuses: arm.fallback_on_statuses,
+                requested_model: model_name.to_string(),
+                api_key_id: api_key_id.to_string(),
+                applied_guardrails: resolved_chain.applied().to_vec(),
+                serving: Arc::clone(&serving),
+                shared: shared.clone(),
+            };
+            Some((plan, serving, shared))
+        });
         // #554: enforce the per-chunk read timeout on the forwarded bytes.
         // When a `stream_timeout` is configured, peek the first byte so a
         // slow/erroring first token fails over (the caller loops to the next
         // target) before the 200 is committed; without one, forward directly
         // (pre-#554 behavior). A mid-stream stall truncates the forwarded
-        // stream — there is no in-band error frame for an opaque passthrough.
+        // stream — there is no in-band error frame for an opaque passthrough
+        // — unless mid-stream failover is armed, in which case the failover
+        // combinator owns the timeout (it must classify the stall as
+        // `read_timeout`, which the silent-truncate wrapper can't signal).
         let stream_budget = timeouts.stream;
-        let wrapped: std::pin::Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>> =
+        let armed = mid_stream_ctx.is_some();
+        let wrapped: std::pin::Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>> = if armed
+        {
+            Box::pin(upstream_resp.bytes_stream())
+        } else {
             Box::pin(crate::stream_timeout::with_read_timeout_bytes(
                 upstream_resp.bytes_stream(),
                 stream_budget,
-            ));
+            ))
+        };
         let body_stream: std::pin::Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>> =
             if timeouts.stream_configured {
                 let mut wrapped = wrapped;
-                let first_bytes = match wrapped.next().await {
+                // The armed pipeline has no outer timeout wrapper — bound
+                // the first-byte peek explicitly so a stalled head still
+                // fails over pre-200 (identical outcome to the unarmed
+                // wrapper, which ends the stream on an elapsed timeout).
+                let first = match (armed, stream_budget) {
+                    (true, Some(d)) => tokio::time::timeout(d, wrapped.next())
+                        .await
+                        .unwrap_or_default(),
+                    _ => wrapped.next().await,
+                };
+                let first_bytes = match first {
                     Some(Ok(b)) => b,
                     Some(Err(e)) => {
                         let err = crate::dispatch::reqwest_error_to_bridge(&e, send_started);
@@ -1202,6 +1321,20 @@ async fn anthropic_passthrough_dispatch(
                 )
             } else {
                 wrapped
+            };
+        let (mid_stream_plan, mid_stream_for_telem) = match mid_stream_ctx {
+            Some((plan, serving, shared)) => (Some(plan), Some((serving, shared))),
+            None => (None, None),
+        };
+        let body_stream: std::pin::Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>> =
+            match mid_stream_plan {
+                Some(plan) => Box::pin(wrap_anthropic_passthrough(
+                    body_stream,
+                    plan,
+                    stream_budget,
+                    model_name.to_string(),
+                )),
+                None => body_stream,
             };
 
         // Issue #245: parity with the OpenAI streaming fix (#225 /
@@ -1279,6 +1412,9 @@ async fn anthropic_passthrough_dispatch(
             &upstream_model,
             crate::token_estimate::PromptInput::Anthropic(body.clone()),
         );
+        let mid_stream_shared_for_parser = mid_stream_for_telem
+            .as_ref()
+            .map(|(_, shared)| shared.clone());
         let parsed_stream = build_anthropic_passthrough_stream(
             body_stream,
             started,
@@ -1287,16 +1423,87 @@ async fn anthropic_passthrough_dispatch(
             model_name.to_string(),
             content_cap,
             Some(estimator),
+            mid_stream_shared_for_parser,
             move |usage| {
                 // Streaming responses that got this far are 200 — the
                 // !status.is_success() guard above returned early on
                 // upstream errors.
                 //
+                // Mid-stream failover may have moved the stream onto a
+                // fallback target — read the SERVING attempt (not the
+                // pre-stream winner) for everything target-scoped
+                // (AISIX-Cloud#1222).
+                let (
+                    model_id_c,
+                    provider_c,
+                    provider_key_id_c,
+                    upstream_model_c,
+                    attempt_c,
+                    attempt_elapsed,
+                    mid_stream_fallbacks,
+                    terminal_failure,
+                ) = match &mid_stream_for_telem {
+                    Some((serving, shared)) => {
+                        let s = serving.lock().expect("serving lock");
+                        (
+                            s.target_id.clone(),
+                            s.provider.clone(),
+                            s.provider_key_id.clone(),
+                            s.upstream_model.clone(),
+                            AttemptInfo {
+                                index: s.attempt_index,
+                                kind: s.attempt_kind.to_string(),
+                                model: s.target_model.clone(),
+                                ..Default::default()
+                            },
+                            s.attempt_started.elapsed(),
+                            shared.attempt_seq.load(Ordering::Relaxed),
+                            shared
+                                .terminal_failure
+                                .lock()
+                                .expect("terminal failure lock")
+                                .clone(),
+                        )
+                    }
+                    None => (
+                        model_id_c,
+                        provider_c,
+                        provider_key_id_c,
+                        upstream_model_c,
+                        attempt_c,
+                        attempt_started.elapsed(),
+                        0,
+                        None,
+                    ),
+                };
+                // Logical stream outcome (AISIX-Cloud#1222) — same
+                // derivation as the typed pumps; the terminal-failure
+                // signal comes from the byte combinator via the shared
+                // slot (the parser below it only sees clean bytes).
+                let stream_failed = terminal_failure.is_some();
+                let stream_outcome = if usage.guardrail_blocked || !usage.reached_end {
+                    ""
+                } else if stream_failed {
+                    "partial_failed"
+                } else if mid_stream_fallbacks > 0 {
+                    "partial_recovered"
+                } else {
+                    "success"
+                };
+                if mid_stream_fallbacks > 0 {
+                    // Recovered = the fallback kept the stream alive;
+                    // only a terminal upstream error counts as failed.
+                    state_c
+                        .metrics
+                        .record_mid_stream_fallback(&model_name_c, !stream_failed);
+                }
                 // #688: apply the terminal token cost to TPM/TPD and release the
                 // concurrency hold now the stream has ended. `add_tokens_post_stream`
                 // is the sync analog of the reservation's async `commit_tokens`
                 // (this end-of-stream closure can't await); dropping the hold frees
                 // the concurrency slot(s) held for the stream's full lifetime.
+                // Mid-stream fallback targets that served part of this stream
+                // bill their TPM here too (AISIX-Cloud#1222).
                 let streamed_tokens = total_tokens_with_cache(
                     usage.prompt_tokens,
                     usage.completion_tokens,
@@ -1305,6 +1512,16 @@ async fn anthropic_passthrough_dispatch(
                 );
                 for key in &post_stream_keys {
                     limiter_c.add_tokens_post_stream(key, streamed_tokens);
+                }
+                if let Some((_, shared)) = &mid_stream_for_telem {
+                    for key in shared
+                        .extra_post_stream_keys
+                        .lock()
+                        .expect("extra keys lock")
+                        .iter()
+                    {
+                        limiter_c.add_tokens_post_stream(key, streamed_tokens);
+                    }
                 }
                 drop(stream_hold);
                 // least_busy: stream over — this target is no longer
@@ -1356,10 +1573,17 @@ async fn anthropic_passthrough_dispatch(
                     },
                     // Attempt-scoped, unlike the e2e histogram above: any
                     // failed attempt before this one emitted its own event.
-                    attempt_started.elapsed(),
+                    attempt_elapsed,
                     metrics,
                     &client_ctx_c,
-                    attempt_c.clone(),
+                    {
+                        let mut attempt = attempt_c.clone();
+                        if let Some((class, message)) = &terminal_failure {
+                            attempt.error_class = class.clone();
+                            attempt.error_message = message.clone();
+                        }
+                        attempt
+                    },
                     applied_guardrails_c.clone(),
                     // #932: input-side mask counts captured before dispatch,
                     // merged with the hold-back release's output-side counts.
@@ -1373,6 +1597,7 @@ async fn anthropic_passthrough_dispatch(
                         merged.extend(usage.monitor_hits);
                         merged
                     },
+                    stream_outcome,
                     // Prompt captured up front; response assembled by the frame
                     // parser into `usage.response_text`. Both gated on the cap.
                     match (&captured_prompt_c, content_cap) {
@@ -1741,6 +1966,9 @@ async fn cross_provider_dispatch(
     member_reservation: &mut Option<aisix_ratelimit::MultiReservation>,
     input_redactions: crate::redact::RedactionCounts,
     input_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
+    // Mid-stream failover context (AISIX-Cloud#1222); `None` disarms —
+    // a mid-stream failure keeps today's terminate behavior.
+    mid_stream: Option<MidStreamArm>,
 ) -> Result<DispatchOutcome, ProxyError> {
     use aisix_gateway::Bridge;
     use aisix_provider_anthropic::{
@@ -1864,6 +2092,61 @@ async fn cross_provider_dispatch(
         state.health.record_success(model_name);
         state.runtime_status.mark_healthy(model_id);
 
+        // Mid-stream failover (AISIX-Cloud#1222): when armed, wrap the
+        // upstream so a qualifying mid-stream failure continues on the
+        // remaining targets inside the SAME client stream. The
+        // AnthropicSseEncoder lives OUTSIDE the combinator, so its
+        // message envelope + content-block state survive the switch and
+        // the spliced fallback chunks continue the same wire message.
+        let mid_stream_state = mid_stream.map(|arm| {
+            let serving = Arc::new(std::sync::Mutex::new(
+                crate::stream_failover::ServingAttempt {
+                    target_id: model_id.to_string(),
+                    target_model: attempt.model.clone(),
+                    provider: provider_label.clone(),
+                    provider_key_id: provider_key_id.to_string(),
+                    upstream_model: upstream_model.clone(),
+                    cooldown: model.cooldown.clone(),
+                    attempt_index: arm.winner_attempt_index,
+                    attempt_kind: arm.winner_attempt_kind,
+                    attempt_started,
+                },
+            ));
+            let shared = crate::stream_failover::MidStreamShared::new();
+            (arm, serving, shared)
+        });
+        let upstream = match &mid_stream_state {
+            Some((arm, serving, shared)) => crate::stream_failover::wrap(
+                upstream,
+                crate::stream_failover::MidStreamPlan {
+                    cfg: arm.cfg.clone(),
+                    endpoint: crate::stream_failover::MidStreamEndpoint::Messages,
+                    structured_output: crate::stream_failover::expects_structured_output(&chat),
+                    remaining: arm.remaining.clone(),
+                    state: state.clone(),
+                    auth: arm.auth.clone(),
+                    group: arm.group.clone(),
+                    req: chat.clone(),
+                    request_id: request_id.to_string(),
+                    client: client.clone(),
+                    retry_on_429: arm.retry_on_429,
+                    fallback_on_statuses: arm.fallback_on_statuses.clone(),
+                    requested_model: model_name.to_string(),
+                    api_key_id: api_key_id.to_string(),
+                    applied_guardrails: resolved_chain.applied().to_vec(),
+                    serving: Arc::clone(serving),
+                    shared: shared.clone(),
+                },
+            ),
+            None => upstream,
+        };
+        let mid_stream_for_telem = mid_stream_state
+            .as_ref()
+            .map(|(_, serving, shared)| (Arc::clone(serving), shared.clone()));
+        let mid_stream_shared_for_pump = mid_stream_state
+            .as_ref()
+            .map(|(_, _, shared)| shared.clone());
+
         let message_id = format!("msg_{}", Uuid::new_v4().simple());
         let encoder = AnthropicSseEncoder::new(message_id, model_name, 0);
         let state_for_telem = state.clone();
@@ -1937,11 +2220,76 @@ async fn cross_provider_dispatch(
             model_name.to_string(),
             content_cap,
             Some(estimator),
+            mid_stream_shared_for_pump,
             move |comp| {
+                // Mid-stream failover may have moved the stream onto a
+                // fallback target — read the SERVING attempt (not the
+                // pre-stream winner) for everything target-scoped
+                // (AISIX-Cloud#1222).
+                let (
+                    model_id_for_telem,
+                    provider_for_telem,
+                    provider_key_id_for_telem,
+                    upstream_model_for_telem,
+                    attempt_for_telem,
+                    attempt_elapsed,
+                    mid_stream_fallbacks,
+                ) = match &mid_stream_for_telem {
+                    Some((serving, shared)) => {
+                        let s = serving.lock().expect("serving lock");
+                        (
+                            s.target_id.clone(),
+                            s.provider.clone(),
+                            s.provider_key_id.clone(),
+                            s.upstream_model.clone(),
+                            AttemptInfo {
+                                index: s.attempt_index,
+                                kind: s.attempt_kind.to_string(),
+                                model: s.target_model.clone(),
+                                ..Default::default()
+                            },
+                            s.attempt_started.elapsed(),
+                            shared
+                                .attempt_seq
+                                .load(std::sync::atomic::Ordering::Relaxed),
+                        )
+                    }
+                    None => (
+                        model_id_for_telem,
+                        provider_for_telem,
+                        provider_key_id_for_telem,
+                        upstream_model_for_telem,
+                        attempt_for_telem,
+                        attempt_started_for_telem.elapsed(),
+                        0,
+                    ),
+                };
+                // Logical stream outcome (AISIX-Cloud#1222) — the HTTP
+                // status froze at 200 when the head committed; this is
+                // the only signal separating "delivered in full" from
+                // "terminated mid-stream". Same derivation as chat.rs.
+                let stream_outcome = if comp.guardrail_blocked || !comp.reached_end {
+                    ""
+                } else if comp.stream_failed {
+                    "partial_failed"
+                } else if mid_stream_fallbacks > 0 {
+                    "partial_recovered"
+                } else {
+                    "success"
+                };
+                if mid_stream_fallbacks > 0 {
+                    // Recovered = the fallback kept the stream alive; only
+                    // a terminal upstream error counts as failed (client
+                    // aborts after a successful switch still recovered).
+                    state_for_telem
+                        .metrics
+                        .record_mid_stream_fallback(&model_for_telem, !comp.stream_failed);
+                }
                 // #688: apply the terminal token cost to TPM/TPD and release the
                 // concurrency hold now the stream has ended (sync analog of the
                 // reservation's async `commit_tokens`, which this closure can't
-                // await).
+                // await). Mid-stream fallback targets that served part of this
+                // stream bill their TPM here too (AISIX-Cloud#1222).
                 let streamed_tokens = total_tokens_with_cache(
                     comp.prompt_tokens,
                     comp.completion_tokens,
@@ -1950,6 +2298,16 @@ async fn cross_provider_dispatch(
                 );
                 for key in &post_stream_keys {
                     limiter_for_stream.add_tokens_post_stream(key, streamed_tokens);
+                }
+                if let Some((_, shared)) = &mid_stream_for_telem {
+                    for key in shared
+                        .extra_post_stream_keys
+                        .lock()
+                        .expect("extra keys lock")
+                        .iter()
+                    {
+                        limiter_for_stream.add_tokens_post_stream(key, streamed_tokens);
+                    }
                 }
                 drop(stream_hold);
                 // least_busy: stream over — this target is no longer
@@ -1998,10 +2356,17 @@ async fn cross_provider_dispatch(
                         crate::CLIENT_CLOSED_REQUEST
                     },
                     // Attempt-scoped — see the sibling passthrough path.
-                    attempt_started_for_telem.elapsed(),
+                    attempt_elapsed,
                     metrics,
                     &client_for_telem,
-                    attempt_for_telem.clone(),
+                    {
+                        let mut attempt = attempt_for_telem.clone();
+                        if comp.stream_failed {
+                            attempt.error_class = comp.stream_error_class.clone();
+                            attempt.error_message = comp.stream_error_message.clone();
+                        }
+                        attempt
+                    },
                     applied_guardrails_for_telem.clone(),
                     // #932: input-side mask counts captured before dispatch,
                     // merged with the hold-back release's output-side counts.
@@ -2015,6 +2380,7 @@ async fn cross_provider_dispatch(
                         merged.extend(comp.monitor_hits);
                         merged
                     },
+                    stream_outcome,
                     // Prompt captured up front, response assembled across the
                     // stream into `comp.response_text`; both gated on the cap.
                     match (&captured_prompt_for_telem, content_cap) {
@@ -2190,6 +2556,12 @@ fn build_anthropic_sse_stream(
     // Token-estimation fallback context (AISIX-Cloud#1074); see
     // `CompleteAnthropicStreamOnDrop::estimator`.
     estimator: Option<crate::token_estimate::Estimator>,
+    // Mid-stream failover shared state (AISIX-Cloud#1222): the pump
+    // watches `attempt_seq` to reset its usage accumulators when the
+    // serving attempt changes, and folds `extra_usage` (failed
+    // partial attempts, estimated) into the encoder's closing usage.
+    // `None` on unarmed streams.
+    mid_stream: Option<crate::stream_failover::MidStreamShared>,
     on_complete: impl FnOnce(AnthropicStreamCompletion) + Send + 'static,
 ) -> axum::body::Body {
     use futures::StreamExt;
@@ -2230,6 +2602,14 @@ fn build_anthropic_sse_stream(
         };
         let mut upstream = upstream;
         let mut first_chunk_seen = false;
+        // Serving-attempt sequence snapshot (mid-stream failover,
+        // AISIX-Cloud#1222) — see chat.rs's pump for the why: max-wins
+        // folding across attempts would mix the failed attempt's usage
+        // into the serving attempt's totals.
+        let mut mid_stream_seq = mid_stream
+            .as_ref()
+            .map(|ms| ms.attempt_seq.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap_or(0);
         // Accumulate assistant text for the end-of-stream output guardrail
         // (#448). Without a hold-back policy, bytes are forwarded live and
         // a blocked response is signalled with a terminal `error` event.
@@ -2247,6 +2627,28 @@ fn build_anthropic_sse_stream(
         while let Some(item) = upstream.next().await {
             match item {
                 Ok(chunk) => {
+                    if let Some(ms) = mid_stream.as_ref() {
+                        let seq = ms.attempt_seq.load(std::sync::atomic::Ordering::Relaxed);
+                        if seq != mid_stream_seq {
+                            mid_stream_seq = seq;
+                            // Serving attempt changed: zero the
+                            // per-attempt accumulators and fold the
+                            // failed partials' estimated usage into the
+                            // encoder's closing counts instead.
+                            let comp = guard.comp();
+                            comp.prompt_tokens = 0;
+                            comp.completion_tokens = 0;
+                            comp.cache_creation_tokens = 0;
+                            comp.cache_read_tokens = 0;
+                            encoder.reset_usage_counters();
+                            let extra = ms
+                                .extra_usage
+                                .lock()
+                                .expect("mid-stream extra lock")
+                                .clone();
+                            encoder.set_extra_usage(extra.prompt_tokens, extra.completion_tokens);
+                        }
+                    }
                     if !first_chunk_seen && chunk.delta.carries_generated_output() {
                         first_chunk_seen = true;
                         guard.comp().upstream_ttft_ms =
@@ -2323,6 +2725,7 @@ fn build_anthropic_sse_stream(
                                 max_buffer_bytes = max_hold,
                                 "streaming /v1/messages response exceeded hold-back cap; failing closed",
                             );
+                            guard.comp().guardrail_blocked = true;
                             yield Ok(bytes::Bytes::from(guardrail_block_frame(None)));
                             return;
                         }
@@ -2337,6 +2740,19 @@ fn build_anthropic_sse_stream(
                     }
                 }
                 Err(e) => {
+                    // Terminal upstream failure: the wire ends with an
+                    // in-band error frame — distinct from a client
+                    // abandon, so `reached_end` is still recorded and
+                    // the telemetry closure reports `stream_outcome:
+                    // partial_failed` (AISIX-Cloud#1222).
+                    {
+                        let comp = guard.comp();
+                        comp.stream_failed = true;
+                        comp.stream_error_class =
+                            crate::attempt::routing_error_class(&e).to_string();
+                        comp.stream_error_message = crate::attempt::attempt_error_message(&e);
+                        comp.reached_end = true;
+                    }
                     // Hold-back: the held (unscanned) chunks are dropped —
                     // fail closed; only the error frame reaches the client.
                     let frame = format!(
@@ -2428,6 +2844,7 @@ fn build_anthropic_sse_stream(
                         reason = %reason,
                         "guardrail blocked streaming /v1/messages response",
                     );
+                    guard.comp().guardrail_blocked = true;
                     // Hold-back: the held chunks are dropped — the matched
                     // content never reached the wire.
                     let frame = guardrail_block_frame(guardrail_name.as_deref());
@@ -2549,6 +2966,23 @@ struct AnthropicStreamCompletion {
     /// check (AISIX-Cloud#562). Merged with the input-side hits by the
     /// on_complete emit.
     monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
+    /// The upstream errored mid-stream and the pump terminated the
+    /// response with an in-band error frame (AISIX-Cloud#1222). The
+    /// telemetry closure turns this into `stream_outcome:
+    /// partial_failed` — distinct from a client abandon, which leaves
+    /// `reached_end` false.
+    stream_failed: bool,
+    /// Attempt-taxonomy class of the terminal stream error; empty
+    /// unless `stream_failed`.
+    stream_error_class: String,
+    /// Client-safe message of the terminal stream error; empty unless
+    /// `stream_failed`.
+    stream_error_message: String,
+    /// The end-of-stream output guardrail blocked the response
+    /// (terminal error frame instead of clean completion). Keeps the
+    /// `stream_outcome` derivation from calling a blocked stream
+    /// `success` (AISIX-Cloud#1222).
+    guardrail_blocked: bool,
 }
 
 struct CompleteAnthropicStreamOnDrop<F: FnOnce(AnthropicStreamCompletion)> {
@@ -2705,6 +3139,11 @@ fn emit_anthropic_usage_event(
     // Monitor-mode guardrail observations (AISIX-Cloud#562), input +
     // output merged.
     guardrail_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
+    // Logical stream outcome (AISIX-Cloud#1222): `success` /
+    // `partial_failed` / `partial_recovered` on streaming terminal
+    // events; empty on non-streaming, aborted, and failed-attempt
+    // events.
+    stream_outcome: &str,
     content: Option<CapturedContent>,
 ) {
     // Per-PK telemetry attribution (#302 M17 / AISIX-Cloud#436).
@@ -2760,6 +3199,7 @@ fn emit_anthropic_usage_event(
         applied_guardrails,
         redacted_entity_counts,
         guardrail_monitor_hits,
+        stream_outcome: stream_outcome.to_string(),
         ..Default::default()
     };
     // Handler label "messages" — Anthropic /v1/messages inbound
@@ -2909,6 +3349,10 @@ struct AnthropicStreamUsage {
     /// check (AISIX-Cloud#562). Merged with the input-side hits by the
     /// on_complete emit.
     monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
+    /// The output guardrail blocked the response (terminal block frame
+    /// instead of clean bytes) — see the sibling field on
+    /// `AnthropicStreamCompletion`.
+    guardrail_blocked: bool,
 }
 
 /// Update the accumulator from one parsed SSE `data:` JSON object.
@@ -3209,6 +3653,459 @@ impl<T> Stream for AnthropicDeliveryCounter<T> {
     }
 }
 
+/// Side-channel wire state for the passthrough mid-stream failover
+/// (AISIX-Cloud#1222): everything needed to decide whether the stream
+/// is still continuation-safe and to seed a resumed
+/// [`AnthropicSseEncoder`] that picks up the client's already-committed
+/// message envelope.
+///
+/// [`AnthropicSseEncoder`]: aisix_provider_anthropic::AnthropicSseEncoder
+#[derive(Default)]
+struct AnthropicWireTracker {
+    /// `message.id` from the forwarded `message_start`; `None` until
+    /// one arrives (a pre-envelope failure resumes with a fresh
+    /// encoder that emits its own `message_start`).
+    message_id: Option<String>,
+    /// Index of the currently open text content block.
+    open_text_block: Option<usize>,
+    /// Next content-block index a resumed encoder may assign.
+    next_block_index: usize,
+    /// Delivered assistant text across the stream — the continuation
+    /// baseline. Bounded by `OUTPUT_ACCUMULATION_CAP`;
+    /// `partial_overflow` disarms past it (a faithful continuation
+    /// prompt can no longer be built).
+    partial: String,
+    partial_overflow: bool,
+    /// Wire shapes a fallback model cannot safely continue: tool_use /
+    /// thinking blocks, or the closing `message_delta` already told
+    /// the client the stop reason. Sticky.
+    unsafe_output: bool,
+    /// Clean terminal `message_stop` forwarded — EOF after this is a
+    /// normal end, not a truncation.
+    terminal_seen: bool,
+}
+
+impl AnthropicWireTracker {
+    /// Update from one complete SSE frame's `data:` JSON. Returns the
+    /// in-band error when the frame is an `error` event — the caller
+    /// withholds that frame and runs the failover decision.
+    fn observe(&mut self, json: &Value) -> Option<aisix_gateway::BridgeError> {
+        match json.get("type").and_then(Value::as_str) {
+            Some("message_start") => {
+                if let Some(id) = json
+                    .get("message")
+                    .and_then(|m| m.get("id"))
+                    .and_then(Value::as_str)
+                {
+                    self.message_id = Some(id.to_string());
+                }
+            }
+            Some("content_block_start") => {
+                let index = json.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                self.next_block_index = self.next_block_index.max(index + 1);
+                match json
+                    .get("content_block")
+                    .and_then(|cb| cb.get("type"))
+                    .and_then(Value::as_str)
+                {
+                    Some("text") => self.open_text_block = Some(index),
+                    // tool_use, thinking, redacted_thinking, and any
+                    // future block type: not safely continuable.
+                    _ => self.unsafe_output = true,
+                }
+            }
+            Some("content_block_delta") => {
+                if let Some(t) = json
+                    .get("delta")
+                    .and_then(|d| d.get("text"))
+                    .and_then(Value::as_str)
+                {
+                    if self.partial.len() + t.len() > crate::token_estimate::OUTPUT_ACCUMULATION_CAP
+                    {
+                        self.partial_overflow = true;
+                    } else {
+                        self.partial.push_str(t);
+                    }
+                }
+            }
+            Some("content_block_stop") => {
+                let index = json.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                if self.open_text_block == Some(index) {
+                    self.open_text_block = None;
+                }
+            }
+            Some("message_delta") => {
+                // The stop reason is on the client's wire — a
+                // continuation after it can't read as one message.
+                self.unsafe_output = true;
+            }
+            Some("message_stop") => self.terminal_seen = true,
+            Some("error") => {
+                let body = json
+                    .get("error")
+                    .and_then(|e| {
+                        serde_json::from_value::<
+                            aisix_provider_anthropic::AnthropicStreamErrorBody,
+                        >(e.clone())
+                        .ok()
+                    })
+                    .unwrap_or(aisix_provider_anthropic::AnthropicStreamErrorBody {
+                        kind: None,
+                        message: None,
+                    });
+                return Some(aisix_provider_anthropic::stream_error_into_bridge_error(
+                    &body,
+                ));
+            }
+            _ => {}
+        }
+        None
+    }
+}
+
+/// The terminal Anthropic-wire error frame the failover paths emit when
+/// the stream cannot be continued — same shape as the cross-provider
+/// pump's `Err` arm.
+fn anthropic_error_frame(err: &aisix_gateway::BridgeError) -> Bytes {
+    Bytes::from(format!(
+        "event: error\ndata: {{\"type\":\"error\",\"error\":{{\"type\":\"{}\",\"message\":{}}}}}\n\n",
+        err.error_type(),
+        serde_json::to_string(&err.to_string()).unwrap_or_else(|_| "\"error\"".into()),
+    ))
+}
+
+/// Wrap the passthrough byte stream with the mid-stream failover
+/// combinator (AISIX-Cloud#1222). Forwarding is frame-granular: bytes
+/// are held until a complete SSE frame is buffered, so an in-band
+/// `error` frame can be withheld (never partially forwarded) while the
+/// fallback decision runs. On a qualifying failure the remaining
+/// targets are dispatched through the chat bridges and their chunks are
+/// re-encoded onto the client's committed Anthropic envelope by a
+/// resumed [`AnthropicSseEncoder`] — block indices and the message id
+/// continue seamlessly. Ineligible failures reproduce today's behavior
+/// (error item forwarded / silent truncation).
+///
+/// The combinator owns the per-chunk read timeout when armed (the
+/// silent-truncate byte wrapper upstream of it cannot signal
+/// `read_timeout`).
+///
+/// [`AnthropicSseEncoder`]: aisix_provider_anthropic::AnthropicSseEncoder
+fn wrap_anthropic_passthrough<S>(
+    upstream: S,
+    plan: crate::stream_failover::MidStreamPlan,
+    per_chunk: Option<Duration>,
+    model_display_name: String,
+) -> impl Stream<Item = reqwest::Result<Bytes>> + Send
+where
+    S: Stream<Item = reqwest::Result<Bytes>> + Send + 'static,
+{
+    use aisix_provider_anthropic::AnthropicSseEncoder;
+
+    /// One poll of the verbatim upstream, timeout folded in.
+    enum Polled {
+        Item(reqwest::Result<Bytes>),
+        Eof,
+        TimedOut,
+    }
+
+    async_stream::stream! {
+        let mut upstream = std::pin::pin!(upstream);
+        let mut tracker = AnthropicWireTracker::default();
+        let mut buf: Vec<u8> = Vec::new();
+        let mut cursor = 0usize;
+        let mut used: u32 = 0;
+        // Frame parsing disarmed (cap overflow on a non-conformant
+        // stream): flush + forward raw items; no failover possible.
+        let mut parse_disarmed = false;
+        let send_started = Instant::now();
+        // The serving fallback target's concurrency hold; replaced on
+        // every switch, dropped at generator end (#450 semantics).
+        let mut _fallback_hold: Option<aisix_ratelimit::StreamConcurrencyGuard> = None;
+        // Set when a qualifying failure acquired a fallback stream —
+        // the verbatim phase ends and the continuation phase drives the
+        // resumed encoder below.
+        let mut continuation: Option<aisix_gateway::ChatChunkStream> = None;
+
+        // ---- Verbatim phase: forward frames, watch for failure ----
+        while continuation.is_none() {
+            let polled = match per_chunk {
+                Some(d) => match tokio::time::timeout(d, upstream.next()).await {
+                    Ok(Some(item)) => Polled::Item(item),
+                    Ok(None) => Polled::Eof,
+                    Err(_) => Polled::TimedOut,
+                },
+                None => match upstream.next().await {
+                    Some(item) => Polled::Item(item),
+                    None => Polled::Eof,
+                },
+            };
+            // Resolve this poll into either forwarded bytes (continue)
+            // or a failure to run the fallback decision on. `original`
+            // keeps the raw reqwest error and `withheld` the raw
+            // in-band error frame, so an ineligible failure surfaces
+            // the exact bytes/item the unarmed path would.
+            let mut original: Option<reqwest::Error> = None;
+            let mut withheld: Option<Vec<u8>> = None;
+            let failure: aisix_gateway::BridgeError = match polled {
+                Polled::Item(Ok(bytes)) => {
+                    if parse_disarmed {
+                        yield Ok(bytes);
+                        continue;
+                    }
+                    buf.extend_from_slice(&bytes);
+                    if buf.len() > MAX_SSE_FRAME_BUF_BYTES {
+                        // Non-conformant stream (no frame terminator
+                        // in 1 MiB): stop parsing, flush verbatim,
+                        // disarm failover for the rest of the stream.
+                        tracing::warn!(
+                            buffered = buf.len(),
+                            "anthropic passthrough failover: frame buffer exceeded cap; \
+                             disarming mid-stream failover for this stream"
+                        );
+                        parse_disarmed = true;
+                        yield Ok(Bytes::from(std::mem::take(&mut buf)));
+                        continue;
+                    }
+                    // Forward complete frames; withhold an in-band
+                    // `error` frame and run the failover decision.
+                    let mut in_band: Option<aisix_gateway::BridgeError> = None;
+                    let mut forward = Vec::new();
+                    while let Some(end) = find_frame_end(&buf) {
+                        let frame: Vec<u8> = buf.drain(..end).collect();
+                        if let Some(data) = extract_sse_data_line(&frame) {
+                            if let Ok(json) = serde_json::from_slice::<Value>(data) {
+                                if let Some(err) = tracker.observe(&json) {
+                                    in_band = Some(err);
+                                    withheld = Some(frame);
+                                    break;
+                                }
+                            }
+                        }
+                        forward.extend_from_slice(&frame);
+                    }
+                    if !forward.is_empty() {
+                        yield Ok(Bytes::from(forward));
+                    }
+                    match in_band {
+                        Some(err) => err,
+                        None => continue,
+                    }
+                }
+                Polled::Item(Err(e)) => {
+                    if parse_disarmed {
+                        yield Err(e);
+                        return;
+                    }
+                    let err = crate::dispatch::reqwest_error_to_bridge(&e, send_started);
+                    original = Some(e);
+                    err
+                }
+                Polled::Eof => {
+                    if parse_disarmed || tracker.terminal_seen {
+                        return;
+                    }
+                    // EOF without `message_stop`: the upstream broke
+                    // the stream — same class the typed bridges map
+                    // to `StreamAborted`.
+                    aisix_gateway::BridgeError::StreamAborted
+                }
+                Polled::TimedOut => {
+                    if parse_disarmed {
+                        return;
+                    }
+                    aisix_gateway::BridgeError::Timeout {
+                        elapsed_ms: per_chunk.map(|d| d.as_millis() as u64).unwrap_or_default(),
+                        cause: String::new(),
+                    }
+                }
+            };
+            match handle_passthrough_failure(&plan, &mut cursor, &mut used, &tracker, failure)
+                .await
+            {
+                PassthroughFailure::Continue(stream, hold) => {
+                    _fallback_hold = hold;
+                    // Discard any incomplete trailing frame of the
+                    // failed upstream — never forwarded, replaced by
+                    // the continuation.
+                    buf.clear();
+                    continuation = Some(stream);
+                }
+                PassthroughFailure::No(err, exhausted) => {
+                    if exhausted {
+                        // Fallbacks attempted and exhausted: terminate
+                        // with the synthesized frame carrying the last
+                        // failure, like the typed pumps.
+                        yield Ok(anthropic_error_frame(&err));
+                    } else if let Some(frame) = withheld {
+                        // Ineligible in-band error: release the
+                        // upstream's own error frame byte-for-byte.
+                        yield Ok(Bytes::from(frame));
+                    } else if let Some(e) = original {
+                        // Ineligible transport error: forward the
+                        // original item verbatim, like the unarmed path.
+                        yield Err(e);
+                    }
+                    // Ineligible timeout / EOF: silent truncation,
+                    // today's behavior.
+                    return;
+                }
+            }
+        }
+
+        // ---- Continuation phase: re-encode fallback chunks ----
+        // Resume the client's committed envelope; a pre-envelope
+        // failure (no message_start forwarded yet) starts a fresh one
+        // instead — the encoder then emits its own message_start.
+        let mut encoder = match tracker.message_id.clone() {
+            Some(id) => AnthropicSseEncoder::resume(
+                id,
+                model_display_name.clone(),
+                tracker.open_text_block,
+                tracker.next_block_index,
+            ),
+            None => AnthropicSseEncoder::new(
+                format!("msg_{}", Uuid::new_v4().simple()),
+                model_display_name.clone(),
+                0,
+            ),
+        };
+        {
+            let extra = plan
+                .shared
+                .extra_usage
+                .lock()
+                .expect("mid-stream extra lock")
+                .clone();
+            encoder.set_extra_usage(extra.prompt_tokens, extra.completion_tokens);
+        }
+        let mut stream = continuation.expect("continuation stream set above");
+        loop {
+            match stream.next().await {
+                Some(Ok(chunk)) => {
+                    // The same output-shape gates as the typed
+                    // combinator, for any FURTHER fallback.
+                    if chunk.delta.tool_calls.is_some() || chunk.delta.reasoning_content.is_some()
+                    {
+                        tracker.unsafe_output = true;
+                    }
+                    if let Some(t) = chunk.delta.content.as_deref() {
+                        if tracker.partial.len() + t.len()
+                            > crate::token_estimate::OUTPUT_ACCUMULATION_CAP
+                        {
+                            tracker.partial_overflow = true;
+                        } else {
+                            tracker.partial.push_str(t);
+                        }
+                    }
+                    for ev in encoder.next_events(&chunk) {
+                        yield Ok(Bytes::from(ev.to_sse_string()));
+                    }
+                    if encoder.is_finished() {
+                        return;
+                    }
+                }
+                Some(Err(err)) => {
+                    match handle_passthrough_failure(
+                        &plan, &mut cursor, &mut used, &tracker, err,
+                    )
+                    .await
+                    {
+                        PassthroughFailure::Continue(next, hold) => {
+                            _fallback_hold = hold;
+                            stream = next;
+                            // New serving attempt: zero the encoder's
+                            // per-attempt counters and re-fold the
+                            // grown failed-partial estimate.
+                            encoder.reset_usage_counters();
+                            let extra = plan
+                                .shared
+                                .extra_usage
+                                .lock()
+                                .expect("mid-stream extra lock")
+                                .clone();
+                            encoder.set_extra_usage(extra.prompt_tokens, extra.completion_tokens);
+                        }
+                        PassthroughFailure::No(err, exhausted) => {
+                            if !exhausted {
+                                // Ineligible mid-continuation failure —
+                                // the wire is gateway-synthesized now,
+                                // so record it like the typed pumps do.
+                                *plan
+                                    .shared
+                                    .terminal_failure
+                                    .lock()
+                                    .expect("terminal failure lock") = Some((
+                                    crate::attempt::routing_error_class(&err).to_string(),
+                                    crate::attempt::attempt_error_message(&err),
+                                ));
+                            }
+                            yield Ok(anthropic_error_frame(&err));
+                            return;
+                        }
+                    }
+                }
+                None => {
+                    for ev in encoder.force_finish() {
+                        yield Ok(Bytes::from(ev.to_sse_string()));
+                    }
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Outcome of one passthrough failure decision.
+enum PassthroughFailure {
+    /// A fallback target is streaming — splice it in.
+    Continue(
+        aisix_gateway::ChatChunkStream,
+        Option<aisix_ratelimit::StreamConcurrencyGuard>,
+    ),
+    /// No continuation. Carries the failure back (the last fallback
+    /// error on exhaustion, else the original) so the caller renders
+    /// phase-appropriate termination; `bool` = fallbacks were attempted
+    /// and exhausted (terminal failure already recorded).
+    No(aisix_gateway::BridgeError, bool),
+}
+
+/// Run the eligibility gate + fallback acquisition for a passthrough
+/// failure. Mirrors `stream_failover::wrap`'s decision order.
+async fn handle_passthrough_failure(
+    plan: &crate::stream_failover::MidStreamPlan,
+    cursor: &mut usize,
+    used: &mut u32,
+    tracker: &AnthropicWireTracker,
+    err: aisix_gateway::BridgeError,
+) -> PassthroughFailure {
+    let eligible = crate::stream_failover::classify_trigger(&err)
+        .is_some_and(|t| plan.cfg.on_or_default().contains(&t))
+        && crate::routing::is_retryable(&err, plan.retry_on_429, &plan.fallback_on_statuses)
+        && !tracker.unsafe_output
+        && !tracker.partial_overflow
+        && !plan.structured_output
+        && *used < plan.cfg.max_fallbacks_or_default();
+    if !eligible {
+        return PassthroughFailure::No(err, false);
+    }
+    match crate::stream_failover::acquire_fallback_stream(plan, cursor, used, err, &tracker.partial)
+        .await
+    {
+        Ok((stream, hold)) => PassthroughFailure::Continue(stream, hold),
+        Err(last) => {
+            *plan
+                .shared
+                .terminal_failure
+                .lock()
+                .expect("terminal failure lock") = Some((
+                crate::attempt::routing_error_class(&last).to_string(),
+                crate::attempt::attempt_error_message(&last),
+            ));
+            PassthroughFailure::No(last, true)
+        }
+    }
+}
+
 /// Wrap an Anthropic upstream byte stream so token usage is parsed
 /// in-flight and `on_complete` fires once at end-of-stream (or
 /// client-disconnect) with the accumulated counts. Bytes are forwarded
@@ -3230,6 +4127,11 @@ fn build_anthropic_passthrough_stream<S, F>(
     // Token-estimation fallback context (AISIX-Cloud#1074); see
     // `AnthropicStreamGuard::estimator`.
     estimator: Option<crate::token_estimate::Estimator>,
+    // Mid-stream failover shared state (AISIX-Cloud#1222): the parser
+    // resets its usage accumulators when the serving attempt changes,
+    // so the failed attempt's counters don't max-wins-mix into the
+    // serving attempt's totals. `None` on unarmed streams.
+    mid_stream: Option<crate::stream_failover::MidStreamShared>,
     on_complete: F,
 ) -> AnthropicDeliveryCounter<reqwest::Result<Bytes>>
 where
@@ -3262,10 +4164,34 @@ where
         futures::pin_mut!(upstream);
         let mut buf: Vec<u8> = Vec::new();
         let mut first_token_seen = false;
+        // Serving-attempt sequence snapshot (mid-stream failover,
+        // AISIX-Cloud#1222) — see chat.rs's pump for the why.
+        let mut mid_stream_seq = mid_stream
+            .as_ref()
+            .map(|ms| ms.attempt_seq.load(Ordering::Relaxed))
+            .unwrap_or(0);
         // Whole-response hold-back buffer (BufferFull policies only).
         let mut held: Vec<u8> = Vec::new();
         while let Some(item) = upstream.next().await {
             if let Ok(bytes) = &item {
+                if let Some(ms) = mid_stream.as_ref() {
+                    let seq = ms.attempt_seq.load(Ordering::Relaxed);
+                    if seq != mid_stream_seq {
+                        mid_stream_seq = seq;
+                        // Serving attempt changed: zero the per-attempt
+                        // usage accumulators; the resumed encoder's
+                        // closing frame carries the serving attempt's
+                        // counts plus the folded failed-partial
+                        // estimate, and gets harvested below like any
+                        // upstream frame.
+                        let usage = guard.usage();
+                        usage.prompt_tokens = 0;
+                        usage.completion_tokens = 0;
+                        usage.cache_creation_tokens = 0;
+                        usage.cache_read_tokens = 0;
+                        usage.output_tokens_from_delta = false;
+                    }
+                }
                 // Side-channel parse: copy into the frame buffer (the
                 // original `bytes` is yielded unchanged below) and drain
                 // any complete SSE frames into the accumulator.
@@ -3309,6 +4235,7 @@ where
                             max_buffer_bytes = max_hold,
                             "streaming /v1/messages passthrough exceeded hold-back cap; failing closed",
                         );
+                        guard.usage().guardrail_blocked = true;
                         yield Ok(Bytes::from(guardrail_block_frame(None)));
                         return;
                     }
@@ -3420,6 +4347,7 @@ where
                         "guardrail blocked streaming /v1/messages passthrough response",
                     );
                     blocked = true;
+                    guard.usage().guardrail_blocked = true;
                     let frame = guardrail_block_frame(guardrail_name.as_deref());
                     yield Ok(Bytes::from(frame));
                 }
