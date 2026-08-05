@@ -93,7 +93,7 @@ pub struct AliyunSlsConfig {
     #[schemars(length(min = 1))]
     pub logstore: String,
 
-    /// Credential reference resolved by the data plane at delivery time. The plaintext AccessKey is not stored in this resource.
+    /// Credential reference resolved by the gateway at delivery time. The plaintext AccessKey is not stored in this resource.
     #[schemars(length(min = 1))]
     pub credential_ref: String,
 
@@ -135,7 +135,7 @@ pub struct DatadogConfig {
     ))]
     pub site: String,
 
-    /// Credential reference resolved by the data plane at delivery time. The plaintext Datadog API key is not stored in this resource.
+    /// Credential reference resolved by the gateway at delivery time. The plaintext Datadog API key is not stored in this resource.
     #[schemars(length(min = 1))]
     pub credential_ref: String,
 
@@ -207,11 +207,11 @@ pub struct ObjectStoreConfig {
     #[serde(default)]
     pub compression: ObjectStoreCompression,
 
-    /// How the data plane authenticates to the bucket.
+    /// How the gateway authenticates to the bucket.
     #[serde(default)]
     pub auth_mode: ObjectStoreAuthMode,
 
-    /// Credential reference resolved by the data plane at delivery time. Required when `auth_mode` is `credential_ref`.
+    /// Credential reference resolved by the gateway at delivery time. Required when `auth_mode` is `credential_ref`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     #[schemars(length(min = 1))]
     pub credential_ref: String,
@@ -240,17 +240,17 @@ pub enum ObjectStoreCompression {
     None,
 }
 
-/// How the data plane obtains credentials for the object-storage bucket.
+/// How the gateway obtains credentials for the object-storage bucket.
 #[derive(
     Debug, Clone, Copy, Default, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq, Hash,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum ObjectStoreAuthMode {
-    /// Resolve `credential_ref` to static keys from data plane environment
+    /// Resolve `credential_ref` to static keys from gateway environment
     /// variables named `OBJSTORE_CRED_<SLUG>_<FIELD>`.
     #[default]
     CredentialRef,
-    /// Use the data plane host's attached cloud identity. Supported for S3 and GCS only.
+    /// Use the gateway host's attached cloud identity. Supported for S3 and GCS only.
     CloudIdentity,
 }
 

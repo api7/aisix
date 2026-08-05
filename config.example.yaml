@@ -10,7 +10,7 @@ etcd:
   dial_timeout_ms: 5000
   request_timeout_ms: 5000
   # Optional TLS / mTLS bundle. Required when connecting to an
-  # aisix.cloud DP Manager (endpoint is https:// and the CP issues
+  # AISIX Cloud Data Plane Manager (endpoint is https:// and the control plane issues
   # a client cert via IssueAIDataplaneCertificate). Uncomment and
   # point to your mTLS bundle.
   # tls:
@@ -134,10 +134,10 @@ observability:
       endpoint: "http://127.0.0.1:4317"
       sample_ratio: 1.0
 
-# Managed-mode switch. Uncomment when running as an aisix.cloud
-# tenant: the admin API and Playground will NOT be bound — all
+# Managed-mode switch. Uncomment when connecting the gateway to
+# AISIX Cloud: the admin API and Playground will NOT be bound — all
 # configuration flows from etcd via the mTLS channel above, driven
-# by the aisix.cloud control plane.
+# by the AISIX Cloud control plane.
 # managed:
 #   enabled: true
 

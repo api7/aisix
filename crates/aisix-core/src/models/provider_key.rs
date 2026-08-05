@@ -34,7 +34,7 @@ pub struct ProviderKey {
     #[schemars(length(min = 1))]
     pub display_name: String,
 
-    /// Upstream provider's API key. The data plane receives plaintext so it
+    /// Upstream provider's API key. The gateway receives plaintext so it
     /// can authenticate to the upstream provider. Protect the configuration
     /// store and transport accordingly.
     // `secret` is the field's former name; stored documents and callers

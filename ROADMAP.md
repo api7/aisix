@@ -10,7 +10,7 @@ For what the gateway does today — including [semantic routing](https://docs.ap
 - **Next** — planned after the current focus.
 - **Later** — on the longer-term horizon.
 
-The **Surface** column shows where a capability lands: **Gateway** is the AISIX AI Gateway data plane; **Cloud** is the AISIX Cloud control plane and dashboard.
+The **Surface** column shows where a capability lands: **Gateway** is the AISIX AI Gateway runtime; **Cloud** is the AISIX Cloud control plane and dashboard.
 
 ## Now
 
@@ -30,7 +30,7 @@ The **Surface** column shows where a capability lands: **Gateway** is the AISIX 
 | Conditional and wildcard routing | Route on request metadata, headers, and tags, and match upstreams by wildcard names such as `provider/*`. | Gateway |
 | Prompt management | Store, version, and reuse prompt templates with variables, resolved at the gateway. | Gateway · Cloud |
 | Caller key rotation experience | Self-service key rotation in the dashboard, plus scheduled auto-rotation with a grace overlap. | Cloud |
-| Production-path playground | Run the Cloud playground through the managed data plane so it reflects real routing, caching, guardrails, and rate limiting. | Cloud |
+| Production-path playground | Run the Cloud playground through a connected AISIX gateway so it reflects real routing, caching, guardrails, and rate limiting. | Cloud |
 | Cross-provider endpoint parity | Consistent embeddings, image generation, and Responses behavior across more providers. | Gateway |
 
 ## Later

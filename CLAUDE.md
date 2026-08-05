@@ -121,6 +121,29 @@ This repo reads its config from etcd, but users never write etcd directly — th
 - Exactly four divergence axes are registered as intentional and allowed: reference style (names here vs UUIDs in the CP), tenancy scoping (flat here vs org/environment there), credential custody (`key_hash` in documents here vs server-generated plaintext-once there), and CP-derived fields (`cost`, `telemetry_tags`). Anything else that diverges from cp-admin.yaml is drift — the planned cross-plane contract check will fail it.
 - Why the CP spec and not this repo's schemas: the CP is spec-first behind a closed validator (its spec already is the authoritative field shape on that side), the spec renders into the customer-facing API reference, and this repo's schemas are generated from the implementation — a schema that follows the implementation cannot lead it. Naming drift has already cost real churn: #644 (the generated schema advertised `rps`/`rph` the validator rejected) and #657 (a wire-breaking rename because the field was named DP-first).
 
+## AISIX Product Terminology
+
+Use the following terms in public prose, generated API descriptions, release
+notes, and configuration comments:
+
+- **AISIX AI Gateway** is the open-source product. Use **open-source AISIX
+  gateway** when the distinction from AISIX Cloud matters; after establishing
+  the product, use **AISIX gateway** or **gateway**.
+- **AISIX Cloud** is the commercial product umbrella. **Hybrid Cloud** is its
+  API7-hosted control-plane option, and **On-Premises** is its customer-hosted
+  control-plane option. Do not present **AISIX Hybrid Cloud** or **AISIX
+  On-Premises** as separate products.
+- An AISIX gateway is a **data plane** only within AISIX Cloud architecture. Do
+  not call an independently operated open-source gateway a data plane.
+- Do not use **standalone gateway** as a product label. `standalone mode` and
+  `managed mode` remain valid when describing runtime behavior.
+- Avoid unqualified **self-hosted**. Name the component being operated, such as
+  the open-source AISIX gateway, the On-Premises control plane, or a self-hosted
+  upstream service.
+- The Dashboard is the control plane's user interface, not the whole control
+  plane. Live AI requests pass through the gateway directly and do not pass
+  through the AISIX Cloud control plane or API7.
+
 ## Documentation Lives in api7/docs
 
 **User-facing documentation is maintained in the `api7/docs` repository (published to <https://docs.api7.ai/ai-gateway/>), not in this repo.**

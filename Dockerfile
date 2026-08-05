@@ -17,13 +17,18 @@
 #   docker run --rm -v $(pwd)/config.example.yaml:/etc/aisix/config.yaml \
 #     aisix:dev
 #
-# Run, managed (aisix.cloud tenant — bake config + env-var overrides):
+# Run, managed (connected to AISIX Cloud with env-var overrides):
 #   docker run --rm \
 #     -e AISIX_CONFIG_PATH=/etc/aisix/config.managed.yaml \
-#     -e AISIX_MANAGED__REGISTRATION_TOKEN=$DEPLOYMENT_TOKEN \
-#     -e AISIX_MANAGED__CP_BASE_URL=https://api.us.aisix.cloud \
+#     -e AISIX_MANAGED__CP_BASE_URL \
+#     -e AISIX_MANAGED__CP_ETCD_ENDPOINT \
+#     -e AISIX_MANAGED__CP_CERT_PEM \
+#     -e AISIX_MANAGED__CP_KEY_PEM \
+#     -e AISIX_MANAGED__CP_CA_PEM \
 #     -v aisix-mtls:/var/lib/aisix \
 #     aisix:dev
+# The volume preserves the materialized mTLS bundle and gateway identity across
+# container restarts.
 
 # --- Stage 1: build ----------------------------------------------------------
 FROM rust:1.93-bookworm AS builder
@@ -98,9 +103,10 @@ RUN --mount=type=bind,from=builder,source=/usr/local/bin/aisix,target=/mnt/aisix
     && apt-get purge -y --auto-remove libcap2-bin \
     && rm -rf /var/lib/apt/lists/*
 
-# Bake the managed-mode bootstrap config so aisix.cloud tenants can
-# `docker run` without mounting anything — env vars carry the per-DP
-# secret bits (registration token + CP base URL).
+# Bake the managed-mode bootstrap config so AISIX gateways managed by
+# AISIX Cloud can `docker run` without mounting a configuration file.
+# Environment variables provide the control-plane endpoints and gateway mTLS
+# certificate bundle.
 COPY config.managed.yaml /etc/aisix/config.managed.yaml
 
 # Entrypoint script picks the config file via AISIX_CONFIG_PATH so the
