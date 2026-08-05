@@ -21,14 +21,24 @@
 //! success-rate and request-count queries built on them while still showing
 //! up in the legacy series.
 //!
-//! Handlers call [`record`] instead of touching `Metrics` directly, and the
-//! tier is decided from the endpoint rather than by the caller, so a new
-//! endpoint cannot land with a half-wired label set — the same anti-drift
-//! move `usage_attr` makes for the UsageEvent side.
+//! [`record_usage`] is the companion emit for what the request consumed —
+//! the token and spend families, which had the same coverage problem, in
+//! three different shapes (see its own docs).
+//!
+//! Handlers call [`record`] and [`record_usage`] instead of touching
+//! `Metrics` directly, and the tier is decided from the endpoint rather than
+//! by the caller, so a new endpoint cannot land with a half-wired label set —
+//! the same anti-drift move `usage_attr` makes for the UsageEvent side.
+//!
+//! Two endpoints are model inference but report no tokens by nature —
+//! `/v1/audio/speech` (billed per input character) and `/v1/videos` (per
+//! video). They count as requests and contribute nothing to the token
+//! families, so aggregate tokens-per-request is only meaningful per
+//! `endpoint`, never summed across all of them.
 
 use std::time::Duration;
 
-use aisix_obs::{RequestLabels, RequestOutcome};
+use aisix_obs::{LlmUsage, RequestLabels, RequestOutcome, UsageLabels};
 
 use crate::auth::AuthenticatedKey;
 use crate::state::ProxyState;
@@ -58,6 +68,30 @@ impl<'a> Caller<'a> {
         }
     }
 
+    /// Recover the caller from an api-key id alone.
+    ///
+    /// The streaming emits run from a detached task or a Drop guard that was
+    /// handed an `api_key_id: &str` rather than the key itself, and threading
+    /// the team / user / name triple down every dispatch signature to reach
+    /// them would be a lot of plumbing for three labels. The id resolves back
+    /// to the same row the auth extractor matched, so the labels come out
+    /// identical to [`Caller::new`]; an id that no longer resolves (the key
+    /// was deleted mid-stream) degrades to `unknown` rather than dropping the
+    /// sample.
+    pub(crate) fn from_api_key_id(
+        snap: &aisix_core::AisixSnapshot,
+        api_key_id: &'a str,
+    ) -> Owned<'a> {
+        let entry = snap.apikeys.get_by_id(api_key_id);
+        let key = entry.as_ref().map(|e| &e.value);
+        Owned {
+            api_key_id,
+            team_id: key.and_then(|k| k.team_id.clone()),
+            user_id: key.and_then(|k| k.user_id.clone()),
+            user_name: key.and_then(|k| k.user_name.clone()),
+        }
+    }
+
     /// A path that gave up before it could attribute the request to a team
     /// or user — the pre-dispatch rejections. `api_key_id` is `Some` once
     /// the auth extractor has run and `None` for the middleware
@@ -68,6 +102,26 @@ impl<'a> Caller<'a> {
             team_id: UNKNOWN,
             user_id: UNKNOWN,
             user_name: UNKNOWN,
+        }
+    }
+}
+
+/// Owning form of [`Caller`], for the snapshot lookup whose strings cannot
+/// outlive the guard. Call [`Owned::as_caller`] at the emit.
+pub(crate) struct Owned<'a> {
+    api_key_id: &'a str,
+    team_id: Option<String>,
+    user_id: Option<String>,
+    user_name: Option<String>,
+}
+
+impl<'a> Owned<'a> {
+    pub(crate) fn as_caller(&'a self) -> Caller<'a> {
+        Caller {
+            api_key_id: self.api_key_id,
+            team_id: self.team_id.as_deref().unwrap_or(UNKNOWN),
+            user_id: self.user_id.as_deref().unwrap_or(UNKNOWN),
+            user_name: self.user_name.as_deref().unwrap_or(UNKNOWN),
         }
     }
 }
@@ -114,10 +168,12 @@ impl Default for Upstream<'_> {
 /// - `/passthrough/:provider/*rest` — an opaque tunnel; the gateway parses
 ///   nothing and cannot attribute a model.
 /// - `/v1/files`, `/v1/batches`, `/v1/fine_tuning/jobs` — management calls.
-/// - `/v1/realtime` — does reach a model, but feeds none of the
-///   `aisix_llm_*_tokens_total` families (still chat + messages only), so
-///   counting it here would inflate the denominator of every
-///   tokens-per-request query.
+///
+/// `/v1/realtime` was in that list until the token families reached it too.
+/// It was held out because it fed none of them, so counting it here would
+/// have inflated the denominator of every tokens-per-request query; now that
+/// a session reports its tokens and cost, that reason is gone and it belongs
+/// with the rest.
 const LLM_ENDPOINTS: &[&str] = &[
     "/v1/chat/completions",
     "/v1/completions",
@@ -132,6 +188,7 @@ const LLM_ENDPOINTS: &[&str] = &[
     "/v1/audio/speech",
     "/v1/videos",
     "/v1/videos/:id",
+    "/v1/realtime",
 ];
 
 /// Whether this endpoint's requests are model inference.
@@ -195,6 +252,87 @@ pub(crate) fn record(
     } else {
         state.metrics.record_proxy_request(labels, elapsed);
     }
+}
+
+/// What one request consumed. Every counter below no-ops on an all-zero
+/// value, so the zero-token paths — a failed attempt, a 501, `/v1/files` —
+/// cost nothing and create no series.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Tokens<'a> {
+    pub input: u32,
+    pub output: u32,
+    /// The canonical, CACHE-INCLUSIVE total. Use
+    /// `usage_attr::total_tokens_with_cache` wherever cache counters exist
+    /// (#740/#1002) — a bare input+output silently undercounts cached
+    /// traffic, and this value is what the by-client series reports as
+    /// `token_type="total"`.
+    pub total: u32,
+    pub spend_usd: f64,
+    /// Normalised inbound client for the by-client series
+    /// (`state.client_classifier.classify(&client.user_agent)`).
+    pub client_type: &'a str,
+}
+
+/// Terminal token/spend emit, shared by every handler — the companion to
+/// [`record`].
+///
+/// Three families ride along, and each had a DIFFERENT endpoint coverage
+/// before AISIX-Cloud#1234's follow-up: the `aisix_llm_*_tokens_total` and
+/// `aisix_llm_spend_micro_usd_total` families were chat and messages only,
+/// `aisix_llm_tokens_by_client_total` was chat, messages and responses, and
+/// the legacy `aisix_tokens_consumed_total` was chat ALONE. A gateway that
+/// billed a customer for `/v1/embeddings` reported none of those tokens.
+///
+/// Labels come from the same [`Caller`] / [`Upstream`] pair [`record`] uses,
+/// so a query joining requests to tokens lines up by construction, and this
+/// adds no series dimension the request families don't already carry.
+pub(crate) fn record_usage(
+    state: &ProxyState,
+    endpoint: &'static str,
+    caller: Caller<'_>,
+    upstream: Upstream<'_>,
+    tokens: Tokens<'_>,
+) {
+    // Legacy compatibility series (provider × model).
+    state
+        .metrics
+        .record_tokens(upstream.provider, upstream.model, u64::from(tokens.total));
+    // Held in a binding: `UsageLabels` borrows it.
+    let provider_key_name = {
+        let snap = state.snapshot.load();
+        provider_key_metric_name(&snap, upstream.provider_key_id)
+    };
+    state.metrics.record_llm_usage(
+        UsageLabels {
+            endpoint,
+            inbound_protocol: crate::inbound_protocol_for_endpoint(endpoint),
+            provider: upstream.provider,
+            model: upstream.model,
+            upstream_model: upstream.upstream_model,
+            provider_key_id: upstream.provider_key_id,
+            provider_key_name: &provider_key_name,
+            api_key_id: caller.api_key_id,
+            team_id: caller.team_id,
+            user_id: caller.user_id,
+            user_name: caller.user_name,
+        },
+        LlmUsage {
+            input_tokens: tokens.input,
+            output_tokens: tokens.output,
+            total_tokens: tokens.total,
+            spend_usd: tokens.spend_usd,
+        },
+    );
+    // Deliberately NOT keyed on the labels above: this family is
+    // client_type × model × token_type only, so the per-key dimensions
+    // never multiply it (#890 req-4).
+    state.metrics.record_llm_tokens_by_client(
+        tokens.client_type,
+        upstream.model,
+        u64::from(tokens.input),
+        u64::from(tokens.output),
+        u64::from(tokens.total),
+    );
 }
 
 #[cfg(test)]
@@ -281,6 +419,8 @@ mod tests {
             "/v1/embeddings",
             "/v1/audio/speech",
             "/v1/videos/vid_abc123/content",
+            // Moved in once realtime started reporting its tokens + cost.
+            "/v1/realtime",
         ] {
             assert!(
                 is_llm_endpoint(crate::normalize_endpoint_label(route)),
@@ -290,7 +430,6 @@ mod tests {
         for route in [
             "/mcp/some-server",
             "/a2a/some-agent",
-            "/v1/realtime",
             "/v1/batches/batch_abc123",
             "/passthrough/openai/v1/anything",
             "/livez",

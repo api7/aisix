@@ -153,6 +153,7 @@ pub async fn transcriptions(
             emit_audio_usage(
                 &state,
                 &request_id,
+                "/v1/audio/transcriptions",
                 &success,
                 &api_key_id,
                 status,
@@ -274,6 +275,7 @@ pub async fn translations(
             emit_audio_usage(
                 &state,
                 &request_id,
+                "/v1/audio/translations",
                 &success,
                 &api_key_id,
                 status,
@@ -401,6 +403,9 @@ pub async fn speech(
                 &model_name,
                 &api_key_id,
                 &success.provider_key_id,
+                "/v1/audio/speech",
+                &success.provider,
+                &success.upstream_model,
                 &success.applied_guardrails,
                 status,
                 elapsed,
@@ -1356,9 +1361,11 @@ fn record_audio_metrics(
 /// Emit a UsageEvent for a successful transcription/translation. Tokens
 /// come from the upstream `usage` block when present (gpt-4o-transcribe);
 /// zero otherwise (whisper-1) — the request is still visible/attributed.
+#[allow(clippy::too_many_arguments)]
 fn emit_audio_usage(
     state: &ProxyState,
     request_id: &str,
+    endpoint: &'static str,
     success: &AudioDispatchSuccess,
     api_key_id: &str,
     status: u16,
@@ -1373,6 +1380,9 @@ fn emit_audio_usage(
         &success.model_name,
         api_key_id,
         &success.provider_key_id,
+        endpoint,
+        &success.provider,
+        &success.upstream_model,
         &success.applied_guardrails,
         status,
         elapsed,
@@ -1402,6 +1412,12 @@ fn emit_usage_event(
     requested_model: &str,
     api_key_id: &str,
     provider_key_id: &str,
+    // Metric labels the UsageEvent has no field for (AISIX-Cloud#1234
+    // follow-up). `endpoint` too: the three audio routes share this emitter
+    // but are three distinct series.
+    endpoint: &'static str,
+    provider: &str,
+    upstream_model: &str,
     applied_guardrails: &[AppliedGuardrail],
     status_code: u16,
     elapsed: Duration,
@@ -1454,6 +1470,28 @@ fn emit_usage_event(
     state
         .otlp_fan_out
         .fan_out(&event, content, exporters.iter().map(|e| &e.value));
+    // Speech (TTS) reports no tokens at all, so this is a no-op there; the
+    // transcription routes report them when the model supplies a usage block.
+    let owned_caller = crate::request_metrics::Caller::from_api_key_id(&snap, api_key_id);
+    crate::request_metrics::record_usage(
+        state,
+        endpoint,
+        owned_caller.as_caller(),
+        crate::request_metrics::Upstream {
+            provider,
+            model: requested_model,
+            upstream_model,
+            provider_key_id,
+            ..Default::default()
+        },
+        crate::request_metrics::Tokens {
+            input: prompt_tokens,
+            output: completion_tokens,
+            total: prompt_tokens.saturating_add(completion_tokens),
+            spend_usd: 0.0,
+            client_type: state.client_classifier.classify(&client.user_agent),
+        },
+    );
 }
 
 fn copy_response_header(src: &HeaderMap, dst: &mut Response, name: header::HeaderName) {
