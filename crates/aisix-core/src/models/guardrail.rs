@@ -94,7 +94,7 @@ pub enum BedrockAWSCredentials {
         #[schemars(length(min = 1))]
         access_key_id: String,
         /// AWS secret access key used to authenticate requests to Amazon
-        /// Bedrock. Plaintext is held in memory only and is not logged.
+        /// Bedrock. The gateway does not log the plaintext value.
         #[schemars(length(min = 1))]
         secret_access_key: String,
     },

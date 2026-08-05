@@ -20,7 +20,7 @@
               "type": "string"
             },
             "secret_access_key": {
-              "description": "AWS secret access key used to authenticate requests to Amazon Bedrock. Plaintext is held in memory only and is not logged.",
+              "description": "AWS secret access key used to authenticate requests to Amazon Bedrock. The gateway does not log the plaintext value.",
               "minLength": 1,
               "type": "string"
             }
