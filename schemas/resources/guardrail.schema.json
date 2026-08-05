@@ -20,7 +20,7 @@
               "type": "string"
             },
             "secret_access_key": {
-              "description": "Decrypted before projection. Plaintext is held in memory only and is not logged. The gateway passes it to the AWS SDK's static credentials provider.",
+              "description": "AWS secret access key used to authenticate requests to Amazon Bedrock. Plaintext is held in memory only and is not logged.",
               "minLength": 1,
               "type": "string"
             }

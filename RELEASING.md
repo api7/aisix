@@ -1,6 +1,6 @@
 # Releasing
 
-How an AISIX gateway release is cut. Order matters: downstream packaging
+How an AISIX AI Gateway release is cut. Order matters: downstream packaging
 (AISIX Cloud and the On-Premises package, whose artifact name is
 `aisix-self-hosted`) pins the exact gateway image version, so the gateway is
 always tagged and published **first**.

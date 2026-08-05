@@ -93,9 +93,8 @@ pub enum BedrockAWSCredentials {
         /// AWS access key ID for static Bedrock guardrail credentials.
         #[schemars(length(min = 1))]
         access_key_id: String,
-        /// Decrypted before projection. Plaintext is held in memory only
-        /// and is not logged. The gateway passes it to the
-        /// AWS SDK's static credentials provider.
+        /// AWS secret access key used to authenticate requests to Amazon
+        /// Bedrock. Plaintext is held in memory only and is not logged.
         #[schemars(length(min = 1))]
         secret_access_key: String,
     },

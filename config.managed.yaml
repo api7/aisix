@@ -1,4 +1,4 @@
-# aisix — managed-mode bootstrap configuration for AISIX Cloud.
+# AISIX gateway — managed-mode bootstrap configuration for AISIX Cloud.
 #
 # Baked into the official Docker image as `/etc/aisix/config.managed.yaml`.
 # Select it by setting `AISIX_CONFIG_PATH` to that path.

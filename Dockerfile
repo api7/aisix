@@ -103,9 +103,10 @@ RUN --mount=type=bind,from=builder,source=/usr/local/bin/aisix,target=/mnt/aisix
     && apt-get purge -y --auto-remove libcap2-bin \
     && rm -rf /var/lib/apt/lists/*
 
-# Bake the managed-mode bootstrap config so AISIX Cloud gateways can
-# `docker run` without mounting a configuration file. Environment variables
-# provide the control-plane endpoints and gateway mTLS certificate bundle.
+# Bake the managed-mode bootstrap config so AISIX gateways managed by
+# AISIX Cloud can `docker run` without mounting a configuration file.
+# Environment variables provide the control-plane endpoints and gateway mTLS
+# certificate bundle.
 COPY config.managed.yaml /etc/aisix/config.managed.yaml
 
 # Entrypoint script picks the config file via AISIX_CONFIG_PATH so the
