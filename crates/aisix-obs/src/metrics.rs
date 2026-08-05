@@ -72,6 +72,19 @@ pub const M_PROXY_REQUEST_DURATION: &str = "aisix_proxy_request_duration_seconds
 /// arrives already collapsed to a bounded route template by the proxy
 /// layer, keeping this series low-cardinality by construction (#451).
 pub const M_PROXY_CLIENT_CANCELLED_TOTAL: &str = "aisix_proxy_client_cancelled_requests_total";
+/// Requests refused by the `request_body_limit_bytes` cap before any
+/// handler ran, split by how the gateway's drain of the refused body
+/// ended. `outcome != "completed"` means the gateway stopped reading
+/// while the caller was still sending, so that caller most likely saw a
+/// connection reset instead of the 413 it was owed.
+///
+/// This is the amplification-safe channel for the same event the
+/// `aisix::body_limit` log carries: a flood of oversize requests can
+/// suppress the log's rate-limited warnings, never this counter. Both
+/// label sets are bounded by construction — `endpoint` is a route
+/// template (#451) and `outcome` a fixed vocabulary.
+pub const M_PROXY_BODY_LIMIT_REJECTIONS_TOTAL: &str =
+    "aisix_proxy_request_body_limit_rejections_total";
 pub const M_DEPLOYMENT_REQUESTS_TOTAL: &str = "aisix_deployment_requests_total";
 pub const M_DEPLOYMENT_SUCCESS_TOTAL: &str = "aisix_deployment_success_responses_total";
 pub const M_DEPLOYMENT_FAILURE_TOTAL: &str = "aisix_deployment_failure_responses_total";
@@ -853,6 +866,26 @@ impl Metrics {
             metrics::counter!(
                 M_PROXY_CLIENT_CANCELLED_TOTAL,
                 "endpoint" => endpoint.to_string(),
+            )
+            .increment(1);
+        });
+    }
+
+    /// Count a request refused by the request-body cap. `endpoint` must
+    /// already be a bounded route template and `outcome` one of the fixed
+    /// drain outcomes — see [`M_PROXY_BODY_LIMIT_REJECTIONS_TOTAL`].
+    pub fn record_body_limit_rejection(
+        &self,
+        endpoint: &str,
+        inbound_protocol: &str,
+        outcome: &str,
+    ) {
+        metrics::with_local_recorder(&self.inner.recorder, || {
+            metrics::counter!(
+                M_PROXY_BODY_LIMIT_REJECTIONS_TOTAL,
+                "endpoint" => endpoint.to_string(),
+                "inbound_protocol" => inbound_protocol.to_string(),
+                "outcome" => outcome.to_string(),
             )
             .increment(1);
         });
