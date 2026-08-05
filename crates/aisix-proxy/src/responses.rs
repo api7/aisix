@@ -323,6 +323,7 @@ pub async fn responses(
                         success.guardrail_blocked,
                         redaction_counts.clone(),
                         monitor_hits.clone(),
+                        "",
                         success.captured_content.as_ref(),
                     );
                 }
@@ -614,6 +615,16 @@ async fn dispatch(
     // pre-dispatch 4xx); if this endpoint ever grows semantic support,
     // widen this flag or the deferred policies are silently skipped.
     let is_routing_request = model_entry.value.routing.is_some();
+    // Mid-stream failover config (AISIX-Cloud#1222): armed only for
+    // `mode: continue` on a routing request, mirroring chat.rs.
+    let stream_failure_cfg = model_entry
+        .value
+        .routing
+        .as_ref()
+        .and_then(|r| r.stream_failure.clone())
+        .filter(|cfg| {
+            cfg.mode_or_default() == aisix_core::StreamFailureMode::Continue && is_routing_request
+        });
     let mut routing = RoutingTelemetry::default();
     // Walk the targets, failing over on a retryable failure. Streaming and
     // non-streaming share this loop: the per-target dispatch branches
@@ -703,6 +714,21 @@ async fn dispatch(
                     continue 'targets;
                 }
             };
+            // Arm mid-stream failover for this attempt when fallback
+            // targets remain after it (AISIX-Cloud#1222).
+            let mid_stream_arm = stream_failure_cfg.as_ref().and_then(|cfg| {
+                let remaining = &attempt_models[target_idx + 1..];
+                (!remaining.is_empty()).then(|| crate::stream_failover::MidStreamArm {
+                    cfg: cfg.clone(),
+                    remaining: remaining.to_vec(),
+                    auth: auth.clone(),
+                    group: model_entry.value.clone(),
+                    retry_on_429,
+                    fallback_on_statuses: fallback_statuses.to_vec(),
+                    winner_attempt_index: idx,
+                    winner_attempt_kind: kind,
+                })
+            });
             let result = if target.model.provider.as_deref() == Some("openai") {
                 responses_to_target(
                     state,
@@ -723,6 +749,7 @@ async fn dispatch(
                     &mut member_reservation,
                     redactions_out.clone(),
                     monitor_hits_out.clone(),
+                    mid_stream_arm,
                 )
                 .await
             } else {
@@ -745,6 +772,7 @@ async fn dispatch(
                     &mut member_reservation,
                     redactions_out.clone(),
                     monitor_hits_out.clone(),
+                    mid_stream_arm,
                 )
                 .await
             };
@@ -984,6 +1012,9 @@ async fn responses_to_target(
     // Input-side monitor hits (AISIX-Cloud#562), same lifecycle as
     // `input_redactions`.
     input_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
+    // Mid-stream failover context (AISIX-Cloud#1222); `None` disarms —
+    // a mid-stream failure keeps today's truncate/forward behavior.
+    mid_stream: Option<crate::stream_failover::MidStreamArm>,
 ) -> Result<ResponseDispatchSuccess, ProxyError> {
     let chain_arc = chain;
     let chain = chain_arc.as_ref();
@@ -1345,24 +1376,83 @@ async fn responses_to_target(
             });
         }
 
+        // Mid-stream failover (AISIX-Cloud#1222): built up front because
+        // it decides who owns the read timeout below. The continuation
+        // dispatch runs on the internal ChatFormat transform of the
+        // (post-redaction) outbound body; the client-facing model name
+        // rides `requested_model`.
+        let mid_stream_ctx = mid_stream.map(|arm| {
+            let chat = crate::responses_bridge::responses_request_to_chat(requested_model, &body);
+            let serving = Arc::new(std::sync::Mutex::new(
+                crate::stream_failover::ServingAttempt {
+                    target_id: model_id.to_string(),
+                    target_model: attempt.model.clone(),
+                    provider: provider_label.clone(),
+                    provider_key_id: provider_key_id.clone(),
+                    upstream_model: upstream_model.clone(),
+                    cooldown: model.cooldown.clone(),
+                    attempt_index: arm.winner_attempt_index,
+                    attempt_kind: arm.winner_attempt_kind,
+                    attempt_started,
+                },
+            ));
+            let shared = crate::stream_failover::MidStreamShared::new();
+            let plan = crate::stream_failover::MidStreamPlan {
+                cfg: arm.cfg,
+                endpoint: crate::stream_failover::MidStreamEndpoint::Responses,
+                structured_output: responses_expects_structured_output(&body),
+                remaining: arm.remaining,
+                state: state.clone(),
+                auth: arm.auth,
+                group: arm.group,
+                req: chat,
+                request_id: request_id.to_string(),
+                client: client_ctx.clone(),
+                retry_on_429: arm.retry_on_429,
+                fallback_on_statuses: arm.fallback_on_statuses,
+                requested_model: requested_model.to_string(),
+                api_key_id: api_key_id.to_string(),
+                applied_guardrails: chain.applied().to_vec(),
+                serving: Arc::clone(&serving),
+                shared: shared.clone(),
+            };
+            (plan, serving, shared)
+        });
         // #554: enforce the per-chunk read timeout on the forwarded bytes.
         // When a `stream_timeout` is configured, peek the first byte so a
         // slow/erroring first token fails over before the 200 is committed;
         // without one, forward directly (pre-#554 behavior). A mid-stream
         // stall truncates the forwarded stream (no in-band error frame for
-        // an opaque byte passthrough).
+        // an opaque byte passthrough) — unless mid-stream failover is
+        // armed, in which case the failover combinator owns the timeout
+        // (it must classify the stall as `read_timeout`, which the
+        // silent-truncate wrapper can't signal).
         let stream_budget = timeouts.stream;
+        let armed = mid_stream_ctx.is_some();
         let wrapped: std::pin::Pin<
             Box<dyn futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>,
-        > = Box::pin(crate::stream_timeout::with_read_timeout_bytes(
-            upstream_resp.bytes_stream(),
-            stream_budget,
-        ));
+        > = if armed {
+            Box::pin(upstream_resp.bytes_stream())
+        } else {
+            Box::pin(crate::stream_timeout::with_read_timeout_bytes(
+                upstream_resp.bytes_stream(),
+                stream_budget,
+            ))
+        };
         let body_stream: std::pin::Pin<
             Box<dyn futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>,
         > = if timeouts.stream_configured {
             let mut wrapped = wrapped;
-            let first_bytes = match wrapped.next().await {
+            // The armed pipeline has no outer timeout wrapper — bound
+            // the first-byte peek explicitly (identical outcome to the
+            // unarmed wrapper, which ends the stream on elapse).
+            let first = match (armed, stream_budget) {
+                (true, Some(d)) => tokio::time::timeout(d, wrapped.next())
+                    .await
+                    .unwrap_or_default(),
+                _ => wrapped.next().await,
+            };
+            let first_bytes = match first {
                 Some(Ok(b)) => b,
                 Some(Err(e)) => {
                     let err = crate::dispatch::reqwest_error_to_bridge(&e, send_started);
@@ -1391,6 +1481,21 @@ async fn responses_to_target(
             )
         } else {
             wrapped
+        };
+        let (mid_stream_plan, mid_stream_for_telem) = match mid_stream_ctx {
+            Some((plan, serving, shared)) => (Some(plan), Some((serving, shared))),
+            None => (None, None),
+        };
+        let body_stream: std::pin::Pin<
+            Box<dyn futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>,
+        > = match mid_stream_plan {
+            Some(plan) => Box::pin(wrap_responses_passthrough(
+                body_stream,
+                plan,
+                stream_budget,
+                requested_model.to_string(),
+            )),
+            None => body_stream,
         };
         // #808: wrap the verbatim byte stream so the terminal
         // `response.completed` SSE event's `usage` block is parsed in-flight
@@ -1469,9 +1574,100 @@ async fn responses_to_target(
                         usage.usage_estimated = true;
                     }
                 }
+                // Mid-stream failover may have moved the stream onto a
+                // fallback target — read the SERVING attempt (not the
+                // pre-stream winner) for everything target-scoped
+                // (AISIX-Cloud#1222).
+                let (
+                    model_id_c,
+                    provider_c,
+                    provider_key_id_c,
+                    upstream_model_c,
+                    attempt,
+                    attempt_elapsed,
+                    mid_stream_fallbacks,
+                    terminal_failure,
+                ) = match &mid_stream_for_telem {
+                    Some((serving, shared)) => {
+                        let s = serving.lock().expect("serving lock");
+                        (
+                            s.target_id.clone(),
+                            s.provider.clone(),
+                            s.provider_key_id.clone(),
+                            s.upstream_model.clone(),
+                            AttemptInfo {
+                                index: s.attempt_index,
+                                kind: s.attempt_kind.to_string(),
+                                model: s.target_model.clone(),
+                                ..Default::default()
+                            },
+                            s.attempt_started.elapsed(),
+                            shared
+                                .attempt_seq
+                                .load(std::sync::atomic::Ordering::Relaxed),
+                            shared
+                                .terminal_failure
+                                .lock()
+                                .expect("terminal failure lock")
+                                .clone(),
+                        )
+                    }
+                    None => (
+                        model_id_c,
+                        provider_c,
+                        provider_key_id_c,
+                        upstream_model_c,
+                        attempt,
+                        attempt_started.elapsed(),
+                        0,
+                        None,
+                    ),
+                };
+                // Logical stream outcome (AISIX-Cloud#1222) — same
+                // derivation as chat.rs; the terminal-failure signal
+                // comes from the byte combinator via the shared slot.
+                let stream_failed = terminal_failure.is_some();
+                let stream_outcome = if !usage.reached_end {
+                    ""
+                } else if stream_failed {
+                    "partial_failed"
+                } else if mid_stream_fallbacks > 0 {
+                    "partial_recovered"
+                } else {
+                    "success"
+                };
+                // The verbatim accumulator harvested the CLIENT-facing
+                // terminal usage — which the resumed encoder already
+                // folded the failed partials' estimate into. Undo that
+                // fold so this event (and the TPM commit) carries the
+                // serving attempt's own counts; the failed partials were
+                // billed on their per-attempt events (#655).
+                if mid_stream_fallbacks > 0 {
+                    if let Some((_, shared)) = &mid_stream_for_telem {
+                        let extra = shared
+                            .extra_usage
+                            .lock()
+                            .expect("mid-stream extra lock")
+                            .clone();
+                        usage.prompt_tokens =
+                            usage.prompt_tokens.saturating_sub(extra.prompt_tokens);
+                        usage.completion_tokens = usage
+                            .completion_tokens
+                            .saturating_sub(extra.completion_tokens);
+                    }
+                }
+                if mid_stream_fallbacks > 0 {
+                    // Recovered = the fallback kept the stream alive;
+                    // only a terminal upstream error counts as failed.
+                    state_c
+                        .metrics
+                        .record_mid_stream_fallback(&requested_model_c, !stream_failed);
+                }
                 // #688: apply the terminal token cost to TPM/TPD and release the
                 // concurrency hold now the stream has ended (sync analog of the
                 // reservation's async `commit_tokens`, which this closure can't await).
+                // Mid-stream fallback targets that served part of this stream
+                // bill their TPM here too (AISIX-Cloud#1222).
                 let streamed_tokens = total_tokens_with_cache(
                     usage.prompt_tokens,
                     usage.completion_tokens,
@@ -1480,6 +1676,16 @@ async fn responses_to_target(
                 );
                 for key in &post_stream_keys {
                     limiter_c.add_tokens_post_stream(key, streamed_tokens);
+                }
+                if let Some((_, shared)) = &mid_stream_for_telem {
+                    for key in shared
+                        .extra_post_stream_keys
+                        .lock()
+                        .expect("extra keys lock")
+                        .iter()
+                    {
+                        limiter_c.add_tokens_post_stream(key, streamed_tokens);
+                    }
                 }
                 drop(stream_hold);
                 // least_busy: stream over — this target is no longer
@@ -1532,13 +1738,21 @@ async fn responses_to_target(
                     },
                     // Attempt-scoped, unlike the e2e histogram above: any
                     // failed attempt before this one emitted its own event.
-                    attempt_started.elapsed(),
+                    attempt_elapsed,
                     &usage,
                     &client_c,
-                    attempt,
+                    {
+                        let mut attempt = attempt;
+                        if let Some((class, message)) = &terminal_failure {
+                            attempt.error_class = class.clone();
+                            attempt.error_message = message.clone();
+                        }
+                        attempt
+                    },
                     /* guardrail_blocked */ false,
                     input_redactions.clone(),
                     monitor_hits,
+                    stream_outcome,
                     captured_content.as_ref(),
                 );
             },
@@ -1750,6 +1964,9 @@ async fn responses_cross_provider_to_target(
     // Input-side monitor hits (AISIX-Cloud#562), same lifecycle as
     // `input_redactions`.
     input_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
+    // Mid-stream failover context (AISIX-Cloud#1222); `None` disarms —
+    // a mid-stream failure keeps today's terminate behavior.
+    mid_stream: Option<crate::stream_failover::MidStreamArm>,
 ) -> Result<ResponseDispatchSuccess, ProxyError> {
     use aisix_gateway::Bridge;
 
@@ -1860,6 +2077,60 @@ async fn responses_cross_provider_to_target(
         state.health.record_success(&model.display_name);
         state.runtime_status.mark_healthy(model_id);
 
+        // Mid-stream failover (AISIX-Cloud#1222): when armed, wrap the
+        // upstream so a qualifying mid-stream failure continues on the
+        // remaining targets inside the SAME client stream. The
+        // ResponsesSseEncoder lives OUTSIDE the combinator, so its
+        // response envelope + item/sequence state survive the switch.
+        let mid_stream_state = mid_stream.map(|arm| {
+            let serving = Arc::new(std::sync::Mutex::new(
+                crate::stream_failover::ServingAttempt {
+                    target_id: model_id.to_string(),
+                    target_model: attempt.model.clone(),
+                    provider: provider_label.clone(),
+                    provider_key_id: provider_key_id.clone(),
+                    upstream_model: model.upstream_model().unwrap_or("unknown").to_string(),
+                    cooldown: model.cooldown.clone(),
+                    attempt_index: arm.winner_attempt_index,
+                    attempt_kind: arm.winner_attempt_kind,
+                    attempt_started,
+                },
+            ));
+            let shared = crate::stream_failover::MidStreamShared::new();
+            (arm, serving, shared)
+        });
+        let upstream = match &mid_stream_state {
+            Some((arm, serving, shared)) => crate::stream_failover::wrap(
+                upstream,
+                crate::stream_failover::MidStreamPlan {
+                    cfg: arm.cfg.clone(),
+                    endpoint: crate::stream_failover::MidStreamEndpoint::Responses,
+                    structured_output: responses_expects_structured_output(body),
+                    remaining: arm.remaining.clone(),
+                    state: state.clone(),
+                    auth: arm.auth.clone(),
+                    group: arm.group.clone(),
+                    req: chat.clone(),
+                    request_id: request_id.to_string(),
+                    client: client_ctx.clone(),
+                    retry_on_429: arm.retry_on_429,
+                    fallback_on_statuses: arm.fallback_on_statuses.clone(),
+                    requested_model: requested_model.to_string(),
+                    api_key_id: api_key_id.to_string(),
+                    applied_guardrails: chain.applied().to_vec(),
+                    serving: Arc::clone(serving),
+                    shared: shared.clone(),
+                },
+            ),
+            None => upstream,
+        };
+        let mid_stream_for_telem = mid_stream_state
+            .as_ref()
+            .map(|(_, serving, shared)| (Arc::clone(serving), shared.clone()));
+        let mid_stream_shared_for_pump = mid_stream_state
+            .as_ref()
+            .map(|(_, _, shared)| shared.clone());
+
         let response_id = format!("resp_{}", Uuid::new_v4().simple());
         let created_at = chrono::Utc::now().timestamp();
         let encoder = crate::responses_bridge::ResponsesSseEncoder::new(
@@ -1932,11 +2203,74 @@ async fn responses_cross_provider_to_target(
             requested_model.to_string(),
             content_cap,
             Some(estimator),
+            mid_stream_shared_for_pump,
             move |comp| {
+                // Mid-stream failover may have moved the stream onto a
+                // fallback target — read the SERVING attempt (not the
+                // pre-stream winner) for everything target-scoped
+                // (AISIX-Cloud#1222).
+                let (
+                    model_id_c,
+                    provider_c,
+                    provider_key_id_c,
+                    upstream_model_c,
+                    attempt_c,
+                    attempt_elapsed,
+                    mid_stream_fallbacks,
+                ) = match &mid_stream_for_telem {
+                    Some((serving, shared)) => {
+                        let s = serving.lock().expect("serving lock");
+                        (
+                            s.target_id.clone(),
+                            s.provider.clone(),
+                            s.provider_key_id.clone(),
+                            s.upstream_model.clone(),
+                            AttemptInfo {
+                                index: s.attempt_index,
+                                kind: s.attempt_kind.to_string(),
+                                model: s.target_model.clone(),
+                                ..Default::default()
+                            },
+                            s.attempt_started.elapsed(),
+                            shared
+                                .attempt_seq
+                                .load(std::sync::atomic::Ordering::Relaxed),
+                        )
+                    }
+                    None => (
+                        model_id_c,
+                        provider_c,
+                        provider_key_id_c,
+                        upstream_model_c,
+                        attempt_c,
+                        attempt_started.elapsed(),
+                        0,
+                    ),
+                };
+                // Logical stream outcome (AISIX-Cloud#1222) — same
+                // derivation as chat.rs.
+                let stream_outcome = if comp.guardrail_blocked || !comp.reached_end {
+                    ""
+                } else if comp.stream_failed {
+                    "partial_failed"
+                } else if mid_stream_fallbacks > 0 {
+                    "partial_recovered"
+                } else {
+                    "success"
+                };
+                if mid_stream_fallbacks > 0 {
+                    // Recovered = the fallback kept the stream alive; only
+                    // a terminal upstream error counts as failed.
+                    state_c
+                        .metrics
+                        .record_mid_stream_fallback(&requested_model_c, !comp.stream_failed);
+                }
                 // #688: apply the terminal token cost to TPM/TPD and release the
                 // concurrency hold now the stream has ended (sync analog of the
                 // reservation's async `commit_tokens`). Tokens count even on an
                 // output-guardrail block — the upstream still billed them.
+                // Mid-stream fallback targets that served part of this stream
+                // bill their TPM here too (AISIX-Cloud#1222).
                 let streamed_tokens = total_tokens_with_cache(
                     comp.prompt_tokens,
                     comp.completion_tokens,
@@ -1945,6 +2279,16 @@ async fn responses_cross_provider_to_target(
                 );
                 for key in &post_stream_keys {
                     limiter_c.add_tokens_post_stream(key, streamed_tokens);
+                }
+                if let Some((_, shared)) = &mid_stream_for_telem {
+                    for key in shared
+                        .extra_post_stream_keys
+                        .lock()
+                        .expect("extra keys lock")
+                        .iter()
+                    {
+                        limiter_c.add_tokens_post_stream(key, streamed_tokens);
+                    }
                 }
                 drop(stream_hold);
                 // least_busy: stream over — this target is no longer
@@ -2000,10 +2344,17 @@ async fn responses_cross_provider_to_target(
                     &upstream_model_c,
                     status,
                     // Attempt-scoped — see the sibling verbatim path.
-                    attempt_started.elapsed(),
+                    attempt_elapsed,
                     &usage,
                     &client_c,
-                    attempt_c,
+                    {
+                        let mut attempt = attempt_c;
+                        if comp.stream_failed {
+                            attempt.error_class = comp.stream_error_class.clone();
+                            attempt.error_message = comp.stream_error_message.clone();
+                        }
+                        attempt
+                    },
                     comp.guardrail_blocked,
                     // #932: input-side counts merged with the hold-back
                     // release's output-side counts.
@@ -2017,6 +2368,7 @@ async fn responses_cross_provider_to_target(
                         merged.extend(comp.monitor_hits);
                         merged
                     },
+                    stream_outcome,
                     captured_content.as_ref(),
                 );
             },
@@ -2542,6 +2894,473 @@ impl EosOutputScan {
     }
 }
 
+/// Whether the Responses request pins the output to a structured shape
+/// (`text.format.type: json_object|json_schema`) — a fallback model
+/// cannot safely continue a half-emitted JSON document, so these
+/// requests keep the terminate behavior regardless of config
+/// (AISIX-Cloud#1222).
+fn responses_expects_structured_output(body: &Value) -> bool {
+    body.get("text")
+        .and_then(|t| t.get("format"))
+        .and_then(|f| f.get("type"))
+        .and_then(Value::as_str)
+        .is_some_and(|t| t == "json_object" || t == "json_schema")
+}
+
+/// Side-channel wire state for the verbatim-path mid-stream failover
+/// (AISIX-Cloud#1222): everything needed to decide whether the stream
+/// is still continuation-safe and to seed a resumed
+/// [`ResponsesSseEncoder`].
+///
+/// [`ResponsesSseEncoder`]: crate::responses_bridge::ResponsesSseEncoder
+#[derive(Default)]
+struct ResponsesWireTracker {
+    /// `(response.id, created_at)` from the forwarded `response.created`.
+    created: Option<(String, i64)>,
+    /// Highest `sequence_number` forwarded; a resumed encoder continues
+    /// at `+ 1`.
+    last_seq: u64,
+    /// The open message item `(item_id, output_index)`.
+    message_item: Option<(String, u32)>,
+    /// `response.content_part.added` (output_text) forwarded for the
+    /// open message item.
+    part_added: bool,
+    /// Delivered output text — the continuation baseline. Bounded by
+    /// `OUTPUT_ACCUMULATION_CAP`; `partial_overflow` disarms past it.
+    partial: String,
+    partial_overflow: bool,
+    /// Wire shapes a fallback model cannot safely continue: any event
+    /// outside the plain-text envelope (tool/function items, reasoning,
+    /// refusals, item/part closings, unknown event types). Sticky.
+    unsafe_output: bool,
+    /// Clean terminal (`response.completed` / `response.incomplete`)
+    /// forwarded.
+    terminal_seen: bool,
+}
+
+impl ResponsesWireTracker {
+    fn continuable(&self) -> bool {
+        !self.unsafe_output
+            && !self.partial_overflow
+            // An item opened but its text part not yet — the resumed
+            // encoder can't splice into that half-opened shape.
+            && (self.message_item.is_none() || self.part_added)
+    }
+
+    /// Update from one complete SSE frame's `data:` JSON. Returns the
+    /// in-band error when the frame reports upstream failure — the
+    /// caller withholds that frame and runs the failover decision.
+    fn observe(&mut self, json: &Value) -> Option<aisix_gateway::BridgeError> {
+        if let Some(seq) = json.get("sequence_number").and_then(Value::as_u64) {
+            self.last_seq = self.last_seq.max(seq);
+        }
+        let in_band = |err: Option<&Value>, fallback_msg: &str| {
+            let cap = aisix_gateway::MAX_UPSTREAM_ERROR_MESSAGE_BYTES;
+            let message = err
+                .and_then(|e| e.get("message"))
+                .and_then(Value::as_str)
+                .map(|m| aisix_gateway::truncate_lossy(m, cap))
+                .unwrap_or_else(|| fallback_msg.to_string());
+            let kind = err
+                .and_then(|e| e.get("code"))
+                .and_then(Value::as_str)
+                .map(|k| aisix_gateway::truncate_lossy(k, cap));
+            aisix_gateway::BridgeError::UpstreamInBand {
+                status: None,
+                message: message.clone(),
+                parsed: Some(Box::new(aisix_gateway::UpstreamErrorView {
+                    kind,
+                    message: Some(message),
+                    code: None,
+                    param: None,
+                })),
+                wire: aisix_gateway::UpstreamWire::OpenAI,
+            }
+        };
+        match json.get("type").and_then(Value::as_str) {
+            Some("response.created") => {
+                if let Some(resp) = json.get("response") {
+                    let id = resp
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let created_at = resp.get("created_at").and_then(Value::as_i64).unwrap_or(0);
+                    self.created = Some((id, created_at));
+                }
+            }
+            Some("response.in_progress") => {}
+            Some("response.output_item.added") => {
+                let item = json.get("item");
+                let item_type = item
+                    .and_then(|i| i.get("type"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if item_type == "message" && self.message_item.is_none() {
+                    let id = item
+                        .and_then(|i| i.get("id"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let output_index = json
+                        .get("output_index")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0) as u32;
+                    self.message_item = Some((id, output_index));
+                } else {
+                    self.unsafe_output = true;
+                }
+            }
+            Some("response.content_part.added") => {
+                let part_type = json
+                    .get("part")
+                    .and_then(|p| p.get("type"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if part_type == "output_text" && self.message_item.is_some() {
+                    self.part_added = true;
+                } else {
+                    self.unsafe_output = true;
+                }
+            }
+            Some("response.output_text.delta") => {
+                if let Some(t) = json.get("delta").and_then(Value::as_str) {
+                    if self.partial.len() + t.len() > crate::token_estimate::OUTPUT_ACCUMULATION_CAP
+                    {
+                        self.partial_overflow = true;
+                    } else {
+                        self.partial.push_str(t);
+                    }
+                }
+            }
+            Some("response.completed") | Some("response.incomplete") => {
+                self.terminal_seen = true;
+            }
+            Some("response.failed") => {
+                return Some(in_band(
+                    json.get("response").and_then(|r| r.get("error")),
+                    "upstream reported response.failed",
+                ));
+            }
+            Some("error") => {
+                return Some(in_band(Some(json), "upstream reported a stream error"));
+            }
+            // Anything else — reasoning summaries, refusals, annotation
+            // adds, function-call deltas, item/part closings — is
+            // outside the continuable plain-text envelope.
+            _ => self.unsafe_output = true,
+        }
+        None
+    }
+}
+
+/// The terminal Responses-wire error frame the failover paths emit when
+/// the stream cannot be continued — same shape as the bridge pump's
+/// `Err` arm.
+fn responses_error_frame(err: &aisix_gateway::BridgeError) -> bytes::Bytes {
+    bytes::Bytes::from(format!(
+        "event: error\ndata: {{\"type\":\"error\",\"code\":\"{}\",\"message\":{}}}\n\n",
+        err.error_type(),
+        serde_json::to_string(&err.to_string()).unwrap_or_else(|_| "\"error\"".into()),
+    ))
+}
+
+/// Outcome of one verbatim-path failure decision. See the `/v1/messages`
+/// sibling for the decision order.
+enum ResponsesPassthroughFailure {
+    Continue(
+        aisix_gateway::ChatChunkStream,
+        Option<aisix_ratelimit::StreamConcurrencyGuard>,
+    ),
+    /// Carries the failure back (the last fallback error on exhaustion,
+    /// else the original); `bool` = fallbacks attempted and exhausted.
+    No(aisix_gateway::BridgeError, bool),
+}
+
+async fn handle_responses_passthrough_failure(
+    plan: &crate::stream_failover::MidStreamPlan,
+    cursor: &mut usize,
+    used: &mut u32,
+    tracker: &ResponsesWireTracker,
+    err: aisix_gateway::BridgeError,
+) -> ResponsesPassthroughFailure {
+    let eligible = crate::stream_failover::classify_trigger(&err)
+        .is_some_and(|t| plan.cfg.on_or_default().contains(&t))
+        && crate::routing::is_retryable(&err, plan.retry_on_429, &plan.fallback_on_statuses)
+        && tracker.continuable()
+        && !plan.structured_output
+        && *used < plan.cfg.max_fallbacks_or_default();
+    if !eligible {
+        return ResponsesPassthroughFailure::No(err, false);
+    }
+    match crate::stream_failover::acquire_fallback_stream(plan, cursor, used, err, &tracker.partial)
+        .await
+    {
+        Ok((stream, hold)) => ResponsesPassthroughFailure::Continue(stream, hold),
+        Err(last) => {
+            *plan
+                .shared
+                .terminal_failure
+                .lock()
+                .expect("terminal failure lock") = Some((
+                crate::attempt::routing_error_class(&last).to_string(),
+                crate::attempt::attempt_error_message(&last),
+            ));
+            ResponsesPassthroughFailure::No(last, true)
+        }
+    }
+}
+
+/// Wrap the verbatim byte stream with the mid-stream failover combinator
+/// (AISIX-Cloud#1222). Forwarding is frame-granular when armed: bytes
+/// are held until a complete SSE frame is buffered, so an in-band error
+/// frame can be withheld while the fallback decision runs. On a
+/// qualifying failure the remaining targets are dispatched through the
+/// chat bridges and their chunks are re-encoded onto the client's
+/// committed response envelope by a resumed [`ResponsesSseEncoder`] —
+/// `response_id`, `sequence_number`, and the open item's ids/indexes
+/// continue seamlessly. Ineligible failures reproduce today's behavior.
+///
+/// [`ResponsesSseEncoder`]: crate::responses_bridge::ResponsesSseEncoder
+fn wrap_responses_passthrough<S>(
+    upstream: S,
+    plan: crate::stream_failover::MidStreamPlan,
+    per_chunk: Option<Duration>,
+    model_display_name: String,
+) -> impl futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send
+where
+    S: futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send + 'static,
+{
+    /// One poll of the verbatim upstream, timeout folded in.
+    enum Polled {
+        Item(reqwest::Result<bytes::Bytes>),
+        Eof,
+        TimedOut,
+    }
+
+    async_stream::stream! {
+        let mut upstream = std::pin::pin!(upstream);
+        let mut tracker = ResponsesWireTracker::default();
+        let mut buf: Vec<u8> = Vec::new();
+        let mut cursor = 0usize;
+        let mut used: u32 = 0;
+        let mut parse_disarmed = false;
+        let send_started = Instant::now();
+        let mut _fallback_hold: Option<aisix_ratelimit::StreamConcurrencyGuard> = None;
+        let mut continuation: Option<aisix_gateway::ChatChunkStream> = None;
+
+        // ---- Verbatim phase: forward frames, watch for failure ----
+        while continuation.is_none() {
+            let polled = match per_chunk {
+                Some(d) => match tokio::time::timeout(d, upstream.next()).await {
+                    Ok(Some(item)) => Polled::Item(item),
+                    Ok(None) => Polled::Eof,
+                    Err(_) => Polled::TimedOut,
+                },
+                None => match upstream.next().await {
+                    Some(item) => Polled::Item(item),
+                    None => Polled::Eof,
+                },
+            };
+            let mut original: Option<reqwest::Error> = None;
+            let mut withheld: Option<Vec<u8>> = None;
+            let failure: aisix_gateway::BridgeError = match polled {
+                Polled::Item(Ok(bytes)) => {
+                    if parse_disarmed {
+                        yield Ok(bytes);
+                        continue;
+                    }
+                    buf.extend_from_slice(&bytes);
+                    if buf.len() > crate::messages::MAX_SSE_FRAME_BUF_BYTES {
+                        tracing::warn!(
+                            buffered = buf.len(),
+                            "responses passthrough failover: frame buffer exceeded cap; \
+                             disarming mid-stream failover for this stream"
+                        );
+                        parse_disarmed = true;
+                        yield Ok(bytes::Bytes::from(std::mem::take(&mut buf)));
+                        continue;
+                    }
+                    let mut in_band: Option<aisix_gateway::BridgeError> = None;
+                    let mut forward = Vec::new();
+                    while let Some(end) = crate::messages::find_frame_end(&buf) {
+                        let frame: Vec<u8> = buf.drain(..end).collect();
+                        if let Some(data) = crate::messages::extract_sse_data_line(&frame) {
+                            if let Ok(json) = serde_json::from_slice::<Value>(data) {
+                                if let Some(err) = tracker.observe(&json) {
+                                    in_band = Some(err);
+                                    withheld = Some(frame);
+                                    break;
+                                }
+                            }
+                        }
+                        forward.extend_from_slice(&frame);
+                    }
+                    if !forward.is_empty() {
+                        yield Ok(bytes::Bytes::from(forward));
+                    }
+                    match in_band {
+                        Some(err) => err,
+                        None => continue,
+                    }
+                }
+                Polled::Item(Err(e)) => {
+                    if parse_disarmed {
+                        yield Err(e);
+                        return;
+                    }
+                    let err = crate::dispatch::reqwest_error_to_bridge(&e, send_started);
+                    original = Some(e);
+                    err
+                }
+                Polled::Eof => {
+                    if parse_disarmed || tracker.terminal_seen {
+                        return;
+                    }
+                    aisix_gateway::BridgeError::StreamAborted
+                }
+                Polled::TimedOut => {
+                    if parse_disarmed {
+                        return;
+                    }
+                    aisix_gateway::BridgeError::Timeout {
+                        elapsed_ms: per_chunk.map(|d| d.as_millis() as u64).unwrap_or_default(),
+                        cause: String::new(),
+                    }
+                }
+            };
+            match handle_responses_passthrough_failure(
+                &plan, &mut cursor, &mut used, &tracker, failure,
+            )
+            .await
+            {
+                ResponsesPassthroughFailure::Continue(stream, hold) => {
+                    _fallback_hold = hold;
+                    buf.clear();
+                    continuation = Some(stream);
+                }
+                ResponsesPassthroughFailure::No(err, exhausted) => {
+                    if exhausted {
+                        yield Ok(responses_error_frame(&err));
+                    } else if let Some(frame) = withheld {
+                        // Ineligible in-band failure: release the
+                        // upstream's own frame byte-for-byte.
+                        yield Ok(bytes::Bytes::from(frame));
+                    } else if let Some(e) = original {
+                        yield Err(e);
+                    }
+                    // Ineligible timeout / EOF: silent truncation,
+                    // today's behavior.
+                    return;
+                }
+            }
+        }
+
+        // ---- Continuation phase: re-encode fallback chunks ----
+        let mut encoder = match tracker.created.clone() {
+            Some((response_id, created_at)) => {
+                let next_output_index =
+                    tracker.message_item.as_ref().map(|(_, oi)| oi + 1).unwrap_or(0);
+                let text_item = tracker
+                    .message_item
+                    .clone()
+                    .filter(|_| tracker.part_added)
+                    .map(|(id, oi)| (id, oi, tracker.partial.clone()));
+                crate::responses_bridge::ResponsesSseEncoder::resume(
+                    response_id,
+                    model_display_name.clone(),
+                    created_at,
+                    tracker.last_seq + 1,
+                    next_output_index,
+                    text_item,
+                )
+            }
+            // Pre-envelope failure: the client saw nothing — start a
+            // fresh response envelope.
+            None => crate::responses_bridge::ResponsesSseEncoder::new(
+                format!("resp_{}", Uuid::new_v4().simple()),
+                model_display_name.clone(),
+                chrono::Utc::now().timestamp(),
+            ),
+        };
+        {
+            let extra = plan
+                .shared
+                .extra_usage
+                .lock()
+                .expect("mid-stream extra lock")
+                .clone();
+            encoder.set_extra_usage(extra.prompt_tokens, extra.completion_tokens);
+        }
+        let mut stream = continuation.expect("continuation stream set above");
+        loop {
+            match stream.next().await {
+                Some(Ok(chunk)) => {
+                    if chunk.delta.tool_calls.is_some() || chunk.delta.reasoning_content.is_some()
+                    {
+                        tracker.unsafe_output = true;
+                    }
+                    if let Some(t) = chunk.delta.content.as_deref() {
+                        if tracker.partial.len() + t.len()
+                            > crate::token_estimate::OUTPUT_ACCUMULATION_CAP
+                        {
+                            tracker.partial_overflow = true;
+                        } else {
+                            tracker.partial.push_str(t);
+                        }
+                    }
+                    for ev in encoder.next_events(&chunk) {
+                        yield Ok(bytes::Bytes::from(ev.to_sse_string()));
+                    }
+                    if encoder.is_finished() {
+                        return;
+                    }
+                }
+                Some(Err(err)) => {
+                    match handle_responses_passthrough_failure(
+                        &plan, &mut cursor, &mut used, &tracker, err,
+                    )
+                    .await
+                    {
+                        ResponsesPassthroughFailure::Continue(next, hold) => {
+                            _fallback_hold = hold;
+                            stream = next;
+                            encoder.reset_usage_counters();
+                            let extra = plan
+                                .shared
+                                .extra_usage
+                                .lock()
+                                .expect("mid-stream extra lock")
+                                .clone();
+                            encoder.set_extra_usage(extra.prompt_tokens, extra.completion_tokens);
+                        }
+                        ResponsesPassthroughFailure::No(err, exhausted) => {
+                            if !exhausted {
+                                *plan
+                                    .shared
+                                    .terminal_failure
+                                    .lock()
+                                    .expect("terminal failure lock") = Some((
+                                    crate::attempt::routing_error_class(&err).to_string(),
+                                    crate::attempt::attempt_error_message(&err),
+                                ));
+                            }
+                            yield Ok(responses_error_frame(&err));
+                            return;
+                        }
+                    }
+                }
+                None => {
+                    for ev in encoder.force_finish() {
+                        yield Ok(bytes::Bytes::from(ev.to_sse_string()));
+                    }
+                    return;
+                }
+            }
+        }
+    }
+}
+
 /// Wrap a Responses-API upstream byte stream so the terminal event's usage is
 /// parsed in-flight and `on_complete` fires once at end-of-stream (or
 /// client-disconnect) with the accumulated counts (#808) plus the captured
@@ -2864,6 +3683,11 @@ fn emit_usage_event(
     // Monitor-mode guardrail observations (AISIX-Cloud#562), input +
     // output merged.
     guardrail_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
+    // Logical stream outcome (AISIX-Cloud#1222): `success` /
+    // `partial_failed` / `partial_recovered` on streaming terminal
+    // events; empty on non-streaming, aborted, and failed-attempt
+    // events.
+    stream_outcome: &str,
     // Captured request/response content for content-capturing exporters
     // (AISIX-Cloud#947). Forwarded only to `fan_out`, never to the CP sink.
     content: Option<&CapturedContent>,
@@ -2905,6 +3729,7 @@ fn emit_usage_event(
         guardrail_blocked,
         redacted_entity_counts,
         guardrail_monitor_hits,
+        stream_outcome: stream_outcome.to_string(),
         ..Default::default()
     };
     state.usage_sink.try_emit("responses", event.clone());

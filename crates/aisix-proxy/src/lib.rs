@@ -5469,6 +5469,385 @@ data: [DONE]\n\n";
         );
     }
 
+    // ── Mid-stream failover on /v1/responses (AISIX-Cloud#1222 phase 2) ──
+
+    /// OpenAI Responses-wire stream head: committed envelope + one text
+    /// delta, then an in-band `response.failed`.
+    const RESP_MID_STREAM_HEAD_SSE: &str = "\
+event: response.created\ndata: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp_up1\",\"object\":\"response\",\"created_at\":170,\"status\":\"in_progress\",\"model\":\"gpt-4o-mini\",\"output\":[]}}\n\n\
+event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"sequence_number\":1,\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_item1\",\"status\":\"in_progress\",\"role\":\"assistant\",\"content\":[]}}\n\n\
+event: response.content_part.added\ndata: {\"type\":\"response.content_part.added\",\"sequence_number\":2,\"item_id\":\"msg_item1\",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"output_text\",\"text\":\"\",\"annotations\":[]}}\n\n\
+event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"sequence_number\":3,\"item_id\":\"msg_item1\",\"output_index\":0,\"content_index\":0,\"delta\":\"Once upon\"}\n\n\
+event: response.failed\ndata: {\"type\":\"response.failed\",\"sequence_number\":4,\"response\":{\"id\":\"resp_up1\",\"status\":\"failed\",\"error\":{\"code\":\"server_error\",\"message\":\"boom\"}}}\n\n";
+
+    const RESP_RECOVERY_CHAT_SSE: &str = "\
+data: {\"id\":\"up-2\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" a time.\"},\"finish_reason\":\"stop\"}]}\n\n\
+data: {\"id\":\"up-2\",\"model\":\"gpt-4o\",\"choices\":[],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":7,\"total_tokens\":16}}\n\n\
+data: [DONE]\n\n";
+
+    async fn streaming_responses_wire(app: axum::Router, model: &str) -> String {
+        let body = serde_json::json!({
+            "model": model,
+            "input": "tell me a story",
+            "stream": true
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let mut body_stream = resp.into_body().into_data_stream();
+        let mut wire = Vec::new();
+        while let Some(chunk) = body_stream.next().await {
+            wire.extend_from_slice(chunk.unwrap().as_ref());
+        }
+        String::from_utf8(wire).expect("SSE bytes are utf8")
+    }
+
+    /// AISIX-Cloud#1222 phase 2 core acceptance (verbatim leg): an
+    /// OpenAI upstream failing in-band (`response.failed`) inside its
+    /// committed Responses stream moves the SAME client stream onto the
+    /// fallback target; the resumed encoder continues the client's
+    /// envelope — same `resp_up1` id, same open item, sequence numbers
+    /// monotonic, one clean `response.completed`.
+    #[tokio::test]
+    async fn responses_mid_stream_failover_verbatim_continues_envelope() {
+        let primary = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(RESP_MID_STREAM_HEAD_SSE),
+            )
+            .mount(&primary)
+            .await;
+        let secondary = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(RESP_RECOVERY_CHAT_SSE),
+            )
+            .mount(&secondary)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = mid_stream_snapshot(
+            &primary.uri(),
+            &secondary.uri(),
+            Some(serde_json::json!({"mode": "continue"})),
+        );
+        let app = build_router(build_state(snap, hub));
+
+        let wire = streaming_responses_wire(app, "smart").await;
+        assert_eq!(
+            wire.matches("event: response.created").count(),
+            1,
+            "the client keeps its original response envelope:\n{wire}"
+        );
+        assert_eq!(
+            wire.matches("event: response.output_item.added").count(),
+            1,
+            "the continuation rides the already-open message item:\n{wire}"
+        );
+        assert!(wire.contains("resp_up1"), "upstream envelope id:\n{wire}");
+        assert!(wire.contains("Once upon"), "primary partial:\n{wire}");
+        assert!(wire.contains(" a time."), "fallback continuation:\n{wire}");
+        assert!(
+            !wire.contains("response.failed") && !wire.contains("event: error"),
+            "recovered stream carries no failure frame:\n{wire}"
+        );
+        assert_eq!(
+            wire.matches("event: response.completed").count(),
+            1,
+            "one clean terminal:\n{wire}"
+        );
+        assert!(
+            wire.contains("Once upon a time."),
+            "terminal snapshot carries the full spliced text:\n{wire}"
+        );
+        // The continuation deltas continue the client's item id.
+        let continuation_delta = wire
+            .split("event: response.output_text.delta")
+            .nth(2)
+            .expect("continuation delta present");
+        assert!(
+            continuation_delta.contains("msg_item1"),
+            "continuation keeps the open item id:\n{wire}"
+        );
+
+        // The fallback got the continuation on the chat wire.
+        let reqs = secondary.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 1, "secondary called exactly once");
+        let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.last().unwrap()["role"], "assistant");
+        assert_eq!(messages.last().unwrap()["content"], "Once upon");
+    }
+
+    /// Cross-provider (bridge) leg: /v1/responses served by
+    /// non-OpenAI-provider targets through the chat bridge +
+    /// ResponsesSseEncoder. The encoder lives outside the combinator,
+    /// so the spliced fallback chunks continue the same synthesized
+    /// envelope.
+    #[tokio::test]
+    async fn responses_mid_stream_failover_bridge_continues_stream() {
+        let primary = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(MID_STREAM_FAILING_SSE),
+            )
+            .mount(&primary)
+            .await;
+        let secondary = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(RESP_RECOVERY_CHAT_SSE),
+            )
+            .mount(&secondary)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        hub.register_specialized("deepseek", Arc::new(openai_test_bridge()));
+        // deepseek provider (openai adapter) → the cross-provider
+        // Responses leg; the verbatim leg is openai-provider-only.
+        let snap = AisixSnapshot::new();
+        snap.provider_keys.insert(matrix_pk_entry(
+            "pk-ds-primary",
+            "sk-ds",
+            &primary.uri(),
+            "deepseek",
+            "openai",
+        ));
+        snap.provider_keys.insert(matrix_pk_entry(
+            "pk-ds-secondary",
+            "sk-ds",
+            &secondary.uri(),
+            "deepseek",
+            "openai",
+        ));
+        let ds_model = |id: &str, name: &str, pk: &str| {
+            let cfg = serde_json::json!({
+                "display_name": name,
+                "provider": "deepseek",
+                "model_name": "deepseek-chat",
+                "provider_key_id": pk,
+            });
+            ResourceEntry::new(id, serde_json::from_value::<Model>(cfg).unwrap(), 1)
+        };
+        snap.models
+            .insert(ds_model("m-ds-primary", "primary", "pk-ds-primary"));
+        snap.models
+            .insert(ds_model("m-ds-secondary", "secondary", "pk-ds-secondary"));
+        snap.models.insert(routing_entry_with_stream_failure(
+            "smart",
+            &["primary", "secondary"],
+            serde_json::json!({"mode": "continue"}),
+        ));
+        snap.apikeys.insert(apikey_entry("sk-caller", &["smart"]));
+        let app = build_router(build_state(snap, hub));
+
+        let wire = streaming_responses_wire(app, "smart").await;
+        assert_eq!(
+            wire.matches("event: response.created").count(),
+            1,
+            "one synthesized envelope across the switch:\n{wire}"
+        );
+        assert!(wire.contains("Once upon"), "primary partial:\n{wire}");
+        assert!(wire.contains(" a time."), "fallback continuation:\n{wire}");
+        assert!(
+            !wire.contains("event: error"),
+            "recovered stream carries no error frame:\n{wire}"
+        );
+        assert_eq!(wire.matches("event: response.completed").count(), 1);
+
+        let reqs = secondary.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 1, "secondary called exactly once");
+        let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3, "user + instruction + partial");
+        assert!(messages[1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("do not repeat any of its content"));
+        assert_eq!(messages[2]["content"], "Once upon");
+    }
+
+    /// Without `stream_failure` config the verbatim path keeps its
+    /// historical behavior byte-for-byte: the upstream's own
+    /// `response.failed` frame is forwarded and the fallback target is
+    /// never contacted.
+    #[tokio::test]
+    async fn responses_mid_stream_default_terminate_forwards_upstream_failed_frame() {
+        let primary = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(RESP_MID_STREAM_HEAD_SSE),
+            )
+            .mount(&primary)
+            .await;
+        let secondary = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&secondary)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = mid_stream_snapshot(&primary.uri(), &secondary.uri(), None);
+        let app = build_router(build_state(snap, hub));
+
+        let wire = streaming_responses_wire(app, "smart").await;
+        assert!(wire.contains("Once upon"));
+        assert!(
+            wire.contains("response.failed"),
+            "upstream failure frame forwards verbatim:\n{wire}"
+        );
+        let reqs = secondary.received_requests().await.unwrap();
+        assert!(reqs.is_empty(), "fallback never contacted");
+    }
+
+    /// Output-shape safety gate on the verbatim leg: a function-call
+    /// item on the wire disarms continuation — the withheld
+    /// `response.failed` frame is released verbatim and no fallback is
+    /// dispatched.
+    #[tokio::test]
+    async fn responses_mid_stream_fallback_skipped_after_function_call_item() {
+        let fc_sse = "\
+event: response.created\ndata: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp_up1\",\"object\":\"response\",\"created_at\":170,\"status\":\"in_progress\",\"model\":\"gpt-4o-mini\",\"output\":[]}}\n\n\
+event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"sequence_number\":1,\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"status\":\"in_progress\",\"name\":\"get_weather\",\"arguments\":\"\"}}\n\n\
+event: response.failed\ndata: {\"type\":\"response.failed\",\"sequence_number\":2,\"response\":{\"id\":\"resp_up1\",\"status\":\"failed\",\"error\":{\"code\":\"server_error\",\"message\":\"boom\"}}}\n\n";
+        let primary = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(fc_sse),
+            )
+            .mount(&primary)
+            .await;
+        let secondary = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&secondary)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = mid_stream_snapshot(
+            &primary.uri(),
+            &secondary.uri(),
+            Some(serde_json::json!({"mode": "continue"})),
+        );
+        let app = build_router(build_state(snap, hub));
+
+        let wire = streaming_responses_wire(app, "smart").await;
+        assert!(wire.contains("function_call"), "item forwarded:\n{wire}");
+        assert!(
+            wire.contains("response.failed"),
+            "withheld upstream failure frame released verbatim:\n{wire}"
+        );
+        let reqs = secondary.received_requests().await.unwrap();
+        assert!(
+            reqs.is_empty(),
+            "no continuation after a function-call item on the wire"
+        );
+    }
+
+    /// Telemetry contract on /v1/responses: the failed serving attempt
+    /// emits its own per-attempt event (estimated partial spend, openai
+    /// protocol stamp) and the terminal event is attributed to the
+    /// fallback target with `stream_outcome: partial_recovered`.
+    #[tokio::test]
+    async fn responses_mid_stream_failover_emits_attempt_events_and_outcome() {
+        use aisix_obs::UsageSink;
+
+        let primary = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(RESP_MID_STREAM_HEAD_SSE),
+            )
+            .mount(&primary)
+            .await;
+        let secondary = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(RESP_RECOVERY_CHAT_SSE),
+            )
+            .mount(&secondary)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = mid_stream_snapshot(
+            &primary.uri(),
+            &secondary.uri(),
+            Some(serde_json::json!({"mode": "continue"})),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = build_router(build_state(snap, hub).with_usage_sink(UsageSink::new(tx)));
+
+        let wire = streaming_responses_wire(app, "smart").await;
+        assert!(wire.contains(" a time."), "recovered:\n{wire}");
+
+        let mut events = Vec::new();
+        for _ in 0..2 {
+            let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+                .await
+                .expect("usage event was never emitted")
+                .expect("sender dropped");
+            events.push(ev);
+        }
+        events.sort_by_key(|e| e.attempt_index);
+
+        assert_eq!(events[0].attempt_index, 0);
+        assert_eq!(events[0].attempt_kind, "initial");
+        assert_eq!(events[0].model_id, "m-primary");
+        assert_eq!(events[0].error_class, "upstream_in_band");
+        assert_eq!(events[0].inbound_protocol, "openai");
+        assert_eq!(events[0].requested_model, "smart");
+        assert!(events[0].usage_estimated);
+        assert!(events[0].completion_tokens > 0, "partial text billed");
+
+        assert_eq!(events[1].attempt_kind, "mid_stream_fallback");
+        assert_eq!(events[1].model_id, "m-secondary");
+        assert_eq!(events[1].attempt_model, "secondary");
+        assert_eq!(events[1].status_code, 200);
+        assert_eq!(events[1].stream_outcome, "partial_recovered");
+        assert_eq!(
+            events[1].completion_tokens, 7,
+            "serving attempt's own count"
+        );
+    }
+
     #[tokio::test]
     async fn routing_failover_retries_to_second_target_when_first_5xxs() {
         let bad_upstream = MockServer::start().await;

@@ -436,6 +436,13 @@ pub struct ResponsesSseEncoder {
     cached_prompt_tokens: u32,
     cache_creation_tokens: u32,
     cache_read_tokens: u32,
+    /// Usage folded ADDITIVELY into the terminal usage on top of the
+    /// max-wins counters (mid-stream failover, AISIX-Cloud#1222): the
+    /// estimated spend of failed partial attempts, so the client's
+    /// terminal counts also cover the partial text it received before
+    /// the switch.
+    extra_prompt_tokens: u32,
+    extra_completion_tokens: u32,
 }
 
 impl ResponsesSseEncoder {
@@ -467,7 +474,64 @@ impl ResponsesSseEncoder {
             cached_prompt_tokens: 0,
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
+            extra_prompt_tokens: 0,
+            extra_completion_tokens: 0,
         }
+    }
+
+    /// Rebuild an encoder positioned mid-response, for the verbatim-path
+    /// mid-stream failover (AISIX-Cloud#1222): the client already holds
+    /// the upstream's own `response.created` envelope (and possibly an
+    /// open message item), so the resumed encoder continues that
+    /// envelope — same `response_id`, monotonic `sequence_number`, the
+    /// open item's ids/indexes — instead of opening its own.
+    /// `text_item` is `(item_id, output_index, delivered_text)` for the
+    /// open message item; `None` → the next text delta opens a fresh
+    /// item at `next_output_index`. `delivered_text` seeds `text_accum`
+    /// so the closing `output_text.done` / `response.completed`
+    /// snapshots carry the full text the client saw.
+    #[allow(clippy::too_many_arguments)]
+    pub fn resume(
+        response_id: impl Into<String>,
+        model_display_name: impl Into<String>,
+        created_at: i64,
+        sequence_number: u64,
+        next_output_index: u32,
+        text_item: Option<(String, u32, String)>,
+    ) -> Self {
+        let mut enc = Self::new(response_id, model_display_name, created_at);
+        enc.sequence_number = sequence_number;
+        enc.sent_created = true;
+        enc.next_output_index = next_output_index;
+        if let Some((item_id, output_index, delivered)) = text_item {
+            enc.text_item_id = Some(item_id);
+            enc.text_output_index = output_index;
+            enc.text_accum = delivered;
+        }
+        enc
+    }
+
+    /// Fold failed-attempt usage additively into the terminal usage
+    /// (see `extra_prompt_tokens`). Refreshed by the driver whenever
+    /// the serving attempt changes.
+    pub fn set_extra_usage(&mut self, prompt_tokens: u32, completion_tokens: u32) {
+        self.extra_prompt_tokens = prompt_tokens;
+        self.extra_completion_tokens = completion_tokens;
+    }
+
+    /// Zero the cumulative usage counters when the serving attempt
+    /// changes (mid-stream failover): max-wins folding across attempts
+    /// would otherwise mix the failed attempt's counters into the
+    /// serving attempt's totals.
+    pub fn reset_usage_counters(&mut self) {
+        self.usage_seen = false;
+        self.prompt_tokens = 0;
+        self.completion_tokens = 0;
+        self.total_tokens = 0;
+        self.reasoning_tokens = 0;
+        self.cached_prompt_tokens = 0;
+        self.cache_creation_tokens = 0;
+        self.cache_read_tokens = 0;
     }
 
     /// Build one event, stamping `type` + `sequence_number`.
@@ -497,10 +561,21 @@ impl ResponsesSseEncoder {
     fn usage_value(&self) -> Value {
         // `responses_usage_json` keeps a provider-supplied `total_tokens`
         // when present and only falls back to prompt+completion when it's 0.
+        // The mid-stream failover extras fold additively into both legs
+        // (LiteLLM merges partial + fallback usage the same way).
+        let extra = self
+            .extra_prompt_tokens
+            .saturating_add(self.extra_completion_tokens);
         responses_usage_json(&UsageStats {
-            prompt_tokens: self.prompt_tokens,
-            completion_tokens: self.completion_tokens,
-            total_tokens: self.total_tokens,
+            prompt_tokens: self.prompt_tokens.saturating_add(self.extra_prompt_tokens),
+            completion_tokens: self
+                .completion_tokens
+                .saturating_add(self.extra_completion_tokens),
+            total_tokens: if self.total_tokens > 0 {
+                self.total_tokens.saturating_add(extra)
+            } else {
+                0
+            },
             cached_prompt_tokens: self.cached_prompt_tokens,
             reasoning_tokens: self.reasoning_tokens,
             cache_creation_tokens: self.cache_creation_tokens,
@@ -927,6 +1002,18 @@ pub struct ResponsesStreamCompletion {
     /// bounded to `token_estimate::OUTPUT_ACCUMULATION_CAP`; never leaves
     /// the process.
     est_output_text: String,
+    /// The upstream errored mid-stream and the pump terminated the
+    /// response with an in-band error frame (AISIX-Cloud#1222). The
+    /// telemetry closure turns this into `stream_outcome:
+    /// partial_failed` — distinct from a client abandon, which leaves
+    /// `reached_end` false.
+    pub stream_failed: bool,
+    /// Attempt-taxonomy class of the terminal stream error; empty
+    /// unless `stream_failed`.
+    pub stream_error_class: String,
+    /// Client-safe message of the terminal stream error; empty unless
+    /// `stream_failed`.
+    pub stream_error_message: String,
 }
 
 struct CompleteOnDrop<F: FnOnce(ResponsesStreamCompletion)> {
@@ -1006,6 +1093,12 @@ pub fn build_responses_bridge_stream(
     // Token-estimation fallback context (AISIX-Cloud#1074); see
     // `CompleteOnDrop::estimator`.
     estimator: Option<crate::token_estimate::Estimator>,
+    // Mid-stream failover shared state (AISIX-Cloud#1222): the pump
+    // watches `attempt_seq` to reset its usage accumulators when the
+    // serving attempt changes, and folds `extra_usage` (failed partial
+    // attempts, estimated) into the encoder's terminal usage. `None` on
+    // unarmed streams.
+    mid_stream: Option<crate::stream_failover::MidStreamShared>,
     on_complete: impl FnOnce(ResponsesStreamCompletion) + Send + 'static,
 ) -> axum::body::Body {
     use futures::StreamExt;
@@ -1028,6 +1121,14 @@ pub fn build_responses_bridge_stream(
         }
         let mut upstream = upstream;
         let mut first_chunk_seen = false;
+        // Serving-attempt sequence snapshot (mid-stream failover,
+        // AISIX-Cloud#1222) — see chat.rs's pump for the why: max-wins
+        // folding across attempts would mix the failed attempt's usage
+        // into the serving attempt's totals.
+        let mut mid_stream_seq = mid_stream
+            .as_ref()
+            .map(|ms| ms.attempt_seq.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap_or(0);
         let buffering = output_guardrail.is_some() && hold_back;
         // Held SSE events when an output guardrail is attached; empty (and
         // unused) on the live-forward path.
@@ -1037,6 +1138,32 @@ pub fn build_responses_bridge_stream(
         while let Some(item) = upstream.next().await {
             match item {
                 Ok(chunk) => {
+                    if let Some(ms) = mid_stream.as_ref() {
+                        let seq = ms.attempt_seq.load(std::sync::atomic::Ordering::Relaxed);
+                        if seq != mid_stream_seq {
+                            mid_stream_seq = seq;
+                            // Serving attempt changed: zero the
+                            // per-attempt accumulators and fold the
+                            // failed partials' estimated usage into the
+                            // encoder's terminal counts instead.
+                            {
+                                let comp = guard.comp();
+                                comp.prompt_tokens = 0;
+                                comp.completion_tokens = 0;
+                                comp.reasoning_tokens = 0;
+                                comp.cached_prompt_tokens = 0;
+                                comp.cache_creation_tokens = 0;
+                                comp.cache_read_tokens = 0;
+                            }
+                            encoder.reset_usage_counters();
+                            let extra = ms
+                                .extra_usage
+                                .lock()
+                                .expect("mid-stream extra lock")
+                                .clone();
+                            encoder.set_extra_usage(extra.prompt_tokens, extra.completion_tokens);
+                        }
+                    }
                     if !first_chunk_seen && chunk.delta.carries_generated_output() {
                         first_chunk_seen = true;
                         guard.comp().upstream_ttft_ms =
@@ -1116,6 +1243,19 @@ pub fn build_responses_bridge_stream(
                     }
                 }
                 Err(e) => {
+                    // Terminal upstream failure: the wire ends with an
+                    // in-band error frame — distinct from a client
+                    // abandon, so `reached_end` is still recorded and
+                    // the telemetry closure reports `stream_outcome:
+                    // partial_failed` (AISIX-Cloud#1222).
+                    {
+                        let comp = guard.comp();
+                        comp.stream_failed = true;
+                        comp.stream_error_class =
+                            crate::attempt::routing_error_class(&e).to_string();
+                        comp.stream_error_message = crate::attempt::attempt_error_message(&e);
+                        comp.reached_end = true;
+                    }
                     let frame = format!(
                         "event: error\ndata: {{\"type\":\"error\",\"code\":\"{}\",\"message\":{}}}\n\n",
                         e.error_type(),

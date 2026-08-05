@@ -474,23 +474,7 @@ fn emit_failed_attempts_anthropic(
     }
 }
 
-/// Per-attempt mid-stream failover context (AISIX-Cloud#1222), built by
-/// `dispatch` when `routing.stream_failure` is `mode: continue` and
-/// fallback targets remain after the current one. Threaded into the
-/// streaming sub-paths, which build the [`MidStreamPlan`] from it;
-/// `None` keeps today's terminate behavior.
-///
-/// [`MidStreamPlan`]: crate::stream_failover::MidStreamPlan
-struct MidStreamArm {
-    cfg: aisix_core::StreamFailure,
-    remaining: Vec<crate::routing::AttemptModel>,
-    auth: AuthenticatedKey,
-    group: aisix_core::Model,
-    retry_on_429: bool,
-    fallback_on_statuses: Vec<u16>,
-    winner_attempt_index: u32,
-    winner_attempt_kind: &'static str,
-}
+use crate::stream_failover::MidStreamArm;
 
 #[allow(clippy::too_many_arguments)]
 async fn dispatch(

@@ -61,6 +61,7 @@ const CONTINUATION_SYSTEM_PROMPT: &str = "The previous assistant response was in
 pub(crate) enum MidStreamEndpoint {
     Chat,
     Messages,
+    Responses,
 }
 
 impl MidStreamEndpoint {
@@ -68,15 +69,32 @@ impl MidStreamEndpoint {
         match self {
             Self::Chat => "chat",
             Self::Messages => "messages",
+            Self::Responses => "responses",
         }
     }
 
     pub(crate) fn inbound_protocol(self) -> &'static str {
         match self {
-            Self::Chat => "openai",
+            Self::Chat | Self::Responses => "openai",
             Self::Messages => "anthropic",
         }
     }
+}
+
+/// Per-attempt mid-stream failover context, built by an endpoint's
+/// dispatch loop when `routing.stream_failure` is `mode: continue` and
+/// fallback targets remain after the current one. Threaded into the
+/// streaming sub-paths, which build the [`MidStreamPlan`] from it;
+/// `None` keeps the terminate behavior.
+pub(crate) struct MidStreamArm {
+    pub cfg: StreamFailure,
+    pub remaining: Vec<AttemptModel>,
+    pub auth: crate::auth::AuthenticatedKey,
+    pub group: Model,
+    pub retry_on_429: bool,
+    pub fallback_on_statuses: Vec<u16>,
+    pub winner_attempt_index: u32,
+    pub winner_attempt_kind: &'static str,
 }
 
 /// The serving attempt behind the live client stream. Starts as the
