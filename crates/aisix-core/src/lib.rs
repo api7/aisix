@@ -49,9 +49,8 @@ pub use models::{
     GuardrailMonitorHit, KeywordConfig, KeywordPattern, McpAuthType, McpRateLimit, McpServer,
     McpServerType, McpTransport, Model, ObservabilityExporter, ParamConstraints, PolicyScope,
     PolicyWindow, ProviderKey, RateLimit, RateLimitPolicy, RequestOverrides, ResponseOverrides,
-    Routing, RoutingStrategy, RoutingTarget, SchemaError, StreamDoneMarker, StreamFailure,
-    StreamFailureMode, StreamFailureTrigger, TelemetryKind, TelemetryTags,
-    WhenAllUnavailablePolicy, DEFAULT_COOLDOWN_TRIGGER_STATUSES,
+    Routing, RoutingStrategy, RoutingTarget, SchemaError, StreamDoneMarker, TelemetryKind,
+    TelemetryTags, WhenAllUnavailablePolicy, DEFAULT_COOLDOWN_TRIGGER_STATUSES,
 };
 pub use resource::{Resource, ResourceEntry};
 pub use snapshot::{ResourceTable, SnapshotHandle};
