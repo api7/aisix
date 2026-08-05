@@ -19,6 +19,13 @@
       "description": "When `false`, AISIX ignores this attachment.",
       "type": "boolean"
     },
+    "env_id": {
+      "description": "Environment the attachment belongs to. Written by the managed control plane for its own scoping; the gateway does not read it.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "guardrail_id": {
       "description": "UUID of the guardrail definition this attachment points to.",
       "minLength": 1,

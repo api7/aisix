@@ -19,7 +19,7 @@
 
 use aisix_core::AppliedGuardrail;
 use aisix_gateway::{ChatMessage, ChatResponse, FinishReason, UsageStats};
-use aisix_obs::{content_capture_cap, AccessLog, CapturedContent, RequestOutcome, UsageEvent};
+use aisix_obs::{content_capture_cap, AccessLog, CapturedContent, UsageEvent};
 use axum::body::Bytes;
 use axum::extract::{Multipart, State};
 use axum::http::{header, HeaderMap};
@@ -46,11 +46,17 @@ struct AudioDispatchSuccess {
     /// Resolved ProviderKey UUID — feeds the per-PK telemetry attribution
     /// tags on the emitted UsageEvent (AISIX-Cloud#867 parity).
     provider_key_id: String,
+    /// Provider-side model name, for the `upstream_model` metric label
+    /// (AISIX-Cloud#1234 parity with chat / messages / responses).
+    upstream_model: String,
     /// `(prompt_tokens, completion_tokens)` from the upstream `usage`
     /// block when the model returns one (gpt-4o-transcribe). `None` for
     /// whisper-1 (no usage block) — those still emit a zero-token event
     /// so the request is visible + attributed.
     usage: Option<(u32, u32)>,
+    /// Audio length in seconds — the cost basis for the duration-billed
+    /// models (whisper-1), which report no tokens at all (#457).
+    duration_seconds: f64,
     /// The `{kind, hook}` set of guardrails that governed this request
     /// (#379 parity, wired with #696) — surfaced on the emitted UsageEvent.
     applied_guardrails: Vec<AppliedGuardrail>,
@@ -83,11 +89,30 @@ pub async fn transcriptions(
     State(state): State<ProxyState>,
     auth: AuthenticatedKey,
     client: ClientContext,
-    multipart: Multipart,
+    multipart: Result<Multipart, axum::extract::multipart::MultipartRejection>,
 ) -> Response {
     let started = Instant::now();
     let request_id = client.request_id.clone();
     let api_key_id = auth.entry.id.clone();
+
+    // Same silent class as the body-extractor rejections #863 collected: a
+    // non-multipart content-type answered axum's bare 400 with no access
+    // log, metrics, or envelope.
+    let multipart = match multipart {
+        Ok(multipart) => multipart,
+        Err(_) => {
+            return crate::reject::reject_before_dispatch(
+                &state,
+                "POST",
+                "/v1/audio/transcriptions",
+                &request_id,
+                Some(&api_key_id),
+                started,
+                crate::reject::Envelope::OpenAi,
+                ProxyError::InvalidRequest("invalid multipart form data".into()),
+            );
+        }
+    };
 
     match multipart_dispatch(
         &state,
@@ -117,16 +142,18 @@ pub async fn transcriptions(
                 &request_id,
                 None,
             );
-            state.metrics.record_request(
-                &success.provider,
-                &success.model_name,
+            record_audio_metrics(
+                &state,
+                "/v1/audio/transcriptions",
+                &auth,
+                &success,
                 status,
-                RequestOutcome::from_status(status),
                 elapsed,
             );
             emit_audio_usage(
                 &state,
                 &request_id,
+                "/v1/audio/transcriptions",
                 &success,
                 &api_key_id,
                 status,
@@ -149,11 +176,14 @@ pub async fn transcriptions(
                 &request_id,
                 Some(&err),
             );
-            state.metrics.record_request(
-                "unknown",
-                "unknown",
+            // The model is never extracted from the multipart form on this
+            // path, so every label but the caller's stays `unknown`.
+            crate::request_metrics::record(
+                &state,
+                "/v1/audio/transcriptions",
+                crate::request_metrics::Caller::new(&auth),
+                crate::request_metrics::Upstream::default(),
                 status,
-                RequestOutcome::from_status(status),
                 elapsed,
             );
             // Per #655 parity: surface the failed request in Logs. The model
@@ -183,11 +213,28 @@ pub async fn translations(
     State(state): State<ProxyState>,
     auth: AuthenticatedKey,
     client: ClientContext,
-    multipart: Multipart,
+    multipart: Result<Multipart, axum::extract::multipart::MultipartRejection>,
 ) -> Response {
     let started = Instant::now();
     let request_id = client.request_id.clone();
     let api_key_id = auth.entry.id.clone();
+
+    // See `transcriptions`: the rejection is recorded, not silently bare.
+    let multipart = match multipart {
+        Ok(multipart) => multipart,
+        Err(_) => {
+            return crate::reject::reject_before_dispatch(
+                &state,
+                "POST",
+                "/v1/audio/translations",
+                &request_id,
+                Some(&api_key_id),
+                started,
+                crate::reject::Envelope::OpenAi,
+                ProxyError::InvalidRequest("invalid multipart form data".into()),
+            );
+        }
+    };
 
     match multipart_dispatch(
         &state,
@@ -217,16 +264,18 @@ pub async fn translations(
                 &request_id,
                 None,
             );
-            state.metrics.record_request(
-                &success.provider,
-                &success.model_name,
+            record_audio_metrics(
+                &state,
+                "/v1/audio/translations",
+                &auth,
+                &success,
                 status,
-                RequestOutcome::from_status(status),
                 elapsed,
             );
             emit_audio_usage(
                 &state,
                 &request_id,
+                "/v1/audio/translations",
                 &success,
                 &api_key_id,
                 status,
@@ -249,11 +298,13 @@ pub async fn translations(
                 &request_id,
                 Some(&err),
             );
-            state.metrics.record_request(
-                "unknown",
-                "unknown",
+            // Same as transcriptions: nothing resolved off the multipart form.
+            crate::request_metrics::record(
+                &state,
+                "/v1/audio/translations",
+                crate::request_metrics::Caller::new(&auth),
+                crate::request_metrics::Upstream::default(),
                 status,
-                RequestOutcome::from_status(status),
                 elapsed,
             );
             // Per #655 parity: surface the failed request in Logs (model not
@@ -286,17 +337,23 @@ pub async fn speech(
     // envelope — see completions.rs.
     body: Result<Json<Value>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
+    let started = Instant::now();
     let Json(body) = match body {
         Ok(json) => json,
+        // Answer through `reject` — see completions.rs.
         Err(rej) => {
-            return crate::error::proxy_error_from_json_rejection(
-                rej,
-                state.request_body_limit_bytes,
-            )
-            .into_response();
+            return crate::reject::reject_before_dispatch(
+                &state,
+                "POST",
+                "/v1/audio/speech",
+                &client.request_id,
+                Some(&auth.entry.id),
+                started,
+                crate::reject::Envelope::OpenAi,
+                crate::error::proxy_error_from_json_rejection(rej, state.request_body_limit_bytes),
+            );
         }
     };
-    let started = Instant::now();
     let request_id = client.request_id.clone();
     let api_key_id = auth.entry.id.clone();
     let model_name = body
@@ -306,33 +363,32 @@ pub async fn speech(
         .to_string();
 
     match speech_dispatch(&state, &auth, body, &request_id, &client).await {
-        Ok((
-            resp,
-            provider,
-            model_id,
-            provider_key_id,
-            applied_guardrails,
-            redactions,
-            monitor_hits,
-            captured,
-        )) => {
+        Ok(success) => {
             let elapsed = started.elapsed();
+            let status = success.response.status().as_u16();
             emit_access_log(
                 "POST",
                 "/v1/audio/speech",
                 &model_name,
-                &provider,
+                &success.provider,
                 &api_key_id,
-                200,
+                status,
                 elapsed,
                 &request_id,
                 None,
             );
-            state.metrics.record_request(
-                &provider,
-                &model_name,
-                200,
-                RequestOutcome::Success,
+            crate::request_metrics::record(
+                &state,
+                "/v1/audio/speech",
+                crate::request_metrics::Caller::new(&auth),
+                crate::request_metrics::Upstream {
+                    provider: &success.provider,
+                    model: &model_name,
+                    upstream_model: &success.upstream_model,
+                    provider_key_id: &success.provider_key_id,
+                    ..Default::default()
+                },
+                status,
                 elapsed,
             );
             // Issue #406: /v1/audio/speech (TTS) returns binary audio
@@ -343,22 +399,28 @@ pub async fn speech(
             emit_usage_event(
                 &state,
                 &request_id,
-                &model_id,
+                &success.model_id,
                 &model_name,
                 &api_key_id,
-                &provider_key_id,
-                &applied_guardrails,
-                200,
+                &success.provider_key_id,
+                "/v1/audio/speech",
+                &success.provider,
+                &success.upstream_model,
+                &success.applied_guardrails,
+                status,
                 elapsed,
                 0,
                 0,
+                // TTS is billed per input character, not by the length of
+                // the audio it produced — no duration cost basis here.
+                0.0,
                 &client,
-                redactions,
-                monitor_hits,
+                success.redactions,
+                success.monitor_hits,
                 /* guardrail_blocked */ false,
-                captured.as_ref(),
+                success.captured_content.as_ref(),
             );
-            resp
+            success.response
         }
         Err(err) => {
             let status = err.status().as_u16();
@@ -376,11 +438,15 @@ pub async fn speech(
             );
             let snap = state.snapshot.load();
             let metric_model = crate::usage_attr::metric_model_label(&snap, &model_name);
-            state.metrics.record_request(
-                "unknown",
-                metric_model,
+            crate::request_metrics::record(
+                &state,
+                "/v1/audio/speech",
+                crate::request_metrics::Caller::new(&auth),
+                crate::request_metrics::Upstream {
+                    model: metric_model,
+                    ..Default::default()
+                },
                 status,
-                RequestOutcome::from_status(status),
                 elapsed,
             );
             // Per #655 parity: surface the failed request in Logs with a
@@ -738,10 +804,28 @@ async fn multipart_dispatch(
     // `text`/`srt`/`vtt` response_formats aren't JSON at all). Parse
     // failure or absence → None → zero-token emit. Done before the
     // bytes move into the Body.
+    //
+    // A `stream=true` transcription answers with SSE instead of a JSON
+    // object, so the parse above finds nothing — the counts ride the
+    // terminal `transcript.text.done` event. Without the second read the
+    // whole streaming surface bills zero and never moves TPM/TPD.
     let usage = serde_json::from_slice::<Value>(&body_bytes)
         .ok()
         .as_ref()
-        .and_then(extract_token_usage);
+        .and_then(extract_token_usage)
+        .or_else(|| extract_sse_token_usage(&upstream_headers, &body_bytes));
+
+    // Duration cost basis (#457): what the upstream reported, else what
+    // the uploaded file says. The probe runs only when the response
+    // carried nothing, so the common `json` path never pays for it.
+    let duration_seconds = upstream_duration_seconds(&body_bytes)
+        .or_else(|| {
+            fields
+                .iter()
+                .find(|(name, ..)| name == "file")
+                .and_then(|(.., data)| probe_audio_duration_seconds(data))
+        })
+        .unwrap_or(0.0);
 
     // #911 [21]: commit the actual token cost so TPM/TPD is enforced for the
     // audio transcription/translation endpoints like chat + embeddings.
@@ -792,7 +876,9 @@ async fn multipart_dispatch(
                     provider: provider_label,
                     model_id: model_entry.id.to_string(),
                     provider_key_id: pk_entry.id.to_string(),
+                    upstream_model: upstream_model.clone(),
                     usage,
+                    duration_seconds,
                     applied_guardrails,
                     redactions,
                     monitor_hits: monitor_hits.clone(),
@@ -836,7 +922,9 @@ async fn multipart_dispatch(
         provider: provider_label,
         model_id: model_entry.id.to_string(),
         provider_key_id: pk_entry.id.to_string(),
+        upstream_model,
         usage,
+        duration_seconds,
         applied_guardrails,
         redactions,
         monitor_hits,
@@ -882,25 +970,30 @@ fn speech_input_to_chat(model: &str, body: &Value) -> aisix_gateway::ChatFormat 
 }
 
 #[allow(clippy::type_complexity)]
+/// `/v1/audio/speech`'s dispatch result. TTS reports no usage block, so
+/// this carries only what the terminal emit needs — a struct rather than
+/// the tuple it used to be, matching `AudioDispatchSuccess` above.
+struct SpeechDispatchSuccess {
+    response: Response,
+    provider: String,
+    model_id: String,
+    provider_key_id: String,
+    /// Provider-side model name, for the `upstream_model` metric label
+    /// (AISIX-Cloud#1234).
+    upstream_model: String,
+    applied_guardrails: Vec<AppliedGuardrail>,
+    redactions: crate::redact::RedactionCounts,
+    monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
+    captured_content: Option<CapturedContent>,
+}
+
 async fn speech_dispatch(
     state: &ProxyState,
     auth: &AuthenticatedKey,
     mut body: Value,
     request_id: &str,
     client_ctx: &ClientContext,
-) -> Result<
-    (
-        Response,
-        String,
-        String,
-        String,
-        Vec<AppliedGuardrail>,
-        crate::redact::RedactionCounts,
-        Vec<aisix_core::GuardrailMonitorHit>,
-        Option<CapturedContent>,
-    ),
-    ProxyError,
-> {
+) -> Result<SpeechDispatchSuccess, ProxyError> {
     let model_name = body
         .get("model")
         .and_then(|v| v.as_str())
@@ -995,7 +1088,7 @@ async fn speech_dispatch(
 
     // Rewrite model field.
     if let Some(m) = body.get_mut("model") {
-        *m = Value::String(upstream_model);
+        *m = Value::String(upstream_model.clone());
     }
 
     // Apply the PK's `request.*` overrides (body + headers) like the OpenAI
@@ -1127,16 +1220,17 @@ async fn speech_dispatch(
 
     let mut out = axum::response::Response::new(axum::body::Body::from(body_bytes));
     copy_response_header(&upstream_headers, &mut out, header::CONTENT_TYPE);
-    Ok((
-        out,
-        provider_label,
-        model_entry.id.to_string(),
-        pk_entry.id.to_string(),
+    Ok(SpeechDispatchSuccess {
+        response: out,
+        provider: provider_label,
+        model_id: model_entry.id.to_string(),
+        provider_key_id: pk_entry.id.to_string(),
+        upstream_model,
         applied_guardrails,
         redactions,
         monitor_hits,
         captured_content,
-    ))
+    })
 }
 
 /// Pull `(prompt_tokens, completion_tokens)` from an audio response
@@ -1145,6 +1239,38 @@ async fn speech_dispatch(
 /// whisper-1 (and the `text`/`srt`/`vtt` response formats) return no
 /// token block → `None`. Spec:
 /// <https://platform.openai.com/docs/api-reference/audio/json-object>
+/// `(prompt, completion)` from a *streamed* transcription body.
+///
+/// `stream=true` on the transcribe models answers `text/event-stream`:
+/// a run of `transcript.text.delta` events and a terminal
+/// `transcript.text.done` that carries the same `usage` block the
+/// non-streaming response would have returned. The body is already
+/// buffered here, so decode it and take the last event that carries
+/// usage — the shape stays the same whether the provider puts it on
+/// `transcript.text.done` or on a later event.
+///
+/// Gated on the upstream content type so a `text`/`srt`/`vtt` transcript
+/// that happens to contain a `data:` line is never mistaken for a stream.
+fn extract_sse_token_usage(headers: &HeaderMap, body: &[u8]) -> Option<(u32, u32)> {
+    let is_sse = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.starts_with("text/event-stream"));
+    if !is_sse {
+        return None;
+    }
+    let mut decoder = aisix_gateway::SseDecoder::new();
+    let mut events = decoder.feed(body);
+    events.extend(decoder.finish());
+    events.iter().rev().find_map(|event| match event {
+        aisix_gateway::SseEvent::Data(payload) => serde_json::from_str::<Value>(payload)
+            .ok()
+            .as_ref()
+            .and_then(extract_token_usage),
+        aisix_gateway::SseEvent::Done => None,
+    })
+}
+
 fn extract_token_usage(body: &Value) -> Option<(u32, u32)> {
     let usage = body.get("usage")?;
     let input = usage.get("input_tokens").and_then(Value::as_u64)? as u32;
@@ -1155,12 +1281,91 @@ fn extract_token_usage(body: &Value) -> Option<(u32, u32)> {
     Some((input, output))
 }
 
+/// Audio length in seconds as the upstream reported it.
+///
+/// Two shapes, both from OpenAI's transcription object: the default
+/// `json` format carries `usage: {type: "duration", seconds: N}`, and
+/// `verbose_json` carries a top-level `duration`. Neither is present on
+/// the `text` / `srt` / `vtt` formats — those response bodies are not
+/// JSON at all — which is what `probe_audio_duration_seconds` covers.
+/// <https://platform.openai.com/docs/api-reference/audio/json-object>
+fn upstream_duration_seconds(body: &[u8]) -> Option<f64> {
+    let json = serde_json::from_slice::<Value>(body).ok()?;
+    let from_usage = json
+        .get("usage")
+        .and_then(|u| u.get("seconds"))
+        .and_then(Value::as_f64);
+    let seconds = from_usage.or_else(|| json.get("duration").and_then(Value::as_f64))?;
+    (seconds.is_finite() && seconds > 0.0).then_some(seconds)
+}
+
+/// Audio length in seconds read off the uploaded file.
+///
+/// The fallback for every response format that carries no duration. Cost
+/// basis must not depend on which `response_format` the caller picked —
+/// otherwise `response_format=text` is an unmetered channel, the same
+/// shape of bypass as an unbilled stream.
+///
+/// Header/metadata parse only: `lofty` reads container and codec
+/// properties without decoding audio, so an arbitrary caller upload
+/// costs microseconds and cannot pull in a decode path. Anything it
+/// cannot identify yields `None` → a zero cost basis, never an error:
+/// the transcript already succeeded and the upstream already billed.
+fn probe_audio_duration_seconds(audio: &[u8]) -> Option<f64> {
+    use lofty::file::AudioFile;
+    use lofty::probe::Probe;
+
+    // WebM/Matroska first: `lofty` does not read EBML, and WebM is what
+    // a browser's MediaRecorder uploads by default — leaving it out
+    // would keep the most common web-app upload unbilled.
+    if audio.starts_with(&crate::ebml::EBML_MAGIC) {
+        return crate::ebml::duration_seconds(audio);
+    }
+
+    let probed = Probe::new(std::io::Cursor::new(audio))
+        .guess_file_type()
+        .ok()?
+        .read()
+        .ok()?;
+    let seconds = probed.properties().duration().as_secs_f64();
+    (seconds > 0.0).then_some(seconds)
+}
+
+/// Terminal request-metric emit for the two transcription-shaped routes,
+/// which share `AudioDispatchSuccess` and would otherwise repeat the same
+/// label set twice.
+fn record_audio_metrics(
+    state: &ProxyState,
+    endpoint: &'static str,
+    auth: &AuthenticatedKey,
+    success: &AudioDispatchSuccess,
+    status: u16,
+    elapsed: Duration,
+) {
+    crate::request_metrics::record(
+        state,
+        endpoint,
+        crate::request_metrics::Caller::new(auth),
+        crate::request_metrics::Upstream {
+            provider: &success.provider,
+            model: &success.model_name,
+            upstream_model: &success.upstream_model,
+            provider_key_id: &success.provider_key_id,
+            ..Default::default()
+        },
+        status,
+        elapsed,
+    );
+}
+
 /// Emit a UsageEvent for a successful transcription/translation. Tokens
 /// come from the upstream `usage` block when present (gpt-4o-transcribe);
 /// zero otherwise (whisper-1) — the request is still visible/attributed.
+#[allow(clippy::too_many_arguments)]
 fn emit_audio_usage(
     state: &ProxyState,
     request_id: &str,
+    endpoint: &'static str,
     success: &AudioDispatchSuccess,
     api_key_id: &str,
     status: u16,
@@ -1175,11 +1380,15 @@ fn emit_audio_usage(
         &success.model_name,
         api_key_id,
         &success.provider_key_id,
+        endpoint,
+        &success.provider,
+        &success.upstream_model,
         &success.applied_guardrails,
         status,
         elapsed,
         prompt_tokens,
         completion_tokens,
+        success.duration_seconds,
         client,
         success.redactions.clone(),
         success.monitor_hits.clone(),
@@ -1203,11 +1412,20 @@ fn emit_usage_event(
     requested_model: &str,
     api_key_id: &str,
     provider_key_id: &str,
+    // Metric labels the UsageEvent has no field for (AISIX-Cloud#1234
+    // follow-up). `endpoint` too: the three audio routes share this emitter
+    // but are three distinct series.
+    endpoint: &'static str,
+    provider: &str,
+    upstream_model: &str,
     applied_guardrails: &[AppliedGuardrail],
     status_code: u16,
     elapsed: Duration,
     prompt_tokens: u32,
     completion_tokens: u32,
+    // Cost basis for the duration-billed models (#457); 0 when neither
+    // the upstream nor the uploaded file yielded a length.
+    audio_duration_seconds: f64,
     client: &ClientContext,
     // Per-detector PII mask counts (#932/#696). Empty = no redaction.
     redacted_entity_counts: crate::redact::RedactionCounts,
@@ -1228,6 +1446,7 @@ fn emit_usage_event(
         requested_model: requested_model.to_string(),
         prompt_tokens,
         completion_tokens,
+        audio_duration_seconds,
         // Single-attempt endpoint: the attempt spans the whole request, so
         // the upstream figure and what the caller waited for coincide.
         upstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
@@ -1251,6 +1470,28 @@ fn emit_usage_event(
     state
         .otlp_fan_out
         .fan_out(&event, content, exporters.iter().map(|e| &e.value));
+    // Speech (TTS) reports no tokens at all, so this is a no-op there; the
+    // transcription routes report them when the model supplies a usage block.
+    let owned_caller = crate::request_metrics::Caller::from_api_key_id(&snap, api_key_id);
+    crate::request_metrics::record_usage(
+        state,
+        endpoint,
+        owned_caller.as_caller(),
+        crate::request_metrics::Upstream {
+            provider,
+            model: requested_model,
+            upstream_model,
+            provider_key_id,
+            ..Default::default()
+        },
+        crate::request_metrics::Tokens {
+            input: prompt_tokens,
+            output: completion_tokens,
+            total: prompt_tokens.saturating_add(completion_tokens),
+            spend_usd: 0.0,
+            client_type: state.client_classifier.classify(&client.user_agent),
+        },
+    );
 }
 
 fn copy_response_header(src: &HeaderMap, dst: &mut Response, name: header::HeaderName) {
@@ -1320,6 +1561,7 @@ mod tests {
             addr: "127.0.0.1:0".into(),
             request_body_limit_bytes: 10_485_760, // 10 MB for audio
             real_ip: Default::default(),
+            url_rewrites: Vec::new(),
             tls: None,
         }
     }
@@ -1721,6 +1963,290 @@ mod tests {
         assert_eq!(event.api_key_id, "k-1");
         assert_eq!(event.model_id, "m-1");
         assert_eq!(event.inbound_protocol, "openai");
+    }
+
+    /// A minimal RIFF/WAVE container holding `seconds` of 8 kHz 16-bit
+    /// mono PCM — a real audio file for the probe path, small enough to
+    /// build inline.
+    fn wav_bytes(seconds: u32) -> Vec<u8> {
+        let samples = 8000usize * 2 * seconds as usize;
+        let mut wav = Vec::with_capacity(44 + samples);
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&((36 + samples) as u32).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&8000u32.to_le_bytes());
+        wav.extend_from_slice(&16000u32.to_le_bytes());
+        wav.extend_from_slice(&2u16.to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&(samples as u32).to_le_bytes());
+        wav.resize(44 + samples, 0);
+        wav
+    }
+
+    /// A multipart body whose `file` part is a real WAV, so the handler's
+    /// fallback probe has something to read.
+    fn transcription_multipart_wav(model: &str, seconds: u32) -> (String, axum::body::Body) {
+        let mut body = Vec::new();
+        body.extend_from_slice(
+            format!(
+                "--b\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n{model}\r\n\
+                 --b\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\n\
+                 Content-Type: audio/wav\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(&wav_bytes(seconds));
+        body.extend_from_slice(b"\r\n--b--\r\n");
+        (
+            "multipart/form-data; boundary=b".to_string(),
+            axum::body::Body::from(body),
+        )
+    }
+
+    /// AISIX-Cloud#1138: whisper-1 bills by audio length and reports no
+    /// tokens, so the emitted event must carry the duration or cp-api has
+    /// nothing to price the request with.
+    #[tokio::test]
+    async fn whisper_response_emits_the_duration_cost_basis() {
+        let upstream = MockServer::start().await;
+        let body = serde_json::json!({
+            "text": "hello world",
+            "usage": {"type": "duration", "seconds": 11.0}
+        });
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/transcriptions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(whisper_model("my-transcribe"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = build_app_with_sink(snap, tx);
+        let (ct, body) = transcription_multipart("my-transcribe");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/audio/transcriptions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", ct)
+            .body(body)
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted")
+            .expect("usage_sink sender dropped");
+        assert_eq!(event.audio_duration_seconds, 11.0);
+        assert_eq!(
+            (event.prompt_tokens, event.completion_tokens),
+            (0, 0),
+            "whisper-1 reports no tokens — duration is the whole cost basis"
+        );
+    }
+
+    /// AISIX-Cloud#1138: `response_format=text` answers with a body that
+    /// carries no usage at all. The cost basis must not depend on which
+    /// response format the caller asked for, so the handler falls back to
+    /// the uploaded file's own length.
+    #[tokio::test]
+    async fn text_format_falls_back_to_the_uploaded_file_duration() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/transcriptions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw("hello world", "text/plain"))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(whisper_model("my-transcribe"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = build_app_with_sink(snap, tx);
+        let (ct, body) = transcription_multipart_wav("my-transcribe", 3);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/audio/transcriptions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", ct)
+            .body(body)
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted")
+            .expect("usage_sink sender dropped");
+        assert!(
+            (event.audio_duration_seconds - 3.0).abs() < 0.05,
+            "3s of uploaded audio must be the cost basis, got {}",
+            event.audio_duration_seconds
+        );
+    }
+
+    /// AISIX-Cloud#1138: `MediaRecorder` uploads `audio/webm`, which
+    /// `lofty` cannot read — so a WebM transcription asked for as `text`
+    /// would have reported no length and billed nothing, which is the
+    /// exact bypass the file probe exists to close. Uses the header of a
+    /// file ffmpeg produced (see `ebml::tests`), whose declared length is
+    /// 7.008s.
+    #[test]
+    fn probing_reads_a_webm_upload() {
+        let webm = crate::ebml::tests::REAL_FFMPEG_WEBM_HEADER;
+        let probed =
+            super::probe_audio_duration_seconds(webm).expect("a webm upload must be measurable");
+        assert!(
+            (probed - 7.008).abs() < 0.01,
+            "webm should probe as ~7.008s, got {probed}"
+        );
+    }
+
+    /// The default `json` transcription reports its length under
+    /// `usage.seconds` (the duration variant of OpenAI's usage oneOf),
+    /// which is the cost basis for whisper-1 — a model that reports no
+    /// tokens at all.
+    #[test]
+    fn duration_reads_the_usage_seconds_variant() {
+        let body = br#"{"text":"hi","usage":{"type":"duration","seconds":11.0}}"#;
+        assert_eq!(super::upstream_duration_seconds(body), Some(11.0));
+    }
+
+    /// `verbose_json` puts the same figure at the top level instead.
+    #[test]
+    fn duration_reads_the_verbose_json_field() {
+        let body = br#"{"task":"transcribe","duration":2.66,"text":"hi"}"#;
+        assert_eq!(super::upstream_duration_seconds(body), Some(2.66));
+    }
+
+    /// A token-usage response carries no duration — the caller must fall
+    /// back to the file probe rather than read a zero off `usage`.
+    #[test]
+    fn duration_absent_from_a_token_usage_response() {
+        let body =
+            br#"{"text":"hi","usage":{"type":"tokens","input_tokens":26,"output_tokens":12}}"#;
+        assert_eq!(super::upstream_duration_seconds(body), None);
+    }
+
+    /// AISIX-Cloud#1138: `response_format=text` (and `srt`/`vtt`) answers
+    /// with a body that is not JSON at all, so the cost basis has to come
+    /// off the uploaded audio — otherwise the caller picks whether the
+    /// request is metered by picking a response format.
+    #[test]
+    fn duration_falls_back_to_probing_the_uploaded_file() {
+        // 1 second of 8 kHz 16-bit mono PCM in a minimal RIFF/WAVE container.
+        let samples = 8000usize * 2;
+        let mut wav = Vec::with_capacity(44 + samples);
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&((36 + samples) as u32).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes()); // PCM fmt chunk size
+        wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        wav.extend_from_slice(&1u16.to_le_bytes()); // mono
+        wav.extend_from_slice(&8000u32.to_le_bytes()); // sample rate
+        wav.extend_from_slice(&16000u32.to_le_bytes()); // byte rate
+        wav.extend_from_slice(&2u16.to_le_bytes()); // block align
+        wav.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&(samples as u32).to_le_bytes());
+        wav.resize(44 + samples, 0);
+
+        let probed = super::probe_audio_duration_seconds(&wav)
+            .expect("a well-formed WAV must yield a duration");
+        assert!(
+            (probed - 1.0).abs() < 0.05,
+            "1s of 8kHz mono PCM should probe as ~1s, got {probed}"
+        );
+    }
+
+    /// Caller uploads are arbitrary bytes. An unrecognised file must
+    /// degrade to "no cost basis", never to an error — the transcript
+    /// already succeeded and the upstream already billed for it.
+    #[test]
+    fn probing_unrecognised_bytes_yields_no_duration() {
+        assert_eq!(super::probe_audio_duration_seconds(b"ID3fakeaudio"), None);
+        assert_eq!(super::probe_audio_duration_seconds(&[]), None);
+    }
+
+    /// AISIX-Cloud#1138: a `stream=true` transcription answers
+    /// `text/event-stream`, so the usage block rides the terminal
+    /// `transcript.text.done` event instead of a JSON body. Pre-fix the
+    /// JSON parse found nothing and the whole streaming surface emitted
+    /// zero tokens — unbilled spend that also never moved TPM/TPD, while
+    /// the identical non-streaming request billed normally.
+    /// <https://platform.openai.com/docs/api-reference/audio/create-transcription>
+    #[tokio::test]
+    async fn streamed_transcription_bills_the_terminal_event_usage() {
+        let upstream = MockServer::start().await;
+        let sse = concat!(
+            "data: {\"type\":\"transcript.text.delta\",\"delta\":\"hello\"}\n\n",
+            "data: {\"type\":\"transcript.text.delta\",\"delta\":\" world\"}\n\n",
+            "data: {\"type\":\"transcript.text.done\",\"text\":\"hello world\",",
+            "\"usage\":{\"type\":\"tokens\",\"total_tokens\":38,\"input_tokens\":26,",
+            "\"input_token_details\":{\"text_tokens\":0,\"audio_tokens\":26},",
+            "\"output_tokens\":12}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/transcriptions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(whisper_model("my-transcribe"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = build_app_with_sink(snap, tx);
+        let (ct, body) = transcription_multipart("my-transcribe");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/audio/transcriptions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", ct)
+            .body(body)
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted for a streamed transcription")
+            .expect("usage_sink sender dropped");
+        assert_eq!(
+            (event.prompt_tokens, event.completion_tokens),
+            (26, 12),
+            "the terminal transcript.text.done usage must be billed"
+        );
+    }
+
+    /// The SSE read is content-type gated: a `srt`/`vtt` transcript is
+    /// `text/plain` and may legitimately contain a line starting with
+    /// `data:`, which must never be decoded as a usage-bearing event.
+    #[test]
+    fn plain_text_transcript_is_not_read_as_a_stream() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("text/plain; charset=utf-8"),
+        );
+        let body = concat!(
+            "1\n00:00:00,000 --> 00:00:02,000\n",
+            "data: {\"usage\":{\"input_tokens\":999,\"output_tokens\":999}}\n\n",
+        );
+        assert_eq!(
+            super::extract_sse_token_usage(&headers, body.as_bytes()),
+            None
+        );
     }
 
     /// AISIX-Cloud#867 parity: a successful audio request must carry the

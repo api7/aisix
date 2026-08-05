@@ -36,6 +36,7 @@ mod completions;
 pub(crate) mod cooldown;
 mod count_tokens;
 mod dispatch;
+mod ebml;
 mod embeddings;
 mod ensemble;
 mod error;
@@ -53,15 +54,19 @@ mod passthrough;
 mod quota;
 mod realtime;
 mod redact;
+mod reject;
 mod render;
 mod request_id;
+mod request_metrics;
 mod rerank;
 mod responses;
 mod responses_bridge;
+mod rewrite;
 mod routing;
 mod semantic;
 pub mod sse_keepalive;
 mod state;
+mod stream_failover;
 mod stream_timeout;
 mod token_estimate;
 mod usage_attr;
@@ -75,10 +80,11 @@ pub use health::{
 };
 pub use state::{CacheBackends, ProxyState};
 
+use aisix_obs::AccessLog;
 use axum::extract::State;
 use axum::http::{header, HeaderValue, Request};
 use axum::middleware::{self, Next};
-use axum::response::{IntoResponse, Response};
+use axum::response::Response;
 use axum::routing::{any, get, post};
 use axum::Router;
 use tower_http::set_header::SetResponseHeaderLayer;
@@ -97,7 +103,7 @@ static SERVER_HEADER_VALUE: std::sync::LazyLock<HeaderValue> = std::sync::LazyLo
 /// OpenAI-compatible proxy surface.
 pub fn build_router(state: ProxyState) -> Router {
     let body_limit = state.request_body_limit_bytes;
-    Router::new()
+    let router = Router::new()
         .route("/livez", get(livez))
         .route("/readyz", get(readyz))
         .route("/v1/models", get(models::list_models))
@@ -157,8 +163,11 @@ pub fn build_router(state: ProxyState) -> Router {
         )
         // Downstream-facing MCP gateway. Authentication (AISIX API key) is
         // enforced inside the handler via the `AuthenticatedKey` extractor.
+        // `/mcp/{server}` is the single-server variant (original tool names);
+        // the static `/mcp/` route wins over the param route for that path.
         .route("/mcp", any(mcp::mcp_endpoint))
         .route("/mcp/", any(mcp::mcp_endpoint))
+        .route("/mcp/:server", any(mcp::mcp_scoped_endpoint))
         // Downstream-facing A2A gateway. One route per registered agent; the
         // agent's card (with the service URL rewritten to the gateway) is served
         // at the RFC 8615 well-known path under it. Authentication (AISIX API
@@ -193,6 +202,16 @@ pub fn build_router(state: ProxyState) -> Router {
             state.clone(),
             record_in_flight_request,
         ))
+        // Record requests the caller abandoned before any response head
+        // existed. Sits outside `record_in_flight_request` so a hang-up
+        // during body upload (which the body-limit layers above are
+        // awaiting) is captured too, and inside `ensure_request_id` so
+        // the emitted line carries the same request id the caller was
+        // handed. See `record_client_cancel`.
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            record_client_cancel,
+        ))
         // Identify the data plane on every response, including error
         // envelopes and short-circuited responses from the layers
         // above. `overriding` (vs `if_not_present`) ensures the
@@ -204,13 +223,35 @@ pub fn build_router(state: ProxyState) -> Router {
             header::SERVER,
             SERVER_HEADER_VALUE.clone(),
         ))
-        // Outermost: mint the request id into the request extensions
-        // before any handler/extractor runs, and stamp it onto every
-        // response (including the short-circuited 4xx from the layers
-        // above) so the whole proxy family carries `x-aisix-request-id`
-        // and it equals the telemetry request_id. See request_id.rs.
-        .layer(middleware::from_fn(request_id::ensure_request_id))
-        .with_state(state)
+        .with_state(state.clone());
+
+    // Pre-routing URL rewriting (`proxy.url_rewrites`). `Router::layer`
+    // middleware runs AFTER route matching, so a URI rewritten there could
+    // never change which route matches. Wrapping the whole router as the
+    // fallback of an outer router — whose "routing" trivially resolves to
+    // that fallback — gives the rewrite layer a genuine pre-routing seat:
+    // it mutates the URI, then the inner router matches on the rewritten
+    // path. Built only when rules are configured, so the default path pays
+    // nothing. See rewrite.rs.
+    let router = if state.url_rewrites.is_empty() {
+        router
+    } else {
+        Router::new()
+            .fallback_service(router)
+            .layer(middleware::from_fn_with_state(
+                state,
+                rewrite::rewrite_request_uri,
+            ))
+    };
+
+    // Outermost: mint the request id into the request extensions
+    // before any handler/extractor runs — including the rewrite layer,
+    // whose fired/failed log lines must carry the request span — and
+    // stamp it onto every response (including the short-circuited 4xx
+    // from the layers above) so the whole proxy family carries
+    // `x-aisix-request-id` and it equals the telemetry request_id. See
+    // request_id.rs.
+    router.layer(middleware::from_fn(request_id::ensure_request_id))
 }
 
 async fn record_in_flight_request(
@@ -254,24 +295,33 @@ fn normalize_endpoint_label(path: &str) -> &'static str {
         "/v1/audio/transcriptions" => "/v1/audio/transcriptions",
         "/v1/audio/translations" => "/v1/audio/translations",
         "/v1/audio/speech" => "/v1/audio/speech",
+        "/v1/videos" => "/v1/videos",
         "/mcp" | "/mcp/" => "/mcp",
         "/v1/realtime" => "/v1/realtime",
         "/v1/files" => "/v1/files",
         "/v1/batches" => "/v1/batches",
         "/v1/fine_tuning/jobs" => "/v1/fine_tuning/jobs",
+        // `/v1/videos/:id` and `/v1/videos/:id/content` collapse together:
+        // the id is the only thing that varies and neither is worth its own
+        // series.
+        _ if path.starts_with("/v1/videos/") => "/v1/videos/:id",
         _ if path.starts_with("/v1/files/") => "/v1/files/:id",
         _ if path.starts_with("/v1/batches/") => "/v1/batches/:id",
         _ if path.starts_with("/v1/fine_tuning/jobs/") => "/v1/fine_tuning/jobs/:id",
+        _ if path.starts_with("/mcp/") => "/mcp/{server}",
         _ if path.starts_with("/a2a/") => "/a2a",
         _ if path.starts_with("/passthrough/") => "/passthrough/:provider/*rest",
         _ => "other",
     }
 }
 
+/// Protocol family a route speaks, keyed off the normalized endpoint label.
+/// Shared by the in-flight gauge and the detailed request families
+/// (`request_metrics`) so the two can't disagree.
 fn inbound_protocol_for_endpoint(endpoint: &str) -> &'static str {
     if endpoint == "/v1/messages" || endpoint == "/v1/messages/count_tokens" {
         "anthropic"
-    } else if endpoint == "/mcp" {
+    } else if endpoint == "/mcp" || endpoint == "/mcp/{server}" {
         "mcp"
     } else if endpoint == "/a2a" {
         "a2a"
@@ -310,6 +360,114 @@ impl Drop for InFlightGuard {
     }
 }
 
+/// nginx's non-standard "client closed request" status, used here purely
+/// as a recorded outcome — nothing is ever sent to a caller that already
+/// hung up. LiteLLM reports the same event as 499, so an operator running
+/// both reads one number.
+pub(crate) const CLIENT_CLOSED_REQUEST: u16 = 499;
+
+/// `error_kind` for an abandoned request, mirroring LiteLLM's
+/// `ClientDisconnected` error class.
+const CLIENT_DISCONNECTED_KIND: &str = "client_disconnected";
+
+/// Record a request whose caller hung up before the response head was
+/// written.
+///
+/// Every endpoint logs and meters itself at the end of its own handler —
+/// 29 `emit_access_log` call sites across 12 modules. When the client
+/// disconnects first, axum drops the handler future and *none* of that
+/// code runs: the request leaves no access-log line, no usage event and
+/// no metric. It is invisible exactly where an operator most needs it,
+/// because the usual reason a caller gives up is a long
+/// time-to-first-token.
+///
+/// A cancelled future is only observable from `Drop`, so arm a guard,
+/// disarm it once the inner service yields a response, and emit from
+/// `Drop` when it is still armed. Doing it in one layer rather than in
+/// each handler also keeps the endpoint family from drifting the way the
+/// request-id header did before `ensure_request_id` (see request_id.rs).
+///
+/// This is NOT the streaming-disconnect path: once SSE bytes flow the
+/// response head is already committed, so the handler has logged and the
+/// per-stream `Drop` guard emits the usage event (see
+/// `chat::build_sse_stream`). Response bodies are polled after this
+/// middleware has returned, so a mid-stream hang-up leaves the guard
+/// disarmed and is not double-counted here.
+async fn record_client_cancel(
+    State(state): State<ProxyState>,
+    request: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    let mut guard = ClientCancelGuard {
+        armed: true,
+        metrics: state.metrics.clone(),
+        endpoint: normalize_endpoint_label(request.uri().path()),
+        method: request.method().clone(),
+        uri: request.uri().clone(),
+        request_id: request
+            .extensions()
+            .get::<request_id::RequestId>()
+            .map(|id| id.0.clone())
+            .unwrap_or_default(),
+        started: std::time::Instant::now(),
+    };
+    let response = next.run(request).await;
+    guard.armed = false;
+    response
+}
+
+struct ClientCancelGuard {
+    /// Cleared when the inner service returns. Still set at drop time
+    /// means the future was cancelled rather than completed.
+    armed: bool,
+    metrics: std::sync::Arc<aisix_obs::Metrics>,
+    /// Bounded route template — safe as a metric label (#451).
+    endpoint: &'static str,
+    method: axum::http::Method,
+    /// `Uri` clones are reference-counted internally; the path is only
+    /// read on the cancel path, so the happy path pays no formatting.
+    uri: axum::http::Uri,
+    request_id: String,
+    started: std::time::Instant,
+}
+
+impl Drop for ClientCancelGuard {
+    fn drop(&mut self) {
+        // A panicking handler also leaves the guard armed — its future is
+        // dropped mid-unwind exactly like a cancelled one. Attributing that
+        // to the caller would be wrong twice over: it fabricates a client
+        // disconnect that never happened, and it buries the panic under a
+        // benign-looking 499. A panic has its own signal (tokio surfaces the
+        // task failure and hyper drops the connection), so stay silent and
+        // let that stand. Emitting here would also risk a double panic,
+        // which aborts the process.
+        if !self.armed || std::thread::panicking() {
+            return;
+        }
+        let latency = self.started.elapsed();
+        AccessLog {
+            method: self.method.as_str(),
+            path: self.uri.path(),
+            status: CLIENT_CLOSED_REQUEST,
+            latency,
+            provider: None,
+            model: None,
+            api_key_id: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            total_tokens: None,
+            request_id: &self.request_id,
+            served_by_model: None,
+            routing_attempt_count: None,
+            routing_fallback_count: None,
+            error_kind: Some(CLIENT_DISCONNECTED_KIND),
+            error: Some("client closed the request before the response head was written"),
+        }
+        .emit();
+        self.metrics.record_client_cancelled(self.endpoint);
+    }
+}
+
 /// Per RFC 9110 §15.5.14, a request body that exceeds the gateway's
 /// configured `request_body_limit_bytes` must surface as a clean
 /// `413 Content Too Large` response — NOT an `ECONNRESET` from a
@@ -326,11 +484,18 @@ impl Drop for InFlightGuard {
 /// `fetch` both set Content-Length for non-streamed POSTs, and
 /// without this middleware they see ECONNRESET (indistinguishable
 /// from a network failure or a gateway crash) instead of 413.
+///
+/// Both short-circuits answer through [`crate::reject`], so a request
+/// refused here still produces the access-log line and request metrics
+/// every other terminal path emits — the handler it never reached can't
+/// do it. The logged latency spans the body drain below, which is what
+/// an oversize request actually costs the gateway.
 async fn enforce_request_body_limit(
     State(state): State<ProxyState>,
     request: Request<axum::body::Body>,
     next: Next,
 ) -> Response {
+    let started = std::time::Instant::now();
     // /v1/messages must emit the Anthropic-shape error envelope
     // (closes #336). The middleware runs BEFORE the handler so the
     // handler's `into_anthropic_response()` would never see the
@@ -349,12 +514,10 @@ async fn enforce_request_body_limit(
     let path = request.uri().path();
     let is_anthropic_path =
         path == "/v1/messages" || path == "/v1/messages/" || path == "/v1/messages/count_tokens";
-    let render = |e: ProxyError| -> Response {
-        if is_anthropic_path {
-            e.into_anthropic_response()
-        } else {
-            e.into_response()
-        }
+    let envelope = if is_anthropic_path {
+        reject::Envelope::Anthropic
+    } else {
+        reject::Envelope::OpenAi
     };
     // RFC 9110 §8.6 — a server SHOULD reject a request that carries
     // duplicate or conflicting `Content-Length` values rather than
@@ -365,9 +528,16 @@ async fn enforce_request_body_limit(
         .iter();
     let first = content_lengths.next();
     if content_lengths.next().is_some() {
-        return render(ProxyError::InvalidRequest(
-            "conflicting Content-Length headers".into(),
-        ));
+        return reject::reject_before_dispatch(
+            &state,
+            request.method().as_str(),
+            request.uri().path(),
+            &request_id_of(&request),
+            None,
+            started,
+            envelope,
+            ProxyError::InvalidRequest("conflicting Content-Length headers".into()),
+        );
     }
     // `0` = the cap is disabled; the duplicate-Content-Length rejection
     // above still applies — that one is request-smuggling hygiene, not a
@@ -377,17 +547,43 @@ async fn enforce_request_body_limit(
         .and_then(|s| s.parse::<usize>().ok())
     {
         if state.request_body_limit_bytes > 0 && declared > state.request_body_limit_bytes {
+            // Capture what the access log needs before the body move
+            // below consumes the request.
+            let method = request.method().clone();
+            let path = request.uri().path().to_string();
+            let request_id = request_id_of(&request);
             // Drain the inbound body so hyper can flush the 413 response
             // on the same HTTP/1.1 connection. Without this, hyper closes
             // the socket while the client is still writing, and the client
             // sees EPIPE/ECONNRESET instead of the 413.
             drain_body(request.into_body()).await;
-            return render(ProxyError::RequestTooLarge {
-                limit_bytes: state.request_body_limit_bytes,
-            });
+            return reject::reject_before_dispatch(
+                &state,
+                method.as_str(),
+                &path,
+                &request_id,
+                None,
+                started,
+                envelope,
+                ProxyError::RequestTooLarge {
+                    limit_bytes: state.request_body_limit_bytes,
+                },
+            );
         }
     }
     next.run(request).await
+}
+
+/// The id `ensure_request_id` (the outermost layer) minted for this
+/// request, so a rejection logged here joins the `x-aisix-request-id` the
+/// caller was handed. The fallback only covers a router assembled without
+/// that layer — every shipped path has it.
+fn request_id_of(request: &Request<axum::body::Body>) -> String {
+    request
+        .extensions()
+        .get::<request_id::RequestId>()
+        .map(|r| r.0.clone())
+        .unwrap_or_else(request_id::new_request_id)
 }
 
 /// Read and discard the inbound body, bounded by both bytes and time.
@@ -459,6 +655,14 @@ mod tests {
         // Arbitrary unauthenticated paths bucket to a single label.
         assert_eq!(normalize_endpoint_label("/random/x"), "other");
         assert_eq!(normalize_endpoint_label("/random/y"), "other");
+        // The scoped MCP endpoint collapses to one label regardless of the
+        // server segment; the aggregated endpoint (with and without the
+        // trailing slash) keeps its own — the exact `"/mcp/"` arm must stay
+        // ahead of the `/mcp/` prefix arm.
+        assert_eq!(normalize_endpoint_label("/mcp/alpha"), "/mcp/{server}");
+        assert_eq!(normalize_endpoint_label("/mcp/unique-xyz"), "/mcp/{server}");
+        assert_eq!(normalize_endpoint_label("/mcp"), "/mcp");
+        assert_eq!(normalize_endpoint_label("/mcp/"), "/mcp");
     }
 
     use aisix_core::resource::ResourceEntry;
@@ -480,6 +684,7 @@ mod tests {
             addr: "127.0.0.1:0".into(),
             request_body_limit_bytes: 1_048_576,
             real_ip: Default::default(),
+            url_rewrites: Vec::new(),
             tls: None,
         }
     }
@@ -1453,6 +1658,7 @@ mod tests {
             addr: "127.0.0.1:0".into(),
             request_body_limit_bytes: limit,
             real_ip: Default::default(),
+            url_rewrites: Vec::new(),
             tls: None,
         };
         ProxyState::new(handle, hub, &cfg).without_cache()
@@ -1520,6 +1726,75 @@ mod tests {
             "limit 0 must not cap a chunked body at axum's 2 MiB default"
         );
         assert!(resp.status().is_server_error());
+    }
+
+    /// A body-cap rejection short-circuits BEFORE any handler runs, and
+    /// both the access log and the request metrics are emitted BY the
+    /// handlers — so pre-fix a caller got a 413 the gateway kept no
+    /// record of: nothing in the log, no `aisix_requests_total` sample.
+    /// "Client reports 413, gateway shows nothing" was indistinguishable
+    /// from the request never arriving.
+    ///
+    /// The metric is what this asserts, because it is per-`ProxyState`
+    /// and so unaffected by whatever else the suite is doing; the log
+    /// line — process-global tracing state, not safely assertable from a
+    /// parallel unit test — is pinned end-to-end in the `body-edges` E2E.
+    #[tokio::test]
+    async fn body_cap_short_circuit_is_counted_like_any_other_terminal_path() {
+        let hub = Arc::new(Hub::new());
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
+        let state = build_state(snap, hub); // 1 MiB cap from cfg()
+        let app = build_router(state.clone());
+
+        let oversized = 2 * 1024 * 1024;
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .header("content-length", oversized.to_string())
+            .body(Body::from(
+                r#"{"model":"my-gpt4","messages":[{"role":"user","content":"hi"}]}"#,
+            ))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        let scrape = state.metrics.render();
+        assert!(
+            scrape.contains("aisix_requests_total") && scrape.contains(r#"status="413""#),
+            "the 413 must be counted, got: {scrape}"
+        );
+    }
+
+    /// The chunked path reaches the handler, which rejects at its body
+    /// extractor and returns before the dispatch tail — silent for the
+    /// same reason, one layer further in. Locks the handler-side half.
+    #[tokio::test]
+    async fn chunked_oversize_rejection_is_counted_like_any_other_terminal_path() {
+        let hub = Arc::new(Hub::new());
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
+        let state = build_state(snap, hub);
+        let app = build_router(state.clone());
+
+        let chunk = vec![b'x'; 200 * 1024];
+        let stream =
+            futures::stream::iter((0..10).map(move |_| Ok::<_, std::io::Error>(chunk.clone())));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from_stream(stream))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        let scrape = state.metrics.render();
+        assert!(
+            scrape.contains(r#"status="413""#),
+            "the 413 must be counted, got: {scrape}"
+        );
     }
 
     /// The duplicate-Content-Length rejection is smuggling hygiene, not
@@ -3086,6 +3361,174 @@ data: [DONE]\n\n"
         );
     }
 
+    /// A schedule window that always matches "now" (every weekday, all
+    /// day) so suspension is deterministic under the system clock.
+    fn always_on_schedule() -> serde_json::Value {
+        serde_json::json!([{
+            "timezone": "UTC",
+            "days_of_week": ["mon", "tue", "wed", "thu", "fri", "sat", "sun"],
+            "start_time": "00:00",
+            "end_time": "24:00"
+        }])
+    }
+
+    /// A schedule window that can never match (a fixed past date).
+    fn never_on_schedule() -> serde_json::Value {
+        serde_json::json!([{
+            "timezone": "UTC",
+            "dates": ["2000-01-01"],
+            "start_time": "00:00",
+            "end_time": "24:00"
+        }])
+    }
+
+    /// While inside a scheduled suspension window the policy reserves
+    /// nothing; once the schedule no longer matches, enforcement resumes
+    /// on the unchanged bucket (AISIX-Cloud#1104).
+    #[tokio::test]
+    async fn scheduled_suspension_pauses_policy_until_window_closes() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/anything"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("my-video-model"));
+        let policy_json = |schedules: serde_json::Value| {
+            serde_json::json!({
+                "name": "video-cap",
+                "scope": "model",
+                "scope_ref": "model-id-1",
+                "window": "minute",
+                "max_requests": 1,
+                "schedules": schedules
+            })
+        };
+        snap.rate_limit_policies.insert(ResourceEntry::new(
+            "pol-1",
+            serde_json::from_value(policy_json(always_on_schedule())).unwrap(),
+            1,
+        ));
+        snap.apikeys
+            .insert(apikey_entry("sk-caller", &["my-video-model"]));
+        let state = build_state(snap, hub);
+
+        let make_req = || {
+            Request::builder()
+                .method("POST")
+                .uri("/passthrough/openai/anything")
+                .header("authorization", "Bearer sk-caller")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"model":"my-video-model","input":"x"}"#))
+                .unwrap()
+        };
+
+        // Suspended: max_requests=1 would reject the second call — both pass.
+        for _ in 0..2 {
+            let resp = run(build_router(state.clone()), make_req()).await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "suspended policy must not gate requests",
+            );
+        }
+
+        // Swap in a schedule that no longer matches (as the loader does
+        // when the window closes relative to a fresh evaluation).
+        state
+            .snapshot
+            .load()
+            .rate_limit_policies
+            .insert(ResourceEntry::new(
+                "pol-1",
+                serde_json::from_value(policy_json(never_on_schedule())).unwrap(),
+                2,
+            ));
+
+        let resp = run(build_router(state.clone()), make_req()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = run(build_router(state.clone()), make_req()).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "policy must enforce again outside its suspension windows",
+        );
+    }
+
+    /// The routing/ensemble per-target path (`reserve_model_only`)
+    /// iterates the policy table independently of `reserve_layers`, so
+    /// it must honor scheduled suspensions too (AISIX-Cloud#1104).
+    #[tokio::test]
+    async fn reserve_model_only_honors_scheduled_suspension() {
+        let hub = Arc::new(Hub::new());
+        let snap = new_snap("http://127.0.0.1:1");
+        let model = model_entry("mg-member");
+        let target = model.value.clone();
+        snap.models.insert(model);
+        let policy_json = |schedules: serde_json::Value| {
+            serde_json::json!({
+                "name": "member-cap",
+                "scope": "model",
+                "scope_ref": "model-id-1",
+                "window": "minute",
+                "max_requests": 1,
+                "schedules": schedules
+            })
+        };
+        snap.rate_limit_policies.insert(ResourceEntry::new(
+            "pol-1",
+            serde_json::from_value(policy_json(always_on_schedule())).unwrap(),
+            1,
+        ));
+        let state = build_state(snap, hub);
+        let auth = AuthenticatedKey {
+            entry: Arc::new(ResourceEntry::new(
+                "key-entry-1",
+                serde_json::from_value::<aisix_core::ApiKey>(serde_json::json!({
+                    "key_hash": "h",
+                    "allowed_models": [],
+                }))
+                .unwrap(),
+                1,
+            )),
+        };
+
+        // Suspended: max_requests=1 would deny the second reservation
+        // (pre_commit counts stick even when the reservation drops
+        // uncommitted) — both succeed because nothing is reserved.
+        for _ in 0..2 {
+            let r =
+                quota::reserve_model_only(&state, &auth, "mg-member", "model-id-1", &target).await;
+            assert!(r.is_ok(), "suspended policy must reserve nothing");
+        }
+
+        state
+            .snapshot
+            .load()
+            .rate_limit_policies
+            .insert(ResourceEntry::new(
+                "pol-1",
+                serde_json::from_value(policy_json(never_on_schedule())).unwrap(),
+                2,
+            ));
+
+        assert!(
+            quota::reserve_model_only(&state, &auth, "mg-member", "model-id-1", &target)
+                .await
+                .is_ok()
+        );
+        assert!(
+            quota::reserve_model_only(&state, &auth, "mg-member", "model-id-1", &target)
+                .await
+                .is_err(),
+            "policy outside its windows must throttle the second reservation",
+        );
+    }
+
     /// The tunnel forwards bodies verbatim, so callers typically name the
     /// provider-native id (`model_name`), not the gateway alias
     /// (`display_name`). The limit must bind either way, and the bucket is
@@ -4237,6 +4680,358 @@ data: [DONE]\n\n";
         });
         let model: Model = serde_json::from_value(cfg).unwrap();
         ResourceEntry::new(format!("router-{name}"), model, 1)
+    }
+
+    /// Like [`routing_entry`] but with a `stream_failure` block —
+    /// the AISIX-Cloud#1222 mid-stream failover knob.
+    fn routing_entry_with_stream_failure(
+        name: &str,
+        targets: &[&str],
+        stream_failure: serde_json::Value,
+    ) -> ResourceEntry<Model> {
+        let target_objs: Vec<serde_json::Value> = targets
+            .iter()
+            .map(|t| serde_json::json!({"model": t}))
+            .collect();
+        let cfg = serde_json::json!({
+            "display_name": name,
+            "routing": {
+                "strategy": "failover",
+                "targets": target_objs,
+                "stream_failure": stream_failure,
+            }
+        });
+        let model: Model = serde_json::from_value(cfg).unwrap();
+        ResourceEntry::new(format!("router-{name}"), model, 1)
+    }
+
+    /// SSE body: role preamble + one content delta + an in-band error
+    /// frame — a provider failing inside its committed 200 stream.
+    const MID_STREAM_FAILING_SSE: &str = "\
+data: {\"id\":\"up-1\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"up-1\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Once upon\"},\"finish_reason\":null}]}\n\n\
+data: {\"error\":{\"message\":\"The server had an error\",\"type\":\"server_error\"}}\n\n";
+
+    fn mid_stream_snapshot(
+        primary_uri: &str,
+        secondary_uri: &str,
+        stream_failure: Option<serde_json::Value>,
+    ) -> AisixSnapshot {
+        let snap = AisixSnapshot::new();
+        snap.provider_keys
+            .insert(pk_entry_with_id("pk-primary", primary_uri));
+        snap.provider_keys
+            .insert(pk_entry_with_id("pk-secondary", secondary_uri));
+        snap.models
+            .insert(model_entry_with_id("m-primary", "primary", "pk-primary"));
+        snap.models.insert(model_entry_with_id(
+            "m-secondary",
+            "secondary",
+            "pk-secondary",
+        ));
+        match stream_failure {
+            Some(sf) => snap.models.insert(routing_entry_with_stream_failure(
+                "smart",
+                &["primary", "secondary"],
+                sf,
+            )),
+            None => snap.models.insert(routing_entry(
+                "smart",
+                "failover",
+                &["primary", "secondary"],
+                None,
+                None,
+                None,
+            )),
+        }
+        snap.apikeys.insert(apikey_entry("sk-caller", &["smart"]));
+        snap
+    }
+
+    async fn streaming_chat_wire(app: axum::Router, model: &str) -> String {
+        let body = serde_json::json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "tell me a story"}],
+            "stream": true
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let mut body_stream = resp.into_body().into_data_stream();
+        let mut wire = Vec::new();
+        while let Some(chunk) = body_stream.next().await {
+            wire.extend_from_slice(chunk.unwrap().as_ref());
+        }
+        String::from_utf8(wire).expect("SSE bytes are utf8")
+    }
+
+    /// AISIX-Cloud#1222 core acceptance: with `stream_failure: continue`,
+    /// a provider error inside the committed 200 stream moves the SAME
+    /// client stream onto the fallback target; the fallback gets the
+    /// original messages + the continuation instruction + the partial
+    /// text as an assistant message; the client sees primary content,
+    /// then fallback content, then exactly one `[DONE]` and no error
+    /// frame.
+    #[tokio::test]
+    async fn mid_stream_failure_continues_on_fallback_target_in_same_stream() {
+        let primary = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(MID_STREAM_FAILING_SSE),
+            )
+            .mount(&primary)
+            .await;
+        let secondary = MockServer::start().await;
+        let recovery_sse = "\
+data: {\"id\":\"up-2\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"up-2\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" a time\"},\"finish_reason\":\"stop\"}]}\n\n\
+data: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(recovery_sse),
+            )
+            .mount(&secondary)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = mid_stream_snapshot(
+            &primary.uri(),
+            &secondary.uri(),
+            Some(serde_json::json!({"mode": "continue"})),
+        );
+        let app = build_router(build_state(snap, hub));
+
+        let wire = streaming_chat_wire(app, "smart").await;
+        assert!(
+            wire.contains("Once upon"),
+            "primary partial must reach the client:\n{wire}"
+        );
+        assert!(
+            wire.contains(" a time"),
+            "fallback continuation must reach the client:\n{wire}"
+        );
+        assert!(
+            !wire.contains("event: error"),
+            "recovered stream must not carry an error frame:\n{wire}"
+        );
+        assert_eq!(
+            wire.matches("data: [DONE]").count(),
+            1,
+            "exactly one [DONE] on recovery:\n{wire}"
+        );
+
+        // The fallback target received the continuation request: the
+        // original user message, then the continuation instruction,
+        // then the partial as an assistant message (LiteLLM shape).
+        let reqs = secondary.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 1, "secondary called exactly once");
+        let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3, "user + continuation system + partial");
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[1]["role"], "system");
+        assert!(messages[1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("Do not repeat the same content"));
+        assert_eq!(messages[2]["role"], "assistant");
+        assert_eq!(messages[2]["content"], "Once upon");
+    }
+
+    /// Default config (no `stream_failure`) keeps the historical
+    /// terminate behavior: in-band error frame, no `[DONE]`, and the
+    /// fallback target is never contacted.
+    #[tokio::test]
+    async fn mid_stream_failure_without_config_terminates_and_never_calls_fallback() {
+        let primary = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(MID_STREAM_FAILING_SSE),
+            )
+            .mount(&primary)
+            .await;
+        let secondary = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&secondary)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = mid_stream_snapshot(&primary.uri(), &secondary.uri(), None);
+        let app = build_router(build_state(snap, hub));
+
+        let wire = streaming_chat_wire(app, "smart").await;
+        assert!(wire.contains("Once upon"));
+        assert!(
+            wire.contains("event: error"),
+            "terminate mode keeps the in-band error frame:\n{wire}"
+        );
+        assert!(
+            wire.contains("upstream_in_band_error"),
+            "error frame carries the in-band error type:\n{wire}"
+        );
+        assert!(
+            !wire.contains("data: [DONE]"),
+            "no [DONE] after abnormal termination:\n{wire}"
+        );
+        let reqs = secondary.received_requests().await.unwrap();
+        assert!(reqs.is_empty(), "fallback target must not be contacted");
+    }
+
+    /// Fallback exhaustion: the fallback target fails mid-stream too
+    /// (and `max_fallbacks` defaults to 1) — the client gets the
+    /// in-band error frame and no `[DONE]`, never a fabricated clean
+    /// completion.
+    #[tokio::test]
+    async fn mid_stream_fallback_exhaustion_surfaces_error_without_done() {
+        let primary = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(MID_STREAM_FAILING_SSE),
+            )
+            .mount(&primary)
+            .await;
+        let secondary = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(MID_STREAM_FAILING_SSE),
+            )
+            .mount(&secondary)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = mid_stream_snapshot(
+            &primary.uri(),
+            &secondary.uri(),
+            Some(serde_json::json!({"mode": "continue"})),
+        );
+        let app = build_router(build_state(snap, hub));
+
+        let wire = streaming_chat_wire(app, "smart").await;
+        assert!(
+            wire.contains("event: error"),
+            "exhausted fallback surfaces the error:\n{wire}"
+        );
+        assert!(
+            !wire.contains("data: [DONE]"),
+            "no fabricated [DONE] when the fallback also fails:\n{wire}"
+        );
+        let reqs = secondary.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 1, "fallback was attempted once");
+    }
+
+    /// Safety boundary: a stream that already emitted tool-call deltas
+    /// must terminate even with `continue` configured — a fallback
+    /// model cannot safely continue half-emitted tool-call arguments
+    /// (the LiteLLM gap this design deliberately closes).
+    #[tokio::test]
+    async fn mid_stream_fallback_skipped_after_tool_call_delta() {
+        let primary = MockServer::start().await;
+        let tool_call_sse = "\
+data: {\"id\":\"up-1\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"up-1\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"ci\"}}]},\"finish_reason\":null}]}\n\n\
+data: {\"error\":{\"message\":\"The server had an error\",\"type\":\"server_error\"}}\n\n";
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(tool_call_sse),
+            )
+            .mount(&primary)
+            .await;
+        let secondary = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&secondary)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = mid_stream_snapshot(
+            &primary.uri(),
+            &secondary.uri(),
+            Some(serde_json::json!({"mode": "continue"})),
+        );
+        let app = build_router(build_state(snap, hub));
+
+        let wire = streaming_chat_wire(app, "smart").await;
+        assert!(
+            wire.contains("event: error"),
+            "tool-call streams terminate, not continue:\n{wire}"
+        );
+        assert!(!wire.contains("data: [DONE]"));
+        let reqs = secondary.received_requests().await.unwrap();
+        assert!(
+            reqs.is_empty(),
+            "no fallback dispatch after a tool-call delta"
+        );
+    }
+
+    /// `on` narrows the trigger set: a config listing only
+    /// `read_timeout` must NOT fall back on an in-band error.
+    #[tokio::test]
+    async fn mid_stream_fallback_respects_on_trigger_list() {
+        let primary = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(MID_STREAM_FAILING_SSE),
+            )
+            .mount(&primary)
+            .await;
+        let secondary = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&secondary)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = mid_stream_snapshot(
+            &primary.uri(),
+            &secondary.uri(),
+            Some(serde_json::json!({"mode": "continue", "on": ["read_timeout"]})),
+        );
+        let app = build_router(build_state(snap, hub));
+
+        let wire = streaming_chat_wire(app, "smart").await;
+        assert!(wire.contains("event: error"));
+        assert!(!wire.contains("data: [DONE]"));
+        let reqs = secondary.received_requests().await.unwrap();
+        assert!(
+            reqs.is_empty(),
+            "in-band error is not in the configured trigger set"
+        );
     }
 
     #[tokio::test]
@@ -6204,8 +6999,351 @@ data: [DONE]\n\n";
         // simply that an event fires; counts are best-effort. Pin
         // the structural fields to confirm we didn't grab some
         // unrelated event.
-        assert_eq!(event.status_code, 200);
+        assert_eq!(
+            event.status_code, CLIENT_CLOSED_REQUEST,
+            "an abandoned stream must be recorded as a client cancel, not as a success"
+        );
         assert!(!event.guardrail_blocked);
+    }
+
+    /// The counterpart to the test above: a stream the consumer reads to
+    /// completion must stay `200`. Without this, the `reached_end` flag
+    /// could be wired to something that is never set and every streamed
+    /// request would silently be reported as abandoned.
+    #[tokio::test]
+    async fn streaming_chat_telemetry_reports_200_when_fully_consumed() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        let sse = "\
+data: {\"id\":\"cmpl-full\",\"model\":\"gpt-4o-2024-08-06\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"cmpl-full\",\"model\":\"gpt-4o-2024-08-06\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"cmpl-full\",\"model\":\"gpt-4o-2024-08-06\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+data: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&upstream)
+            .await;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
+        let state = build_state(snap, hub).with_usage_sink(UsageSink::new(tx));
+        let app = build_router(state);
+
+        let body = serde_json::json!({
+            "model": "my-gpt4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Drain to the end, the way a client that wants the whole answer does.
+        let mut body_stream = resp.into_body().into_data_stream();
+        while body_stream.next().await.is_some() {}
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("usage event was never emitted")
+            .expect("sender dropped without sending");
+        assert_eq!(
+            event.status_code, 200,
+            "a fully consumed stream must not be reported as a client cancel"
+        );
+    }
+
+    /// Same contract, but with an output guardrail attached — the shape that
+    /// puts an awaiting end-of-stream scan between the upstream's last chunk
+    /// and `[DONE]`. `reached_end` must be set before that scan, so pin the
+    /// outcome with one configured.
+    ///
+    /// This fixes the placement contract; it cannot reproduce the race
+    /// itself. A keyword guardrail scans locally, so its await completes
+    /// immediately and a consumer cannot realistically be dropped inside it.
+    /// The actual protection is that all five stream paths mark the flag at
+    /// upstream EOF, ahead of any scan.
+    #[tokio::test]
+    async fn streaming_chat_with_output_guardrail_reports_200_when_fully_consumed() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        let sse = "\
+data: {\"id\":\"cmpl-guard\",\"model\":\"gpt-4o-2024-08-06\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"cmpl-guard\",\"model\":\"gpt-4o-2024-08-06\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"all clear\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"cmpl-guard\",\"model\":\"gpt-4o-2024-08-06\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+data: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&upstream)
+            .await;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
+        let state = build_state(snap, hub).with_usage_sink(UsageSink::new(tx));
+        // The literal never appears in the response above, so the scan runs
+        // to completion and allows — the stream is delivered in full.
+        seed_guardrail(
+            &state.snapshot,
+            "g-eos-scan",
+            r#"{"name":"eos-scan-guard","kind":"keyword","hook_point":"output","patterns":[{"kind":"literal","value":"never-present-literal"}]}"#,
+        );
+        let app = build_router(state);
+
+        let body = serde_json::json!({
+            "model": "my-gpt4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let mut body_stream = resp.into_body().into_data_stream();
+        while body_stream.next().await.is_some() {}
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("usage event was never emitted")
+            .expect("sender dropped without sending");
+        assert_eq!(
+            event.status_code, 200,
+            "a fully consumed stream with an output guardrail must not be reported as a cancel"
+        );
+    }
+
+    const CANCEL_METRIC: &str = "aisix_proxy_client_cancelled_requests_total";
+
+    /// A caller that hangs up before the response head exists must still
+    /// leave a trace. Every endpoint logs and meters from the tail of its
+    /// own handler, which a cancelled future never reaches — so such a
+    /// request used to be absent from the access log, the usage events
+    /// AND the metrics simultaneously. That made "the client says it sent
+    /// N requests but the gateway only logged M" unaccountable, and it
+    /// hid exactly the case operators care about: a caller giving up
+    /// during a long time-to-first-token.
+    #[tokio::test]
+    async fn client_cancel_before_response_head_is_recorded() {
+        let upstream = MockServer::start().await;
+        // Outlives the patience window below, so the handler is still
+        // awaiting the upstream when its future is dropped.
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_secs(30))
+                    .set_body_json(serde_json::json!({
+                        "id": "cmpl-never",
+                        "model": "gpt-4o",
+                        "choices": []
+                    })),
+            )
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
+        let state = build_state(snap, hub);
+        let metrics = state.metrics.clone();
+        let app = build_router(state);
+
+        assert!(!metrics.render().contains(CANCEL_METRIC));
+
+        let body = serde_json::json!({
+            "model": "my-gpt4",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+
+        // Dropping the in-flight future is precisely what axum does when
+        // the client's connection goes away before the handler produced a
+        // response head.
+        let outcome =
+            tokio::time::timeout(std::time::Duration::from_millis(300), app.oneshot(req)).await;
+        assert!(
+            outcome.is_err(),
+            "upstream answered too fast to model a cancel"
+        );
+
+        let rendered = metrics.render();
+        assert!(
+            rendered.contains(CANCEL_METRIC),
+            "cancelled request left no metric: {rendered}"
+        );
+        assert!(
+            rendered.contains("endpoint=\"/v1/chat/completions\""),
+            "cancel metric lost its endpoint label: {rendered}"
+        );
+    }
+
+    /// The guard must stay silent on the happy path. A completed request
+    /// is already logged and metered by its own handler; counting it as a
+    /// client cancel too would make the new series useless for alerting.
+    #[tokio::test]
+    async fn completed_request_is_not_counted_as_client_cancel() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-ok",
+                "model": "gpt-4o",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })))
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
+        let state = build_state(snap, hub);
+        let metrics = state.metrics.clone();
+        let app = build_router(state);
+
+        let body = serde_json::json!({
+            "model": "my-gpt4",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let rendered = metrics.render();
+        assert!(
+            !rendered.contains(CANCEL_METRIC),
+            "a completed request was miscounted as a client cancel: {rendered}"
+        );
+    }
+
+    /// A panicking handler drops the guard mid-unwind with `armed` still
+    /// set, which looks identical to a cancel from `Drop`'s point of view.
+    /// Recording it would invent a client disconnect that never happened and
+    /// bury the panic under a benign 499, so the guard must stay silent and
+    /// let the panic's own signal stand.
+    #[test]
+    fn cancel_guard_stays_silent_during_unwind() {
+        let metrics = std::sync::Arc::new(aisix_obs::Metrics::new(false));
+        let probe = metrics.clone();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = ClientCancelGuard {
+                armed: true,
+                metrics: metrics.clone(),
+                endpoint: "/v1/chat/completions",
+                method: axum::http::Method::POST,
+                uri: "/v1/chat/completions".parse().unwrap(),
+                request_id: "req-unwind".to_string(),
+                started: std::time::Instant::now(),
+            };
+            panic!("handler blew up");
+        }));
+
+        assert!(result.is_err(), "the test's own panic must have unwound");
+        assert!(
+            !probe.render().contains(CANCEL_METRIC),
+            "a panicking handler was miscounted as a client cancel: {}",
+            probe.render()
+        );
+    }
+
+    /// A mid-stream hang-up is NOT a head-phase cancel. By the time SSE
+    /// bytes flow the response head is committed, the handler has already
+    /// written its access log, and the per-stream Drop guard emits the
+    /// usage event (see `streaming_chat_telemetry_fires_on_client_disconnect`).
+    /// Counting it here as well would report one disconnect twice under
+    /// two different outcomes.
+    #[tokio::test]
+    async fn mid_stream_disconnect_is_not_counted_as_head_phase_cancel() {
+        let upstream = MockServer::start().await;
+        let sse = "\
+data: {\"id\":\"cmpl-mid\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"cmpl-mid\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n\
+data: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
+        let state = build_state(snap, hub);
+        let metrics = state.metrics.clone();
+        let app = build_router(state);
+
+        let body = serde_json::json!({
+            "model": "my-gpt4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Read one chunk, then hang up mid-stream.
+        let mut body_stream = resp.into_body().into_data_stream();
+        let _first = body_stream.next().await;
+        drop(body_stream);
+
+        let rendered = metrics.render();
+        assert!(
+            !rendered.contains(CANCEL_METRIC),
+            "mid-stream disconnect was double-counted as a head-phase cancel: {rendered}"
+        );
     }
 
     /// Regression for #225: streaming chat must read the terminal SSE

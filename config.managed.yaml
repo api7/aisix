@@ -45,6 +45,16 @@ proxy:
   # 0 = no request-body cap (the default); set a value to bound
   # per-request memory.
   # request_body_limit_bytes: 0
+  # Entry-level URL rewriting (first matching rule wins; `match` runs on
+  # the raw, percent-encoded path; `rewrite` replaces the matched portion,
+  # $1 = capture group; the query string is preserved). Lets clients keep
+  # legacy URL shapes, e.g. per-server MCP paths served on the
+  # /mcp/{server} endpoint. When configuring through env vars only, set
+  # one JSON array: AISIX_PROXY__URL_REWRITES='[{"match":"...","rewrite":"..."}]'
+  # url_rewrites:
+  #   - name: per-server-mcp-compat
+  #     match: "^/mcp-servers/([^/]+)/mcp$"
+  #     rewrite: "/mcp/$1"
 
 admin:
   # Bind to an unbindable port so even if managed mode somehow
@@ -76,6 +86,13 @@ observability:
     # client_type_rules:
     #   - pattern: "^py-billing-batcher/"
     #     client: billing-batcher
+    # Optional per-metric histogram bucket edges, in seconds; each metric
+    # keeps its own default when unset. See config.example.yaml for the
+    # full annotation and the cardinality/contract caveats. Override with
+    # a comma-separated list, e.g.
+    # AISIX_OBSERVABILITY__METRICS__BUCKETS__REQUEST_TTFT=0.1,0.5,1,5,30,300
+    # buckets:
+    #   request_ttft: [0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60, 120, 300]
   tracing:
     otlp:
       enabled: false

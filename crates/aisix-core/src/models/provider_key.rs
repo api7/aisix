@@ -27,7 +27,6 @@ use crate::resource::Resource;
 // NaN / Number-equality semantics. Tests compare via `assert_eq!`
 // which only needs `PartialEq`.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
-#[serde(deny_unknown_fields)]
 pub struct ProviderKey {
     /// Operator-facing label, unique within the gateway. Surfaces in
     /// the Admin API list view and in dashboard UIs that wrap this
@@ -105,7 +104,6 @@ pub struct ProviderKey {
 // settings themselves, sharing one connection pool across every Provider
 // Key configured the same way.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq, Hash)]
-#[serde(deny_unknown_fields)]
 pub struct ProviderKeyTls {
     /// PEM-encoded certificate authority certificates trusted as issuers for
     /// this endpoint, in addition to the gateway's default trust store. A
@@ -212,7 +210,6 @@ impl TelemetryKind {
 
 /// Telemetry attribution tags emitted with requests routed through this provider key.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct TelemetryTags {
     /// Provider-key category, such as `"catalog"` for curated providers or
     /// `"byo"` for bring-your-own providers.
@@ -243,7 +240,6 @@ pub struct TelemetryTags {
 /// request body parameters, clamp supported numeric parameters, add fallback
 /// outbound headers, or add fallback outbound body fields.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
-#[serde(deny_unknown_fields)]
 pub struct RequestOverrides {
     /// `apply_param_renames` input. Top-level body keys named on the left are renamed to the right. Leave empty to preserve request parameter names.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -282,7 +278,6 @@ pub struct RequestOverrides {
 
 /// Numeric range clamps applied to chat-completion request bodies.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
-#[serde(deny_unknown_fields)]
 pub struct ParamConstraints {
     /// Upper bound for `temperature`. Values above this are clamped
     /// to this value. If omitted, no upper bound is applied.
@@ -299,7 +294,6 @@ pub struct ParamConstraints {
 /// stream termination behavior, flatten list-style content when needed, select
 /// an error envelope strategy, or lift provider-specific reasoning content.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct ResponseOverrides {
     /// Stream `[DONE]` terminator expectation. If omitted, either presence
     /// or absence of the terminator is accepted.
@@ -373,10 +367,14 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_fields() {
-        let r: Result<ProviderKey, _> =
-            serde_json::from_str(r#"{"display_name":"x","secret":"k","extra":1}"#);
-        assert!(r.is_err());
+    fn tolerates_unknown_fields_for_forward_compat() {
+        // cp-api may ship new fields ahead of the DP rolling out; serde
+        // must accept them. The write path still rejects them via the
+        // strict schema validator (validate_provider_key in
+        // models/schema.rs).
+        let p: ProviderKey =
+            serde_json::from_str(r#"{"display_name":"x","secret":"k","extra":1}"#).unwrap();
+        assert_eq!(p.display_name, "x");
     }
 
     // ---- `secret` → `api_key` rename ----
@@ -506,17 +504,20 @@ mod tests {
     }
 
     #[test]
-    fn telemetry_tags_rejects_unknown_field() {
-        // TelemetryTags is `deny_unknown_fields` — stops cp-api from
-        // silently shipping a new tag the DP can't see.
-        let r: Result<ProviderKey, _> = serde_json::from_str(
+    fn telemetry_tags_tolerates_unknown_field_for_forward_compat() {
+        // cp-api may ship a new tag ahead of the DP rolling out; serde
+        // must accept it. The write path still rejects it via the
+        // strict schema validator (validate_provider_key in
+        // models/schema.rs).
+        let p: ProviderKey = serde_json::from_str(
             r#"{
                 "display_name": "x",
                 "secret": "k",
-                "telemetry_tags": { "unknown_tag": "v" }
+                "telemetry_tags": { "unknown_tag": "v", "featured": true }
             }"#,
-        );
-        assert!(r.is_err());
+        )
+        .unwrap();
+        assert!(p.telemetry_tags.featured);
     }
 
     #[test]
@@ -650,17 +651,21 @@ mod tests {
     }
 
     #[test]
-    fn request_overrides_rejects_unknown_field() {
-        // deny_unknown_fields on RequestOverrides stops a typo in
-        // cp-api JSON from silently no-oping the apply call.
-        let r: Result<ProviderKey, _> = serde_json::from_str(
+    fn request_overrides_tolerates_unknown_field_for_forward_compat() {
+        // cp-api may ship new override fields ahead of the DP rolling
+        // out; serde must accept them. Typos on the write path are
+        // still rejected by the strict schema validator
+        // (validate_provider_key in models/schema.rs).
+        let p: ProviderKey = serde_json::from_str(
             r#"{
                 "display_name": "x",
                 "secret": "k",
-                "request": { "param_rename": {} }
+                "request": { "param_rename": {}, "default_headers": { "X-Foo": "bar" } }
             }"#,
-        );
-        assert!(r.is_err());
+        )
+        .unwrap();
+        let req = p.request.expect("request was Some");
+        assert_eq!(req.default_headers.get("X-Foo"), Some(&"bar".to_string()));
     }
 
     #[test]
@@ -701,15 +706,20 @@ mod tests {
     }
 
     #[test]
-    fn response_overrides_rejects_unknown_field() {
-        let r: Result<ProviderKey, _> = serde_json::from_str(
+    fn response_overrides_tolerates_unknown_field_for_forward_compat() {
+        // cp-api may ship new override fields ahead of the DP rolling
+        // out; serde must accept them (the strict write-path schema
+        // still rejects them — validate_provider_key in models/schema.rs).
+        let p: ProviderKey = serde_json::from_str(
             r#"{
                 "display_name": "x",
                 "secret": "k",
-                "response": { "reasoning_fields": "delta.foo" }
+                "response": { "reasoning_fields": "delta.foo", "error_envelope": "openai" }
             }"#,
-        );
-        assert!(r.is_err());
+        )
+        .unwrap();
+        let resp = p.response.expect("response was Some");
+        assert_eq!(resp.error_envelope.as_deref(), Some("openai"));
     }
 
     #[test]
@@ -754,9 +764,13 @@ mod tests {
     }
 
     #[test]
-    fn param_constraints_rejects_unknown_field() {
-        let r: Result<ParamConstraints, _> = serde_json::from_str(r#"{"top_p_max": 0.9}"#);
-        assert!(r.is_err());
+    fn param_constraints_tolerates_unknown_field_for_forward_compat() {
+        // cp-api may ship a new clamp ahead of the DP rolling out;
+        // serde must accept it (the strict write-path schema still
+        // rejects it — validate_provider_key in models/schema.rs).
+        let c: ParamConstraints =
+            serde_json::from_str(r#"{"top_p_max": 0.9, "temperature_max": 1.0}"#).unwrap();
+        assert_eq!(c.temperature_max, Some(1.0));
     }
 
     // ---- Issue #411 strip_headers deserialize/normalize ----

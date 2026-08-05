@@ -112,6 +112,17 @@ pub struct UsageEvent {
     #[serde(default, skip_serializing_if = "is_false")]
     pub usage_estimated: bool,
 
+    /// Audio length in seconds — the cost basis for models billed by
+    /// duration rather than tokens (AISIX-Cloud#1138, api7/aisix#457).
+    /// `whisper-1` reports `usage: {type: "duration", seconds: N}` and no
+    /// token counts at all, so without this field its spend is
+    /// unpriceable; cp-api multiplies it by the model's per-second rate.
+    /// Populated on `/v1/audio/transcriptions` + `/translations`; 0
+    /// elsewhere and omitted from the wire, so token-only events are
+    /// unchanged and older cp-api builds ignore it.
+    #[serde(default, skip_serializing_if = "is_zero_f64")]
+    pub audio_duration_seconds: f64,
+
     /// How long THIS attempt spent on the upstream, in milliseconds:
     /// from the moment the attempt began to the moment it settled —
     /// end-of-stream for a streamed attempt, not first-chunk.
@@ -183,6 +194,22 @@ pub struct UsageEvent {
     /// for upstream errors and guardrail blocks.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub finish_reason: String,
+
+    /// Logical outcome of a STREAMING response, set on the serving
+    /// attempt's event only (AISIX-Cloud#1222). The HTTP status is
+    /// committed at 200 before the stream runs, so it cannot express a
+    /// mid-stream failure; this field can:
+    /// - `success` — the stream completed normally;
+    /// - `partial_failed` — the stream terminated after the 200 with an
+    ///   in-band error frame (`[DONE]` withheld);
+    /// - `partial_recovered` — a mid-stream failure was recovered by
+    ///   `routing.stream_failure: continue` on a fallback target and the
+    ///   stream then completed normally.
+    ///
+    /// Empty on non-streaming events, failed-attempt events, and
+    /// client-abandoned streams (those keep `status_code: 499`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub stream_outcome: String,
 
     /// Cost the DP computed for this request in US dollars. Zero when
     /// the request never reached cost calculation (e.g. blocked by a
@@ -436,6 +463,11 @@ fn is_zero_u32(n: &u32) -> bool {
 #[inline]
 fn is_false(b: &bool) -> bool {
     !*b
+}
+
+#[inline]
+fn is_zero_f64(n: &f64) -> bool {
+    *n == 0.0
 }
 
 /// Cheap clonable handle the proxy hands to request handlers. Backed

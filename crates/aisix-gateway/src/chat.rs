@@ -490,6 +490,31 @@ pub struct ChatDelta {
     pub reasoning_content: Option<String>,
 }
 
+impl ChatDelta {
+    /// Whether this delta carries generated output — the only frames a
+    /// time-to-first-token measurement may stop on. Every streaming
+    /// handler that records `upstream_ttft_ms` off a [`ChatChunk`] shares
+    /// this predicate so the family can't drift apart again.
+    ///
+    /// Reasoning text counts. A reasoning model streams its chain of
+    /// thought first and only emits `content` once it has stopped
+    /// thinking, so a predicate that ignores `reasoning_content` reports
+    /// the end of the thinking phase as the first token — 183.5s against
+    /// a real 1.2s on the request in AISIX-Cloud#1225.
+    ///
+    /// Empty strings do not count: OpenAI opens a stream with a role-only
+    /// `{"role":"assistant","content":""}` frame, which marks the stream
+    /// starting rather than a token arriving.
+    pub fn carries_generated_output(&self) -> bool {
+        self.content.as_deref().is_some_and(|s| !s.is_empty())
+            || self
+                .reasoning_content
+                .as_deref()
+                .is_some_and(|s| !s.is_empty())
+            || self.tool_calls.as_ref().is_some_and(|t| !t.is_empty())
+    }
+}
+
 // ─── Embeddings ──────────────────────────────────────────────────────────────
 
 /// The vector returned on one embedding object. Untagged enum so JSON

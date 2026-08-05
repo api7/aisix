@@ -264,10 +264,16 @@ pub struct ManagedConfig {
     /// so the proxy can serve traffic from cached config across CP
     /// outages and full container restarts.
     ///
-    /// Empty string disables persistence — useful for ephemeral test
-    /// runs where you don't want a stale cache to mask a real failure.
-    #[serde(default = "ManagedConfig::default_snapshot_cache_path")]
-    pub snapshot_cache_path: String,
+    /// When the field is omitted, managed mode uses
+    /// `/var/lib/aisix/config_cache.json` and self-hosted etcd mode
+    /// leaves persistence off (unchanged defaults). Setting a path
+    /// enables the cache in either mode — self-hosted etcd deployments
+    /// gain the same offline resilience by opting in. Empty string
+    /// disables persistence everywhere — useful for ephemeral test runs
+    /// where you don't want a stale cache to mask a real failure. A
+    /// bare `snapshot_cache_path:` (YAML null) is treated as omitted.
+    #[serde(default)]
+    pub snapshot_cache_path: Option<String>,
 
     /// Heartbeat interval, in seconds. The DP POSTs a heartbeat to
     /// dp-manager every `heartbeat_interval_secs`; CP surfaces a DP as
@@ -302,14 +308,27 @@ impl ManagedConfig {
         has_pem || has_file
     }
 
+    /// Resolve the snapshot-cache path per the field docs: an explicit
+    /// path wins in any mode, an explicit empty string disables, and an
+    /// omitted field means "the default path in managed mode, disabled
+    /// in self-hosted etcd mode".
+    pub fn effective_snapshot_cache_path(&self) -> Option<&str> {
+        match self.snapshot_cache_path.as_deref() {
+            Some("") => None,
+            Some(path) => Some(path),
+            None if self.is_managed() => Some(Self::DEFAULT_SNAPSHOT_CACHE_PATH),
+            None => None,
+        }
+    }
+
+    /// Default on-disk snapshot cache location for managed mode.
+    pub const DEFAULT_SNAPSHOT_CACHE_PATH: &'static str = "/var/lib/aisix/config_cache.json";
+
     fn default_mtls_dir() -> String {
         "/var/lib/aisix/mtls".into()
     }
     fn default_dp_id_file() -> String {
         "/var/lib/aisix/dp_id".into()
-    }
-    fn default_snapshot_cache_path() -> String {
-        "/var/lib/aisix/config_cache.json".into()
     }
     const fn default_heartbeat_interval_secs() -> u64 {
         15
@@ -403,12 +422,139 @@ pub struct ProxyConfig {
     /// an L7 LB / ingress that sets `x-forwarded-for`.
     #[serde(default)]
     pub real_ip: RealIpConfig,
+    /// Entry-level URL rewrite rules, applied to every proxy-listener
+    /// request **before** routing (the admin and metrics listeners are
+    /// unaffected). The first rule whose `match` regex matches the request
+    /// path rewrites it — once, no cascading — and the request then flows
+    /// through the normal endpoint (auth, ACL, quota, …) as if the client
+    /// had sent the rewritten path. Lets operators map legacy URL shapes
+    /// onto AISIX endpoints, e.g. per-server MCP paths onto
+    /// `/mcp/{server}`. Empty (the default) = no rewriting.
+    ///
+    /// Env-only deployments (the chart injects config purely through
+    /// `AISIX_*` vars, which cannot express a structured list) set the
+    /// whole list as one JSON array:
+    /// `AISIX_PROXY__URL_REWRITES='[{"match":"^/x$","rewrite":"/y"}]'`.
+    #[serde(default, deserialize_with = "deserialize_url_rewrites")]
+    pub url_rewrites: Vec<UrlRewriteRule>,
 }
 
 impl ProxyConfig {
     const fn default_body_limit() -> usize {
         0
     }
+}
+
+/// One entry-level URL rewrite rule (see [`ProxyConfig::url_rewrites`]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UrlRewriteRule {
+    /// Optional name, used in logs when the rule fires.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Regex matched against the **raw, percent-encoded** request path
+    /// (never the query string) — no decoding, no normalization. Anchor
+    /// with `^`/`$` to match the whole path; an unanchored pattern matches
+    /// anywhere in it. Must not match the empty string.
+    #[serde(rename = "match")]
+    pub pattern: String,
+    /// Replacement for the matched portion of the path. Capture groups are
+    /// available as `$1`… / `${name}`; use `${1}x` (braced) when a literal
+    /// character follows a group reference (`$1x` reads as the group named
+    /// `1x`). The query string is preserved as sent, so the template must
+    /// not contain `?`, `#`, whitespace, or control characters.
+    #[serde(rename = "rewrite")]
+    pub replacement: String,
+}
+
+/// Accept `url_rewrites` either as a structured sequence (config file) or
+/// as a JSON array carried in one string — the only shape an env var can
+/// hold, and env vars are the sole config channel in chart-driven
+/// deployments.
+fn deserialize_url_rewrites<'de, D>(deserializer: D) -> Result<Vec<UrlRewriteRule>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum SeqOrJsonString {
+        Seq(Vec<UrlRewriteRule>),
+        JsonString(String),
+    }
+    match SeqOrJsonString::deserialize(deserializer)? {
+        SeqOrJsonString::Seq(rules) => Ok(rules),
+        SeqOrJsonString::JsonString(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return Ok(Vec::new());
+            }
+            serde_json::from_str(trimmed)
+                .map_err(|e| serde::de::Error::custom(format!("url_rewrites JSON string: {e}")))
+        }
+    }
+}
+
+/// Reject a rewrite template that references capture groups its pattern
+/// does not define — the regex engine expands unknown references to the
+/// empty string, which would silently rewrite traffic to the wrong
+/// endpoint. Mirrors the engine's replacement syntax: `$$` is a literal
+/// `$`, `${name}` is a braced reference, and a bare `$name` reference
+/// spans the longest run of `[0-9A-Za-z_]` (so `$1x` reads as a group
+/// named `1x`, not group 1 followed by `x`).
+fn validate_rewrite_template_refs(regex: &regex::Regex, template: &str) -> Result<(), String> {
+    let names: std::collections::HashSet<&str> = regex.capture_names().flatten().collect();
+    let group_count = regex.captures_len(); // includes group 0 (the whole match)
+    let ref_ok = |name: &str| {
+        if name.chars().all(|c| c.is_ascii_digit()) {
+            name.parse::<usize>().is_ok_and(|idx| idx < group_count)
+        } else {
+            names.contains(name)
+        }
+    };
+    let bytes = template.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'$' {
+            i += 1;
+            continue;
+        }
+        if bytes.get(i + 1) == Some(&b'$') {
+            i += 2;
+            continue;
+        }
+        if bytes.get(i + 1) == Some(&b'{') {
+            let Some(end) = template[i + 2..].find('}') else {
+                return Err("rewrite has an unterminated `${…}` group reference".to_string());
+            };
+            let name = &template[i + 2..i + 2 + end];
+            if name.is_empty() || !ref_ok(name) {
+                return Err(format!(
+                    "rewrite references unknown capture group `${{{name}}}`"
+                ));
+            }
+            i += 2 + end + 1;
+            continue;
+        }
+        let start = i + 1;
+        let mut end = start;
+        while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+            end += 1;
+        }
+        if end == start {
+            // A bare trailing `$`: the engine treats it as a literal.
+            i += 1;
+            continue;
+        }
+        let name = &template[start..end];
+        if !ref_ok(name) {
+            return Err(format!(
+                "rewrite references unknown capture group `${name}` \
+                 (write `${{N}}text` to follow group N with literal text)"
+            ));
+        }
+        i = end;
+    }
+    Ok(())
 }
 
 /// nginx `set_real_ip_from` + `real_ip_recursive` equivalent. Resolves
@@ -551,6 +697,32 @@ pub struct MetricsConfig {
     /// owns the scrape owns the label set. Order matters (first match
     /// wins); compiled + validated at boot (fail-fast), never hot-reloaded.
     pub client_type_rules: Vec<ClientTypeRule>,
+    /// Operator overrides for the histogram bucket edges
+    /// (AISIX-Cloud#1226). Deployment-scoped for the same reason as
+    /// `client_type_rules`: the series these edges mint go to this DP's
+    /// own Prometheus scrape surface. Validated at boot (fail-fast),
+    /// never hot-reloaded.
+    pub buckets: HistogramBucketsConfig,
+}
+
+/// Per-metric bucket-edge overrides, in seconds. An unset field keeps that
+/// metric's built-in default; the defaults deliberately differ per metric
+/// because the three distributions do (see `aisix_obs::metrics`). Edges
+/// must be finite, positive and strictly ascending; the `+Inf` bucket is
+/// appended by the exporter and must not be listed.
+///
+/// Changing these changes the Prometheus metric contract: dashboards and
+/// recording rules that hardcode an `le` value break, and previously
+/// recorded series are not comparable across the change.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct HistogramBucketsConfig {
+    /// `aisix_request_e2e_latency_seconds`
+    pub request_e2e_latency: Option<Vec<f64>>,
+    /// `aisix_request_ttft_seconds`
+    pub request_ttft: Option<Vec<f64>>,
+    /// `aisix_guardrail_latency_seconds`
+    pub guardrail_latency: Option<Vec<f64>>,
 }
 
 /// One `client_type_rules` entry: a regex tried against the raw inbound
@@ -1049,10 +1221,19 @@ impl Config {
                 // which blows up secrets that happen to contain a
                 // comma with a serde "invalid type: sequence, expected
                 // a string" error. Opt in only for fields that are
-                // actually Vec<String>.
+                // actually sequences.
+                //
+                // EVERY sequence field belongs on this list: the deployed
+                // chart injects gateway config purely through AISIX_* env
+                // vars, so an unregistered key is not merely awkward from
+                // the environment — it fails to deserialize, leaving the
+                // field unreachable in Kubernetes.
                 .list_separator(",")
                 .with_list_parse_key("etcd.endpoints")
                 .with_list_parse_key("admin.admin_keys")
+                .with_list_parse_key("observability.metrics.buckets.request_e2e_latency")
+                .with_list_parse_key("observability.metrics.buckets.request_ttft")
+                .with_list_parse_key("observability.metrics.buckets.guardrail_latency")
                 .try_parsing(true),
         );
 
@@ -1069,6 +1250,54 @@ impl Config {
     }
 
     fn validate(&self) -> Result<(), BootstrapError> {
+        // Fail fast on an unusable rewrite rule: a broken rule would
+        // otherwise surface at runtime as silently mis-routed or 404ing
+        // legacy traffic, which is much harder to trace back to a typo in
+        // one line of config.
+        for (i, rule) in self.proxy.url_rewrites.iter().enumerate() {
+            let ctx = || {
+                rule.name
+                    .clone()
+                    .unwrap_or_else(|| format!("proxy.url_rewrites[{i}]"))
+            };
+            let regex = match regex::Regex::new(&rule.pattern) {
+                Ok(regex) => regex,
+                Err(e) => {
+                    return Err(BootstrapError::Config(format!(
+                        "{}: invalid match regex: {e}",
+                        ctx()
+                    )));
+                }
+            };
+            // A pattern that matches the empty string would fire on every
+            // request (zero-width match at position 0) and prepend the
+            // template to every path.
+            if regex.find("").is_some() {
+                return Err(BootstrapError::Config(format!(
+                    "{}: match must not match the empty string",
+                    ctx()
+                )));
+            }
+            // The template lands inside a URI path; a `?` would absorb the
+            // caller's query into itself and a `#` would truncate the path
+            // as a fragment — both silently. Reject them (and unprintables)
+            // up front; capture-group expansions are safe because a request
+            // path can never contain these characters raw.
+            if let Some(bad) = rule
+                .replacement
+                .chars()
+                .find(|c| matches!(c, '?' | '#') || c.is_whitespace() || c.is_control())
+            {
+                return Err(BootstrapError::Config(format!(
+                    "{}: rewrite must not contain {bad:?} (the template is a path; \
+                     the query string is preserved automatically)",
+                    ctx()
+                )));
+            }
+            if let Err(e) = validate_rewrite_template_refs(&regex, &rule.replacement) {
+                return Err(BootstrapError::Config(format!("{}: {e}", ctx())));
+            }
+        }
         if let Some(path) = self.resources_file.as_deref() {
             // File source selected: exactly one resource source may be
             // active. A configured etcd endpoint list alongside the file
@@ -1299,6 +1528,162 @@ admin:
         let nets = cfg.proxy.real_ip.parse_trusted().unwrap();
         assert_eq!(nets.len(), 2);
         assert!(nets.iter().any(|n| n.to_string() == "10.0.0.0/8"));
+    }
+
+    #[test]
+    fn loads_url_rewrites_and_rejects_an_invalid_regex() {
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+  prefix: "/aisix"
+proxy:
+  addr: "0.0.0.0:3000"
+  url_rewrites:
+    - name: per-server-mcp-compat
+      match: "^/mcp-servers/([^/]+)/mcp$"
+      rewrite: "/mcp/$1"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+"#,
+        );
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert_eq!(cfg.proxy.url_rewrites.len(), 1);
+        assert_eq!(cfg.proxy.url_rewrites[0].replacement, "/mcp/$1");
+
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+  prefix: "/aisix"
+proxy:
+  addr: "0.0.0.0:3000"
+  url_rewrites:
+    - match: "^/mcp-servers/([^/+/mcp$"
+      rewrite: "/mcp/$1"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+"#,
+        );
+        let err = Config::load_from_path(Some(f.path())).unwrap_err();
+        assert!(
+            format!("{err}").contains("url_rewrites"),
+            "error should name the bad rule: {err}"
+        );
+    }
+
+    #[test]
+    fn url_rewrites_accepts_a_json_string_for_env_only_deployments() {
+        // Chart-driven deployments inject config purely through AISIX_* env
+        // vars, which cannot express a structured list — the whole list
+        // rides in one JSON string. A YAML string scalar takes the same
+        // code path as the env source.
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+  prefix: "/aisix"
+proxy:
+  addr: "0.0.0.0:3000"
+  url_rewrites: '[{"name":"compat","match":"^/mcp-servers/([^/]+)/mcp$","rewrite":"/mcp/$1"}]'
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+"#,
+        );
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert_eq!(cfg.proxy.url_rewrites.len(), 1);
+        assert_eq!(cfg.proxy.url_rewrites[0].name.as_deref(), Some("compat"));
+
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+  prefix: "/aisix"
+proxy:
+  addr: "0.0.0.0:3000"
+  url_rewrites: '[{"match": broken'
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+"#,
+        );
+        let err = Config::load_from_path(Some(f.path())).unwrap_err();
+        assert!(
+            format!("{err}").contains("url_rewrites"),
+            "error should name the field: {err}"
+        );
+    }
+
+    #[test]
+    fn url_rewrites_rejects_silent_template_mistakes() {
+        let case = |rule_yaml: &str, expect: &str| {
+            let f = write_yaml(&format!(
+                r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+  prefix: "/aisix"
+proxy:
+  addr: "0.0.0.0:3000"
+  url_rewrites:
+{rule_yaml}
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+"#
+            ));
+            let err = Config::load_from_path(Some(f.path())).unwrap_err();
+            assert!(
+                format!("{err}").contains(expect),
+                "expected {expect:?} in: {err}"
+            );
+        };
+
+        // An unknown group reference expands to the empty string at runtime
+        // — every legacy request would silently land on the wrong endpoint.
+        case(
+            "    - match: \"^/mcp-servers/([^/]+)/mcp$\"\n      rewrite: \"/mcp/$2\"",
+            "unknown capture group",
+        );
+        case(
+            "    - match: \"^/gw/(?P<server>[^/]+)$\"\n      rewrite: \"/mcp/${srv}\"",
+            "unknown capture group",
+        );
+        // `?` would absorb the caller's query; `#` would truncate the path.
+        case(
+            "    - match: \"^/a$\"\n      rewrite: \"/v1/chat?model=x\"",
+            "must not contain",
+        );
+        case(
+            "    - match: \"^/a$\"\n      rewrite: \"/v1/models#frag\"",
+            "must not contain",
+        );
+        // A pattern matching the empty string fires on every request.
+        case(
+            "    - match: \"(x)?\"\n      rewrite: \"/y\"",
+            "empty string",
+        );
+
+        // The braced form with literal text after a group is the valid way
+        // to write what `$1x` cannot mean.
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+  prefix: "/aisix"
+proxy:
+  addr: "0.0.0.0:3000"
+  url_rewrites:
+    - match: "^/gw/(?P<server>[^/]+)/v(\\d+)$"
+      rewrite: "/mcp/${server}-v${2}"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+"#,
+        );
+        Config::load_from_path(Some(f.path())).expect("braced references are valid");
     }
 
     #[test]
@@ -2086,13 +2471,49 @@ managed:
         assert_eq!(cfg.managed.mtls_dir, "/var/lib/aisix/mtls");
         assert_eq!(cfg.managed.dp_id_file, "/var/lib/aisix/dp_id");
         // Default snapshot cache path keeps offline-resilience on by
-        // default; operators opt out by setting the field to "".
+        // default in managed mode; operators opt out by setting the
+        // field to "".
         assert_eq!(
-            cfg.managed.snapshot_cache_path,
-            "/var/lib/aisix/config_cache.json",
+            cfg.managed.effective_snapshot_cache_path(),
+            Some("/var/lib/aisix/config_cache.json"),
         );
         // CP URL comes from env at runtime — empty here is fine.
         assert!(cfg.managed.cp_base_url.is_none());
+    }
+
+    /// #871: the snapshot cache resolves per mode — managed defaults on,
+    /// self-hosted etcd defaults off, an explicit path enables either,
+    /// an explicit "" disables either.
+    #[test]
+    fn snapshot_cache_path_resolution_per_mode() {
+        let mut managed = ManagedConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            managed.effective_snapshot_cache_path(),
+            Some(ManagedConfig::DEFAULT_SNAPSHOT_CACHE_PATH),
+        );
+        managed.snapshot_cache_path = Some(String::new());
+        assert_eq!(managed.effective_snapshot_cache_path(), None);
+        managed.snapshot_cache_path = Some("/tmp/cache.json".into());
+        assert_eq!(
+            managed.effective_snapshot_cache_path(),
+            Some("/tmp/cache.json"),
+        );
+
+        let mut self_hosted = ManagedConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        assert_eq!(self_hosted.effective_snapshot_cache_path(), None);
+        self_hosted.snapshot_cache_path = Some("/tmp/cache.json".into());
+        assert_eq!(
+            self_hosted.effective_snapshot_cache_path(),
+            Some("/tmp/cache.json"),
+        );
+        self_hosted.snapshot_cache_path = Some(String::new());
+        assert_eq!(self_hosted.effective_snapshot_cache_path(), None);
     }
 
     #[test]

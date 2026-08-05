@@ -12,7 +12,7 @@
 
 use aisix_core::AppliedGuardrail;
 use aisix_gateway::BridgeError;
-use aisix_obs::{content_capture_cap, AccessLog, CapturedContent, RequestOutcome, UsageEvent};
+use aisix_obs::{content_capture_cap, AccessLog, CapturedContent, UsageEvent};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -37,6 +37,9 @@ struct ImageDispatchSuccess {
     /// Resolved ProviderKey UUID — feeds per-PK telemetry attribution
     /// (AISIX-Cloud#867 parity).
     provider_key_id: String,
+    /// Provider-side model name, for the `upstream_model` metric label
+    /// (AISIX-Cloud#1234 parity with chat / messages / responses).
+    upstream_model: String,
     /// The `{kind, hook}` set of guardrails that governed this request (#379
     /// parity) — surfaced on the emitted UsageEvent.
     applied_guardrails: Vec<AppliedGuardrail>,
@@ -70,17 +73,23 @@ pub async fn image_generations(
     // envelope — see completions.rs.
     body: Result<Json<Value>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
+    let started = Instant::now();
     let Json(body) = match body {
         Ok(json) => json,
+        // Answer through `reject` — see completions.rs.
         Err(rej) => {
-            return crate::error::proxy_error_from_json_rejection(
-                rej,
-                state.request_body_limit_bytes,
-            )
-            .into_response();
+            return crate::reject::reject_before_dispatch(
+                &state,
+                "POST",
+                "/v1/images/generations",
+                &client.request_id,
+                Some(&auth.entry.id),
+                started,
+                crate::reject::Envelope::OpenAi,
+                crate::error::proxy_error_from_json_rejection(rej, state.request_body_limit_bytes),
+            );
         }
     };
-    let started = Instant::now();
     let request_id = client.request_id.clone();
     let api_key_id = auth.entry.id.clone();
     let model_name = body
@@ -92,20 +101,33 @@ pub async fn image_generations(
     match dispatch(&state, &auth, body, &request_id, &client).await {
         Ok(success) => {
             let elapsed = started.elapsed();
+            // The actual response status, not a hardcoded 200: the 501
+            // NotImplemented branch also returns `Ok(success)`, and calling
+            // it a 200 both mislabels the access log and books it as
+            // `outcome="success"` on the request metrics. Same fix #426 made
+            // for completions / responses / rerank.
+            let status = success.response.status().as_u16();
             emit_access_log(
                 &model_name,
                 &success.provider,
                 &api_key_id,
-                200,
+                status,
                 elapsed,
                 &request_id,
                 None,
             );
-            state.metrics.record_request(
-                &success.provider,
-                &model_name,
-                200,
-                RequestOutcome::Success,
+            crate::request_metrics::record(
+                &state,
+                "/v1/images/generations",
+                crate::request_metrics::Caller::new(&auth),
+                crate::request_metrics::Upstream {
+                    provider: &success.provider,
+                    model: &model_name,
+                    upstream_model: &success.upstream_model,
+                    provider_key_id: &success.provider_key_id,
+                    ..Default::default()
+                },
+                status,
                 elapsed,
             );
             // Issue #407: emit UsageEvent so cp-api's budget ledger +
@@ -126,6 +148,8 @@ pub async fn image_generations(
                     &model_name,
                     &api_key_id,
                     &success.provider_key_id,
+                    &success.provider,
+                    &success.upstream_model,
                     &success.applied_guardrails,
                     200,
                     elapsed,
@@ -153,11 +177,15 @@ pub async fn image_generations(
             );
             let snap = state.snapshot.load();
             let metric_model = crate::usage_attr::metric_model_label(&snap, &model_name);
-            state.metrics.record_request(
-                "unknown",
-                metric_model,
+            crate::request_metrics::record(
+                &state,
+                "/v1/images/generations",
+                crate::request_metrics::Caller::new(&auth),
+                crate::request_metrics::Upstream {
+                    model: metric_model,
+                    ..Default::default()
+                },
                 status,
-                RequestOutcome::from_status(status),
                 elapsed,
             );
             // Per #655 parity: surface the failed request in Logs with a
@@ -364,6 +392,7 @@ async fn dispatch(
                 provider: provider_label,
                 model_id: model_entry.id.to_string(),
                 provider_key_id: pk_entry.id.to_string(),
+                upstream_model: model.upstream_model().unwrap_or("unknown").to_string(),
                 applied_guardrails: applied_guardrails.clone(),
                 usage,
                 upstream_called: true,
@@ -381,6 +410,7 @@ async fn dispatch(
                 provider: provider_label,
                 model_id: model_entry.id.to_string(),
                 provider_key_id: pk_entry.id.to_string(),
+                upstream_model: model.upstream_model().unwrap_or("unknown").to_string(),
                 applied_guardrails: applied_guardrails.clone(),
                 usage: None,
                 // No upstream call happened → handler skips emit.
@@ -433,6 +463,11 @@ fn emit_usage_event(
     requested_model: &str,
     api_key_id: &str,
     provider_key_id: &str,
+    // Metric labels the UsageEvent has no field for (AISIX-Cloud#1234
+    // follow-up): the wire struct is the CP contract, so they ride
+    // alongside rather than in it.
+    provider: &str,
+    upstream_model: &str,
     applied_guardrails: &[AppliedGuardrail],
     status_code: u16,
     elapsed: Duration,
@@ -476,8 +511,27 @@ fn emit_usage_event(
     state
         .otlp_fan_out
         .fan_out(&event, content, exporters.iter().map(|e| &e.value));
+    let owned_caller = crate::request_metrics::Caller::from_api_key_id(&snap, api_key_id);
+    crate::request_metrics::record_usage(
+        state,
+        "/v1/images/generations",
+        owned_caller.as_caller(),
+        crate::request_metrics::Upstream {
+            provider,
+            model: requested_model,
+            upstream_model,
+            provider_key_id,
+            ..Default::default()
+        },
+        crate::request_metrics::Tokens {
+            input: prompt_tokens,
+            output: completion_tokens,
+            total: prompt_tokens.saturating_add(completion_tokens),
+            spend_usd: 0.0,
+            client_type: state.client_classifier.classify(&client.user_agent),
+        },
+    );
 }
-
 fn emit_access_log(
     model: &str,
     provider: &str,
@@ -535,6 +589,7 @@ mod tests {
             addr: "127.0.0.1:0".into(),
             request_body_limit_bytes: 1_048_576,
             real_ip: Default::default(),
+            url_rewrites: Vec::new(),
             tls: None,
         }
     }

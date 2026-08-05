@@ -37,8 +37,7 @@
 
 use aisix_core::AppliedGuardrail;
 use aisix_obs::{
-    content_capture_cap, AccessLog, CapturedContent, LatencyLabels, LlmUsage, RequestLabels,
-    RequestOutcome, UsageEvent, UsageLabels,
+    content_capture_cap, AccessLog, CapturedContent, LatencyLabels, UsageEvent, UsageLabels,
 };
 use axum::extract::State;
 use axum::http::{HeaderName, HeaderValue};
@@ -84,22 +83,28 @@ pub async fn messages(
         Ok(a) => a,
         Err(e) => return e.into_anthropic_response(),
     };
+    let started = Instant::now();
     let Json(mut body) = match body {
         Ok(j) => j,
         Err(rej) => {
             // Classify the body-extractor failure (malformed JSON vs
             // 413 cap vs transport read error) via the shared helper so
             // /v1/messages and /v1/messages/count_tokens stay in lockstep
-            // on the discrimination rules, then render the Anthropic-
-            // shape envelope the Claude SDK can parse (#336).
-            return crate::error::proxy_error_from_json_rejection(
-                rej,
-                state.request_body_limit_bytes,
-            )
-            .into_anthropic_response();
+            // on the discrimination rules, then answer through `reject`,
+            // which renders the Anthropic-shape envelope the Claude SDK
+            // can parse (#336) and emits the access log + metrics.
+            return crate::reject::reject_before_dispatch(
+                &state,
+                "POST",
+                "/v1/messages",
+                &client.request_id,
+                Some(&auth.entry.id),
+                started,
+                crate::reject::Envelope::Anthropic,
+                crate::error::proxy_error_from_json_rejection(rej, state.request_body_limit_bytes),
+            );
         }
     };
-    let started = Instant::now();
     let request_id = client.request_id.clone();
     let api_key_id = auth.entry.id.clone();
 
@@ -173,37 +178,21 @@ pub async fn messages(
                 &routing,
                 None,
             );
-            state.metrics.record_request(
-                &provider_label,
-                &model_name,
+            crate::request_metrics::record(
+                &state,
+                "/v1/messages",
+                crate::request_metrics::Caller::new(&auth),
+                crate::request_metrics::Upstream {
+                    provider: &provider_label,
+                    model: &model_name,
+                    upstream_model: &upstream_model,
+                    provider_key_id: &provider_key_id,
+                    stream: stream_requested,
+                    is_fallback: routing.fallback_count() > 0,
+                },
                 status,
-                RequestOutcome::from_status(status),
                 elapsed,
             );
-            let outcome = RequestOutcome::from_status(status);
-            // #890 req-3: readable provider-key name resolved from the snapshot.
-            let provider_key_name = {
-                let snap = state.snapshot.load();
-                crate::usage_attr::provider_key_metric_name(&snap, &provider_key_id)
-            };
-            let labels = RequestLabels {
-                endpoint: "/v1/messages",
-                inbound_protocol: "anthropic",
-                provider: &provider_label,
-                model: &model_name,
-                upstream_model: &upstream_model,
-                provider_key_id: &provider_key_id,
-                provider_key_name: &provider_key_name,
-                api_key_id: &api_key_id,
-                team_id: auth.key().team_id.as_deref().unwrap_or("unknown"),
-                user_id: auth.key().user_id.as_deref().unwrap_or("unknown"),
-                user_name: auth.key().user_name.as_deref().unwrap_or("unknown"),
-                stream: stream_requested,
-                is_fallback: routing.fallback_count() > 0,
-                status,
-                outcome,
-            };
-            state.metrics.record_proxy_and_llm_request(labels, elapsed);
             // SLO e2e histogram (AISIX-Cloud#1011): non-streaming only —
             // a stream records its full duration at completion instead.
             if !stream_requested {
@@ -302,36 +291,22 @@ pub async fn messages(
             );
             let snap = state.snapshot.load();
             let metric_model = crate::usage_attr::metric_model_label(&snap, &model_name);
-            state.metrics.record_request(
-                "unknown",
-                metric_model,
-                status,
-                RequestOutcome::from_status(status),
-                elapsed,
-            );
             // #890 req-2: count the FAILED request on the rich request metrics
             // so a success rate is computable (denominator incl. failures).
             // Provider/upstream/provider_key are unknown on the failure path.
-            let fail_labels = RequestLabels {
-                endpoint: "/v1/messages",
-                inbound_protocol: "anthropic",
-                provider: "unknown",
-                model: metric_model,
-                upstream_model: "unknown",
-                provider_key_id: "unknown",
-                provider_key_name: "unknown",
-                api_key_id: &api_key_id,
-                team_id: auth.key().team_id.as_deref().unwrap_or("unknown"),
-                user_id: auth.key().user_id.as_deref().unwrap_or("unknown"),
-                user_name: auth.key().user_name.as_deref().unwrap_or("unknown"),
-                stream: stream_requested,
-                is_fallback: routing.fallback_count() > 0,
+            crate::request_metrics::record(
+                &state,
+                "/v1/messages",
+                crate::request_metrics::Caller::new(&auth),
+                crate::request_metrics::Upstream {
+                    model: metric_model,
+                    stream: stream_requested,
+                    is_fallback: routing.fallback_count() > 0,
+                    ..Default::default()
+                },
                 status,
-                outcome: RequestOutcome::from_status(status),
-            };
-            state
-                .metrics
-                .record_proxy_and_llm_request(fail_labels, elapsed);
+                elapsed,
+            );
             state.metrics.record_request_e2e_latency(
                 LatencyLabels {
                     endpoint: "/v1/messages",
@@ -671,6 +646,14 @@ async fn dispatch(
     // Routing target names only matter on the telemetry for a real Model
     // Group; a direct model leaves `attempt_model` empty (its `model_id`
     // already identifies it), matching chat.rs.
+    // NOTE: deliberately narrower than chat's `routing.is_some() ||
+    // is_semantic()`. The quota gate defers model-property policies on any
+    // routing/ensemble/semantic PARENT (`ModelRateLimit::routing_parent`),
+    // expecting the per-target pass to reserve them — which only runs when
+    // this flag is true. Safe today because semantic/ensemble parents
+    // cannot successfully dispatch on this endpoint (no provider →
+    // pre-dispatch 4xx); if this endpoint ever grows semantic support,
+    // widen this flag or the deferred policies are silently skipped.
     let is_routing_request = model_entry.value.routing.is_some();
     let mut routing = RoutingTelemetry::default();
 
@@ -731,6 +714,7 @@ async fn dispatch(
             // reset mid-loop).
             let mut member_reservation = match crate::quota::reserve_routing_target(
                 state,
+                auth,
                 is_routing_request,
                 &target.model.display_name,
                 &target.id,
@@ -1361,7 +1345,15 @@ async fn anthropic_passthrough_dispatch(
                     team_id_c.as_deref(),
                     user_id_c.as_deref(),
                     user_name_c.as_deref(),
-                    200,
+                    // A stream the consumer abandoned mid-flight is reported
+                    // as 499, matching LiteLLM. The upstream work still
+                    // happened, so the event is emitted either way — only
+                    // its outcome differs.
+                    if usage.reached_end {
+                        200
+                    } else {
+                        crate::CLIENT_CLOSED_REQUEST
+                    },
                     // Attempt-scoped, unlike the e2e histogram above: any
                     // failed attempt before this one emitted its own event.
                     attempt_started.elapsed(),
@@ -1998,7 +1990,13 @@ async fn cross_provider_dispatch(
                     team_id_for_telem.as_deref(),
                     user_id_for_telem.as_deref(),
                     user_name_for_telem.as_deref(),
-                    200,
+                    // See the sibling passthrough path: an abandoned stream
+                    // is reported as 499, matching LiteLLM.
+                    if comp.reached_end {
+                        200
+                    } else {
+                        crate::CLIENT_CLOSED_REQUEST
+                    },
                     // Attempt-scoped — see the sibling passthrough path.
                     attempt_started_for_telem.elapsed(),
                     metrics,
@@ -2249,9 +2247,7 @@ fn build_anthropic_sse_stream(
         while let Some(item) = upstream.next().await {
             match item {
                 Ok(chunk) => {
-                    if !first_chunk_seen
-                        && (chunk.delta.content.is_some() || chunk.delta.tool_calls.is_some())
-                    {
+                    if !first_chunk_seen && chunk.delta.carries_generated_output() {
                         first_chunk_seen = true;
                         guard.comp().upstream_ttft_ms =
                             attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
@@ -2353,6 +2349,10 @@ fn build_anthropic_sse_stream(
                 }
             }
         }
+        // Upstream stream over — the response was received in full. Record
+        // it before the scan below, which awaits a remote provider and is a
+        // routine drop point for clients that close on the terminal event.
+        guard.comp().reached_end = true;
         // End-of-stream output guardrail (#448): scan the accumulated
         // assistant text and, on a block, emit a terminal Anthropic
         // `error` event instead of completing the stream cleanly.
@@ -2511,6 +2511,11 @@ fn finish_reason_label(reason: &aisix_gateway::FinishReason) -> String {
 
 #[derive(Default)]
 struct AnthropicStreamCompletion {
+    /// `true` once the upstream stream reached its end, i.e. the response
+    /// was received in full. Stays `false` when the consumer went away
+    /// first — the generator is dropped at a suspension point and the tail
+    /// never runs — which the telemetry closure reports as `499`.
+    reached_end: bool,
     prompt_tokens: u32,
     completion_tokens: u32,
     cache_creation_tokens: u32,
@@ -2774,37 +2779,31 @@ fn emit_anthropic_usage_event(
         metrics.cache_creation_tokens,
         metrics.cache_read_tokens,
     );
-    state.metrics.record_llm_usage(
-        UsageLabels {
-            endpoint: "/v1/messages",
-            inbound_protocol: "anthropic",
-            provider,
-            model,
-            upstream_model,
-            provider_key_id,
-            provider_key_name: &provider_key_name,
+    // Covers streaming and non-streaming — every /v1/messages usage event
+    // flows through here.
+    crate::request_metrics::record_usage(
+        state,
+        "/v1/messages",
+        crate::request_metrics::Caller {
             api_key_id,
             team_id: team_id.unwrap_or("unknown"),
             user_id: user_id.unwrap_or("unknown"),
             user_name: user_name.unwrap_or("unknown"),
         },
-        LlmUsage {
-            input_tokens: metrics.prompt_tokens,
-            output_tokens: metrics.completion_tokens,
-            total_tokens: total_tokens_all.min(u64::from(u32::MAX)) as u32,
-            spend_usd: 0.0,
+        crate::request_metrics::Upstream {
+            provider,
+            model,
+            upstream_model,
+            provider_key_id,
+            ..Default::default()
         },
-    );
-    // #890 req-4: token volume by inbound client type (covers streaming and
-    // non-streaming — every /v1/messages usage event flows through here).
-    // #1002: total_tokens_all folds in the Anthropic cache counters.
-    // AISIX-Cloud#1044: same requested logical model as the UsageLabels above.
-    state.metrics.record_llm_tokens_by_client(
-        state.client_classifier.classify(&client.user_agent),
-        model,
-        u64::from(metrics.prompt_tokens),
-        u64::from(metrics.completion_tokens),
-        total_tokens_all,
+        crate::request_metrics::Tokens {
+            input: metrics.prompt_tokens,
+            output: metrics.completion_tokens,
+            total: total_tokens_all.min(u64::from(u32::MAX)) as u32,
+            spend_usd: 0.0,
+            client_type: state.client_classifier.classify(&client.user_agent),
+        },
     );
     if metrics.upstream_ttft_ms > 0 {
         state.metrics.record_request_ttft(
@@ -2862,6 +2861,11 @@ pub(crate) const MAX_SSE_FRAME_BUF_BYTES: usize = 1 << 20; // 1 MiB
 /// corresponding frame.
 #[derive(Default)]
 struct AnthropicStreamUsage {
+    /// `true` once the upstream stream reached its end, i.e. the response
+    /// was forwarded in full. Stays `false` when the consumer went away
+    /// first — the generator is dropped at a suspension point and the tail
+    /// never runs — which the telemetry closure reports as `499`.
+    reached_end: bool,
     prompt_tokens: u32,
     completion_tokens: u32,
     cache_creation_tokens: u32,
@@ -3327,6 +3331,10 @@ where
                 return;
             }
         }
+        // Upstream stream over — the response was forwarded in full. Record
+        // it before the scan below, which awaits a remote provider and is a
+        // routine drop point for clients that close on the terminal event.
+        guard.usage().reached_end = true;
         // End-of-stream output guardrail (#448): scan the accumulated
         // assistant text. On a block, emit a terminal Anthropic `error`
         // event. On the hold-back path (BufferFull) nothing has been
@@ -3542,6 +3550,7 @@ mod tests {
             addr: "127.0.0.1:0".into(),
             request_body_limit_bytes: 1_048_576,
             real_ip: Default::default(),
+            url_rewrites: Vec::new(),
             tls: None,
         }
     }

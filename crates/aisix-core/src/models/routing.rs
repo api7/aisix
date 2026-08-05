@@ -70,7 +70,6 @@ impl RoutingStrategy {
 
 /// One destination in a routing configuration. `model` references a direct model alias.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct RoutingTarget {
     /// Model alias for a direct model that can receive routed traffic.
     #[schemars(length(min = 1))]
@@ -153,7 +152,6 @@ pub enum WhenAllUnavailablePolicy {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
 pub struct Routing {
     /// Strategy used to select a target for each request.
     #[serde(default)]
@@ -186,6 +184,90 @@ pub struct Routing {
     /// default). Ignored by non-`weighted` strategies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sticky: Option<bool>,
+    /// What to do when a streaming response fails AFTER its first chunk was
+    /// already delivered to the client (the HTTP 200 is committed and cannot
+    /// be revised). Omitted keeps the historical behavior: terminate the
+    /// stream with an in-band error frame and no `[DONE]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_failure: Option<StreamFailure>,
+}
+
+/// Mid-stream failure policy for streaming responses. Applies only to
+/// failures that occur after the response head (and possibly some
+/// chunks) reached the client; failures before the first chunk keep
+/// using the regular retry/failover loop.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct StreamFailure {
+    /// `terminate` (default) keeps the current behavior. `continue` lets
+    /// the router call the remaining fallback targets and resume the SAME
+    /// client stream with a best-effort continuation of the partial text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<StreamFailureMode>,
+    /// Which mid-stream error classes trigger the fallback. Omitted =
+    /// all of them. Non-retryable errors (an in-band 4xx other than 429,
+    /// unless listed in `fallback_on_statuses`) never trigger regardless.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on: Option<Vec<StreamFailureTrigger>>,
+    /// Max fallback targets tried for one mid-stream failure. Defaults
+    /// to 1 — mid-stream recovery burns client-visible latency per
+    /// attempt, so the default is deliberately tighter than the
+    /// pre-stream `max_fallbacks`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_fallbacks: Option<u32>,
+}
+
+impl StreamFailure {
+    pub fn mode_or_default(&self) -> StreamFailureMode {
+        self.mode.unwrap_or_default()
+    }
+
+    pub fn max_fallbacks_or_default(&self) -> u32 {
+        self.max_fallbacks.unwrap_or(1)
+    }
+
+    /// Configured trigger classes; all classes when unset. `continue`
+    /// is itself the explicit opt-in, so the default set is the full
+    /// one rather than a conservative subset.
+    pub fn on_or_default(&self) -> &[StreamFailureTrigger] {
+        const ALL: &[StreamFailureTrigger] = &[
+            StreamFailureTrigger::TransportError,
+            StreamFailureTrigger::ReadTimeout,
+            StreamFailureTrigger::UpstreamDecodeError,
+            StreamFailureTrigger::UpstreamInBandError,
+        ];
+        self.on.as_deref().unwrap_or(ALL)
+    }
+}
+
+/// How a mid-stream failure is handled once the response is already
+/// streaming to the client.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamFailureMode {
+    /// Terminate the stream: in-band error frame, no `[DONE]` (the
+    /// historical behavior).
+    #[default]
+    Terminate,
+    /// Continue on a fallback target inside the same client stream.
+    Continue,
+}
+
+/// Mid-stream error classes eligible for [`StreamFailureMode::Continue`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamFailureTrigger {
+    /// The upstream connection broke mid-stream (reset, premature close).
+    TransportError,
+    /// The gap between chunks exceeded the effective `stream_timeout`.
+    ReadTimeout,
+    /// A frame failed to parse as a chunk (and was not a recognizable
+    /// in-band error envelope).
+    UpstreamDecodeError,
+    /// The provider reported an error inside the committed 200 stream
+    /// (an SSE error frame / event-stream modeled exception).
+    UpstreamInBandError,
 }
 
 impl Routing {
@@ -273,6 +355,7 @@ mod tests {
             fallback_on_statuses: None,
             when_all_unavailable: None,
             sticky: None,
+            stream_failure: None,
         };
         assert_eq!(r.max_fallbacks_or_default(), 0);
     }
@@ -288,6 +371,7 @@ mod tests {
             fallback_on_statuses: None,
             when_all_unavailable: None,
             sticky: None,
+            stream_failure: None,
         };
         assert_eq!(r.max_fallbacks_or_default(), 0);
     }
@@ -382,16 +466,22 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_routing_fields() {
-        let r: Result<Routing, _> =
-            serde_json::from_str(r#"{"strategy":"failover","targets":[{"model":"a"}],"foo":1}"#);
-        assert!(r.is_err());
+    fn tolerates_unknown_routing_fields_for_forward_compat() {
+        // A newer control plane may ship fields ahead of this DP; serde must
+        // accept them. The write path still rejects them via the strict schema
+        // validator of the enclosing resource (validate_model in models/schema.rs).
+        let r: Routing =
+            serde_json::from_str(r#"{"strategy":"failover","targets":[{"model":"a"}],"foo":1}"#)
+                .unwrap();
+        assert_eq!(r.strategy, RoutingStrategy::Failover);
     }
 
     #[test]
-    fn rejects_unknown_target_fields() {
-        let r: Result<RoutingTarget, _> =
-            serde_json::from_str(r#"{"model":"a","weight":2,"extra":true}"#);
-        assert!(r.is_err());
+    fn tolerates_unknown_target_fields_for_forward_compat() {
+        // Same forward-compat contract as above, for the nested target struct.
+        let t: RoutingTarget =
+            serde_json::from_str(r#"{"model":"a","weight":2,"extra":true}"#).unwrap();
+        assert_eq!(t.model, "a");
+        assert_eq!(t.weight, Some(2));
     }
 }

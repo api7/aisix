@@ -426,9 +426,21 @@ pub fn load_from_str(
                 }
             }
             "rate_limit_policies" => {
-                if let Some(t) = finish(&scope, &entry.doc, validate_rate_limit_policy, &mut errors)
-                {
-                    rate_limit_policies.push((id, scope, t));
+                if let Some(t) = finish::<RateLimitPolicy>(
+                    &scope,
+                    &entry.doc,
+                    validate_rate_limit_policy,
+                    &mut errors,
+                ) {
+                    // Semantic caps the schema can't express (condition-tree
+                    // depth/leaf counts, operator×dimension admission, regex
+                    // compilability) — a failing entry is a load error like
+                    // any schema failure.
+                    if let Err(message) = t.validate_semantics() {
+                        errors.push(LoadError { scope, message });
+                    } else {
+                        rate_limit_policies.push((id, scope, t));
+                    }
                 }
             }
             "oidc_providers" => {

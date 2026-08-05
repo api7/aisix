@@ -29,8 +29,8 @@ pub mod wildcard;
 
 pub use config::{
     AdminConfig, CacheBackend, CacheConfig, ClientTypeRule, Config, EtcdConfig, EtcdTlsConfig,
-    ManagedConfig, ObservabilityConfig, ProxyConfig, RateLimitBackend, RateLimitConfig,
-    RealIpConfig, RedisConnConfig, RedisMode, TlsConfig,
+    HistogramBucketsConfig, ManagedConfig, ObservabilityConfig, ProxyConfig, RateLimitBackend,
+    RateLimitConfig, RealIpConfig, RedisConnConfig, RedisMode, TlsConfig, UrlRewriteRule,
 };
 pub use config_status::{
     hash_bytes, hash_entries, AppliedSnapshot, ConfigMetricsView, ConfigState, ConfigStatus,
@@ -49,8 +49,9 @@ pub use models::{
     GuardrailMonitorHit, KeywordConfig, KeywordPattern, McpAuthType, McpRateLimit, McpServer,
     McpServerType, McpTransport, Model, ObservabilityExporter, ParamConstraints, PolicyScope,
     PolicyWindow, ProviderKey, RateLimit, RateLimitPolicy, RequestOverrides, ResponseOverrides,
-    Routing, RoutingStrategy, RoutingTarget, SchemaError, StreamDoneMarker, TelemetryKind,
-    TelemetryTags, WhenAllUnavailablePolicy, DEFAULT_COOLDOWN_TRIGGER_STATUSES,
+    Routing, RoutingStrategy, RoutingTarget, SchemaError, StreamDoneMarker, StreamFailure,
+    StreamFailureMode, StreamFailureTrigger, TelemetryKind, TelemetryTags,
+    WhenAllUnavailablePolicy, DEFAULT_COOLDOWN_TRIGGER_STATUSES,
 };
 pub use resource::{Resource, ResourceEntry};
 pub use snapshot::{ResourceTable, SnapshotHandle};

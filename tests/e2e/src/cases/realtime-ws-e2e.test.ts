@@ -182,6 +182,19 @@ describe("realtime e2e: /v1/realtime WebSocket relay (#721)", () => {
     ws.close();
   });
 
+  test("a plain http GET answers the envelope, not a bare rejection", async (ctx) => {
+    if (!etcdReachable || !app) {
+      ctx.skip();
+      return;
+    }
+    // No upgrade headers: pre-#885 this got axum's bare 400 with no
+    // telemetry. It must now wear the endpoint's error envelope.
+    const res = await fetch(`${app.proxyUrl}/v1/realtime`);
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error?: { type?: string } };
+    expect(body.error?.type).toBe("websocket_upgrade_required");
+  });
+
   test("bad credentials reject the upgrade handshake", async (ctx) => {
     if (!etcdReachable || !app) {
       ctx.skip();

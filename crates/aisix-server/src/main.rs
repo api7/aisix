@@ -576,17 +576,15 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
                     etcd_prefix.clone(),
                 ))
             };
-            // Snapshot cache: in managed mode persist to disk (default
-            // /var/lib/aisix/config_cache.json) so the DP can serve traffic
+            // Snapshot cache: persist to disk so the DP can serve traffic
             // from the last-known config across CP outages and restarts.
-            // Disabled outside managed mode and when the operator clears the
-            // path explicitly.
-            let snapshot_cache =
-                if cfg.managed.is_managed() && !cfg.managed.snapshot_cache_path.is_empty() {
-                    SnapshotCache::new(&cfg.managed.snapshot_cache_path)
-                } else {
-                    SnapshotCache::disabled()
-                };
+            // Managed mode defaults to /var/lib/aisix/config_cache.json;
+            // self-hosted etcd mode enables it only when the operator sets
+            // a path explicitly; "" disables it in either mode.
+            let snapshot_cache = match cfg.managed.effective_snapshot_cache_path() {
+                Some(path) => SnapshotCache::new(path),
+                None => SnapshotCache::disabled(),
+            };
             let supervisor = Arc::new(Supervisor::with_cache(
                 provider,
                 etcd_prefix,
@@ -684,7 +682,16 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     // env_id is resolved by now (managed provisioning / sidecar restore
     // above); it becomes the constant `env_id` label on the SLO latency
     // histograms. Standalone DPs leave it empty → "unknown".
-    let metrics = Arc::new(Metrics::new_with_env_id(&cfg.etcd.env_id));
+    // AISIX-Cloud#1226: operator bucket overrides. Validation errors are
+    // boot-fatal — a silently ignored override would leave the deployment
+    // reading quantiles off bucket edges it did not choose.
+    let histogram_buckets =
+        aisix_obs::HistogramBuckets::from_config(&cfg.observability.metrics.buckets)
+            .map_err(|e| anyhow::anyhow!(e))?;
+    let metrics = Arc::new(Metrics::new_with_buckets(
+        &cfg.etcd.env_id,
+        &histogram_buckets,
+    ));
     let metrics_upkeep_task = {
         let metrics = metrics.clone();
         tokio::spawn(run_metrics_upkeep(
@@ -795,6 +802,10 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
         let config_status_for_heartbeat = supervisor.config_status();
         h = h.with_config_hash_fetcher(Arc::new(move || {
             config_status_for_heartbeat.applied_config_hash()
+        }));
+        let supervisor_for_partial = Arc::clone(supervisor);
+        h = h.with_partial_compat_fetcher(Arc::new(move || {
+            supervisor_for_partial.recent_partial_compat()
         }));
         let fan_out = proxy_state.otlp_fan_out.clone();
         h = h.with_exporter_health_fetcher(Arc::new(move || fan_out.exporter_stats()));

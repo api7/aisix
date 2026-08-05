@@ -31,7 +31,7 @@ use std::sync::Arc;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
-use aisix_etcd::loader::RejectedEntry;
+use aisix_etcd::loader::{PartialCompatEntry, RejectedEntry};
 use aisix_obs::SinkStatsSnapshot;
 use anyhow::{anyhow, Context};
 use serde::Serialize;
@@ -94,6 +94,14 @@ pub type ExporterHealthFetcher = Arc<dyn Fn() -> HashMap<String, SinkStatsSnapsh
 /// is honoured.
 pub type ConfigHashFetcher = Arc<dyn Fn() -> Option<String> + Send + Sync>;
 
+/// Per-tick source of the supervisor's partially-compatible aggregate:
+/// resources served with unknown fields ignored, per (kind, field) with
+/// row counts (#871, `Supervisor::recent_partial_compat`). Reported as
+/// `partially_compatible_resources` so cp-api can tell an operator
+/// "these DPs load your documents but do not enforce field X" — the
+/// signal that a fleet is mid-rollout behind a newer control plane.
+pub type PartialCompatFetcher = Arc<dyn Fn() -> Vec<PartialCompatEntry> + Send + Sync>;
+
 /// File paths to the on-disk mTLS bundle the heartbeat client presents
 /// to cp-api. Same three files written by cert-bundle provisioning and
 /// re-used on every subsequent boot when the bundle is already on disk.
@@ -150,6 +158,10 @@ pub struct HeartbeatConfig {
     /// `config_hash` from the body — cp-api tolerates its absence. See
     /// #774.
     pub config_hash_fetcher: Option<ConfigHashFetcher>,
+    /// Optional source of the supervisor's partially-compatible
+    /// aggregate. `None` (tests / no supervisor) omits the field, same
+    /// tolerance contract as the other optional fields. See #871.
+    pub partial_compat_fetcher: Option<PartialCompatFetcher>,
 }
 
 impl std::fmt::Debug for HeartbeatConfig {
@@ -176,6 +188,10 @@ impl std::fmt::Debug for HeartbeatConfig {
             .field(
                 "config_hash_fetcher",
                 &self.config_hash_fetcher.as_ref().map(|_| "<fn>"),
+            )
+            .field(
+                "partial_compat_fetcher",
+                &self.partial_compat_fetcher.as_ref().map(|_| "<fn>"),
             )
             .finish()
     }
@@ -204,6 +220,7 @@ impl HeartbeatConfig {
             applied_revision_fetcher: None,
             exporter_health_fetcher: None,
             config_hash_fetcher: None,
+            partial_compat_fetcher: None,
         }
     }
 
@@ -229,6 +246,12 @@ impl HeartbeatConfig {
     /// Wire the supervisor's applied config-hash source (#774).
     pub fn with_config_hash_fetcher(mut self, fetcher: ConfigHashFetcher) -> Self {
         self.config_hash_fetcher = Some(fetcher);
+        self
+    }
+
+    /// Wire the supervisor's partially-compatible aggregate source (#871).
+    pub fn with_partial_compat_fetcher(mut self, fetcher: PartialCompatFetcher) -> Self {
+        self.partial_compat_fetcher = Some(fetcher);
         self
     }
 }
@@ -329,6 +352,13 @@ struct HeartbeatBody<'a> {
     /// historical body shape. See issue #115.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     rejected_resources: Vec<RejectedResourceWire>,
+    /// Resources served with unknown fields ignored, aggregated per
+    /// (kind, field) with row counts (#871). Omitted when empty for the
+    /// same historical-shape tolerance as `rejected_resources`; cp-api's
+    /// heartbeat handler accepts unknown fields, so an older CP simply
+    /// ignores this until AISIX-Cloud#1227 surfaces it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    partially_compatible_resources: Vec<PartialCompatWire>,
 }
 
 /// Cap on the `last_error` excerpt forwarded per exporter. The pipeline
@@ -383,6 +413,14 @@ struct RejectedResourceWire {
     kind: &'static str,
     error: String,
     timestamp_unix_secs: u64,
+    /// Unix seconds since when this key has been serving its last known
+    /// good value instead of the rejected bytes (#871) — present on
+    /// every beat while stale serving lasts, so cp-api can derive the
+    /// staleness age each cycle. Omitted when nothing serves for the
+    /// key, preserving the historical body shape for older CPs (whose
+    /// heartbeat handler tolerates unknown fields either way).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stale_serving_since_unix_secs: Option<u64>,
 }
 
 impl From<&RejectedEntry> for RejectedResourceWire {
@@ -392,6 +430,30 @@ impl From<&RejectedEntry> for RejectedResourceWire {
             kind: r.kind.as_str(),
             error: r.error.clone(),
             timestamp_unix_secs: r.timestamp_unix_secs,
+            stale_serving_since_unix_secs: r.stale_serving_since_unix_secs,
+        }
+    }
+}
+
+/// On-the-wire shape of one partially-compatible aggregate entry (#871).
+/// Kept separate from `aisix_etcd::loader::PartialCompatEntry` so the
+/// loader's internal representation can evolve without a wire bump.
+/// `kind` is the plural resource kind; `field` a dotted document path
+/// with array indices normalized to `[]`; `count` the number of served
+/// rows of that kind carrying the field.
+#[derive(Debug, Serialize)]
+struct PartialCompatWire {
+    kind: String,
+    field: String,
+    count: usize,
+}
+
+impl From<PartialCompatEntry> for PartialCompatWire {
+    fn from(e: PartialCompatEntry) -> Self {
+        Self {
+            kind: e.kind,
+            field: e.field,
+            count: e.count,
         }
     }
 }
@@ -426,6 +488,12 @@ async fn send(client: &reqwest::Client, cfg: &HeartbeatConfig, uptime: i64) -> a
         .unwrap_or_default();
     // Deterministic order — the fetcher hands back a HashMap.
     exporter_health.sort_by(|a, b| a.name.cmp(&b.name));
+    // Already (kind, field)-sorted by the supervisor's aggregation.
+    let partially_compatible_resources: Vec<PartialCompatWire> = cfg
+        .partial_compat_fetcher
+        .as_ref()
+        .map(|fetcher| fetcher().into_iter().map(PartialCompatWire::from).collect())
+        .unwrap_or_default();
 
     let resp = client
         .post(&cfg.url)
@@ -442,6 +510,7 @@ async fn send(client: &reqwest::Client, cfg: &HeartbeatConfig, uptime: i64) -> a
             config_hash,
             exporter_health,
             rejected_resources: rejections,
+            partially_compatible_resources,
         })
         .send()
         .await
@@ -724,6 +793,96 @@ mod tests {
         assert!(
             body.get("rejected_resources").is_none(),
             "empty rejected_resources must stay off the wire",
+        );
+        // Same for the partially-compatible aggregate: unwired fetcher
+        // (or an empty aggregate) keeps the historical body shape.
+        assert!(
+            body.get("partially_compatible_resources").is_none(),
+            "empty partially_compatible_resources must stay off the wire",
+        );
+    }
+
+    /// #871: a rejection whose key still serves its last known good value
+    /// carries the stale-serving instant on every beat; one with nothing
+    /// serving omits the field (historical body shape).
+    #[tokio::test]
+    async fn send_includes_stale_serving_since_on_rejections() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/dp/heartbeat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true
+            })))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mtls = write_test_bundle(dir.path());
+        let cfg = cfg_with_bundle(format!("{}/dp/heartbeat", server.uri()), mtls)
+            .with_rejection_fetcher(Arc::new(|| {
+                vec![
+                    RejectedEntry {
+                        key: "/aisix/models/stale-served".into(),
+                        kind: aisix_etcd::loader::RejectionKind::SchemaFailed,
+                        error: "schema validation failed".into(),
+                        timestamp_unix_secs: 1_770_000_100,
+                        stale_serving_since_unix_secs: Some(1_770_000_000),
+                    },
+                    RejectedEntry {
+                        key: "/aisix/models/never-loaded".into(),
+                        kind: aisix_etcd::loader::RejectionKind::SchemaFailed,
+                        error: "schema validation failed".into(),
+                        timestamp_unix_secs: 1_770_000_100,
+                        stale_serving_since_unix_secs: None,
+                    },
+                ]
+            }));
+        send(&plain_client(), &cfg, 7).await.unwrap();
+
+        let received = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
+        let rejected = body["rejected_resources"].as_array().unwrap();
+        assert_eq!(rejected.len(), 2);
+        assert_eq!(
+            rejected[0]["stale_serving_since_unix_secs"],
+            1_770_000_000_i64,
+        );
+        assert!(
+            rejected[1].get("stale_serving_since_unix_secs").is_none(),
+            "a rejection with nothing serving must omit the stale field",
+        );
+    }
+
+    #[tokio::test]
+    async fn send_includes_partially_compatible_resources_when_wired() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/dp/heartbeat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true
+            })))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mtls = write_test_bundle(dir.path());
+        let cfg = cfg_with_bundle(format!("{}/dp/heartbeat", server.uri()), mtls)
+            .with_partial_compat_fetcher(Arc::new(|| {
+                vec![aisix_etcd::loader::PartialCompatEntry {
+                    kind: "api_keys".into(),
+                    field: "quota_profile".into(),
+                    count: 3,
+                }]
+            }));
+        send(&plain_client(), &cfg, 7).await.unwrap();
+
+        let received = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
+        assert_eq!(
+            body["partially_compatible_resources"],
+            serde_json::json!([
+                {"kind": "api_keys", "field": "quota_profile", "count": 3}
+            ]),
         );
     }
 

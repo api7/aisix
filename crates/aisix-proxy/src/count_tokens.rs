@@ -39,7 +39,7 @@
 //!   user-facing passthrough and hit the identical "route missing from
 //!   the list" bug.
 
-use aisix_obs::{AccessLog, RequestOutcome};
+use aisix_obs::AccessLog;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::State;
 use axum::http::{HeaderName, HeaderValue};
@@ -69,18 +69,24 @@ pub async fn count_tokens(
         Ok(a) => a,
         Err(e) => return e.into_anthropic_response(),
     };
+    let started = Instant::now();
     let Json(body) = match body {
         Ok(j) => j,
+        // Answer through `reject` — see messages.rs.
         Err(rej) => {
-            return crate::error::proxy_error_from_json_rejection(
-                rej,
-                state.request_body_limit_bytes,
-            )
-            .into_anthropic_response();
+            return crate::reject::reject_before_dispatch(
+                &state,
+                "POST",
+                "/v1/messages/count_tokens",
+                &client.request_id,
+                Some(&auth.entry.id),
+                started,
+                crate::reject::Envelope::Anthropic,
+                crate::error::proxy_error_from_json_rejection(rej, state.request_body_limit_bytes),
+            );
         }
     };
 
-    let started = Instant::now();
     let request_id = client.request_id.clone();
     let api_key_id = auth.entry.id.clone();
 
@@ -91,26 +97,33 @@ pub async fn count_tokens(
         .to_string();
 
     match dispatch(&state, &auth, &body, &request_id, &client).await {
-        Ok((resp, provider)) => {
+        Ok(success) => {
             let elapsed = started.elapsed();
-            let status = resp.status().as_u16();
+            let status = success.response.status().as_u16();
             emit_access_log(
                 &model_name,
-                &provider,
+                &success.provider,
                 &api_key_id,
                 status,
                 elapsed,
                 &request_id,
                 None,
             );
-            state.metrics.record_request(
-                &provider,
-                &model_name,
+            crate::request_metrics::record(
+                &state,
+                "/v1/messages/count_tokens",
+                crate::request_metrics::Caller::new(&auth),
+                crate::request_metrics::Upstream {
+                    provider: &success.provider,
+                    model: &model_name,
+                    upstream_model: &success.upstream_model,
+                    provider_key_id: &success.provider_key_id,
+                    ..Default::default()
+                },
                 status,
-                RequestOutcome::from_status(status),
                 elapsed,
             );
-            resp
+            success.response
         }
         Err(err) => {
             let status = err.status().as_u16();
@@ -126,11 +139,15 @@ pub async fn count_tokens(
             );
             let snap = state.snapshot.load();
             let metric_model = crate::usage_attr::metric_model_label(&snap, &model_name);
-            state.metrics.record_request(
-                "unknown",
-                metric_model,
+            crate::request_metrics::record(
+                &state,
+                "/v1/messages/count_tokens",
+                crate::request_metrics::Caller::new(&auth),
+                crate::request_metrics::Upstream {
+                    model: metric_model,
+                    ..Default::default()
+                },
                 status,
-                RequestOutcome::from_status(status),
                 elapsed,
             );
             // Anthropic-shape envelope (#336) — count_tokens callers are
@@ -140,13 +157,24 @@ pub async fn count_tokens(
     }
 }
 
+/// What the winning attempt resolved. `/v1/messages/count_tokens` emits no
+/// UsageEvent, so the only consumer is the request-metric label set — which
+/// still has to match what chat / messages / responses report
+/// (AISIX-Cloud#1234).
+struct CountTokensSuccess {
+    response: Response,
+    provider: String,
+    upstream_model: String,
+    provider_key_id: String,
+}
+
 async fn dispatch(
     state: &ProxyState,
     auth: &AuthenticatedKey,
     body: &Value,
     request_id: &str,
     client: &ClientContext,
-) -> Result<(Response, String), ProxyError> {
+) -> Result<CountTokensSuccess, ProxyError> {
     let snapshot = state.snapshot.load();
 
     let model_name = body
@@ -203,6 +231,14 @@ async fn dispatch(
         .map(|r| r.fallback_on_statuses_or_default())
         .unwrap_or(&[]);
 
+    // NOTE: deliberately narrower than chat's `routing.is_some() ||
+    // is_semantic()`. The quota gate defers model-property policies on any
+    // routing/ensemble/semantic PARENT (`ModelRateLimit::routing_parent`),
+    // expecting the per-target pass to reserve them — which only runs when
+    // this flag is true. Safe today because semantic/ensemble parents
+    // cannot successfully dispatch on this endpoint (no provider →
+    // pre-dispatch 4xx); if this endpoint ever grows semantic support,
+    // widen this flag or the deferred policies are silently skipped.
     let is_routing_request = model_entry.value.routing.is_some();
     let mut last_err: Option<ProxyError> = None;
     let mut any_anthropic = false;
@@ -221,6 +257,7 @@ async fn dispatch(
         // the drop at scope end releases the concurrency slot.
         let _member_reservation = match crate::quota::reserve_routing_target(
             state,
+            auth,
             is_routing_request,
             &target.model.display_name,
             &target.id,
@@ -277,7 +314,7 @@ async fn dispatch(
             )
             .await
             {
-                Ok(resp) => return Ok((resp, "anthropic".to_string())),
+                Ok(success) => return Ok(success),
                 Err(e) => {
                     let retryable = matches!(
                         &e,
@@ -329,7 +366,7 @@ async fn count_tokens_to_target(
     timeouts: crate::routing::TimeoutBudget,
     request_id: &str,
     client: &ClientContext,
-) -> Result<Response, ProxyError> {
+) -> Result<CountTokensSuccess, ProxyError> {
     let mut body = body.clone();
     let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
     let api_key = crate::dispatch::require_api_key(&pk_entry.value, model)?;
@@ -480,7 +517,13 @@ async fn count_tokens_to_target(
             .insert(HeaderName::from_static("x-aisix-request-id"), hv);
     }
 
-    Ok(resp)
+    Ok(CountTokensSuccess {
+        response: resp,
+        // The loop above only ever dispatches Anthropic targets.
+        provider: "anthropic".to_string(),
+        upstream_model,
+        provider_key_id: pk_entry.id.to_string(),
+    })
 }
 
 fn emit_access_log(
@@ -538,6 +581,7 @@ mod tests {
             addr: "127.0.0.1:0".into(),
             request_body_limit_bytes: 1_048_576,
             real_ip: Default::default(),
+            url_rewrites: Vec::new(),
             tls: None,
         }
     }

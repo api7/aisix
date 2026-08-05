@@ -13,9 +13,7 @@
 //! 400 with an explanatory message.
 
 use aisix_gateway::{ChatFormat, ChatMessage, ChatResponse, FinishReason, UsageStats};
-use aisix_obs::{
-    content_capture_cap, AccessLog, CapturedContent, LatencyLabels, RequestOutcome, UsageEvent,
-};
+use aisix_obs::{content_capture_cap, AccessLog, CapturedContent, LatencyLabels, UsageEvent};
 use axum::extract::State;
 use axum::http::{HeaderName, HeaderValue};
 use axum::response::{IntoResponse, Response};
@@ -58,6 +56,11 @@ struct ResponseDispatchSuccess {
     /// pk_label / …) on the emitted UsageEvent (AISIX-Cloud#867). Empty when
     /// the target carried no provider_key_id.
     provider_key_id: String,
+    /// The provider-side model name the winning attempt actually called,
+    /// for the `upstream_model` metric label (AISIX-Cloud#1234). Same value
+    /// chat + messages report, so a query can group all three endpoints by
+    /// the model the provider was billed for rather than the alias.
+    upstream_model: String,
     /// Per-attempt routing telemetry (#655): the failed attempts that
     /// preceded the winner plus the winning attempt itself.
     routing: RoutingTelemetry,
@@ -114,6 +117,15 @@ impl From<ProxyError> for ResponsesDispatchError {
 /// the ones below.
 #[derive(Default, Clone)]
 struct ResponseUsage {
+    /// `true` once the upstream stream reached EOF, i.e. the response was
+    /// delivered in full. Stays `false` when the consumer went away first,
+    /// which is what the telemetry closure turns into `499`.
+    ///
+    /// Set at upstream EOF rather than after the end-of-stream guardrail
+    /// scan: SDK clients routinely close right after the terminal frame and
+    /// drop this generator at that await, and such a request was delivered
+    /// in full — marking it later would report it as abandoned.
+    reached_end: bool,
     prompt_tokens: u32,
     completion_tokens: u32,
     /// True when any token counter was filled by the local estimator
@@ -154,17 +166,23 @@ pub async fn responses(
     // envelope — see completions.rs.
     body: Result<Json<Value>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
+    let started = Instant::now();
     let Json(mut body) = match body {
         Ok(json) => json,
+        // Answer through `reject` — see completions.rs.
         Err(rej) => {
-            return crate::error::proxy_error_from_json_rejection(
-                rej,
-                state.request_body_limit_bytes,
-            )
-            .into_response();
+            return crate::reject::reject_before_dispatch(
+                &state,
+                "POST",
+                "/v1/responses",
+                &client.request_id,
+                Some(&auth.entry.id),
+                started,
+                crate::reject::Envelope::OpenAi,
+                crate::error::proxy_error_from_json_rejection(rej, state.request_body_limit_bytes),
+            );
         }
     };
-    let started = Instant::now();
     let request_id = client.request_id.clone();
     let api_key_id = auth.entry.id.clone();
 
@@ -173,6 +191,13 @@ pub async fn responses(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+    // Read once here rather than off `body` at each terminal emit: dispatch
+    // never rewrites the field, and the failure paths must label the request
+    // with what the caller asked for.
+    let stream_requested = body
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     // Filled by `dispatch` with per-detector PII mask counts (#932); attached
     // to the terminal usage event on both the success and failure paths.
@@ -209,11 +234,19 @@ pub async fn responses(
                 &success.routing,
                 None,
             );
-            state.metrics.record_request(
-                &success.provider,
-                &model_name,
+            crate::request_metrics::record(
+                &state,
+                "/v1/responses",
+                crate::request_metrics::Caller::new(&auth),
+                crate::request_metrics::Upstream {
+                    provider: &success.provider,
+                    model: &model_name,
+                    upstream_model: &success.upstream_model,
+                    provider_key_id: &success.provider_key_id,
+                    stream: stream_requested,
+                    is_fallback: success.routing.fallback_count() > 0,
+                },
                 status,
-                RequestOutcome::from_status(status),
                 elapsed,
             );
             // Per #655: one zero-token UsageEvent per failed attempt that
@@ -252,10 +285,7 @@ pub async fn responses(
                         model: &model_name,
                         provider: &success.provider,
                         status,
-                        streaming: body
-                            .get("stream")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false),
+                        streaming: stream_requested,
                     },
                     elapsed,
                 );
@@ -283,6 +313,8 @@ pub async fn responses(
                         &model_name,
                         &api_key_id,
                         &success.provider_key_id,
+                        &success.provider,
+                        &success.upstream_model,
                         status,
                         winner_latency,
                         &usage,
@@ -312,11 +344,21 @@ pub async fn responses(
             );
             let snap = state.snapshot.load();
             let metric_model = crate::usage_attr::metric_model_label(&snap, &model_name);
-            state.metrics.record_request(
-                "unknown",
-                metric_model,
+            // The failed request counts on the detailed families too, so a
+            // success rate over /v1/responses has the failures in its
+            // denominator. Provider / upstream / provider-key never
+            // resolved on this path.
+            crate::request_metrics::record(
+                &state,
+                "/v1/responses",
+                crate::request_metrics::Caller::new(&auth),
+                crate::request_metrics::Upstream {
+                    model: metric_model,
+                    stream: stream_requested,
+                    is_fallback: routing.fallback_count() > 0,
+                    ..Default::default()
+                },
                 status,
-                RequestOutcome::from_status(status),
                 elapsed,
             );
             state.metrics.record_request_e2e_latency(
@@ -325,10 +367,7 @@ pub async fn responses(
                     model: metric_model,
                     provider: "unknown",
                     status,
-                    streaming: body
-                        .get("stream")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false),
+                    streaming: stream_requested,
                 },
                 elapsed,
             );
@@ -566,6 +605,14 @@ async fn dispatch(
         .as_ref()
         .map(|r| r.fallback_on_statuses_or_default())
         .unwrap_or(&[]);
+    // NOTE: deliberately narrower than chat's `routing.is_some() ||
+    // is_semantic()`. The quota gate defers model-property policies on any
+    // routing/ensemble/semantic PARENT (`ModelRateLimit::routing_parent`),
+    // expecting the per-target pass to reserve them — which only runs when
+    // this flag is true. Safe today because semantic/ensemble parents
+    // cannot successfully dispatch on this endpoint (no provider →
+    // pre-dispatch 4xx); if this endpoint ever grows semantic support,
+    // widen this flag or the deferred policies are silently skipped.
     let is_routing_request = model_entry.value.routing.is_some();
     let mut routing = RoutingTelemetry::default();
     // Walk the targets, failing over on a retryable failure. Streaming and
@@ -630,6 +677,7 @@ async fn dispatch(
             // reset mid-loop).
             let mut member_reservation = match crate::quota::reserve_routing_target(
                 state,
+                auth,
                 is_routing_request,
                 &target.model.display_name,
                 &target.id,
@@ -1287,6 +1335,7 @@ async fn responses_to_target(
                 usage,
                 model_id: model_id.to_string(),
                 provider_key_id: provider_key_id.clone(),
+                upstream_model: upstream_model.clone(),
                 routing: RoutingTelemetry::default(),
                 guardrail_blocked: false,
                 usage_handled_by_stream: false,
@@ -1358,6 +1407,7 @@ async fn responses_to_target(
         let api_key_id_c = api_key_id.to_string();
         let provider_key_id_c = provider_key_id.clone();
         let provider_c = provider_label.clone();
+        let upstream_model_c = upstream_model.clone();
         let client_c = client_ctx.clone();
         // #688: carry the reservation into the end-of-stream guard — keys drive
         // post-stream TPM/TPD accounting, the hold keeps the concurrency slot(s)
@@ -1469,7 +1519,17 @@ async fn responses_to_target(
                     &requested_model_c,
                     &api_key_id_c,
                     &provider_key_id_c,
-                    200,
+                    &provider_c,
+                    &upstream_model_c,
+                    // A stream the consumer abandoned mid-flight is reported
+                    // as 499, matching LiteLLM. The upstream work still
+                    // happened, so the event is emitted either way — only
+                    // its outcome differs.
+                    if usage.reached_end {
+                        200
+                    } else {
+                        crate::CLIENT_CLOSED_REQUEST
+                    },
                     // Attempt-scoped, unlike the e2e histogram above: any
                     // failed attempt before this one emitted its own event.
                     attempt_started.elapsed(),
@@ -1498,6 +1558,7 @@ async fn responses_to_target(
             usage: None,
             model_id: model_id.to_string(),
             provider_key_id,
+            upstream_model: upstream_model.clone(),
             routing: RoutingTelemetry::default(),
             guardrail_blocked: false,
             usage_handled_by_stream: true,
@@ -1599,6 +1660,7 @@ async fn responses_to_target(
                     usage,
                     model_id: model_id.to_string(),
                     provider_key_id: provider_key_id.clone(),
+                    upstream_model: upstream_model.clone(),
                     routing: RoutingTelemetry::default(),
                     guardrail_blocked: true,
                     usage_handled_by_stream: false,
@@ -1640,6 +1702,7 @@ async fn responses_to_target(
             usage,
             model_id: model_id.to_string(),
             provider_key_id,
+            upstream_model,
             routing: RoutingTelemetry::default(),
             guardrail_blocked: false,
             usage_handled_by_stream: false,
@@ -1831,6 +1894,7 @@ async fn responses_cross_provider_to_target(
         let api_key_id_c = api_key_id.to_string();
         let provider_key_id_c = provider_key_id.clone();
         let provider_c = provider_label.clone();
+        let upstream_model_c = model.upstream_model().unwrap_or("unknown").to_string();
         let client_c = client_ctx.clone();
         let attempt_c = attempt.clone();
         // #688: carry the reservation into the end-of-stream guard — keys drive
@@ -1887,6 +1951,7 @@ async fn responses_cross_provider_to_target(
                 // in-flight.
                 drop(in_flight);
                 let usage = ResponseUsage {
+                    reached_end: comp.reached_end,
                     prompt_tokens: comp.prompt_tokens,
                     completion_tokens: comp.completion_tokens,
                     reasoning_tokens: comp.reasoning_tokens,
@@ -1931,6 +1996,8 @@ async fn responses_cross_provider_to_target(
                     &requested_model_c,
                     &api_key_id_c,
                     &provider_key_id_c,
+                    &provider_c,
+                    &upstream_model_c,
                     status,
                     // Attempt-scoped — see the sibling verbatim path.
                     attempt_started.elapsed(),
@@ -1974,6 +2041,7 @@ async fn responses_cross_provider_to_target(
             usage: None,
             model_id: model_id.to_string(),
             provider_key_id,
+            upstream_model: model.upstream_model().unwrap_or("unknown").to_string(),
             routing: RoutingTelemetry::default(),
             guardrail_blocked: false,
             usage_handled_by_stream: true,
@@ -1998,6 +2066,9 @@ async fn responses_cross_provider_to_target(
 
     let usage = {
         let mut u = ResponseUsage {
+            // Non-streaming: the response was received in full or this code
+            // would not run.
+            reached_end: true,
             prompt_tokens: resp.usage.prompt_tokens,
             completion_tokens: resp.usage.completion_tokens,
             reasoning_tokens: resp.usage.reasoning_tokens,
@@ -2074,6 +2145,7 @@ async fn responses_cross_provider_to_target(
                 usage: Some(usage),
                 model_id: model_id.to_string(),
                 provider_key_id: provider_key_id.clone(),
+                upstream_model: model.upstream_model().unwrap_or("unknown").to_string(),
                 routing: RoutingTelemetry::default(),
                 guardrail_blocked: true,
                 usage_handled_by_stream: false,
@@ -2126,6 +2198,7 @@ async fn responses_cross_provider_to_target(
         usage: Some(usage),
         model_id: model_id.to_string(),
         provider_key_id,
+        upstream_model: model.upstream_model().unwrap_or("unknown").to_string(),
         routing: RoutingTelemetry::default(),
         guardrail_blocked: false,
         usage_handled_by_stream: false,
@@ -2169,6 +2242,9 @@ fn extract_response_usage(body: &Value) -> Option<ResponseUsage> {
         .and_then(|v| v.as_u64())
         .unwrap_or(0) as u32;
     Some(ResponseUsage {
+        // Parsed from a fully buffered response body, so by definition the
+        // response was delivered in full.
+        reached_end: true,
         prompt_tokens,
         completion_tokens,
         usage_estimated: false,
@@ -2235,6 +2311,14 @@ fn responses_sse_usage(bytes: &[u8]) -> Option<ResponseUsage> {
 /// Whether this SSE event carries generated output. Mirrors the set
 /// `SseTextCapture::observe` accumulates, so TTFT lands on the same frame
 /// the capture considers the first real token.
+/// Frames that carry generated output, and so may stop the TTFT clock.
+///
+/// The reasoning arms are the Responses-API counterpart of
+/// [`ChatDelta::carries_generated_output`](aisix_gateway::ChatDelta::carries_generated_output):
+/// a reasoning model streams its summary (or, for models that expose it,
+/// its raw reasoning text) well before the first `output_text` frame, so
+/// leaving them out reports the end of the thinking phase as the first
+/// token — AISIX-Cloud#1225.
 fn is_responses_content_delta(json: &Value) -> bool {
     matches!(
         json.get("type").and_then(Value::as_str),
@@ -2243,6 +2327,8 @@ fn is_responses_content_delta(json: &Value) -> bool {
                 | "response.function_call_arguments.delta"
                 | "response.mcp_call_arguments.delta"
                 | "response.custom_tool_call_input.delta"
+                | "response.reasoning_summary_text.delta"
+                | "response.reasoning_text.delta"
         )
     )
 }
@@ -2553,6 +2639,13 @@ where
             }
             yield item;
         }
+        // Upstream EOF — the response was delivered in full. Record that
+        // before the scan below, which awaits a remote provider and is a
+        // routine drop point for clients that close on the terminal frame.
+        {
+            let (usage_acc, _) = guard.parts();
+            usage_acc.get_or_insert_with(Default::default).reached_end = true;
+        }
         // Clean end-of-stream: run the monitor observation (needs async, so
         // it can't live in the Drop guard), then complete explicitly. The
         // scan awaits a remote guardrail provider, and SDK clients routinely
@@ -2754,6 +2847,11 @@ fn emit_usage_event(
     requested_model: &str,
     api_key_id: &str,
     provider_key_id: &str,
+    // Metric labels the UsageEvent has no field for (AISIX-Cloud#1234
+    // follow-up): the wire struct is the CP contract, so they ride
+    // alongside rather than in it.
+    provider: &str,
+    upstream_model: &str,
     status_code: u16,
     elapsed: Duration,
     usage: &ResponseUsage,
@@ -2824,17 +2922,31 @@ fn emit_usage_event(
     // intentionally stays chat/messages-scoped (cross-API audit #646-652).
     // #1002: cache-inclusive total via the shared helper — cache counters are
     // non-zero only on the #825 Anthropic bridge path.
-    state.metrics.record_llm_tokens_by_client(
-        state.client_classifier.classify(&client.user_agent),
-        requested_model,
-        u64::from(usage.prompt_tokens),
-        u64::from(usage.completion_tokens),
-        total_tokens_with_cache(
-            usage.prompt_tokens,
-            usage.completion_tokens,
-            usage.cache_creation_tokens,
-            usage.cache_read_tokens,
-        ),
+    let total_all = total_tokens_with_cache(
+        usage.prompt_tokens,
+        usage.completion_tokens,
+        usage.cache_creation_tokens,
+        usage.cache_read_tokens,
+    );
+    let owned_caller = crate::request_metrics::Caller::from_api_key_id(&snap, api_key_id);
+    crate::request_metrics::record_usage(
+        state,
+        "/v1/responses",
+        owned_caller.as_caller(),
+        crate::request_metrics::Upstream {
+            provider,
+            model: requested_model,
+            upstream_model,
+            provider_key_id,
+            ..Default::default()
+        },
+        crate::request_metrics::Tokens {
+            input: usage.prompt_tokens,
+            output: usage.completion_tokens,
+            total: total_all.min(u64::from(u32::MAX)) as u32,
+            spend_usd: 0.0,
+            client_type: state.client_classifier.classify(&client.user_agent),
+        },
     );
 }
 
@@ -3018,6 +3130,7 @@ mod tests {
             addr: "127.0.0.1:0".into(),
             request_body_limit_bytes: 1_048_576,
             real_ip: Default::default(),
+            url_rewrites: Vec::new(),
             tls: None,
         }
     }

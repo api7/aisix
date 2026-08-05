@@ -19,7 +19,6 @@ use super::rate_limit::{McpRateLimit, RateLimit};
 use crate::resource::Resource;
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
 pub struct ApiKey {
     /// SHA-256 hexadecimal hash of the plaintext bearer. The proxy hashes
     /// incoming bearer tokens before lookup.
@@ -395,11 +394,18 @@ mod tests {
     }
 
     #[test]
-    fn mcp_access_rejects_unknown_inner_fields() {
-        let r: Result<ApiKey, _> = serde_json::from_str(
+    fn mcp_access_tolerates_unknown_inner_fields_for_forward_compat() {
+        // cp-api may ship new `mcp_access` fields ahead of the DP rolling
+        // out; serde must accept them (the write path still rejects them
+        // via `validate_apikey` in models/schema.rs).
+        let k: ApiKey = serde_json::from_str(
             r#"{"key_hash":"h","allowed_models":[],"mcp_access":{"mode":"inherit","widen":["*"]}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            k.mcp_access.unwrap().mode,
+            crate::models::McpAccessMode::Inherit
         );
-        assert!(r.is_err());
     }
 
     #[test]
@@ -490,10 +496,13 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_fields() {
-        let r: Result<ApiKey, _> =
-            serde_json::from_str(r#"{"key_hash":"x","allowed_models":[],"extra":1}"#);
-        assert!(r.is_err());
+    fn tolerates_unknown_fields_for_forward_compat() {
+        // cp-api may ship new fields ahead of the DP rolling out; serde
+        // must accept them (the write path still rejects them via
+        // `validate_apikey` in models/schema.rs).
+        let k: ApiKey =
+            serde_json::from_str(r#"{"key_hash":"x","allowed_models":[],"extra":1}"#).unwrap();
+        assert_eq!(k.key_hash, "x");
     }
 
     #[test]

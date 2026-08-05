@@ -20,7 +20,6 @@ use serde::{Deserialize, Serialize};
 use crate::resource::Resource;
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct A2aAgent {
     /// Operator-facing label, unique within the gateway. It is the path segment
     /// under which the agent is exposed to callers as `/a2a/<name>`, so it must
@@ -164,25 +163,26 @@ mod tests {
     }
 
     #[test]
-    fn rejects_oauth2_auth_type_and_oauth_fields() {
+    fn rejects_oauth2_auth_type_but_tolerates_removed_oauth_fields() {
         // `auth_type` accepts only `none` / `bearer` / `api_key` — the same
         // closed set as the control plane's a2a_agent resource.
         assert!(serde_json::from_str::<A2aAgent>(
             r#"{"display_name":"a","url":"https://x/a2a","auth_type":"oauth2","secret":"cs-1"}"#,
         )
         .is_err());
-        // The OAuth-specific fields were removed with the `oauth2` arm, so a
-        // document carrying one is rejected as an unknown field.
+        // The OAuth-specific fields were removed with the `oauth2` arm; serde
+        // now tolerates them as unknown fields for forward compatibility (the
+        // write path still rejects them via `validate_a2a_agent` in
+        // `models/schema.rs`).
         for field in [
             r#""client_id":"cid""#,
             r#""token_url":"https://auth/x/token""#,
             r#""scopes":["read","write"]"#,
         ] {
             let doc = format!(r#"{{"display_name":"a","url":"https://x/a2a",{field}}}"#);
-            assert!(
-                serde_json::from_str::<A2aAgent>(&doc).is_err(),
-                "field must be rejected as unknown: {doc}"
-            );
+            let a: A2aAgent = serde_json::from_str(&doc)
+                .unwrap_or_else(|e| panic!("field must be tolerated as unknown: {doc}: {e}"));
+            assert_eq!(a.name, "a");
         }
     }
 
@@ -213,10 +213,13 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_fields() {
-        let r: Result<A2aAgent, _> =
-            serde_json::from_str(r#"{"display_name":"x","url":"u","extra":1}"#);
-        assert!(r.is_err());
+    fn tolerates_unknown_fields_for_forward_compat() {
+        // A newer control plane may ship fields ahead of this DP; serde must
+        // accept them (the write path still rejects them via
+        // `validate_a2a_agent` in `models/schema.rs`).
+        let a: A2aAgent =
+            serde_json::from_str(r#"{"display_name":"x","url":"u","extra":1}"#).unwrap();
+        assert_eq!(a.name, "x");
     }
 
     // ---- `display_name` → `name` rename ----

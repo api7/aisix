@@ -26,6 +26,7 @@ pub mod mcp_server;
 pub mod model;
 pub mod observability_exporter;
 pub mod oidc_provider;
+pub mod policy_conditions;
 pub mod provider_key;
 pub mod rate_limit;
 pub mod rate_limit_policy;
@@ -57,18 +58,31 @@ pub use observability_exporter::{
     ObjectStoreProvider, ObservabilityExporter, OtlpHttpConfig, SlsContentMode,
 };
 pub use oidc_provider::{BoundClaimExpect, OidcProvider};
+pub use policy_conditions::{
+    eval_condition_nodes, validate_condition_nodes, ConditionGroup, ConditionInput, ConditionLogic,
+    ConditionNode, ConditionOperator, ConditionValue, GroupByDimension, PolicyAction,
+    PolicyCondition, PolicyDimension,
+};
 pub use provider_key::{
     ParamConstraints, ProviderKey, RequestOverrides, ResponseOverrides, StreamDoneMarker,
     TelemetryKind, TelemetryTags,
 };
 pub use rate_limit::{McpRateLimit, RateLimit};
 pub use rate_limit_policy::{PolicyScope, PolicyWindow, RateLimitPolicy};
-pub use routing::{Routing, RoutingStrategy, RoutingTarget, WhenAllUnavailablePolicy};
+pub use routing::{
+    Routing, RoutingStrategy, RoutingTarget, StreamFailure, StreamFailureMode,
+    StreamFailureTrigger, WhenAllUnavailablePolicy,
+};
 pub use schema::{
-    validate_a2a_agent, validate_apikey, validate_cache_policy, validate_guardrail,
-    validate_guardrail_attachment, validate_mcp_policy, validate_mcp_server, validate_model,
-    validate_observability_exporter, validate_oidc_provider, validate_provider_key,
-    validate_rate_limit_policy, SchemaError,
+    validate_a2a_agent, validate_a2a_agent_lenient, validate_apikey, validate_apikey_lenient,
+    validate_cache_policy, validate_cache_policy_lenient, validate_guardrail,
+    validate_guardrail_attachment, validate_guardrail_attachment_lenient,
+    validate_guardrail_lenient, validate_mcp_policy, validate_mcp_policy_lenient,
+    validate_mcp_server, validate_mcp_server_lenient, validate_model, validate_model_lenient,
+    validate_observability_exporter, validate_observability_exporter_lenient,
+    validate_oidc_provider, validate_oidc_provider_lenient, validate_provider_key,
+    validate_provider_key_lenient, validate_rate_limit_policy, validate_rate_limit_policy_lenient,
+    SchemaError,
 };
 pub use semantic::{
     Aggregation, DistanceMetric, EmbeddingFailureMode, OnEmbeddingFailure, Semantic, SemanticMatch,

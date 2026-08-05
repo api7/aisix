@@ -884,6 +884,11 @@ impl ResponsesSseEncoder {
 /// End-of-stream telemetry captured by [`build_responses_bridge_stream`].
 #[derive(Default, Debug)]
 pub struct ResponsesStreamCompletion {
+    /// `true` once the upstream stream reached EOF, i.e. the response was
+    /// received in full. Stays `false` when the consumer went away first —
+    /// the generator is then dropped at a suspension point and the tail
+    /// never runs — which the telemetry closure reports as `499`.
+    pub reached_end: bool,
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub reasoning_tokens: u32,
@@ -1032,9 +1037,7 @@ pub fn build_responses_bridge_stream(
         while let Some(item) = upstream.next().await {
             match item {
                 Ok(chunk) => {
-                    if !first_chunk_seen
-                        && (chunk.delta.content.is_some() || chunk.delta.tool_calls.is_some())
-                    {
+                    if !first_chunk_seen && chunk.delta.carries_generated_output() {
                         first_chunk_seen = true;
                         guard.comp().upstream_ttft_ms =
                             attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
@@ -1139,6 +1142,11 @@ pub fn build_responses_bridge_stream(
                 }
             }
         }
+
+        // Upstream EOF — the response was received in full. Record it before
+        // the guardrail work below, which awaits a remote provider and is a
+        // routine drop point for clients that close on the terminal frame.
+        guard.comp().reached_end = true;
 
         // No output-hook guardrail: nothing to scan.
         let Some(chain) = output_guardrail.as_ref() else { return; };

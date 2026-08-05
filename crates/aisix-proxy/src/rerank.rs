@@ -10,7 +10,7 @@
 //! The gateway appends `/v1/rerank`.
 
 use aisix_core::AppliedGuardrail;
-use aisix_obs::{content_capture_cap, AccessLog, CapturedContent, RequestOutcome, UsageEvent};
+use aisix_obs::{content_capture_cap, AccessLog, CapturedContent, UsageEvent};
 use axum::extract::State;
 use axum::http::HeaderValue;
 use axum::response::{IntoResponse, Response};
@@ -35,6 +35,9 @@ struct RerankDispatchSuccess {
     /// Resolved ProviderKey UUID — feeds per-PK telemetry attribution
     /// (AISIX-Cloud#867 parity).
     provider_key_id: String,
+    /// Provider-side model name, for the `upstream_model` metric label
+    /// (AISIX-Cloud#1234 parity with chat / messages / responses).
+    upstream_model: String,
     /// The `{kind, hook}` set of guardrails that governed this request (#379
     /// parity) — surfaced on the emitted UsageEvent.
     applied_guardrails: Vec<AppliedGuardrail>,
@@ -76,17 +79,23 @@ pub async fn rerank(
     // envelope — see completions.rs.
     body: Result<Json<Value>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
+    let started = Instant::now();
     let Json(mut body) = match body {
         Ok(json) => json,
+        // Answer through `reject` — see completions.rs.
         Err(rej) => {
-            return crate::error::proxy_error_from_json_rejection(
-                rej,
-                state.request_body_limit_bytes,
-            )
-            .into_response();
+            return crate::reject::reject_before_dispatch(
+                &state,
+                "POST",
+                "/v1/rerank",
+                &client.request_id,
+                Some(&auth.entry.id),
+                started,
+                crate::reject::Envelope::OpenAi,
+                crate::error::proxy_error_from_json_rejection(rej, state.request_body_limit_bytes),
+            );
         }
     };
-    let started = Instant::now();
     let request_id = client.request_id.clone();
     let api_key_id = auth.entry.id.clone();
 
@@ -109,11 +118,18 @@ pub async fn rerank(
                 &request_id,
                 None,
             );
-            state.metrics.record_request(
-                &success.provider,
-                &model_name,
+            crate::request_metrics::record(
+                &state,
+                "/v1/rerank",
+                crate::request_metrics::Caller::new(&auth),
+                crate::request_metrics::Upstream {
+                    provider: &success.provider,
+                    model: &model_name,
+                    upstream_model: &success.upstream_model,
+                    provider_key_id: &success.provider_key_id,
+                    ..Default::default()
+                },
                 status,
-                RequestOutcome::from_status(status),
                 elapsed,
             );
             // Issue #405: emit UsageEvent so cp-api's budget ledger
@@ -130,6 +146,8 @@ pub async fn rerank(
                     &model_name,
                     &api_key_id,
                     &success.provider_key_id,
+                    &success.provider,
+                    &success.upstream_model,
                     &success.applied_guardrails,
                     status,
                     elapsed,
@@ -156,11 +174,15 @@ pub async fn rerank(
             );
             let snap = state.snapshot.load();
             let metric_model = crate::usage_attr::metric_model_label(&snap, &model_name);
-            state.metrics.record_request(
-                "unknown",
-                metric_model,
+            crate::request_metrics::record(
+                &state,
+                "/v1/rerank",
+                crate::request_metrics::Caller::new(&auth),
+                crate::request_metrics::Upstream {
+                    model: metric_model,
+                    ..Default::default()
+                },
                 status,
-                RequestOutcome::from_status(status),
                 elapsed,
             );
             // Per #655 parity: surface the failed request in Logs with a
@@ -540,6 +562,7 @@ async fn dispatch(
         provider: provider_label,
         model_id: model_entry.id.to_string(),
         provider_key_id: pk_entry.id.to_string(),
+        upstream_model,
         applied_guardrails: applied_guardrails.clone(),
         usage,
         redactions,
@@ -600,6 +623,11 @@ fn emit_usage_event(
     requested_model: &str,
     api_key_id: &str,
     provider_key_id: &str,
+    // Metric labels the UsageEvent has no field for (AISIX-Cloud#1234
+    // follow-up): the wire struct is the CP contract, so they ride
+    // alongside rather than in it.
+    provider: &str,
+    upstream_model: &str,
     applied_guardrails: &[AppliedGuardrail],
     status_code: u16,
     elapsed: Duration,
@@ -643,8 +671,27 @@ fn emit_usage_event(
     state
         .otlp_fan_out
         .fan_out(&event, content, exporters.iter().map(|e| &e.value));
+    let owned_caller = crate::request_metrics::Caller::from_api_key_id(&snap, api_key_id);
+    crate::request_metrics::record_usage(
+        state,
+        "/v1/rerank",
+        owned_caller.as_caller(),
+        crate::request_metrics::Upstream {
+            provider,
+            model: requested_model,
+            upstream_model,
+            provider_key_id,
+            ..Default::default()
+        },
+        crate::request_metrics::Tokens {
+            input: usage.prompt_tokens,
+            output: 0,
+            total: usage.prompt_tokens,
+            spend_usd: 0.0,
+            client_type: state.client_classifier.classify(&client.user_agent),
+        },
+    );
 }
-
 /// Default upstream host for the rerank-supporting providers,
 /// keyed by the lowercase `Model.provider` string. Per #302 Phase A
 /// this is a string-keyed match: the `Provider` enum has been
@@ -729,6 +776,7 @@ mod tests {
             addr: "127.0.0.1:0".into(),
             request_body_limit_bytes: 1_048_576,
             real_ip: Default::default(),
+            url_rewrites: Vec::new(),
             tls: None,
         }
     }

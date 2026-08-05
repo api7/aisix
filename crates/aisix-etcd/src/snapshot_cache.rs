@@ -34,10 +34,13 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 
 use crate::provider::RawEntry;
+use crate::supervisor::StaleServing;
 
 /// File-format version. Bumped whenever the wire shape of [`CachedFile`]
 /// changes incompatibly so old DPs ignore future caches instead of
-/// crashing on a stale-format upgrade.
+/// crashing on a stale-format upgrade. The `stale` section added for
+/// #871 is additive (defaulted on read, ignored by older DPs), so it
+/// stays at 1.
 const FORMAT_VERSION: u32 = 1;
 
 /// Owned, sync-or-async-safe snapshot cache. Cheap to clone — internally
@@ -61,6 +64,12 @@ struct CachedFile {
     version: u32,
     revision: i64,
     entries: Vec<CachedEntry>,
+    /// Last-known-good values pinned for keys whose current bytes (in
+    /// `entries`) are rejected (#871). Restored before the boot resync so
+    /// stale-serving rows survive a restart. Defaulted so pre-#871 cache
+    /// files keep loading.
+    #[serde(default)]
+    stale: Vec<CachedStaleEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,6 +79,27 @@ struct CachedEntry {
     /// the cache must round-trip whatever the supervisor saw.
     value_b64: String,
     revision: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedStaleEntry {
+    key: String,
+    /// Base64 of the pinned last-known-good value bytes.
+    value_b64: String,
+    /// Revision the pinned value was accepted at.
+    revision: i64,
+    /// Unix seconds when stale serving began — persisted so the reported
+    /// staleness age stays continuous across restarts.
+    since_unix_secs: u64,
+}
+
+/// The parsed contents of a cache file: the raw entry set, the revision
+/// it reflects, and the pinned last-known-good values (#871).
+#[derive(Debug, Clone)]
+pub struct CachedSnapshot {
+    pub entries: Vec<RawEntry>,
+    pub revision: i64,
+    pub stale: Vec<StaleServing>,
 }
 
 impl SnapshotCache {
@@ -102,7 +132,7 @@ impl SnapshotCache {
     /// recognised [`FORMAT_VERSION`], and every entry's value decodes.
     /// Anything else is logged and treated as cache-miss so a corrupt
     /// file can never wedge the DP.
-    pub fn load(&self) -> Option<(Vec<RawEntry>, i64)> {
+    pub fn load(&self) -> Option<CachedSnapshot> {
         let path = self.inner.path.as_ref()?;
         let bytes = match std::fs::read(path) {
             Ok(b) => b,
@@ -138,20 +168,38 @@ impl SnapshotCache {
                 })
             })
             .collect();
-        match entries {
-            Ok(entries) => Some((entries, cached.revision)),
-            Err(e) => {
+        let stale: Result<Vec<_>, _> = cached
+            .stale
+            .into_iter()
+            .map(|s| {
+                B64.decode(&s.value_b64).map(|value| StaleServing {
+                    entry: RawEntry {
+                        key: s.key,
+                        value,
+                        revision: s.revision,
+                    },
+                    since_unix_secs: s.since_unix_secs,
+                })
+            })
+            .collect();
+        match (entries, stale) {
+            (Ok(entries), Ok(stale)) => Some(CachedSnapshot {
+                entries,
+                revision: cached.revision,
+                stale,
+            }),
+            (Err(e), _) | (_, Err(e)) => {
                 tracing::warn!(error = %e, "snapshot cache entry decode failed; ignoring");
                 None
             }
         }
     }
 
-    /// Write the given entries + revision atomically. Errors are
-    /// logged-and-swallowed because losing the cache is not worth
-    /// blowing up an otherwise-healthy DP — at worst the next restart
-    /// rebuilds from etcd.
-    pub async fn store(&self, entries: &[RawEntry], revision: i64) {
+    /// Write the given entries + revision + pinned last-known-good values
+    /// atomically. Errors are logged-and-swallowed because losing the
+    /// cache is not worth blowing up an otherwise-healthy DP — at worst
+    /// the next restart rebuilds from etcd.
+    pub async fn store(&self, entries: &[RawEntry], revision: i64, stale: &[StaleServing]) {
         let Some(path) = self.inner.path.clone() else {
             return;
         };
@@ -164,6 +212,15 @@ impl SnapshotCache {
                     key: e.key.clone(),
                     value_b64: B64.encode(&e.value),
                     revision: e.revision,
+                })
+                .collect(),
+            stale: stale
+                .iter()
+                .map(|s| CachedStaleEntry {
+                    key: s.entry.key.clone(),
+                    value_b64: B64.encode(&s.entry.value),
+                    revision: s.entry.revision,
+                    since_unix_secs: s.since_unix_secs,
                 })
                 .collect(),
         };
@@ -219,11 +276,47 @@ mod tests {
             entry("/aisix/models/m-1", br#"{"name":"m1"}"#, 7),
             entry("/aisix/api_keys/k-1", b"\xff\x00\x01raw", 8),
         ];
-        cache.store(&entries, 42).await;
+        cache.store(&entries, 42, &[]).await;
 
-        let (loaded, rev) = cache.load().expect("cache file exists");
-        assert_eq!(rev, 42);
-        assert_eq!(loaded, entries);
+        let cached = cache.load().expect("cache file exists");
+        assert_eq!(cached.revision, 42);
+        assert_eq!(cached.entries, entries);
+        assert!(cached.stale.is_empty());
+    }
+
+    #[tokio::test]
+    async fn round_trips_stale_entries() {
+        let dir = tempdir().unwrap();
+        let cache = SnapshotCache::new(dir.path().join("snap.json"));
+        let entries = vec![entry("/aisix/models/m-1", br#"{"bad":true}"#, 9)];
+        let stale = vec![StaleServing {
+            entry: entry("/aisix/models/m-1", br#"{"name":"last-good"}"#, 7),
+            since_unix_secs: 1_770_000_000,
+        }];
+        cache.store(&entries, 9, &stale).await;
+
+        let cached = cache.load().expect("cache file exists");
+        assert_eq!(cached.stale, stale);
+    }
+
+    /// A pre-#871 cache file (no `stale` section) must keep loading.
+    #[tokio::test]
+    async fn legacy_file_without_stale_section_loads() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("snap.json");
+        let legacy = serde_json::json!({
+            "version": 1,
+            "revision": 5,
+            "entries": [
+                {"key": "/aisix/models/m-1", "value_b64": B64.encode(br#"{"a":1}"#), "revision": 5}
+            ],
+        });
+        tokio::fs::write(&path, serde_json::to_vec(&legacy).unwrap())
+            .await
+            .unwrap();
+        let cached = SnapshotCache::new(&path).load().expect("legacy file loads");
+        assert_eq!(cached.entries.len(), 1);
+        assert!(cached.stale.is_empty());
     }
 
     #[tokio::test]
@@ -236,7 +329,7 @@ mod tests {
     #[tokio::test]
     async fn disabled_cache_is_a_noop() {
         let cache = SnapshotCache::disabled();
-        cache.store(&[entry("/a", b"x", 1)], 1).await;
+        cache.store(&[entry("/a", b"x", 1)], 1, &[]).await;
         assert!(cache.load().is_none());
     }
 
@@ -270,10 +363,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("snap.json");
         let cache = SnapshotCache::new(&path);
-        cache.store(&[entry("/a", b"v1", 1)], 1).await;
-        cache.store(&[entry("/a", b"v2", 2)], 2).await;
-        let (loaded, rev) = cache.load().unwrap();
-        assert_eq!(rev, 2);
-        assert_eq!(loaded[0].value, b"v2".to_vec());
+        cache.store(&[entry("/a", b"v1", 1)], 1, &[]).await;
+        cache.store(&[entry("/a", b"v2", 2)], 2, &[]).await;
+        let cached = cache.load().unwrap();
+        assert_eq!(cached.revision, 2);
+        assert_eq!(cached.entries[0].value, b"v2".to_vec());
     }
 }

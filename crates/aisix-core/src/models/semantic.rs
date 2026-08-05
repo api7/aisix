@@ -49,7 +49,6 @@ pub enum Aggregation {
 /// embeddings define the route. A request that scores high enough against
 /// them dispatches to `target`.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
-#[serde(deny_unknown_fields)]
 pub struct SemanticRoute {
     /// Operator-facing route label. Surfaced in the `x-aisix-route`
     /// response header and access logs (e.g. `prod-chat -> route:legal`).
@@ -78,7 +77,6 @@ pub struct SemanticRoute {
 
 /// Matching parameters shared across every route in a semantic router.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
-#[serde(deny_unknown_fields)]
 pub struct SemanticMatch {
     /// Similarity metric. v1: cosine.
     #[serde(default)]
@@ -131,7 +129,6 @@ impl Default for OnEmbeddingFailure {
 
 /// Semantic-routing config: pick a target by request meaning.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
-#[serde(deny_unknown_fields)]
 pub struct Semantic {
     /// Alias of an `embedding`-modality Model used to embed the request
     /// and (at apply time) the route examples.
@@ -288,18 +285,24 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_semantic_field() {
-        let r: Result<Semantic, _> = serde_json::from_str(
+    fn tolerates_unknown_semantic_field_for_forward_compat() {
+        // cp-api may ship new fields ahead of the DP rolling out; serde must
+        // accept them. The write path still rejects them via the strict
+        // schema validators (validate_* in models/schema.rs).
+        let s: Semantic = serde_json::from_str(
             r#"{"embedding_model":"e","routes":[{"name":"a","target":"m","examples":["x"]}],"default":"d","match":{"threshold":0.5},"foo":1}"#,
-        );
-        assert!(r.is_err());
+        )
+        .unwrap();
+        assert_eq!(s.embedding_model, "e");
     }
 
     #[test]
-    fn rejects_unknown_route_field() {
-        let r: Result<SemanticRoute, _> =
-            serde_json::from_str(r#"{"name":"a","target":"m","examples":["x"],"bogus":true}"#);
-        assert!(r.is_err());
+    fn tolerates_unknown_route_field_for_forward_compat() {
+        // Same forward-compat contract as above, at the route level.
+        let r: SemanticRoute =
+            serde_json::from_str(r#"{"name":"a","target":"m","examples":["x"],"bogus":true}"#)
+                .unwrap();
+        assert_eq!(r.target, "m");
     }
 
     #[test]

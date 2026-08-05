@@ -22,7 +22,8 @@
 //!   stop reason — other events just advance internal state.
 
 use aisix_gateway::{
-    ChatChunk, ChatDelta, ChatFormat, ChatMessage, ChatResponse, FinishReason, Role, UsageStats,
+    BridgeError, ChatChunk, ChatDelta, ChatFormat, ChatMessage, ChatResponse, FinishReason, Role,
+    UsageStats,
 };
 use serde::{Deserialize, Serialize};
 
@@ -972,10 +973,79 @@ pub enum AnthropicStreamEvent {
     },
     #[serde(rename = "message_stop")]
     MessageStop,
+    /// In-band error event — Anthropic reports mid-stream failures
+    /// (`overloaded_error`, `api_error`, …) as an `event: error` frame
+    /// inside the committed 200 stream instead of an HTTP status.
+    /// Without this variant the frame fell into [`Self::Other`] and was
+    /// silently swallowed: the connection then closed and the truncated
+    /// stream looked like a clean completion (AISIX-Cloud#1222).
+    #[serde(rename = "error")]
+    Error { error: AnthropicStreamErrorBody },
     /// Catch-all for content_block_start / content_block_stop / ping /
     /// unknown event types — we don't need their state for chunk emission.
     #[serde(other)]
     Other,
+}
+
+/// Body of an in-band `event: error` frame:
+/// `{"type":"error","error":{"type":"overloaded_error","message":"…"}}`.
+#[derive(Debug, Deserialize)]
+pub struct AnthropicStreamErrorBody {
+    #[serde(rename = "type")]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+/// The HTTP status Anthropic documents for each error type — in-band
+/// stream errors carry only the type token, and this is the same
+/// mapping the HTTP (non-2xx) surface uses for those errors.
+/// Reference: <https://docs.anthropic.com/en/api/errors>.
+/// Unknown / absent types return `None`; the proxy treats a
+/// status-less in-band error as a transient upstream fault.
+pub fn anthropic_error_kind_status(kind: Option<&str>) -> Option<u16> {
+    match kind? {
+        "invalid_request_error" => Some(400),
+        "authentication_error" => Some(401),
+        "permission_error" => Some(403),
+        "not_found_error" => Some(404),
+        "request_too_large" => Some(413),
+        "rate_limit_error" => Some(429),
+        "api_error" => Some(500),
+        "overloaded_error" => Some(529),
+        _ => None,
+    }
+}
+
+/// Convert an in-band `event: error` body into the typed
+/// [`BridgeError::UpstreamInBand`]. Shared by the Anthropic bridge and
+/// the Vertex Claude (`:streamRawPredict`) path — both speak the
+/// Anthropic Messages wire, so the Anthropic taxonomy applies to the
+/// envelope translation either way.
+pub fn stream_error_into_bridge_error(err: &AnthropicStreamErrorBody) -> BridgeError {
+    let cap = aisix_gateway::MAX_UPSTREAM_ERROR_MESSAGE_BYTES;
+    let status = anthropic_error_kind_status(err.kind.as_deref());
+    let kind = err
+        .kind
+        .as_deref()
+        .map(|k| aisix_gateway::truncate_lossy(k, cap));
+    let message = err
+        .message
+        .as_deref()
+        .map(|m| aisix_gateway::truncate_lossy(m, cap));
+    BridgeError::UpstreamInBand {
+        status,
+        message: message
+            .clone()
+            .unwrap_or_else(|| "upstream reported a stream error".to_string()),
+        parsed: Some(Box::new(aisix_gateway::UpstreamErrorView {
+            kind,
+            message,
+            code: None,
+            param: None,
+        })),
+        wire: aisix_gateway::UpstreamWire::Anthropic,
+    }
 }
 
 #[derive(Debug, Deserialize)]

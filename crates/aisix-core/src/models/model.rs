@@ -41,7 +41,6 @@ pub enum Adapter {
 
 /// Per-token cost for budget tracking. Both values are in USD per 1,000 tokens.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
-#[serde(deny_unknown_fields)]
 pub struct ModelCost {
     /// Prompt token cost in USD per 1,000 tokens.
     #[schemars(range(min = 0.0))]
@@ -61,7 +60,6 @@ impl ModelCost {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct BackgroundModelCheck {
     /// Whether background health checks are enabled for this model.
     pub enabled: bool,
@@ -88,7 +86,6 @@ pub struct BackgroundModelCheck {
 
 /// Request-path cooldown settings for a direct model after retryable upstream failures.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq, Default)]
-#[serde(deny_unknown_fields)]
 pub struct CooldownConfig {
     /// Whether cooldown is active for this model. Set to `false` to keep the model in rotation regardless of upstream failures.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -183,7 +180,6 @@ impl CacheTtl {
 /// prompt-cache discounts without changing their requests. Requests that
 /// already set their own cache-control markers are forwarded unchanged.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct AutoPromptCaching {
     /// Whether automatic prompt-cache injection is active for this model.
     pub enabled: bool,
@@ -200,7 +196,6 @@ impl AutoPromptCaching {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
 pub struct Model {
     /// Operator-facing unique label. Surfaces on `/v1/models`,
     /// `req.model` on chat completions, `ApiKey.allowed_models`, and
@@ -517,15 +512,19 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_top_level_fields() {
-        let r: Result<Model, _> = serde_json::from_str(
+    fn tolerates_unknown_top_level_fields_for_forward_compat() {
+        // cp-api may ship new fields ahead of the DP rolling out; serde must
+        // accept them. The write path still rejects them via `validate_model`
+        // in models/schema.rs.
+        let m: Model = serde_json::from_str(
             r#"{
               "display_name":"x","provider":"openai","model_name":"g",
               "provider_key_id":"pk-1",
               "foo": 1
             }"#,
-        );
-        assert!(r.is_err());
+        )
+        .unwrap();
+        assert_eq!(m.display_name, "x");
     }
 
     #[test]
