@@ -72,6 +72,19 @@ pub const M_PROXY_REQUEST_DURATION: &str = "aisix_proxy_request_duration_seconds
 /// arrives already collapsed to a bounded route template by the proxy
 /// layer, keeping this series low-cardinality by construction (#451).
 pub const M_PROXY_CLIENT_CANCELLED_TOTAL: &str = "aisix_proxy_client_cancelled_requests_total";
+/// Requests refused by the `request_body_limit_bytes` cap before any
+/// handler ran, split by how the gateway's drain of the refused body
+/// ended. `outcome != "completed"` means the gateway stopped reading
+/// while the caller was still sending, so that caller most likely saw a
+/// connection reset instead of the 413 it was owed.
+///
+/// This is the amplification-safe channel for the same event the
+/// `aisix::body_limit` log carries: a flood of oversize requests can
+/// suppress the log's rate-limited warnings, never this counter. Both
+/// label sets are bounded by construction — `endpoint` is a route
+/// template (#451) and `outcome` a fixed vocabulary.
+pub const M_PROXY_BODY_LIMIT_REJECTIONS_TOTAL: &str =
+    "aisix_proxy_request_body_limit_rejections_total";
 pub const M_DEPLOYMENT_REQUESTS_TOTAL: &str = "aisix_deployment_requests_total";
 pub const M_DEPLOYMENT_SUCCESS_TOTAL: &str = "aisix_deployment_success_responses_total";
 pub const M_DEPLOYMENT_FAILURE_TOTAL: &str = "aisix_deployment_failure_responses_total";
@@ -79,12 +92,6 @@ pub const M_DEPLOYMENT_STATE: &str = "aisix_deployment_state";
 pub const M_DEPLOYMENT_COOLED_DOWN_TOTAL: &str = "aisix_deployment_cooled_down_total";
 pub const M_ROUTING_SUCCESSFUL_FALLBACKS_TOTAL: &str = "aisix_routing_successful_fallbacks_total";
 pub const M_ROUTING_FAILED_FALLBACKS_TOTAL: &str = "aisix_routing_failed_fallbacks_total";
-/// Mid-stream fallback outcomes (`routing.stream_failure: continue`,
-/// AISIX-Cloud#1222). `outcome` is `recovered` (the client stream
-/// completed on a fallback target) or `failed` (every eligible fallback
-/// target also failed and the stream terminated). Labelled by the
-/// requested (routing) model.
-pub const M_MID_STREAM_FALLBACKS_TOTAL: &str = "aisix_mid_stream_fallbacks_total";
 pub const M_RATELIMIT_REMAINING_REQUESTS: &str = "aisix_ratelimit_remaining_requests";
 pub const M_RATELIMIT_REMAINING_TOKENS: &str = "aisix_ratelimit_remaining_tokens";
 pub const M_BUDGET_LIMIT_USD: &str = "aisix_budget_limit_usd";
@@ -858,6 +865,26 @@ impl Metrics {
         });
     }
 
+    /// Count a request refused by the request-body cap. `endpoint` must
+    /// already be a bounded route template and `outcome` one of the fixed
+    /// drain outcomes — see [`M_PROXY_BODY_LIMIT_REJECTIONS_TOTAL`].
+    pub fn record_body_limit_rejection(
+        &self,
+        endpoint: &str,
+        inbound_protocol: &str,
+        outcome: &str,
+    ) {
+        metrics::with_local_recorder(&self.inner.recorder, || {
+            metrics::counter!(
+                M_PROXY_BODY_LIMIT_REJECTIONS_TOTAL,
+                "endpoint" => endpoint.to_string(),
+                "inbound_protocol" => inbound_protocol.to_string(),
+                "outcome" => outcome.to_string(),
+            )
+            .increment(1);
+        });
+    }
+
     pub fn record_tokens(&self, provider: &str, model: &str, total_tokens: u64) {
         if total_tokens == 0 {
             return;
@@ -1213,20 +1240,6 @@ impl Metrics {
         };
         metrics::with_local_recorder(&self.inner.recorder, || {
             metrics::counter!(metric, "model" => model.to_string()).increment(1);
-        });
-    }
-
-    /// One mid-stream fallback episode resolved (AISIX-Cloud#1222):
-    /// `recovered` when the client stream completed on a fallback
-    /// target, `failed` when the fallback chain was exhausted.
-    pub fn record_mid_stream_fallback(&self, model: &str, recovered: bool) {
-        metrics::with_local_recorder(&self.inner.recorder, || {
-            metrics::counter!(
-                M_MID_STREAM_FALLBACKS_TOTAL,
-                "model" => model.to_string(),
-                "outcome" => if recovered { "recovered" } else { "failed" },
-            )
-            .increment(1);
         });
     }
 
