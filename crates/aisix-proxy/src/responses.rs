@@ -313,6 +313,8 @@ pub async fn responses(
                         &model_name,
                         &api_key_id,
                         &success.provider_key_id,
+                        &success.provider,
+                        &success.upstream_model,
                         status,
                         winner_latency,
                         &usage,
@@ -1405,6 +1407,7 @@ async fn responses_to_target(
         let api_key_id_c = api_key_id.to_string();
         let provider_key_id_c = provider_key_id.clone();
         let provider_c = provider_label.clone();
+        let upstream_model_c = upstream_model.clone();
         let client_c = client_ctx.clone();
         // #688: carry the reservation into the end-of-stream guard — keys drive
         // post-stream TPM/TPD accounting, the hold keeps the concurrency slot(s)
@@ -1516,6 +1519,8 @@ async fn responses_to_target(
                     &requested_model_c,
                     &api_key_id_c,
                     &provider_key_id_c,
+                    &provider_c,
+                    &upstream_model_c,
                     // A stream the consumer abandoned mid-flight is reported
                     // as 499, matching LiteLLM. The upstream work still
                     // happened, so the event is emitted either way — only
@@ -1889,6 +1894,7 @@ async fn responses_cross_provider_to_target(
         let api_key_id_c = api_key_id.to_string();
         let provider_key_id_c = provider_key_id.clone();
         let provider_c = provider_label.clone();
+        let upstream_model_c = model.upstream_model().unwrap_or("unknown").to_string();
         let client_c = client_ctx.clone();
         let attempt_c = attempt.clone();
         // #688: carry the reservation into the end-of-stream guard — keys drive
@@ -1990,6 +1996,8 @@ async fn responses_cross_provider_to_target(
                     &requested_model_c,
                     &api_key_id_c,
                     &provider_key_id_c,
+                    &provider_c,
+                    &upstream_model_c,
                     status,
                     // Attempt-scoped — see the sibling verbatim path.
                     attempt_started.elapsed(),
@@ -2839,6 +2847,11 @@ fn emit_usage_event(
     requested_model: &str,
     api_key_id: &str,
     provider_key_id: &str,
+    // Metric labels the UsageEvent has no field for (AISIX-Cloud#1234
+    // follow-up): the wire struct is the CP contract, so they ride
+    // alongside rather than in it.
+    provider: &str,
+    upstream_model: &str,
     status_code: u16,
     elapsed: Duration,
     usage: &ResponseUsage,
@@ -2909,17 +2922,31 @@ fn emit_usage_event(
     // intentionally stays chat/messages-scoped (cross-API audit #646-652).
     // #1002: cache-inclusive total via the shared helper — cache counters are
     // non-zero only on the #825 Anthropic bridge path.
-    state.metrics.record_llm_tokens_by_client(
-        state.client_classifier.classify(&client.user_agent),
-        requested_model,
-        u64::from(usage.prompt_tokens),
-        u64::from(usage.completion_tokens),
-        total_tokens_with_cache(
-            usage.prompt_tokens,
-            usage.completion_tokens,
-            usage.cache_creation_tokens,
-            usage.cache_read_tokens,
-        ),
+    let total_all = total_tokens_with_cache(
+        usage.prompt_tokens,
+        usage.completion_tokens,
+        usage.cache_creation_tokens,
+        usage.cache_read_tokens,
+    );
+    let owned_caller = crate::request_metrics::Caller::from_api_key_id(&snap, api_key_id);
+    crate::request_metrics::record_usage(
+        state,
+        "/v1/responses",
+        owned_caller.as_caller(),
+        crate::request_metrics::Upstream {
+            provider,
+            model: requested_model,
+            upstream_model,
+            provider_key_id,
+            ..Default::default()
+        },
+        crate::request_metrics::Tokens {
+            input: usage.prompt_tokens,
+            output: usage.completion_tokens,
+            total: total_all.min(u64::from(u32::MAX)) as u32,
+            spend_usd: 0.0,
+            client_type: state.client_classifier.classify(&client.user_agent),
+        },
     );
 }
 

@@ -37,8 +37,7 @@
 
 use aisix_core::AppliedGuardrail;
 use aisix_obs::{
-    content_capture_cap, AccessLog, CapturedContent, LatencyLabels, LlmUsage, UsageEvent,
-    UsageLabels,
+    content_capture_cap, AccessLog, CapturedContent, LatencyLabels, UsageEvent, UsageLabels,
 };
 use axum::extract::State;
 use axum::http::{HeaderName, HeaderValue};
@@ -2780,37 +2779,31 @@ fn emit_anthropic_usage_event(
         metrics.cache_creation_tokens,
         metrics.cache_read_tokens,
     );
-    state.metrics.record_llm_usage(
-        UsageLabels {
-            endpoint: "/v1/messages",
-            inbound_protocol: "anthropic",
-            provider,
-            model,
-            upstream_model,
-            provider_key_id,
-            provider_key_name: &provider_key_name,
+    // Covers streaming and non-streaming — every /v1/messages usage event
+    // flows through here.
+    crate::request_metrics::record_usage(
+        state,
+        "/v1/messages",
+        crate::request_metrics::Caller {
             api_key_id,
             team_id: team_id.unwrap_or("unknown"),
             user_id: user_id.unwrap_or("unknown"),
             user_name: user_name.unwrap_or("unknown"),
         },
-        LlmUsage {
-            input_tokens: metrics.prompt_tokens,
-            output_tokens: metrics.completion_tokens,
-            total_tokens: total_tokens_all.min(u64::from(u32::MAX)) as u32,
-            spend_usd: 0.0,
+        crate::request_metrics::Upstream {
+            provider,
+            model,
+            upstream_model,
+            provider_key_id,
+            ..Default::default()
         },
-    );
-    // #890 req-4: token volume by inbound client type (covers streaming and
-    // non-streaming — every /v1/messages usage event flows through here).
-    // #1002: total_tokens_all folds in the Anthropic cache counters.
-    // AISIX-Cloud#1044: same requested logical model as the UsageLabels above.
-    state.metrics.record_llm_tokens_by_client(
-        state.client_classifier.classify(&client.user_agent),
-        model,
-        u64::from(metrics.prompt_tokens),
-        u64::from(metrics.completion_tokens),
-        total_tokens_all,
+        crate::request_metrics::Tokens {
+            input: metrics.prompt_tokens,
+            output: metrics.completion_tokens,
+            total: total_tokens_all.min(u64::from(u32::MAX)) as u32,
+            spend_usd: 0.0,
+            client_type: state.client_classifier.classify(&client.user_agent),
+        },
     );
     if metrics.upstream_ttft_ms > 0 {
         state.metrics.record_request_ttft(

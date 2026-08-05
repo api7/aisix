@@ -21,7 +21,7 @@ use aisix_core::AppliedGuardrail;
 use aisix_gateway::{BridgeError, ChatFormat};
 use aisix_guardrails::GuardrailVerdict;
 use aisix_obs::{
-    content_capture_cap, AccessLog, CapturedContent, LatencyLabels, LlmUsage, Metrics, UsageEvent,
+    content_capture_cap, AccessLog, CapturedContent, LatencyLabels, Metrics, UsageEvent,
     UsageLabels,
 };
 use axum::extract::State;
@@ -142,19 +142,13 @@ pub async fn chat_completions(
         Ok(mut success) => {
             let status = 200;
             let elapsed = started.elapsed();
-            // #890 req-3/req-4: resolve the readable provider-key name from the
-            // snapshot and normalise the inbound client type once.
-            let provider_key_name = {
-                let snap = state.snapshot.load();
-                crate::usage_attr::provider_key_metric_name(&snap, &success.provider_key_id)
-            };
+            // #890 req-4: normalise the inbound client type once.
             let client_type = state.client_classifier.classify(&client.user_agent);
             record_success(
                 &state,
                 &auth,
                 &success.provider,
                 &model_name,
-                &provider_key_name,
                 client_type,
                 req.is_streaming(),
                 success.routing.fallback_count() > 0,
@@ -1881,39 +1875,33 @@ async fn dispatch(
                         _ => None,
                     },
                 );
-                metrics_for_stream.record_llm_usage(
-                    UsageLabels {
-                        endpoint: "/v1/chat/completions",
-                        inbound_protocol: "openai",
-                        provider: &provider_for_metrics,
-                        model: &model_for_metrics,
-                        upstream_model: &upstream_model_for_metrics,
-                        provider_key_id: &provider_key_id_for_metrics,
-                        provider_key_name: &provider_key_name_for_metrics,
+                // #1002: comp.total_tokens is the cache-inclusive total (an
+                // Anthropic upstream bridged to an OpenAI-shape client folds
+                // cache tokens into total_tokens per #679).
+                crate::request_metrics::record_usage(
+                    &state_for_telem,
+                    "/v1/chat/completions",
+                    crate::request_metrics::Caller {
                         api_key_id: &api_key_id_for_telem,
                         team_id: team_id_for_metrics.as_deref().unwrap_or("unknown"),
                         user_id: user_id_for_metrics.as_deref().unwrap_or("unknown"),
                         user_name: user_name_for_metrics.as_deref().unwrap_or("unknown"),
                     },
-                    LlmUsage {
-                        input_tokens: comp.prompt_tokens,
-                        output_tokens: comp.completion_tokens,
-                        total_tokens: comp.total_tokens.min(u64::from(u32::MAX)) as u32,
-                        spend_usd: 0.0,
+                    crate::request_metrics::Upstream {
+                        provider: &provider_for_metrics,
+                        model: &model_for_metrics,
+                        upstream_model: &upstream_model_for_metrics,
+                        provider_key_id: &provider_key_id_for_metrics,
+                        stream: true,
+                        is_fallback: mid_stream_fallbacks > 0,
                     },
-                );
-                // #890 req-4: streaming token volume by inbound client type.
-                // #1002: comp.total_tokens is the cache-inclusive total (an
-                // Anthropic upstream bridged to an OpenAI-shape client folds
-                // cache tokens into total_tokens per #679).
-                // AISIX-Cloud#1044: same requested logical model as the
-                // UsageLabels above.
-                metrics_for_stream.record_llm_tokens_by_client(
-                    &client_type_for_metrics,
-                    &model_for_metrics,
-                    u64::from(comp.prompt_tokens),
-                    u64::from(comp.completion_tokens),
-                    comp.total_tokens,
+                    crate::request_metrics::Tokens {
+                        input: comp.prompt_tokens,
+                        output: comp.completion_tokens,
+                        total: comp.total_tokens.min(u64::from(u32::MAX)) as u32,
+                        spend_usd: 0.0,
+                        client_type: &client_type_for_metrics,
+                    },
                 );
                 metrics_for_stream.record_request_e2e_latency(
                     LatencyLabels {
@@ -3692,8 +3680,8 @@ fn record_success(
     auth: &AuthenticatedKey,
     provider: &str,
     model: &str,
-    // #890 req-3 readable name + req-4 client type + req-1/req-2 dimensions.
-    provider_key_name: &str,
+    // #890 req-4 client type + req-1/req-2 dimensions. The readable
+    // provider-key name is resolved inside `request_metrics`.
     client_type: &str,
     stream: bool,
     is_fallback: bool,
@@ -3733,42 +3721,29 @@ fn record_success(
             elapsed,
         );
     }
-    if let Some(total) = s.total_tokens {
-        metrics.record_tokens(provider, model, total);
-    }
-    metrics.record_llm_usage(
-        UsageLabels {
-            endpoint: "/v1/chat/completions",
-            inbound_protocol: "openai",
+    // Non-streaming path only; streaming tokens arrive in the SSE
+    // on_complete and are recorded there. All-zero is a no-op, which is what
+    // the streaming branch reaching here produces.
+    // #1002: `s.total_tokens` is the cache-inclusive canonical total.
+    crate::request_metrics::record_usage(
+        state,
+        "/v1/chat/completions",
+        caller,
+        crate::request_metrics::Upstream {
             provider,
             model,
             upstream_model: &s.upstream_model,
             provider_key_id: &s.provider_key_id,
-            provider_key_name,
-            api_key_id: caller.api_key_id,
-            team_id: caller.team_id,
-            user_id: caller.user_id,
-            user_name: caller.user_name,
+            stream,
+            is_fallback,
         },
-        LlmUsage {
-            input_tokens: s.prompt_tokens.unwrap_or(0).min(u64::from(u32::MAX)) as u32,
-            output_tokens: s.completion_tokens.unwrap_or(0).min(u64::from(u32::MAX)) as u32,
-            total_tokens: s.total_tokens.unwrap_or(0).min(u64::from(u32::MAX)) as u32,
+        crate::request_metrics::Tokens {
+            input: s.prompt_tokens.unwrap_or(0).min(u64::from(u32::MAX)) as u32,
+            output: s.completion_tokens.unwrap_or(0).min(u64::from(u32::MAX)) as u32,
+            total: s.total_tokens.unwrap_or(0).min(u64::from(u32::MAX)) as u32,
             spend_usd: s.cost_usd,
+            client_type,
         },
-    );
-    // #890 req-4: token volume by inbound client type (non-streaming path;
-    // streaming tokens arrive in the SSE on_complete and are recorded there).
-    // No-op when all counts are zero (e.g. the streaming branch here).
-    // #1002: s.total_tokens is the cache-inclusive canonical total.
-    // AISIX-Cloud#1044: `model` is the same requested logical model recorded
-    // on the UsageLabels above.
-    metrics.record_llm_tokens_by_client(
-        client_type,
-        model,
-        s.prompt_tokens.unwrap_or(0),
-        s.completion_tokens.unwrap_or(0),
-        s.total_tokens.unwrap_or(0),
     );
 }
 

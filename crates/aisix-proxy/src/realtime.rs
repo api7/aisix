@@ -726,6 +726,29 @@ async fn run_session(
     state
         .otlp_fan_out
         .fan_out(&event, None, exporters.iter().map(|e| &e.value));
+    // A realtime session bills real tokens against a real model, and this is
+    // the only place that knows the session's totals. Its cost is resolved
+    // here too, unlike the other endpoints, so it is the one non-chat surface
+    // that also feeds `aisix_llm_spend_micro_usd_total`.
+    crate::request_metrics::record_usage(
+        &state,
+        "/v1/realtime",
+        crate::request_metrics::Caller::new(&auth),
+        crate::request_metrics::Upstream {
+            provider: &provider_label,
+            model: &model_entry.value.display_name,
+            upstream_model: model_entry.value.upstream_model().unwrap_or("unknown"),
+            provider_key_id: &pk_id,
+            ..Default::default()
+        },
+        crate::request_metrics::Tokens {
+            input: usage.input_tokens.min(u32::MAX as u64) as u32,
+            output: usage.output_tokens.min(u32::MAX as u64) as u32,
+            total: total_tokens.min(u32::MAX as u64) as u32,
+            spend_usd: event.cost_usd,
+            client_type: state.client_classifier.classify(&client.user_agent),
+        },
+    );
 }
 
 enum Dir {
