@@ -215,10 +215,10 @@ describe("deployment-wide upstream timeout default", () => {
         key_hash: CALLER_KEY_HASH,
         allowed_models: ["td-group"],
       });
-      // Routing models are not listed on /v1/models — gate on a probe call
-      // instead (the pattern timeout-fallback-e2e uses). A 504 means the
-      // virtual model and its member are both loaded; before that the
-      // gateway answers 404.
+      // The group showing up on /v1/models would only prove the group itself
+      // propagated — gate on a probe call instead (the pattern
+      // timeout-fallback-e2e uses). A 504 means the virtual model and its
+      // member are both loaded; before that the gateway answers 404.
       await waitConfigPropagation(async () => {
         const res = await callChat(grouped!, "td-group");
         if (res.status !== 504) {

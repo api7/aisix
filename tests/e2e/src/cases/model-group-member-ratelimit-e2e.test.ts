@@ -33,8 +33,8 @@ const CALLER_KEY_HASH = createHash("sha256")
 // returns 404 while a name is absent from the snapshot and 403 once it
 // propagated. The 403 fires at the ACL gate, before any rate-limit
 // reservation, so probing never consumes the member quotas under test
-// (and routing models never appear in /v1/models, so listing can't be
-// the probe).
+// (and this key is allowed nothing, so its /v1/models listing is always
+// empty and can't be the probe).
 const PROBE_PLAINTEXT = "sk-1087-probe";
 const PROBE_KEY_HASH = createHash("sha256")
   .update(PROBE_PLAINTEXT)
