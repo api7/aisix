@@ -94,7 +94,7 @@ pub enum BedrockAWSCredentials {
         #[schemars(length(min = 1))]
         access_key_id: String,
         /// Decrypted before projection. Plaintext is held in memory only
-        /// and is not logged. The data plane passes it to the
+        /// and is not logged. The gateway passes it to the
         /// AWS SDK's static credentials provider.
         #[schemars(length(min = 1))]
         secret_access_key: String,
@@ -127,7 +127,7 @@ pub enum BedrockLatencyMode {
 pub struct AzureContentSafetyConfig {
     /// Azure Cognitive Services resource endpoint, e.g.
     /// `https://my-resource.cognitiveservices.azure.com`.
-    /// The data plane appends `/contentsafety/text:shieldPrompt?api-version=2024-09-01`.
+    /// The gateway appends `/contentsafety/text:shieldPrompt?api-version=2024-09-01`.
     #[schemars(length(min = 1))]
     pub endpoint: String,
     /// Azure subscription key sent with the `Ocp-Apim-Subscription-Key` header. Decrypted before
@@ -161,7 +161,7 @@ fn default_acs_timeout_ms() -> u32 {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AzureContentSafetyTextModerationConfig {
-    /// Azure Cognitive Services resource endpoint. The data plane appends
+    /// Azure Cognitive Services resource endpoint. The gateway appends
     /// `/contentsafety/text:analyze?api-version=2024-09-01`.
     #[schemars(length(min = 1))]
     pub endpoint: String,
@@ -285,7 +285,7 @@ fn default_acs_on_buffer_exceeded() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AliyunTextModerationConfig {
-    /// Aliyun region the guardrail lives in, e.g. `cn-shanghai`. The data plane
+    /// Aliyun region the guardrail lives in, e.g. `cn-shanghai`. The gateway
     /// builds the endpoint `https://green-cip.<region>.aliyuncs.com`.
     #[schemars(length(min = 1))]
     pub region: String,
@@ -364,7 +364,7 @@ fn default_aliyun_risk_level_threshold() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AliyunAiGuardrailConfig {
-    /// Aliyun region the guardrail lives in, e.g. `cn-shanghai`. The data plane
+    /// Aliyun region the guardrail lives in, e.g. `cn-shanghai`. The gateway
     /// builds the endpoint `https://green-cip.<region>.aliyuncs.com`.
     #[schemars(length(min = 1))]
     pub region: String,
@@ -547,7 +547,7 @@ pub struct LakeraConfig {
     #[schemars(length(min = 1))]
     pub api_key: String,
     /// Endpoint override, e.g. a regional or self-hosted Lakera deployment.
-    /// The data plane appends `/v2/guard`. Defaults to `https://api.lakera.ai`.
+    /// The gateway appends `/v2/guard`. Defaults to `https://api.lakera.ai`.
     #[serde(default)]
     #[schemars(length(min = 1))]
     pub endpoint: Option<String>,
@@ -661,11 +661,11 @@ pub struct PresidioEntityConfig {
 #[serde(deny_unknown_fields)]
 pub struct PresidioConfig {
     /// Presidio analyzer base URL, e.g. `http://presidio-analyzer:3000`.
-    /// The data plane appends `/analyze`.
+    /// The gateway appends `/analyze`.
     #[schemars(length(min = 1))]
     pub analyzer_url: String,
     /// Presidio anonymizer base URL, e.g. `http://presidio-anonymizer:3000`.
-    /// The data plane appends `/anonymize`. Only called when a detected
+    /// The gateway appends `/anonymize`. Only called when a detected
     /// entity's effective action is `mask`.
     #[schemars(length(min = 1))]
     pub anonymizer_url: String,

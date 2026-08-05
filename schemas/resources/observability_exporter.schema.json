@@ -2,17 +2,17 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "definitions": {
     "ObjectStoreAuthMode": {
-      "description": "How the data plane obtains credentials for the object-storage bucket.",
+      "description": "How the gateway obtains credentials for the object-storage bucket.",
       "oneOf": [
         {
-          "description": "Resolve `credential_ref` to static keys from data plane environment variables named `OBJSTORE_CRED_<SLUG>_<FIELD>`.",
+          "description": "Resolve `credential_ref` to static keys from gateway environment variables named `OBJSTORE_CRED_<SLUG>_<FIELD>`.",
           "enum": [
             "credential_ref"
           ],
           "type": "string"
         },
         {
-          "description": "Use the data plane host's attached cloud identity. Supported for S3 and GCS only.",
+          "description": "Use the gateway host's attached cloud identity. Supported for S3 and GCS only.",
           "enum": [
             "cloud_identity"
           ],
@@ -156,7 +156,7 @@
           "description": "Controls whether logs include prompt and response content. `metadata_only` omits content. `full` includes content truncated by `content_max_bytes`."
         },
         "credential_ref": {
-          "description": "Credential reference resolved by the data plane at delivery time. The plaintext AccessKey is not stored in this resource.",
+          "description": "Credential reference resolved by the gateway at delivery time. The plaintext AccessKey is not stored in this resource.",
           "minLength": 1,
           "type": "string"
         },
@@ -242,7 +242,7 @@
             }
           ],
           "default": "credential_ref",
-          "description": "How the data plane authenticates to the bucket."
+          "description": "How the gateway authenticates to the bucket."
         },
         "bucket": {
           "description": "Bucket for S3 or GCS, or container for Azure Blob, that receives exported files.",
@@ -259,7 +259,7 @@
           "description": "Compression applied to each NDJSON file before upload."
         },
         "credential_ref": {
-          "description": "Credential reference resolved by the data plane at delivery time. Required when `auth_mode` is `credential_ref`.",
+          "description": "Credential reference resolved by the gateway at delivery time. Required when `auth_mode` is `credential_ref`.",
           "minLength": 1,
           "type": "string"
         },
@@ -334,7 +334,7 @@
           "description": "Controls whether logs include prompt and response content. `metadata_only` omits content. `full` includes content truncated by `content_max_bytes`."
         },
         "credential_ref": {
-          "description": "Credential reference resolved by the data plane at delivery time. The plaintext Datadog API key is not stored in this resource.",
+          "description": "Credential reference resolved by the gateway at delivery time. The plaintext Datadog API key is not stored in this resource.",
           "minLength": 1,
           "type": "string"
         },

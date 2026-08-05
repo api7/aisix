@@ -10,8 +10,12 @@
 #   Managed (connected to AISIX Cloud) — use the baked-in template + env vars:
 #       docker run \
 #         -e AISIX_CONFIG_PATH=/etc/aisix/config.managed.yaml \
-#         -e AISIX_MANAGED__REGISTRATION_TOKEN=$DEPLOYMENT_TOKEN \
-#         -e AISIX_MANAGED__CP_BASE_URL=https://api.us.aisix.cloud \
+#         -e AISIX_MANAGED__CP_BASE_URL \
+#         -e AISIX_MANAGED__CP_ETCD_ENDPOINT \
+#         -e AISIX_MANAGED__CP_CERT_PEM \
+#         -e AISIX_MANAGED__CP_KEY_PEM \
+#         -e AISIX_MANAGED__CP_CA_PEM \
+#         -v aisix-mtls:/var/lib/aisix \
 #         ghcr.io/api7/aisix:dev
 #
 # The Rust binary's `Config::load_from_path` already layers

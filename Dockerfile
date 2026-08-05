@@ -20,8 +20,11 @@
 # Run, managed (connected to AISIX Cloud with env-var overrides):
 #   docker run --rm \
 #     -e AISIX_CONFIG_PATH=/etc/aisix/config.managed.yaml \
-#     -e AISIX_MANAGED__REGISTRATION_TOKEN=$DEPLOYMENT_TOKEN \
-#     -e AISIX_MANAGED__CP_BASE_URL=https://api.us.aisix.cloud \
+#     -e AISIX_MANAGED__CP_BASE_URL \
+#     -e AISIX_MANAGED__CP_ETCD_ENDPOINT \
+#     -e AISIX_MANAGED__CP_CERT_PEM \
+#     -e AISIX_MANAGED__CP_KEY_PEM \
+#     -e AISIX_MANAGED__CP_CA_PEM \
 #     -v aisix-mtls:/var/lib/aisix \
 #     aisix:dev
 
@@ -99,8 +102,8 @@ RUN --mount=type=bind,from=builder,source=/usr/local/bin/aisix,target=/mnt/aisix
     && rm -rf /var/lib/apt/lists/*
 
 # Bake the managed-mode bootstrap config so AISIX Cloud gateways can
-# `docker run` without mounting anything — env vars carry the per-DP
-# secret bits (registration token + CP base URL).
+# `docker run` without mounting a configuration file. Environment variables
+# provide the control-plane endpoints and gateway mTLS certificate bundle.
 COPY config.managed.yaml /etc/aisix/config.managed.yaml
 
 # Entrypoint script picks the config file via AISIX_CONFIG_PATH so the

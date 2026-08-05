@@ -206,7 +206,7 @@ fn report_secrets(document: &document::ExportDocument, reveal_secrets: bool) {
 
     eprintln!(
         "\n{} secret value(s) were replaced with ${{VAR}} placeholders. Set each variable to the \
-         real credential in the data plane's environment before loading this file:",
+         real credential in the gateway's environment before loading this file:",
         lines.len()
     );
     for line in lines {

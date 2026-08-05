@@ -2227,6 +2227,69 @@ observability:
     }
 
     #[test]
+    fn managed_container_examples_use_supported_bootstrap_env() {
+        const CHILD_MARKER: &str = "TEST_MANAGED_CONFIG_ENV_CHILD";
+        const MANAGED_ENV_VARS: [&str; 5] = [
+            "AISIX_MANAGED__CP_BASE_URL",
+            "AISIX_MANAGED__CP_ETCD_ENDPOINT",
+            "AISIX_MANAGED__CP_CERT_PEM",
+            "AISIX_MANAGED__CP_KEY_PEM",
+            "AISIX_MANAGED__CP_CA_PEM",
+        ];
+
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+            for relative in ["Dockerfile", "docker/entrypoint.sh"] {
+                let example = std::fs::read_to_string(repo_root.join(relative)).unwrap();
+                for variable in MANAGED_ENV_VARS {
+                    assert!(
+                        example.contains(variable),
+                        "{relative} must document {variable}",
+                    );
+                }
+                assert!(
+                    !example.contains("AISIX_MANAGED__REGISTRATION_TOKEN"),
+                    "{relative} must not document the removed registration-token bootstrap",
+                );
+            }
+
+            // Isolate environment-backed loading in a child test process so
+            // concurrent tests cannot observe or overwrite these variables.
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .arg("managed_container_examples_use_supported_bootstrap_env")
+                .arg("--test-threads=1")
+                .env(CHILD_MARKER, "1");
+            for (key, _) in std::env::vars_os() {
+                if key.to_string_lossy().starts_with("AISIX_") {
+                    child.env_remove(key);
+                }
+            }
+            child
+                .env(MANAGED_ENV_VARS[0], "https://cp.example.com/api")
+                .env(MANAGED_ENV_VARS[1], "etcd.example.com:7943")
+                .env(MANAGED_ENV_VARS[2], "test certificate")
+                .env(MANAGED_ENV_VARS[3], "test private key")
+                .env(MANAGED_ENV_VARS[4], "test CA certificate");
+            assert!(child.status().unwrap().success());
+            return;
+        }
+
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config.managed.yaml");
+        let cfg = Config::load_from_path(Some(Path::new(path)))
+            .expect("documented managed-mode environment variables must load");
+        assert_eq!(
+            cfg.managed.cp_base_url.as_deref(),
+            Some("https://cp.example.com/api")
+        );
+        assert_eq!(
+            cfg.managed.cp_etcd_endpoint.as_deref(),
+            Some("etcd.example.com:7943")
+        );
+        assert!(cfg.managed.cert_bundle_provided());
+    }
+
+    #[test]
     fn shipped_example_config_binds_the_metrics_listener() {
         // `config.example.yaml` is the self-hosted reference shape; pin
         // the explicit unified scrape address so standalone and managed
