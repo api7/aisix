@@ -526,12 +526,18 @@ async fn enforce_request_body_limit(
         .headers()
         .get_all(axum::http::header::CONTENT_LENGTH)
         .iter();
+    // The access log takes the bounded route template, not the raw path.
+    // This is the one logging site that runs before authentication AND
+    // before route matching, so the raw path is unvalidated
+    // caller-controlled text — the same reason the metric labels are
+    // collapsed (#451).
+    let endpoint = normalize_endpoint_label(path);
     let first = content_lengths.next();
     if content_lengths.next().is_some() {
         return reject::reject_before_dispatch(
             &state,
             request.method().as_str(),
-            request.uri().path(),
+            endpoint,
             &request_id_of(&request),
             None,
             started,
@@ -547,20 +553,28 @@ async fn enforce_request_body_limit(
         .and_then(|s| s.parse::<usize>().ok())
     {
         if state.request_body_limit_bytes > 0 && declared > state.request_body_limit_bytes {
-            // Capture what the access log needs before the body move
-            // below consumes the request.
+            // Capture what the logs need before the body move below
+            // consumes the request.
             let method = request.method().clone();
-            let path = request.uri().path().to_string();
             let request_id = request_id_of(&request);
             // Drain the inbound body so hyper can flush the 413 response
             // on the same HTTP/1.1 connection. Without this, hyper closes
             // the socket while the client is still writing, and the client
             // sees EPIPE/ECONNRESET instead of the 413.
-            drain_body(request.into_body()).await;
+            let drain = drain_body(request.into_body()).await;
+            record_body_limit_rejection(
+                &state,
+                endpoint,
+                method.as_str(),
+                &request_id,
+                declared,
+                &drain,
+                started,
+            );
             return reject::reject_before_dispatch(
                 &state,
                 method.as_str(),
-                &path,
+                endpoint,
                 &request_id,
                 None,
                 started,
@@ -586,30 +600,175 @@ fn request_id_of(request: &Request<axum::body::Body>) -> String {
         .unwrap_or_else(request_id::new_request_id)
 }
 
+/// How the drain of a refused body ended. A fixed vocabulary: it is both
+/// a metric label and a log field, and `completed` vs the rest is what
+/// tells an operator whether the caller could still read the 413.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DrainOutcome {
+    /// The caller finished sending. The connection is clean, so the 413
+    /// reaches it.
+    Completed,
+    /// The byte cap was hit first. The rest of the body is never read, so
+    /// the caller may see a reset instead of the 413.
+    CapReached,
+    /// The time budget expired with the caller still sending — same
+    /// visible result as `CapReached`, different cause (a slow or
+    /// dribbling client rather than a huge one).
+    Timeout,
+    /// The caller's stream errored mid-drain: it went away on its own.
+    ClientReadError,
+}
+
+impl DrainOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            DrainOutcome::Completed => "completed",
+            DrainOutcome::CapReached => "cap_reached",
+            DrainOutcome::Timeout => "timeout",
+            DrainOutcome::ClientReadError => "client_read_error",
+        }
+    }
+}
+
+/// What a drain cost and how it ended.
+struct Drain {
+    bytes: usize,
+    outcome: DrainOutcome,
+}
+
 /// Read and discard the inbound body, bounded by both bytes and time.
 ///
 /// Byte cap (32 MiB) prevents a huge `Content-Length` from consuming
 /// unbounded memory.  Time cap (5 s) prevents a slowloris-style
 /// client from holding the task indefinitely by dribbling data.
-async fn drain_body(body: axum::body::Body) {
+///
+/// Returns how it ended, because those two bounds are exactly the cases
+/// where the caller gets a connection reset instead of the 413 the drain
+/// exists to deliver — and a discarded result made a reset caused here
+/// indistinguishable from one caused anywhere else.
+async fn drain_body(body: axum::body::Body) -> Drain {
     use http_body_util::BodyExt;
 
     const DRAIN_CAP: usize = 32 * 1024 * 1024;
     const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-    let _ = tokio::time::timeout(DRAIN_TIMEOUT, async {
-        let mut drained = 0usize;
+    let mut drained = 0usize;
+    // Bound the future to its own statement: holding it in the `match`
+    // scrutinee would keep `drained` mutably borrowed through the arms.
+    let ended = tokio::time::timeout(DRAIN_TIMEOUT, async {
         let mut body = body;
-        while let Some(Ok(frame)) = body.frame().await {
-            if let Some(data) = frame.data_ref() {
-                drained += data.len();
-                if drained >= DRAIN_CAP {
-                    break;
+        loop {
+            match body.frame().await {
+                Some(Ok(frame)) => {
+                    if let Some(data) = frame.data_ref() {
+                        drained += data.len();
+                        if drained >= DRAIN_CAP {
+                            return DrainOutcome::CapReached;
+                        }
+                    }
                 }
+                // Distinguishing this from the clean end below is the
+                // point: `while let Some(Ok(_))` folded a client that
+                // vanished mid-body into "drained fine".
+                Some(Err(_)) => return DrainOutcome::ClientReadError,
+                None => return DrainOutcome::Completed,
             }
         }
     })
     .await;
+    Drain {
+        // On timeout the inner future is dropped mid-poll, so this is
+        // what had been absorbed by then — the useful number.
+        bytes: drained,
+        outcome: ended.unwrap_or(DrainOutcome::Timeout),
+    }
+}
+
+/// Emit the body-limit diagnostic for a refused request: what the caller
+/// declared, what the cap was, how much of the body the gateway absorbed
+/// and how that drain ended. Joined to the access log by `request_id`.
+///
+/// Level follows the outcome. A clean drain is routine and stays `info`;
+/// a cap hit, a timeout or a mid-drain read error all mean the gateway
+/// stopped reading while the caller was still writing — the case where
+/// the caller sees a reset rather than the 413 — so those warn. The warn
+/// is rate limited per outcome so a flood of oversize requests can't
+/// amplify into a log flood; the counter above it is unconditional and
+/// keeps the true volume regardless of what the limiter drops.
+fn record_body_limit_rejection(
+    state: &ProxyState,
+    endpoint: &'static str,
+    method: &str,
+    request_id: &str,
+    declared_content_length: usize,
+    drain: &Drain,
+    started: std::time::Instant,
+) {
+    let inbound_protocol = inbound_protocol_for_endpoint(endpoint);
+    state
+        .metrics
+        .record_body_limit_rejection(endpoint, inbound_protocol, drain.outcome.as_str());
+
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    if drain.outcome == DrainOutcome::Completed {
+        tracing::info!(
+            target: "aisix::body_limit",
+            request_id,
+            endpoint,
+            method,
+            status = 413,
+            declared_content_length,
+            configured_limit_bytes = state.request_body_limit_bytes,
+            drained_bytes = drain.bytes,
+            drain_outcome = drain.outcome.as_str(),
+            elapsed_ms,
+            "request body exceeded the configured limit",
+        );
+    } else if warn_allowed(drain.outcome) {
+        tracing::warn!(
+            target: "aisix::body_limit",
+            request_id,
+            endpoint,
+            method,
+            status = 413,
+            declared_content_length,
+            configured_limit_bytes = state.request_body_limit_bytes,
+            drained_bytes = drain.bytes,
+            drain_outcome = drain.outcome.as_str(),
+            elapsed_ms,
+            "request body exceeded the configured limit and the drain did not finish",
+        );
+    }
+}
+
+/// At most one warn per abnormal outcome per second. Per outcome rather
+/// than global so a steady stream of one kind can't mask the first of
+/// another. Races between threads at the boundary can let a second line
+/// through; that is cheaper than the synchronisation to prevent it, and
+/// the counter is the source of truth for volume anyway.
+fn warn_allowed(outcome: DrainOutcome) -> bool {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    const WARN_INTERVAL_MS: u64 = 1_000;
+    // `0` = never warned. Elapsed millis are clamped to >= 1 on store so
+    // the sentinel can't collide with a warn in the first millisecond.
+    static LAST_WARN_MS: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+    static PROCESS_START: std::sync::LazyLock<std::time::Instant> =
+        std::sync::LazyLock::new(std::time::Instant::now);
+
+    let slot = match outcome {
+        DrainOutcome::CapReached => 0,
+        DrainOutcome::Timeout => 1,
+        DrainOutcome::ClientReadError => 2,
+        DrainOutcome::Completed => return false,
+    };
+    let now = (PROCESS_START.elapsed().as_millis() as u64).max(1);
+    let last = LAST_WARN_MS[slot].load(Ordering::Relaxed);
+    if last != 0 && now.saturating_sub(last) < WARN_INTERVAL_MS {
+        return false;
+    }
+    LAST_WARN_MS[slot].store(now, Ordering::Relaxed);
+    true
 }
 
 async fn livez(
@@ -1728,6 +1887,75 @@ mod tests {
         assert!(resp.status().is_server_error());
     }
 
+    /// A caller that sends everything it declared leaves the connection
+    /// clean, so it can actually read the 413 the drain exists to
+    /// deliver. This is the only outcome that is not a warning.
+    #[tokio::test]
+    async fn drain_reports_a_body_the_client_finished_sending() {
+        let drain = drain_body(Body::from(vec![b'x'; 4096])).await;
+        assert_eq!(drain.outcome, DrainOutcome::Completed);
+        assert_eq!(drain.bytes, 4096);
+    }
+
+    /// Past the byte cap the rest of the body is never read, so the
+    /// caller is likely to see a reset instead of the 413 — an operator
+    /// has to be able to tell that apart from a clean drain.
+    #[tokio::test]
+    async fn drain_reports_hitting_the_byte_cap() {
+        // One MiB over the 32 MiB cap, in chunks so nothing holds the
+        // whole body at once.
+        let chunk = vec![b'x'; 1024 * 1024];
+        let stream =
+            futures::stream::iter((0..33).map(move |_| Ok::<_, std::io::Error>(chunk.clone())));
+        let drain = drain_body(Body::from_stream(stream)).await;
+        assert_eq!(drain.outcome, DrainOutcome::CapReached);
+        assert_eq!(drain.bytes, 32 * 1024 * 1024);
+    }
+
+    /// A client that dribbles (or stops) holds the drain until the time
+    /// budget expires. `start_paused` advances the clock as soon as the
+    /// runtime idles, so this costs no wall-clock time.
+    #[tokio::test(start_paused = true)]
+    async fn drain_reports_the_time_budget_expiring() {
+        let head = futures::stream::iter([Ok::<_, std::io::Error>(vec![b'x'; 512])]);
+        let never_ends = head.chain(futures::stream::pending());
+        let drain = drain_body(Body::from_stream(never_ends)).await;
+        assert_eq!(drain.outcome, DrainOutcome::Timeout);
+        // What had been absorbed when the budget ran out, not zero.
+        assert_eq!(drain.bytes, 512);
+    }
+
+    /// The client going away mid-body used to be folded into "drained
+    /// fine" by a `while let Some(Ok(_))` loop, which is exactly the case
+    /// an operator is trying to explain when a caller reports a reset.
+    #[tokio::test]
+    async fn drain_reports_the_client_vanishing_mid_body() {
+        let stream = futures::stream::iter([
+            Ok(vec![b'x'; 256]),
+            Err(std::io::Error::other("connection reset")),
+        ]);
+        let drain = drain_body(Body::from_stream(stream)).await;
+        assert_eq!(drain.outcome, DrainOutcome::ClientReadError);
+        assert_eq!(drain.bytes, 256);
+    }
+
+    /// The rate limiter must never swallow the FIRST warning of a kind —
+    /// that is the one an operator needs — and must not let one noisy
+    /// outcome mask another's first occurrence.
+    #[test]
+    fn the_first_warning_of_each_abnormal_outcome_survives_the_rate_limit() {
+        assert!(warn_allowed(DrainOutcome::Timeout));
+        assert!(!warn_allowed(DrainOutcome::Timeout), "second within 1s");
+        assert!(
+            warn_allowed(DrainOutcome::ClientReadError),
+            "a different outcome keeps its own budget"
+        );
+        assert!(
+            !warn_allowed(DrainOutcome::Completed),
+            "a clean drain is not a warning"
+        );
+    }
+
     /// A body-cap rejection short-circuits BEFORE any handler runs, and
     /// both the access log and the request metrics are emitted BY the
     /// handlers — so pre-fix a caller got a 413 the gateway kept no
@@ -1765,6 +1993,42 @@ mod tests {
             scrape.contains("aisix_requests_total") && scrape.contains(r#"status="413""#),
             "the 413 must be counted, got: {scrape}"
         );
+    }
+
+    /// The refusal is counted with the outcome of its drain, and both
+    /// labels stay bounded: `endpoint` collapses to a route template even
+    /// when the caller invents the path. This surface answers before
+    /// authentication, so an unbounded label here would let anyone mint
+    /// series at will (#451).
+    #[tokio::test]
+    async fn body_cap_rejection_is_counted_with_a_bounded_endpoint_and_its_outcome() {
+        let hub = Arc::new(Hub::new());
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
+        let state = build_state(snap, hub); // 1 MiB cap from cfg()
+        let app = build_router(state.clone());
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/passthrough/openai/caller-invented-path-9d3f")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .header("content-length", (2 * 1024 * 1024).to_string())
+            .body(Body::from("{}"))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        let scrape = state.metrics.render();
+        let sample = scrape
+            .lines()
+            .find(|l| l.starts_with("aisix_proxy_request_body_limit_rejections_total{"))
+            .unwrap_or_else(|| panic!("the refusal must be counted, got: {scrape}"));
+        assert!(
+            sample.contains(r#"endpoint="/passthrough/:provider/*rest""#),
+            "the caller's path must not reach the label: {sample}"
+        );
+        assert!(sample.contains(r#"outcome="completed""#), "{sample}");
+        assert!(sample.contains(r#"inbound_protocol="openai""#), "{sample}");
     }
 
     /// The chunked path reaches the handler, which rejects at its body
