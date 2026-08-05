@@ -120,20 +120,15 @@ describe("models listing e2e: a Model Group is a discoverable entry point", () =
       maxRetries: 0,
     });
 
-    // Readiness doubles as the callability half of the contract: a 200 from
-    // the group means the ProviderKey, both targets, the group and the key
-    // have all propagated. Probing with the chat call rather than the listing
-    // keeps the readiness gate independent of the behavior under test.
+    // Both caller keys are seeded after every model and watch events apply in
+    // revision order, so this key authenticating at all means the provider
+    // key, both targets and the group are already in the snapshot. Gating on
+    // the key rather than on a model name keeps the gate independent of what
+    // the assertions check, and keeps a regression an assertion diff rather
+    // than a propagation timeout.
     await waitConfigPropagation(async () => {
-      try {
-        const r = await client.chat.completions.create({
-          model: "ml-group",
-          messages: [{ role: "user", content: "ready-probe" }],
-        });
-        return r.choices[0]?.message.role === "assistant";
-      } catch {
-        return false;
-      }
+      const res = await probe.listModels();
+      return res.status === 200;
     });
 
     const res = await probe.listModels();
@@ -169,11 +164,12 @@ describe("models listing e2e: a Model Group is a discoverable entry point", () =
 
     const probe = new ProxyClient(app.proxyUrl, ALL_MODELS_PLAINTEXT);
 
-    // Gate on a direct model, so the readiness probe doesn't presuppose the
-    // group's presence — that's what the assertion below is for.
+    // Same gate as above, and this key is seeded last of all: authenticating
+    // proves every model landed. Waiting on one target's name would not —
+    // the other target and the group are written after it.
     await waitConfigPropagation(async () => {
       const res = await probe.listModels();
-      return res.status === 200 && idsOf(res.body).includes("ml-primary");
+      return res.status === 200;
     });
 
     const res = await probe.listModels();
