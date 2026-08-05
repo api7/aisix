@@ -27,6 +27,8 @@
 #     -e AISIX_MANAGED__CP_CA_PEM \
 #     -v aisix-mtls:/var/lib/aisix \
 #     aisix:dev
+# The volume preserves the materialized mTLS bundle and gateway identity across
+# container restarts.
 
 # --- Stage 1: build ----------------------------------------------------------
 FROM rust:1.93-bookworm AS builder

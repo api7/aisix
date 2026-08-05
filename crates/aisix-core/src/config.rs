@@ -2271,13 +2271,24 @@ observability:
                 .env(MANAGED_ENV_VARS[2], "test certificate")
                 .env(MANAGED_ENV_VARS[3], "test private key")
                 .env(MANAGED_ENV_VARS[4], "test CA certificate");
-            assert!(child.status().unwrap().success());
+            let output = child.output().unwrap();
+            assert!(
+                output.status.success(),
+                "child config test failed: {}",
+                String::from_utf8_lossy(&output.stderr),
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "child config test did not run exactly one passing test: {}",
+                String::from_utf8_lossy(&output.stdout),
+            );
             return;
         }
 
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config.managed.yaml");
         let cfg = Config::load_from_path(Some(Path::new(path)))
             .expect("documented managed-mode environment variables must load");
+        assert!(cfg.managed.is_managed());
         assert_eq!(
             cfg.managed.cp_base_url.as_deref(),
             Some("https://cp.example.com/api")

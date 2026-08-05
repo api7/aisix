@@ -17,6 +17,8 @@
 #         -e AISIX_MANAGED__CP_CA_PEM \
 #         -v aisix-mtls:/var/lib/aisix \
 #         ghcr.io/api7/aisix:dev
+# The volume preserves the materialized mTLS bundle and gateway identity across
+# container restarts.
 #
 # The Rust binary's `Config::load_from_path` already layers
 # `AISIX_<UPPER>__<UPPER>` env vars on top of the YAML, so any field

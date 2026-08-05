@@ -4,7 +4,7 @@
 # Select it by setting `AISIX_CONFIG_PATH` to that path.
 # Only the bare minimum is set here:
 #
-#   - `managed.enabled: true`           always on for this image
+#   - `managed.enabled: true`           always on in this bootstrap configuration
 #   - `etcd.endpoints: [placeholder]`   overridden at boot from managed
 #                                       CP endpoint config
 #   - `admin.admin_keys: [placeholder]` validation requires the slot,
