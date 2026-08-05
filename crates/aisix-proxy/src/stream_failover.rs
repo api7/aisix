@@ -44,9 +44,9 @@ use crate::ProxyState;
 
 /// Verbatim LiteLLM continuation instruction (`litellm/router.py`,
 /// `_build_responses_continuation_input` — the one continuation surface
-/// LiteLLM still ships after #34627 removed the chat-completions one) —
-/// kept byte-identical so the two gateways' fallback models receive the
-/// same steering. LiteLLM sends it as a `developer` turn on the
+/// LiteLLM still ships, after upstream removed the chat-completions
+/// one) — kept byte-identical so the two gateways' fallback models
+/// receive the same steering. LiteLLM sends it as a `developer` turn on the
 /// Responses input; our internal shape carries it as a system message,
 /// which each provider bridge maps to its own instruction tier. The
 /// partial text is NOT interpolated here; it rides the assistant
