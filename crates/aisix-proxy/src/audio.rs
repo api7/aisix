@@ -119,7 +119,7 @@ pub async fn transcriptions(
         &auth,
         multipart,
         // Version-independent path — multipart_dispatch's URL builder
-        // (build_v1_url) owns the `/v1` prefix.
+        // appends it to the configured api_base.
         "/audio/transcriptions",
         &request_id,
         &client,
@@ -241,7 +241,7 @@ pub async fn translations(
         &auth,
         multipart,
         // Version-independent path — multipart_dispatch's URL builder
-        // (build_v1_url) owns the `/v1` prefix.
+        // appends it to the configured api_base.
         "/audio/translations",
         &request_id,
         &client,
@@ -644,10 +644,7 @@ async fn multipart_dispatch(
     let api_key = crate::dispatch::require_api_key(&pk_entry.value, model)?;
 
     let base = crate::dispatch::resolve_base_url(&pk_entry.value)?;
-    // build_v1_url owns the /v1 prefix; callers pass the suffix
-    // (e.g. `/audio/transcriptions`) so this code is agnostic to
-    // whether the customer's api_base ends in /v1 or not.
-    let url = crate::dispatch::build_v1_url(&base, upstream_path);
+    let url = crate::dispatch::build_openai_url(&base, upstream_path);
     let provider_label = provider.to_ascii_lowercase();
     // Static label for retry tracing — this dispatch serves both audio
     // sub-routes, and logging translations under the transcription label
@@ -1137,7 +1134,7 @@ async fn speech_dispatch(
     );
 
     let client = crate::http_client::client_for(pk_entry.value.tls.as_ref());
-    let speech_url = crate::dispatch::build_v1_url(&base, "/audio/speech");
+    let speech_url = crate::dispatch::build_openai_url(&base, "/audio/speech");
     let tracker = &state.runtime_status;
     let model_id: &str = &model_entry.id;
     let cooldown_cfg = model.cooldown.as_ref();

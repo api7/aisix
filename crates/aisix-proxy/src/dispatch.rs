@@ -149,27 +149,17 @@ pub(crate) fn require_upstream_model(model: &Model) -> Result<&str, ProxyError> 
     })
 }
 
-/// Path suffixes the proxy-side handlers (audio, responses, messages)
-/// build via [`build_v1_url`]. If an operator accidentally pasted the
-/// full upstream URL into `api_base`, strip the suffix here so the
-/// later [`build_v1_url`] call does not double-append. The list mirrors
-/// every concrete endpoint the proxy currently routes to upstream,
-/// covered in both the bare (`/responses`) and `/v1`-prefixed
-/// (`/v1/responses`) form an operator might paste.
+/// Endpoint suffixes the proxy-side handlers append themselves. If an
+/// operator accidentally pasted the full upstream URL into `api_base`,
+/// strip the suffix here so the later URL build does not double-append.
 ///
-/// Longer suffixes appear first so `/v1/audio/transcriptions` matches
-/// before `/audio/transcriptions`, etc.
+/// Only the **bare** endpoint is stripped, never a `/v1/` prefixed form:
+/// the version segment belongs to the base and must survive, or a
+/// pasted `https://proxy.corp/shim/v1/responses` would collapse to
+/// `https://proxy.corp/shim` and rebuild as `…/shim/responses`.
+/// Stripping just `/responses` leaves `…/shim/v1`, which
+/// [`build_openai_url`] then preserves verbatim.
 const API_BASE_ENDPOINT_SUFFIXES: &[&str] = &[
-    "/v1/audio/transcriptions",
-    "/v1/audio/translations",
-    "/v1/audio/speech",
-    "/v1/chat/completions",
-    "/v1/images/generations",
-    "/v1/completions",
-    "/v1/embeddings",
-    "/v1/responses",
-    "/v1/messages",
-    "/v1/rerank",
     "/audio/transcriptions",
     "/audio/translations",
     "/audio/speech",
@@ -199,8 +189,7 @@ fn strip_endpoint_suffix(base: &str) -> &str {
 /// The upstream base URL: `provider_key.api_base` override if set,
 /// otherwise the `Provider`'s built-in default. Tolerates an operator
 /// pasting the full upstream URL into `api_base` by stripping any
-/// trailing endpoint suffix — see [`API_BASE_ENDPOINT_SUFFIXES`] for
-/// the full list and [`build_v1_url`] for the matching `/v1` synthesis.
+/// trailing endpoint suffix — see [`API_BASE_ENDPOINT_SUFFIXES`].
 pub(crate) fn resolve_base_url(provider_key: &ProviderKey) -> Result<String, ProxyError> {
     match provider_key.api_base.as_deref() {
         Some(b) if !b.trim().is_empty() => Ok(strip_endpoint_suffix(b.trim()).to_string()),
@@ -213,44 +202,73 @@ pub(crate) fn resolve_base_url(provider_key: &ProviderKey) -> Result<String, Pro
     }
 }
 
-/// Build a `/v1`-prefixed upstream URL while tolerating either
-/// convention for the configured `api_base`:
+/// True when `base` carries a path component beyond the host — i.e. the
+/// operator (or the CP catalog) pinned an explicit upstream root such as
+/// `…/v2`, `…/api/paas/v4` or `…/v1beta/openai`, rather than leaving the
+/// bare host. Callers pass a slash-trimmed base.
+fn base_has_path(base: &str) -> bool {
+    base.split_once("://")
+        .map_or(base, |(_, rest)| rest)
+        .contains('/')
+}
+
+/// Join an OpenAI-family upstream base with a version-independent
+/// endpoint path (`/responses`, `/rerank`, `/audio/speech`, `/files`, …).
 ///
-/// * `https://api.openai.com` builds `…/v1/<path>` — the bare-host
-///   convention `OpenAiBridge::resolve_base` synthesizes when the
-///   operator leaves the trailing `/v1` off (the same form
-///   `aisix-proxy`'s pre-existing handlers use directly).
-/// * `https://api.openai.com/v1` also builds `…/v1/<path>` — the
-///   OpenAI SDK convention every published example uses, and the
-///   exact placeholder the dashboard's provider-keys form pre-fills.
+/// In this family `api_base` **is** the versioned root, so whatever path
+/// the operator or the CP catalog configured is preserved verbatim and
+/// the endpoint is appended to it. Only a bare host — no path at all —
+/// gets the canonical `/v1` synthesized, because several vendor defaults
+/// ship that form (`https://api.deepseek.com`, `https://api.cohere.com`,
+/// `https://api.dev.runwayml.com`).
 ///
-/// Without this normalization, a customer who follows OpenAI SDK
-/// docs (api_base = `…/v1`) hits `…/v1/v1/responses` upstream — the
-/// upstream 404s, the DP wraps it as 502 upstream_error, and the
-/// failure surfaces as "intermittent SDK-incompatible behaviour"
-/// (chat works because aisix-provider-openai/src/bridge.rs uses
-/// the OpenAI-SDK convention; the proxy crate handlers — responses,
-/// rerank, audio — follow the provider-default convention, so the
-/// customer's api_base satisfies one but not the other).
+/// Preserving the path is what makes non-`/v1` roots reachable: Baidu
+/// Qianfan serves `…/v2/responses`, Zhipu `…/api/paas/v4/…`, Volcengine
+/// Ark `…/api/v3/…`, Gemini `…/v1beta/openai/…`. Synthesizing `/v1`
+/// there built `…/v2/v1/responses`, which every one of those upstreams
+/// 404s. It also matches how `OpenAiBridge` has always built
+/// `/chat/completions`, so both halves of the gateway now agree on what
+/// `api_base` means — before this, chat worked while responses, rerank,
+/// audio, realtime and the batch/files routes 404'd on the same key.
 ///
-/// `path` MUST start with `/` and SHOULD start with the version-
-/// independent route (e.g. `/responses`, not `/v1/responses`); this
-/// helper owns the `/v1` prefix.
-pub(crate) fn build_v1_url(base: &str, path: &str) -> String {
+/// `path` MUST start with `/` and MUST be the version-independent route
+/// (`/responses`, not `/v1/responses`).
+pub(crate) fn build_openai_url(base: &str, path: &str) -> String {
     // assert!, not debug_assert! — the cost of a single bounds check
     // per upstream dispatch is negligible compared to the network
     // round-trip, and a release-mode caller passing a malformed path
     // would silently produce a wrong URL (e.g. `…/v1responses`).
     assert!(
         path.starts_with('/'),
-        "build_v1_url path must start with /, got {path:?}",
+        "build_openai_url path must start with /, got {path:?}",
     );
     let trimmed = base.trim_end_matches('/');
-    if trimmed.ends_with("/v1") {
+    if base_has_path(trimmed) {
         format!("{trimmed}{path}")
     } else {
         format!("{trimmed}/v1{path}")
     }
+}
+
+/// Join an Anthropic upstream base with a version-independent endpoint
+/// path (`/messages`, `/messages/count_tokens`).
+///
+/// Anthropic's convention is the mirror image of the OpenAI family's:
+/// the documented `api_base` is the bare host and the `/v1` belongs to
+/// the endpoint (`POST {base}/v1/messages`). So `/v1` is synthesized for
+/// every base, including one that carries a path — a self-hosted
+/// Anthropic-compatible gateway mounted at `…/anthropic` serves
+/// `…/anthropic/v1/messages`. A base that already ends in `/v1` is an
+/// operator importing the OpenAI habit; collapse it so it can't double.
+/// Mirrors `AnthropicBridge::normalize_api_base`.
+pub(crate) fn build_anthropic_url(base: &str, path: &str) -> String {
+    assert!(
+        path.starts_with('/'),
+        "build_anthropic_url path must start with /, got {path:?}",
+    );
+    let trimmed = base.trim_end_matches('/');
+    let root = trimmed.strip_suffix("/v1").unwrap_or(trimmed);
+    format!("{root}/v1{path}")
 }
 
 /// The upstream API key — `provider_key.api_key`. Empty string is
@@ -516,10 +534,10 @@ mod tests {
     }
 
     /// Every OpenAI-shape paste an operator might make must, when fed
-    /// to `build_v1_url(base, "/<endpoint>")`, produce the canonical
+    /// to `build_openai_url(base, "/<endpoint>")`, produce the canonical
     /// upstream URL. The intermediate `resolve_base_url` result may be
-    /// either bare-host or `<host>/v1` — `build_v1_url` accepts both —
-    /// so the assertion is on the final URL the handler dispatches to,
+    /// either bare-host or `<host>/v1` — `build_openai_url` accepts both
+    /// — so the assertion is on the final URL the handler dispatches to,
     /// not on the intermediate base.
     ///
     /// Without suffix stripping, pasting `…/v1/audio/transcriptions`
@@ -554,7 +572,7 @@ mod tests {
         for (paste, endpoint) in cases {
             let pk = pk_with_base(paste);
             let base = resolve_base_url(&pk).unwrap();
-            let url = build_v1_url(&base, endpoint);
+            let url = build_openai_url(&base, endpoint);
             let expected = format!("https://api.openai.com/v1{endpoint}");
             assert_eq!(
                 url, expected,
@@ -575,7 +593,7 @@ mod tests {
         ] {
             let pk = pk_with_base(paste);
             let base = resolve_base_url(&pk).unwrap();
-            let url = build_v1_url(&base, "/chat/completions");
+            let url = build_openai_url(&base, "/chat/completions");
             assert_eq!(
                 url, "https://api.deepseek.com/v1/chat/completions",
                 "paste {paste:?} must build to the canonical chat-completions URL",
@@ -584,8 +602,9 @@ mod tests {
     }
 
     /// Anthropic: the messages handler builds `…/v1/messages`. A paste
-    /// of the full upstream URL must strip so `build_v1_url("/messages")`
-    /// does not produce `…/v1/messages/v1/messages`.
+    /// of the full upstream URL must strip so
+    /// `build_anthropic_url("/messages")` does not produce
+    /// `…/v1/messages/v1/messages`.
     #[test]
     fn resolve_base_url_strips_anthropic_messages_suffix() {
         for paste in [
@@ -598,7 +617,7 @@ mod tests {
             let pk = pk_with_base(paste);
             let base = resolve_base_url(&pk).unwrap();
             assert_eq!(
-                build_v1_url(&base, "/messages"),
+                build_anthropic_url(&base, "/messages"),
                 "https://api.anthropic.com/v1/messages",
                 "paste {paste:?} must build to the canonical messages URL",
             );
@@ -618,10 +637,13 @@ mod tests {
 
         // Suffix stripping still applies on non-canonical hosts —
         // operator pasting the full upstream URL is still recovered.
+        // Only the bare `/responses` is stripped, so the `/v1` the
+        // operator wrote survives into the rebuilt URL.
         let pk = pk_with_base("https://proxy.example.com/openai-shim/v1/responses");
         let base = resolve_base_url(&pk).unwrap();
+        assert_eq!(base, "https://proxy.example.com/openai-shim/v1");
         assert_eq!(
-            build_v1_url(&base, "/responses"),
+            build_openai_url(&base, "/responses"),
             "https://proxy.example.com/openai-shim/v1/responses",
         );
     }
@@ -632,69 +654,175 @@ mod tests {
         let pk = pk_with_base("  https://api.openai.com/v1/chat/completions/  ");
         let base = resolve_base_url(&pk).unwrap();
         assert_eq!(
-            build_v1_url(&base, "/chat/completions"),
+            build_openai_url(&base, "/chat/completions"),
             "https://api.openai.com/v1/chat/completions",
         );
     }
 
     // ---------------------------------------------------------------
-    // build_v1_url — the path-doubling regression fixture.
+    // build_openai_url — the path-doubling regression fixture.
     // ---------------------------------------------------------------
 
     #[test]
-    fn build_v1_url_appends_v1_when_base_lacks_it() {
+    fn build_openai_url_appends_v1_only_for_a_bare_host() {
         // Bare-host convention: the operator pasted
-        // `https://api.openai.com` without the trailing `/v1`.
+        // `https://api.openai.com` without the trailing `/v1`, or the
+        // vendor default ships that form (deepseek, cohere, runwayml).
         assert_eq!(
-            build_v1_url("https://api.openai.com", "/responses"),
+            build_openai_url("https://api.openai.com", "/responses"),
             "https://api.openai.com/v1/responses",
+        );
+        assert_eq!(
+            build_openai_url("https://api.deepseek.com", "/chat/completions"),
+            "https://api.deepseek.com/v1/chat/completions",
+        );
+        // Host:port with no path is still a bare host.
+        assert_eq!(
+            build_openai_url("http://127.0.0.1:8080", "/rerank"),
+            "http://127.0.0.1:8080/v1/rerank",
         );
     }
 
     #[test]
-    fn build_v1_url_skips_v1_when_base_already_has_it() {
+    fn build_openai_url_preserves_v1_base_without_doubling() {
         // Customer follows the OpenAI SDK convention + the dashboard's
         // provider-keys form pre-fill (`https://api.openai.com/v1`).
         // A naive `format!("{base}/v1/responses")` would produce
         // `https://api.openai.com/v1/v1/responses` and 404 upstream.
         assert_eq!(
-            build_v1_url("https://api.openai.com/v1", "/responses"),
+            build_openai_url("https://api.openai.com/v1", "/responses"),
             "https://api.openai.com/v1/responses",
         );
     }
 
+    /// AISIX-Cloud#1244: an `api_base` whose root is not `/v1` must be
+    /// preserved verbatim. Synthesizing `/v1` built `…/v2/v1/responses`,
+    /// which the upstream 404s. Every value here is a real upstream root
+    /// — three of them ship as CP catalog defaults.
     #[test]
-    fn build_v1_url_strips_trailing_slash() {
+    fn build_openai_url_preserves_non_v1_roots() {
+        let cases: &[(&str, &str, &str)] = &[
+            // Baidu Qianfan — the reported customer config.
+            (
+                "https://qianfan.baidubce.com/v2",
+                "/responses",
+                "https://qianfan.baidubce.com/v2/responses",
+            ),
+            // Zhipu — CP catalog default.
+            (
+                "https://open.bigmodel.cn/api/paas/v4",
+                "/audio/speech",
+                "https://open.bigmodel.cn/api/paas/v4/audio/speech",
+            ),
+            // Volcengine Ark — CP catalog default.
+            (
+                "https://ark.cn-beijing.volces.com/api/v3",
+                "/files",
+                "https://ark.cn-beijing.volces.com/api/v3/files",
+            ),
+            // Gemini's OpenAI-compat surface — CP catalog default, and
+            // the case a "does the last segment look like a version?"
+            // heuristic would miss.
+            (
+                "https://generativelanguage.googleapis.com/v1beta/openai",
+                "/realtime",
+                "https://generativelanguage.googleapis.com/v1beta/openai/realtime",
+            ),
+            // Alibaba DashScope's compatible mode.
+            (
+                "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                "/rerank",
+                "https://dashscope.aliyuncs.com/compatible-mode/v1/rerank",
+            ),
+        ];
+        for (base, path, expected) in cases {
+            assert_eq!(
+                &build_openai_url(base, path),
+                expected,
+                "base {base:?} + path {path:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn build_openai_url_strips_trailing_slash() {
         assert_eq!(
-            build_v1_url("https://api.openai.com/", "/rerank"),
+            build_openai_url("https://api.openai.com/", "/rerank"),
             "https://api.openai.com/v1/rerank",
         );
         assert_eq!(
-            build_v1_url("https://api.openai.com/v1/", "/rerank"),
+            build_openai_url("https://api.openai.com/v1/", "/rerank"),
             "https://api.openai.com/v1/rerank",
+        );
+        // A trailing slash must not make a bare host look path-bearing.
+        assert_eq!(
+            build_openai_url("https://api.deepseek.com/", "/embeddings"),
+            "https://api.deepseek.com/v1/embeddings",
         );
     }
 
     #[test]
-    fn build_v1_url_handles_nested_paths() {
+    fn build_openai_url_handles_nested_paths() {
         // /audio/speech, /audio/transcriptions, /audio/translations all
         // pass nested paths — make sure the helper doesn't try to be
         // clever about them.
         assert_eq!(
-            build_v1_url("https://api.openai.com", "/audio/speech"),
+            build_openai_url("https://api.openai.com", "/audio/speech"),
             "https://api.openai.com/v1/audio/speech",
         );
         assert_eq!(
-            build_v1_url("https://api.openai.com/v1", "/audio/transcriptions"),
+            build_openai_url("https://api.openai.com/v1", "/audio/transcriptions"),
             "https://api.openai.com/v1/audio/transcriptions",
         );
     }
 
     #[test]
-    #[should_panic(expected = "build_v1_url path must start with /")]
-    fn build_v1_url_rejects_path_without_leading_slash() {
+    #[should_panic(expected = "build_openai_url path must start with /")]
+    fn build_openai_url_rejects_path_without_leading_slash() {
         // Misuse — handlers should always pass a `/`-prefixed path.
-        let _ = build_v1_url("https://api.openai.com", "responses");
+        let _ = build_openai_url("https://api.openai.com", "responses");
+    }
+
+    // ---------------------------------------------------------------
+    // build_anthropic_url — the mirror-image convention: `/v1` belongs
+    // to the endpoint, so it is synthesized for a path-bearing base too.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn build_anthropic_url_synthesizes_v1_for_every_base_shape() {
+        assert_eq!(
+            build_anthropic_url("https://api.anthropic.com", "/messages"),
+            "https://api.anthropic.com/v1/messages",
+        );
+        assert_eq!(
+            build_anthropic_url("https://api.anthropic.com/", "/messages"),
+            "https://api.anthropic.com/v1/messages",
+        );
+        // Operator importing the OpenAI habit — must not double.
+        assert_eq!(
+            build_anthropic_url("https://api.anthropic.com/v1", "/messages"),
+            "https://api.anthropic.com/v1/messages",
+        );
+        // A self-hosted Anthropic-compatible gateway mounted under a
+        // path still serves `<mount>/v1/messages` — unlike the OpenAI
+        // family, the path here does NOT suppress the `/v1`.
+        assert_eq!(
+            build_anthropic_url("https://gw.corp.example/anthropic", "/messages"),
+            "https://gw.corp.example/anthropic/v1/messages",
+        );
+        assert_eq!(
+            build_anthropic_url(
+                "https://gw.corp.example/anthropic",
+                "/messages/count_tokens"
+            ),
+            "https://gw.corp.example/anthropic/v1/messages/count_tokens",
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "build_anthropic_url path must start with /")]
+    fn build_anthropic_url_rejects_path_without_leading_slash() {
+        let _ = build_anthropic_url("https://api.anthropic.com", "messages");
     }
 
     // --- resolve_bridge tests -------------------------------------
