@@ -30,6 +30,7 @@ use aws_sdk_bedrockruntime::operation::converse::ConverseError;
 use aws_sdk_bedrockruntime::operation::converse_stream::ConverseStreamError;
 use aws_sdk_bedrockruntime::operation::invoke_model::InvokeModelError;
 use aws_sdk_bedrockruntime::primitives::Blob;
+use aws_sdk_bedrockruntime::types::error::ConverseStreamOutputError;
 use aws_sdk_bedrockruntime::types::{
     AnyToolChoice, ContentBlock, ContentBlockDelta, ContentBlockStart, ConversationRole,
     ConverseStreamOutput, InferenceConfiguration, Message as BedrockMessage, SpecificToolChoice,
@@ -1049,13 +1050,7 @@ impl BedrockBridge {
                     }
                     Ok(None) => break,
                     Err(e) => {
-                        // SDK already maps eventstream-decode and
-                        // transport failures into its error type.
-                        // Surface as Transport to flow through the
-                        // existing customer-visible error envelope.
-                        Err(BridgeError::Transport(format!(
-                            "bedrock converse-stream: {e}"
-                        )))?;
+                        Err(map_converse_stream_event_error(e))?;
                     }
                 }
             }
@@ -1500,6 +1495,60 @@ fn map_converse_stream_sdk_error(
     map_aws_sdk_error_generic(e, started, deadline)
 }
 
+/// Map a mid-stream `ConverseStream` receiver failure. The AWS event
+/// stream carries modeled exceptions *inside* the committed 200
+/// response — throttling, internal failures, and model stream errors
+/// arrive as event-stream messages, not HTTP statuses — so surface
+/// them as [`BridgeError::UpstreamInBand`] with the AWS exception code
+/// in the view for `error_translate` (AISIX-Cloud#1222 scenario 3).
+/// Same redaction rule as [`map_service_error`]: canned message keyed
+/// on the derived status, code-only view, no raw AWS text (which
+/// embeds ARNs / account ids). Non-service failures (transport,
+/// event-stream decode) keep the previous Transport mapping.
+fn map_converse_stream_event_error(
+    e: SdkError<ConverseStreamOutputError, aws_smithy_types::event_stream::RawMessage>,
+) -> BridgeError {
+    let Some(svc) = e.as_service_error() else {
+        // SDK already maps eventstream-decode and transport failures
+        // into its error type. Surface as Transport to flow through
+        // the existing customer-visible error envelope.
+        return BridgeError::Transport(format!("bedrock converse-stream: {e}"));
+    };
+    let status: Option<u16> = match svc {
+        ConverseStreamOutputError::InternalServerException(_) => Some(500),
+        // The exception relays the model backend's own status when it
+        // has one; 502 otherwise (an unspecified upstream fault).
+        ConverseStreamOutputError::ModelStreamErrorException(inner) => inner
+            .original_status_code()
+            .and_then(|c| u16::try_from(c).ok())
+            .or(Some(502)),
+        ConverseStreamOutputError::ThrottlingException(_) => Some(429),
+        ConverseStreamOutputError::ValidationException(_) => Some(400),
+        ConverseStreamOutputError::ServiceUnavailableException(_) => Some(503),
+        _ => None,
+    };
+    let message = match status {
+        Some(429) => "upstream rate limited".to_string(),
+        Some(400) => "upstream rejected the streaming request".to_string(),
+        Some(s) => format!("upstream reported stream error {s}"),
+        None => "upstream reported a stream error".to_string(),
+    };
+    let parsed = svc.meta().code().map(|k| {
+        Box::new(aisix_gateway::UpstreamErrorView {
+            kind: Some(k.to_string()),
+            message: None,
+            code: None,
+            param: None,
+        })
+    });
+    BridgeError::UpstreamInBand {
+        status,
+        message,
+        parsed,
+        wire: aisix_gateway::UpstreamWire::Bedrock,
+    }
+}
+
 /// Common AWS SDK error classifier. Routes through the same
 /// UpstreamStatus / Transport / Timeout taxonomy the legacy
 /// `map_service_error` uses for `/invoke`, preserving:
@@ -1775,6 +1824,100 @@ fn map_tool_choice(choice: &serde_json::Value) -> Option<ToolChoice> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── Mid-stream event errors (AISIX-Cloud#1222) ──────────────────
+
+    /// The Converse event stream carries modeled exceptions inside the
+    /// committed 200 response. They must surface as typed in-band
+    /// errors (status derived per exception family, AWS code in the
+    /// view, canned message — never the raw AWS text), not as a
+    /// generic Transport failure.
+    #[test]
+    fn converse_stream_modeled_exceptions_map_to_in_band_errors() {
+        use aws_smithy_types::error::metadata::ErrorMetadata;
+
+        let meta = |code: &str| ErrorMetadata::builder().code(code).build();
+        let cases: Vec<(ConverseStreamOutputError, Option<u16>)> = vec![
+            (
+                ConverseStreamOutputError::ThrottlingException(
+                    aws_sdk_bedrockruntime::types::error::ThrottlingException::builder()
+                        .message("Too many requests for arn:aws:secret")
+                        .meta(meta("ThrottlingException"))
+                        .build(),
+                ),
+                Some(429),
+            ),
+            (
+                ConverseStreamOutputError::InternalServerException(
+                    aws_sdk_bedrockruntime::types::error::InternalServerException::builder()
+                        .meta(meta("InternalServerException"))
+                        .build(),
+                ),
+                Some(500),
+            ),
+            (
+                ConverseStreamOutputError::ServiceUnavailableException(
+                    aws_sdk_bedrockruntime::types::error::ServiceUnavailableException::builder()
+                        .meta(meta("ServiceUnavailableException"))
+                        .build(),
+                ),
+                Some(503),
+            ),
+            (
+                ConverseStreamOutputError::ModelStreamErrorException(
+                    aws_sdk_bedrockruntime::types::error::ModelStreamErrorException::builder()
+                        .original_status_code(529)
+                        .meta(meta("ModelStreamErrorException"))
+                        .build(),
+                ),
+                Some(529),
+            ),
+            (
+                ConverseStreamOutputError::ModelStreamErrorException(
+                    aws_sdk_bedrockruntime::types::error::ModelStreamErrorException::builder()
+                        .meta(meta("ModelStreamErrorException"))
+                        .build(),
+                ),
+                Some(502),
+            ),
+        ];
+        for (svc, want_status) in cases {
+            let want_kind = svc.meta().code().map(str::to_string);
+            let e = SdkError::service_error(
+                svc,
+                aws_smithy_types::event_stream::RawMessage::invalid(None),
+            );
+            match map_converse_stream_event_error(e) {
+                BridgeError::UpstreamInBand {
+                    status,
+                    message,
+                    parsed,
+                    wire,
+                } => {
+                    assert_eq!(status, want_status);
+                    assert_eq!(parsed.expect("view").kind, want_kind);
+                    assert!(matches!(wire, aisix_gateway::UpstreamWire::Bedrock));
+                    assert!(
+                        !message.contains("arn:"),
+                        "raw AWS text must not leak: {message}"
+                    );
+                }
+                other => panic!("unexpected: {other:?}"),
+            }
+        }
+    }
+
+    /// Non-service receiver failures (event-stream decode, transport)
+    /// keep the historical Transport classification.
+    #[test]
+    fn converse_stream_non_service_error_stays_transport() {
+        let e: SdkError<ConverseStreamOutputError, aws_smithy_types::event_stream::RawMessage> =
+            SdkError::construction_failure("boom");
+        assert!(matches!(
+            map_converse_stream_event_error(e),
+            BridgeError::Transport(_)
+        ));
+    }
 
     // ─── Publisher resolution (preserved from skeleton) ───────────────
 

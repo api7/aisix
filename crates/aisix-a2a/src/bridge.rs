@@ -149,8 +149,43 @@ impl std::fmt::Debug for A2aUpstream {
     }
 }
 
+/// Warn — once per (agent, url) per process — when a credentialed agent is
+/// reached over cleartext HTTP: the gateway-held secret travels unencrypted
+/// on every call. Same posture as the MCP registry's warning (#879): a
+/// warning, never a rejection, and no request-behavior change. Deduped
+/// because the upstream is rebuilt per request. The scheme check mirrors
+/// the URL parser (lowercased scheme, leading whitespace stripped).
+fn warn_cleartext_credential(agent: &A2aAgent) {
+    use std::sync::{Mutex, OnceLock};
+    static WARNED: OnceLock<Mutex<std::collections::HashSet<(String, String)>>> = OnceLock::new();
+    if agent.auth_type == A2aAuthType::None {
+        return;
+    }
+    let cleartext = agent
+        .url
+        .trim_start()
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"));
+    if !cleartext {
+        return;
+    }
+    let mut warned = WARNED
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if warned.insert((agent.name.clone(), agent.url.clone())) {
+        tracing::warn!(
+            agent = %agent.name,
+            url = %agent.url,
+            "the gateway-held A2A agent credential is sent over cleartext http; anyone \
+             on the network path can read it — serve this agent over https"
+        );
+    }
+}
+
 /// Build an [`A2aUpstream`] from a registered [`A2aAgent`] resource.
 pub fn upstream_from_a2a_agent(agent: &A2aAgent) -> A2aUpstream {
+    warn_cleartext_credential(agent);
     let secret = agent.secret.clone().unwrap_or_default();
     let auth = match agent.auth_type {
         A2aAuthType::None => A2aAuth::None,

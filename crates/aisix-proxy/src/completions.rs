@@ -15,7 +15,7 @@
 //! 8. Providers that don't support completions return 501.
 
 use aisix_gateway::{BridgeError, ChatMessage, ChatResponse, FinishReason, UsageStats};
-use aisix_obs::{content_capture_cap, AccessLog, CapturedContent, RequestOutcome, UsageEvent};
+use aisix_obs::{content_capture_cap, AccessLog, CapturedContent, UsageEvent};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -44,6 +44,9 @@ struct CompletionDispatchSuccess {
     /// Resolved ProviderKey UUID — feeds per-PK telemetry attribution
     /// (AISIX-Cloud#867 parity).
     provider_key_id: String,
+    /// Provider-side model name, for the `upstream_model` metric label
+    /// (AISIX-Cloud#1234 parity with chat / messages / responses).
+    upstream_model: String,
     /// Upstream-reported token counts. `None` on the 501
     /// NotImplemented path (provider doesn't support completions)
     /// or on a 200 with no `usage` block (rare edge). Handler
@@ -139,11 +142,18 @@ pub async fn completions(
                 &request_id,
                 None,
             );
-            state.metrics.record_request(
-                &success.provider,
-                &model_name,
+            crate::request_metrics::record(
+                &state,
+                "/v1/completions",
+                crate::request_metrics::Caller::new(&auth),
+                crate::request_metrics::Upstream {
+                    provider: &success.provider,
+                    model: &model_name,
+                    upstream_model: &success.upstream_model,
+                    provider_key_id: &success.provider_key_id,
+                    ..Default::default()
+                },
                 status,
-                RequestOutcome::from_status(status),
                 elapsed,
             );
             // Issue #403: emit UsageEvent so cp-api's budget ledger
@@ -160,6 +170,8 @@ pub async fn completions(
                     &model_name,
                     &api_key_id,
                     &success.provider_key_id,
+                    &success.provider,
+                    &success.upstream_model,
                     status,
                     elapsed,
                     &usage,
@@ -186,11 +198,15 @@ pub async fn completions(
             );
             let snap = state.snapshot.load();
             let metric_model = crate::usage_attr::metric_model_label(&snap, &model_name);
-            state.metrics.record_request(
-                "unknown",
-                metric_model,
+            crate::request_metrics::record(
+                &state,
+                "/v1/completions",
+                crate::request_metrics::Caller::new(&auth),
+                crate::request_metrics::Upstream {
+                    model: metric_model,
+                    ..Default::default()
+                },
                 status,
-                RequestOutcome::from_status(status),
                 elapsed,
             );
             // Per #655 parity: surface the failed request in Logs with a
@@ -482,6 +498,7 @@ async fn dispatch(
                         provider: provider_label,
                         model_id: model_entry.id.to_string(),
                         provider_key_id: pk_entry.id.to_string(),
+                        upstream_model: model.upstream_model().unwrap_or("unknown").to_string(),
                         usage,
                         redactions,
                         monitor_hits,
@@ -517,6 +534,7 @@ async fn dispatch(
                 provider: provider_label,
                 model_id: model_entry.id.to_string(),
                 provider_key_id: pk_entry.id.to_string(),
+                upstream_model: model.upstream_model().unwrap_or("unknown").to_string(),
                 usage,
                 redactions,
                 monitor_hits,
@@ -533,6 +551,7 @@ async fn dispatch(
                 provider: provider_label,
                 model_id: model_entry.id.to_string(),
                 provider_key_id: pk_entry.id.to_string(),
+                upstream_model: model.upstream_model().unwrap_or("unknown").to_string(),
                 // No upstream call → no usage to attribute. Handler
                 // gates emission on `usage.is_some()` so 501 stays
                 // out of /logs noise (same convention as #402).
@@ -638,6 +657,11 @@ fn emit_usage_event(
     requested_model: &str,
     api_key_id: &str,
     provider_key_id: &str,
+    // Metric labels the UsageEvent has no field for (AISIX-Cloud#1234
+    // follow-up): the wire struct is the CP contract, so they ride
+    // alongside rather than in it.
+    provider: &str,
+    upstream_model: &str,
     status_code: u16,
     elapsed: Duration,
     usage: &CompletionUsage,
@@ -682,8 +706,27 @@ fn emit_usage_event(
     state
         .otlp_fan_out
         .fan_out(&event, content, exporters.iter().map(|e| &e.value));
+    let owned_caller = crate::request_metrics::Caller::from_api_key_id(&snap, api_key_id);
+    crate::request_metrics::record_usage(
+        state,
+        "/v1/completions",
+        owned_caller.as_caller(),
+        crate::request_metrics::Upstream {
+            provider,
+            model: requested_model,
+            upstream_model,
+            provider_key_id,
+            ..Default::default()
+        },
+        crate::request_metrics::Tokens {
+            input: usage.prompt_tokens,
+            output: usage.completion_tokens,
+            total: usage.prompt_tokens.saturating_add(usage.completion_tokens),
+            spend_usd: 0.0,
+            client_type: state.client_classifier.classify(&client.user_agent),
+        },
+    );
 }
-
 fn emit_access_log(
     model: &str,
     provider: &str,
@@ -744,6 +787,7 @@ mod tests {
             addr: "127.0.0.1:0".into(),
             request_body_limit_bytes: 1_048_576,
             real_ip: Default::default(),
+            url_rewrites: Vec::new(),
             tls: None,
             thread_per_core: None,
             workers: None,

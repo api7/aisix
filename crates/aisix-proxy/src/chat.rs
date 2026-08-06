@@ -21,8 +21,8 @@ use aisix_core::AppliedGuardrail;
 use aisix_gateway::{BridgeError, ChatFormat};
 use aisix_guardrails::GuardrailVerdict;
 use aisix_obs::{
-    content_capture_cap, AccessLog, CapturedContent, LatencyLabels, LlmUsage, Metrics,
-    RequestLabels, RequestOutcome, UsageEvent, UsageLabels,
+    content_capture_cap, AccessLog, CapturedContent, LatencyLabels, Metrics, UsageEvent,
+    UsageLabels,
 };
 use axum::extract::State;
 use axum::http::HeaderValue;
@@ -142,22 +142,13 @@ pub async fn chat_completions(
         Ok(mut success) => {
             let status = 200;
             let elapsed = started.elapsed();
-            // #890 req-3/req-4: resolve the readable provider-key name from the
-            // snapshot and normalise the inbound client type once.
-            let provider_key_name = {
-                let snap = state.snapshot.load();
-                crate::usage_attr::provider_key_metric_name(&snap, &success.provider_key_id)
-            };
+            // #890 req-4: normalise the inbound client type once.
             let client_type = state.client_classifier.classify(&client.user_agent);
             record_success(
-                &state.metrics,
+                &state,
+                &auth,
                 &success.provider,
                 &model_name,
-                &api_key_id,
-                auth.key().team_id.as_deref(),
-                auth.key().user_id.as_deref(),
-                auth.key().user_name.as_deref(),
-                &provider_key_name,
                 client_type,
                 req.is_streaming(),
                 success.routing.fallback_count() > 0,
@@ -349,7 +340,6 @@ pub async fn chat_completions(
             // volume, not label cardinality).
             let snap = state.snapshot.load();
             let metric_model = crate::usage_attr::metric_model_label(&snap, &model_name);
-            record_error(&state.metrics, &err, metric_model, status, elapsed);
             // Access log: surface the upstream-billed counts when the
             // error fired AFTER the upstream call (output-content-filter
             // block). Pre-upstream errors (input filter, budget,
@@ -378,26 +368,19 @@ pub async fn chat_completions(
             // Provider / upstream_model / provider_key are unknown on the
             // failure path; identity + status + outcome + stream + is_fallback
             // are what the success-rate query needs.
-            let fail_labels = RequestLabels {
-                endpoint: "/v1/chat/completions",
-                inbound_protocol: "openai",
-                provider: "unknown",
-                model: metric_model,
-                upstream_model: "unknown",
-                provider_key_id: "unknown",
-                provider_key_name: "unknown",
-                api_key_id: &api_key_id,
-                team_id: auth.key().team_id.as_deref().unwrap_or("unknown"),
-                user_id: auth.key().user_id.as_deref().unwrap_or("unknown"),
-                user_name: auth.key().user_name.as_deref().unwrap_or("unknown"),
-                stream: req.is_streaming(),
-                is_fallback: routing.fallback_count() > 0,
+            crate::request_metrics::record(
+                &state,
+                "/v1/chat/completions",
+                crate::request_metrics::Caller::new(&auth),
+                crate::request_metrics::Upstream {
+                    model: metric_model,
+                    stream: req.is_streaming(),
+                    is_fallback: routing.fallback_count() > 0,
+                    ..Default::default()
+                },
                 status,
-                outcome: RequestOutcome::from_status(status),
-            };
-            state
-                .metrics
-                .record_proxy_and_llm_request(fail_labels, elapsed);
+                elapsed,
+            );
             state.metrics.record_request_e2e_latency(
                 LatencyLabels {
                     endpoint: "/v1/chat/completions",
@@ -1169,6 +1152,7 @@ async fn dispatch(
     if virtual_entry.value.is_ensemble() {
         return dispatch_ensemble(
             state,
+            auth,
             &snapshot,
             &virtual_entry,
             req,
@@ -1214,6 +1198,11 @@ async fn dispatch(
             virtual_entry.value.routing.is_some() || virtual_entry.value.is_semantic();
         let mut stream_routing = RoutingTelemetry::default();
         let mut last_err: Option<BridgeError> = None;
+        // The un-flattened per-target quota rejection, kept only while it
+        // is the loop's LATEST failure: on exhaustion it is surfaced
+        // instead of its flattened BridgeError twin so the 429 keeps the
+        // structured `error.policy` attribution (AISIX-Cloud#892).
+        let mut last_reserve_reject: Option<ProxyError> = None;
 
         struct StreamWin {
             model: aisix_core::Model,
@@ -1242,16 +1231,19 @@ async fn dispatch(
         'targets: for (target_idx, attempt) in attempt_models.iter().enumerate() {
             let model = &attempt.model;
             let Ok(provider) = crate::dispatch::require_provider(model) else {
+                last_reserve_reject = None;
                 last_err = Some(BridgeError::Config("model has no provider".into()));
                 continue 'targets;
             };
             let Ok(pk_entry) = crate::dispatch::resolve_provider_key(&snapshot, model) else {
+                last_reserve_reject = None;
                 last_err = Some(BridgeError::Config(
                     "model references unknown provider_key_id".into(),
                 ));
                 continue 'targets;
             };
             let Some(bridge) = crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value) else {
+                last_reserve_reject = None;
                 last_err = Some(BridgeError::Config(
                     "no bridge registered for provider_key".into(),
                 ));
@@ -1313,6 +1305,7 @@ async fn dispatch(
                 // reset mid-loop).
                 let member_reservation = match crate::quota::reserve_routing_target(
                     state,
+                    auth,
                     is_routing_request,
                     &model.display_name,
                     &attempt.id,
@@ -1320,7 +1313,10 @@ async fn dispatch(
                 )
                 .await
                 {
-                    Ok(r) => r,
+                    Ok(r) => {
+                        last_reserve_reject = None;
+                        r
+                    }
                     Err(e) => {
                         stream_routing.attempts.push(AttemptRecord {
                             index: idx,
@@ -1345,6 +1341,12 @@ async fn dispatch(
                             ),
                             crate::quota::retry_after_of(&e).map(Duration::from_secs),
                         ));
+                        // Only the policy-layer rejection is worth
+                        // surfacing un-flattened (it carries the
+                        // `error.policy` attribution); the inline model
+                        // layer keeps the established flattened shape.
+                        last_reserve_reject =
+                            matches!(e, ProxyError::PolicyRateLimit { .. }).then_some(e);
                         continue 'targets;
                     }
                 };
@@ -1455,6 +1457,7 @@ async fn dispatch(
                         // timeout — see `RetryBudget::covers`. Fail-over is
                         // unaffected: the outer loop still moves on.
                         let budget_covers = budget.covers(&err);
+                        last_reserve_reject = None;
                         last_err = Some(err);
                         if !retryable {
                             break 'targets;
@@ -1481,6 +1484,13 @@ async fn dispatch(
         }
 
         let Some(won) = won else {
+            // When the loop's LAST failure was a per-target quota
+            // rejection, surface the un-flattened ProxyError: same 429 +
+            // Retry-After as the BridgeError twin, plus the structured
+            // `error.policy` attribution (AISIX-Cloud#892).
+            if let Some(e) = last_reserve_reject {
+                return Err(with_model(e).with_routing(stream_routing));
+            }
             let err = last_err.unwrap_or_else(|| {
                 BridgeError::Config("streaming routing exhausted with no targets".into())
             });
@@ -1734,39 +1744,36 @@ async fn dispatch(
                         _ => None,
                     },
                 );
-                metrics_for_stream.record_llm_usage(
-                    UsageLabels {
-                        endpoint: "/v1/chat/completions",
-                        inbound_protocol: "openai",
-                        provider: &provider_for_metrics,
-                        model: &model_for_metrics,
-                        upstream_model: &upstream_model_for_metrics,
-                        provider_key_id: &provider_key_id_for_metrics,
-                        provider_key_name: &provider_key_name_for_metrics,
+                // #1002: comp.total_tokens is the cache-inclusive total (an
+                // Anthropic upstream bridged to an OpenAI-shape client folds
+                // cache tokens into total_tokens per #679).
+                crate::request_metrics::record_usage(
+                    &state_for_telem,
+                    "/v1/chat/completions",
+                    crate::request_metrics::Caller {
                         api_key_id: &api_key_id_for_telem,
                         team_id: team_id_for_metrics.as_deref().unwrap_or("unknown"),
                         user_id: user_id_for_metrics.as_deref().unwrap_or("unknown"),
                         user_name: user_name_for_metrics.as_deref().unwrap_or("unknown"),
                     },
-                    LlmUsage {
-                        input_tokens: comp.prompt_tokens,
-                        output_tokens: comp.completion_tokens,
-                        total_tokens: comp.total_tokens.min(u64::from(u32::MAX)) as u32,
-                        spend_usd: 0.0,
+                    crate::request_metrics::Upstream {
+                        provider: &provider_for_metrics,
+                        model: &model_for_metrics,
+                        upstream_model: &upstream_model_for_metrics,
+                        provider_key_id: &provider_key_id_for_metrics,
+                        stream: true,
+                        // The serving target is fixed once the stream
+                        // commits, so fallback attribution is the
+                        // pre-stream winner's attempt kind.
+                        is_fallback: winner_kind == "fallback",
                     },
-                );
-                // #890 req-4: streaming token volume by inbound client type.
-                // #1002: comp.total_tokens is the cache-inclusive total (an
-                // Anthropic upstream bridged to an OpenAI-shape client folds
-                // cache tokens into total_tokens per #679).
-                // AISIX-Cloud#1044: same requested logical model as the
-                // UsageLabels above.
-                metrics_for_stream.record_llm_tokens_by_client(
-                    &client_type_for_metrics,
-                    &model_for_metrics,
-                    u64::from(comp.prompt_tokens),
-                    u64::from(comp.completion_tokens),
-                    comp.total_tokens,
+                    crate::request_metrics::Tokens {
+                        input: comp.prompt_tokens,
+                        output: comp.completion_tokens,
+                        total: comp.total_tokens.min(u64::from(u32::MAX)) as u32,
+                        spend_usd: 0.0,
+                        client_type: &client_type_for_metrics,
+                    },
                 );
                 metrics_for_stream.record_request_e2e_latency(
                     LatencyLabels {
@@ -2114,6 +2121,9 @@ async fn dispatch(
     // to later targets only after retries are exhausted. Non-retryable
     // (non-429 4xx) errors stop immediately.
     let mut last_err: Option<BridgeError> = None;
+    // See the streaming loop: latest per-target quota rejection, surfaced
+    // un-flattened on exhaustion for `error.policy` attribution (#892).
+    let mut last_reserve_reject: Option<ProxyError> = None;
     let mut chosen_provider: Option<String> = None;
     let mut chosen_provider_key_id: Option<String> = None;
     let mut chosen_upstream_model: Option<String> = None;
@@ -2146,12 +2156,14 @@ async fn dispatch(
     'targets: for (target_idx, attempt) in attempt_models.iter().enumerate() {
         let model = &attempt.model;
         let Some(provider) = model.provider.as_deref() else {
+            last_reserve_reject = None;
             last_err = Some(BridgeError::Config("model has no provider".into()));
             continue;
         };
         let pk_entry = match crate::dispatch::resolve_provider_key(&snapshot, model) {
             Ok(pk) => pk,
             Err(_) => {
+                last_reserve_reject = None;
                 last_err = Some(BridgeError::Config(
                     "model references unknown provider_key_id".into(),
                 ));
@@ -2164,6 +2176,7 @@ async fn dispatch(
         // is gone after #302 Phase A; a PK that matches neither tier is
         // a misconfiguration and surfaces as 503.
         let Some(bridge) = crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value) else {
+            last_reserve_reject = None;
             last_err = Some(BridgeError::Config(format!(
                 "no bridge registered for provider_key provider={:?} adapter={:?}",
                 pk_entry.value.provider, pk_entry.value.adapter
@@ -2219,6 +2232,7 @@ async fn dispatch(
             // reset mid-loop).
             let member_reservation = match crate::quota::reserve_routing_target(
                 state,
+                auth,
                 is_routing_request,
                 &model.display_name,
                 &attempt.id,
@@ -2226,7 +2240,10 @@ async fn dispatch(
             )
             .await
             {
-                Ok(r) => r,
+                Ok(r) => {
+                    last_reserve_reject = None;
+                    r
+                }
                 Err(e) => {
                     routing.attempts.push(AttemptRecord {
                         index: attempt_index,
@@ -2251,6 +2268,12 @@ async fn dispatch(
                         ),
                         crate::quota::retry_after_of(&e).map(Duration::from_secs),
                     ));
+                    // Only the policy-layer rejection is worth surfacing
+                    // un-flattened (it carries the `error.policy`
+                    // attribution); the inline model layer keeps the
+                    // established flattened shape.
+                    last_reserve_reject =
+                        matches!(e, ProxyError::PolicyRateLimit { .. }).then_some(e);
                     continue 'targets;
                 }
             };
@@ -2333,6 +2356,7 @@ async fn dispatch(
                     // same-target retries for timeouts. Fail-over is
                     // unaffected.
                     let budget_covers = budget.covers(&err);
+                    last_reserve_reject = None;
                     last_err = Some(err);
                     if !retryable {
                         break;
@@ -2368,6 +2392,11 @@ async fn dispatch(
     }
 
     let Some(mut upstream) = upstream else {
+        // Prefer the un-flattened quota rejection when it was the last
+        // failure — keeps `error.policy` attribution (AISIX-Cloud#892).
+        if let Some(e) = last_reserve_reject {
+            return Err(with_model(e).with_routing(routing));
+        }
         // Bubble the most recent BridgeError through ProxyError::Bridge.
         let err = last_err.unwrap_or_else(|| {
             BridgeError::Config("routing exhausted with no targets attempted".into())
@@ -2637,6 +2666,7 @@ async fn dispatch(
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_ensemble(
     state: &ProxyState,
+    auth: &AuthenticatedKey,
     snapshot: &aisix_core::AisixSnapshot,
     virtual_entry: &aisix_core::ResourceEntry<aisix_core::Model>,
     req: &ChatFormat,
@@ -2767,6 +2797,7 @@ async fn dispatch_ensemble(
 
     let caller = crate::ensemble::ProxyModelCaller {
         state,
+        auth,
         snapshot,
         request_id,
         client,
@@ -2899,6 +2930,7 @@ async fn dispatch_ensemble(
         // tokens are added post-stream, mirroring the entry reservation below.
         let judge_reservation = match crate::quota::reserve_model_only(
             state,
+            auth,
             &ensemble_cfg.judge.model,
             &judge_entry.id,
             judge_model,
@@ -3514,15 +3546,12 @@ fn finish_reason_label(reason: &aisix_gateway::FinishReason) -> String {
 
 #[allow(clippy::too_many_arguments)]
 fn record_success(
-    metrics: &Metrics,
+    state: &ProxyState,
+    auth: &AuthenticatedKey,
     provider: &str,
     model: &str,
-    api_key_id: &str,
-    team_id: Option<&str>,
-    user_id: Option<&str>,
-    // #890 req-3 readable name + req-4 client type + req-1/req-2 dimensions.
-    user_name: Option<&str>,
-    provider_key_name: &str,
+    // #890 req-4 client type + req-1/req-2 dimensions. The readable
+    // provider-key name is resolved inside `request_metrics`.
     client_type: &str,
     stream: bool,
     is_fallback: bool,
@@ -3530,26 +3559,23 @@ fn record_success(
     s: &Success,
     elapsed: Duration,
 ) {
-    let outcome = RequestOutcome::from_status(status);
-    metrics.record_request(provider, model, status, outcome, elapsed);
-    let request_labels = RequestLabels {
-        endpoint: "/v1/chat/completions",
-        inbound_protocol: "openai",
-        provider,
-        model,
-        upstream_model: &s.upstream_model,
-        provider_key_id: &s.provider_key_id,
-        provider_key_name,
-        api_key_id,
-        team_id: team_id.unwrap_or("unknown"),
-        user_id: user_id.unwrap_or("unknown"),
-        user_name: user_name.unwrap_or("unknown"),
-        stream,
-        is_fallback,
+    let metrics = &state.metrics;
+    let caller = crate::request_metrics::Caller::new(auth);
+    crate::request_metrics::record(
+        state,
+        "/v1/chat/completions",
+        caller,
+        crate::request_metrics::Upstream {
+            provider,
+            model,
+            upstream_model: &s.upstream_model,
+            provider_key_id: &s.provider_key_id,
+            stream,
+            is_fallback,
+        },
         status,
-        outcome,
-    };
-    metrics.record_proxy_and_llm_request(request_labels, elapsed);
+        elapsed,
+    );
     // SLO e2e histogram (AISIX-Cloud#1011): non-streaming only here —
     // `elapsed` for a stream is time-to-response-start; the stream's
     // on_complete records the full duration instead.
@@ -3565,42 +3591,29 @@ fn record_success(
             elapsed,
         );
     }
-    if let Some(total) = s.total_tokens {
-        metrics.record_tokens(provider, model, total);
-    }
-    metrics.record_llm_usage(
-        UsageLabels {
-            endpoint: "/v1/chat/completions",
-            inbound_protocol: "openai",
+    // Non-streaming path only; streaming tokens arrive in the SSE
+    // on_complete and are recorded there. All-zero is a no-op, which is what
+    // the streaming branch reaching here produces.
+    // #1002: `s.total_tokens` is the cache-inclusive canonical total.
+    crate::request_metrics::record_usage(
+        state,
+        "/v1/chat/completions",
+        caller,
+        crate::request_metrics::Upstream {
             provider,
             model,
             upstream_model: &s.upstream_model,
             provider_key_id: &s.provider_key_id,
-            provider_key_name,
-            api_key_id,
-            team_id: team_id.unwrap_or("unknown"),
-            user_id: user_id.unwrap_or("unknown"),
-            user_name: user_name.unwrap_or("unknown"),
+            stream,
+            is_fallback,
         },
-        LlmUsage {
-            input_tokens: s.prompt_tokens.unwrap_or(0).min(u64::from(u32::MAX)) as u32,
-            output_tokens: s.completion_tokens.unwrap_or(0).min(u64::from(u32::MAX)) as u32,
-            total_tokens: s.total_tokens.unwrap_or(0).min(u64::from(u32::MAX)) as u32,
+        crate::request_metrics::Tokens {
+            input: s.prompt_tokens.unwrap_or(0).min(u64::from(u32::MAX)) as u32,
+            output: s.completion_tokens.unwrap_or(0).min(u64::from(u32::MAX)) as u32,
+            total: s.total_tokens.unwrap_or(0).min(u64::from(u32::MAX)) as u32,
             spend_usd: s.cost_usd,
+            client_type,
         },
-    );
-    // #890 req-4: token volume by inbound client type (non-streaming path;
-    // streaming tokens arrive in the SSE on_complete and are recorded there).
-    // No-op when all counts are zero (e.g. the streaming branch here).
-    // #1002: s.total_tokens is the cache-inclusive canonical total.
-    // AISIX-Cloud#1044: `model` is the same requested logical model recorded
-    // on the UsageLabels above.
-    metrics.record_llm_tokens_by_client(
-        client_type,
-        model,
-        s.prompt_tokens.unwrap_or(0),
-        s.completion_tokens.unwrap_or(0),
-        s.total_tokens.unwrap_or(0),
     );
 }
 
@@ -3914,15 +3927,6 @@ fn emit_failed_attempts(
             client,
             content,
         );
-    }
-}
-
-fn record_error(metrics: &Metrics, err: &ProxyError, model: &str, status: u16, elapsed: Duration) {
-    let outcome = RequestOutcome::from_status(status);
-    // Provider is unknown for pre-dispatch errors (auth, 404, etc.).
-    metrics.record_request("unknown", model, status, outcome, elapsed);
-    if let ProxyError::RateLimit(rl) = err {
-        metrics.record_ratelimit_rejection(&rl.scope().to_string());
     }
 }
 

@@ -1,8 +1,9 @@
-//! `/mcp` — the downstream-facing MCP gateway endpoint.
+//! `/mcp` and `/mcp/{server}` — the downstream-facing MCP gateway endpoints.
 //!
 //! AISIX presents as a single MCP server to a downstream agent: it aggregates
 //! the tools of the registered `mcp_servers` and routes tool calls back to
-//! them. The caller authenticates with an AISIX API key — the
+//! them. `/mcp/{server}` scopes the same gateway to one registered server,
+//! serving its tools under their original (un-namespaced) names. The caller authenticates with an AISIX API key — the
 //! [`AuthenticatedKey`] extractor rejects a missing or invalid key with `401`
 //! before the request reaches the gateway. The gateway is rebuilt from the
 //! current configuration snapshot on each request, so it always reflects the
@@ -16,7 +17,7 @@
 
 use std::time::{Duration, Instant};
 
-use aisix_obs::{AccessLog, RequestOutcome, UsageEvent};
+use aisix_obs::{AccessLog, UsageEvent};
 use axum::body::{to_bytes, Body};
 use axum::extract::{Request, State};
 use axum::http::StatusCode;
@@ -64,6 +65,32 @@ pub async fn mcp_endpoint(
     State(state): State<ProxyState>,
     request: Request,
 ) -> Response {
+    serve(auth, state, request, None).await
+}
+
+/// Serve a `/mcp/{server}` request: the single-server variant of
+/// [`mcp_endpoint`]. The path names a registered MCP server; the gateway is
+/// scoped to it and serves its tools under their original names (`tools/call`
+/// also accepts the namespaced form). Everything else — auth, per-tool ACL,
+/// quota, guardrails, usage — is the same pipeline as the aggregated endpoint;
+/// only the server selection and the tool-name surface differ. An unknown or
+/// disabled server is `404` (after auth, so an unauthenticated caller learns
+/// nothing about which servers exist).
+pub async fn mcp_scoped_endpoint(
+    auth: AuthenticatedKey,
+    crate::reject::AisixPath(server): crate::reject::AisixPath<String>,
+    State(state): State<ProxyState>,
+    request: Request,
+) -> Response {
+    serve(auth, state, request, Some(server)).await
+}
+
+async fn serve(
+    auth: AuthenticatedKey,
+    state: ProxyState,
+    request: Request,
+    scope: Option<String>,
+) -> Response {
     // #698: /mcp emits the same access log + request metrics as every other
     // handler — pre-fix the endpoint was invisible in both. One wrapper
     // around `dispatch` covers every early-return path (quota, guardrail
@@ -76,14 +103,24 @@ pub async fn mcp_endpoint(
         .unwrap_or_else(new_request_id);
     let api_key_id = auth.entry.id.clone();
     let method = request.method().clone();
+    // `dispatch` takes the key by value; the terminal emit below still needs
+    // the caller's team / user labels (the handle is an `Arc` clone).
+    let caller_auth = auth.clone();
 
-    let response = dispatch(auth, &state, request, &request_id).await;
+    let response = dispatch(auth, scope.as_deref(), &state, request, &request_id).await;
 
     let elapsed = started.elapsed();
     let status = response.status().as_u16();
+    // Bounded route template, mirroring `/a2a` (the per-request server is
+    // on the usage event, not the access log).
+    let endpoint = if scope.is_some() {
+        "/mcp/{server}"
+    } else {
+        "/mcp"
+    };
     AccessLog {
         method: method.as_str(),
-        path: "/mcp",
+        path: endpoint,
         status,
         latency: elapsed,
         provider: Some("mcp"),
@@ -103,11 +140,16 @@ pub async fn mcp_endpoint(
         routing_fallback_count: None,
     }
     .emit();
-    state.metrics.record_request(
-        "mcp",
-        MCP_MODEL_LABEL,
+    crate::request_metrics::record(
+        &state,
+        endpoint,
+        crate::request_metrics::Caller::new(&caller_auth),
+        crate::request_metrics::Upstream {
+            provider: "mcp",
+            model: MCP_MODEL_LABEL,
+            ..Default::default()
+        },
         status,
-        RequestOutcome::from_status(status),
         elapsed,
     );
     response
@@ -115,10 +157,33 @@ pub async fn mcp_endpoint(
 
 async fn dispatch(
     auth: AuthenticatedKey,
+    scope: Option<&str>,
     state: &ProxyState,
     request: Request,
     request_id: &str,
 ) -> Response {
+    // One snapshot for the whole request: the scoped-server resolution below
+    // and the gateway construction further down must see the same resource
+    // set.
+    let snapshot = state.snapshot.load();
+
+    // Scoped endpoint: resolve the path's server before doing any work. A
+    // disabled server is treated as absent — not served, same as the
+    // aggregated endpoint skipping it (and same as `/a2a/:agent`).
+    if let Some(server) = scope {
+        let known = snapshot
+            .mcp_servers
+            .get_by_name(server)
+            .is_some_and(|entry| entry.value.enabled);
+        if !known {
+            return (
+                StatusCode::NOT_FOUND,
+                format!("unknown MCP server: {server}"),
+            )
+                .into_response();
+        }
+    }
+
     // Buffer the body so the JSON-RPC method can be inspected, then rebuilt for
     // the gateway. The global body-limit layer has already capped the size.
     let (parts, body) = request.into_parts();
@@ -143,15 +208,29 @@ async fn dispatch(
 
     let peek = serde_json::from_slice::<JsonRpcPeek>(&bytes).ok();
     let is_tool_call = peek.as_ref().and_then(|p| p.method.as_deref()) == Some("tools/call");
-    // Split the namespaced tool name into (server, tool) up front, owned, so it
-    // survives the body being consumed when the request is rebuilt.
+    // Resolve the called (server, tool) up front, owned, so it survives the
+    // body being consumed when the request is rebuilt. Aggregated: split the
+    // namespaced name. Scoped: the server comes from the path and the name is
+    // the upstream's original one — stripped through the same primitive the
+    // gateway parses with (`strip_server_prefix`), so quota and usage
+    // attribute the same tool for both spellings and can never drift from
+    // what actually dispatches.
     let (mcp_server, mcp_tool) = if is_tool_call {
-        peek.as_ref()
+        let name = peek
+            .as_ref()
             .and_then(|p| p.params.as_ref())
             .and_then(|p| p.name.as_deref())
-            .and_then(|name| name.split_once(aisix_mcp::TOOL_NAMESPACE_SEPARATOR))
-            .map(|(server, tool)| (server.to_string(), tool.to_string()))
-            .unwrap_or_default()
+            .unwrap_or_default();
+        match scope {
+            Some(server) => {
+                let bare = aisix_mcp::strip_server_prefix(server, name).unwrap_or(name);
+                (server.to_string(), bare.to_string())
+            }
+            None => name
+                .split_once(aisix_mcp::TOOL_NAMESPACE_SEPARATOR)
+                .map(|(server, tool)| (server.to_string(), tool.to_string()))
+                .unwrap_or_default(),
+        }
     } else {
         (String::new(), String::new())
     };
@@ -243,12 +322,25 @@ async fn dispatch(
         }
     }
 
-    let snapshot = state.snapshot.load();
     // Scope the gateway to the tools this caller's key permits — resolved
     // from the key together with the environment/team MCP access policies —
     // so MCP tool access is governed by the same key object as LLM access.
     let acl = aisix_mcp::ToolAcl::resolve(&snapshot, auth.key());
-    let gateway = aisix_mcp::McpGateway::from_snapshot(&snapshot).with_tool_acl(acl);
+    let gateway = match scope {
+        // Same snapshot as the resolution above, so the entry is still there.
+        Some(server) => match aisix_mcp::McpGateway::from_snapshot_scoped(&snapshot, server) {
+            Some(gateway) => gateway,
+            None => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    format!("unknown MCP server: {server}"),
+                )
+                    .into_response()
+            }
+        },
+        None => aisix_mcp::McpGateway::from_snapshot(&snapshot),
+    }
+    .with_tool_acl(acl);
     let service = aisix_mcp::streamable_http_service(gateway);
     let request = Request::from_parts(parts, Body::from(bytes));
     // `StreamableHttpService` is a tower service that dispatches on method and
@@ -463,6 +555,7 @@ mod tests {
             addr: "127.0.0.1:0".into(),
             request_body_limit_bytes: 1_048_576,
             real_ip: Default::default(),
+            url_rewrites: Vec::new(),
             tls: None,
             thread_per_core: None,
             workers: None,
@@ -1319,5 +1412,207 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
+    }
+
+    // ── /mcp/{server} — the scoped, single-server endpoint ──
+
+    /// Seed an MCP server row. The URL is unroutable on purpose: these tests
+    /// pin routing, resolution and attribution, not upstream success (that is
+    /// covered by the aisix-mcp integration tests and the e2e suite).
+    fn insert_mcp_server(snapshot: &AisixSnapshot, id: &str, name: &str, enabled: bool) {
+        let server: aisix_core::McpServer = serde_json::from_value(serde_json::json!({
+            "display_name": name,
+            "url": "http://127.0.0.1:9/mcp",
+            "enabled": enabled,
+        }))
+        .expect("valid mcp server");
+        snapshot
+            .mcp_servers
+            .insert(ResourceEntry::new(id, server, 1));
+    }
+
+    /// A JSON-RPC request to `/mcp/{server}`, optionally authenticated.
+    fn scoped_request(
+        server: &str,
+        auth: Option<&str>,
+        method: &str,
+        params: serde_json::Value,
+    ) -> HttpRequest<Body> {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": method,
+            "params": params
+        });
+        let mut builder = HttpRequest::post(format!("/mcp/{server}"))
+            .header("host", "mcp.aisix.example.com")
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream");
+        if let Some(token) = auth {
+            builder = builder.header("authorization", format!("Bearer {token}"));
+        }
+        builder.body(Body::from(body.to_string())).unwrap()
+    }
+
+    fn scoped_tools_call(server: &str, name: &str) -> HttpRequest<Body> {
+        scoped_request(
+            server,
+            Some(TOKEN),
+            "tools/call",
+            serde_json::json!({ "name": name, "arguments": {} }),
+        )
+    }
+
+    /// A snapshot with one enabled server `alpha` and a key that may call
+    /// every tool.
+    fn scoped_snapshot() -> AisixSnapshot {
+        let apikey: ApiKey = serde_json::from_value(serde_json::json!({
+            "key_hash": ApiKey::hash_bearer(TOKEN),
+            "allowed_models": ["*"],
+            "allowed_tools": ["*"],
+        }))
+        .expect("valid apikey");
+        let snapshot = AisixSnapshot::new();
+        snapshot
+            .apikeys
+            .insert(ResourceEntry::new("ak-1", apikey, 1));
+        insert_mcp_server(&snapshot, "mcp-1", "alpha", true);
+        snapshot
+    }
+
+    #[tokio::test]
+    async fn scoped_endpoint_auth_precedes_server_resolution() {
+        // No credentials → 401, even for a server that does not exist: an
+        // unauthenticated caller must not learn which servers are registered.
+        let router = router_with(snapshot_with_key());
+        let response = router
+            .oneshot(scoped_request(
+                "ghost",
+                None,
+                "initialize",
+                serde_json::json!({}),
+            ))
+            .await
+            .expect("router responds");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn scoped_endpoint_unknown_or_disabled_server_is_404() {
+        // Unregistered server.
+        let router = router_with(scoped_snapshot());
+        let response = router
+            .oneshot(scoped_tools_call("ghost", "tool"))
+            .await
+            .expect("router responds");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        // Registered but disabled server: treated as absent, no fallback to
+        // the aggregated surface.
+        let snapshot = scoped_snapshot();
+        insert_mcp_server(&snapshot, "mcp-2", "dark", false);
+        let router = router_with(snapshot);
+        let response = router
+            .oneshot(scoped_tools_call("dark", "tool"))
+            .await
+            .expect("router responds");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn scoped_tool_call_attributes_server_from_path() {
+        use aisix_obs::{UsageEvent, UsageSink};
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<UsageEvent>(8);
+        let handle = SnapshotHandle::new(scoped_snapshot());
+        let hub = Arc::new(aisix_gateway::Hub::new());
+        let state = ProxyState::new(handle, hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let router = build_router(state);
+
+        // A bare (original) tool name: the server comes from the path, not
+        // from a namespace prefix inside the name.
+        let _ = router
+            .clone()
+            .oneshot(scoped_tools_call("alpha", "tool"))
+            .await
+            .expect("router responds");
+        let event = rx.try_recv().expect("usage event for the bare-name call");
+        assert_eq!(event.inbound_protocol, "mcp");
+        assert_eq!(event.mcp_server_name, "alpha");
+        assert_eq!(event.mcp_tool_name, "tool");
+
+        // The namespaced spelling attributes identically — same tool, same
+        // server — so quota and usage cannot be split by client spelling.
+        let _ = router
+            .oneshot(scoped_tools_call("alpha", "alpha__tool"))
+            .await
+            .expect("router responds");
+        let event = rx.try_recv().expect("usage event for the prefixed call");
+        assert_eq!(event.mcp_server_name, "alpha");
+        assert_eq!(event.mcp_tool_name, "tool");
+    }
+
+    #[tokio::test]
+    async fn scoped_per_server_rate_limit_keys_on_path_server() {
+        // The key may call `alpha` once a minute. On the scoped endpoint the
+        // limit must key on the path's server even for bare tool names.
+        let snapshot = snapshot_with_mcp_server_limits(&[(
+            "ak-1",
+            TOKEN,
+            serde_json::json!({ "alpha": { "rpm": 1 } }),
+        )]);
+        insert_mcp_server(&snapshot, "mcp-1", "alpha", true);
+        let router = router_with(snapshot);
+
+        let first = router
+            .clone()
+            .oneshot(scoped_tools_call("alpha", "tool"))
+            .await
+            .expect("router responds");
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let second = router
+            .clone()
+            .oneshot(scoped_tools_call("alpha", "tool"))
+            .await
+            .expect("router responds");
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        // The namespaced spelling shares the SAME bucket — a client cannot
+        // double its per-server allowance by switching spellings.
+        let prefixed = router
+            .oneshot(scoped_tools_call("alpha", "alpha__tool"))
+            .await
+            .expect("router responds");
+        assert_eq!(prefixed.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn scoped_and_aggregated_endpoints_share_the_per_server_bucket() {
+        // rpm=1 for `alpha`: one call through the aggregated endpoint must
+        // exhaust the allowance for the scoped endpoint too — switching
+        // endpoints cannot double the limit.
+        let snapshot = snapshot_with_mcp_server_limits(&[(
+            "ak-1",
+            TOKEN,
+            serde_json::json!({ "alpha": { "rpm": 1 } }),
+        )]);
+        insert_mcp_server(&snapshot, "mcp-1", "alpha", true);
+        let router = router_with(snapshot);
+
+        let aggregated = router
+            .clone()
+            .oneshot(tools_call_on(TOKEN, "alpha"))
+            .await
+            .expect("router responds");
+        assert_eq!(aggregated.status(), StatusCode::OK);
+
+        let scoped = router
+            .oneshot(scoped_tools_call("alpha", "tool"))
+            .await
+            .expect("router responds");
+        assert_eq!(scoped.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 }

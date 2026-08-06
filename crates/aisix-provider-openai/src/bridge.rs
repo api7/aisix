@@ -719,17 +719,22 @@ fn parse_stream_chunk(
     payload: &str,
     reasoning_path: Option<&str>,
 ) -> Result<OpenAiStreamChunk, BridgeError> {
-    match reasoning_path {
-        Some(path) => {
-            let mut value: Value = serde_json::from_str(payload)
-                .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?;
-            extract_reasoning_field(&mut value, path);
-            serde_json::from_value(value).map_err(|e| BridgeError::UpstreamDecode(e.to_string()))
-        }
-        None => {
-            serde_json::from_str(payload).map_err(|e| BridgeError::UpstreamDecode(e.to_string()))
-        }
-    }
+    let parsed = match reasoning_path {
+        Some(path) => serde_json::from_str::<Value>(payload)
+            .map_err(|e| e.to_string())
+            .and_then(|mut value| {
+                extract_reasoning_field(&mut value, path);
+                serde_json::from_value(value).map_err(|e| e.to_string())
+            }),
+        None => serde_json::from_str(payload).map_err(|e| e.to_string()),
+    };
+    parsed.map_err(|serde_err| {
+        // A frame that isn't a chunk may be the provider reporting an
+        // error inside the 200 stream (`{"error":{...}}`) — surface the
+        // provider's own error instead of the serde failure.
+        aisix_gateway::capture_in_band_error(payload, aisix_gateway::UpstreamWire::OpenAI)
+            .unwrap_or(BridgeError::UpstreamDecode(serde_err))
+    })
 }
 
 #[cfg(test)]
@@ -1155,6 +1160,61 @@ data: [DONE]\n\n";
             Err(BridgeError::UpstreamStatus { status: 500, .. }) => {}
             Err(other) => panic!("unexpected: {other:?}"),
         }
+    }
+
+    /// AISIX-Cloud#1222 scenario 3: an OpenAI-compatible upstream that
+    /// commits a 200 stream and then reports failure as a
+    /// `data: {"error":{...}}` frame. Pre-fix the frame surfaced as an
+    /// `UpstreamDecode` serde failure and the provider's own error
+    /// type/message were lost.
+    #[tokio::test]
+    async fn streaming_in_band_error_frame_surfaces_as_typed_error() {
+        let server = MockServer::start().await;
+        let sse = "\
+data: {\"id\":\"cmpl-s\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hel\"},\"finish_reason\":null}]}\n\n\
+data: {\"error\":{\"message\":\"The server had an error processing your request\",\"type\":\"server_error\",\"code\":\"server_error\"}}\n\n";
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&server)
+            .await;
+
+        let bridge = OpenAiBridge::new();
+        let ctx = sample_ctx(&server.uri());
+        let mut stream = bridge.chat_stream(&req(), &ctx).await.unwrap();
+
+        let first = stream.next().await.expect("delta before the error");
+        assert_eq!(first.unwrap().delta.content.as_deref(), Some("hel"));
+        let err = stream.next().await.expect("error frame").unwrap_err();
+        match err {
+            BridgeError::UpstreamInBand {
+                status,
+                message,
+                parsed,
+                wire,
+            } => {
+                assert_eq!(status, None);
+                assert_eq!(message, "The server had an error processing your request");
+                assert_eq!(parsed.expect("view").kind.as_deref(), Some("server_error"));
+                assert!(matches!(wire, aisix_gateway::UpstreamWire::OpenAI));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert!(stream.next().await.is_none());
+    }
+
+    /// Garbage that is not an error envelope keeps the historical
+    /// `UpstreamDecode` classification.
+    #[test]
+    fn parse_stream_chunk_garbage_still_decodes_error() {
+        let err = parse_stream_chunk("{not-json", None).unwrap_err();
+        assert!(matches!(err, BridgeError::UpstreamDecode(_)));
+        let err = parse_stream_chunk(r#"{"unexpected":"shape"}"#, None).unwrap_err();
+        assert!(matches!(err, BridgeError::UpstreamDecode(_)));
     }
 
     #[test]

@@ -98,8 +98,7 @@ describe("cost-aware (least_cost) routing e2e", () => {
     // Declare the expensive target FIRST — least_cost must reorder by price,
     // not honor declaration order. The router document is written BEFORE its
     // targets: watch events apply in revision order, so once both targets are
-    // visible the router is in the snapshot too (virtual models don't appear
-    // in /v1/models themselves).
+    // visible the router is in the snapshot too.
     await seed.createModel({
       display_name: "cost-virtual",
       routing: {

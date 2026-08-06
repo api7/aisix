@@ -37,8 +37,7 @@
 
 use aisix_core::AppliedGuardrail;
 use aisix_obs::{
-    content_capture_cap, AccessLog, CapturedContent, LatencyLabels, LlmUsage, RequestLabels,
-    RequestOutcome, UsageEvent, UsageLabels,
+    content_capture_cap, AccessLog, CapturedContent, LatencyLabels, UsageEvent, UsageLabels,
 };
 use axum::extract::State;
 use axum::http::{HeaderName, HeaderValue};
@@ -179,37 +178,21 @@ pub async fn messages(
                 &routing,
                 None,
             );
-            state.metrics.record_request(
-                &provider_label,
-                &model_name,
+            crate::request_metrics::record(
+                &state,
+                "/v1/messages",
+                crate::request_metrics::Caller::new(&auth),
+                crate::request_metrics::Upstream {
+                    provider: &provider_label,
+                    model: &model_name,
+                    upstream_model: &upstream_model,
+                    provider_key_id: &provider_key_id,
+                    stream: stream_requested,
+                    is_fallback: routing.fallback_count() > 0,
+                },
                 status,
-                RequestOutcome::from_status(status),
                 elapsed,
             );
-            let outcome = RequestOutcome::from_status(status);
-            // #890 req-3: readable provider-key name resolved from the snapshot.
-            let provider_key_name = {
-                let snap = state.snapshot.load();
-                crate::usage_attr::provider_key_metric_name(&snap, &provider_key_id)
-            };
-            let labels = RequestLabels {
-                endpoint: "/v1/messages",
-                inbound_protocol: "anthropic",
-                provider: &provider_label,
-                model: &model_name,
-                upstream_model: &upstream_model,
-                provider_key_id: &provider_key_id,
-                provider_key_name: &provider_key_name,
-                api_key_id: &api_key_id,
-                team_id: auth.key().team_id.as_deref().unwrap_or("unknown"),
-                user_id: auth.key().user_id.as_deref().unwrap_or("unknown"),
-                user_name: auth.key().user_name.as_deref().unwrap_or("unknown"),
-                stream: stream_requested,
-                is_fallback: routing.fallback_count() > 0,
-                status,
-                outcome,
-            };
-            state.metrics.record_proxy_and_llm_request(labels, elapsed);
             // SLO e2e histogram (AISIX-Cloud#1011): non-streaming only —
             // a stream records its full duration at completion instead.
             if !stream_requested {
@@ -308,36 +291,22 @@ pub async fn messages(
             );
             let snap = state.snapshot.load();
             let metric_model = crate::usage_attr::metric_model_label(&snap, &model_name);
-            state.metrics.record_request(
-                "unknown",
-                metric_model,
-                status,
-                RequestOutcome::from_status(status),
-                elapsed,
-            );
             // #890 req-2: count the FAILED request on the rich request metrics
             // so a success rate is computable (denominator incl. failures).
             // Provider/upstream/provider_key are unknown on the failure path.
-            let fail_labels = RequestLabels {
-                endpoint: "/v1/messages",
-                inbound_protocol: "anthropic",
-                provider: "unknown",
-                model: metric_model,
-                upstream_model: "unknown",
-                provider_key_id: "unknown",
-                provider_key_name: "unknown",
-                api_key_id: &api_key_id,
-                team_id: auth.key().team_id.as_deref().unwrap_or("unknown"),
-                user_id: auth.key().user_id.as_deref().unwrap_or("unknown"),
-                user_name: auth.key().user_name.as_deref().unwrap_or("unknown"),
-                stream: stream_requested,
-                is_fallback: routing.fallback_count() > 0,
+            crate::request_metrics::record(
+                &state,
+                "/v1/messages",
+                crate::request_metrics::Caller::new(&auth),
+                crate::request_metrics::Upstream {
+                    model: metric_model,
+                    stream: stream_requested,
+                    is_fallback: routing.fallback_count() > 0,
+                    ..Default::default()
+                },
                 status,
-                outcome: RequestOutcome::from_status(status),
-            };
-            state
-                .metrics
-                .record_proxy_and_llm_request(fail_labels, elapsed);
+                elapsed,
+            );
             state.metrics.record_request_e2e_latency(
                 LatencyLabels {
                     endpoint: "/v1/messages",
@@ -677,6 +646,14 @@ async fn dispatch(
     // Routing target names only matter on the telemetry for a real Model
     // Group; a direct model leaves `attempt_model` empty (its `model_id`
     // already identifies it), matching chat.rs.
+    // NOTE: deliberately narrower than chat's `routing.is_some() ||
+    // is_semantic()`. The quota gate defers model-property policies on any
+    // routing/ensemble/semantic PARENT (`ModelRateLimit::routing_parent`),
+    // expecting the per-target pass to reserve them — which only runs when
+    // this flag is true. Safe today because semantic/ensemble parents
+    // cannot successfully dispatch on this endpoint (no provider →
+    // pre-dispatch 4xx); if this endpoint ever grows semantic support,
+    // widen this flag or the deferred policies are silently skipped.
     let is_routing_request = model_entry.value.routing.is_some();
     let mut routing = RoutingTelemetry::default();
 
@@ -737,6 +714,7 @@ async fn dispatch(
             // reset mid-loop).
             let mut member_reservation = match crate::quota::reserve_routing_target(
                 state,
+                auth,
                 is_routing_request,
                 &target.model.display_name,
                 &target.id,
@@ -2801,37 +2779,31 @@ fn emit_anthropic_usage_event(
         metrics.cache_creation_tokens,
         metrics.cache_read_tokens,
     );
-    state.metrics.record_llm_usage(
-        UsageLabels {
-            endpoint: "/v1/messages",
-            inbound_protocol: "anthropic",
-            provider,
-            model,
-            upstream_model,
-            provider_key_id,
-            provider_key_name: &provider_key_name,
+    // Covers streaming and non-streaming — every /v1/messages usage event
+    // flows through here.
+    crate::request_metrics::record_usage(
+        state,
+        "/v1/messages",
+        crate::request_metrics::Caller {
             api_key_id,
             team_id: team_id.unwrap_or("unknown"),
             user_id: user_id.unwrap_or("unknown"),
             user_name: user_name.unwrap_or("unknown"),
         },
-        LlmUsage {
-            input_tokens: metrics.prompt_tokens,
-            output_tokens: metrics.completion_tokens,
-            total_tokens: total_tokens_all.min(u64::from(u32::MAX)) as u32,
-            spend_usd: 0.0,
+        crate::request_metrics::Upstream {
+            provider,
+            model,
+            upstream_model,
+            provider_key_id,
+            ..Default::default()
         },
-    );
-    // #890 req-4: token volume by inbound client type (covers streaming and
-    // non-streaming — every /v1/messages usage event flows through here).
-    // #1002: total_tokens_all folds in the Anthropic cache counters.
-    // AISIX-Cloud#1044: same requested logical model as the UsageLabels above.
-    state.metrics.record_llm_tokens_by_client(
-        state.client_classifier.classify(&client.user_agent),
-        model,
-        u64::from(metrics.prompt_tokens),
-        u64::from(metrics.completion_tokens),
-        total_tokens_all,
+        crate::request_metrics::Tokens {
+            input: metrics.prompt_tokens,
+            output: metrics.completion_tokens,
+            total: total_tokens_all.min(u64::from(u32::MAX)) as u32,
+            spend_usd: 0.0,
+            client_type: state.client_classifier.classify(&client.user_agent),
+        },
     );
     if metrics.upstream_ttft_ms > 0 {
         state.metrics.record_request_ttft(
@@ -3578,6 +3550,7 @@ mod tests {
             addr: "127.0.0.1:0".into(),
             request_body_limit_bytes: 1_048_576,
             real_ip: Default::default(),
+            url_rewrites: Vec::new(),
             tls: None,
             thread_per_core: None,
             workers: None,

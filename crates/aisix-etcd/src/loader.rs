@@ -88,6 +88,12 @@ pub struct RejectedEntry {
     pub kind: RejectionKind,
     pub error: String,
     pub timestamp_unix_secs: u64,
+    /// Unix seconds since when this key has been serving its last known
+    /// good value instead of the rejected bytes (#871). Always `None` as
+    /// produced by the loader — the supervisor joins its retained
+    /// stale-serving state in on read, so the heartbeat reports the
+    /// staleness age next to the rejection.
+    pub stale_serving_since_unix_secs: Option<u64>,
 }
 
 impl RejectedEntry {
@@ -101,6 +107,7 @@ impl RejectedEntry {
             kind,
             error: error.into(),
             timestamp_unix_secs: now,
+            stale_serving_since_unix_secs: None,
         }
     }
 }
@@ -314,12 +321,21 @@ pub fn build_snapshot(prefix: &str, entries: &[RawEntry]) -> (AisixSnapshot, Bui
                 }
             }
             "rate_limit_policies" => {
-                if let Some(entry) = validate_and_parse::<RateLimitPolicy>(
+                // The condition-tree caps, operator×dimension matrix and
+                // regex compilability are beyond the JSON Schema — the
+                // semantic hook rejects such rows inside
+                // `validate_and_parse`, BEFORE any accept accounting, so a
+                // failing row is indistinguishable from a schema failure
+                // everywhere downstream (`apply_put` gates success on
+                // `stats.accepted`, partial-compat state is never
+                // recorded for a row that does not serve).
+                if let Some(entry) = validate_and_parse_with_semantics::<RateLimitPolicy>(
                     &raw.key,
                     raw.revision,
                     parsed,
                     &value,
                     validate_rate_limit_policy_lenient,
+                    |p| p.validate_semantics(),
                     &mut stats,
                 ) {
                     snapshot.rate_limit_policies.insert(entry);
@@ -400,6 +416,28 @@ fn validate_and_parse<T>(
 where
     T: DeserializeOwned,
 {
+    validate_and_parse_with_semantics(key, revision, parsed, value, validate, |_| Ok(()), stats)
+}
+
+/// [`validate_and_parse`] plus a typed semantic hook, run after serde
+/// succeeds but BEFORE any accept accounting. A semantic failure is
+/// recorded exactly like a schema failure (RED, `schema_rejected`,
+/// [`RejectionKind::SchemaFailed`]) and the row contributes nothing to
+/// `accepted`/`partial_rows` — so `Supervisor::apply_put`, which gates
+/// success on `stats.accepted`, retains the last-good value and
+/// surfaces the rejection, instead of reporting a silent no-op apply.
+fn validate_and_parse_with_semantics<T>(
+    key: &str,
+    revision: i64,
+    parsed: ResourceKey<'_>,
+    value: &Value,
+    validate: fn(&Value) -> Result<(), SchemaError>,
+    semantic: fn(&T) -> Result<(), String>,
+    stats: &mut BuildStats,
+) -> Option<ResourceEntry<T>>
+where
+    T: DeserializeOwned,
+{
     // RED: the lenient schema still enforces types, required fields,
     // ranges and closed enums — a failure here means this build cannot
     // represent the row at all, so it is skipped. ERROR, not warn: under
@@ -421,6 +459,14 @@ where
         ignored.push(normalize_ignored_path(&path.to_string()));
     }) {
         Ok(t) => {
+            if let Err(err) = semantic(&t) {
+                tracing::error!(key = %key, error = %err, "semantic validation failed; skipping (incompatible row)");
+                stats.schema_rejected += 1;
+                stats
+                    .rejections
+                    .push(RejectedEntry::new(key, RejectionKind::SchemaFailed, err));
+                return None;
+            }
             stats.accepted += 1;
             if !ignored.is_empty() {
                 // YELLOW: loaded, but fields this build does not know were
@@ -1084,8 +1130,70 @@ mod tests {
         assert_eq!(snap.rate_limit_policies.len(), 1);
         let entry = snap.rate_limit_policies.get_by_id("rlp-1").unwrap();
         assert_eq!(entry.value.name, "team-quota");
-        assert_eq!(entry.value.scope, aisix_core::models::PolicyScope::Team);
-        assert_eq!(entry.value.scope_ref, "team-uuid-1");
+        assert_eq!(
+            entry.value.scope,
+            Some(aisix_core::models::PolicyScope::Team)
+        );
+        assert_eq!(entry.value.scope_ref.as_deref(), Some("team-uuid-1"));
         assert_eq!(entry.value.max_requests, Some(100));
+    }
+
+    #[test]
+    fn conditional_rate_limit_policy_loads_into_snapshot() {
+        let entries = vec![raw(
+            "/aisix/rate_limit_policies/rlp-2",
+            br#"{
+                "name": "premium-family",
+                "conditions": [
+                    { "dimension": "team", "operator": "in", "value": ["t-1"] },
+                    { "logic": "or", "children": [
+                        { "dimension": "model_name", "operator": "~~", "value": "^gpt-4" },
+                        { "dimension": "provider", "operator": "==", "value": "anthropic" }
+                    ]}
+                ],
+                "group_by": ["member"],
+                "limits": { "rpm": 20 }
+            }"#,
+            6,
+        )];
+        let (snap, stats) = build_snapshot("/aisix", &entries);
+        assert_eq!(stats.accepted, 1);
+        let entry = snap.rate_limit_policies.get_by_id("rlp-2").unwrap();
+        assert!(entry.value.is_conditional());
+    }
+
+    #[test]
+    fn semantically_invalid_policy_is_rejected_like_a_schema_failure() {
+        // Passes the JSON Schema (shape is fine) but fails the semantic
+        // gate: the regex does not compile. The row must contribute to
+        // schema_rejected — NOT accepted — so `Supervisor::apply_put`
+        // (which gates success on `stats.accepted`) retains the
+        // last-good value and surfaces the rejection; and no
+        // partial-compat state may be recorded for a row that does not
+        // serve.
+        let bad = raw(
+            "/aisix/rate_limit_policies/rlp-bad",
+            br#"{
+                "name": "bad-regex",
+                "conditions": [
+                    { "dimension": "model_name", "operator": "~~", "value": "(unclosed" }
+                ],
+                "limits": { "rpm": 5 },
+                "future_field": true
+            }"#,
+            7,
+        );
+        let (snap, stats) = build_snapshot("/aisix", std::slice::from_ref(&bad));
+        assert_eq!(stats.accepted, 0);
+        assert_eq!(stats.schema_rejected, 1);
+        assert_eq!(snap.rate_limit_policies.len(), 0);
+        assert!(
+            stats.partial_rows.is_empty(),
+            "a rejected row must not leave partial-compat state behind"
+        );
+        let rej = &stats.rejections[0];
+        assert_eq!(rej.key, "/aisix/rate_limit_policies/rlp-bad");
+        assert_eq!(rej.kind, RejectionKind::SchemaFailed);
+        assert!(rej.error.contains("does not compile"), "{}", rej.error);
     }
 }

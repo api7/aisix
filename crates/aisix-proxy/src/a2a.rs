@@ -22,14 +22,15 @@
 use std::time::{Duration, Instant};
 
 use aisix_a2a::{upstream_from_a2a_agent, A2aBridge, A2aError, HttpBridge};
-use aisix_obs::{AccessLog, RequestOutcome, UsageEvent};
+use aisix_obs::{AccessLog, UsageEvent};
 use axum::body::to_bytes;
-use axum::extract::{Path, Request, State};
+use axum::extract::{Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 
 use crate::auth::AuthenticatedKey;
+use crate::reject::AisixPath;
 use crate::request_id::new_request_id;
 use crate::state::ProxyState;
 
@@ -52,7 +53,7 @@ struct JsonRpcPeek {
 /// emitted either way.
 pub async fn a2a_endpoint(
     auth: AuthenticatedKey,
-    Path(agent): Path<String>,
+    AisixPath(agent): AisixPath<String>,
     State(state): State<ProxyState>,
     request: Request,
 ) -> Response {
@@ -64,6 +65,9 @@ pub async fn a2a_endpoint(
         .unwrap_or_else(new_request_id);
     let api_key_id = auth.entry.id.clone();
     let http_method = request.method().clone();
+    // `dispatch` takes the key by value; the terminal emit below still needs
+    // the caller's team / user labels (the handle is an `Arc` clone).
+    let caller_auth = auth.clone();
 
     let response = dispatch(auth, &agent, &state, request, &request_id).await;
 
@@ -90,11 +94,16 @@ pub async fn a2a_endpoint(
         routing_fallback_count: None,
     }
     .emit();
-    state.metrics.record_request(
-        "a2a",
-        A2A_MODEL_LABEL,
+    crate::request_metrics::record(
+        &state,
+        "/a2a",
+        crate::request_metrics::Caller::new(&caller_auth),
+        crate::request_metrics::Upstream {
+            provider: "a2a",
+            model: A2A_MODEL_LABEL,
+            ..Default::default()
+        },
         status,
-        RequestOutcome::from_status(status),
         elapsed,
     );
     response
@@ -216,7 +225,7 @@ async fn dispatch(
 /// callers discover the agent through `/a2a/<agent>`.
 pub async fn a2a_agent_card(
     auth: AuthenticatedKey,
-    Path(agent): Path<String>,
+    AisixPath(agent): AisixPath<String>,
     State(state): State<ProxyState>,
     headers: HeaderMap,
 ) -> Response {
@@ -375,6 +384,7 @@ mod tests {
             addr: "127.0.0.1:0".into(),
             request_body_limit_bytes: 1_048_576,
             real_ip: Default::default(),
+            url_rewrites: Vec::new(),
             tls: None,
             thread_per_core: None,
             workers: None,

@@ -86,6 +86,26 @@ pub fn decide_cooldown(
             };
             Some((ttl, reason_for_status(*status)))
         }
+        // In-band stream errors with an embedded status get the same
+        // status-list gate as HTTP status errors (no Retry-After header
+        // exists inside a stream, so the default TTL applies); a
+        // status-less one is an unspecified provider fault and follows
+        // the transport-error gate.
+        BridgeError::UpstreamInBand {
+            status: Some(status),
+            ..
+        } => {
+            let triggers = cfg.effective_trigger_statuses();
+            if !triggers.contains(status) {
+                return None;
+            }
+            Some((default_ttl, reason_for_status(*status)))
+        }
+        BridgeError::UpstreamInBand { status: None, .. }
+            if cfg.trigger_on_transport_or_default() =>
+        {
+            Some((default_ttl, "upstream_in_band_error"))
+        }
         BridgeError::Timeout { .. } if cfg.trigger_on_timeout_or_default() => {
             Some((default_ttl, "request_timeout"))
         }
@@ -148,6 +168,30 @@ mod tests {
 
     fn upstream(status: u16) -> BridgeError {
         BridgeError::upstream_status(status, "boom")
+    }
+
+    #[test]
+    fn in_band_errors_cool_down_by_embedded_status_or_transport_gate() {
+        let in_band = |status: Option<u16>| BridgeError::UpstreamInBand {
+            status,
+            message: "m".into(),
+            parsed: None,
+            wire: aisix_gateway::UpstreamWire::Anthropic,
+        };
+        // Embedded status follows the trigger-status list: 503 is in
+        // the default list, 400 is not.
+        let (ttl, reason) = decide_cooldown(&in_band(Some(503)), None).expect("cooldown");
+        assert_eq!(reason, "upstream_server_error");
+        assert!(ttl > Duration::ZERO);
+        assert!(decide_cooldown(&in_band(Some(400)), None).is_none());
+        // Status-less in-band errors follow the transport gate.
+        let (_, reason) = decide_cooldown(&in_band(None), None).expect("cooldown");
+        assert_eq!(reason, "upstream_in_band_error");
+        let cfg = CooldownConfig {
+            trigger_on_transport: Some(false),
+            ..Default::default()
+        };
+        assert!(decide_cooldown(&in_band(None), Some(&cfg)).is_none());
     }
 
     #[test]

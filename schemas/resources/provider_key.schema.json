@@ -249,7 +249,7 @@
       ]
     },
     "api_key": {
-      "description": "Upstream provider's API key. The data plane receives plaintext so it can authenticate to the upstream provider. Protect the configuration store and transport accordingly.",
+      "description": "Upstream provider's API key. The gateway receives plaintext so it can authenticate to the upstream provider. Protect the configuration store and transport accordingly.",
       "minLength": 1,
       "type": "string"
     },

@@ -289,6 +289,38 @@ describe("body edges e2e: multi-turn, oversize body, empty messages", () => {
       r.text(),
     );
     expect(scrape).toMatch(/aisix_requests_total\{[^}]*status="413"/);
+
+    // The access log says the request was refused; it cannot say what
+    // the gateway did with the body it refused. That second question is
+    // what an operator has when the caller reports a connection reset
+    // rather than a 413 — so the same request also carries a diagnostic
+    // naming the declared size, the cap, how much was absorbed and how
+    // the drain ended, joined by the same request id.
+    const detail = app
+      .output()
+      .split("\n")
+      .find(
+        (l) =>
+          l.includes(requestId!) &&
+          l.includes("request body exceeded the configured limit"),
+      );
+    expect(detail).toBeDefined();
+    expect(detail).toMatch(/declared_content_length=\d+/);
+    expect(detail).toMatch(/configured_limit_bytes=10485760/);
+    expect(detail).toMatch(/drained_bytes=\d+/);
+    // This caller sent everything it declared, so the connection stayed
+    // usable and it got to read the 413 above.
+    expect(detail).toMatch(/drain_outcome="completed"/);
+    expect(detail).toMatch(/endpoint="\/v1\/chat\/completions"/);
+
+    const sample = scrape
+      .split("\n")
+      .find((l) =>
+        l.startsWith("aisix_proxy_request_body_limit_rejections_total{"),
+      );
+    expect(sample).toBeDefined();
+    expect(sample).toContain('endpoint="/v1/chat/completions"');
+    expect(sample).toContain('outcome="completed"');
   });
 
   test("chunked oversize body: the handler that rejected it records the refusal", async (ctx) => {

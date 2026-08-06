@@ -1,9 +1,10 @@
-# aisix — managed-mode bootstrap config (aisix.cloud tenant).
+# AISIX gateway — managed-mode bootstrap configuration for AISIX Cloud.
 #
-# Used by the official Docker image as `/etc/aisix/config.yaml`.
+# Baked into the official Docker image as `/etc/aisix/config.managed.yaml`.
+# Select it by setting `AISIX_CONFIG_PATH` to that path.
 # Only the bare minimum is set here:
 #
-#   - `managed.enabled: true`           always on for this image
+#   - `managed.enabled: true`           always on in this bootstrap configuration
 #   - `etcd.endpoints: [placeholder]`   overridden at boot from managed
 #                                       CP endpoint config
 #   - `admin.admin_keys: [placeholder]` validation requires the slot,
@@ -49,6 +50,16 @@ proxy:
   # file: AISIX_PROXY__THREAD_PER_CORE, AISIX_PROXY__WORKERS.
   # thread_per_core: true
   # workers: 4
+  # Entry-level URL rewriting (first matching rule wins; `match` runs on
+  # the raw, percent-encoded path; `rewrite` replaces the matched portion,
+  # $1 = capture group; the query string is preserved). Lets clients keep
+  # legacy URL shapes, e.g. per-server MCP paths served on the
+  # /mcp/{server} endpoint. When configuring through env vars only, set
+  # one JSON array: AISIX_PROXY__URL_REWRITES='[{"match":"...","rewrite":"..."}]'
+  # url_rewrites:
+  #   - name: per-server-mcp-compat
+  #     match: "^/mcp-servers/([^/]+)/mcp$"
+  #     rewrite: "/mcp/$1"
 
 admin:
   # Bind to an unbindable port so even if managed mode somehow

@@ -26,6 +26,7 @@ pub mod mcp_server;
 pub mod model;
 pub mod observability_exporter;
 pub mod oidc_provider;
+pub mod policy_conditions;
 pub mod provider_key;
 pub mod rate_limit;
 pub mod rate_limit_policy;
@@ -57,6 +58,11 @@ pub use observability_exporter::{
     ObjectStoreProvider, ObservabilityExporter, OtlpHttpConfig, SlsContentMode,
 };
 pub use oidc_provider::{BoundClaimExpect, OidcProvider};
+pub use policy_conditions::{
+    eval_condition_nodes, validate_condition_nodes, ConditionGroup, ConditionInput, ConditionLogic,
+    ConditionNode, ConditionOperator, ConditionValue, GroupByDimension, PolicyAction,
+    PolicyCondition, PolicyDimension,
+};
 pub use provider_key::{
     ParamConstraints, ProviderKey, RequestOverrides, ResponseOverrides, StreamDoneMarker,
     TelemetryKind, TelemetryTags,

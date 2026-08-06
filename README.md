@@ -6,7 +6,8 @@
 
 **One OpenAI-compatible API in front of every model.** Route, govern, secure, cache, and
 observe all your LLM and AI-agent traffic from a single control point — shipped as one
-static binary with low per-request overhead. Self-host for free, forever.
+static binary with low per-request overhead. Run it in your infrastructure for free,
+forever.
 
 *Built by the original creators of [Apache APISIX](https://apisix.apache.org/).*
 
@@ -38,16 +39,19 @@ overhead.
 
 It runs as a **single static binary** — low cold-start, lock-free config reads, and hot
 configuration reloads with no restarts: declare resources in one `resources.yaml` and
-reload on `SIGHUP`, or point the gateway at etcd for a multi-replica cluster. Run it **self-hosted and free**, or connect it to
+reload on `SIGHUP`, or point the gateway at etcd for a multi-replica cluster. Run the
+open-source gateway in your infrastructure, or connect it to
 **[AISIX Cloud](https://api7.ai/ai-gateway?utm_source=github&utm_medium=readme&utm_campaign=cloud)**
-for a managed control plane with team governance, budgets, audit, and a dashboard.
+for centralized management with team governance, budgets, audit, and a dashboard.
 
-> **AISIX AI Gateway (this repo)** is the open-source core — the gateway, i.e. the data
-> plane. **[AISIX Cloud](https://api7.ai/ai-gateway?utm_source=github&utm_medium=readme&utm_campaign=cloud)**
-> adds a managed control plane on top, either operated by API7 (**Hybrid Cloud**) or run
-> entirely in your own infrastructure (**On-Premises**). In every form the gateway runs in
-> your environment and calls providers directly — live AI traffic never leaves your
-> infrastructure. The proxy API is identical throughout.
+> **AISIX AI Gateway (this repo)** is the open-source product. It runs without a control
+> plane using declarative configuration or etcd. When connected to
+> **[AISIX Cloud](https://api7.ai/ai-gateway?utm_source=github&utm_medium=readme&utm_campaign=cloud)**,
+> the same gateway serves as the data plane. AISIX Cloud adds a commercial control plane,
+> either hosted by API7 (**Hybrid Cloud**) or hosted by you in your infrastructure
+> (**On-Premises**). In both options, the gateway runs in your environment and calls
+> providers directly; live AI traffic does not pass through the control plane or API7.
+> The proxy API is identical throughout.
 > **[Talk to us about AISIX Cloud →](https://api7.ai/contact?utm_source=github&utm_medium=readme&utm_campaign=cloud)**
 
 ## ⚡ Quickstart
@@ -131,8 +135,9 @@ For a multi-replica cluster, point the gateway at etcd instead — `resources_fi
   one `base_url` and switch models without changing code.
 - **A real gateway, in Rust.** Single static binary, low cold-start, lock-free config reads
   on the hot path, native streaming.
-- **Open-source core, free forever.** Apache-2.0, self-hostable end to end. Reach for
-  AISIX Cloud only when you want the managed control plane.
+- **Open source, free forever.** Apache-2.0 licensed and built to run in your
+  infrastructure. Choose AISIX Cloud when you want centralized management through a
+  control plane and dashboard.
 - **Production controls built in.** Routing & failover, rate limits, guardrails, caching,
   and observability ship in the box. (Budgets and spend caps are an AISIX Cloud feature —
   the gateway enforces the control plane's decisions.)
@@ -206,7 +211,7 @@ OpenAI-shaped.
 
 | Adapter family | Reaches | Wire shape · auth |
 |---|---|---|
-| `openai` | OpenAI **+ any OpenAI-compatible vendor** — DeepSeek, Groq, Mistral, Together, Fireworks, Perplexity, vLLM, Ollama, self-hosted | OpenAI chat completions · Bearer |
+| `openai` | OpenAI **+ any OpenAI-compatible vendor** — DeepSeek, Groq, Mistral, Together, Fireworks, Perplexity, vLLM, Ollama, or self-hosted OpenAI-compatible endpoints | OpenAI chat completions · Bearer |
 | `anthropic` | Anthropic Claude | Anthropic Messages · `x-api-key` |
 | `bedrock` | AWS Bedrock — Anthropic, Meta Llama, Mistral, Cohere, Amazon Titan/Nova, AI21 | Bedrock Converse + `/invoke` · SigV4 |
 | `vertex` | Google Vertex AI (Gemini) | Vertex `:generateContent` · OAuth2 |
@@ -219,8 +224,8 @@ Plus specialized handling for vendor quirks (e.g. DeepSeek reasoning content) an
 ## ☁️ Open source vs AISIX Cloud
 
 Same gateway binary, same proxy API — in every form the gateway runs in your environment.
-**AISIX Cloud** adds a managed control plane on top, either operated by API7
-(**Hybrid Cloud**) or running entirely in your infrastructure (**On-Premises**).
+**AISIX Cloud** adds a commercial control plane, either hosted by API7
+(**Hybrid Cloud**) or hosted in your infrastructure (**On-Premises**).
 
 <table>
   <tr>
@@ -266,7 +271,7 @@ Same gateway binary, same proxy API — in every form the gateway runs in your e
 | Usage & cost | Export logs, metrics, and usage events yourself | Managed usage views, model pricing catalog, spend reporting |
 | Surface | Status endpoints, OpenAPI read surface, playground | Full dashboard + per-environment playground |
 
-→ **Want the managed control plane, governance, budgets, and dashboard?**
+→ **Want the AISIX Cloud control plane, governance, budgets, and dashboard?**
 **[Talk to API7](https://api7.ai/contact?utm_source=github&utm_medium=readme&utm_campaign=cloud)** about
 Hybrid Cloud or On-Premises, or **[book a demo](https://api7.ai/contact?utm_source=github&utm_medium=readme&utm_campaign=demo)**.
 

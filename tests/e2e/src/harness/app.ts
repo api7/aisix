@@ -43,6 +43,13 @@ export interface AppOverrides {
     header?: string;
   };
   /**
+   * `proxy.url_rewrites` block. Merged into the base proxy config (like
+   * `realIp`) so the listener addr is preserved. Entry-level path
+   * rewriting: first matching rule wins, `rewrite` replaces the matched
+   * portion of the path.
+   */
+  urlRewrites?: Array<{ name?: string; match: string; rewrite: string }>;
+  /**
    * `proxy.request_body_limit_bytes`. A dedicated override (like
    * `realIp`) because `extra` replaces whole top-level blocks and the
    * proxy block carries the harness-picked listener addr. `0` disables
@@ -97,6 +104,21 @@ export interface AppOverrides {
    * and send SIGHUP to exercise reloads.
    */
   resourcesFile?: string;
+  /**
+   * Reuse a fixed etcd prefix instead of generating a fresh one. For
+   * restart scenarios: `stop()` the first app (keeps etcd data), then
+   * spawn a second one with the same prefix so it loads the survivor
+   * state. The LAST app spawned on the prefix should `exit()` to clean
+   * it up.
+   */
+  etcdPrefix?: string;
+  /**
+   * `managed.snapshot_cache_path` — enables the on-disk snapshot cache
+   * (#871) without managed mode. Point two sequential apps (same
+   * `etcdPrefix`) at one path to exercise cache-restored restarts.
+   * The caller owns the file's lifecycle.
+   */
+  snapshotCachePath?: string;
 }
 
 export interface SpawnedApp {
@@ -123,6 +145,13 @@ export interface SpawnedApp {
   output(): string;
   signal(signal: NodeJS.Signals): void;
   exit(): Promise<void>;
+  /**
+   * Terminate the binary WITHOUT cleaning up: the etcd prefix, the tmp
+   * config dir, and any snapshot cache file survive. For restart
+   * scenarios — spawn a successor with the same `etcdPrefix` /
+   * `snapshotCachePath`, and let the successor's `exit()` clean up.
+   */
+  stop(): Promise<void>;
 }
 
 const BIN_PATH =
@@ -212,7 +241,7 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
   }
   const [proxyPort, adminPort, metricsPort] = await pickFreePorts(3);
   const adminKey = overrides.adminKey ?? `admin-${randomUUID()}`;
-  const etcdPrefix = `/aisix-e2e-${randomUUID()}`;
+  const etcdPrefix = overrides.etcdPrefix ?? `/aisix-e2e-${randomUUID()}`;
 
   const dir = await mkdtemp(join(tmpdir(), "aisix-e2e-"));
   let resourcesPath: string | undefined;
@@ -240,6 +269,7 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
       ...((overrides.threadPerCore ?? suiteThreadPerCore) !== undefined
         ? { thread_per_core: overrides.threadPerCore ?? suiteThreadPerCore }
         : {}),
+      ...(overrides.urlRewrites ? { url_rewrites: overrides.urlRewrites } : {}),
     },
     admin: adminEnabled
       ? { addr: `127.0.0.1:${adminPort}`, admin_keys: [adminKey] }
@@ -262,6 +292,9 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
       tracing: { otlp: { enabled: false, endpoint: "http://127.0.0.1:4317", sample_ratio: 1 } },
     },
     cache: { backend: "memory" },
+    ...(overrides.snapshotCachePath
+      ? { managed: { snapshot_cache_path: overrides.snapshotCachePath } }
+      : {}),
     ...(overrides.extra ?? {}),
   };
 
@@ -378,6 +411,9 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
     async exit() {
       await terminate(child);
       await cleanup(fileMode ? undefined : etcd, etcdPrefix, dir);
+    },
+    async stop() {
+      await terminate(child);
     },
   };
 }

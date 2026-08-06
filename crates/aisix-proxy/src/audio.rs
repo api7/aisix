@@ -19,7 +19,7 @@
 
 use aisix_core::AppliedGuardrail;
 use aisix_gateway::{ChatMessage, ChatResponse, FinishReason, UsageStats};
-use aisix_obs::{content_capture_cap, AccessLog, CapturedContent, RequestOutcome, UsageEvent};
+use aisix_obs::{content_capture_cap, AccessLog, CapturedContent, UsageEvent};
 use axum::body::Bytes;
 use axum::extract::{Multipart, State};
 use axum::http::{header, HeaderMap};
@@ -46,6 +46,9 @@ struct AudioDispatchSuccess {
     /// Resolved ProviderKey UUID — feeds the per-PK telemetry attribution
     /// tags on the emitted UsageEvent (AISIX-Cloud#867 parity).
     provider_key_id: String,
+    /// Provider-side model name, for the `upstream_model` metric label
+    /// (AISIX-Cloud#1234 parity with chat / messages / responses).
+    upstream_model: String,
     /// `(prompt_tokens, completion_tokens)` from the upstream `usage`
     /// block when the model returns one (gpt-4o-transcribe). `None` for
     /// whisper-1 (no usage block) — those still emit a zero-token event
@@ -86,11 +89,30 @@ pub async fn transcriptions(
     State(state): State<ProxyState>,
     auth: AuthenticatedKey,
     client: ClientContext,
-    multipart: Multipart,
+    multipart: Result<Multipart, axum::extract::multipart::MultipartRejection>,
 ) -> Response {
     let started = Instant::now();
     let request_id = client.request_id.clone();
     let api_key_id = auth.entry.id.clone();
+
+    // Same silent class as the body-extractor rejections #863 collected: a
+    // non-multipart content-type answered axum's bare 400 with no access
+    // log, metrics, or envelope.
+    let multipart = match multipart {
+        Ok(multipart) => multipart,
+        Err(_) => {
+            return crate::reject::reject_before_dispatch(
+                &state,
+                "POST",
+                "/v1/audio/transcriptions",
+                &request_id,
+                Some(&api_key_id),
+                started,
+                crate::reject::Envelope::OpenAi,
+                ProxyError::InvalidRequest("invalid multipart form data".into()),
+            );
+        }
+    };
 
     match multipart_dispatch(
         &state,
@@ -120,16 +142,18 @@ pub async fn transcriptions(
                 &request_id,
                 None,
             );
-            state.metrics.record_request(
-                &success.provider,
-                &success.model_name,
+            record_audio_metrics(
+                &state,
+                "/v1/audio/transcriptions",
+                &auth,
+                &success,
                 status,
-                RequestOutcome::from_status(status),
                 elapsed,
             );
             emit_audio_usage(
                 &state,
                 &request_id,
+                "/v1/audio/transcriptions",
                 &success,
                 &api_key_id,
                 status,
@@ -152,11 +176,14 @@ pub async fn transcriptions(
                 &request_id,
                 Some(&err),
             );
-            state.metrics.record_request(
-                "unknown",
-                "unknown",
+            // The model is never extracted from the multipart form on this
+            // path, so every label but the caller's stays `unknown`.
+            crate::request_metrics::record(
+                &state,
+                "/v1/audio/transcriptions",
+                crate::request_metrics::Caller::new(&auth),
+                crate::request_metrics::Upstream::default(),
                 status,
-                RequestOutcome::from_status(status),
                 elapsed,
             );
             // Per #655 parity: surface the failed request in Logs. The model
@@ -186,11 +213,28 @@ pub async fn translations(
     State(state): State<ProxyState>,
     auth: AuthenticatedKey,
     client: ClientContext,
-    multipart: Multipart,
+    multipart: Result<Multipart, axum::extract::multipart::MultipartRejection>,
 ) -> Response {
     let started = Instant::now();
     let request_id = client.request_id.clone();
     let api_key_id = auth.entry.id.clone();
+
+    // See `transcriptions`: the rejection is recorded, not silently bare.
+    let multipart = match multipart {
+        Ok(multipart) => multipart,
+        Err(_) => {
+            return crate::reject::reject_before_dispatch(
+                &state,
+                "POST",
+                "/v1/audio/translations",
+                &request_id,
+                Some(&api_key_id),
+                started,
+                crate::reject::Envelope::OpenAi,
+                ProxyError::InvalidRequest("invalid multipart form data".into()),
+            );
+        }
+    };
 
     match multipart_dispatch(
         &state,
@@ -220,16 +264,18 @@ pub async fn translations(
                 &request_id,
                 None,
             );
-            state.metrics.record_request(
-                &success.provider,
-                &success.model_name,
+            record_audio_metrics(
+                &state,
+                "/v1/audio/translations",
+                &auth,
+                &success,
                 status,
-                RequestOutcome::from_status(status),
                 elapsed,
             );
             emit_audio_usage(
                 &state,
                 &request_id,
+                "/v1/audio/translations",
                 &success,
                 &api_key_id,
                 status,
@@ -252,11 +298,13 @@ pub async fn translations(
                 &request_id,
                 Some(&err),
             );
-            state.metrics.record_request(
-                "unknown",
-                "unknown",
+            // Same as transcriptions: nothing resolved off the multipart form.
+            crate::request_metrics::record(
+                &state,
+                "/v1/audio/translations",
+                crate::request_metrics::Caller::new(&auth),
+                crate::request_metrics::Upstream::default(),
                 status,
-                RequestOutcome::from_status(status),
                 elapsed,
             );
             // Per #655 parity: surface the failed request in Logs (model not
@@ -315,33 +363,32 @@ pub async fn speech(
         .to_string();
 
     match speech_dispatch(&state, &auth, body, &request_id, &client).await {
-        Ok((
-            resp,
-            provider,
-            model_id,
-            provider_key_id,
-            applied_guardrails,
-            redactions,
-            monitor_hits,
-            captured,
-        )) => {
+        Ok(success) => {
             let elapsed = started.elapsed();
+            let status = success.response.status().as_u16();
             emit_access_log(
                 "POST",
                 "/v1/audio/speech",
                 &model_name,
-                &provider,
+                &success.provider,
                 &api_key_id,
-                200,
+                status,
                 elapsed,
                 &request_id,
                 None,
             );
-            state.metrics.record_request(
-                &provider,
-                &model_name,
-                200,
-                RequestOutcome::Success,
+            crate::request_metrics::record(
+                &state,
+                "/v1/audio/speech",
+                crate::request_metrics::Caller::new(&auth),
+                crate::request_metrics::Upstream {
+                    provider: &success.provider,
+                    model: &model_name,
+                    upstream_model: &success.upstream_model,
+                    provider_key_id: &success.provider_key_id,
+                    ..Default::default()
+                },
+                status,
                 elapsed,
             );
             // Issue #406: /v1/audio/speech (TTS) returns binary audio
@@ -352,12 +399,15 @@ pub async fn speech(
             emit_usage_event(
                 &state,
                 &request_id,
-                &model_id,
+                &success.model_id,
                 &model_name,
                 &api_key_id,
-                &provider_key_id,
-                &applied_guardrails,
-                200,
+                &success.provider_key_id,
+                "/v1/audio/speech",
+                &success.provider,
+                &success.upstream_model,
+                &success.applied_guardrails,
+                status,
                 elapsed,
                 0,
                 0,
@@ -365,12 +415,12 @@ pub async fn speech(
                 // the audio it produced — no duration cost basis here.
                 0.0,
                 &client,
-                redactions,
-                monitor_hits,
+                success.redactions,
+                success.monitor_hits,
                 /* guardrail_blocked */ false,
-                captured.as_ref(),
+                success.captured_content.as_ref(),
             );
-            resp
+            success.response
         }
         Err(err) => {
             let status = err.status().as_u16();
@@ -388,11 +438,15 @@ pub async fn speech(
             );
             let snap = state.snapshot.load();
             let metric_model = crate::usage_attr::metric_model_label(&snap, &model_name);
-            state.metrics.record_request(
-                "unknown",
-                metric_model,
+            crate::request_metrics::record(
+                &state,
+                "/v1/audio/speech",
+                crate::request_metrics::Caller::new(&auth),
+                crate::request_metrics::Upstream {
+                    model: metric_model,
+                    ..Default::default()
+                },
                 status,
-                RequestOutcome::from_status(status),
                 elapsed,
             );
             // Per #655 parity: surface the failed request in Logs with a
@@ -822,6 +876,7 @@ async fn multipart_dispatch(
                     provider: provider_label,
                     model_id: model_entry.id.to_string(),
                     provider_key_id: pk_entry.id.to_string(),
+                    upstream_model: upstream_model.clone(),
                     usage,
                     duration_seconds,
                     applied_guardrails,
@@ -867,6 +922,7 @@ async fn multipart_dispatch(
         provider: provider_label,
         model_id: model_entry.id.to_string(),
         provider_key_id: pk_entry.id.to_string(),
+        upstream_model,
         usage,
         duration_seconds,
         applied_guardrails,
@@ -914,25 +970,30 @@ fn speech_input_to_chat(model: &str, body: &Value) -> aisix_gateway::ChatFormat 
 }
 
 #[allow(clippy::type_complexity)]
+/// `/v1/audio/speech`'s dispatch result. TTS reports no usage block, so
+/// this carries only what the terminal emit needs — a struct rather than
+/// the tuple it used to be, matching `AudioDispatchSuccess` above.
+struct SpeechDispatchSuccess {
+    response: Response,
+    provider: String,
+    model_id: String,
+    provider_key_id: String,
+    /// Provider-side model name, for the `upstream_model` metric label
+    /// (AISIX-Cloud#1234).
+    upstream_model: String,
+    applied_guardrails: Vec<AppliedGuardrail>,
+    redactions: crate::redact::RedactionCounts,
+    monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
+    captured_content: Option<CapturedContent>,
+}
+
 async fn speech_dispatch(
     state: &ProxyState,
     auth: &AuthenticatedKey,
     mut body: Value,
     request_id: &str,
     client_ctx: &ClientContext,
-) -> Result<
-    (
-        Response,
-        String,
-        String,
-        String,
-        Vec<AppliedGuardrail>,
-        crate::redact::RedactionCounts,
-        Vec<aisix_core::GuardrailMonitorHit>,
-        Option<CapturedContent>,
-    ),
-    ProxyError,
-> {
+) -> Result<SpeechDispatchSuccess, ProxyError> {
     let model_name = body
         .get("model")
         .and_then(|v| v.as_str())
@@ -1027,7 +1088,7 @@ async fn speech_dispatch(
 
     // Rewrite model field.
     if let Some(m) = body.get_mut("model") {
-        *m = Value::String(upstream_model);
+        *m = Value::String(upstream_model.clone());
     }
 
     // Apply the PK's `request.*` overrides (body + headers) like the OpenAI
@@ -1159,16 +1220,17 @@ async fn speech_dispatch(
 
     let mut out = axum::response::Response::new(axum::body::Body::from(body_bytes));
     copy_response_header(&upstream_headers, &mut out, header::CONTENT_TYPE);
-    Ok((
-        out,
-        provider_label,
-        model_entry.id.to_string(),
-        pk_entry.id.to_string(),
+    Ok(SpeechDispatchSuccess {
+        response: out,
+        provider: provider_label,
+        model_id: model_entry.id.to_string(),
+        provider_key_id: pk_entry.id.to_string(),
+        upstream_model,
         applied_guardrails,
         redactions,
         monitor_hits,
         captured_content,
-    ))
+    })
 }
 
 /// Pull `(prompt_tokens, completion_tokens)` from an audio response
@@ -1269,12 +1331,41 @@ fn probe_audio_duration_seconds(audio: &[u8]) -> Option<f64> {
     (seconds > 0.0).then_some(seconds)
 }
 
+/// Terminal request-metric emit for the two transcription-shaped routes,
+/// which share `AudioDispatchSuccess` and would otherwise repeat the same
+/// label set twice.
+fn record_audio_metrics(
+    state: &ProxyState,
+    endpoint: &'static str,
+    auth: &AuthenticatedKey,
+    success: &AudioDispatchSuccess,
+    status: u16,
+    elapsed: Duration,
+) {
+    crate::request_metrics::record(
+        state,
+        endpoint,
+        crate::request_metrics::Caller::new(auth),
+        crate::request_metrics::Upstream {
+            provider: &success.provider,
+            model: &success.model_name,
+            upstream_model: &success.upstream_model,
+            provider_key_id: &success.provider_key_id,
+            ..Default::default()
+        },
+        status,
+        elapsed,
+    );
+}
+
 /// Emit a UsageEvent for a successful transcription/translation. Tokens
 /// come from the upstream `usage` block when present (gpt-4o-transcribe);
 /// zero otherwise (whisper-1) — the request is still visible/attributed.
+#[allow(clippy::too_many_arguments)]
 fn emit_audio_usage(
     state: &ProxyState,
     request_id: &str,
+    endpoint: &'static str,
     success: &AudioDispatchSuccess,
     api_key_id: &str,
     status: u16,
@@ -1289,6 +1380,9 @@ fn emit_audio_usage(
         &success.model_name,
         api_key_id,
         &success.provider_key_id,
+        endpoint,
+        &success.provider,
+        &success.upstream_model,
         &success.applied_guardrails,
         status,
         elapsed,
@@ -1318,6 +1412,12 @@ fn emit_usage_event(
     requested_model: &str,
     api_key_id: &str,
     provider_key_id: &str,
+    // Metric labels the UsageEvent has no field for (AISIX-Cloud#1234
+    // follow-up). `endpoint` too: the three audio routes share this emitter
+    // but are three distinct series.
+    endpoint: &'static str,
+    provider: &str,
+    upstream_model: &str,
     applied_guardrails: &[AppliedGuardrail],
     status_code: u16,
     elapsed: Duration,
@@ -1370,6 +1470,28 @@ fn emit_usage_event(
     state
         .otlp_fan_out
         .fan_out(&event, content, exporters.iter().map(|e| &e.value));
+    // Speech (TTS) reports no tokens at all, so this is a no-op there; the
+    // transcription routes report them when the model supplies a usage block.
+    let owned_caller = crate::request_metrics::Caller::from_api_key_id(&snap, api_key_id);
+    crate::request_metrics::record_usage(
+        state,
+        endpoint,
+        owned_caller.as_caller(),
+        crate::request_metrics::Upstream {
+            provider,
+            model: requested_model,
+            upstream_model,
+            provider_key_id,
+            ..Default::default()
+        },
+        crate::request_metrics::Tokens {
+            input: prompt_tokens,
+            output: completion_tokens,
+            total: prompt_tokens.saturating_add(completion_tokens),
+            spend_usd: 0.0,
+            client_type: state.client_classifier.classify(&client.user_agent),
+        },
+    );
 }
 
 fn copy_response_header(src: &HeaderMap, dst: &mut Response, name: header::HeaderName) {
@@ -1439,6 +1561,7 @@ mod tests {
             addr: "127.0.0.1:0".into(),
             request_body_limit_bytes: 10_485_760, // 10 MB for audio
             real_ip: Default::default(),
+            url_rewrites: Vec::new(),
             tls: None,
             thread_per_core: None,
             workers: None,
