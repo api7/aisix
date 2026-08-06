@@ -230,7 +230,7 @@ async fn prepare(
     let upstream_request = match pk_entry.value.adapter {
         Some(Adapter::Openai) => {
             let base = crate::dispatch::resolve_base_url(&pk_entry.value)?;
-            let url = crate::dispatch::build_v1_url(&base, "/realtime");
+            let url = crate::dispatch::build_openai_url(&base, "/realtime");
             let url = format!(
                 "{}?model={}",
                 to_ws_scheme(&url)?,

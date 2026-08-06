@@ -1033,12 +1033,12 @@ async fn anthropic_passthrough_dispatch(
         );
     }
 
-    // Build the target URL. build_v1_url tolerates the rare case
+    // Build the target URL. build_anthropic_url tolerates the rare case
     // where the customer mistakenly puts `/v1` in the Anthropic
     // api_base (the dashboard placeholder uses the OpenAI form, so
     // this is a copy-paste hazard).
     let base = crate::dispatch::resolve_base_url(pk_value)?;
-    let url = crate::dispatch::build_v1_url(&base, "/messages");
+    let url = crate::dispatch::build_anthropic_url(&base, "/messages");
 
     // Check if the request wants streaming.
     let is_stream = body

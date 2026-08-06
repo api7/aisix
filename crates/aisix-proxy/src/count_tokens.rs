@@ -396,11 +396,11 @@ async fn count_tokens_to_target(
         );
     }
 
-    // `build_v1_url` tolerates an api_base with or without `/v1` (the
+    // `build_anthropic_url` tolerates an api_base with or without `/v1` (the
     // Anthropic dashboard placeholder and copy-pasted full URLs both
     // resolve to `…/v1/messages/count_tokens`).
     let base = crate::dispatch::resolve_base_url(&pk_entry.value)?;
-    let url = crate::dispatch::build_v1_url(&base, "/messages/count_tokens");
+    let url = crate::dispatch::build_anthropic_url(&base, "/messages/count_tokens");
 
     // Build the outbound HeaderMap explicitly so the PK's
     // `request.default_headers` / `request.forward_client_headers` can
