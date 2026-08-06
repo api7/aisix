@@ -139,6 +139,31 @@ pub(crate) fn check_ip_access(model: &Model, source_ip: &str) -> Result<(), Prox
     Err(ProxyError::ModelIpRestricted(model.display_name.clone()))
 }
 
+/// Whether this Model's upstream speaks the Anthropic wire protocol, i.e.
+/// whether `/v1/messages` and `/v1/messages/count_tokens` may forward the
+/// caller's Anthropic-native body verbatim instead of round-tripping it
+/// through the cross-provider bridge.
+///
+/// Keyed on the ProviderKey's `adapter`, not on the vendor id:
+/// `provider: "byo"` + `adapter: anthropic` is the documented way to front a
+/// self-hosted or proxied Anthropic endpoint, and such an upstream serves
+/// both routes exactly like the catalog vendor does. Gating on the vendor id
+/// alone made `/v1/messages` bridge a body that needed no translation (which
+/// drops caller-owned fields such as `cache_control`) and made
+/// `/v1/messages/count_tokens` reject the model outright.
+///
+/// `model.provider` is still honoured so a ProviderKey written without an
+/// adapter — cp-api's AdapterMap-absent degenerate boot — keeps dispatching
+/// as before. A dangling `provider_key_id` likewise falls back to the vendor
+/// id, leaving the dispatch path (not this gate) to report it.
+pub(crate) fn speaks_anthropic(snapshot: &AisixSnapshot, model: &Model) -> bool {
+    if model.provider.as_deref() == Some("anthropic") {
+        return true;
+    }
+    resolve_provider_key(snapshot, model)
+        .is_ok_and(|pk| pk.value.adapter == Some(aisix_core::Adapter::Anthropic))
+}
+
 /// Required upstream model id (`model_name`) for a non-routing Model.
 pub(crate) fn require_upstream_model(model: &Model) -> Result<&str, ProxyError> {
     model.model_name.as_deref().ok_or_else(|| {
