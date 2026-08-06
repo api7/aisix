@@ -293,13 +293,22 @@ jobs:
         env:
           E2E_THREAD_PER_CORE: ${{ matrix.thread_per_core }}
         run: pnpm test
+      - name: tag coverage by leg
+        # The gate downloads every leg with `merge-multiple: true`, which
+        # flattens same-named files to one — the legs must upload distinct
+        # filenames or only one leg's coverage survives the merge.
+        if: always()
+        run: |
+          if [ -f tests/e2e/coverage/lcov.info ]; then
+            mv tests/e2e/coverage/lcov.info "tests/e2e/coverage/lcov-${{ matrix.serving }}.info"
+          fi
       - uses: actions/upload-artifact@v7
         if: always()
         with:
           # Per leg: two uploads under one name is a hard conflict the
           # moment the suite starts emitting coverage.
           name: coverage-e2e-${{ matrix.serving }}
-          path: tests/e2e/coverage/lcov.info
+          path: tests/e2e/coverage/lcov-${{ matrix.serving }}.info
           if-no-files-found: ignore
           retention-days: 7
 
