@@ -1531,14 +1531,21 @@ async fn serve_http_tpc(
             .map_err(|e| anyhow::anyhow!("{label} listener bind {addr} failed: {e}"))?,
     );
 
-    // One slot per worker so no worker blocks reporting its exit.
-    let (exit_tx, exit_rx) = std::sync::mpsc::sync_channel::<anyhow::Result<()>>(workers);
-    for worker in 0..workers {
-        // Bound on this thread so a bind failure aborts startup before
-        // any worker begins serving, exactly as the single listener does.
+    // Every listener is bound before any worker spawns, so a bind
+    // failure — fd exhaustion on the last socket included — aborts
+    // startup before a single connection is accepted, exactly as the
+    // single listener does.
+    let mut listeners = Vec::with_capacity(workers);
+    for _ in 0..workers {
         let listener = bind_reuseport_listener(addr)
             .map_err(|e| anyhow::anyhow!("{label} listener bind {addr} failed: {e}"))?;
         listener.set_nonblocking(true)?;
+        listeners.push(listener);
+    }
+
+    // One slot per worker so no worker blocks reporting its exit.
+    let (exit_tx, exit_rx) = std::sync::mpsc::sync_channel::<anyhow::Result<()>>(workers);
+    for (worker, listener) in listeners.into_iter().enumerate() {
         let router = router.clone();
         let cancel = cancel.clone();
         let tls_config = tls_config.clone();
@@ -1569,15 +1576,31 @@ async fn serve_http_tpc(
     // every worker is gone.
     drop(exit_tx);
 
-    // The first worker to leave decides the outcome for all of them: a
-    // graceful shutdown ends them together, and any other exit — an
-    // accept loop failing, a panic unwinding — has to bring the process
-    // down rather than leave it serving on fewer listeners than it
-    // reported binding.
+    // A graceful shutdown ends the workers together, but each drains its
+    // own connections on its own clock — an idle worker returns at once
+    // while a sibling may hold an in-flight stream for minutes. Wait for
+    // every worker, so the fastest drain cannot end the process under
+    // the slowest. Everything else stays immediately fatal: an accept
+    // loop failing, a panic unwinding, or a worker stopping without a
+    // shutdown signal has to bring the process down rather than leave it
+    // serving on fewer listeners than it reported binding.
+    let shutdown_seen = cancel;
     tokio::task::spawn_blocking(move || {
-        exit_rx
-            .recv()
-            .unwrap_or_else(|_| Err(anyhow::anyhow!("no proxy worker reported its exit")))
+        for _ in 0..workers {
+            match exit_rx.recv() {
+                Ok(Ok(())) if *shutdown_seen.borrow() => {}
+                Ok(Ok(())) => {
+                    return Err(anyhow::anyhow!(
+                        "a proxy worker stopped serving without a shutdown signal"
+                    ));
+                }
+                Ok(Err(e)) => return Err(e),
+                Err(_) => {
+                    return Err(anyhow::anyhow!("a proxy worker exited without reporting"));
+                }
+            }
+        }
+        Ok(())
     })
     .await?
 }
