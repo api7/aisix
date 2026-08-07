@@ -1030,12 +1030,7 @@ async fn responses_to_target(
     }
 
     let base = crate::dispatch::resolve_base_url(&pk_entry.value)?;
-    // build_v1_url tolerates both `https://api.openai.com` (provider
-    // default) and `https://api.openai.com/v1` (the OpenAI-SDK form
-    // the dashboard's provider-keys placeholder pre-fills). Without
-    // it, the SDK convention double-prefixes to `/v1/v1/responses`
-    // and 404s.
-    let url = crate::dispatch::build_v1_url(&base, "/responses");
+    let url = crate::dispatch::build_openai_url(&base, "/responses");
 
     let is_stream = body
         .get("stream")

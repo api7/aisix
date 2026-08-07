@@ -83,3 +83,5 @@ tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
 # [dependencies] so the /v1/messages handler can use their primitives
 # in non-test builds too.
 wiremock.workspace = true
+# Captures the auth-denial log lines so their per-request fields are pinned.
+tracing-subscriber.workspace = true

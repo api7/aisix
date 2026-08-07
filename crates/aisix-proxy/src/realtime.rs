@@ -193,7 +193,7 @@ async fn prepare(
     headers: &HeaderMap,
     client: &ClientContext,
 ) -> Result<Prepared, ProxyError> {
-    let auth = authenticate(state, headers).await?;
+    let auth = authenticate(state, headers, client).await?;
 
     let requested_model = params
         .get("model")
@@ -230,7 +230,7 @@ async fn prepare(
     let upstream_request = match pk_entry.value.adapter {
         Some(Adapter::Openai) => {
             let base = crate::dispatch::resolve_base_url(&pk_entry.value)?;
-            let url = crate::dispatch::build_v1_url(&base, "/realtime");
+            let url = crate::dispatch::build_openai_url(&base, "/realtime");
             let url = format!(
                 "{}?model={}",
                 to_ws_scheme(&url)?,
@@ -319,28 +319,38 @@ async fn prepare(
 async fn authenticate(
     state: &ProxyState,
     headers: &HeaderMap,
+    client: &ClientContext,
 ) -> Result<AuthenticatedKey, ProxyError> {
+    // `/v1/realtime` is a WebSocket upgrade, so there are no request parts
+    // to read here — the resolved client context carries the same two
+    // identifying fields the HTTP extractor puts on a denial.
+    let ctx = crate::auth::DenialContext {
+        method: "GET",
+        path: "/v1/realtime",
+        request_id: &client.request_id,
+        source_ip: &client.source_ip,
+    };
     if let Some(auth) = headers.get(axum::http::header::AUTHORIZATION) {
         let s = auth.to_str().map_err(|_| ProxyError::MissingAuth)?;
         let token = s.strip_prefix("Bearer ").map(str::trim).unwrap_or("");
         if token.is_empty() {
             return Err(ProxyError::MissingAuth);
         }
-        return crate::auth::authenticate_token(state, token).await;
+        return crate::auth::authenticate_token(state, token, ctx).await;
     }
     if let Some(raw) = headers.get("x-api-key") {
         let token = raw.to_str().map_err(|_| ProxyError::MissingAuth)?.trim();
         if token.is_empty() {
             return Err(ProxyError::MissingAuth);
         }
-        return crate::auth::authenticate_token(state, token).await;
+        return crate::auth::authenticate_token(state, token, ctx).await;
     }
     if let Some(proto) = headers.get("sec-websocket-protocol") {
         let s = proto.to_str().map_err(|_| ProxyError::MissingAuth)?;
         for item in s.split(',') {
             if let Some(token) = item.trim().strip_prefix(SUBPROTOCOL_KEY_PREFIX) {
                 if !token.is_empty() {
-                    return crate::auth::authenticate_token(state, token).await;
+                    return crate::auth::authenticate_token(state, token, ctx).await;
                 }
             }
         }

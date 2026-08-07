@@ -377,11 +377,6 @@ async fn dispatch(
         aisix_provider_openai::overrides::apply_default_body_fields(body, &r.default_body_fields);
     }
 
-    // Build upstream URL. build_v1_url tolerates either base form —
-    // `https://api.cohere.com` (bare host) and `https://api.openai.com/v1`
-    // (OpenAI-SDK convention, with /v1) both end up at `…/v1/rerank`
-    // instead of `…/v1/v1/rerank`.
-    //
     // The provider arm of `default_base_for_provider` is guaranteed to
     // return `Some` here because the gate above already rejected any
     // provider label outside `{"openai", "cohere", "jina"}` — all three
@@ -395,7 +390,7 @@ async fn dispatch(
         _ => default_base_for_provider(&provider_label)
             .unwrap_or_else(|| "https://api.openai.com".to_string()),
     };
-    let url = crate::dispatch::build_v1_url(&base, "/rerank");
+    let url = crate::dispatch::build_openai_url(&base, "/rerank");
 
     // Build headers explicitly so the PK's `request.default_headers` and
     // `request.forward_client_headers` can inject operator/client headers
@@ -707,7 +702,7 @@ fn default_base_for_provider(provider: &str) -> Option<String> {
     match provider {
         "openai" => Some("https://api.openai.com".to_string()),
         // Cohere v1 path (deprecated by Cohere but still functional)
-        // is what the gateway's `build_v1_url` produces from this
+        // is what the gateway's `build_openai_url` produces from this
         // base. Operators who want the Cohere v2 path can override
         // `api_base` to `https://api.cohere.com/v2` — see #213's v2
         // follow-up for the version-routing extension if needed.
@@ -1136,7 +1131,7 @@ mod tests {
 
         let snap = AisixSnapshot::new();
         // Operator-style configuration: bare host, no /v1 suffix.
-        // The gateway's `build_v1_url` produces `/v1/rerank` correctly
+        // The gateway's `build_openai_url` produces `/v1/rerank` correctly
         // for both `https://api.jina.ai` and `https://api.jina.ai/v1`.
         let pk_json = format!(
             r#"{{"display_name":"jina-up","secret":"jina_mock_secret","api_base":"{}","provider":"jina"}}"#,
@@ -1212,7 +1207,7 @@ mod tests {
 
         let snap = AisixSnapshot::new();
         // Cohere's API base form: bare host, no /v1 suffix. The
-        // gateway's `build_v1_url` appends /v1/rerank correctly for
+        // gateway's `build_openai_url` appends /v1/rerank correctly for
         // both `https://api.cohere.com` and `https://api.cohere.com/v1`.
         let pk_json = format!(
             r#"{{"display_name":"cohere-up","secret":"sk-cohere-mock","api_base":"{}","provider":"cohere","adapter":"openai"}}"#,

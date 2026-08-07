@@ -642,6 +642,34 @@ pub trait Guardrail: Send + Sync + 'static {
 #[cfg(test)]
 pub(crate) static TRACING_CAPTURE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// Keep every callsite emittable for the whole test binary; call it before
+/// installing a capturing subscriber.
+///
+/// The lock above only orders the capture tests against each other. It does
+/// nothing about the *other* piece of tracing global state: a callsite's
+/// `Interest` is cached process-wide the first time that callsite is hit,
+/// from whichever dispatcher the hitting thread has. With no global default
+/// that is `NoSubscriber`, so any unrelated test reaching a guardrail's log
+/// line first caches `Interest::never()` and the event is then skipped
+/// everywhere — the capture sees only the events of crates whose callsites
+/// happened to be registered under a subscriber.
+///
+/// A permissive global default removes both failure modes at once: no thread
+/// ever falls back to `NoSubscriber`, and a permanently registered TRACE
+/// dispatcher pins the global max-level hint. Registering it also
+/// re-evaluates the callsites seen so far, so a lazy install still repairs a
+/// cache poisoned earlier in the run.
+#[cfg(test)]
+pub(crate) fn keep_callsites_enabled() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        // A bare registry writes nothing and formats nothing; it is here only
+        // so that callsites register as enabled. The captured events are
+        // rendered by each capture helper's own scoped subscriber.
+        let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry());
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

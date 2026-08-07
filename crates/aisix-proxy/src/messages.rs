@@ -862,9 +862,10 @@ async fn dispatch(
     })
 }
 
-/// Dispatch one concrete (non-routing) target Model. Branches on the
-/// target's provider: Anthropic upstreams go through the byte-for-byte
-/// passthrough, everything else through the cross-provider translation.
+/// Dispatch one concrete (non-routing) target Model. Branches on the wire
+/// protocol the target's upstream speaks (`dispatch::speaks_anthropic`):
+/// Anthropic-protocol upstreams go through the byte-for-byte passthrough,
+/// everything else through the cross-provider translation.
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_to_target(
     state: &ProxyState,
@@ -913,7 +914,7 @@ async fn dispatch_to_target(
     let model = &target.model;
     let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
 
-    if model.provider.as_deref() != Some("anthropic") {
+    if !crate::dispatch::speaks_anthropic(snapshot, model) {
         return cross_provider_dispatch(
             state,
             body,
@@ -1033,12 +1034,12 @@ async fn anthropic_passthrough_dispatch(
         );
     }
 
-    // Build the target URL. build_v1_url tolerates the rare case
+    // Build the target URL. build_anthropic_url tolerates the rare case
     // where the customer mistakenly puts `/v1` in the Anthropic
     // api_base (the dashboard placeholder uses the OpenAI form, so
     // this is a copy-paste hazard).
     let base = crate::dispatch::resolve_base_url(pk_value)?;
-    let url = crate::dispatch::build_v1_url(&base, "/messages");
+    let url = crate::dispatch::build_anthropic_url(&base, "/messages");
 
     // Check if the request wants streaming.
     let is_stream = body
@@ -3672,6 +3673,67 @@ mod tests {
             "stop_reason": "end_turn",
             "usage": {"input_tokens": 10, "output_tokens": 3}
         })
+    }
+
+    /// A `provider: "byo"` model whose ProviderKey carries
+    /// `adapter: anthropic` fronts an Anthropic-protocol upstream, so
+    /// `/v1/messages` must forward the caller's body verbatim just like it
+    /// does for the catalog vendor. Branching on the vendor id instead sent
+    /// it through the cross-provider bridge, which re-encodes the body from
+    /// the normalized form and silently drops caller-owned fields — here
+    /// `cache_control`, whose loss changes both prompt-cache behavior and
+    /// what the upstream bills.
+    #[tokio::test]
+    async fn byo_model_on_the_anthropic_adapter_passes_the_body_through() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(header("x-api-key", "sk-byo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(anthropic_response()))
+            .mount(&upstream)
+            .await;
+
+        let snap = AisixSnapshot::new();
+        let pk_json = format!(
+            r#"{{"display_name":"byo-anthropic","secret":"sk-byo","api_base":"{}","provider":"byo","adapter":"anthropic"}}"#,
+            upstream.uri()
+        );
+        let pk: aisix_core::ProviderKey = serde_json::from_str(&pk_json).unwrap();
+        snap.provider_keys
+            .insert(ResourceEntry::new(ANTHROPIC_PK_ID, pk, 1));
+        let model_json = format!(
+            r#"{{"display_name":"byo-claude","provider":"byo","model_name":"claude-sonnet-4-5","provider_key_id":"{ANTHROPIC_PK_ID}"}}"#
+        );
+        let m: Model = serde_json::from_str(&model_json).unwrap();
+        snap.models.insert(ResourceEntry::new("m-1", m, 1));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let app = build_app(snap);
+        let resp = app
+            .oneshot(make_req(serde_json::json!({
+                "model": "byo-claude",
+                "max_tokens": 100,
+                "system": [{
+                    "type": "text",
+                    "text": "long shared preamble",
+                    "cache_control": {"type": "ephemeral", "ttl": "5m"}
+                }],
+                "messages": [{"role": "user", "content": "Hello"}]
+            })))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let received = upstream.received_requests().await.unwrap();
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].url.path(), "/v1/messages");
+        let sent: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
+        assert_eq!(sent["model"], "claude-sonnet-4-5");
+        assert_eq!(
+            sent["system"][0]["cache_control"],
+            serde_json::json!({"type": "ephemeral", "ttl": "5m"}),
+            "the caller's cache_control must reach the upstream unchanged"
+        );
     }
 
     #[tokio::test]

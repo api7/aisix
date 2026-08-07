@@ -118,8 +118,8 @@ const RUNWAY_TASK_PATH: &str = "/v1/tasks";
 /// and <https://docs.dev.runwayml.com/api-details/versions/2024-11-06/>.
 const RUNWAY_VERSION_HEADER: &str = "X-Runway-Version";
 const RUNWAY_VERSION_VALUE: &str = "2024-11-06";
-/// OpenAI Sora videos base path (version-independent — `build_v1_url` owns
-/// the `/v1` prefix). Submit POSTs it, poll GETs `{path}/{id}`, content
+/// OpenAI Sora videos base path (version-independent — `build_openai_url`
+/// joins it onto the api_base). Submit POSTs it, poll GETs `{path}/{id}`, content
 /// GETs `{path}/{id}/content`. Source: official `openai-python` SDK,
 /// `resources/videos.py` (`self._post("/videos", …)`,
 /// `self._get("/videos/{video_id}", …)`,
@@ -624,9 +624,9 @@ impl VideoProvider {
             // endpoint paths, not the base — so there is no version suffix
             // to strip (no stripper invented per the PR brief).
             Self::Runway => &[],
-            // OpenAI composes its URLs via `build_v1_url` (which owns the
-            // `/v1` prefix and tolerates both the bare-host and `…/v1`
-            // conventions), so `root` is never consulted for it.
+            // OpenAI composes its URLs via `build_openai_url`, which
+            // preserves whatever root the api_base carries, so `root`
+            // is never consulted for it.
             Self::Openai => &[],
         };
         for suffix in suffixes {
@@ -639,10 +639,10 @@ impl VideoProvider {
 
     fn submit_url(self, base: &str) -> String {
         // OpenAI uses the version-independent `/videos` path under the
-        // shared `build_v1_url` normalizer; the other four compose the
+        // shared `build_openai_url` joiner; the other four compose the
         // vendor's versioned path onto the stripped host root.
         if self == Self::Openai {
-            return crate::dispatch::build_v1_url(base, OPENAI_VIDEOS_PATH);
+            return crate::dispatch::build_openai_url(base, OPENAI_VIDEOS_PATH);
         }
         let root = self.root(base);
         match self {
@@ -656,7 +656,10 @@ impl VideoProvider {
 
     fn poll_url(self, base: &str, task_id: &str) -> String {
         if self == Self::Openai {
-            return crate::dispatch::build_v1_url(base, &format!("{OPENAI_VIDEOS_PATH}/{task_id}"));
+            return crate::dispatch::build_openai_url(
+                base,
+                &format!("{OPENAI_VIDEOS_PATH}/{task_id}"),
+            );
         }
         let root = self.root(base);
         match self {
@@ -954,7 +957,7 @@ impl VideoProvider {
             Self::Openai => {
                 crate::jobs::require_safe_upstream_id(task_id)?;
                 Ok(ContentDelivery::Proxy {
-                    url: crate::dispatch::build_v1_url(
+                    url: crate::dispatch::build_openai_url(
                         base,
                         &format!("{OPENAI_VIDEOS_PATH}/{task_id}/content"),
                     ),

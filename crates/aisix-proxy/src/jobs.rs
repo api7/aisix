@@ -280,7 +280,7 @@ fn upstream_url(target: &JobTarget, path: &str, query: &str) -> Result<String, P
     match target.adapter {
         Adapter::Openai => {
             let base = crate::dispatch::resolve_base_url(&target.pk_entry.value)?;
-            let url = crate::dispatch::build_v1_url(&base, path);
+            let url = crate::dispatch::build_openai_url(&base, path);
             if query.is_empty() {
                 Ok(url)
             } else {
@@ -1717,7 +1717,7 @@ async fn attribute_batch_usage(
                 .map(str::trim)
                 .filter(|b| !b.is_empty())
                 .ok_or("provider_key has no api_base")?;
-            crate::dispatch::build_v1_url(
+            crate::dispatch::build_openai_url(
                 base.trim_end_matches('/'),
                 &format!("/files/{output_file_id}/content"),
             )
