@@ -141,5 +141,10 @@ describe("graceful shutdown drains in-flight requests", () => {
     // The drained response must be followed by the process exiting on
     // its own — no SIGKILL, no lingering listeners.
     await exited;
+
+    // Post-exit calls must short-circuit: a signal-terminated child has
+    // exitCode === null but signalCode set, and a late listener would
+    // otherwise wait for an exit event that already fired.
+    await app.waitForExit(1_000);
   }, 20_000);
 });

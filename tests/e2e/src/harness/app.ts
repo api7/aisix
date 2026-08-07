@@ -415,16 +415,20 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
       if (child.exitCode === null) child.kill(signal);
     },
     waitForExit(timeoutMs = 10_000) {
-      if (child.exitCode !== null) return Promise.resolve();
+      // A signal-terminated child has exitCode === null and signalCode
+      // set — both mean "already exited", and the exit event will not
+      // fire again for a late listener.
+      if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
       return new Promise<void>((resolve, reject) => {
-        const timer = setTimeout(
-          () => reject(new Error(`aisix did not exit within ${timeoutMs}ms`)),
-          timeoutMs,
-        );
-        child.once("exit", () => {
+        const onExit = () => {
           clearTimeout(timer);
           resolve();
-        });
+        };
+        const timer = setTimeout(() => {
+          child.off("exit", onExit);
+          reject(new Error(`aisix did not exit within ${timeoutMs}ms`));
+        }, timeoutMs);
+        child.once("exit", onExit);
       });
     },
     async exit() {
