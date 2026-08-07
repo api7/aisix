@@ -4,8 +4,9 @@
 //! reject duplicate names (409), generate a uuid v4 on POST, bump revision on
 //! PUT. The name is the path segment under which the agent is exposed
 //! (`/a2a/<name>`), so it must be a single URL path segment (no `/`). The
-//! per-auth_type credential coupling is enforced here too, since the flat
-//! schema stays permissive on it.
+//! per-auth_type credential coupling is enforced by the canonical schema, so
+//! every configuration path rejects an incomplete credential set; the checks
+//! below are defense in depth.
 
 use aisix_core::models::validate_a2a_agent;
 use aisix_core::resource::ResourceEntry;
@@ -137,6 +138,12 @@ fn assert_unique_name(
 
 #[cfg(test)]
 mod tests {
+    // These rules moved into the canonical schema (see
+    // `a2a_agent_credential_coupling` / `mcp_server_credential_coupling` and the
+    // `name` patterns), so the schema gate now rejects these payloads before
+    // `decode`'s own checks run. The variant is `Schema` rather than
+    // `BadRequest`; both map to 400, so the wire contract is unchanged. The
+    // assertions below check the status-bearing outcome, not the variant.
     use super::*;
     use serde_json::json;
 
@@ -144,7 +151,7 @@ mod tests {
     fn decode_rejects_slash_in_name() {
         let err = decode(&json!({"display_name": "a/b", "url": "https://x/a2a"}))
             .expect_err("`/` in the agent name must be rejected");
-        assert!(matches!(err, AdminError::BadRequest(_)));
+        assert_eq!(err.status(), axum::http::StatusCode::BAD_REQUEST);
     }
 
     #[test]
@@ -155,7 +162,7 @@ mod tests {
             "auth_type": "bearer"
         }))
         .expect_err("bearer auth without a secret must be rejected");
-        assert!(matches!(err, AdminError::BadRequest(_)));
+        assert_eq!(err.status(), axum::http::StatusCode::BAD_REQUEST);
     }
 
     #[test]
