@@ -218,9 +218,25 @@ jobs:
           retention-days: 1
 
   e2e:
-    name: e2e (vitest) + coverage
+    name: e2e (vitest, ${{ matrix.serving }}) + coverage
     needs: [build-bin]
     runs-on: ubuntu-latest
+    strategy:
+      # The two serving modes are separate products of the same binary:
+      # thread-per-core answers a request on the thread that accepted it
+      # and dispatches on that thread's own upstream pool, work-stealing
+      # shares one runtime and one pool. A failure in one says nothing
+      # about the other, so neither leg cancels the other.
+      fail-fast: false
+      matrix:
+        include:
+          # The Linux default, and so the one production runs.
+          - serving: thread-per-core
+            thread_per_core: "true"
+          # The documented fallback. Kept green so it stays a real
+          # option when a deployment needs it.
+          - serving: work-stealing
+            thread_per_core: "false"
     services:
       etcd:
         image: quay.io/coreos/etcd:v3.5.15
@@ -270,14 +286,55 @@ jobs:
       - name: run e2e
         if: steps.harness.outputs.present == 'true'
         working-directory: tests/e2e
+        # Read by the harness, which writes it into every spawned
+        # gateway's `proxy.thread_per_core`. The binary's own default is
+        # platform-derived, so without this both legs would run the same
+        # mode and the second would prove nothing.
+        env:
+          E2E_THREAD_PER_CORE: ${{ matrix.thread_per_core }}
         run: pnpm test
+      - name: tag coverage by leg
+        # The gate downloads every leg with `merge-multiple: true`, which
+        # flattens same-named files to one — the legs must upload distinct
+        # filenames or only one leg's coverage survives the merge.
+        if: always()
+        run: |
+          if [ -f tests/e2e/coverage/lcov.info ]; then
+            mv tests/e2e/coverage/lcov.info "tests/e2e/coverage/lcov-${{ matrix.serving }}.info"
+          fi
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: coverage-e2e
-          path: tests/e2e/coverage/lcov.info
+          # Per leg: two uploads under one name is a hard conflict the
+          # moment the suite starts emitting coverage.
+          name: coverage-e2e-${{ matrix.serving }}
+          path: tests/e2e/coverage/lcov-${{ matrix.serving }}.info
           if-no-files-found: ignore
           retention-days: 7
+
+  e2e-gate:
+    # `main` requires the status check named literally `e2e (vitest) +
+    # coverage`. The matrix above publishes one check per leg instead, so
+    # that exact context never arrives and the PR sits forever at
+    # "Expected — Waiting for status to be reported" with every leg green.
+    # This job republishes the required name over the matrix's aggregate
+    # result, which keeps the branch-protection setting untouched — the
+    # other open PRs still report the old name and would all break the
+    # moment the required contexts were renamed to the two leg names.
+    name: e2e (vitest) + coverage
+    needs: [e2e]
+    # A skipped required check counts as satisfied, so this must still run
+    # when the matrix fails — otherwise the gate would vanish exactly when
+    # it matters.
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: assert every serving mode passed
+        run: |
+          if [ "${{ needs.e2e.result }}" != "success" ]; then
+            echo "::error::e2e matrix result: ${{ needs.e2e.result }}"
+            exit 1
+          fi
 
   coverage-gate:
     name: coverage >= 90%
@@ -296,7 +353,7 @@ jobs:
         # follow-up), this download must remain soft — otherwise the
         # coverage-gate hard-fails every run on `Artifact not found`.
         continue-on-error: true
-        with: { name: coverage-e2e, path: cov/e2e }
+        with: { pattern: coverage-e2e-*, path: cov/e2e, merge-multiple: true }
       - name: merge + threshold
         run: |
           npm i -g lcov-result-merger @lcov-viewer/cli

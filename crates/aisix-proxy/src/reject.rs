@@ -205,6 +205,8 @@ mod tests {
             request_body_limit_bytes: 0,
             tls: None,
             real_ip: Default::default(),
+            thread_per_core: None,
+            workers: None,
             url_rewrites: Vec::new(),
         };
         ProxyState::new(

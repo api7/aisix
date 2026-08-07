@@ -51,6 +51,16 @@ proxy:
   #   trusted_proxies: ["10.0.0.0/8", "127.0.0.1/32"]
   #   recursive: true
   #   header: x-forwarded-for
+  # Serve from independent worker threads, each with its own runtime,
+  # its own SO_REUSEPORT listener on addr, and its own upstream
+  # connection pool, so a request is handled end to end on the thread
+  # that accepted it. Omitted, it is on for Linux and off elsewhere.
+  # Set false to serve from one shared runtime. Applied at startup.
+  # thread_per_core: true
+  # Number of proxy worker threads. Omitted, it follows the parallelism
+  # available to the process, so a container CPU limit or a taskset
+  # affinity mask sizes it. Applied at startup.
+  # workers: 4
   # Entry-level URL rewriting: map legacy URL shapes onto AISIX endpoints
   # before routing. The first rule whose `match` regex matches the request
   # path rewrites it (once, no cascading); the request then flows through

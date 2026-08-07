@@ -873,6 +873,8 @@ mod tests {
             real_ip: Default::default(),
             url_rewrites: Vec::new(),
             tls: None,
+            thread_per_core: None,
+            workers: None,
         }
     }
 

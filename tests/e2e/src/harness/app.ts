@@ -66,6 +66,17 @@ export interface AppOverrides {
    */
   extraEnv?: Record<string, string>;
   /**
+   * `proxy.thread_per_core`. Omitted, the binary picks its platform
+   * default, which is what the suite should normally exercise.
+   *
+   * Pin it to `false` in a test whose subject is per-connection or
+   * per-pool state: with thread-per-core serving the kernel picks which
+   * worker accepts each connection, and each worker keeps its own
+   * upstream pool, so a count taken across two calls depends on that
+   * choice. Pinning keeps such an assertion measuring its own subject.
+   */
+  threadPerCore?: boolean;
+  /**
    * Log level for the spawned binary. Defaults to `warn` — quiet enough
    * that the suite's output stays readable. Tests that assert on a line
    * the gateway emits at `info` (the access log) raise it here.
@@ -133,6 +144,12 @@ export interface SpawnedApp {
    */
   output(): string;
   signal(signal: NodeJS.Signals): void;
+  /**
+   * Resolves when the process exits on its own — no signal is sent, no
+   * SIGKILL escalation. Rejects after `timeoutMs`. For asserting that a
+   * shutdown initiated via `signal()` actually terminates the process.
+   */
+  waitForExit(timeoutMs?: number): Promise<void>;
   exit(): Promise<void>;
   /**
    * Terminate the binary WITHOUT cleaning up: the etcd prefix, the tmp
@@ -147,6 +164,21 @@ const BIN_PATH =
   process.env.AISIX_BIN ?? join(process.cwd(), "..", "..", "target", "debug", "aisix");
 const READY_TIMEOUT_MS = 10_000;
 const SHUTDOWN_GRACE_MS = 3_000;
+
+/**
+ * Suite-wide `proxy.thread_per_core`, from `E2E_THREAD_PER_CORE`, so CI
+ * can run the whole suite in each serving mode. Unset leaves the binary
+ * on its platform default; a per-test `threadPerCore` still wins over
+ * both.
+ *
+ * Every site that spawns the binary has to read this — a spawn site that
+ * ignores it silently stays on one mode forever, and the leg that was
+ * supposed to cover the other one goes green without ever running it.
+ */
+export const suiteThreadPerCore: boolean | undefined =
+  process.env.E2E_THREAD_PER_CORE === undefined
+    ? undefined
+    : process.env.E2E_THREAD_PER_CORE !== "false";
 
 /**
  * Per-test handle to a spawned `aisix` binary. Each call writes a fresh
@@ -240,6 +272,9 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
       addr: `127.0.0.1:${proxyPort}`,
       request_body_limit_bytes: overrides.requestBodyLimitBytes ?? 10485760,
       ...(overrides.realIp ? { real_ip: overrides.realIp } : {}),
+      ...((overrides.threadPerCore ?? suiteThreadPerCore) !== undefined
+        ? { thread_per_core: overrides.threadPerCore ?? suiteThreadPerCore }
+        : {}),
       ...(overrides.urlRewrites ? { url_rewrites: overrides.urlRewrites } : {}),
     },
     admin: adminEnabled
@@ -378,6 +413,23 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
     },
     signal(signal: NodeJS.Signals) {
       if (child.exitCode === null) child.kill(signal);
+    },
+    waitForExit(timeoutMs = 10_000) {
+      // A signal-terminated child has exitCode === null and signalCode
+      // set — both mean "already exited", and the exit event will not
+      // fire again for a late listener.
+      if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+      return new Promise<void>((resolve, reject) => {
+        const onExit = () => {
+          clearTimeout(timer);
+          resolve();
+        };
+        const timer = setTimeout(() => {
+          child.off("exit", onExit);
+          reject(new Error(`aisix did not exit within ${timeoutMs}ms`));
+        }, timeoutMs);
+        child.once("exit", onExit);
+      });
     },
     async exit() {
       await terminate(child);

@@ -46,6 +46,11 @@ rcgen.workspace = true
 uuid.workspace = true
 hostname.workspace = true
 x509-parser = "0.16"
+# `SO_REUSEPORT` for the thread-per-core proxy listeners. `all` is
+# explicit because `set_reuse_port` lives behind it — it resolves
+# without the feature today only because other dependencies happen to
+# enable it on the same socket2, which a version bump would end.
+socket2 = { version = "0.5", features = ["all"] }
 # Only for the hyper connection builder `axum_server::Server::http_builder()`
 # hands back — where `downstream.idle_timeout_secs` is applied. Same 0.1.x
 # axum-server itself depends on, so the builder types unify.
