@@ -8,8 +8,15 @@ name: docker-image
 #   - push to poc               → :poc + :sha-<shortsha>
 #   - push tag vX.Y.Z           → :X.Y.Z + :X.Y + :X + :latest
 #                                 + :sha-<shortsha>
+#   - push tag vX.Y.Z-rc.N      → :X.Y.Z-rc.N + :sha-<shortsha>  (NO rolling tags)
 #   - pull request              → build-only (no push), sanity check
 #   - workflow_dispatch         → :sha-<shortsha> + optional tag input
+#
+# Pre-release tags exist so a release candidate can be QA'd on the exact
+# artifacts customers receive before anything points at it. They must move
+# no rolling pointer: docker/metadata-action already skips :X.Y and :X for
+# pre-release semver, and the guards below keep :latest and the published
+# `openapi-latest.json` on the last stable release.
 
 on:
   push:
@@ -83,6 +90,9 @@ jobs:
           images: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
             ${{ startsWith(github.ref, 'refs/tags/v') && format('{0}/{1}', secrets.DOCKER_REGISTRY, env.IMAGE_NAME) || '' }}
+          # `latest` is guarded on `!contains(ref_name, '-')` so a `-rc.N` tag
+          # cannot move it; metadata-action already skips {{major}}.{{minor}}
+          # and {{major}} for pre-release semver.
           tags: |
             type=raw,value=dev,enable=${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
             type=raw,value=poc,enable=${{ github.event_name == 'push' && github.ref == 'refs/heads/poc' }}
@@ -91,7 +101,7 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-') }}
             type=raw,value=${{ github.event.inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag != '' }}
           labels: |
             org.opencontainers.image.title=aisix
@@ -293,8 +303,17 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           jq --arg version "$VERSION" '.info.version = $version' ./openapi.json > "openapi-${VERSION}.json"
           aws s3 cp "./openapi-${VERSION}.json" "s3://${S3_BUCKET}/ai-gateway/openapi-${VERSION}.json"
-          aws s3 cp "./openapi-${VERSION}.json" "s3://${S3_BUCKET}/ai-gateway/openapi-latest.json"
-          echo "/ai-gateway/openapi-${VERSION}.json /ai-gateway/openapi-latest.json" > .updated_openapi_files
+          PATHS="/ai-gateway/openapi-${VERSION}.json"
+          # A release candidate publishes its own version-pinned spec (QA reads
+          # it) but must leave `openapi-latest.json` on the last stable release.
+          case "$VERSION" in
+            *-*) echo "::notice::pre-release ${VERSION}: openapi-latest.json left untouched" ;;
+            *)
+              aws s3 cp "./openapi-${VERSION}.json" "s3://${S3_BUCKET}/ai-gateway/openapi-latest.json"
+              PATHS="$PATHS /ai-gateway/openapi-latest.json"
+              ;;
+          esac
+          echo "$PATHS" > .updated_openapi_files
 
       - name: Invalidate OpenAPI CloudFront paths
         if: steps.openapi-secrets.outputs.enabled == 'true'
