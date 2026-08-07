@@ -21,6 +21,23 @@ pub struct AuthenticatedKey {
     pub entry: Arc<ResourceEntry<ApiKey>>,
 }
 
+/// Per-request context carried onto an authentication denial.
+///
+/// A 401 short-circuits ahead of every handler, so the request never
+/// reaches an access-log emit; AISIX-Cloud#1081 deliberately kept these out
+/// of the access log because an internet-facing DP would drown in scanner
+/// probes, leaving `aisix_auth_decisions_total` as the only record. That
+/// metric answers "how many" but not "who, when, against what" — so the
+/// denial log line, which an operator turns on precisely when investigating,
+/// carries the identifying detail instead.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct DenialContext<'a> {
+    pub method: &'a str,
+    pub path: &'a str,
+    pub request_id: &'a str,
+    pub source_ip: &'a str,
+}
+
 impl AuthenticatedKey {
     pub fn key(&self) -> &ApiKey {
         &self.entry.value
@@ -37,18 +54,41 @@ where
 
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
         let proxy_state = ProxyState::from_ref(state);
+        let source_ip = crate::client_ip::source_ip_from_parts(parts, &proxy_state.real_ip);
+        let request_id = parts
+            .extensions
+            .get::<crate::request_id::RequestId>()
+            .map(|r| r.0.as_str())
+            .unwrap_or_default();
+        let ctx = DenialContext {
+            method: parts.method.as_str(),
+            path: parts.uri.path(),
+            request_id,
+            source_ip: &source_ip,
+        };
         let token = match extract_bearer(parts) {
             Ok(t) => t,
             Err(e) => {
-                // No credential at all: metric only — logging every
-                // scanner probe would be noise (AISIX-Cloud#1081).
+                // No credential at all: metric + a debug line, never the
+                // access log — logging every scanner probe at the default
+                // level would be noise (AISIX-Cloud#1081).
                 proxy_state
                     .metrics
                     .record_auth_decision("none", false, "missing_credentials");
+                tracing::debug!(
+                    target: "aisix::auth",
+                    method = "none",
+                    reason = "missing_credentials",
+                    http_method = %ctx.method,
+                    path = %ctx.path,
+                    request_id = %ctx.request_id,
+                    source_ip = %ctx.source_ip,
+                    "rejected inbound request without a credential",
+                );
                 return Err(e);
             }
         };
-        let authed = authenticate_token(&proxy_state, &token).await?;
+        let authed = authenticate_token(&proxy_state, &token, ctx).await?;
         // Publish the resolved key so extractors that run after this one can
         // see who is calling without re-authenticating. `ClientContext` reads
         // it for the `${request.api_key.*}` header templates
@@ -71,10 +111,11 @@ where
 pub(crate) async fn authenticate_token(
     state: &ProxyState,
     token: &str,
+    ctx: DenialContext<'_>,
 ) -> Result<AuthenticatedKey, ProxyError> {
     let snapshot = state.snapshot.load();
     if crate::jwt::looks_like_jwt(token) && crate::jwt::any_enabled_provider(&snapshot) {
-        return crate::jwt::authenticate_jwt(state, &snapshot, token).await;
+        return crate::jwt::authenticate_jwt(state, &snapshot, token, ctx).await;
         // No enabled trust provider: fall through to the key path so a
         // custom-imported key that happens to look like a JWT keeps
         // authenticating on deployments that never enable JWT auth.
@@ -86,7 +127,13 @@ pub(crate) async fn authenticate_token(
     // function before persistence, so the two sides agree byte
     // for byte.
     let Some(entry) = snapshot.apikeys.get_by_name(&ApiKey::hash_bearer(token)) else {
-        return Err(deny_key(state, "unknown_key", ProxyError::InvalidApiKey));
+        return Err(deny_key(
+            state,
+            "unknown_key",
+            None,
+            ctx,
+            ProxyError::InvalidApiKey,
+        ));
     };
     // Lifecycle enforcement (#933): a known key that is disabled or
     // past its expiry deadline must be rejected here, at the single
@@ -94,10 +141,22 @@ pub(crate) async fn authenticate_token(
     // responses, embeddings, audio, passthrough, MCP, …) inherits
     // the same 401 without per-handler checks.
     if entry.value.disabled {
-        return Err(deny_key(state, "key_disabled", ProxyError::ApiKeyDisabled));
+        return Err(deny_key(
+            state,
+            "key_disabled",
+            Some(&entry.id),
+            ctx,
+            ProxyError::ApiKeyDisabled,
+        ));
     }
     if entry.value.is_expired_at(chrono::Utc::now()) {
-        return Err(deny_key(state, "key_expired", ProxyError::ApiKeyExpired));
+        return Err(deny_key(
+            state,
+            "key_expired",
+            Some(&entry.id),
+            ctx,
+            ProxyError::ApiKeyExpired,
+        ));
     }
     state.metrics.record_auth_decision("api_key", true, "");
     Ok(AuthenticatedKey { entry })
@@ -109,19 +168,33 @@ pub(crate) async fn authenticate_token(
 /// counter nor the access log ever fired). The token itself is never
 /// logged.
 ///
-/// `unknown_key` is the scanner-probe shape (`Bearer <junk>`) and
-/// carries no operator signal beyond the metric — same reasoning as the
-/// extractor's `missing_credentials`, which is also metric-only. It logs
-/// at `debug` so an internet-facing DP is not flooded. `key_disabled` /
-/// `key_expired` name a real key an operator provisioned, so they stay
-/// at `warn`.
-fn deny_key(state: &ProxyState, reason: &'static str, err: ProxyError) -> ProxyError {
+/// `unknown_key` is the scanner-probe shape (`Bearer <junk>`), so it logs
+/// at `debug` and an internet-facing DP is not flooded at the default
+/// level. `key_disabled` / `key_expired` name a real key an operator
+/// provisioned, so they stay at `warn` and carry `api_key_id`.
+///
+/// Every line carries the [`DenialContext`] — the caller's address, the
+/// route it hit, and the request id. Without it the record was
+/// unactionable: the metric has no such dimensions, and the 401 never
+/// reaches the access log, so "who is hammering us with a bad key" had no
+/// answer anywhere.
+fn deny_key(
+    state: &ProxyState,
+    reason: &'static str,
+    api_key_id: Option<&str>,
+    ctx: DenialContext<'_>,
+    err: ProxyError,
+) -> ProxyError {
     state.metrics.record_auth_decision("api_key", false, reason);
     if reason == "unknown_key" {
         tracing::debug!(
             target: "aisix::auth",
             method = "api_key",
             reason = %reason,
+            http_method = %ctx.method,
+            path = %ctx.path,
+            request_id = %ctx.request_id,
+            source_ip = %ctx.source_ip,
             "rejected inbound credential",
         );
     } else {
@@ -129,6 +202,11 @@ fn deny_key(state: &ProxyState, reason: &'static str, err: ProxyError) -> ProxyE
             target: "aisix::auth",
             method = "api_key",
             reason = %reason,
+            api_key_id = ?api_key_id,
+            http_method = %ctx.method,
+            path = %ctx.path,
+            request_id = %ctx.request_id,
+            source_ip = %ctx.source_ip,
             "rejected inbound credential",
         );
     }
@@ -162,6 +240,148 @@ fn extract_bearer(parts: &Parts) -> Result<String, ProxyError> {
 mod tests {
     use super::*;
     use axum::http::{HeaderMap, HeaderValue, Request};
+
+    /// A tracing writer that appends every emitted byte into a shared buffer
+    /// so a test can assert what a log line carried.
+    #[derive(Clone)]
+    struct BufWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for BufWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl tracing_subscriber::fmt::MakeWriter<'_> for BufWriter {
+        type Writer = BufWriter;
+        fn make_writer(&self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Only one test at a time may install a process-wide subscriber.
+    static CAPTURE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Run `f` with a log-capturing subscriber installed and return
+    /// everything it emitted. `unknown_key` / `missing_credentials` are the
+    /// scanner-probe shapes and log at DEBUG on purpose, so widen past the
+    /// builder's INFO default.
+    async fn capture_logs<F, Fut>(f: F) -> String
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let _capture_guard = CAPTURE_LOCK.lock().await;
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(BufWriter(buf.clone()))
+            .finish();
+        {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            f().await;
+        }
+        let bytes = buf.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    const GOOD_TOKEN: &str = "sk-auth-ctx-good";
+
+    fn router_with_key(disabled: bool) -> axum::Router {
+        use aisix_core::snapshot::SnapshotHandle;
+        use aisix_core::{AisixSnapshot, ProxyConfig};
+
+        let apikey: ApiKey = serde_json::from_value(serde_json::json!({
+            "key_hash": ApiKey::hash_bearer(GOOD_TOKEN),
+            "allowed_models": ["*"],
+            "disabled": disabled,
+        }))
+        .expect("valid apikey");
+        let snapshot = AisixSnapshot::new();
+        snapshot
+            .apikeys
+            .insert(ResourceEntry::new("ak-ctx-1", apikey, 1));
+        let cfg = ProxyConfig {
+            addr: "127.0.0.1:0".into(),
+            request_body_limit_bytes: 1 << 20,
+            tls: None,
+            real_ip: Default::default(),
+            url_rewrites: Vec::new(),
+        };
+        crate::build_router(
+            ProxyState::new(
+                SnapshotHandle::new(snapshot),
+                Arc::new(aisix_gateway::Hub::new()),
+                &cfg,
+            )
+            .without_cache(),
+        )
+    }
+
+    async fn call_with_bearer(router: axum::Router, bearer: Option<&str>) {
+        use tower::ServiceExt;
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json");
+        if let Some(b) = bearer {
+            builder = builder.header("authorization", format!("Bearer {b}"));
+        }
+        let mut request = builder
+            .body(axum::body::Body::from(r#"{"model":"m","messages":[]}"#))
+            .unwrap();
+        // The peer address the real server injects; without it the
+        // extractor has nothing to resolve the caller's address from.
+        request
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                [203, 0, 113, 7],
+                5555,
+            ))));
+        let _ = router.oneshot(request).await.expect("router responds");
+    }
+
+    /// A 401 short-circuits ahead of every handler, so it never reaches an
+    /// access-log emit and `aisix_auth_decisions_total` is the only other
+    /// record — and that metric has no caller, route, or request id. The
+    /// denial line is therefore the one place an operator can learn who is
+    /// hammering the gateway with a bad key; it must name them.
+    #[tokio::test]
+    async fn an_unknown_key_denial_names_the_caller_and_the_route() {
+        let logs = capture_logs(|| call_with_bearer(router_with_key(false), Some("sk-nope"))).await;
+        assert!(logs.contains("reason=unknown_key"), "got: {logs}");
+        assert!(logs.contains("http_method=POST"), "got: {logs}");
+        assert!(logs.contains("path=/v1/chat/completions"), "got: {logs}");
+        assert!(logs.contains("source_ip=203.0.113.7"), "got: {logs}");
+        // Correlates the denial with everything else stamped with this id.
+        assert!(logs.contains("request_id="), "got: {logs}");
+    }
+
+    /// Same for a request that carries no credential at all.
+    #[tokio::test]
+    async fn a_missing_credential_denial_names_the_caller_and_the_route() {
+        let logs = capture_logs(|| call_with_bearer(router_with_key(false), None)).await;
+        assert!(
+            logs.contains(r#"reason="missing_credentials""#),
+            "got: {logs}"
+        );
+        assert!(logs.contains("path=/v1/chat/completions"), "got: {logs}");
+        assert!(logs.contains("source_ip=203.0.113.7"), "got: {logs}");
+    }
+
+    /// A disabled key names a real key an operator provisioned, so the line
+    /// additionally identifies WHICH key — the operator's next action is to
+    /// look it up.
+    #[tokio::test]
+    async fn a_disabled_key_denial_also_names_the_key() {
+        let logs = capture_logs(|| call_with_bearer(router_with_key(true), Some(GOOD_TOKEN))).await;
+        assert!(logs.contains("reason=key_disabled"), "got: {logs}");
+        assert!(logs.contains("ak-ctx-1"), "got: {logs}");
+        assert!(logs.contains("source_ip=203.0.113.7"), "got: {logs}");
+    }
 
     fn parts_with(headers: HeaderMap) -> Parts {
         let mut req = Request::builder().uri("/").body(()).unwrap();

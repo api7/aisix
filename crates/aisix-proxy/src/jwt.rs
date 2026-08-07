@@ -188,24 +188,18 @@ pub(crate) async fn authenticate_jwt(
     state: &ProxyState,
     snapshot: &AisixSnapshot,
     token: &str,
+    ctx: crate::auth::DenialContext<'_>,
 ) -> Result<AuthenticatedKey, ProxyError> {
+    let d = Denier { state, ctx };
     let header = match jsonwebtoken::decode_header(token) {
         Ok(h) => h,
-        Err(_) => {
-            return Err(deny(
-                state,
-                "jwt_malformed",
-                "",
-                None,
-                ProxyError::JwtInvalid,
-            ))
-        }
+        Err(_) => return Err(deny(d, "jwt_malformed", "", None, ProxyError::JwtInvalid)),
     };
     let kid = header.kid.clone();
 
     let Some(iss) = unverified_issuer(token) else {
         return Err(deny(
-            state,
+            d,
             "jwt_missing_issuer",
             "",
             kid.as_deref(),
@@ -215,7 +209,7 @@ pub(crate) async fn authenticate_jwt(
 
     let Some(provider) = provider_for_issuer(snapshot, &iss) else {
         return Err(deny(
-            state,
+            d,
             "jwt_untrusted_issuer",
             &iss,
             kid.as_deref(),
@@ -226,7 +220,7 @@ pub(crate) async fn authenticate_jwt(
 
     if !ALLOWED_ALGS.contains(&header.alg) {
         return Err(deny(
-            state,
+            d,
             "jwt_alg_not_allowed",
             &iss,
             kid.as_deref(),
@@ -246,7 +240,7 @@ pub(crate) async fn authenticate_jwt(
                 "cannot resolve the trust provider's JWKS endpoint",
             );
             return Err(deny(
-                state,
+                d,
                 "jwks_unavailable",
                 &iss,
                 kid.as_deref(),
@@ -265,7 +259,7 @@ pub(crate) async fn authenticate_jwt(
                 "cannot fetch the trust provider's JWKS",
             );
             return Err(deny(
-                state,
+                d,
                 "jwks_unavailable",
                 &iss,
                 kid.as_deref(),
@@ -284,7 +278,7 @@ pub(crate) async fn authenticate_jwt(
     }
     if candidates.is_empty() {
         return Err(deny(
-            state,
+            d,
             "jwt_unknown_kid",
             &iss,
             kid.as_deref(),
@@ -295,13 +289,13 @@ pub(crate) async fn authenticate_jwt(
     // ── Signature + registered claims ────────────────────────────────
     let claims = match validate_with_keys(token, header.alg, prov, &candidates) {
         Ok(c) => c,
-        Err((reason, err)) => return Err(deny(state, reason, &iss, kid.as_deref(), err)),
+        Err((reason, err)) => return Err(deny(d, reason, &iss, kid.as_deref(), err)),
     };
 
     // ── Provider claim requirements ──────────────────────────────────
     if let Err(reason) = check_provider_claims(&claims, prov) {
         return Err(deny(
-            state,
+            d,
             reason,
             &iss,
             kid.as_deref(),
@@ -312,7 +306,7 @@ pub(crate) async fn authenticate_jwt(
     // ── Identity mapping ─────────────────────────────────────────────
     let Some(subject) = nested_claim(&claims, &prov.identity_claim).and_then(|v| v.as_str()) else {
         return Err(deny(
-            state,
+            d,
             "jwt_identity_claim_missing",
             &iss,
             kid.as_deref(),
@@ -339,7 +333,7 @@ pub(crate) async fn authenticate_jwt(
     // Same lifecycle enforcement as the API-key path (#933).
     if entry.value.disabled {
         return Err(deny(
-            state,
+            d,
             "key_disabled",
             &iss,
             kid.as_deref(),
@@ -348,7 +342,7 @@ pub(crate) async fn authenticate_jwt(
     }
     if entry.value.is_expired_at(chrono::Utc::now()) {
         return Err(deny(
-            state,
+            d,
             "key_expired",
             &iss,
             kid.as_deref(),
@@ -393,12 +387,13 @@ fn clip(s: &str) -> &str {
 /// provider has matched, a denial names a real configured issuer and is
 /// worth a `warn`.
 fn deny(
-    state: &ProxyState,
+    d: Denier<'_>,
     reason: &'static str,
     issuer: &str,
     kid: Option<&str>,
     err: ProxyError,
 ) -> ProxyError {
+    let Denier { state, ctx } = d;
     state.metrics.record_auth_decision("jwt", false, reason);
     let pre_match = matches!(
         reason,
@@ -411,6 +406,10 @@ fn deny(
             reason = %reason,
             issuer = ?clip(issuer),
             kid = ?clip(kid.unwrap_or("")),
+            http_method = %ctx.method,
+            path = %ctx.path,
+            request_id = %ctx.request_id,
+            source_ip = %ctx.source_ip,
             "rejected inbound JWT (pre-verification)",
         );
     } else {
@@ -420,10 +419,22 @@ fn deny(
             reason = %reason,
             issuer = ?clip(issuer),
             kid = ?clip(kid.unwrap_or("")),
+            http_method = %ctx.method,
+            path = %ctx.path,
+            request_id = %ctx.request_id,
+            source_ip = %ctx.source_ip,
             "rejected inbound JWT",
         );
     }
     err
+}
+
+/// `state` + the request context every JWT denial line carries, bundled so
+/// the twelve `deny` sites stay one argument wide.
+#[derive(Clone, Copy)]
+struct Denier<'a> {
+    state: &'a ProxyState,
+    ctx: crate::auth::DenialContext<'a>,
 }
 
 /// Verify signature + registered claims against each candidate key.
