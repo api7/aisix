@@ -312,6 +312,30 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+  e2e-gate:
+    # `main` requires the status check named literally `e2e (vitest) +
+    # coverage`. The matrix above publishes one check per leg instead, so
+    # that exact context never arrives and the PR sits forever at
+    # "Expected — Waiting for status to be reported" with every leg green.
+    # This job republishes the required name over the matrix's aggregate
+    # result, which keeps the branch-protection setting untouched — the
+    # other open PRs still report the old name and would all break the
+    # moment the required contexts were renamed to the two leg names.
+    name: e2e (vitest) + coverage
+    needs: [e2e]
+    # A skipped required check counts as satisfied, so this must still run
+    # when the matrix fails — otherwise the gate would vanish exactly when
+    # it matters.
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: assert every serving mode passed
+        run: |
+          if [ "${{ needs.e2e.result }}" != "success" ]; then
+            echo "::error::e2e matrix result: ${{ needs.e2e.result }}"
+            exit 1
+          fi
+
   coverage-gate:
     name: coverage >= 90%
     needs: [rust-unit, e2e]
