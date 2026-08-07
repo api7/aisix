@@ -243,10 +243,10 @@ async fn dispatch(
     let mut last_err: Option<ProxyError> = None;
     let mut any_anthropic = false;
     for (target_idx, target) in attempt_models.iter().enumerate() {
-        // count_tokens has no upstream equivalent for non-Anthropic
-        // providers; skip foreign targets in a mixed group rather than
+        // count_tokens has no upstream equivalent outside the Anthropic
+        // protocol; skip foreign targets in a mixed group rather than
         // dispatching to an upstream that would 404.
-        if target.model.provider.as_deref() != Some("anthropic") {
+        if !crate::dispatch::speaks_anthropic(&snapshot, &target.model) {
             continue;
         }
         any_anthropic = true;
@@ -283,7 +283,7 @@ async fn dispatch(
         // target that can actually serve the request.
         let has_usable_fallback = attempt_models[target_idx + 1..]
             .iter()
-            .any(|t| t.model.provider.as_deref() == Some("anthropic"));
+            .any(|t| crate::dispatch::speaks_anthropic(&snapshot, &t.model));
         let budget = crate::routing::effective_retries(
             &target.model,
             model_entry.value.routing.as_ref(),
@@ -344,16 +344,17 @@ async fn dispatch(
     // dispatching to an upstream that would 404.
     if !any_anthropic {
         return Err(ProxyError::InvalidRequest(format!(
-            "model `{model_name}` is not an Anthropic provider; \
-             /v1/messages/count_tokens requires an Anthropic-backed model"
+            "model `{model_name}` is not backed by an Anthropic-protocol upstream; \
+             /v1/messages/count_tokens requires a model whose provider key uses \
+             the anthropic adapter"
         )));
     }
     Err(last_err.unwrap_or(ProxyError::ProviderUnavailable))
 }
 
 /// Dispatch one concrete Anthropic target's count_tokens passthrough to
-/// `{api_base}/v1/messages/count_tokens`. The caller has already
-/// confirmed `model.provider == anthropic`.
+/// `{api_base}/v1/messages/count_tokens`. The caller has already confirmed
+/// the target speaks the Anthropic protocol (`dispatch::speaks_anthropic`).
 #[allow(clippy::too_many_arguments)]
 async fn count_tokens_to_target(
     state: &ProxyState,
@@ -881,6 +882,54 @@ mod tests {
         let sent: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
         assert_eq!(sent["model"], "claude-haiku-4-5-20251001");
         assert_eq!(sent["messages"][0]["content"], "hello");
+    }
+
+    /// A `provider: "byo"` model whose ProviderKey carries
+    /// `adapter: anthropic` fronts an Anthropic-protocol upstream, so
+    /// count_tokens must serve it exactly like the catalog vendor.
+    /// Gating on the vendor id rejected it with a 400 while its sibling
+    /// `/v1/messages` happily served the same model.
+    #[tokio::test]
+    async fn byo_model_on_the_anthropic_adapter_is_served() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages/count_tokens"))
+            .and(header("x-api-key", "sk-byo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "input_tokens": 23
+            })))
+            .mount(&upstream)
+            .await;
+
+        let snap = AisixSnapshot::new();
+        let pk_json = format!(
+            r#"{{"display_name":"byo-anthropic","secret":"sk-byo","api_base":"{}","provider":"byo","adapter":"anthropic"}}"#,
+            upstream.uri()
+        );
+        let pk: aisix_core::ProviderKey = serde_json::from_str(&pk_json).unwrap();
+        snap.provider_keys.insert(ResourceEntry::new(PK_ID, pk, 1));
+        let model_json = format!(
+            r#"{{"display_name":"byo-claude","provider":"byo","model_name":"claude-sonnet-4-5","provider_key_id":"{PK_ID}"}}"#
+        );
+        let m: Model = serde_json::from_str(&model_json).unwrap();
+        snap.models.insert(ResourceEntry::new("m-1", m, 1));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        let app = build_app(snap);
+
+        let resp = app
+            .oneshot(make_req(serde_json::json!({
+                "model": "byo-claude",
+                "messages": [{"role": "user", "content": "hello"}]
+            })))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["input_tokens"], 23);
+        let received = upstream.received_requests().await.unwrap();
+        assert_eq!(received[0].url.path(), "/v1/messages/count_tokens");
     }
 
     // ─── PK request.* overrides must apply identically to /v1/messages ──
