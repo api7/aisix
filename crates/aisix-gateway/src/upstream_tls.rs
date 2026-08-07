@@ -562,6 +562,15 @@ mod tests {
         params.self_signed(&kp).unwrap().pem().into_bytes()
     }
 
+    /// The literal scan in `upstream_http` cannot see named constants, so
+    /// the per-key client's agent is pinned to the dispatch agent here —
+    /// a per-key client must stay indistinguishable upstream from the
+    /// shared (or per-worker) one.
+    #[test]
+    fn provider_key_clients_present_the_dispatch_user_agent() {
+        assert_eq!(PROVIDER_KEY_USER_AGENT, DISPATCH_USER_AGENT);
+    }
+
     #[test]
     fn default_settings_leave_every_client_untouched() {
         let settings = TlsSettings::load("upstream.tls", &OutboundTlsConfig::default()).unwrap();

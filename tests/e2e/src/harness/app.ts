@@ -144,6 +144,12 @@ export interface SpawnedApp {
    */
   output(): string;
   signal(signal: NodeJS.Signals): void;
+  /**
+   * Resolves when the process exits on its own — no signal is sent, no
+   * SIGKILL escalation. Rejects after `timeoutMs`. For asserting that a
+   * shutdown initiated via `signal()` actually terminates the process.
+   */
+  waitForExit(timeoutMs?: number): Promise<void>;
   exit(): Promise<void>;
   /**
    * Terminate the binary WITHOUT cleaning up: the etcd prefix, the tmp
@@ -407,6 +413,19 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
     },
     signal(signal: NodeJS.Signals) {
       if (child.exitCode === null) child.kill(signal);
+    },
+    waitForExit(timeoutMs = 10_000) {
+      if (child.exitCode !== null) return Promise.resolve();
+      return new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(
+          () => reject(new Error(`aisix did not exit within ${timeoutMs}ms`)),
+          timeoutMs,
+        );
+        child.once("exit", () => {
+          clearTimeout(timer);
+          resolve();
+        });
+      });
     },
     async exit() {
       await terminate(child);

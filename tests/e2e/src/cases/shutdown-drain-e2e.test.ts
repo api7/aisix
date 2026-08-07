@@ -121,6 +121,11 @@ describe("graceful shutdown drains in-flight requests", () => {
     // Only signal once the request has actually reached the upstream —
     // from here the gateway holds it in flight for UPSTREAM_DELAY_MS.
     await upstreamGotRequest;
+    // Armed before the signal: the same test also has to prove the
+    // process actually terminates once its drain completes — a
+    // worker-coordination failure that leaves the process alive would
+    // otherwise pass on the response assertions alone.
+    const exited = app.waitForExit(15_000);
     app.signal("SIGTERM");
 
     // The drain contract: the response completes despite the shutdown.
@@ -132,5 +137,9 @@ describe("graceful shutdown drains in-flight requests", () => {
       choices?: Array<{ message?: { content?: string } }>;
     };
     expect(body.choices?.[0]?.message?.content).toBe("drained");
+
+    // The drained response must be followed by the process exiting on
+    // its own — no SIGKILL, no lingering listeners.
+    await exited;
   }, 20_000);
 });
