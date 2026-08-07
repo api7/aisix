@@ -264,6 +264,31 @@ mod tests {
     /// Only one test at a time may install a process-wide subscriber.
     static CAPTURE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+    /// Keep every callsite emittable for the whole test binary.
+    ///
+    /// `set_default` below is thread-local, but a callsite's `Interest` is
+    /// cached *process-wide* the first time that callsite is hit, from
+    /// whichever dispatcher the hitting thread has. With no global default
+    /// that is `NoSubscriber`, so a sibling test reaching the denial path on
+    /// another thread caches `Interest::never()` and the event is then
+    /// skipped everywhere — including inside the capture, which sees an
+    /// empty buffer. Dozens of router tests hit the unauthenticated path, so
+    /// under the parallel harness that race is routine, not exotic.
+    ///
+    /// A permissive global default removes the outcome: no thread ever falls
+    /// back to `NoSubscriber`. Registering it also re-evaluates the
+    /// callsites seen so far, so installing it lazily still repairs a cache
+    /// poisoned earlier in the run.
+    fn keep_callsites_enabled() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            // A bare registry writes nothing and formats nothing; it is here
+            // only so that callsites register as enabled. The captured events
+            // are rendered by the scoped subscriber below.
+            let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry());
+        });
+    }
+
     /// Run `f` with a log-capturing subscriber installed and return
     /// everything it emitted. `unknown_key` / `missing_credentials` are the
     /// scanner-probe shapes and log at DEBUG on purpose, so widen past the
@@ -273,6 +298,7 @@ mod tests {
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = ()>,
     {
+        keep_callsites_enabled();
         let _capture_guard = CAPTURE_LOCK.lock().await;
         let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let subscriber = tracing_subscriber::fmt()
