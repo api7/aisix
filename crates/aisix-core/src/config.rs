@@ -503,21 +503,33 @@ pub struct UrlRewriteRule {
     pub replacement: String,
 }
 
-/// Accept `url_rewrites` either as a structured sequence (config file) or
-/// as a JSON array carried in one string — the only shape an env var can
+/// Accept a list of structs either as a structured sequence (config file)
+/// or as a JSON array carried in one string — the only shape an env var can
 /// hold, and env vars are the sole config channel in chart-driven
 /// deployments.
-fn deserialize_url_rewrites<'de, D>(deserializer: D) -> Result<Vec<UrlRewriteRule>, D::Error>
+///
+/// `with_list_parse_key` covers the other half of the problem: it splits a
+/// comma-separated env value, which is enough for a `Vec<String>` but cannot
+/// express a list of structs. So every sequence field needs one of the two —
+/// this for `Vec<Struct>`, a `with_list_parse_key` registration for
+/// `Vec<String>` / `Vec<f64>` — or it is unreachable from the environment.
+/// `field` names the setting in the error, so a malformed JSON string says
+/// which one it came from.
+fn deserialize_seq_or_json_string<'de, D, T>(
+    deserializer: D,
+    field: &str,
+) -> Result<Vec<T>, D::Error>
 where
     D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
 {
     #[derive(Deserialize)]
     #[serde(untagged)]
-    enum SeqOrJsonString {
-        Seq(Vec<UrlRewriteRule>),
+    enum SeqOrJsonString<T> {
+        Seq(Vec<T>),
         JsonString(String),
     }
-    match SeqOrJsonString::deserialize(deserializer)? {
+    match SeqOrJsonString::<T>::deserialize(deserializer)? {
         SeqOrJsonString::Seq(rules) => Ok(rules),
         SeqOrJsonString::JsonString(raw) => {
             let trimmed = raw.trim();
@@ -525,9 +537,23 @@ where
                 return Ok(Vec::new());
             }
             serde_json::from_str(trimmed)
-                .map_err(|e| serde::de::Error::custom(format!("url_rewrites JSON string: {e}")))
+                .map_err(|e| serde::de::Error::custom(format!("{field} JSON string: {e}")))
         }
     }
+}
+
+fn deserialize_url_rewrites<'de, D>(deserializer: D) -> Result<Vec<UrlRewriteRule>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_seq_or_json_string(deserializer, "url_rewrites")
+}
+
+fn deserialize_client_type_rules<'de, D>(deserializer: D) -> Result<Vec<ClientTypeRule>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_seq_or_json_string(deserializer, "client_type_rules")
 }
 
 /// Reject a rewrite template that references capture groups its pattern
@@ -732,6 +758,10 @@ pub struct MetricsConfig {
     /// go to this DP's own Prometheus scrape surface, so the operator who
     /// owns the scrape owns the label set. Order matters (first match
     /// wins); compiled + validated at boot (fail-fast), never hot-reloaded.
+    ///
+    /// Env-only deployments set the whole list as one JSON array:
+    /// `AISIX_OBSERVABILITY__METRICS__CLIENT_TYPE_RULES='[{"pattern":"^py-bill/","client":"billing"}]'`.
+    #[serde(default, deserialize_with = "deserialize_client_type_rules")]
     pub client_type_rules: Vec<ClientTypeRule>,
     /// Operator overrides for the histogram bucket edges
     /// (AISIX-Cloud#1226). Deployment-scoped for the same reason as
@@ -1264,9 +1294,16 @@ impl Config {
                 // vars, so an unregistered key is not merely awkward from
                 // the environment — it fails to deserialize, leaving the
                 // field unreachable in Kubernetes.
+                // A `Vec<Struct>` cannot be expressed by comma-splitting;
+                // those fields carry `deserialize_seq_or_json_string`
+                // instead and take one JSON array. Between the two
+                // mechanisms every sequence field must be covered —
+                // `env_only_deployments_can_set_every_sequence_field` is
+                // the guard.
                 .list_separator(",")
                 .with_list_parse_key("etcd.endpoints")
                 .with_list_parse_key("admin.admin_keys")
+                .with_list_parse_key("proxy.real_ip.trusted_proxies")
                 .with_list_parse_key("observability.metrics.buckets.request_e2e_latency")
                 .with_list_parse_key("observability.metrics.buckets.request_ttft")
                 .with_list_parse_key("observability.metrics.buckets.guardrail_latency")
@@ -1639,6 +1676,91 @@ admin:
         assert!(
             format!("{err}").contains("url_rewrites"),
             "error should name the field: {err}"
+        );
+    }
+
+    #[test]
+    fn env_only_deployments_can_set_every_sequence_field() {
+        // The chart and the dashboard's `docker run` snippet configure the
+        // gateway purely through AISIX_* env vars, so a sequence field that
+        // the env source cannot express is unreachable in those deployments
+        // — it does not fall back to a default, the whole load fails.
+        //
+        // The YAML-scalar tests above do NOT cover this: they exercise the
+        // deserializer, not the `Environment` source's list-parse
+        // registration. `proxy.real_ip.trusted_proxies` was registered
+        // nowhere and shipped unreachable behind exactly that gap.
+        const CHILD_MARKER: &str = "TEST_ENV_SEQUENCE_FIELDS_CHILD";
+        const ENV: [(&str, &str); 8] = [
+            ("AISIX_ETCD__ENDPOINTS", "http://127.0.0.1:2379"),
+            ("AISIX_ADMIN__ADMIN_KEYS", "k1,k2"),
+            ("AISIX_PROXY__ADDR", "0.0.0.0:3000"),
+            ("AISIX_ADMIN__ADDR", "127.0.0.1:3001"),
+            (
+                "AISIX_PROXY__REAL_IP__TRUSTED_PROXIES",
+                "10.0.0.0/8,127.0.0.1/32",
+            ),
+            (
+                "AISIX_PROXY__URL_REWRITES",
+                r#"[{"name":"c","match":"^/a$","rewrite":"/b"}]"#,
+            ),
+            (
+                "AISIX_OBSERVABILITY__METRICS__CLIENT_TYPE_RULES",
+                r#"[{"pattern":"^py-bill/","client":"billing"}]"#,
+            ),
+            (
+                "AISIX_OBSERVABILITY__METRICS__BUCKETS__REQUEST_TTFT",
+                "0.1,0.5,1",
+            ),
+        ];
+
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            // Isolate env-backed loading in a child process so concurrent
+            // tests neither observe nor overwrite these variables.
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .arg("env_only_deployments_can_set_every_sequence_field")
+                .arg("--test-threads=1")
+                .env(CHILD_MARKER, "1");
+            for (key, _) in std::env::vars_os() {
+                if key.to_string_lossy().starts_with("AISIX_") {
+                    child.env_remove(key);
+                }
+            }
+            for (k, v) in ENV {
+                child.env(k, v);
+            }
+            let output = child.output().unwrap();
+            assert!(
+                output.status.success(),
+                "child config test failed: {}",
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        }
+
+        let cfg = Config::load_from_path(None).unwrap();
+        assert_eq!(
+            cfg.proxy.real_ip.trusted_proxies,
+            vec!["10.0.0.0/8".to_string(), "127.0.0.1/32".to_string()],
+        );
+        assert_eq!(cfg.proxy.url_rewrites.len(), 1);
+        assert_eq!(cfg.observability.metrics.client_type_rules.len(), 1);
+        assert_eq!(
+            cfg.observability.metrics.client_type_rules[0].client,
+            "billing"
+        );
+        assert_eq!(
+            cfg.observability.metrics.buckets.request_ttft,
+            Some(vec![0.1, 0.5, 1.0])
+        );
+        assert_eq!(
+            cfg.etcd.endpoints,
+            vec!["http://127.0.0.1:2379".to_string()]
+        );
+        assert_eq!(
+            cfg.admin.admin_keys,
+            vec!["k1".to_string(), "k2".to_string()]
         );
     }
 
