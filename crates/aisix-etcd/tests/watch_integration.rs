@@ -2,12 +2,16 @@
 //!
 //! Requires a real etcd — gated by `ETCD_TEST_URL`.  CI sets this via
 //! the etcd service container; local runs without the var are no-ops.
+//!
+//! For auth-token-refresh tests, set `ETCD_TEST_AUTH_URL` pointing to an
+//! etcd with `--auth-token-ttl` set short (e.g. 5s for test speed) and
+//! `ETCD_TEST_USER` / `ETCD_TEST_PASSWORD` for a valid user.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aisix_etcd::provider::ConfigProvider;
 use aisix_etcd::EtcdConfigProvider;
-use etcd_client::Client;
+use etcd_client::{Client, ConnectOptions};
 use futures::StreamExt;
 use tokio::time::timeout;
 
@@ -48,7 +52,7 @@ async fn watch_stream_delivers_events_after_put() {
 
     let prefix = unique_prefix();
     let endpoints = vec![url.clone()];
-    let provider = EtcdConfigProvider::connect(&endpoints, prefix.clone(), None)
+    let provider = EtcdConfigProvider::connect(&endpoints, prefix.clone(), None, None)
         .await
         .expect("connect");
 
@@ -92,6 +96,95 @@ async fn watch_stream_delivers_events_after_put() {
         .expect("cleanup delete");
 }
 
+/// Regression test: the token refresh loop must keep a `user`/`password`
+/// client authenticated past etcd's `--auth-token-ttl` window.
+///
+/// Requires `ETCD_TEST_AUTH_URL` (auth-enabled etcd) + `ETCD_TEST_USER` /
+/// `ETCD_TEST_PASSWORD`; no-ops otherwise (CI's etcd has no auth).
+///
+/// Local run:
+///   docker run --rm -p 2379:2379 quay.io/coreos/etcd:v3.5.18 \
+///     --listen-client-urls=http://0.0.0.0:2379 \
+///     --advertise-client-urls=http://0.0.0.0:2379 --auth-token-ttl=5
+///   etcdctl user add root:rootpw && etcdctl user grant-role root root \
+///     && etcdctl user add test:testpw && etcdctl user grant-role test root \
+///     && etcdctl auth enable
+///   ETCD_TEST_AUTH_URL=http://127.0.0.1:2379 ETCD_TEST_USER=test \
+///   ETCD_TEST_PASSWORD=testpw \
+///   cargo test --test watch_integration token_refresh -- --nocapture
+#[tokio::test]
+async fn token_refresh_prevents_auth_expiry() {
+    let auth_url = match std::env::var("ETCD_TEST_AUTH_URL").ok() {
+        Some(u) => u,
+        None => {
+            eprintln!("ETCD_TEST_AUTH_URL not set — skipping");
+            return;
+        }
+    };
+    let user = std::env::var("ETCD_TEST_USER").expect("ETCD_TEST_USER required");
+    let password = std::env::var("ETCD_TEST_PASSWORD").expect("ETCD_TEST_PASSWORD required");
+
+    let prefix = unique_prefix();
+    let endpoints = vec![auth_url];
+    let options = ConnectOptions::new().with_user(user.clone(), password.clone());
+
+    // Refresh every 2s — well under the 5s --auth-token-ttl the local-run
+    // etcd is started with above, so the loop refreshes before expiry.
+    let provider = EtcdConfigProvider::connect(&endpoints, prefix.clone(), Some(options), Some(2))
+        .await
+        .expect("connect with auth");
+
+    // Wait past the 5s TTL window (1s margin absorbs scheduler jitter);
+    // without refresh this load_all would 401.
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    let (entries, rev) = provider
+        .load_all()
+        .await
+        .expect("load_all should succeed after token refresh");
+    assert_eq!(entries.len(), 0, "unique prefix should be empty");
+
+    // Exercise the authenticated watch path: create a watch stream after
+    // the TTL window, write an event, and assert it arrives. This verifies
+    // the refresh also keeps watch operations authenticated (the PR changes
+    // WatchStream ownership, so this is load-bearing).
+    let mut stream = provider
+        .watch(rev + 1)
+        .await
+        .expect("watch should succeed after token refresh");
+
+    // Write a key via a separate authenticated client.
+    let write_options = ConnectOptions::new().with_user(user, password);
+    let mut writer = Client::connect(&endpoints, Some(write_options))
+        .await
+        .expect("writer connect");
+    let test_key = format!("{prefix}/models/watch-auth-test");
+    let test_value = br#"{"display_name":"post-ttl","provider":"openai","model_name":"gpt-4o","provider_key_id":"11111111-1111-1111-1111-111111111111"}"#;
+    writer
+        .put(test_key.as_bytes(), test_value.as_ref(), None)
+        .await
+        .expect("put after TTL");
+
+    // The watch stream must deliver the event within a reasonable window
+    let event = timeout(Duration::from_secs(5), stream.next())
+        .await
+        .expect("timed out — watch stream did not deliver event after token refresh")
+        .expect("stream ended unexpectedly");
+
+    match event.expect("watch error after token refresh") {
+        aisix_etcd::WatchEvent::Put(entry) => {
+            assert_eq!(entry.key, test_key);
+            assert_eq!(entry.value, test_value);
+        }
+        other => panic!("expected Put after TTL, got {other:?}"),
+    }
+
+    // Cleanup
+    writer
+        .delete(test_key.as_bytes(), None)
+        .await
+        .expect("cleanup delete");
+}
+
 /// #519 B.3: the supervisor's applied revision (read by the heartbeat as
 /// `applied_revision`) must catch up to the header revision returned to a
 /// writer — for puts AND deletes. This is the exact comparison cp-api
@@ -109,7 +202,7 @@ async fn supervisor_applied_revision_catches_up_to_writer_revision() {
 
     let prefix = unique_prefix();
     let endpoints = vec![url.clone()];
-    let provider = EtcdConfigProvider::connect(&endpoints, prefix.clone(), None)
+    let provider = EtcdConfigProvider::connect(&endpoints, prefix.clone(), None, None)
         .await
         .expect("connect");
     let supervisor = std::sync::Arc::new(aisix_etcd::Supervisor::new(
@@ -178,7 +271,7 @@ async fn watch_stream_delivers_all_events_from_batched_response() {
 
     let prefix = unique_prefix();
     let endpoints = vec![url.clone()];
-    let provider = EtcdConfigProvider::connect(&endpoints, prefix.clone(), None)
+    let provider = EtcdConfigProvider::connect(&endpoints, prefix.clone(), None, None)
         .await
         .expect("connect");
 

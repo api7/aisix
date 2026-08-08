@@ -77,23 +77,162 @@ impl std::fmt::Debug for EtcdConfigProvider {
     }
 }
 
+/// etcd's default `--auth-token-ttl` is 300s; 240s leaves a 60s margin.
+/// Override via `EtcdConfig.auth_token_refresh_secs` for a shorter TTL.
+const DEFAULT_TOKEN_REFRESH_SECS: u64 = 240;
+
+/// Bounded retry on a failed refresh, so a transient error doesn't leave
+/// the client unauthenticated until the next full `refresh_interval` tick.
+/// Counts total attempts (the first try plus retries), not retries alone —
+/// 3 attempts means the first try plus 2 retries.
+const TOKEN_REFRESH_MAX_ATTEMPTS: u32 = 3;
+/// Exponential backoff base delay: the wait after a failure is
+/// `TOKEN_REFRESH_RETRY_BASE_SECS * 2^(attempt - 1)` (5s, 10s for the
+/// default 3 attempts — 15s worst case across the 2 retries). Comfortably
+/// inside the 60s margin `DEFAULT_TOKEN_REFRESH_SECS` leaves before etcd's
+/// default TTL; an operator who configures a much shorter
+/// `auth_token_refresh_secs` is responsible for leaving enough margin for
+/// this to fit inside it too.
+const TOKEN_REFRESH_RETRY_BASE_SECS: u64 = 5;
+
+/// `config_secs` is `EtcdConfig.auth_token_refresh_secs`; `None` or `0`
+/// (an operator-supplied 0, or the pre-migration config default) falls
+/// back to the hardcoded default.
+fn resolve_refresh_secs(config_secs: Option<u64>) -> u64 {
+    config_secs
+        .filter(|&secs| secs > 0)
+        .unwrap_or(DEFAULT_TOKEN_REFRESH_SECS)
+}
+
+/// Spawn a background task that refreshes the etcd auth token at the
+/// given interval. Safe to call unconditionally: `Client::refresh_token`
+/// (v0.18+) no-ops when no credentials were configured.
+///
+/// `config_secs` (typically `EtcdConfig.auth_token_refresh_secs`) sets the
+/// interval; `None` or `0` falls back to the hardcoded default (240s).
+/// `Client` is `Clone`-cheap (internally `Arc`'d) and shares its
+/// auth-token cell across clones, so this works on any clone of the
+/// caller's client.
+///
+/// Each interval tick makes up to `TOKEN_REFRESH_MAX_ATTEMPTS` attempts
+/// (the first try plus retries), with exponential backoff between
+/// failures, before giving up until the next tick — a single transient
+/// failure no longer leaves the client unauthenticated for a full
+/// `refresh_interval`.
+///
+/// No-ops outside a Tokio runtime (e.g. a sync unit test building a
+/// `Client`/store via `Runtime::block_on` and returning it) — `tokio::spawn`
+/// requires an active runtime, and such contexts never carry credentials.
+pub fn start_token_refresh_task(client: Client, config_secs: Option<u64>) {
+    if tokio::runtime::Handle::try_current().is_err() {
+        return;
+    }
+
+    if config_secs == Some(0) {
+        tracing::warn!(
+            interval_secs = DEFAULT_TOKEN_REFRESH_SECS,
+            "etcd.auth_token_refresh_secs = 0 is not a valid interval — falling back to the default",
+        );
+    }
+
+    let refresh_interval = Duration::from_secs(resolve_refresh_secs(config_secs));
+
+    tracing::info!(
+        interval_secs = refresh_interval.as_secs(),
+        "etcd auth token refresh loop started",
+    );
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(refresh_interval);
+        // First tick fires immediately — skip it; `Client::connect`
+        // already authenticated once.
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+
+            // Try refresh with bounded retry on failure.
+            let mut attempt = 0;
+            let mut success = false;
+
+            while attempt < TOKEN_REFRESH_MAX_ATTEMPTS {
+                match client.refresh_token().await {
+                    Ok(()) => {
+                        if attempt == 0 {
+                            tracing::debug!("etcd auth token refreshed");
+                        } else {
+                            tracing::info!(attempt, "etcd auth token refreshed after retry");
+                        }
+                        success = true;
+                        break;
+                    }
+                    Err(e) => {
+                        attempt += 1;
+                        if attempt < TOKEN_REFRESH_MAX_ATTEMPTS {
+                            let backoff = Duration::from_secs(
+                                TOKEN_REFRESH_RETRY_BASE_SECS * 2u64.pow(attempt - 1),
+                            );
+                            tracing::warn!(
+                                error = %format_error_chain(&e),
+                                attempt,
+                                max_attempts = TOKEN_REFRESH_MAX_ATTEMPTS,
+                                backoff_secs = backoff.as_secs(),
+                                "etcd auth token refresh failed — retrying after backoff",
+                            );
+                            tokio::time::sleep(backoff).await;
+                        } else {
+                            tracing::error!(
+                                error = %format_error_chain(&e),
+                                attempt,
+                                "etcd auth token refresh failed after all attempts — \
+                                 watch may see UNAUTHENTICATED on next expiry",
+                            );
+                        }
+                    }
+                }
+            }
+
+            // If every attempt failed, continue to next interval rather than crash.
+            if !success {
+                tracing::warn!(
+                    "will retry token refresh at next interval ({}s)",
+                    refresh_interval.as_secs()
+                );
+            }
+        }
+    });
+}
+
 impl EtcdConfigProvider {
-    /// Connect with the spec §2 default retry policy.
+    /// Connect with the spec §2 default retry policy. `refresh_secs`
+    /// overrides the auth-token refresh interval (typically
+    /// `EtcdConfig.auth_token_refresh_secs`); `None` uses the default —
+    /// see `start_token_refresh_task`.
     pub async fn connect(
         endpoints: &[String],
         prefix: impl Into<String>,
         options: Option<ConnectOptions>,
+        refresh_secs: Option<u64>,
     ) -> Result<Self, ProviderError> {
-        Self::connect_with_policy(endpoints, prefix, options, ConnectPolicy::default()).await
+        Self::connect_with_policy(
+            endpoints,
+            prefix,
+            options,
+            ConnectPolicy::default(),
+            refresh_secs,
+        )
+        .await
     }
 
-    /// Connect with a caller-chosen retry policy. Returns the last-seen
-    /// error on failure to surface useful context in the bootstrap logs.
+    /// Connect with a caller-chosen retry policy and auth-token refresh
+    /// interval override (`refresh_secs`, typically
+    /// `EtcdConfig.auth_token_refresh_secs` — `None` uses the default).
+    /// Returns the last-seen error on failure to surface useful context
+    /// in the bootstrap logs.
     pub async fn connect_with_policy(
         endpoints: &[String],
         prefix: impl Into<String>,
         options: Option<ConnectOptions>,
         policy: ConnectPolicy,
+        refresh_secs: Option<u64>,
     ) -> Result<Self, ProviderError> {
         let prefix = prefix.into();
         let mut last_err: Option<EtcdError> = None;
@@ -101,6 +240,7 @@ impl EtcdConfigProvider {
             match Client::connect(endpoints, options.clone()).await {
                 Ok(client) => {
                     tracing::info!(attempt, prefix = %prefix, "etcd connected");
+                    start_token_refresh_task(client.clone(), refresh_secs);
                     return Ok(Self {
                         client: Mutex::new(client),
                         prefix,
@@ -171,30 +311,27 @@ impl ConfigProvider for EtcdConfigProvider {
         let opts = WatchOptions::new()
             .with_prefix()
             .with_start_revision(start_revision);
-        let (watcher, stream) = client
+        let stream = client
             .watch(self.prefix.as_bytes(), Some(opts))
             .await
             .map_err(|e| ProviderError::Watch(format_error_chain(&e)))?;
 
         Ok(Box::new(EtcdWatchStream {
             inner: stream,
-            _watcher: watcher,
             buf: VecDeque::new(),
         }))
     }
 }
 
 /// Adapter from `etcd-client`'s WatchStream to our typed [`WatchEvent`].
+/// A `VecDeque` buffer drains multi-event responses across successive
+/// `poll_next` calls so no events are silently dropped.
 ///
-/// Each `WatchResponse` carries a batch of events; we flatten them
-/// into individual `WatchEvent` items. A `VecDeque` buffer drains
-/// multi-event responses across successive `poll_next` calls so that
-/// no events are silently dropped.
+/// Pre-0.18 `etcd-client` required a separate `Watcher` handle alongside
+/// the stream (dropping it killed the watch — issue #237). Since 0.18
+/// `WatchStream` owns both halves, so `inner` alone keeps it alive.
 pub struct EtcdWatchStream {
     inner: etcd_client::WatchStream,
-    // Must outlive `inner` — dropping the Watcher closes the client→server
-    // half of the gRPC stream, causing the server to tear down the watch.
-    _watcher: etcd_client::Watcher,
     buf: VecDeque<WatchEvent>,
 }
 
@@ -277,6 +414,19 @@ mod tests {
         assert_eq!(p.attempts, CONNECT_MAX_ATTEMPTS);
     }
 
+    #[test]
+    fn token_refresh_retry_backoff_stays_well_under_ttl_margin() {
+        // 3 attempts (the first try plus 2 retries) at 5s/10s (base
+        // doubling each attempt) = 15s worst case, comfortably inside the
+        // 60s margin DEFAULT_TOKEN_REFRESH_SECS leaves before the 300s
+        // etcd default --auth-token-ttl.
+        let worst_case_secs: u64 = (0..TOKEN_REFRESH_MAX_ATTEMPTS - 1)
+            .map(|attempt| TOKEN_REFRESH_RETRY_BASE_SECS * 2u64.pow(attempt))
+            .sum();
+        assert_eq!(worst_case_secs, 15);
+        assert!(worst_case_secs < DEFAULT_TOKEN_REFRESH_SECS);
+    }
+
     #[tokio::test]
     async fn connect_with_malformed_endpoint_returns_connect_error() {
         // Empty endpoint list is treated as a parse failure by etcd-client,
@@ -288,7 +438,7 @@ mod tests {
             attempts: 1,
         };
         let endpoints: Vec<String> = vec![];
-        let err = EtcdConfigProvider::connect_with_policy(&endpoints, "/aisix", None, policy)
+        let err = EtcdConfigProvider::connect_with_policy(&endpoints, "/aisix", None, policy, None)
             .await
             .unwrap_err();
         assert!(matches!(err, ProviderError::Connect(_)));
@@ -328,5 +478,20 @@ mod tests {
     fn format_error_chain_handles_empty_source() {
         let err = std::io::Error::other("bare");
         assert_eq!(format_error_chain(&err), "bare");
+    }
+
+    #[test]
+    fn resolve_refresh_secs_defaults_when_unset() {
+        assert_eq!(resolve_refresh_secs(None), DEFAULT_TOKEN_REFRESH_SECS);
+    }
+
+    #[test]
+    fn resolve_refresh_secs_honors_config_value() {
+        assert_eq!(resolve_refresh_secs(Some(90)), 90);
+    }
+
+    #[test]
+    fn resolve_refresh_secs_falls_back_on_zero() {
+        assert_eq!(resolve_refresh_secs(Some(0)), DEFAULT_TOKEN_REFRESH_SECS);
     }
 }
