@@ -37,6 +37,10 @@ BODY_JSON=$(printf '%s' "$BODY" | python3 -c 'import json,sys; print(json.dumps(
 
 mkdir -p "$OUT"
 RESULTS="$OUT/results.jsonl"; : > "$RESULTS"
+# Flipped to 1 when any point ends with fewer valid windows than promised; the
+# run still completes and collects, but exits nonzero so an incomplete run can
+# never be mistaken for a baseline.
+HARNESS_RC=0
 
 GW_PID=""; MOCK_PID=""; SAMPLER_PID=""
 cleanup() {
@@ -141,6 +145,22 @@ measured_window() { # measured_window <point> <ttft> <conc> <rep>
 
 [ -x "$BIN" ] || { echo "FATAL: $BIN missing - build first"; exit 1; }
 [ "$(nproc)" = 16 ] || { echo "FATAL: expected a 16-core box, got $(nproc)"; exit 1; }
+[ "$(uname -m)" = "aarch64" ] || { echo "FATAL: expected an aarch64 rig, got $(uname -m)"; exit 1; }
+# Instance identity via IMDSv2: numbers from this harness are read as
+# m7g.4xlarge baselines, so a wrong instance type must refuse to measure.
+# IMDS being unreachable (non-EC2 lab box) is recorded rather than fatal.
+IMDS_TOKEN=$(curl -s --max-time 2 -X PUT \
+    -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' \
+    http://169.254.169.254/latest/api/token || true)
+INSTANCE_TYPE=$(curl -s --max-time 2 -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" \
+    http://169.254.169.254/latest/meta-data/instance-type || true)
+if [ -n "$INSTANCE_TYPE" ]; then
+    [ "$INSTANCE_TYPE" = "m7g.4xlarge" ] ||
+        { echo "FATAL: this core split is calibrated for m7g.4xlarge, got $INSTANCE_TYPE"; exit 1; }
+else
+    INSTANCE_TYPE="unknown"
+    echo "WARNING: no IMDS answer; recording instance_type=unknown" >&2
+fi
 SYMS=$(nm "$BIN" 2>/dev/null | grep -c ' [tT] ' || true)
 [ "$SYMS" -gt 100 ] || { echo "FATAL: $BIN has $SYMS text symbols - stripped binary, flamegraph would be unreadable"; exit 1; }
 ulimit -n 65536
@@ -182,19 +202,26 @@ EOF
 # ---- rig floor (0-delay): loadgen -> mock directly, gateway not yet running --
 
 floor_point() { # floor_point <ttft> <conc>  (mock must already run with that ttft)
-    local ttft="$1" conc="$2" rep line fail valid
+    # Same validity policy as gateway points, scaled to FLOOR_REPS: an invalid
+    # window is recorded, marked, and retried, and can never stand as the rig
+    # reference on its own.
+    local ttft="$1" conc="$2" valid_n=0 try=0 line fail valid
     loadgen "127.0.0.1:$MOCK_PORT" "$conc" 5 > /dev/null || true   # warmup
-    for rep in $(seq 1 "$FLOOR_REPS"); do
+    while [ "$valid_n" -lt "$FLOOR_REPS" ] && [ "$try" -lt "$MAX_TRIES" ]; do
+        try=$((try + 1))
         line=$(loadgen "127.0.0.1:$MOCK_PORT" "$conc" "$WINDOW") || line=""
         line=${line//[\"\\]/ }
         fail=$(field fail "$line")
         valid=true; [ "${fail:-1}" = "0" ] || valid=false
+        [ "$valid" = true ] && valid_n=$((valid_n + 1))
         printf '{"kind":"floor","point":"floor-ttft%s-c%s","ttft_ms":%s,"conc":%s,"rep":%s,"valid":%s,"rps":%s,"fail":%s,"p50_us":%s,"p99_us":%s,"otb_line":"%s"}\n' \
-            "$ttft" "$conc" "$ttft" "$conc" "$rep" "$valid" "$(field rps "$line")" "${fail:-null}" \
+            "$ttft" "$conc" "$ttft" "$conc" "$try" "$valid" "$(field rps "$line")" "${fail:-null}" \
             "$(field p50us "$line")" "$(field p99us "$line")" "$line" >> "$RESULTS"
-        echo "  [floor ttft=$ttft c=$conc rep=$rep] valid=$valid $line" >&2
-        [ "$valid" = true ] || echo "WARNING: floor window ttft=$ttft c=$conc rep=$rep had failures - reference ceiling tainted" >&2
+        echo "  [floor ttft=$ttft c=$conc rep=$try] valid=$valid $line" >&2
     done
+    [ "$valid_n" -ge "$FLOOR_REPS" ] ||
+        { echo "WARNING: floor ttft=$ttft c=$conc got only $valid_n valid windows in $MAX_TRIES tries" >&2
+          HARNESS_RC=1; }
 }
 
 echo "== mock (0-delay) + rig floor ==" >&2
@@ -216,10 +243,12 @@ RSS_IDLE=$(rss_kb "$GW_PID")
 TPC_WORKERS=$(ps -T -p "$GW_PID" | grep -c 'tpc-' || true)
 echo "  pid=$GW_PID idle_rss=${RSS_IDLE}kB tpc_workers=$TPC_WORKERS" >&2
 # Serving-mode self-check, asserted rather than merely recorded: measuring the
-# shared-runtime fallback while calling it the default would be a silently
-# wrong baseline (thread-per-core is the shipped default on Linux).
-[ "$TPC_WORKERS" -ge 1 ] ||
-    { echo "FATAL: no tpc- worker threads - gateway is not in thread-per-core mode"; exit 1; }
+# shared-runtime fallback (or a wrong worker count) while calling it the
+# default would be a silently wrong baseline. The expected count is derived
+# from the gateway's own affinity mask, not hardcoded.
+GW_NPROC=$(taskset -c "$GW_CORES" nproc)
+[ "$TPC_WORKERS" -eq "$GW_NPROC" ] ||
+    { echo "FATAL: expected $GW_NPROC tpc- workers under the $GW_CORES affinity, got $TPC_WORKERS"; exit 1; }
 
 # Metadata is written NOW, before the first measured window, so an aborted run
 # still leaves results.jsonl attributable to a commit and binary; the end of
@@ -232,6 +261,7 @@ write_meta() { # write_meta <rss_hwm_kb-or-null>
   "timestamp_utc": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
   "rig": {
     "host": "$(hostname)",
+    "instance_type": "$INSTANCE_TYPE",
     "kernel": "$(uname -r)",
     "arch": "$(uname -m)",
     "nproc": $(nproc),
@@ -273,7 +303,8 @@ run_point() { # run_point <ttft> <conc>
         valid_n=$((valid_n + $(measured_window "$point" "$ttft" "$conc" "$try")))
     done
     [ "$valid_n" -ge "$REPS" ] ||
-        echo "WARNING: $point got only $valid_n valid reps in $MAX_TRIES tries" >&2
+        { echo "WARNING: $point got only $valid_n valid reps in $MAX_TRIES tries" >&2
+          HARNESS_RC=1; }
 }
 
 for spec in $GRID; do
@@ -320,4 +351,7 @@ done
 RSS_HWM=$(awk '/VmHWM/{print $2}' "/proc/$GW_PID/status" 2>/dev/null || true)
 write_meta "${RSS_HWM:-null}"
 
+[ "$HARNESS_RC" = 0 ] ||
+    echo "FATAL: one or more points are incomplete - do not use this run as a baseline" >&2
 echo "== done: $OUT ==" >&2
+exit "$HARNESS_RC"

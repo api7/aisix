@@ -36,10 +36,10 @@ Replicates the published onthebench setup (https://onthebench.ai/gateways/perfor
   same `otb loadgen` used for the api7/aisix#891 / #902 tables.
 - **Default shipped config** — a setting may appear only if the process cannot
   run the benchmark without it. The full claim set (in `run-baseline.sh`):
-  `resources_file` (boot: standalone source, else aisix demands etcd),
+  `resources_file` (boot: standalone source, else AISIX demands etcd),
   `proxy.addr` (bind: the port the harness drives), `admin.admin_keys` (boot:
   config refuses to load without one), plus a resources file wiring the mock
-  as the only upstream and minting the single client key (boot: aisix has no
+  as the only upstream and minting the single client key (boot: AISIX has no
   anonymous mode). Everything else — thread-per-core, worker count, telemetry —
   is whatever the defaults do.
 - **Load grid** — fixed concurrency, the api7/aisix#891 grid: c=16/32/128
@@ -47,10 +47,12 @@ Replicates the published onthebench setup (https://onthebench.ai/gateways/perfor
   (`MOCK_TTFT_MS=10`). 25s windows, 5s warmup per point, ≥4 repetitions;
   a window with any failed request (`fail`, `rigrefused`, `budgetexceeded`,
   `spawnfailed`) is recorded but marked invalid, and the point retries until
-  4 valid windows or 8 attempts.
+  4 valid windows or 8 attempts. A run in which any point ends incomplete
+  exits nonzero so it can never be mistaken for a baseline.
 - **Rig floor** — the load generator driving the mock directly (c=128 0-delay,
   c=768 10ms), so every gateway number can be checked against the instrument's
-  own ceiling.
+  own ceiling; two valid windows per floor point, under the same
+  record-mark-retry validity policy as the gateway points.
 - **Recorded per window** — rps, fail/ok counts, p50/p99 (µs, from otb),
   gateway CPU% (`/proc/<pid>/stat` utime+stime across the window), gateway
   peak RSS (VmRSS sampled at 5 Hz), the raw otb stats line. Idle RSS and
@@ -65,8 +67,10 @@ Replicates the published onthebench setup (https://onthebench.ai/gateways/perfor
 ## Output
 
 One directory per run: `results.jsonl` (one JSON object per measured window,
-`kind` gateway/floor), `meta.json`, `flamegraph-c128.svg`, the generated
-config files, and the gateway/mock logs.
+`kind` gateway/floor), `meta.json`, the generated config files, and the
+gateway/mock logs. `flamegraph-c128.svg` is present when Inferno rendering
+succeeded; on a rendering failure the run keeps `perf.data` instead, so the
+SVG can be produced off-rig.
 
 ## Deviations from stock defaults, and why
 

@@ -19,18 +19,24 @@ DEST="${2:-bench-results}"
 SRC_LOCAL="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 COMMIT=$(git -C "$SRC_LOCAL" rev-parse HEAD)
 DIRTY=$(git -C "$SRC_LOCAL" status --porcelain | wc -l)
-RUNID="$(date -u +%Y%m%d-%H%M%S)-${COMMIT:0:7}"
+# The pid suffix keeps two same-commit runs started in the same second from
+# sharing a remote output directory and merging their results.
+RUNID="$(date -u +%Y%m%d-%H%M%S)-${COMMIT:0:7}-$$"
 [ "$DIRTY" = 0 ] || echo "WARNING: measuring a dirty tree ($DIRTY changed files); recorded in metadata" >&2
 
 echo "== rsync source -> $RIG (commit ${COMMIT:0:12}) =="
-rsync -az --delete --exclude=target --exclude=.git --exclude=docs/superpowers \
-    --exclude=bench-results "$SRC_LOCAL"/ "$RIG":aisix-src/
+# The gitignore filter keeps every ignored file off the rig — .env files and
+# other gitignored local material may hold credentials, and none of it belongs
+# in the measured tree. Untracked-but-not-ignored files still sync, preserving
+# "the tree you run it from is the tree that gets measured".
+rsync -az --delete --exclude=.git --filter=':- .gitignore' \
+    "$SRC_LOCAL"/ "$RIG":aisix-src/
 
 echo "== provision rig =="
 ssh "$RIG" 'bash aisix-src/bench/onthebench/rig-setup.sh'
 
 echo "== build (native release on the rig) =="
-ssh "$RIG" 'source ~/.cargo/env && cd aisix-src && cargo build --release --bin aisix'
+ssh "$RIG" 'source ~/.cargo/env && cd aisix-src && cargo build --locked --release --bin aisix'
 
 echo "== run baseline ($RUNID) =="
 # BENCH_-prefixed, never AISIX_-prefixed: aisix reads AISIX_* environment

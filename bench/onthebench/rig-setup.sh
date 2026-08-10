@@ -33,9 +33,20 @@ sudo -n DEBIAN_FRONTEND=noninteractive apt-get install -y -q "linux-tools-$(unam
 perf --version
 
 echo "== rust toolchain =="
+# Pinned, checksum-verified rustup-init instead of the curl|sh installer: the
+# same rule as the bench instruments — every executed third-party artifact is
+# a fixed byte sequence or the setup fails loudly.
+RUSTUP_VERSION="1.28.2"
+RUSTUP_SHA256="e3853c5a252fca15252d07cb23a1bdd9377a8c6f3efa01531109281ae47f841c"
 if ! command -v "$HOME/.cargo/bin/cargo" >/dev/null 2>&1; then
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs |
-        sh -s -- -y --default-toolchain none
+    tmp=$(mktemp -d)
+    curl -fsSL -o "$tmp/rustup-init" \
+        "https://static.rust-lang.org/rustup/archive/$RUSTUP_VERSION/aarch64-unknown-linux-gnu/rustup-init"
+    echo "$RUSTUP_SHA256  $tmp/rustup-init" | sha256sum -c --quiet ||
+        { echo "setup: rustup-init does not match its pinned sha256"; exit 1; }
+    chmod +x "$tmp/rustup-init"
+    "$tmp/rustup-init" -y --default-toolchain none
+    rm -rf "$tmp"
 fi
 # shellcheck disable=SC1091
 source "$HOME/.cargo/env"
@@ -46,8 +57,12 @@ SRC_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 (cd "$SRC_ROOT" && cargo --version)
 
 echo "== inferno (flamegraph rendering: perf script -> SVG) =="
-command -v inferno-flamegraph >/dev/null 2>&1 ||
-    (cd "$SRC_ROOT" && cargo install --locked inferno)
+# Version-pinned like every other instrument: --locked alone pins inferno's
+# dependencies, not inferno itself, and two rigs rendering with different
+# inferno versions would produce non-comparable artifacts.
+INFERNO_VERSION="0.12.8"
+inferno-flamegraph --version 2>/dev/null | grep -qF "$INFERNO_VERSION" ||
+    (cd "$SRC_ROOT" && cargo install --locked --force --version "$INFERNO_VERSION" inferno)
 
 echo "== pinned bench instruments (otb loadgen + mock upstream) =="
 mkdir -p "$TOOLS"
