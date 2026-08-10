@@ -1179,6 +1179,8 @@ mod tests {
         // pinned field-by-field — a projection that dropped one of these
         // would still pass an id-only check.
         payload["allowed_tools"] = json!(["github__create_issue"]);
+        payload["allowed_agents"] = json!(["invoice-agent"]);
+        payload["rate_limit"] = json!({"rpm": 60});
         payload["disabled"] = json!(true);
         payload["expires_at"] = json!("2099-01-01T00:00:00Z");
         let key: aisix_core::ApiKey = serde_json::from_value(payload).unwrap();
@@ -1203,6 +1205,12 @@ mod tests {
                 json!(["github__create_issue"]),
                 "{base}"
             );
+            assert_eq!(
+                v["value"]["allowed_agents"],
+                json!(["invoice-agent"]),
+                "{base}"
+            );
+            assert_eq!(v["value"]["rate_limit"]["rpm"], 60, "{base}");
             assert_eq!(v["value"]["disabled"], true, "{base}");
             assert_eq!(v["value"]["expires_at"], "2099-01-01T00:00:00Z", "{base}");
 
@@ -1210,7 +1218,15 @@ mod tests {
             let resp = run(app, auth_req("GET", base, None)).await;
             assert_eq!(resp.status(), StatusCode::OK, "GET {base}");
             let v = body_json(resp).await;
-            assert_eq!(v.as_array().unwrap().len(), 1, "{base}");
+            let arr = v.as_array().unwrap();
+            assert_eq!(arr.len(), 1, "{base}");
+            // The list entry carries the same projection, not a thinner one.
+            assert_eq!(
+                arr[0]["value"]["key_hash"],
+                expected_hash.as_str(),
+                "{base}"
+            );
+            assert_eq!(arr[0]["value"]["disabled"], true, "{base}");
         }
     }
 

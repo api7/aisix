@@ -144,7 +144,7 @@ For a multi-replica cluster, point the gateway at etcd instead — `resources_fi
 
 ## 🧩 Features — available today
 
-Covered by 185 end-to-end test files (503 cases) that run against real gateway processes.
+Covered by 183 end-to-end scenario files (496 cases) that run against real gateway processes.
 
 - **OpenAI-compatible proxy** (`:3000`) — `chat/completions`, `completions`, `responses`,
   `embeddings`, `rerank`, `images/generations`, `audio/{speech,transcriptions,translations}`,

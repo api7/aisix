@@ -42,7 +42,8 @@ fn main() {
     // validators compile, so the published schema == the enforced write
     // contract by construction. The published files deliberately carry the
     // STRICT shape: they document the declarative write contract (unknown
-    // fields are rejected by `aisix validate` and the file source) and the
+    // fields are rejected by `aisix validate` and the file source wherever
+    // a resource closes them) and the
     // etcd loader's lenient read tolerance is a runtime behavior, not a
     // contract callers may write against.
     // `ensemble`/`rate_limit`/`routing` have no standalone validator (they

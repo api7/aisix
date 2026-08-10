@@ -29,7 +29,7 @@ import {
 //      with the Anthropic-shaped 401 envelope
 //   7. secret swap: updating a key's `key_hash` in place (the
 //      declarative rotation the control plane performs) invalidates the
-//      old plaintext immediately, id unchanged
+//      old plaintext as soon as the write propagates
 //   8. deletion: removing a key's etcd entry revokes an in-use bearer
 //      (fail-closed), without touching other keys
 //
@@ -285,7 +285,7 @@ describe("api key lifecycle e2e: expired/disabled keys fail closed, secret swap 
 
     // The declarative equivalent of a rotation: the control plane (or
     // an operator editing resources) writes the same resource id with a
-    // new key_hash. Nothing else about the entry changes.
+    // new key_hash (a full-document replacement, as etcd writes are).
     await seed.update("api_keys", id, {
       key_hash: sha256(nextPlaintext),
       allowed_models: [MODEL],
@@ -315,16 +315,27 @@ describe("api key lifecycle e2e: expired/disabled keys fail closed, secret swap 
     // operator or the control plane uses. Fail-closed: the bearer must
     // stop authenticating once the delete propagates.
     await seed.delete("api_keys", id);
-    await waitConfigPropagation(async () => {
-      const res = await chat(plaintext, "post-delete probe");
-      const body = (await res.json()) as { error?: { code?: unknown } };
-      // The unknown-token 401 (no error.code) — distinct from the
-      // lifecycle 401s, which carry a code: the key is GONE, not
-      // disabled/expired.
-      return res.status === 401 && body.error?.code === undefined;
-    });
 
-    // The deletion was scoped: an unrelated key still authenticates.
+    // Propagation barrier per the harness gate rules: a FRESH key
+    // seeded after the delete carries a later etcd revision, so it
+    // authenticating proves the watch stream has applied the delete —
+    // without polling the revocation behavior under test (a regression
+    // would then surface as the assertion below, not a gate timeout).
+    const barrier = "sk-lifecycle-delete-barrier";
+    await seed!.createApiKey({
+      key_hash: sha256(barrier),
+      allowed_models: [MODEL],
+    });
+    await waitConfigPropagation(async () => is200(await chat(barrier, "barrier probe")));
+
+    // One explicit assertion each: the deleted bearer gets the
+    // unknown-token 401 (no error.code — the key is GONE, not
+    // disabled/expired), and an unrelated key still authenticates.
+    const deleted = await chat(plaintext, "post-delete probe");
+    expect(deleted.status).toBe(401);
+    const deletedBody = (await deleted.json()) as { error?: { code?: unknown } };
+    expect(deletedBody.error?.code).toBeUndefined();
+
     const res = await chat(control, "control key after delete");
     expect(res.status).toBe(200);
     await res.text();

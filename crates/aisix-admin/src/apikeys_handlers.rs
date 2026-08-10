@@ -3,8 +3,8 @@
 //!
 //! Same shape as [`crate::models_handlers`], operating on `ApiKey`
 //! resources, except the responses project through [`PublicApiKey`]:
-//! the stored entry minus nothing today, but a dedicated projection so
-//! sensitive additions to `ApiKey` never leak by default.
+//! an explicit read-safe allowlist of fields, manually mapped, so a
+//! field newly added to `ApiKey` never leaks here by default.
 
 use aisix_core::resource::ResourceEntry;
 use aisix_core::ApiKey;
