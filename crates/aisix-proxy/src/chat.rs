@@ -2235,11 +2235,15 @@ async fn dispatch(
                     .map(|e| e.dimensions)
                     .unwrap_or(0);
                 // Partition = scope fingerprint + embedding model
-                // identity: see the `SemanticGateCtx::scope_fp` docs.
+                // identity (resource id, upstream model name, and
+                // dimensions — the upstream name catches an in-place
+                // `model_name` edit that keeps id + dims): see the
+                // `SemanticGateCtx::scope_fp` docs.
                 let scope_fp = format!(
-                    "{}:{}:{}",
+                    "{}:{}:{}:{}",
                     key_full.scope_fingerprint(),
                     embed_entry.id,
+                    embed_entry.value.model_name.as_deref().unwrap_or(""),
                     dims
                 );
                 Some(SemanticGateCtx {

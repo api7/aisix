@@ -248,10 +248,22 @@ fn message_pair(m: &ChatMessage) -> (String, String) {
     // upstream sees just as much as the content does: `name`,
     // `tool_call_id`, and the forward-compat `extra` bag (`tool_calls`,
     // `refusal`, …). Two histories that differ only in an assistant's
-    // `tool_calls` MUST NOT share a fingerprint. The common no-tools
-    // case keeps the plain content representation.
+    // `tool_calls` MUST NOT share a fingerprint.
+    //
+    // Each representation is type-prefixed (`t:` plain text, `b:`
+    // canonical content blocks, `j:` decorated) so a plain message
+    // whose CONTENT happens to equal another form's serialization can
+    // never collide with it.
     if m.name.is_none() && m.tool_call_id.is_none() && m.extra.is_empty() {
-        return (role_str(m.role).to_string(), content_repr);
+        let prefix = if m.content_blocks.is_some() {
+            "b:"
+        } else {
+            "t:"
+        };
+        return (
+            role_str(m.role).to_string(),
+            format!("{prefix}{content_repr}"),
+        );
     }
     let decorated = serde_json::json!({
         "content": content_repr,
@@ -259,7 +271,7 @@ fn message_pair(m: &ChatMessage) -> (String, String) {
         "tool_call_id": m.tool_call_id,
         "extra": canonicalise(&serde_json::Value::Object(m.extra.clone())),
     });
-    (role_str(m.role).to_string(), decorated.to_string())
+    (role_str(m.role).to_string(), format!("j:{decorated}"))
 }
 
 fn role_str(role: Role) -> &'static str {
@@ -703,6 +715,26 @@ mod tests {
         named.name = Some("alice".into());
         let r = req("m", vec![named], None);
         assert_eq!(semantic_prompt_text(&r), None);
+    }
+
+    #[test]
+    fn representation_forms_never_collide() {
+        // A plain message whose content IS another form's serialization
+        // must not share a fingerprint with that form. The decorated
+        // (`j:`) form of a tool message vs a plain message carrying the
+        // same JSON as literal text:
+        let mut tool_msg = ChatMessage::user("result");
+        tool_msg.role = Role::Tool;
+        tool_msg.tool_call_id = Some("call_1".into());
+        let decorated = req("m", vec![tool_msg.clone()], None);
+        let (_, decorated_repr) = message_pair(&tool_msg);
+        let mut spoof = ChatMessage::user(decorated_repr.trim_start_matches("j:").to_string());
+        spoof.role = Role::Tool;
+        let plain = req("m", vec![spoof], None);
+        assert_ne!(
+            CacheKey::from_request(&decorated).fingerprint(),
+            CacheKey::from_request(&plain).fingerprint(),
+        );
     }
 
     #[test]

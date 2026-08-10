@@ -174,11 +174,13 @@ pub const M_CACHE_REQUESTS_TOTAL: &str = "aisix_cache_requests_total";
 /// `histogram!` series here.
 pub const M_CACHE_SEMANTIC_EMBED_SECONDS: &str = "aisix_cache_semantic_embedding_seconds";
 /// Embedding failures on the cache semantic layer, by `policy` and
-/// `cause` (`resolve` = embedding model missing or not an embedding
-/// model; `embed` = the provider call failed or timed out). Each
-/// failure degrades that request to exact-only matching, so a nonzero
-/// rate here with a flat `hit_semantic` outcome is the "semantic layer
-/// silently down" signal.
+/// `cause`. `resolve` (embedding model missing or not an embedding
+/// model) is counted once per eligible request — including requests
+/// that then hit the exact layer; `embed` (provider call failed or
+/// timed out) is counted per attempted call. Each failure leaves that
+/// request exact-only, so a nonzero rate here with a flat
+/// `hit_semantic` outcome is the "semantic layer silently down"
+/// signal.
 pub const M_CACHE_SEMANTIC_EMBED_FAILURES_TOTAL: &str =
     "aisix_cache_semantic_embedding_failures_total";
 /// Semantic-store operation failures, by `policy` and `op`
