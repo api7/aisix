@@ -26,8 +26,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use aisix_admin::{build_router, AdminState, ConfigStore, EtcdConfigStore};
 use aisix_core::snapshot::SnapshotHandle;
 use aisix_core::{AdminConfig, AisixSnapshot};
+use aisix_etcd::provider::ConfigProvider as EtcdConfigProviderTrait;
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
+use futures::StreamExt;
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
@@ -35,6 +37,11 @@ const ADMIN_KEY: &str = "admin-it-secret";
 
 fn etcd_url() -> Option<String> {
     std::env::var("ADMIN_TEST_ETCD_URL").ok()
+}
+
+/// Separate from `ADMIN_TEST_ETCD_URL`: CI's etcd container has no auth.
+fn auth_etcd_url() -> Option<String> {
+    std::env::var("ADMIN_TEST_ETCD_AUTH_URL").ok()
 }
 
 /// Per-test prefix so concurrent tests in this binary don't collide.
@@ -54,7 +61,7 @@ async fn build_state_with_real_etcd(url: &str, prefix: &str) -> AdminState {
     let client = etcd_client::Client::connect([url], None)
         .await
         .expect("etcd connect");
-    let store: Arc<dyn ConfigStore> = Arc::new(EtcdConfigStore::new(client, prefix));
+    let store: Arc<dyn ConfigStore> = Arc::new(EtcdConfigStore::new(client, prefix, None));
     let handle = SnapshotHandle::new(AisixSnapshot::new());
     let cfg = AdminConfig {
         enabled: true,
@@ -403,4 +410,153 @@ async fn loader_picks_up_every_admin_write() {
     assert_eq!(snap.cache_policies.len(), 1);
     assert_eq!(snap.observability_exporters.len(), 1);
     assert_eq!(snap.mcp_servers.len(), 1);
+}
+
+// ─────────────────────────── Auth token refresh ───────────────────────────
+//
+// Regression test for a production incident: Admin API calls made long
+// after boot failed with "etcdserver: invalid auth token". Root cause:
+// `EtcdConfigStore`'s write-path client authenticated once at connect
+// time and never refreshed, so any write issued past
+// `--auth-token-ttl` (default 300s) hit UNAUTHENTICATED.
+// `EtcdConfigStore::new` now spawns `aisix_etcd::start_token_refresh_task`
+// to fix this.
+//
+// Requires `ADMIN_TEST_ETCD_AUTH_URL` (auth-enabled etcd, short TTL) +
+// `ADMIN_TEST_ETCD_USER` / `ADMIN_TEST_ETCD_PASSWORD`; no-ops otherwise.
+//
+// Local run:
+//   docker run --rm -p 2379:2379 quay.io/coreos/etcd:v3.5.18 \
+//     --listen-client-urls=http://0.0.0.0:2379 \
+//     --advertise-client-urls=http://0.0.0.0:2379 --auth-token-ttl=5
+//   etcdctl user add root:rootpw && etcdctl user grant-role root root \
+//     && etcdctl user add test:testpw && etcdctl user grant-role test root \
+//     && etcdctl auth enable
+//   ADMIN_TEST_ETCD_AUTH_URL=http://127.0.0.1:2379 ADMIN_TEST_ETCD_USER=test \
+//   ADMIN_TEST_ETCD_PASSWORD=testpw \
+//   cargo test -p aisix-admin --test etcd_integration \
+//     admin_write_survives_token_expiry -- --nocapture
+#[tokio::test]
+async fn admin_write_survives_token_expiry() {
+    let Some(url) = auth_etcd_url() else {
+        eprintln!("skipping: ADMIN_TEST_ETCD_AUTH_URL not set");
+        return;
+    };
+    let user = std::env::var("ADMIN_TEST_ETCD_USER").expect("ADMIN_TEST_ETCD_USER required");
+    let password =
+        std::env::var("ADMIN_TEST_ETCD_PASSWORD").expect("ADMIN_TEST_ETCD_PASSWORD required");
+
+    let prefix = unique_prefix();
+    let options = etcd_client::ConnectOptions::new().with_user(user.clone(), password.clone());
+    let client = etcd_client::Client::connect([url.as_str()], Some(options))
+        .await
+        .expect("etcd connect with auth");
+    // Mirrors main.rs's production bootstrap call, but with a 2s refresh
+    // interval — well under the 5s --auth-token-ttl the local-run etcd is
+    // started with above, so the loop refreshes before expiry.
+    let store: Arc<dyn ConfigStore> = Arc::new(EtcdConfigStore::new(client, &prefix, Some(2)));
+    let handle = SnapshotHandle::new(AisixSnapshot::new());
+    let cfg = AdminConfig {
+        enabled: true,
+        addr: "127.0.0.1:0".into(),
+        admin_keys: vec![ADMIN_KEY.into()],
+        tls: None,
+    };
+    let state = AdminState::new(handle, store, &cfg);
+
+    // Wait past the 5s TTL window (1s margin absorbs scheduler jitter);
+    // without refresh this POST would 401.
+    tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+
+    let app = build_router(state.clone());
+    let resp = app
+        .oneshot(auth_post(
+            "/admin/v1/models",
+            json!({
+                "display_name": "post-expiry",
+                "provider": "openai",
+                "model_name": "gpt-4o",
+                "provider_key_id": "11111111-1111-1111-1111-111111111111"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "admin write after token-TTL window should succeed; a non-OK \
+         status here means the auth-token refresh loop isn't running",
+    );
+    let created = body_json(resp).await;
+    let post_expiry_id = created["id"].as_str().expect("created.id").to_string();
+
+    let app = build_router(state.clone());
+    let resp = app.oneshot(auth_get("/admin/v1/models")).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "admin list after token-TTL window should succeed"
+    );
+    let listed = body_json(resp).await;
+    let arr = listed.as_array().expect("list array");
+    assert_eq!(arr.len(), 1, "should have the post-expiry model");
+    assert_eq!(arr[0]["id"], post_expiry_id);
+
+    // `ConfigStore` doesn't expose `watch` (that's `aisix-etcd`'s
+    // `ConfigProvider` side), so exercise it through a second client on the
+    // same account/prefix past the same TTL window this test already
+    // waited out. A passing POST/GET above only proves range/get requests
+    // survive refresh; this verifies that `EtcdWatchStream`'s ownership
+    // change also keeps a watch gRPC stream alive and authenticated.
+    let watch_options = etcd_client::ConnectOptions::new().with_user(user, password);
+    let watch_provider = aisix_etcd::EtcdConfigProvider::connect(
+        std::slice::from_ref(&url),
+        prefix.clone(),
+        Some(watch_options),
+        Some(2),
+    )
+    .await
+    .expect("watch-side etcd connect with auth");
+    let (_entries, rev) = watch_provider
+        .load_all()
+        .await
+        .expect("watch-side load_all for start revision");
+    let mut stream = watch_provider
+        .watch(rev + 1)
+        .await
+        .expect("watch should succeed after token refresh");
+
+    let app = build_router(state.clone());
+    let resp = app
+        .oneshot(auth_post(
+            "/admin/v1/models",
+            json!({
+                "display_name": "post-expiry-watch",
+                "provider": "openai",
+                "model_name": "gpt-4o",
+                "provider_key_id": "11111111-1111-1111-1111-111111111111"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "second admin write to trigger a watch event"
+    );
+
+    let event = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+        .await
+        .expect("timed out — watch stream did not deliver an event after token refresh")
+        .expect("watch stream ended unexpectedly");
+    match event.expect("watch error after token refresh") {
+        aisix_etcd::WatchEvent::Put(entry) => {
+            assert!(
+                entry.key.starts_with(&format!("{prefix}/models/")),
+                "unexpected watch key: {}",
+                entry.key
+            );
+        }
+        other => panic!("expected Put after token refresh, got {other:?}"),
+    }
 }

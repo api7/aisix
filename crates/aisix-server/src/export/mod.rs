@@ -59,6 +59,7 @@ pub async fn run(args: ExportArgs) -> anyhow::Result<()> {
         &args.prefix,
         None,
         CLI_CONNECT_POLICY,
+        None,
     )
     .await
     .map_err(|e| anyhow::anyhow!("etcd connect failed: {e}"))?;

@@ -29,8 +29,8 @@ pub mod supervisor;
 
 pub use backoff::{ExpBackoff, BASE_MS, MAX_MS};
 pub use etcd_provider::{
-    ConnectPolicy, EtcdConfigProvider, EtcdWatchStream, CONNECT_MAX_ATTEMPTS,
-    CONNECT_RETRY_INTERVAL,
+    start_token_refresh_task, ConnectPolicy, EtcdConfigProvider, EtcdWatchStream,
+    CONNECT_MAX_ATTEMPTS, CONNECT_RETRY_INTERVAL,
 };
 pub use key::{parse as parse_key, KeyError, ResourceKey};
 pub use loader::{build_snapshot, BuildStats};
