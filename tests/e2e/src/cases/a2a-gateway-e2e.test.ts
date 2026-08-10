@@ -245,6 +245,70 @@ describe("a2a gateway e2e: /a2a/{agent}", () => {
     expect(JSON.stringify(reply.json)).not.toContain("upstream-secret-tok");
   });
 
+  test("relays message/stream as live SSE rather than one buffered reply", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+
+    const res = await fetch(`${app.proxyUrl}/a2a/invoices`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${KEY_ALLOWED}`,
+        "content-type": "application/json",
+        accept: "text/event-stream",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: "stream-1",
+        method: "message/stream",
+        params: {
+          message: {
+            role: "user",
+            parts: [{ kind: "text", text: "invoice 42" }],
+            messageId: "m-s",
+          },
+        },
+      }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("text/event-stream");
+
+    // Read event by event and timestamp each one. A buffered implementation
+    // delivers all three at once; a relayed one spaces them out the way the
+    // agent emitted them.
+    const events: Array<{ at: number; json: Record<string, any> }> = [];
+    const started = Date.now();
+    const reader = res.body!.getReader();
+    const decoder = new TextDecoder();
+    let buffered = "";
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffered += decoder.decode(value, { stream: true });
+      let nl: number;
+      while ((nl = buffered.indexOf("\n")) !== -1) {
+        const line = buffered.slice(0, nl);
+        buffered = buffered.slice(nl + 1);
+        if (line.startsWith("data:")) {
+          const payload = line.slice(5).trim();
+          if (payload) {
+            events.push({ at: Date.now() - started, json: JSON.parse(payload) });
+          }
+        }
+      }
+    }
+
+    expect(events.map((e) => e.json.result.seq)).toEqual([1, 2, 3]);
+    expect(events.every((e) => e.json.id === "stream-1")).toBe(true);
+    expect(events[2].json.result.status.state).toBe("completed");
+    // A streaming call is still an A2A call: the gateway announced the pinned
+    // version and asked the agent for the streaming content type.
+    expect(events[0].json.result.sawVersion).toBe("1.0");
+    expect(events[0].json.result.sawAccept).toContain("text/event-stream");
+    // The stub sleeps 30ms between events. Buffering would collapse those
+    // gaps; relaying preserves them.
+    expect(events[2].at).toBeGreaterThan(events[0].at);
+  });
+
   test("gates on the per-agent ACL and on agent existence", async (ctx) => {
     if (!etcdReachable || !app) return ctx.skip();
 

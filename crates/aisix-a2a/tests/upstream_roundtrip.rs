@@ -350,3 +350,82 @@ async fn the_card_fetch_deadline_covers_the_whole_candidate_walk() {
         "card fetch took {elapsed:?}; the candidate walk must share ONE deadline"
     );
 }
+
+/// An upstream that answers `message/stream` with a real SSE body, written in
+/// awkward chunks: two events in one write, an event split across two writes,
+/// and comment / `event:` framing in between. Proves the reader reassembles
+/// across chunk boundaries rather than assuming one chunk is one event.
+async fn spawn_streaming_agent() -> SocketAddr {
+    async fn stream(headers: HeaderMap) -> impl IntoResponse {
+        let seen_version = seen_version(&headers).to_string();
+        let accept = headers
+            .get("accept")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let chunks: Vec<Result<String, std::convert::Infallible>> = vec![
+            Ok(format!(
+                ": open\ndata: {{\"jsonrpc\":\"2.0\",\"id\":\"s\",\"result\":{{\"seq\":1,\"version\":{seen_version},\"accept\":\"{accept}\"}}}}\n\n\
+                 event: status-update\ndata: {{\"jsonrpc\":\"2.0\",\"id\":\"s\",\"result\":{{\"seq\":2}}}}\n\n"
+            )),
+            Ok("data: {\"jsonrpc\":\"2.0\",\"id\":\"s\",\"resu".to_string()),
+            Ok("lt\":{\"seq\":3,\"final\":true}}\n\n".to_string()),
+        ];
+        (
+            [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+            axum::body::Body::from_stream(futures::stream::iter(chunks)),
+        )
+    }
+
+    let app = Router::new().route("/a2a", post(stream));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app.into_make_service())
+            .await
+            .unwrap();
+    });
+    addr
+}
+
+#[tokio::test]
+async fn streams_events_as_they_arrive_across_chunk_boundaries() {
+    use futures::StreamExt;
+
+    let addr = spawn_streaming_agent().await;
+    let bridge = HttpBridge::new(upstream(format!("http://{addr}/a2a"), A2aAuth::None));
+
+    let events: Vec<Value> = bridge
+        .send_stream(&json!({"jsonrpc":"2.0","id":"s","method":"message/stream"}))
+        .await
+        .expect("stream opens")
+        .map(|e| e.expect("event parses"))
+        .collect()
+        .await;
+
+    assert_eq!(events.len(), 3, "got {events:#?}");
+    assert_eq!(events[0]["result"]["seq"], 1);
+    assert_eq!(events[1]["result"]["seq"], 2);
+    // Reassembled from two writes that split mid-JSON.
+    assert_eq!(events[2]["result"]["seq"], 3);
+    assert_eq!(events[2]["result"]["final"], true);
+    // A streaming call is still an A2A call: it announces its version and asks
+    // for the streaming content type.
+    assert_eq!(events[0]["result"]["version"], "1.0");
+    assert_eq!(events[0]["result"]["accept"], "text/event-stream");
+}
+
+#[tokio::test]
+async fn a_refused_stream_surfaces_before_any_event() {
+    let addr = spawn_path_hosted_agent().await;
+    // `/nope` is the catch-all 405, so the upstream refuses the call outright.
+    let bridge = HttpBridge::new(upstream(format!("http://{addr}/nope"), A2aAuth::None));
+
+    let Err(err) = bridge
+        .send_stream(&json!({"jsonrpc":"2.0","id":"s","method":"message/stream"}))
+        .await
+    else {
+        panic!("a refused stream must not open");
+    };
+    assert!(matches!(err, A2aError::Request(_)), "got {err:?}");
+}

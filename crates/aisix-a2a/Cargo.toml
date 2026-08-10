@@ -16,6 +16,7 @@ aisix-core = { path = "../aisix-core" }
 aisix-gateway = { path = "../aisix-gateway" }
 tokio.workspace = true
 async-trait.workspace = true
+async-stream = "0.3"
 futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true

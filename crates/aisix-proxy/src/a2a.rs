@@ -18,6 +18,15 @@
 //! The request body is forwarded verbatim to the upstream agent, so the caller
 //! speaks whichever A2A wire version the agent is pinned to; the gateway does
 //! not translate between the 0.3 and 1.0 formats here.
+//!
+//! `message/stream` and `tasks/resubscribe` are relayed as a live SSE stream —
+//! each event reaches the caller as the agent pushes it, which is the whole
+//! point of those methods: an A2A task runs for minutes or hours and reports
+//! progress as it goes. Those calls carry no upstream deadline for the same
+//! reason (the unary `timeout_ms` would cut every long task off), so downstream
+//! liveness rests on the SSE keep-alive. Their usage event and quota
+//! reservation are tied to the stream's real lifetime via a drop guard, so a
+//! caller that walks away mid-task is still accounted for.
 
 use std::time::{Duration, Instant};
 
@@ -27,6 +36,7 @@ use axum::body::to_bytes;
 use axum::extract::{Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
+use futures::StreamExt;
 use serde::Deserialize;
 
 use crate::auth::AuthenticatedKey;
@@ -166,9 +176,9 @@ async fn dispatch(
     let rpc_id = peek.and_then(|p| p.id);
 
     // Reuse the LLM path's rate-limit + budget gate. The reservation is held
-    // for the call and dropped after (an A2A call carries no token cost yet).
-    // On 429 / budget-exceeded this returns before the upstream is contacted.
-    let _reservation = match crate::quota::enforce(state, &auth, None).await {
+    // for the call (an A2A call carries no token cost yet). On 429 /
+    // budget-exceeded this returns before the upstream is contacted.
+    let reservation = match crate::quota::enforce(state, &auth, None).await {
         Ok(reservation) => reservation,
         Err(err) => {
             let response = err.into_response();
@@ -184,6 +194,22 @@ async fn dispatch(
             return response;
         }
     };
+
+    if is_streaming_method(&method) {
+        return dispatch_stream(
+            auth,
+            agent,
+            state,
+            request_id,
+            upstream,
+            value,
+            &method,
+            rpc_id,
+            reservation,
+        )
+        .await;
+    }
+    let _reservation = reservation;
 
     let bridge = HttpBridge::new(upstream);
     let started = Instant::now();
@@ -218,6 +244,141 @@ async fn dispatch(
             a2a_error_response(rpc_id, status, &err.to_string())
         }
     }
+}
+
+/// JSON-RPC methods whose response is an SSE event stream rather than one
+/// envelope. Both spellings are listed because the body is forwarded verbatim:
+/// the caller speaks whichever wire version its agent is pinned to, and 1.0
+/// names the same two methods in PascalCase.
+fn is_streaming_method(method: &str) -> bool {
+    matches!(
+        method,
+        "message/stream" | "SendStreamingMessage" | "tasks/resubscribe" | "SubscribeToTask"
+    )
+}
+
+/// Fires the A2A usage event once a streamed call is over, and owns the quota
+/// reservation for that whole span.
+///
+/// Both jobs have to happen on drop rather than at the end of a loop: a caller
+/// walking away mid-task drops the stream without it ever completing, and that
+/// is the ordinary case for a long-running A2A task, not an edge one. Emitting
+/// from `Drop` means such a call still lands in usage, and the caller's
+/// rate-limit slot stays occupied for as long as the stream is really open —
+/// not merely until the response headers went out.
+struct StreamUsageOnDrop {
+    state: ProxyState,
+    auth: AuthenticatedKey,
+    request_id: String,
+    agent: String,
+    method: String,
+    started: Instant,
+    /// What to record for the call. Starts at the status already sent to the
+    /// caller and is downgraded if the stream later faults — once the headers
+    /// are out, the usage event is the only place that can say so.
+    status: u16,
+    _reservation: aisix_ratelimit::MultiReservation,
+}
+
+impl Drop for StreamUsageOnDrop {
+    fn drop(&mut self) {
+        // A panic is already unwinding; emitting here would at best double-report
+        // and at worst panic again while panicking.
+        if std::thread::panicking() {
+            return;
+        }
+        emit_a2a_usage(
+            &self.state,
+            &self.auth,
+            &self.request_id,
+            &self.agent,
+            &self.method,
+            self.status,
+            self.started.elapsed(),
+        );
+    }
+}
+
+/// Forward a streaming JSON-RPC call as SSE, event by event.
+///
+/// The gateway does not buffer the task: each event the upstream pushes is
+/// relayed as it arrives, which is the entire point of `message/stream` — a
+/// caller watches a long-running task progress instead of waiting for it.
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_stream(
+    auth: AuthenticatedKey,
+    agent: &str,
+    state: &ProxyState,
+    request_id: &str,
+    upstream: aisix_a2a::A2aUpstream,
+    request: serde_json::Value,
+    method: &str,
+    rpc_id: Option<serde_json::Value>,
+    reservation: aisix_ratelimit::MultiReservation,
+) -> Response {
+    let started = Instant::now();
+    let bridge = HttpBridge::new(upstream);
+    let events = match bridge.send_stream(&request).await {
+        Ok(events) => events,
+        // The upstream refused before any event: the headers have not gone out,
+        // so this is still an ordinary error response rather than a stream.
+        Err(err) => {
+            let status = a2a_error_status(&err);
+            tracing::warn!(agent = %agent, error = %err, "A2A upstream stream failed to open");
+            drop(reservation);
+            emit_a2a_usage(
+                state,
+                &auth,
+                request_id,
+                agent,
+                method,
+                status.as_u16(),
+                started.elapsed(),
+            );
+            return a2a_error_response(rpc_id, status, &err.to_string());
+        }
+    };
+
+    let mut guard = StreamUsageOnDrop {
+        state: state.clone(),
+        auth,
+        request_id: request_id.to_string(),
+        agent: agent.to_string(),
+        method: method.to_string(),
+        started,
+        status: StatusCode::OK.as_u16(),
+        _reservation: reservation,
+    };
+    let agent_label = agent.to_string();
+
+    let sse = async_stream::stream! {
+        let mut events = events;
+        while let Some(event) = events.next().await {
+            match event {
+                Ok(value) => yield Ok::<_, std::convert::Infallible>(
+                    axum::response::sse::Event::default().data(value.to_string()),
+                ),
+                Err(err) => {
+                    // Mid-stream the status line is long gone, so the failure
+                    // can only be told to the caller in-band. Relay it as a
+                    // JSON-RPC error event and stop, rather than cutting the
+                    // connection and leaving a truncated task looking complete.
+                    tracing::warn!(agent = %agent_label, error = %err, "A2A stream failed mid-flight");
+                    guard.status = a2a_error_status(&err).as_u16();
+                    yield Ok(axum::response::sse::Event::default()
+                        .data(a2a_error_envelope(rpc_id.clone(), &err.to_string()).to_string()));
+                    break;
+                }
+            }
+        }
+        drop(guard);
+    };
+
+    let mut response = axum::response::Sse::new(sse);
+    if let Some(interval) = crate::sse_keepalive::interval() {
+        response = response.keep_alive(axum::response::sse::KeepAlive::new().interval(interval));
+    }
+    response.into_response()
 }
 
 /// Serve the upstream agent's card at `/a2a/:agent/.well-known/agent-card.json`,
@@ -341,12 +502,18 @@ fn a2a_error_response(
     status: StatusCode,
     message: &str,
 ) -> Response {
-    let body = serde_json::json!({
+    (status, axum::Json(a2a_error_envelope(id, message))).into_response()
+}
+
+/// The JSON-RPC error object itself, for the streaming path — mid-stream there
+/// is no status line left to carry the failure, so the same envelope has to
+/// travel as an event.
+fn a2a_error_envelope(id: Option<serde_json::Value>, message: &str) -> serde_json::Value {
+    serde_json::json!({
         "jsonrpc": "2.0",
         "id": id.unwrap_or(serde_json::Value::Null),
         "error": { "code": -32000, "message": message },
-    });
-    (status, axum::Json(body)).into_response()
+    })
 }
 
 /// Emit a usage event for a single A2A call into the same sink as LLM usage.
@@ -440,6 +607,32 @@ mod tests {
     fn gateway_base_is_none_without_any_authority() {
         let origin_form = axum::http::Uri::from_static("/a2a/x/.well-known/agent-card.json");
         assert_eq!(gateway_base(&origin_form, &HeaderMap::new()), None);
+    }
+
+    #[test]
+    fn streaming_methods_are_recognised_in_both_spellings() {
+        // The body is forwarded verbatim, so the caller uses whichever spelling
+        // its wire version defines. Missing one spelling would silently route a
+        // 1.0 caller's stream through the buffering path.
+        for method in [
+            "message/stream",
+            "SendStreamingMessage",
+            "tasks/resubscribe",
+            "SubscribeToTask",
+        ] {
+            assert!(is_streaming_method(method), "{method} must stream");
+        }
+        for method in [
+            "message/send",
+            "SendMessage",
+            "tasks/get",
+            "GetTask",
+            "tasks/cancel",
+            "agent/getAuthenticatedExtendedCard",
+            "",
+        ] {
+            assert!(!is_streaming_method(method), "{method} must not stream");
+        }
     }
 
     #[test]
