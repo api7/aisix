@@ -29,7 +29,7 @@
       ]
     },
     "SemanticCacheConfig": {
-      "description": "Embedding-similarity matching for a cache policy. When present, a request that misses the exact layer is embedded and compared against stored entries; the nearest entry at or above `threshold` cosine similarity is served. Only requests whose messages are entirely text participate — requests containing images or audio never match by similarity.",
+      "description": "Embedding-similarity matching for a cache policy. When present, a request that misses the exact layer is embedded and compared against stored entries; the nearest entry at or above `threshold` cosine similarity is served. Only requests whose messages are entirely text participate — requests containing images or audio never match by similarity.\n\nSimilarity matching currently requires `backend: memory`. A policy with `backend: redis` accepts this configuration but keeps serving exact matches only (a warning is logged) until shared semantic storage ships.",
       "properties": {
         "embedding_model": {
           "description": "Name of the `embedding` model used to embed requests. The model must exist in the same environment and carry an `embedding` block; its `dimensions` value fixes the vector size for this policy's entries.",
@@ -96,7 +96,7 @@
     },
     "purge_generation": {
       "default": 0,
-      "description": "Invalidation counter. Entries are readable only while their stored generation matches; a purge bumps this value, making every earlier entry unreachable at once. Managed by the purge operation — not set directly.",
+      "description": "Invalidation counter. Entries are readable only while their stored generation matches; a purge bumps this value, making every earlier entry unreachable at once. Managed by the purge operation — not set directly. Full-document updates must carry the current value forward: writing a lower (or omitted, i.e. `0`) value re-exposes entries stored under that earlier generation until their TTL passes.",
       "format": "uint32",
       "minimum": 0.0,
       "type": "integer"

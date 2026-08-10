@@ -3,6 +3,7 @@ import { connect } from "node:net";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
+  ProxyClient,
   SeedClient,
   spawnApp,
   startOpenAiUpstream,
@@ -88,10 +89,6 @@ async function seedApp(
       provider_key_id: pk.id,
     });
   }
-  await seed.createApiKey({
-    key_hash: CALLER_KEY_HASH,
-    allowed_models: [modelAlias, canaryAlias],
-  });
   // Order matters: redis policy FIRST, canary memory policy SECOND.
   await seed.createCachePolicy({
     name: `${modelAlias}-redis-policy`,
@@ -105,7 +102,25 @@ async function seedApp(
     backend: "memory",
     applies_to: `model:${canaryAlias}`,
   });
+  // The caller key is seeded LAST: once it authenticates, revision
+  // order implies every resource above is in the snapshot
+  // (tests/e2e/AGENTS.md).
+  await seed.createApiKey({
+    key_hash: CALLER_KEY_HASH,
+    allowed_models: [modelAlias, canaryAlias],
+  });
   return { app };
+}
+
+/** Non-throwing readiness gate per tests/e2e/AGENTS.md: the caller key
+ *  (seeded last) authenticating via listModels proves the whole seed
+ *  batch is live; a transient non-200 is the normal pre-propagation
+ *  state and nothing else is swallowed. */
+async function waitSeedLive(proxyUrl: string): Promise<void> {
+  const probe = new ProxyClient(proxyUrl, CALLER_PLAINTEXT);
+  await waitConfigPropagation(
+    async () => (await probe.listModels()).status === 200,
+  );
 }
 
 function chatRequest(
@@ -218,8 +233,8 @@ describe("cache policy backend=redis with a configured redis is shared across DP
     appA = await spawnApp({ extra: redisExtra });
     appB = await spawnApp({ extra: redisExtra, etcdPrefix: appA.etcdPrefix });
     await seedApp(appA, upstream.baseUrl, "cache-redis-shared", "canary-a");
-    await waitCanaryPolicyLive(appA.proxyUrl, "canary-a");
-    await waitCanaryPolicyLive(appB.proxyUrl, "canary-a");
+    await waitSeedLive(appA.proxyUrl);
+    await waitSeedLive(appB.proxyUrl);
   });
 
   afterAll(async () => {

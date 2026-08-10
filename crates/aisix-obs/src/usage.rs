@@ -260,6 +260,9 @@ pub struct UsageEvent {
     ///   upstream response was just stored
     /// - `"disabled"` — no enabled `cache_policy` in snapshot for
     ///   this env, the cache gate was closed
+    /// - `"bypass"` — the gate was open but the caller sent
+    ///   `Cache-Control: no-cache`, so the read path was skipped and
+    ///   the upstream served the request (the entry was refreshed)
     ///
     /// Empty string = cache state unknown / not applicable (error
     /// paths that fail before the cache lookup). cp-api persists

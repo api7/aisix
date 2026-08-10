@@ -50,6 +50,11 @@ pub enum CacheScope {
 /// similarity is served. Only requests whose messages are entirely text
 /// participate — requests containing images or audio never match by
 /// similarity.
+///
+/// Similarity matching currently requires `backend: memory`. A policy
+/// with `backend: redis` accepts this configuration but keeps serving
+/// exact matches only (a warning is logged) until shared semantic
+/// storage ships.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
 pub struct SemanticCacheConfig {
     /// Name of the `embedding` model used to embed requests. The model
@@ -135,7 +140,10 @@ pub struct CachePolicy {
     /// Invalidation counter. Entries are readable only while their
     /// stored generation matches; a purge bumps this value, making
     /// every earlier entry unreachable at once. Managed by the purge
-    /// operation — not set directly.
+    /// operation — not set directly. Full-document updates must carry
+    /// the current value forward: writing a lower (or omitted, i.e.
+    /// `0`) value re-exposes entries stored under that earlier
+    /// generation until their TTL passes.
     #[serde(default)]
     pub purge_generation: u32,
 

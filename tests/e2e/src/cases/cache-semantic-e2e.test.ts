@@ -3,6 +3,7 @@ import { createServer, type Server } from "node:http";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
+  ProxyClient,
   SeedClient,
   spawnApp,
   startOpenAiUpstream,
@@ -18,14 +19,14 @@ import { pickFreePort } from "../harness/ports.js";
 // above the policy's cosine threshold (L2). Real `aisix` binary + etcd +
 // mock chat upstreams + a deterministic mock embedding endpoint; no CP.
 //
-// The embedding mock maps input text to fixed 8-dim vectors by keyword,
+// The embedding mock maps input text to fixed 12-dim vectors by keyword,
 // so similarity is fully deterministic. Each test owns an orthogonal
 // axis (entries persist across tests within a policy+scope partition,
 // so unrelated tests must never share a vector):
 //   "topic-a-near" -> 0.9*topic-a + spill   (cos 0.9 vs topic-a)
 //   "topic-c-near" -> 0.9*topic-c + spill   (same pair on another axis)
 //   "topic-a" / "topic-b" / "topic-c" / "no-store" / "refresh" /
-//   "purge" / default -> one distinct axis each
+//   "purge" / "params-x" / "scope-x" / default -> one distinct axis each
 //
 // Observable contract under test (headers are the wire surface):
 //   x-aisix-cache: hit | miss | bypass
@@ -41,19 +42,37 @@ const OTHER_CALLER_KEY_HASH = createHash("sha256")
   .update(OTHER_CALLER_PLAINTEXT)
   .digest("hex");
 
+const DIMS = 12;
+
+function axis(i: number, weight = 1): number[] {
+  const v = new Array<number>(DIMS).fill(0);
+  v[i] = weight;
+  return v;
+}
+
 function keywordVector(text: string): number[] {
   const t = text.toLowerCase();
   const spill = Math.sqrt(0.19); // makes the *-near vectors unit-length
   // Longest keyword first: "topic-a-near" contains "topic-a".
-  if (t.includes("topic-a-near")) return [0.9, 0, 0, 0, spill, 0, 0, 0];
-  if (t.includes("topic-a")) return [1, 0, 0, 0, 0, 0, 0, 0];
-  if (t.includes("topic-b")) return [0, 1, 0, 0, 0, 0, 0, 0];
-  if (t.includes("topic-c-near")) return [0, 0, 0.9, 0, spill, 0, 0, 0];
-  if (t.includes("topic-c")) return [0, 0, 1, 0, 0, 0, 0, 0];
-  if (t.includes("no-store")) return [0, 0, 0, 0, 0, 1, 0, 0];
-  if (t.includes("refresh")) return [0, 0, 0, 0, 0, 0, 1, 0];
-  if (t.includes("purge")) return [0, 0, 0, 0, 0, 0, 0, 1];
-  return [0, 0, 0, 1, 0, 0, 0, 0];
+  if (t.includes("topic-a-near")) {
+    const v = axis(0, 0.9);
+    v[4] = spill;
+    return v;
+  }
+  if (t.includes("topic-a")) return axis(0);
+  if (t.includes("topic-b")) return axis(1);
+  if (t.includes("topic-c-near")) {
+    const v = axis(2, 0.9);
+    v[4] = spill;
+    return v;
+  }
+  if (t.includes("topic-c")) return axis(2);
+  if (t.includes("no-store")) return axis(5);
+  if (t.includes("refresh")) return axis(6);
+  if (t.includes("purge")) return axis(7);
+  if (t.includes("params-x")) return axis(8);
+  if (t.includes("scope-x")) return axis(9);
+  return axis(3);
 }
 
 interface EmbeddingMock {
@@ -211,8 +230,7 @@ describe("semantic cache e2e", () => {
   const embedMocks: EmbeddingMock[] = [];
   let embed: EmbeddingMock;
   let upstreamA: OpenAiUpstream;
-  let sharedPolicyId: string | undefined;
-  let sharedPolicyBody: Record<string, unknown>;
+  let canarySeq = 0;
 
   async function createDirectModel(
     displayName: string,
@@ -247,8 +265,26 @@ describe("semantic cache e2e", () => {
       provider: "openai",
       model_name: "embed-mock",
       provider_key_id: pk.id,
-      embedding: { dimensions: 8, normalize: true },
+      embedding: { dimensions: 12, normalize: true },
     });
+  }
+
+  // Convention (tests/e2e/AGENTS.md): resources land as etcd watch
+  // events in revision order, so a throwaway key seeded AFTER a batch
+  // authenticating proves the whole batch is in the snapshot. The gate
+  // is the non-throwing ProxyClient.listModels — never the cache
+  // behavior under test — and a non-200 is the normal transient state.
+  async function sealSeedBatch(): Promise<void> {
+    if (!seed || !app) throw new Error("seed not ready");
+    const plaintext = `sk-semcache-canary-${++canarySeq}`;
+    await seed.createApiKey({
+      key_hash: createHash("sha256").update(plaintext).digest("hex"),
+      allowed_models: ["*"],
+    });
+    const probe = new ProxyClient(app.proxyUrl, plaintext);
+    await waitConfigPropagation(
+      async () => (await probe.listModels()).status === 200,
+    );
   }
 
   async function chat(
@@ -308,14 +344,6 @@ describe("semantic cache e2e", () => {
 
     app = await spawnApp();
     seed = new SeedClient(etcd, app.etcdPrefix);
-    await seed.createApiKey({
-      key_hash: CALLER_KEY_HASH,
-      allowed_models: ["*"],
-    });
-    await seed.createApiKey({
-      key_hash: OTHER_CALLER_KEY_HASH,
-      allowed_models: ["*"],
-    });
 
     embed = await startEmbeddingMock();
     embedMocks.push(embed);
@@ -324,26 +352,28 @@ describe("semantic cache e2e", () => {
     upstreamA = await chatUpstreamReplying("answer-a");
     upstreams.push(upstreamA);
     await createDirectModel("chat-a", upstreamA);
-    const created = await seed.createCachePolicy({
+    await seed.createCachePolicy({
       name: "sem-default",
       backend: "memory",
       applies_to: "model:chat-a",
       ttl_seconds: 600,
       semantic: { embedding_model: "embed-cache", threshold: 0.85 },
     });
-    sharedPolicyId = created.id;
-    sharedPolicyBody = created.value;
 
-    // Gate open = the policy propagated (header present on a covered
-    // request).
-    await waitConfigPropagation(async () => {
-      try {
-        const r = await chat("chat-a", "warmup probe please");
-        return r.status === 200 && r.cache !== null;
-      } catch {
-        return false;
-      }
+    // Caller keys are seeded LAST: once one authenticates, revision
+    // order implies every resource above is in the snapshot.
+    await seed.createApiKey({
+      key_hash: CALLER_KEY_HASH,
+      allowed_models: ["*"],
     });
+    await seed.createApiKey({
+      key_hash: OTHER_CALLER_KEY_HASH,
+      allowed_models: ["*"],
+    });
+    const probe = new ProxyClient(app.proxyUrl, OTHER_CALLER_PLAINTEXT);
+    await waitConfigPropagation(
+      async () => (await probe.listModels()).status === 200,
+    );
   });
 
   afterAll(async () => {
@@ -409,10 +439,12 @@ describe("semantic cache e2e", () => {
       ctx.skip();
       return;
     }
-    // "topic-a" entries exist from the first test at default params; the
-    // same meaning with temperature set must not be served from them —
-    // the stored answer was generated under different parameters.
-    const r = await chat("chat-a", "tell me about topic-a", {
+    // Self-seeded on a dedicated axis: store at default params, then
+    // the same meaning with temperature set must not be served from it
+    // — the stored answer was generated under different parameters.
+    const seeded = await chat("chat-a", "params-x probe question");
+    expect(seeded.cache).toBe("miss");
+    const r = await chat("chat-a", "params-x probe question", {
       temperature: 0.9,
     });
     expect(r.status).toBe(200);
@@ -434,14 +466,7 @@ describe("semantic cache e2e", () => {
       ttl_seconds: 600,
       semantic: { embedding_model: "embed-cache", threshold: 0.95 },
     });
-    await waitConfigPropagation(async () => {
-      try {
-        const r = await chat("chat-strict", "warmup probe please");
-        return r.status === 200 && r.cache !== null;
-      } catch {
-        return false;
-      }
-    });
+    await sealSeedBatch();
 
     const seeded = await chat("chat-strict", "tell me about topic-a");
     expect(seeded.cache).toBe("miss");
@@ -467,9 +492,12 @@ describe("semantic cache e2e", () => {
       ctx.skip();
       return;
     }
-    // Default scope (api_key): the other caller's identical + similar
-    // requests both miss.
-    const otherExact = await chat("chat-a", "tell me about topic-a", {
+    // Default scope (api_key), self-seeded on a dedicated axis:
+    // caller 1 stores, then the other caller's identical request must
+    // miss BOTH layers (scoped exact key + scoped semantic partition).
+    const mine = await chat("chat-a", "scope-x probe question");
+    expect(mine.cache).toBe("miss");
+    const otherExact = await chat("chat-a", "scope-x probe question", {
       bearer: OTHER_CALLER_PLAINTEXT,
     });
     expect(otherExact.status).toBe(200);
@@ -488,14 +516,7 @@ describe("semantic cache e2e", () => {
       scope: "env",
       semantic: { embedding_model: "embed-cache", threshold: 0.85 },
     });
-    await waitConfigPropagation(async () => {
-      try {
-        const r = await chat("chat-shared", "warmup probe please");
-        return r.status === 200 && r.cache !== null;
-      } catch {
-        return false;
-      }
-    });
+    await sealSeedBatch();
 
     const store = await chat("chat-shared", "tell me about topic-a");
     expect(store.cache).toBe("miss");
@@ -588,14 +609,7 @@ describe("semantic cache e2e", () => {
       ttl_seconds: 600,
       semantic: { embedding_model: "embed-cache", threshold: 0.85 },
     });
-    await waitConfigPropagation(async () => {
-      try {
-        const r = await chat("chat-refresh", "warmup probe please");
-        return r.status === 200 && r.cache !== null;
-      } catch {
-        return false;
-      }
-    });
+    await sealSeedBatch();
 
     const seeded = await chat("chat-refresh", "refresh probe unique");
     expect(seeded.cache).toBe("miss");
@@ -649,14 +663,7 @@ describe("semantic cache e2e", () => {
       ttl_seconds: 600,
       semantic: { embedding_model: "embed-broken", threshold: 0.85 },
     });
-    await waitConfigPropagation(async () => {
-      try {
-        const r = await chat("chat-broken", "warmup probe please");
-        return r.status === 200 && r.cache !== null;
-      } catch {
-        return false;
-      }
-    });
+    await sealSeedBatch();
 
     const first = await chat("chat-broken", "tell me about topic-a");
     expect(first.status).toBe(200);
@@ -692,14 +699,7 @@ describe("semantic cache e2e", () => {
       ttl_seconds: 600,
       semantic: { embedding_model: "embed-cache", threshold: 0.85 },
     });
-    await waitConfigPropagation(async () => {
-      try {
-        const r = await chat("chat-swap", "warmup probe please");
-        return r.status === 200 && r.cache !== null;
-      } catch {
-        return false;
-      }
-    });
+    await sealSeedBatch();
 
     const seeded = await chat("chat-swap", "tell me about topic-a");
     expect(seeded.cache).toBe("miss");
@@ -711,16 +711,14 @@ describe("semantic cache e2e", () => {
       ...policy.value,
       semantic: { embedding_model: "embed-cache-b", threshold: 0.85 },
     });
-    // A FRESH same-meaning wording (L1-cold) flips from semantic-hit to
-    // miss once the swap propagates — the old partition is orphaned.
-    await waitConfigPropagation(async () => {
-      try {
-        const r = await chat("chat-swap", "describe topic-a now");
-        return r.status === 200 && r.cache === "miss";
-      } catch {
-        return false;
-      }
-    });
+    await sealSeedBatch();
+
+    // A FRESH same-meaning wording (L1-cold) misses once the swap has
+    // landed — the old partition is orphaned even though both models
+    // produce identical vectors.
+    const fresh = await chat("chat-swap", "describe topic-a now");
+    expect(fresh.status).toBe(200);
+    expect(fresh.cache).toBe("miss");
     // …and the new partition warms normally.
     const rewarmed = await chat("chat-swap", "topic-a summary please");
     expect(rewarmed.cache).toBe("hit");
@@ -729,40 +727,47 @@ describe("semantic cache e2e", () => {
   });
 
   test("purge_generation bump invalidates both layers at once", async (ctx) => {
-    if (!etcdReachable || !app || !seed || !sharedPolicyId) {
+    if (!etcdReachable || !app || !seed) {
       ctx.skip();
       return;
     }
-    const seeded = await chat("chat-a", "purge probe unique");
-    expect(seeded.cache).toBe("miss");
-    expect(
-      (await chat("chat-a", "purge probe unique")).cache,
-    ).toBe("hit");
+    // Dedicated model + policy: purging must not disturb (or depend
+    // on) any other test's partition.
+    const upstream = await chatUpstreamReplying("answer-purge");
+    upstreams.push(upstream);
+    await createDirectModel("chat-purge", upstream);
+    const policy = await seed.createCachePolicy({
+      name: "sem-purge",
+      backend: "memory",
+      applies_to: "model:chat-purge",
+      ttl_seconds: 600,
+      semantic: { embedding_model: "embed-cache", threshold: 0.85 },
+    });
+    await sealSeedBatch();
 
-    await seed.update("cache_policies", sharedPolicyId, {
-      ...sharedPolicyBody,
+    const seeded = await chat("chat-purge", "purge probe unique");
+    expect(seeded.cache).toBe("miss");
+    expect((await chat("chat-purge", "purge probe unique")).cache).toBe("hit");
+
+    await seed.update("cache_policies", policy.id, {
+      ...policy.value,
       purge_generation: 1,
     });
-    // Propagation probe on an UNRELATED axis (the keyword-free warmup
-    // text): its pre-purge entry stops being served once the new
-    // generation lands. Probing with the purge-axis text would re-store
-    // a fresh same-axis entry and hand the paraphrase below a
-    // legitimate new-generation hit, masking what this test pins.
-    await waitConfigPropagation(async () => {
-      try {
-        const r = await chat("chat-a", "warmup probe please");
-        return r.status === 200 && r.cache === "miss";
-      } catch {
-        return false;
-      }
-    });
+    await sealSeedBatch();
 
     // Both layers are gone: a paraphrase of the pre-purge entry misses
-    // (nothing on its axis was re-stored since the purge)…
-    const paraphrase = await chat("chat-a", "purge probe reworded");
+    // (nothing on its axis exists in the new generation)…
+    const paraphrase = await chat("chat-purge", "purge probe reworded");
     expect(paraphrase.cache).toBe("miss");
+    // …the pre-purge WORDING is no longer exact-served either: it now
+    // matches the paraphrase's fresh entry SEMANTICALLY, proving the
+    // old exact entry (which would win as `layer: exact`) is gone…
+    const oldWording = await chat("chat-purge", "purge probe unique");
+    expect(oldWording.cache).toBe("hit");
+    expect(oldWording.layer).toBe("semantic");
     // …and the cache works normally under the new generation.
-    const rewarm = await chat("chat-a", "purge probe reworded");
+    const rewarm = await chat("chat-purge", "purge probe reworded");
     expect(rewarm.cache).toBe("hit");
+    expect(rewarm.layer).toBe("exact");
   });
 });
