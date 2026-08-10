@@ -8,9 +8,12 @@ figure can be checked against a box we control.
 ## One command
 
 ```sh
-bench/onthebench/bench.sh                       # default rig, results under ./bench-results/
 bench/onthebench/bench.sh ubuntu@<rig-ip> /path/to/results
+BENCH_RIG=ubuntu@<rig-ip> bench/onthebench/bench.sh   # results under ./bench-results/
 ```
+
+The rig address is deliberately never committed: this is a public repository,
+and a committed default would publish a live passwordless-sudo box.
 
 The tree you run it from is the tree that gets measured. The script rsyncs the
 source to the rig, provisions it (idempotently), builds a native release
@@ -54,7 +57,7 @@ Replicates the published onthebench setup (https://onthebench.ai/gateways/perfor
   VmHWM are in the metadata, alongside commit, binary sha256, instrument
   sha256s, core split, kernel, and the full method parameters.
 - **Flamegraph** — one on-CPU flamegraph at the c=128 saturation point per run
-  (`perf record -F 997 --call-graph dwarf` → inferno), the api7/aisix#847
+  (`perf record -F 499 --call-graph dwarf` → inferno), the api7/aisix#847
   workflow. `rig-setup.sh` sets `kernel.perf_event_paranoid=1` (session-scoped,
   reverts on reboot) so an unprivileged run can sample its own process, and
   `run-baseline.sh` refuses a stripped binary before wasting a run.
@@ -72,3 +75,12 @@ config files, and the gateway/mock logs.
   exhaustion, not the gateway.
 - `kernel.perf_event_paranoid=1`: flamegraph sampling only; not active during
   measurement windows other than the dedicated flamegraph window.
+
+## Trust posture
+
+Provisioning executes third-party bytes as a passwordless-sudo user: rustup
+via its official `curl | sh` installer, and the prebuilt instrument binaries
+from the public benchmark release. The sha256 pins freeze reproducibility,
+not trustworthiness — the accepted trade is that the rig is a disposable,
+single-purpose box holding no secrets beyond its own ssh host key, rebuilt at
+will. Do not point this harness at a machine that matters.

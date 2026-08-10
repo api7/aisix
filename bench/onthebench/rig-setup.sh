@@ -22,9 +22,13 @@ MOCK_SHA256="c32b9ff470eddf87d477098dac6e19a6c75eeef6e594dfc57005310d69e9049d"
 
 echo "== apt packages (build deps + perf) =="
 sudo -n DEBIAN_FRONTEND=noninteractive apt-get update -q
+# Two transactions on purpose: apt is all-or-nothing, so bundling the
+# kernel-versioned linux-tools package (absent for some AWS kernels) with the
+# build deps would silently drop ALL of them and fail much later in the build.
 sudo -n DEBIAN_FRONTEND=noninteractive apt-get install -y -q \
     git curl build-essential pkg-config libssl-dev protobuf-compiler \
-    linux-tools-common "linux-tools-$(uname -r)" 2>/dev/null ||
+    python3 linux-tools-common
+sudo -n DEBIAN_FRONTEND=noninteractive apt-get install -y -q "linux-tools-$(uname -r)" ||
     sudo -n DEBIAN_FRONTEND=noninteractive apt-get install -y -q linux-tools-aws
 perf --version
 
@@ -50,7 +54,7 @@ mkdir -p "$TOOLS"
 fetch_pinned() {
     local name="$1" sha="$2" path="$TOOLS/$1"
     if [ ! -x "$path" ] || ! echo "$sha  $path" | sha256sum -c --quiet 2>/dev/null; then
-        curl -sL -o "$path" "$REL/${name}-arm64"
+        curl -fsSL -o "$path" "$REL/${name}-arm64"
         chmod +x "$path"
     fi
     echo "$sha  $path" | sha256sum -c --quiet ||

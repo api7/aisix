@@ -31,6 +31,9 @@ TOOLS="$HOME/bench-tools"
 CLK_TCK=$(getconf CLK_TCK)
 # Non-interactive ssh shells don't source the cargo env; inferno lives there.
 export PATH="$HOME/.cargo/bin:$PATH"
+# Plain assignment on purpose: a heredoc swallows a failing command
+# substitution under set -e, so this must fail loudly here instead.
+BODY_JSON=$(printf '%s' "$BODY" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')
 
 mkdir -p "$OUT"
 RESULTS="$OUT/results.jsonl"; : > "$RESULTS"
@@ -59,7 +62,7 @@ rss_kb() { awk '/VmRSS/{print $2}' "/proc/$1/status"; }
 wait_http_200() { # wait_http_200 <url> <label> [max_s]
     local url="$1" label="$2" max="${3:-30}" code
     for _ in $(seq 1 $((max * 2))); do
-        code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+        code=$(curl -s --max-time 2 -o /dev/null -w '%{http_code}' -X POST \
             -H 'authorization: Bearer bench-token' -H 'content-type: application/json' \
             -d "$BODY" "$url" || true)
         [ "$code" = "200" ] && return 0
@@ -75,6 +78,17 @@ start_mock() { # start_mock <ttft_ms>
         >> "$OUT/mock.log" 2>&1 &
     MOCK_PID=$!
     wait_http_200 "http://127.0.0.1:$MOCK_PORT$CHAT_PATH" "mock (ttft=${1}ms)"
+    # A mock that ignores MOCK_TTFT_MS would make the delayed leg silently
+    # measure a 0-delay upstream with fail=0 throughout; assert the delay is
+    # actually in effect before any window runs against it.
+    if [ "$1" -gt 0 ]; then
+        local ttfb
+        ttfb=$(curl -s --max-time 2 -o /dev/null -w '%{time_starttransfer}' -X POST \
+            -H 'content-type: application/json' -d "$BODY" \
+            "http://127.0.0.1:$MOCK_PORT$CHAT_PATH" || echo 0)
+        awk -v t="$ttfb" -v want="$1" 'BEGIN{exit !(t*1000 >= want*0.9)}' ||
+            { echo "FATAL: mock TTFT ${ttfb}s does not reflect ${1}ms"; exit 1; }
+    fi
 }
 
 loadgen() { # loadgen <ip:port> <conc> <dur>  -> stats line on stdout
@@ -88,7 +102,9 @@ measured_window() { # measured_window <point> <ttft> <conc> <rep>
     local rssfile="$OUT/.rss.$$" line t0 t1 ticks0 ticks1 elapsed cpu_pct rss_peak
     local rps fail ok p50 p99 rigref budget spawn valid
 
-    ( max=0; while :; do
+    # Self-terminating on gateway death: this function runs inside a command
+    # substitution subshell, so the EXIT trap can never see SAMPLER_PID.
+    ( max=0; while kill -0 "$GW_PID" 2>/dev/null; do
           v=$(awk '/VmRSS/{print $2}' "/proc/$GW_PID/status" 2>/dev/null || true)
           v="${v:-0}"
           if [ "$v" -gt "$max" ]; then max="$v"; echo "$max" > "$rssfile"; fi
@@ -96,7 +112,8 @@ measured_window() { # measured_window <point> <ttft> <conc> <rep>
       done ) & SAMPLER_PID=$!
 
     ticks0=$(cpu_ticks "$GW_PID"); t0=$(date +%s.%N)
-    line=$(loadgen "127.0.0.1:$GW_PORT" "$conc" "$WINDOW")
+    line=$(loadgen "127.0.0.1:$GW_PORT" "$conc" "$WINDOW") || line=""
+    line=${line//[\"\\]/ }
     t1=$(date +%s.%N); ticks1=$(cpu_ticks "$GW_PID")
     kill "$SAMPLER_PID" 2>/dev/null || true; wait "$SAMPLER_PID" 2>/dev/null || true; SAMPLER_PID=""
     rss_peak=$(cat "$rssfile" 2>/dev/null || echo 0); rm -f "$rssfile"
@@ -165,14 +182,18 @@ EOF
 # ---- rig floor (0-delay): loadgen -> mock directly, gateway not yet running --
 
 floor_point() { # floor_point <ttft> <conc>  (mock must already run with that ttft)
-    local ttft="$1" conc="$2" rep line
-    loadgen "127.0.0.1:$MOCK_PORT" "$conc" 5 > /dev/null   # warmup
+    local ttft="$1" conc="$2" rep line fail valid
+    loadgen "127.0.0.1:$MOCK_PORT" "$conc" 5 > /dev/null || true   # warmup
     for rep in $(seq 1 "$FLOOR_REPS"); do
-        line=$(loadgen "127.0.0.1:$MOCK_PORT" "$conc" "$WINDOW")
-        printf '{"kind":"floor","point":"floor-ttft%s-c%s","ttft_ms":%s,"conc":%s,"rep":%s,"rps":%s,"fail":%s,"p50_us":%s,"p99_us":%s,"otb_line":"%s"}\n' \
-            "$ttft" "$conc" "$ttft" "$conc" "$rep" "$(field rps "$line")" "$(field fail "$line")" \
+        line=$(loadgen "127.0.0.1:$MOCK_PORT" "$conc" "$WINDOW") || line=""
+        line=${line//[\"\\]/ }
+        fail=$(field fail "$line")
+        valid=true; [ "${fail:-1}" = "0" ] || valid=false
+        printf '{"kind":"floor","point":"floor-ttft%s-c%s","ttft_ms":%s,"conc":%s,"rep":%s,"valid":%s,"rps":%s,"fail":%s,"p50_us":%s,"p99_us":%s,"otb_line":"%s"}\n' \
+            "$ttft" "$conc" "$ttft" "$conc" "$rep" "$valid" "$(field rps "$line")" "${fail:-null}" \
             "$(field p50us "$line")" "$(field p99us "$line")" "$line" >> "$RESULTS"
-        echo "  [floor ttft=$ttft c=$conc rep=$rep] $line" >&2
+        echo "  [floor ttft=$ttft c=$conc rep=$rep] valid=$valid $line" >&2
+        [ "$valid" = true ] || echo "WARNING: floor window ttft=$ttft c=$conc rep=$rep had failures - reference ceiling tainted" >&2
     done
 }
 
@@ -194,13 +215,59 @@ sleep 3
 RSS_IDLE=$(rss_kb "$GW_PID")
 TPC_WORKERS=$(ps -T -p "$GW_PID" | grep -c 'tpc-' || true)
 echo "  pid=$GW_PID idle_rss=${RSS_IDLE}kB tpc_workers=$TPC_WORKERS" >&2
+# Serving-mode self-check, asserted rather than merely recorded: measuring the
+# shared-runtime fallback while calling it the default would be a silently
+# wrong baseline (thread-per-core is the shipped default on Linux).
+[ "$TPC_WORKERS" -ge 1 ] ||
+    { echo "FATAL: no tpc- worker threads - gateway is not in thread-per-core mode"; exit 1; }
+
+# Metadata is written NOW, before the first measured window, so an aborted run
+# still leaves results.jsonl attributable to a commit and binary; the end of
+# the run rewrites it with the final memory high-water mark.
+write_meta() { # write_meta <rss_hwm_kb-or-null>
+    cat > "$OUT/meta.json" <<EOF
+{
+  "commit": "${BENCH_SRC_COMMIT:-unknown}",
+  "dirty_files": ${BENCH_SRC_DIRTY:-0},
+  "timestamp_utc": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "rig": {
+    "host": "$(hostname)",
+    "kernel": "$(uname -r)",
+    "arch": "$(uname -m)",
+    "nproc": $(nproc),
+    "mem_total_kb": $(awk '/MemTotal/{print $2}' /proc/meminfo),
+    "cpu_part": "$(awk -F': ' '/CPU part/{print $2; exit}' /proc/cpuinfo)"
+  },
+  "cores": {"gateway": "$GW_CORES", "load": "$LOAD_CORES", "mock": "$MOCK_CORES"},
+  "instruments": {
+    "engine_pin": "f3adbb1315b26129f5e317af5279decefb1cea8f (engine-v1)",
+    "otb_sha256": "$(sha256sum "$TOOLS/otb" | cut -d' ' -f1)",
+    "mock_sha256": "$(sha256sum "$TOOLS/mock" | cut -d' ' -f1)"
+  },
+  "method": {
+    "window_s": $WINDOW, "warmup_s": $WARMUP, "reps": $REPS,
+    "max_tries": $MAX_TRIES, "floor_reps": $FLOOR_REPS,
+    "grid": "$GRID", "body": $BODY_JSON,
+    "path": "$CHAT_PATH", "clk_tck": $CLK_TCK, "nofile": $(ulimit -n),
+    "loadgen_headers": $(printf '%s' "$OTB_LOADGEN_HEADERS" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))'),
+    "flamegraph": {"freq_hz": 499, "callgraph": "dwarf", "window_s": 25, "conc": 128}
+  },
+  "gateway": {
+    "binary_sha256": "$(sha256sum "$BIN" | cut -d' ' -f1)",
+    "rss_idle_kb": $RSS_IDLE, "rss_hwm_kb": $1,
+    "tpc_workers": $TPC_WORKERS
+  }
+}
+EOF
+}
+write_meta null
 
 # ---- 0-delay grid -----------------------------------------------------------
 
 run_point() { # run_point <ttft> <conc>
     local ttft="$1" conc="$2" point="ttft$1-c$2" valid_n=0 try=0
     echo "== point $point ==" >&2
-    loadgen "127.0.0.1:$GW_PORT" "$conc" "$WARMUP" > /dev/null
+    loadgen "127.0.0.1:$GW_PORT" "$conc" "$WARMUP" > /dev/null || true
     while [ "$valid_n" -lt "$REPS" ] && [ "$try" -lt "$MAX_TRIES" ]; do
         try=$((try + 1))
         valid_n=$((valid_n + $(measured_window "$point" "$ttft" "$conc" "$try")))
@@ -248,39 +315,9 @@ for spec in $GRID; do
     run_point "$ttft" "$conc"
 done
 
-# ---- metadata ---------------------------------------------------------------
+# ---- final metadata (adds the memory high-water mark) -----------------------
 
-RSS_HWM=$(awk '/VmHWM/{print $2}' "/proc/$GW_PID/status")
-cat > "$OUT/meta.json" <<EOF
-{
-  "commit": "${BENCH_SRC_COMMIT:-unknown}",
-  "dirty_files": ${BENCH_SRC_DIRTY:-0},
-  "timestamp_utc": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-  "rig": {
-    "host": "$(hostname)",
-    "kernel": "$(uname -r)",
-    "arch": "$(uname -m)",
-    "nproc": $(nproc),
-    "mem_total_kb": $(awk '/MemTotal/{print $2}' /proc/meminfo),
-    "cpu_part": "$(awk -F': ' '/CPU part/{print $2; exit}' /proc/cpuinfo)"
-  },
-  "cores": {"gateway": "$GW_CORES", "load": "$LOAD_CORES", "mock": "$MOCK_CORES"},
-  "instruments": {
-    "engine_pin": "f3adbb1315b26129f5e317af5279decefb1cea8f (engine-v1)",
-    "otb_sha256": "$(sha256sum "$TOOLS/otb" | cut -d' ' -f1)",
-    "mock_sha256": "$(sha256sum "$TOOLS/mock" | cut -d' ' -f1)"
-  },
-  "method": {
-    "window_s": $WINDOW, "warmup_s": $WARMUP, "reps": $REPS,
-    "grid": "$GRID", "body": $(printf '%s' "$BODY" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))'),
-    "path": "$CHAT_PATH", "clk_tck": $CLK_TCK, "nofile": $(ulimit -n)
-  },
-  "gateway": {
-    "binary_sha256": "$(sha256sum "$BIN" | cut -d' ' -f1)",
-    "rss_idle_kb": $RSS_IDLE, "rss_hwm_kb": $RSS_HWM,
-    "tpc_workers": $TPC_WORKERS
-  }
-}
-EOF
+RSS_HWM=$(awk '/VmHWM/{print $2}' "/proc/$GW_PID/status" 2>/dev/null || true)
+write_meta "${RSS_HWM:-null}"
 
 echo "== done: $OUT ==" >&2
