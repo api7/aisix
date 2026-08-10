@@ -2,8 +2,8 @@ import { createHash } from "node:crypto";
 import OpenAI from "openai";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
+  SeedClient,
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
@@ -33,11 +33,11 @@ describe("openai SDK compat: drive gateway through real client", () => {
   let app: SpawnedApp | undefined;
   let nonStreamUpstream: OpenAiUpstream | undefined;
   let streamUpstream: OpenAiUpstream | undefined;
-  let admin: AdminClient | undefined;
   let etcdReachable = false;
 
   beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
     nonStreamUpstream = await startOpenAiUpstream();
@@ -51,40 +51,37 @@ describe("openai SDK compat: drive gateway through real client", () => {
       ],
     });
 
-    // Held-back: this test drives the Admin API surface itself, so it
-    // keeps the admin listener bound (the suite default is now admin-off).
-    app = await spawnApp({ admin: true });
-    // Deliberately seeds via the Admin API: deprecation-window coverage.
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    app = await spawnApp({});
+    const seed = new SeedClient(etcd, app.etcdPrefix);
 
     // Two ProviderKeys → two Models — keeps `receivedRequests` on each
     // mock unambiguous so the assertion below proves the SDK hit the
     // expected upstream rather than leaking across.
-    const pkSync = await admin.createProviderKey({
+    const pkSync = await seed.createProviderKey({
       display_name: "sdk-compat-sync-pk",
       secret: "sk-mock",
       api_base: `${nonStreamUpstream.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "sdk-compat-sync",
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: pkSync.id,
     });
 
-    const pkStream = await admin.createProviderKey({
+    const pkStream = await seed.createProviderKey({
       display_name: "sdk-compat-stream-pk",
       secret: "sk-mock",
       api_base: `${streamUpstream.baseUrl}/v1`,
     });
-    await admin.createModel({
+    await seed.createModel({
       display_name: "sdk-compat-stream",
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: pkStream.id,
     });
 
-    await admin.createApiKey({
+    await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["sdk-compat-sync", "sdk-compat-stream"],
     });
@@ -212,44 +209,4 @@ describe("openai SDK compat: drive gateway through real client", () => {
     expect(testCalls[0]?.method).toBe("POST");
   });
 
-  // The deprecation signal is part of the admin-write contract this
-  // suite deliberately exercises: every mutating Admin API response
-  // must carry the `Deprecation` header — a structured-field date per
-  // RFC 9745 (https://www.rfc-editor.org/rfc/rfc9745), so `@<unix>`,
-  // not the draft-era boolean — plus a `Link` with rel="deprecation"
-  // pointing at the declarative-configuration docs. Reads carry
-  // neither: the read surface is not deprecated.
-  test("admin writes carry the RFC 9745 deprecation signal; reads do not", async (ctx) => {
-    if (!etcdReachable || !app || !nonStreamUpstream) {
-      ctx.skip();
-      return;
-    }
-
-    const auth = {
-      authorization: `Bearer ${app.adminKey}`,
-      "content-type": "application/json",
-    };
-    const write = await fetch(`${app.adminUrl}/admin/v1/provider_keys`, {
-      method: "POST",
-      headers: auth,
-      body: JSON.stringify({
-        display_name: "sdk-compat-deprecation-probe-pk",
-        provider: "openai",
-        adapter: "openai",
-        secret: "sk-mock",
-        api_base: `${nonStreamUpstream.baseUrl}/v1`,
-      }),
-    });
-    expect(write.status).toBe(200);
-    expect(write.headers.get("deprecation")).toMatch(/^@\d+$/);
-    const link = write.headers.get("link") ?? "";
-    expect(link).toContain('rel="deprecation"');
-    expect(link).toMatch(/<https:\/\/[^>]+>/);
-
-    const read = await fetch(`${app.adminUrl}/admin/v1/provider_keys`, {
-      headers: { authorization: `Bearer ${app.adminKey}` },
-    });
-    expect(read.status).toBe(200);
-    expect(read.headers.get("deprecation")).toBeNull();
-  });
 });

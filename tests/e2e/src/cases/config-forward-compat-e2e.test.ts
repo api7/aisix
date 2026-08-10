@@ -66,7 +66,7 @@ describe("config forward-compat: unknown fields from a newer control plane", () 
     if (!etcdReachable) return;
 
     upstream = await startOpenAiUpstream();
-    app = await spawnApp({ admin: true });
+    app = await spawnApp({});
     const seed = new SeedClient(etcd, app.etcdPrefix);
 
     const pk = await seed.createProviderKey({
@@ -234,33 +234,5 @@ describe("config forward-compat: unknown fields from a newer control plane", () 
     expect(text).toMatch(
       /aisix_config_partially_compatible_resources\{kind="api_keys"\} 0/,
     );
-  });
-
-  test("the Admin API write path still rejects unknown fields with 400", async (ctx) => {
-    if (!etcdReachable || !app) {
-      ctx.skip();
-      return;
-    }
-
-    // Strict write / lenient read: leniency is a property of the etcd
-    // READ path only. A human (or script) writing through the Admin API
-    // gets typo protection unchanged.
-    const res = await fetch(`${app.adminUrl}/admin/v1/models`, {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${app.adminKey}`,
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({
-        display_name: "fc-typo",
-        provider: "openai",
-        model_name: "gpt-4o-mini",
-        provider_key_id: randomUUID(),
-        dispaly_name_typo: true,
-      }),
-    });
-    expect(res.status).toBe(400);
-    const body = (await res.json()) as { error_msg?: string };
-    expect(body.error_msg ?? "").toMatch(/schema validation|unknown field/i);
   });
 });

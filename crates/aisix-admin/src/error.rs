@@ -27,12 +27,6 @@ pub enum AdminError {
     NotFound,
     #[error("name {0:?} already in use by another resource")]
     Conflict(String),
-    /// Resource writes are refused because this gateway loads its
-    /// resources from a declarative file. 409, like [`Self::Conflict`]:
-    /// the request is well-formed but conflicts with how the resource
-    /// set is managed.
-    #[error("{0}")]
-    FileManaged(String),
     #[error("schema validation failed at {path}: {message}")]
     Schema { path: String, message: String },
     #[error("store error: {0}")]
@@ -45,7 +39,7 @@ impl AdminError {
             AdminError::Unauthorized => StatusCode::UNAUTHORIZED,
             AdminError::BadRequest(_) | AdminError::Schema { .. } => StatusCode::BAD_REQUEST,
             AdminError::NotFound => StatusCode::NOT_FOUND,
-            AdminError::Conflict(_) | AdminError::FileManaged(_) => StatusCode::CONFLICT,
+            AdminError::Conflict(_) => StatusCode::CONFLICT,
             AdminError::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -62,10 +56,7 @@ impl From<SchemaError> for AdminError {
 
 impl From<StoreError> for AdminError {
     fn from(e: StoreError) -> Self {
-        match e {
-            StoreError::ReadOnly(msg) => AdminError::FileManaged(msg),
-            other => AdminError::Store(other.to_string()),
-        }
+        AdminError::Store(e.to_string())
     }
 }
 

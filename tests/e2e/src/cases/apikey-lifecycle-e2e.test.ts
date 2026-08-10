@@ -1,7 +1,6 @@
 import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
-  AdminClient,
   EtcdClient,
   SeedClient,
   spawnApp,
@@ -28,8 +27,9 @@ import {
 //      not at load time)
 //   6. the Anthropic surface (`/v1/messages`) rejects a disabled key
 //      with the Anthropic-shaped 401 envelope
-//   7. rotate: the old plaintext stops working, the returned new
-//      plaintext works, and the resource id is unchanged
+//   7. secret swap: updating a key's `key_hash` in place (the
+//      declarative rotation the control plane performs) invalidates the
+//      old plaintext immediately, id unchanged
 //
 // Reference: OpenAI authentication doc
 // <https://platform.openai.com/docs/api-reference/authentication>,
@@ -41,10 +41,9 @@ function sha256(plaintext: string): string {
   return createHash("sha256").update(plaintext).digest("hex");
 }
 
-describe("api key lifecycle e2e: expired/disabled keys fail closed, rotate swaps the secret", () => {
+describe("api key lifecycle e2e: expired/disabled keys fail closed, secret swap kills the old plaintext", () => {
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
-  let admin: AdminClient | undefined;
   let seed: SeedClient | undefined;
   let etcdReachable = false;
 
@@ -54,10 +53,7 @@ describe("api key lifecycle e2e: expired/disabled keys fail closed, rotate swaps
     if (!etcdReachable) return;
 
     upstream = await startOpenAiUpstream();
-    // Held-back: this test drives the Admin API surface itself, so it
-    // keeps the admin listener bound (the suite default is now admin-off).
-    app = await spawnApp({ admin: true });
-    admin = new AdminClient(app.adminUrl, app.adminKey);
+    app = await spawnApp({});
     seed = new SeedClient(etcd, app.etcdPrefix);
 
     const pk = await seed.createProviderKey({
@@ -275,60 +271,30 @@ describe("api key lifecycle e2e: expired/disabled keys fail closed, rotate swaps
     expect(body.error?.type).toBe("authentication_error");
   });
 
-  test("rotate swaps the secret in place: old plaintext dies, new one works, id unchanged", async (ctx) => {
-    if (!etcdReachable || !app || !admin) {
+  test("secret swap in place: old plaintext dies, new one works, id unchanged", async (ctx) => {
+    if (!etcdReachable || !app || !seed) {
       ctx.skip();
       return;
     }
 
-    const plaintext = "sk-lifecycle-rotate";
+    const plaintext = "sk-lifecycle-swap";
+    const nextPlaintext = "sk-lifecycle-swap-next";
     const { id } = await seedKey(plaintext, {}, is200);
 
-    // Rotate through the canonical `api_keys` route; the disabled-key
-    // rotation below keeps the former `apikeys` spelling so both stay
-    // exercised end-to-end.
-    const rotated = await admin.json<{
-      entry: { id: string };
-      plaintext: string;
-    }>("POST", `/admin/v1/api_keys/${id}/rotate`);
-    expect(rotated.entry.id).toBe(id);
-    expect(rotated.plaintext).not.toBe(plaintext);
+    // The declarative equivalent of a rotation: the control plane (or
+    // an operator editing resources) writes the same resource id with a
+    // new key_hash. Nothing else about the entry changes.
+    await seed.update("api_keys", id, {
+      key_hash: sha256(nextPlaintext),
+      allowed_models: [MODEL],
+    });
 
     // New secret authenticates…
-    await waitConfigPropagation(async () => is200(await chat(rotated.plaintext, "rotated probe")));
+    await waitConfigPropagation(async () => is200(await chat(nextPlaintext, "swapped probe")));
     // …and the old one is invalid (unknown-token 401), so a leaked
-    // pre-rotation secret is worthless immediately after rotation.
-    const res = await chat(plaintext, "old secret after rotate");
+    // pre-swap secret is worthless immediately after the swap.
+    const res = await chat(plaintext, "old secret after swap");
     expect(res.status).toBe(401);
     await res.text();
-  });
-
-  test("rotate preserves lifecycle fields: a disabled key's new secret is still disabled", async (ctx) => {
-    if (!etcdReachable || !app || !admin) {
-      ctx.skip();
-      return;
-    }
-
-    const plaintext = "sk-lifecycle-rotate-disabled";
-    const expiresAt = "2099-01-01T00:00:00Z";
-    const { id } = await seedKey(
-      plaintext,
-      { disabled: true, expires_at: expiresAt },
-      isLifecycle401("api_key_disabled"),
-    );
-
-    const rotated = await admin!.json<{
-      entry: { id: string; value: { disabled?: boolean; expires_at?: string } };
-      plaintext: string;
-    }>("POST", `/admin/v1/apikeys/${id}/rotate`);
-
-    // Rotation swaps ONLY the secret — a regression that rebuilt the
-    // entry from a partial body would silently re-enable a disabled
-    // key under its fresh plaintext.
-    expect(rotated.entry.value.disabled).toBe(true);
-    expect(Date.parse(rotated.entry.value.expires_at ?? "")).toBe(Date.parse(expiresAt));
-    await waitConfigPropagation(async () =>
-      isLifecycle401("api_key_disabled")(await chat(rotated.plaintext, "rotated but disabled")),
-    );
   });
 });

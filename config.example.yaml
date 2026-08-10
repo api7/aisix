@@ -81,6 +81,9 @@ proxy:
   #     match: "^/mcp-servers/([^/]+)/mcp$"
   #     rewrite: "/mcp/$1"
 
+# Admin listener — read-only resource surface, OpenAPI reference, and
+# playground. Resources are managed declaratively (resources_file or
+# direct etcd writes), not through this listener.
 admin:
   addr: "127.0.0.1:3001"
   admin_keys:
