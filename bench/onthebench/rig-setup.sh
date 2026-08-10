@@ -33,13 +33,17 @@ if ! command -v "$HOME/.cargo/bin/cargo" >/dev/null 2>&1; then
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs |
         sh -s -- -y --default-toolchain none
 fi
-# The actual toolchain version comes from the repo's rust-toolchain.toml the
-# first time cargo runs inside the source tree; nothing to pin here.
 # shellcheck disable=SC1091
 source "$HOME/.cargo/env"
+# No default toolchain is configured; every cargo invocation below runs inside
+# the source tree so the repo's rust-toolchain.toml pins the version. This also
+# front-loads the toolchain download out of the build step.
+SRC_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+(cd "$SRC_ROOT" && cargo --version)
 
 echo "== inferno (flamegraph rendering: perf script -> SVG) =="
-command -v inferno-flamegraph >/dev/null 2>&1 || cargo install --locked inferno
+command -v inferno-flamegraph >/dev/null 2>&1 ||
+    (cd "$SRC_ROOT" && cargo install --locked inferno)
 
 echo "== pinned bench instruments (otb loadgen + mock upstream) =="
 mkdir -p "$TOOLS"
