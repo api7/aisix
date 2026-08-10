@@ -445,11 +445,19 @@ async fn ttl_expires_documents() {
         )
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(400)).await;
-    let miss = store
-        .lookup(&policy, 0, "fp", &[1.0, 0.0], 0.5)
-        .await
-        .unwrap();
+    // Redis expires documents lazily; poll until the reclaim lands
+    // instead of trusting one fixed sleep.
+    let mut miss = None;
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        miss = store
+            .lookup(&policy, 0, "fp", &[1.0, 0.0], 0.5)
+            .await
+            .unwrap();
+        if miss.is_none() {
+            break;
+        }
+    }
     assert!(miss.is_none(), "expired document must not match");
 }
 

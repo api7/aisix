@@ -37,6 +37,10 @@ const CALLER_KEY_HASH = createHash("sha256")
 /** RESP-level probe: does the server speak FT.* (vector search)?
  *  `null` = server unreachable (both suites skip). */
 async function redisVectorSupport(url: string): Promise<boolean | null> {
+  // Plaintext RESP probe: a rediss:// target cannot be probed this way
+  // — that is "unknown", not "unsupported", so both suites skip
+  // honestly rather than mislabeling a TLS server as vector-less.
+  if (/^rediss:\/\//.test(url)) return null;
   const m = /^redis:\/\/(?:[^@/]*@)?([^:/]+)(?::(\d+))?/.exec(url);
   if (!m) return null;
   const host = m[1];
@@ -50,8 +54,11 @@ async function redisVectorSupport(url: string): Promise<boolean | null> {
     sock.once("data", (buf) => {
       const head = buf.toString();
       if (head.startsWith("*")) return done(true); // array reply = supported
-      if (head.startsWith("-ERR unknown command")) return done(false);
-      done(false);
+      // Only an explicit unknown-command error PROVES the capability is
+      // absent; anything else (auth required, loading, protocol noise)
+      // proves nothing either way.
+      if (/^-ERR unknown command/i.test(head)) return done(false);
+      done(null);
     });
     sock.once("error", () => done(null));
     sock.setTimeout(1000, () => done(null));

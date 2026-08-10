@@ -92,12 +92,27 @@ impl RedisSemanticCache {
     }
 
     /// One-shot capability probe: succeeds iff the server speaks the
-    /// vector-search command family. The bootstrap calls this once and
-    /// skips wiring the store when it fails, so a plain Redis 6/7
-    /// degrades semantic matching visibly at boot, never silently at
-    /// request time.
+    /// vector-search command family AND the connection talks RESP2.
+    /// The bootstrap calls this once and skips wiring the store when it
+    /// fails, so a plain Redis 6/7 — or a `?protocol=resp3` connection,
+    /// whose `FT.SEARCH` replies use a nested map shape this parser
+    /// does not speak — degrades semantic matching visibly at boot,
+    /// never silently at request time.
     pub async fn probe(&self) -> Result<(), CacheError> {
         let mut conn = self.acquire().await?;
+        let proto: redis::Value = redis::cmd("HELLO")
+            .query_async(&mut conn)
+            .await
+            .unwrap_or(redis::Value::Nil);
+        if let redis::Value::Map(_) = proto {
+            // A map HELLO reply means the connection negotiated RESP3.
+            return Err(CacheError::Backend(
+                "RESP3 connections are not supported by the semantic cache \
+                 (FT.SEARCH reply parsing assumes RESP2); remove \
+                 protocol=resp3 from cache.redis"
+                    .into(),
+            ));
+        }
         redis::cmd("FT._LIST")
             .query_async::<()>(&mut conn)
             .await
