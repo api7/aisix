@@ -751,10 +751,56 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
         }
         None => None,
     };
-    let cache = Some(CacheBackends::new(
-        Arc::new(MemoryCache::with_defaults()),
-        redis_cache,
-    ));
+    // Shared semantic (L2) store for `backend: redis` policies. Wired
+    // only when the server passes the vector-search probe — a plain
+    // Redis 6/7 (or cluster mode, unsupported yet) degrades those
+    // policies to exact-only, loudly, HERE at boot rather than
+    // silently per request.
+    let semantic_redis: Option<Arc<dyn aisix_cache::SemanticCacheStore>> =
+        match cfg.cache.redis.as_ref() {
+            Some(redis_cfg) if redis_cfg.mode == aisix_core::RedisMode::Cluster => {
+                tracing::warn!(
+                    target: "aisix::cache",
+                    "cache.redis is in cluster mode; semantic matching on backend=redis \
+                     policies is not supported yet and stays exact-only"
+                );
+                None
+            }
+            Some(redis_cfg) => {
+                let store = aisix_cache::RedisSemanticCache::connect(redis_cfg)
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!("redis semantic cache connect failed (cache.redis): {e}")
+                    })?
+                    .with_env_namespace(&cfg.etcd.env_id);
+                match store.probe().await {
+                    Ok(()) => {
+                        tracing::info!(
+                            target: "aisix::cache",
+                            "cache.redis supports vector search; semantic matching \
+                             enabled for backend=redis policies"
+                        );
+                        Some(Arc::new(store) as Arc<dyn aisix_cache::SemanticCacheStore>)
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "aisix::cache",
+                            error = %e,
+                            "cache.redis has no vector-search support; semantic matching \
+                             on backend=redis policies stays exact-only"
+                        );
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
+    let mut cache_backends =
+        CacheBackends::new(Arc::new(MemoryCache::with_defaults()), redis_cache);
+    if let Some(store) = semantic_redis {
+        cache_backends = cache_backends.with_semantic_redis(store);
+    }
+    let cache = Some(cache_backends);
 
     let mut proxy_state = ProxyState::with_components(
         snapshot_handle.clone(),
