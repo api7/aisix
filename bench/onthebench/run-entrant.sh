@@ -18,10 +18,16 @@
 # and may provide:
 #
 #   entrant_prepare <out-dir>  one-time fetch/build, before any measurement
-#   entrant_stop               teardown beyond `kill $GW_PID` (containers)
+#   entrant_stop               teardown beyond `kill $GW_PID` (containers);
+#                            must tolerate being called when entrant_start
+#                            never ran (cleanup on a prepare failure)
 #   entrant_meta_json          extra identity JSON object (version, digest, …)
 #   REQ_PATH / BODY / AUTH_HEADER  request shape, when the entrant's ingress
 #                            speaks a dialect other than OpenAI chat
+#
+# entrant.sh is sourced before lib.sh: harness variables (GW_PORT, GW_CORES,
+# MOCK_PORT, ...) are available inside the hook functions when they are
+# called, but NOT at the entrant.sh top level.
 #
 # The entrant dir itself is deliberately not part of this repository: the
 # harness carries the method; what it points at is the operator's business.
@@ -55,9 +61,16 @@ if type entrant_prepare >/dev/null 2>&1; then
     echo "== prepare ($ENTRANT_NAME) ==" >&2
     # The pipe puts entrant_prepare in a subshell: state it wants to hand to
     # entrant_start or entrant_meta_json must go through files, not variables.
-    # pipefail carries a prepare failure out of the pipeline; the || names it.
-    entrant_prepare "$OUT" 2>&1 | tee "$OUT/prepare.log" >&2 ||
-        { echo "FATAL: entrant_prepare failed (see $OUT/prepare.log)"; exit 1; }
+    # The explicit subshell re-arms errexit — a `prepare || die` form would
+    # disable set -e inside the hook and let a mid-prepare failure (a failed
+    # fetch before a succeeding final step) pass as success, measuring stale
+    # artifacts; the rc capture keeps pipefail out of the decision.
+    set +e
+    ( set -e; entrant_prepare "$OUT" ) 2>&1 | tee "$OUT/prepare.log" >&2
+    PREP_RC=${PIPESTATUS[0]}
+    set -e
+    [ "$PREP_RC" -eq 0 ] ||
+        { echo "FATAL: entrant_prepare failed (rc=$PREP_RC, see $OUT/prepare.log)"; exit 1; }
 fi
 
 start_target() {
@@ -75,8 +88,14 @@ start_target() {
     wait_http_200 "http://127.0.0.1:$GW_PORT$REQ_PATH" "$ENTRANT_NAME"
     sleep 3
     RSS_IDLE=$(rss_kb "$GW_PID")
-    THREADS=$(ps -T -p "$GW_PID" 2>/dev/null | tail -n +2 | wc -l || echo 0)
-    echo "  pid=$GW_PID idle_rss=${RSS_IDLE}kB threads=$THREADS" >&2
+    THREADS=$(ps -T -p "$GW_PID" 2>/dev/null | tail -n +2 | wc -l) || THREADS=0
+    # CPU% and RSS cover GW_PID alone. A multi-process target (master +
+    # workers) would be silently understated; surface it loudly and record
+    # the count so the numbers can never pass unannotated.
+    CHILDREN=$(pgrep -cP "$GW_PID" 2>/dev/null) || CHILDREN=0
+    [ "$CHILDREN" -eq 0 ] ||
+        echo "WARNING: target pid $GW_PID has $CHILDREN child processes; CPU%/RSS cover this pid only" >&2
+    echo "  pid=$GW_PID idle_rss=${RSS_IDLE}kB threads=$THREADS children=$CHILDREN" >&2
 }
 
 write_meta() { # write_meta <rss_hwm_kb-or-null>
@@ -97,6 +116,7 @@ write_meta() { # write_meta <rss_hwm_kb-or-null>
     "binary_sha256": "${bin_sha:-unknown}",
     "rss_idle_kb": ${RSS_IDLE:-null}, "rss_hwm_kb": $1,
     "threads": ${THREADS:-null},
+    "children": ${CHILDREN:-null},
     "identity": $(type entrant_meta_json >/dev/null 2>&1 && entrant_meta_json || echo null)
   }
 }
@@ -119,10 +139,15 @@ for TTFT in $(grid_ttfts); do
         run_point "$TTFT" "$CONC"
     done
     if [ "$TTFT" = 0 ] && [ "$FLAMEGRAPH" = 1 ] && grid_has 0 128; then
-        if nm "/proc/$GW_PID/exe" 2>/dev/null | grep -q ' [tT] '; then
+        # Same >100 symbol threshold as the baseline's require_symbols: a
+        # nearly-stripped binary would render a noise flamegraph, not a
+        # useful one. Soft skip, unlike the baseline - the throughput
+        # numbers stand on their own.
+        SYMS=$(nm "/proc/$GW_PID/exe" 2>/dev/null | grep -c ' [tT] ') || SYMS=0
+        if [ "$SYMS" -gt 100 ]; then
             flamegraph_point 128 "$ENTRANT_NAME c=128 0-delay (4 pinned cores)"
         else
-            echo "WARNING: target binary is stripped or unreadable; skipping flamegraph" >&2
+            echo "WARNING: target binary is stripped or unreadable ($SYMS text symbols); skipping flamegraph" >&2
         fi
     fi
 done

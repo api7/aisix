@@ -28,8 +28,12 @@ DEFAULT_BODY='{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hello
 BODY="${BODY:-$DEFAULT_BODY}"
 AUTH_HEADER="${AUTH_HEADER:-authorization: Bearer bench-token}"
 # Same header shape the public board's engine sends for the chosen dialect.
+# json.dumps, not string splicing: a quote or backslash in the header value
+# must not produce an invalid header list the loadgen then misparses.
 if [ -z "${OTB_LOADGEN_HEADERS:-}" ]; then
-    OTB_LOADGEN_HEADERS='[["'"${AUTH_HEADER%%:*}"'","'"${AUTH_HEADER#*: }"'"]]'
+    OTB_LOADGEN_HEADERS=$(python3 -c 'import json,sys
+k, _, v = sys.argv[1].partition(":")
+print(json.dumps([[k.strip(), v.strip()]]))' "$AUTH_HEADER")
 fi
 export OTB_LOADGEN_HEADERS
 
@@ -237,8 +241,13 @@ grid_ttfts() { # distinct delay tiers, in grid order
 }
 
 grid_concs() { # grid_concs <ttft>  -> the tier's concurrencies, in grid order
+    # if, not &&: with && the function returns 1 whenever the LAST grid
+    # element is another tier's, and a `conc=$(grid_concs 0 | ...)`
+    # assignment under set -e + pipefail then kills the run silently.
     local t="$1" s
-    for s in $GRID; do [ "${s%%:*}" = "$t" ] && printf '%s\n' "${s##*:}"; done
+    for s in $GRID; do
+        if [ "${s%%:*}" = "$t" ]; then printf '%s\n' "${s##*:}"; fi
+    done
 }
 
 grid_has() { # grid_has <ttft> <conc>
@@ -322,7 +331,7 @@ meta_method_json() {
     "grid": "$GRID", "body": $BODY_JSON,
     "path": "$REQ_PATH", "clk_tck": $CLK_TCK, "nofile": $(ulimit -n),
     "loadgen_headers": $HEADERS_JSON,
-    "flamegraph": {"enabled": $([ "$FLAMEGRAPH" = 1 ] && echo true || echo false), "freq_hz": 499, "callgraph": "dwarf", "window_s": 25, "conc": 128}
+    "flamegraph": {"enabled": $([ "$FLAMEGRAPH" = 1 ] && grid_has 0 128 && echo true || echo false), "freq_hz": 499, "callgraph": "dwarf", "window_s": 25, "conc": 128}
   }
 EOF
 }
