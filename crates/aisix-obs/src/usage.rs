@@ -260,6 +260,9 @@ pub struct UsageEvent {
     ///   upstream response was just stored
     /// - `"disabled"` — no enabled `cache_policy` in snapshot for
     ///   this env, the cache gate was closed
+    /// - `"bypass"` — the gate was open but the caller sent
+    ///   `Cache-Control: no-cache`, so the read path was skipped and
+    ///   the upstream served the request (the entry was refreshed)
     ///
     /// Empty string = cache state unknown / not applicable (error
     /// paths that fail before the cache lookup). cp-api persists
@@ -286,6 +289,19 @@ pub struct UsageEvent {
     /// for the full pricing-derivation story.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub cache_hit_saved_output_tokens: u32,
+
+    /// On a cache hit, which matching layer served it: `"exact"` (a
+    /// byte-identical request) or `"semantic"` (an
+    /// embedding-similarity match above the policy's threshold).
+    /// Empty on every other outcome — `/dp/telemetry` binds JSON
+    /// leniently, so older CP images ignore the unknown field.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub cache_hit_layer: String,
+
+    /// On a semantic cache hit, the cosine similarity between the
+    /// request and the stored entry, in `[0, 1]`. `None` otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_similarity: Option<f32>,
 
     /// Which client-facing protocol the request used:
     ///

@@ -4824,8 +4824,12 @@ data: [DONE]\n\n";
         // The entry must live in the redis instance and ONLY there —
         // a dispatch bug that wrote to the memory instance would
         // still produce a "hit" above, so pin the instance directly.
+        // The stored key carries the gate's scope: policy id, purge
+        // generation 0, and (scope defaults to `api_key`) the caller.
         let req: aisix_gateway::ChatFormat = serde_json::from_value(body).unwrap();
-        let key = CacheKey::from_request(&req).fingerprint();
+        let key = CacheKey::from_request(&req)
+            .with_scope("cp-id-redis-cache", 0, Some("key-id-1"))
+            .fingerprint();
         assert!(
             redis_standin.get(&key).await.unwrap().is_some(),
             "cache entry must be written to the policy's redis backend",

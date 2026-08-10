@@ -3,6 +3,7 @@ import { connect } from "node:net";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
+  ProxyClient,
   SeedClient,
   spawnApp,
   startOpenAiUpstream,
@@ -88,10 +89,6 @@ async function seedApp(
       provider_key_id: pk.id,
     });
   }
-  await seed.createApiKey({
-    key_hash: CALLER_KEY_HASH,
-    allowed_models: [modelAlias, canaryAlias],
-  });
   // Order matters: redis policy FIRST, canary memory policy SECOND.
   await seed.createCachePolicy({
     name: `${modelAlias}-redis-policy`,
@@ -105,7 +102,25 @@ async function seedApp(
     backend: "memory",
     applies_to: `model:${canaryAlias}`,
   });
+  // The caller key is seeded LAST: once it authenticates, revision
+  // order implies every resource above is in the snapshot
+  // (tests/e2e/AGENTS.md).
+  await seed.createApiKey({
+    key_hash: CALLER_KEY_HASH,
+    allowed_models: [modelAlias, canaryAlias],
+  });
   return { app };
+}
+
+/** Non-throwing readiness gate per tests/e2e/AGENTS.md: the caller key
+ *  (seeded last) authenticating via listModels proves the whole seed
+ *  batch is live; a transient non-200 is the normal pre-propagation
+ *  state and nothing else is swallowed. */
+async function waitSeedLive(proxyUrl: string): Promise<void> {
+  const probe = new ProxyClient(proxyUrl, CALLER_PLAINTEXT);
+  await waitConfigPropagation(
+    async () => (await probe.listModels()).status === 200,
+  );
 }
 
 function chatRequest(
@@ -207,16 +222,19 @@ describe("cache policy backend=redis with a configured redis is shared across DP
     const redisExtra = {
       cache: { backend: "memory", redis: { url: REDIS_URL } },
     };
-    // Two DP instances sharing one redis. A hit on the instance that
-    // never served the original request proves the entry really lives
-    // in redis — an (incorrect) memory-cache write could only produce
-    // hits on the same instance.
+    // Two DP replicas of ONE environment (same etcd prefix, so the
+    // same policy/api-key resource identities) sharing one redis. A
+    // hit on the instance that never served the original request
+    // proves the entry really lives in redis — an (incorrect)
+    // memory-cache write could only produce hits on the same instance.
+    // Cache keys are scoped by resource ids (policy id, caller id), so
+    // replicas MUST share the resource rows, exactly as they do behind
+    // one environment in production.
     appA = await spawnApp({ extra: redisExtra });
-    appB = await spawnApp({ extra: redisExtra });
+    appB = await spawnApp({ extra: redisExtra, etcdPrefix: appA.etcdPrefix });
     await seedApp(appA, upstream.baseUrl, "cache-redis-shared", "canary-a");
-    await seedApp(appB, upstream.baseUrl, "cache-redis-shared", "canary-b");
-    await waitCanaryPolicyLive(appA.proxyUrl, "canary-a");
-    await waitCanaryPolicyLive(appB.proxyUrl, "canary-b");
+    await waitSeedLive(appA.proxyUrl);
+    await waitSeedLive(appB.proxyUrl);
   });
 
   afterAll(async () => {

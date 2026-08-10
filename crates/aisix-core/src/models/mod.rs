@@ -37,7 +37,7 @@ pub mod snapshot;
 
 pub use a2a_agent::{A2aAgent, A2aAuthType, A2aProtocolVersion};
 pub use apikey::ApiKey;
-pub use cache_policy::{AppliesTo, CacheBackend, CachePolicy};
+pub use cache_policy::{AppliesTo, CacheBackend, CachePolicy, CacheScope, SemanticCacheConfig};
 pub use embedding::EmbeddingConfig;
 pub use ensemble::{EnsembleConfig, Judge, PanelMember};
 pub use guardrail::{

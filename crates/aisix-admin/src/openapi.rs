@@ -3991,7 +3991,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
     },
     {
       "name": "Cache Policies",
-      "description": "Semantic cache policies attached to models."
+      "description": "Response cache rules: exact-match caching, with optional embedding-similarity (semantic) matching per policy."
     },
     {
       "name": "Observability Exporters",
@@ -4257,6 +4257,10 @@ fn add_variant_titles(doc: &mut Value) {
         (
             "/components/schemas/BedrockLatencyMode/oneOf",
             &["Serial", "Timed"],
+        ),
+        (
+            "/components/schemas/CacheScope/oneOf",
+            &["Per API key", "Environment-wide"],
         ),
         (
             "/components/schemas/Guardrail/oneOf",

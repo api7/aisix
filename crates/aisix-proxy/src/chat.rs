@@ -16,9 +16,10 @@
 //!    line. Errors surface via [`ProxyError`] which carries the right
 //!    status, error type, and (for rate-limits) Retry-After.
 
-use aisix_cache::{Cache, CacheKey};
-use aisix_core::AppliedGuardrail;
-use aisix_gateway::{BridgeError, ChatFormat};
+use aisix_cache::{semantic_prompt_text, Cache, CacheKey, SemanticCacheStore};
+use aisix_core::models::{CacheScope, SemanticCacheConfig};
+use aisix_core::{AisixSnapshot, AppliedGuardrail};
+use aisix_gateway::{BridgeError, ChatFormat, ChatResponse};
 use aisix_guardrails::GuardrailVerdict;
 use aisix_obs::{
     content_capture_cap, AccessLog, CapturedContent, LatencyLabels, Metrics, UsageEvent,
@@ -44,8 +45,17 @@ use crate::routing::{is_retryable, resolve_attempt_models, AttemptModel, Routing
 use crate::state::ProxyState;
 
 /// Header set on every non-streaming response indicating whether the
-/// response came from the cache (`hit`) or the upstream (`miss`).
+/// response came from the cache (`hit`), the upstream (`miss`), or the
+/// upstream because the caller sent `Cache-Control: no-cache` (`bypass`).
 pub const CACHE_HEADER: &str = "x-aisix-cache";
+
+/// On a cache hit, which matching layer served it: `exact` or
+/// `semantic`. Absent on miss/bypass.
+pub const CACHE_LAYER_HEADER: &str = "x-aisix-cache-layer";
+
+/// On a semantic cache hit, the cosine similarity between the request
+/// and the stored entry (4 decimal places). Absent otherwise.
+pub const CACHE_SIMILARITY_HEADER: &str = "x-aisix-cache-similarity";
 
 struct DispatchFailure {
     model_id: Option<String>,
@@ -230,6 +240,11 @@ pub async fn chat_completions(
                         finish_reason: success.finish_reason.clone(),
                         bypass_reason: success.bypass_reason.clone().unwrap_or_default(),
                         cache_status: success.cache_status.as_str().to_string(),
+                        cache_hit_layer: success
+                            .cache_hit_layer
+                            .map(|l| l.as_str().to_string())
+                            .unwrap_or_default(),
+                        cache_similarity: success.cache_similarity,
                         cache_hit_saved_input_tokens: success.cache_hit_saved_input_tokens,
                         cache_hit_saved_output_tokens: success.cache_hit_saved_output_tokens,
                         // Non-streaming: nothing was streamed, so there is no
@@ -502,6 +517,10 @@ pub async fn chat_completions(
                             finish_reason: c.finish_reason,
                             bypass_reason: c.bypass_reason,
                             cache_status: c.cache_status.as_str().to_string(),
+                            // Output-blocked responses were upstream-served,
+                            // never cache hits — no layer / similarity.
+                            cache_hit_layer: String::new(),
+                            cache_similarity: None,
                             cache_hit_saved_input_tokens: 0,
                             cache_hit_saved_output_tokens: 0,
                             upstream_ttft_ms: 0,
@@ -620,6 +639,12 @@ struct Success {
     /// the dashboard's /logs column. See `aisix-core::CachePolicy`
     /// (Stage 2) and `aisix-cache::Cache` for the source of truth.
     cache_status: CacheStatus,
+    /// On a cache hit, the matching layer that served it. `None` on
+    /// every other outcome. Lands on `usage_events.cache_hit_layer`.
+    cache_hit_layer: Option<CacheHitLayer>,
+    /// On a semantic cache hit, the request↔entry cosine similarity.
+    /// `None` otherwise. Lands on `usage_events.cache_similarity`.
+    cache_similarity: Option<f32>,
     /// True when telemetry emission is wired into the SSE stream's
     /// on_complete callback (streaming path). The top-level handler
     /// must NOT call `emit_usage_event` again — that would emit one
@@ -680,6 +705,10 @@ pub(crate) enum CacheStatus {
     /// Cache consulted, entry returned without an upstream call. Maps
     /// to `x-aisix-cache: hit` on the response header.
     Hit,
+    /// The gate was open but the caller sent `Cache-Control: no-cache`,
+    /// so the read path was skipped and the upstream served the
+    /// request. Maps to `x-aisix-cache: bypass` on the response header.
+    Bypass,
 }
 
 impl CacheStatus {
@@ -689,6 +718,208 @@ impl CacheStatus {
             CacheStatus::Disabled => "disabled",
             CacheStatus::Miss => "miss",
             CacheStatus::Hit => "hit",
+            CacheStatus::Bypass => "bypass",
+        }
+    }
+}
+
+/// Which matching layer served a cache hit. Surfaced on the
+/// [`CACHE_LAYER_HEADER`] response header and the usage event's
+/// `cache_hit_layer` field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CacheHitLayer {
+    /// The exact-fingerprint (L1) layer: a byte-identical request.
+    Exact,
+    /// The embedding-similarity (L2) layer: a semantically similar
+    /// request cleared the policy's threshold.
+    Semantic,
+}
+
+impl CacheHitLayer {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            CacheHitLayer::Exact => "exact",
+            CacheHitLayer::Semantic => "semantic",
+        }
+    }
+}
+
+/// Request-side `Cache-Control` directives the gate honors (per-request
+/// bypass): `no-cache` skips the read path but still stores the fresh
+/// response; `no-store` suppresses the write. Anything else in the
+/// header is ignored.
+#[derive(Debug, Clone, Copy, Default)]
+struct CacheControlDirectives {
+    no_cache: bool,
+    no_store: bool,
+}
+
+fn cache_control_directives(headers: &axum::http::HeaderMap) -> CacheControlDirectives {
+    let mut out = CacheControlDirectives::default();
+    for value in headers.get_all(axum::http::header::CACHE_CONTROL) {
+        let Ok(s) = value.to_str() else { continue };
+        for token in s.split(',') {
+            // Token match only — RFC 9111 request directives we honor
+            // carry no arguments, and an argument form (`no-cache=...`)
+            // deliberately does NOT match rather than over-matching.
+            let token = token.trim();
+            if token.eq_ignore_ascii_case("no-cache") {
+                out.no_cache = true;
+            } else if token.eq_ignore_ascii_case("no-store") {
+                out.no_store = true;
+            }
+        }
+    }
+    out
+}
+
+/// Everything the semantic (L2) layer needs for this request, resolved
+/// once at the gate: the store for the policy's backend, the policy's
+/// semantic config, the resolved embedding model, the candidate
+/// partition, and the canonical request text to embed. Built only when
+/// the matched policy configures semantic matching, the embedding model
+/// resolves, AND the request is embeddable — `None` runs the policy
+/// exact-only.
+struct SemanticGateCtx {
+    store: Arc<dyn SemanticCacheStore>,
+    cfg: SemanticCacheConfig,
+    /// Resolved at gate time so the partition can carry the embedding
+    /// model's identity, and so a dangling reference is one metric'd
+    /// warn instead of a per-lookup surprise.
+    embed_entry: Arc<aisix_core::ResourceEntry<aisix_core::Model>>,
+    policy_id: String,
+    policy_name: String,
+    generation: u32,
+    /// Candidate partition: the request scope fingerprint PLUS the
+    /// embedding model's resource id + dimensions. Vectors from two
+    /// different embedding models live in unrelated spaces — cosine
+    /// across them is meaningless — so swapping a policy's
+    /// `embedding_model` (even at equal dimensions) must orphan the old
+    /// entries rather than compare against them.
+    scope_fp: String,
+    text: String,
+}
+
+/// Embed the request text for the cache's semantic layer. `None` on any
+/// failure — the cache is an optimization layer, so a broken embedding
+/// path degrades to an ordinary miss instead of failing the request.
+async fn cache_semantic_embed(
+    state: &ProxyState,
+    snapshot: &AisixSnapshot,
+    sem: &SemanticGateCtx,
+    request_id: &str,
+) -> Option<Vec<f32>> {
+    let started = Instant::now();
+    let texts = [sem.text.clone()];
+    match crate::semantic::embed_texts(
+        state,
+        snapshot,
+        &sem.embed_entry,
+        sem.cfg.embedding_timeout(),
+        request_id,
+        &texts,
+    )
+    .await
+    {
+        Ok(vectors) => {
+            state
+                .metrics
+                .record_cache_semantic_embed(&sem.policy_name, started.elapsed());
+            vectors.into_iter().next()
+        }
+        Err(err) => {
+            tracing::warn!(
+                target: "aisix::cache",
+                policy_name = %sem.policy_name,
+                error = %err,
+                "cache semantic embedding call failed; request proceeds uncached",
+            );
+            state
+                .metrics
+                .record_cache_semantic_embed_failure(&sem.policy_name, "embed");
+            None
+        }
+    }
+}
+
+/// Read path of the cache gate: exact (L1) lookup first, then — on an
+/// exact miss, when the policy configures it — the semantic (L2)
+/// similarity lookup. A semantic hit backfills the exact layer so the
+/// same wording takes the cheap L1 path next time.
+///
+/// `semantic_embedding` hands the L2 request embedding back to the
+/// caller on a miss, so the post-upstream write reuses it instead of
+/// paying a second embedding call.
+#[allow(clippy::too_many_arguments)]
+async fn resolve_cache_hit(
+    state: &ProxyState,
+    snapshot: &AisixSnapshot,
+    cache: &Arc<dyn Cache>,
+    key: &str,
+    ttl: Option<Duration>,
+    semantic_gate: Option<&SemanticGateCtx>,
+    request_id: &str,
+    semantic_embedding: &mut Option<Vec<f32>>,
+) -> Option<(ChatResponse, CacheHitLayer, Option<f32>)> {
+    match cache.get(key).await {
+        Ok(Some(cached)) => return Some((cached, CacheHitLayer::Exact, None)),
+        Ok(None) => {}
+        Err(err) => {
+            tracing::warn!(error = %err, key = %key, "cache lookup failed");
+        }
+    }
+    let sem = semantic_gate?;
+    let vector = cache_semantic_embed(state, snapshot, sem, request_id).await?;
+    match sem
+        .store
+        .lookup(
+            &sem.policy_id,
+            sem.generation,
+            &sem.scope_fp,
+            &vector,
+            sem.cfg.threshold,
+        )
+        .await
+    {
+        Ok(Some(hit)) => {
+            // Backfill TTL is capped at the matched entry's own
+            // remaining lifetime: a paraphrase near expiry must not
+            // grant the stored response a fresh full TTL, or repeated
+            // paraphrases could keep stale data alive indefinitely.
+            let remaining = hit
+                .expires_at
+                .saturating_duration_since(std::time::Instant::now());
+            let backfill_ttl = ttl.map(|t| t.min(remaining)).unwrap_or(remaining);
+            if !backfill_ttl.is_zero() {
+                if let Err(err) = cache
+                    .put_with_ttl(key, hit.response.clone(), backfill_ttl)
+                    .await
+                {
+                    tracing::warn!(error = %err, key = %key, "cache backfill write failed");
+                }
+            }
+            // 4-dp similarity everywhere it surfaces (header, usage
+            // event) so the stored value matches what callers see.
+            let similarity = (hit.similarity * 10_000.0).round() / 10_000.0;
+            Some((hit.response, CacheHitLayer::Semantic, Some(similarity)))
+        }
+        Ok(None) => {
+            *semantic_embedding = Some(vector);
+            None
+        }
+        Err(err) => {
+            tracing::warn!(
+                target: "aisix::cache",
+                policy_name = %sem.policy_name,
+                error = %err,
+                "semantic cache lookup failed",
+            );
+            state
+                .metrics
+                .record_cache_semantic_store_failure(&sem.policy_name, "lookup");
+            // The embedding is still good — keep it for the write path.
+            *semantic_embedding = Some(vector);
+            None
         }
     }
 }
@@ -1706,6 +1937,8 @@ async fn dispatch(
                         // local at that point. Tracking issue to be filed
                         // alongside the streaming-cache implementation.
                         cache_status: CacheStatus::Disabled.as_str().to_string(),
+                        cache_hit_layer: String::new(),
+                        cache_similarity: None,
                         cache_hit_saved_input_tokens: 0,
                         cache_hit_saved_output_tokens: 0,
                         upstream_ttft_ms: comp.upstream_ttft_ms,
@@ -1851,6 +2084,8 @@ async fn dispatch(
             // crates/aisix-cache/src/lib.rs. Always surface as
             // `disabled` on the streaming path.
             cache_status: CacheStatus::Disabled,
+            cache_hit_layer: None,
+            cache_similarity: None,
             cache_hit_saved_input_tokens: 0,
             cache_hit_saved_output_tokens: 0,
             telemetry_handled_by_stream: true,
@@ -1918,21 +2153,135 @@ async fn dispatch(
         .and(matched_policy.as_ref())
         .map(|entry| Duration::from_secs(u64::from(entry.value.ttl_seconds)));
 
+    // Per-request bypass: standard `Cache-Control` request directives.
+    // `no-cache` skips the read path (both layers) but still refreshes
+    // the stored entry on success; `no-store` suppresses the writes.
+    let cc = cache_control_directives(client.headers.as_ref());
+
     // Cache lookup keyed on the *virtual* model name so a re-request
-    // hits the cache regardless of which target served the original.
-    let cache_key = policy_cache
-        .as_ref()
-        .map(|_| CacheKey::from_request(req).fingerprint());
+    // hits the cache regardless of which target served the original,
+    // scoped by the matched policy (id + purge generation) and — under
+    // `scope: api_key` — by the caller, so entries never leak across
+    // policies, purges, or callers.
+    let cache_key_full = match (policy_cache.as_ref(), matched_policy.as_ref()) {
+        (Some(_), Some(entry)) => {
+            let scope_api_key = match entry.value.scope {
+                CacheScope::ApiKey => Some(auth.entry.id.as_str()),
+                CacheScope::Env => None,
+            };
+            Some(CacheKey::from_request(req).with_scope(
+                &entry.id,
+                entry.value.purge_generation,
+                scope_api_key,
+            ))
+        }
+        _ => None,
+    };
+    let cache_key = cache_key_full.as_ref().map(|k| k.fingerprint());
 
     let cache_status = if policy_cache.is_some() {
-        CacheStatus::Miss
+        if cc.no_cache {
+            CacheStatus::Bypass
+        } else {
+            CacheStatus::Miss
+        }
     } else {
         CacheStatus::Disabled
     };
 
+    // Semantic (L2) context — present only when the matched policy
+    // carries a `semantic` block, its backend has a semantic store, and
+    // this request is embeddable (all-text messages). Absent, the
+    // policy runs exact-only.
+    let semantic_gate: Option<SemanticGateCtx> =
+        match (matched_policy.as_ref(), cache_key_full.as_ref()) {
+            (Some(entry), Some(key_full)) => entry.value.semantic.as_ref().and_then(|cfg| {
+                let store = state
+                    .cache
+                    .as_ref()?
+                    .semantic_for_policy_backend(entry.value.backend, &entry.id, &entry.value.name)?
+                    .clone();
+                let text = semantic_prompt_text(req)?;
+                let embed_entry = match snapshot.models.get_by_name(&cfg.embedding_model) {
+                    Some(e) if e.value.is_embedding() => e.clone(),
+                    other => {
+                        // A stable config error, not a per-request one:
+                        // log once per policy, count every request.
+                        if state
+                            .cache
+                            .as_ref()
+                            .is_some_and(|c| c.semantic_resolve_warn_once(&entry.id))
+                        {
+                            tracing::warn!(
+                                target: "aisix::cache",
+                                policy_name = %entry.value.name,
+                                embedding_model = %cfg.embedding_model,
+                                found = other.is_some(),
+                                "cache policy references a missing or non-embedding \
+                                 embedding_model; semantic matching is skipped until \
+                                 the reference resolves",
+                            );
+                        }
+                        state
+                            .metrics
+                            .record_cache_semantic_embed_failure(&entry.value.name, "resolve");
+                        return None;
+                    }
+                };
+                let dims = embed_entry
+                    .value
+                    .embedding
+                    .as_ref()
+                    .map(|e| e.dimensions)
+                    .unwrap_or(0);
+                // Partition = scope fingerprint + embedding model
+                // identity (resource id, upstream model name, and
+                // dimensions — the upstream name catches an in-place
+                // `model_name` edit that keeps id + dims): see the
+                // `SemanticGateCtx::scope_fp` docs.
+                let scope_fp = format!(
+                    "{}:{}:{}:{}",
+                    key_full.scope_fingerprint(),
+                    embed_entry.id,
+                    embed_entry.value.model_name.as_deref().unwrap_or(""),
+                    dims
+                );
+                Some(SemanticGateCtx {
+                    store,
+                    cfg: cfg.clone(),
+                    embed_entry,
+                    policy_id: entry.id.clone(),
+                    policy_name: entry.value.name.clone(),
+                    generation: entry.value.purge_generation,
+                    scope_fp,
+                    text,
+                })
+            }),
+            _ => None,
+        };
+
+    // Handed from the read path (L2 miss) to the write path so a full
+    // miss costs exactly one embedding call.
+    let mut semantic_embedding: Option<Vec<f32>> = None;
+
     if let (Some(cache), Some(key)) = (policy_cache.as_ref(), cache_key.as_ref()) {
-        match cache.get(key).await {
-            Ok(Some(mut cached)) => {
+        let resolved = if cc.no_cache {
+            None
+        } else {
+            resolve_cache_hit(
+                state,
+                &snapshot,
+                cache,
+                key,
+                matched_policy_ttl,
+                semantic_gate.as_ref(),
+                request_id,
+                &mut semantic_embedding,
+            )
+            .await
+        };
+        match resolved {
+            Some((mut cached, hit_layer, hit_similarity)) => {
                 reservation.commit_tokens(0).await;
                 // #448: a cache hit is client-visible output just like a
                 // fresh upstream response, so it must run output guardrails
@@ -2061,10 +2410,29 @@ async fn dispatch(
                         cap as usize,
                     )
                 });
+                state.metrics.record_cache_event(
+                    matched_policy
+                        .as_ref()
+                        .map(|e| e.value.name.as_str())
+                        .unwrap_or_default(),
+                    match hit_layer {
+                        CacheHitLayer::Exact => "hit_exact",
+                        CacheHitLayer::Semantic => "hit_semantic",
+                    },
+                );
                 let mut response = Json(render_response(now, cached, &req.model)).into_response();
                 response
                     .headers_mut()
                     .insert(CACHE_HEADER, HeaderValue::from_static("hit"));
+                response.headers_mut().insert(
+                    CACHE_LAYER_HEADER,
+                    HeaderValue::from_static(hit_layer.as_str()),
+                );
+                if let Some(similarity) = hit_similarity {
+                    if let Ok(v) = HeaderValue::try_from(format!("{similarity:.4}")) {
+                        response.headers_mut().insert(CACHE_SIMILARITY_HEADER, v);
+                    }
+                }
                 return Ok(Success {
                     response,
                     provider: provider_label,
@@ -2091,6 +2459,8 @@ async fn dispatch(
                     cost_usd: 0.0,
                     bypass_reason: bypass_reason.clone(),
                     cache_status: CacheStatus::Hit,
+                    cache_hit_layer: Some(hit_layer),
+                    cache_similarity: hit_similarity,
                     // The whole point of #88: cache hit replays the
                     // upstream's prompt + completion tokens. Surfacing
                     // them as a dedicated counter (rather than relying
@@ -2110,9 +2480,17 @@ async fn dispatch(
                     captured_content,
                 });
             }
-            Ok(None) => {}
-            Err(err) => {
-                tracing::warn!(error = %err, key = %key, "cache lookup failed");
+            None => {
+                // Consulted-but-not-served: count the outcome now
+                // (`miss` or `bypass`) so the metric reflects every gate
+                // decision, including requests that later fail upstream.
+                state.metrics.record_cache_event(
+                    matched_policy
+                        .as_ref()
+                        .map(|e| e.value.name.as_str())
+                        .unwrap_or_default(),
+                    cache_status.as_str(),
+                );
             }
         }
     }
@@ -2576,13 +2954,55 @@ async fn dispatch(
     // not the cache backend's global fallback. Backends without
     // per-entry support (defined via `Cache::put_with_ttl`'s default
     // impl) silently fall back to `put`.
-    if let (Some(ttl), Some(cache), Some(key)) = (
+    if let (Some(ttl), Some(cache), Some(key), false) = (
         matched_policy_ttl,
         policy_cache.as_ref(),
         cache_key.as_ref(),
+        // `Cache-Control: no-store` suppresses both layers' writes.
+        cc.no_store,
     ) {
         if let Err(err) = cache.put_with_ttl(key, upstream.clone(), ttl).await {
             tracing::warn!(error = %err, key = %key, "cache write failed");
+        }
+        // Semantic (L2) write. Reuses the read path's embedding; when
+        // the read path was bypassed (`no-cache`) compute one now so
+        // the refreshed entry is findable by similarity too. A `None`
+        // without `no-cache` means the read path already tried and
+        // failed to embed this request — don't pay a second doomed call.
+        if let Some(sem) = semantic_gate.as_ref() {
+            let vector = match semantic_embedding.take() {
+                Some(v) => Some(v),
+                None if cc.no_cache => {
+                    cache_semantic_embed(state, &snapshot, sem, request_id).await
+                }
+                None => None,
+            };
+            if let Some(vector) = vector {
+                if let Err(err) = sem
+                    .store
+                    .store(
+                        &sem.policy_id,
+                        sem.generation,
+                        &sem.scope_fp,
+                        key,
+                        vector,
+                        upstream.clone(),
+                        ttl,
+                        sem.cfg.max_entries,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        target: "aisix::cache",
+                        policy_name = %sem.policy_name,
+                        error = %err,
+                        "semantic cache write failed",
+                    );
+                    state
+                        .metrics
+                        .record_cache_semantic_store_failure(&sem.policy_name, "store");
+                }
+            }
         }
     }
 
@@ -2599,13 +3019,22 @@ async fn dispatch(
     });
 
     let mut response = Json(render_response(now, upstream, &req.model)).into_response();
-    if matches!(cache_status, CacheStatus::Miss) {
-        // Miss header only when the cache was actually consulted —
-        // policy-disabled requests have no cache header at all so a
-        // user can tell at a glance whether the gate was open.
-        response
-            .headers_mut()
-            .insert(CACHE_HEADER, HeaderValue::from_static("miss"));
+    // Header only when the gate was open — policy-disabled requests have
+    // no cache header at all so a user can tell at a glance whether the
+    // gate ran. `bypass` = the caller's `Cache-Control: no-cache`
+    // skipped the read path.
+    match cache_status {
+        CacheStatus::Miss => {
+            response
+                .headers_mut()
+                .insert(CACHE_HEADER, HeaderValue::from_static("miss"));
+        }
+        CacheStatus::Bypass => {
+            response
+                .headers_mut()
+                .insert(CACHE_HEADER, HeaderValue::from_static("bypass"));
+        }
+        _ => {}
     }
 
     // Header presence is the wire signal for "routing happened" —
@@ -2637,6 +3066,8 @@ async fn dispatch(
         cost_usd,
         bypass_reason,
         cache_status,
+        cache_hit_layer: None,
+        cache_similarity: None,
         // Cache-saved counters are zero on the upstream-served path —
         // the request *did* hit the upstream, no work was saved.
         cache_hit_saved_input_tokens: 0,
@@ -3260,6 +3691,8 @@ async fn dispatch_ensemble(
             finish_reason: String::new(),
             bypass_reason,
             cache_status: CacheStatus::Disabled,
+            cache_hit_layer: None,
+            cache_similarity: None,
             cache_hit_saved_input_tokens: 0,
             cache_hit_saved_output_tokens: 0,
             // Per-sub-call usage is emitted from on_complete; suppress the
@@ -3517,6 +3950,8 @@ async fn dispatch_ensemble(
         cost_usd: 0.0,
         bypass_reason,
         cache_status: CacheStatus::Disabled,
+        cache_hit_layer: None,
+        cache_similarity: None,
         cache_hit_saved_input_tokens: 0,
         cache_hit_saved_output_tokens: 0,
         // Telemetry already emitted per-sub-call above; suppress the
@@ -3706,6 +4141,8 @@ fn emit_usage_event(
         redacted_entity_counts: extras.redacted_entity_counts,
         guardrail_monitor_hits: extras.guardrail_monitor_hits,
         cache_status: extras.cache_status,
+        cache_hit_layer: extras.cache_hit_layer,
+        cache_similarity: extras.cache_similarity,
         cache_hit_saved_input_tokens: extras.cache_hit_saved_input_tokens,
         cache_hit_saved_output_tokens: extras.cache_hit_saved_output_tokens,
         upstream_ttft_ms: extras.upstream_ttft_ms,
@@ -3814,10 +4251,16 @@ struct UsageExtras {
     /// `dpmgr_usage_events.guardrail_bypassed_reason`. Default empty
     /// string = no bypass; cp-api stores NULL in that case.
     bypass_reason: String,
-    /// Lowercased `CacheStatus` (`"hit"` / `"miss"` / `"disabled"`).
-    /// Empty default for the error path where the cache lookup never
-    /// fired. Goes onto `dpmgr_usage_events.cache_status`.
+    /// Lowercased `CacheStatus` (`"hit"` / `"miss"` / `"disabled"` /
+    /// `"bypass"`). Empty default for the error path where the cache
+    /// lookup never fired. Goes onto `dpmgr_usage_events.cache_status`.
     cache_status: String,
+    /// On a cache hit, the matching layer (`"exact"` / `"semantic"`).
+    /// Empty otherwise. Goes onto `usage_events.cache_hit_layer`.
+    cache_hit_layer: String,
+    /// On a semantic cache hit, the request↔entry cosine similarity.
+    /// `None` otherwise. Goes onto `usage_events.cache_similarity`.
+    cache_similarity: Option<f32>,
     /// On a cache HIT, the cached response's prompt + completion
     /// tokens. Zero otherwise. cp-api derives `cost_saved_usd` on
     /// ingest from these + its pricing catalog (see #88).
