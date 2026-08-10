@@ -251,14 +251,40 @@ pub async fn a2a_agent_card(
             return (StatusCode::BAD_GATEWAY, err.to_string()).into_response();
         }
     };
-    // Rewrite the advertised service endpoint to the gateway so downstream
+    // Rewrite the advertised service endpoints to the gateway so downstream
     // callers route subsequent requests through `/a2a/<agent>`. Derived from
     // the request's Host header (and forwarded scheme) since the gateway's
     // public URL is not otherwise known here.
     if let Some(base) = gateway_base(&headers) {
-        card.url = format!("{base}/a2a/{agent}");
+        rewrite_card_urls(&mut card, &format!("{base}/a2a/{agent}"));
     }
     axum::Json(card).into_response()
+}
+
+/// Point every service URL the card advertises at the gateway.
+///
+/// The top-level `url` is what a 0.3 caller reads. A 1.0 caller instead picks
+/// its endpoint out of `supportedInterfaces` (`additionalInterfaces` on a 0.3
+/// card), so rewriting only the top level leaves it reading the upstream
+/// address off the card and calling the agent directly — no auth, no quota, no
+/// usage, and the internal address handed to the caller on the way past.
+///
+/// Entries are rewritten in place rather than filtered out: this gateway serves
+/// JSON-RPC over HTTP only, so an entry naming a transport it does not proxy
+/// now points somewhere that will reject the caller. That is the intended
+/// trade — failing loudly beats silently bypassing governance.
+fn rewrite_card_urls(card: &mut aisix_a2a::AgentCard, gateway_url: &str) {
+    card.url = gateway_url.to_string();
+    for key in ["supportedInterfaces", "additionalInterfaces"] {
+        let Some(serde_json::Value::Array(interfaces)) = card.rest.get_mut(key) else {
+            continue;
+        };
+        for interface in interfaces {
+            if let Some(url) = interface.get_mut("url") {
+                *url = serde_json::Value::String(gateway_url.to_string());
+            }
+        }
+    }
 }
 
 /// Reconstruct the gateway's public base (`scheme://host`) from request
@@ -367,6 +393,49 @@ mod tests {
     #[test]
     fn gateway_base_is_none_without_host() {
         assert_eq!(gateway_base(&HeaderMap::new()), None);
+    }
+
+    #[test]
+    fn card_rewrite_leaves_no_upstream_url_for_a_caller_to_follow() {
+        // Only the top-level `url` used to be rewritten. A 1.0 caller reads its
+        // endpoint out of `supportedInterfaces` instead, so it went straight to
+        // the upstream — past auth, quota and usage — and read the internal
+        // address off the card on the way (#911).
+        let mut card: aisix_a2a::AgentCard = serde_json::from_str(
+            r#"{
+                "name": "Agent",
+                "url": "https://internal.upstream/a2a",
+                "supportedInterfaces": [
+                    {"url": "https://internal.upstream/a2a", "protocolBinding": "JSONRPC"},
+                    {"url": "https://internal.upstream/grpc", "protocolBinding": "GRPC"}
+                ],
+                "additionalInterfaces": [
+                    {"url": "https://internal.upstream/rest", "transport": "HTTP+JSON"}
+                ],
+                "skills": [{"id": "s1"}]
+            }"#,
+        )
+        .unwrap();
+
+        rewrite_card_urls(&mut card, "https://gw.example.com/a2a/billing");
+
+        let served = serde_json::to_string(&card).unwrap();
+        assert!(
+            !served.contains("internal.upstream"),
+            "no upstream address may survive anywhere in the served card:\n{served}"
+        );
+        assert_eq!(card.url, "https://gw.example.com/a2a/billing");
+        for key in ["supportedInterfaces", "additionalInterfaces"] {
+            for interface in card.rest[key].as_array().unwrap() {
+                assert_eq!(interface["url"], "https://gw.example.com/a2a/billing");
+            }
+        }
+        // Everything the gateway does not own is passed through untouched.
+        assert_eq!(card.rest["skills"][0]["id"], "s1");
+        assert_eq!(
+            card.rest["supportedInterfaces"][1]["protocolBinding"],
+            "GRPC"
+        );
     }
 
     // ---- endpoint integration tests: drive the real router via oneshot ----
