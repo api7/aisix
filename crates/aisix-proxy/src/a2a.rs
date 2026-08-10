@@ -227,6 +227,7 @@ pub async fn a2a_agent_card(
     auth: AuthenticatedKey,
     AisixPath(agent): AisixPath<String>,
     State(state): State<ProxyState>,
+    uri: axum::http::Uri,
     headers: HeaderMap,
 ) -> Response {
     let snapshot = state.snapshot.load();
@@ -241,6 +242,21 @@ pub async fn a2a_agent_card(
         )
             .into_response();
     }
+    // Resolved BEFORE the upstream is contacted: without a public base there is
+    // no card this gateway can serve, and finding that out after the fetch only
+    // wastes an upstream round trip.
+    let Some(base) = gateway_base(&uri, &headers) else {
+        tracing::warn!(
+            agent = %agent,
+            "cannot derive the gateway's public base for an A2A agent card; refusing to serve one"
+        );
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "cannot determine the gateway's public address for this agent card",
+        )
+            .into_response();
+    };
+
     let upstream = upstream_from_a2a_agent(&entry.value);
 
     let bridge = HttpBridge::new(upstream);
@@ -251,22 +267,56 @@ pub async fn a2a_agent_card(
             return (StatusCode::BAD_GATEWAY, err.to_string()).into_response();
         }
     };
-    // Rewrite the advertised service endpoint to the gateway so downstream
-    // callers route subsequent requests through `/a2a/<agent>`. Derived from
-    // the request's Host header (and forwarded scheme) since the gateway's
-    // public URL is not otherwise known here.
-    if let Some(base) = gateway_base(&headers) {
-        card.url = format!("{base}/a2a/{agent}");
-    }
+    // Rewrite the advertised service endpoints to the gateway so downstream
+    // callers route subsequent requests through `/a2a/<agent>`.
+    rewrite_card_urls(&mut card, &format!("{base}/a2a/{agent}"));
     axum::Json(card).into_response()
 }
 
-/// Reconstruct the gateway's public base (`scheme://host`) from request
-/// headers: the `Host` header, and `X-Forwarded-Proto` when a proxy set it
-/// (defaulting to `https`). Returns `None` when no Host header is present, in
-/// which case the card's `url` is left as the upstream advertised it.
-fn gateway_base(headers: &HeaderMap) -> Option<String> {
-    let host = headers.get(header::HOST)?.to_str().ok()?;
+/// Point every service URL the card advertises at the gateway.
+///
+/// The top-level `url` is what a 0.3 caller reads. A 1.0 caller instead picks
+/// its endpoint out of `supportedInterfaces` (`additionalInterfaces` on a 0.3
+/// card), so rewriting only the top level leaves it reading the upstream
+/// address off the card and calling the agent directly — no auth, no quota, no
+/// usage, and the internal address handed to the caller on the way past.
+///
+/// Entries are rewritten in place rather than filtered out: this gateway serves
+/// JSON-RPC over HTTP only, so an entry naming a transport it does not proxy
+/// now points somewhere that will reject the caller. That is the intended
+/// trade — failing loudly beats silently bypassing governance.
+fn rewrite_card_urls(card: &mut aisix_a2a::AgentCard, gateway_url: &str) {
+    card.url = gateway_url.to_string();
+    for key in ["supportedInterfaces", "additionalInterfaces"] {
+        let Some(serde_json::Value::Array(interfaces)) = card.rest.get_mut(key) else {
+            continue;
+        };
+        for interface in interfaces {
+            if let Some(url) = interface.get_mut("url") {
+                *url = serde_json::Value::String(gateway_url.to_string());
+            }
+        }
+    }
+}
+
+/// Reconstruct the gateway's public base (`scheme://host`) for a request: the
+/// authority, and `X-Forwarded-Proto` when a proxy set it (defaulting to
+/// `https`).
+///
+/// The authority comes from the `Host` header, falling back to the request
+/// URI's own authority. HTTP/2 carries it there as the `:authority`
+/// pseudo-header and sends no `Host` at all — and this listener negotiates h2
+/// whenever `proxy.tls` is set, so header-only lookup finds nothing on exactly
+/// the deployments most likely to be in production.
+///
+/// `None` means no card can be served: the caller must fail rather than hand
+/// back a card still advertising the upstream's own address.
+fn gateway_base(uri: &axum::http::Uri, headers: &HeaderMap) -> Option<String> {
+    let host = headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| !v.is_empty())
+        .or_else(|| uri.authority().map(|a| a.as_str()))?;
     let scheme = headers
         .get("x-forwarded-proto")
         .and_then(|v| v.to_str().ok())
@@ -351,22 +401,88 @@ mod tests {
 
     #[test]
     fn gateway_base_uses_forwarded_proto_then_defaults_https() {
+        let uri = axum::http::Uri::from_static("/a2a/x/.well-known/agent-card.json");
         let mut headers = HeaderMap::new();
         headers.insert(header::HOST, "gw.example.com".parse().unwrap());
         assert_eq!(
-            gateway_base(&headers).as_deref(),
+            gateway_base(&uri, &headers).as_deref(),
             Some("https://gw.example.com")
         );
         headers.insert("x-forwarded-proto", "http".parse().unwrap());
         assert_eq!(
-            gateway_base(&headers).as_deref(),
+            gateway_base(&uri, &headers).as_deref(),
             Some("http://gw.example.com")
         );
     }
 
     #[test]
-    fn gateway_base_is_none_without_host() {
-        assert_eq!(gateway_base(&HeaderMap::new()), None);
+    fn gateway_base_falls_back_to_the_uri_authority() {
+        // HTTP/2 sends no `Host` — the authority arrives as the `:authority`
+        // pseudo-header, which lands on the URI. This listener negotiates h2
+        // whenever `proxy.tls` is set, so a header-only lookup finds nothing
+        // there and the card would otherwise be served still advertising the
+        // upstream's address.
+        let h2_uri = axum::http::Uri::from_static("https://gw.example.com/a2a/x");
+        assert_eq!(
+            gateway_base(&h2_uri, &HeaderMap::new()).as_deref(),
+            Some("https://gw.example.com")
+        );
+        // An empty Host does not shadow a usable authority either.
+        let mut empty_host = HeaderMap::new();
+        empty_host.insert(header::HOST, "".parse().unwrap());
+        assert_eq!(
+            gateway_base(&h2_uri, &empty_host).as_deref(),
+            Some("https://gw.example.com")
+        );
+    }
+
+    #[test]
+    fn gateway_base_is_none_without_any_authority() {
+        let origin_form = axum::http::Uri::from_static("/a2a/x/.well-known/agent-card.json");
+        assert_eq!(gateway_base(&origin_form, &HeaderMap::new()), None);
+    }
+
+    #[test]
+    fn card_rewrite_leaves_no_upstream_url_for_a_caller_to_follow() {
+        // Only the top-level `url` used to be rewritten. A 1.0 caller reads its
+        // endpoint out of `supportedInterfaces` instead, so it went straight to
+        // the upstream — past auth, quota and usage — and read the internal
+        // address off the card on the way (#911).
+        let mut card: aisix_a2a::AgentCard = serde_json::from_str(
+            r#"{
+                "name": "Agent",
+                "url": "https://internal.upstream/a2a",
+                "supportedInterfaces": [
+                    {"url": "https://internal.upstream/a2a", "protocolBinding": "JSONRPC"},
+                    {"url": "https://internal.upstream/grpc", "protocolBinding": "GRPC"}
+                ],
+                "additionalInterfaces": [
+                    {"url": "https://internal.upstream/rest", "transport": "HTTP+JSON"}
+                ],
+                "skills": [{"id": "s1"}]
+            }"#,
+        )
+        .unwrap();
+
+        rewrite_card_urls(&mut card, "https://gw.example.com/a2a/billing");
+
+        let served = serde_json::to_string(&card).unwrap();
+        assert!(
+            !served.contains("internal.upstream"),
+            "no upstream address may survive anywhere in the served card:\n{served}"
+        );
+        assert_eq!(card.url, "https://gw.example.com/a2a/billing");
+        for key in ["supportedInterfaces", "additionalInterfaces"] {
+            for interface in card.rest[key].as_array().unwrap() {
+                assert_eq!(interface["url"], "https://gw.example.com/a2a/billing");
+            }
+        }
+        // Everything the gateway does not own is passed through untouched.
+        assert_eq!(card.rest["skills"][0]["id"], "s1");
+        assert_eq!(
+            card.rest["supportedInterfaces"][1]["protocolBinding"],
+            "GRPC"
+        );
     }
 
     // ---- endpoint integration tests: drive the real router via oneshot ----

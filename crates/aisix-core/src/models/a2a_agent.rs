@@ -40,15 +40,19 @@ pub struct A2aAgent {
     )]
     pub name: String,
 
-    /// The upstream agent's base URL, such as `https://agents.example.com/a2a`.
-    /// AISIX reaches this URL over HTTP with the A2A JSON-RPC 2.0 protocol and
-    /// discovers the agent card relative to it.
+    /// The upstream agent's A2A service endpoint, such as
+    /// `https://agents.example.com/a2a`, where AISIX sends JSON-RPC 2.0 requests
+    /// over HTTP. AISIX looks for the agent card at the well-known path under
+    /// this URL's own path first, then under its origin, so both an agent that
+    /// owns its domain and one published under a path prefix are reachable
+    /// without extra configuration.
     #[schemars(length(min = 1))]
     pub url: String,
 
-    /// The A2A wire-format version AISIX uses for this agent. AISIX pins the
-    /// version explicitly so the served agent card and accepted requests stay
-    /// consistent.
+    /// The A2A wire-format version this agent speaks. AISIX announces it to the
+    /// agent in the `A2A-Version` header on every request, so it must match what
+    /// the agent actually serves: an agent reads an absent or mismatched version
+    /// as a protocol error and rejects the call.
     #[serde(default)]
     pub protocol_version: A2aProtocolVersion,
 
@@ -104,6 +108,18 @@ pub enum A2aProtocolVersion {
     /// A2A 0.3 wire format with `kind`-discriminated JSON-RPC objects.
     #[serde(rename = "0.3")]
     V0_3,
+}
+
+impl A2aProtocolVersion {
+    /// The value this version carries on the wire, in the `A2A-Version` header
+    /// and in the `protocolVersion` field of an agent card. Kept in lockstep
+    /// with the `serde` renames above, which are the same strings.
+    pub fn as_wire_str(self) -> &'static str {
+        match self {
+            Self::V1_0 => "1.0",
+            Self::V0_3 => "0.3",
+        }
+    }
 }
 
 /// How the gateway authenticates to an upstream A2A agent.

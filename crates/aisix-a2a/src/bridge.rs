@@ -11,9 +11,14 @@
 //! exposed to the calling client, which presents only its AISIX key.
 //!
 //! Wire references (verified against the A2A specification):
-//! - Agent card discovery: `https://{domain}/.well-known/agent-card.json`,
-//!   an RFC 8615 well-known URI resolved at the domain origin.
+//! - Agent card discovery: the RFC 8615 well-known URI
+//!   `https://{domain}/.well-known/agent-card.json`. The spec resolves it at the
+//!   origin, but real deployments also publish it under the agent's own path
+//!   prefix, so both bases are tried — see [`HttpBridge::agent_card_urls`].
 //!   <https://a2a-protocol.org/latest/topics/agent-discovery/>
+//! - Every request announces the wire version it speaks in the `A2A-Version`
+//!   header; an agent that receives none must assume `0.3`. The version is
+//!   pinned per agent on the `A2aAgent` resource.
 //! - `message/send` is a JSON-RPC 2.0 method whose envelope differs between the
 //!   A2A 0.3 and 1.0 wire formats. This bridge forwards the caller's request
 //!   verbatim and does not translate between versions, so the method name and
@@ -21,9 +26,9 @@
 //!   <https://a2a-protocol.org/latest/topics/life-of-a-task/>
 
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use aisix_core::{A2aAgent, A2aAuthType};
+use aisix_core::{A2aAgent, A2aAuthType, A2aProtocolVersion};
 use async_trait::async_trait;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -39,8 +44,17 @@ pub const DEFAULT_UPSTREAM_TIMEOUT: Duration = Duration::from_secs(30);
 /// Header carrying the gateway-held key for `api_key` upstream auth.
 const API_KEY_HEADER: &str = "x-api-key";
 
-/// Standard RFC 8615 well-known path for an A2A agent card.
-const AGENT_CARD_PATH: &str = "/.well-known/agent-card.json";
+/// Header naming the A2A wire version the client speaks. The spec requires a
+/// client to send it on every request and requires an agent to read an absent
+/// value as `0.3`, so an unlabelled call to a 1.0 agent is not merely untidy —
+/// the agent answers `VersionNotSupportedError` and the call never lands.
+const VERSION_HEADER: &str = "A2A-Version";
+
+/// Well-known agent-card paths, current spec first. RFC 8615 resolves a
+/// well-known URI at the origin, but platforms that multiplex tenants under a
+/// path prefix publish the card relative to the agent's own path instead, so
+/// each of these is tried against both bases — see [`HttpBridge::agent_card_urls`].
+const AGENT_CARD_PATHS: [&str; 2] = ["/.well-known/agent-card.json", "/.well-known/agent.json"];
 
 /// Hard cap on an upstream response body the gateway will buffer. A registered
 /// agent is semi-trusted, but a compromised or misbehaving one must not be able
@@ -129,10 +143,13 @@ impl std::fmt::Debug for A2aAuth {
 pub struct A2aUpstream {
     /// The agent's A2A service endpoint, where JSON-RPC requests are sent, e.g.
     /// `https://agents.example.com/a2a`. The agent card is discovered at the
-    /// well-known path relative to this URL's origin.
+    /// well-known paths relative to this URL, then to its origin.
     pub url: String,
     /// Upstream authentication, held gateway-side.
     pub auth: A2aAuth,
+    /// The wire version this agent speaks, announced to it on every request in
+    /// the `A2A-Version` header.
+    pub protocol_version: A2aProtocolVersion,
     /// Per-operation deadline. Defaults to [`DEFAULT_UPSTREAM_TIMEOUT`].
     pub timeout: Duration,
 }
@@ -144,6 +161,7 @@ impl std::fmt::Debug for A2aUpstream {
         f.debug_struct("A2aUpstream")
             .field("url", &self.url)
             .field("auth", &self.auth)
+            .field("protocol_version", &self.protocol_version)
             .field("timeout", &self.timeout)
             .finish()
     }
@@ -199,6 +217,7 @@ pub fn upstream_from_a2a_agent(agent: &A2aAgent) -> A2aUpstream {
     A2aUpstream {
         url: agent.url.clone(),
         auth,
+        protocol_version: agent.protocol_version,
         timeout,
     }
 }
@@ -249,8 +268,12 @@ impl HttpBridge {
         }
     }
 
-    /// Apply the gateway-held upstream credential to an outgoing request.
-    fn apply_auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    /// Apply the gateway-held upstream credential and announce the wire version
+    /// this agent is pinned to. Both belong on every outgoing request: the
+    /// credential because the gateway is the one holding it, the version
+    /// because an agent that receives no `A2A-Version` must assume `0.3`.
+    fn prepare(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        let req = req.header(VERSION_HEADER, self.upstream.protocol_version.as_wire_str());
         match &self.upstream.auth {
             A2aAuth::None => req,
             A2aAuth::Bearer(token) => req.bearer_auth(token),
@@ -258,23 +281,48 @@ impl HttpBridge {
         }
     }
 
-    /// Resolve the agent-card well-known URI from the service endpoint's origin
-    /// (RFC 8615): scheme + host + port, with the well-known path.
-    fn agent_card_url(&self) -> Result<reqwest::Url, A2aError> {
-        let mut url = reqwest::Url::parse(&self.upstream.url)
+    /// Candidate agent-card URIs, most specific first: each well-known path
+    /// resolved against the registered URL's own path, then against its origin.
+    ///
+    /// Both bases are real deployments. An agent that owns its domain publishes
+    /// at the RFC 8615 origin URI — the only shape this bridge used to try, and
+    /// what every agent registered before now still serves. A platform that
+    /// multiplexes tenants under a path prefix (or a self-hosted agent behind an
+    /// ingress path) publishes relative to its own path instead — the origin
+    /// there belongs to the platform, not to any one agent. Resolving only one
+    /// of the two locks out the other, so both are tried, specific first.
+    ///
+    /// A registered URL that is already at the origin yields the origin
+    /// candidates alone — the two bases coincide and probing twice is waste.
+    fn agent_card_urls(&self) -> Result<Vec<reqwest::Url>, A2aError> {
+        let base = reqwest::Url::parse(&self.upstream.url)
             .map_err(|e| A2aError::Connect(format!("invalid upstream url: {e}")))?;
-        url.set_path(AGENT_CARD_PATH);
-        url.set_query(None);
-        Ok(url)
+        let prefix = base.path().trim_end_matches('/').to_string();
+        let mut urls = Vec::with_capacity(AGENT_CARD_PATHS.len() * 2);
+        for path in AGENT_CARD_PATHS {
+            if !prefix.is_empty() {
+                let mut relative = base.clone();
+                relative.set_path(&format!("{prefix}{path}"));
+                relative.set_query(None);
+                urls.push(relative);
+            }
+            let mut origin = base.clone();
+            origin.set_path(path);
+            origin.set_query(None);
+            urls.push(origin);
+        }
+        Ok(urls)
     }
-}
 
-#[async_trait]
-impl A2aBridge for HttpBridge {
-    async fn fetch_agent_card(&self) -> Result<AgentCard, A2aError> {
-        let url = self.agent_card_url()?;
+    /// Fetch and parse the card at exactly one candidate URI, within whatever
+    /// is left of the fetch's overall budget.
+    async fn fetch_card_at(
+        &self,
+        url: reqwest::Url,
+        budget: Duration,
+    ) -> Result<AgentCard, A2aError> {
         let resp = self
-            .apply_auth(self.client.get(url).timeout(self.upstream.timeout))
+            .prepare(self.client.get(url).timeout(budget))
             .send()
             .await
             .map_err(|e| A2aError::Connect(e.to_string()))?;
@@ -288,10 +336,48 @@ impl A2aBridge for HttpBridge {
         serde_json::from_slice::<AgentCard>(&bytes)
             .map_err(|e| A2aError::Request(format!("malformed agent card: {e}")))
     }
+}
+
+#[async_trait]
+impl A2aBridge for HttpBridge {
+    async fn fetch_agent_card(&self) -> Result<AgentCard, A2aError> {
+        // Any failure moves to the next candidate, not just a 404: an upstream
+        // that does not route the URI answers with whatever its catch-all
+        // returns (the 405 in #913), and a prefix that happens to resolve can
+        // still hand back something that is not a card.
+        //
+        // `timeout_ms` bounds the card fetch as ONE upstream operation, so the
+        // whole walk shares a single deadline instead of handing each candidate
+        // a fresh one. Otherwise a slow or hung upstream stretches the fetch to
+        // `candidates × timeout_ms` — four times what the operator configured —
+        // and pins a gateway request for the duration.
+        let deadline = Instant::now() + self.upstream.timeout;
+        let mut last_err = None;
+        for url in self.agent_card_urls()? {
+            let budget = deadline.saturating_duration_since(Instant::now());
+            if budget.is_zero() {
+                tracing::debug!(
+                    agent_url = %self.upstream.url,
+                    "A2A agent card fetch exhausted its deadline before trying every candidate"
+                );
+                break;
+            }
+            match self.fetch_card_at(url.clone(), budget).await {
+                Ok(card) => return Ok(card),
+                Err(err) => {
+                    tracing::debug!(%url, error = %err, "A2A agent card candidate did not answer");
+                    last_err = Some(err);
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| {
+            A2aError::Connect("agent card fetch exceeded its timeout".to_string())
+        }))
+    }
 
     async fn send(&self, request: &serde_json::Value) -> Result<serde_json::Value, A2aError> {
         let resp = self
-            .apply_auth(
+            .prepare(
                 self.client
                     .post(&self.upstream.url)
                     .timeout(self.upstream.timeout)
@@ -368,22 +454,82 @@ mod tests {
         let up = A2aUpstream {
             url: "https://x/a2a".into(),
             auth: A2aAuth::Bearer("super-secret".into()),
+            protocol_version: A2aProtocolVersion::V1_0,
             timeout: DEFAULT_UPSTREAM_TIMEOUT,
         };
         assert!(!format!("{up:?}").contains("super-secret"));
     }
 
-    #[test]
-    fn agent_card_url_is_origin_well_known() {
-        let bridge = HttpBridge::new(A2aUpstream {
-            url: "https://agents.example.com/a2a/v1".into(),
+    fn bridge_at(url: &str) -> HttpBridge {
+        HttpBridge::new(A2aUpstream {
+            url: url.into(),
             auth: A2aAuth::None,
+            protocol_version: A2aProtocolVersion::V1_0,
             timeout: DEFAULT_UPSTREAM_TIMEOUT,
-        });
+        })
+    }
+
+    fn card_candidates(url: &str) -> Vec<String> {
+        bridge_at(url)
+            .agent_card_urls()
+            .unwrap()
+            .iter()
+            .map(|u| u.as_str().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn card_candidates_try_the_registered_path_before_the_origin() {
+        // #913: `set_path` used to replace the path outright, so a path-hosted
+        // agent was asked for a card URI it never publishes. The prefix now
+        // survives, and the origin URI stays as the fallback so agents
+        // registered under the old behaviour keep resolving.
         assert_eq!(
-            bridge.agent_card_url().unwrap().as_str(),
-            "https://agents.example.com/.well-known/agent-card.json"
+            card_candidates("https://agents.example.com/v3/a2a/serve/abc"),
+            vec![
+                "https://agents.example.com/v3/a2a/serve/abc/.well-known/agent-card.json",
+                "https://agents.example.com/.well-known/agent-card.json",
+                "https://agents.example.com/v3/a2a/serve/abc/.well-known/agent.json",
+                "https://agents.example.com/.well-known/agent.json",
+            ]
         );
+    }
+
+    #[test]
+    fn card_candidates_collapse_when_the_agent_owns_the_origin() {
+        // The two bases coincide here, so the relative candidate would be a
+        // byte-identical second request. A trailing slash is the same case.
+        let expected = vec![
+            "https://agents.example.com/.well-known/agent-card.json",
+            "https://agents.example.com/.well-known/agent.json",
+        ];
+        assert_eq!(card_candidates("https://agents.example.com"), expected);
+        assert_eq!(card_candidates("https://agents.example.com/"), expected);
+    }
+
+    #[test]
+    fn card_candidates_drop_the_query_and_keep_the_port() {
+        assert_eq!(
+            card_candidates("http://127.0.0.1:8080/a2a?tenant=acme"),
+            vec![
+                "http://127.0.0.1:8080/a2a/.well-known/agent-card.json",
+                "http://127.0.0.1:8080/.well-known/agent-card.json",
+                "http://127.0.0.1:8080/a2a/.well-known/agent.json",
+                "http://127.0.0.1:8080/.well-known/agent.json",
+            ]
+        );
+    }
+
+    #[test]
+    fn upstream_carries_the_pinned_protocol_version() {
+        let mut pinned_03 = agent("none");
+        pinned_03.protocol_version = A2aProtocolVersion::V0_3;
+        assert_eq!(
+            upstream_from_a2a_agent(&pinned_03).protocol_version,
+            A2aProtocolVersion::V0_3
+        );
+        assert_eq!(A2aProtocolVersion::V1_0.as_wire_str(), "1.0");
+        assert_eq!(A2aProtocolVersion::V0_3.as_wire_str(), "0.3");
     }
 
     #[test]
