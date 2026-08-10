@@ -767,29 +767,57 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
                 None
             }
             Some(redis_cfg) => {
-                let store = aisix_cache::RedisSemanticCache::connect(redis_cfg)
-                    .await
-                    .map_err(|e| {
-                        anyhow::anyhow!("redis semantic cache connect failed (cache.redis): {e}")
-                    })?
-                    .with_env_namespace(&cfg.etcd.env_id);
-                match store.probe().await {
-                    Ok(()) => {
-                        tracing::info!(
-                            target: "aisix::cache",
-                            "cache.redis supports vector search; semantic matching \
-                             enabled for backend=redis policies"
-                        );
-                        Some(Arc::new(store) as Arc<dyn aisix_cache::SemanticCacheStore>)
-                    }
+                // Degrade (never abort) on any failure here: the exact
+                // redis cache above is the load-bearing connection; the
+                // semantic store is an optimization layer.
+                match aisix_cache::RedisSemanticCache::connect(redis_cfg).await {
                     Err(e) => {
                         tracing::warn!(
                             target: "aisix::cache",
                             error = %e,
-                            "cache.redis has no vector-search support; semantic matching \
+                            "redis semantic cache connect failed; semantic matching \
                              on backend=redis policies stays exact-only"
                         );
                         None
+                    }
+                    Ok(store) => {
+                        let store = store.with_env_namespace(&cfg.etcd.env_id);
+                        match store.probe().await {
+                            Ok(()) => {
+                                match store.sweep_empty_indexes().await {
+                                    Ok(dropped) if dropped > 0 => {
+                                        tracing::info!(
+                                            target: "aisix::cache",
+                                            dropped,
+                                            "reclaimed empty semantic-cache indexes"
+                                        );
+                                    }
+                                    Ok(_) => {}
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            target: "aisix::cache",
+                                            error = %e,
+                                            "semantic-cache index sweep failed; continuing"
+                                        );
+                                    }
+                                }
+                                tracing::info!(
+                                    target: "aisix::cache",
+                                    "cache.redis supports vector search; semantic matching \
+                                     enabled for backend=redis policies"
+                                );
+                                Some(Arc::new(store) as Arc<dyn aisix_cache::SemanticCacheStore>)
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    target: "aisix::cache",
+                                    error = %e,
+                                    "cache.redis has no vector-search support; semantic matching \
+                                     on backend=redis policies stays exact-only"
+                                );
+                                None
+                            }
+                        }
                     }
                 }
             }

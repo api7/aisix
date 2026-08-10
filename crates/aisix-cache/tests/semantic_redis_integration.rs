@@ -227,6 +227,124 @@ async fn generation_rotation_orphans_old_entries() {
 }
 
 #[tokio::test]
+async fn stale_generation_never_rotates_backwards() {
+    let Some(url) = vector_url() else { return };
+    let store = connect(&url).await;
+    let policy = unique("p-stale");
+
+    // Live at generation 1 with a document.
+    store
+        .store(
+            &policy,
+            1,
+            "fp",
+            "k-new",
+            vec![0.0, 1.0],
+            resp("new"),
+            TTL,
+            100,
+        )
+        .await
+        .unwrap();
+    // A stale in-flight writer (pre-purge snapshot) must be dropped —
+    // NOT recreate the generation-0 index and drop generation 1's
+    // documents.
+    store
+        .store(
+            &policy,
+            0,
+            "fp",
+            "k-old",
+            vec![1.0, 0.0],
+            resp("stale"),
+            TTL,
+            100,
+        )
+        .await
+        .unwrap();
+    let hit = store
+        .lookup(&policy, 1, "fp", &[0.0, 1.0], 0.9)
+        .await
+        .unwrap()
+        .expect("generation-1 document must survive the stale write");
+    assert_eq!(hit.response.message.content_str(), "new");
+    // Stale lookups miss rather than rotating.
+    let stale = store
+        .lookup(&policy, 0, "fp", &[1.0, 0.0], 0.5)
+        .await
+        .unwrap();
+    assert!(stale.is_none());
+}
+
+#[tokio::test]
+async fn sweep_drops_only_empty_indexes() {
+    let Some(url) = vector_url() else { return };
+    let store = connect(&url).await;
+    let live = unique("p-sweep-live");
+    let dead = unique("p-sweep-dead");
+
+    store
+        .store(&live, 0, "fp", "k1", vec![1.0, 0.0], resp("live"), TTL, 100)
+        .await
+        .unwrap();
+    // An index whose documents all expired — the orphan shape a
+    // deleted policy leaves behind.
+    store
+        .store(
+            &dead,
+            0,
+            "fp",
+            "k1",
+            vec![1.0, 0.0],
+            resp("dead"),
+            Duration::from_millis(100),
+            100,
+        )
+        .await
+        .unwrap();
+    // Redis expires documents lazily — `num_docs` catches up when the
+    // active-expiry cycle reclaims the hash. Poll rather than assuming
+    // one fixed sleep is enough.
+    let mut dropped = 0;
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        dropped = store.sweep_empty_indexes().await.unwrap();
+        if dropped >= 1 {
+            break;
+        }
+    }
+    assert!(dropped >= 1, "the emptied index must be reclaimed");
+    // The live policy still serves.
+    let hit = store
+        .lookup(&live, 0, "fp", &[1.0, 0.0], 0.9)
+        .await
+        .unwrap()
+        .expect("live index must survive the sweep");
+    assert_eq!(hit.response.message.content_str(), "live");
+    // Even if the sweep raced the live index away, the store self-heals
+    // on the next touch (missing-index guard) — pin that too by
+    // storing + looking up once more.
+    store
+        .store(
+            &live,
+            0,
+            "fp",
+            "k2",
+            vec![0.0, 1.0],
+            resp("live2"),
+            TTL,
+            100,
+        )
+        .await
+        .unwrap();
+    assert!(store
+        .lookup(&live, 0, "fp", &[0.0, 1.0], 0.9)
+        .await
+        .unwrap()
+        .is_some());
+}
+
+#[tokio::test]
 async fn dims_change_rotates_the_index() {
     let Some(url) = vector_url() else { return };
     let store = connect(&url).await;

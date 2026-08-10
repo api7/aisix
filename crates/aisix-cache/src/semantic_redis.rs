@@ -134,17 +134,25 @@ impl RedisSemanticCache {
     }
 
     /// Make sure the index for `(policy, generation, dims)` exists,
-    /// rotating (drop + recreate) when either component changed since
-    /// this instance last saw the policy.
+    /// rotating (drop + recreate) when the identity moved FORWARD since
+    /// this instance last saw the policy. Returns `Ok(None)` for a
+    /// STALE caller — one whose generation is lower than the ensured
+    /// one (an in-flight request holding a pre-purge policy snapshot):
+    /// rotating backwards would recreate the old index empty and then
+    /// drop the live one, documents included. Stale lookups miss, stale
+    /// stores are dropped, mirroring the in-process store's contract.
     async fn ensure_index(
         &self,
         policy_id: &str,
         generation: u32,
         dims: usize,
-    ) -> Result<String, CacheError> {
+    ) -> Result<Option<String>, CacheError> {
         if let Some(e) = self.ensured.get(policy_id) {
             if e.generation == generation && e.dims == dims {
-                return Ok(e.index.clone());
+                return Ok(Some(e.index.clone()));
+            }
+            if generation < e.generation {
+                return Ok(None);
             }
         }
         let index = self.index_name(policy_id, generation, dims);
@@ -186,7 +194,9 @@ impl RedisSemanticCache {
         }
         // Rotate away the previously ensured identity, documents
         // included — its entries belong to a purged generation or a
-        // different vector space and must never serve again.
+        // different vector space and must never serve again. Guarded by
+        // the monotonic check above, so this only ever drops an OLDER
+        // identity.
         if let Some((_, old)) = self.ensured.remove(policy_id) {
             if old.index != index {
                 let _ = redis::cmd("FT.DROPINDEX")
@@ -204,7 +214,67 @@ impl RedisSemanticCache {
                 index: index.clone(),
             },
         );
-        Ok(index)
+        Ok(Some(index))
+    }
+
+    /// Forget a memoized index after the server reported it missing
+    /// (`no such index`): the server lost state (restart / external
+    /// cleanup / a concurrent boot sweep), so the next call must
+    /// re-create instead of trusting the memo forever.
+    fn forget_missing_index(&self, policy_id: &str, err: &CacheError) {
+        let msg = err.to_string().to_ascii_lowercase();
+        if msg.contains("no such index") || msg.contains("unknown index") {
+            self.ensured.remove(policy_id);
+        }
+    }
+
+    /// Boot-time GC: drop indexes under this instance's prefix whose
+    /// document count is zero. Index DEFINITIONS never expire on their
+    /// own, so deleted policies and rotated-away generations would
+    /// otherwise accumulate empty definitions forever. Dropping a
+    /// still-live empty index is safe: the next request that touches
+    /// its policy re-creates it (the missing-index guard above clears
+    /// any stale memo). Best-effort — errors are returned for the
+    /// caller to log, never fatal.
+    pub async fn sweep_empty_indexes(&self) -> Result<usize, CacheError> {
+        let mut conn = self.acquire().await?;
+        let names: Vec<String> = redis::cmd("FT._LIST")
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| CacheError::Backend(format!("redis FT._LIST: {e}")))?;
+        let ours = format!("{}:idx:", self.prefix);
+        let mut dropped = 0usize;
+        for name in names.iter().filter(|n| n.starts_with(&ours)) {
+            let info: redis::Value =
+                match redis::cmd("FT.INFO").arg(name).query_async(&mut conn).await {
+                    Ok(v) => v,
+                    Err(_) => continue, // racing another sweep; skip
+                };
+            let redis::Value::Array(items) = info else {
+                continue;
+            };
+            let mut it = items.iter();
+            let mut num_docs: Option<i64> = None;
+            while let (Some(k), Some(v)) = (it.next(), it.next()) {
+                if value_name_eq(k, "num_docs") {
+                    num_docs = match v {
+                        redis::Value::Int(n) => Some(*n),
+                        other => value_str(other).and_then(|s| s.parse().ok()),
+                    };
+                    break;
+                }
+            }
+            if num_docs == Some(0)
+                && redis::cmd("FT.DROPINDEX")
+                    .arg(name)
+                    .query_async::<()>(&mut conn)
+                    .await
+                    .is_ok()
+            {
+                dropped += 1;
+            }
+        }
+        Ok(dropped)
     }
 }
 
@@ -221,11 +291,21 @@ fn vector_blob(embedding: &[f32]) -> Vec<u8> {
 fn field<'a>(fields: &'a [redis::Value], name: &str) -> Option<&'a redis::Value> {
     let mut it = fields.iter();
     while let (Some(k), Some(v)) = (it.next(), it.next()) {
-        if matches!(k, redis::Value::BulkString(b) if b == name.as_bytes()) {
+        if value_name_eq(k, name) {
             return Some(v);
         }
     }
     None
+}
+
+/// Field names in `FT.*` replies arrive as either simple or bulk
+/// strings depending on the server version — match both.
+fn value_name_eq(v: &redis::Value, name: &str) -> bool {
+    match v {
+        redis::Value::BulkString(b) => b == name.as_bytes(),
+        redis::Value::SimpleString(s) => s == name,
+        _ => false,
+    }
 }
 
 fn value_str(v: &redis::Value) -> Option<String> {
@@ -246,9 +326,13 @@ impl SemanticCacheStore for RedisSemanticCache {
         embedding: &[f32],
         threshold: f32,
     ) -> Result<Option<SemanticHit>, CacheError> {
-        let index = self
+        let Some(index) = self
             .ensure_index(policy_id, generation, embedding.len())
-            .await?;
+            .await?
+        else {
+            // Stale generation: miss, never rotate backwards.
+            return Ok(None);
+        };
         let mut conn = self.acquire().await?;
         let query = format!(
             "(@scope_fp:{{{}}})=>[KNN 1 @embedding $vec AS dist]",
@@ -278,7 +362,9 @@ impl SemanticCacheStore for RedisSemanticCache {
             Ok(v) => v,
             Err(e) => {
                 self.conn.note_error().await;
-                return Err(CacheError::Backend(format!("redis FT.SEARCH: {e}")));
+                let err = CacheError::Backend(format!("redis FT.SEARCH: {e}"));
+                self.forget_missing_index(policy_id, &err);
+                return Err(err);
             }
         };
         // Reply shape: [total, key, [field, value, …], …].
@@ -331,7 +417,15 @@ impl SemanticCacheStore for RedisSemanticCache {
         _max_entries: u32,
     ) -> Result<(), CacheError> {
         let dims = embedding.len();
-        self.ensure_index(policy_id, generation, dims).await?;
+        if self
+            .ensure_index(policy_id, generation, dims)
+            .await?
+            .is_none()
+        {
+            // Stale generation: drop the write, mirroring the
+            // in-process store.
+            return Ok(());
+        }
         let doc_key = format!(
             "{}{exact_key}",
             self.doc_prefix(policy_id, generation, dims)
@@ -355,7 +449,9 @@ impl SemanticCacheStore for RedisSemanticCache {
             .ignore();
         if let Err(e) = pipe.query_async::<()>(&mut conn).await {
             self.conn.note_error().await;
-            return Err(CacheError::Backend(format!("redis HSET: {e}")));
+            let err = CacheError::Backend(format!("redis HSET: {e}"));
+            self.forget_missing_index(policy_id, &err);
+            return Err(err);
         }
         Ok(())
     }
