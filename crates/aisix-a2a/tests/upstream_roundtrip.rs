@@ -9,6 +9,7 @@
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use aisix_a2a::{A2aAuth, A2aBridge, A2aError, A2aUpstream, HttpBridge, DEFAULT_UPSTREAM_TIMEOUT};
 use aisix_core::A2aProtocolVersion;
@@ -306,5 +307,46 @@ async fn announces_the_pinned_wire_version_on_every_upstream_call() {
     assert_eq!(
         pinned_03.send(&message_send("v-0")).await.unwrap()["result"]["echoed_version"],
         "0.3"
+    );
+}
+
+/// An upstream that accepts the connection and never answers, so every
+/// candidate URI burns its whole deadline.
+async fn spawn_black_hole() -> SocketAddr {
+    let app = Router::new().fallback(any(|| async {
+        std::future::pending::<()>().await;
+        StatusCode::OK
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app.into_make_service())
+            .await
+            .unwrap();
+    });
+    addr
+}
+
+#[tokio::test]
+async fn the_card_fetch_deadline_covers_the_whole_candidate_walk() {
+    // `timeout_ms` bounds the card fetch as ONE upstream operation. Walking
+    // several candidates must not hand each a fresh deadline, or a hung agent
+    // pins a gateway request for `candidates × timeout_ms`.
+    let addr = spawn_black_hole().await;
+    let bridge = HttpBridge::new(A2aUpstream {
+        timeout: Duration::from_millis(600),
+        ..upstream(format!("http://{addr}/a2a"), A2aAuth::None)
+    });
+
+    let started = Instant::now();
+    let err = bridge.fetch_agent_card().await.unwrap_err();
+    let elapsed = started.elapsed();
+
+    assert!(matches!(err, A2aError::Connect(_)), "got {err:?}");
+    // Four candidates would be 2.4s if each restarted the clock. The bound is
+    // loose enough for a slow CI box while staying far below that.
+    assert!(
+        elapsed < Duration::from_millis(1500),
+        "card fetch took {elapsed:?}; the candidate walk must share ONE deadline"
     );
 }

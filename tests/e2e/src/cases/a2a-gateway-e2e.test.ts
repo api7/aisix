@@ -144,11 +144,15 @@ describe("a2a gateway e2e: /a2a/{agent}", () => {
       allowed_models: [],
     });
 
+    // The gate proves only that the seeded rows reached the DP snapshot, and
+    // deliberately asserts none of the behaviour under test: a 404 would mean
+    // the agent row has not landed, a 401 that the key row has not. Anything
+    // else — including a 403 or a 502 — means both are present, and any defect
+    // in discovery, the version header, the card rewrite or the ACL then fails
+    // its own test by name instead of surfacing as a 60s propagation timeout.
     await waitConfigPropagation(async () => {
-      const card = await fetchCard("invoices", KEY_ALLOWED);
-      if (card.status !== 200) return false;
-      const denied = await fetchCard("invoices", KEY_NO_AGENTS);
-      return denied.status === 403;
+      const probe = await call("/a2a/invoices", KEY_ALLOWED, messageSend("gate"));
+      return probe.status !== 404 && probe.status !== 401;
     });
   }, 60_000);
 

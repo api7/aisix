@@ -26,7 +26,7 @@
 //!   <https://a2a-protocol.org/latest/topics/life-of-a-task/>
 
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use aisix_core::{A2aAgent, A2aAuthType, A2aProtocolVersion};
 use async_trait::async_trait;
@@ -314,10 +314,15 @@ impl HttpBridge {
         Ok(urls)
     }
 
-    /// Fetch and parse the card at exactly one candidate URI.
-    async fn fetch_card_at(&self, url: reqwest::Url) -> Result<AgentCard, A2aError> {
+    /// Fetch and parse the card at exactly one candidate URI, within whatever
+    /// is left of the fetch's overall budget.
+    async fn fetch_card_at(
+        &self,
+        url: reqwest::Url,
+        budget: Duration,
+    ) -> Result<AgentCard, A2aError> {
         let resp = self
-            .prepare(self.client.get(url).timeout(self.upstream.timeout))
+            .prepare(self.client.get(url).timeout(budget))
             .send()
             .await
             .map_err(|e| A2aError::Connect(e.to_string()))?;
@@ -340,9 +345,24 @@ impl A2aBridge for HttpBridge {
         // that does not route the URI answers with whatever its catch-all
         // returns (the 405 in #913), and a prefix that happens to resolve can
         // still hand back something that is not a card.
+        //
+        // `timeout_ms` bounds the card fetch as ONE upstream operation, so the
+        // whole walk shares a single deadline instead of handing each candidate
+        // a fresh one. Otherwise a slow or hung upstream stretches the fetch to
+        // `candidates × timeout_ms` — four times what the operator configured —
+        // and pins a gateway request for the duration.
+        let deadline = Instant::now() + self.upstream.timeout;
         let mut last_err = None;
         for url in self.agent_card_urls()? {
-            match self.fetch_card_at(url.clone()).await {
+            let budget = deadline.saturating_duration_since(Instant::now());
+            if budget.is_zero() {
+                tracing::debug!(
+                    agent_url = %self.upstream.url,
+                    "A2A agent card fetch exhausted its deadline before trying every candidate"
+                );
+                break;
+            }
+            match self.fetch_card_at(url.clone(), budget).await {
                 Ok(card) => return Ok(card),
                 Err(err) => {
                     tracing::debug!(%url, error = %err, "A2A agent card candidate did not answer");
@@ -350,7 +370,9 @@ impl A2aBridge for HttpBridge {
                 }
             }
         }
-        Err(last_err.expect("agent_card_urls always yields at least one candidate"))
+        Err(last_err.unwrap_or_else(|| {
+            A2aError::Connect("agent card fetch exceeded its timeout".to_string())
+        }))
     }
 
     async fn send(&self, request: &serde_json::Value) -> Result<serde_json::Value, A2aError> {
