@@ -26,10 +26,16 @@ fn single(url: &str) -> RedisConnConfig {
     }
 }
 
-async fn connect(url: &str) -> RedisSemanticCache {
+/// Every test gets its own key/index namespace (via the env-namespace
+/// hook) so concurrent tests — and concurrent CI runs against one
+/// long-lived server — can never see each other's indexes. Without
+/// this, the sweep test races sibling tests' just-created (still
+/// empty) indexes away.
+async fn connect_ns(url: &str, ns: &str) -> RedisSemanticCache {
     let store = RedisSemanticCache::connect(&single(url))
         .await
-        .expect("connect");
+        .expect("connect")
+        .with_env_namespace(ns);
     store.probe().await.expect("vector-capable redis required");
     store
 }
@@ -60,8 +66,8 @@ const TTL: Duration = Duration::from_secs(60);
 #[tokio::test]
 async fn nearest_above_threshold_round_trips() {
     let Some(url) = vector_url() else { return };
-    let store = connect(&url).await;
     let policy = unique("p-roundtrip");
+    let store = connect_ns(&url, &policy).await;
 
     store
         .store(
@@ -100,8 +106,8 @@ async fn nearest_above_threshold_round_trips() {
 #[tokio::test]
 async fn scope_fp_partitions_candidates() {
     let Some(url) = vector_url() else { return };
-    let store = connect(&url).await;
     let policy = unique("p-scope");
+    let store = connect_ns(&url, &policy).await;
 
     store
         .store(
@@ -131,8 +137,8 @@ async fn scope_fp_partitions_candidates() {
 #[tokio::test]
 async fn store_upserts_by_exact_key() {
     let Some(url) = vector_url() else { return };
-    let store = connect(&url).await;
     let policy = unique("p-upsert");
+    let store = connect_ns(&url, &policy).await;
 
     store
         .store(
@@ -175,8 +181,8 @@ async fn store_upserts_by_exact_key() {
 #[tokio::test]
 async fn generation_rotation_orphans_old_entries() {
     let Some(url) = vector_url() else { return };
-    let store = connect(&url).await;
     let policy = unique("p-gen");
+    let store = connect_ns(&url, &policy).await;
 
     store
         .store(
@@ -229,8 +235,8 @@ async fn generation_rotation_orphans_old_entries() {
 #[tokio::test]
 async fn stale_generation_never_rotates_backwards() {
     let Some(url) = vector_url() else { return };
-    let store = connect(&url).await;
     let policy = unique("p-stale");
+    let store = connect_ns(&url, &policy).await;
 
     // Live at generation 1 with a document.
     store
@@ -279,9 +285,9 @@ async fn stale_generation_never_rotates_backwards() {
 #[tokio::test]
 async fn sweep_drops_only_empty_indexes() {
     let Some(url) = vector_url() else { return };
-    let store = connect(&url).await;
     let live = unique("p-sweep-live");
     let dead = unique("p-sweep-dead");
+    let store = connect_ns(&url, &live).await;
 
     store
         .store(&live, 0, "fp", "k1", vec![1.0, 0.0], resp("live"), TTL, 100)
@@ -347,8 +353,8 @@ async fn sweep_drops_only_empty_indexes() {
 #[tokio::test]
 async fn dims_change_rotates_the_index() {
     let Some(url) = vector_url() else { return };
-    let store = connect(&url).await;
     let policy = unique("p-dims");
+    let store = connect_ns(&url, &policy).await;
 
     store
         .store(
@@ -395,9 +401,9 @@ async fn dims_change_rotates_the_index() {
 #[tokio::test]
 async fn entries_are_shared_across_store_instances() {
     let Some(url) = vector_url() else { return };
-    let store_a = connect(&url).await;
-    let store_b = connect(&url).await;
     let policy = unique("p-shared");
+    let store_a = connect_ns(&url, &policy).await;
+    let store_b = connect_ns(&url, &policy).await;
 
     store_a
         .store(
@@ -423,8 +429,8 @@ async fn entries_are_shared_across_store_instances() {
 #[tokio::test]
 async fn ttl_expires_documents() {
     let Some(url) = vector_url() else { return };
-    let store = connect(&url).await;
     let policy = unique("p-ttl");
+    let store = connect_ns(&url, &policy).await;
 
     store
         .store(
@@ -449,17 +455,74 @@ async fn ttl_expires_documents() {
 
 #[tokio::test]
 async fn probe_fails_on_plain_redis() {
-    // Uses the PLAIN redis the exact-cache tests run against; skip when
-    // absent or when it actually has vector support (e.g. local dev
-    // pointing both vars at one Redis 8).
+    // `CACHE_TEST_REDIS_PLAIN_URL` points at a server WITHOUT vector
+    // search (CI: a redis:7 cluster node). Skip when absent — and skip
+    // rather than fail when the target actually has vector support,
+    // so local setups pointing it at a Redis 8 stay honest.
     let Some(url) = std::env::var("CACHE_TEST_REDIS_PLAIN_URL").ok() else {
         return;
     };
     let store = RedisSemanticCache::connect(&single(&url))
         .await
         .expect("connect");
-    assert!(
-        store.probe().await.is_err(),
-        "probe must fail on a server without vector search",
-    );
+    if store.probe().await.is_ok() {
+        return; // vector-capable target: nothing to pin here
+    }
+    // Reaching here means the probe failed — which IS the assertion;
+    // make it explicit for readers.
+    assert!(store.probe().await.is_err());
+}
+
+#[tokio::test]
+async fn lookup_recovers_after_external_index_loss() {
+    // Redis restarting empty (or an operator dropping the index) must
+    // not permanently disable the semantic layer: the memoized index
+    // is evicted on the "index not found" error and the next touch
+    // re-creates it.
+    let Some(url) = vector_url() else { return };
+    let policy = unique("p-recover");
+    let store = connect_ns(&url, &policy).await;
+
+    store
+        .store(&policy, 0, "fp", "k1", vec![1.0, 0.0], resp("a"), TTL, 100)
+        .await
+        .unwrap();
+    assert!(store
+        .lookup(&policy, 0, "fp", &[1.0, 0.0], 0.9)
+        .await
+        .unwrap()
+        .is_some());
+
+    // Simulate the loss out-of-band through a raw connection.
+    let raw = aisix_redis::connect(&single(&url)).await.expect("raw conn");
+    let mut conn = raw.acquire().await.expect("acquire");
+    redis::cmd("FT.DROPINDEX")
+        .arg(format!("aisix:semcache:{policy}:idx:{policy}:0:2"))
+        .arg("DD")
+        .query_async::<()>(&mut conn)
+        .await
+        .expect("external drop");
+
+    // First call fails visibly (fail-open at the gate) and evicts the
+    // memo…
+    assert!(store
+        .lookup(&policy, 0, "fp", &[1.0, 0.0], 0.9)
+        .await
+        .is_err());
+    // …the next one re-creates the (empty) index and misses cleanly…
+    assert!(store
+        .lookup(&policy, 0, "fp", &[1.0, 0.0], 0.9)
+        .await
+        .unwrap()
+        .is_none());
+    // …and the layer is fully functional again.
+    store
+        .store(&policy, 0, "fp", "k2", vec![0.0, 1.0], resp("b"), TTL, 100)
+        .await
+        .unwrap();
+    assert!(store
+        .lookup(&policy, 0, "fp", &[0.0, 1.0], 0.9)
+        .await
+        .unwrap()
+        .is_some());
 }

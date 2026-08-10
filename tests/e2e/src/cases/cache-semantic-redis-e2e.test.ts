@@ -345,6 +345,11 @@ describe("semantic cache on shared redis (vector-capable)", () => {
   });
 });
 
+// A dedicated vector-LESS redis for this suite when provided (CI sets
+// AISIX_E2E_REDIS_PLAIN to a redis:7 service); otherwise fall back to
+// the main URL and run only when IT happens to lack vector support.
+const PLAIN_REDIS_URL = process.env.AISIX_E2E_REDIS_PLAIN ?? REDIS_URL;
+
 describe("semantic on backend=redis degrades to exact-only without vector support", () => {
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
@@ -354,12 +359,12 @@ describe("semantic on backend=redis degrades to exact-only without vector suppor
   beforeAll(async () => {
     const etcd = new EtcdClient();
     if (!(await etcd.ping())) return;
-    if ((await redisVectorSupport(REDIS_URL)) !== false) return;
+    if ((await redisVectorSupport(PLAIN_REDIS_URL)) !== false) return;
 
     embedMock = await startEmbeddingMock();
     upstream = await startOpenAiUpstream();
     app = await spawnApp({
-      extra: { cache: { backend: "memory", redis: { url: REDIS_URL } } },
+      extra: { cache: { backend: "memory", redis: { url: PLAIN_REDIS_URL } } },
     });
     const seed = new SeedClient(etcd, app.etcdPrefix);
     await seedFixtures(seed, embedMock.baseUrl, upstream.baseUrl);

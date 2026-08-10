@@ -192,38 +192,79 @@ impl RedisSemanticCache {
                 return Err(CacheError::Backend(format!("redis FT.CREATE: {e}")));
             }
         }
-        // Rotate away the previously ensured identity, documents
-        // included — its entries belong to a purged generation or a
-        // different vector space and must never serve again. Guarded by
-        // the monotonic check above, so this only ever drops an OLDER
-        // identity.
-        if let Some((_, old)) = self.ensured.remove(policy_id) {
-            if old.index != index {
+        // Publish under the entry lock, re-checking monotonicity: a
+        // concurrent task may have ensured a NEWER identity while our
+        // FT.CREATE was in flight (two generation bumps straddled by
+        // slow requests). Whoever is newest wins; the loser's
+        // just-created index is dropped, never the winner's — a plain
+        // remove+insert here could regress the memo and delete the live
+        // index. Decision happens under the lock, redis IO outside it.
+        enum Rotate {
+            Publish(Option<String>),
+            LostRace,
+        }
+        let outcome = match self.ensured.entry(policy_id.to_string()) {
+            dashmap::mapref::entry::Entry::Occupied(mut e) => {
+                if generation < e.get().generation {
+                    Rotate::LostRace
+                } else {
+                    let old = (e.get().index != index).then(|| e.get().index.clone());
+                    e.insert(EnsuredIndex {
+                        generation,
+                        dims,
+                        index: index.clone(),
+                    });
+                    Rotate::Publish(old)
+                }
+            }
+            dashmap::mapref::entry::Entry::Vacant(v) => {
+                v.insert(EnsuredIndex {
+                    generation,
+                    dims,
+                    index: index.clone(),
+                });
+                Rotate::Publish(None)
+            }
+        };
+        match outcome {
+            Rotate::LostRace => {
+                // Our index (re-created empty above) must not linger
+                // beside the newer one that won.
                 let _ = redis::cmd("FT.DROPINDEX")
-                    .arg(&old.index)
+                    .arg(&index)
                     .arg("DD")
                     .query_async::<()>(&mut conn)
                     .await;
+                Ok(None)
+            }
+            Rotate::Publish(old) => {
+                // Drop the rotated-away identity, documents included —
+                // its entries belong to a purged generation or a
+                // different vector space and must never serve again.
+                if let Some(old) = old {
+                    let _ = redis::cmd("FT.DROPINDEX")
+                        .arg(&old)
+                        .arg("DD")
+                        .query_async::<()>(&mut conn)
+                        .await;
+                }
+                Ok(Some(index))
             }
         }
-        self.ensured.insert(
-            policy_id.to_string(),
-            EnsuredIndex {
-                generation,
-                dims,
-                index: index.clone(),
-            },
-        );
-        Ok(Some(index))
     }
 
-    /// Forget a memoized index after the server reported it missing
-    /// (`no such index`): the server lost state (restart / external
-    /// cleanup / a concurrent boot sweep), so the next call must
-    /// re-create instead of trusting the memo forever.
+    /// Forget a memoized index after the server reported it missing:
+    /// the server lost state (restart / failover to an empty replica /
+    /// external cleanup / a concurrent boot sweep), so the next call
+    /// must re-create instead of trusting the memo forever. Matches
+    /// every known wording — redis 8 reports `Index not found`, older
+    /// search modules `no such index` / `Unknown index name`.
     fn forget_missing_index(&self, policy_id: &str, err: &CacheError) {
         let msg = err.to_string().to_ascii_lowercase();
-        if msg.contains("no such index") || msg.contains("unknown index") {
+        if msg.contains("index not found")
+            || msg.contains("no such index")
+            || msg.contains("unknown index")
+        {
             self.ensured.remove(policy_id);
         }
     }
@@ -392,11 +433,17 @@ impl SemanticCacheStore for RedisSemanticCache {
         // Remaining lifetime for the exact-layer backfill cap.
         let doc_key = value_str(doc_key)
             .ok_or_else(|| CacheError::Backend("redis FT.SEARCH: bad document key".into()))?;
-        let pttl_ms: i64 = redis::cmd("PTTL")
+        let pttl_ms: i64 = match redis::cmd("PTTL")
             .arg(&doc_key)
             .query_async(&mut conn)
             .await
-            .map_err(|e| CacheError::Backend(format!("redis PTTL: {e}")))?;
+        {
+            Ok(v) => v,
+            Err(e) => {
+                self.conn.note_error().await;
+                return Err(CacheError::Backend(format!("redis PTTL: {e}")));
+            }
+        };
         let expires_at = Instant::now() + Duration::from_millis(pttl_ms.max(0) as u64);
         Ok(Some(SemanticHit {
             response,

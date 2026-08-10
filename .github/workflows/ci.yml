@@ -258,6 +258,12 @@ jobs:
         # exercises the real path against AISIX_E2E_REDIS.
         image: redis:8-alpine
         ports: ["6379:6379"]
+      redis-plain:
+        # A vector-LESS redis so the semantic-cache degradation suite
+        # (exact-only on plain redis) actually runs in CI instead of
+        # skipping forever now that the main service is redis:8.
+        image: redis:7-alpine
+        ports: ["6377:6379"]
     steps:
       - uses: actions/checkout@v6
       - uses: actions/download-artifact@v8
@@ -303,6 +309,9 @@ jobs:
         # mode and the second would prove nothing.
         env:
           E2E_THREAD_PER_CORE: ${{ matrix.thread_per_core }}
+          # Vector-less redis for the semantic-cache degradation suite;
+          # the main 6379 service is redis:8 (vector-capable).
+          AISIX_E2E_REDIS_PLAIN: redis://127.0.0.1:6377
         run: pnpm test
       - name: tag coverage by leg
         # The gate downloads every leg with `merge-multiple: true`, which
