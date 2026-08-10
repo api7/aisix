@@ -29,6 +29,8 @@ export OTB_LOADGEN_HEADERS='[["authorization","Bearer bench-token"]]'
 BIN="$SRC/target/release/aisix"
 TOOLS="$HOME/bench-tools"
 CLK_TCK=$(getconf CLK_TCK)
+# Non-interactive ssh shells don't source the cargo env; inferno lives there.
+export PATH="$HOME/.cargo/bin:$PATH"
 
 mkdir -p "$OUT"
 RESULTS="$OUT/results.jsonl"; : > "$RESULTS"
@@ -218,15 +220,20 @@ done
 echo "== flamegraph (c=128, 0-delay) ==" >&2
 loadgen "127.0.0.1:$GW_PORT" 128 45 > "$OUT/flamegraph-window.txt" & LOAD_BG=$!
 sleep 5
-perf record -F 997 --call-graph dwarf,16384 -p "$GW_PID" -o "$OUT/perf.data" -- sleep 25 \
+perf record -F 499 --call-graph dwarf -p "$GW_PID" -o "$OUT/perf.data" -- sleep 25 \
     >> "$OUT/perf.log" 2>&1 || echo "WARNING: perf record failed" >&2
 wait "$LOAD_BG" || true
+# Rendering must never kill the measurement: perf.data is kept on any failure
+# so the SVG can be produced off-rig.
 if [ -s "$OUT/perf.data" ]; then
-    perf script -i "$OUT/perf.data" 2>> "$OUT/perf.log" |
-        inferno-collapse-perf > "$OUT/flamegraph-c128.folded" 2>> "$OUT/perf.log"
-    inferno-flamegraph --title "aisix c=128 0-delay (4 pinned cores)" \
-        < "$OUT/flamegraph-c128.folded" > "$OUT/flamegraph-c128.svg" 2>> "$OUT/perf.log"
-    rm -f "$OUT/perf.data"
+    if perf script -i "$OUT/perf.data" 2>> "$OUT/perf.log" |
+           inferno-collapse-perf > "$OUT/flamegraph-c128.folded" 2>> "$OUT/perf.log" &&
+       inferno-flamegraph --title "aisix c=128 0-delay (4 pinned cores)" \
+           < "$OUT/flamegraph-c128.folded" > "$OUT/flamegraph-c128.svg" 2>> "$OUT/perf.log"; then
+        rm -f "$OUT/perf.data"
+    else
+        echo "WARNING: flamegraph rendering failed; perf.data kept" >&2
+    fi
 fi
 
 # ---- 10ms-TTFT leg: mock restarted with the delay, floor then gateway -------
