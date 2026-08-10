@@ -36,11 +36,13 @@ while the etcd prefix groups a collection of instances.
 
 ## Strictness: these files describe the write contract
 
-The published schemas carry the **write contract**: the Admin API rejects
-a payload that fails them (including unknown fields, where a resource
-closes them) with a 400. They are generated from the same producers the
-write-path validators compile, so the published and enforced shapes
-cannot drift.
+The published schemas carry the **write contract**: every declarative
+writer enforces them before a document is accepted — `aisix validate
+--resources` offline, the `resources_file` source at boot and SIGHUP,
+and the AISIX Cloud control plane before it writes etcd. A payload that
+fails them (including unknown fields, where a resource closes them) is
+rejected. They are generated from the same producers the runtime
+validators compile, so the published and enforced shapes cannot drift.
 
 The gateway's **etcd read path is deliberately more lenient** (#871): a
 stored document carrying fields outside these schemas still loads, with

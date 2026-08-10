@@ -1174,20 +1174,37 @@ mod tests {
     #[tokio::test]
     async fn api_keys_former_spelling_serves_the_same_resources() {
         let (state, store) = build_seedable_state();
-        let key: aisix_core::ApiKey =
-            serde_json::from_value(apikey_payload("sk-canonical", &["my-model"])).unwrap();
+        let mut payload = apikey_payload("sk-canonical", &["my-model"]);
+        // Non-default optional fields, so the PublicApiKey projection is
+        // pinned field-by-field — a projection that dropped one of these
+        // would still pass an id-only check.
+        payload["allowed_tools"] = json!(["github__create_issue"]);
+        payload["disabled"] = json!(true);
+        payload["expires_at"] = json!("2099-01-01T00:00:00Z");
+        let key: aisix_core::ApiKey = serde_json::from_value(payload).unwrap();
+        let expected_hash = key.key_hash.clone();
         store
             .put_apikey(aisix_core::ResourceEntry::new("k-1", key, 1))
             .await
             .unwrap();
 
-        // The same entry is readable through both spellings.
+        // The same entry is readable through both spellings, with the
+        // full projection intact.
         for base in ["/admin/v1/api_keys", "/admin/v1/apikeys"] {
             let app = build_router(state.clone());
             let resp = run(app, auth_req("GET", &format!("{base}/k-1"), None)).await;
             assert_eq!(resp.status(), StatusCode::OK, "GET {base}/k-1");
             let v = body_json(resp).await;
             assert_eq!(v["id"], "k-1", "{base}");
+            assert_eq!(v["value"]["key_hash"], expected_hash.as_str(), "{base}");
+            assert_eq!(v["value"]["allowed_models"], json!(["my-model"]), "{base}");
+            assert_eq!(
+                v["value"]["allowed_tools"],
+                json!(["github__create_issue"]),
+                "{base}"
+            );
+            assert_eq!(v["value"]["disabled"], true, "{base}");
+            assert_eq!(v["value"]["expires_at"], "2099-01-01T00:00:00Z", "{base}");
 
             let app = build_router(state.clone());
             let resp = run(app, auth_req("GET", base, None)).await;
@@ -1456,19 +1473,25 @@ mod tests {
 
     /// The rotate route was removed outright, so it 404s — the path no
     /// longer exists (it was POST-only, there is no read to keep).
+    /// POST alone can't prove the route is gone: the old handler also
+    /// answered 404 for an unknown id. GET is the discriminator — a
+    /// surviving POST-only route would answer GET with 405, an absent
+    /// route with 404.
     #[tokio::test]
     async fn removed_rotate_route_answers_404() {
         for uri in [
             "/admin/v1/api_keys/some-id/rotate",
             "/admin/v1/apikeys/some-id/rotate",
         ] {
-            let app = build_router(build_state());
-            let resp = run(app, auth_req("POST", uri, None)).await;
-            assert_eq!(
-                resp.status(),
-                StatusCode::NOT_FOUND,
-                "POST {uri} must 404 after rotate removal",
-            );
+            for method in ["POST", "GET"] {
+                let app = build_router(build_state());
+                let resp = run(app, auth_req(method, uri, None)).await;
+                assert_eq!(
+                    resp.status(),
+                    StatusCode::NOT_FOUND,
+                    "{method} {uri} must 404 after rotate removal",
+                );
+            }
         }
     }
 

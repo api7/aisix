@@ -30,6 +30,8 @@ import {
 //   7. secret swap: updating a key's `key_hash` in place (the
 //      declarative rotation the control plane performs) invalidates the
 //      old plaintext immediately, id unchanged
+//   8. deletion: removing a key's etcd entry revokes an in-use bearer
+//      (fail-closed), without touching other keys
 //
 // Reference: OpenAI authentication doc
 // <https://platform.openai.com/docs/api-reference/authentication>,
@@ -271,7 +273,7 @@ describe("api key lifecycle e2e: expired/disabled keys fail closed, secret swap 
     expect(body.error?.type).toBe("authentication_error");
   });
 
-  test("secret swap in place: old plaintext dies, new one works, id unchanged", async (ctx) => {
+  test("secret swap in place: the old plaintext dies, the new one works", async (ctx) => {
     if (!etcdReachable || !app || !seed) {
       ctx.skip();
       return;
@@ -295,6 +297,36 @@ describe("api key lifecycle e2e: expired/disabled keys fail closed, secret swap 
     // pre-swap secret is worthless immediately after the swap.
     const res = await chat(plaintext, "old secret after swap");
     expect(res.status).toBe(401);
+    await res.text();
+  });
+
+  test("deleting a key's etcd entry revokes an in-use bearer, other keys unaffected", async (ctx) => {
+    if (!etcdReachable || !app || !seed) {
+      ctx.skip();
+      return;
+    }
+
+    const plaintext = "sk-lifecycle-delete";
+    const control = "sk-lifecycle-delete-control";
+    const { id } = await seedKey(plaintext, {}, is200);
+    await seedKey(control, {}, is200);
+
+    // Revocation is a direct etcd delete — the declarative path an
+    // operator or the control plane uses. Fail-closed: the bearer must
+    // stop authenticating once the delete propagates.
+    await seed.delete("api_keys", id);
+    await waitConfigPropagation(async () => {
+      const res = await chat(plaintext, "post-delete probe");
+      const body = (await res.json()) as { error?: { code?: unknown } };
+      // The unknown-token 401 (no error.code) — distinct from the
+      // lifecycle 401s, which carry a code: the key is GONE, not
+      // disabled/expired.
+      return res.status === 401 && body.error?.code === undefined;
+    });
+
+    // The deletion was scoped: an unrelated key still authenticates.
+    const res = await chat(control, "control key after delete");
+    expect(res.status).toBe(200);
     await res.text();
   });
 });

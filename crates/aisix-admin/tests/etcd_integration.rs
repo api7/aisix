@@ -299,6 +299,25 @@ async fn observability_exporters_round_trip_through_real_etcd() {
     .await;
 }
 
+#[tokio::test]
+async fn a2a_agents_round_trip_through_real_etcd() {
+    let Some(url) = etcd_url() else {
+        eprintln!("skipping: ADMIN_TEST_ETCD_URL not set");
+        return;
+    };
+    direct_write_read_round_trip(
+        &url,
+        "a2a_agents",
+        "/admin/v1/a2a_agents",
+        "a2a-it-1",
+        json!({
+            "name": "invoice-it",
+            "url": "https://agents.example.com/a2a"
+        }),
+    )
+    .await;
+}
+
 // ─────────────────────────── Removed write path ───────────────────────────
 
 /// The write contract holds against the real etcd-backed store too:
@@ -336,12 +355,16 @@ async fn admin_writes_are_refused_against_real_etcd() {
         .expect("Allow header");
     assert!(allow.contains("GET"), "Allow: {allow}");
 
-    let app = build_router(state);
-    let resp = app
-        .oneshot(auth_req("POST", "/admin/v1/api_keys/any-id/rotate", None))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    // GET discriminates route absence from unknown-id: a surviving
+    // POST-only rotate route would answer GET with 405, not 404.
+    for method in ["POST", "GET"] {
+        let app = build_router(state.clone());
+        let resp = app
+            .oneshot(auth_req(method, "/admin/v1/api_keys/any-id/rotate", None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{method} rotate");
+    }
 
     // Nothing was written.
     let resp = client
@@ -434,6 +457,11 @@ async fn loader_picks_up_every_direct_write() {
             "mcp-loader-1",
             json!({"name": "loader-mcp", "url": "https://api.example.com/mcp"}),
         ),
+        (
+            "a2a_agents",
+            "a2a-loader-1",
+            json!({"name": "loader-a2a", "url": "https://agents.example.com/a2a"}),
+        ),
     ];
     for (kind, id, doc) in &writes {
         seed(&mut client, &prefix, kind, id, doc).await;
@@ -476,7 +504,7 @@ async fn loader_picks_up_every_direct_write() {
          likely a subkey drift against the match arms in \
          aisix_etcd::loader: {stats:?}"
     );
-    assert_eq!(stats.accepted, 7, "expected 7 entries; got {stats:?}");
+    assert_eq!(stats.accepted, 8, "expected 8 entries; got {stats:?}");
 
     // Each resource table should now have exactly one entry.
     assert_eq!(snap.models.len(), 1);
@@ -486,4 +514,5 @@ async fn loader_picks_up_every_direct_write() {
     assert_eq!(snap.cache_policies.len(), 1);
     assert_eq!(snap.observability_exporters.len(), 1);
     assert_eq!(snap.mcp_servers.len(), 1);
+    assert_eq!(snap.a2a_agents.len(), 1);
 }

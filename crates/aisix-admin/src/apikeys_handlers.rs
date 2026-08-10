@@ -1,13 +1,10 @@
-//! CRUD handlers for `/admin/v1/apikeys`.
+//! Read handlers for `/admin/v1/api_keys` (and the former `apikeys`
+//! spelling — same handlers).
 //!
 //! Same shape as [`crate::models_handlers`], operating on `ApiKey`
-//! resources. Duplicate-name detection uses `ApiKey::key` (which is the
-//! ApiKey's unique human-readable name from [`aisix_core::Resource`]),
-//! matching the proxy auth lookup by `by_name` index.
-//!
-//! Also provides key rotation: `POST /admin/v1/apikeys/:id/rotate`
-//! replaces the `key` field with a freshly-generated `sk-*` value and
-//! bumps the revision, invalidating the old credential.
+//! resources, except the responses project through [`PublicApiKey`]:
+//! the stored entry minus nothing today, but a dedicated projection so
+//! sensitive additions to `ApiKey` never leak by default.
 
 use aisix_core::resource::ResourceEntry;
 use aisix_core::ApiKey;

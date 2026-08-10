@@ -4,7 +4,6 @@
 //! The `AdminError` enum is the internal taxonomy. `IntoResponse` lets
 //! handlers `?`-propagate without touching JSON shape boilerplate.
 
-use aisix_core::models::SchemaError;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -21,14 +20,8 @@ pub struct ErrorBody {
 pub enum AdminError {
     #[error("missing or malformed admin authorization")]
     Unauthorized,
-    #[error("{0}")]
-    BadRequest(String),
     #[error("resource not found")]
     NotFound,
-    #[error("name {0:?} already in use by another resource")]
-    Conflict(String),
-    #[error("schema validation failed at {path}: {message}")]
-    Schema { path: String, message: String },
     #[error("store error: {0}")]
     Store(String),
 }
@@ -37,19 +30,8 @@ impl AdminError {
     pub fn status(&self) -> StatusCode {
         match self {
             AdminError::Unauthorized => StatusCode::UNAUTHORIZED,
-            AdminError::BadRequest(_) | AdminError::Schema { .. } => StatusCode::BAD_REQUEST,
             AdminError::NotFound => StatusCode::NOT_FOUND,
-            AdminError::Conflict(_) => StatusCode::CONFLICT,
             AdminError::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
-        }
-    }
-}
-
-impl From<SchemaError> for AdminError {
-    fn from(e: SchemaError) -> Self {
-        AdminError::Schema {
-            path: e.path,
-            message: e.message,
         }
     }
 }
@@ -77,15 +59,7 @@ mod tests {
     #[test]
     fn status_codes_match_spec_admin_envelope_rules() {
         assert_eq!(AdminError::Unauthorized.status(), StatusCode::UNAUTHORIZED);
-        assert_eq!(
-            AdminError::BadRequest("x".into()).status(),
-            StatusCode::BAD_REQUEST
-        );
         assert_eq!(AdminError::NotFound.status(), StatusCode::NOT_FOUND);
-        assert_eq!(
-            AdminError::Conflict("n".into()).status(),
-            StatusCode::CONFLICT
-        );
         assert_eq!(
             AdminError::Store("boom".into()).status(),
             StatusCode::INTERNAL_SERVER_ERROR,
