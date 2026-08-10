@@ -36,12 +36,28 @@ pub struct CacheKey {
     /// deterministic and so two requests that differ only in JSON key
     /// order collapse to the same fingerprint.
     pub extras: Vec<(String, String)>,
+    /// The matched `CachePolicy`'s resource id. Scopes entries per
+    /// policy so two policies never share entries even on the same
+    /// backend instance.
+    pub policy_id: String,
+    /// The policy's `purge_generation` at request time. A purge bumps
+    /// the generation, so every earlier entry's key becomes
+    /// unreachable at once (entries are then reclaimed by TTL).
+    pub purge_generation: u32,
+    /// The caller's api_key id when the policy's `scope` is `api_key`;
+    /// `None` under `scope: env`. Part of BOTH fingerprints, so scoped
+    /// entries are invisible across callers.
+    pub scope_api_key: Option<String>,
 }
 
 impl CacheKey {
     /// Build a key from the proxy's normalised `ChatFormat`. Streaming
     /// requests are *not* cached at this layer — callers should skip the
     /// cache when `req.is_streaming()`.
+    ///
+    /// The scope fields (`policy_id`, `purge_generation`,
+    /// `scope_api_key`) start empty; the proxy fills them via
+    /// [`CacheKey::with_scope`] once it knows the matched policy.
     pub fn from_request(req: &ChatFormat) -> Self {
         Self {
             model: req.model.clone(),
@@ -50,7 +66,25 @@ impl CacheKey {
             top_p_milli: req.top_p.map(quantise_milli),
             max_tokens: req.max_tokens,
             extras: canonical_extras(&req.extra),
+            policy_id: String::new(),
+            purge_generation: 0,
+            scope_api_key: None,
         }
+    }
+
+    /// Attach the matched policy's scope: its resource id, its current
+    /// purge generation, and — when the policy isolates per caller —
+    /// the caller's api_key id.
+    pub fn with_scope(
+        mut self,
+        policy_id: &str,
+        purge_generation: u32,
+        scope_api_key: Option<&str>,
+    ) -> Self {
+        self.policy_id = policy_id.to_string();
+        self.purge_generation = purge_generation;
+        self.scope_api_key = scope_api_key.map(str::to_string);
+        self
     }
 
     /// Hex-encoded u64 hash, used as the cache backend's lookup key.
@@ -59,15 +93,24 @@ impl CacheKey {
         self.hash(&mut h);
         format!("{:016x}", h.finish())
     }
-}
 
-impl Hash for CacheKey {
-    fn hash<H: Hasher>(&self, state: &mut H) {
+    /// Fingerprint of everything EXCEPT the messages — the semantic
+    /// layer's candidate filter. Two requests share a scope fingerprint
+    /// iff they agree on model, sampling params, extras, policy,
+    /// generation, and caller scope; only then may they match by
+    /// embedding similarity. This is what keeps a tool-calling request
+    /// from ever being answered by a similar-but-toolless entry.
+    pub fn scope_fingerprint(&self) -> String {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.hash_scope(&mut h);
+        format!("{:016x}", h.finish())
+    }
+
+    /// Hash the non-message fields. Shared by [`Hash`] and
+    /// [`CacheKey::scope_fingerprint`] so the two can never disagree on
+    /// which fields scope an entry.
+    fn hash_scope<H: Hasher>(&self, state: &mut H) {
         self.model.hash(state);
-        for (role, content) in &self.messages {
-            role.hash(state);
-            content.hash(state);
-        }
         self.temperature_milli.hash(state);
         self.top_p_milli.hash(state);
         self.max_tokens.hash(state);
@@ -75,7 +118,64 @@ impl Hash for CacheKey {
             k.hash(state);
             v.hash(state);
         }
+        self.policy_id.hash(state);
+        self.purge_generation.hash(state);
+        self.scope_api_key.hash(state);
     }
+}
+
+impl Hash for CacheKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.hash_scope(state);
+        for (role, content) in &self.messages {
+            role.hash(state);
+            content.hash(state);
+        }
+    }
+}
+
+/// Canonical text the semantic layer embeds for a request: one
+/// `role: content` line per message, preserving roles and message
+/// boundaries so `["ab"]` and `["a","b"]` embed differently.
+///
+/// Returns `None` — semantic matching is skipped, exact matching still
+/// applies — when the request is not entirely text: any non-`text`
+/// content block (image, audio, …) disqualifies it, because a text
+/// embedding cannot represent the non-text part and similar prompts
+/// about *different* images must never match. Also `None` when there is
+/// no non-whitespace text at all (embedding an empty string could match
+/// almost anything).
+pub fn semantic_prompt_text(req: &ChatFormat) -> Option<String> {
+    let mut out = String::new();
+    let mut has_text = false;
+    for m in &req.messages {
+        let text = match m.content_blocks.as_ref() {
+            Some(blocks) => {
+                let mut t = String::new();
+                for b in blocks {
+                    let obj = b.as_object()?;
+                    match obj.get("type").and_then(|v| v.as_str()) {
+                        Some("text") => {
+                            if let Some(s) = obj.get("text").and_then(|v| v.as_str()) {
+                                t.push_str(s);
+                            }
+                        }
+                        _ => return None,
+                    }
+                }
+                t
+            }
+            None => m.content_str().to_string(),
+        };
+        if !text.trim().is_empty() {
+            has_text = true;
+        }
+        out.push_str(role_str(m.role));
+        out.push_str(": ");
+        out.push_str(&text);
+        out.push('\n');
+    }
+    has_text.then_some(out)
 }
 
 /// Sort `extra` by key (recursively, into nested objects too) and emit
@@ -392,5 +492,114 @@ mod tests {
         assert_eq!(quantise_milli(0.0), 0);
         assert_eq!(quantise_milli(0.5), 500);
         assert_eq!(quantise_milli(f32::INFINITY), u32::MAX);
+    }
+
+    #[test]
+    fn different_policies_never_share_a_fingerprint() {
+        let r = req("m", vec![ChatMessage::user("hi")], None);
+        let a = CacheKey::from_request(&r).with_scope("policy-a", 0, None);
+        let b = CacheKey::from_request(&r).with_scope("policy-b", 0, None);
+        assert_ne!(a.fingerprint(), b.fingerprint());
+        assert_ne!(a.scope_fingerprint(), b.scope_fingerprint());
+    }
+
+    #[test]
+    fn purge_generation_bump_invalidates_both_fingerprints() {
+        let r = req("m", vec![ChatMessage::user("hi")], None);
+        let a = CacheKey::from_request(&r).with_scope("p", 0, None);
+        let b = CacheKey::from_request(&r).with_scope("p", 1, None);
+        assert_ne!(a.fingerprint(), b.fingerprint());
+        assert_ne!(a.scope_fingerprint(), b.scope_fingerprint());
+    }
+
+    #[test]
+    fn api_key_scope_isolates_callers_env_scope_shares() {
+        let r = req("m", vec![ChatMessage::user("hi")], None);
+        let a = CacheKey::from_request(&r).with_scope("p", 0, Some("key-a"));
+        let b = CacheKey::from_request(&r).with_scope("p", 0, Some("key-b"));
+        let shared_a = CacheKey::from_request(&r).with_scope("p", 0, None);
+        let shared_b = CacheKey::from_request(&r).with_scope("p", 0, None);
+        assert_ne!(a.fingerprint(), b.fingerprint());
+        assert_ne!(a.scope_fingerprint(), b.scope_fingerprint());
+        assert_eq!(shared_a.fingerprint(), shared_b.fingerprint());
+    }
+
+    #[test]
+    fn scope_fingerprint_ignores_messages_but_tracks_params() {
+        let a = req("m", vec![ChatMessage::user("hello there")], Some(0.2));
+        let b = req("m", vec![ChatMessage::user("совершенно другой")], Some(0.2));
+        let c = req("m", vec![ChatMessage::user("hello there")], Some(0.7));
+        let (ka, kb, kc) = (
+            CacheKey::from_request(&a).with_scope("p", 0, None),
+            CacheKey::from_request(&b).with_scope("p", 0, None),
+            CacheKey::from_request(&c).with_scope("p", 0, None),
+        );
+        assert_eq!(ka.scope_fingerprint(), kb.scope_fingerprint());
+        assert_ne!(ka.fingerprint(), kb.fingerprint());
+        assert_ne!(ka.scope_fingerprint(), kc.scope_fingerprint());
+    }
+
+    #[test]
+    fn scope_fingerprint_tracks_extras() {
+        let mut a = req("m", vec![ChatMessage::user("hi")], None);
+        let b = req("m", vec![ChatMessage::user("hi")], None);
+        a.extra.insert(
+            "tools".into(),
+            serde_json::json!([{"type": "function", "function": {"name": "f"}}]),
+        );
+        assert_ne!(
+            CacheKey::from_request(&a).scope_fingerprint(),
+            CacheKey::from_request(&b).scope_fingerprint(),
+        );
+    }
+
+    #[test]
+    fn semantic_text_preserves_roles_and_message_boundaries() {
+        let a = req(
+            "m",
+            vec![ChatMessage::system("be brief"), ChatMessage::user("hi")],
+            None,
+        );
+        let text = semantic_prompt_text(&a).unwrap();
+        assert_eq!(text, "system: be brief\nuser: hi\n");
+        // One message "ab" vs two messages "a"/"b" must differ.
+        let one = req("m", vec![ChatMessage::user("ab")], None);
+        let two = req(
+            "m",
+            vec![ChatMessage::user("a"), ChatMessage::user("b")],
+            None,
+        );
+        assert_ne!(
+            semantic_prompt_text(&one).unwrap(),
+            semantic_prompt_text(&two).unwrap(),
+        );
+    }
+
+    #[test]
+    fn semantic_text_none_for_non_text_blocks() {
+        let mut msg = ChatMessage::user("what's in this image?");
+        msg.content_blocks = Some(vec![
+            serde_json::json!({"type": "text", "text": "what's in this image?"}),
+            serde_json::json!({"type": "image_url", "image_url": {"url": "https://x/cat.jpg"}}),
+        ]);
+        let r = req("m", vec![msg], None);
+        assert_eq!(semantic_prompt_text(&r), None);
+    }
+
+    #[test]
+    fn semantic_text_accepts_text_only_blocks() {
+        let mut msg = ChatMessage::user("hello");
+        msg.content_blocks = Some(vec![
+            serde_json::json!({"type": "text", "text": "hel"}),
+            serde_json::json!({"type": "text", "text": "lo"}),
+        ]);
+        let r = req("m", vec![msg], None);
+        assert_eq!(semantic_prompt_text(&r).unwrap(), "user: hello\n");
+    }
+
+    #[test]
+    fn semantic_text_none_for_empty_content() {
+        let r = req("m", vec![ChatMessage::user("   ")], None);
+        assert_eq!(semantic_prompt_text(&r), None);
     }
 }

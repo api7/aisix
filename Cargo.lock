@@ -86,6 +86,7 @@ dependencies = [
  "aisix-gateway",
  "aisix-redis",
  "async-trait",
+ "dashmap",
  "moka",
  "redis",
  "serde_json",

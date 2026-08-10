@@ -14,7 +14,7 @@
 //!
 //! Cheap to clone: every field is either an `Arc` or a small Copy scalar.
 
-use aisix_cache::{Cache, MemoryCache};
+use aisix_cache::{Cache, MemoryCache, MemorySemanticCache, SemanticCacheStore};
 use aisix_core::models::CacheBackend;
 use aisix_core::snapshot::SnapshotHandle;
 use aisix_core::{AisixSnapshot, ProxyConfig};
@@ -43,9 +43,16 @@ use crate::routing::RoutingRegistry;
 pub struct CacheBackends {
     memory: Arc<dyn Cache>,
     redis: Option<Arc<dyn Cache>>,
+    /// Semantic (L2) store for `backend: memory` policies. Always
+    /// built — in-process, no config needed, zero cost until a policy
+    /// with a `semantic` block matches a request.
+    semantic_memory: Arc<dyn SemanticCacheStore>,
     /// Policy ids already warned about an unavailable redis backend,
     /// so the gate logs once per policy instead of once per request.
     redis_warned: Arc<DashSet<String>>,
+    /// Policy ids already warned about the redis semantic layer being
+    /// unavailable (same warn-once discipline as `redis_warned`).
+    semantic_redis_warned: Arc<DashSet<String>>,
 }
 
 impl CacheBackends {
@@ -53,7 +60,9 @@ impl CacheBackends {
         Self {
             memory,
             redis,
+            semantic_memory: Arc::new(MemorySemanticCache::new()),
             redis_warned: Arc::new(DashSet::new()),
+            semantic_redis_warned: Arc::new(DashSet::new()),
         }
     }
 
@@ -88,6 +97,38 @@ impl CacheBackends {
                     );
                 }
                 redis
+            }
+        }
+    }
+
+    /// Resolve the semantic (L2) store for a matched policy's
+    /// `backend`. Same never-fall-back discipline as
+    /// [`Self::for_policy_backend`]: a policy whose backend has no
+    /// semantic store gets NO semantic matching (exact matching still
+    /// works) rather than a silent per-node stand-in with different
+    /// sharing semantics.
+    pub fn semantic_for_policy_backend(
+        &self,
+        backend: CacheBackend,
+        policy_id: &str,
+        policy_name: &str,
+    ) -> Option<&Arc<dyn SemanticCacheStore>> {
+        match backend {
+            CacheBackend::Memory => Some(&self.semantic_memory),
+            CacheBackend::Redis => {
+                // The shared (redis) semantic store ships separately;
+                // until then a redis-backed policy runs exact-only.
+                if self.semantic_redis_warned.insert(policy_id.to_string()) {
+                    tracing::warn!(
+                        target: "aisix::cache",
+                        policy_id = %policy_id,
+                        policy_name = %policy_name,
+                        "cache policy configures semantic matching on backend=redis, \
+                         which this gateway version does not support yet; requests \
+                         fall back to exact matching only"
+                    );
+                }
+                None
             }
         }
     }

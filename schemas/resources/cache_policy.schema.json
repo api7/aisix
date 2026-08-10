@@ -8,9 +8,64 @@
         "redis"
       ],
       "type": "string"
+    },
+    "CacheScope": {
+      "description": "Sharing boundary for cache entries created under a policy. Applies to both matching layers: an entry written in one scope bucket is never served to a request in another.",
+      "oneOf": [
+        {
+          "description": "Entries are private to the API key that created them. The safe default: one caller's answers are never replayed to another.",
+          "enum": [
+            "api_key"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Entries are shared by every API key in the environment. Pick this for shared-knowledge traffic (FAQ, documentation Q&A) where cross-caller reuse is the point.",
+          "enum": [
+            "env"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "SemanticCacheConfig": {
+      "description": "Embedding-similarity matching for a cache policy. When present, a request that misses the exact layer is embedded and compared against stored entries; the nearest entry at or above `threshold` cosine similarity is served. Only requests whose messages are entirely text participate — requests containing images or audio never match by similarity.",
+      "properties": {
+        "embedding_model": {
+          "description": "Name of the `embedding` model used to embed requests. The model must exist in the same environment and carry an `embedding` block; its `dimensions` value fixes the vector size for this policy's entries.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "embedding_timeout_ms": {
+          "description": "Per-call deadline for the embedding request in milliseconds. `0` or absent disables the embedding-specific deadline. On timeout the request proceeds to the upstream uncached.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "max_entries": {
+          "default": 1000,
+          "description": "Upper bound on stored entries for this policy on the `memory` backend; the oldest entry is evicted first. Shared backends bound growth by TTL instead and ignore this value.",
+          "format": "uint32",
+          "maximum": 100000.0,
+          "minimum": 1.0,
+          "type": "integer"
+        },
+        "threshold": {
+          "description": "Minimum cosine similarity for a stored entry to be served, in `[0, 1]`. Higher is stricter. Values below `0.9` noticeably increase wrong-answer risk for most embedding models.",
+          "format": "float",
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "type": "number"
+        }
+      },
+      "required": [
+        "embedding_model",
+        "threshold"
+      ],
+      "type": "object"
     }
   },
-  "description": "Semantic cache policy for chat requests.",
+  "description": "A prompt-response cache rule. Requests covered by an enabled policy are served from cache when an identical request was answered before (exact matching), and — when `semantic` is configured — when a sufficiently similar request was.",
   "properties": {
     "applies_to": {
       "default": "all",
@@ -38,6 +93,30 @@
       "maxLength": 120,
       "minLength": 1,
       "type": "string"
+    },
+    "purge_generation": {
+      "default": 0,
+      "description": "Invalidation counter. Entries are readable only while their stored generation matches; a purge bumps this value, making every earlier entry unreachable at once. Managed by the purge operation — not set directly.",
+      "format": "uint32",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "scope": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/CacheScope"
+        }
+      ],
+      "default": "api_key",
+      "description": "Sharing boundary for entries created under this policy: `api_key` (default) keeps entries private to the caller that created them; `env` shares them across the environment."
+    },
+    "semantic": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/SemanticCacheConfig"
+        }
+      ],
+      "description": "Embedding-similarity matching. Absent: the policy matches exactly-identical requests only."
     },
     "ttl_seconds": {
       "default": 3600,

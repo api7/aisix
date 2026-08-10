@@ -207,16 +207,19 @@ describe("cache policy backend=redis with a configured redis is shared across DP
     const redisExtra = {
       cache: { backend: "memory", redis: { url: REDIS_URL } },
     };
-    // Two DP instances sharing one redis. A hit on the instance that
-    // never served the original request proves the entry really lives
-    // in redis — an (incorrect) memory-cache write could only produce
-    // hits on the same instance.
+    // Two DP replicas of ONE environment (same etcd prefix, so the
+    // same policy/api-key resource identities) sharing one redis. A
+    // hit on the instance that never served the original request
+    // proves the entry really lives in redis — an (incorrect)
+    // memory-cache write could only produce hits on the same instance.
+    // Cache keys are scoped by resource ids (policy id, caller id), so
+    // replicas MUST share the resource rows, exactly as they do behind
+    // one environment in production.
     appA = await spawnApp({ extra: redisExtra });
-    appB = await spawnApp({ extra: redisExtra });
+    appB = await spawnApp({ extra: redisExtra, etcdPrefix: appA.etcdPrefix });
     await seedApp(appA, upstream.baseUrl, "cache-redis-shared", "canary-a");
-    await seedApp(appB, upstream.baseUrl, "cache-redis-shared", "canary-b");
     await waitCanaryPolicyLive(appA.proxyUrl, "canary-a");
-    await waitCanaryPolicyLive(appB.proxyUrl, "canary-b");
+    await waitCanaryPolicyLive(appB.proxyUrl, "canary-a");
   });
 
   afterAll(async () => {

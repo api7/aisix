@@ -287,6 +287,19 @@ pub struct UsageEvent {
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub cache_hit_saved_output_tokens: u32,
 
+    /// On a cache hit, which matching layer served it: `"exact"` (a
+    /// byte-identical request) or `"semantic"` (an
+    /// embedding-similarity match above the policy's threshold).
+    /// Empty on every other outcome — `/dp/telemetry` binds JSON
+    /// leniently, so older CP images ignore the unknown field.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub cache_hit_layer: String,
+
+    /// On a semantic cache hit, the cosine similarity between the
+    /// request and the stored entry, in `[0, 1]`. `None` otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_similarity: Option<f32>,
+
     /// Which client-facing protocol the request used:
     ///
     /// - `"openai"` — `/v1/chat/completions` / `/v1/responses` /

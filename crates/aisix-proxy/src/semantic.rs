@@ -203,7 +203,7 @@ pub(crate) async fn resolve(
         state,
         snapshot,
         &embed_entry,
-        semantic,
+        semantic.embedding_timeout(),
         request_id,
         &to_embed,
     )
@@ -289,12 +289,15 @@ fn attempt_for_target(snapshot: &AisixSnapshot, alias: &str) -> Result<AttemptMo
 }
 
 /// Embed `texts` through the embedding model's bridge in one batched call,
-/// returning one float vector per input in input order.
-async fn embed_texts(
+/// returning one float vector per input in input order. Shared by the
+/// semantic router (route matching) and the cache gate's semantic layer
+/// (`aisix-proxy::chat`), which is why the deadline arrives as a plain
+/// `Option<Duration>` rather than either feature's config type.
+pub(crate) async fn embed_texts(
     state: &ProxyState,
     snapshot: &AisixSnapshot,
     embed_entry: &ResourceEntry<Model>,
-    semantic: &Semantic,
+    timeout: Option<std::time::Duration>,
     request_id: &str,
     texts: &[String],
 ) -> Result<Vec<Vec<f32>>, ProxyError> {
@@ -322,7 +325,7 @@ async fn embed_texts(
             Arc::new(pk_entry.value.clone()),
             None,
         );
-        match semantic.embedding_timeout() {
+        match timeout {
             Some(d) => base.with_deadline(d),
             None => base,
         }

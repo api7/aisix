@@ -158,6 +158,29 @@ pub const M_GUARDRAIL_LATENCY_SECONDS: &str = "aisix_guardrail_latency_seconds";
 /// Paired with `aisix_usage_event_drops_total{reason}` for the
 /// `try_send` failure paths (sink full / closed).
 pub const M_USAGE_EVENT_EMITS_TOTAL: &str = "aisix_usage_events_emitted_total";
+/// Cache gate outcomes, one increment per request that reached an
+/// enabled cache policy with an available backend. Labels:
+/// - `policy`: the policy's operator-facing name (bounded by the
+///   configured policy count).
+/// - `outcome`: `hit_exact` / `hit_semantic` / `miss` / `bypass`
+///   (`bypass` = the caller's `Cache-Control: no-cache` skipped the
+///   read path).
+///
+/// Requests with no matching policy or an unavailable backend
+/// (`cache_status=disabled`) are not counted — the gate never opened.
+pub const M_CACHE_REQUESTS_TOTAL: &str = "aisix_cache_requests_total";
+/// Latency of the cache semantic layer's embedding calls, by `policy`.
+/// Summary series (no fixed buckets), like the other legacy
+/// `histogram!` series here.
+pub const M_CACHE_SEMANTIC_EMBED_SECONDS: &str = "aisix_cache_semantic_embedding_seconds";
+/// Embedding failures on the cache semantic layer, by `policy` and
+/// `cause` (`resolve` = embedding model missing or not an embedding
+/// model; `embed` = the provider call failed or timed out). Each
+/// failure degrades that request to exact-only matching, so a nonzero
+/// rate here with a flat `hit_semantic` outcome is the "semantic layer
+/// silently down" signal.
+pub const M_CACHE_SEMANTIC_EMBED_FAILURES_TOTAL: &str =
+    "aisix_cache_semantic_embedding_failures_total";
 pub const M_OTLP_FANOUT_DROPS_TOTAL: &str = "aisix_otlp_fanout_drops_total";
 pub const M_OTLP_FANOUT_FAILURES_TOTAL: &str = "aisix_otlp_fanout_failures_total";
 /// AISIX-Cloud#1011: SLO-grade latency distributions as REAL bucketed
@@ -847,6 +870,45 @@ impl Metrics {
                 "scope" => scope.to_string(),
                 "layer" => layer.to_string(),
                 "policy_id" => policy_id.unwrap_or_default().to_string(),
+            )
+            .increment(1);
+        });
+    }
+
+    /// Count one cache-gate outcome. `policy` is the matched policy's
+    /// name, `outcome` one of the fixed [`M_CACHE_REQUESTS_TOTAL`]
+    /// values.
+    pub fn record_cache_event(&self, policy: &str, outcome: &str) {
+        metrics::with_local_recorder(&self.inner.recorder, || {
+            metrics::counter!(
+                M_CACHE_REQUESTS_TOTAL,
+                "policy" => policy.to_string(),
+                "outcome" => outcome.to_string(),
+            )
+            .increment(1);
+        });
+    }
+
+    /// Record one successful cache semantic-layer embedding call.
+    pub fn record_cache_semantic_embed(&self, policy: &str, elapsed: Duration) {
+        metrics::with_local_recorder(&self.inner.recorder, || {
+            metrics::histogram!(
+                M_CACHE_SEMANTIC_EMBED_SECONDS,
+                "policy" => policy.to_string(),
+            )
+            .record(elapsed.as_secs_f64());
+        });
+    }
+
+    /// Count one failed cache semantic-layer embedding attempt. `cause`
+    /// is one of the fixed [`M_CACHE_SEMANTIC_EMBED_FAILURES_TOTAL`]
+    /// values.
+    pub fn record_cache_semantic_embed_failure(&self, policy: &str, cause: &str) {
+        metrics::with_local_recorder(&self.inner.recorder, || {
+            metrics::counter!(
+                M_CACHE_SEMANTIC_EMBED_FAILURES_TOTAL,
+                "policy" => policy.to_string(),
+                "cause" => cause.to_string(),
             )
             .increment(1);
         });
