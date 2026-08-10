@@ -42,17 +42,19 @@ Replicates the published onthebench setup (https://onthebench.ai/gateways/perfor
   as the only upstream and minting the single client key (boot: AISIX has no
   anonymous mode). Everything else — thread-per-core, worker count, telemetry —
   is whatever the defaults do.
-- **Load grid** — fixed concurrency, the api7/aisix#891 grid: c=16/32/128
-  against the 0-delay mock, c=768 against the 10ms-TTFT mock
+- **Load grid** — fixed concurrency, the api7/aisix#891 grid by default:
+  c=16/32/128 against the 0-delay mock, c=768 against the 10ms-TTFT mock
   (`MOCK_TTFT_MS=10`). 25s windows, 5s warmup per point, ≥4 repetitions;
   a window with any failed request (`fail`, `rigrefused`, `budgetexceeded`,
   `spawnfailed`) is recorded but marked invalid, and the point retries until
   4 valid windows or 8 attempts. A run in which any point ends incomplete
   exits nonzero so it can never be mistaken for a baseline.
-- **Rig floor** — the load generator driving the mock directly (c=128 0-delay,
-  c=768 10ms), so every gateway number can be checked against the instrument's
-  own ceiling; two valid windows per floor point, under the same
-  record-mark-retry validity policy as the gateway points.
+- **Rig floor** — the load generator driving the mock directly, so every
+  gateway number can be checked against the instrument's own ceiling; two
+  valid windows per floor point, under the same record-mark-retry validity
+  policy as the gateway points. The 0-delay tier gets one floor at its
+  largest concurrency (the ceiling barely moves with c); each delayed tier
+  gets a floor per concurrency, because there the ceiling is ~conc/delay.
 - **Recorded per window** — rps, fail/ok counts, p50/p99 (µs, from otb),
   gateway CPU% (`/proc/<pid>/stat` utime+stime across the window), gateway
   peak RSS (VmRSS sampled at 5 Hz), the raw otb stats line. Idle RSS and
@@ -64,13 +66,42 @@ Replicates the published onthebench setup (https://onthebench.ai/gateways/perfor
   reverts on reboot) so an unprivileged run can sample its own process, and
   `run-baseline.sh` refuses a stripped binary before wasting a run.
 
+## Method overrides
+
+Every method knob is a `BENCH_*` environment variable (defaults in `lib.sh`
+match the #891 grid exactly): `BENCH_GRID` (`"ttft_ms:conc ..."`, e.g.
+`"20:1536 20:2048"` for an added delay tier, `"0:128"` for a spot-check),
+`BENCH_REPS`, `BENCH_WINDOW`, `BENCH_WARMUP`, `BENCH_MAX_TRIES`,
+`BENCH_FLOOR_REPS`, `BENCH_FLAMEGRAPH`. `bench.sh` forwards them to the rig.
+A changed knob is recorded in `meta.json`, so a non-default run can never
+pass silently as the standard grid.
+
+Values are validated at startup and nonsense refuses to run: grid entries
+must be `ttft_ms:conc` with a positive concurrency; window, reps, max tries
+and floor reps must be positive integers (warmup may be `0`);
+`BENCH_FLAMEGRAPH` is `0` or `1`.
+
+## Measuring another target ("entrant")
+
+`run-entrant.sh <entrant-dir> <out-dir>` measures any gateway-shaped process
+with the same instruments, floors, windows and validity policy — both runners
+source `lib.sh`, so cross-target numbers are comparable by construction. The
+entrant dir provides an `entrant.sh` implementing the contract documented at
+the top of `run-entrant.sh` (start the target pinned to the gateway cores on
+the harness port, upstream at the mock; optionally a prepare/teardown step,
+identity metadata, and a request-shape override for targets whose ingress
+speaks a dialect other than OpenAI chat). Entrant dirs are deliberately not
+part of this repository; flamegraphs default off for entrants because shipped
+release binaries are usually stripped (a stripped target skips the flamegraph
+with a warning rather than failing the run).
+
 ## Output
 
 One directory per run: `results.jsonl` (one JSON object per measured window,
-`kind` gateway/floor), `meta.json`, the generated config files, and the
-gateway/mock logs. `flamegraph-c128.svg` is present when Inferno rendering
-succeeded; on a rendering failure the run keeps `perf.data` instead, so the
-SVG can be produced off-rig.
+`kind` gateway/floor, `entrant` naming the measured target), `meta.json`, the
+generated config files, and the gateway/mock logs. `flamegraph-c128.svg` is
+present when Inferno rendering succeeded; on a rendering failure the run
+keeps `perf.data` instead, so the SVG can be produced off-rig.
 
 ## Deviations from stock defaults, and why
 
