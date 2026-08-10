@@ -1,10 +1,11 @@
-//! [`ConfigStore`] — the storage abstraction every admin handler reads
-//! and writes through.
+//! [`ConfigStore`] — the read-only storage abstraction every admin
+//! handler reads through. Writes left the trait when the Admin API
+//! write path was removed; resources are written declaratively
+//! (resources file or etcd) and this layer only serves them back.
 //!
-//! Production wires an etcd-backed implementation (follow-up PR); tests
-//! use [`InMemoryStore`]. The trait keeps CRUD minimal — orchestration
-//! (schema validation, duplicate-name detection, uuid generation) belongs
-//! in the handler layer so the store stays dumb and fast.
+//! Production wires the etcd-backed or file-snapshot implementation;
+//! tests use [`InMemoryStore`], which keeps `#[cfg(test)]` inherent
+//! write methods for seeding.
 
 use aisix_core::resource::ResourceEntry;
 use aisix_core::{

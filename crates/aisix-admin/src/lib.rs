@@ -1401,37 +1401,48 @@ mod tests {
     /// `Allow: GET` header — regardless of store backend or auth.
     #[tokio::test]
     async fn removed_resource_writes_answer_405_with_allow_get() {
-        let writes: Vec<(&str, String, Option<Value>)> = vec![
-            (
-                "POST",
-                "/admin/v1/models".into(),
-                Some(model_payload("new")),
-            ),
-            (
-                "PUT",
-                "/admin/v1/models/m-1".into(),
-                Some(model_payload("m")),
-            ),
-            ("DELETE", "/admin/v1/models/m-1".into(), None),
-            (
-                "POST",
-                "/admin/v1/api_keys".into(),
-                Some(apikey_payload("sk-x", &["*"])),
-            ),
-            ("DELETE", "/admin/v1/api_keys/some-id".into(), None),
-            // Former `apikeys` spelling: same removed write path.
-            ("DELETE", "/admin/v1/apikeys/some-id".into(), None),
-            (
-                "POST",
-                "/admin/v1/guardrails".into(),
-                Some(guardrail_payload("g")),
-            ),
-            ("POST", "/admin/v1/provider_keys".into(), None),
-            ("POST", "/admin/v1/mcp_servers".into(), None),
-            ("POST", "/admin/v1/a2a_agents".into(), None),
-            ("POST", "/admin/v1/cache_policies".into(), None),
-            ("POST", "/admin/v1/observability_exporters".into(), None),
+        // The FULL matrix — every route spelling × every write method.
+        // A partial revert (say, PUT re-added on one {id} route) must
+        // fail here; a sampled subset would let it through.
+        const ROUTE_SPELLINGS: [&str; 9] = [
+            "models",
+            "api_keys",
+            "apikeys", // former spelling: same removed write path
+            "provider_keys",
+            "guardrails",
+            "cache_policies",
+            "observability_exporters",
+            "mcp_servers",
+            "a2a_agents",
         ];
+        let mut writes: Vec<(&str, String, Option<Value>)> = Vec::new();
+        for kind in ROUTE_SPELLINGS {
+            writes.push(("POST", format!("/admin/v1/{kind}"), None));
+            writes.push(("PUT", format!("/admin/v1/{kind}/some-id"), None));
+            writes.push(("DELETE", format!("/admin/v1/{kind}/some-id"), None));
+        }
+        // Plus representative rows with well-formed bodies, pinning that
+        // a valid payload doesn't route any differently.
+        writes.push((
+            "POST",
+            "/admin/v1/models".into(),
+            Some(model_payload("new")),
+        ));
+        writes.push((
+            "PUT",
+            "/admin/v1/models/m-1".into(),
+            Some(model_payload("m")),
+        ));
+        writes.push((
+            "POST",
+            "/admin/v1/api_keys".into(),
+            Some(apikey_payload("sk-x", &["*"])),
+        ));
+        writes.push((
+            "POST",
+            "/admin/v1/guardrails".into(),
+            Some(guardrail_payload("g")),
+        ));
         for (method, uri, body) in writes {
             let app = build_router(build_state());
             let resp = run(app, auth_req(method, &uri, body)).await;

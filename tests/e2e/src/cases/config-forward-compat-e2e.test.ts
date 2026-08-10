@@ -23,8 +23,8 @@ import {
 //   and the metrics listener exposes a per-kind gauge;
 // - a converged same-version deployment (documents written by this
 //   version's own canonical shapes) reports ZERO partially-compatible
-//   rows — the strictness that catches typos is preserved;
-// - the Admin API write path still rejects unknown fields with 400.
+//   rows — the strictness that catches typos lives in the declarative
+//   writers (`aisix validate`, the file source, the control plane).
 
 const CALLER_PLAINTEXT = "sk-forward-compat-caller";
 const CALLER_KEY_HASH = createHash("sha256").update(CALLER_PLAINTEXT).digest("hex");

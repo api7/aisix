@@ -29,9 +29,9 @@ use axum::response::{Html, IntoResponse, Response};
 use serde_json::{json, Map, Value};
 
 /// Paths + OpenAPI-specific wrapper schemas (`ModelEntry`,
-/// `ApiKeyEntry`, `ModelStatusView`, `AdminError`, etc.). Resource
-/// schemas live in [`RESOURCE_SCHEMAS`] below and get merged in by
-/// [`merged_openapi`]. Update this whenever a route is added or
+/// `PublicApiKeyEntry`, `ModelStatusView`, `AdminError`, etc.).
+/// Resource schemas live in [`RESOURCE_SCHEMAS`] below and get merged
+/// in by [`merged_openapi`]. Update this whenever a route is added or
 /// removed in `lib.rs`.
 const OPENAPI_JSON_BASE: &str = r##"{
   "openapi": "3.1.0",
