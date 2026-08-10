@@ -75,7 +75,9 @@ jobs:
     runs-on: ubuntu-latest
     services:
       redis:
-        image: redis:7-alpine
+        # redis:8 ships the vector-search query engine the semantic
+        # cache needs; a superset of redis:7 for the exact-cache tests.
+        image: redis:8-alpine
         ports: ["6379:6379"]
       # Real etcd for crates/aisix-admin/tests/etcd_integration.rs —
       # exercises the full Admin handler → EtcdConfigStore →
@@ -105,6 +107,13 @@ jobs:
       # every Config::load_from_path test as `redis_url` and breaks
       # the entire `aisix-core::config::tests` module.
       CACHE_TEST_REDIS_URL: redis://127.0.0.1:6379
+      # Picked up by crates/aisix-cache/tests/semantic_redis_integration.rs
+      # — needs the vector-capable redis:8 service above. The PLAIN url
+      # points at a cluster node (redis:7, no vector search) to pin the
+      # capability probe's failure path. Same skip-if-unset /
+      # no-AISIX_-prefix rules.
+      CACHE_TEST_REDIS_VECTOR_URL: redis://127.0.0.1:6379
+      CACHE_TEST_REDIS_PLAIN_URL: redis://127.0.0.1:7000
       # Picked up by crates/aisix-ratelimit/tests/redis_integration.rs
       # (shared cluster-level counters, #798). Same skip-if-unset /
       # no-AISIX_-prefix rules as CACHE_TEST_REDIS_URL above.
@@ -245,8 +254,16 @@ jobs:
           ETCD_ADVERTISE_CLIENT_URLS: "http://0.0.0.0:2379"
         ports: ["2379:2379"]
       redis:
-        image: redis:7-alpine
+        # redis:8 = vector-capable, so the semantic-cache redis e2e
+        # exercises the real path against AISIX_E2E_REDIS.
+        image: redis:8-alpine
         ports: ["6379:6379"]
+      redis-plain:
+        # A vector-LESS redis so the semantic-cache degradation suite
+        # (exact-only on plain redis) actually runs in CI instead of
+        # skipping forever now that the main service is redis:8.
+        image: redis:7-alpine
+        ports: ["6377:6379"]
     steps:
       - uses: actions/checkout@v6
       - uses: actions/download-artifact@v8
@@ -292,6 +309,9 @@ jobs:
         # mode and the second would prove nothing.
         env:
           E2E_THREAD_PER_CORE: ${{ matrix.thread_per_core }}
+          # Vector-less redis for the semantic-cache degradation suite;
+          # the main 6379 service is redis:8 (vector-capable).
+          AISIX_E2E_REDIS_PLAIN: redis://127.0.0.1:6377
         run: pnpm test
       - name: tag coverage by leg
         # The gate downloads every leg with `merge-multiple: true`, which

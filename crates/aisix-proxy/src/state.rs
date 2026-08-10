@@ -47,6 +47,11 @@ pub struct CacheBackends {
     /// built — in-process, no config needed, zero cost until a policy
     /// with a `semantic` block matches a request.
     semantic_memory: Arc<dyn SemanticCacheStore>,
+    /// Semantic (L2) store for `backend: redis` policies. Wired by the
+    /// bootstrap only when `cache.redis` is configured, is not cluster
+    /// mode, AND the server passed the vector-search capability probe —
+    /// so its absence here IS the degradation signal.
+    semantic_redis: Option<Arc<dyn SemanticCacheStore>>,
     /// Policy ids already warned about an unavailable redis backend,
     /// so the gate logs once per policy instead of once per request.
     redis_warned: Arc<DashSet<String>>,
@@ -65,10 +70,18 @@ impl CacheBackends {
             memory,
             redis,
             semantic_memory: Arc::new(MemorySemanticCache::new()),
+            semantic_redis: None,
             redis_warned: Arc::new(DashSet::new()),
             semantic_redis_warned: Arc::new(DashSet::new()),
             semantic_resolve_warned: Arc::new(DashSet::new()),
         }
+    }
+
+    /// Attach the shared semantic store for `backend: redis` policies.
+    /// The bootstrap calls this only after the capability probe passed.
+    pub fn with_semantic_redis(mut self, store: Arc<dyn SemanticCacheStore>) -> Self {
+        self.semantic_redis = Some(store);
+        self
     }
 
     /// True the FIRST time `policy_id` reports a stable semantic config
@@ -127,19 +140,19 @@ impl CacheBackends {
         match backend {
             CacheBackend::Memory => Some(&self.semantic_memory),
             CacheBackend::Redis => {
-                // The shared (redis) semantic store ships separately;
-                // until then a redis-backed policy runs exact-only.
-                if self.semantic_redis_warned.insert(policy_id.to_string()) {
+                let store = self.semantic_redis.as_ref();
+                if store.is_none() && self.semantic_redis_warned.insert(policy_id.to_string()) {
                     tracing::warn!(
                         target: "aisix::cache",
                         policy_id = %policy_id,
                         policy_name = %policy_name,
-                        "cache policy configures semantic matching on backend=redis, \
-                         which this gateway version does not support yet; requests \
-                         fall back to exact matching only"
+                        "cache policy configures semantic matching on backend=redis but \
+                         the configured cache.redis has no vector-search support \
+                         (requires Redis 8+ or the search module; cluster mode is not \
+                         supported yet); requests fall back to exact matching only"
                     );
                 }
-                None
+                store
             }
         }
     }

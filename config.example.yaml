@@ -166,6 +166,11 @@ cache:
   # Legacy knob — no longer selects a single global cache. Kept for
   # config compatibility; `backend: "redis"` still requires the
   # `redis` block below (validated at boot).
+  #
+  # Cache policies with a `semantic` block additionally need vector
+  # search on this Redis (Redis 8+, or the search module) in `single`
+  # or `sentinel` mode; without it, `backend: redis` policies serve
+  # exact matches only (probed and logged at boot).
   backend: "memory"   # memory | redis
   # redis:
   #   # mode picks the topology. Credentials travel inside the URLs, as

@@ -51,10 +51,11 @@ pub enum CacheScope {
 /// participate — requests containing images or audio never match by
 /// similarity.
 ///
-/// Similarity matching currently requires `backend: memory`. A policy
-/// with `backend: redis` accepts this configuration but keeps serving
-/// exact matches only (a warning is logged) until shared semantic
-/// storage ships.
+/// On `backend: redis`, similarity matching requires a Redis server
+/// with vector search (Redis 8 or later, or the search module) in
+/// `single` or `sentinel` mode; without it — or in `cluster` mode —
+/// the policy keeps serving exact matches only and a warning is
+/// logged.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
 pub struct SemanticCacheConfig {
     /// Name of the `embedding` model used to embed requests. The model
