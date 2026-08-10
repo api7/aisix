@@ -50,7 +50,10 @@ pub struct SemanticHit {
 #[async_trait]
 pub trait SemanticCacheStore: Send + Sync + 'static {
     /// Nearest stored entry in the partition with cosine similarity
-    /// `>= threshold`, or `None`.
+    /// `>= threshold`, or `None`. A similarity of exactly `0.0` never
+    /// matches regardless of threshold: `0.0` is also the fold value
+    /// for degenerate comparisons (dimension mismatch, zero vector),
+    /// and a `threshold: 0.0` policy must not turn those into hits.
     async fn lookup(
         &self,
         policy_id: &str,
@@ -60,16 +63,20 @@ pub trait SemanticCacheStore: Send + Sync + 'static {
         threshold: f32,
     ) -> Result<Option<SemanticHit>, CacheError>;
 
-    /// Store a response under the partition. `max_entries` caps the
-    /// policy's entry count where the backend enforces one (the memory
-    /// backend evicts oldest-first; shared backends may ignore it and
-    /// bound growth by TTL).
+    /// Store a response under the partition. `exact_key` is the
+    /// request's exact-layer fingerprint: an existing entry with the
+    /// same `exact_key` is REPLACED (a `Cache-Control: no-cache`
+    /// refresh must update the entry, not stack a duplicate beside
+    /// it). `max_entries` caps the policy's entry count where the
+    /// backend enforces one (the memory backend evicts oldest-first;
+    /// shared backends may ignore it and bound growth by TTL).
     #[allow(clippy::too_many_arguments)]
     async fn store(
         &self,
         policy_id: &str,
         generation: u32,
         scope_fp: &str,
+        exact_key: &str,
         embedding: Vec<f32>,
         response: ChatResponse,
         ttl: Duration,
@@ -100,6 +107,7 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 
 struct SemanticEntry {
     scope_fp: String,
+    exact_key: String,
     embedding: Vec<f32>,
     response: ChatResponse,
     expires_at: Instant,
@@ -160,8 +168,11 @@ impl SemanticCacheStore for MemorySemanticCache {
                 continue;
             }
             let similarity = cosine_similarity(embedding, &entry.embedding);
+            // `> 0.0` (not just `>= threshold`): 0.0 is the degenerate
+            // fold — see the trait docs.
             if similarity >= threshold
-                && best.as_ref().map(|b| similarity > b.similarity) != Some(false)
+                && similarity > 0.0
+                && best.as_ref().is_none_or(|b| similarity > b.similarity)
             {
                 best = Some(SemanticHit {
                     response: entry.response.clone(),
@@ -178,6 +189,7 @@ impl SemanticCacheStore for MemorySemanticCache {
         policy_id: &str,
         generation: u32,
         scope_fp: &str,
+        exact_key: &str,
         embedding: Vec<f32>,
         response: ChatResponse,
         ttl: Duration,
@@ -223,8 +235,13 @@ impl SemanticCacheStore for MemorySemanticCache {
         while policy.entries.front().is_some_and(|e| e.expires_at <= now) {
             policy.entries.pop_front();
         }
+        // Upsert by exact wording: a refresh replaces, never duplicates.
+        policy
+            .entries
+            .retain(|e| e.exact_key != exact_key || e.scope_fp != scope_fp);
         policy.entries.push_back(SemanticEntry {
             scope_fp: scope_fp.to_string(),
+            exact_key: exact_key.to_string(),
             embedding,
             response,
             expires_at: now + ttl,
@@ -257,11 +274,20 @@ mod tests {
     async fn nearest_entry_above_threshold_wins() {
         let store = MemorySemanticCache::new();
         store
-            .store("p", 0, "fp", vec![1.0, 0.0], resp("exact"), TTL, 100)
+            .store("p", 0, "fp", "k1", vec![1.0, 0.0], resp("exact"), TTL, 100)
             .await
             .unwrap();
         store
-            .store("p", 0, "fp", vec![0.9, 0.4359], resp("near"), TTL, 100)
+            .store(
+                "p",
+                0,
+                "fp",
+                "k2",
+                vec![0.9, 0.4359],
+                resp("near"),
+                TTL,
+                100,
+            )
             .await
             .unwrap();
         // Query aligned with the second entry: both clear 0.8, nearest wins.
@@ -278,7 +304,7 @@ mod tests {
     async fn below_threshold_misses() {
         let store = MemorySemanticCache::new();
         store
-            .store("p", 0, "fp", vec![1.0, 0.0], resp("a"), TTL, 100)
+            .store("p", 0, "fp", "k3", vec![1.0, 0.0], resp("a"), TTL, 100)
             .await
             .unwrap();
         // cos = 0.7071 < 0.9.
@@ -290,7 +316,7 @@ mod tests {
     async fn scope_fp_partitions_candidates() {
         let store = MemorySemanticCache::new();
         store
-            .store("p", 0, "fp-a", vec![1.0, 0.0], resp("a"), TTL, 100)
+            .store("p", 0, "fp-a", "k4", vec![1.0, 0.0], resp("a"), TTL, 100)
             .await
             .unwrap();
         let got = store
@@ -304,7 +330,7 @@ mod tests {
     async fn policies_partition_candidates() {
         let store = MemorySemanticCache::new();
         store
-            .store("p1", 0, "fp", vec![1.0, 0.0], resp("a"), TTL, 100)
+            .store("p1", 0, "fp", "k5", vec![1.0, 0.0], resp("a"), TTL, 100)
             .await
             .unwrap();
         let got = store.lookup("p2", 0, "fp", &[1.0, 0.0], 0.5).await.unwrap();
@@ -315,7 +341,7 @@ mod tests {
     async fn generation_bump_purges_lookups_and_resets_on_store() {
         let store = MemorySemanticCache::new();
         store
-            .store("p", 0, "fp", vec![1.0, 0.0], resp("old"), TTL, 100)
+            .store("p", 0, "fp", "k6", vec![1.0, 0.0], resp("old"), TTL, 100)
             .await
             .unwrap();
         // Purge: lookups under the new generation miss.
@@ -323,7 +349,7 @@ mod tests {
         assert!(got.is_none());
         // First store under the new generation resets the list.
         store
-            .store("p", 1, "fp", vec![0.0, 1.0], resp("new"), TTL, 100)
+            .store("p", 1, "fp", "k7", vec![0.0, 1.0], resp("new"), TTL, 100)
             .await
             .unwrap();
         assert_eq!(store.entry_count("p"), 1);
@@ -337,13 +363,13 @@ mod tests {
         let store = MemorySemanticCache::new();
         // Purged bucket already re-warmed at generation 1.
         store
-            .store("p", 1, "fp", vec![0.0, 1.0], resp("new"), TTL, 100)
+            .store("p", 1, "fp", "k8", vec![0.0, 1.0], resp("new"), TTL, 100)
             .await
             .unwrap();
         // A request that read the pre-purge policy snapshot finishes its
         // upstream call late and stores under generation 0: dropped.
         store
-            .store("p", 0, "fp", vec![1.0, 0.0], resp("stale"), TTL, 100)
+            .store("p", 0, "fp", "k9", vec![1.0, 0.0], resp("stale"), TTL, 100)
             .await
             .unwrap();
         assert_eq!(store.entry_count("p"), 1);
@@ -368,6 +394,7 @@ mod tests {
                 "idle",
                 0,
                 "fp",
+                "k10",
                 vec![1.0, 0.0],
                 resp("orphan"),
                 Duration::from_millis(20),
@@ -378,7 +405,16 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(40)).await;
         // A store on ANY other policy sweeps the fully-expired bucket.
         store
-            .store("busy", 0, "fp", vec![0.0, 1.0], resp("live"), TTL, 100)
+            .store(
+                "busy",
+                0,
+                "fp",
+                "k11",
+                vec![0.0, 1.0],
+                resp("live"),
+                TTL,
+                100,
+            )
             .await
             .unwrap();
         assert_eq!(store.entry_count("idle"), 0);
@@ -390,7 +426,7 @@ mod tests {
         let store = MemorySemanticCache::new();
         let ttl = Duration::from_secs(60);
         store
-            .store("p", 0, "fp", vec![1.0, 0.0], resp("a"), ttl, 100)
+            .store("p", 0, "fp", "k12", vec![1.0, 0.0], resp("a"), ttl, 100)
             .await
             .unwrap();
         let hit = store
@@ -413,6 +449,7 @@ mod tests {
                 "p",
                 0,
                 "fp",
+                "k13",
                 vec![1.0, 0.0],
                 resp("a"),
                 Duration::from_millis(20),
@@ -429,15 +466,15 @@ mod tests {
     async fn max_entries_evicts_oldest_first() {
         let store = MemorySemanticCache::new();
         store
-            .store("p", 0, "fp", vec![1.0, 0.0], resp("first"), TTL, 2)
+            .store("p", 0, "fp", "k14", vec![1.0, 0.0], resp("first"), TTL, 2)
             .await
             .unwrap();
         store
-            .store("p", 0, "fp", vec![0.0, 1.0], resp("second"), TTL, 2)
+            .store("p", 0, "fp", "k15", vec![0.0, 1.0], resp("second"), TTL, 2)
             .await
             .unwrap();
         store
-            .store("p", 0, "fp", vec![-1.0, 0.0], resp("third"), TTL, 2)
+            .store("p", 0, "fp", "k16", vec![-1.0, 0.0], resp("third"), TTL, 2)
             .await
             .unwrap();
         assert_eq!(store.entry_count("p"), 2);
@@ -451,6 +488,72 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(hit.response.message.content_str(), "second");
+    }
+
+    #[tokio::test]
+    async fn store_upserts_by_exact_key() {
+        let store = MemorySemanticCache::new();
+        store
+            .store(
+                "p",
+                0,
+                "fp",
+                "same-wording",
+                vec![1.0, 0.0],
+                resp("v1"),
+                TTL,
+                100,
+            )
+            .await
+            .unwrap();
+        // A refresh of the SAME wording replaces the entry in place.
+        store
+            .store(
+                "p",
+                0,
+                "fp",
+                "same-wording",
+                vec![1.0, 0.0],
+                resp("v2"),
+                TTL,
+                100,
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.entry_count("p"), 1);
+        let hit = store
+            .lookup("p", 0, "fp", &[1.0, 0.0], 0.9)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(hit.response.message.content_str(), "v2");
+        // Same wording under a DIFFERENT scope partition is untouched.
+        store
+            .store(
+                "p",
+                0,
+                "fp-b",
+                "same-wording",
+                vec![1.0, 0.0],
+                resp("other"),
+                TTL,
+                100,
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.entry_count("p"), 2);
+    }
+
+    #[tokio::test]
+    async fn zero_similarity_never_matches_even_at_threshold_zero() {
+        let store = MemorySemanticCache::new();
+        // Dimension mismatch folds to 0.0; threshold 0.0 must still miss.
+        store
+            .store("p", 0, "fp", "k", vec![1.0, 0.0, 0.0], resp("a"), TTL, 100)
+            .await
+            .unwrap();
+        let got = store.lookup("p", 0, "fp", &[1.0, 0.0], 0.0).await.unwrap();
+        assert!(got.is_none());
     }
 
     #[test]

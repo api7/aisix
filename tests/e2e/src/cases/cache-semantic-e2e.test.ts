@@ -121,6 +121,60 @@ async function startEmbeddingMock(
   };
 }
 
+interface CountingUpstream {
+  baseUrl: string;
+  callCount(): number;
+  close(): Promise<void>;
+}
+
+/**
+ * A chat upstream whose reply body CHANGES on every call
+ * (`reply-1`, `reply-2`, …). Refresh contracts need this: with a
+ * fixed-body mock, "the entry was re-stored" and "the old entry
+ * survived" are indistinguishable.
+ */
+async function countingChatUpstream(): Promise<CountingUpstream> {
+  let calls = 0;
+  const server: Server = createServer((req, res) => {
+    res.on("error", () => {});
+    req.on("data", () => {});
+    req.on("end", () => {
+      calls++;
+      res.statusCode = 200;
+      res.setHeader("content-type", "application/json");
+      res.end(
+        JSON.stringify({
+          id: `cmpl-${calls}`,
+          object: "chat.completion",
+          created: Math.floor(Date.now() / 1000),
+          model: "gpt-4o-mini",
+          choices: [
+            {
+              index: 0,
+              message: { role: "assistant", content: `reply-${calls}` },
+              finish_reason: "stop",
+            },
+          ],
+          usage: { prompt_tokens: 7, completion_tokens: 5, total_tokens: 12 },
+        }),
+      );
+    });
+  });
+  const port = await pickFreePort();
+  await new Promise<void>((resolve) =>
+    server.listen(port, "127.0.0.1", resolve),
+  );
+  return {
+    baseUrl: `http://127.0.0.1:${port}`,
+    callCount: () => calls,
+    async close() {
+      await new Promise<void>((resolve, reject) => {
+        server.close((err) => (err ? reject(err) : resolve()));
+      });
+    },
+  };
+}
+
 function chatUpstreamReplying(content: string): Promise<OpenAiUpstream> {
   return startOpenAiUpstream({
     nonStreamBody: {
@@ -153,6 +207,7 @@ describe("semantic cache e2e", () => {
   let seed: SeedClient | undefined;
   let etcdReachable = false;
   const upstreams: OpenAiUpstream[] = [];
+  const countingUpstreams: CountingUpstream[] = [];
   const embedMocks: EmbeddingMock[] = [];
   let embed: EmbeddingMock;
   let upstreamA: OpenAiUpstream;
@@ -294,6 +349,7 @@ describe("semantic cache e2e", () => {
   afterAll(async () => {
     await app?.exit();
     await Promise.all(upstreams.map((u) => u.close()));
+    await Promise.all(countingUpstreams.map((u) => u.close()));
     await Promise.all(embedMocks.map((m) => m.close()));
   });
 
@@ -302,10 +358,14 @@ describe("semantic cache e2e", () => {
       ctx.skip();
       return;
     }
+    const embedCallsBeforeMiss = embed.callCount();
     const first = await chat("chat-a", "tell me about topic-a");
     expect(first.status).toBe(200);
     expect(first.cache).toBe("miss");
     expect(first.content).toBe("answer-a");
+    // One embedding call covers BOTH the L2 lookup and the store —
+    // a miss must never pay twice.
+    expect(embed.callCount()).toBe(embedCallsBeforeMiss + 1);
 
     const upstreamCallsAfterMiss = upstreamA.receivedRequests.length;
 
@@ -500,28 +560,75 @@ describe("semantic cache e2e", () => {
     expect(repeat.cache).toBe("miss");
   });
 
-  test("Cache-Control: no-cache bypasses the read path and refreshes the entry", async (ctx) => {
+  test("Cache-Control: no-cache bypasses the read path and refreshes BOTH layers", async (ctx) => {
     if (!etcdReachable || !app || !seed) {
       ctx.skip();
       return;
     }
-    const seeded = await chat("chat-a", "refresh probe unique");
-    expect(seeded.cache).toBe("miss");
-    const cachedNow = await chat("chat-a", "refresh probe unique");
-    expect(cachedNow.cache).toBe("hit");
+    // Dedicated model on a counting upstream: every upstream call
+    // returns a DIFFERENT body, so "refreshed" vs "stale entry
+    // survived" is distinguishable in the served content.
+    const counting = await countingChatUpstream();
+    countingUpstreams.push(counting);
+    const pk = await seed.createProviderKey({
+      display_name: "chat-refresh-pk",
+      secret: "sk-mock",
+      api_base: `${counting.baseUrl}/v1`,
+    });
+    await seed.createModel({
+      display_name: "chat-refresh",
+      provider: "openai",
+      model_name: "gpt-4o-mini",
+      provider_key_id: pk.id,
+    });
+    await seed.createCachePolicy({
+      name: "sem-refresh",
+      backend: "memory",
+      applies_to: "model:chat-refresh",
+      ttl_seconds: 600,
+      semantic: { embedding_model: "embed-cache", threshold: 0.85 },
+    });
+    await waitConfigPropagation(async () => {
+      try {
+        const r = await chat("chat-refresh", "warmup probe please");
+        return r.status === 200 && r.cache !== null;
+      } catch {
+        return false;
+      }
+    });
 
-    const before = upstreamA.receivedRequests.length;
-    const bypass = await chat("chat-a", "refresh probe unique", {
+    const seeded = await chat("chat-refresh", "refresh probe unique");
+    expect(seeded.cache).toBe("miss");
+    const originalBody = seeded.content!;
+    const cachedNow = await chat("chat-refresh", "refresh probe unique");
+    expect(cachedNow.cache).toBe("hit");
+    expect(cachedNow.content).toBe(originalBody);
+
+    const upstreamBefore = counting.callCount();
+    const bypass = await chat("chat-refresh", "refresh probe unique", {
       cacheControl: "no-cache",
     });
     expect(bypass.status).toBe(200);
     expect(bypass.cache).toBe("bypass");
     expect(bypass.layer).toBeNull();
-    expect(upstreamA.receivedRequests.length).toBe(before + 1);
+    expect(counting.callCount()).toBe(upstreamBefore + 1);
+    const refreshedBody = bypass.content!;
+    expect(refreshedBody).not.toBe(originalBody);
 
-    // The bypass refreshed (re-stored) the entry — still served after.
-    const after = await chat("chat-a", "refresh probe unique");
-    expect(after.cache).toBe("hit");
+    // The bypass refreshed the EXACT layer: the identical request now
+    // serves the NEW body, not the pre-bypass one.
+    const exactAfter = await chat("chat-refresh", "refresh probe unique");
+    expect(exactAfter.cache).toBe("hit");
+    expect(exactAfter.layer).toBe("exact");
+    expect(exactAfter.content).toBe(refreshedBody);
+
+    // …and the SEMANTIC layer: the bypass path re-embedded and
+    // upserted, so a paraphrase serves the new body too (upsert —
+    // the stale entry was replaced, not shadowed).
+    const semanticAfter = await chat("chat-refresh", "refresh probe reworded");
+    expect(semanticAfter.cache).toBe("hit");
+    expect(semanticAfter.layer).toBe("semantic");
+    expect(semanticAfter.content).toBe(refreshedBody);
   });
 
   test("embedding failure degrades to exact-only, never fails the request", async (ctx) => {

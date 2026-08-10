@@ -53,6 +53,10 @@ pub struct CacheBackends {
     /// Policy ids already warned about the redis semantic layer being
     /// unavailable (same warn-once discipline as `redis_warned`).
     semantic_redis_warned: Arc<DashSet<String>>,
+    /// Policy ids already warned about a stable semantic config error
+    /// (missing / non-embedding `embedding_model`). The per-request
+    /// metric keeps counting; only the log line is deduplicated.
+    semantic_resolve_warned: Arc<DashSet<String>>,
 }
 
 impl CacheBackends {
@@ -63,7 +67,14 @@ impl CacheBackends {
             semantic_memory: Arc::new(MemorySemanticCache::new()),
             redis_warned: Arc::new(DashSet::new()),
             semantic_redis_warned: Arc::new(DashSet::new()),
+            semantic_resolve_warned: Arc::new(DashSet::new()),
         }
+    }
+
+    /// True the FIRST time `policy_id` reports a stable semantic config
+    /// error, so the gate logs once per policy instead of per request.
+    pub fn semantic_resolve_warn_once(&self, policy_id: &str) -> bool {
+        self.semantic_resolve_warned.insert(policy_id.to_string())
     }
 
     /// Memory cache only — the default for self-hosted dev and tests.

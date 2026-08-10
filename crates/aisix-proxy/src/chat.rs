@@ -2205,14 +2205,23 @@ async fn dispatch(
                 let embed_entry = match snapshot.models.get_by_name(&cfg.embedding_model) {
                     Some(e) if e.value.is_embedding() => e.clone(),
                     other => {
-                        tracing::warn!(
-                            target: "aisix::cache",
-                            policy_name = %entry.value.name,
-                            embedding_model = %cfg.embedding_model,
-                            found = other.is_some(),
-                            "cache policy references a missing or non-embedding \
-                             embedding_model; semantic matching skipped for this request",
-                        );
+                        // A stable config error, not a per-request one:
+                        // log once per policy, count every request.
+                        if state
+                            .cache
+                            .as_ref()
+                            .is_some_and(|c| c.semantic_resolve_warn_once(&entry.id))
+                        {
+                            tracing::warn!(
+                                target: "aisix::cache",
+                                policy_name = %entry.value.name,
+                                embedding_model = %cfg.embedding_model,
+                                found = other.is_some(),
+                                "cache policy references a missing or non-embedding \
+                                 embedding_model; semantic matching is skipped until \
+                                 the reference resolves",
+                            );
+                        }
                         state
                             .metrics
                             .record_cache_semantic_embed_failure(&entry.value.name, "resolve");
@@ -2971,6 +2980,7 @@ async fn dispatch(
                         &sem.policy_id,
                         sem.generation,
                         &sem.scope_fp,
+                        key,
                         vector,
                         upstream.clone(),
                         ttl,
