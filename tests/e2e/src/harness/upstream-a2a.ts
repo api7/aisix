@@ -44,6 +44,16 @@ export interface A2aUpstreamOptions {
 
 const PATH_PREFIX = "/v3/agents/serve/tenant-42";
 
+/**
+ * Pause between streamed events. Sized so the arrival spread a relayed stream
+ * produces dwarfs the noise a buffered one would show: a client does not begin
+ * reading the instant the headers land (connection setup and the fetch
+ * implementation's own buffering cost tens of ms), which compresses the
+ * measured spread. A small gap leaves that compression the same order as the
+ * signal; this makes the signal an order larger instead.
+ */
+const STREAM_GAP_MS = 120;
+
 /** JSON-RPC methods this stub answers with an SSE stream, in both spellings. */
 const STREAMING_METHODS = new Set([
   "message/stream",
@@ -192,10 +202,10 @@ async function handle(
         sawAccept: header("accept"),
       }),
     );
-    await new Promise((resolve) => setTimeout(resolve, 30));
+    await new Promise((resolve) => setTimeout(resolve, STREAM_GAP_MS));
     res.write("event: status-update\n");
     res.write(envelope({ kind: "status-update", taskId: "task-e2e-stream", seq: 2 }));
-    await new Promise((resolve) => setTimeout(resolve, 30));
+    await new Promise((resolve) => setTimeout(resolve, STREAM_GAP_MS));
     res.write(
       envelope({
         kind: "task",

@@ -424,21 +424,31 @@ impl A2aBridge for HttpBridge {
     }
 
     async fn send_stream(&self, request: &serde_json::Value) -> Result<A2aEventStream, A2aError> {
-        // No per-request deadline here, deliberately. `timeout_ms` bounds one
-        // upstream operation, and a stream is not one: an A2A task legitimately
-        // runs for minutes or hours, pushing status updates the whole time.
-        // Applying the unary deadline would cut every such task off at 30s.
-        // Downstream liveness is the SSE keep-alive's job, not a hard cap's.
-        let resp = self
-            .prepare(
+        // `timeout_ms` bounds OPENING the stream, and nothing after that.
+        //
+        // The two halves need different treatment. Reading the stream must not
+        // be bounded: an A2A task legitimately runs for minutes or hours,
+        // pushing status updates the whole time, and the unary deadline would
+        // cut every such task off at 30s. But opening it must be, because until
+        // the response headers arrive there is no stream and no keep-alive —
+        // an upstream that accepts the connection and then says nothing would
+        // otherwise pin this request, and the quota slot it holds, forever.
+        // `reqwest`'s own `.timeout()` cannot express that: it covers reading
+        // the body too, so it would cap the stream's whole life.
+        let resp = tokio::time::timeout(
+            self.upstream.timeout,
+            self.prepare(
                 self.client
                     .post(&self.upstream.url)
                     .header(reqwest::header::ACCEPT, SSE_CONTENT_TYPE)
                     .json(request),
             )
-            .send()
-            .await
-            .map_err(|e| A2aError::Connect(e.to_string()))?;
+            .send(),
+        )
+        .await
+        .map_err(|_| A2aError::Connect("timed out opening the upstream stream".to_string()))?
+        .map_err(|e| A2aError::Connect(e.to_string()))?;
+
         if !resp.status().is_success() {
             // Status only — never proxy the upstream's error body, same as
             // `send`.
@@ -446,6 +456,32 @@ impl A2aBridge for HttpBridge {
                 "upstream returned HTTP {}",
                 resp.status().as_u16()
             )));
+        }
+
+        // A JSON-RPC error is delivered at HTTP 200 with an `error` member, so
+        // an agent that refuses a streaming call answers 200 + JSON, not SSE.
+        // Handing that body to the SSE reader would find no `data:` line and
+        // yield nothing: the caller would see an empty, apparently successful
+        // stream and the refusal would vanish. Relay it as the single event it
+        // is instead — the envelope still carries `error`, so nothing reads as
+        // a completed task.
+        let is_sse = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| {
+                v.trim_start()
+                    .to_ascii_lowercase()
+                    .starts_with(SSE_CONTENT_TYPE)
+            });
+        if !is_sse {
+            let bytes = read_capped(resp).await?;
+            let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
+                A2aError::Request(format!(
+                    "upstream answered a streaming call with neither SSE nor JSON: {e}"
+                ))
+            })?;
+            return Ok(Box::pin(futures::stream::once(async move { Ok(value) })));
         }
         Ok(Box::pin(sse_events(resp)))
     }
@@ -493,9 +529,15 @@ fn sse_events(resp: reqwest::Response) -> impl futures::Stream<Item = A2aEvent> 
                 }
             }
         }
-        // A body that ends without its final newline still carries an event.
-        if let Ok(Some(event)) = parse_sse_data_line(&pending) {
-            yield Ok(event);
+        // A body that ends without its final newline still carries an event —
+        // and if that last line is malformed it fails the stream like any
+        // other. Swallowing the error here would make a truncated task read as
+        // a clean end, which is the exact failure the per-line rule exists to
+        // prevent.
+        match parse_sse_data_line(&pending) {
+            Ok(Some(event)) => yield Ok(event),
+            Ok(None) => {}
+            Err(e) => yield Err(e),
         }
     }
 }

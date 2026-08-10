@@ -257,15 +257,19 @@ fn is_streaming_method(method: &str) -> bool {
     )
 }
 
-/// Fires the A2A usage event once a streamed call is over, and owns the quota
-/// reservation for that whole span.
+/// Fires the A2A usage event once a streamed call is over, and owns the
+/// concurrency hold for that whole span.
 ///
 /// Both jobs have to happen on drop rather than at the end of a loop: a caller
 /// walking away mid-task drops the stream without it ever completing, and that
 /// is the ordinary case for a long-running A2A task, not an edge one. Emitting
-/// from `Drop` means such a call still lands in usage, and the caller's
-/// rate-limit slot stays occupied for as long as the stream is really open —
-/// not merely until the response headers went out.
+/// from `Drop` means such a call still lands in usage.
+///
+/// The hold is a [`StreamConcurrencyGuard`], the same type the LLM streaming
+/// path uses. Releasing the reservation at handler return instead would free
+/// the caller's slot the moment the response headers went out, letting a key
+/// capped at N run many more than N concurrent streams — #450, on a second
+/// endpoint.
 struct StreamUsageOnDrop {
     state: ProxyState,
     auth: AuthenticatedKey,
@@ -277,7 +281,7 @@ struct StreamUsageOnDrop {
     /// caller and is downgraded if the stream later faults — once the headers
     /// are out, the usage event is the only place that can say so.
     status: u16,
-    _reservation: aisix_ratelimit::MultiReservation,
+    _concurrency: aisix_ratelimit::StreamConcurrencyGuard,
 }
 
 impl Drop for StreamUsageOnDrop {
@@ -347,7 +351,7 @@ async fn dispatch_stream(
         method: method.to_string(),
         started,
         status: StatusCode::OK.as_u16(),
-        _reservation: reservation,
+        _concurrency: reservation.into_stream_hold(),
     };
     let agent_label = agent.to_string();
 
@@ -607,6 +611,80 @@ mod tests {
     fn gateway_base_is_none_without_any_authority() {
         let origin_form = axum::http::Uri::from_static("/a2a/x/.well-known/agent-card.json");
         assert_eq!(gateway_base(&origin_form, &HeaderMap::new()), None);
+    }
+
+    /// A local agent that answers `message/stream` with SSE and then keeps the
+    /// connection open, so a test can drop the response mid-stream the way a
+    /// caller walking away does.
+    async fn spawn_open_ended_stream_agent() -> String {
+        use axum::response::IntoResponse;
+        let app = axum::Router::new().route(
+            "/a2a",
+            axum::routing::post(|| async {
+                let chunks: Vec<Result<String, std::convert::Infallible>> = vec![Ok(
+                    "data: {\"jsonrpc\":\"2.0\",\"result\":{\"seq\":1}}\n\n".to_string(),
+                )];
+                (
+                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                    axum::body::Body::from_stream(futures::stream::iter(chunks)),
+                )
+                    .into_response()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service())
+                .await
+                .unwrap();
+        });
+        format!("http://{addr}/a2a")
+    }
+
+    #[tokio::test]
+    async fn a_stream_dropped_mid_flight_still_emits_usage() {
+        use aisix_obs::{UsageEvent, UsageSink};
+
+        // The drop guard is the whole reason a streamed call is accounted for:
+        // a caller walking away mid-task drops the body without the stream ever
+        // completing, and for a long-running A2A task that is the ordinary
+        // ending, not an edge case. Without the guard the call would simply
+        // never appear in usage.
+        let agent_url = spawn_open_ended_stream_agent().await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<UsageEvent>(8);
+        let handle = SnapshotHandle::new(snapshot_with(&agent_url, true, serde_json::json!(["*"])));
+        let hub = Arc::new(aisix_gateway::Hub::new());
+        let state = ProxyState::new(handle, hub, &proxy_cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let router = build_router(state);
+
+        let response = router
+            .oneshot(
+                HttpRequest::post("/a2a/invoice")
+                    .header("host", "gw.example.com")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {TOKEN}"))
+                    .body(Body::from(
+                        r#"{"jsonrpc":"2.0","id":"s","method":"message/stream"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("router responds");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Never read the body — this is the client disconnecting.
+        drop(response);
+        // Let the dropped stream's guard run.
+        tokio::task::yield_now().await;
+
+        let event = rx
+            .try_recv()
+            .expect("a usage event must be emitted even when the caller never reads the stream");
+        assert_eq!(event.inbound_protocol, "a2a");
+        assert_eq!(event.a2a_agent_name, "invoice");
+        assert_eq!(event.a2a_method, "message/stream");
     }
 
     #[test]

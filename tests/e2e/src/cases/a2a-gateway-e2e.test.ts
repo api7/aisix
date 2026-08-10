@@ -304,9 +304,14 @@ describe("a2a gateway e2e: /a2a/{agent}", () => {
     // version and asked the agent for the streaming content type.
     expect(events[0].json.result.sawVersion).toBe("1.0");
     expect(events[0].json.result.sawAccept).toContain("text/event-stream");
-    // The stub sleeps 30ms between events. Buffering would collapse those
-    // gaps; relaying preserves them.
-    expect(events[2].at).toBeGreaterThan(events[0].at);
+    // The discriminating assertion. The stub pauses 120ms before each of the
+    // last two events, so a relayed stream spreads first-to-last over well over
+    // 100ms, while a buffered one hands all three over together and the spread
+    // collapses to parse time. `> 0` would not separate the two: three JSON
+    // parses can straddle a millisecond boundary. The floor sits far above that
+    // and far below the 240ms the stub spends, with room for the client not
+    // beginning to read the instant the headers land.
+    expect(events[2].at - events[0].at).toBeGreaterThan(60);
   });
 
   test("gates on the per-agent ACL and on agent existence", async (ctx) => {

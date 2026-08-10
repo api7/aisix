@@ -429,3 +429,116 @@ async fn a_refused_stream_surfaces_before_any_event() {
     };
     assert!(matches!(err, A2aError::Request(_)), "got {err:?}");
 }
+
+/// An upstream that answers a streaming call the way an A2A agent refuses one:
+/// HTTP 200 with a JSON-RPC error body, not SSE.
+async fn spawn_json_refusing_agent() -> SocketAddr {
+    let app = Router::new().route(
+        "/a2a",
+        post(|| async {
+            Json(json!({
+                "jsonrpc": "2.0",
+                "id": "s",
+                "error": {"code": -32601, "message": "streaming not supported"}
+            }))
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app.into_make_service())
+            .await
+            .unwrap();
+    });
+    addr
+}
+
+#[tokio::test]
+async fn a_json_rpc_error_at_http_200_reaches_the_caller() {
+    use futures::StreamExt;
+
+    // A JSON-RPC error is delivered at HTTP 200, so an agent refusing a
+    // streaming call answers JSON rather than SSE. Handed to the SSE reader
+    // that body has no `data:` line, so the caller would get an empty,
+    // apparently successful stream and the refusal would vanish.
+    let addr = spawn_json_refusing_agent().await;
+    let bridge = HttpBridge::new(upstream(format!("http://{addr}/a2a"), A2aAuth::None));
+
+    let events: Vec<Value> = bridge
+        .send_stream(&json!({"jsonrpc":"2.0","id":"s","method":"message/stream"}))
+        .await
+        .expect("a 200 answer opens")
+        .map(|e| e.expect("event parses"))
+        .collect()
+        .await;
+
+    assert_eq!(events.len(), 1, "the refusal must reach the caller");
+    assert_eq!(events[0]["error"]["code"], -32601);
+}
+
+#[tokio::test]
+async fn opening_a_stream_is_bounded_even_though_reading_it_is_not() {
+    // Until the response headers arrive there is no stream and no keep-alive,
+    // so an upstream that accepts the connection and then says nothing would
+    // pin this request — and the quota slot it holds — forever.
+    let addr = spawn_black_hole().await;
+    let bridge = HttpBridge::new(A2aUpstream {
+        timeout: Duration::from_millis(400),
+        ..upstream(format!("http://{addr}/a2a"), A2aAuth::None)
+    });
+
+    let started = Instant::now();
+    let Err(err) = bridge
+        .send_stream(&json!({"jsonrpc":"2.0","id":"s","method":"message/stream"}))
+        .await
+    else {
+        panic!("opening must not hang on an upstream that never answers");
+    };
+    let elapsed = started.elapsed();
+
+    assert!(matches!(err, A2aError::Connect(_)), "got {err:?}");
+    assert!(
+        elapsed < Duration::from_millis(2_000),
+        "opening took {elapsed:?}; it must be bounded by timeout_ms"
+    );
+}
+
+#[tokio::test]
+async fn a_malformed_final_line_fails_the_stream() {
+    use futures::StreamExt;
+
+    // The body ends mid-event with no trailing newline. Treating that as a
+    // clean end would let a truncated task read as a complete one.
+    async fn truncated() -> impl IntoResponse {
+        let chunks: Vec<Result<String, std::convert::Infallible>> = vec![Ok(
+            "data: {\"jsonrpc\":\"2.0\",\"result\":{\"seq\":1}}\n\ndata: {\"jsonrpc\"".to_string(),
+        )];
+        (
+            [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+            axum::body::Body::from_stream(futures::stream::iter(chunks)),
+        )
+    }
+    let app = Router::new().route("/a2a", post(truncated));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app.into_make_service())
+            .await
+            .unwrap();
+    });
+
+    let bridge = HttpBridge::new(upstream(format!("http://{addr}/a2a"), A2aAuth::None));
+    let events: Vec<Result<Value, A2aError>> = bridge
+        .send_stream(&json!({"jsonrpc":"2.0","id":"s","method":"message/stream"}))
+        .await
+        .expect("stream opens")
+        .collect()
+        .await;
+
+    assert_eq!(events.len(), 2, "got {events:#?}");
+    assert!(events[0].is_ok());
+    assert!(
+        events[1].is_err(),
+        "a truncated trailing event must fail the stream, not end it quietly"
+    );
+}
