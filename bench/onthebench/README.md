@@ -76,6 +76,11 @@ match the #891 grid exactly): `BENCH_GRID` (`"ttft_ms:conc ..."`, e.g.
 A changed knob is recorded in `meta.json`, so a non-default run can never
 pass silently as the standard grid.
 
+Values are validated at startup and nonsense refuses to run: grid entries
+must be `ttft_ms:conc` with a positive concurrency; window, reps, max tries
+and floor reps must be positive integers (warmup may be `0`);
+`BENCH_FLAMEGRAPH` is `0` or `1`.
+
 ## Measuring another target ("entrant")
 
 `run-entrant.sh <entrant-dir> <out-dir>` measures any gateway-shaped process

@@ -29,7 +29,7 @@ BIN="$SRC/target/release/aisix"
 
 [ -x "$BIN" ] || { echo "FATAL: $BIN missing - build first"; exit 1; }
 rig_sanity
-[ "$FLAMEGRAPH" = 1 ] && require_symbols "$BIN"
+if [ "$FLAMEGRAPH" = 1 ]; then require_symbols "$BIN"; fi
 
 bench_init
 

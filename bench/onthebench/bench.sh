@@ -49,7 +49,9 @@ echo "== run baseline ($RUNID) =="
 ENVPASS="BENCH_SRC_COMMIT=$COMMIT BENCH_SRC_DIRTY=$DIRTY"
 for v in BENCH_GRID BENCH_REPS BENCH_WINDOW BENCH_WARMUP BENCH_MAX_TRIES \
          BENCH_FLOOR_REPS BENCH_FLAMEGRAPH; do
-    [ -n "${!v:-}" ] && ENVPASS="$ENVPASS $v=$(printf %q "${!v}")"
+    # if, not `[ ] &&`: harmless here, but the && form as a function's last
+    # statement is exactly how the grid_concs regression happened once.
+    if [ -n "${!v:-}" ]; then ENVPASS="$ENVPASS $v=$(printf %q "${!v}")"; fi
 done
 RUN_RC=0
 ssh "$RIG" "$ENVPASS \

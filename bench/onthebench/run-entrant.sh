@@ -52,7 +52,10 @@ source "$ENTRANT_DIR/entrant.sh"
 # shellcheck source=lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
-[ -n "$ENTRANT_NAME" ] || { echo "FATAL: entrant.sh must set ENTRANT_NAME"; exit 1; }
+# The name is spliced verbatim into meta.json and every JSONL record; a
+# constrained identifier set keeps that safe without escaping at every site.
+[[ "${ENTRANT_NAME:-}" =~ ^[A-Za-z0-9._-]+$ ]] ||
+    { echo "FATAL: entrant.sh must set ENTRANT_NAME matching [A-Za-z0-9._-]+ (got '${ENTRANT_NAME:-}')"; exit 1; }
 
 rig_sanity
 bench_init
@@ -102,8 +105,17 @@ write_meta() { # write_meta <rss_hwm_kb-or-null>
     # /proc/<pid>/exe may belong to another user (a container's init); sudo -n
     # is how the rest of the rig already escalates, and "unknown" is recorded
     # rather than failing the run — entrant_meta_json carries identity anyway.
-    local bin_sha
+    local bin_sha identity=null
     bin_sha=$(sudo -n sha256sum "/proc/$GW_PID/exe" 2>/dev/null | cut -d' ' -f1 || true)
+    # The identity hook is evaluated and validated before the heredoc: a hook
+    # that fails or emits partial output must fail the run loudly, not ship a
+    # meta.json that is silently null or unparseable.
+    if type entrant_meta_json >/dev/null 2>&1; then
+        identity=$(entrant_meta_json) ||
+            { echo "FATAL: entrant_meta_json failed"; exit 1; }
+        printf '%s' "$identity" | python3 -c 'import json,sys; json.load(sys.stdin)' ||
+            { echo "FATAL: entrant_meta_json returned invalid JSON: $identity"; exit 1; }
+    fi
     cat > "$OUT/meta.json" <<EOF
 {
   "entrant": "$ENTRANT_NAME",
@@ -117,7 +129,7 @@ write_meta() { # write_meta <rss_hwm_kb-or-null>
     "rss_idle_kb": ${RSS_IDLE:-null}, "rss_hwm_kb": $1,
     "threads": ${THREADS:-null},
     "children": ${CHILDREN:-null},
-    "identity": $(type entrant_meta_json >/dev/null 2>&1 && entrant_meta_json || echo null)
+    "identity": $identity
   }
 }
 EOF

@@ -28,18 +28,33 @@ DEFAULT_BODY='{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hello
 BODY="${BODY:-$DEFAULT_BODY}"
 AUTH_HEADER="${AUTH_HEADER:-authorization: Bearer bench-token}"
 # Same header shape the public board's engine sends for the chosen dialect.
-# json.dumps, not string splicing: a quote or backslash in the header value
-# must not produce an invalid header list the loadgen then misparses.
-if [ -z "${OTB_LOADGEN_HEADERS:-}" ]; then
-    OTB_LOADGEN_HEADERS=$(python3 -c 'import json,sys
+# Always derived from AUTH_HEADER — an ambient OTB_LOADGEN_HEADERS would let
+# measured requests carry credentials the wait_http_200 readiness check never
+# exercised. json.dumps, not string splicing: a quote or backslash in the
+# header value must not produce an invalid header list.
+OTB_LOADGEN_HEADERS=$(python3 -c 'import json,sys
 k, _, v = sys.argv[1].partition(":")
 print(json.dumps([[k.strip(), v.strip()]]))' "$AUTH_HEADER")
-fi
 export OTB_LOADGEN_HEADERS
 
 # The name stamped into every result line, so mixed result sets stay
 # attributable; run-baseline.sh sets "aisix", run-entrant.sh requires one.
 ENTRANT_NAME="${ENTRANT_NAME:-}"
+
+# Overrides are operator input; nonsense must refuse to measure rather than
+# succeed while collecting nothing (BENCH_REPS=0 would "pass" every point).
+is_pos_int() { [[ "$1" =~ ^[1-9][0-9]*$ ]]; }
+is_pos_int "$WINDOW" || { echo "FATAL: BENCH_WINDOW must be a positive integer, got '$WINDOW'"; exit 1; }
+[[ "$WARMUP" =~ ^[0-9]+$ ]] || { echo "FATAL: BENCH_WARMUP must be a non-negative integer, got '$WARMUP'"; exit 1; }
+is_pos_int "$REPS" || { echo "FATAL: BENCH_REPS must be a positive integer, got '$REPS'"; exit 1; }
+is_pos_int "$MAX_TRIES" || { echo "FATAL: BENCH_MAX_TRIES must be a positive integer, got '$MAX_TRIES'"; exit 1; }
+is_pos_int "$FLOOR_REPS" || { echo "FATAL: BENCH_FLOOR_REPS must be a positive integer, got '$FLOOR_REPS'"; exit 1; }
+case "$FLAMEGRAPH" in 0|1) ;; *) echo "FATAL: BENCH_FLAMEGRAPH must be 0 or 1, got '$FLAMEGRAPH'"; exit 1 ;; esac
+[ -n "$GRID" ] || { echo "FATAL: BENCH_GRID is empty"; exit 1; }
+for _spec in $GRID; do
+    [[ "$_spec" =~ ^[0-9]+:[1-9][0-9]*$ ]] ||
+        { echo "FATAL: BENCH_GRID entry '$_spec' is not ttft_ms:conc"; exit 1; }
+done
 
 TOOLS="$HOME/bench-tools"
 CLK_TCK=$(getconf CLK_TCK)
@@ -170,23 +185,32 @@ measured_window() { # measured_window <point> <ttft> <conc> <rep>
           sleep 0.2
       done ) & SAMPLER_PID=$!
 
-    ticks0=$(cpu_ticks "$GW_PID"); t0=$(date +%s.%N)
+    # Tick reads are fallible on purpose: a target that dies mid-window takes
+    # /proc/<pid>/stat with it, and that must record an invalid window, not
+    # kill the runner before the JSONL line lands.
+    ticks0=$(cpu_ticks "$GW_PID" 2>/dev/null) || ticks0=""
+    t0=$(date +%s.%N)
     line=$(loadgen "127.0.0.1:$GW_PORT" "$conc" "$WINDOW") || line=""
     line=${line//[\"\\]/ }
-    t1=$(date +%s.%N); ticks1=$(cpu_ticks "$GW_PID")
+    t1=$(date +%s.%N)
+    ticks1=$(cpu_ticks "$GW_PID" 2>/dev/null) || ticks1=""
     kill "$SAMPLER_PID" 2>/dev/null || true; wait "$SAMPLER_PID" 2>/dev/null || true; SAMPLER_PID=""
     rss_peak=$(cat "$rssfile" 2>/dev/null || echo 0); rm -f "$rssfile"
 
     elapsed=$(awk -v a="$t0" -v b="$t1" 'BEGIN{print b-a}')
-    cpu_pct=$(awk -v d=$((ticks1 - ticks0)) -v hz="$CLK_TCK" -v e="$elapsed" \
-        'BEGIN{printf "%.1f", d/hz/e*100}')
+    if [ -n "$ticks0" ] && [ -n "$ticks1" ]; then
+        cpu_pct=$(awk -v d=$((ticks1 - ticks0)) -v hz="$CLK_TCK" -v e="$elapsed" \
+            'BEGIN{printf "%.1f", d/hz/e*100}')
+    else
+        cpu_pct=null
+    fi
 
     rps=$(field rps "$line"); fail=$(field fail "$line"); ok=$(field ok "$line")
     p50=$(field p50us "$line"); p99=$(field p99us "$line")
     rigref=$(field rigrefused "$line"); budget=$(field budgetexceeded "$line"); spawn=$(field spawnfailed "$line")
     valid=true
-    [ "${fail:-1}" = "0" ] && [ "${rigref:-0}" = "0" ] && [ "${budget:-0}" = "0" ] \
-        && [ "${spawn:-0}" = "0" ] || valid=false
+    [ "$cpu_pct" != null ] && [ "${fail:-1}" = "0" ] && [ "${rigref:-0}" = "0" ] \
+        && [ "${budget:-0}" = "0" ] && [ "${spawn:-0}" = "0" ] || valid=false
 
     printf '{"kind":"gateway","entrant":"%s","point":"%s","ttft_ms":%s,"conc":%s,"rep":%s,"valid":%s,"rps":%s,"fail":%s,"ok":%s,"p50_us":%s,"p99_us":%s,"gw_cpu_pct":%s,"gw_rss_peak_kb":%s,"window_s":%s,"elapsed_s":%.2f,"otb_line":"%s"}\n' \
         "$ENTRANT_NAME" "$point" "$ttft" "$conc" "$rep" "$valid" "${rps:-null}" "${fail:-null}" "${ok:-null}" \
@@ -202,18 +226,26 @@ floor_point() { # floor_point <ttft> <conc>  (mock must already run with that tt
     # Same validity policy as gateway points, scaled to FLOOR_REPS: an invalid
     # window is recorded, marked, and retried, and can never stand as the rig
     # reference on its own.
-    local ttft="$1" conc="$2" valid_n=0 try=0 line fail valid
+    local ttft="$1" conc="$2" valid_n=0 try=0
+    local line fail rigref budget spawn rps p50 p99 valid
     loadgen "127.0.0.1:$MOCK_PORT" "$conc" 5 > /dev/null || true   # warmup
     while [ "$valid_n" -lt "$FLOOR_REPS" ] && [ "$try" -lt "$MAX_TRIES" ]; do
         try=$((try + 1))
         line=$(loadgen "127.0.0.1:$MOCK_PORT" "$conc" "$WINDOW") || line=""
         line=${line//[\"\\]/ }
-        fail=$(field fail "$line")
-        valid=true; [ "${fail:-1}" = "0" ] || valid=false
+        # Same validity fields as measured_window: a floor window that was
+        # refused or over budget must not become the rig reference, and an
+        # empty loadgen line must record nulls, not invalid JSON.
+        rps=$(field rps "$line"); fail=$(field fail "$line")
+        p50=$(field p50us "$line"); p99=$(field p99us "$line")
+        rigref=$(field rigrefused "$line"); budget=$(field budgetexceeded "$line"); spawn=$(field spawnfailed "$line")
+        valid=true
+        [ "${fail:-1}" = "0" ] && [ "${rigref:-0}" = "0" ] && [ "${budget:-0}" = "0" ] \
+            && [ "${spawn:-0}" = "0" ] || valid=false
         [ "$valid" = true ] && valid_n=$((valid_n + 1))
         printf '{"kind":"floor","entrant":"%s","point":"floor-ttft%s-c%s","ttft_ms":%s,"conc":%s,"rep":%s,"valid":%s,"rps":%s,"fail":%s,"p50_us":%s,"p99_us":%s,"otb_line":"%s"}\n' \
-            "$ENTRANT_NAME" "$ttft" "$conc" "$ttft" "$conc" "$try" "$valid" "$(field rps "$line")" "${fail:-null}" \
-            "$(field p50us "$line")" "$(field p99us "$line")" "$line" >> "$RESULTS"
+            "$ENTRANT_NAME" "$ttft" "$conc" "$ttft" "$conc" "$try" "$valid" "${rps:-null}" "${fail:-null}" \
+            "${p50:-null}" "${p99:-null}" "$line" >> "$RESULTS"
         echo "  [floor ttft=$ttft c=$conc rep=$try] valid=$valid $line" >&2
     done
     [ "$valid_n" -ge "$FLOOR_REPS" ] ||
