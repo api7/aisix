@@ -56,6 +56,15 @@ const VERSION_HEADER: &str = "A2A-Version";
 /// each of these is tried against both bases — see [`HttpBridge::agent_card_urls`].
 const AGENT_CARD_PATHS: [&str; 2] = ["/.well-known/agent-card.json", "/.well-known/agent.json"];
 
+/// Content type of an A2A streaming response, asked for on every streaming call.
+const SSE_CONTENT_TYPE: &str = "text/event-stream";
+
+/// Hard cap on a SINGLE buffered SSE event. A stream has no total size — a task
+/// may push updates for hours — so the cap is per event: it bounds how much an
+/// upstream can accumulate without ever emitting a newline, which is the only
+/// way a streaming reader can be made to grow without limit.
+const MAX_SSE_EVENT_BYTES: usize = 16 * 1024 * 1024;
+
 /// Hard cap on an upstream response body the gateway will buffer. A registered
 /// agent is semi-trusted, but a compromised or misbehaving one must not be able
 /// to OOM the gateway with a multi-gigabyte (or unbounded streaming) response.
@@ -239,6 +248,13 @@ pub struct AgentCard {
     pub rest: serde_json::Map<String, serde_json::Value>,
 }
 
+/// One event read off an upstream A2A stream: the JSON-RPC envelope carried in
+/// a single SSE `data:` field, verbatim.
+pub type A2aEvent = Result<serde_json::Value, A2aError>;
+
+/// A stream of upstream A2A events.
+pub type A2aEventStream = futures::stream::BoxStream<'static, A2aEvent>;
+
 /// A governed client tunnel to a single upstream A2A agent.
 #[async_trait]
 pub trait A2aBridge: Send + Sync {
@@ -248,6 +264,14 @@ pub trait A2aBridge: Send + Sync {
     /// Forward a JSON-RPC 2.0 request (such as `message/send`) to the upstream
     /// service endpoint and return its JSON-RPC response verbatim.
     async fn send(&self, request: &serde_json::Value) -> Result<serde_json::Value, A2aError>;
+
+    /// Open a streaming JSON-RPC call (`message/stream`, `tasks/resubscribe`)
+    /// and yield each event the upstream pushes, as it arrives.
+    ///
+    /// The returned stream resolves only once the upstream has accepted the
+    /// call, so a refusal surfaces as an error here rather than as a stream
+    /// that opens and immediately dies.
+    async fn send_stream(&self, request: &serde_json::Value) -> Result<A2aEventStream, A2aError>;
 }
 
 /// The default [`A2aBridge`], built on the workspace HTTP client.
@@ -398,6 +422,141 @@ impl A2aBridge for HttpBridge {
         serde_json::from_slice::<serde_json::Value>(&bytes)
             .map_err(|e| A2aError::Request(format!("malformed JSON-RPC response: {e}")))
     }
+
+    async fn send_stream(&self, request: &serde_json::Value) -> Result<A2aEventStream, A2aError> {
+        // `timeout_ms` bounds OPENING the stream, and nothing after that.
+        //
+        // The two halves need different treatment. Reading the stream must not
+        // be bounded: an A2A task legitimately runs for minutes or hours,
+        // pushing status updates the whole time, and the unary deadline would
+        // cut every such task off at 30s. But opening it must be, because until
+        // the response headers arrive there is no stream and no keep-alive —
+        // an upstream that accepts the connection and then says nothing would
+        // otherwise pin this request, and the quota slot it holds, forever.
+        // `reqwest`'s own `.timeout()` cannot express that: it covers reading
+        // the body too, so it would cap the stream's whole life.
+        let resp = tokio::time::timeout(
+            self.upstream.timeout,
+            self.prepare(
+                self.client
+                    .post(&self.upstream.url)
+                    .header(reqwest::header::ACCEPT, SSE_CONTENT_TYPE)
+                    .json(request),
+            )
+            .send(),
+        )
+        .await
+        .map_err(|_| A2aError::Connect("timed out opening the upstream stream".to_string()))?
+        .map_err(|e| A2aError::Connect(e.to_string()))?;
+
+        if !resp.status().is_success() {
+            // Status only — never proxy the upstream's error body, same as
+            // `send`.
+            return Err(A2aError::Request(format!(
+                "upstream returned HTTP {}",
+                resp.status().as_u16()
+            )));
+        }
+
+        // A JSON-RPC error is delivered at HTTP 200 with an `error` member, so
+        // an agent that refuses a streaming call answers 200 + JSON, not SSE.
+        // Handing that body to the SSE reader would find no `data:` line and
+        // yield nothing: the caller would see an empty, apparently successful
+        // stream and the refusal would vanish. Relay it as the single event it
+        // is instead — the envelope still carries `error`, so nothing reads as
+        // a completed task.
+        let is_sse = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| {
+                v.trim_start()
+                    .to_ascii_lowercase()
+                    .starts_with(SSE_CONTENT_TYPE)
+            });
+        if !is_sse {
+            let bytes = read_capped(resp).await?;
+            let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
+                A2aError::Request(format!(
+                    "upstream answered a streaming call with neither SSE nor JSON: {e}"
+                ))
+            })?;
+            return Ok(Box::pin(futures::stream::once(async move { Ok(value) })));
+        }
+        Ok(Box::pin(sse_events(resp)))
+    }
+}
+
+/// Parse an upstream SSE body into the JSON-RPC envelope of each `data:` field.
+///
+/// Deliberately minimal: A2A carries one JSON-RPC envelope per `data:` line, so
+/// `event:` / `id:` / `retry:` fields and comments are metadata this gateway has
+/// no use for and passes over. A `data:` line that is not JSON ends the stream
+/// with an error rather than being skipped — a caller that silently dropped
+/// events would report a truncated task as a complete one.
+fn sse_events(resp: reqwest::Response) -> impl futures::Stream<Item = A2aEvent> + Send {
+    async_stream::stream! {
+        let mut bytes = resp.bytes_stream();
+        let mut pending: Vec<u8> = Vec::new();
+        loop {
+            let chunk = match bytes.next().await {
+                Some(Ok(chunk)) => chunk,
+                Some(Err(e)) => {
+                    yield Err(A2aError::Request(e.to_string()));
+                    return;
+                }
+                None => break,
+            };
+            pending.extend_from_slice(&chunk);
+            // A single event is bounded even though the stream is not: an
+            // upstream that never emits a newline must not grow this buffer
+            // without limit.
+            if pending.len() > MAX_SSE_EVENT_BYTES {
+                yield Err(A2aError::Request(
+                    "upstream SSE event exceeded size cap".to_string(),
+                ));
+                return;
+            }
+            while let Some(newline) = pending.iter().position(|b| *b == b'\n') {
+                let line: Vec<u8> = pending.drain(..=newline).collect();
+                match parse_sse_data_line(&line) {
+                    Ok(Some(event)) => yield Ok(event),
+                    Ok(None) => {}
+                    Err(e) => {
+                        yield Err(e);
+                        return;
+                    }
+                }
+            }
+        }
+        // A body that ends without its final newline still carries an event —
+        // and if that last line is malformed it fails the stream like any
+        // other. Swallowing the error here would make a truncated task read as
+        // a clean end, which is the exact failure the per-line rule exists to
+        // prevent.
+        match parse_sse_data_line(&pending) {
+            Ok(Some(event)) => yield Ok(event),
+            Ok(None) => {}
+            Err(e) => yield Err(e),
+        }
+    }
+}
+
+/// Extract the JSON-RPC envelope from one SSE line, or `None` when the line
+/// carries no `data:` field.
+fn parse_sse_data_line(line: &[u8]) -> Result<Option<serde_json::Value>, A2aError> {
+    let text = std::str::from_utf8(line)
+        .map_err(|_| A2aError::Request("upstream SSE event was not valid UTF-8".to_string()))?;
+    let Some(payload) = text.trim_end_matches(['\r', '\n']).strip_prefix("data:") else {
+        return Ok(None);
+    };
+    let payload = payload.trim();
+    if payload.is_empty() {
+        return Ok(None);
+    }
+    serde_json::from_str(payload)
+        .map(Some)
+        .map_err(|e| A2aError::Request(format!("malformed JSON-RPC event: {e}")))
 }
 
 #[cfg(test)]
@@ -518,6 +677,39 @@ mod tests {
                 "http://127.0.0.1:8080/.well-known/agent.json",
             ]
         );
+    }
+
+    #[test]
+    fn sse_lines_yield_only_data_payloads() {
+        let event = |line: &str| parse_sse_data_line(line.as_bytes()).unwrap();
+
+        assert_eq!(
+            event("data: {\"jsonrpc\":\"2.0\",\"id\":1}\n").unwrap()["id"],
+            1
+        );
+        // No space after the colon is equally valid SSE.
+        assert_eq!(event("data:{\"id\":2}\n").unwrap()["id"], 2);
+        assert_eq!(event("data: {\"id\":3}\r\n").unwrap()["id"], 3);
+
+        // Framing the gateway has no use for.
+        assert!(event("event: task-update\n").is_none());
+        assert!(event(": keep-alive comment\n").is_none());
+        assert!(event("id: 42\n").is_none());
+        assert!(event("retry: 1000\n").is_none());
+        assert!(event("\n").is_none());
+        assert!(event("data:\n").is_none());
+    }
+
+    #[test]
+    fn a_data_line_that_is_not_json_is_an_error_not_a_skip() {
+        // Silently dropping it would let a truncated task read as a complete
+        // one, which is worse than failing the stream.
+        let err = parse_sse_data_line(b"data: not-json\n").unwrap_err();
+        assert!(
+            matches!(err, A2aError::Request(ref m) if m.contains("malformed JSON-RPC event")),
+            "got {err:?}"
+        );
+        assert!(parse_sse_data_line(b"data: \xff\xfe\n").is_err());
     }
 
     #[test]

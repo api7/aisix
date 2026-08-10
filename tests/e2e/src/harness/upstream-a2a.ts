@@ -45,6 +45,24 @@ export interface A2aUpstreamOptions {
 const PATH_PREFIX = "/v3/agents/serve/tenant-42";
 
 /**
+ * Pause between streamed events. Sized so the arrival spread a relayed stream
+ * produces dwarfs the noise a buffered one would show: a client does not begin
+ * reading the instant the headers land (connection setup and the fetch
+ * implementation's own buffering cost tens of ms), which compresses the
+ * measured spread. A small gap leaves that compression the same order as the
+ * signal; this makes the signal an order larger instead.
+ */
+const STREAM_GAP_MS = 120;
+
+/** JSON-RPC methods this stub answers with an SSE stream, in both spellings. */
+const STREAMING_METHODS = new Set([
+  "message/stream",
+  "SendStreamingMessage",
+  "tasks/resubscribe",
+  "SubscribeToTask",
+]);
+
+/**
  * A stub upstream A2A agent: serves an agent card and answers JSON-RPC, while
  * recording what the gateway actually sent it — the wire version it announced
  * and the credential it presented.
@@ -154,6 +172,49 @@ async function handle(
       ],
       skills: [{ id: "invoice", name: "Process invoice", tags: ["billing"] }],
     });
+    return;
+  }
+
+  if (
+    req.method === "POST" &&
+    path === ctx.servicePath &&
+    typeof body?.method === "string" &&
+    STREAMING_METHODS.has(body.method)
+  ) {
+    // A real SSE body, written as three separate flushes with a comment and an
+    // `event:` field mixed in, so a test can tell a relayed stream from a
+    // buffered one: the gateway must forward each event as it lands.
+    res.writeHead(200, {
+      "content-type": "text/event-stream",
+      "cache-control": "no-cache",
+      connection: "keep-alive",
+    });
+    const envelope = (result: Record<string, unknown>) =>
+      `data: ${JSON.stringify({ jsonrpc: "2.0", id: body?.id ?? null, result })}\n\n`;
+    res.write(": open\n\n");
+    res.write(
+      envelope({
+        kind: "status-update",
+        taskId: "task-e2e-stream",
+        status: { state: "working" },
+        seq: 1,
+        sawVersion: header("a2a-version"),
+        sawAccept: header("accept"),
+      }),
+    );
+    await new Promise((resolve) => setTimeout(resolve, STREAM_GAP_MS));
+    res.write("event: status-update\n");
+    res.write(envelope({ kind: "status-update", taskId: "task-e2e-stream", seq: 2 }));
+    await new Promise((resolve) => setTimeout(resolve, STREAM_GAP_MS));
+    res.write(
+      envelope({
+        kind: "task",
+        id: "task-e2e-stream",
+        status: { state: "completed" },
+        seq: 3,
+      }),
+    );
+    res.end();
     return;
   }
 

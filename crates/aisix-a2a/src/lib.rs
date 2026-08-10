@@ -22,7 +22,7 @@ pub mod bridge;
 pub mod error;
 
 pub use bridge::{
-    upstream_from_a2a_agent, A2aAuth, A2aBridge, A2aUpstream, AgentCard, HttpBridge,
-    DEFAULT_UPSTREAM_TIMEOUT,
+    upstream_from_a2a_agent, A2aAuth, A2aBridge, A2aEvent, A2aEventStream, A2aUpstream, AgentCard,
+    HttpBridge, DEFAULT_UPSTREAM_TIMEOUT,
 };
 pub use error::A2aError;
