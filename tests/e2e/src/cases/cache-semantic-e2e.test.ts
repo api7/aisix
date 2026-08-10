@@ -565,6 +565,62 @@ describe("semantic cache e2e", () => {
     expect(exact.layer).toBe("exact");
   });
 
+  test("swapping the embedding model orphans old entries even at identical vectors", async (ctx) => {
+    if (!etcdReachable || !app || !seed) {
+      ctx.skip();
+      return;
+    }
+    // Second embedding model on the SAME mock: identical vectors, new
+    // identity. If the candidate partition keyed only on vectors, the
+    // swap would keep serving old entries; the contract is that vectors
+    // from a different embedding model are never compared.
+    await createEmbeddingModel("embed-cache-b", embed);
+    const upstream = await chatUpstreamReplying("answer-swap");
+    upstreams.push(upstream);
+    await createDirectModel("chat-swap", upstream);
+    const policy = await seed.createCachePolicy({
+      name: "sem-swap",
+      backend: "memory",
+      applies_to: "model:chat-swap",
+      ttl_seconds: 600,
+      semantic: { embedding_model: "embed-cache", threshold: 0.85 },
+    });
+    await waitConfigPropagation(async () => {
+      try {
+        const r = await chat("chat-swap", "warmup probe please");
+        return r.status === 200 && r.cache !== null;
+      } catch {
+        return false;
+      }
+    });
+
+    const seeded = await chat("chat-swap", "tell me about topic-a");
+    expect(seeded.cache).toBe("miss");
+    const baseline = await chat("chat-swap", "explain topic-a please");
+    expect(baseline.cache).toBe("hit");
+    expect(baseline.layer).toBe("semantic");
+
+    await seed.update("cache_policies", policy.id, {
+      ...policy.value,
+      semantic: { embedding_model: "embed-cache-b", threshold: 0.85 },
+    });
+    // A FRESH same-meaning wording (L1-cold) flips from semantic-hit to
+    // miss once the swap propagates — the old partition is orphaned.
+    await waitConfigPropagation(async () => {
+      try {
+        const r = await chat("chat-swap", "describe topic-a now");
+        return r.status === 200 && r.cache === "miss";
+      } catch {
+        return false;
+      }
+    });
+    // …and the new partition warms normally.
+    const rewarmed = await chat("chat-swap", "topic-a summary please");
+    expect(rewarmed.cache).toBe("hit");
+    expect(rewarmed.layer).toBe("semantic");
+    expect(rewarmed.content).toBe("answer-swap");
+  });
+
   test("purge_generation bump invalidates both layers at once", async (ctx) => {
     if (!etcdReachable || !app || !seed || !sharedPolicyId) {
       ctx.skip();

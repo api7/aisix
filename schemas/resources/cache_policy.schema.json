@@ -44,9 +44,9 @@
         },
         "max_entries": {
           "default": 1000,
-          "description": "Upper bound on stored entries for this policy on the `memory` backend; the oldest entry is evicted first. Shared backends bound growth by TTL instead and ignore this value.",
+          "description": "Upper bound on stored entries for this policy on the `memory` backend; the oldest entry is evicted first. Shared backends bound growth by TTL instead and ignore this value. The ceiling keeps the per-request similarity scan and the per-policy vector memory bounded; workloads needing more entries belong on a shared backend.",
           "format": "uint32",
-          "maximum": 100000.0,
+          "maximum": 10000.0,
           "minimum": 1.0,
           "type": "integer"
         },

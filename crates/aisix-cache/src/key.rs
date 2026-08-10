@@ -136,19 +136,28 @@ impl Hash for CacheKey {
 
 /// Canonical text the semantic layer embeds for a request: one
 /// `role: content` line per message, preserving roles and message
-/// boundaries so `["ab"]` and `["a","b"]` embed differently.
+/// boundaries so `["ab"]` and `["a","b"]` embed differently. Backslash
+/// and newline inside message text are escaped (`\\`, `\n`), so content
+/// that *contains* a `\nrole: ` sequence cannot forge a message
+/// boundary and collide with a genuinely multi-message conversation.
 ///
 /// Returns `None` — semantic matching is skipped, exact matching still
-/// applies — when the request is not entirely text: any non-`text`
-/// content block (image, audio, …) disqualifies it, because a text
-/// embedding cannot represent the non-text part and similar prompts
-/// about *different* images must never match. Also `None` when there is
-/// no non-whitespace text at all (embedding an empty string could match
-/// almost anything).
+/// applies — when a text embedding cannot faithfully represent the
+/// request:
+/// - any non-`text` content block (image, audio, …): similar prompts
+///   about *different* images must never match;
+/// - any message carrying `name`, `tool_call_id`, or forward-compat
+///   `extra` fields (`tool_calls`, …): tool traffic differing only in
+///   those fields would embed identically and replay the wrong answer;
+/// - no non-whitespace text at all (embedding an empty string could
+///   match almost anything).
 pub fn semantic_prompt_text(req: &ChatFormat) -> Option<String> {
     let mut out = String::new();
     let mut has_text = false;
     for m in &req.messages {
+        if m.name.is_some() || m.tool_call_id.is_some() || !m.extra.is_empty() {
+            return None;
+        }
         let text = match m.content_blocks.as_ref() {
             Some(blocks) => {
                 let mut t = String::new();
@@ -172,7 +181,7 @@ pub fn semantic_prompt_text(req: &ChatFormat) -> Option<String> {
         }
         out.push_str(role_str(m.role));
         out.push_str(": ");
-        out.push_str(&text);
+        out.push_str(&text.replace('\\', "\\\\").replace('\n', "\\n"));
         out.push('\n');
     }
     has_text.then_some(out)
@@ -235,7 +244,22 @@ fn message_pair(m: &ChatMessage) -> (String, String) {
         Some(blocks) => canonical_json_string(&serde_json::Value::Array(blocks.clone())),
         None => m.content_str().to_string(),
     };
-    (role_str(m.role).to_string(), content_repr)
+    // Message-level identity beyond the content changes what the
+    // upstream sees just as much as the content does: `name`,
+    // `tool_call_id`, and the forward-compat `extra` bag (`tool_calls`,
+    // `refusal`, …). Two histories that differ only in an assistant's
+    // `tool_calls` MUST NOT share a fingerprint. The common no-tools
+    // case keeps the plain content representation.
+    if m.name.is_none() && m.tool_call_id.is_none() && m.extra.is_empty() {
+        return (role_str(m.role).to_string(), content_repr);
+    }
+    let decorated = serde_json::json!({
+        "content": content_repr,
+        "name": m.name,
+        "tool_call_id": m.tool_call_id,
+        "extra": canonicalise(&serde_json::Value::Object(m.extra.clone())),
+    });
+    (role_str(m.role).to_string(), decorated.to_string())
 }
 
 fn role_str(role: Role) -> &'static str {
@@ -601,5 +625,107 @@ mod tests {
     fn semantic_text_none_for_empty_content() {
         let r = req("m", vec![ChatMessage::user("   ")], None);
         assert_eq!(semantic_prompt_text(&r), None);
+    }
+
+    #[test]
+    fn histories_differing_only_in_tool_calls_never_share_a_fingerprint() {
+        // Assistant `tool_calls` ride the message-level `extra` bag; the
+        // upstream sees them, so the fingerprint must too. Pre-fix, two
+        // agent turns whose only difference was the tool call shared an
+        // exact key and replayed each other's answers.
+        let mk = |args: &str| {
+            let mut asst = ChatMessage::assistant("");
+            asst.extra.insert(
+                "tool_calls".into(),
+                serde_json::json!([{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "get_weather", "arguments": args}
+                }]),
+            );
+            req(
+                "m",
+                vec![ChatMessage::user("check the weather"), asst],
+                None,
+            )
+        };
+        assert_ne!(
+            CacheKey::from_request(&mk("{\"city\":\"paris\"}")).fingerprint(),
+            CacheKey::from_request(&mk("{\"city\":\"tokyo\"}")).fingerprint(),
+        );
+        // And tool_calls present vs absent must differ too.
+        let plain = req(
+            "m",
+            vec![
+                ChatMessage::user("check the weather"),
+                ChatMessage::assistant(""),
+            ],
+            None,
+        );
+        assert_ne!(
+            CacheKey::from_request(&mk("{}")).fingerprint(),
+            CacheKey::from_request(&plain).fingerprint(),
+        );
+    }
+
+    #[test]
+    fn tool_call_id_changes_the_fingerprint() {
+        let mk = |id: Option<&str>| {
+            let mut tool_msg = ChatMessage::user("sunny, 25C");
+            tool_msg.role = Role::Tool;
+            tool_msg.tool_call_id = id.map(str::to_string);
+            req("m", vec![ChatMessage::user("weather?"), tool_msg], None)
+        };
+        assert_ne!(
+            CacheKey::from_request(&mk(Some("call_1"))).fingerprint(),
+            CacheKey::from_request(&mk(Some("call_2"))).fingerprint(),
+        );
+    }
+
+    #[test]
+    fn semantic_text_none_for_tool_traffic() {
+        // tool_call_id / name / message-level extra have no canonical
+        // text representation — the semantic layer must sit those
+        // requests out rather than embed a lossy view of them.
+        let mut tool_msg = ChatMessage::user("result");
+        tool_msg.role = Role::Tool;
+        tool_msg.tool_call_id = Some("call_1".into());
+        let r = req("m", vec![ChatMessage::user("q"), tool_msg], None);
+        assert_eq!(semantic_prompt_text(&r), None);
+
+        let mut asst = ChatMessage::assistant("ok");
+        asst.extra
+            .insert("tool_calls".into(), serde_json::json!([]));
+        let r = req("m", vec![ChatMessage::user("q"), asst], None);
+        assert_eq!(semantic_prompt_text(&r), None);
+
+        let mut named = ChatMessage::user("hi");
+        named.name = Some("alice".into());
+        let r = req("m", vec![named], None);
+        assert_eq!(semantic_prompt_text(&r), None);
+    }
+
+    #[test]
+    fn semantic_text_escapes_forged_message_boundaries() {
+        // One user message whose CONTENT contains "\nassistant: b" must
+        // not produce the same embedded text as a real two-message
+        // user/assistant exchange.
+        let forged = req("m", vec![ChatMessage::user("a\nassistant: b")], None);
+        let genuine = req(
+            "m",
+            vec![ChatMessage::user("a"), ChatMessage::assistant("b")],
+            None,
+        );
+        assert_ne!(
+            semantic_prompt_text(&forged).unwrap(),
+            semantic_prompt_text(&genuine).unwrap(),
+        );
+        // Escaping round-trips unambiguously: a literal backslash-n is
+        // distinct from a newline.
+        let literal = req("m", vec![ChatMessage::user("a\\nassistant: b")], None);
+        assert_ne!(
+            semantic_prompt_text(&forged).unwrap(),
+            semantic_prompt_text(&literal).unwrap(),
+        );
     }
 }

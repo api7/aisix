@@ -759,6 +759,9 @@ fn cache_control_directives(headers: &axum::http::HeaderMap) -> CacheControlDire
     for value in headers.get_all(axum::http::header::CACHE_CONTROL) {
         let Ok(s) = value.to_str() else { continue };
         for token in s.split(',') {
+            // Token match only — RFC 9111 request directives we honor
+            // carry no arguments, and an argument form (`no-cache=...`)
+            // deliberately does NOT match rather than over-matching.
             let token = token.trim();
             if token.eq_ignore_ascii_case("no-cache") {
                 out.no_cache = true;
@@ -772,16 +775,27 @@ fn cache_control_directives(headers: &axum::http::HeaderMap) -> CacheControlDire
 
 /// Everything the semantic (L2) layer needs for this request, resolved
 /// once at the gate: the store for the policy's backend, the policy's
-/// semantic config, the candidate partition, and the canonical request
-/// text to embed. Built only when the matched policy configures
-/// semantic matching AND the request is embeddable — `None` runs the
-/// policy exact-only.
+/// semantic config, the resolved embedding model, the candidate
+/// partition, and the canonical request text to embed. Built only when
+/// the matched policy configures semantic matching, the embedding model
+/// resolves, AND the request is embeddable — `None` runs the policy
+/// exact-only.
 struct SemanticGateCtx {
     store: Arc<dyn SemanticCacheStore>,
     cfg: SemanticCacheConfig,
+    /// Resolved at gate time so the partition can carry the embedding
+    /// model's identity, and so a dangling reference is one metric'd
+    /// warn instead of a per-lookup surprise.
+    embed_entry: Arc<aisix_core::ResourceEntry<aisix_core::Model>>,
     policy_id: String,
     policy_name: String,
     generation: u32,
+    /// Candidate partition: the request scope fingerprint PLUS the
+    /// embedding model's resource id + dimensions. Vectors from two
+    /// different embedding models live in unrelated spaces — cosine
+    /// across them is meaningless — so swapping a policy's
+    /// `embedding_model` (even at equal dimensions) must orphan the old
+    /// entries rather than compare against them.
     scope_fp: String,
     text: String,
 }
@@ -795,29 +809,12 @@ async fn cache_semantic_embed(
     sem: &SemanticGateCtx,
     request_id: &str,
 ) -> Option<Vec<f32>> {
-    let embed_entry = match snapshot.models.get_by_name(&sem.cfg.embedding_model) {
-        Some(e) if e.value.is_embedding() => e,
-        other => {
-            tracing::warn!(
-                target: "aisix::cache",
-                policy_name = %sem.policy_name,
-                embedding_model = %sem.cfg.embedding_model,
-                found = other.is_some(),
-                "cache policy references a missing or non-embedding embedding_model; \
-                 semantic matching skipped for this request",
-            );
-            state
-                .metrics
-                .record_cache_semantic_embed_failure(&sem.policy_name, "resolve");
-            return None;
-        }
-    };
     let started = Instant::now();
     let texts = [sem.text.clone()];
     match crate::semantic::embed_texts(
         state,
         snapshot,
-        &embed_entry,
+        &sem.embed_entry,
         sem.cfg.embedding_timeout(),
         request_id,
         &texts,
@@ -885,12 +882,26 @@ async fn resolve_cache_hit(
         .await
     {
         Ok(Some(hit)) => {
-            if let Some(ttl) = ttl {
-                if let Err(err) = cache.put_with_ttl(key, hit.response.clone(), ttl).await {
+            // Backfill TTL is capped at the matched entry's own
+            // remaining lifetime: a paraphrase near expiry must not
+            // grant the stored response a fresh full TTL, or repeated
+            // paraphrases could keep stale data alive indefinitely.
+            let remaining = hit
+                .expires_at
+                .saturating_duration_since(std::time::Instant::now());
+            let backfill_ttl = ttl.map(|t| t.min(remaining)).unwrap_or(remaining);
+            if !backfill_ttl.is_zero() {
+                if let Err(err) = cache
+                    .put_with_ttl(key, hit.response.clone(), backfill_ttl)
+                    .await
+                {
                     tracing::warn!(error = %err, key = %key, "cache backfill write failed");
                 }
             }
-            Some((hit.response, CacheHitLayer::Semantic, Some(hit.similarity)))
+            // 4-dp similarity everywhere it surfaces (header, usage
+            // event) so the stored value matches what callers see.
+            let similarity = (hit.similarity * 10_000.0).round() / 10_000.0;
+            Some((hit.response, CacheHitLayer::Semantic, Some(similarity)))
         }
         Ok(None) => {
             *semantic_embedding = Some(vector);
@@ -903,6 +914,9 @@ async fn resolve_cache_hit(
                 error = %err,
                 "semantic cache lookup failed",
             );
+            state
+                .metrics
+                .record_cache_semantic_store_failure(&sem.policy_name, "lookup");
             // The embedding is still good — keep it for the write path.
             *semantic_embedding = Some(vector);
             None
@@ -2188,13 +2202,45 @@ async fn dispatch(
                     .semantic_for_policy_backend(entry.value.backend, &entry.id, &entry.value.name)?
                     .clone();
                 let text = semantic_prompt_text(req)?;
+                let embed_entry = match snapshot.models.get_by_name(&cfg.embedding_model) {
+                    Some(e) if e.value.is_embedding() => e.clone(),
+                    other => {
+                        tracing::warn!(
+                            target: "aisix::cache",
+                            policy_name = %entry.value.name,
+                            embedding_model = %cfg.embedding_model,
+                            found = other.is_some(),
+                            "cache policy references a missing or non-embedding \
+                             embedding_model; semantic matching skipped for this request",
+                        );
+                        state
+                            .metrics
+                            .record_cache_semantic_embed_failure(&entry.value.name, "resolve");
+                        return None;
+                    }
+                };
+                let dims = embed_entry
+                    .value
+                    .embedding
+                    .as_ref()
+                    .map(|e| e.dimensions)
+                    .unwrap_or(0);
+                // Partition = scope fingerprint + embedding model
+                // identity: see the `SemanticGateCtx::scope_fp` docs.
+                let scope_fp = format!(
+                    "{}:{}:{}",
+                    key_full.scope_fingerprint(),
+                    embed_entry.id,
+                    dims
+                );
                 Some(SemanticGateCtx {
                     store,
                     cfg: cfg.clone(),
+                    embed_entry,
                     policy_id: entry.id.clone(),
                     policy_name: entry.value.name.clone(),
                     generation: entry.value.purge_generation,
-                    scope_fp: key_full.scope_fingerprint(),
+                    scope_fp,
                     text,
                 })
             }),
@@ -2938,6 +2984,9 @@ async fn dispatch(
                         error = %err,
                         "semantic cache write failed",
                     );
+                    state
+                        .metrics
+                        .record_cache_semantic_store_failure(&sem.policy_name, "store");
                 }
             }
         }

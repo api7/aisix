@@ -181,6 +181,12 @@ pub const M_CACHE_SEMANTIC_EMBED_SECONDS: &str = "aisix_cache_semantic_embedding
 /// silently down" signal.
 pub const M_CACHE_SEMANTIC_EMBED_FAILURES_TOTAL: &str =
     "aisix_cache_semantic_embedding_failures_total";
+/// Semantic-store operation failures, by `policy` and `op`
+/// (`lookup` / `store`). Failures degrade to an ordinary miss, which
+/// makes a broken store indistinguishable from a healthy low hit rate
+/// in the outcome counter alone — this series is the disambiguator.
+/// The in-process store cannot fail today; shared (redis) stores can.
+pub const M_CACHE_SEMANTIC_STORE_FAILURES_TOTAL: &str = "aisix_cache_semantic_store_failures_total";
 pub const M_OTLP_FANOUT_DROPS_TOTAL: &str = "aisix_otlp_fanout_drops_total";
 pub const M_OTLP_FANOUT_FAILURES_TOTAL: &str = "aisix_otlp_fanout_failures_total";
 /// AISIX-Cloud#1011: SLO-grade latency distributions as REAL bucketed
@@ -909,6 +915,19 @@ impl Metrics {
                 M_CACHE_SEMANTIC_EMBED_FAILURES_TOTAL,
                 "policy" => policy.to_string(),
                 "cause" => cause.to_string(),
+            )
+            .increment(1);
+        });
+    }
+
+    /// Count one failed semantic-store operation. `op` is one of the
+    /// fixed [`M_CACHE_SEMANTIC_STORE_FAILURES_TOTAL`] values.
+    pub fn record_cache_semantic_store_failure(&self, policy: &str, op: &str) {
+        metrics::with_local_recorder(&self.inner.recorder, || {
+            metrics::counter!(
+                M_CACHE_SEMANTIC_STORE_FAILURES_TOTAL,
+                "policy" => policy.to_string(),
+                "op" => op.to_string(),
             )
             .increment(1);
         });

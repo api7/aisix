@@ -67,9 +67,12 @@ pub struct SemanticCacheConfig {
 
     /// Upper bound on stored entries for this policy on the `memory`
     /// backend; the oldest entry is evicted first. Shared backends
-    /// bound growth by TTL instead and ignore this value.
+    /// bound growth by TTL instead and ignore this value. The ceiling
+    /// keeps the per-request similarity scan and the per-policy vector
+    /// memory bounded; workloads needing more entries belong on a
+    /// shared backend.
     #[serde(default = "default_semantic_max_entries")]
-    #[schemars(range(min = 1, max = 100000))]
+    #[schemars(range(min = 1, max = 10000))]
     pub max_entries: u32,
 
     /// Per-call deadline for the embedding request in milliseconds.

@@ -14,10 +14,13 @@
 //! generation makes every earlier entry unreachable.
 //!
 //! [`MemorySemanticCache`] is the in-process implementation (`backend:
-//! memory`): per-policy entry lists scanned with brute-force cosine.
-//! At the schema-capped 100k entries × 1536 dims that is a few ms; at
-//! the default 1000 entries it is microseconds. Like the exact memory
-//! backend, it is per-instance — replicas do not share entries.
+//! memory`): per-policy entry lists scanned with brute-force cosine
+//! under a map-shard read guard. The `max_entries` schema cap (10 000)
+//! bounds the scan at ~15M f32 ops ≈ low-ms worst case and ~60 MB of
+//! vectors per policy at 1536 dims; the 1000 default is microseconds.
+//! Workloads beyond that belong on the shared (redis vector) backend.
+//! Like the exact memory backend, it is per-instance — replicas do not
+//! share entries.
 
 use aisix_gateway::ChatResponse;
 use async_trait::async_trait;
@@ -33,6 +36,11 @@ use crate::cache::CacheError;
 pub struct SemanticHit {
     pub response: ChatResponse,
     pub similarity: f32,
+    /// When the matched entry expires. Callers that copy the response
+    /// into another layer (the exact-layer backfill) must cap that
+    /// copy's TTL to this deadline, so a near-expiry entry cannot be
+    /// granted a fresh full lifetime on every similar request.
+    pub expires_at: Instant,
 }
 
 /// Storage seam for the semantic layer. Implementations must treat
@@ -158,6 +166,7 @@ impl SemanticCacheStore for MemorySemanticCache {
                 best = Some(SemanticHit {
                     response: entry.response.clone(),
                     similarity,
+                    expires_at: entry.expires_at,
                 });
             }
         }
@@ -175,6 +184,22 @@ impl SemanticCacheStore for MemorySemanticCache {
         max_entries: u32,
     ) -> Result<(), CacheError> {
         let now = Instant::now();
+        // Opportunistic reclamation of OTHER policies' storage: a policy
+        // that was deleted (or just went idle) never runs its own store
+        // path again, so front-drain its expired entries here and drop
+        // buckets that emptied. Bounds orphaned memory at one TTL
+        // (≤ 7 days) past the last write instead of process lifetime.
+        // O(#policies) per store — policies are operator-configured and
+        // few, and stores only happen on upstream misses.
+        self.policies.retain(|id, p| {
+            if id == policy_id {
+                return true;
+            }
+            while p.entries.front().is_some_and(|e| e.expires_at <= now) {
+                p.entries.pop_front();
+            }
+            !p.entries.is_empty()
+        });
         let mut policy = self
             .policies
             .entry(policy_id.to_string())
@@ -182,7 +207,14 @@ impl SemanticCacheStore for MemorySemanticCache {
                 generation,
                 entries: VecDeque::new(),
             });
-        if policy.generation != generation {
+        // A store from a request that read the policy BEFORE a purge
+        // must not roll the bucket back and wipe post-purge entries:
+        // drop the stale write instead. (Generations only ever move
+        // forward — cp-api increments on purge.)
+        if generation < policy.generation {
+            return Ok(());
+        }
+        if generation > policy.generation {
             policy.generation = generation;
             policy.entries.clear();
         }
@@ -298,6 +330,79 @@ mod tests {
         // Old-generation entry is gone even for old-generation lookups.
         let got = store.lookup("p", 0, "fp", &[1.0, 0.0], 0.5).await.unwrap();
         assert!(got.is_none());
+    }
+
+    #[tokio::test]
+    async fn stale_generation_store_is_dropped_not_rolled_back() {
+        let store = MemorySemanticCache::new();
+        // Purged bucket already re-warmed at generation 1.
+        store
+            .store("p", 1, "fp", vec![0.0, 1.0], resp("new"), TTL, 100)
+            .await
+            .unwrap();
+        // A request that read the pre-purge policy snapshot finishes its
+        // upstream call late and stores under generation 0: dropped.
+        store
+            .store("p", 0, "fp", vec![1.0, 0.0], resp("stale"), TTL, 100)
+            .await
+            .unwrap();
+        assert_eq!(store.entry_count("p"), 1);
+        let hit = store
+            .lookup("p", 1, "fp", &[0.0, 1.0], 0.9)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(hit.response.message.content_str(), "new");
+        assert!(store
+            .lookup("p", 0, "fp", &[1.0, 0.0], 0.5)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn store_reclaims_other_policies_expired_buckets() {
+        let store = MemorySemanticCache::new();
+        store
+            .store(
+                "idle",
+                0,
+                "fp",
+                vec![1.0, 0.0],
+                resp("orphan"),
+                Duration::from_millis(20),
+                100,
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        // A store on ANY other policy sweeps the fully-expired bucket.
+        store
+            .store("busy", 0, "fp", vec![0.0, 1.0], resp("live"), TTL, 100)
+            .await
+            .unwrap();
+        assert_eq!(store.entry_count("idle"), 0);
+        assert_eq!(store.entry_count("busy"), 1);
+    }
+
+    #[tokio::test]
+    async fn lookup_reports_entry_expiry_for_backfill_capping() {
+        let store = MemorySemanticCache::new();
+        let ttl = Duration::from_secs(60);
+        store
+            .store("p", 0, "fp", vec![1.0, 0.0], resp("a"), ttl, 100)
+            .await
+            .unwrap();
+        let hit = store
+            .lookup("p", 0, "fp", &[1.0, 0.0], 0.9)
+            .await
+            .unwrap()
+            .unwrap();
+        // `expires_at` was set at store time, so measured from any later
+        // instant the remaining lifetime is within (ttl - ε, ttl].
+        let remaining = hit.expires_at.saturating_duration_since(Instant::now());
+        assert!(remaining <= ttl);
+        assert!(remaining > ttl - Duration::from_secs(5));
     }
 
     #[tokio::test]
