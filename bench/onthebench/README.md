@@ -1,0 +1,74 @@
+# onthebench-style rig harness
+
+Reproduces the public onthebench AI-gateway benchmark methodology on our own
+`m7g.4xlarge` (Graviton3, 16 cores, single NUMA node), so performance work can
+be measured on the same rig shape the public board uses — and so any published
+figure can be checked against a box we control.
+
+## One command
+
+```sh
+bench/onthebench/bench.sh                       # default rig, results under ./bench-results/
+bench/onthebench/bench.sh ubuntu@<rig-ip> /path/to/results
+```
+
+The tree you run it from is the tree that gets measured. The script rsyncs the
+source to the rig, provisions it (idempotently), builds a native release
+binary, runs every load point, and rsyncs the results back. The rig is
+disposable; a rebuilt box only needs passwordless ssh + sudo and this harness.
+
+## Methodology
+
+Replicates the published onthebench setup (https://onthebench.ai/gateways/performance):
+
+- **Core split** — three disjoint pinned groups via `taskset`: gateway `0-3`
+  (4 cores), load generator `4-9` (6), mock upstream `10-15` (6). Neither
+  instrument can starve the gateway or bottleneck it.
+- **Instruments** — the prebuilt, pinned `otb` load generator and `mock`
+  upstream from the public benchmark rig release (engine pin
+  `f3adbb1315b26129f5e317af5279decefb1cea8f`, tag `engine-v1`, from
+  https://github.com/GetBusbar/benchmarking). `rig-setup.sh` verifies their
+  sha256 so a re-provisioned rig either runs the byte-identical instrument or
+  fails loudly. These are the same binaries behind the public board and the
+  same `otb loadgen` used for the api7/aisix#891 / #902 tables.
+- **Default shipped config** — a setting may appear only if the process cannot
+  run the benchmark without it. The full claim set (in `run-baseline.sh`):
+  `resources_file` (boot: standalone source, else aisix demands etcd),
+  `proxy.addr` (bind: the port the harness drives), `admin.admin_keys` (boot:
+  config refuses to load without one), plus a resources file wiring the mock
+  as the only upstream and minting the single client key (boot: aisix has no
+  anonymous mode). Everything else — thread-per-core, worker count, telemetry —
+  is whatever the defaults do.
+- **Load grid** — fixed concurrency, the api7/aisix#891 grid: c=16/32/128
+  against the 0-delay mock, c=768 against the 10ms-TTFT mock
+  (`MOCK_TTFT_MS=10`). 25s windows, 5s warmup per point, ≥4 repetitions;
+  a window with any failed request (`fail`, `rigrefused`, `budgetexceeded`,
+  `spawnfailed`) is recorded but marked invalid, and the point retries until
+  4 valid windows or 8 attempts.
+- **Rig floor** — the load generator driving the mock directly (c=128 0-delay,
+  c=768 10ms), so every gateway number can be checked against the instrument's
+  own ceiling.
+- **Recorded per window** — rps, fail/ok counts, p50/p99 (µs, from otb),
+  gateway CPU% (`/proc/<pid>/stat` utime+stime across the window), gateway
+  peak RSS (VmRSS sampled at 5 Hz), the raw otb stats line. Idle RSS and
+  VmHWM are in the metadata, alongside commit, binary sha256, instrument
+  sha256s, core split, kernel, and the full method parameters.
+- **Flamegraph** — one on-CPU flamegraph at the c=128 saturation point per run
+  (`perf record -F 997 --call-graph dwarf` → inferno), the api7/aisix#847
+  workflow. `rig-setup.sh` sets `kernel.perf_event_paranoid=1` (session-scoped,
+  reverts on reboot) so an unprivileged run can sample its own process, and
+  `run-baseline.sh` refuses a stripped binary before wasting a run.
+
+## Output
+
+One directory per run: `results.jsonl` (one JSON object per measured window,
+`kind` gateway/floor), `meta.json`, `flamegraph-c128.svg`, the generated
+config files, and the gateway/mock logs.
+
+## Deviations from stock defaults, and why
+
+- `ulimit -n 65536` in the run shell: c=768 plus per-worker upstream pools
+  exceeds the 1024 default soft limit; without it the run measures fd
+  exhaustion, not the gateway.
+- `kernel.perf_event_paranoid=1`: flamegraph sampling only; not active during
+  measurement windows other than the dedicated flamegraph window.
