@@ -65,7 +65,21 @@ export async function startA2aUpstream(
       : "/.well-known/agent-card.json";
 
   const httpServer: HttpServer = createServer((req, res) => {
-    void handle(req, res, { requests, servicePath, cardPath, token: options.token });
+    handle(req, res, {
+      requests,
+      servicePath,
+      cardPath,
+      token: options.token,
+    }).catch((err: unknown) => {
+      // `handle` rejects on a malformed body, and on a write to an already
+      // closed socket. Unhandled, that terminates the test process; worse, the
+      // request never gets a response, so a stub fault reads as a gateway
+      // timeout instead of what it is. Answer on the wire either way.
+      if (!res.headersSent) {
+        res.writeHead(500, { "content-type": "application/json" });
+      }
+      res.end(JSON.stringify({ error: `a2a stub failed: ${String(err)}` }));
+    });
   });
   await new Promise<void>((resolve) =>
     httpServer.listen(0, "127.0.0.1", resolve),
