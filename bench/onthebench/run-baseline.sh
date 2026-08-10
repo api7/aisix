@@ -181,6 +181,9 @@ floor_point 0 128
 # ---- gateway: default shipped config, pinned to its 4 cores -----------------
 
 echo "== gateway ==" >&2
+# aisix reads AISIX_* environment variables as config overrides; nothing from
+# the harness environment may leak into the measured process.
+while read -r v; do unset "$v"; done < <(compgen -v | grep '^AISIX_' || true)
 BENCH_AISIX_KEY=bench-token taskset -c "$GW_CORES" "$BIN" --config "$OUT/config.yaml" \
     > "$OUT/gateway.log" 2>&1 &
 GW_PID=$!
@@ -243,8 +246,8 @@ done
 RSS_HWM=$(awk '/VmHWM/{print $2}' "/proc/$GW_PID/status")
 cat > "$OUT/meta.json" <<EOF
 {
-  "commit": "${AISIX_COMMIT:-unknown}",
-  "dirty_files": ${AISIX_DIRTY:-0},
+  "commit": "${BENCH_SRC_COMMIT:-unknown}",
+  "dirty_files": ${BENCH_SRC_DIRTY:-0},
   "timestamp_utc": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
   "rig": {
     "host": "$(hostname)",

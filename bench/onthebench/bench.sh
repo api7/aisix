@@ -29,7 +29,10 @@ echo "== build (native release on the rig) =="
 ssh "$RIG" 'source ~/.cargo/env && cd aisix-src && cargo build --release --bin aisix'
 
 echo "== run baseline ($RUNID) =="
-ssh "$RIG" "AISIX_COMMIT=$COMMIT AISIX_DIRTY=$DIRTY \
+# BENCH_-prefixed, never AISIX_-prefixed: aisix reads AISIX_* environment
+# variables as config overrides, so an AISIX_COMMIT in the gateway's
+# environment becomes an unknown top-level config field and refuses boot.
+ssh "$RIG" "BENCH_SRC_COMMIT=$COMMIT BENCH_SRC_DIRTY=$DIRTY \
     bash aisix-src/bench/onthebench/run-baseline.sh \"\$HOME/aisix-src\" \"\$HOME/bench-results/$RUNID\""
 
 echo "== collect results =="
