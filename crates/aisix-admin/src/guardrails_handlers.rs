@@ -1,8 +1,5 @@
-//! CRUD handlers for `/admin/v1/guardrails`.
-//!
-//! Same shape as the Models / ApiKeys / ProviderKeys handlers:
-//! validate against the JSON schema, reject duplicate names (409),
-//! generate a uuid v4 on POST, bump revision on PUT.
+//! Read handlers for `/admin/v1/guardrails`: list and get-by-id,
+//! same shape as [`crate::models_handlers`].
 
 use aisix_core::resource::ResourceEntry;
 use aisix_core::Guardrail;

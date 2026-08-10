@@ -1765,7 +1765,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
     },
     {
       "name": "Caller API Keys",
-      "description": "Caller-facing proxy API keys and key rotation."
+      "description": "Caller-facing proxy API keys."
     },
     {
       "name": "Provider Keys",

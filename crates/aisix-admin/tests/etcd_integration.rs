@@ -333,27 +333,36 @@ async fn admin_writes_are_refused_against_real_etcd() {
     let mut client = etcd_client_for(&url).await;
     let state = build_state(client.clone(), &prefix).await;
 
-    let app = build_router(state.clone());
-    let resp = app
-        .oneshot(auth_req(
-            "POST",
-            "/admin/v1/models",
-            Some(json!({
-                "display_name": "sneaky",
-                "provider": "openai",
-                "model_name": "gpt-4o",
-                "provider_key_id": "11111111-1111-1111-1111-111111111111"
-            })),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
-    let allow = resp
-        .headers()
-        .get(axum::http::header::ALLOW)
-        .and_then(|v| v.to_str().ok())
-        .expect("Allow header");
-    assert!(allow.contains("GET"), "Allow: {allow}");
+    let payload = json!({
+        "display_name": "sneaky",
+        "provider": "openai",
+        "model_name": "gpt-4o",
+        "provider_key_id": "11111111-1111-1111-1111-111111111111"
+    });
+    for (method, uri) in [
+        ("POST", "/admin/v1/models"),
+        ("PUT", "/admin/v1/models/any-id"),
+        ("DELETE", "/admin/v1/models/any-id"),
+    ] {
+        let app = build_router(state.clone());
+        let body = if method == "DELETE" {
+            None
+        } else {
+            Some(payload.clone())
+        };
+        let resp = app.oneshot(auth_req(method, uri, body)).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "{method} {uri}"
+        );
+        let allow = resp
+            .headers()
+            .get(axum::http::header::ALLOW)
+            .and_then(|v| v.to_str().ok())
+            .expect("Allow header");
+        assert!(allow.contains("GET"), "{method} {uri} Allow: {allow}");
+    }
 
     // GET discriminates route absence from unknown-id: a surviving
     // POST-only rotate route would answer GET with 405, not 404.

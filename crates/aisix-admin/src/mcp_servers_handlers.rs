@@ -1,9 +1,7 @@
-//! CRUD handlers for `/admin/v1/mcp_servers`.
-//!
-//! Same shape as the ProviderKeys handlers: validate against the JSON schema,
-//! reject duplicate names (409), generate a uuid v4 on POST, bump revision on
-//! PUT. Additionally rejects a name containing the reserved tool-namespace
-//! separator `__`, since the name prefixes the server's tools.
+//! Read handlers for `/admin/v1/mcp_servers`: list and get-by-id,
+//! same shape as [`crate::models_handlers`]. Name constraints (no
+//! reserved `__` tool-namespace separator, no trailing `_`) live in
+//! the canonical schema, enforced on every declarative write path.
 
 use aisix_core::resource::ResourceEntry;
 use aisix_core::McpServer;

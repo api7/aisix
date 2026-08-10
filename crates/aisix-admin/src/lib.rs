@@ -1214,9 +1214,6 @@ mod tests {
         }
     }
 
-    // ---- coverage of issue api7/AISIX-Cloud#398 Addendum.B "admin
-    // /apikeys/:id/rotate" — race window + auth-bypass surface.
-
     #[tokio::test]
     async fn openapi_apikey_schema_excludes_max_budget_usd() {
         let resp = openapi::openapi_json().await;
@@ -1230,7 +1227,7 @@ mod tests {
         assert!(props.get("max_budget_usd").is_none());
     }
 
-    // ──────────────────── Guardrails CRUD ────────────────────
+    // ──────────────────── Guardrail payloads ────────────────────
 
     fn guardrail_payload(name: &str) -> Value {
         json!({
@@ -1239,10 +1236,6 @@ mod tests {
             "patterns": [{"kind": "literal", "value": "secret"}]
         })
     }
-
-    // ──────────────────── CachePolicy CRUD ────────────────────
-
-    // ──────────────────── ObservabilityExporter CRUD ────────────────────
 
     // ──────────────────── Health endpoint ────────────────────
 

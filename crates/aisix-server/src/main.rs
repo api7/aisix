@@ -963,7 +963,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     // Admin router + listener are only built in standalone mode.
     // In managed mode (`cfg.managed.enabled = true`) the DP reads
     // configuration exclusively from etcd; exposing the admin surface
-    // or the Playground would bypass the aisix.cloud control plane.
+    // or the Playground would bypass the AISIX Cloud control plane.
     //
     // Which store backs the admin surface depends on the resource
     // source: etcd standalone reads the etcd store; file mode reads a
@@ -971,7 +971,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     // read-only — writes were removed with the Admin API write path.
     let admin_store: Option<Arc<dyn ConfigStore>> = match (admin_client, &file_source_path) {
         (Some((client, prefix)), _) => Some(Arc::new(EtcdConfigStore::new(client, prefix))),
-        (None, Some(path)) if !cfg.managed.is_managed() => {
+        (None, Some(_)) if !cfg.managed.is_managed() => {
             Some(Arc::new(FileManagedStore::new(snapshot_handle.clone())))
         }
         _ => None,
@@ -981,8 +981,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     // surface's store handle, so the status-listener view and
     // `GET /admin/v1/models/status` read the very same source; managed mode
     // has no admin store and serves the applied snapshot through the same
-    // read-only view file mode uses (the path only appears in write
-    // rejections, which the read-only status listener never issues).
+    // read-only view file mode uses.
     let status_models_state = aisix_admin::ModelsStatusState {
         store: match &admin_store {
             Some(store) => Arc::clone(store),

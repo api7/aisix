@@ -1,8 +1,5 @@
-//! CRUD handlers for `/admin/v1/provider_keys`.
-//!
-//! Same shape as the Models / ApiKeys handlers: validate against the
-//! JSON schema, reject duplicate display_names (409), generate a uuid
-//! v4 on POST, bump revision on PUT.
+//! Read handlers for `/admin/v1/provider_keys`: list and get-by-id,
+//! same shape as [`crate::models_handlers`].
 
 use aisix_core::resource::ResourceEntry;
 use aisix_core::ProviderKey;

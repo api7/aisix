@@ -1,12 +1,8 @@
-//! CRUD handlers for `/admin/v1/a2a_agents`.
-//!
-//! Same shape as the McpServers handlers: validate against the JSON schema,
-//! reject duplicate names (409), generate a uuid v4 on POST, bump revision on
-//! PUT. The name is the path segment under which the agent is exposed
-//! (`/a2a/<name>`), so it must be a single URL path segment (no `/`). The
-//! per-auth_type credential coupling is enforced by the canonical schema, so
-//! every configuration path rejects an incomplete credential set; the checks
-//! below are defense in depth.
+//! Read handlers for `/admin/v1/a2a_agents`: list and get-by-id, same
+//! shape as [`crate::models_handlers`]. The name is the path segment
+//! under which the agent is exposed (`/a2a/<name>`); its constraints
+//! and the per-auth_type credential coupling live in the canonical
+//! schema, enforced on every declarative write path.
 
 use aisix_core::resource::ResourceEntry;
 use aisix_core::A2aAgent;

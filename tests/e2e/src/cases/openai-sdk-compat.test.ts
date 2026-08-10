@@ -93,6 +93,18 @@ describe("openai SDK compat: drive gateway through real client", () => {
     await streamUpstream?.close();
   });
 
+  /** Readiness gate per the harness rules: the caller key is seeded
+   * last, so it authenticating `GET /v1/models` (200) implies the whole
+   * seed set has propagated — without exercising the SDK chat path this
+   * suite is testing. */
+  async function seedsPropagated(): Promise<boolean> {
+    const res = await fetch(`${app!.proxyUrl}/v1/models`, {
+      headers: { authorization: `Bearer ${CALLER_PLAINTEXT}` },
+    });
+    await res.text();
+    return res.status === 200;
+  }
+
   test("openai.chat.completions.create() — non-streaming", async (ctx) => {
     if (!etcdReachable || !app || !nonStreamUpstream) {
       ctx.skip();
@@ -104,25 +116,10 @@ describe("openai SDK compat: drive gateway through real client", () => {
       baseURL: `${app.proxyUrl}/v1`,
     });
 
-    // Snapshot propagation: poll the SDK path itself until it stops
-    // erroring (Model + ProviderKey + ApiKey all visible to the
-    // dispatcher). Mirrors the pattern in smoke.test.ts.
-    await waitConfigPropagation(async () => {
-      try {
-        await client.chat.completions.create({
-          model: "sdk-compat-sync",
-          messages: [{ role: "user", content: "ping" }],
-        });
-        return true;
-      } catch {
-        return false;
-      }
-    });
+    await waitConfigPropagation(seedsPropagated);
 
-    // Baseline-isolate the propagation probe so the assertion below
-    // measures only the effect of the actual test call. Without this,
-    // tightening to an absolute count (e.g. `length === 1`) would
-    // silently break — the probe consumes one slot in receivedRequests.
+    // Baseline-isolate anything earlier tests sent so the assertion
+    // below measures only the effect of the actual test call.
     const baseline = nonStreamUpstream.receivedRequests.length;
 
     const completion = await client.chat.completions.create({
@@ -156,23 +153,9 @@ describe("openai SDK compat: drive gateway through real client", () => {
       baseURL: `${app.proxyUrl}/v1`,
     });
 
-    await waitConfigPropagation(async () => {
-      try {
-        const probe = await client.chat.completions.create({
-          model: "sdk-compat-stream",
-          messages: [{ role: "user", content: "ping" }],
-          stream: true,
-        });
-        for await (const _chunk of probe) {
-          break;
-        }
-        return true;
-      } catch {
-        return false;
-      }
-    });
+    await waitConfigPropagation(seedsPropagated);
 
-    // Baseline-isolate the readiness probe so the count + path
+    // Baseline-isolate anything earlier tests sent so the count + path
     // assertions below measure only the test call's effect.
     const baseline = streamUpstream.receivedRequests.length;
     const stream = await client.chat.completions.create({

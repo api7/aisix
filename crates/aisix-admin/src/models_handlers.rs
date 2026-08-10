@@ -1,12 +1,7 @@
-//! CRUD handlers for `/admin/v1/models`.
-//!
-//! Every mutating endpoint:
-//! 1. validates the JSON body against the Model schema (aisix-core),
-//! 2. rejects duplicate `name` against other resources in the store,
-//! 3. persists via `ConfigStore`,
-//! 4. returns the full `ResourceEntry<Model>` as JSON.
-//!
-//! ids are UUID v4s generated on POST; PUT preserves the existing id.
+//! Read handlers for `/admin/v1/models`: list and get-by-id over the
+//! configured [`crate::ConfigStore`], returning `ResourceEntry<Model>`
+//! as JSON. Models are written declaratively (resources file or etcd),
+//! not through this surface.
 
 use aisix_core::resource::ResourceEntry;
 use aisix_core::Model;
