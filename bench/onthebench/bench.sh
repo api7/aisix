@@ -42,8 +42,17 @@ echo "== run baseline ($RUNID) =="
 # BENCH_-prefixed, never AISIX_-prefixed: aisix reads AISIX_* environment
 # variables as config overrides, so an AISIX_COMMIT in the gateway's
 # environment becomes an unknown top-level config field and refuses boot.
+#
+# Method overrides (BENCH_GRID, BENCH_REPS, ...) forward to the rig so a
+# spot-check or an extra delay tier is a local env var, not a script edit;
+# printf %q keeps values with spaces intact through the remote shell.
+ENVPASS="BENCH_SRC_COMMIT=$COMMIT BENCH_SRC_DIRTY=$DIRTY"
+for v in BENCH_GRID BENCH_REPS BENCH_WINDOW BENCH_WARMUP BENCH_MAX_TRIES \
+         BENCH_FLOOR_REPS BENCH_FLAMEGRAPH; do
+    [ -n "${!v:-}" ] && ENVPASS="$ENVPASS $v=$(printf %q "${!v}")"
+done
 RUN_RC=0
-ssh "$RIG" "BENCH_SRC_COMMIT=$COMMIT BENCH_SRC_DIRTY=$DIRTY \
+ssh "$RIG" "$ENVPASS \
     bash aisix-src/bench/onthebench/run-baseline.sh \"\$HOME/aisix-src\" \"\$HOME/bench-results/$RUNID\"" ||
     RUN_RC=$?
 
