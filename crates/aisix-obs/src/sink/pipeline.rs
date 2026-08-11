@@ -339,9 +339,12 @@ fn backoff(base: Duration, cap: Duration, attempt: u32) -> Duration {
 
 /// Trim a sink error to a bounded, log-safe excerpt. The sink is responsible
 /// for not embedding secrets in its error text; this only caps length so a
-/// verbose upstream body can't flood the logs.
+/// verbose upstream body can't flood the logs. Wide enough that a sink's
+/// own 500-char detail (object URL + error source chain) survives with the
+/// enum prefix — this cap is the last one before the log line / `last_error`,
+/// so trimming tighter than the sinks re-hides the cause they now carry.
 fn masked(err: &SinkError) -> String {
-    err.to_string().chars().take(200).collect()
+    err.to_string().chars().take(600).collect()
 }
 
 #[cfg(test)]
@@ -364,6 +367,8 @@ mod tests {
         TransientThenOk(AtomicU32),
         AlwaysTransient,
         Permanent,
+        /// Permanent failure carrying a caller-chosen detail string.
+        PermanentDetail(String),
     }
 
     /// A configurable sink that records the batch sizes it was handed.
@@ -428,6 +433,7 @@ mod tests {
                 }
                 Mode::AlwaysTransient => Err(SinkError::Transient("always failing".into())),
                 Mode::Permanent => Err(SinkError::Permanent("bad credentials".into())),
+                Mode::PermanentDetail(detail) => Err(SinkError::Permanent(detail.clone())),
             }
         }
 
@@ -565,6 +571,31 @@ mod tests {
         assert_eq!(s.retries, 0, "permanent errors are not retried");
         assert_eq!(s.dropped, 1);
         assert_eq!(s.sent, 0);
+    }
+
+    #[tokio::test]
+    async fn long_error_detail_keeps_its_cause_in_last_error() {
+        // The sinks put the actionable cause (DNS/TLS failure) at the END of
+        // a detail that can run ~500 chars — a partitioned object URL alone
+        // is ~180. `masked` is the last cap before the warn line and
+        // `last_error`; trimming tighter than the sinks' own caps re-hides
+        // the cause they now carry (this fails with the old 200-char cap).
+        let host = "h".repeat(400);
+        let sink = FakeSink::new(Mode::PermanentDetail(format!(
+            "PUT https://{host}/k: dns error: failed to lookup address information"
+        )));
+        let (handle, worker) = SinkPipeline::new(sink.clone(), cfg());
+        assert!(handle.try_enqueue(rec(0)));
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let jh = tokio::spawn(worker.run(cancel_rx));
+        cancel_tx.send(true).unwrap();
+        jh.await.unwrap();
+
+        let last = handle.stats().last_error.expect("error recorded");
+        assert!(
+            last.contains("failed to lookup address information"),
+            "the cause at the end of the detail must survive masking, got: {last}"
+        );
     }
 
     #[tokio::test]
