@@ -151,6 +151,14 @@ async function handle(
     body,
   });
 
+  // The context the caller asked to continue, echoed back on every result the
+  // way a real agent does — so a test can prove the gateway correlated the
+  // call to that conversation rather than to one it invented.
+  const params = body?.params as Record<string, unknown> | undefined;
+  const message = params?.message as Record<string, unknown> | undefined;
+  const contextId =
+    typeof message?.contextId === "string" ? message.contextId : undefined;
+
   if (ctx.token !== undefined && header("authorization") !== `Bearer ${ctx.token}`) {
     send(401, { error: "unauthorized" });
     return;
@@ -196,6 +204,7 @@ async function handle(
       envelope({
         kind: "status-update",
         taskId: "task-e2e-stream",
+        contextId,
         status: { state: "working" },
         seq: 1,
         sawVersion: header("a2a-version"),
@@ -204,12 +213,15 @@ async function handle(
     );
     await new Promise((resolve) => setTimeout(resolve, STREAM_GAP_MS));
     res.write("event: status-update\n");
-    res.write(envelope({ kind: "status-update", taskId: "task-e2e-stream", seq: 2 }));
+    res.write(
+      envelope({ kind: "status-update", taskId: "task-e2e-stream", contextId, seq: 2 }),
+    );
     await new Promise((resolve) => setTimeout(resolve, STREAM_GAP_MS));
     res.write(
       envelope({
         kind: "task",
         id: "task-e2e-stream",
+        contextId,
         status: { state: "completed" },
         seq: 3,
       }),
@@ -225,6 +237,7 @@ async function handle(
       result: {
         kind: "task",
         id: "task-e2e-1",
+        contextId,
         status: { state: "completed" },
         // Echoed so the gateway's forwarding can be asserted from the caller
         // side as well as from `requests`.

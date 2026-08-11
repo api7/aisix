@@ -455,10 +455,59 @@ pub struct UsageEvent {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub a2a_agent_name: String,
 
-    /// The JSON-RPC method invoked on the A2A agent (such as `message/send`).
+    /// The JSON-RPC method invoked on the A2A agent, exactly as the caller
+    /// wrote it (such as `message/send`, or its 1.0 spelling `SendMessage`).
     /// Empty for non-A2A events; cp-api stores empty as NULL.
+    ///
+    /// Unbounded by nature — a caller picks the string — so this is the
+    /// forensic value only. Aggregate on `a2a_operation`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub a2a_method: String,
+
+    /// The canonical operation `a2a_method` names, collapsing the two wire
+    /// vocabularies onto one bounded set (`message/send`, `message/stream`,
+    /// `tasks/get`, …) and everything unrecognised onto `unknown`.
+    ///
+    /// A gateway may front a 0.3 agent and a 1.0 agent at once, and those call
+    /// the same operation `message/stream` and `SendStreamingMessage`. This is
+    /// the field to group or label by; `a2a_method` keeps the raw value.
+    /// Empty for non-A2A events.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub a2a_operation: String,
+
+    /// The A2A wire version this agent is pinned to (`0.3` / `1.0`) — what the
+    /// gateway announced to it in the `A2A-Version` header. Empty for non-A2A
+    /// events.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub a2a_protocol_version: String,
+
+    /// The A2A task this call created or acted on. Empty when the call names
+    /// no task — a first `message/send` whose agent answers with a bare
+    /// message never has one.
+    ///
+    /// High-cardinality by design: it joins a request to a task across the
+    /// `message/send` → `tasks/get` → `tasks/resubscribe` sequence, so it
+    /// belongs in logs and traces and never in a metric label.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub a2a_task_id: String,
+
+    /// The A2A context (conversation) the call belongs to — the id that ties
+    /// a multi-turn interaction's tasks together. Empty when the exchange
+    /// carried none. High-cardinality, same as `a2a_task_id`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub a2a_context_id: String,
+
+    /// The last task state the upstream reported on this call, normalized to
+    /// the specification's set (`submitted`, `working`, `input-required`,
+    /// `completed`, `canceled`, `failed`, `rejected`, `auth-required`) or
+    /// `unknown` for anything else.
+    ///
+    /// For a streamed call this is the state the task was in when the stream
+    /// ended — including when the caller walked away mid-task, where no
+    /// terminal state is invented. Empty when no response carried a state at
+    /// all (the call failed before the upstream answered).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub a2a_task_state: String,
 }
 
 #[inline]
