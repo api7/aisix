@@ -7,6 +7,7 @@
 use super::a2a_agent::A2aAgent;
 use super::apikey::ApiKey;
 use super::cache_policy::CachePolicy;
+use super::claim_mapping::ClaimMapping;
 use super::guardrail::{Guardrail, GuardrailAttachment};
 use super::mcp_policy::McpPolicy;
 use super::mcp_server::McpServer;
@@ -56,6 +57,11 @@ pub struct AisixSnapshot {
     /// request to the API key whose `jwt_subject` equals the token's
     /// identity claim.
     pub oidc_providers: ResourceTable<OidcProvider>,
+    /// Claim-mapping rules: `/aisix/<env>/claim_mappings/<uuid>`. When a
+    /// verified JWT's subject binds to no API key directly, the enabled
+    /// rules for the matched trust provider are evaluated in priority
+    /// order and the first match selects the key the request runs as.
+    pub claim_mappings: ResourceTable<ClaimMapping>,
 }
 
 impl AisixSnapshot {
@@ -78,6 +84,7 @@ impl AisixSnapshot {
             + self.mcp_policies.len()
             + self.a2a_agents.len()
             + self.oidc_providers.len()
+            + self.claim_mappings.len()
     }
 }
 

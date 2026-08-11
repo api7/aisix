@@ -116,6 +116,26 @@ pub(crate) fn apply_pk_telemetry(
     event.byo_label = sanitize_tag(tags.byo_label.unwrap_or_default());
 }
 
+/// Stamp the JWT identity attribution fields onto an in-progress
+/// UsageEvent (AISIX-Cloud#564). A `None` identity (the API-key path)
+/// leaves the fields empty, which skip-serialize to wire NULL. One
+/// source of truth for the mapping so the handler family can't drift —
+/// same rationale as [`apply_pk_telemetry`]. The values are sanitised
+/// like every other externally-influenced tag: the subject is a claim
+/// from a verified token, but the identity provider is still not a
+/// trusted emitter of control characters or unbounded strings.
+pub(crate) fn apply_jwt_identity(
+    event: &mut UsageEvent,
+    jwt: Option<&std::sync::Arc<crate::auth::JwtIdentity>>,
+) {
+    let Some(jwt) = jwt else {
+        return;
+    };
+    event.jwt_subject = sanitize_tag(jwt.subject.clone());
+    event.jwt_provider = sanitize_tag(jwt.provider.clone());
+    event.jwt_claim_mapping = sanitize_tag(jwt.claim_mapping.clone().unwrap_or_default());
+}
+
 /// Emit ONE zero-token `UsageEvent` for a FAILED request on a non-chat handler
 /// (completions / embeddings / rerank / audio / images / passthrough / jobs /
 /// realtime), so the dashboard Logs and budget ledger surface the failure
@@ -144,7 +164,7 @@ pub(crate) fn emit_error_usage_event(
     error_class: &str,
     client: &ClientContext,
 ) {
-    let event = UsageEvent {
+    let mut event = UsageEvent {
         request_id: request_id.to_string(),
         occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         api_key_id: api_key_id.to_string(),
@@ -156,6 +176,7 @@ pub(crate) fn emit_error_usage_event(
         client_user_agent: client.user_agent.clone(),
         ..Default::default()
     };
+    apply_jwt_identity(&mut event, client.jwt.as_ref());
     state.usage_sink.try_emit(label, event.clone());
     let snap = state.snapshot.load();
     let exporters = snap.observability_exporters.entries();

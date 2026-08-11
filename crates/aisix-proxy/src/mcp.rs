@@ -488,7 +488,7 @@ fn emit_tool_call_usage(
     guardrail_blocked: bool,
     guardrail_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
 ) {
-    let event = UsageEvent {
+    let mut event = UsageEvent {
         request_id: request_id.to_string(),
         occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         api_key_id: auth.entry.id.clone(),
@@ -504,6 +504,7 @@ fn emit_tool_call_usage(
         guardrail_monitor_hits,
         ..Default::default()
     };
+    crate::usage_attr::apply_jwt_identity(&mut event, auth.jwt.as_ref());
     state.usage_sink.try_emit("mcp", event.clone());
     // #698: fan the event out to the per-env OTLP/SLS/Datadog exporters like
     // every other emitter — pre-fix MCP usage reached only the CP sink, so

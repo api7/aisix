@@ -77,6 +77,12 @@ export class SeedClient {
     return this.put("oidc_providers", provider);
   }
 
+  async createClaimMapping(
+    mapping: Record<string, unknown>,
+  ): Promise<{ id: string; value: Record<string, unknown> }> {
+    return this.put("claim_mappings", mapping);
+  }
+
   /**
    * Overwrite the document at `<prefix>/<kind>/<id>` — the seed-side
    * equivalent of an Admin API PUT. Propagation is asynchronous; probe

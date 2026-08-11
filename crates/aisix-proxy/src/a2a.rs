@@ -532,7 +532,7 @@ fn emit_a2a_usage(
     status_code: u16,
     latency: Duration,
 ) {
-    let event = UsageEvent {
+    let mut event = UsageEvent {
         request_id: request_id.to_string(),
         occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         api_key_id: auth.entry.id.clone(),
@@ -546,6 +546,7 @@ fn emit_a2a_usage(
         a2a_method: method.to_string(),
         ..Default::default()
     };
+    crate::usage_attr::apply_jwt_identity(&mut event, auth.jwt.as_ref());
     state.usage_sink.try_emit("a2a", event.clone());
     let snap = state.snapshot.load();
     let exporters = snap.observability_exporters.entries();

@@ -1462,6 +1462,7 @@ fn emit_usage_event(
     // responses (AISIX-Cloud#867 parity).
     crate::usage_attr::apply_pk_telemetry(&mut event, &snap, provider_key_id);
     // Handler label "audio" — bucketed prometheus counter (#408).
+    crate::usage_attr::apply_jwt_identity(&mut event, client.jwt.as_ref());
     state.usage_sink.try_emit("audio", event.clone());
     let exporters = snap.observability_exporters.entries();
     state

@@ -125,6 +125,20 @@ oidc_providers:
     issuer: https://sso.example.com/realms/agents
     audiences: ["aisix-gateway"]
     required_scopes: ["ai.access"]
+
+claim_mappings:
+  - name: finance-dept
+    jwt_provider: corp-keycloak
+    priority: 100
+    match:
+      - claim: department
+        op: exact
+        values: ["finance"]
+      - claim: groups
+        op: contains
+        values: ["ai-users"]
+    resolve:
+      api_key: ops
 "#;
 
 fn full_env() -> HashMap<String, String> {
@@ -148,6 +162,7 @@ fn full_valid_file_loads_every_kind() {
     assert_eq!(snap.observability_exporters.len(), 1);
     assert_eq!(snap.rate_limit_policies.len(), 4);
     assert_eq!(snap.oidc_providers.len(), 1);
+    assert_eq!(snap.claim_mappings.len(), 1);
 
     // The OIDC provider loads with serde defaults filled.
     let idp = snap.oidc_providers.get_by_name("corp-keycloak").unwrap();
@@ -160,6 +175,14 @@ fn full_valid_file_loads_every_kind() {
     let ci_bot = snap.apikeys.get_by_name(&ci_bot_hash).unwrap();
     assert_eq!(ci_bot.value.jwt_subject.as_deref(), Some("agent-ci-bot"));
     assert_eq!(ci_bot.value.jwt_provider.as_deref(), Some("corp-keycloak"));
+
+    // The claim mapping loads and its `resolve.api_key` name sugar
+    // resolved to the ops key's derived id.
+    let cm = snap.claim_mappings.get_by_name("finance-dept").unwrap();
+    assert_eq!(cm.value.jwt_provider, "corp-keycloak");
+    assert_eq!(cm.value.priority, 100);
+    assert_eq!(cm.value.match_.len(), 2);
+    assert_eq!(cm.value.resolve.api_key_id, derive_id("api_keys", "ops"));
 
     // Interpolation landed in the provider key (full + partial).
     let pk = snap.provider_keys.get_by_name("openai-prod").unwrap();
@@ -756,4 +779,136 @@ fn report_formats_file_and_all_errors() {
         text.contains("  - (file): missing mandatory _format_version"),
         "{text}"
     );
+}
+
+/// Minimal valid prelude for claim-mapping error tests: one provider
+/// key, one model, one api key, one OIDC provider.
+const CLAIM_MAPPING_PRELUDE: &str = r#"
+_format_version: "1"
+
+provider_keys:
+  - display_name: pk
+    provider: openai
+    api_key: sk-x
+
+models:
+  - display_name: gpt-4o
+    provider: openai
+    model_name: gpt-4o
+    provider_key: pk
+
+api_keys:
+  - display_name: policy-key
+    key_hash: 91ed2dbc407561556f3e7be98ba0bd2a57986d6a868c482d867d19c6d40d201c
+    allowed_models: ["gpt-4o"]
+
+oidc_providers:
+  - name: corp
+    issuer: https://sso.example.com/realms/agents
+    audiences: ["aisix"]
+"#;
+
+#[test]
+fn claim_mapping_with_unknown_provider_is_a_load_error() {
+    let file = format!(
+        "{CLAIM_MAPPING_PRELUDE}
+claim_mappings:
+  - name: bad-provider
+    jwt_provider: no-such-idp
+    match:
+      - claim: department
+        op: exact
+        values: [\"finance\"]
+    resolve:
+      api_key: policy-key
+"
+    );
+    let errors = errors_of(load(&file, &env_of(&[])));
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].contains("no-such-idp"), "{errors:?}");
+    assert!(errors[0].contains("corp"), "{errors:?}");
+}
+
+#[test]
+fn claim_mapping_with_unknown_api_key_name_is_a_load_error() {
+    let file = format!(
+        "{CLAIM_MAPPING_PRELUDE}
+claim_mappings:
+  - name: bad-target
+    jwt_provider: corp
+    match:
+      - claim: department
+        op: exact
+        values: [\"finance\"]
+    resolve:
+      api_key: no-such-key
+"
+    );
+    let errors = errors_of(load(&file, &env_of(&[])));
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].contains("no-such-key"), "{errors:?}");
+}
+
+#[test]
+fn claim_mapping_with_raw_unmatched_api_key_id_is_a_load_error() {
+    // A canonical api_key_id written directly (e.g. copied from a
+    // managed environment) must still land on a key defined in this
+    // file — otherwise the mapping would silently resolve nothing.
+    let file = format!(
+        "{CLAIM_MAPPING_PRELUDE}
+claim_mappings:
+  - name: raw-id
+    jwt_provider: corp
+    match:
+      - claim: department
+        op: exact
+        values: [\"finance\"]
+    resolve:
+      api_key_id: 99999999-9999-9999-9999-999999999999
+"
+    );
+    let errors = errors_of(load(&file, &env_of(&[])));
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].contains("resolve.api_key_id"), "{errors:?}");
+}
+
+#[test]
+fn claim_mapping_name_and_id_reference_are_mutually_exclusive() {
+    let file = format!(
+        "{CLAIM_MAPPING_PRELUDE}
+claim_mappings:
+  - name: both-refs
+    jwt_provider: corp
+    match:
+      - claim: department
+        op: exact
+        values: [\"finance\"]
+    resolve:
+      api_key: policy-key
+      api_key_id: 99999999-9999-9999-9999-999999999999
+"
+    );
+    let errors = errors_of(load(&file, &env_of(&[])));
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].contains("mutually"), "{errors:?}");
+}
+
+#[test]
+fn claim_mapping_without_conditions_is_a_load_error() {
+    // An empty `match` list would make the rule match every verified
+    // token — the schema requires at least one condition so a mapping
+    // is always an explicit selection.
+    let file = format!(
+        "{CLAIM_MAPPING_PRELUDE}
+claim_mappings:
+  - name: match-all
+    jwt_provider: corp
+    match: []
+    resolve:
+      api_key: policy-key
+"
+    );
+    let errors = errors_of(load(&file, &env_of(&[])));
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].contains("match"), "{errors:?}");
 }

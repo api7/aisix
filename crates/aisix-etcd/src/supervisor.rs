@@ -831,6 +831,9 @@ impl<P: ConfigProvider> Supervisor<P> {
                 "oidc_providers" => {
                     new.oidc_providers.remove(parsed.id);
                 }
+                "claim_mappings" => {
+                    new.claim_mappings.remove(parsed.id);
+                }
                 _ => {}
             }
             new
@@ -1165,6 +1168,7 @@ fn merge_snapshot(dst: &AisixSnapshot, src: &AisixSnapshot) {
         mcp_policies,
         a2a_agents,
         oidc_providers,
+        claim_mappings,
     } = src;
     for e in models.entries() {
         dst.models.insert(clone_entry(&e));
@@ -1202,6 +1206,9 @@ fn merge_snapshot(dst: &AisixSnapshot, src: &AisixSnapshot) {
     for e in oidc_providers.entries() {
         dst.oidc_providers.insert(clone_entry(&e));
     }
+    for e in claim_mappings.entries() {
+        dst.claim_mappings.insert(clone_entry(&e));
+    }
 }
 
 /// Whether the snapshot holds an entry for `(kind, id)`. An unknown
@@ -1222,6 +1229,7 @@ fn snapshot_has(snap: &AisixSnapshot, kind: &str, id: &str) -> bool {
         mcp_policies,
         a2a_agents,
         oidc_providers,
+        claim_mappings,
     } = snap;
     match kind {
         "models" => models.get_by_id(id).is_some(),
@@ -1236,6 +1244,7 @@ fn snapshot_has(snap: &AisixSnapshot, kind: &str, id: &str) -> bool {
         "mcp_policies" => mcp_policies.get_by_id(id).is_some(),
         "a2a_agents" => a2a_agents.get_by_id(id).is_some(),
         "oidc_providers" => oidc_providers.get_by_id(id).is_some(),
+        "claim_mappings" => claim_mappings.get_by_id(id).is_some(),
         _ => false,
     }
 }
@@ -1269,6 +1278,7 @@ fn resource_counts(snap: &AisixSnapshot) -> BTreeMap<String, usize> {
         ("mcp_policies", snap.mcp_policies.len()),
         ("a2a_agents", snap.a2a_agents.len()),
         ("oidc_providers", snap.oidc_providers.len()),
+        ("claim_mappings", snap.claim_mappings.len()),
     ] {
         if n > 0 {
             counts.insert(kind.to_string(), n);

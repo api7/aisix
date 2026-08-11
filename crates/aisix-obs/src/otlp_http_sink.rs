@@ -716,6 +716,21 @@ fn build_otlp_span(record: &SinkRecord, exporter_name: &str) -> Value {
             &event.client_user_agent,
         ));
     }
+    // JWT identity attribution (AISIX-Cloud#564): who the request ran as
+    // when it authenticated with a JWT — the identity behind the (possibly
+    // shared) api_key_id.
+    if !event.jwt_subject.is_empty() {
+        attributes.push(attr_string("aisix.jwt_subject", &event.jwt_subject));
+    }
+    if !event.jwt_provider.is_empty() {
+        attributes.push(attr_string("aisix.jwt_provider", &event.jwt_provider));
+    }
+    if !event.jwt_claim_mapping.is_empty() {
+        attributes.push(attr_string(
+            "aisix.jwt_claim_mapping",
+            &event.jwt_claim_mapping,
+        ));
+    }
     // Opt-in captured content (#519 B.2) — present ONLY on a record built by
     // [`content_record`] for a `content_mode = full` exporter. Keys match the
     // Datadog sink's flattened content fields, so one query vocabulary works

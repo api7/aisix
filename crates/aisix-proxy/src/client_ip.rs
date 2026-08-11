@@ -157,6 +157,11 @@ pub struct ClientContext {
     /// arranges by declaring `auth` before `client`. Default (empty) on
     /// the unauthenticated paths; those resolve no `api_key` variable.
     pub caller: aisix_gateway::CallerIdentity,
+    /// The verified JWT identity behind the request, for usage
+    /// attribution (AISIX-Cloud#564). Published by the same auth
+    /// extractor; `None` when the request authenticated with the key's
+    /// plaintext.
+    pub jwt: Option<Arc<crate::auth::JwtIdentity>>,
 }
 
 /// Resolve the caller's address from the peer plus the trusted-proxy
@@ -232,6 +237,10 @@ where
                 .get::<Arc<aisix_core::ResourceEntry<aisix_core::ApiKey>>>()
                 .map(|e| aisix_gateway::CallerIdentity::from_entry(e))
                 .unwrap_or_default(),
+            jwt: parts
+                .extensions
+                .get::<Arc<crate::auth::JwtIdentity>>()
+                .cloned(),
         })
     }
 }

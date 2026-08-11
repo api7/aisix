@@ -62,6 +62,7 @@ fn main() {
         "mcp_policy",
         "a2a_agent",
         "oidc_provider",
+        "claim_mapping",
     ] {
         dump_value(
             &out_dir,

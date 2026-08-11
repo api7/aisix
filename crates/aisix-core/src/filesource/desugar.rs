@@ -143,6 +143,40 @@ pub(crate) fn desugar_model(doc: &mut Value, maps: &IdentityMaps) -> Result<(), 
     Ok(())
 }
 
+/// `claim_mappings[].resolve.api_key` (name) → `resolve.api_key_id`
+/// (derived id).
+pub(crate) fn desugar_claim_mapping(doc: &mut Value, maps: &IdentityMaps) -> Result<(), String> {
+    let Some(resolve) = doc.get_mut("resolve").and_then(Value::as_object_mut) else {
+        return Ok(()); // missing / mistyped resolve: canonical validation reports it
+    };
+    let Some(name_value) = resolve.get("api_key") else {
+        return Ok(());
+    };
+    let Some(name) = name_value.as_str() else {
+        return Err("`resolve.api_key` must be a string (an api key display_name)".into());
+    };
+    if resolve.contains_key("api_key_id") {
+        return Err(
+            "`resolve.api_key` (a name reference) and `resolve.api_key_id` are mutually \
+             exclusive — set exactly one"
+                .into(),
+        );
+    }
+    let resolved = maps
+        .get("api_keys")
+        .and_then(|m| m.get(name))
+        .cloned()
+        .ok_or_else(|| {
+            format!(
+                "`resolve.api_key` references unknown api key {name:?} ({})",
+                known_names(maps, "api_keys")
+            )
+        })?;
+    resolve.remove("api_key");
+    resolve.insert("api_key_id".into(), Value::String(resolved));
+    Ok(())
+}
+
 /// `api_keys[]`: strip the identity-only `display_name`, resolve
 /// `key_env` XOR `key_hash`. The plaintext read from the environment is
 /// hashed and dropped — it must never surface in errors, logs, or the

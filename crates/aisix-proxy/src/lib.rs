@@ -3762,6 +3762,7 @@ data: [DONE]\n\n"
                 .unwrap(),
                 1,
             )),
+            jwt: None,
         };
 
         // Suspended: max_requests=1 would deny the second reservation

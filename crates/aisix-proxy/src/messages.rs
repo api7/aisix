@@ -2729,7 +2729,7 @@ fn emit_anthropic_usage_event(
     // #890 req-3: readable provider-key name for the metric label (shared
     // resolver so chat + messages can't drift).
     let provider_key_name = crate::usage_attr::provider_key_metric_name(&snap, provider_key_id);
-    let event = UsageEvent {
+    let mut event = UsageEvent {
         request_id: request_id.to_string(),
         occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         model_id: model_id.to_string(),
@@ -2769,6 +2769,7 @@ fn emit_anthropic_usage_event(
     };
     // Handler label "messages" — Anthropic /v1/messages inbound
     // path. Bucketed prometheus counter (#408).
+    crate::usage_attr::apply_jwt_identity(&mut event, client.jwt.as_ref());
     state.usage_sink.try_emit("messages", event.clone());
     let exporters = snap.observability_exporters.entries();
     state

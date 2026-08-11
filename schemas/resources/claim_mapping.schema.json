@@ -1,0 +1,120 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "additionalProperties": false,
+  "definitions": {
+    "ClaimMatch": {
+      "additionalProperties": false,
+      "description": "One claim condition. A mapping matches only when every condition holds (logical AND); within one condition, `values` are alternatives (logical OR).",
+      "properties": {
+        "claim": {
+          "description": "Claim to inspect. Dots traverse nested objects (for example `realm_access.roles`). A missing claim never matches.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "op": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ClaimMatchOp"
+            }
+          ],
+          "description": "Comparison operator. A claim whose JSON type does not fit the operator (an array for `exact`, a string for `contains`) never matches — mistyped claims deny rather than surprise."
+        },
+        "values": {
+          "description": "Accepted values; the condition holds when any one matches.",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": "array"
+        }
+      },
+      "required": [
+        "claim",
+        "op",
+        "values"
+      ],
+      "type": "object"
+    },
+    "ClaimMatchOp": {
+      "description": "How one [`ClaimMatch`] compares the claim's value against `values`.",
+      "oneOf": [
+        {
+          "description": "The claim must be a string equal to one of `values`. An array claim never matches `exact`.",
+          "enum": [
+            "exact"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The claim must be an array of strings containing one of `values`. A string claim never matches `contains`.",
+          "enum": [
+            "contains"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "ClaimResolve": {
+      "additionalProperties": false,
+      "description": "What a matched mapping resolves to. Targets always reference existing resources — a dangling reference rejects the request.",
+      "properties": {
+        "api_key_id": {
+          "description": "Id of the API key the request runs as. The key's model and tool access, rate limits, and budget apply exactly as if the caller had presented the key itself.",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "api_key_id"
+      ],
+      "type": "object"
+    }
+  },
+  "properties": {
+    "enabled": {
+      "default": true,
+      "description": "Whether the mapping participates in evaluation. A disabled mapping is kept but skipped. Treated as `true` when omitted.",
+      "type": "boolean"
+    },
+    "jwt_provider": {
+      "description": "Name of the OIDC provider whose tokens this mapping applies to. A mapping never matches a token verified by a different provider, so two providers cannot select each other's keys.",
+      "minLength": 1,
+      "type": "string"
+    },
+    "match": {
+      "description": "Claim conditions, all of which must hold for the mapping to match.",
+      "items": {
+        "$ref": "#/definitions/ClaimMatch"
+      },
+      "minItems": 1,
+      "type": "array"
+    },
+    "name": {
+      "description": "Human-readable mapping name, unique within the environment.",
+      "minLength": 1,
+      "type": "string"
+    },
+    "priority": {
+      "description": "Evaluation order among the provider's mappings: lower values are evaluated first, ties are broken by `name`. Defaults to 0.",
+      "format": "uint32",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "resolve": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/ClaimResolve"
+        }
+      ],
+      "description": "The API key a matching token resolves to."
+    }
+  },
+  "required": [
+    "jwt_provider",
+    "match",
+    "name",
+    "resolve"
+  ],
+  "title": "ClaimMapping",
+  "type": "object"
+}
