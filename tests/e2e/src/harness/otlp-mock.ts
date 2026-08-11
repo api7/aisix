@@ -16,6 +16,12 @@ export interface CapturedSpan {
 export interface MockOtlp {
   url: string;
   spans: CapturedSpan[];
+  /**
+   * Bodies this receiver could not parse, empty on a healthy run. Without it a
+   * malformed export and a never-sent one look identical: both end as "no
+   * matching span arrived".
+   */
+  parseFailures: string[];
   close(): Promise<void>;
 }
 
@@ -36,6 +42,7 @@ function anyValue(value: Record<string, unknown>): string | number | boolean {
 
 export async function startMockOtlp(): Promise<MockOtlp> {
   const spans: CapturedSpan[] = [];
+  const parseFailures: string[] = [];
   const server: Server = createServer((req, res) => {
     const chunks: Buffer[] = [];
     req.on("data", (chunk: Buffer) => chunks.push(chunk));
@@ -62,9 +69,11 @@ export async function startMockOtlp(): Promise<MockOtlp> {
             }
           }
         }
-      } catch {
+      } catch (err) {
         // A body this receiver cannot parse is a failure of the thing under
-        // test; the assertion that no matching span arrived reports it.
+        // test, so it is kept rather than swallowed — otherwise it reaches the
+        // test as an indistinguishable "no span arrived".
+        parseFailures.push(String(err));
       }
       res.writeHead(200, { "content-type": "application/json" });
       res.end("{}");
@@ -78,6 +87,7 @@ export async function startMockOtlp(): Promise<MockOtlp> {
   return {
     url: `http://127.0.0.1:${address.port}/v1/traces`,
     spans,
+    parseFailures,
     close: () => new Promise((resolve) => server.close(() => resolve())),
   };
 }

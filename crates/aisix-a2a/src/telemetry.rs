@@ -176,16 +176,22 @@ impl A2aCallFacts {
             return;
         };
         // A send / stream continues a task from its message; the
-        // push-notification operations name the task on params itself; and
-        // `tasks/get` / `tasks/cancel` / `tasks/resubscribe` carry it as
-        // `params.id`. The three are mutually exclusive per operation, and the
-        // field names are identical in both wire versions (1.0's protobuf JSON
+        // push-notification operations name it as `params.taskId`. Both spell
+        // the field the same way in either wire version (1.0's protobuf JSON
         // renders `task_id` / `context_id` in camelCase).
         for source in [params.get("message"), Some(params)].into_iter().flatten() {
             self.set_task_id(str_field(source, "taskId"));
             self.set_context_id(str_field(source, "contextId"));
         }
-        self.set_task_id(str_field(params, "id"));
+        // `params.id` is a FALLBACK, never an override: it is the task for
+        // `tasks/get` / `tasks/cancel` / `tasks/resubscribe` (both versions)
+        // and for the 0.3 push-notification operations, but on their 1.0
+        // counterparts it is the push-notification CONFIG's id sitting
+        // alongside the task's own `taskId`. Applying it unconditionally would
+        // file those calls under a task that does not exist.
+        if self.task_id.is_empty() {
+            self.set_task_id(str_field(params, "id"));
+        }
     }
 
     /// Read a JSON-RPC response envelope — or one streamed event — for the
@@ -346,13 +352,25 @@ mod tests {
             assert_eq!(facts.task_id, "t-7", "{method} names its task");
         }
 
-        // The push-notification operations name the parent task instead.
-        let mut cfg = A2aCallFacts::default();
-        cfg.observe_request(&json!({
+        // The push-notification operations name the parent task instead — and
+        // in 1.0 they carry the CONFIG's id in `params.id` right next to it.
+        // Reading `id` last would file the call under a task that does not
+        // exist, so an explicit `taskId` has to win.
+        let mut v10_cfg = A2aCallFacts::default();
+        v10_cfg.observe_request(&json!({
             "method": "GetTaskPushNotificationConfig",
-            "params": {"taskId": "t-8", "configId": "c-9"}
+            "params": {"taskId": "t-8", "id": "cfg-9"}
         }));
-        assert_eq!(cfg.task_id, "t-8");
+        assert_eq!(v10_cfg.task_id, "t-8");
+
+        // 0.3 spells the same request with the TASK in `id`, so the fallback
+        // still has to fire when no `taskId` is present.
+        let mut v03_cfg = A2aCallFacts::default();
+        v03_cfg.observe_request(&json!({
+            "method": "tasks/pushNotificationConfig/get",
+            "params": {"id": "t-8", "pushNotificationConfigId": "cfg-9"}
+        }));
+        assert_eq!(v03_cfg.task_id, "t-8");
     }
 
     #[test]

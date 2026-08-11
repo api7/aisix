@@ -62,7 +62,7 @@ describe("a2a protocol telemetry e2e (AISIX-Cloud#1215)", () => {
     throw new Error(
       `no matching span exported within ${EXPORT_TIMEOUT_MS}ms; saw: ${JSON.stringify(
         otlp!.spans.map((s) => s.name),
-      )}`,
+      )}; unparseable export bodies: ${JSON.stringify(otlp!.parseFailures)}`,
     );
   };
 
@@ -103,14 +103,15 @@ describe("a2a protocol telemetry e2e (AISIX-Cloud#1215)", () => {
       allowed_agents: ["*"],
     });
 
+    // The caller key is seeded last, so its arrival means every resource
+    // above it has landed in the snapshot too. Gated on an endpoint this
+    // suite asserts nothing about, so a defect in A2A dispatch fails its own
+    // test by name instead of surfacing as a 60s propagation timeout here.
     await waitConfigPropagation(async () => {
-      const status = await call("invoices", {
-        jsonrpc: "2.0",
-        id: "gate",
-        method: "message/send",
-        params: { message: { role: "user", parts: [] } },
+      const res = await fetch(`${app!.proxyUrl}/v1/models`, {
+        headers: { authorization: `Bearer ${KEY}` },
       });
-      return status !== 404 && status !== 401;
+      return res.status === 200;
     });
   }, 60_000);
 
@@ -121,7 +122,7 @@ describe("a2a protocol telemetry e2e (AISIX-Cloud#1215)", () => {
   });
 
   test("a completed call records the task, the context and how it ended", async (ctx) => {
-    if (!etcdReachable) return ctx.skip();
+    if (!etcdReachable || !app || !upstream || !otlp) return ctx.skip();
 
     const contextId = `ctx-${randomUUID()}`;
     expect(
@@ -147,7 +148,7 @@ describe("a2a protocol telemetry e2e (AISIX-Cloud#1215)", () => {
   });
 
   test("both wire vocabularies aggregate under one operation", async (ctx) => {
-    if (!etcdReachable) return ctx.skip();
+    if (!etcdReachable || !app || !upstream || !otlp) return ctx.skip();
 
     // The same operation, spelled the way each agent's version spells it.
     const v10Context = `ctx-${randomUUID()}`;
@@ -185,7 +186,7 @@ describe("a2a protocol telemetry e2e (AISIX-Cloud#1215)", () => {
   });
 
   test("a streamed task is recorded with the state its stream ended on", async (ctx) => {
-    if (!etcdReachable) return ctx.skip();
+    if (!etcdReachable || !app || !upstream || !otlp) return ctx.skip();
 
     const contextId = `ctx-${randomUUID()}`;
     expect(
@@ -207,7 +208,7 @@ describe("a2a protocol telemetry e2e (AISIX-Cloud#1215)", () => {
   });
 
   test("an unrecognised method cannot become an unbounded label", async (ctx) => {
-    if (!etcdReachable) return ctx.skip();
+    if (!etcdReachable || !app || !upstream || !otlp) return ctx.skip();
 
     // The method is caller-chosen. The raw value stays available for
     // forensics, but the aggregating field must collapse to `unknown`.
