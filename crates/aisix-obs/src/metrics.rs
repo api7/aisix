@@ -1106,6 +1106,12 @@ impl Metrics {
     /// Apply one in-flight edge and return the new count, clamped at zero
     /// (a decrement without its increment — e.g. after a restart race —
     /// must not wedge the gauge negative).
+    ///
+    /// Precondition: `endpoint` must already be a bounded route template
+    /// (`normalize_endpoint_label` output, #451) and `inbound_protocol` a
+    /// fixed vocabulary. The slot vector's boundedness — and the linear
+    /// scan's cost — depend on it; a raw request path here would grow the
+    /// vector without bound.
     fn in_flight_delta(&self, endpoint: &str, inbound_protocol: &str, delta: i64) -> i64 {
         let mut slots = self.inner.proxy_in_flight.lock().expect("lock in-flight");
         if let Some(slot) = slots
@@ -2727,10 +2733,11 @@ mod tests {
         assert!(series(M_DEPLOYMENT_FAILURE_TOTAL, "pk-a").is_none());
     }
 
-    /// Pins the budget gauge family the same way. A gauge alias is worse
-    /// than a counter alias — `set()` overwrites, so key B's dollars
-    /// would silently replace key A's — and these five series had no
-    /// exposition test at all before this one.
+    /// Pins the budget gauge family's values, field gating and clear
+    /// semantics. (Key-drift protection is NOT this test's job — its two
+    /// label sets differ in every dimension, so dropping one key label
+    /// still yields distinct keys; `budget_gauge_key_covers_every_label`
+    /// below is the drift guard.)
     #[test]
     fn budget_gauges_stay_distinct_per_label_set_and_clear() {
         let metrics = Metrics::new(false);
@@ -2800,10 +2807,11 @@ mod tests {
         assert!(details("team-b").is_some_and(|l| l.ends_with(" 1")));
     }
 
-    /// Pins the legacy spec-7 pair's full label sets and per-series
-    /// distinctness through the hand-built cache keys: dropping status
-    /// or model from `record_request`'s key builder must fail here, not
-    /// ship.
+    /// Pins the legacy spec-7 pair's full label sets, accumulation, and
+    /// the outcome-stays-off-durations invariant. (Its two label sets
+    /// differ in several dimensions at once, so this test cannot catch a
+    /// single dropped key label; `legacy_request_key_covers_every_label`
+    /// below is the drift guard.)
     #[test]
     fn legacy_request_series_stay_fully_labelled_and_distinct() {
         let metrics = Metrics::new(false);
@@ -2878,6 +2886,472 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── Vary-one-label key-drift guards ────────────────────────────────
+    //
+    // The worker cache duplicates each family's label list in two places:
+    // the key builder and the register closure. A label present in the
+    // register closure but DROPPED from the key builder aliases every
+    // pair of label sets that differ only in that label — silently, with
+    // correct-looking output for single-label-set traffic. These tests
+    // emit a base label set twice plus one variant per label differing
+    // ONLY in that label, then assert one rendered series per label set:
+    // any single dropped key label folds its variant into the base series
+    // and fails both the count and the base-total assertion.
+    // (An independent audit demonstrated by mutation that multi-dimension
+    // pairs do NOT catch single-label drops; each variant here differs in
+    // exactly one.)
+
+    /// Rendered value lines for one exact metric name (brace-delimited,
+    /// so `aisix_x` never matches `aisix_x_count` and vice versa).
+    fn series_lines<'r>(rendered: &'r str, metric: &str) -> Vec<&'r str> {
+        rendered
+            .lines()
+            .filter(|l| l.starts_with(metric) && l.as_bytes().get(metric.len()) == Some(&b'{'))
+            .collect()
+    }
+
+    #[track_caller]
+    fn assert_one_series_per_label_set(rendered: &str, metric: &str, expected: usize) {
+        let series = series_lines(rendered, metric);
+        assert_eq!(
+            series.len(),
+            expected,
+            "{metric}: a dropped key label folds a variant into the base series\n{rendered}"
+        );
+        assert_eq!(
+            series.iter().filter(|l| l.ends_with(" 2")).count(),
+            1,
+            "{metric}: exactly the base series must show both base emits\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn request_series_key_covers_every_label() {
+        let base = RequestLabels::default();
+        let variants = [
+            RequestLabels {
+                endpoint: "/v1/messages",
+                ..base
+            },
+            RequestLabels {
+                inbound_protocol: "anthropic",
+                ..base
+            },
+            RequestLabels {
+                provider: "p2",
+                ..base
+            },
+            RequestLabels {
+                model: "m2",
+                ..base
+            },
+            RequestLabels {
+                upstream_model: "um2",
+                ..base
+            },
+            RequestLabels {
+                provider_key_id: "pk2",
+                ..base
+            },
+            RequestLabels {
+                provider_key_name: "pkn2",
+                ..base
+            },
+            RequestLabels {
+                api_key_id: "ak2",
+                ..base
+            },
+            RequestLabels {
+                team_id: "t2",
+                ..base
+            },
+            RequestLabels {
+                user_id: "u2",
+                ..base
+            },
+            RequestLabels {
+                user_name: "n2",
+                ..base
+            },
+            RequestLabels {
+                stream: true,
+                ..base
+            },
+            RequestLabels {
+                is_fallback: true,
+                ..base
+            },
+            RequestLabels {
+                status: 201,
+                ..base
+            },
+            RequestLabels {
+                outcome: RequestOutcome::ClientError,
+                ..base
+            },
+        ];
+        let m = Metrics::new(false);
+        m.record_proxy_and_llm_request(base, Duration::from_millis(1));
+        m.record_proxy_and_llm_request(base, Duration::from_millis(1));
+        for v in &variants {
+            m.record_proxy_and_llm_request(*v, Duration::from_millis(1));
+        }
+        assert_one_series_per_label_set(&m.render(), M_PROXY_REQUESTS_TOTAL, 1 + variants.len());
+    }
+
+    #[test]
+    fn usage_series_key_covers_every_label() {
+        let base = UsageLabels::default();
+        let variants = [
+            UsageLabels {
+                endpoint: "/v1/messages",
+                ..base
+            },
+            UsageLabels {
+                inbound_protocol: "anthropic",
+                ..base
+            },
+            UsageLabels {
+                provider: "p2",
+                ..base
+            },
+            UsageLabels {
+                model: "m2",
+                ..base
+            },
+            UsageLabels {
+                upstream_model: "um2",
+                ..base
+            },
+            UsageLabels {
+                provider_key_id: "pk2",
+                ..base
+            },
+            UsageLabels {
+                provider_key_name: "pkn2",
+                ..base
+            },
+            UsageLabels {
+                api_key_id: "ak2",
+                ..base
+            },
+            UsageLabels {
+                team_id: "t2",
+                ..base
+            },
+            UsageLabels {
+                user_id: "u2",
+                ..base
+            },
+            UsageLabels {
+                user_name: "n2",
+                ..base
+            },
+        ];
+        let m = Metrics::new(false);
+        let one_token = LlmUsage {
+            input_tokens: 1,
+            ..LlmUsage::default()
+        };
+        m.record_llm_usage(base, one_token);
+        m.record_llm_usage(base, one_token);
+        for v in &variants {
+            m.record_llm_usage(*v, one_token);
+        }
+        assert_one_series_per_label_set(&m.render(), M_LLM_INPUT_TOKENS_TOTAL, 1 + variants.len());
+    }
+
+    #[test]
+    fn legacy_request_key_covers_every_label() {
+        let m = Metrics::new(false);
+        let emit = |provider, model, status, outcome| {
+            m.record_request(provider, model, status, outcome, Duration::from_millis(1));
+        };
+        emit("openai", "m", 200, RequestOutcome::Success);
+        emit("openai", "m", 200, RequestOutcome::Success);
+        emit("p2", "m", 200, RequestOutcome::Success);
+        emit("openai", "m2", 200, RequestOutcome::Success);
+        emit("openai", "m", 201, RequestOutcome::Success);
+        emit("openai", "m", 200, RequestOutcome::ClientError);
+
+        let rendered = m.render();
+        assert_one_series_per_label_set(&rendered, M_REQUESTS_TOTAL, 5);
+        // The duration histogram keys on (provider, model, status) only:
+        // the outcome variant lands on the base duration series, so the
+        // base count is 3 across 4 series. A status/model/provider drop
+        // from the HISTOGRAM key collapses its series count below 4.
+        let dur = series_lines(&rendered, &format!("{M_REQUEST_DURATION}_count"));
+        assert_eq!(dur.len(), 4, "{rendered}");
+        assert_eq!(
+            dur.iter().filter(|l| l.ends_with(" 3")).count(),
+            1,
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn budget_gauge_key_covers_every_label() {
+        let m = Metrics::new(false);
+        let base = BudgetLabels {
+            api_key_id: "ak",
+            team_id: "t",
+            user_id: "u",
+        };
+        let variants = [
+            BudgetLabels {
+                api_key_id: "ak2",
+                ..base
+            },
+            BudgetLabels {
+                team_id: "t2",
+                ..base
+            },
+            BudgetLabels {
+                user_id: "u2",
+                ..base
+            },
+        ];
+        let spend = |v| BudgetGauges {
+            spent_usd: Some(v),
+            ..BudgetGauges::default()
+        };
+        m.set_budget_gauges(base, spend(1.0));
+        for (i, v) in variants.iter().enumerate() {
+            m.set_budget_gauges(*v, spend(2.0 + i as f64));
+        }
+        let rendered = m.render();
+        let series = series_lines(&rendered, M_BUDGET_SPENT_USD);
+        assert_eq!(series.len(), 1 + variants.len(), "{rendered}");
+        // Gauges overwrite rather than sum: a dropped key label makes the
+        // LAST variant's value land on the base series instead.
+        assert!(
+            series.iter().any(|l| l.contains("api_key_id=\"ak\"")
+                && l.contains("team_id=\"t\"")
+                && l.ends_with(" 1")),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn llm_ttft_key_covers_every_label() {
+        let base = UsageLabels::default();
+        let variants = [
+            UsageLabels {
+                endpoint: "/v1/messages",
+                ..base
+            },
+            UsageLabels {
+                inbound_protocol: "anthropic",
+                ..base
+            },
+            UsageLabels {
+                provider: "p2",
+                ..base
+            },
+            UsageLabels {
+                model: "m2",
+                ..base
+            },
+            UsageLabels {
+                upstream_model: "um2",
+                ..base
+            },
+            UsageLabels {
+                provider_key_id: "pk2",
+                ..base
+            },
+            UsageLabels {
+                provider_key_name: "pkn2",
+                ..base
+            },
+            UsageLabels {
+                api_key_id: "ak2",
+                ..base
+            },
+            UsageLabels {
+                team_id: "t2",
+                ..base
+            },
+            UsageLabels {
+                user_id: "u2",
+                ..base
+            },
+            UsageLabels {
+                user_name: "n2",
+                ..base
+            },
+        ];
+        let m = Metrics::new(false);
+        m.record_time_to_first_token(base, Duration::from_millis(1));
+        m.record_time_to_first_token(base, Duration::from_millis(1));
+        for v in &variants {
+            m.record_time_to_first_token(*v, Duration::from_millis(1));
+        }
+        assert_one_series_per_label_set(
+            &m.render(),
+            &format!("{M_LLM_TTFT}_count"),
+            1 + variants.len(),
+        );
+    }
+
+    #[test]
+    fn latency_histogram_key_covers_every_label() {
+        let base = LatencyLabels {
+            endpoint: "/v1/chat/completions",
+            model: "m",
+            provider: "p",
+            status: 200,
+            streaming: false,
+        };
+        let variants = [
+            LatencyLabels {
+                endpoint: "/v1/messages",
+                ..base
+            },
+            LatencyLabels {
+                model: "m2",
+                ..base
+            },
+            LatencyLabels {
+                provider: "p2",
+                ..base
+            },
+            // The key uses the status CLASS, so the variant must change
+            // the bucket, not just the code.
+            LatencyLabels {
+                status: 404,
+                ..base
+            },
+            LatencyLabels {
+                streaming: true,
+                ..base
+            },
+        ];
+        let m = Metrics::new(false);
+        m.record_request_e2e_latency(base, Duration::from_millis(1));
+        m.record_request_e2e_latency(base, Duration::from_millis(1));
+        for v in &variants {
+            m.record_request_e2e_latency(*v, Duration::from_millis(1));
+        }
+        assert_one_series_per_label_set(
+            &m.render(),
+            &format!("{M_REQUEST_E2E_LATENCY_SECONDS}_count"),
+            1 + variants.len(),
+        );
+    }
+
+    #[test]
+    fn auth_decision_key_covers_every_label() {
+        let m = Metrics::new(false);
+        m.record_auth_decision("api_key", true, "");
+        m.record_auth_decision("api_key", true, "");
+        m.record_auth_decision("jwt", true, "");
+        m.record_auth_decision("api_key", false, "");
+        m.record_auth_decision("api_key", true, "key_expired");
+        assert_one_series_per_label_set(&m.render(), M_AUTH_DECISIONS_TOTAL, 4);
+    }
+
+    #[test]
+    fn guardrail_latency_key_covers_every_label() {
+        let base = aisix_core::GuardrailExecution {
+            guardrail_name: "g",
+            kind: "keyword",
+            phase: "input",
+            result: "allowed",
+            error_type: None,
+            elapsed: Duration::from_millis(1),
+        };
+        let variants = [
+            aisix_core::GuardrailExecution {
+                guardrail_name: "g2",
+                ..base
+            },
+            aisix_core::GuardrailExecution {
+                kind: "pii",
+                ..base
+            },
+            aisix_core::GuardrailExecution {
+                phase: "output",
+                ..base
+            },
+            aisix_core::GuardrailExecution {
+                result: "blocked",
+                ..base
+            },
+            aisix_core::GuardrailExecution {
+                error_type: Some("timeout"),
+                ..base
+            },
+        ];
+        let m = Metrics::new(false);
+        m.record_guardrail_execution(&base);
+        m.record_guardrail_execution(&base);
+        for v in &variants {
+            m.record_guardrail_execution(v);
+        }
+        assert_one_series_per_label_set(
+            &m.render(),
+            &format!("{M_GUARDRAIL_LATENCY_SECONDS}_count"),
+            1 + variants.len(),
+        );
+    }
+
+    #[test]
+    fn ratelimit_rejection_key_covers_every_label() {
+        let m = Metrics::new(false);
+        m.record_ratelimit_rejection("requests", "api_key", None);
+        m.record_ratelimit_rejection("requests", "api_key", None);
+        m.record_ratelimit_rejection("tokens", "api_key", None);
+        m.record_ratelimit_rejection("requests", "model", None);
+        m.record_ratelimit_rejection("requests", "api_key", Some("p1"));
+        assert_one_series_per_label_set(&m.render(), M_RATELIMIT_REJECTIONS, 4);
+    }
+
+    #[test]
+    fn tokens_by_client_key_covers_every_label() {
+        let m = Metrics::new(false);
+        m.record_llm_tokens_by_client("cli", "m", 1, 0, 0);
+        m.record_llm_tokens_by_client("cli", "m", 1, 0, 0);
+        m.record_llm_tokens_by_client("cli2", "m", 1, 0, 0);
+        m.record_llm_tokens_by_client("cli", "m2", 1, 0, 0);
+        assert_one_series_per_label_set(&m.render(), M_LLM_TOKENS_BY_CLIENT_TOTAL, 3);
+    }
+
+    #[test]
+    fn consumed_tokens_key_covers_every_label() {
+        let m = Metrics::new(false);
+        m.record_tokens("p", "m", 1);
+        m.record_tokens("p", "m", 1);
+        m.record_tokens("p2", "m", 1);
+        m.record_tokens("p", "m2", 1);
+        assert_one_series_per_label_set(&m.render(), M_TOKENS_CONSUMED, 3);
+    }
+
+    #[test]
+    fn usage_event_emit_key_covers_every_label() {
+        let m = Metrics::new(false);
+        m.record_usage_event_emit("chat", 200, "openai");
+        m.record_usage_event_emit("chat", 200, "openai");
+        m.record_usage_event_emit("embeddings", 200, "openai");
+        m.record_usage_event_emit("chat", 404, "openai");
+        m.record_usage_event_emit("chat", 200, "anthropic");
+        assert_one_series_per_label_set(&m.render(), M_USAGE_EVENT_EMITS_TOTAL, 4);
+    }
+
+    #[test]
+    fn in_flight_gauge_key_covers_every_label() {
+        let m = Metrics::new(false);
+        m.increment_proxy_in_flight("/v1/chat/completions", "openai");
+        m.increment_proxy_in_flight("/v1/messages", "openai");
+        m.increment_proxy_in_flight("/v1/chat/completions", "anthropic");
+        let rendered = m.render();
+        assert_eq!(
+            series_lines(&rendered, M_PROXY_IN_FLIGHT).len(),
+            3,
+            "a dropped key label folds distinct endpoints/protocols into one gauge\n{rendered}"
+        );
     }
 
     #[test]
