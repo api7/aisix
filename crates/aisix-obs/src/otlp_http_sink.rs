@@ -745,6 +745,12 @@ fn build_otlp_span(record: &SinkRecord, exporter_name: &str) -> Value {
                     attributes.push(attr_string_capped(key, value));
                 }
             }
+            if event.a2a_stream_event_count > 0 {
+                attributes.push(attr_int(
+                    "aisix.a2a.stream_event_count",
+                    i64::from(event.a2a_stream_event_count),
+                ));
+            }
         }
         "mcp" => {
             if !event.mcp_tool_name.is_empty() {
@@ -1459,6 +1465,39 @@ mod tests {
         assert_eq!(string_at("aisix.a2a.protocol_version"), "1.0");
         assert_eq!(string_at("aisix.a2a.task_id"), "task-9");
         assert_eq!(string_at("aisix.a2a.task_state"), "working");
+    }
+
+    #[test]
+    fn a_streamed_a2a_call_carries_its_event_count() {
+        // A unary call has no count, and exporting a zero would read as "the
+        // stream carried nothing" rather than "there was no stream".
+        let mut streamed = sample_event();
+        streamed.inbound_protocol = "a2a".into();
+        streamed.a2a_agent_name = "invoice-processor".into();
+        streamed.a2a_stream_event_count = 17;
+        let body = build_otlp_traces_payload(&streamed, "test-exp");
+        let attrs = body["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["attributes"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(
+            attrs
+                .iter()
+                .find(|a| a["key"] == "aisix.a2a.stream_event_count")
+                .unwrap()["value"]["intValue"],
+            "17"
+        );
+
+        let mut unary = sample_event();
+        unary.inbound_protocol = "a2a".into();
+        let body = build_otlp_traces_payload(&unary, "test-exp");
+        let attrs = body["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["attributes"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert!(attrs
+            .iter()
+            .all(|a| a["key"] != "aisix.a2a.stream_event_count"));
     }
 
     #[test]

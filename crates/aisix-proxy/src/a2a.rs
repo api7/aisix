@@ -66,6 +66,28 @@ struct A2aCall {
     /// The wire version the agent is pinned to (`0.3` / `1.0`).
     protocol_version: &'static str,
     facts: A2aCallFacts,
+    /// How the stream behaved, for a streaming call. Left at its default for
+    /// a unary one, which observes none of the stream series.
+    stream: A2aStreamProgress,
+}
+
+/// What a streamed A2A call did on the wire, accumulated as events pass.
+///
+/// A stream is the only place these can be observed: once the response head is
+/// out, nothing downstream of it can say how long the first event took, how
+/// many followed, or whether the caller was still there at the end.
+#[derive(Default)]
+struct A2aStreamProgress {
+    /// Time from the call starting to the upstream's first event. `None` until
+    /// one arrives — a stream that opens and produces nothing never sets it,
+    /// and no figure is invented for it.
+    ttfb: Option<Duration>,
+    /// Events relayed downstream.
+    event_count: u32,
+    /// Set when the upstream stream ends — exhausted or faulted. Still false
+    /// when the guard drops means the generator was cancelled underneath us,
+    /// which is a caller that hung up mid-task.
+    reached_end: bool,
 }
 
 /// Serve a JSON-RPC request to `/a2a/:agent`. Authentication (`401`), per-agent
@@ -190,6 +212,7 @@ async fn dispatch(
         method,
         protocol_version: upstream.protocol_version.as_wire_str(),
         facts: A2aCallFacts::default(),
+        stream: A2aStreamProgress::default(),
     };
     // Read before the upstream is contacted, so a call that never lands still
     // records which task the caller was asking about.
@@ -305,13 +328,22 @@ impl Drop for StreamUsageOnDrop {
         if std::thread::panicking() {
             return;
         }
+        // A stream the caller abandoned mid-task is recorded as 499, the same
+        // outcome the LLM streaming paths record for the same event. Only a
+        // still-successful call is downgraded: a stream that already faulted
+        // has a truer status than the hang-up that followed it.
+        let status = if self.call.stream.reached_end || self.status != StatusCode::OK.as_u16() {
+            self.status
+        } else {
+            crate::CLIENT_CLOSED_REQUEST
+        };
         emit_a2a_usage(
             &self.state,
             &self.auth,
             &self.request_id,
             &self.agent,
             &self.call,
-            self.status,
+            status,
             self.started.elapsed(),
         );
     }
@@ -377,6 +409,11 @@ async fn dispatch_stream(
                     // Read the task's progress off the event on its way past —
                     // the relay itself stays verbatim.
                     guard.call.facts.observe_result(&value);
+                    guard.call.stream.event_count += 1;
+                    // The agent's own time to first byte. Stamped on the first
+                    // event of any kind, matching how the LLM paths stamp
+                    // TTFT, so the two figures answer the same question.
+                    guard.call.stream.ttfb.get_or_insert_with(|| started.elapsed());
                     yield Ok::<_, std::convert::Infallible>(
                         axum::response::sse::Event::default().data(value.to_string()),
                     );
@@ -394,6 +431,9 @@ async fn dispatch_stream(
                 }
             }
         }
+        // The upstream is done — exhausted or faulted. Reaching here at all is
+        // what separates a finished stream from one the caller abandoned.
+        guard.call.stream.reached_end = true;
         drop(guard);
     };
 
@@ -568,8 +608,28 @@ fn emit_a2a_usage(
         a2a_task_id: call.facts.task_id.clone(),
         a2a_context_id: call.facts.context_id.clone(),
         a2a_task_state: call.facts.task_state.clone(),
+        a2a_stream_event_count: call.stream.event_count,
+        upstream_ttft_ms: call
+            .stream
+            .ttfb
+            .map(|d| d.as_millis().min(u32::MAX as u128) as u32)
+            .unwrap_or_default(),
         ..Default::default()
     };
+    // The `aisix_a2a_*` family rides on the same chokepoint as the usage
+    // event, so a path that accounts for a call cannot skip metering it.
+    state.metrics.record_a2a_call(
+        aisix_obs::A2aLabels {
+            agent,
+            operation: call.operation,
+            status: status_code,
+        },
+        aisix_obs::A2aCallOutcome {
+            ttfb: call.stream.ttfb,
+            stream_events: call.stream.event_count,
+            task_state: &call.facts.task_state,
+        },
+    );
     state.usage_sink.try_emit("a2a", event.clone());
     let snap = state.snapshot.load();
     let exporters = snap.observability_exporters.entries();
@@ -865,6 +925,12 @@ mod tests {
             .expect("an abandoned stream still emits usage");
         assert_eq!(event.a2a_task_id, "task-88");
         assert_eq!(event.a2a_task_state, "working");
+        // A caller that hung up mid-task is not a success. Recording 200 here
+        // put abandoned streams in the same bucket as completed ones, so an
+        // agent nobody waits for looked perfectly healthy.
+        assert_eq!(event.status_code, crate::CLIENT_CLOSED_REQUEST);
+        // Only what the caller actually received is counted.
+        assert_eq!(event.a2a_stream_event_count, 2);
     }
 
     #[tokio::test]
@@ -945,6 +1011,27 @@ mod tests {
         assert_eq!(event.a2a_task_id, "task-77");
         assert_eq!(event.a2a_context_id, "ctx-77");
         assert_eq!(event.a2a_task_state, "input-required");
+        // A stream read to the end is a success, and every event it relayed
+        // is counted.
+        assert_eq!(event.status_code, StatusCode::OK.as_u16());
+        assert_eq!(event.a2a_stream_event_count, 3);
+    }
+
+    #[tokio::test]
+    async fn a_unary_call_observes_none_of_the_stream_figures() {
+        // Nothing was streamed, so an event count or a time-to-first-event
+        // would be a number with no referent.
+        let event = usage_event_for(
+            &spawn_task_agent().await,
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "message/send",
+                "params": {"message": {"role": "user", "contextId": "ctx-u"}}
+            }),
+        )
+        .await;
+
+        assert_eq!(event.a2a_stream_event_count, 0);
+        assert_eq!(event.upstream_ttft_ms, 0);
     }
 
     #[tokio::test]

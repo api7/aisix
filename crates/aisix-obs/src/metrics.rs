@@ -210,6 +210,42 @@ pub const M_REQUEST_E2E_LATENCY_SECONDS: &str = "aisix_request_e2e_latency_secon
 /// [`M_REQUEST_E2E_LATENCY_SECONDS`] (with `streaming="true"` always).
 pub const M_REQUEST_TTFT_SECONDS: &str = "aisix_request_ttft_seconds";
 
+// ── A2A gateway series (AISIX-Cloud#1215) ──────────────────────────────────
+//
+// The `aisix_proxy_*` families already count `/a2a` traffic and time it, but
+// only by route: which agent was reached and which operation was invoked are
+// not labels there, so "is the invoice agent's `message/stream` failing?" —
+// the question an agent-platform operator actually asks — cannot be answered
+// from them. These four carry that dimension and nothing else, so they stay
+// bounded: `agent` is a registered resource name, `operation` the canonical
+// bounded set, `state` the specification's task states. Task, context and
+// JSON-RPC request ids are deliberately absent — they belong in logs and
+// traces, never in a label.
+//
+// Request DURATION is not repeated here: `aisix_proxy_request_duration_seconds`
+// already times `/a2a` end to end, and a second histogram of the same quantity
+// would only be a second thing to keep in sync.
+/// A2A calls by agent, canonical operation and status class. Counts the same
+/// requests as `aisix_proxy_requests_total{endpoint="/a2a"}`, split the way an
+/// agent operator needs.
+pub const M_A2A_REQUESTS_TOTAL: &str = "aisix_a2a_requests_total";
+/// Time from an A2A streaming call starting to the FIRST event the upstream
+/// agent pushed — the agent's own "time to first byte".
+///
+/// Named for the event rather than a token because an agent stream carries
+/// task updates, not tokens; it shares [`M_REQUEST_TTFT_SECONDS`]'s bucket
+/// edges (and therefore its `request_ttft` operator override) since the two
+/// measure the same shape of wait.
+pub const M_A2A_TTFB_SECONDS: &str = "aisix_a2a_ttfb_seconds";
+/// Events relayed downstream on A2A streaming calls. Divided by
+/// [`M_A2A_REQUESTS_TOTAL`] over the streaming operations it gives events per
+/// call — how chatty an agent is, and whether that changed.
+pub const M_A2A_STREAM_EVENTS_TOTAL: &str = "aisix_a2a_stream_events_total";
+/// A2A calls by the task state they ended on, normalized to the
+/// specification's set plus `unknown`. The series an operator watches for
+/// tasks piling up in `input-required` or `failed`.
+pub const M_A2A_TASK_STATE_TOTAL: &str = "aisix_a2a_task_state_total";
+
 // ── Config load-observability series (load-observability contract) ─────────
 // Reflected from [`aisix_core::ConfigMetricsView`] at scrape time via
 // [`Metrics::sync_config_status`]. Standard Prometheus config-reload naming so
@@ -649,6 +685,15 @@ impl Metrics {
                 &buckets.guardrail_latency,
             )
             .expect("bucket lists are validated non-empty")
+            // An agent's time-to-first-event is the same shape of wait as a
+            // model's time-to-first-token, so it takes the same edges — and
+            // the same `request_ttft` operator override, rather than adding a
+            // config key that would have to be kept in step with it.
+            .set_buckets_for_metric(
+                Matcher::Full(M_A2A_TTFB_SECONDS.to_string()),
+                &buckets.request_ttft,
+            )
+            .expect("bucket lists are validated non-empty")
             .build_recorder();
         let handle = recorder.handle();
         static NEXT_INSTANCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1031,6 +1076,90 @@ impl Metrics {
                 )
             },
         );
+    }
+
+    /// Record one finished A2A call across the whole `aisix_a2a_*` family.
+    ///
+    /// A single entry point rather than four, so a new call site cannot land
+    /// with half the series wired — the same anti-drift move
+    /// [`crate::metrics`]' request families make. Every label here is bounded
+    /// by construction: `agent` is a registered resource, `operation` and
+    /// `task_state` come from fixed sets.
+    ///
+    /// `ttfb` and `stream_events` are `None` / `0` for a unary call, which
+    /// observes neither series.
+    pub fn record_a2a_call(&self, labels: A2aLabels<'_>, call: A2aCallOutcome<'_>) {
+        let status = status_bucket(labels.status);
+        self.cached_counter(
+            M_A2A_REQUESTS_TOTAL,
+            1,
+            |k| {
+                k.label(labels.agent);
+                k.label(labels.operation);
+                k.label(status);
+            },
+            || {
+                metrics::counter!(
+                    M_A2A_REQUESTS_TOTAL,
+                    "agent" => labels.agent.to_string(),
+                    "operation" => labels.operation.to_string(),
+                    "status" => status.to_string(),
+                )
+            },
+        );
+        if let Some(ttfb) = call.ttfb {
+            self.cached_histogram(
+                M_A2A_TTFB_SECONDS,
+                ttfb.as_secs_f64(),
+                |k| {
+                    k.label(labels.agent);
+                    k.label(labels.operation);
+                },
+                || {
+                    metrics::histogram!(
+                        M_A2A_TTFB_SECONDS,
+                        "agent" => labels.agent.to_string(),
+                        "operation" => labels.operation.to_string(),
+                    )
+                },
+            );
+        }
+        if call.stream_events > 0 {
+            self.cached_counter(
+                M_A2A_STREAM_EVENTS_TOTAL,
+                u64::from(call.stream_events),
+                |k| {
+                    k.label(labels.agent);
+                    k.label(labels.operation);
+                },
+                || {
+                    metrics::counter!(
+                        M_A2A_STREAM_EVENTS_TOTAL,
+                        "agent" => labels.agent.to_string(),
+                        "operation" => labels.operation.to_string(),
+                    )
+                },
+            );
+        }
+        // Only a call that reached a task has a state to report; counting an
+        // empty one would invent a bucket for "the upstream never answered".
+        if !call.task_state.is_empty() {
+            self.cached_counter(
+                M_A2A_TASK_STATE_TOTAL,
+                1,
+                |k| {
+                    k.label(labels.agent);
+                    k.label(call.task_state);
+                },
+                || {
+                    metrics::counter!(
+                        M_A2A_TASK_STATE_TOTAL,
+                        "agent" => labels.agent.to_string(),
+                        "state" => call.task_state.to_string(),
+                    )
+                },
+            );
+        }
     }
 
     /// Count a request the client abandoned before it produced a response
@@ -1852,6 +1981,29 @@ impl aisix_core::GuardrailMetricsSink for Metrics {
 /// low-cardinality: bounded endpoint set, configured model/provider names,
 /// bucketed status — never per-key / per-user dimensions, which would
 /// multiply every bucket edge.
+/// Who was called and how, for the `aisix_a2a_*` family. Every field is
+/// bounded: a registered agent name and the canonical operation set.
+#[derive(Clone, Copy)]
+pub struct A2aLabels<'a> {
+    pub agent: &'a str,
+    pub operation: &'a str,
+    /// Raw HTTP status; bucketed to `2xx` / `4xx` / … at record time.
+    pub status: u16,
+}
+
+/// What one A2A call did, for the series that only some calls observe.
+#[derive(Clone, Copy, Default)]
+pub struct A2aCallOutcome<'a> {
+    /// Time to the upstream agent's first streamed event. `None` for a unary
+    /// call and for a stream that never produced one.
+    pub ttfb: Option<Duration>,
+    /// Events relayed downstream. 0 for a unary call.
+    pub stream_events: u32,
+    /// Normalized task state the call ended on; empty when no response
+    /// carried one.
+    pub task_state: &'a str,
+}
+
 #[derive(Clone, Copy)]
 pub struct LatencyLabels<'a> {
     /// Route template, e.g. `/v1/chat/completions`. Bounded set.
@@ -2427,6 +2579,63 @@ mod tests {
         // layers leave the label empty.
         assert!(rendered.contains("policy_id=\"pol-1\""));
         assert!(rendered.contains("policy_id=\"\""));
+    }
+
+    #[test]
+    fn a2a_family_slices_by_agent_and_operation() {
+        let m = Metrics::new(false);
+        m.record_a2a_call(
+            A2aLabels {
+                agent: "invoices",
+                operation: "message/stream",
+                status: 200,
+            },
+            A2aCallOutcome {
+                ttfb: Some(Duration::from_millis(80)),
+                stream_events: 17,
+                task_state: "completed",
+            },
+        );
+        let rendered = m.render();
+        // The dimension the proxy families cannot answer: which agent, which
+        // operation.
+        assert!(rendered.contains(&format!(
+            "{M_A2A_REQUESTS_TOTAL}{{agent=\"invoices\",operation=\"message/stream\",status=\"2xx\"}} 1"
+        )));
+        assert!(rendered.contains(&format!(
+            "{M_A2A_STREAM_EVENTS_TOTAL}{{agent=\"invoices\",operation=\"message/stream\"}} 17"
+        )));
+        assert!(rendered.contains(&format!(
+            "{M_A2A_TASK_STATE_TOTAL}{{agent=\"invoices\",state=\"completed\"}} 1"
+        )));
+        // A real histogram, not a summary — the buckets are registered.
+        assert!(rendered.contains(&format!("{M_A2A_TTFB_SECONDS}_bucket")));
+        // Task and context ids are the whole reason this family is safe to
+        // label; neither may ever appear.
+        assert!(!rendered.contains("task_id="));
+        assert!(!rendered.contains("context_id="));
+    }
+
+    #[test]
+    fn a2a_unary_call_observes_only_the_series_it_has_data_for() {
+        let m = Metrics::new(false);
+        m.record_a2a_call(
+            A2aLabels {
+                agent: "invoices",
+                operation: "tasks/get",
+                status: 502,
+            },
+            // No stream, and the upstream never answered, so no task state.
+            A2aCallOutcome::default(),
+        );
+        let rendered = m.render();
+        assert!(rendered.contains("status=\"5xx\""));
+        // An absent figure must not be recorded as zero: a call with no stream
+        // is not a call whose stream carried nothing, and a call with no
+        // answer has no task state to bucket.
+        assert!(!rendered.contains(M_A2A_STREAM_EVENTS_TOTAL));
+        assert!(!rendered.contains(M_A2A_TASK_STATE_TOTAL));
+        assert!(!rendered.contains(M_A2A_TTFB_SECONDS));
     }
 
     #[test]

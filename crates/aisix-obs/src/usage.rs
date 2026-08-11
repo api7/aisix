@@ -508,6 +508,16 @@ pub struct UsageEvent {
     /// all (the call failed before the upstream answered).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub a2a_task_state: String,
+
+    /// Events the gateway relayed downstream on a streamed A2A call.
+    ///
+    /// Read together with `upstream_ttft_ms` and `upstream_latency_ms` it
+    /// separates the two ways a stream disappoints: nothing arrived for a long
+    /// time (high TTFT), or plenty arrived and none of it advanced the task
+    /// (high count, no terminal state). 0 for a unary call, and for a stream
+    /// whose upstream produced nothing at all.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub a2a_stream_event_count: u32,
 }
 
 #[inline]
