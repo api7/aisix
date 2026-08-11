@@ -253,15 +253,35 @@ impl std::ops::DerefMut for ProxyState {
     }
 }
 
+/// Frozen `unix_secs` for unit-test limiters — an arbitrary mid-window
+/// instant; the exact value only shapes reported retry-after seconds.
+#[cfg(test)]
+const TEST_RATE_LIMIT_CLOCK_SECS: u64 = 1_763_000_000;
+
 impl ProxyState {
     pub fn new(snapshot: SnapshotHandle<AisixSnapshot>, hub: Arc<Hub>, cfg: &ProxyConfig) -> Self {
         let metrics = Arc::new(Metrics::new(false));
         let guardrail_index =
             LiveGuardrailIndex::new_with_sink(snapshot.clone(), None, Some(metrics.clone()));
+        // Unit tests get a frozen rate-limit clock: on the wall clock, any
+        // "the next request 429s" assertion silently races the fixed-window
+        // minute boundary — a test that straddles :00 lands its two requests
+        // in different windows and the 429 never comes (seen flaking in the
+        // mcp per-server-limit tests under a loaded runner). Freezing the
+        // clock puts every request of a test in one window by construction.
+        // Only this crate's own test build is affected; other crates calling
+        // `ProxyState::new` (e.g. aisix-admin's playground) compile the
+        // system-clock arm.
+        #[cfg(test)]
+        let limiter = Arc::new(Limiter::local_with_clock(aisix_ratelimit::TestClock::new(
+            TEST_RATE_LIMIT_CLOCK_SECS,
+        )));
+        #[cfg(not(test))]
+        let limiter = Arc::new(Limiter::new());
         Self::from_inner(ProxyStateInner {
             snapshot,
             hub,
-            limiter: Arc::new(Limiter::new()),
+            limiter,
             metrics,
             cache: Some(CacheBackends::memory_only()),
             routing: Arc::new(RoutingRegistry::new()),
