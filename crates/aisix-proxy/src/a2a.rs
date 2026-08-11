@@ -337,23 +337,6 @@ impl Drop for StreamUsageOnDrop {
         } else {
             crate::CLIENT_CLOSED_REQUEST
         };
-        let elapsed = self.started.elapsed();
-        // The client-perceived duration of a streamed call, which nothing else
-        // records: the handler returns the moment the response head is out, so
-        // `aisix_proxy_request_duration_seconds` times only how long the
-        // stream took to OPEN. Same placement as the LLM streaming paths,
-        // which observe this histogram at stream completion for the same
-        // reason.
-        self.state.metrics.record_request_e2e_latency(
-            aisix_obs::LatencyLabels {
-                endpoint: "/a2a",
-                model: A2A_MODEL_LABEL,
-                provider: "a2a",
-                status,
-                streaming: true,
-            },
-            elapsed,
-        );
         emit_a2a_usage(
             &self.state,
             &self.auth,
@@ -361,7 +344,7 @@ impl Drop for StreamUsageOnDrop {
             &self.agent,
             &self.call,
             status,
-            elapsed,
+            self.started.elapsed(),
         );
     }
 }
@@ -654,6 +637,23 @@ fn emit_a2a_usage(
             .unwrap_or_default(),
         ..Default::default()
     };
+    // The client-perceived duration of the call. Nothing else records it for
+    // `/a2a`: the handler returns the moment a stream's response head is out,
+    // so `aisix_proxy_request_duration_seconds` times only how long a stream
+    // took to OPEN. Recorded here rather than at the stream's drop guard so
+    // the unary, quota-rejected and failed-to-open paths are in the sample
+    // too — a streaming-only series would report `/a2a` as having no failures
+    // at all.
+    state.metrics.record_request_e2e_latency(
+        aisix_obs::LatencyLabels {
+            endpoint: "/a2a",
+            model: A2A_MODEL_LABEL,
+            provider: "a2a",
+            status: status_code,
+            streaming: is_streaming_operation(call.operation),
+        },
+        latency,
+    );
     // The `aisix_a2a_*` family rides on the same chokepoint as the usage
     // event, so a path that accounts for a call cannot skip metering it.
     state.metrics.record_a2a_call(
