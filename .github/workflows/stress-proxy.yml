@@ -6,12 +6,16 @@
 #   - fast64: plain cargo test with --test-threads=64 — heavy in-process
 #             concurrency, which reproduced the mcp minute-window race.
 #
-# `ref` stresses any branch without adding this file to it (the workflow
-# definition runs from THIS branch; the checkout follows the input).
-# Never wired to push/PR triggers — dispatch it, read the verdict, done.
+# Runs on any push to a `ci-stress/**` branch (push events use the workflow
+# file at the pushed ref, so this never needs to exist on main): put the code
+# to stress plus this file on such a branch and push. workflow_dispatch is
+# kept for the day this lands on the default branch, where it becomes
+# dispatchable against arbitrary refs.
 name: stress-proxy
 
 on:
+  push:
+    branches: ["ci-stress/**"]
   workflow_dispatch:
     inputs:
       ref:
@@ -44,6 +48,8 @@ jobs:
       - uses: actions/checkout@v6
         with:
           ref: ${{ inputs.ref || github.ref }}
+      - name: which ref
+        run: git log -1 --oneline
       - uses: dtolnay/rust-toolchain@stable
       - uses: ./.github/actions/setup-protoc
       - uses: Swatinem/rust-cache@v2
@@ -53,8 +59,8 @@ jobs:
       - name: stress loop
         run: |
           set -uo pipefail
-          iters="${{ inputs.iterations }}"
-          filter="${{ inputs.testfilter }}"
+          iters="${{ inputs.iterations || '40' }}"
+          filter="${{ inputs.testfilter || '' }}"
           for i in $(seq 1 "$iters"); do
             echo "::group::iteration $i"
             if [ "${{ matrix.mode }}" = "cov4" ]; then
