@@ -379,11 +379,19 @@ pub struct Metrics {
 struct MetricsInner {
     recorder: PrometheusRecorder,
     handle: PrometheusHandle,
-    proxy_in_flight: Mutex<HashMap<(String, String), i64>>,
+    /// Per-(endpoint, protocol) in-flight counts. A linear scan over a
+    /// bounded slot list (route templates × protocols): the steady-state
+    /// hit is two pointer-length string compares with no allocation and
+    /// no hashing, where the map this replaced allocated two `String`
+    /// keys and ran SipHash on every request edge. Slots for drained
+    /// pairs stay at zero rather than being removed — the set is bounded,
+    /// and reuse beats churn.
+    proxy_in_flight: Mutex<Vec<(String, String, i64)>>,
     /// Process-unique id prefixed onto every worker-cache key, so
     /// thread-local entries minted for one instance's recorder can never
     /// serve another instance (parallel tests build many `Metrics`).
-    instance: u64,
+    /// Pre-formatted once — per-emit `fmt::write` was a visible cost.
+    worker_key_prefix: String,
     /// Constant `env_id` label for the SLO latency histograms — one DP
     /// process serves exactly one environment. `"unknown"` when the DP
     /// runs standalone (no control plane).
@@ -573,9 +581,22 @@ impl WorkerKey<'_> {
     }
 
     fn label_u16(&mut self, value: u16) {
-        use std::fmt::Write as _;
         self.buf.push(WORKER_KEY_SEP);
-        let _ = write!(self.buf, "{value}");
+        // Hand-rolled digits: `fmt::write` machinery was a visible
+        // per-emit cost for what is a five-byte-max ASCII render.
+        let mut digits = [0u8; 5];
+        let mut i = digits.len();
+        let mut v = value;
+        loop {
+            i -= 1;
+            digits[i] = b'0' + (v % 10) as u8;
+            v /= 10;
+            if v == 0 {
+                break;
+            }
+        }
+        self.buf
+            .push_str(std::str::from_utf8(&digits[i..]).expect("ascii digits"));
     }
 
     fn label_bool(&mut self, value: bool) {
@@ -635,8 +656,11 @@ impl Metrics {
             inner: Arc::new(MetricsInner {
                 recorder,
                 handle,
-                proxy_in_flight: Mutex::new(HashMap::new()),
-                instance: NEXT_INSTANCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                proxy_in_flight: Mutex::new(Vec::new()),
+                worker_key_prefix: format!(
+                    "{:x}",
+                    NEXT_INSTANCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                ),
                 env_id: if env_id.is_empty() {
                     "unknown".to_string()
                 } else {
@@ -1070,30 +1094,31 @@ impl Metrics {
     }
 
     pub fn increment_proxy_in_flight(&self, endpoint: &str, inbound_protocol: &str) {
-        let value = {
-            let mut counters = self.inner.proxy_in_flight.lock().expect("lock in-flight");
-            let value = counters
-                .entry((endpoint.to_string(), inbound_protocol.to_string()))
-                .or_insert(0);
-            *value += 1;
-            *value
-        };
+        let value = self.in_flight_delta(endpoint, inbound_protocol, 1);
         self.set_proxy_in_flight_gauge(endpoint, inbound_protocol, value);
     }
 
     pub fn decrement_proxy_in_flight(&self, endpoint: &str, inbound_protocol: &str) {
-        let value = {
-            let mut counters = self.inner.proxy_in_flight.lock().expect("lock in-flight");
-            let key = (endpoint.to_string(), inbound_protocol.to_string());
-            let value = counters.entry(key.clone()).or_insert(0);
-            *value = (*value - 1).max(0);
-            let current = *value;
-            if current == 0 {
-                counters.remove(&key);
-            }
-            current
-        };
+        let value = self.in_flight_delta(endpoint, inbound_protocol, -1);
         self.set_proxy_in_flight_gauge(endpoint, inbound_protocol, value);
+    }
+
+    /// Apply one in-flight edge and return the new count, clamped at zero
+    /// (a decrement without its increment — e.g. after a restart race —
+    /// must not wedge the gauge negative).
+    fn in_flight_delta(&self, endpoint: &str, inbound_protocol: &str, delta: i64) -> i64 {
+        let mut slots = self.inner.proxy_in_flight.lock().expect("lock in-flight");
+        if let Some(slot) = slots
+            .iter_mut()
+            .find(|(e, p, _)| e == endpoint && p == inbound_protocol)
+        {
+            slot.2 = (slot.2 + delta).max(0);
+            slot.2
+        } else {
+            let value = delta.max(0);
+            slots.push((endpoint.to_string(), inbound_protocol.to_string(), value));
+            value
+        }
     }
 
     /// Shared gauge emit for the increment/decrement pair — one cache
@@ -1139,12 +1164,11 @@ impl Metrics {
             let cache = &mut *cell.borrow_mut();
             cache.key_buf.clear();
             let dirty = {
-                use std::fmt::Write as _;
                 let mut key = WorkerKey {
                     buf: &mut cache.key_buf,
                     dirty: false,
                 };
-                let _ = write!(key.buf, "{:x}", self.inner.instance);
+                key.buf.push_str(&self.inner.worker_key_prefix);
                 key.buf.push(WORKER_KEY_SEP);
                 key.buf.push_str(site);
                 build_key(&mut key);
@@ -2648,6 +2672,212 @@ mod tests {
             .render()
             .lines()
             .any(|line| line.starts_with(M_TOKENS_CONSUMED) && line.ends_with(" 2")));
+    }
+
+    /// Pins the deployment counter family against a cache-key/label
+    /// drift: the key builder and the register closure in
+    /// `cached_deployment_counter` list the labels independently, and
+    /// dropping one from the KEY would silently alias two deployments
+    /// onto one series while every single-label-set test stayed green.
+    #[test]
+    fn deployment_counters_stay_distinct_per_label_set() {
+        let metrics = Metrics::new(false);
+        let dep_a = DeploymentLabels {
+            provider: "openai",
+            model: "gpt",
+            upstream_model: "gpt-4o",
+            provider_key_id: "pk-a",
+        };
+        // Differs ONLY in provider_key_id — the label a key-builder
+        // regression is most likely to drop.
+        let dep_b = DeploymentLabels {
+            provider_key_id: "pk-b",
+            ..dep_a
+        };
+        metrics.record_deployment_request(dep_a, RequestOutcome::Success);
+        metrics.record_deployment_request(dep_a, RequestOutcome::Success);
+        metrics.record_deployment_request(dep_b, RequestOutcome::UpstreamError);
+
+        let rendered = metrics.render();
+        let series = |metric: &str, key: &str| {
+            rendered
+                .lines()
+                .find(|l| {
+                    l.starts_with(metric) && l.contains(&format!("provider_key_id=\"{key}\""))
+                })
+                .map(str::to_owned)
+        };
+        let requests_a = series(M_DEPLOYMENT_REQUESTS_TOTAL, "pk-a")
+            .expect("deployment A must have its own requests series");
+        assert!(requests_a.ends_with(" 2"), "got: {requests_a}");
+        for label in [
+            "provider=\"openai\"",
+            "model=\"gpt\"",
+            "upstream_model=\"gpt-4o\"",
+        ] {
+            assert!(requests_a.contains(label), "missing {label}: {requests_a}");
+        }
+        let requests_b = series(M_DEPLOYMENT_REQUESTS_TOTAL, "pk-b")
+            .expect("deployment B must have its own requests series");
+        assert!(requests_b.ends_with(" 1"), "got: {requests_b}");
+        assert!(series(M_DEPLOYMENT_SUCCESS_TOTAL, "pk-a").is_some_and(|l| l.ends_with(" 2")));
+        assert!(series(M_DEPLOYMENT_FAILURE_TOTAL, "pk-b").is_some_and(|l| l.ends_with(" 1")));
+        // The outcome split must not cross-pollinate.
+        assert!(series(M_DEPLOYMENT_SUCCESS_TOTAL, "pk-b").is_none());
+        assert!(series(M_DEPLOYMENT_FAILURE_TOTAL, "pk-a").is_none());
+    }
+
+    /// Pins the budget gauge family the same way. A gauge alias is worse
+    /// than a counter alias — `set()` overwrites, so key B's dollars
+    /// would silently replace key A's — and these five series had no
+    /// exposition test at all before this one.
+    #[test]
+    fn budget_gauges_stay_distinct_per_label_set_and_clear() {
+        let metrics = Metrics::new(false);
+        let key_a = BudgetLabels {
+            api_key_id: "ak-a",
+            team_id: "team-a",
+            user_id: "user-a",
+        };
+        let key_b = BudgetLabels {
+            api_key_id: "ak-b",
+            team_id: "team-b",
+            user_id: "user-b",
+        };
+        metrics.set_budget_gauges(
+            key_a,
+            BudgetGauges {
+                limit_usd: Some(100.0),
+                spent_usd: Some(40.0),
+                remaining_usd: Some(60.0),
+                reset_seconds: Some(3600),
+            },
+        );
+        metrics.set_budget_gauges(
+            key_b,
+            BudgetGauges {
+                spent_usd: Some(7.0),
+                ..BudgetGauges::default()
+            },
+        );
+
+        let rendered = metrics.render();
+        let series = |metric: &str, team: &str| {
+            rendered
+                .lines()
+                .find(|l| l.starts_with(metric) && l.contains(&format!("team_id=\"{team}\"")))
+                .map(str::to_owned)
+        };
+        for (metric, value) in [
+            (M_BUDGET_DETAILS_PRESENT, "1"),
+            (M_BUDGET_LIMIT_USD, "100"),
+            (M_BUDGET_SPENT_USD, "40"),
+            (M_BUDGET_REMAINING_USD, "60"),
+            (M_BUDGET_RESET_SECONDS, "3600"),
+        ] {
+            let line = series(metric, "team-a")
+                .unwrap_or_else(|| panic!("{metric} missing for team-a:\n{rendered}"));
+            assert!(line.ends_with(&format!(" {value}")), "got: {line}");
+            assert!(line.contains("api_key_id=\"ak-a\"") && line.contains("user_id=\"user-a\""));
+        }
+        // Key B must have its OWN spent series, not overwrite A's.
+        assert!(series(M_BUDGET_SPENT_USD, "team-b").is_some_and(|l| l.ends_with(" 7")));
+        // Unset dimensions register nothing for B.
+        assert!(series(M_BUDGET_LIMIT_USD, "team-b").is_none());
+
+        metrics.clear_budget_gauges(key_a);
+        let rendered = metrics.render();
+        let details = |team: &str| {
+            rendered
+                .lines()
+                .find(|l| {
+                    l.starts_with(M_BUDGET_DETAILS_PRESENT)
+                        && l.contains(&format!("team_id=\"{team}\""))
+                })
+                .map(str::to_owned)
+        };
+        assert!(details("team-a").is_some_and(|l| l.ends_with(" 0")));
+        assert!(details("team-b").is_some_and(|l| l.ends_with(" 1")));
+    }
+
+    /// Pins the legacy spec-7 pair's full label sets and per-series
+    /// distinctness through the hand-built cache keys: dropping status
+    /// or model from `record_request`'s key builder must fail here, not
+    /// ship.
+    #[test]
+    fn legacy_request_series_stay_fully_labelled_and_distinct() {
+        let metrics = Metrics::new(false);
+        metrics.record_request(
+            "openai",
+            "my-gpt4",
+            200,
+            RequestOutcome::Success,
+            Duration::from_millis(120),
+        );
+        metrics.record_request(
+            "openai",
+            "my-gpt4",
+            200,
+            RequestOutcome::Success,
+            Duration::from_millis(80),
+        );
+        metrics.record_request(
+            "openai",
+            "other-model",
+            404,
+            RequestOutcome::ClientError,
+            Duration::from_millis(5),
+        );
+
+        let rendered = metrics.render();
+        let counter_a = rendered
+            .lines()
+            .find(|l| l.starts_with(M_REQUESTS_TOTAL) && l.contains("status=\"200\""))
+            .expect("200 series must render");
+        assert!(
+            counter_a.ends_with(" 2"),
+            "cached handle must accumulate: {counter_a}"
+        );
+        for label in [
+            "provider=\"openai\"",
+            "model=\"my-gpt4\"",
+            "outcome=\"success\"",
+        ] {
+            assert!(counter_a.contains(label), "missing {label}: {counter_a}");
+        }
+        let counter_b = rendered
+            .lines()
+            .find(|l| l.starts_with(M_REQUESTS_TOTAL) && l.contains("status=\"404\""))
+            .expect("404 series must render distinctly");
+        assert!(counter_b.ends_with(" 1"), "got: {counter_b}");
+        assert!(counter_b.contains("model=\"other-model\""));
+
+        // Duration summary: carries provider/model/status, never outcome,
+        // and counts per (model, status) series independently.
+        let dur_count_a = rendered
+            .lines()
+            .find(|l| {
+                l.starts_with(&format!("{M_REQUEST_DURATION}_count"))
+                    && l.contains("model=\"my-gpt4\"")
+            })
+            .expect("duration count for my-gpt4 must render");
+        assert!(dur_count_a.ends_with(" 2") && dur_count_a.contains("status=\"200\""));
+        let dur_count_b = rendered
+            .lines()
+            .find(|l| {
+                l.starts_with(&format!("{M_REQUEST_DURATION}_count"))
+                    && l.contains("model=\"other-model\"")
+            })
+            .expect("duration count for other-model must render");
+        assert!(dur_count_b.ends_with(" 1") && dur_count_b.contains("status=\"404\""));
+        for line in rendered.lines() {
+            if line.starts_with(M_REQUEST_DURATION) {
+                assert!(
+                    !line.contains("outcome="),
+                    "outcome must stay off durations: {line}"
+                );
+            }
+        }
     }
 
     #[test]
