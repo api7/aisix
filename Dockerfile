@@ -71,6 +71,11 @@ COPY schemas ./schemas
 # `--locked` forces the build to use the exact versions in Cargo.lock —
 # fails fast if the lockfile is stale rather than silently resolving
 # fresh deps in CI.
+#
+# If this ever builds for linux/arm64: jemalloc bakes the build host's
+# page size into the binary, and QEMU reports 4K — set
+# JEMALLOC_SYS_WITH_LG_PAGE=16 here or the image aborts at startup on
+# 64K-page kernels (see crates/aisix-server/src/main.rs).
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     cargo build --locked --release --bin aisix \

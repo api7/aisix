@@ -219,6 +219,11 @@ jobs:
           ls -l /tmp/aisix-shipped
           test "$(nm /tmp/aisix-shipped | grep -c ' [tT] ')" -gt 1000
           readelf -S /tmp/aisix-shipped | grep -E '\.symtab|\.eh_frame'
+          # jemalloc must actually be linked (prefixed _rjem_ symbols):
+          # if the cfg gates in aisix-server drift, the binary silently
+          # falls back to glibc malloc with no other signal.
+          nm /tmp/aisix-shipped | grep -q ' [tT] _rjem_' \
+            || { echo "::error::jemalloc symbols missing from shipped binary"; exit 1; }
 
       - name: Install cosign
         if: github.event_name != 'pull_request'

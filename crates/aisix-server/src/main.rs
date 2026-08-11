@@ -16,6 +16,18 @@ use std::error::Error as StdError;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+// jemalloc as the global allocator on the shipped/benched targets
+// (Linux glibc): under the thread-per-core saturation load, allocator
+// time drops from ~15% of request CPU (glibc malloc) to ~6%. Other
+// targets keep the system allocator. One deploy caveat: jemalloc bakes
+// the build host's page size into the binary, so an aarch64 binary
+// built on a 4K-page host aborts at startup on a 64K-page kernel —
+// cross-building for such kernels needs JEMALLOC_SYS_WITH_LG_PAGE=16,
+// which runs on both page sizes.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 mod cert_bundle;
 mod export;
 mod heartbeat;

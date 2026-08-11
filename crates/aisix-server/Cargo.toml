@@ -56,6 +56,13 @@ socket2 = { version = "0.5", features = ["all"] }
 # axum-server itself depends on, so the builder types unify.
 hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
 
+# jemalloc as the global allocator, only on the targets we ship and
+# bench (Linux glibc — the Docker image and both supported production
+# arches). Other targets (macOS dev builds, musl) keep the system
+# allocator rather than carry an allocator we never run in production.
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+tikv-jemallocator = "0.6"
+
 [dev-dependencies]
 tempfile = "3"
 wiremock = "0.6"

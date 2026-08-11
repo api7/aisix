@@ -189,7 +189,10 @@ tempfile = "3.13"
 #   CARGO_PROFILE_RELEASE_STRIP=none cargo build --release
 # See issue #847.
 [profile.release]
-lto = "thin"
+# Fat LTO over thin: cross-crate inlining across the whole graph is a
+# measured per-request win on the saturation grid, paid for once per
+# release build in link time. Numbers in the PR that flipped it.
+lto = "fat"
 codegen-units = 1
 strip = "debuginfo"
 
