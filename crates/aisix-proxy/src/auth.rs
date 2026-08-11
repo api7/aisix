@@ -339,7 +339,11 @@ mod tests {
             let probe_captured = !probe_buf.lock().unwrap().is_empty();
             eprintln!(
                 "capture_logs: probe after empty capture {} — {}",
-                if probe_captured { "captured" } else { "ALSO EMPTY" },
+                if probe_captured {
+                    "captured"
+                } else {
+                    "ALSO EMPTY"
+                },
                 if probe_captured {
                     "transient race during f()"
                 } else {
