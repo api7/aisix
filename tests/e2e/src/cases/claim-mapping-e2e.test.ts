@@ -29,7 +29,9 @@ import {
 //      (dotted) path.
 //   4. The direct `(jwt_provider, jwt_subject)` key binding stays
 //      authoritative: a subject with a bound key never falls through to
-//      the rules, even when its claims match one.
+//      the rules, even when its claims match one — including a DISABLED
+//      binding (rules cannot re-enable a pinned identity) and an
+//      AMBIGUOUS one (two keys claiming the binding fail closed).
 //   5. A token matching no rule is rejected (`jwt_identity_unmapped`) —
 //      never an anonymous or default pass.
 //   6. A rule resolving to a nonexistent key rejects; a rule resolving
@@ -207,6 +209,27 @@ describe("claim mapping e2e: verified claims resolve to an existing api key", ()
       jwt_subject: "agent-bound",
       jwt_provider: "mock-idp",
     });
+    // agent-bound-off is bound to a DISABLED key: the binding must stay
+    // authoritative (401 api_key_disabled), never fall through to a
+    // matching rule — a mapping cannot re-enable a pinned identity.
+    await seed.createApiKey({
+      key_hash: createHash("sha256").update("sk-cm-bound-off").digest("hex"),
+      allowed_models: ["*"],
+      jwt_subject: "agent-bound-off",
+      jwt_provider: "mock-idp",
+      disabled: true,
+    });
+    // agent-dup is bound TWICE (a CP-invariant violation the etcd path
+    // cannot rule out): the identity is ambiguous and must be rejected,
+    // never resolved through the rules.
+    for (const plaintext of ["sk-cm-dup-a", "sk-cm-dup-b"]) {
+      await seed.createApiKey({
+        key_hash: createHash("sha256").update(plaintext).digest("hex"),
+        allowed_models: ["*"],
+        jwt_subject: "agent-dup",
+        jwt_provider: "mock-idp",
+      });
+    }
 
     // department=finance → the finance policy key.
     await seed.createClaimMapping({
@@ -258,10 +281,22 @@ describe("claim mapping e2e: verified claims resolve to an existing api key", ()
       resolve: { api_key_id: frozenKey.id },
     });
 
+    // Probe the LAST-written rule (`frozen-dept`, distinguishable by
+    // its error code flipping from jwt_identity_unmapped to
+    // api_key_disabled): watch events apply in revision order, so the
+    // final seed being live implies every earlier one is too. Probing
+    // the first rule would leave a window where later rules haven't
+    // landed yet.
     await waitConfigPropagation(async () => {
-      const res = await chat(app!, idp!.sign(financeClaims()));
-      await res.text();
-      return res.status === 200;
+      const res = await chat(
+        app!,
+        idp!.sign(financeClaims({ department: "frozen" })),
+      );
+      if (res.status !== 401) {
+        await res.text();
+        return false;
+      }
+      return (await errorCode(res)) === "api_key_disabled";
     });
   });
 
@@ -335,6 +370,32 @@ describe("claim mapping e2e: verified claims resolve to an existing api key", ()
     );
     expect(viaBinding.status).toBe(200);
     await viaBinding.text();
+  });
+
+  test("a disabled direct binding is not re-enabled by a matching rule", async (ctx) => {
+    if (!requireSetup(ctx)) return;
+    // agent-bound-off's claims match finance-dept, but its disabled
+    // binding stays authoritative.
+    const res = await chat(
+      app!,
+      idp!.sign(financeClaims({ sub: "agent-bound-off" })),
+    );
+    expect(res.status).toBe(401);
+    expect(await errorCode(res)).toBe("api_key_disabled");
+  });
+
+  test("an ambiguous direct binding fails closed, not through the rules", async (ctx) => {
+    if (!requireSetup(ctx)) return;
+    // agent-dup is bound to two keys; its claims match finance-dept —
+    // the request must still be rejected.
+    const res = await chat(app!, idp!.sign(financeClaims({ sub: "agent-dup" })));
+    expect(res.status).toBe(401);
+    expect(await errorCode(res)).toBe("jwt_identity_unmapped");
+
+    const metrics = await fetch(`${app!.metricsUrl}/metrics`).then((r) =>
+      r.text(),
+    );
+    expect(metrics).toContain('reason="jwt_binding_ambiguous"');
   });
 
   test("claims matching no rule are rejected, never defaulted", async (ctx) => {

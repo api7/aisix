@@ -152,19 +152,21 @@ fn provider_for_issuer(
     found
 }
 
-/// The API key bound to `subject` **as asserted by `provider_name`**. A
-/// key whose `jwt_provider` names a different trust provider is never a
-/// candidate: subjects are namespaced by the provider that vouched for
-/// them, so a second trusted provider cannot mint a token impersonating
-/// the first provider's identity of the same name. Fails closed on
-/// ambiguity for the same reason as [`provider_for_issuer`] — the CP
-/// enforces `(jwt_provider, jwt_subject)` uniqueness and the file loader
-/// rejects duplicates, so this only guards a transient race.
+/// The API key bound to `subject` **as asserted by `provider_name`**,
+/// plus whether the binding was ambiguous. A key whose `jwt_provider`
+/// names a different trust provider is never a candidate: subjects are
+/// namespaced by the provider that vouched for them, so a second
+/// trusted provider cannot mint a token impersonating the first
+/// provider's identity of the same name. Ambiguity (two keys sharing
+/// one binding) is surfaced to the caller so it can fail closed rather
+/// than fall through to the claim mappings — the CP enforces
+/// `(jwt_provider, jwt_subject)` uniqueness and the file loader rejects
+/// duplicates, so this only guards a transient race.
 fn key_for_subject(
     snapshot: &AisixSnapshot,
     provider_name: &str,
     subject: &str,
-) -> Option<Arc<ResourceEntry<ApiKey>>> {
+) -> (Option<Arc<ResourceEntry<ApiKey>>>, bool) {
     let (found, ambiguous) = snapshot.apikeys.find_unique_by(|e| {
         e.value.jwt_subject.as_deref() == Some(subject)
             && e.value.jwt_provider.as_deref() == Some(provider_name)
@@ -177,14 +179,15 @@ fn key_for_subject(
              is ambiguous and neither key's limits can be applied",
         );
     }
-    found
+    (found, ambiguous)
 }
 
 /// The highest-priority enabled claim mapping for `provider_name` whose
 /// conditions all hold against the verified claims. Candidates are
-/// ordered by `priority` (ascending) with `name` as the tie-break, so
-/// evaluation is deterministic across replicas and across snapshot
-/// updates — the same token always resolves the same mapping.
+/// ordered by `(priority, name, id)` — a total order, so evaluation is
+/// deterministic across replicas and across snapshot updates even if a
+/// control-plane bug ever produced duplicate names — and the same token
+/// always resolves the same mapping.
 fn matching_claim_mapping(
     snapshot: &AisixSnapshot,
     provider_name: &str,
@@ -197,7 +200,11 @@ fn matching_claim_mapping(
         .filter(|e| e.value.enabled && e.value.jwt_provider == provider_name)
         .collect();
     candidates.sort_by(|a, b| {
-        (a.value.priority, a.value.name.as_str()).cmp(&(b.value.priority, b.value.name.as_str()))
+        (a.value.priority, a.value.name.as_str(), a.id.as_str()).cmp(&(
+            b.value.priority,
+            b.value.name.as_str(),
+            b.id.as_str(),
+        ))
     });
     candidates
         .into_iter()
@@ -363,8 +370,28 @@ pub(crate) async fn authenticate_jwt(
     // authoritative for its subject — including its disabled/expired
     // lifecycle. Claim mappings only admit identities no key binds
     // explicitly, so adding a mapping can never reroute (or re-enable)
-    // an identity an operator pinned to a specific key.
-    let (entry, claim_mapping) = match key_for_subject(snapshot, &prov.name, subject) {
+    // an identity an operator pinned to a specific key. An AMBIGUOUS
+    // binding fails closed here for the same reason: the subject *is*
+    // bound, just not resolvably, and letting it fall through to the
+    // mappings would hand a mis-provisioned identity whatever a rule
+    // grants.
+    let (bound, ambiguous) = key_for_subject(snapshot, &prov.name, subject);
+    if ambiguous {
+        tracing::warn!(
+            target: "aisix::auth",
+            method = "jwt",
+            reason = "jwt_binding_ambiguous",
+            provider = %clip(&prov.name),
+            issuer = %clip(&iss),
+            subject = ?clip(subject),
+            "rejected inbound JWT: two API keys claim this identity's binding",
+        );
+        state
+            .metrics
+            .record_auth_decision("jwt", false, "jwt_binding_ambiguous");
+        return Err(ProxyError::JwtIdentityUnmapped);
+    }
+    let (entry, claim_mapping) = match bound {
         Some(entry) => (entry, None),
         None => match matching_claim_mapping(snapshot, &prov.name, &claims) {
             Some(mapping) => {
@@ -1367,24 +1394,39 @@ jyxumGxNpoIV8LlzsMsaWQ==
         // the cross-provider impersonation guard (audit H1).
         mk_key("k-5", Some("agent-1"), Some("partner"));
         assert_eq!(
-            key_for_subject(&snapshot, "corp", "agent-1").unwrap().id,
+            key_for_subject(&snapshot, "corp", "agent-1").0.unwrap().id,
             "k-1"
         );
         assert_eq!(
-            key_for_subject(&snapshot, "corp", "agent-2").unwrap().id,
+            key_for_subject(&snapshot, "corp", "agent-2").0.unwrap().id,
             "k-3"
         );
         assert_eq!(
-            key_for_subject(&snapshot, "partner", "agent-1").unwrap().id,
+            key_for_subject(&snapshot, "partner", "agent-1")
+                .0
+                .unwrap()
+                .id,
             "k-5"
         );
-        // No provider match -> no key, even though the subject exists.
-        assert!(key_for_subject(&snapshot, "unknown", "agent-1").is_none());
-        assert!(key_for_subject(&snapshot, "corp", "agent-9").is_none());
+        // No provider match -> no key, even though the subject exists —
+        // and no ambiguity signal either.
+        assert!(matches!(
+            key_for_subject(&snapshot, "unknown", "agent-1"),
+            (None, false)
+        ));
+        assert!(matches!(
+            key_for_subject(&snapshot, "corp", "agent-9"),
+            (None, false)
+        ));
 
-        // A duplicate (provider, subject) pair -> fail closed.
+        // A duplicate (provider, subject) pair -> fail closed, and the
+        // ambiguity is REPORTED so the auth path can reject instead of
+        // falling through to the claim mappings.
         mk_key("k-1-dup", Some("agent-1"), Some("corp"));
-        assert!(key_for_subject(&snapshot, "corp", "agent-1").is_none());
+        assert!(matches!(
+            key_for_subject(&snapshot, "corp", "agent-1"),
+            (None, true)
+        ));
     }
 
     #[test]

@@ -1430,6 +1430,14 @@ mod tests {
             "issuer": "https://idp.example.com/realms/agents",
             "audiences": ["aisix-gateway"]
         }"#;
+        // A claim mapping created mid-run (AISIX-Cloud#564) — same
+        // guard: a rule added via watch must be live without a resync.
+        const VALID_CLAIM_MAPPING: &[u8] = br#"{
+            "name": "watch-rule",
+            "jwt_provider": "watch-idp",
+            "match": [{"claim": "department", "op": "exact", "values": ["finance"]}],
+            "resolve": {"api_key_id": "ak-1"}
+        }"#;
 
         let provider = Arc::new(FakeProvider::new(vec![], 0));
         let sup = Supervisor::new(provider, "/aisix");
@@ -1458,6 +1466,11 @@ mod tests {
                 VALID_OIDC_PROVIDER,
                 "OidcProvider",
             ),
+            (
+                "/aisix/claim_mappings/cm-1",
+                VALID_CLAIM_MAPPING,
+                "ClaimMapping",
+            ),
         ] {
             assert!(
                 sup.apply_put(&entry(key, body, 2)),
@@ -1480,6 +1493,7 @@ mod tests {
             "ObservabilityExporter not merged"
         );
         assert_eq!(snap.oidc_providers.len(), 1, "OidcProvider not merged");
+        assert_eq!(snap.claim_mappings.len(), 1, "ClaimMapping not merged");
     }
 
     #[tokio::test]
@@ -1506,6 +1520,13 @@ mod tests {
                     br#"{"name":"idp","issuer":"https://idp.example.com","audiences":["aisix"]}"#,
                     1,
                 ),
+                // AISIX-Cloud#564: deleting a claim mapping must reach
+                // the snapshot, or revoking a rule never takes effect.
+                entry(
+                    "/aisix/claim_mappings/cm-1",
+                    br#"{"name":"r","jwt_provider":"idp","match":[{"claim":"d","op":"exact","values":["v"]}],"resolve":{"api_key_id":"ak-1"}}"#,
+                    1,
+                ),
             ],
             1,
         ));
@@ -1520,6 +1541,9 @@ mod tests {
         assert!(sup.handle().load().guardrail_attachments.is_empty());
         assert!(sup.apply_delete("/aisix/oidc_providers/op-1"));
         assert!(sup.handle().load().oidc_providers.is_empty());
+        assert_eq!(sup.handle().load().claim_mappings.len(), 1);
+        assert!(sup.apply_delete("/aisix/claim_mappings/cm-1"));
+        assert!(sup.handle().load().claim_mappings.is_empty());
     }
 
     #[tokio::test]
