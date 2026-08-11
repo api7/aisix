@@ -54,6 +54,13 @@ export interface A2aUpstreamOptions {
   token?: string;
   /** Wire shape of the results this agent returns. Defaults to `0.3`. */
   wireShape?: A2aWireShape;
+  /**
+   * Stream an actual answer: [`STREAM_ANSWER`] as two continued artifact
+   * chunks with a progress note between them and a closing statement — the
+   * shape a reference agent produces. Off by default, because it changes the
+   * event sequence the streaming-relay suite counts.
+   */
+  streamAnswer?: boolean;
 }
 
 const PATH_PREFIX = "/v3/agents/serve/tenant-42";
@@ -67,6 +74,16 @@ const PATH_PREFIX = "/v3/agents/serve/tenant-42";
  * signal; this makes the signal an order larger instead.
  */
 const STREAM_GAP_MS = 120;
+
+/**
+ * The two halves of the streamed answer under `streamAnswer`, delivered as one
+ * artifact continued across two chunks. Exported so a test can assert the whole
+ * of it survived the progress note and the terminal statement around it.
+ */
+export const STREAM_ANSWER = [
+  "The invoice totals four hundred and twenty euros",
+  ", payable within thirty days of receipt.",
+] as const;
 
 /** JSON-RPC methods this stub answers with an SSE stream, in both spellings. */
 const STREAMING_METHODS = new Set([
@@ -103,6 +120,7 @@ export async function startA2aUpstream(
       cardPath,
       token: options.token,
       wireShape: options.wireShape ?? "0.3",
+      streamAnswer: options.streamAnswer ?? false,
     }).catch((err: unknown) => {
       // `handle` rejects on a malformed body, and on a write to an already
       // closed socket. Unhandled, that terminates the test process; worse, the
@@ -138,6 +156,7 @@ async function handle(
     cardPath: string;
     token?: string;
     wireShape: A2aWireShape;
+    streamAnswer: boolean;
   },
 ): Promise<void> {
   const path = new URL(req.url ?? "/", "http://127.0.0.1").pathname;
@@ -180,13 +199,16 @@ async function handle(
    * flat under `result` with a `kind` tag on 0.3, inside the response's
    * payload wrapper on 1.0.
    */
+  const V1_PAYLOAD_KEY = {
+    task: "task",
+    "status-update": "statusUpdate",
+    "artifact-update": "artifactUpdate",
+  } as const;
   const payload = (
-    kind: "task" | "status-update",
+    kind: keyof typeof V1_PAYLOAD_KEY,
     obj: Record<string, unknown>,
   ): Record<string, unknown> =>
-    ctx.wireShape === "1.0"
-      ? { [kind === "task" ? "task" : "statusUpdate"]: obj }
-      : { kind, ...obj };
+    ctx.wireShape === "1.0" ? { [V1_PAYLOAD_KEY[kind]]: obj } : { kind, ...obj };
 
   if (ctx.token !== undefined && header("authorization") !== `Bearer ${ctx.token}`) {
     send(401, { error: "unauthorized" });
@@ -250,13 +272,59 @@ async function handle(
     res.write(
       envelope(payload("status-update", { taskId: "task-e2e-stream", contextId, seq: 2 })),
     );
+    if (ctx.streamAnswer) {
+      // The answer in two continued chunks with a progress note between them:
+      // an accumulator that lets a note replace the answer keeps only the note.
+      res.write(
+        envelope(
+          payload("artifact-update", {
+            taskId: "task-e2e-stream",
+            contextId,
+            artifact: {
+              artifactId: "report",
+              parts: [{ kind: "text", text: STREAM_ANSWER[0] }],
+            },
+          }),
+        ),
+      );
+      res.write(
+        envelope(
+          payload("status-update", {
+            taskId: "task-e2e-stream",
+            contextId,
+            status: {
+              state: "working",
+              message: { role: "agent", parts: [{ kind: "text", text: "halfway" }] },
+            },
+          }),
+        ),
+      );
+      res.write(
+        envelope(
+          payload("artifact-update", {
+            taskId: "task-e2e-stream",
+            contextId,
+            append: true,
+            artifact: {
+              artifactId: "report",
+              parts: [{ kind: "text", text: STREAM_ANSWER[1] }],
+            },
+          }),
+        ),
+      );
+    }
     await new Promise((resolve) => setTimeout(resolve, STREAM_GAP_MS));
     res.write(
       envelope(
         payload("task", {
           id: "task-e2e-stream",
           contextId,
-          status: { state: "completed" },
+          status: ctx.streamAnswer
+            ? {
+                state: "completed",
+                message: { role: "agent", parts: [{ kind: "text", text: "Report generated." }] },
+              }
+            : { state: "completed" },
           seq: 3,
         }),
       ),
@@ -272,7 +340,10 @@ async function handle(
       result: payload("task", {
         id: "task-e2e-1",
         contextId,
-        status: { state: "completed" },
+        status: {
+          state: "completed",
+          message: { role: "agent", parts: [{ kind: "text", text: "The invoice is settled." }] },
+        },
         // Echoed so the gateway's forwarding can be asserted from the caller
         // side as well as from `requests`.
         sawVersion: header("a2a-version"),
