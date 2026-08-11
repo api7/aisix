@@ -817,6 +817,9 @@ fn emit_access_log(
         completion_tokens: None,
         total_tokens: None,
         request_id,
+        // The tunnel forwards the body verbatim and never parses it, so
+        // there is no response object to read an id from (AISIX-Cloud#1289).
+        provider_request_id: None,
         served_by_model: None,
         routing_attempt_count: None,
         routing_fallback_count: None,

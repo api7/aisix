@@ -504,6 +504,48 @@ pub struct UsageSink {
     metrics: Option<crate::metrics::Metrics>,
 }
 
+/// Log one line per provider call that came back with a response id
+/// (AISIX-Cloud#1289), so `provider_request_id` is greppable in the plain
+/// application log and not only in telemetry.
+///
+/// This lives on the usage-sink path on purpose: per #655 **every** upstream
+/// attempt — the winner, an abandoned mid-stream fallover, a retried target —
+/// becomes its own `UsageEvent`, and every handler funnels those through
+/// [`UsageSink::try_emit`]. That makes this the single point that sees each
+/// attempt's id, so no handler can be added later that records an id in
+/// telemetry while staying silent in the log. It also covers the two cases the
+/// one-line-per-request access log structurally cannot: a **streamed**
+/// response (the id arrives in the first frame, after the access-log line is
+/// written) and a **mid-stream failover** (two provider calls, two ids, one
+/// access-log line).
+///
+/// `request_id` + `attempt_index` identify the individual call; the line is
+/// skipped entirely when there is no id (guardrail block, pre-dispatch error,
+/// cache hit, a failed attempt that never got a response body, and the
+/// endpoints whose provider response carries no id).
+fn log_provider_call(handler: &'static str, event: &UsageEvent) {
+    if event.provider_request_id.is_empty() {
+        return;
+    }
+    // Field rendering matches `AccessLog::emit` (plain `&str`, so the fmt
+    // layer quotes it) — an operator greps the two lines the same way.
+    tracing::info!(
+        request_id = event.request_id.as_str(),
+        provider_request_id = event.provider_request_id.as_str(),
+        attempt_index = event.attempt_index,
+        attempt_kind = if event.attempt_kind.is_empty() {
+            "initial"
+        } else {
+            event.attempt_kind.as_str()
+        },
+        handler,
+        status = event.status_code,
+        requested_model = event.requested_model.as_str(),
+        provider_model_version = event.provider_model_version.as_str(),
+        "provider call completed",
+    );
+}
+
 impl UsageSink {
     /// Build a real sink backed by an mpsc::Sender. The receiving end
     /// is owned by the worker spawned in aisix-server. No prometheus
@@ -548,6 +590,7 @@ impl UsageSink {
     /// `"embeddings"`, `"messages"`, `"responses"`, etc. Keep it
     /// `&'static str` so cardinality stays bounded.
     pub fn try_emit(&self, handler: &'static str, event: UsageEvent) {
+        log_provider_call(handler, &event);
         // Normalise inbound_protocol to a fixed `&'static str` set at
         // the boundary (audit MEDIUM-3). This both kills the heap
         // alloc per call AND pins prometheus cardinality at the type
@@ -606,6 +649,116 @@ mod tests {
         // row also fine.
         sink.try_emit("test", sample_event("req-1"));
         sink.try_emit("test", sample_event("req-2"));
+    }
+
+    /// Keep every callsite emittable for the whole test binary.
+    ///
+    /// A callsite's `Interest` is cached process-wide the first time it is
+    /// hit, from whichever dispatcher the hitting thread has; with no global
+    /// default that is `NoSubscriber`, and a sibling test reaching
+    /// `log_provider_call` on another thread would cache `Interest::never()`,
+    /// leaving the capture below empty. A permissive global default removes
+    /// the outcome (api7/aisix#909).
+    fn keep_callsites_enabled() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry());
+        });
+    }
+
+    /// Run `emit` with a capturing subscriber installed; return what it wrote.
+    fn capture_logs(emit: impl FnOnce()) -> String {
+        #[derive(Clone)]
+        struct BufWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for BufWriter {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl tracing_subscriber::fmt::MakeWriter<'_> for BufWriter {
+            type Writer = BufWriter;
+            fn make_writer(&self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        keep_callsites_enabled();
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(BufWriter(buf.clone()))
+            .finish();
+        {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            emit();
+        }
+        let bytes = buf.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    /// AISIX-Cloud#1289: a provider call that came back with a response id
+    /// must be greppable in the plain application log, keyed by the gateway
+    /// `request_id` + `attempt_index` so a retried/failed-over request can be
+    /// walked call by call. Emitting from `try_emit` is what makes this hold
+    /// for a *streamed* response too — its id only exists long after the
+    /// one-line-per-request access log was written.
+    #[test]
+    fn try_emit_logs_the_provider_call_with_its_ids() {
+        let mut ev = sample_event("req-1289");
+        ev.provider_request_id = "chatcmpl-abc".into();
+        ev.provider_model_version = "gpt-4o-2024-08-06".into();
+        ev.attempt_index = 2;
+        ev.attempt_kind = "fallback".into();
+        ev.status_code = 200;
+
+        let out = capture_logs(|| UsageSink::disabled().try_emit("chat", ev));
+
+        assert!(out.contains("provider call completed"), "{out}");
+        assert!(
+            out.contains("provider_request_id=\"chatcmpl-abc\"")
+                || out.contains("provider_request_id=chatcmpl-abc"),
+            "{out}"
+        );
+        // The two ids coexist — neither may overwrite the other.
+        assert!(
+            out.contains("request_id=\"req-1289\"") || out.contains("request_id=req-1289"),
+            "{out}"
+        );
+        assert!(out.contains("attempt_index=2"), "{out}");
+        assert!(
+            out.contains("attempt_kind=\"fallback\"") || out.contains("attempt_kind=fallback"),
+            "{out}"
+        );
+    }
+
+    /// The line is skipped entirely when the call produced no provider id
+    /// (guardrail block, pre-dispatch error, cache hit, an attempt that never
+    /// got a response body) — a `provider_request_id=""` on every request
+    /// would defeat filtering on the field, and inventing a value would be
+    /// worse still.
+    #[test]
+    fn try_emit_is_silent_when_there_is_no_provider_id() {
+        let out = capture_logs(|| UsageSink::disabled().try_emit("chat", sample_event("req-none")));
+        assert!(!out.contains("provider call completed"), "{out}");
+    }
+
+    /// An event that predates `attempt_kind` (or a single-shot endpoint that
+    /// never sets it) must still read as a real attempt rather than an empty
+    /// string — the wire default is `initial`.
+    #[test]
+    fn provider_call_log_defaults_a_blank_attempt_kind() {
+        let mut ev = sample_event("req-blank");
+        ev.provider_request_id = "cmpl-1".into();
+        let out = capture_logs(|| UsageSink::disabled().try_emit("completions", ev));
+        assert!(
+            out.contains("attempt_kind=\"initial\"") || out.contains("attempt_kind=initial"),
+            "{out}"
+        );
     }
 
     #[tokio::test]

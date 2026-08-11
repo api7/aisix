@@ -178,6 +178,11 @@ pub async fn chat_completions(
                 success.completion_tokens,
                 success.total_tokens,
                 &request_id,
+                // Empty on the streaming path — the id rides the first
+                // upstream frame, which has not arrived yet. That case is
+                // covered by the per-attempt `provider call completed` line
+                // the usage sink emits (AISIX-Cloud#1289).
+                Some(success.provider_request_id.as_str()),
                 &success.routing,
                 None,
             );
@@ -418,6 +423,7 @@ pub async fn chat_completions(
                 al_completion,
                 al_total,
                 &request_id,
+                None,
                 &routing,
                 Some(&err),
             );
@@ -4386,6 +4392,9 @@ fn emit_access_log(
     completion_tokens: Option<u64>,
     total_tokens: Option<u64>,
     request_id: &str,
+    // Winning attempt's provider response id; empty when unknown at this
+    // point (streaming, cache hit, guardrail block, pre-dispatch error).
+    provider_request_id: Option<&str>,
     routing: &RoutingTelemetry,
     error: Option<&ProxyError>,
 ) {
@@ -4412,6 +4421,7 @@ fn emit_access_log(
         completion_tokens,
         total_tokens,
         request_id,
+        provider_request_id: provider_request_id.filter(|s| !s.is_empty()),
         served_by_model: served_by.filter(|s| !s.is_empty()),
         routing_attempt_count: match routing.attempt_count() {
             0 => None,

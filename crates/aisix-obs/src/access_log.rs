@@ -20,6 +20,22 @@ pub struct AccessLog<'a> {
     pub completion_tokens: Option<u64>,
     pub total_tokens: Option<u64>,
     pub request_id: &'a str,
+    /// Provider response object `id` of the attempt that served the request
+    /// — OpenAI's `chat.completion.id`, Anthropic's message `id`,
+    /// `/v1/responses`' `resp_…`. Distinct from `request_id` (this
+    /// gateway's own id) and from the provider's HTTP transport header id;
+    /// none of the three may overwrite another (AISIX-Cloud#1289).
+    ///
+    /// `None` whenever no id exists by the time this line is written:
+    /// the request never reached an upstream (guardrail block,
+    /// pre-dispatch error), it was served from cache, the endpoint's
+    /// provider response carries no id at all (embeddings / audio /
+    /// images / count_tokens), or the response is **streamed** — there the
+    /// id arrives in the first frame, after this line. Streamed and
+    /// mid-stream-failed-over calls are covered instead by the per-attempt
+    /// `provider call completed` line (see `UsageSink::try_emit`), which
+    /// shares this `request_id`.
+    pub provider_request_id: Option<&'a str>,
     /// Routing target that ultimately served the request (the winning
     /// attempt's display name). `None` for direct models / cache hits.
     pub served_by_model: Option<&'a str>,
@@ -58,6 +74,7 @@ impl AccessLog<'_> {
             completion_tokens = self.completion_tokens,
             total_tokens = self.total_tokens,
             request_id = self.request_id,
+            provider_request_id = self.provider_request_id,
             served_by_model = self.served_by_model,
             routing_attempt_count = self.routing_attempt_count,
             routing_fallback_count = self.routing_fallback_count,
@@ -124,6 +141,7 @@ mod tests {
                 completion_tokens: Some(1),
                 total_tokens: Some(3),
                 request_id: "req-abc",
+                provider_request_id: Some("chatcmpl-abc"),
                 served_by_model: Some("fallback-target"),
                 routing_attempt_count: Some(2),
                 routing_fallback_count: Some(1),
@@ -141,6 +159,13 @@ mod tests {
         assert!(out.contains("provider=\"openai\"") || out.contains("provider=openai"));
         assert!(out.contains("total_tokens=3"));
         assert!(out.contains("request_id=\"req-abc\"") || out.contains("request_id=req-abc"));
+        // AISIX-Cloud#1289: the provider's own response id, next to — never
+        // instead of — the gateway's `request_id`.
+        assert!(
+            out.contains("provider_request_id=\"chatcmpl-abc\"")
+                || out.contains("provider_request_id=chatcmpl-abc"),
+            "{out}"
+        );
         assert!(
             out.contains("served_by_model=\"fallback-target\"")
                 || out.contains("served_by_model=fallback-target")
@@ -178,6 +203,7 @@ mod tests {
                 completion_tokens: None,
                 total_tokens: None,
                 request_id: "req-fail",
+                provider_request_id: None,
                 served_by_model: None,
                 routing_attempt_count: Some(1),
                 routing_fallback_count: None,
@@ -189,6 +215,10 @@ mod tests {
 
         let out = writer.contents();
         assert!(out.contains("status=504"));
+        // A call that never got a provider response must not carry an empty
+        // `provider_request_id=""` — an always-present field defeats
+        // filtering on it, same rule as `error_kind` above.
+        assert!(!out.contains("provider_request_id"), "{out}");
         assert!(
             out.contains("error_kind=\"timeout\"") || out.contains("error_kind=timeout"),
             "{out}"
@@ -222,6 +252,7 @@ mod tests {
                 completion_tokens: None,
                 total_tokens: None,
                 request_id: "req-xyz",
+                provider_request_id: None,
                 served_by_model: None,
                 routing_attempt_count: None,
                 routing_fallback_count: None,

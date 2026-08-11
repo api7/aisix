@@ -38,6 +38,9 @@ struct RerankDispatchSuccess {
     /// Provider-side model name, for the `upstream_model` metric label
     /// (AISIX-Cloud#1234 parity with chat / messages / responses).
     upstream_model: String,
+    /// Rerank response object `id` (Cohere sends one; Jina-style upstreams
+    /// do not). Empty when the upstream omitted it (AISIX-Cloud#1289).
+    provider_request_id: String,
     /// The `{kind, hook}` set of guardrails that governed this request (#379
     /// parity) — surfaced on the emitted UsageEvent.
     applied_guardrails: Vec<AppliedGuardrail>,
@@ -116,6 +119,7 @@ pub async fn rerank(
                 status,
                 elapsed,
                 &request_id,
+                Some(success.provider_request_id.as_str()),
                 None,
             );
             crate::request_metrics::record(
@@ -152,6 +156,7 @@ pub async fn rerank(
                     status,
                     elapsed,
                     &usage,
+                    &success.provider_request_id,
                     &client,
                     success.redactions.clone(),
                     success.monitor_hits.clone(),
@@ -170,6 +175,7 @@ pub async fn rerank(
                 status,
                 elapsed,
                 &request_id,
+                None,
                 Some(&err),
             );
             let snap = state.snapshot.load();
@@ -505,8 +511,11 @@ async fn dispatch(
     // upstream returned 200 + claimed JSON but the body was
     // unparseable — this is upstream-malformed, not gateway-bug,
     // but operators need to see it).
-    let usage = match serde_json::from_slice::<Value>(&body_bytes) {
-        Ok(v) => extract_rerank_usage(&v),
+    let (usage, provider_request_id) = match serde_json::from_slice::<Value>(&body_bytes) {
+        Ok(v) => (
+            extract_rerank_usage(&v),
+            crate::usage_attr::provider_response_id(&v),
+        ),
         Err(e) => {
             tracing::warn!(
                 request_id = %request_id,
@@ -514,7 +523,7 @@ async fn dispatch(
                 error = %e,
                 "rerank: upstream body parse failed; skipping UsageEvent emission"
             );
-            None
+            (None, String::new())
         }
     };
 
@@ -560,6 +569,7 @@ async fn dispatch(
         upstream_model,
         applied_guardrails: applied_guardrails.clone(),
         usage,
+        provider_request_id,
         redactions,
         monitor_hits,
         captured_content,
@@ -627,6 +637,7 @@ fn emit_usage_event(
     status_code: u16,
     elapsed: Duration,
     usage: &RerankUsage,
+    provider_request_id: &str,
     client: &ClientContext,
     // Per-detector PII mask counts (#932/#696). Empty = no redaction.
     redacted_entity_counts: crate::redact::RedactionCounts,
@@ -649,6 +660,7 @@ fn emit_usage_event(
         upstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
         downstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
         status_code,
+        provider_request_id: provider_request_id.to_string(),
         inbound_protocol: "openai".to_string(),
         applied_guardrails: applied_guardrails.to_vec(),
         client_source_ip: client.source_ip.clone(),
@@ -715,6 +727,7 @@ fn default_base_for_provider(provider: &str) -> Option<String> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_access_log(
     model: &str,
     provider: &str,
@@ -722,6 +735,8 @@ fn emit_access_log(
     status: u16,
     elapsed: Duration,
     request_id: &str,
+    // Provider response id; `None`/empty when the call produced none.
+    provider_request_id: Option<&str>,
     error: Option<&ProxyError>,
 ) {
     let (error_kind, error) = match error {
@@ -743,6 +758,7 @@ fn emit_access_log(
         completion_tokens: None,
         total_tokens: None,
         request_id,
+        provider_request_id: provider_request_id.filter(|s| !s.is_empty()),
         served_by_model: None,
         routing_attempt_count: None,
         routing_fallback_count: None,
@@ -1303,6 +1319,56 @@ mod tests {
 
         assert_eq!(resp.status(), StatusCode::OK);
         upstream.verify().await;
+    }
+
+    /// AISIX-Cloud#1289: a rerank response object carries an `id` (Cohere
+    /// sends one) and it must reach the UsageEvent — the handler recorded
+    /// none before. Fails before the fix (empty), passes after.
+    #[tokio::test]
+    async fn records_the_provider_response_id_1289() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/rerank"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "rerank_1289",
+                "results": [{"index": 0, "relevance_score": 0.9}],
+                "model": "rerank-multilingual-v3.0",
+                "usage": {"prompt_tokens": 12, "total_tokens": 12}
+            })))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(openai_model("rerank-openai"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let state = crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+
+        let resp = tower::ServiceExt::oneshot(
+            crate::build_router(state),
+            make_req(serde_json::json!({
+                "model": "rerank-openai",
+                "query": "q",
+                "documents": ["a", "b"]
+            })),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted")
+            .expect("usage_sink sender dropped");
+        assert_eq!(event.provider_request_id, "rerank_1289");
+        assert_ne!(event.request_id, event.provider_request_id);
     }
 
     /// Issue #405: a successful /v1/rerank call must emit a

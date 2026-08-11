@@ -47,6 +47,10 @@ struct CompletionDispatchSuccess {
     /// Provider-side model name, for the `upstream_model` metric label
     /// (AISIX-Cloud#1234 parity with chat / messages / responses).
     upstream_model: String,
+    /// Legacy-completions response object `id` (`cmpl-…`). Empty on the 501
+    /// NotImplemented path (no upstream call) and when the upstream omitted
+    /// it (AISIX-Cloud#1289).
+    provider_request_id: String,
     /// Upstream-reported token counts. `None` on the 501
     /// NotImplemented path (provider doesn't support completions)
     /// or on a 200 with no `usage` block (rare edge). Handler
@@ -140,6 +144,7 @@ pub async fn completions(
                 status,
                 elapsed,
                 &request_id,
+                Some(success.provider_request_id.as_str()),
                 None,
             );
             crate::request_metrics::record(
@@ -175,6 +180,7 @@ pub async fn completions(
                     status,
                     elapsed,
                     &usage,
+                    &success.provider_request_id,
                     &client,
                     success.guardrail_blocked,
                     success.redactions.clone(),
@@ -194,6 +200,7 @@ pub async fn completions(
                 status,
                 elapsed,
                 &request_id,
+                None,
                 Some(&err),
             );
             let snap = state.snapshot.load();
@@ -399,6 +406,9 @@ async fn dispatch(
             // to each. The 200-without-usage edge previously skipped the
             // event entirely; it now emits an estimated record instead.
             // Telemetry only — the response body forwards untouched.
+            // AISIX-Cloud#1289: read the response object id BEFORE the
+            // redaction pass below rewrites the body.
+            let provider_request_id = crate::usage_attr::provider_response_id(&resp_json);
             let usage = {
                 let mut u = extract_completion_usage(&resp_json).unwrap_or(CompletionUsage {
                     prompt_tokens: 0,
@@ -500,6 +510,7 @@ async fn dispatch(
                         provider_key_id: pk_entry.id.to_string(),
                         upstream_model: model.upstream_model().unwrap_or("unknown").to_string(),
                         usage,
+                        provider_request_id,
                         redactions,
                         monitor_hits,
                         guardrail_blocked: true,
@@ -536,6 +547,7 @@ async fn dispatch(
                 provider_key_id: pk_entry.id.to_string(),
                 upstream_model: model.upstream_model().unwrap_or("unknown").to_string(),
                 usage,
+                provider_request_id,
                 redactions,
                 monitor_hits,
                 guardrail_blocked: false,
@@ -556,6 +568,7 @@ async fn dispatch(
                 // gates emission on `usage.is_some()` so 501 stays
                 // out of /logs noise (same convention as #402).
                 usage: None,
+                provider_request_id: String::new(),
                 redactions,
                 monitor_hits,
                 guardrail_blocked: false,
@@ -665,6 +678,7 @@ fn emit_usage_event(
     status_code: u16,
     elapsed: Duration,
     usage: &CompletionUsage,
+    provider_request_id: &str,
     client: &ClientContext,
     guardrail_blocked: bool,
     // Per-detector PII mask counts (#932). Empty = no redaction.
@@ -690,6 +704,7 @@ fn emit_usage_event(
         upstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
         downstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
         status_code,
+        provider_request_id: provider_request_id.to_string(),
         inbound_protocol: "openai".to_string(),
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),
@@ -727,6 +742,7 @@ fn emit_usage_event(
         },
     );
 }
+#[allow(clippy::too_many_arguments)]
 fn emit_access_log(
     model: &str,
     provider: &str,
@@ -734,6 +750,8 @@ fn emit_access_log(
     status: u16,
     latency: Duration,
     request_id: &str,
+    // Provider response id; `None`/empty when the call produced none.
+    provider_request_id: Option<&str>,
     error: Option<&ProxyError>,
 ) {
     let (error_kind, error) = match error {
@@ -759,6 +777,7 @@ fn emit_access_log(
         completion_tokens: None,
         total_tokens: None,
         request_id,
+        provider_request_id: provider_request_id.filter(|s| !s.is_empty()),
         served_by_model: None,
         routing_attempt_count: None,
         routing_fallback_count: None,
@@ -1105,6 +1124,55 @@ mod tests {
         assert_eq!(event.inbound_protocol, "openai");
         assert!(!event.request_id.is_empty());
         assert!(!event.occurred_at.is_empty());
+    }
+
+    /// AISIX-Cloud#1289: the legacy completions response object carries a
+    /// `cmpl-…` id, and it must reach the UsageEvent — the handler recorded
+    /// none before, so this endpoint's calls had nothing an operator could
+    /// look up in the provider's console. Fails before the fix (empty),
+    /// passes after.
+    #[tokio::test]
+    async fn records_the_provider_response_id_1289() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl_1289",
+                "object": "text_completion",
+                "model": "gpt-3.5-turbo-instruct",
+                "choices": [{"index": 0, "text": "hi", "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}
+            })))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("instruct"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let state = crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+
+        let resp = tower::ServiceExt::oneshot(
+            crate::build_router(state),
+            make_req(serde_json::json!({"model": "instruct", "prompt": "hello"})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted")
+            .expect("usage_sink sender dropped");
+        assert_eq!(event.provider_request_id, "cmpl_1289");
+        assert_ne!(event.request_id, event.provider_request_id);
     }
 
     /// Companion: an upstream 200 with `usage: {}` (malformed —

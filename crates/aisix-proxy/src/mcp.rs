@@ -135,6 +135,7 @@ async fn serve(
         // code is all this endpoint can attribute a failure to.
         error_kind: None,
         error: None,
+        provider_request_id: None,
         served_by_model: None,
         routing_attempt_count: None,
         routing_fallback_count: None,
