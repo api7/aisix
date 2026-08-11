@@ -295,23 +295,65 @@ mod tests {
     /// builder's INFO default.
     async fn capture_logs<F, Fut>(f: F) -> String
     where
-        F: FnOnce() -> Fut,
+        F: Fn() -> Fut,
         Fut: std::future::Future<Output = ()>,
     {
+        /// One capture pass: run `emit` with a fresh buffer-backed scoped
+        /// subscriber installed and return what it wrote.
+        async fn scoped_capture<Fut: std::future::Future<Output = ()>>(
+            emit: impl FnOnce() -> Fut,
+        ) -> String {
+            let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::DEBUG)
+                .with_writer(BufWriter(buf.clone()))
+                .finish();
+            {
+                let _guard = tracing::subscriber::set_default(subscriber);
+                emit().await;
+            }
+            let bytes = buf.lock().unwrap().clone();
+            String::from_utf8(bytes).unwrap()
+        }
+
         keep_callsites_enabled();
         let _capture_guard = CAPTURE_LOCK.lock().await;
-        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let subscriber = tracing_subscriber::fmt()
-            .with_ansi(false)
-            .with_max_level(tracing::Level::DEBUG)
-            .with_writer(BufWriter(buf.clone()))
-            .finish();
-        {
-            let _guard = tracing::subscriber::set_default(subscriber);
-            f().await;
+        let text = scoped_capture(&f).await;
+        if text.is_empty() {
+            // An empty capture has flaked exactly once on main (run
+            // 31137791884, `got: ` with nothing behind it) and did not
+            // reproduce in ~390 stressed suite executions, so it cannot be
+            // studied on demand. Self-diagnose instead, splitting the
+            // mechanism space three ways for the next natural occurrence:
+            // re-run `f` — driving the SAME production callsites — under a
+            // fresh scope, and emit a probe through a fresh callsite. The
+            // rerun capturing means the original callsites work now (the
+            // emptiness was confined to the first scope); only the probe
+            // capturing means those specific callsites stay suppressed
+            // while the machinery works (per-callsite Interest poisoning);
+            // neither capturing means global suppression (max-level hint /
+            // dispatcher state).
+            eprintln!(
+                "capture_logs: EMPTY capture; LevelFilter::current()={:?}",
+                tracing::level_filters::LevelFilter::current(),
+            );
+            let rerun_captured = !scoped_capture(&f).await.is_empty();
+            let probe_captured = !scoped_capture(|| async {
+                tracing::debug!(target: "aisix::auth", probe = true, "capture-probe");
+            })
+            .await
+            .is_empty();
+            let verdict = match (rerun_captured, probe_captured) {
+                (true, _) => "rerun captured — emptiness was confined to the first scope",
+                (false, true) => {
+                    "rerun EMPTY, fresh-callsite probe captured — original callsites suppressed"
+                }
+                (false, false) => "rerun and probe both EMPTY — global suppression",
+            };
+            eprintln!("capture_logs: {verdict}");
         }
-        let bytes = buf.lock().unwrap().clone();
-        String::from_utf8(bytes).unwrap()
+        text
     }
 
     const GOOD_TOKEN: &str = "sk-auth-ctx-good";
