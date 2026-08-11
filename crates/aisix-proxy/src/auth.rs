@@ -311,7 +311,43 @@ mod tests {
             f().await;
         }
         let bytes = buf.lock().unwrap().clone();
-        String::from_utf8(bytes).unwrap()
+        let text = String::from_utf8(bytes).unwrap();
+        if text.is_empty() {
+            // An empty capture has flaked exactly once on main (run
+            // 31137791884, `got: ` with nothing behind it) and did not
+            // reproduce in ~390 stressed suite executions, so it cannot be
+            // studied on demand. Self-diagnose instead: report the global
+            // max-level hint and whether a fresh scoped subscriber can
+            // capture at all, so the next natural occurrence says which
+            // mechanism ate the events (a persistently poisoned
+            // callsite/filter state would also swallow the probe; a
+            // transient race during `f()` would not).
+            eprintln!(
+                "capture_logs: EMPTY capture; LevelFilter::current()={:?}",
+                tracing::level_filters::LevelFilter::current(),
+            );
+            let probe_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let probe_sub = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::DEBUG)
+                .with_writer(BufWriter(probe_buf.clone()))
+                .finish();
+            {
+                let _g = tracing::subscriber::set_default(probe_sub);
+                tracing::debug!(target: "aisix::auth", probe = true, "capture-probe");
+            }
+            let probe_captured = !probe_buf.lock().unwrap().is_empty();
+            eprintln!(
+                "capture_logs: probe after empty capture {} — {}",
+                if probe_captured { "captured" } else { "ALSO EMPTY" },
+                if probe_captured {
+                    "transient race during f()"
+                } else {
+                    "persistent poisoning"
+                },
+            );
+        }
+        text
     }
 
     const GOOD_TOKEN: &str = "sk-auth-ctx-good";
