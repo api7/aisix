@@ -36,7 +36,9 @@ use super::{
 };
 
 /// Cap on a masked error-detail string surfaced to logs / health.
-const DETAIL_MAX_CHARS: usize = 200;
+// Wide enough that a bucket URL (~180 chars for a partitioned object key)
+// leaves room for the error source chain behind it.
+const DETAIL_MAX_CHARS: usize = 500;
 
 /// A delivery target for one object-storage bucket (any provider).
 pub struct ObjectStoreSink {
@@ -559,7 +561,10 @@ fn partition(occurred_at: &str) -> (String, String) {
 /// does not echo secrets in error text.
 fn map_object_store_err(e: object_store::Error) -> SinkError {
     use object_store::Error as E;
-    let detail = truncate(&e.to_string());
+    // The full source chain, not just the outer Display: object_store's
+    // retry error stops at "Error performing PUT <url>" and keeps the
+    // connect/DNS/TLS cause in `source()`.
+    let detail = truncate(&super::error_chain(&e));
     match e {
         E::PermissionDenied { .. }
         | E::Unauthenticated { .. }
@@ -1057,6 +1062,39 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn mapped_detail_carries_the_error_source_chain() {
+        // A Generic transport error's Display stops at the outer layer
+        // ("Error performing PUT <url>"); the connect/DNS cause lives in
+        // `source()`. The nightly real-cloud smoke failed for five weeks
+        // with a detail that never named the cause — the mapped detail
+        // must include the chain.
+        #[derive(Debug)]
+        struct Outer(std::io::Error);
+        impl std::fmt::Display for Outer {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("error performing PUT https://acct.example.net/container/key")
+            }
+        }
+        impl std::error::Error for Outer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+
+        let e = object_store::Error::Generic {
+            store: "MicrosoftAzure",
+            source: Box::new(Outer(std::io::Error::other(
+                "failed to lookup address information: Name or service not known",
+            ))),
+        };
+        let (SinkError::Transient(detail) | SinkError::Permanent(detail)) = map_object_store_err(e);
+        assert!(
+            detail.contains("failed to lookup address information"),
+            "detail must surface the underlying cause, got: {detail}"
+        );
+    }
 }
 
 /// Real-emulator smoke tests — the one-off validation that the sink's real
@@ -1122,7 +1160,7 @@ mod smoke {
 
         sink.append_batch(&batch, &IdempotencyMarker::None)
             .await
-            .expect("real put accepted by the emulator");
+            .expect("real put accepted by the object store");
 
         let keys = list_under(&store, &prefix).await;
         assert_eq!(keys.len(), 1, "exactly one object written");
