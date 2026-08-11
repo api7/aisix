@@ -253,6 +253,11 @@ impl std::ops::DerefMut for ProxyState {
     }
 }
 
+/// Frozen `unix_secs` for unit-test limiters — an arbitrary mid-window
+/// instant; the exact value only shapes reported retry-after seconds.
+#[cfg(test)]
+const TEST_RATE_LIMIT_CLOCK_SECS: u64 = 1_763_000_000;
+
 impl ProxyState {
     pub fn new(snapshot: SnapshotHandle<AisixSnapshot>, hub: Arc<Hub>, cfg: &ProxyConfig) -> Self {
         let metrics = Arc::new(Metrics::new(false));
@@ -269,7 +274,7 @@ impl ProxyState {
         // system-clock arm.
         #[cfg(test)]
         let limiter = Arc::new(Limiter::local_with_clock(aisix_ratelimit::TestClock::new(
-            1_763_000_000,
+            TEST_RATE_LIMIT_CLOCK_SECS,
         )));
         #[cfg(not(test))]
         let limiter = Arc::new(Limiter::new());
