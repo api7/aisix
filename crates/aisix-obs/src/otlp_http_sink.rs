@@ -551,8 +551,13 @@ impl ObservabilitySink for OtlpSink {
                     Err(SinkError::Permanent(detail))
                 }
             }
-            // Connect / DNS / timeout — transient by nature.
-            Err(e) => Err(SinkError::Transient(format!("POST {}: {e}", self.endpoint))),
+            // Connect / DNS / timeout — transient by nature. reqwest's
+            // Display hides the cause in `source()` — chain it.
+            Err(e) => Err(SinkError::Transient(format!(
+                "POST {}: {}",
+                self.endpoint,
+                crate::sink::error_chain(&e)
+            ))),
         }
     }
 

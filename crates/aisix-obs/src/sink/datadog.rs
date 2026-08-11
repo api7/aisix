@@ -153,11 +153,13 @@ impl ObservabilitySink for DatadogSink {
         {
             Ok(resp) => resp,
             // Connect / DNS / timeout — transient by nature. The endpoint URL
-            // carries no secret, so it is safe in the error detail.
+            // carries no secret, so it is safe in the error detail. reqwest's
+            // Display hides the cause in `source()` — chain it.
             Err(e) => {
                 return Err(SinkError::Transient(format!(
-                    "datadog: POST {}: {e}",
-                    self.endpoint_url
+                    "datadog: POST {}: {}",
+                    self.endpoint_url,
+                    super::error_chain(&e)
                 )))
             }
         };
