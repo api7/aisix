@@ -160,11 +160,9 @@ async fn scope_fp_partitions_candidates() {
         )
         .await
         .unwrap();
-    let cross = store
-        .lookup(&policy, 0, "fp-b", &[1.0, 0.0], 0.5)
-        .await
-        .unwrap();
-    assert!(cross.is_none(), "entries must not cross scope fingerprints");
+    // Positive lookup FIRST: it doubles as the index-visibility
+    // barrier, so the cross-partition miss below is a real verdict on
+    // the scope filter — not a vacuous pass on a not-yet-indexed doc.
     lookup_hit(
         &store,
         &policy,
@@ -175,6 +173,11 @@ async fn scope_fp_partitions_candidates() {
         "same-partition entry must hit",
     )
     .await;
+    let cross = store
+        .lookup(&policy, 0, "fp-b", &[1.0, 0.0], 0.5)
+        .await
+        .unwrap();
+    assert!(cross.is_none(), "entries must not cross scope fingerprints");
 }
 
 #[tokio::test]
@@ -236,6 +239,19 @@ async fn generation_rotation_orphans_old_entries() {
         )
         .await
         .unwrap();
+    // Barrier: the generation-0 document is indexed and served before
+    // the cross-generation miss below — otherwise a broken generation
+    // partition could pass vacuously on a not-yet-indexed doc.
+    lookup_hit(
+        &store,
+        &policy,
+        0,
+        "fp",
+        &[1.0, 0.0],
+        0.5,
+        "generation-0 entry must hit before rotation",
+    )
+    .await;
     // Purged: lookups under the new generation must miss even though
     // the old document still physically exists.
     let miss = store
