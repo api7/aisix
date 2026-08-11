@@ -42,7 +42,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        mode: [cov4, fast64]
+        # covws mirrors the real ci.yml unit job (whole-workspace llvm-cov,
+        # multiple test binaries in parallel) at ~10min/iteration, so it gets
+        # a reduced iteration count in the loop below.
+        mode: [cov4, fast64, covws]
         shard: [1, 2, 3]
     steps:
       - uses: actions/checkout@v6
@@ -54,27 +57,33 @@ jobs:
       - uses: ./.github/actions/setup-protoc
       - uses: Swatinem/rust-cache@v2
       - name: install cargo-llvm-cov
-        if: matrix.mode == 'cov4'
+        if: matrix.mode == 'cov4' || matrix.mode == 'covws'
         uses: taiki-e/install-action@cargo-llvm-cov
       - name: stress loop
+        # Actions runs `run:` under `bash -e`: a bare failing command kills
+        # the step before any failure-dump logic executes (learned the hard
+        # way — the first hunt run swallowed its own verdict). Capture rc
+        # with `|| rc=$?` so the dump always runs.
         run: |
           set -uo pipefail
           iters="${{ inputs.iterations || '40' }}"
           filter="${{ inputs.testfilter || '' }}"
+          if [ "${{ matrix.mode }}" = "covws" ] && [ "$iters" -gt 10 ]; then
+            iters=10
+          fi
           for i in $(seq 1 "$iters"); do
             echo "::group::iteration $i"
-            if [ "${{ matrix.mode }}" = "cov4" ]; then
-              cargo llvm-cov --no-report -p aisix-proxy --lib -- $filter >/tmp/out.log 2>&1
-              rc=$?
-            else
-              cargo test -p aisix-proxy --lib -- --test-threads=64 $filter >/tmp/out.log 2>&1
-              rc=$?
-            fi
+            rc=0
+            case "${{ matrix.mode }}" in
+              cov4)   cargo llvm-cov --no-report -p aisix-proxy --lib -- $filter >/tmp/out.log 2>&1 || rc=$? ;;
+              covws)  cargo llvm-cov --no-report --workspace --all-features -- $filter >/tmp/out.log 2>&1 || rc=$? ;;
+              *)      cargo test -p aisix-proxy --lib -- --test-threads=64 $filter >/tmp/out.log 2>&1 || rc=$? ;;
+            esac
             tail -3 /tmp/out.log
             echo "::endgroup::"
             if [ "$rc" -ne 0 ]; then
               echo "FAILED on iteration $i (mode ${{ matrix.mode }}, shard ${{ matrix.shard }})"
-              grep -B5 -A60 -E "panicked|FAILED" /tmp/out.log | head -300
+              grep -B5 -A60 -E "panicked|FAILED|capture_logs" /tmp/out.log | head -400
               exit 1
             fi
           done
