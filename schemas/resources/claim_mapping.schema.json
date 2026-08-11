@@ -46,7 +46,7 @@
           "type": "string"
         },
         {
-          "description": "The claim must be an array of strings containing one of `values`. A string claim never matches `contains`.",
+          "description": "The claim must be an array containing one of `values` among its string items; non-string items are ignored, matching the `bound_claims` array semantics. A string claim never matches `contains`.",
           "enum": [
             "contains"
           ],
