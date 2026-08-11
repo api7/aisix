@@ -178,11 +178,13 @@ impl ObservabilitySink for AliyunSlsSink {
             .await
         {
             Ok(resp) => resp,
-            // Connect / DNS / timeout — transient by nature.
+            // Connect / DNS / timeout — transient by nature. reqwest's
+            // Display hides the cause in `source()` — chain it.
             Err(e) => {
                 return Err(SinkError::Transient(format!(
-                    "sls: POST {}: {e}",
-                    self.endpoint_url
+                    "sls: POST {}: {}",
+                    self.endpoint_url,
+                    super::error_chain(&e)
                 )))
             }
         };
