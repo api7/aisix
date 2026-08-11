@@ -30,14 +30,16 @@
 
 use std::time::{Duration, Instant};
 
-use aisix_a2a::{upstream_from_a2a_agent, A2aBridge, A2aError, HttpBridge};
+use aisix_a2a::{
+    canonical_operation, is_streaming_operation, upstream_from_a2a_agent, A2aBridge, A2aCallFacts,
+    A2aError, HttpBridge,
+};
 use aisix_obs::{AccessLog, UsageEvent};
 use axum::body::to_bytes;
 use axum::extract::{Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures::StreamExt;
-use serde::Deserialize;
 
 use crate::auth::AuthenticatedKey;
 use crate::reject::AisixPath;
@@ -49,12 +51,21 @@ use crate::state::ProxyState;
 /// kept as a fixed label to match the /mcp convention and #451).
 const A2A_MODEL_LABEL: &str = "a2a";
 
-/// Just enough of a JSON-RPC request to record the method for usage and echo
-/// the id back in a synthesized error. Unknown fields are ignored.
-#[derive(Deserialize)]
-struct JsonRpcPeek {
-    method: Option<String>,
-    id: Option<serde_json::Value>,
+/// One A2A call's protocol-level identity, read off its JSON-RPC envelopes and
+/// carried to the usage emit.
+///
+/// [`A2aCallFacts`] keeps accumulating as responses (or stream events) arrive,
+/// so the emit records the task the call ended on rather than the one it
+/// started with.
+struct A2aCall {
+    /// The wire method exactly as the caller wrote it — unbounded, kept for
+    /// forensics.
+    method: String,
+    /// The bounded operation that method names, for aggregation.
+    operation: &'static str,
+    /// The wire version the agent is pinned to (`0.3` / `1.0`).
+    protocol_version: &'static str,
+    facts: A2aCallFacts,
 }
 
 /// Serve a JSON-RPC request to `/a2a/:agent`. Authentication (`401`), per-agent
@@ -168,12 +179,21 @@ async fn dispatch(
         Ok(value) => value,
         Err(_) => return (StatusCode::BAD_REQUEST, "invalid JSON-RPC body").into_response(),
     };
-    let peek = serde_json::from_slice::<JsonRpcPeek>(&bytes).ok();
-    let method = peek
-        .as_ref()
-        .and_then(|p| p.method.clone())
-        .unwrap_or_default();
-    let rpc_id = peek.and_then(|p| p.id);
+    let method = value
+        .get("method")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let rpc_id = value.get("id").cloned();
+    let mut call = A2aCall {
+        operation: canonical_operation(&method),
+        method,
+        protocol_version: upstream.protocol_version.as_wire_str(),
+        facts: A2aCallFacts::default(),
+    };
+    // Read before the upstream is contacted, so a call that never lands still
+    // records which task the caller was asking about.
+    call.facts.observe_request(&value);
 
     // Reuse the LLM path's rate-limit + budget gate. The reservation is held
     // for the call (an A2A call carries no token cost yet). On 429 /
@@ -187,7 +207,7 @@ async fn dispatch(
                 &auth,
                 request_id,
                 agent,
-                &method,
+                &call,
                 response.status().as_u16(),
                 Duration::ZERO,
             );
@@ -195,7 +215,7 @@ async fn dispatch(
         }
     };
 
-    if is_streaming_method(&method) {
+    if is_streaming_operation(call.operation) {
         return dispatch_stream(
             auth,
             agent,
@@ -203,7 +223,7 @@ async fn dispatch(
             request_id,
             upstream,
             value,
-            &method,
+            call,
             rpc_id,
             reservation,
         )
@@ -218,12 +238,13 @@ async fn dispatch(
 
     match result {
         Ok(response_value) => {
+            call.facts.observe_result(&response_value);
             emit_a2a_usage(
                 state,
                 &auth,
                 request_id,
                 agent,
-                &method,
+                &call,
                 StatusCode::OK.as_u16(),
                 latency,
             );
@@ -237,24 +258,13 @@ async fn dispatch(
                 &auth,
                 request_id,
                 agent,
-                &method,
+                &call,
                 status.as_u16(),
                 latency,
             );
             a2a_error_response(rpc_id, status, &err.to_string())
         }
     }
-}
-
-/// JSON-RPC methods whose response is an SSE event stream rather than one
-/// envelope. Both spellings are listed because the body is forwarded verbatim:
-/// the caller speaks whichever wire version its agent is pinned to, and 1.0
-/// names the same two methods in PascalCase.
-fn is_streaming_method(method: &str) -> bool {
-    matches!(
-        method,
-        "message/stream" | "SendStreamingMessage" | "tasks/resubscribe" | "SubscribeToTask"
-    )
 }
 
 /// Fires the A2A usage event once a streamed call is over, and owns the
@@ -275,7 +285,11 @@ struct StreamUsageOnDrop {
     auth: AuthenticatedKey,
     request_id: String,
     agent: String,
-    method: String,
+    /// The call's protocol identity. Its [`A2aCallFacts`] keep accumulating as
+    /// events arrive, so a caller that walks away mid-task is recorded against
+    /// the last state the upstream actually reported rather than an invented
+    /// terminal one.
+    call: A2aCall,
     started: Instant,
     /// What to record for the call. Starts at the status already sent to the
     /// caller and is downgraded if the stream later faults — once the headers
@@ -296,7 +310,7 @@ impl Drop for StreamUsageOnDrop {
             &self.auth,
             &self.request_id,
             &self.agent,
-            &self.method,
+            &self.call,
             self.status,
             self.started.elapsed(),
         );
@@ -316,7 +330,7 @@ async fn dispatch_stream(
     request_id: &str,
     upstream: aisix_a2a::A2aUpstream,
     request: serde_json::Value,
-    method: &str,
+    call: A2aCall,
     rpc_id: Option<serde_json::Value>,
     reservation: aisix_ratelimit::MultiReservation,
 ) -> Response {
@@ -335,7 +349,7 @@ async fn dispatch_stream(
                 &auth,
                 request_id,
                 agent,
-                method,
+                &call,
                 status.as_u16(),
                 started.elapsed(),
             );
@@ -348,7 +362,7 @@ async fn dispatch_stream(
         auth,
         request_id: request_id.to_string(),
         agent: agent.to_string(),
-        method: method.to_string(),
+        call,
         started,
         status: StatusCode::OK.as_u16(),
         _concurrency: reservation.into_stream_hold(),
@@ -359,9 +373,14 @@ async fn dispatch_stream(
         let mut events = events;
         while let Some(event) = events.next().await {
             match event {
-                Ok(value) => yield Ok::<_, std::convert::Infallible>(
-                    axum::response::sse::Event::default().data(value.to_string()),
-                ),
+                Ok(value) => {
+                    // Read the task's progress off the event on its way past —
+                    // the relay itself stays verbatim.
+                    guard.call.facts.observe_result(&value);
+                    yield Ok::<_, std::convert::Infallible>(
+                        axum::response::sse::Event::default().data(value.to_string()),
+                    );
+                }
                 Err(err) => {
                     // Mid-stream the status line is long gone, so the failure
                     // can only be told to the caller in-band. Relay it as a
@@ -528,7 +547,7 @@ fn emit_a2a_usage(
     auth: &AuthenticatedKey,
     request_id: &str,
     agent: &str,
-    method: &str,
+    call: &A2aCall,
     status_code: u16,
     latency: Duration,
 ) {
@@ -543,7 +562,12 @@ fn emit_a2a_usage(
         downstream_latency_ms: latency.as_millis().min(u32::MAX as u128) as u32,
         inbound_protocol: "a2a".to_string(),
         a2a_agent_name: agent.to_string(),
-        a2a_method: method.to_string(),
+        a2a_method: call.method.clone(),
+        a2a_operation: call.operation.to_string(),
+        a2a_protocol_version: call.protocol_version.to_string(),
+        a2a_task_id: call.facts.task_id.clone(),
+        a2a_context_id: call.facts.context_id.clone(),
+        a2a_task_state: call.facts.task_state.clone(),
         ..Default::default()
     };
     state.usage_sink.try_emit("a2a", event.clone());
@@ -687,6 +711,298 @@ mod tests {
         assert_eq!(event.a2a_method, "message/stream");
     }
 
+    /// An agent that answers `message/send` with a Task in the state the
+    /// caller asked for, echoing the task and context ids it was given.
+    async fn spawn_task_agent() -> String {
+        let app = axum::Router::new().route(
+            "/a2a",
+            axum::routing::post(|body: axum::Json<serde_json::Value>| async move {
+                let message = &body.0["params"]["message"];
+                axum::Json(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": body.0["id"],
+                    "result": {
+                        "kind": "task",
+                        "id": "task-42",
+                        "contextId": message["contextId"],
+                        "status": {"state": "completed"},
+                    }
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service())
+                .await
+                .unwrap();
+        });
+        format!("http://{addr}/a2a")
+    }
+
+    /// Drive one A2A request through the real router and return the usage
+    /// event it emitted.
+    async fn usage_event_for(agent_url: &str, body: serde_json::Value) -> aisix_obs::UsageEvent {
+        use aisix_obs::UsageSink;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let handle = SnapshotHandle::new(snapshot_with(agent_url, true, serde_json::json!(["*"])));
+        let hub = Arc::new(aisix_gateway::Hub::new());
+        let state = ProxyState::new(handle, hub, &proxy_cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let response = build_router(state)
+            .oneshot(
+                HttpRequest::post("/a2a/invoice")
+                    .header("host", "gw.example.com")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {TOKEN}"))
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .expect("router responds");
+        // Drain the body so a streamed response reaches its end and its
+        // drop guard fires.
+        let _ = axum::body::to_bytes(response.into_body(), 1_048_576).await;
+        tokio::task::yield_now().await;
+        rx.try_recv().expect("a usage event is emitted")
+    }
+
+    /// An agent that reports a task's progress and then keeps the stream open
+    /// without ever finishing it — a long-running task the caller may leave
+    /// before it settles. It emits exactly the two states below and nothing
+    /// more, so what a partial reader saw is not a matter of timing.
+    async fn spawn_unfinished_stream_agent() -> String {
+        use axum::response::IntoResponse;
+        let app = axum::Router::new().route(
+            "/a2a",
+            axum::routing::post(|| async {
+                let chunks: Vec<Result<String, std::convert::Infallible>> =
+                    ["submitted", "working"]
+                        .iter()
+                        .map(|state| {
+                            let event = serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "result": {
+                                    "kind": "status-update",
+                                    "taskId": "task-88",
+                                    "status": {"state": state},
+                                    "final": false,
+                                },
+                            });
+                            Ok(format!("data: {event}\n\n"))
+                        })
+                        .collect();
+                let body = async_stream::stream! {
+                    for chunk in chunks {
+                        yield chunk;
+                    }
+                    // Never completes: the task is still running when the
+                    // caller gives up on it.
+                    std::future::pending::<()>().await;
+                };
+                (
+                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                    axum::body::Body::from_stream(body),
+                )
+                    .into_response()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service())
+                .await
+                .unwrap();
+        });
+        format!("http://{addr}/a2a")
+    }
+
+    #[tokio::test]
+    async fn a_stream_abandoned_mid_task_records_the_last_state_seen() {
+        use aisix_obs::UsageSink;
+        use futures::StreamExt;
+
+        // The claim is that no terminal state is invented for a task the
+        // caller stopped watching. The agent reports `submitted` then
+        // `working` and never finishes, so `working` is the only honest
+        // answer — and the one an operator hunting stuck tasks needs.
+        let agent_url = spawn_unfinished_stream_agent().await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let handle = SnapshotHandle::new(snapshot_with(&agent_url, true, serde_json::json!(["*"])));
+        let hub = Arc::new(aisix_gateway::Hub::new());
+        let state = ProxyState::new(handle, hub, &proxy_cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let response = build_router(state)
+            .oneshot(
+                HttpRequest::post("/a2a/invoice")
+                    .header("host", "gw.example.com")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {TOKEN}"))
+                    .body(Body::from(
+                        r#"{"jsonrpc":"2.0","id":1,"method":"message/stream"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("router responds");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Read what the agent has sent so far, then walk away mid-task.
+        let mut body = response.into_body().into_data_stream();
+        let mut seen = String::new();
+        while !seen.contains("working") {
+            let chunk = body.next().await.expect("the relayed events arrive");
+            seen.push_str(std::str::from_utf8(&chunk.expect("a readable chunk")).unwrap());
+        }
+        drop(body);
+        tokio::task::yield_now().await;
+
+        let event = rx
+            .try_recv()
+            .expect("an abandoned stream still emits usage");
+        assert_eq!(event.a2a_task_id, "task-88");
+        assert_eq!(event.a2a_task_state, "working");
+    }
+
+    #[tokio::test]
+    async fn a_failed_call_still_records_the_task_it_asked_about() {
+        // The upstream is unreachable, so no response ever names the task.
+        // Reading the request up front is what keeps a failed `tasks/get`
+        // attributable — the whole point of observing before dispatch.
+        let event = usage_event_for(
+            "http://127.0.0.1:1/a2a",
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tasks/get",
+                "params": {"id": "task-99"}
+            }),
+        )
+        .await;
+
+        assert_eq!(event.status_code, StatusCode::BAD_GATEWAY.as_u16());
+        assert_eq!(event.a2a_operation, "tasks/get");
+        assert_eq!(event.a2a_task_id, "task-99");
+        assert_eq!(event.a2a_task_state, "", "no state may be invented");
+    }
+
+    /// An agent whose stream walks a task through several states and then
+    /// ends, the way a real long-running task reports progress.
+    async fn spawn_progressing_stream_agent() -> String {
+        use axum::response::IntoResponse;
+        let app = axum::Router::new().route(
+            "/a2a",
+            axum::routing::post(|| async {
+                let chunks: Vec<Result<String, std::convert::Infallible>> =
+                    ["submitted", "working", "input-required"]
+                        .iter()
+                        .map(|state| {
+                            let event = serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "result": {
+                                    "kind": "status-update",
+                                    "taskId": "task-77",
+                                    "contextId": "ctx-77",
+                                    "status": {"state": state},
+                                },
+                            });
+                            Ok(format!("data: {event}\n\n"))
+                        })
+                        .collect();
+                (
+                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                    axum::body::Body::from_stream(futures::stream::iter(chunks)),
+                )
+                    .into_response()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service())
+                .await
+                .unwrap();
+        });
+        format!("http://{addr}/a2a")
+    }
+
+    #[tokio::test]
+    async fn a_stream_records_the_state_its_task_ended_in() {
+        // A streamed task's outcome is only ever stated in-band, so a call
+        // whose task stalled on `input-required` is indistinguishable from one
+        // that completed unless the events are read on their way past.
+        let event = usage_event_for(
+            &spawn_progressing_stream_agent().await,
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "SendStreamingMessage",
+                "params": {"message": {"role": "user"}}
+            }),
+        )
+        .await;
+
+        assert_eq!(event.a2a_operation, "message/stream");
+        assert_eq!(event.a2a_task_id, "task-77");
+        assert_eq!(event.a2a_context_id, "ctx-77");
+        assert_eq!(event.a2a_task_state, "input-required");
+    }
+
+    #[tokio::test]
+    async fn a_call_records_the_task_and_context_it_touched() {
+        // Without these the log answers "someone called the invoice agent" and
+        // nothing else — not which task it produced, nor how that task ended
+        // (AISIX-Cloud#1215).
+        let event = usage_event_for(
+            &spawn_task_agent().await,
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "message/send",
+                "params": {"message": {"role": "user", "contextId": "ctx-7"}}
+            }),
+        )
+        .await;
+
+        assert_eq!(event.a2a_method, "message/send");
+        assert_eq!(event.a2a_operation, "message/send");
+        assert_eq!(event.a2a_task_id, "task-42");
+        assert_eq!(event.a2a_context_id, "ctx-7");
+        assert_eq!(event.a2a_task_state, "completed");
+        // The agent fixture pins no version, so the resource default applies —
+        // and it is the version the gateway announced upstream.
+        assert_eq!(event.a2a_protocol_version, "1.0");
+    }
+
+    #[tokio::test]
+    async fn a_1_0_caller_aggregates_with_its_0_3_twin() {
+        // `SendMessage` and `message/send` are one operation. A gateway may
+        // front agents on both versions at once, so without canonicalisation
+        // every per-operation figure is silently split in two.
+        let event = usage_event_for(
+            &spawn_task_agent().await,
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "SendMessage",
+                "params": {"message": {"role": "user", "contextId": "ctx-8"}}
+            }),
+        )
+        .await;
+
+        assert_eq!(event.a2a_method, "SendMessage", "the raw value is kept");
+        assert_eq!(event.a2a_operation, "message/send");
+    }
+
+    #[tokio::test]
+    async fn an_unrecognised_method_is_bounded_in_the_event() {
+        // The method is caller-chosen, so it must never reach an aggregated
+        // position unbounded.
+        let event = usage_event_for(
+            &spawn_task_agent().await,
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "vendor/doWhatever"}),
+        )
+        .await;
+
+        assert_eq!(event.a2a_method, "vendor/doWhatever");
+        assert_eq!(event.a2a_operation, "unknown");
+    }
+
     #[test]
     fn streaming_methods_are_recognised_in_both_spellings() {
         // The body is forwarded verbatim, so the caller uses whichever spelling
@@ -698,7 +1014,10 @@ mod tests {
             "tasks/resubscribe",
             "SubscribeToTask",
         ] {
-            assert!(is_streaming_method(method), "{method} must stream");
+            assert!(
+                is_streaming_operation(canonical_operation(method)),
+                "{method} must stream"
+            );
         }
         for method in [
             "message/send",
@@ -709,7 +1028,10 @@ mod tests {
             "agent/getAuthenticatedExtendedCard",
             "",
         ] {
-            assert!(!is_streaming_method(method), "{method} must not stream");
+            assert!(
+                !is_streaming_operation(canonical_operation(method)),
+                "{method} must not stream"
+            );
         }
     }
 
