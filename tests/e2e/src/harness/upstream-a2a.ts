@@ -229,6 +229,10 @@ async function handle(
     const envelope = (result: Record<string, unknown>) =>
       `data: ${JSON.stringify({ jsonrpc: "2.0", id: body?.id ?? null, result })}\n\n`;
     res.write(": open\n\n");
+    // The agent thinks before it says anything, like a real one. Without this
+    // the first event lands sub-millisecond and a time-to-first-event of 0 is
+    // indistinguishable from one that was never recorded.
+    await new Promise((resolve) => setTimeout(resolve, STREAM_GAP_MS));
     res.write(
       envelope(
         payload("status-update", {

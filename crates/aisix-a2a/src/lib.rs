@@ -27,4 +27,4 @@ pub use bridge::{
     HttpBridge, DEFAULT_UPSTREAM_TIMEOUT,
 };
 pub use error::A2aError;
-pub use telemetry::{canonical_operation, is_streaming_operation, A2aCallFacts};
+pub use telemetry::{canonical_operation, is_stream_end, is_streaming_operation, A2aCallFacts};

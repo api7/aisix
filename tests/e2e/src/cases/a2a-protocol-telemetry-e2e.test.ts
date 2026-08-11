@@ -221,6 +221,87 @@ describe("a2a protocol telemetry e2e (AISIX-Cloud#1215)", () => {
     expect(span.attributes["aisix.a2a.task_state"]).toBe("completed");
   });
 
+  test("a streamed call records how it ran, not just how it ended", async (ctx) => {
+    if (!etcdReachable || !app || !upstream10 || !upstream03 || !otlp) return ctx.skip();
+
+    // The stub paces its three events apart, so a wait for the first one is
+    // separable from the total: a stream that is slow to start and one that is
+    // slow overall are different problems with different fixes.
+    const contextId = `ctx-${randomUUID()}`;
+    expect(
+      await call("invoices", {
+        jsonrpc: "2.0",
+        id: 6,
+        method: "message/stream",
+        params: { message: { role: "user", contextId, parts: [] } },
+      }),
+    ).toBe(200);
+
+    const span = await awaitSpan((s) => s.attributes["gen_ai.conversation.id"] === contextId);
+    expect(span.attributes["aisix.a2a.stream_event_count"]).toBe(3);
+    // The agent's own time to first event. The stub pauses before each of its
+    // three events, so a figure that actually stopped at the first one is a
+    // fraction of the call; one that quietly measured the whole stream would
+    // equal the total. Compared against the total rather than a fixed
+    // millisecond bound, so the assertion does not track the stub's pacing.
+    const ttfb = span.attributes["aisix.upstream_ttft_ms"] as number;
+    const total = span.attributes["aisix.downstream_latency_ms"] as number;
+    // The stub pauses equally before each of its three counted events, so an
+    // honest time-to-first-event lands near a THIRD of the call. Both bounds
+    // matter and each is placed far from that third rather than close to it:
+    // a regression that stamped the response head reads near zero and has to
+    // clear the floor, one that timed the whole stream reads near `total` and
+    // has to clear the ceiling, while ordinary scheduling jitter — which
+    // moves the ratio by well under either margin — cannot reach either.
+    expect(ttfb).toBeGreaterThan(total / 8);
+    expect(ttfb).toBeLessThan((total * 3) / 4);
+  });
+
+  test("the a2a metric family slices by agent and operation", async (ctx) => {
+    if (!etcdReachable || !app || !upstream10 || !upstream03 || !otlp) return ctx.skip();
+
+    // `aisix_proxy_requests_total` already counts these calls, but only by
+    // route — it cannot answer "is the invoices agent's stream failing?".
+    await call("invoices", {
+      jsonrpc: "2.0",
+      id: 7,
+      method: "message/stream",
+      params: { message: { role: "user", parts: [] } },
+    });
+
+    const scrape = await fetch(`${app.metricsUrl}/metrics`);
+    expect(scrape.status).toBe(200);
+    const text = await scrape.text();
+
+    expect(text).toContain(
+      'aisix_a2a_requests_total{agent="invoices",operation="message/stream",status="2xx"}',
+    );
+    expect(text).toContain(
+      'aisix_a2a_stream_events_total{agent="invoices",operation="message/stream"}',
+    );
+    expect(text).toContain('aisix_a2a_task_state_total{agent="invoices",state="completed"}');
+    expect(text).toContain("aisix_a2a_ttfb_seconds_bucket");
+    // The client-perceived duration series has to cover `/a2a` at all — and
+    // cover the calls that FAILED, not only the streams that opened. A
+    // streaming-only sample would report the endpoint as having no failures.
+    expect(text).toMatch(/aisix_request_e2e_latency_seconds_bucket\{[^}]*endpoint="\/a2a"/);
+    await call("does-not-exist-agent", {
+      jsonrpc: "2.0",
+      id: 8,
+      method: "message/send",
+      params: { message: { role: "user", parts: [] } },
+    });
+    await call("invoices", { jsonrpc: "2.0", id: 9, method: "message/send", params: {} });
+    const withFailures = await (await fetch(`${app.metricsUrl}/metrics`)).text();
+    expect(withFailures).toMatch(
+      /aisix_a2a_requests_total\{agent="invoices",operation="message\/send",status="2xx"\}/,
+    );
+    // The ids that make a task traceable are exactly the ones that must not
+    // become label values.
+    expect(text).not.toMatch(/aisix_a2a_[a-z_]*\{[^}]*task_id=/);
+    expect(text).not.toMatch(/aisix_a2a_[a-z_]*\{[^}]*context_id=/);
+  });
+
   test("an unrecognised method cannot become an unbounded label", async (ctx) => {
     if (!etcdReachable || !app || !upstream10 || !upstream03 || !otlp) return ctx.skip();
 

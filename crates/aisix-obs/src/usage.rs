@@ -144,7 +144,11 @@ pub struct UsageEvent {
     /// (AISIX-Cloud#1225) shows the wait in `upstream_latency_ms`, not
     /// here. Same attempt scope as `upstream_latency_ms`, so the two
     /// are directly comparable. 0 on non-streaming, error, and
-    /// cache-hit paths (omitted from the wire via skip_serializing_if).
+    /// cache-hit paths (omitted from the wire via skip_serializing_if)
+    /// — and, since the field is whole milliseconds, also on a stream
+    /// whose first frame arrived in under one. Absent therefore means
+    /// "no streamed first frame was measured", not "there was no
+    /// stream".
     ///
     /// This is what the UPSTREAM delivered on this attempt. What the
     /// caller actually waited for is `downstream_latency_ms`, which also
@@ -178,6 +182,12 @@ pub struct UsageEvent {
     ///
     /// Absent (0) on the non-terminal attempts of a request, and on any
     /// path that never reached response delivery.
+    ///
+    /// `/a2a` is the one exception to the streaming rule above: it records
+    /// the WHOLE stream, because an agent's stream of task updates is the
+    /// call's product rather than a delivery mechanism for one. The
+    /// subtraction against `upstream_ttft_ms` therefore does not describe
+    /// gateway overhead there — it is the rest of the agent's own work.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub downstream_latency_ms: u32,
 
@@ -508,6 +518,16 @@ pub struct UsageEvent {
     /// all (the call failed before the upstream answered).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub a2a_task_state: String,
+
+    /// Events the gateway relayed downstream on a streamed A2A call.
+    ///
+    /// Read together with `upstream_ttft_ms` and `upstream_latency_ms` it
+    /// separates the two ways a stream disappoints: nothing arrived for a long
+    /// time (high TTFT), or plenty arrived and none of it advanced the task
+    /// (high count, no terminal state). 0 for a unary call, and for a stream
+    /// whose upstream produced nothing at all.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub a2a_stream_event_count: u32,
 }
 
 #[inline]
