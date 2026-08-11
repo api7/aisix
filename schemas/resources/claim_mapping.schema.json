@@ -95,6 +95,7 @@
       "type": "string"
     },
     "priority": {
+      "default": 0,
       "description": "Evaluation order among the provider's mappings: lower values are evaluated first, ties are broken by `name`. Defaults to 0.",
       "format": "uint32",
       "minimum": 0.0,

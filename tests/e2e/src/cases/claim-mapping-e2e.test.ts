@@ -446,6 +446,39 @@ describe("claim mapping e2e: verified claims resolve to an existing api key", ()
     expect(span["aisix.jwt_claim_mapping"]).toBe("finance-dept");
   });
 
+  test("attribution rides the shared emit helper on the messages family too", async (ctx) => {
+    if (!requireSetup(ctx)) return;
+    // The stamping lives in one usage_attr helper wired through every
+    // handler family's emit funnel; this pins a second, structurally
+    // different family (Anthropic-shaped /v1/messages through the
+    // OpenAI bridge) so an extractor-ordering or emitter regression on
+    // the non-chat paths cannot hide behind chat-only coverage.
+    const res = await fetch(`${app!.proxyUrl}/v1/messages`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${idp!.sign(financeClaims())}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: MODEL,
+        max_tokens: 64,
+        messages: [{ role: "user", content: "claim mapping messages probe" }],
+      }),
+    });
+    expect(res.status).toBe(200);
+    // /v1/messages carries the middleware-stamped x-aisix-request-id
+    // (the usage event keys on the same id); x-aisix-call-id is the
+    // chat-path spelling.
+    const requestId = res.headers.get("x-aisix-request-id");
+    expect(requestId).toBeTruthy();
+    await res.text();
+
+    const span = await waitForSpan(otlp!, requestId!);
+    expect(span["aisix.jwt_subject"]).toBe("dev-alice");
+    expect(span["aisix.jwt_provider"]).toBe("mock-idp");
+    expect(span["aisix.jwt_claim_mapping"]).toBe("finance-dept");
+  });
+
   test("a directly-bound identity attributes subject but no rule name", async (ctx) => {
     if (!requireSetup(ctx)) return;
     const res = await chat(

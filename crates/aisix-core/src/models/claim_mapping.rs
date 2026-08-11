@@ -29,8 +29,10 @@ pub enum ClaimMatchOp {
     /// The claim must be a string equal to one of `values`. An array
     /// claim never matches `exact`.
     Exact,
-    /// The claim must be an array of strings containing one of `values`.
-    /// A string claim never matches `contains`.
+    /// The claim must be an array containing one of `values` among its
+    /// string items; non-string items are ignored, matching the
+    /// `bound_claims` array semantics. A string claim never matches
+    /// `contains`.
     Contains,
 }
 

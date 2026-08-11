@@ -604,7 +604,20 @@ pub fn oidc_provider_root_schema() -> Value {
 /// plain-but-absent `Option` representation (`false`): the resource has
 /// no nullable fields, only defaults omitted when unset.
 pub fn claim_mapping_root_schema() -> Value {
-    struct_root_schema::<crate::models::ClaimMapping>(false)
+    let mut schema = struct_root_schema::<crate::models::ClaimMapping>(false);
+    // `priority` has a stable runtime default of 0, but schemars drops
+    // the `default` keyword for fields whose default value is skipped
+    // on serialization (`skip_serializing_if = "is_zero"`). Re-assert
+    // it so API consumers can discover the behavior from the contract,
+    // matching the `enabled: true` default the derive does emit.
+    if let Some(priority) = schema
+        .get_mut("properties")
+        .and_then(|p| p.get_mut("priority"))
+        .and_then(Value::as_object_mut)
+    {
+        priority.insert("default".to_string(), json!(0));
+    }
+    schema
 }
 
 /// Canonical JSON Schema for the `mcp_policy` resource, derived from the
