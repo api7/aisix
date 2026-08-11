@@ -38,6 +38,7 @@ describe("a2a protocol telemetry e2e (AISIX-Cloud#1215)", () => {
   let upstream10: A2aUpstream | undefined;
   let upstream03: A2aUpstream | undefined;
   let otlp: MockOtlp | undefined;
+  let otlpFull: MockOtlp | undefined;
   let etcdReachable = false;
 
   const call = async (agent: string, body: unknown) => {
@@ -77,6 +78,7 @@ describe("a2a protocol telemetry e2e (AISIX-Cloud#1215)", () => {
     if (!etcdReachable) return;
 
     otlp = await startMockOtlp();
+    otlpFull = await startMockOtlp();
     upstream10 = await startA2aUpstream({ cardMount: "origin", wireShape: "1.0" });
     upstream03 = await startA2aUpstream({ cardMount: "origin", wireShape: "0.3" });
     app = await spawnApp();
@@ -87,6 +89,16 @@ describe("a2a protocol telemetry e2e (AISIX-Cloud#1215)", () => {
       enabled: true,
       kind: "otlp_http",
       endpoint: otlp.url,
+    });
+    // A second exporter that opts into content. Both receive every event, so
+    // the pair is what proves capture is opt-in rather than merely present:
+    // the words must reach this one and no other.
+    await seed.createObservabilityExporter({
+      name: "a2a-telemetry-otlp-full",
+      enabled: true,
+      kind: "otlp_http",
+      endpoint: otlpFull.url,
+      content_mode: "full",
     });
     // One agent per wire version, each against the stub that speaks it. Both
     // run the same operations, so what has to come out the same (the canonical
@@ -127,10 +139,12 @@ describe("a2a protocol telemetry e2e (AISIX-Cloud#1215)", () => {
     await upstream10?.close();
     await upstream03?.close();
     await otlp?.close();
+    await otlpFull?.close();
   });
 
   test("a completed call records the task, the context and how it ended", async (ctx) => {
-    if (!etcdReachable || !app || !upstream10 || !upstream03 || !otlp) return ctx.skip();
+    if (!etcdReachable || !app || !upstream10 || !upstream03 || !otlp || !otlpFull)
+      return ctx.skip();
 
     const contextId = `ctx-${randomUUID()}`;
     expect(
@@ -156,7 +170,8 @@ describe("a2a protocol telemetry e2e (AISIX-Cloud#1215)", () => {
   });
 
   test("both wire vocabularies aggregate under one operation", async (ctx) => {
-    if (!etcdReachable || !app || !upstream10 || !upstream03 || !otlp) return ctx.skip();
+    if (!etcdReachable || !app || !upstream10 || !upstream03 || !otlp || !otlpFull)
+      return ctx.skip();
 
     // The same operation, spelled the way each agent's version spells it.
     const v10Context = `ctx-${randomUUID()}`;
@@ -200,7 +215,8 @@ describe("a2a protocol telemetry e2e (AISIX-Cloud#1215)", () => {
   });
 
   test("a streamed task is recorded with the state its stream ended on", async (ctx) => {
-    if (!etcdReachable || !app || !upstream10 || !upstream03 || !otlp) return ctx.skip();
+    if (!etcdReachable || !app || !upstream10 || !upstream03 || !otlp || !otlpFull)
+      return ctx.skip();
 
     const contextId = `ctx-${randomUUID()}`;
     expect(
@@ -222,7 +238,8 @@ describe("a2a protocol telemetry e2e (AISIX-Cloud#1215)", () => {
   });
 
   test("a streamed call records how it ran, not just how it ended", async (ctx) => {
-    if (!etcdReachable || !app || !upstream10 || !upstream03 || !otlp) return ctx.skip();
+    if (!etcdReachable || !app || !upstream10 || !upstream03 || !otlp || !otlpFull)
+      return ctx.skip();
 
     // The stub paces its three events apart, so a wait for the first one is
     // separable from the total: a stream that is slow to start and one that is
@@ -258,7 +275,8 @@ describe("a2a protocol telemetry e2e (AISIX-Cloud#1215)", () => {
   });
 
   test("the a2a metric family slices by agent and operation", async (ctx) => {
-    if (!etcdReachable || !app || !upstream10 || !upstream03 || !otlp) return ctx.skip();
+    if (!etcdReachable || !app || !upstream10 || !upstream03 || !otlp || !otlpFull)
+      return ctx.skip();
 
     // `aisix_proxy_requests_total` already counts these calls, but only by
     // route — it cannot answer "is the invoices agent's stream failing?".
@@ -302,8 +320,45 @@ describe("a2a protocol telemetry e2e (AISIX-Cloud#1215)", () => {
     expect(text).not.toMatch(/aisix_a2a_[a-z_]*\{[^}]*context_id=/);
   });
 
+  test("the words are metered always and captured only on request", async (ctx) => {
+    if (!etcdReachable || !app || !upstream10 || !upstream03 || !otlp || !otlpFull)
+      return ctx.skip();
+
+    const contextId = `ctx-${randomUUID()}`;
+    const prompt = "summarise invoice forty two for the finance team";
+    expect(
+      await call("invoices", {
+        jsonrpc: "2.0",
+        id: 10,
+        method: "message/send",
+        params: {
+          message: { role: "user", contextId, parts: [{ kind: "text", text: prompt }] },
+        },
+      }),
+    ).toBe(200);
+
+    // An agent reports no usage of its own, so without the gateway counting
+    // them every agent's spend would read as identical and zero.
+    const metered = await awaitSpan((s) => s.attributes["gen_ai.conversation.id"] === contextId);
+    expect(metered.attributes["gen_ai.usage.input_tokens"]).toBeGreaterThan(0);
+
+    // The words themselves reach only the exporter that asked for them.
+    const deadline = Date.now() + EXPORT_TIMEOUT_MS;
+    let captured: (typeof otlpFull.spans)[number] | undefined;
+    while (Date.now() < deadline && !captured) {
+      captured = otlpFull.spans.find((s) => s.attributes["gen_ai.conversation.id"] === contextId);
+      if (!captured) await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    expect(captured, "the full-content exporter received the call").toBeDefined();
+    expect(captured!.attributes["gen_ai.prompt"]).toContain(prompt);
+    // ...and never the default one, whatever else it carries.
+    expect(metered.attributes["gen_ai.prompt"]).toBeUndefined();
+    expect(metered.attributes["gen_ai.completion"]).toBeUndefined();
+  });
+
   test("an unrecognised method cannot become an unbounded label", async (ctx) => {
-    if (!etcdReachable || !app || !upstream10 || !upstream03 || !otlp) return ctx.skip();
+    if (!etcdReachable || !app || !upstream10 || !upstream03 || !otlp || !otlpFull)
+      return ctx.skip();
 
     // The method is caller-chosen. The raw value stays available for
     // forensics, but the aggregating field must collapse to `unknown`.

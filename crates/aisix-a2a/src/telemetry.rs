@@ -285,6 +285,83 @@ impl A2aCallFacts {
     }
 }
 
+/// The text a caller sent an agent: every text part of the request's message,
+/// newline-joined.
+///
+/// A `Part` carries its text under `text` in both wire versions (0.3 tags the
+/// part with `kind`, 1.0 uses a protobuf `oneof` whose set field has the same
+/// name), so one reader serves both. File and data parts contribute nothing —
+/// their bytes are not language, and a base64 blob would wreck both the token
+/// estimate and any captured content it lands in.
+pub fn request_text(request: &Value) -> String {
+    let mut buf = String::new();
+    if let Some(message) = request.pointer("/params/message") {
+        collect_part_text(message, &mut buf);
+    }
+    buf
+}
+
+/// Read the text an agent produced in one response or streamed event into
+/// `buf`, honouring the protocol's own rule for whether it continues or
+/// replaces what came before.
+///
+/// An artifact update says which it is: `append` means this chunk continues a
+/// previously sent artifact, and its absence means the payload stands alone.
+/// Everything else — a Task, a Message, a status update — is a complete
+/// statement of where the task has got to, so it replaces rather than piles
+/// up. Concatenating unconditionally would multiply the text of any agent
+/// that resends its result, which is the common convention.
+///
+/// `buf` is bounded by the caller (see `push` — the estimate degrades to a
+/// lower bound rather than the buffer growing without limit), because an A2A
+/// stream may run for hours.
+pub fn append_result_text(response: &Value, buf: &mut String, push: impl Fn(&mut String, &str)) {
+    let Some(result) = response.get("result") else {
+        return;
+    };
+    let payload = unwrap_payload(result);
+    let mut fresh = String::new();
+    // A Message payload holds its parts directly; a Task or status update puts
+    // the agent's words on `status.message`; an artifact update on `artifact`.
+    collect_part_text(payload, &mut fresh);
+    if let Some(message) = payload.pointer("/status/message") {
+        collect_part_text(message, &mut fresh);
+    }
+    if let Some(artifact) = payload.get("artifact") {
+        collect_part_text(artifact, &mut fresh);
+    }
+    for artifact in payload
+        .get("artifacts")
+        .and_then(Value::as_array)
+        .unwrap_or(&Vec::new())
+    {
+        collect_part_text(artifact, &mut fresh);
+    }
+    if fresh.is_empty() {
+        return;
+    }
+    let continues = payload.get("append").and_then(Value::as_bool) == Some(true);
+    if !continues {
+        buf.clear();
+    }
+    push(buf, &fresh);
+}
+
+/// Append every text part of a parts-bearing object (a message or an artifact).
+fn collect_part_text(owner: &Value, buf: &mut String) {
+    let Some(parts) = owner.get("parts").and_then(Value::as_array) else {
+        return;
+    };
+    for part in parts {
+        if let Some(text) = str_field(part, "text") {
+            if !buf.is_empty() {
+                buf.push('\n');
+            }
+            buf.push_str(text);
+        }
+    }
+}
+
 /// The 1.0 payload `oneof` field names, in `SendMessageResponse` /
 /// `StreamResponse` order.
 const V1_PAYLOAD_KEYS: [&str; 4] = ["task", "message", "statusUpdate", "artifactUpdate"];
@@ -582,6 +659,119 @@ mod tests {
         }));
         assert_eq!(facts.task_id, "t-5");
         assert_eq!(facts.task_state, "");
+    }
+
+    /// The bounded push the proxy uses; unbounded here so the rule under
+    /// test is the append/replace one, not the cap.
+    fn push(buf: &mut String, s: &str) {
+        buf.push_str(s);
+    }
+
+    #[test]
+    fn text_is_read_from_parts_in_both_versions() {
+        // 0.3 tags each part with `kind`, 1.0 sets a protobuf oneof — both
+        // put the words under `text`, and neither file nor data parts carry
+        // language worth counting.
+        let v03 = request_text(&json!({"params": {"message": {"role": "user", "parts": [
+            {"kind": "text", "text": "invoice 42"},
+            {"kind": "file", "file": {"bytes": "AAAA", "mimeType": "application/pdf"}},
+            {"kind": "text", "text": "please summarise"}
+        ]}}}));
+        assert_eq!(v03, "invoice 42\nplease summarise");
+
+        let v10 = request_text(&json!({"params": {"message": {"role": "user", "parts": [
+            {"text": "invoice 42"},
+            {"raw": "AAAA", "mediaType": "application/pdf"},
+            {"text": "please summarise"}
+        ]}}}));
+        assert_eq!(v10, "invoice 42\nplease summarise");
+
+        // A request with no message, or a message with no text, yields none.
+        assert_eq!(request_text(&json!({"params": {"id": "t-1"}})), "");
+        assert_eq!(
+            request_text(&json!({"params": {"message": {"parts": [{"data": {"a": 1}}]}}})),
+            ""
+        );
+    }
+
+    #[test]
+    fn a_resent_result_replaces_rather_than_doubles() {
+        // The common agent convention is to resend the whole answer as the
+        // task progresses. Concatenating would report it two or three times.
+        let mut buf = String::new();
+        for _ in 0..3 {
+            append_result_text(
+                &json!({"result": {"kind": "task", "id": "t", "status": {
+                    "state": "working",
+                    "message": {"role": "agent", "parts": [{"text": "the answer"}]}
+                }}}),
+                &mut buf,
+                push,
+            );
+        }
+        assert_eq!(buf, "the answer");
+    }
+
+    #[test]
+    fn an_appending_artifact_chunk_continues_the_previous_one() {
+        // `append` is the protocol's own word for "this continues the
+        // artifact I already sent", so an incremental stream must not be
+        // collapsed to its last fragment.
+        let mut buf = String::new();
+        let chunk = |text: &str, append: bool| {
+            json!({"result": {"kind": "artifact-update", "taskId": "t", "append": append,
+                              "artifact": {"parts": [{"text": text}]}}})
+        };
+        append_result_text(&chunk("Hello", false), &mut buf, push);
+        append_result_text(&chunk(", world", true), &mut buf, push);
+        append_result_text(&chunk("!", true), &mut buf, push);
+        assert_eq!(buf, "Hello, world!");
+    }
+
+    #[test]
+    fn a_1_0_wrapped_result_yields_its_text_too() {
+        // The payload wrapper has to be seen through here as well, or the
+        // default wire version contributes no text at all.
+        let mut buf = String::new();
+        append_result_text(
+            &json!({"result": {"message": {"role": "agent", "parts": [{"text": "done"}]}}}),
+            &mut buf,
+            push,
+        );
+        assert_eq!(buf, "done");
+
+        let mut streamed = String::new();
+        append_result_text(
+            &json!({"result": {"statusUpdate": {"taskId": "t", "status": {
+                "state": "TASK_STATE_COMPLETED",
+                "message": {"parts": [{"text": "finished"}]}
+            }}}}),
+            &mut streamed,
+            push,
+        );
+        assert_eq!(streamed, "finished");
+    }
+
+    #[test]
+    fn an_event_with_no_text_leaves_what_came_before() {
+        // A bare progress ping must not wipe the answer already collected.
+        let mut buf = String::new();
+        append_result_text(
+            &json!({"result": {"message": {"parts": [{"text": "answer"}]}}}),
+            &mut buf,
+            push,
+        );
+        append_result_text(
+            &json!({"result": {"statusUpdate": {"taskId": "t", "status": {"state": "working"}}}}),
+            &mut buf,
+            push,
+        );
+        append_result_text(
+            &json!({"error": {"code": -1, "message": "x"}}),
+            &mut buf,
+            push,
+        );
+        assert_eq!(buf, "answer");
     }
 
     #[test]
