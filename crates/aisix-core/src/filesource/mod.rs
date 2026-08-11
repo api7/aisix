@@ -45,11 +45,11 @@ use std::path::Path;
 use yaml_rust2::{Yaml, YamlLoader};
 
 use crate::models::{
-    validate_a2a_agent, validate_apikey, validate_cache_policy, validate_guardrail,
-    validate_mcp_server, validate_model, validate_observability_exporter, validate_oidc_provider,
-    validate_provider_key, validate_rate_limit_policy, A2aAgent, ApiKey, CachePolicy, Guardrail,
-    McpServer, Model, ObservabilityExporter, OidcProvider, ProviderKey, RateLimitPolicy,
-    SchemaError,
+    validate_a2a_agent, validate_apikey, validate_cache_policy, validate_claim_mapping,
+    validate_guardrail, validate_mcp_server, validate_model, validate_observability_exporter,
+    validate_oidc_provider, validate_provider_key, validate_rate_limit_policy, A2aAgent, ApiKey,
+    CachePolicy, ClaimMapping, Guardrail, McpServer, Model, ObservabilityExporter, OidcProvider,
+    ProviderKey, RateLimitPolicy, SchemaError,
 };
 use crate::resource::ResourceEntry;
 use crate::AisixSnapshot;
@@ -130,8 +130,8 @@ pub(crate) fn url_has_credentials(url: &str) -> bool {
     false
 }
 
-/// Fixed processing order for the ten resource collections.
-const KINDS: [(&str, IdentityField); 10] = [
+/// Fixed processing order for the eleven resource collections.
+const KINDS: [(&str, IdentityField); 11] = [
     ("provider_keys", IdentityField::DisplayName),
     ("models", IdentityField::DisplayName),
     ("api_keys", IdentityField::DisplayName),
@@ -142,6 +142,7 @@ const KINDS: [(&str, IdentityField); 10] = [
     ("observability_exporters", IdentityField::Name),
     ("rate_limit_policies", IdentityField::Name),
     ("oidc_providers", IdentityField::Name),
+    ("claim_mappings", IdentityField::Name),
 ];
 
 /// Load `path` into a fresh [`AisixSnapshot`], resolving `${VAR}`
@@ -346,6 +347,7 @@ pub fn load_from_str(
     let mut observability_exporters: Vec<(String, String, ObservabilityExporter)> = Vec::new();
     let mut rate_limit_policies: Vec<(String, String, RateLimitPolicy)> = Vec::new();
     let mut oidc_providers: Vec<(String, String, OidcProvider)> = Vec::new();
+    let mut claim_mappings: Vec<(String, String, ClaimMapping)> = Vec::new();
 
     for mut entry in prepared {
         let id = derive_id(entry.kind, &entry.identity);
@@ -372,6 +374,7 @@ pub fn load_from_str(
             "rate_limit_policies" => {
                 desugar::desugar_rate_limit_policy(&mut entry.doc, &identity_maps)
             }
+            "claim_mappings" => desugar::desugar_claim_mapping(&mut entry.doc, &identity_maps),
             _ => Ok(()),
         };
         if let Err(message) = sugar_result {
@@ -446,6 +449,11 @@ pub fn load_from_str(
             "oidc_providers" => {
                 if let Some(t) = finish(&scope, &entry.doc, validate_oidc_provider, &mut errors) {
                     oidc_providers.push((id, scope, t));
+                }
+            }
+            "claim_mappings" => {
+                if let Some(t) = finish(&scope, &entry.doc, validate_claim_mapping, &mut errors) {
+                    claim_mappings.push((id, scope, t));
                 }
             }
             other => unreachable!("kind {other} is not in KINDS"),
@@ -585,6 +593,50 @@ pub fn load_from_str(
         }
     }
 
+    // A claim mapping only ever evaluates against tokens verified by the
+    // provider it names, so a typo'd `jwt_provider` would make the rule
+    // silently dead. Resolve the reference at load like any other
+    // cross-reference. (API keys deliberately allow a dangling
+    // `jwt_provider`: the binding goes inert but the key still
+    // authenticates by plaintext. A mapping has no such fallback role.)
+    let provider_names = identity_maps.get("oidc_providers").unwrap_or(&empty);
+    let api_key_ids = identity_maps.get("api_keys").unwrap_or(&empty);
+    for (_, scope, mapping) in &claim_mappings {
+        if !provider_names.contains_key(&mapping.jwt_provider) {
+            let mut known: Vec<&str> = provider_names.keys().map(String::as_str).collect();
+            known.sort_unstable();
+            errors.push(LoadError {
+                scope: scope.clone(),
+                message: format!(
+                    "jwt_provider references unknown OIDC provider {:?} (defined providers: {})",
+                    mapping.jwt_provider,
+                    if known.is_empty() {
+                        "none".to_string()
+                    } else {
+                        known.join(", ")
+                    }
+                ),
+            });
+        }
+        // The `resolve.api_key` name sugar resolves (or errors) in
+        // desugar; a canonical `resolve.api_key_id` written directly must
+        // equally land on a key defined in this file, or the mapping
+        // would silently resolve nothing at runtime.
+        if !api_key_ids
+            .values()
+            .any(|derived| derived == &mapping.resolve.api_key_id)
+        {
+            errors.push(LoadError {
+                scope: scope.clone(),
+                message: format!(
+                    "resolve.api_key_id {:?} does not match any api key defined in this file — \
+                     reference the key by name via `resolve.api_key` instead",
+                    mapping.resolve.api_key_id
+                ),
+            });
+        }
+    }
+
     // A JWKS/discovery URL must never carry embedded credentials
     // (`user:pass@host` or a credential query): JWKS material is public,
     // credentials there would only leak (e.g. through a snapshot export).
@@ -681,6 +733,11 @@ pub fn load_from_str(
     for (id, _, v) in oidc_providers {
         snapshot
             .oidc_providers
+            .insert(ResourceEntry::new(id, v, revision));
+    }
+    for (id, _, v) in claim_mappings {
+        snapshot
+            .claim_mappings
             .insert(ResourceEntry::new(id, v, revision));
     }
     Ok(snapshot)

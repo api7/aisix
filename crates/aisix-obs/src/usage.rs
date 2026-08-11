@@ -528,6 +528,29 @@ pub struct UsageEvent {
     /// whose upstream produced nothing at all.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub a2a_stream_event_count: u32,
+
+    // ─── JWT identity attribution (AISIX-Cloud#564) ───
+    /// Value of the OIDC trust provider's identity claim (`sub` by
+    /// default) when the request authenticated with a JWT. Claim
+    /// mappings let many external identities share one API key, so
+    /// `api_key_id` alone can no longer name the caller — this field
+    /// restores per-identity attribution. Empty for requests
+    /// authenticated with the key's plaintext; cp-api stores empty as
+    /// NULL. Older cp-api images ignore it (DP-first rollout).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub jwt_subject: String,
+
+    /// Name of the OIDC trust provider that verified the token.
+    /// Subjects are only unique per provider, so attribution carries
+    /// both. Empty for non-JWT events; cp-api stores empty as NULL.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub jwt_provider: String,
+
+    /// Name of the claim mapping that selected the API key. Empty for
+    /// non-JWT events and for identities bound to their key directly
+    /// via `jwt_subject`; cp-api stores empty as NULL.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub jwt_claim_mapping: String,
 }
 
 #[inline]

@@ -506,6 +506,7 @@ fn emit_usage_event(
     };
     crate::usage_attr::apply_pk_telemetry(&mut event, &snap, provider_key_id);
     // Handler label "images" — bucketed prometheus counter (#408).
+    crate::usage_attr::apply_jwt_identity(&mut event, client.jwt.as_ref());
     state.usage_sink.try_emit("images", event.clone());
     let exporters = snap.observability_exporters.entries();
     state

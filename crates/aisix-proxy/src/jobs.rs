@@ -596,6 +596,7 @@ fn emit_job_usage_event(
         ..Default::default()
     };
     crate::usage_attr::apply_pk_telemetry(&mut event, &snap, &target.pk_entry.id);
+    crate::usage_attr::apply_jwt_identity(&mut event, auth.jwt.as_ref());
     state.usage_sink.try_emit(label, event.clone());
     let exporters = snap.observability_exporters.entries();
     state
@@ -1645,6 +1646,7 @@ fn maybe_attribute_batch(
 
     let state = state.clone();
     let api_key_id = auth.entry.id.clone();
+    let jwt = auth.jwt.clone();
     let model_id = target.model_entry.id.clone();
     let display_name = target.display_name().to_string();
     let cost = target.model_entry.value.cost.clone();
@@ -1659,6 +1661,7 @@ fn maybe_attribute_batch(
         if let Err(e) = attribute_batch_usage(
             &state,
             &api_key_id,
+            jwt.as_ref(),
             &model_id,
             &display_name,
             cost.as_ref(),
@@ -1690,6 +1693,7 @@ fn maybe_attribute_batch(
 async fn attribute_batch_usage(
     state: &ProxyState,
     api_key_id: &str,
+    jwt: Option<&std::sync::Arc<crate::auth::JwtIdentity>>,
     model_id: &str,
     display_name: &str,
     cost: Option<&aisix_core::models::model::ModelCost>,
@@ -1797,6 +1801,9 @@ async fn attribute_batch_usage(
             ..Default::default()
         };
         crate::usage_attr::apply_pk_telemetry(&mut event, &snap, pk_id);
+        // Attribution names the identity that observed completion — the
+        // same caller the event's api_key_id already reflects.
+        crate::usage_attr::apply_jwt_identity(&mut event, jwt);
         state.usage_sink.try_emit("batch", event.clone());
         let exporters = snap.observability_exporters.entries();
         state

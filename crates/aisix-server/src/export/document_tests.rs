@@ -442,6 +442,40 @@ fn export_output_reloads_through_the_real_file_loader() {
         serde_json::from_value(attachment("g-1", "env", None)).unwrap(),
         1,
     ));
+    // A claim mapping whose `resolve.api_key_id` must resugar to the
+    // key's (synthetic) file name and re-resolve on load — plus the key
+    // and trust provider it references, so the loader's cross-checks
+    // hold.
+    snap.apikeys.insert(ResourceEntry::new(
+        "ak-1",
+        serde_json::from_value(json!({
+            "key_hash": "91ed2dbc407561556f3e7be98ba0bd2a57986d6a868c482d867d19c6d40d201c",
+            "allowed_models": ["gpt-4o"]
+        }))
+        .unwrap(),
+        1,
+    ));
+    snap.oidc_providers.insert(ResourceEntry::new(
+        "op-1",
+        serde_json::from_value(json!({
+            "name": "corp",
+            "issuer": "https://sso.example.com/realms/agents",
+            "audiences": ["aisix"]
+        }))
+        .unwrap(),
+        1,
+    ));
+    snap.claim_mappings.insert(ResourceEntry::new(
+        "cm-1",
+        serde_json::from_value(json!({
+            "name": "finance-dept",
+            "jwt_provider": "corp",
+            "match": [{"claim": "department", "op": "exact", "values": ["finance"]}],
+            "resolve": {"api_key_id": "ak-1"}
+        }))
+        .unwrap(),
+        1,
+    ));
 
     let doc = build_export_document(&snap, false);
     let yaml = crate::export::yaml_emit::emit_yaml(&doc).expect("emit");
@@ -470,4 +504,49 @@ fn export_output_reloads_through_the_real_file_loader() {
     let guardrail = loaded.guardrails.get_by_name("log4shell").unwrap();
     let value = serde_json::to_value(&guardrail.value).unwrap();
     assert_eq!(value["patterns"][0]["value"], json!("${jndi:ldap}"));
+
+    // The claim mapping's key reference resugared to the synthetic file
+    // name and re-resolved to the id the loader derives for that key —
+    // the whole reason the exporter cannot emit the raw etcd uuid.
+    assert_eq!(loaded.oidc_providers.len(), 1);
+    assert_eq!(loaded.claim_mappings.len(), 1);
+    let cm = loaded.claim_mappings.get_by_name("finance-dept").unwrap();
+    assert_eq!(cm.value.jwt_provider, "corp");
+    assert_eq!(
+        cm.value.resolve.api_key_id,
+        derive_id("api_keys", "apikey-91ed2dbc40756155")
+    );
+}
+
+#[test]
+fn dangling_claim_mapping_target_is_kept_and_blocking() {
+    let snap = AisixSnapshot::new();
+    snap.claim_mappings.insert(ResourceEntry::new(
+        "cm-1",
+        serde_json::from_value(json!({
+            "name": "finance-dept",
+            "jwt_provider": "corp",
+            "match": [{"claim": "department", "op": "exact", "values": ["finance"]}],
+            "resolve": {"api_key_id": "ak-does-not-exist"}
+        }))
+        .unwrap(),
+        1,
+    ));
+    let doc = build_export_document(&snap, false);
+    let mappings = find(&doc, "claim_mappings");
+    assert_eq!(mappings.len(), 1);
+    // Raw id kept, no name sugar minted for a key that isn't there.
+    assert_eq!(
+        mappings[0]["resolve"]["api_key_id"],
+        json!("ak-does-not-exist")
+    );
+    assert!(mappings[0]["resolve"].get("api_key").is_none());
+    // A dangling target makes the file non-loadable → blocking.
+    assert!(
+        doc.blocking
+            .iter()
+            .any(|w| w.contains("dangling") && w.contains("finance-dept")),
+        "{:?}",
+        doc.blocking
+    );
 }

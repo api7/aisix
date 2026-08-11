@@ -596,6 +596,7 @@ mod tests {
                 key,
                 1,
             )),
+            jwt: None,
         }
     }
 

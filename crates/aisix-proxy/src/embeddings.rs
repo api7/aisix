@@ -668,6 +668,7 @@ fn emit_usage_event(
     };
     crate::usage_attr::apply_pk_telemetry(&mut event, &snap, provider_key_id);
     // Handler label "embeddings" — bucketed prometheus counter (#408).
+    crate::usage_attr::apply_jwt_identity(&mut event, client.jwt.as_ref());
     state.usage_sink.try_emit("embeddings", event.clone());
     // Per-env OTLP/HTTP fan-out — same shape as chat.rs:1334. The
     // snapshot's exporter table is empty for envs that haven't

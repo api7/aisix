@@ -731,6 +731,7 @@ async fn run_session(
         ..Default::default()
     };
     crate::usage_attr::apply_pk_telemetry(&mut event, &snap, &pk_id);
+    crate::usage_attr::apply_jwt_identity(&mut event, auth.jwt.as_ref());
     state.usage_sink.try_emit("realtime", event.clone());
     let exporters = snap.observability_exporters.entries();
     state

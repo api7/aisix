@@ -693,7 +693,7 @@ fn emit_a2a_usage(
     let response_text = call.text.response.joined();
     let prompt_tokens = crate::token_estimate::count_text("", &call.text.request);
     let completion_tokens = crate::token_estimate::count_text("", &response_text);
-    let event = UsageEvent {
+    let mut event = UsageEvent {
         request_id: request_id.to_string(),
         occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         api_key_id: auth.entry.id.clone(),
@@ -729,6 +729,7 @@ fn emit_a2a_usage(
             .unwrap_or_default(),
         ..Default::default()
     };
+    crate::usage_attr::apply_jwt_identity(&mut event, auth.jwt.as_ref());
     // The client-perceived duration of the call. Nothing else records it for
     // `/a2a`: the handler returns the moment a stream's response head is out,
     // so `aisix_proxy_request_duration_seconds` times only how long a stream

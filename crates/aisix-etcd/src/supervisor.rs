@@ -831,6 +831,9 @@ impl<P: ConfigProvider> Supervisor<P> {
                 "oidc_providers" => {
                     new.oidc_providers.remove(parsed.id);
                 }
+                "claim_mappings" => {
+                    new.claim_mappings.remove(parsed.id);
+                }
                 _ => {}
             }
             new
@@ -1165,6 +1168,7 @@ fn merge_snapshot(dst: &AisixSnapshot, src: &AisixSnapshot) {
         mcp_policies,
         a2a_agents,
         oidc_providers,
+        claim_mappings,
     } = src;
     for e in models.entries() {
         dst.models.insert(clone_entry(&e));
@@ -1202,6 +1206,9 @@ fn merge_snapshot(dst: &AisixSnapshot, src: &AisixSnapshot) {
     for e in oidc_providers.entries() {
         dst.oidc_providers.insert(clone_entry(&e));
     }
+    for e in claim_mappings.entries() {
+        dst.claim_mappings.insert(clone_entry(&e));
+    }
 }
 
 /// Whether the snapshot holds an entry for `(kind, id)`. An unknown
@@ -1222,6 +1229,7 @@ fn snapshot_has(snap: &AisixSnapshot, kind: &str, id: &str) -> bool {
         mcp_policies,
         a2a_agents,
         oidc_providers,
+        claim_mappings,
     } = snap;
     match kind {
         "models" => models.get_by_id(id).is_some(),
@@ -1236,6 +1244,7 @@ fn snapshot_has(snap: &AisixSnapshot, kind: &str, id: &str) -> bool {
         "mcp_policies" => mcp_policies.get_by_id(id).is_some(),
         "a2a_agents" => a2a_agents.get_by_id(id).is_some(),
         "oidc_providers" => oidc_providers.get_by_id(id).is_some(),
+        "claim_mappings" => claim_mappings.get_by_id(id).is_some(),
         _ => false,
     }
 }
@@ -1269,6 +1278,7 @@ fn resource_counts(snap: &AisixSnapshot) -> BTreeMap<String, usize> {
         ("mcp_policies", snap.mcp_policies.len()),
         ("a2a_agents", snap.a2a_agents.len()),
         ("oidc_providers", snap.oidc_providers.len()),
+        ("claim_mappings", snap.claim_mappings.len()),
     ] {
         if n > 0 {
             counts.insert(kind.to_string(), n);
@@ -1420,6 +1430,14 @@ mod tests {
             "issuer": "https://idp.example.com/realms/agents",
             "audiences": ["aisix-gateway"]
         }"#;
+        // A claim mapping created mid-run (AISIX-Cloud#564) — same
+        // guard: a rule added via watch must be live without a resync.
+        const VALID_CLAIM_MAPPING: &[u8] = br#"{
+            "name": "watch-rule",
+            "jwt_provider": "watch-idp",
+            "match": [{"claim": "department", "op": "exact", "values": ["finance"]}],
+            "resolve": {"api_key_id": "ak-1"}
+        }"#;
 
         let provider = Arc::new(FakeProvider::new(vec![], 0));
         let sup = Supervisor::new(provider, "/aisix");
@@ -1448,6 +1466,11 @@ mod tests {
                 VALID_OIDC_PROVIDER,
                 "OidcProvider",
             ),
+            (
+                "/aisix/claim_mappings/cm-1",
+                VALID_CLAIM_MAPPING,
+                "ClaimMapping",
+            ),
         ] {
             assert!(
                 sup.apply_put(&entry(key, body, 2)),
@@ -1470,6 +1493,7 @@ mod tests {
             "ObservabilityExporter not merged"
         );
         assert_eq!(snap.oidc_providers.len(), 1, "OidcProvider not merged");
+        assert_eq!(snap.claim_mappings.len(), 1, "ClaimMapping not merged");
     }
 
     #[tokio::test]
@@ -1496,6 +1520,13 @@ mod tests {
                     br#"{"name":"idp","issuer":"https://idp.example.com","audiences":["aisix"]}"#,
                     1,
                 ),
+                // AISIX-Cloud#564: deleting a claim mapping must reach
+                // the snapshot, or revoking a rule never takes effect.
+                entry(
+                    "/aisix/claim_mappings/cm-1",
+                    br#"{"name":"r","jwt_provider":"idp","match":[{"claim":"d","op":"exact","values":["v"]}],"resolve":{"api_key_id":"ak-1"}}"#,
+                    1,
+                ),
             ],
             1,
         ));
@@ -1510,6 +1541,9 @@ mod tests {
         assert!(sup.handle().load().guardrail_attachments.is_empty());
         assert!(sup.apply_delete("/aisix/oidc_providers/op-1"));
         assert!(sup.handle().load().oidc_providers.is_empty());
+        assert_eq!(sup.handle().load().claim_mappings.len(), 1);
+        assert!(sup.apply_delete("/aisix/claim_mappings/cm-1"));
+        assert!(sup.handle().load().claim_mappings.is_empty());
     }
 
     #[tokio::test]

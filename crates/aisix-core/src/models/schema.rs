@@ -58,6 +58,7 @@ pub struct Schemas {
     pub mcp_policy: Validator,
     pub a2a_agent: Validator,
     pub oidc_provider: Validator,
+    pub claim_mapping: Validator,
 }
 
 pub static SCHEMAS: Lazy<Arc<Schemas>> = Lazy::new(|| Arc::new(Schemas::compile(true)));
@@ -99,6 +100,7 @@ pub fn resource_root_schema(resource: &str, strict: bool) -> Value {
         "mcp_policy" => mcp_policy_root_schema(),
         "a2a_agent" => a2a_agent_root_schema(),
         "oidc_provider" => oidc_provider_root_schema(),
+        "claim_mapping" => claim_mapping_root_schema(),
         other => panic!("unknown resource {other:?}"),
     };
     if strict && closes_on_write(resource) {
@@ -127,6 +129,7 @@ impl Schemas {
             mcp_policy: build("mcp_policy"),
             a2a_agent: build("a2a_agent"),
             oidc_provider: build("oidc_provider"),
+            claim_mapping: build("claim_mapping"),
         }
     }
 }
@@ -237,6 +240,10 @@ pub fn validate_oidc_provider(value: &Value) -> Result<(), SchemaError> {
     validate(&SCHEMAS.oidc_provider, value)
 }
 
+pub fn validate_claim_mapping(value: &Value) -> Result<(), SchemaError> {
+    validate(&SCHEMAS.claim_mapping, value)
+}
+
 // ---- lenient variants (etcd snapshot loader only, issue #871) ----
 //
 // Unknown fields pass; every other constraint still applies. The loader
@@ -289,6 +296,10 @@ pub fn validate_mcp_policy_lenient(value: &Value) -> Result<(), SchemaError> {
 
 pub fn validate_oidc_provider_lenient(value: &Value) -> Result<(), SchemaError> {
     validate(&LENIENT_SCHEMAS.oidc_provider, value)
+}
+
+pub fn validate_claim_mapping_lenient(value: &Value) -> Result<(), SchemaError> {
+    validate(&LENIENT_SCHEMAS.claim_mapping, value)
 }
 
 /// Build a resource's canonical JSON Schema from its struct via `schemars`,
@@ -584,6 +595,27 @@ pub fn oidc_provider_root_schema() -> Value {
                 }
             }
         }
+    }
+    schema
+}
+
+/// Canonical JSON Schema for the `claim_mapping` resource, derived from
+/// the [`ClaimMapping`](crate::models::ClaimMapping) struct. Uses the
+/// plain-but-absent `Option` representation (`false`): the resource has
+/// no nullable fields, only defaults omitted when unset.
+pub fn claim_mapping_root_schema() -> Value {
+    let mut schema = struct_root_schema::<crate::models::ClaimMapping>(false);
+    // `priority` has a stable runtime default of 0, but schemars drops
+    // the `default` keyword for fields whose default value is skipped
+    // on serialization (`skip_serializing_if = "is_zero"`). Re-assert
+    // it so API consumers can discover the behavior from the contract,
+    // matching the `enabled: true` default the derive does emit.
+    if let Some(priority) = schema
+        .get_mut("properties")
+        .and_then(|p| p.get_mut("priority"))
+        .and_then(Value::as_object_mut)
+    {
+        priority.insert("default".to_string(), json!(0));
     }
     schema
 }

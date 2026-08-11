@@ -4113,7 +4113,7 @@ fn emit_usage_event(
     } else {
         Default::default()
     };
-    let event = UsageEvent {
+    let mut event = UsageEvent {
         request_id: request_id.to_string(),
         // RFC 3339 UTC. cp-api parses with time.Parse(time.RFC3339, ...);
         // chrono's `to_rfc3339_opts(Secs, true)` emits the trailing Z.
@@ -4176,6 +4176,7 @@ fn emit_usage_event(
         // MCP attribution does not apply to the chat path.
         ..Default::default()
     };
+    crate::usage_attr::apply_jwt_identity(&mut event, client.jwt.as_ref());
     // Handler label "chat" matches the documented enumeration for
     // `aisix_usage_events_emitted_total` (#408). Keep `&'static str`
     // so prometheus cardinality stays bounded.

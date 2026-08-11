@@ -716,6 +716,21 @@ fn build_otlp_span(record: &SinkRecord, exporter_name: &str) -> Value {
             &event.client_user_agent,
         ));
     }
+    // JWT identity attribution (AISIX-Cloud#564): who the request ran as
+    // when it authenticated with a JWT — the identity behind the (possibly
+    // shared) api_key_id.
+    if !event.jwt_subject.is_empty() {
+        attributes.push(attr_string("aisix.jwt_subject", &event.jwt_subject));
+    }
+    if !event.jwt_provider.is_empty() {
+        attributes.push(attr_string("aisix.jwt_provider", &event.jwt_provider));
+    }
+    if !event.jwt_claim_mapping.is_empty() {
+        attributes.push(attr_string(
+            "aisix.jwt_claim_mapping",
+            &event.jwt_claim_mapping,
+        ));
+    }
     // Gateway-protocol attribution. An A2A or MCP call is not a model
     // inference, and encoding one as a bare `chat` span left every agent and
     // tool call in a trace backend indistinguishable from an LLM request —

@@ -2845,7 +2845,7 @@ fn emit_usage_event(
 ) {
     let snap = state.snapshot.load();
     let tags = provider_telemetry_tags(&snap, provider_key_id);
-    let event = UsageEvent {
+    let mut event = UsageEvent {
         request_id: request_id.to_string(),
         occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         model_id: model_id.to_string(),
@@ -2882,6 +2882,7 @@ fn emit_usage_event(
         guardrail_monitor_hits,
         ..Default::default()
     };
+    crate::usage_attr::apply_jwt_identity(&mut event, client.jwt.as_ref());
     state.usage_sink.try_emit("responses", event.clone());
     let exporters = snap.observability_exporters.entries();
     state
@@ -2951,7 +2952,7 @@ fn emit_zero_token_event(
 ) {
     let snap = state.snapshot.load();
     let tags = provider_telemetry_tags(&snap, provider_key_id);
-    let event = UsageEvent {
+    let mut event = UsageEvent {
         request_id: request_id.to_string(),
         occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         model_id: model_id.to_string(),
@@ -2976,6 +2977,7 @@ fn emit_zero_token_event(
         client_user_agent: client.user_agent.clone(),
         ..Default::default()
     };
+    crate::usage_attr::apply_jwt_identity(&mut event, client.jwt.as_ref());
     state.usage_sink.try_emit("responses", event.clone());
     let exporters = snap.observability_exporters.entries();
     state

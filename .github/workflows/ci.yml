@@ -5,6 +5,12 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Manual escape hatch: GitHub intermittently fails to materialize
+  # pull_request-triggered runs for a branch (observed on #936 — the
+  # synchronize/opened events produced no check suite while every other
+  # branch's did). Dispatching on the PR ref attaches the same check
+  # runs to the head commit.
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always

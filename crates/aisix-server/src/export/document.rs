@@ -318,6 +318,21 @@ pub fn build_export_document(snapshot: &AisixSnapshot, reveal_secrets: bool) -> 
         ),
     );
 
+    // claim_mappings — identity: name; `resolve.api_key_id` resugars to
+    // the referenced key's file name so the reference survives reload.
+    push_kind(
+        &mut collections,
+        "claim_mappings",
+        emit_entries(
+            &snapshot.claim_mappings,
+            |m| m.name.clone(),
+            "claim_mappings",
+            &mut diag,
+            |doc, identity, diag| resugar_claim_resolve(doc, identity, &api_key_names, diag),
+            |_, _| {},
+        ),
+    );
+
     // guardrail_attachments are consumed above to decide which guardrails
     // are gateway-wide; they are not a file collection of their own.
 
@@ -519,6 +534,39 @@ fn resugar_provider_key(
             "model {model:?} references provider_key_id {id:?}, which is not among the exported \
              provider keys — kept as a raw id (dangling reference in the source data; the file \
              will not load until it is resolved)"
+        )),
+    }
+}
+
+/// `claim_mapping.resolve.api_key_id` (etcd id) → `resolve.api_key`
+/// (name), the file's sugar form, which the loader resolves back to the
+/// key's derived id. Emitting the raw etcd UUID would resolve to nothing
+/// at runtime (a silently dead mapping), so a dangling id is blocking.
+fn resugar_claim_resolve(
+    doc: &mut Value,
+    mapping: &str,
+    api_key_names: &BTreeMap<String, String>,
+    diag: &mut Diagnostics,
+) {
+    let Some(resolve) = doc.get_mut("resolve").and_then(Value::as_object_mut) else {
+        return;
+    };
+    let Some(id) = resolve
+        .get("api_key_id")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+    else {
+        return;
+    };
+    match api_key_names.get(&id) {
+        Some(name) => {
+            resolve.remove("api_key_id");
+            resolve.insert("api_key".into(), Value::String(name.clone()));
+        }
+        None => diag.blocking.push(format!(
+            "claim_mapping {mapping:?} resolve.api_key_id references api key id {id:?}, which is \
+             not among the exported api keys — kept as a raw id (dangling reference in the source \
+             data; the file will not load until it is resolved)"
         )),
     }
 }

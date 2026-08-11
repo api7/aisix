@@ -19,6 +19,24 @@ use crate::state::ProxyState;
 #[derive(Debug, Clone)]
 pub struct AuthenticatedKey {
     pub entry: Arc<ResourceEntry<ApiKey>>,
+    /// The external identity behind this request when it authenticated
+    /// with a JWT instead of the key's plaintext; `None` on the API-key
+    /// path. Carried for usage attribution — the resolved key alone
+    /// cannot name the subject once claim mappings let many identities
+    /// share one key (AISIX-Cloud#564).
+    pub jwt: Option<Arc<JwtIdentity>>,
+}
+
+/// The verified JWT identity a request authenticated as.
+#[derive(Debug)]
+pub struct JwtIdentity {
+    /// Value of the trust provider's identity claim (`sub` by default).
+    pub subject: String,
+    /// Name of the OIDC provider that verified the token.
+    pub provider: String,
+    /// Name of the claim mapping that selected the API key, or `None`
+    /// when the subject was bound to the key directly via `jwt_subject`.
+    pub claim_mapping: Option<String>,
 }
 
 /// Per-request context carried onto an authentication denial.
@@ -95,6 +113,11 @@ where
         // (AISIX-Cloud#1112) — which is why every handler declares
         // `auth: AuthenticatedKey` before `client: ClientContext`.
         parts.extensions.insert(authed.entry.clone());
+        // Same for the JWT identity: `ClientContext` carries it to each
+        // handler's usage-event emitter for attribution.
+        if let Some(jwt) = &authed.jwt {
+            parts.extensions.insert(jwt.clone());
+        }
         Ok(authed)
     }
 }
@@ -159,7 +182,7 @@ pub(crate) async fn authenticate_token(
         ));
     }
     state.metrics.record_auth_decision("api_key", true, "");
-    Ok(AuthenticatedKey { entry })
+    Ok(AuthenticatedKey { entry, jwt: None })
 }
 
 /// Record an API-key denial on the decision metric + log
