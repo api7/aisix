@@ -31,8 +31,8 @@
 use std::time::{Duration, Instant};
 
 use aisix_a2a::{
-    append_result_text, canonical_operation, is_stream_end, is_streaming_operation, request_text,
-    upstream_from_a2a_agent, A2aBridge, A2aCallFacts, A2aError, HttpBridge,
+    canonical_operation, is_stream_end, is_streaming_operation, request_text,
+    upstream_from_a2a_agent, A2aBridge, A2aCallFacts, A2aError, HttpBridge, ResultText,
 };
 use aisix_obs::{content_capture_cap, AccessLog, CapturedContent, UsageEvent};
 use axum::body::to_bytes;
@@ -77,17 +77,16 @@ struct A2aCall {
 ///
 /// An agent reports no token usage — there is no `usage` block in the
 /// protocol — so the only way a call can be metered at all is to count what
-/// passed through. Both buffers are hard-capped by
-/// [`crate::token_estimate::push_capped`]: an A2A task may stream for hours,
-/// and past the cap the estimate becomes a lower bound rather than the buffer
-/// growing without limit.
-#[derive(Default)]
+/// passed through. Both buffers are bounded by
+/// [`crate::token_estimate::push_capped`]: a request body has no size limit by
+/// default and an A2A task may stream for hours, and both are retained for the
+/// life of the call. Past the bound the text becomes a prefix and the estimate
+/// a lower bound, rather than the buffer growing without limit.
 struct A2aCallText {
     /// The caller's message text.
     request: String,
-    /// The agent's, accumulated across a stream under the protocol's own
-    /// append/replace rule.
-    response: String,
+    /// The agent's, under the protocol's own per-artifact append/replace rule.
+    response: ResultText,
 }
 
 /// What a streamed A2A call did on the wire, accumulated as events pass.
@@ -107,6 +106,18 @@ struct A2aStreamProgress {
     /// when the guard drops means the generator was cancelled underneath us,
     /// which is a caller that hung up mid-task.
     reached_end: bool,
+}
+
+/// Whether an operation's words are the agent GENERATING something, and so
+/// worth metering and capturing.
+///
+/// `message/send` and `message/stream` are the two that make an agent produce.
+/// Everything else reads back a task the gateway has already accounted for:
+/// `tasks/get` returns the whole task on every poll and `tasks/resubscribe`
+/// replays its stream from the start, so counting those would report one
+/// answer as many times as a client cared to look at it.
+fn meters_content(operation: &str) -> bool {
+    matches!(operation, "message/send" | "message/stream")
 }
 
 /// Serve a JSON-RPC request to `/a2a/:agent`. Authentication (`401`), per-agent
@@ -143,6 +154,9 @@ pub async fn a2a_endpoint(
         provider: Some("a2a"),
         model: None,
         api_key_id: Some(&api_key_id),
+        // Counted inside `dispatch`, which hands back only a rendered
+        // `Response` — and for a stream, not until its drop guard fires, long
+        // after this line. The usage event carries them.
         prompt_tokens: None,
         completion_tokens: None,
         total_tokens: None,
@@ -226,15 +240,25 @@ async fn dispatch(
         .unwrap_or_default()
         .to_string();
     let rpc_id = value.get("id").cloned();
+    let operation = canonical_operation(&method);
     let mut call = A2aCall {
-        operation: canonical_operation(&method),
+        operation,
         method,
         protocol_version: upstream.protocol_version.as_wire_str(),
         facts: A2aCallFacts::default(),
         stream: A2aStreamProgress::default(),
         text: A2aCallText {
-            request: request_text(&value),
-            response: String::new(),
+            // Only the operations that make an agent GENERATE are metered.
+            // A read (`tasks/get`, `tasks/resubscribe`) hands back the same
+            // answer on every poll, and counting those would let a client
+            // polling a ten-minute task report its answer six hundred times —
+            // swamping exactly the per-agent figures this exists to produce.
+            request: if meters_content(operation) {
+                request_text(&value, crate::token_estimate::push_capped)
+            } else {
+                String::new()
+            },
+            response: ResultText::default(),
         },
     };
     // Read before the upstream is contacted, so a call that never lands still
@@ -242,7 +266,12 @@ async fn dispatch(
     call.facts.observe_request(&value);
 
     // Reuse the LLM path's rate-limit + budget gate. The reservation is held
-    // for the call (an A2A call carries no token cost yet). On 429 /
+    // for the call and released without committing tokens: the counts this
+    // endpoint reports are the gateway's own reading of the words, not an
+    // agent's billed usage, so they are REPORTED but never CHARGED. Token
+    // windows and token budgets therefore do not move on A2A traffic, which
+    // is deliberate — inferring a spend limit from an estimate would throttle
+    // callers on a number no provider ever confirmed. On 429 /
     // budget-exceeded this returns before the upstream is contacted.
     let reservation = match crate::quota::enforce(state, &auth, None).await {
         Ok(reservation) => reservation,
@@ -285,11 +314,11 @@ async fn dispatch(
     match result {
         Ok(response_value) => {
             call.facts.observe_result(&response_value);
-            append_result_text(
-                &response_value,
-                &mut call.text.response,
-                crate::token_estimate::push_capped,
-            );
+            if meters_content(call.operation) {
+                call.text
+                    .response
+                    .observe(&response_value, crate::token_estimate::push_capped);
+            }
             emit_a2a_usage(
                 state,
                 &auth,
@@ -444,11 +473,13 @@ async fn dispatch_stream(
                     // inflate the event counter and put a near-zero
                     // observation into the time-to-first-event histogram,
                     // dragging the percentile of real streams down with it.
-                    append_result_text(
-                        &value,
-                        &mut guard.call.text.response,
-                        crate::token_estimate::push_capped,
-                    );
+                    if meters_content(guard.call.operation) {
+                        guard
+                            .call
+                            .text
+                            .response
+                            .observe(&value, crate::token_estimate::push_capped);
+                    }
                     if value.get("result").is_some() {
                         guard.call.stream.event_count += 1;
                         // The agent's own time to first byte. Stamped on the
@@ -647,8 +678,9 @@ fn emit_a2a_usage(
 ) {
     // No model resolves on this endpoint, so the estimator falls back to its
     // default encoding — the same thing it does for any non-OpenAI model.
+    let response_text = call.text.response.joined();
     let prompt_tokens = crate::token_estimate::count_text("", &call.text.request);
-    let completion_tokens = crate::token_estimate::count_text("", &call.text.response);
+    let completion_tokens = crate::token_estimate::count_text("", &response_text);
     let event = UsageEvent {
         request_id: request_id.to_string(),
         occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
@@ -674,7 +706,10 @@ fn emit_a2a_usage(
         // know, and inventing a number would be worse than reporting none.
         prompt_tokens,
         completion_tokens,
-        usage_estimated: prompt_tokens > 0 || completion_tokens > 0,
+        // Set on every A2A row, not only the counted ones: a zero here is
+        // the gateway's own count too, so a consumer filtering for
+        // provider-billed exactness must not pick these up as exact.
+        usage_estimated: true,
         upstream_ttft_ms: call
             .stream
             .ttfb
@@ -723,7 +758,7 @@ fn emit_a2a_usage(
     // envelopes, so it reads as a prompt and a completion rather than as
     // protocol scaffolding.
     let captured = content_capture_cap(exporters.iter().map(|e| &e.value))
-        .map(|cap| CapturedContent::new(&call.text.request, &call.text.response, cap as usize));
+        .map(|cap| CapturedContent::new(&call.text.request, &response_text, cap as usize));
     state.otlp_fan_out.fan_out(
         &event,
         captured.as_ref(),
@@ -1330,7 +1365,31 @@ mod tests {
         .await;
 
         assert_eq!(event.prompt_tokens, 0);
-        assert!(!event.usage_estimated, "nothing was estimated");
+        assert_eq!(event.completion_tokens, 0);
+        // The flag rides every A2A row, zero included: the zero is the
+        // gateway's own count too, and a consumer filtering for
+        // provider-billed exactness must not mistake it for one.
+        assert!(event.usage_estimated);
+    }
+
+    #[tokio::test]
+    async fn reading_a_task_back_does_not_re_meter_its_answer() {
+        // `tasks/get` returns the whole task on every poll. Counting it would
+        // let a client polling a long task report one answer as many times as
+        // it cared to look, swamping the per-agent figures this exists for.
+        let event = usage_event_for(
+            &spawn_talking_agent().await,
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tasks/get", "params": {"id": "t-1"}
+            }),
+        )
+        .await;
+
+        assert_eq!(event.a2a_operation, "tasks/get");
+        assert_eq!(
+            event.completion_tokens, 0,
+            "a read re-states an answer already counted"
+        );
     }
 
     #[tokio::test]

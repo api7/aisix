@@ -10,6 +10,7 @@ import {
   type SpawnedApp,
 } from "../harness/index.js";
 import { startMockOtlp, type MockOtlp } from "../harness/otlp-mock.js";
+import { STREAM_ANSWER } from "../harness/upstream-a2a.js";
 
 // E2E for AISIX-Cloud#1215: protocol-level observability for the A2A gateway.
 //
@@ -79,8 +80,16 @@ describe("a2a protocol telemetry e2e (AISIX-Cloud#1215)", () => {
 
     otlp = await startMockOtlp();
     otlpFull = await startMockOtlp();
-    upstream10 = await startA2aUpstream({ cardMount: "origin", wireShape: "1.0" });
-    upstream03 = await startA2aUpstream({ cardMount: "origin", wireShape: "0.3" });
+    upstream10 = await startA2aUpstream({
+      cardMount: "origin",
+      wireShape: "1.0",
+      streamAnswer: true,
+    });
+    upstream03 = await startA2aUpstream({
+      cardMount: "origin",
+      wireShape: "0.3",
+      streamAnswer: true,
+    });
     app = await spawnApp();
     const seed = new SeedClient(etcd, app.etcdPrefix);
 
@@ -255,7 +264,7 @@ describe("a2a protocol telemetry e2e (AISIX-Cloud#1215)", () => {
     ).toBe(200);
 
     const span = await awaitSpan((s) => s.attributes["gen_ai.conversation.id"] === contextId);
-    expect(span.attributes["aisix.a2a.stream_event_count"]).toBe(3);
+    expect(span.attributes["aisix.a2a.stream_event_count"]).toBe(6);
     // The agent's own time to first event. The stub pauses before each of its
     // three events, so a figure that actually stopped at the first one is a
     // fraction of the call; one that quietly measured the whole stream would
@@ -351,9 +360,47 @@ describe("a2a protocol telemetry e2e (AISIX-Cloud#1215)", () => {
     }
     expect(captured, "the full-content exporter received the call").toBeDefined();
     expect(captured!.attributes["gen_ai.prompt"]).toContain(prompt);
+    expect(captured!.attributes["gen_ai.completion"]).toContain("The invoice is settled.");
     // ...and never the default one, whatever else it carries.
     expect(metered.attributes["gen_ai.prompt"]).toBeUndefined();
     expect(metered.attributes["gen_ai.completion"]).toBeUndefined();
+  });
+
+  test("a streamed answer survives the progress notes around it", async (ctx) => {
+    if (!etcdReachable || !app || !upstream10 || !upstream03 || !otlp || !otlpFull)
+      return ctx.skip();
+
+    // The agent delivers its answer as two continued artifact chunks with a
+    // progress note between them and a closing statement after — the shape a
+    // reference agent produces. An accumulator that treats every statement as
+    // a replacement keeps only "Report generated." and loses the report.
+    const contextId = `ctx-${randomUUID()}`;
+    expect(
+      await call("invoices", {
+        jsonrpc: "2.0",
+        id: 11,
+        method: "message/stream",
+        params: { message: { role: "user", contextId, parts: [{ kind: "text", text: "report?" }] } },
+      }),
+    ).toBe(200);
+
+    const deadline = Date.now() + EXPORT_TIMEOUT_MS;
+    let captured: (typeof otlpFull.spans)[number] | undefined;
+    while (Date.now() < deadline && !captured) {
+      captured = otlpFull.spans.find((s) => s.attributes["gen_ai.conversation.id"] === contextId);
+      if (!captured) await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    expect(captured, "the full-content exporter received the stream").toBeDefined();
+
+    const completion = String(captured!.attributes["gen_ai.completion"]);
+    expect(completion).toContain(STREAM_ANSWER.join(""));
+    expect(completion).toContain("Report generated.");
+    expect(completion).not.toContain("halfway");
+    // The answer appears once, not once per chunk that restated it.
+    expect(completion.split(STREAM_ANSWER[0]).length - 1).toBe(1);
+    // And it is counted, so a long answer is not metered as a short one.
+    const metered = await awaitSpan((s) => s.attributes["gen_ai.conversation.id"] === contextId);
+    expect(metered.attributes["gen_ai.usage.output_tokens"]).toBeGreaterThan(5);
   });
 
   test("an unrecognised method cannot become an unbounded label", async (ctx) => {

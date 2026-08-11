@@ -28,6 +28,6 @@ pub use bridge::{
 };
 pub use error::A2aError;
 pub use telemetry::{
-    append_result_text, canonical_operation, is_stream_end, is_streaming_operation, request_text,
-    A2aCallFacts,
+    canonical_operation, is_stream_end, is_streaming_operation, request_text, A2aCallFacts,
+    ResultText,
 };
