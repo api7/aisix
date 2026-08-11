@@ -458,10 +458,13 @@ describe("upstream TTFT stops on the first streamed frame", () => {
 
     // Anthropic-shaped request, OpenAI-compatible upstream: the
     // cross-provider translation, not the byte-for-byte passthrough.
+    // The wide gap makes the assertion discriminate this call site's
+    // stamp: a generated-output predicate skips the opener and waits a
+    // full CHAT_GAP_MS for the first reasoning delta.
     const upstream = await startOpenAiUpstream({
-      streamEvents: openerThenQuietThenContent(),
+      streamEvents: openerThenQuietThenContent(2),
       firstEventDelayMs: LEAD_MS,
-      eventDelayMs: GAP_MS,
+      eventDelayMs: CHAT_GAP_MS,
     });
     upstreams.push(upstream);
     await createModel("ttft-ff-messages-bridge", upstream, "deepseek");
@@ -488,9 +491,12 @@ describe("upstream TTFT stops on the first streamed frame", () => {
     const span = await waitForSpan(otlp, requestId!);
     const ttft = Number(span["aisix.upstream_ttft_ms"]);
 
+    // Same discriminating bound as the chat case: the mock cannot
+    // deliver frame two before LEAD_MS + CHAT_GAP_MS, so a predicate
+    // that skips the opener always lands past this bound.
     expect(Number.isFinite(ttft)).toBe(true);
     expect(ttft).toBeGreaterThan(0);
-    expect(ttft).toBeLessThan(OUTPUT_STARTS_MS / 2);
+    expect(ttft).toBeLessThan(LEAD_MS + CHAT_GAP_MS);
   });
 
   test("the first bridged chunk stops the clock on the /v1/responses bridge", async (ctx) => {
@@ -500,11 +506,13 @@ describe("upstream TTFT stops on the first streamed frame", () => {
     }
 
     // A non-OpenAI provider serves /v1/responses through the
-    // chat-completions bridge, so the upstream speaks chat SSE.
+    // chat-completions bridge, so the upstream speaks chat SSE. Wide gap
+    // for the same reason as the messages bridge above: the bound must
+    // fail if this call site regains a generated-output predicate.
     const upstream = await startOpenAiUpstream({
-      streamEvents: openerThenQuietThenContent(),
+      streamEvents: openerThenQuietThenContent(2),
       firstEventDelayMs: LEAD_MS,
-      eventDelayMs: GAP_MS,
+      eventDelayMs: CHAT_GAP_MS,
     });
     upstreams.push(upstream);
     await createModel("ttft-ff-resp-bridge", upstream, "deepseek");
@@ -530,8 +538,10 @@ describe("upstream TTFT stops on the first streamed frame", () => {
     const span = await waitForSpan(otlp, requestId!);
     const ttft = Number(span["aisix.upstream_ttft_ms"]);
 
+    // Same discriminating bound as the chat case — see the messages
+    // bridge above.
     expect(Number.isFinite(ttft)).toBe(true);
     expect(ttft).toBeGreaterThan(0);
-    expect(ttft).toBeLessThan(OUTPUT_STARTS_MS / 2);
+    expect(ttft).toBeLessThan(LEAD_MS + CHAT_GAP_MS);
   });
 });
