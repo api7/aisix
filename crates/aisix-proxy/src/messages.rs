@@ -1852,7 +1852,7 @@ async fn cross_provider_dispatch(
                 }
             };
             // Re-prepend the peeked chunk so the SSE encoder sees the whole
-            // stream (and records TTFT on the first content chunk).
+            // stream (and records TTFT on the first chunk).
             Box::pin(
                 futures::stream::once(std::future::ready(Ok::<_, aisix_gateway::BridgeError>(
                     first_chunk,
@@ -2248,7 +2248,11 @@ fn build_anthropic_sse_stream(
         while let Some(item) = upstream.next().await {
             match item {
                 Ok(chunk) => {
-                    if !first_chunk_seen && chunk.delta.carries_generated_output() {
+                    // First upstream chunk of ANY type stops the TTFT clock —
+                    // the industry convention (LiteLLM, caller-side gateways),
+                    // so the figure matches external observers
+                    // (AISIX-Cloud#1225).
+                    if !first_chunk_seen {
                         first_chunk_seen = true;
                         guard.comp().upstream_ttft_ms =
                             attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
@@ -2883,7 +2887,8 @@ struct AnthropicStreamUsage {
     provider_request_id: String,
     provider_model_version: String,
     finish_reason: String,
-    /// Attempt-scoped time to the upstream's first content frame.
+    /// Attempt-scoped time to the upstream's first streamed frame,
+    /// whatever its type — see `UsageEvent::upstream_ttft_ms`.
     upstream_ttft_ms: u32,
     /// Request-scoped time until the caller got its first response
     /// bytes. Trails `upstream_ttft_ms` by whatever the gateway did
@@ -2914,15 +2919,21 @@ struct AnthropicStreamUsage {
 
 /// Update the accumulator from one parsed SSE `data:` JSON object.
 /// Best-effort: unrecognised `type` values are ignored. The TTFT
-/// measurement (first content frame) is driven by `attempt_started` and
-/// `first_token_seen`, and is attempt-scoped — see
-/// `UsageEvent::upstream_ttft_ms`.
+/// measurement is driven by `attempt_started` and `first_token_seen`,
+/// and is attempt-scoped — see `UsageEvent::upstream_ttft_ms`.
 fn update_anthropic_usage(
     acc: &mut AnthropicStreamUsage,
     json: &Value,
     attempt_started: Instant,
     first_token_seen: &mut bool,
 ) {
+    // First parsed frame of ANY type (`message_start` included) stops the
+    // TTFT clock — the industry convention (LiteLLM, caller-side gateways),
+    // so the figure matches external observers (AISIX-Cloud#1225).
+    if !*first_token_seen {
+        *first_token_seen = true;
+        acc.upstream_ttft_ms = attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+    }
     match json.get("type").and_then(Value::as_str) {
         Some("message_start") => {
             let msg = json.get("message");
@@ -2955,12 +2966,6 @@ fn update_anthropic_usage(
             }
         }
         Some("content_block_start") | Some("content_block_delta") => {
-            // First content frame → record time-to-first-token.
-            if !*first_token_seen {
-                *first_token_seen = true;
-                acc.upstream_ttft_ms =
-                    attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
-            }
             // Accumulate assistant output for the end-of-stream output
             // guardrail (#448). text streams as `delta.text`; tool_use
             // streams its name in `content_block.{name,input}` on

@@ -4819,10 +4819,11 @@ where
         while let Some(item) = upstream.next().await {
             let maybe_chunk = match item {
                 Ok(mut chunk) => {
-                    // Record TTFT on the first chunk carrying generated
-                    // output — reasoning text included, role-only frames
-                    // excluded. See `ChatDelta::carries_generated_output`.
-                    if !first_chunk_seen && chunk.delta.carries_generated_output() {
+                    // Record TTFT on the first upstream chunk of ANY type,
+                    // role-only preambles included — the industry convention
+                    // (LiteLLM, caller-side gateways), so the figure matches
+                    // what external observers report (AISIX-Cloud#1225).
+                    if !first_chunk_seen {
                         first_chunk_seen = true;
                         guard.comp().upstream_ttft_ms =
                             attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
