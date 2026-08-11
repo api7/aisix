@@ -1,0 +1,75 @@
+# Flake-hunt stress loop for the aisix-proxy unit suite — manual only.
+#
+# Repeats the suite many times per shard under two conditions:
+#   - cov4:   cargo llvm-cov, default test threads — the ci.yml unit job's
+#             conditions, where the auth log-capture flake was seen on main.
+#   - fast64: plain cargo test with --test-threads=64 — heavy in-process
+#             concurrency, which reproduced the mcp minute-window race.
+#
+# `ref` stresses any branch without adding this file to it (the workflow
+# definition runs from THIS branch; the checkout follows the input).
+# Never wired to push/PR triggers — dispatch it, read the verdict, done.
+name: stress-proxy
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "git ref to check out and stress (default: this branch)"
+        required: false
+        default: ""
+      iterations:
+        description: "iterations per shard"
+        required: false
+        default: "30"
+      testfilter:
+        description: "test name filter passed to the harness"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  stress:
+    name: stress (${{ matrix.mode }}, shard ${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [cov4, fast64]
+        shard: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-protoc
+      - uses: Swatinem/rust-cache@v2
+      - name: install cargo-llvm-cov
+        if: matrix.mode == 'cov4'
+        uses: taiki-e/install-action@cargo-llvm-cov
+      - name: stress loop
+        run: |
+          set -uo pipefail
+          iters="${{ inputs.iterations }}"
+          filter="${{ inputs.testfilter }}"
+          for i in $(seq 1 "$iters"); do
+            echo "::group::iteration $i"
+            if [ "${{ matrix.mode }}" = "cov4" ]; then
+              cargo llvm-cov --no-report -p aisix-proxy --lib -- $filter >/tmp/out.log 2>&1
+              rc=$?
+            else
+              cargo test -p aisix-proxy --lib -- --test-threads=64 $filter >/tmp/out.log 2>&1
+              rc=$?
+            fi
+            tail -3 /tmp/out.log
+            echo "::endgroup::"
+            if [ "$rc" -ne 0 ]; then
+              echo "FAILED on iteration $i (mode ${{ matrix.mode }}, shard ${{ matrix.shard }})"
+              grep -B5 -A60 -E "panicked|FAILED" /tmp/out.log | head -300
+              exit 1
+            fi
+          done
+          echo "clean: $iters iterations (mode ${{ matrix.mode }}, shard ${{ matrix.shard }})"

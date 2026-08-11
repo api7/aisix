@@ -311,7 +311,34 @@ mod tests {
             f().await;
         }
         let bytes = buf.lock().unwrap().clone();
-        String::from_utf8(bytes).unwrap()
+        let text = String::from_utf8(bytes).unwrap();
+        if text.is_empty() {
+            // FLAKE-HUNT DIAGNOSTICS (never merge). An empty capture is the
+            // failure seen on main (run 31137791884): distinguish a
+            // persistently poisoned callsite/filter state from a transient
+            // race by re-emitting a probe under a fresh scoped subscriber.
+            eprintln!(
+                "capture_logs EMPTY: LevelFilter::current()={:?}",
+                tracing::level_filters::LevelFilter::current(),
+            );
+            let probe_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let probe_sub = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::DEBUG)
+                .with_writer(BufWriter(probe_buf.clone()))
+                .finish();
+            {
+                let _g = tracing::subscriber::set_default(probe_sub);
+                tracing::debug!(target: "aisix::auth", probe = true, "capture-probe");
+            }
+            let probe = String::from_utf8(probe_buf.lock().unwrap().clone()).unwrap_or_default();
+            if probe.is_empty() {
+                eprintln!("capture_logs probe: ALSO EMPTY — persistent poisoning");
+            } else {
+                eprintln!("capture_logs probe: captured — transient race during f()");
+            }
+        }
+        text
     }
 
     const GOOD_TOKEN: &str = "sk-auth-ctx-good";
