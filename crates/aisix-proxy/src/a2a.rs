@@ -776,20 +776,22 @@ mod tests {
         let app = axum::Router::new().route(
             "/a2a",
             axum::routing::post(|| async {
-                let chunks: Vec<Result<String, std::convert::Infallible>> = [
-                    "submitted",
-                    "working",
-                    "input-required",
-                ]
-                .iter()
-                .map(|state| {
-                    Ok(format!(
-                        "data: {{\"jsonrpc\":\"2.0\",\"result\":{{\"kind\":\"status-update\",\
-                                 \"taskId\":\"task-77\",\"contextId\":\"ctx-77\",\
-                                 \"status\":{{\"state\":\"{state}\"}}}}}}\n\n"
-                    ))
-                })
-                .collect();
+                let chunks: Vec<Result<String, std::convert::Infallible>> =
+                    ["submitted", "working", "input-required"]
+                        .iter()
+                        .map(|state| {
+                            let event = serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "result": {
+                                    "kind": "status-update",
+                                    "taskId": "task-77",
+                                    "contextId": "ctx-77",
+                                    "status": {"state": state},
+                                },
+                            });
+                            Ok(format!("data: {event}\n\n"))
+                        })
+                        .collect();
                 (
                     [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
                     axum::body::Body::from_stream(futures::stream::iter(chunks)),
