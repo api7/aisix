@@ -789,6 +789,13 @@ pub struct HistogramBucketsConfig {
     pub request_ttft: Option<Vec<f64>>,
     /// `aisix_guardrail_latency_seconds`
     pub guardrail_latency: Option<Vec<f64>>,
+    /// `aisix_a2a_ttfb_seconds`
+    ///
+    /// Separate from `request_ttft` on purpose: an agent's wait for its first
+    /// event and a model's wait for its first token have the same shape but
+    /// not the same range — an A2A task may think for minutes before it says
+    /// anything. Defaults to the same edges as `request_ttft`.
+    pub a2a_ttfb: Option<Vec<f64>>,
 }
 
 /// One `client_type_rules` entry: a regex tried against the raw inbound
@@ -1307,6 +1314,7 @@ impl Config {
                 .with_list_parse_key("observability.metrics.buckets.request_e2e_latency")
                 .with_list_parse_key("observability.metrics.buckets.request_ttft")
                 .with_list_parse_key("observability.metrics.buckets.guardrail_latency")
+                .with_list_parse_key("observability.metrics.buckets.a2a_ttfb")
                 .try_parsing(true),
         );
 

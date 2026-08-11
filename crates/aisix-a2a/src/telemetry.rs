@@ -151,6 +151,45 @@ pub fn normalize_task_state(state: &str) -> &'static str {
         .unwrap_or(UNKNOWN_TASK_STATE)
 }
 
+/// Task states that mean the agent has said everything it is going to say on
+/// this stream: the task is finished, or it is waiting on the caller.
+const STREAM_ENDING_STATES: &[&str] = &[
+    "completed",
+    "canceled",
+    "failed",
+    "rejected",
+    "input-required",
+    "auth-required",
+];
+
+/// Whether a streamed event is the last one its stream will carry.
+///
+/// A caller stops reading here, which makes this — not the upstream's
+/// eventual EOF — the moment the response was fully delivered. Anything that
+/// waits for the connection to close instead reports a completed task as
+/// abandoned whenever the agent leaves the stream open afterwards.
+///
+/// 0.3 says so with `final`. 1.0's `TaskStatusUpdateEvent` has no such field
+/// at all, so there the task's own state is the only signal: a task that is
+/// neither `submitted` nor `working` has nothing further to stream until the
+/// caller acts.
+pub fn is_stream_end(event: &Value) -> bool {
+    let Some(result) = event.get("result") else {
+        return false;
+    };
+    let payload = unwrap_payload(result);
+    if payload.get("final").and_then(Value::as_bool) == Some(true) {
+        return true;
+    }
+    let Some(state) = payload
+        .get("status")
+        .and_then(|status| str_field(status, "state"))
+    else {
+        return false;
+    };
+    STREAM_ENDING_STATES.contains(&normalize_task_state(state))
+}
+
 /// What one A2A call touched, accumulated as its request and response(s) are
 /// seen.
 ///
@@ -169,7 +208,12 @@ pub struct A2aCallFacts {
     /// Last task state reported, in its 0.3 spelling. Empty when no response
     /// carried one — a state is never invented for a call that failed before
     /// the upstream answered.
-    pub task_state: String,
+    ///
+    /// `&'static str` rather than a `String`: the value is always one of the
+    /// specification's states or `unknown`, and typing it that way is what
+    /// lets it be used as a metric label without a caller having to promise
+    /// it is bounded.
+    pub task_state: &'static str,
 }
 
 impl A2aCallFacts {
@@ -223,7 +267,7 @@ impl A2aCallFacts {
         if let Some(status) = payload.get("status") {
             self.set_task_id(str_field(payload, "id"));
             if let Some(state) = str_field(status, "state") {
-                self.task_state = normalize_task_state(state).to_string();
+                self.task_state = normalize_task_state(state);
             }
         }
     }
@@ -538,6 +582,38 @@ mod tests {
         }));
         assert_eq!(facts.task_id, "t-5");
         assert_eq!(facts.task_state, "");
+    }
+
+    #[test]
+    fn the_terminal_event_is_recognised_in_both_versions() {
+        // The moment a caller stops reading. 0.3 marks it with `final`; 1.0's
+        // status-update has no such field, so only the task's own state says
+        // so — and both spellings of that state have to work.
+        for terminal in [
+            json!({"result": {"kind": "status-update", "taskId": "t", "final": true,
+                              "status": {"state": "input-required"}}}),
+            json!({"result": {"kind": "task", "id": "t", "status": {"state": "completed"}}}),
+            json!({"result": {"statusUpdate": {"taskId": "t",
+                              "status": {"state": "TASK_STATE_FAILED"}}}}),
+            json!({"result": {"task": {"id": "t", "status": {"state": "TASK_STATE_CANCELED"}}}}),
+        ] {
+            assert!(is_stream_end(&terminal), "{terminal} ends the stream");
+        }
+        // A task still running does not, nor does an event with no state at
+        // all (an artifact chunk), nor an error envelope.
+        for ongoing in [
+            json!({"result": {"kind": "status-update", "taskId": "t", "final": false,
+                              "status": {"state": "working"}}}),
+            json!({"result": {"statusUpdate": {"taskId": "t",
+                              "status": {"state": "TASK_STATE_SUBMITTED"}}}}),
+            json!({"result": {"artifactUpdate": {"taskId": "t"}}}),
+            json!({"error": {"code": -32000, "message": "boom"}}),
+        ] {
+            assert!(
+                !is_stream_end(&ongoing),
+                "{ongoing} does not end the stream"
+            );
+        }
     }
 
     #[test]

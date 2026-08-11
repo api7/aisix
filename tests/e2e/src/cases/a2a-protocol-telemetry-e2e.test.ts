@@ -246,7 +246,12 @@ describe("a2a protocol telemetry e2e (AISIX-Cloud#1215)", () => {
     // millisecond bound, so the assertion does not track the stub's pacing.
     const ttfb = span.attributes["aisix.upstream_ttft_ms"] as number;
     const total = span.attributes["aisix.downstream_latency_ms"] as number;
-    expect(ttfb).toBeGreaterThan(0);
+    // The stub waits before each of its four writes, so an honest
+    // time-to-first-event lands near a quarter of the call. Both bounds
+    // matter: without the floor a regression that stamped the response head
+    // instead of the first event would still pass, and without the ceiling
+    // one that timed the whole stream would.
+    expect(ttfb).toBeGreaterThan(total / 6);
     expect(ttfb).toBeLessThan(total / 2);
   });
 

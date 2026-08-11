@@ -31,8 +31,8 @@
 use std::time::{Duration, Instant};
 
 use aisix_a2a::{
-    canonical_operation, is_streaming_operation, upstream_from_a2a_agent, A2aBridge, A2aCallFacts,
-    A2aError, HttpBridge,
+    canonical_operation, is_stream_end, is_streaming_operation, upstream_from_a2a_agent, A2aBridge,
+    A2aCallFacts, A2aError, HttpBridge,
 };
 use aisix_obs::{AccessLog, UsageEvent};
 use axum::body::to_bytes;
@@ -337,6 +337,23 @@ impl Drop for StreamUsageOnDrop {
         } else {
             crate::CLIENT_CLOSED_REQUEST
         };
+        let elapsed = self.started.elapsed();
+        // The client-perceived duration of a streamed call, which nothing else
+        // records: the handler returns the moment the response head is out, so
+        // `aisix_proxy_request_duration_seconds` times only how long the
+        // stream took to OPEN. Same placement as the LLM streaming paths,
+        // which observe this histogram at stream completion for the same
+        // reason.
+        self.state.metrics.record_request_e2e_latency(
+            aisix_obs::LatencyLabels {
+                endpoint: "/a2a",
+                model: A2A_MODEL_LABEL,
+                provider: "a2a",
+                status,
+                streaming: true,
+            },
+            elapsed,
+        );
         emit_a2a_usage(
             &self.state,
             &self.auth,
@@ -344,7 +361,7 @@ impl Drop for StreamUsageOnDrop {
             &self.agent,
             &self.call,
             status,
-            self.started.elapsed(),
+            elapsed,
         );
     }
 }
@@ -409,11 +426,32 @@ async fn dispatch_stream(
                     // Read the task's progress off the event on its way past —
                     // the relay itself stays verbatim.
                     guard.call.facts.observe_result(&value);
-                    guard.call.stream.event_count += 1;
-                    // The agent's own time to first byte. Stamped on the first
-                    // event of any kind, matching how the LLM paths stamp
-                    // TTFT, so the two figures answer the same question.
-                    guard.call.stream.ttfb.get_or_insert_with(|| started.elapsed());
+                    // An agent may refuse a streaming call with a JSON-RPC
+                    // error at HTTP 200, which arrives here as a lone
+                    // envelope carrying `error` instead of `result`. It is
+                    // relayed, but it is not a task stream: counting it would
+                    // inflate the event counter and put a near-zero
+                    // observation into the time-to-first-event histogram,
+                    // dragging the percentile of real streams down with it.
+                    if value.get("result").is_some() {
+                        guard.call.stream.event_count += 1;
+                        // The agent's own time to first byte. Stamped on the
+                        // first event of any kind, matching how the LLM paths
+                        // stamp TTFT, so the two figures answer the same
+                        // question.
+                        guard.call.stream.ttfb.get_or_insert_with(|| started.elapsed());
+                    }
+                    // Forwarding the terminal event IS the end of the
+                    // response, and it has to be recorded BEFORE the yield:
+                    // an A2A client stops reading here, and the loop below
+                    // only resumes when the consumer pulls again — which,
+                    // for an agent that leaves the connection open after
+                    // finishing, never happens. Marking the end at the loop
+                    // exit instead reported every such completed task as
+                    // abandoned.
+                    if is_stream_end(&value) {
+                        guard.call.stream.reached_end = true;
+                    }
                     yield Ok::<_, std::convert::Infallible>(
                         axum::response::sse::Event::default().data(value.to_string()),
                     );
@@ -431,8 +469,8 @@ async fn dispatch_stream(
                 }
             }
         }
-        // The upstream is done — exhausted or faulted. Reaching here at all is
-        // what separates a finished stream from one the caller abandoned.
+        // The upstream ran out or faulted without ever marking the stream
+        // finished. Either way the caller was handed everything there was.
         guard.call.stream.reached_end = true;
         drop(guard);
     };
@@ -607,7 +645,7 @@ fn emit_a2a_usage(
         a2a_protocol_version: call.protocol_version.to_string(),
         a2a_task_id: call.facts.task_id.clone(),
         a2a_context_id: call.facts.context_id.clone(),
-        a2a_task_state: call.facts.task_state.clone(),
+        a2a_task_state: call.facts.task_state.to_string(),
         a2a_stream_event_count: call.stream.event_count,
         upstream_ttft_ms: call
             .stream
@@ -627,7 +665,7 @@ fn emit_a2a_usage(
         aisix_obs::A2aCallOutcome {
             ttfb: call.stream.ttfb,
             stream_events: call.stream.event_count,
-            task_state: &call.facts.task_state,
+            task_state: call.facts.task_state,
         },
     );
     state.usage_sink.try_emit("a2a", event.clone());
@@ -769,6 +807,9 @@ mod tests {
         assert_eq!(event.inbound_protocol, "a2a");
         assert_eq!(event.a2a_agent_name, "invoice");
         assert_eq!(event.a2a_method, "message/stream");
+        // Dropped before the body was ever polled: nothing was delivered, so
+        // this is the client hanging up, not a completed call.
+        assert_eq!(event.status_code, crate::CLIENT_CLOSED_REQUEST);
     }
 
     /// An agent that answers `message/send` with a Task in the state the
@@ -933,6 +974,92 @@ mod tests {
         assert_eq!(event.a2a_stream_event_count, 2);
     }
 
+    /// An agent that finishes the task and then leaves the SSE connection
+    /// open — the shape that exposes the difference between "the caller got
+    /// everything" and "the upstream closed".
+    async fn spawn_completed_but_open_stream_agent() -> String {
+        use axum::response::IntoResponse;
+        let app = axum::Router::new().route(
+            "/a2a",
+            axum::routing::post(|| async {
+                let event = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "result": {
+                        "kind": "status-update",
+                        "taskId": "task-55",
+                        "final": true,
+                        "status": {"state": "completed"},
+                    },
+                });
+                let body = async_stream::stream! {
+                    yield Ok::<_, std::convert::Infallible>(format!("data: {event}\n\n"));
+                    std::future::pending::<()>().await;
+                };
+                (
+                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                    axum::body::Body::from_stream(body),
+                )
+                    .into_response()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service())
+                .await
+                .unwrap();
+        });
+        format!("http://{addr}/a2a")
+    }
+
+    #[tokio::test]
+    async fn a_completed_task_is_not_recorded_as_abandoned() {
+        use aisix_obs::UsageSink;
+        use futures::StreamExt;
+
+        // An A2A client stops reading at the terminal event; the agent may
+        // hold the connection open long after. Waiting for the upstream to
+        // close before calling the response delivered therefore reports every
+        // such COMPLETED task as a client hang-up — the exact inversion this
+        // PR's 499 is supposed to prevent.
+        let agent_url = spawn_completed_but_open_stream_agent().await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let handle = SnapshotHandle::new(snapshot_with(&agent_url, true, serde_json::json!(["*"])));
+        let hub = Arc::new(aisix_gateway::Hub::new());
+        let state = ProxyState::new(handle, hub, &proxy_cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let response = build_router(state)
+            .oneshot(
+                HttpRequest::post("/a2a/invoice")
+                    .header("host", "gw.example.com")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {TOKEN}"))
+                    .body(Body::from(
+                        r#"{"jsonrpc":"2.0","id":1,"method":"message/stream"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("router responds");
+
+        // Read exactly the terminal event, then stop — what a conforming
+        // client does.
+        let mut body = response.into_body().into_data_stream();
+        let chunk = body.next().await.expect("the terminal event arrives");
+        assert!(String::from_utf8_lossy(&chunk.unwrap()).contains("completed"));
+        drop(body);
+        tokio::task::yield_now().await;
+
+        let event = rx.try_recv().expect("a usage event is emitted");
+        assert_eq!(event.a2a_task_state, "completed");
+        assert_eq!(
+            event.status_code,
+            StatusCode::OK.as_u16(),
+            "a fully delivered stream is a success, not an abandoned one"
+        );
+    }
+
     #[tokio::test]
     async fn a_failed_call_still_records_the_task_it_asked_about() {
         // The upstream is unreachable, so no response ever names the task.
@@ -960,8 +1087,11 @@ mod tests {
         let app = axum::Router::new().route(
             "/a2a",
             axum::routing::post(|| async {
+                // A pause before the first event, so a time-to-first-event
+                // of 0 cannot pass for one that was never stamped.
+                tokio::time::sleep(Duration::from_millis(20)).await;
                 let chunks: Vec<Result<String, std::convert::Infallible>> =
-                    ["submitted", "working", "input-required"]
+                    ["submitted", "working", "completed"]
                         .iter()
                         .map(|state| {
                             let event = serde_json::json!({
@@ -1010,11 +1140,17 @@ mod tests {
         assert_eq!(event.a2a_operation, "message/stream");
         assert_eq!(event.a2a_task_id, "task-77");
         assert_eq!(event.a2a_context_id, "ctx-77");
-        assert_eq!(event.a2a_task_state, "input-required");
+        assert_eq!(event.a2a_task_state, "completed");
         // A stream read to the end is a success, and every event it relayed
         // is counted.
         assert_eq!(event.status_code, StatusCode::OK.as_u16());
         assert_eq!(event.a2a_stream_event_count, 3);
+        // The agent paused before speaking, so a stamped time-to-first-event
+        // is non-zero — an unstamped one would also read as 0.
+        assert!(
+            event.upstream_ttft_ms > 0,
+            "the first event's arrival must be stamped"
+        );
     }
 
     #[tokio::test]

@@ -225,17 +225,24 @@ pub const M_REQUEST_TTFT_SECONDS: &str = "aisix_request_ttft_seconds";
 // Request DURATION is not repeated here: `aisix_proxy_request_duration_seconds`
 // already times `/a2a` end to end, and a second histogram of the same quantity
 // would only be a second thing to keep in sync.
-/// A2A calls by agent, canonical operation and status class. Counts the same
-/// requests as `aisix_proxy_requests_total{endpoint="/a2a"}`, split the way an
-/// agent operator needs.
+/// A2A calls by agent, canonical operation and status class.
+///
+/// It does NOT agree with `aisix_proxy_requests_total{endpoint="/a2a"}`, and
+/// two differences are deliberate. A call refused before its agent is resolved
+/// — a bad key, a denied agent, an unknown one — has no agent or operation to
+/// file under, so it is counted there and not here. And a stream the caller
+/// abandoned is `4xx` here but `2xx` there, because the response head really
+/// did go out as a 200. Read this family for agent health and that one for
+/// route traffic; do not expect the totals to match.
 pub const M_A2A_REQUESTS_TOTAL: &str = "aisix_a2a_requests_total";
 /// Time from an A2A streaming call starting to the FIRST event the upstream
 /// agent pushed — the agent's own "time to first byte".
 ///
 /// Named for the event rather than a token because an agent stream carries
-/// task updates, not tokens; it shares [`M_REQUEST_TTFT_SECONDS`]'s bucket
-/// edges (and therefore its `request_ttft` operator override) since the two
-/// measure the same shape of wait.
+/// task updates, not tokens. It defaults to [`M_REQUEST_TTFT_SECONDS`]'s
+/// bucket edges — the same shape of wait — but takes its own `a2a_ttfb`
+/// operator override, so tuning one histogram never silently retunes the
+/// other.
 pub const M_A2A_TTFB_SECONDS: &str = "aisix_a2a_ttfb_seconds";
 /// Events relayed downstream on A2A streaming calls. Divided by
 /// [`M_A2A_REQUESTS_TOTAL`] over the streaming operations it gives events per
@@ -325,6 +332,7 @@ pub struct HistogramBuckets {
     pub request_e2e_latency: Vec<f64>,
     pub request_ttft: Vec<f64>,
     pub guardrail_latency: Vec<f64>,
+    pub a2a_ttfb: Vec<f64>,
 }
 
 impl Default for HistogramBuckets {
@@ -333,6 +341,7 @@ impl Default for HistogramBuckets {
             request_e2e_latency: DEFAULT_E2E_LATENCY_BUCKETS.to_vec(),
             request_ttft: DEFAULT_TTFT_BUCKETS.to_vec(),
             guardrail_latency: DEFAULT_GUARDRAIL_LATENCY_BUCKETS.to_vec(),
+            a2a_ttfb: DEFAULT_TTFT_BUCKETS.to_vec(),
         }
     }
 }
@@ -363,6 +372,7 @@ impl HistogramBuckets {
                 cfg.guardrail_latency.as_deref(),
                 DEFAULT_GUARDRAIL_LATENCY_BUCKETS,
             )?,
+            a2a_ttfb: resolve_edges("a2a_ttfb", cfg.a2a_ttfb.as_deref(), DEFAULT_TTFT_BUCKETS)?,
         })
     }
 }
@@ -685,13 +695,9 @@ impl Metrics {
                 &buckets.guardrail_latency,
             )
             .expect("bucket lists are validated non-empty")
-            // An agent's time-to-first-event is the same shape of wait as a
-            // model's time-to-first-token, so it takes the same edges — and
-            // the same `request_ttft` operator override, rather than adding a
-            // config key that would have to be kept in step with it.
             .set_buckets_for_metric(
                 Matcher::Full(M_A2A_TTFB_SECONDS.to_string()),
-                &buckets.request_ttft,
+                &buckets.a2a_ttfb,
             )
             .expect("bucket lists are validated non-empty")
             .build_recorder();
@@ -1088,7 +1094,7 @@ impl Metrics {
     ///
     /// `ttfb` and `stream_events` are `None` / `0` for a unary call, which
     /// observes neither series.
-    pub fn record_a2a_call(&self, labels: A2aLabels<'_>, call: A2aCallOutcome<'_>) {
+    pub fn record_a2a_call(&self, labels: A2aLabels<'_>, call: A2aCallOutcome) {
         let status = status_bucket(labels.status);
         self.cached_counter(
             M_A2A_REQUESTS_TOTAL,
@@ -1977,31 +1983,33 @@ impl aisix_core::GuardrailMetricsSink for Metrics {
     }
 }
 
-/// Labels for the SLO latency histograms (AISIX-Cloud#1011). Deliberately
-/// low-cardinality: bounded endpoint set, configured model/provider names,
-/// bucketed status — never per-key / per-user dimensions, which would
-/// multiply every bucket edge.
 /// Who was called and how, for the `aisix_a2a_*` family. Every field is
 /// bounded: a registered agent name and the canonical operation set.
 #[derive(Clone, Copy)]
 pub struct A2aLabels<'a> {
+    /// Registered agent name. Borrowed: it comes from the snapshot, and an
+    /// unregistered agent is refused before any call is metered.
     pub agent: &'a str,
-    pub operation: &'a str,
+    /// Canonical operation. `&'static str` so the fixed set is enforced by the
+    /// compiler rather than by a comment — the same reason
+    /// `record_usage_event_emit` takes its handler that way.
+    pub operation: &'static str,
     /// Raw HTTP status; bucketed to `2xx` / `4xx` / … at record time.
     pub status: u16,
 }
 
 /// What one A2A call did, for the series that only some calls observe.
 #[derive(Clone, Copy, Default)]
-pub struct A2aCallOutcome<'a> {
+pub struct A2aCallOutcome {
     /// Time to the upstream agent's first streamed event. `None` for a unary
     /// call and for a stream that never produced one.
     pub ttfb: Option<Duration>,
     /// Events relayed downstream. 0 for a unary call.
     pub stream_events: u32,
     /// Normalized task state the call ended on; empty when no response
-    /// carried one.
-    pub task_state: &'a str,
+    /// carried one. `&'static str` for the same reason as
+    /// [`A2aLabels::operation`].
+    pub task_state: &'static str,
 }
 
 #[derive(Clone, Copy)]
@@ -2629,7 +2637,9 @@ mod tests {
             A2aCallOutcome::default(),
         );
         let rendered = m.render();
-        assert!(rendered.contains("status=\"5xx\""));
+        assert!(rendered.contains(&format!(
+            "{M_A2A_REQUESTS_TOTAL}{{agent=\"invoices\",operation=\"tasks/get\",status=\"5xx\"}} 1"
+        )));
         // An absent figure must not be recorded as zero: a call with no stream
         // is not a call whose stream carried nothing, and a call with no
         // answer has no task state to bucket.
