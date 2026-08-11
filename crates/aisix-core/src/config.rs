@@ -672,6 +672,40 @@ impl RealIpConfig {
     }
 }
 
+/// Headers an operator's `default_headers` block may never set, that are
+/// never forwarded from a client, and that a caller-supplied request id may
+/// never be read out of.
+///
+/// The auth entries are the credentials each bridge mints for itself: letting
+/// config override them would swap the gateway's upstream identity for an
+/// attacker-supplied one. The last three are host-routing / session /
+/// proxy-auth headers that no provider auth scheme uses but that are still
+/// dangerous to hand to config.
+///
+/// cp-api rejects these at write time
+/// (`internal/cpapi/resources/provider_key_overrides.go`); this list is the
+/// runtime half of that pair, and the two must stay in sync.
+///
+/// Lives here rather than in `aisix-gateway` (which re-exports it as
+/// `upstream_headers::RESERVED_UPSTREAM_HEADERS`) so that [`Config::validate`]
+/// can enforce it too: naming one of these in
+/// `proxy.request_id.accept_headers` would turn the caller's credential into
+/// the request id, which the gateway then writes to its logs and telemetry,
+/// returns in `x-aisix-request-id`, and sends upstream — routing around this
+/// very guard by a different door.
+pub const RESERVED_UPSTREAM_HEADERS: &[&str] = &[
+    "authorization",        // OpenAI / Anthropic / Vertex Bearer
+    "x-api-key",            // Anthropic raw, also OpenAI legacy proxies
+    "x-goog-api-key",       // Gemini API key
+    "api-key",              // Azure OpenAI key
+    "x-amz-security-token", // AWS SigV4 session header (Bedrock)
+    "x-amz-date",           // AWS SigV4 timestamp (Bedrock)
+    "x-amz-content-sha256", // AWS SigV4 body hash (Bedrock)
+    "proxy-authorization",  // proxy auth — never operator-controllable
+    "cookie",               // session bleed between caller and upstream
+    "host",                 // URL hijack via Host header
+];
+
 /// Where the gateway will accept a caller-supplied request id
 /// (AISIX-Cloud#1288).
 ///
@@ -706,13 +740,28 @@ impl Default for RequestIdConfig {
 }
 
 impl RequestIdConfig {
-    /// Parse `accept_headers` into header names, rejecting malformed
-    /// entries. Header names are case-insensitive on the wire, so the
-    /// parse also lowercases and gives the proxy ready-to-use keys.
+    /// Parse `accept_headers` into header names, rejecting malformed entries
+    /// and any name in [`RESERVED_UPSTREAM_HEADERS`]. Header names are
+    /// case-insensitive on the wire, so the parse also lowercases and gives
+    /// the proxy ready-to-use keys.
+    ///
+    /// The reserved check is what stops a request id being read out of a
+    /// credential header: the resolved id is echoed to the caller, written to
+    /// the logs and telemetry, and sent upstream, so accepting one from
+    /// `authorization` would disclose the caller's secret through all three.
     pub fn parse_accept_headers(&self) -> Result<Vec<http::HeaderName>, String> {
         self.accept_headers
             .iter()
-            .map(|s| s.trim().parse::<http::HeaderName>().map_err(|_| s.clone()))
+            .map(|s| {
+                let name = s
+                    .trim()
+                    .parse::<http::HeaderName>()
+                    .map_err(|_| s.clone())?;
+                if RESERVED_UPSTREAM_HEADERS.contains(&name.as_str()) {
+                    return Err(s.clone());
+                }
+                Ok(name)
+            })
             .collect()
     }
 }
@@ -1484,10 +1533,15 @@ impl Config {
         }
         // A malformed name here would otherwise just never match any
         // inbound header, so the operator would see caller-supplied
-        // request ids silently ignored with nothing to point at.
+        // request ids silently ignored with nothing to point at. A reserved
+        // name is worse than useless: it would copy a caller credential into
+        // the response header, the logs and the upstream request.
         if let Err(bad) = self.proxy.request_id.parse_accept_headers() {
             return Err(BootstrapError::Config(format!(
-                "proxy.request_id.accept_headers invalid HTTP header name: {bad}"
+                "proxy.request_id.accept_headers rejects {bad:?}: not a valid HTTP \
+                 header name, or a reserved header a request id must never be read \
+                 from ({})",
+                RESERVED_UPSTREAM_HEADERS.join(", ")
             )));
         }
         // Zero workers would bind no listener at all: the proxy would
@@ -1681,6 +1735,42 @@ admin:
             err.contains("proxy.request_id.accept_headers"),
             "expected the offending key in the error, got: {err}"
         );
+    }
+
+    // A request id read out of a credential header would be echoed to the
+    // caller, written to the logs and telemetry, and sent upstream as
+    // `x-aisix-request-id` — disclosing the caller's secret through all
+    // three, and walking around the RESERVED_UPSTREAM_HEADERS guard by a
+    // different door. Every reserved name must fail the boot.
+    #[test]
+    fn request_id_accept_headers_rejects_credential_headers() {
+        for reserved in RESERVED_UPSTREAM_HEADERS {
+            for spelling in [reserved.to_string(), reserved.to_uppercase()] {
+                let f = write_yaml(&format!(
+                    r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+  prefix: "/aisix"
+proxy:
+  addr: "0.0.0.0:3000"
+  request_id:
+    accept_headers: ["{spelling}"]
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+"#
+                ));
+                let err = Config::load_from_path(Some(f.path()))
+                    .expect_err(&format!(
+                        "{spelling} must be refused as a request-id source"
+                    ))
+                    .to_string();
+                assert!(
+                    err.contains("proxy.request_id.accept_headers"),
+                    "expected the offending key in the error for {spelling}, got: {err}"
+                );
+            }
+        }
     }
 
     #[test]

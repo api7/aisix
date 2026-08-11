@@ -36,27 +36,12 @@ use http::{
 /// Headers an operator's `default_headers` block may never set, and that are
 /// never forwarded from a client.
 ///
-/// The auth entries are the credentials each bridge mints for itself: letting
-/// config override them would swap the gateway's upstream identity for an
-/// attacker-supplied one. The last three are host-routing / session /
-/// proxy-auth headers that no provider auth scheme uses but that are still
-/// dangerous to hand to config.
-///
-/// cp-api rejects these at write time
-/// (`internal/cpapi/resources/provider_key_overrides.go`); this list is the
-/// runtime half of that pair, and the two must stay in sync.
-pub const RESERVED_UPSTREAM_HEADERS: &[&str] = &[
-    "authorization",        // OpenAI / Anthropic / Vertex Bearer
-    "x-api-key",            // Anthropic raw, also OpenAI legacy proxies
-    "x-goog-api-key",       // Gemini API key
-    "api-key",              // Azure OpenAI key
-    "x-amz-security-token", // AWS SigV4 session header (Bedrock)
-    "x-amz-date",           // AWS SigV4 timestamp (Bedrock)
-    "x-amz-content-sha256", // AWS SigV4 body hash (Bedrock)
-    "proxy-authorization",  // proxy auth — never operator-controllable
-    "cookie",               // session bleed between caller and upstream
-    "host",                 // URL hijack via Host header
-];
+/// Re-exported from `aisix-core`, which owns the list so that
+/// `Config::validate` can reject the same names in
+/// `proxy.request_id.accept_headers` — reading a request id out of
+/// `authorization` would copy the caller's credential into a response header,
+/// the logs, and the upstream request, walking straight around this guard.
+pub use aisix_core::RESERVED_UPSTREAM_HEADERS;
 
 /// Client headers never forwarded, on top of [`RESERVED_UPSTREAM_HEADERS`].
 ///

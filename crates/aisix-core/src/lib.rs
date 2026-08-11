@@ -31,7 +31,7 @@ pub use config::{
     AdminConfig, CacheBackend, CacheConfig, ClientTypeRule, Config, EtcdConfig, EtcdTlsConfig,
     HistogramBucketsConfig, ManagedConfig, ObservabilityConfig, ProxyConfig, RateLimitBackend,
     RateLimitConfig, RealIpConfig, RedisConnConfig, RedisMode, RequestIdConfig, TlsConfig,
-    UrlRewriteRule,
+    UrlRewriteRule, RESERVED_UPSTREAM_HEADERS,
 };
 pub use config_status::{
     hash_bytes, hash_entries, AppliedSnapshot, ConfigMetricsView, ConfigState, ConfigStatus,
