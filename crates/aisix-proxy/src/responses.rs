@@ -148,9 +148,11 @@ struct ResponseUsage {
     /// verbatim OpenAI path (OpenAI surfaces cache hits via
     /// `cached_prompt_tokens` instead).
     cache_read_tokens: u32,
-    /// Attempt-scoped time to the upstream's first content delta. 0 on the
-    /// non-streaming paths. Before this existed `/v1/responses` reported no
-    /// TTFT at all, so codex-class clients showed blank.
+    /// Attempt-scoped time to the upstream's first streamed frame, whatever
+    /// its type (`response.created` included) — see
+    /// `UsageEvent::upstream_ttft_ms`. 0 on the non-streaming paths. Before
+    /// this existed `/v1/responses` reported no TTFT at all, so codex-class
+    /// clients showed blank.
     upstream_ttft_ms: u32,
     /// Request-scoped time until the caller got its first response bytes.
     /// 0 until the stream forwards something (or the handler stamps it on
@@ -2303,37 +2305,12 @@ fn responses_sse_usage(bytes: &[u8]) -> Option<ResponseUsage> {
 /// an incomplete trailing frame is left in `buf` for the next chunk. Reuses
 /// the shared SSE framing helpers from the `/v1/messages` passthrough so the
 /// two surfaces parse identically.
-/// Whether this SSE event carries generated output. Mirrors the set
-/// `SseTextCapture::observe` accumulates, so TTFT lands on the same frame
-/// the capture considers the first real token.
-/// Frames that carry generated output, and so may stop the TTFT clock.
-///
-/// The reasoning arms are the Responses-API counterpart of
-/// [`ChatDelta::carries_generated_output`](aisix_gateway::ChatDelta::carries_generated_output):
-/// a reasoning model streams its summary (or, for models that expose it,
-/// its raw reasoning text) well before the first `output_text` frame, so
-/// leaving them out reports the end of the thinking phase as the first
-/// token — AISIX-Cloud#1225.
-fn is_responses_content_delta(json: &Value) -> bool {
-    matches!(
-        json.get("type").and_then(Value::as_str),
-        Some(
-            "response.output_text.delta"
-                | "response.function_call_arguments.delta"
-                | "response.mcp_call_arguments.delta"
-                | "response.custom_tool_call_input.delta"
-                | "response.reasoning_summary_text.delta"
-                | "response.reasoning_text.delta"
-        )
-    )
-}
-
 fn drain_responses_sse_frames(
     buf: &mut Vec<u8>,
     acc: &mut Option<ResponseUsage>,
     mut capture: Option<&mut SseTextCapture>,
     attempt_started: Instant,
-    first_token_seen: &mut bool,
+    first_frame_seen: &mut bool,
 ) {
     while let Some(end) = crate::messages::find_frame_end(buf) {
         let frame: Vec<u8> = buf.drain(..end).collect();
@@ -2342,11 +2319,14 @@ fn drain_responses_sse_frames(
                 continue;
             }
             if let Ok(json) = serde_json::from_slice::<Value>(data) {
-                // First content delta → upstream TTFT. `/v1/responses`
-                // reported none at all before this, so codex-class clients
-                // showed a blank figure.
-                if !*first_token_seen && is_responses_content_delta(&json) {
-                    *first_token_seen = true;
+                // First parsed frame of ANY type (`response.created`
+                // included) → upstream TTFT. The industry convention
+                // (LiteLLM, caller-side gateways) stamps the same event, so
+                // the figure matches external observers. A generated-output
+                // whitelist here reported the END of a silent thinking
+                // phase on hidden-reasoning upstreams — AISIX-Cloud#1225.
+                if !*first_frame_seen {
+                    *first_frame_seen = true;
                     acc.get_or_insert_with(Default::default).upstream_ttft_ms =
                         attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
                 }
@@ -2593,7 +2573,7 @@ where
         };
         futures::pin_mut!(upstream);
         let mut buf: Vec<u8> = Vec::new();
-        let mut first_token_seen = false;
+        let mut first_frame_seen = false;
         while let Some(item) = upstream.next().await {
             if let Ok(bytes) = &item {
                 // Side-channel parse: copy into the frame buffer (the original
@@ -2605,7 +2585,7 @@ where
                     usage_acc,
                     capture,
                     attempt_started,
-                    &mut first_token_seen,
+                    &mut first_frame_seen,
                 );
                 // Bound the frame buffer: the happy path drains complete frames
                 // above so `buf` only holds a partial trailing frame. A

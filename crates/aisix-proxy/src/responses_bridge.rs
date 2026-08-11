@@ -1037,7 +1037,11 @@ pub fn build_responses_bridge_stream(
         while let Some(item) = upstream.next().await {
             match item {
                 Ok(chunk) => {
-                    if !first_chunk_seen && chunk.delta.carries_generated_output() {
+                    // First upstream chunk of ANY type stops the TTFT clock —
+                    // the industry convention (LiteLLM, caller-side gateways),
+                    // so the figure matches external observers
+                    // (AISIX-Cloud#1225).
+                    if !first_chunk_seen {
                         first_chunk_seen = true;
                         guard.comp().upstream_ttft_ms =
                             attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
