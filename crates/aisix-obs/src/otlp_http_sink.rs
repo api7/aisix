@@ -306,15 +306,39 @@ fn fingerprint_otlp(cfg: &OtlpHttpConfig) -> u64 {
 /// (0.01%) resolution, plenty for an operator-facing percentage knob.
 const SAMPLE_PRECISION: u64 = 10_000;
 
+/// Salt mixed into the sampling hash, drawn once per process.
+///
+/// Without it the bucket is a pure function of `request_id` — and since
+/// AISIX-Cloud#1288 the caller may choose that id. A caller could then grind
+/// FNV-1a (which is trivially cheap) for ids that land outside the configured
+/// bucket and make its own traffic invisible to a sampled exporter, or inside
+/// it to force itself into every trace. The salt is not caller-observable, so
+/// the bucket is no longer predictable off the wire.
+static SAMPLE_SALT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+fn sample_salt() -> u64 {
+    *SAMPLE_SALT.get_or_init(|| uuid::Uuid::new_v4().as_u128() as u64)
+}
+
 /// Per-request sampling decision for an `otlp_http` exporter. `rate` is the
 /// exporter's `sample_rate` (`None` = 1.0, the pre-knob default).
 ///
-/// Deterministic — no clock, no RNG: the request's `request_id` is hashed
-/// (FNV-1a 64, stable across processes and versions) into a bucket in
-/// `0..SAMPLE_PRECISION`, and the request is sampled when the bucket falls
-/// below `rate × SAMPLE_PRECISION`. Same id → same decision, so the
-/// per-attempt events of one request (#655, which share `request_id`) are
-/// exported all-or-nothing, and every DP replica samples the same set.
+/// No clock: the request's `request_id` is hashed (FNV-1a 64) together with a
+/// per-process salt into a bucket in `0..SAMPLE_PRECISION`, and the request is
+/// sampled when the bucket falls below `rate × SAMPLE_PRECISION`. Within a
+/// process the same id always gets the same decision, so the per-attempt
+/// events of one request (#655, which share `request_id`) are exported
+/// all-or-nothing — they are emitted by the process that served the request,
+/// which is the only place that guarantee is needed.
+///
+/// Replicas therefore sample different subsets, and a restart reshuffles.
+/// That is the deliberate cost of the salt (see [`SAMPLE_SALT`]); the property
+/// it replaces — every replica choosing the identical set — only had meaning
+/// when ids were gateway-minted UUIDs that could not repeat across replicas.
+///
+/// Note this samples per REQUEST, not per caller: a caller that reuses one id
+/// across many requests still gets one decision for all of them, so a heavily
+/// id-reusing client can skew what fraction of total traffic an exporter sees.
 fn otlp_should_sample(rate: Option<f64>, request_id: &str) -> bool {
     let rate = rate.unwrap_or(1.0);
     if rate >= 1.0 {
@@ -324,7 +348,10 @@ fn otlp_should_sample(rate: Option<f64>, request_id: &str) -> bool {
         return false;
     }
     let threshold = (rate * SAMPLE_PRECISION as f64).round() as u64;
-    fnv1a_64(request_id.as_bytes()) % SAMPLE_PRECISION < threshold
+    let mut salted = [0u8; 8].to_vec();
+    salted.copy_from_slice(&sample_salt().to_le_bytes());
+    salted.extend_from_slice(request_id.as_bytes());
+    fnv1a_64(&salted) % SAMPLE_PRECISION < threshold
 }
 
 /// FNV-1a 64-bit — implemented inline (a fold over two constants) so the
@@ -1301,14 +1328,40 @@ mod tests {
             }
         }
 
-        // Across many distinct ids the kept fraction tracks the rate. The id
-        // set is fixed, so the count is exact and the test cannot flake.
+        // Across many distinct ids the kept fraction tracks the rate. The
+        // per-process salt makes the exact count vary between runs, so the
+        // band is wide: at n=1000, p=0.5 the standard deviation is ~16, and
+        // ±150 is over nine of them.
         let kept = (0..1000)
             .filter(|i| otlp_should_sample(Some(0.5), &format!("req-{i}")))
             .count();
         assert!(
             (350..=650).contains(&kept),
             "rate 0.5 kept {kept}/1000 — hash badly skewed"
+        );
+    }
+
+    // AISIX-Cloud#1288: the request id is caller-supplied, so the sampling
+    // bucket must not be a pure function of it. Without the salt a caller can
+    // grind ids offline until one falls outside a sampled exporter's bucket
+    // and never appear in a trace again.
+    #[test]
+    fn sampling_bucket_is_not_predictable_from_the_request_id_alone() {
+        // The unsalted hash is what an attacker can compute off the wire.
+        // Over many ids it must disagree with the real decision often enough
+        // that precomputing an evasive id is not possible.
+        let disagreements = (0..1000)
+            .filter(|i| {
+                let id = format!("req-{i}");
+                let unsalted = fnv1a_64(id.as_bytes()) % SAMPLE_PRECISION
+                    < (0.5 * SAMPLE_PRECISION as f64) as u64;
+                unsalted != otlp_should_sample(Some(0.5), &id)
+            })
+            .count();
+        assert!(
+            disagreements > 100,
+            "only {disagreements}/1000 ids differ from the unsalted bucket — \
+             the salt is not reaching the hash"
         );
     }
 

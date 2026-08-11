@@ -210,6 +210,10 @@ pub struct ProxyStateInner {
     /// client IP on each request (#492). Default = trust nothing → the
     /// logged source IP is the immediate TCP peer.
     pub real_ip: Arc<ResolvedRealIp>,
+    /// Pre-parsed `proxy.request_id.accept_headers`: the inbound headers a
+    /// caller may supply its own request id in, in priority order
+    /// (AISIX-Cloud#1288). Default = `[x-aisix-request-id]`.
+    pub request_id_accept: Arc<[axum::http::HeaderName]>,
     /// Boot-compiled `proxy.url_rewrites` rules, applied in order to every
     /// request before routing (first match wins). Empty = layer no-ops.
     pub url_rewrites: Arc<[crate::rewrite::CompiledRewrite]>,
@@ -296,6 +300,11 @@ impl ProxyState {
             otlp_fan_out: OtlpHttpFanOut::new(),
             request_body_limit_bytes: cfg.request_body_limit_bytes,
             real_ip: Arc::new(ResolvedRealIp::from_config(&cfg.real_ip)),
+            request_id_accept: cfg
+                .request_id
+                .parse_accept_headers()
+                .unwrap_or_default()
+                .into(),
             url_rewrites: crate::rewrite::compile(&cfg.url_rewrites),
             billed_batches: Arc::new(dashmap::DashSet::new()),
             client_classifier: Arc::new(ClientTypeClassifier::builtin()),
@@ -333,6 +342,11 @@ impl ProxyState {
             otlp_fan_out: OtlpHttpFanOut::new(),
             request_body_limit_bytes: cfg.request_body_limit_bytes,
             real_ip: Arc::new(ResolvedRealIp::from_config(&cfg.real_ip)),
+            request_id_accept: cfg
+                .request_id
+                .parse_accept_headers()
+                .unwrap_or_default()
+                .into(),
             url_rewrites: crate::rewrite::compile(&cfg.url_rewrites),
             billed_batches: Arc::new(dashmap::DashSet::new()),
             client_classifier: Arc::new(ClientTypeClassifier::builtin()),
@@ -380,6 +394,11 @@ impl ProxyState {
             otlp_fan_out: OtlpHttpFanOut::new(),
             request_body_limit_bytes: cfg.request_body_limit_bytes,
             real_ip: Arc::new(ResolvedRealIp::from_config(&cfg.real_ip)),
+            request_id_accept: cfg
+                .request_id
+                .parse_accept_headers()
+                .unwrap_or_default()
+                .into(),
             url_rewrites: crate::rewrite::compile(&cfg.url_rewrites),
             billed_batches: Arc::new(dashmap::DashSet::new()),
             client_classifier: Arc::new(ClientTypeClassifier::builtin()),
@@ -479,6 +498,7 @@ mod tests {
                 request_body_limit_bytes: 1_048_576,
                 tls: None,
                 real_ip: Default::default(),
+                request_id: Default::default(),
                 thread_per_core: None,
                 workers: None,
                 url_rewrites: Vec::new(),

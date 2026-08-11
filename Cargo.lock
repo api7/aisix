@@ -103,6 +103,7 @@ dependencies = [
  "config",
  "dashmap",
  "hex",
+ "http 1.4.0",
  "ipnet",
  "jsonschema",
  "once_cell",

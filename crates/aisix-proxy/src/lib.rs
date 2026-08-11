@@ -238,7 +238,7 @@ pub fn build_router(state: ProxyState) -> Router {
         Router::new()
             .fallback_service(router)
             .layer(middleware::from_fn_with_state(
-                state,
+                state.clone(),
                 rewrite::rewrite_request_uri,
             ))
     };
@@ -250,7 +250,10 @@ pub fn build_router(state: ProxyState) -> Router {
     // from the layers above) so the whole proxy family carries
     // `x-aisix-request-id` and it equals the telemetry request_id. See
     // request_id.rs.
-    router.layer(middleware::from_fn(request_id::ensure_request_id))
+    router.layer(middleware::from_fn_with_state(
+        state,
+        request_id::ensure_request_id,
+    ))
 }
 
 async fn record_in_flight_request(
@@ -842,6 +845,7 @@ mod tests {
             addr: "127.0.0.1:0".into(),
             request_body_limit_bytes: 1_048_576,
             real_ip: Default::default(),
+            request_id: Default::default(),
             url_rewrites: Vec::new(),
             tls: None,
             thread_per_core: None,
@@ -1818,6 +1822,7 @@ mod tests {
             addr: "127.0.0.1:0".into(),
             request_body_limit_bytes: limit,
             real_ip: Default::default(),
+            request_id: Default::default(),
             url_rewrites: Vec::new(),
             tls: None,
             thread_per_core: None,

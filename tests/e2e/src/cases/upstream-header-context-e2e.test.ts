@@ -278,7 +278,7 @@ describe("upstream header context e2e: ${...} variables + client-header allowlis
       const { status, sent } = await chat(CALLER_PLAINTEXT, {
         "x-api-key": CALLER_PLAINTEXT,
         cookie: "session=secret",
-        "x-aisix-request-id": "spoofed-by-caller",
+        "x-aisix-routing-tags": "spoofed-by-caller",
         "x-stainless-lang": "js",
       });
       expect(status).toBe(200);
@@ -295,9 +295,12 @@ describe("upstream header context e2e: ${...} variables + client-header allowlis
       expect(req.body).not.toContain(CALLER_PLAINTEXT);
       expect(req.headers.cookie).toBeUndefined();
       expect(req.headers["x-stainless-lang"]).toBeUndefined();
-      // The gateway stamps its own correlation id; the caller's forged
-      // value must not be what the upstream sees.
-      expect(req.headers["x-aisix-request-id"]).not.toBe("spoofed-by-caller");
+      // `x-aisix-*` is the gateway's own namespace: a caller's copy is
+      // never relayed as-is, so gateway-asserted context cannot be forged
+      // upstream. (`x-aisix-request-id` is the deliberate exception — the
+      // gateway ADOPTS the caller's id at the mint point and sends that
+      // one value itself; see client-request-id-e2e.test.ts.)
+      expect(req.headers["x-aisix-routing-tags"]).toBeUndefined();
     },
     30_000,
   );

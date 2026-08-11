@@ -124,6 +124,7 @@ mod tests {
             addr: "127.0.0.1:0".into(),
             request_body_limit_bytes: 1_048_576,
             real_ip: Default::default(),
+            request_id: Default::default(),
             url_rewrites: Vec::new(),
             tls: None,
             thread_per_core: None,

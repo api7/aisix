@@ -53,6 +53,24 @@ proxy:
   #   trusted_proxies: ["10.0.0.0/8", "127.0.0.1/32"]
   #   recursive: true
   #   header: x-forwarded-for
+  # Which inbound headers a caller may hand the gateway its own request
+  # id in. The id it sends becomes THE id for the request: the
+  # x-aisix-request-id response header, every retry/failover attempt's
+  # usage event, the access log, and the x-aisix-request-id the upstream
+  # sees — so a caller can find a gateway request by an id its own logs
+  # already carry. Headers are consulted in order, first acceptable value
+  # wins; an absent or unusable value (empty, longer than 256 bytes, or
+  # containing anything outside visible ASCII) falls back to a generated
+  # UUID rather than failing the request.
+  # Defaults to ["x-aisix-request-id"]. Add x-request-id to honour the
+  # de-facto standard header — off by default because every reverse proxy
+  # and ingress in front of the gateway stamps it automatically, which
+  # would make the correlation id come from the infrastructure rather
+  # than from the caller. Set to [] to always mint a UUID.
+  # Env-only deployments set the list comma-separated:
+  # AISIX_PROXY__REQUEST_ID__ACCEPT_HEADERS=x-aisix-request-id,x-request-id
+  # request_id:
+  #   accept_headers: ["x-aisix-request-id", "x-request-id"]
   # Serve from independent worker threads, each with its own runtime,
   # its own SO_REUSEPORT listener on addr, and its own upstream
   # connection pool, so a request is handled end to end on the thread
