@@ -769,6 +769,124 @@ mod tests {
         rx.try_recv().expect("a usage event is emitted")
     }
 
+    /// An agent that reports a task's progress and then keeps the stream open
+    /// without ever finishing it — a long-running task the caller may leave
+    /// before it settles. It emits exactly the two states below and nothing
+    /// more, so what a partial reader saw is not a matter of timing.
+    async fn spawn_unfinished_stream_agent() -> String {
+        use axum::response::IntoResponse;
+        let app = axum::Router::new().route(
+            "/a2a",
+            axum::routing::post(|| async {
+                let chunks: Vec<Result<String, std::convert::Infallible>> =
+                    ["submitted", "working"]
+                        .iter()
+                        .map(|state| {
+                            let event = serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "result": {
+                                    "kind": "status-update",
+                                    "taskId": "task-88",
+                                    "status": {"state": state},
+                                    "final": false,
+                                },
+                            });
+                            Ok(format!("data: {event}\n\n"))
+                        })
+                        .collect();
+                let body = async_stream::stream! {
+                    for chunk in chunks {
+                        yield chunk;
+                    }
+                    // Never completes: the task is still running when the
+                    // caller gives up on it.
+                    std::future::pending::<()>().await;
+                };
+                (
+                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                    axum::body::Body::from_stream(body),
+                )
+                    .into_response()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service())
+                .await
+                .unwrap();
+        });
+        format!("http://{addr}/a2a")
+    }
+
+    #[tokio::test]
+    async fn a_stream_abandoned_mid_task_records_the_last_state_seen() {
+        use aisix_obs::UsageSink;
+        use futures::StreamExt;
+
+        // The claim is that no terminal state is invented for a task the
+        // caller stopped watching. The agent reports `submitted` then
+        // `working` and never finishes, so `working` is the only honest
+        // answer — and the one an operator hunting stuck tasks needs.
+        let agent_url = spawn_unfinished_stream_agent().await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let handle = SnapshotHandle::new(snapshot_with(&agent_url, true, serde_json::json!(["*"])));
+        let hub = Arc::new(aisix_gateway::Hub::new());
+        let state = ProxyState::new(handle, hub, &proxy_cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let response = build_router(state)
+            .oneshot(
+                HttpRequest::post("/a2a/invoice")
+                    .header("host", "gw.example.com")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {TOKEN}"))
+                    .body(Body::from(
+                        r#"{"jsonrpc":"2.0","id":1,"method":"message/stream"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("router responds");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Read what the agent has sent so far, then walk away mid-task.
+        let mut body = response.into_body().into_data_stream();
+        let mut seen = String::new();
+        while !seen.contains("working") {
+            let chunk = body.next().await.expect("the relayed events arrive");
+            seen.push_str(std::str::from_utf8(&chunk.expect("a readable chunk")).unwrap());
+        }
+        drop(body);
+        tokio::task::yield_now().await;
+
+        let event = rx
+            .try_recv()
+            .expect("an abandoned stream still emits usage");
+        assert_eq!(event.a2a_task_id, "task-88");
+        assert_eq!(event.a2a_task_state, "working");
+    }
+
+    #[tokio::test]
+    async fn a_failed_call_still_records_the_task_it_asked_about() {
+        // The upstream is unreachable, so no response ever names the task.
+        // Reading the request up front is what keeps a failed `tasks/get`
+        // attributable — the whole point of observing before dispatch.
+        let event = usage_event_for(
+            "http://127.0.0.1:1/a2a",
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tasks/get",
+                "params": {"id": "task-99"}
+            }),
+        )
+        .await;
+
+        assert_eq!(event.status_code, StatusCode::BAD_GATEWAY.as_u16());
+        assert_eq!(event.a2a_operation, "tasks/get");
+        assert_eq!(event.a2a_task_id, "task-99");
+        assert_eq!(event.a2a_task_state, "", "no state may be invented");
+    }
+
     /// An agent whose stream walks a task through several states and then
     /// ends, the way a real long-running task reports progress.
     async fn spawn_progressing_stream_agent() -> String {

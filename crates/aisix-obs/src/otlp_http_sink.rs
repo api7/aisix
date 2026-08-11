@@ -729,7 +729,10 @@ fn build_otlp_span(record: &SinkRecord, exporter_name: &str) -> Value {
             // An A2A context ties a multi-turn exchange's tasks together —
             // exactly what semconv means by a conversation id.
             if !event.a2a_context_id.is_empty() {
-                attributes.push(attr_string("gen_ai.conversation.id", &event.a2a_context_id));
+                attributes.push(attr_string_capped(
+                    "gen_ai.conversation.id",
+                    &event.a2a_context_id,
+                ));
             }
             for (key, value) in [
                 ("aisix.a2a.method", &event.a2a_method),
@@ -739,13 +742,13 @@ fn build_otlp_span(record: &SinkRecord, exporter_name: &str) -> Value {
                 ("aisix.a2a.task_state", &event.a2a_task_state),
             ] {
                 if !value.is_empty() {
-                    attributes.push(attr_string(key, value));
+                    attributes.push(attr_string_capped(key, value));
                 }
             }
         }
         "mcp" => {
             if !event.mcp_tool_name.is_empty() {
-                attributes.push(attr_string("gen_ai.tool.name", &event.mcp_tool_name));
+                attributes.push(attr_string_capped("gen_ai.tool.name", &event.mcp_tool_name));
             }
             if !event.mcp_server_name.is_empty() {
                 attributes.push(attr_string("aisix.mcp.server_name", &event.mcp_server_name));
@@ -769,7 +772,10 @@ fn build_otlp_span(record: &SinkRecord, exporter_name: &str) -> Value {
         "traceId": trace_id,
         "spanId":  span_id,
         "name":    span_name(event),
-        "kind":    3, // SPAN_KIND_CLIENT (DP → upstream LLM / agent / MCP server)
+        // SPAN_KIND_CLIENT for all three: the gateway is the client of a
+        // remote LLM, agent or MCP server. The conventions name INTERNAL for
+        // a tool executed in-process, which is not what this span describes.
+        "kind":    3,
         "startTimeUnixNano": start_unix_nano.to_string(),
         "endTimeUnixNano":   end_unix_nano.to_string(),
         "attributes": attributes,
@@ -791,9 +797,23 @@ fn operation_name(event: &UsageEvent) -> &'static str {
     }
 }
 
+/// Longest target this will append to a span name.
+///
+/// An A2A agent name is a registered resource, but an MCP tool name is the
+/// caller's own `tools/call` `params.name` and is recorded before the tool is
+/// known to exist — including on the quota-rejection path, which emits without
+/// ever contacting an upstream. A trace backend indexes span names and most
+/// derive RED metrics from them, so the one field a caller picks freely is
+/// bounded before it gets there.
+const MAX_SPAN_NAME_TARGET: usize = 64;
+
 /// The span's name: `{operation} {target}` where the target is low-cardinality
 /// and known, per the semconv's naming rule for agent and tool spans. LLM
 /// traffic keeps the name it has always had.
+///
+/// A target that is absent or outside [`MAX_SPAN_NAME_TARGET`] leaves the bare
+/// operation, which the conventions name as the fallback for exactly this
+/// case. The raw value is still on the span as an attribute either way.
 fn span_name(event: &UsageEvent) -> String {
     let operation = operation_name(event);
     let target = match event.inbound_protocol.as_str() {
@@ -801,7 +821,7 @@ fn span_name(event: &UsageEvent) -> String {
         "mcp" => &event.mcp_tool_name,
         _ => return "chat.completions".to_string(),
     };
-    if target.is_empty() {
+    if target.is_empty() || target.len() > MAX_SPAN_NAME_TARGET {
         operation.to_string()
     } else {
         format!("{operation} {target}")
@@ -840,6 +860,25 @@ fn attr_string(key: &str, value: &str) -> Value {
         "key": key,
         "value": { "stringValue": value },
     })
+}
+
+/// Longest caller-supplied attribute value carried on a span.
+///
+/// The gateway-protocol attributes below are copied from the caller's own
+/// JSON-RPC envelope (the method it invoked, the ids it named), and the
+/// request body limit defaults to unlimited, so their length is the caller's
+/// choice. Every span rides in a batched export, so an unbounded value is a
+/// delivery problem as much as a storage one.
+const MAX_PROTOCOL_ATTR_BYTES: usize = 256;
+
+/// [`attr_string`] for a value a caller controls, cut to
+/// [`MAX_PROTOCOL_ATTR_BYTES`] on a UTF-8 boundary.
+fn attr_string_capped(key: &str, value: &str) -> Value {
+    let mut end = MAX_PROTOCOL_ATTR_BYTES.min(value.len());
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    attr_string(key, &value[..end])
 }
 
 fn attr_int(key: &str, value: i64) -> Value {
@@ -1446,6 +1485,53 @@ mod tests {
             find("aisix.mcp.server_name").unwrap()["value"]["stringValue"],
             "github"
         );
+    }
+
+    #[test]
+    fn a_caller_chosen_target_cannot_grow_the_span_name() {
+        // An MCP tool name is the caller's own `tools/call` `params.name`,
+        // recorded before the tool is known to exist, and the request body
+        // limit defaults to unlimited. A trace backend indexes span names, so
+        // an oversized one falls back to the bare operation and travels as an
+        // attribute instead — itself cut to a fixed cap.
+        let mut ev = sample_event();
+        ev.inbound_protocol = "mcp".into();
+        ev.mcp_tool_name = "t".repeat(4096);
+
+        let body = build_otlp_traces_payload(&ev, "test-exp");
+        let span = &body["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
+        assert_eq!(span["name"], "execute_tool");
+        let attrs = span["attributes"].as_array().unwrap();
+        let tool = attrs
+            .iter()
+            .find(|a| a["key"] == "gen_ai.tool.name")
+            .unwrap()["value"]["stringValue"]
+            .as_str()
+            .unwrap();
+        assert_eq!(tool.len(), MAX_PROTOCOL_ATTR_BYTES);
+    }
+
+    #[test]
+    fn a_capped_attribute_is_cut_on_a_char_boundary() {
+        // A multi-byte character straddling the cap must not produce invalid
+        // UTF-8 in the export body.
+        let mut ev = sample_event();
+        ev.inbound_protocol = "a2a".into();
+        ev.a2a_method = "情".repeat(200);
+
+        let body = build_otlp_traces_payload(&ev, "test-exp");
+        let attrs = body["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["attributes"]
+            .as_array()
+            .unwrap()
+            .clone();
+        let method = attrs
+            .iter()
+            .find(|a| a["key"] == "aisix.a2a.method")
+            .unwrap()["value"]["stringValue"]
+            .as_str()
+            .unwrap();
+        assert!(method.len() <= MAX_PROTOCOL_ATTR_BYTES);
+        assert!(method.chars().all(|c| c == '情'));
     }
 
     #[test]

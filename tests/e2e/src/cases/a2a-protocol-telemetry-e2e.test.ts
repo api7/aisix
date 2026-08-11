@@ -31,7 +31,12 @@ const EXPORT_TIMEOUT_MS = 20_000;
 
 describe("a2a protocol telemetry e2e (AISIX-Cloud#1215)", () => {
   let app: SpawnedApp | undefined;
-  let upstream: A2aUpstream | undefined;
+  // Two stubs, each answering in the shape its version actually defines: 1.0
+  // wraps the Task in the response's payload oneof, 0.3 puts it flat under
+  // `result`. One stub for both would leave the default version's real
+  // response shape untested.
+  let upstream10: A2aUpstream | undefined;
+  let upstream03: A2aUpstream | undefined;
   let otlp: MockOtlp | undefined;
   let etcdReachable = false;
 
@@ -72,7 +77,8 @@ describe("a2a protocol telemetry e2e (AISIX-Cloud#1215)", () => {
     if (!etcdReachable) return;
 
     otlp = await startMockOtlp();
-    upstream = await startA2aUpstream({ cardMount: "origin" });
+    upstream10 = await startA2aUpstream({ cardMount: "origin", wireShape: "1.0" });
+    upstream03 = await startA2aUpstream({ cardMount: "origin", wireShape: "0.3" });
     app = await spawnApp();
     const seed = new SeedClient(etcd, app.etcdPrefix);
 
@@ -82,16 +88,17 @@ describe("a2a protocol telemetry e2e (AISIX-Cloud#1215)", () => {
       kind: "otlp_http",
       endpoint: otlp.url,
     });
-    // Two agents on the SAME upstream, pinned to different wire versions:
-    // the only difference between them is the vocabulary their callers use,
-    // which is exactly what canonicalisation has to erase.
-    for (const [name, version] of [
-      ["invoices", "1.0"],
-      ["legacy", "0.3"],
+    // One agent per wire version, each against the stub that speaks it. Both
+    // run the same operations, so what has to come out the same (the canonical
+    // operation) and what has to differ (the announced version) are both
+    // visible.
+    for (const [name, version, agent] of [
+      ["invoices", "1.0", upstream10],
+      ["legacy", "0.3", upstream03],
     ] as const) {
       await seed.update("a2a_agents", randomUUID(), {
         name,
-        url: upstream.url,
+        url: agent.url,
         protocol_version: version,
         auth_type: "none",
         enabled: true,
@@ -117,12 +124,13 @@ describe("a2a protocol telemetry e2e (AISIX-Cloud#1215)", () => {
 
   afterAll(async () => {
     await app?.exit();
-    await upstream?.close();
+    await upstream10?.close();
+    await upstream03?.close();
     await otlp?.close();
   });
 
   test("a completed call records the task, the context and how it ended", async (ctx) => {
-    if (!etcdReachable || !app || !upstream || !otlp) return ctx.skip();
+    if (!etcdReachable || !app || !upstream10 || !upstream03 || !otlp) return ctx.skip();
 
     const contextId = `ctx-${randomUUID()}`;
     expect(
@@ -148,7 +156,7 @@ describe("a2a protocol telemetry e2e (AISIX-Cloud#1215)", () => {
   });
 
   test("both wire vocabularies aggregate under one operation", async (ctx) => {
-    if (!etcdReachable || !app || !upstream || !otlp) return ctx.skip();
+    if (!etcdReachable || !app || !upstream10 || !upstream03 || !otlp) return ctx.skip();
 
     // The same operation, spelled the way each agent's version spells it.
     const v10Context = `ctx-${randomUUID()}`;
@@ -177,6 +185,12 @@ describe("a2a protocol telemetry e2e (AISIX-Cloud#1215)", () => {
     // mixed-version deployment is silently split in two.
     expect(v10.attributes["aisix.a2a.operation"]).toBe("message/send");
     expect(v03.attributes["aisix.a2a.operation"]).toBe("message/send");
+    // The two agents return the same task in DIFFERENT envelopes (1.0 wraps
+    // it in the response's payload oneof), and both must be read.
+    expect(v10.attributes["aisix.a2a.task_id"]).toBe("task-e2e-1");
+    expect(v03.attributes["aisix.a2a.task_id"]).toBe("task-e2e-1");
+    expect(v10.attributes["aisix.a2a.task_state"]).toBe("completed");
+    expect(v03.attributes["aisix.a2a.task_state"]).toBe("completed");
     // ...while the raw method each caller actually sent is still recoverable.
     expect(v10.attributes["aisix.a2a.method"]).toBe("SendMessage");
     expect(v03.attributes["aisix.a2a.method"]).toBe("message/send");
@@ -186,7 +200,7 @@ describe("a2a protocol telemetry e2e (AISIX-Cloud#1215)", () => {
   });
 
   test("a streamed task is recorded with the state its stream ended on", async (ctx) => {
-    if (!etcdReachable || !app || !upstream || !otlp) return ctx.skip();
+    if (!etcdReachable || !app || !upstream10 || !upstream03 || !otlp) return ctx.skip();
 
     const contextId = `ctx-${randomUUID()}`;
     expect(
@@ -208,7 +222,7 @@ describe("a2a protocol telemetry e2e (AISIX-Cloud#1215)", () => {
   });
 
   test("an unrecognised method cannot become an unbounded label", async (ctx) => {
-    if (!etcdReachable || !app || !upstream || !otlp) return ctx.skip();
+    if (!etcdReachable || !app || !upstream10 || !upstream03 || !otlp) return ctx.skip();
 
     // The method is caller-chosen. The raw value stays available for
     // forensics, but the aggregating field must collapse to `unknown`.

@@ -32,9 +32,13 @@ pub const UNKNOWN_OPERATION: &str = "unknown";
 /// specification defines.
 pub const UNKNOWN_TASK_STATE: &str = "unknown";
 
-/// The canonical operation names, in their 0.3 spelling — the vocabulary the
-/// dashboard, metrics and docs use. The 1.0 PascalCase RPC name for the same
-/// operation maps onto the same entry.
+/// The canonical operation names — the vocabulary the dashboard, metrics and
+/// docs use. Each is a method's 0.3 spelling where 0.3 defines the operation,
+/// and the 1.0 PascalCase RPC name for the same operation maps onto it.
+///
+/// `ListTasks` is the exception: 1.0 added it, so there is no 0.3 spelling to
+/// borrow and only the 1.0 method appears on the left. Its canonical name
+/// follows the same shape as the rest so the vocabulary stays uniform.
 const OPERATIONS: &[(&str, &str)] = &[
     // (wire method, canonical operation)
     ("message/send", "message/send"),
@@ -43,7 +47,6 @@ const OPERATIONS: &[(&str, &str)] = &[
     ("SendStreamingMessage", "message/stream"),
     ("tasks/get", "tasks/get"),
     ("GetTask", "tasks/get"),
-    ("tasks/list", "tasks/list"),
     ("ListTasks", "tasks/list"),
     ("tasks/cancel", "tasks/cancel"),
     ("CancelTask", "tasks/cancel"),
@@ -89,6 +92,11 @@ const OPERATIONS: &[(&str, &str)] = &[
 ];
 
 /// The task states the specification defines, in their 0.3 wire spelling.
+///
+/// 0.3's own enum also carries a literal `unknown` (1.0 replaced it with
+/// `TASK_STATE_UNSPECIFIED`). It is deliberately absent here so it falls
+/// through to [`UNKNOWN_TASK_STATE`] — the recorded string is the same either
+/// way, and listing it would only imply the two are distinguishable.
 const TASK_STATES: &[&str] = &[
     "submitted",
     "working",
@@ -204,13 +212,16 @@ impl A2aCallFacts {
         let Some(result) = response.get("result") else {
             return;
         };
-        self.set_context_id(str_field(result, "contextId"));
-        self.set_task_id(str_field(result, "taskId"));
-        // A `Task` names itself in `id`, but so does a `Message` — and a
-        // message id is not a task id. `status` is the discriminator: every
-        // Task has one and no Message does, in either wire version.
-        if let Some(status) = result.get("status") {
-            self.set_task_id(str_field(result, "id"));
+        let payload = unwrap_payload(result);
+        self.set_context_id(str_field(payload, "contextId"));
+        self.set_task_id(str_field(payload, "taskId"));
+        // `status` is the discriminator between a Task and a Message: every
+        // Task has one and no Message does, in either wire version. Neither
+        // spells a message id as `id` (both use `messageId`), so this guards
+        // only against a nonstandard shape — it costs nothing and keeps a
+        // message from ever being filed as a task.
+        if let Some(status) = payload.get("status") {
+            self.set_task_id(str_field(payload, "id"));
             if let Some(state) = str_field(status, "state") {
                 self.task_state = normalize_task_state(state).to_string();
             }
@@ -228,6 +239,31 @@ impl A2aCallFacts {
             self.context_id = value.to_string();
         }
     }
+}
+
+/// The 1.0 payload `oneof` field names, in `SendMessageResponse` /
+/// `StreamResponse` order.
+const V1_PAYLOAD_KEYS: [&str; 4] = ["task", "message", "statusUpdate", "artifactUpdate"];
+
+/// Reach the Task / Message / update event a `result` carries.
+///
+/// 0.3 puts the object directly at `result`, tagged with `kind`. 1.0's
+/// `SendMessage` and streaming responses instead wrap it in a `oneof payload`,
+/// which protobuf JSON renders as the set field's own name — so the same task
+/// arrives as `{"task": {…}}` there. Reading only the 0.3 shape found nothing
+/// at all on 1.0, which is the DEFAULT version for a registered agent.
+///
+/// A `kind` settles it as 0.3 outright; no 1.0 payload has one. Anything else
+/// is returned untouched, which is also right for the 1.0 operations that
+/// answer with a bare `Task` (`GetTask`, `CancelTask` define no wrapper).
+fn unwrap_payload(result: &Value) -> &Value {
+    if result.get("kind").is_some() {
+        return result;
+    }
+    V1_PAYLOAD_KEYS
+        .iter()
+        .find_map(|key| result.get(*key).filter(|value| value.is_object()))
+        .unwrap_or(result)
 }
 
 /// A non-empty string field, or `None` — an absent field and an empty one are
@@ -253,7 +289,6 @@ mod tests {
             ("message/send", "SendMessage"),
             ("message/stream", "SendStreamingMessage"),
             ("tasks/get", "GetTask"),
-            ("tasks/list", "ListTasks"),
             ("tasks/cancel", "CancelTask"),
             ("tasks/resubscribe", "SubscribeToTask"),
             (
@@ -281,6 +316,15 @@ mod tests {
                 "{v10} must canonicalise to {v03}"
             );
         }
+    }
+
+    #[test]
+    fn a_1_0_only_operation_has_no_0_3_spelling_to_accept() {
+        // `ListTasks` was added in 1.0, so `tasks/list` is a name this
+        // gateway's own vocabulary uses — not a method any version defines.
+        // Accepting it on the wire would invent a 0.3 method.
+        assert_eq!(canonical_operation("ListTasks"), "tasks/list");
+        assert_eq!(canonical_operation("tasks/list"), UNKNOWN_OPERATION);
     }
 
     #[test]
@@ -390,16 +434,75 @@ mod tests {
 
     #[test]
     fn a_message_result_is_not_mistaken_for_a_task() {
-        // An agent may answer `message/send` with a bare Message, whose `id`
-        // is a MESSAGE id. Recording it as the task id would attach the call
-        // to a task that does not exist.
+        // An agent may answer `message/send` with a bare Message rather than a
+        // Task. It carries a context but no task and no state, and none of
+        // those may be invented for it.
         let mut facts = A2aCallFacts::default();
         facts.observe_result(&json!({
-            "result": {"kind": "message", "id": "m-1", "role": "agent", "contextId": "c-3"}
+            "result": {"kind": "message", "messageId": "m-1", "role": "agent", "contextId": "c-3"}
         }));
         assert_eq!(facts.task_id, "");
         assert_eq!(facts.context_id, "c-3");
         assert_eq!(facts.task_state, "");
+    }
+
+    #[test]
+    fn a_1_0_result_is_read_through_its_payload_wrapper() {
+        // 1.0 — the DEFAULT version for a registered agent — wraps the object
+        // in the response's `oneof payload`, which protobuf JSON renders as
+        // the set field's name. Reading only 0.3's flat shape found nothing at
+        // all here, so every field this module exists to record came back
+        // empty on the default version.
+        let mut send = A2aCallFacts::default();
+        send.observe_result(&json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": {"task": {
+                "id": "t-10", "contextId": "c-10",
+                "status": {"state": "TASK_STATE_COMPLETED"}
+            }}
+        }));
+        assert_eq!(send.task_id, "t-10");
+        assert_eq!(send.context_id, "c-10");
+        assert_eq!(send.task_state, "completed");
+
+        // The streaming wrapper has two more variants.
+        let mut status = A2aCallFacts::default();
+        status.observe_result(&json!({
+            "result": {"statusUpdate": {
+                "taskId": "t-11", "contextId": "c-11",
+                "status": {"state": "TASK_STATE_WORKING"}
+            }}
+        }));
+        assert_eq!(status.task_id, "t-11");
+        assert_eq!(status.task_state, "working");
+
+        let mut artifact = A2aCallFacts::default();
+        artifact.observe_result(&json!({
+            "result": {"artifactUpdate": {"taskId": "t-12", "contextId": "c-12"}}
+        }));
+        assert_eq!(artifact.task_id, "t-12");
+        assert_eq!(artifact.context_id, "c-12");
+
+        // A 1.0 Message payload still yields its context and no task.
+        let mut message = A2aCallFacts::default();
+        message.observe_result(&json!({
+            "result": {"message": {"messageId": "m-2", "contextId": "c-13", "role": "agent"}}
+        }));
+        assert_eq!(message.task_id, "");
+        assert_eq!(message.context_id, "c-13");
+    }
+
+    #[test]
+    fn a_1_0_bare_task_result_is_read_without_a_wrapper() {
+        // `GetTask` and `CancelTask` define no response wrapper — they answer
+        // with the Task itself, so the unwrapping must not require one.
+        let mut facts = A2aCallFacts::default();
+        facts.observe_result(&json!({
+            "result": {"id": "t-14", "contextId": "c-14", "status": {"state": "TASK_STATE_CANCELED"}}
+        }));
+        assert_eq!(facts.task_id, "t-14");
+        assert_eq!(facts.context_id, "c-14");
+        assert_eq!(facts.task_state, "canceled");
     }
 
     #[test]
