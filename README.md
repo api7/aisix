@@ -144,7 +144,7 @@ For a multi-replica cluster, point the gateway at etcd instead — `resources_fi
 
 ## 🧩 Features — available today
 
-Covered by 165 end-to-end test files (426 cases) that run against real gateway processes.
+Covered by 183 end-to-end scenario files (496 cases) that run against real gateway processes.
 
 - **OpenAI-compatible proxy** (`:3000`) — `chat/completions`, `completions`, `responses`,
   `embeddings`, `rerank`, `images/generations`, `audio/{speech,transcriptions,translations}`,
@@ -197,11 +197,10 @@ Covered by 165 end-to-end test files (426 cases) that run against real gateway p
   reloads it atomically.
 - **Operational endpoints** — `/livez` and `/readyz` on the proxy listener; `/status/config`,
   `/status/ready`, `/status/models`, and Prometheus `/metrics` on a dedicated metrics
-  listener (`:9090`). The admin listener (`:3001`) additionally serves a resource read
-  surface, OpenAPI 3 with a Scalar UI, and a playground. Its resource **write** endpoints
-  are deprecated in favor of declarative configuration: on a `resources_file` gateway they
-  are rejected with `409`, and on a store-backed gateway they still work but every mutating
-  response carries an RFC 9745 `Deprecation` header.
+  listener (`:9090`). The admin listener (`:3001`) additionally serves a **read-only**
+  resource surface, OpenAPI 3 with a Scalar UI, and a playground. Resources are managed
+  declaratively — through the `resources_file` (reloaded on SIGHUP) or direct etcd
+  writes — not through the admin listener; its former write endpoints were removed.
 
 ## 🔌 Supported providers
 
@@ -266,7 +265,7 @@ Same gateway binary, same proxy API — in every form the gateway runs in your e
 | Provider keys | In the resources file as `${VAR}` env references, or in etcd | Envelope-encrypted at rest, write-only, in-place rotation |
 | Inbound auth | Caller keys (SHA-256 hashed, model allowlists, expiry), or OIDC/JWT bearers | Same, plus masked reveal, key ownership, and PATs |
 | Budgets | — (rate and token limits only) | Per key / provider / env / org / team, hard-stop & alerts |
-| RBAC | Admin key = full access | Org roles (owner / admin / member), invites |
+| RBAC | Admin key = read-only resource surface | Org roles (owner / admin / member), invites |
 | Audit log | — | Full org-scoped audit with diff viewer |
 | Usage & cost | Export logs, metrics, and usage events yourself | Managed usage views, model pricing catalog, spend reporting |
 | Surface | Status endpoints, OpenAPI read surface, playground | Full dashboard + per-environment playground |
@@ -286,7 +285,7 @@ crates/
 ├── aisix-etcd           Config provider + watch supervisor
 ├── aisix-gateway        Hub & bridge, SSE parser, provider trait
 ├── aisix-proxy          /v1/*, /mcp, /a2a handlers, routing, middleware
-├── aisix-admin          Read surface + playground + OpenAPI (writes deprecated)
+├── aisix-admin          Read-only resource surface + playground + OpenAPI
 ├── aisix-provider-*     openai · anthropic · azure-openai · bedrock · vertex
 ├── aisix-mcp            MCP gateway — server registry, tool ACL, transports
 ├── aisix-a2a            A2A agent gateway — agent cards, JSON-RPC bridge

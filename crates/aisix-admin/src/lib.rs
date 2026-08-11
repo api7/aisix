@@ -9,32 +9,26 @@
 //! lives on the dedicated metrics listener (see [`metrics_router`]),
 //! identical in standalone and managed mode.
 //!
-//! Admin-key protected routes:
-//! - `GET|POST            /admin/v1/models`
-//! - `GET|PUT|DELETE      /admin/v1/models/:id`
-//! - `GET|POST            /admin/v1/api_keys` (also served at the former
-//!   `/admin/v1/apikeys` spelling, same handlers)
-//! - `GET|PUT|DELETE      /admin/v1/api_keys/:id`
-//! - `GET|POST            /admin/v1/provider_keys`
-//! - `GET|PUT|DELETE      /admin/v1/provider_keys/:id`
-//! - `GET|POST            /admin/v1/guardrails`
-//! - `GET|PUT|DELETE      /admin/v1/guardrails/:id`
-//! - `GET|POST            /admin/v1/cache_policies`
-//! - `GET|PUT|DELETE      /admin/v1/cache_policies/:id`
-//! - `GET|POST            /admin/v1/observability_exporters`
-//! - `GET|PUT|DELETE      /admin/v1/observability_exporters/:id`
+//! Admin-key protected routes (read-only — every resource route serves
+//! GET; `api_keys` is also served at the former `apikeys` spelling):
+//! - `GET /admin/v1/models` and `GET /admin/v1/models/:id`
+//! - `GET /admin/v1/api_keys` and `GET /admin/v1/api_keys/:id`
+//! - `GET /admin/v1/provider_keys` and `GET /admin/v1/provider_keys/:id`
+//! - `GET /admin/v1/guardrails` and `GET /admin/v1/guardrails/:id`
+//! - `GET /admin/v1/cache_policies` and `GET /admin/v1/cache_policies/:id`
+//! - `GET /admin/v1/observability_exporters` and
+//!   `GET /admin/v1/observability_exporters/:id`
+//! - `GET /admin/v1/mcp_servers` and `GET /admin/v1/mcp_servers/:id`
+//! - `GET /admin/v1/a2a_agents` and `GET /admin/v1/a2a_agents/:id`
+//! - `GET /admin/v1/models/status`, `GET /admin/v1/health`
 //!
-//! Writes validate against the JSON Schemas from `aisix-core` and reject
-//! duplicate names (409). The storage layer is pluggable via the
-//! [`ConfigStore`] trait; production wires an etcd-backed impl in a
-//! follow-up PR, tests use [`InMemoryStore`].
-//!
-//! The write endpoints above (POST/PUT/DELETE, including rotate) are
-//! deprecated in favor of the declarative configuration paths — a
-//! `resources_file` source (`resources.yaml`) or direct etcd writes.
-//! They remain functional; every mutating response carries the RFC 9745
-//! `Deprecation` header and a `rel="deprecation"` `Link` (stamped by
-//! [`deprecated_write_headers`] so new write routes can't omit them).
+//! The resource write endpoints (POST/PUT/DELETE, including api-key
+//! rotate) were removed in favor of the declarative configuration
+//! paths — a `resources_file` source (`resources.yaml`, reloaded on
+//! SIGHUP) or direct etcd writes. Writes to the routes above answer
+//! 405; the rotate path is gone (404). The storage layer stays
+//! pluggable via the read-only [`ConfigStore`] trait; production wires
+//! etcd or the file-snapshot store, tests use [`InMemoryStore`].
 //!
 //! Errors follow the simple admin envelope: `{"error_msg": "..."}`,
 //! distinct from the proxy's OpenAI-style envelope.
@@ -100,22 +94,6 @@ pub fn admin_openapi_json() -> &'static str {
     openapi::merged_openapi()
 }
 
-/// RFC 9745 `Deprecation` value for the Admin API write path: a
-/// structured-field date (RFC 9651 Section 3.3.7), as the RFC requires —
-/// the boolean form from earlier drafts is not valid. The timestamp is
-/// the release date of the file-based resource source (`resources_file`),
-/// the point at which declarative configuration became the recommended
-/// way to manage standalone resources; a past date means the write path
-/// "was deprecated at that date". It stays functional — this header is
-/// the in-band signal, not a removal.
-const ADMIN_WRITE_DEPRECATION: &str = "@1783929480";
-
-/// RFC 8288 `Link` with the `deprecation` relation type registered by
-/// RFC 9745 — human-readable documentation covering the declarative
-/// configuration paths that replace Admin API writes.
-const ADMIN_WRITE_DEPRECATION_LINK: &str =
-    "<https://docs.api7.ai/ai-gateway/reference/resources-file>; rel=\"deprecation\"";
-
 pub fn build_router(state: AdminState) -> Router {
     // Eagerly build the merged OpenAPI doc so any panic in schema
     // parsing surfaces at boot, not at first `/admin/openapi.json`
@@ -132,13 +110,11 @@ pub fn build_router(state: AdminState) -> Router {
         .route("/admin/openapi-scalar", get(openapi::openapi_scalar))
         .route(
             "/admin/v1/models",
-            get(models_handlers::list_models).post(models_handlers::create_model),
+            get(models_handlers::list_models),
         )
         .route(
             "/admin/v1/models/:id",
-            get(models_handlers::get_model)
-                .put(models_handlers::update_model)
-                .delete(models_handlers::delete_model),
+            get(models_handlers::get_model),
         )
         .route(
             "/admin/v1/models/status",
@@ -149,97 +125,67 @@ pub fn build_router(state: AdminState) -> Router {
         // spelling. Same handlers; existing callers keep working.
         .route(
             "/admin/v1/api_keys",
-            get(apikeys_handlers::list_apikeys).post(apikeys_handlers::create_apikey),
+            get(apikeys_handlers::list_apikeys),
         )
         .route(
             "/admin/v1/api_keys/:id",
-            get(apikeys_handlers::get_apikey)
-                .put(apikeys_handlers::update_apikey)
-                .delete(apikeys_handlers::delete_apikey),
-        )
-        .route(
-            "/admin/v1/api_keys/:id/rotate",
-            post(apikeys_handlers::rotate_apikey),
+            get(apikeys_handlers::get_apikey),
         )
         .route(
             "/admin/v1/apikeys",
-            get(apikeys_handlers::list_apikeys).post(apikeys_handlers::create_apikey),
+            get(apikeys_handlers::list_apikeys),
         )
         .route(
             "/admin/v1/apikeys/:id",
-            get(apikeys_handlers::get_apikey)
-                .put(apikeys_handlers::update_apikey)
-                .delete(apikeys_handlers::delete_apikey),
-        )
-        .route(
-            "/admin/v1/apikeys/:id/rotate",
-            post(apikeys_handlers::rotate_apikey),
+            get(apikeys_handlers::get_apikey),
         )
         .route(
             "/admin/v1/provider_keys",
-            get(provider_keys_handlers::list_provider_keys)
-                .post(provider_keys_handlers::create_provider_key),
+            get(provider_keys_handlers::list_provider_keys),
         )
         .route(
             "/admin/v1/provider_keys/:id",
-            get(provider_keys_handlers::get_provider_key)
-                .put(provider_keys_handlers::update_provider_key)
-                .delete(provider_keys_handlers::delete_provider_key),
+            get(provider_keys_handlers::get_provider_key),
         )
         .route(
             "/admin/v1/mcp_servers",
-            get(mcp_servers_handlers::list_mcp_servers)
-                .post(mcp_servers_handlers::create_mcp_server),
+            get(mcp_servers_handlers::list_mcp_servers),
         )
         .route(
             "/admin/v1/mcp_servers/:id",
-            get(mcp_servers_handlers::get_mcp_server)
-                .put(mcp_servers_handlers::update_mcp_server)
-                .delete(mcp_servers_handlers::delete_mcp_server),
+            get(mcp_servers_handlers::get_mcp_server),
         )
         .route(
             "/admin/v1/a2a_agents",
-            get(a2a_agents_handlers::list_a2a_agents)
-                .post(a2a_agents_handlers::create_a2a_agent),
+            get(a2a_agents_handlers::list_a2a_agents),
         )
         .route(
             "/admin/v1/a2a_agents/:id",
-            get(a2a_agents_handlers::get_a2a_agent)
-                .put(a2a_agents_handlers::update_a2a_agent)
-                .delete(a2a_agents_handlers::delete_a2a_agent),
+            get(a2a_agents_handlers::get_a2a_agent),
         )
         .route(
             "/admin/v1/guardrails",
-            get(guardrails_handlers::list_guardrails)
-                .post(guardrails_handlers::create_guardrail),
+            get(guardrails_handlers::list_guardrails),
         )
         .route(
             "/admin/v1/guardrails/:id",
-            get(guardrails_handlers::get_guardrail)
-                .put(guardrails_handlers::update_guardrail)
-                .delete(guardrails_handlers::delete_guardrail),
+            get(guardrails_handlers::get_guardrail),
         )
         .route(
             "/admin/v1/cache_policies",
-            get(cache_policies_handlers::list_cache_policies)
-                .post(cache_policies_handlers::create_cache_policy),
+            get(cache_policies_handlers::list_cache_policies),
         )
         .route(
             "/admin/v1/cache_policies/:id",
-            get(cache_policies_handlers::get_cache_policy)
-                .put(cache_policies_handlers::update_cache_policy)
-                .delete(cache_policies_handlers::delete_cache_policy),
+            get(cache_policies_handlers::get_cache_policy),
         )
         .route(
             "/admin/v1/observability_exporters",
-            get(observability_exporters_handlers::list_observability_exporters)
-                .post(observability_exporters_handlers::create_observability_exporter),
+            get(observability_exporters_handlers::list_observability_exporters),
         )
         .route(
             "/admin/v1/observability_exporters/:id",
-            get(observability_exporters_handlers::get_observability_exporter)
-                .put(observability_exporters_handlers::update_observability_exporter)
-                .delete(observability_exporters_handlers::delete_observability_exporter),
+            get(observability_exporters_handlers::get_observability_exporter),
         )
         // Health — per-model upstream health levels (0/1/2).
         .route("/admin/v1/health", get(health_handler::get_health))
@@ -249,96 +195,9 @@ pub fn build_router(state: AdminState) -> Router {
         .route(
             "/playground/chat/completions",
             post(playground_handler::playground_chat_completions),
-        )
-        // File-managed write guard: one chokepoint covering every
-        // resource write endpoint (POST/PUT/DELETE, including rotate)
-        // so file mode can't drift as routes are added. Reads and the
-        // playground pass through untouched. No-op when the gateway is
-        // etcd-backed (`file_managed_path` unset).
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            file_managed_write_guard,
-        ))
-        // Deprecation signal for the Admin API write path. Added after
-        // (= outside of) the file-managed guard so the guard's 409 file-
-        // managed responses carry the headers too.
-        .layer(axum::middleware::from_fn(deprecated_write_headers));
+        );
 
     router.with_state(state)
-}
-
-/// True for a mutating request against the `/admin/v1/*` resource
-/// surface — POST/PUT/DELETE, rotate included. GET/HEAD/OPTIONS are the
-/// read surface, and non-resource endpoints (playground, livez/readyz,
-/// openapi) never count. One predicate shared by the file-managed write
-/// guard and the deprecation-header layer so the two views of "a write"
-/// can't drift apart.
-fn is_admin_resource_write(method: &axum::http::Method, path: &str) -> bool {
-    use axum::http::Method;
-
-    !matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS)
-        && path.starts_with("/admin/v1/")
-}
-
-/// Stamp the deprecation signal onto every mutating `/admin/v1/*`
-/// response, whatever its status: one chokepoint above the whole
-/// resource router, so newly added write routes can't ship without it.
-/// Applies in both etcd mode and file mode (the file-managed 409
-/// carries it too). The read surface and non-resource endpoints pass
-/// through untouched.
-///
-/// Emits, per RFC 9745:
-/// - `Deprecation: @<sf-date>` ([`ADMIN_WRITE_DEPRECATION`])
-/// - `Link: <docs>; rel="deprecation"` ([`ADMIN_WRITE_DEPRECATION_LINK`])
-async fn deprecated_write_headers(
-    req: axum::extract::Request,
-    next: axum::middleware::Next,
-) -> Response {
-    use axum::http::{header, HeaderName, HeaderValue};
-
-    let is_write = is_admin_resource_write(req.method(), req.uri().path());
-    let mut resp = next.run(req).await;
-    if is_write {
-        let headers = resp.headers_mut();
-        headers.insert(
-            HeaderName::from_static("deprecation"),
-            HeaderValue::from_static(ADMIN_WRITE_DEPRECATION),
-        );
-        // `Link` is list-valued (RFC 8288) — append rather than insert
-        // so a handler-provided link relation is never clobbered.
-        headers.append(
-            header::LINK,
-            HeaderValue::from_static(ADMIN_WRITE_DEPRECATION_LINK),
-        );
-    }
-    resp
-}
-
-/// Reject mutating `/admin/v1/*` requests with a 409 when resources are
-/// managed by the resources file. GET/HEAD/OPTIONS — the read surface —
-/// and non-resource endpoints (playground, livez, openapi) pass through.
-///
-/// Auth still wins: this layer runs before the per-handler [`AdminAuth`]
-/// extractor, so it only short-circuits for requests carrying a valid
-/// admin key. Unauthenticated writes fall through to the handler and get
-/// its `401` — the 409 body names the resources-file path, which is not
-/// for unauthenticated eyes.
-async fn file_managed_write_guard(
-    axum::extract::State(state): axum::extract::State<AdminState>,
-    req: axum::extract::Request,
-    next: axum::middleware::Next,
-) -> Response {
-    use axum::response::IntoResponse;
-
-    if is_admin_resource_write(req.method(), req.uri().path()) {
-        if let Some(path) = state.file_managed_path.as_deref() {
-            if auth::is_admin_authorized(req.headers(), &state.admin_keys) {
-                return AdminError::FileManaged(FileManagedStore::read_only_message(path))
-                    .into_response();
-            }
-        }
-    }
-    next.run(req).await
 }
 
 /// Build the router for the **dedicated** metrics/status listener — the
@@ -558,6 +417,16 @@ mod tests {
         AdminState::new(handle, store, &cfg())
     }
 
+    /// `build_state`, but hands back the concrete store so tests can
+    /// seed resources through the in-memory write methods — the read
+    /// endpoints are the surface under test.
+    fn build_seedable_state() -> (AdminState, Arc<InMemoryStore>) {
+        let handle = SnapshotHandle::new(AisixSnapshot::new());
+        let store = InMemoryStore::new();
+        let state = AdminState::new(handle, Arc::clone(&store) as Arc<dyn ConfigStore>, &cfg());
+        (state, store)
+    }
+
     /// `ModelsStatusState` over an empty in-memory store, for metrics
     /// listener tests that don't exercise `/status/models`.
     fn empty_models_status() -> ModelsStatusState {
@@ -581,12 +450,6 @@ mod tests {
         // stores SHA-256 hashes (§9A.7B.4).
         let key_hash = aisix_core::ApiKey::hash_bearer(key);
         json!({"key_hash": key_hash, "allowed_models": allowed})
-    }
-
-    fn apikey_payload_with_tools(key: &str, allowed: &[&str], tools: Value) -> Value {
-        let mut payload = apikey_payload(key, allowed);
-        payload["allowed_tools"] = tools;
-        payload
     }
 
     fn auth_req(method: &str, uri: &str, body: Option<Value>) -> Request<Body> {
@@ -941,7 +804,7 @@ mod tests {
         use aisix_proxy::ModelRuntimeStatusTracker;
         use std::time::Duration;
 
-        let store = InMemoryStore::new() as Arc<dyn ConfigStore>;
+        let store = InMemoryStore::new();
         let direct: Model = serde_json::from_value(model_payload("gpt4")).unwrap();
         store
             .put_model(ResourceEntry {
@@ -966,6 +829,7 @@ mod tests {
             })
             .await
             .unwrap();
+        let store: Arc<dyn ConfigStore> = store;
 
         let tracker = Arc::new(ModelRuntimeStatusTracker::new());
         tracker.mark_cooldown("direct-1", Duration::from_secs(60), "upstream_rate_limited");
@@ -1055,13 +919,10 @@ mod tests {
         struct FailingStore;
 
         macro_rules! impl_failing_store {
-            ($( { $ty:ty, $put:ident, $get:ident, $list:ident, $delete:ident } )+) => {
+            ($( { $ty:ty, $get:ident, $list:ident } )+) => {
                 #[async_trait::async_trait]
                 impl ConfigStore for FailingStore {
                     $(
-                        async fn $put(&self, _entry: ResourceEntry<$ty>) -> Result<(), StoreError> {
-                            Err(StoreError::Backend(LEAKY.into()))
-                        }
                         async fn $get(
                             &self,
                             _id: &str,
@@ -1071,22 +932,19 @@ mod tests {
                         async fn $list(&self) -> Result<Vec<ResourceEntry<$ty>>, StoreError> {
                             Err(StoreError::Backend(LEAKY.into()))
                         }
-                        async fn $delete(&self, _id: &str) -> Result<bool, StoreError> {
-                            Err(StoreError::Backend(LEAKY.into()))
-                        }
                     )+
                 }
             };
         }
         impl_failing_store! {
-            { Model, put_model, get_model, list_models, delete_model }
-            { ApiKey, put_apikey, get_apikey, list_apikeys, delete_apikey }
-            { ProviderKey, put_provider_key, get_provider_key, list_provider_keys, delete_provider_key }
-            { Guardrail, put_guardrail, get_guardrail, list_guardrails, delete_guardrail }
-            { CachePolicy, put_cache_policy, get_cache_policy, list_cache_policies, delete_cache_policy }
-            { ObservabilityExporter, put_observability_exporter, get_observability_exporter, list_observability_exporters, delete_observability_exporter }
-            { McpServer, put_mcp_server, get_mcp_server, list_mcp_servers, delete_mcp_server }
-            { A2aAgent, put_a2a_agent, get_a2a_agent, list_a2a_agents, delete_a2a_agent }
+            { Model, get_model, list_models }
+            { ApiKey, get_apikey, list_apikeys }
+            { ProviderKey, get_provider_key, list_provider_keys }
+            { Guardrail, get_guardrail, list_guardrails }
+            { CachePolicy, get_cache_policy, list_cache_policies }
+            { ObservabilityExporter, get_observability_exporter, list_observability_exporters }
+            { McpServer, get_mcp_server, list_mcp_servers }
+            { A2aAgent, get_a2a_agent, list_a2a_agents }
         }
 
         let app = metrics_router(
@@ -1135,13 +993,10 @@ mod tests {
         struct HangingStore;
 
         macro_rules! impl_hanging_store {
-            ($( { $ty:ty, $put:ident, $get:ident, $list:ident, $delete:ident } )+) => {
+            ($( { $ty:ty, $get:ident, $list:ident } )+) => {
                 #[async_trait::async_trait]
                 impl ConfigStore for HangingStore {
                     $(
-                        async fn $put(&self, _entry: ResourceEntry<$ty>) -> Result<(), StoreError> {
-                            std::future::pending().await
-                        }
                         async fn $get(
                             &self,
                             _id: &str,
@@ -1151,22 +1006,19 @@ mod tests {
                         async fn $list(&self) -> Result<Vec<ResourceEntry<$ty>>, StoreError> {
                             std::future::pending().await
                         }
-                        async fn $delete(&self, _id: &str) -> Result<bool, StoreError> {
-                            std::future::pending().await
-                        }
                     )+
                 }
             };
         }
         impl_hanging_store! {
-            { Model, put_model, get_model, list_models, delete_model }
-            { ApiKey, put_apikey, get_apikey, list_apikeys, delete_apikey }
-            { ProviderKey, put_provider_key, get_provider_key, list_provider_keys, delete_provider_key }
-            { Guardrail, put_guardrail, get_guardrail, list_guardrails, delete_guardrail }
-            { CachePolicy, put_cache_policy, get_cache_policy, list_cache_policies, delete_cache_policy }
-            { ObservabilityExporter, put_observability_exporter, get_observability_exporter, list_observability_exporters, delete_observability_exporter }
-            { McpServer, put_mcp_server, get_mcp_server, list_mcp_servers, delete_mcp_server }
-            { A2aAgent, put_a2a_agent, get_a2a_agent, list_a2a_agents, delete_a2a_agent }
+            { Model, get_model, list_models }
+            { ApiKey, get_apikey, list_apikeys }
+            { ProviderKey, get_provider_key, list_provider_keys }
+            { Guardrail, get_guardrail, list_guardrails }
+            { CachePolicy, get_cache_policy, list_cache_policies }
+            { ObservabilityExporter, get_observability_exporter, list_observability_exporters }
+            { McpServer, get_mcp_server, list_mcp_servers }
+            { A2aAgent, get_a2a_agent, list_a2a_agents }
         }
 
         let app = metrics_router(
@@ -1249,28 +1101,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_model_returns_entry_with_generated_id() {
-        let app = build_router(build_state());
-        let resp = run(
-            app,
-            auth_req("POST", "/admin/v1/models", Some(model_payload("my-gpt4"))),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        let v = body_json(resp).await;
-        assert!(!v["id"].as_str().unwrap().is_empty());
-        assert_eq!(v["revision"], 1);
-        assert_eq!(v["value"]["display_name"], "my-gpt4");
-    }
-
-    #[tokio::test]
-    async fn create_model_without_auth_is_401() {
+    async fn list_models_without_auth_is_401() {
         let app = build_router(build_state());
         let req = Request::builder()
-            .method("POST")
             .uri("/admin/v1/models")
-            .header("content-type", "application/json")
-            .body(Body::from(model_payload("m").to_string()))
+            .body(Body::empty())
             .unwrap();
         let resp = run(app, req).await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
@@ -1281,77 +1116,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_model_with_wrong_admin_key_is_401() {
+    async fn list_models_with_wrong_admin_key_is_401() {
         let app = build_router(build_state());
         let req = Request::builder()
-            .method("POST")
             .uri("/admin/v1/models")
             .header("authorization", "Bearer wrong")
-            .header("content-type", "application/json")
-            .body(Body::from(model_payload("m").to_string()))
+            .body(Body::empty())
             .unwrap();
         let resp = run(app, req).await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
-    async fn create_model_with_empty_display_name_is_400_schema_error() {
-        // After #302 Phase A `provider` is a free-form string — any
-        // catalog vendor cp-api admits flows through. The schema
-        // still rejects empty `display_name` (`minLength: 1`), which
-        // is what we exercise here as the canonical "bad input → 400"
-        // path. The old "unknown provider rejected" assertion is
-        // intentionally retired: the whole point of #302 Phase A is
-        // that the DP no longer enumerates vendors.
-        let app = build_router(build_state());
-        let body = json!({
-            "display_name": "",
-            "provider": "openai",
-            "model_name": "x",
-            "provider_key_id": "11111111-1111-1111-1111-111111111111"
-        });
-        let resp = run(app, auth_req("POST", "/admin/v1/models", Some(body))).await;
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        let v = body_json(resp).await;
-        assert!(v["error_msg"]
-            .as_str()
-            .unwrap()
-            .contains("schema validation"));
-    }
-
-    #[tokio::test]
-    async fn duplicate_model_name_on_create_is_409() {
-        let state = build_state();
-        let app = build_router(state.clone());
-        let _ = run(
-            app,
-            auth_req("POST", "/admin/v1/models", Some(model_payload("dup"))),
-        )
-        .await;
-        let app = build_router(state);
-        let resp = run(
-            app,
-            auth_req("POST", "/admin/v1/models", Some(model_payload("dup"))),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::CONFLICT);
-    }
-
-    #[tokio::test]
-    async fn list_models_returns_created_entries() {
-        let state = build_state();
-        let app = build_router(state.clone());
-        let _ = run(
-            app,
-            auth_req("POST", "/admin/v1/models", Some(model_payload("foo"))),
-        )
-        .await;
-        let app = build_router(state.clone());
-        let _ = run(
-            app,
-            auth_req("POST", "/admin/v1/models", Some(model_payload("bar"))),
-        )
-        .await;
+    async fn list_models_returns_seeded_entries() {
+        let (state, store) = build_seedable_state();
+        for (id, name) in [("m-1", "foo"), ("m-2", "bar")] {
+            let model: aisix_core::Model = serde_json::from_value(model_payload(name)).unwrap();
+            store
+                .put_model(aisix_core::ResourceEntry::new(id, model, 1))
+                .await
+                .unwrap();
+        }
         let app = build_router(state);
         let resp = run(app, auth_req("GET", "/admin/v1/models", None)).await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -1360,23 +1145,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_model_round_trip() {
-        let state = build_state();
-        let app = build_router(state.clone());
-        let resp = run(
-            app,
-            auth_req("POST", "/admin/v1/models", Some(model_payload("foo"))),
-        )
-        .await;
-        let created = body_json(resp).await;
-        let id = created["id"].as_str().unwrap();
+    async fn get_model_serves_seeded_entry() {
+        let (state, store) = build_seedable_state();
+        let model: aisix_core::Model = serde_json::from_value(model_payload("foo")).unwrap();
+        store
+            .put_model(aisix_core::ResourceEntry::new("m-1", model, 1))
+            .await
+            .unwrap();
 
         let app = build_router(state);
-        let resp = run(
-            app,
-            auth_req("GET", &format!("/admin/v1/models/{id}"), None),
-        )
-        .await;
+        let resp = run(app, auth_req("GET", "/admin/v1/models/m-1", None)).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let v = body_json(resp).await;
         assert_eq!(v["value"]["display_name"], "foo");
@@ -1389,555 +1167,67 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
-    #[tokio::test]
-    async fn update_model_bumps_revision_and_persists_changes() {
-        let state = build_state();
-        let app = build_router(state.clone());
-        let resp = run(
-            app,
-            auth_req("POST", "/admin/v1/models", Some(model_payload("foo"))),
-        )
-        .await;
-        let id = body_json(resp).await["id"].as_str().unwrap().to_string();
-
-        // Change provider upstream.
-        let updated_body = json!({
-            "display_name": "foo",
-            "provider": "anthropic",
-            "model_name": "claude-sonnet-4-5",
-            "provider_key_id": "22222222-2222-2222-2222-222222222222"
-        });
-        let app = build_router(state);
-        let resp = run(
-            app,
-            auth_req("PUT", &format!("/admin/v1/models/{id}"), Some(updated_body)),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        let v = body_json(resp).await;
-        assert_eq!(v["revision"], 2);
-        assert_eq!(v["value"]["provider"], "anthropic");
-        assert_eq!(v["value"]["model_name"], "claude-sonnet-4-5");
-    }
-
-    #[tokio::test]
-    async fn update_model_renaming_to_existing_name_is_409() {
-        let state = build_state();
-        let app = build_router(state.clone());
-        let _ = run(
-            app,
-            auth_req("POST", "/admin/v1/models", Some(model_payload("foo"))),
-        )
-        .await;
-        let app = build_router(state.clone());
-        let resp = run(
-            app,
-            auth_req("POST", "/admin/v1/models", Some(model_payload("bar"))),
-        )
-        .await;
-        let bar_id = body_json(resp).await["id"].as_str().unwrap().to_string();
-
-        // Try to rename "bar" -> "foo".
-        let app = build_router(state);
-        let resp = run(
-            app,
-            auth_req(
-                "PUT",
-                &format!("/admin/v1/models/{bar_id}"),
-                Some(model_payload("foo")),
-            ),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::CONFLICT);
-    }
-
-    #[tokio::test]
-    async fn update_model_keeping_own_name_is_allowed() {
-        let state = build_state();
-        let app = build_router(state.clone());
-        let resp = run(
-            app,
-            auth_req("POST", "/admin/v1/models", Some(model_payload("foo"))),
-        )
-        .await;
-        let id = body_json(resp).await["id"].as_str().unwrap().to_string();
-
-        let app = build_router(state);
-        let resp = run(
-            app,
-            auth_req(
-                "PUT",
-                &format!("/admin/v1/models/{id}"),
-                Some(model_payload("foo")),
-            ),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn delete_model_is_204_esque_and_subsequent_get_is_404() {
-        let state = build_state();
-        let app = build_router(state.clone());
-        let resp = run(
-            app,
-            auth_req("POST", "/admin/v1/models", Some(model_payload("foo"))),
-        )
-        .await;
-        let id = body_json(resp).await["id"].as_str().unwrap().to_string();
-
-        let app = build_router(state.clone());
-        let resp = run(
-            app,
-            auth_req("DELETE", &format!("/admin/v1/models/{id}"), None),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        let app = build_router(state);
-        let resp = run(
-            app,
-            auth_req("GET", &format!("/admin/v1/models/{id}"), None),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn delete_missing_model_is_404() {
-        let app = build_router(build_state());
-        let resp = run(app, auth_req("DELETE", "/admin/v1/models/missing-id", None)).await;
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn rotate_apikey_generates_new_key_and_increments_revision() {
-        let state = build_state();
-
-        // Create a key.
-        let app = build_router(state.clone());
-        let resp = run(
-            app,
-            auth_req(
-                "POST",
-                "/admin/v1/apikeys",
-                Some(apikey_payload("sk-original", &["my-model"])),
-            ),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        let created = body_json(resp).await;
-        let id = created["id"].as_str().unwrap().to_string();
-        let original_hash = created["value"]["key_hash"].as_str().unwrap().to_string();
-        // The created hash matches SHA-256(sk-original) — the wire
-        // schema stores hashes only (§9A.7B.4).
-        assert_eq!(
-            original_hash,
-            aisix_core::ApiKey::hash_bearer("sk-original")
-        );
-        assert_eq!(created["revision"], 1);
-
-        // Rotate.
-        let app = build_router(state.clone());
-        let resp = run(
-            app,
-            auth_req("POST", &format!("/admin/v1/apikeys/{id}/rotate"), None),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        let rotated = body_json(resp).await;
-
-        // Rotation response shape: { entry: ResourceEntry<ApiKey>, plaintext: "sk-..." }.
-        // The plaintext is shown exactly once.
-        let new_plaintext = rotated["plaintext"].as_str().unwrap().to_string();
-        assert!(
-            new_plaintext.starts_with("sk-"),
-            "rotated plaintext lacks sk- prefix"
-        );
-
-        let entry = &rotated["entry"];
-        let new_hash = entry["value"]["key_hash"].as_str().unwrap().to_string();
-        assert_ne!(
-            new_hash, original_hash,
-            "hash did not change after rotation"
-        );
-        // The new hash matches SHA-256(new_plaintext).
-        assert_eq!(new_hash, aisix_core::ApiKey::hash_bearer(&new_plaintext));
-        // Revision must bump.
-        assert_eq!(entry["revision"], 2);
-        // Other fields preserved.
-        let allowed: Vec<&str> = entry["value"]["allowed_models"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_str().unwrap())
-            .collect();
-        assert_eq!(allowed, ["my-model"]);
-    }
-
-    #[tokio::test]
-    async fn rotate_missing_apikey_returns_404() {
-        let app = build_router(build_state());
-        let resp = run(
-            app,
-            auth_req("POST", "/admin/v1/apikeys/nonexistent/rotate", None),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    }
-
     // Caller API keys are served at both the canonical `/admin/v1/api_keys`
     // path and the former `/admin/v1/apikeys` spelling — same handlers,
     // same store. Pin that a resource written through one path is fully
     // addressable through the other.
     #[tokio::test]
-    async fn api_keys_canonical_and_former_paths_share_the_same_resources() {
-        let state = build_state();
-
-        // Create through the canonical path.
-        let app = build_router(state.clone());
-        let resp = run(
-            app,
-            auth_req(
-                "POST",
-                "/admin/v1/api_keys",
-                Some(apikey_payload("sk-canonical", &["my-model"])),
-            ),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        let created = body_json(resp).await;
-        let id = created["id"].as_str().unwrap().to_string();
-
-        // Read it back through the former spelling.
-        let app = build_router(state.clone());
-        let resp = run(
-            app,
-            auth_req("GET", &format!("/admin/v1/apikeys/{id}"), None),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        // Rotate through the canonical spelling.
-        let app = build_router(state.clone());
-        let resp = run(
-            app,
-            auth_req("POST", &format!("/admin/v1/api_keys/{id}/rotate"), None),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        let rotated = body_json(resp).await;
-        assert_eq!(rotated["entry"]["revision"], 2);
-
-        // Delete through the former spelling; the canonical GET 404s.
-        let app = build_router(state.clone());
-        let resp = run(
-            app,
-            auth_req("DELETE", &format!("/admin/v1/apikeys/{id}"), None),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        let app = build_router(state);
-        let resp = run(
-            app,
-            auth_req("GET", &format!("/admin/v1/api_keys/{id}"), None),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    }
-
-    // ---- coverage of issue api7/AISIX-Cloud#398 Addendum.B "admin
-    // /apikeys/:id/rotate" — race window + auth-bypass surface.
-
-    // Rotation is admin-authenticated: no Bearer admin-secret header
-    // means 401 BEFORE touching the etcd store. This pins the
-    // contract so a future "accidental open endpoint" refactor
-    // can't ship undetected.
-    #[tokio::test]
-    async fn rotate_apikey_requires_admin_auth() {
-        let state = build_state();
-
-        // Create the key with auth so we have a valid id to target.
-        let app = build_router(state.clone());
-        let resp = run(
-            app,
-            auth_req(
-                "POST",
-                "/admin/v1/apikeys",
-                Some(apikey_payload("sk-original", &["my-model"])),
-            ),
-        )
-        .await;
-        let id = body_json(resp).await["id"].as_str().unwrap().to_string();
-
-        // Now hit /rotate WITHOUT the admin Bearer header.
-        let app = build_router(state);
-        let req = Request::builder()
-            .method("POST")
-            .uri(format!("/admin/v1/apikeys/{id}/rotate"))
-            .body(Body::empty())
+    async fn api_keys_former_spelling_serves_the_same_resources() {
+        let (state, store) = build_seedable_state();
+        let mut payload = apikey_payload("sk-canonical", &["my-model"]);
+        // Non-default optional fields, so the PublicApiKey projection is
+        // pinned field-by-field — a projection that dropped one of these
+        // would still pass an id-only check.
+        payload["allowed_tools"] = json!(["github__create_issue"]);
+        payload["allowed_agents"] = json!(["invoice-agent"]);
+        payload["rate_limit"] = json!({"rpm": 60});
+        payload["disabled"] = json!(true);
+        payload["expires_at"] = json!("2099-01-01T00:00:00Z");
+        let key: aisix_core::ApiKey = serde_json::from_value(payload).unwrap();
+        let expected_hash = key.key_hash.clone();
+        store
+            .put_apikey(aisix_core::ResourceEntry::new("k-1", key, 1))
+            .await
             .unwrap();
-        let resp = run(app, req).await;
-        assert_eq!(
-            resp.status(),
-            StatusCode::UNAUTHORIZED,
-            "rotate must require admin auth — unauthenticated callers must NOT be able to invalidate or replace an api_key",
-        );
-    }
 
-    // Two concurrent rotations against the same key must serialize
-    // cleanly: both calls succeed, the store ends in a consistent
-    // state with revisions monotonically increasing past 1, and the
-    // final stored hash matches the winner's plaintext (not a torn
-    // write).
-    //
-    // This pins the rotation race-window concern from #398
-    // Addendum.B: "rotation race window (new + old both admit
-    // simultaneously)". Atomicity comes from the store's RwLock; a
-    // refactor to an etcd-backed store without CAS semantics would
-    // regress this test.
-    #[tokio::test]
-    async fn concurrent_rotate_apikey_serializes_atomically() {
-        let state = build_state();
+        // The same entry is readable through both spellings, with the
+        // full projection intact.
+        for base in ["/admin/v1/api_keys", "/admin/v1/apikeys"] {
+            let app = build_router(state.clone());
+            let resp = run(app, auth_req("GET", &format!("{base}/k-1"), None)).await;
+            assert_eq!(resp.status(), StatusCode::OK, "GET {base}/k-1");
+            let v = body_json(resp).await;
+            assert_eq!(v["id"], "k-1", "{base}");
+            assert_eq!(v["value"]["key_hash"], expected_hash.as_str(), "{base}");
+            assert_eq!(v["value"]["allowed_models"], json!(["my-model"]), "{base}");
+            assert_eq!(
+                v["value"]["allowed_tools"],
+                json!(["github__create_issue"]),
+                "{base}"
+            );
+            assert_eq!(
+                v["value"]["allowed_agents"],
+                json!(["invoice-agent"]),
+                "{base}"
+            );
+            assert_eq!(v["value"]["rate_limit"]["rpm"], 60, "{base}");
+            assert_eq!(v["value"]["disabled"], true, "{base}");
+            assert_eq!(v["value"]["expires_at"], "2099-01-01T00:00:00Z", "{base}");
 
-        // Create.
-        let app = build_router(state.clone());
-        let resp = run(
-            app,
-            auth_req(
-                "POST",
-                "/admin/v1/apikeys",
-                Some(apikey_payload("sk-original", &["my-model"])),
-            ),
-        )
-        .await;
-        let id = body_json(resp).await["id"].as_str().unwrap().to_string();
-
-        // Fire two rotations concurrently. Each rotation is one
-        // PUT to the in-memory ConfigStore, so the RwLock serializes
-        // them; both should succeed with monotonically-increasing
-        // revisions.
-        let app_a = build_router(state.clone());
-        let app_b = build_router(state.clone());
-        let id_a = id.clone();
-        let id_b = id.clone();
-
-        let task_a = tokio::spawn(async move {
-            run(
-                app_a,
-                auth_req("POST", &format!("/admin/v1/apikeys/{id_a}/rotate"), None),
-            )
-            .await
-        });
-        let task_b = tokio::spawn(async move {
-            run(
-                app_b,
-                auth_req("POST", &format!("/admin/v1/apikeys/{id_b}/rotate"), None),
-            )
-            .await
-        });
-
-        let resp_a = task_a.await.unwrap();
-        let resp_b = task_b.await.unwrap();
-        assert_eq!(
-            resp_a.status(),
-            StatusCode::OK,
-            "concurrent rotation a must succeed"
-        );
-        assert_eq!(
-            resp_b.status(),
-            StatusCode::OK,
-            "concurrent rotation b must succeed"
-        );
-
-        let body_a = body_json(resp_a).await;
-        let body_b = body_json(resp_b).await;
-        let plain_a = body_a["plaintext"].as_str().unwrap().to_string();
-        let plain_b = body_b["plaintext"].as_str().unwrap().to_string();
-        let rev_a = body_a["entry"]["revision"].as_u64().unwrap();
-        let rev_b = body_b["entry"]["revision"].as_u64().unwrap();
-
-        assert_ne!(
-            plain_a, plain_b,
-            "two rotations must yield distinct plaintexts"
-        );
-        assert!(rev_a >= 2 && rev_b >= 2);
-        assert_ne!(
-            rev_a, rev_b,
-            "concurrent rotations must produce distinct revisions"
-        );
-
-        // Final stored state matches the winner (highest revision).
-        // The loser's plaintext must NOT still be admitted — that
-        // would be the "new + old both admit" race the audit warned
-        // about.
-        let app = build_router(state);
-        let resp = run(
-            app,
-            auth_req("GET", &format!("/admin/v1/apikeys/{id}"), None),
-        )
-        .await;
-        let final_entry = body_json(resp).await;
-        let final_hash = final_entry["value"]["key_hash"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        let winner_plain = if rev_a > rev_b {
-            plain_a.clone()
-        } else {
-            plain_b.clone()
-        };
-        let loser_plain = if rev_a > rev_b {
-            plain_b.clone()
-        } else {
-            plain_a.clone()
-        };
-        assert_eq!(
-            final_hash,
-            aisix_core::ApiKey::hash_bearer(&winner_plain),
-            "final stored hash must match the highest-revision rotation winner",
-        );
-        assert_ne!(
-            final_hash,
-            aisix_core::ApiKey::hash_bearer(&loser_plain),
-            "loser plaintext must NOT match the final stored hash — that would be a race-window admit",
-        );
-    }
-
-    #[tokio::test]
-    async fn apikey_crud_follows_the_same_flow() {
-        let state = build_state();
-
-        // Create.
-        let app = build_router(state.clone());
-        let resp = run(
-            app,
-            auth_req(
-                "POST",
-                "/admin/v1/apikeys",
-                Some(apikey_payload("sk-user-1", &["my-gpt4"])),
-            ),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        let id = body_json(resp).await["id"].as_str().unwrap().to_string();
-
-        // Duplicate key rejected.
-        let app = build_router(state.clone());
-        let resp = run(
-            app,
-            auth_req(
-                "POST",
-                "/admin/v1/apikeys",
-                Some(apikey_payload("sk-user-1", &["*"])),
-            ),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::CONFLICT);
-
-        // List sees exactly one.
-        let app = build_router(state.clone());
-        let resp = run(app, auth_req("GET", "/admin/v1/apikeys", None)).await;
-        let listed = body_json(resp).await;
-        assert_eq!(listed.as_array().unwrap().len(), 1);
-
-        // Delete.
-        let app = build_router(state);
-        let resp = run(
-            app,
-            auth_req("DELETE", &format!("/admin/v1/apikeys/{id}"), None),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn apikey_crud_round_trips_allowed_tools() {
-        let state = build_state();
-
-        let app = build_router(state.clone());
-        let resp = run(
-            app,
-            auth_req(
-                "POST",
-                "/admin/v1/apikeys",
-                Some(apikey_payload_with_tools(
-                    "sk-mcp-tools",
-                    &["*"],
-                    json!(["github__create_issue"]),
-                )),
-            ),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        let created = body_json(resp).await;
-        let id = created["id"].as_str().unwrap().to_string();
-        assert_eq!(
-            created["value"]["allowed_tools"],
-            json!(["github__create_issue"])
-        );
-
-        let app = build_router(state.clone());
-        let resp = run(app, auth_req("GET", "/admin/v1/apikeys", None)).await;
-        let listed = body_json(resp).await;
-        assert_eq!(
-            listed[0]["value"]["allowed_tools"],
-            json!(["github__create_issue"])
-        );
-
-        let app = build_router(state.clone());
-        let resp = run(
-            app,
-            auth_req("GET", &format!("/admin/v1/apikeys/{id}"), None),
-        )
-        .await;
-        let fetched = body_json(resp).await;
-        assert_eq!(
-            fetched["value"]["allowed_tools"],
-            json!(["github__create_issue"])
-        );
-
-        let app = build_router(state.clone());
-        let resp = run(
-            app,
-            auth_req(
-                "PUT",
-                &format!("/admin/v1/apikeys/{id}"),
-                Some(apikey_payload_with_tools(
-                    "sk-mcp-tools-2",
-                    &["*"],
-                    Value::Null,
-                )),
-            ),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        let updated = body_json(resp).await;
-        assert!(
-            updated["value"].get("allowed_tools").is_none(),
-            "explicit null should clear allowed_tools and be omitted from the response"
-        );
-    }
-
-    #[tokio::test]
-    async fn create_apikey_rejects_unknown_field() {
-        let app = build_router(build_state());
-        let resp = run(
-            app,
-            auth_req(
-                "POST",
-                "/admin/v1/apikeys",
-                Some(json!({
-                    "key_hash": aisix_core::ApiKey::hash_bearer("sk-budget"),
-                    "allowed_models": ["*"],
-                    "max_budget_usd": 500.0
-                })),
-            ),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        let v = body_json(resp).await;
-        assert!(v["error_msg"].as_str().unwrap().contains("unknown field"));
+            let app = build_router(state.clone());
+            let resp = run(app, auth_req("GET", base, None)).await;
+            assert_eq!(resp.status(), StatusCode::OK, "GET {base}");
+            let v = body_json(resp).await;
+            let arr = v.as_array().unwrap();
+            assert_eq!(arr.len(), 1, "{base}");
+            // The list entry carries the same projection, not a thinner one.
+            assert_eq!(
+                arr[0]["value"]["key_hash"],
+                expected_hash.as_str(),
+                "{base}"
+            );
+            assert_eq!(arr[0]["value"]["disabled"], true, "{base}");
+        }
     }
 
     #[tokio::test]
@@ -1953,7 +1243,7 @@ mod tests {
         assert!(props.get("max_budget_usd").is_none());
     }
 
-    // ──────────────────── Guardrails CRUD ────────────────────
+    // ──────────────────── Guardrail payloads ────────────────────
 
     fn guardrail_payload(name: &str) -> Value {
         json!({
@@ -1961,210 +1251,6 @@ mod tests {
             "kind": "keyword",
             "patterns": [{"kind": "literal", "value": "secret"}]
         })
-    }
-
-    #[tokio::test]
-    async fn guardrail_crud_create_list_get_update_delete() {
-        let state = build_state();
-
-        // Create.
-        let app = build_router(state.clone());
-        let resp = run(
-            app,
-            auth_req(
-                "POST",
-                "/admin/v1/guardrails",
-                Some(guardrail_payload("g-1")),
-            ),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        let id = body_json(resp).await["id"].as_str().unwrap().to_string();
-
-        // Duplicate name → 409.
-        let app = build_router(state.clone());
-        let resp = run(
-            app,
-            auth_req(
-                "POST",
-                "/admin/v1/guardrails",
-                Some(guardrail_payload("g-1")),
-            ),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::CONFLICT);
-
-        // List sees one.
-        let app = build_router(state.clone());
-        let resp = run(app, auth_req("GET", "/admin/v1/guardrails", None)).await;
-        assert_eq!(body_json(resp).await.as_array().unwrap().len(), 1);
-
-        // Update bumps revision.
-        let app = build_router(state.clone());
-        let updated = json!({
-            "name": "g-1",
-            "kind": "keyword",
-            "patterns": [{"kind": "literal", "value": "topsecret"}]
-        });
-        let resp = run(
-            app,
-            auth_req("PUT", &format!("/admin/v1/guardrails/{id}"), Some(updated)),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(body_json(resp).await["revision"], 2);
-
-        // Delete + 404.
-        let app = build_router(state.clone());
-        let resp = run(
-            app,
-            auth_req("DELETE", &format!("/admin/v1/guardrails/{id}"), None),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        let app = build_router(state);
-        let resp = run(
-            app,
-            auth_req("GET", &format!("/admin/v1/guardrails/{id}"), None),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn guardrail_create_with_invalid_schema_returns_400() {
-        let app = build_router(build_state());
-        // Missing required `kind` field.
-        let resp = run(
-            app,
-            auth_req("POST", "/admin/v1/guardrails", Some(json!({"name": "g-1"}))),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    }
-
-    // ──────────────────── CachePolicy CRUD ────────────────────
-
-    fn cache_policy_payload(name: &str) -> Value {
-        json!({
-            "name": name,
-            "enabled": true,
-            "ttl_seconds": 600
-        })
-    }
-
-    #[tokio::test]
-    async fn cache_policy_crud_create_list_delete() {
-        let state = build_state();
-
-        let app = build_router(state.clone());
-        let resp = run(
-            app,
-            auth_req(
-                "POST",
-                "/admin/v1/cache_policies",
-                Some(cache_policy_payload("p-1")),
-            ),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        let id = body_json(resp).await["id"].as_str().unwrap().to_string();
-
-        // Duplicate → 409.
-        let app = build_router(state.clone());
-        let resp = run(
-            app,
-            auth_req(
-                "POST",
-                "/admin/v1/cache_policies",
-                Some(cache_policy_payload("p-1")),
-            ),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::CONFLICT);
-
-        // Get round-trip.
-        let app = build_router(state.clone());
-        let resp = run(
-            app,
-            auth_req("GET", &format!("/admin/v1/cache_policies/{id}"), None),
-        )
-        .await;
-        assert_eq!(body_json(resp).await["value"]["name"], "p-1");
-
-        // Delete.
-        let app = build_router(state);
-        let resp = run(
-            app,
-            auth_req("DELETE", &format!("/admin/v1/cache_policies/{id}"), None),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::OK);
-    }
-
-    // ──────────────────── ObservabilityExporter CRUD ────────────────────
-
-    fn exporter_payload(name: &str) -> Value {
-        json!({
-            "name": name,
-            "kind": "otlp_http",
-            "endpoint": "https://otel.example.com/v1/traces"
-        })
-    }
-
-    #[tokio::test]
-    async fn observability_exporter_crud_create_list_delete() {
-        let state = build_state();
-
-        let app = build_router(state.clone());
-        let resp = run(
-            app,
-            auth_req(
-                "POST",
-                "/admin/v1/observability_exporters",
-                Some(exporter_payload("oe-1")),
-            ),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        let id = body_json(resp).await["id"].as_str().unwrap().to_string();
-
-        let app = build_router(state.clone());
-        let resp = run(
-            app,
-            auth_req("GET", "/admin/v1/observability_exporters", None),
-        )
-        .await;
-        assert_eq!(body_json(resp).await.as_array().unwrap().len(), 1);
-
-        let app = build_router(state);
-        let resp = run(
-            app,
-            auth_req(
-                "DELETE",
-                &format!("/admin/v1/observability_exporters/{id}"),
-                None,
-            ),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn observability_exporter_rejects_http_endpoint_unless_loopback() {
-        let app = build_router(build_state());
-        let bad = json!({
-            "name": "oe-1",
-            "kind": "otlp_http",
-            "endpoint": "http://attacker.example.com/v1/traces"
-        });
-        let resp = run(
-            app,
-            auth_req("POST", "/admin/v1/observability_exporters", Some(bad)),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     // ──────────────────── Health endpoint ────────────────────
@@ -2192,15 +1278,12 @@ mod tests {
 
     #[tokio::test]
     async fn health_lists_models_with_default_healthy_when_no_tracker() {
-        let state = build_state();
-
-        // Create a model so the snapshot is non-empty.
-        let app = build_router(state.clone());
-        run(
-            app,
-            auth_req("POST", "/admin/v1/models", Some(model_payload("gpt4"))),
-        )
-        .await;
+        let (state, store) = build_seedable_state();
+        let model: aisix_core::Model = serde_json::from_value(model_payload("gpt4")).unwrap();
+        store
+            .put_model(aisix_core::ResourceEntry::new("m-1", model, 1))
+            .await
+            .unwrap();
 
         // Health endpoint on the same state (no tracker wired).
         let app = build_router(state);
@@ -2226,7 +1309,7 @@ mod tests {
         }
 
         let handle = SnapshotHandle::new(AisixSnapshot::new());
-        let store = InMemoryStore::new() as Arc<dyn ConfigStore>;
+        let store = InMemoryStore::new();
         let state =
             AdminState::new(handle.clone(), store.clone(), &cfg()).with_health_tracker(health);
 
@@ -2262,7 +1345,7 @@ mod tests {
         use aisix_proxy::ModelRuntimeStatusTracker;
 
         let handle = SnapshotHandle::new(AisixSnapshot::new());
-        let store = InMemoryStore::new() as Arc<dyn ConfigStore>;
+        let store = InMemoryStore::new();
         let runtime = Arc::new(ModelRuntimeStatusTracker::new());
 
         let direct: Model = serde_json::from_value(model_payload("gpt4")).unwrap();
@@ -2315,8 +1398,7 @@ mod tests {
     // ──────────────────── File-managed mode ────────────────────
 
     /// AdminState wired the way `aisix-server` wires file mode: the
-    /// store reads from the snapshot, and `file_managed_path` arms the
-    /// router-level write guard.
+    /// store reads from the file-loaded snapshot.
     fn build_file_managed_state() -> AdminState {
         let snapshot = AisixSnapshot::new();
         let model: aisix_core::Model = serde_json::from_value(model_payload("file-model")).unwrap();
@@ -2324,55 +1406,112 @@ mod tests {
             .models
             .insert(aisix_core::ResourceEntry::new("m-file-1", model, 1));
         let handle = SnapshotHandle::new(snapshot);
-        let store: Arc<dyn ConfigStore> = Arc::new(FileManagedStore::new(
-            handle.clone(),
-            "/etc/aisix/resources.yaml",
-        ));
-        AdminState::new(handle, store, &cfg()).with_file_managed_path("/etc/aisix/resources.yaml")
+        let store: Arc<dyn ConfigStore> = Arc::new(FileManagedStore::new(handle.clone()));
+        AdminState::new(handle, store, &cfg())
     }
 
+    // ──────────────────── Removed write path ────────────────────
+
+    /// The resource write path was removed: every collection and `:id`
+    /// route serves GET only, so POST/PUT/DELETE answer 405 with an
+    /// `Allow: GET` header — regardless of store backend or auth.
     #[tokio::test]
-    async fn file_managed_mode_rejects_every_resource_write_with_409() {
-        let state = build_file_managed_state();
-        let writes: Vec<(&str, String, Option<Value>)> = vec![
-            (
-                "POST",
-                "/admin/v1/models".into(),
-                Some(model_payload("new")),
-            ),
-            (
-                "PUT",
-                "/admin/v1/models/m-file-1".into(),
-                Some(model_payload("file-model")),
-            ),
-            ("DELETE", "/admin/v1/models/m-file-1".into(), None),
-            (
-                "POST",
-                "/admin/v1/api_keys".into(),
-                Some(apikey_payload("sk-x", &["*"])),
-            ),
-            ("POST", "/admin/v1/api_keys/some-id/rotate".into(), None),
-            (
-                "POST",
-                "/admin/v1/guardrails".into(),
-                Some(guardrail_payload("g")),
-            ),
+    async fn removed_resource_writes_answer_405_with_allow_get() {
+        // The FULL matrix — every route spelling × every write method.
+        // A partial revert (say, PUT re-added on one {id} route) must
+        // fail here; a sampled subset would let it through.
+        const ROUTE_SPELLINGS: [&str; 9] = [
+            "models",
+            "api_keys",
+            "apikeys", // former spelling: same removed write path
+            "provider_keys",
+            "guardrails",
+            "cache_policies",
+            "observability_exporters",
+            "mcp_servers",
+            "a2a_agents",
         ];
+        let mut writes: Vec<(&str, String, Option<Value>)> = Vec::new();
+        for kind in ROUTE_SPELLINGS {
+            writes.push(("POST", format!("/admin/v1/{kind}"), None));
+            writes.push(("PUT", format!("/admin/v1/{kind}/some-id"), None));
+            writes.push(("DELETE", format!("/admin/v1/{kind}/some-id"), None));
+        }
+        // Plus representative rows with well-formed bodies, pinning that
+        // a valid payload doesn't route any differently.
+        writes.push((
+            "POST",
+            "/admin/v1/models".into(),
+            Some(model_payload("new")),
+        ));
+        writes.push((
+            "PUT",
+            "/admin/v1/models/m-1".into(),
+            Some(model_payload("m")),
+        ));
+        writes.push((
+            "POST",
+            "/admin/v1/api_keys".into(),
+            Some(apikey_payload("sk-x", &["*"])),
+        ));
+        writes.push((
+            "POST",
+            "/admin/v1/guardrails".into(),
+            Some(guardrail_payload("g")),
+        ));
         for (method, uri, body) in writes {
-            let app = build_router(state.clone());
+            let app = build_router(build_state());
             let resp = run(app, auth_req(method, &uri, body)).await;
             assert_eq!(
                 resp.status(),
-                StatusCode::CONFLICT,
-                "{method} {uri} must be refused in file mode",
+                StatusCode::METHOD_NOT_ALLOWED,
+                "{method} {uri} must answer 405 after write removal",
             );
-            let v = body_json(resp).await;
-            let msg = v["error_msg"].as_str().unwrap();
-            assert!(msg.contains("file-managed"), "{method} {uri}: {msg}");
+            let allow = resp
+                .headers()
+                .get(axum::http::header::ALLOW)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_else(|| panic!("{method} {uri}: missing Allow header"));
             assert!(
-                msg.contains("/etc/aisix/resources.yaml"),
-                "message must name the file: {msg}",
+                allow.contains("GET"),
+                "{method} {uri}: Allow must advertise GET, got {allow}",
             );
+        }
+
+        // Method routing answers before auth: an unauthenticated write
+        // gets the same 405 (there is no write endpoint to protect).
+        let app = build_router(build_state());
+        let req = Request::builder()
+            .method("POST")
+            .uri("/admin/v1/models")
+            .header("content-type", "application/json")
+            .body(Body::from(model_payload("x").to_string()))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    /// The rotate route was removed outright, so it 404s — the path no
+    /// longer exists (it was POST-only, there is no read to keep).
+    /// POST alone can't prove the route is gone: the old handler also
+    /// answered 404 for an unknown id. GET is the discriminator — a
+    /// surviving POST-only route would answer GET with 405, an absent
+    /// route with 404.
+    #[tokio::test]
+    async fn removed_rotate_route_answers_404() {
+        for uri in [
+            "/admin/v1/api_keys/some-id/rotate",
+            "/admin/v1/apikeys/some-id/rotate",
+        ] {
+            for method in ["POST", "GET"] {
+                let app = build_router(build_state());
+                let resp = run(app, auth_req(method, uri, None)).await;
+                assert_eq!(
+                    resp.status(),
+                    StatusCode::NOT_FOUND,
+                    "{method} {uri} must 404 after rotate removal",
+                );
+            }
         }
     }
 
@@ -2410,125 +1549,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
-    #[tokio::test]
-    async fn file_managed_mode_unauthenticated_writes_still_get_401_without_path_leak() {
-        // Auth ordering: the write guard must not answer an
-        // unauthenticated caller — the 409 body names the resources
-        // file path, which only authenticated admins may see.
-        let app = build_router(build_file_managed_state());
-        let req = Request::builder()
-            .method("POST")
-            .uri("/admin/v1/models")
-            .header("content-type", "application/json")
-            .body(Body::from(model_payload("x").to_string()))
-            .unwrap();
-        let resp = run(app, req).await;
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-        let v = body_json(resp).await;
-        assert!(
-            !v["error_msg"]
-                .as_str()
-                .unwrap()
-                .contains("/etc/aisix/resources.yaml"),
-            "401 body must not leak the resources file path: {v}",
-        );
-
-        // Wrong key is equally unauthorized.
-        let app = build_router(build_file_managed_state());
-        let req = Request::builder()
-            .method("DELETE")
-            .uri("/admin/v1/models/m-file-1")
-            .header("authorization", "Bearer wrong-key")
-            .body(Body::empty())
-            .unwrap();
-        let resp = run(app, req).await;
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    async fn write_guard_is_inert_when_not_file_managed() {
-        // Same router build path, no file_managed_path → writes work.
-        let app = build_router(build_state());
-        let resp = run(
-            app,
-            auth_req("POST", "/admin/v1/models", Some(model_payload("ok"))),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::OK);
-    }
-
-    // ──────────────────── Write-path deprecation signal ────────────────────
-
-    fn assert_deprecation_headers(resp: &axum::http::Response<Body>, context: &str) {
-        let deprecation = resp
-            .headers()
-            .get("deprecation")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or_else(|| panic!("{context}: missing Deprecation header"));
-        // RFC 9745: the value is a structured-field Date (`@<unix>`),
-        // pinned to the release that shipped the file-based source.
-        assert_eq!(deprecation, ADMIN_WRITE_DEPRECATION, "{context}");
-        assert!(deprecation.starts_with('@'), "{context}: not an sf-date");
-
-        let link = resp
-            .headers()
-            .get(axum::http::header::LINK)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or_else(|| panic!("{context}: missing Link header"));
-        assert!(
-            link.contains("rel=\"deprecation\""),
-            "{context}: Link lacks the deprecation relation: {link}"
-        );
-        assert!(
-            link.contains("https://docs.api7.ai/"),
-            "{context}: Link must point at the published docs: {link}"
-        );
-    }
-
-    #[tokio::test]
-    async fn admin_write_responses_carry_rfc9745_deprecation_headers() {
-        // Representative create: 200 with both headers.
-        let state = build_state();
-        let app = build_router(state.clone());
-        let resp = run(
-            app,
-            auth_req("POST", "/admin/v1/models", Some(model_payload("dep"))),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert_deprecation_headers(&resp, "POST /admin/v1/models");
-
-        // The signal covers the whole write path, not just the happy
-        // path: rotate (POST), a DELETE, and even a failed write (404)
-        // all carry it — the deprecation is a property of the endpoint,
-        // not of the outcome.
-        let app = build_router(state.clone());
-        let resp = run(
-            app,
-            auth_req("POST", "/admin/v1/api_keys/missing/rotate", None),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-        assert_deprecation_headers(&resp, "POST /admin/v1/api_keys/{id}/rotate");
-
-        // Former `apikeys` spelling is the same deprecated write path.
-        let app = build_router(state);
-        let resp = run(app, auth_req("DELETE", "/admin/v1/apikeys/missing", None)).await;
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-        assert_deprecation_headers(&resp, "DELETE /admin/v1/apikeys/{id}");
-    }
-
-    #[tokio::test]
-    async fn file_managed_409_carries_the_deprecation_headers_too() {
-        let app = build_router(build_file_managed_state());
-        let resp = run(
-            app,
-            auth_req("POST", "/admin/v1/models", Some(model_payload("new"))),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::CONFLICT);
-        assert_deprecation_headers(&resp, "file-managed POST /admin/v1/models");
-    }
+    // ──────────────── No deprecation marks on the surviving surface ────────────────
 
     #[tokio::test]
     async fn read_and_non_resource_responses_carry_no_deprecation_header() {
@@ -2577,36 +1598,5 @@ mod tests {
             resp.headers().get("deprecation").is_none(),
             "playground must NOT carry a Deprecation header"
         );
-    }
-
-    #[tokio::test]
-    async fn create_model_accepts_background_model_check() {
-        let app = build_router(build_state());
-        let resp = run(
-            app,
-            auth_req(
-                "POST",
-                "/admin/v1/models",
-                Some(json!({
-                    "display_name": "bg-model",
-                    "provider": "openai",
-                    "model_name": "gpt-4o-mini",
-                    "provider_key_id": "11111111-1111-1111-1111-111111111111",
-                    "background_model_check": {
-                        "enabled": true,
-                        // Minimum interval is 5s in schema; using 30 to
-                        // mirror a realistic operator config.
-                        "interval_seconds": 30,
-                        "timeout_seconds": 10,
-                        "prompt": "Respond with OK",
-                        "max_tokens": 8,
-                        "ignore_statuses": [408, 429],
-                        "stale_after_seconds": 90
-                    }
-                })),
-            ),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::OK);
     }
 }

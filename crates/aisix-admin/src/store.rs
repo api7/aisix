@@ -1,10 +1,11 @@
-//! [`ConfigStore`] — the storage abstraction every admin handler reads
-//! and writes through.
+//! [`ConfigStore`] — the read-only storage abstraction every admin
+//! handler reads through. Writes left the trait when the Admin API
+//! write path was removed; resources are written declaratively
+//! (resources file or etcd) and this layer only serves them back.
 //!
-//! Production wires an etcd-backed implementation (follow-up PR); tests
-//! use [`InMemoryStore`]. The trait keeps CRUD minimal — orchestration
-//! (schema validation, duplicate-name detection, uuid generation) belongs
-//! in the handler layer so the store stays dumb and fast.
+//! Production wires the etcd-backed or file-snapshot implementation;
+//! tests use [`InMemoryStore`], which keeps `#[cfg(test)]` inherent
+//! write methods for seeding.
 
 use aisix_core::resource::ResourceEntry;
 use aisix_core::{
@@ -17,52 +18,34 @@ use std::sync::Arc;
 pub enum StoreError {
     #[error("store backend failure: {0}")]
     Backend(String),
-    /// The store is read-only because resources come from a declarative
-    /// source (the resources file). Maps to a 409 at the HTTP surface.
-    #[error("{0}")]
-    ReadOnly(String),
 }
 
 // `async_trait` macro is what makes `dyn ConfigStore` trait objects
 // compile — bare `async fn` in traits isn't dyn-compatible today.
 #[async_trait::async_trait]
 pub trait ConfigStore: Send + Sync + 'static {
-    async fn put_model(&self, entry: ResourceEntry<Model>) -> Result<(), StoreError>;
     async fn get_model(&self, id: &str) -> Result<Option<ResourceEntry<Model>>, StoreError>;
     async fn list_models(&self) -> Result<Vec<ResourceEntry<Model>>, StoreError>;
-    async fn delete_model(&self, id: &str) -> Result<bool, StoreError>;
 
-    async fn put_apikey(&self, entry: ResourceEntry<ApiKey>) -> Result<(), StoreError>;
     async fn get_apikey(&self, id: &str) -> Result<Option<ResourceEntry<ApiKey>>, StoreError>;
     async fn list_apikeys(&self) -> Result<Vec<ResourceEntry<ApiKey>>, StoreError>;
-    async fn delete_apikey(&self, id: &str) -> Result<bool, StoreError>;
 
-    async fn put_provider_key(&self, entry: ResourceEntry<ProviderKey>) -> Result<(), StoreError>;
     async fn get_provider_key(
         &self,
         id: &str,
     ) -> Result<Option<ResourceEntry<ProviderKey>>, StoreError>;
     async fn list_provider_keys(&self) -> Result<Vec<ResourceEntry<ProviderKey>>, StoreError>;
-    async fn delete_provider_key(&self, id: &str) -> Result<bool, StoreError>;
 
-    async fn put_guardrail(&self, entry: ResourceEntry<Guardrail>) -> Result<(), StoreError>;
     async fn get_guardrail(&self, id: &str)
         -> Result<Option<ResourceEntry<Guardrail>>, StoreError>;
     async fn list_guardrails(&self) -> Result<Vec<ResourceEntry<Guardrail>>, StoreError>;
-    async fn delete_guardrail(&self, id: &str) -> Result<bool, StoreError>;
 
-    async fn put_cache_policy(&self, entry: ResourceEntry<CachePolicy>) -> Result<(), StoreError>;
     async fn get_cache_policy(
         &self,
         id: &str,
     ) -> Result<Option<ResourceEntry<CachePolicy>>, StoreError>;
     async fn list_cache_policies(&self) -> Result<Vec<ResourceEntry<CachePolicy>>, StoreError>;
-    async fn delete_cache_policy(&self, id: &str) -> Result<bool, StoreError>;
 
-    async fn put_observability_exporter(
-        &self,
-        entry: ResourceEntry<ObservabilityExporter>,
-    ) -> Result<(), StoreError>;
     async fn get_observability_exporter(
         &self,
         id: &str,
@@ -70,20 +53,15 @@ pub trait ConfigStore: Send + Sync + 'static {
     async fn list_observability_exporters(
         &self,
     ) -> Result<Vec<ResourceEntry<ObservabilityExporter>>, StoreError>;
-    async fn delete_observability_exporter(&self, id: &str) -> Result<bool, StoreError>;
 
-    async fn put_mcp_server(&self, entry: ResourceEntry<McpServer>) -> Result<(), StoreError>;
     async fn get_mcp_server(
         &self,
         id: &str,
     ) -> Result<Option<ResourceEntry<McpServer>>, StoreError>;
     async fn list_mcp_servers(&self) -> Result<Vec<ResourceEntry<McpServer>>, StoreError>;
-    async fn delete_mcp_server(&self, id: &str) -> Result<bool, StoreError>;
 
-    async fn put_a2a_agent(&self, entry: ResourceEntry<A2aAgent>) -> Result<(), StoreError>;
     async fn get_a2a_agent(&self, id: &str) -> Result<Option<ResourceEntry<A2aAgent>>, StoreError>;
     async fn list_a2a_agents(&self) -> Result<Vec<ResourceEntry<A2aAgent>>, StoreError>;
-    async fn delete_a2a_agent(&self, id: &str) -> Result<bool, StoreError>;
 }
 
 /// In-memory store. Thread-safe via DashMap; mainly used by tests, but
@@ -108,11 +86,6 @@ impl InMemoryStore {
 
 #[async_trait::async_trait]
 impl ConfigStore for InMemoryStore {
-    async fn put_model(&self, entry: ResourceEntry<Model>) -> Result<(), StoreError> {
-        self.models.insert(entry.id.clone(), entry);
-        Ok(())
-    }
-
     async fn get_model(&self, id: &str) -> Result<Option<ResourceEntry<Model>>, StoreError> {
         Ok(self.models.get(id).map(|r| r.clone()))
     }
@@ -121,30 +94,12 @@ impl ConfigStore for InMemoryStore {
         Ok(self.models.iter().map(|r| r.clone()).collect())
     }
 
-    async fn delete_model(&self, id: &str) -> Result<bool, StoreError> {
-        Ok(self.models.remove(id).is_some())
-    }
-
-    async fn put_apikey(&self, entry: ResourceEntry<ApiKey>) -> Result<(), StoreError> {
-        self.apikeys.insert(entry.id.clone(), entry);
-        Ok(())
-    }
-
     async fn get_apikey(&self, id: &str) -> Result<Option<ResourceEntry<ApiKey>>, StoreError> {
         Ok(self.apikeys.get(id).map(|r| r.clone()))
     }
 
     async fn list_apikeys(&self) -> Result<Vec<ResourceEntry<ApiKey>>, StoreError> {
         Ok(self.apikeys.iter().map(|r| r.clone()).collect())
-    }
-
-    async fn delete_apikey(&self, id: &str) -> Result<bool, StoreError> {
-        Ok(self.apikeys.remove(id).is_some())
-    }
-
-    async fn put_provider_key(&self, entry: ResourceEntry<ProviderKey>) -> Result<(), StoreError> {
-        self.provider_keys.insert(entry.id.clone(), entry);
-        Ok(())
     }
 
     async fn get_provider_key(
@@ -158,15 +113,6 @@ impl ConfigStore for InMemoryStore {
         Ok(self.provider_keys.iter().map(|r| r.clone()).collect())
     }
 
-    async fn delete_provider_key(&self, id: &str) -> Result<bool, StoreError> {
-        Ok(self.provider_keys.remove(id).is_some())
-    }
-
-    async fn put_guardrail(&self, entry: ResourceEntry<Guardrail>) -> Result<(), StoreError> {
-        self.guardrails.insert(entry.id.clone(), entry);
-        Ok(())
-    }
-
     async fn get_guardrail(
         &self,
         id: &str,
@@ -178,15 +124,6 @@ impl ConfigStore for InMemoryStore {
         Ok(self.guardrails.iter().map(|r| r.clone()).collect())
     }
 
-    async fn delete_guardrail(&self, id: &str) -> Result<bool, StoreError> {
-        Ok(self.guardrails.remove(id).is_some())
-    }
-
-    async fn put_cache_policy(&self, entry: ResourceEntry<CachePolicy>) -> Result<(), StoreError> {
-        self.cache_policies.insert(entry.id.clone(), entry);
-        Ok(())
-    }
-
     async fn get_cache_policy(
         &self,
         id: &str,
@@ -196,18 +133,6 @@ impl ConfigStore for InMemoryStore {
 
     async fn list_cache_policies(&self) -> Result<Vec<ResourceEntry<CachePolicy>>, StoreError> {
         Ok(self.cache_policies.iter().map(|r| r.clone()).collect())
-    }
-
-    async fn delete_cache_policy(&self, id: &str) -> Result<bool, StoreError> {
-        Ok(self.cache_policies.remove(id).is_some())
-    }
-
-    async fn put_observability_exporter(
-        &self,
-        entry: ResourceEntry<ObservabilityExporter>,
-    ) -> Result<(), StoreError> {
-        self.observability_exporters.insert(entry.id.clone(), entry);
-        Ok(())
     }
 
     async fn get_observability_exporter(
@@ -227,15 +152,6 @@ impl ConfigStore for InMemoryStore {
             .collect())
     }
 
-    async fn delete_observability_exporter(&self, id: &str) -> Result<bool, StoreError> {
-        Ok(self.observability_exporters.remove(id).is_some())
-    }
-
-    async fn put_mcp_server(&self, entry: ResourceEntry<McpServer>) -> Result<(), StoreError> {
-        self.mcp_servers.insert(entry.id.clone(), entry);
-        Ok(())
-    }
-
     async fn get_mcp_server(
         &self,
         id: &str,
@@ -247,15 +163,6 @@ impl ConfigStore for InMemoryStore {
         Ok(self.mcp_servers.iter().map(|r| r.clone()).collect())
     }
 
-    async fn delete_mcp_server(&self, id: &str) -> Result<bool, StoreError> {
-        Ok(self.mcp_servers.remove(id).is_some())
-    }
-
-    async fn put_a2a_agent(&self, entry: ResourceEntry<A2aAgent>) -> Result<(), StoreError> {
-        self.a2a_agents.insert(entry.id.clone(), entry);
-        Ok(())
-    }
-
     async fn get_a2a_agent(&self, id: &str) -> Result<Option<ResourceEntry<A2aAgent>>, StoreError> {
         Ok(self.a2a_agents.get(id).map(|r| r.clone()))
     }
@@ -263,9 +170,24 @@ impl ConfigStore for InMemoryStore {
     async fn list_a2a_agents(&self) -> Result<Vec<ResourceEntry<A2aAgent>>, StoreError> {
         Ok(self.a2a_agents.iter().map(|r| r.clone()).collect())
     }
+}
 
-    async fn delete_a2a_agent(&self, id: &str) -> Result<bool, StoreError> {
-        Ok(self.a2a_agents.remove(id).is_some())
+/// Write access for tests and in-process seeding. These left the
+/// [`ConfigStore`] trait when the Admin API write path was removed; the
+/// in-memory store keeps them as inherent methods so unit tests can
+/// arrange state without a store round-trip.
+#[cfg(test)]
+impl InMemoryStore {
+    pub(crate) async fn put_model(&self, entry: ResourceEntry<Model>) -> Result<(), StoreError> {
+        self.models.insert(entry.id.clone(), entry);
+        Ok(())
+    }
+    pub(crate) async fn delete_model(&self, id: &str) -> Result<bool, StoreError> {
+        Ok(self.models.remove(id).is_some())
+    }
+    pub(crate) async fn put_apikey(&self, entry: ResourceEntry<ApiKey>) -> Result<(), StoreError> {
+        self.apikeys.insert(entry.id.clone(), entry);
+        Ok(())
     }
 }
 

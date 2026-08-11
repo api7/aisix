@@ -57,7 +57,6 @@ dependencies = [
  "aisix-core",
  "aisix-etcd",
  "aisix-gateway",
- "aisix-mcp",
  "aisix-obs",
  "aisix-provider-openai",
  "aisix-proxy",
@@ -74,7 +73,6 @@ dependencies = [
  "tokio",
  "tower 0.5.3",
  "tracing",
- "uuid",
  "wiremock",
 ]
 

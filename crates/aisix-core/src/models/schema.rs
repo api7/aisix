@@ -13,9 +13,12 @@
 //! Two validator sets exist since issue #871 (strict write / lenient read):
 //!
 //! - **Strict** ([`SCHEMAS`], the plain `validate_*` functions): unknown
-//!   fields are rejected. Used by every write path (Admin API, file source)
-//!   so typos keep failing loud with a 400, and published as the resource
-//!   schema files in `schemas/resources/` — the write contract.
+//!   fields are rejected (where a resource closes them). Used by the
+//!   in-repo declarative writers — `aisix validate` and the file
+//!   source — so typos keep failing loud, and published as the
+//!   resource schema files in `schemas/resources/` — the write
+//!   contract. (The control plane validates against its own API
+//!   schema; raw direct etcd puts are only checked on read.)
 //! - **Lenient** ([`LENIENT_SCHEMAS`], the `validate_*_lenient` functions):
 //!   unknown fields pass; every other constraint (types, required, ranges,
 //!   closed enums) still applies. Used only by the etcd snapshot loader so a

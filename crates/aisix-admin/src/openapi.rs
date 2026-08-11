@@ -29,16 +29,16 @@ use axum::response::{Html, IntoResponse, Response};
 use serde_json::{json, Map, Value};
 
 /// Paths + OpenAPI-specific wrapper schemas (`ModelEntry`,
-/// `ApiKeyEntry`, `ModelStatusView`, `AdminError`, etc.). Resource
-/// schemas live in [`RESOURCE_SCHEMAS`] below and get merged in by
-/// [`merged_openapi`]. Update this whenever a route is added or
+/// `PublicApiKeyEntry`, `ModelStatusView`, `AdminError`, etc.).
+/// Resource schemas live in [`RESOURCE_SCHEMAS`] below and get merged
+/// in by [`merged_openapi`]. Update this whenever a route is added or
 /// removed in `lib.rs`.
 const OPENAPI_JSON_BASE: &str = r##"{
   "openapi": "3.1.0",
   "info": {
     "title": "AISIX Admin API",
     "version": "dev",
-    "description": "The AISIX Admin API configures an open-source AISIX gateway at runtime. Use it when you operate the gateway directly and need to create or update models, caller API keys, provider credentials, guardrails, cache policies, and observability exporters.\n\nThe write endpoints (POST, PUT, DELETE) are deprecated in favor of declarative configuration: load resources from a `resources_file` (`resources.yaml`) or write them to etcd directly. Write endpoints remain functional, and every mutating response carries a `Deprecation` header (RFC 9745) plus a `Link` header with `rel=\"deprecation\"` pointing at the migration documentation. Read endpoints are not deprecated.\n\nGateways connected to AISIX Cloud do not expose this listener. Configure them through AISIX Cloud."
+    "description": "The AISIX Admin API is the read-only operational surface of an open-source AISIX gateway: list and inspect the loaded models, caller API keys, provider credentials, guardrails, MCP servers, A2A agents, cache policies, and observability exporters, check per-model upstream health, and drive the playground.\n\nResource write endpoints were removed in favor of declarative configuration: declare resources in a `resources_file` (`resources.yaml`) and reload with SIGHUP, or write them to etcd directly. See the resources file reference at https://docs.api7.ai/ai-gateway/reference/resources-file.\n\nGateways connected to AISIX Cloud do not expose this listener. Configure them through AISIX Cloud."
   },
   "paths": {
     "/livez": {
@@ -126,7 +126,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
         "tags": [
           "Health"
         ],
-        "description": "Traffic eligibility (readiness): 200 when the instance can serve, 503 while draining or before the first config apply. Stays 200 for as long as the instance keeps serving that configuration, however long ago the last config event was — see /admin/v1/health and /status/config for configuration freshness. Distinct from /livez (process liveness)."
+        "description": "Traffic eligibility (readiness): 200 when the instance can serve, 503 while draining or before the first config apply. Stays 200 for as long as the instance keeps serving that configuration, however long ago the last config event was \u2014 see /admin/v1/health and /status/config for configuration freshness. Distinct from /livez (process liveness)."
       }
     },
     "/admin/openapi.json": {
@@ -216,101 +216,6 @@ const OPENAPI_JSON_BASE: &str = r##"{
           "Models"
         ],
         "description": "List all configured model resources."
-      },
-      "post": {
-        "summary": "Create Model",
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/Model"
-              }
-            }
-          },
-          "description": "Model configuration for a direct, routing, or ensemble model."
-        },
-        "responses": {
-          "200": {
-            "description": "OK",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ModelEntry"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Schema validation failed or the JSON body is malformed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              },
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Missing or invalid admin key",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          },
-          "409": {
-            "description": "Duplicate display_name",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          },
-          "413": {
-            "description": "JSON request body exceeds the admin body-size limit",
-            "content": {
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "415": {
-            "description": "Missing or unsupported JSON content type",
-            "content": {
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Configuration store operation failed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          }
-        },
-        "tags": [
-          "Models"
-        ],
-        "description": "Create a model resource. The gateway validates the payload against the Model schema, rejects duplicate `display_name` values, and returns the stored resource entry."
       }
     },
     "/admin/v1/models/{id}": {
@@ -322,7 +227,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
           "schema": {
             "type": "string"
           },
-          "description": "Model resource ID generated by the Admin API.",
+          "description": "Model resource ID, as assigned by the active resource source (a UUIDv5 derived from the entry name in file mode; the etcd key's ID segment otherwise).",
           "example": "c7f13a2e-5d6b-4b87-9f47-2c34de35f4aa"
         }
       ],
@@ -374,160 +279,6 @@ const OPENAPI_JSON_BASE: &str = r##"{
           "Models"
         ],
         "description": "Get a model resource by ID."
-      },
-      "put": {
-        "summary": "Update Model by ID",
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/Model"
-              }
-            }
-          },
-          "description": "Replacement model configuration."
-        },
-        "responses": {
-          "200": {
-            "description": "OK",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ModelEntry"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Schema validation failed or the JSON body is malformed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              },
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Missing or invalid admin key",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Resource not found",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          },
-          "409": {
-            "description": "Duplicate display_name",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          },
-          "413": {
-            "description": "JSON request body exceeds the admin body-size limit",
-            "content": {
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "415": {
-            "description": "Missing or unsupported JSON content type",
-            "content": {
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Configuration store operation failed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          }
-        },
-        "tags": [
-          "Models"
-        ],
-        "description": "Update a model resource by ID. The gateway validates the payload, rejects duplicate `display_name` values, preserves the resource ID, and increments the revision."
-      },
-      "delete": {
-        "summary": "Delete Model by ID",
-        "responses": {
-          "200": {
-            "description": "OK",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/DeleteResponse"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Missing or invalid admin key",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Resource not found",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Configuration store operation failed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          }
-        },
-        "tags": [
-          "Models"
-        ],
-        "description": "Delete a model resource by ID."
       }
     },
     "/admin/v1/models/status": {
@@ -616,101 +367,6 @@ const OPENAPI_JSON_BASE: &str = r##"{
           "Caller API Keys"
         ],
         "description": "List caller API keys with plaintext credentials redacted."
-      },
-      "post": {
-        "summary": "Create Caller API Key",
-        "description": "Create a caller API key. The gateway validates the payload, rejects duplicate `key_hash` values, and returns the stored resource entry with plaintext credentials redacted.",
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/ApiKeyRequest"
-              }
-            }
-          },
-          "description": "Caller API key configuration. Send the SHA-256 hash of the plaintext key. The Admin API stores only this hash and returns a plaintext credential only after key rotation."
-        },
-        "responses": {
-          "200": {
-            "description": "OK",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/PublicApiKeyEntry"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Schema validation failed or the JSON body is malformed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              },
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Missing or invalid admin key",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          },
-          "409": {
-            "description": "Duplicate `key_hash`",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          },
-          "413": {
-            "description": "JSON request body exceeds the admin body-size limit",
-            "content": {
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "415": {
-            "description": "Missing or unsupported JSON content type",
-            "content": {
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Configuration store operation failed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          }
-        },
-        "tags": [
-          "Caller API Keys"
-        ]
       }
     },
     "/admin/v1/api_keys/{id}": {
@@ -722,7 +378,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
           "schema": {
             "type": "string"
           },
-          "description": "Caller API key resource ID generated by the Admin API.",
+          "description": "Caller API key resource ID, as assigned by the active resource source (a UUIDv5 derived from the entry name in file mode; the etcd key's ID segment otherwise).",
           "example": "9f3b2a70-7a3d-4d83-96e1-0c6e5ad4f280"
         }
       ],
@@ -774,223 +430,6 @@ const OPENAPI_JSON_BASE: &str = r##"{
           "Caller API Keys"
         ],
         "description": "Get a caller API key by ID with plaintext credentials redacted."
-      },
-      "put": {
-        "summary": "Update Caller API Key by ID",
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/ApiKeyRequest"
-              }
-            }
-          },
-          "description": "Caller API key configuration. Send the SHA-256 hash of the plaintext key. The Admin API stores only this hash and returns a plaintext credential only after key rotation."
-        },
-        "responses": {
-          "200": {
-            "description": "OK",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/PublicApiKeyEntry"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Schema validation failed or the JSON body is malformed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              },
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Missing or invalid admin key",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Resource not found",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          },
-          "409": {
-            "description": "Duplicate `key_hash`",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          },
-          "413": {
-            "description": "JSON request body exceeds the admin body-size limit",
-            "content": {
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "415": {
-            "description": "Missing or unsupported JSON content type",
-            "content": {
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Configuration store operation failed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          }
-        },
-        "tags": [
-          "Caller API Keys"
-        ],
-        "description": "Update a caller API key by ID. The gateway validates the payload, rejects duplicate `key_hash` values, preserves the resource ID, and increments the revision."
-      },
-      "delete": {
-        "summary": "Delete Caller API Key by ID",
-        "responses": {
-          "200": {
-            "description": "OK",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/DeleteResponse"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Missing or invalid admin key",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Resource not found",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Configuration store operation failed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          }
-        },
-        "tags": [
-          "Caller API Keys"
-        ],
-        "description": "Delete a caller API key by ID."
-      }
-    },
-    "/admin/v1/api_keys/{id}/rotate": {
-      "parameters": [
-        {
-          "name": "id",
-          "in": "path",
-          "required": true,
-          "schema": {
-            "type": "string"
-          },
-          "description": "Caller API key resource ID generated by the Admin API.",
-          "example": "9f3b2a70-7a3d-4d83-96e1-0c6e5ad4f280"
-        }
-      ],
-      "post": {
-        "summary": "Rotate Caller API Key by ID",
-        "description": "Rotate a caller API key by ID. The gateway generates a new plaintext key, stores only its SHA-256 hash, and returns the plaintext once.",
-        "responses": {
-          "200": {
-            "description": "OK",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ApiKeyRotateResponse"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Missing or invalid admin key",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Resource not found",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Configuration store operation failed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          }
-        },
-        "tags": [
-          "Caller API Keys"
-        ]
       }
     },
     "/admin/v1/provider_keys": {
@@ -1035,101 +474,6 @@ const OPENAPI_JSON_BASE: &str = r##"{
           "Provider Keys"
         ],
         "description": "List all configured provider key resources."
-      },
-      "post": {
-        "summary": "Create Provider Key",
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/ProviderKey"
-              }
-            }
-          },
-          "description": "Provider key configuration containing the upstream credential and provider routing metadata."
-        },
-        "responses": {
-          "200": {
-            "description": "OK",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProviderKeyEntry"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Schema validation failed or the JSON body is malformed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              },
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Missing or invalid admin key",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          },
-          "409": {
-            "description": "Duplicate display_name",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          },
-          "413": {
-            "description": "JSON request body exceeds the admin body-size limit",
-            "content": {
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "415": {
-            "description": "Missing or unsupported JSON content type",
-            "content": {
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Configuration store operation failed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          }
-        },
-        "tags": [
-          "Provider Keys"
-        ],
-        "description": "Create a provider key resource. The gateway validates the payload, rejects duplicate `display_name` values, and returns the stored resource entry."
       }
     },
     "/admin/v1/provider_keys/{id}": {
@@ -1141,7 +485,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
           "schema": {
             "type": "string"
           },
-          "description": "Provider key resource ID generated by the Admin API.",
+          "description": "Provider key resource ID, as assigned by the active resource source (a UUIDv5 derived from the entry name in file mode; the etcd key's ID segment otherwise).",
           "example": "4f8f70e7-0c6e-4f74-92c5-cd70d94f3a21"
         }
       ],
@@ -1193,160 +537,6 @@ const OPENAPI_JSON_BASE: &str = r##"{
           "Provider Keys"
         ],
         "description": "Get a provider key resource by ID."
-      },
-      "put": {
-        "summary": "Update Provider Key by ID",
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/ProviderKey"
-              }
-            }
-          },
-          "description": "Replacement provider key configuration."
-        },
-        "responses": {
-          "200": {
-            "description": "OK",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProviderKeyEntry"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Schema validation failed or the JSON body is malformed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              },
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Missing or invalid admin key",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Resource not found",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          },
-          "409": {
-            "description": "Duplicate display_name",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          },
-          "413": {
-            "description": "JSON request body exceeds the admin body-size limit",
-            "content": {
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "415": {
-            "description": "Missing or unsupported JSON content type",
-            "content": {
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Configuration store operation failed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          }
-        },
-        "tags": [
-          "Provider Keys"
-        ],
-        "description": "Update a provider key resource by ID. The gateway validates the payload, rejects duplicate `display_name` values, preserves the resource ID, and increments the revision."
-      },
-      "delete": {
-        "summary": "Delete Provider Key by ID",
-        "responses": {
-          "200": {
-            "description": "OK",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/DeleteResponse"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Missing or invalid admin key",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Resource not found",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Configuration store operation failed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          }
-        },
-        "tags": [
-          "Provider Keys"
-        ],
-        "description": "Delete a provider key resource by ID."
       }
     },
     "/admin/v1/mcp_servers": {
@@ -1391,101 +581,6 @@ const OPENAPI_JSON_BASE: &str = r##"{
           "MCP Servers"
         ],
         "description": "List registered upstream MCP server resources."
-      },
-      "post": {
-        "summary": "Create MCP Server",
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/McpServer"
-              }
-            }
-          },
-          "description": "Upstream MCP server configuration."
-        },
-        "responses": {
-          "200": {
-            "description": "OK",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/McpServerEntry"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Schema validation failed, the JSON body is malformed, `name` contains the reserved `__` separator, or the credentials required by `auth_type` are missing (`secret` for `bearer`/`api_key`; `client_id`, `token_url`, and `secret` for `oauth2`)",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              },
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Missing or invalid admin key",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          },
-          "409": {
-            "description": "Duplicate name",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          },
-          "413": {
-            "description": "JSON request body exceeds the admin body-size limit",
-            "content": {
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "415": {
-            "description": "Missing or unsupported JSON content type",
-            "content": {
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Configuration store operation failed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          }
-        },
-        "tags": [
-          "MCP Servers"
-        ],
-        "description": "Create an upstream MCP server resource. The gateway validates the payload, rejects duplicate `name` values, and returns the stored resource entry."
       }
     },
     "/admin/v1/mcp_servers/{id}": {
@@ -1497,7 +592,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
           "schema": {
             "type": "string"
           },
-          "description": "MCP server resource ID generated by the Admin API.",
+          "description": "MCP server resource ID, as assigned by the active resource source (a UUIDv5 derived from the entry name in file mode; the etcd key's ID segment otherwise).",
           "example": "1d95ac57-7f27-46a4-b5a3-55d3c3ad0a12"
         }
       ],
@@ -1549,160 +644,6 @@ const OPENAPI_JSON_BASE: &str = r##"{
           "MCP Servers"
         ],
         "description": "Get an upstream MCP server resource by ID."
-      },
-      "put": {
-        "summary": "Update MCP Server by ID",
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/McpServer"
-              }
-            }
-          },
-          "description": "Replacement upstream MCP server configuration."
-        },
-        "responses": {
-          "200": {
-            "description": "OK",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/McpServerEntry"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Schema validation failed, the JSON body is malformed, `name` contains the reserved `__` separator, or the credentials required by `auth_type` are missing (`secret` for `bearer`/`api_key`; `client_id`, `token_url`, and `secret` for `oauth2`)",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              },
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Missing or invalid admin key",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Resource not found",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          },
-          "409": {
-            "description": "Duplicate name",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          },
-          "413": {
-            "description": "JSON request body exceeds the admin body-size limit",
-            "content": {
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "415": {
-            "description": "Missing or unsupported JSON content type",
-            "content": {
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Configuration store operation failed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          }
-        },
-        "tags": [
-          "MCP Servers"
-        ],
-        "description": "Update an upstream MCP server resource by ID. The gateway validates the payload, rejects duplicate `name` values, preserves the resource ID, and increments the revision."
-      },
-      "delete": {
-        "summary": "Delete MCP Server by ID",
-        "responses": {
-          "200": {
-            "description": "OK",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/DeleteResponse"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Missing or invalid admin key",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Resource not found",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Configuration store operation failed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          }
-        },
-        "tags": [
-          "MCP Servers"
-        ],
-        "description": "Delete an upstream MCP server resource by ID."
       }
     },
     "/admin/v1/a2a_agents": {
@@ -1747,118 +688,6 @@ const OPENAPI_JSON_BASE: &str = r##"{
           "A2A Agents"
         ],
         "description": "List registered upstream A2A agent resources."
-      },
-      "post": {
-        "summary": "Create A2A Agent",
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/A2aAgent"
-              },
-              "example": {
-                "name": "invoice-processor",
-                "url": "https://agents.example.com/invoice",
-                "protocol_version": "0.3",
-                "auth_type": "none"
-              }
-            }
-          },
-          "description": "Upstream A2A agent configuration."
-        },
-        "responses": {
-          "200": {
-            "description": "OK",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/A2aAgentEntry"
-                },
-                "example": {
-                  "id": "1d95ac57-7f27-46a4-b5a3-55d3c3ad0a12",
-                  "value": {
-                    "name": "invoice-processor",
-                    "url": "https://agents.example.com/invoice",
-                    "protocol_version": "0.3",
-                    "auth_type": "none",
-                    "enabled": true
-                  },
-                  "revision": 1
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Invalid request body, `name` contains `/`, or the selected `auth_type` is missing required credentials.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              },
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Missing or invalid admin key",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          },
-          "409": {
-            "description": "Duplicate name",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          },
-          "413": {
-            "description": "JSON request body exceeds the admin body-size limit",
-            "content": {
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "415": {
-            "description": "Missing or unsupported JSON content type",
-            "content": {
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Configuration store operation failed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          }
-        },
-        "tags": [
-          "A2A Agents"
-        ],
-        "description": "Create an upstream A2A agent resource. The gateway validates the payload, rejects duplicate `name` values, and returns the stored resource entry."
       }
     },
     "/admin/v1/a2a_agents/{id}": {
@@ -1870,7 +699,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
           "schema": {
             "type": "string"
           },
-          "description": "A2A agent resource ID generated by the Admin API.",
+          "description": "A2A agent resource ID, as assigned by the active resource source (a UUIDv5 derived from the entry name in file mode; the etcd key's ID segment otherwise).",
           "example": "1d95ac57-7f27-46a4-b5a3-55d3c3ad0a12"
         }
       ],
@@ -1922,160 +751,6 @@ const OPENAPI_JSON_BASE: &str = r##"{
           "A2A Agents"
         ],
         "description": "Get an upstream A2A agent resource by ID."
-      },
-      "put": {
-        "summary": "Update A2A Agent by ID",
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/A2aAgent"
-              }
-            }
-          },
-          "description": "Replacement upstream A2A agent configuration."
-        },
-        "responses": {
-          "200": {
-            "description": "OK",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/A2aAgentEntry"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Invalid request body, `name` contains `/`, or the selected `auth_type` is missing required credentials.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              },
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Missing or invalid admin key",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Resource not found",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          },
-          "409": {
-            "description": "Duplicate name",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          },
-          "413": {
-            "description": "JSON request body exceeds the admin body-size limit",
-            "content": {
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "415": {
-            "description": "Missing or unsupported JSON content type",
-            "content": {
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Configuration store operation failed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          }
-        },
-        "tags": [
-          "A2A Agents"
-        ],
-        "description": "Update an upstream A2A agent resource by ID. The gateway validates the payload, rejects duplicate `name` values, preserves the resource ID, and increments the revision."
-      },
-      "delete": {
-        "summary": "Delete A2A Agent by ID",
-        "responses": {
-          "200": {
-            "description": "OK",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/DeleteResponse"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Missing or invalid admin key",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Resource not found",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Configuration store operation failed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          }
-        },
-        "tags": [
-          "A2A Agents"
-        ],
-        "description": "Delete an upstream A2A agent resource by ID."
       }
     },
     "/admin/v1/guardrails": {
@@ -2120,101 +795,6 @@ const OPENAPI_JSON_BASE: &str = r##"{
           "Guardrails"
         ],
         "description": "List all configured guardrail resources."
-      },
-      "post": {
-        "summary": "Create Guardrail",
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/Guardrail"
-              }
-            }
-          },
-          "description": "Guardrail configuration for request or response checks."
-        },
-        "responses": {
-          "200": {
-            "description": "OK",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/GuardrailEntry"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Schema validation failed or the JSON body is malformed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              },
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Missing or invalid admin key",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          },
-          "409": {
-            "description": "Duplicate name",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          },
-          "413": {
-            "description": "JSON request body exceeds the admin body-size limit",
-            "content": {
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "415": {
-            "description": "Missing or unsupported JSON content type",
-            "content": {
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Configuration store operation failed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          }
-        },
-        "tags": [
-          "Guardrails"
-        ],
-        "description": "Create a guardrail resource. The gateway validates the payload, rejects duplicate `name` values, and returns the stored resource entry."
       }
     },
     "/admin/v1/guardrails/{id}": {
@@ -2226,7 +806,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
           "schema": {
             "type": "string"
           },
-          "description": "Guardrail resource ID generated by the Admin API.",
+          "description": "Guardrail resource ID, as assigned by the active resource source (a UUIDv5 derived from the entry name in file mode; the etcd key's ID segment otherwise).",
           "example": "b0c04774-216f-4fb2-96f0-5f7f0a75b76a"
         }
       ],
@@ -2278,160 +858,6 @@ const OPENAPI_JSON_BASE: &str = r##"{
           "Guardrails"
         ],
         "description": "Get a guardrail resource by ID."
-      },
-      "put": {
-        "summary": "Update Guardrail by ID",
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/Guardrail"
-              }
-            }
-          },
-          "description": "Replacement guardrail configuration."
-        },
-        "responses": {
-          "200": {
-            "description": "OK",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/GuardrailEntry"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Schema validation failed or the JSON body is malformed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              },
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Missing or invalid admin key",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Resource not found",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          },
-          "409": {
-            "description": "Duplicate name",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          },
-          "413": {
-            "description": "JSON request body exceeds the admin body-size limit",
-            "content": {
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "415": {
-            "description": "Missing or unsupported JSON content type",
-            "content": {
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Configuration store operation failed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          }
-        },
-        "tags": [
-          "Guardrails"
-        ],
-        "description": "Update a guardrail resource by ID. The gateway validates the payload, rejects duplicate `name` values, preserves the resource ID, and increments the revision."
-      },
-      "delete": {
-        "summary": "Delete Guardrail by ID",
-        "responses": {
-          "200": {
-            "description": "OK",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/DeleteResponse"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Missing or invalid admin key",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Resource not found",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Configuration store operation failed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          }
-        },
-        "tags": [
-          "Guardrails"
-        ],
-        "description": "Delete a guardrail resource by ID."
       }
     },
     "/admin/v1/cache_policies": {
@@ -2476,101 +902,6 @@ const OPENAPI_JSON_BASE: &str = r##"{
           "Cache Policies"
         ],
         "description": "List all configured cache policy resources."
-      },
-      "post": {
-        "summary": "Create Cache Policy",
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/CachePolicy"
-              }
-            }
-          },
-          "description": "Cache policy configuration for response cache matching and storage behavior."
-        },
-        "responses": {
-          "200": {
-            "description": "OK",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/CachePolicyEntry"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Schema validation failed or the JSON body is malformed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              },
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Missing or invalid admin key",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          },
-          "409": {
-            "description": "Duplicate name",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          },
-          "413": {
-            "description": "JSON request body exceeds the admin body-size limit",
-            "content": {
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "415": {
-            "description": "Missing or unsupported JSON content type",
-            "content": {
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Configuration store operation failed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          }
-        },
-        "tags": [
-          "Cache Policies"
-        ],
-        "description": "Create a cache policy resource. The gateway validates the payload, rejects duplicate `name` values, and returns the stored resource entry."
       }
     },
     "/admin/v1/cache_policies/{id}": {
@@ -2582,7 +913,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
           "schema": {
             "type": "string"
           },
-          "description": "Cache policy resource ID generated by the Admin API.",
+          "description": "Cache policy resource ID, as assigned by the active resource source (a UUIDv5 derived from the entry name in file mode; the etcd key's ID segment otherwise).",
           "example": "6fdb4165-0970-47fb-9aa8-729f07889fd1"
         }
       ],
@@ -2634,160 +965,6 @@ const OPENAPI_JSON_BASE: &str = r##"{
           "Cache Policies"
         ],
         "description": "Get a cache policy resource by ID."
-      },
-      "put": {
-        "summary": "Update Cache Policy by ID",
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/CachePolicy"
-              }
-            }
-          },
-          "description": "Replacement cache policy configuration."
-        },
-        "responses": {
-          "200": {
-            "description": "OK",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/CachePolicyEntry"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Schema validation failed or the JSON body is malformed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              },
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Missing or invalid admin key",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Resource not found",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          },
-          "409": {
-            "description": "Duplicate name",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          },
-          "413": {
-            "description": "JSON request body exceeds the admin body-size limit",
-            "content": {
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "415": {
-            "description": "Missing or unsupported JSON content type",
-            "content": {
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Configuration store operation failed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          }
-        },
-        "tags": [
-          "Cache Policies"
-        ],
-        "description": "Update a cache policy resource by ID. The gateway validates the payload, rejects duplicate `name` values, preserves the resource ID, and increments the revision."
-      },
-      "delete": {
-        "summary": "Delete Cache Policy by ID",
-        "responses": {
-          "200": {
-            "description": "OK",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/DeleteResponse"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Missing or invalid admin key",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Resource not found",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Configuration store operation failed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          }
-        },
-        "tags": [
-          "Cache Policies"
-        ],
-        "description": "Delete a cache policy resource by ID."
       }
     },
     "/admin/v1/observability_exporters": {
@@ -2832,101 +1009,6 @@ const OPENAPI_JSON_BASE: &str = r##"{
           "Observability Exporters"
         ],
         "description": "List all configured observability exporter resources."
-      },
-      "post": {
-        "summary": "Create Observability Exporter",
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/ObservabilityExporter"
-              }
-            }
-          },
-          "description": "Observability exporter configuration for telemetry export and content capture settings."
-        },
-        "responses": {
-          "200": {
-            "description": "OK",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ObservabilityExporterEntry"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Schema validation failed or the JSON body is malformed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              },
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Missing or invalid admin key",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          },
-          "409": {
-            "description": "Duplicate name",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          },
-          "413": {
-            "description": "JSON request body exceeds the admin body-size limit",
-            "content": {
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "415": {
-            "description": "Missing or unsupported JSON content type",
-            "content": {
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Configuration store operation failed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          }
-        },
-        "tags": [
-          "Observability Exporters"
-        ],
-        "description": "Create an observability exporter resource. The gateway validates the payload, rejects duplicate `name` values, and returns the stored resource entry."
       }
     },
     "/admin/v1/observability_exporters/{id}": {
@@ -2938,7 +1020,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
           "schema": {
             "type": "string"
           },
-          "description": "Observability exporter resource ID generated by the Admin API.",
+          "description": "Observability exporter resource ID, as assigned by the active resource source (a UUIDv5 derived from the entry name in file mode; the etcd key's ID segment otherwise).",
           "example": "b2b0c782-d81d-4ac9-b9f7-98e3b0e5b261"
         }
       ],
@@ -2990,160 +1072,6 @@ const OPENAPI_JSON_BASE: &str = r##"{
           "Observability Exporters"
         ],
         "description": "Get an observability exporter resource by ID."
-      },
-      "put": {
-        "summary": "Update Observability Exporter by ID",
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/ObservabilityExporter"
-              }
-            }
-          },
-          "description": "Replacement observability exporter configuration."
-        },
-        "responses": {
-          "200": {
-            "description": "OK",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ObservabilityExporterEntry"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Schema validation failed or the JSON body is malformed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              },
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Missing or invalid admin key",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Resource not found",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          },
-          "409": {
-            "description": "Duplicate name",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          },
-          "413": {
-            "description": "JSON request body exceeds the admin body-size limit",
-            "content": {
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "415": {
-            "description": "Missing or unsupported JSON content type",
-            "content": {
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Configuration store operation failed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          }
-        },
-        "tags": [
-          "Observability Exporters"
-        ],
-        "description": "Update an observability exporter resource by ID. The gateway validates the payload, rejects duplicate `name` values, preserves the resource ID, and increments the revision."
-      },
-      "delete": {
-        "summary": "Delete Observability Exporter by ID",
-        "responses": {
-          "200": {
-            "description": "OK",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/DeleteResponse"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Missing or invalid admin key",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Resource not found",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Configuration store operation failed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AdminError"
-                }
-              }
-            }
-          }
-        },
-        "tags": [
-          "Observability Exporters"
-        ],
-        "description": "Delete an observability exporter resource by ID."
       }
     },
     "/admin/v1/health": {
@@ -3366,7 +1294,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
         "properties": {
           "id": {
             "type": "string",
-            "description": "Resource ID generated by the Admin API.",
+            "description": "Resource ID, as assigned by the active resource source.",
             "example": "c7f13a2e-5d6b-4b87-9f47-2c34de35f4aa"
           },
           "value": {
@@ -3375,7 +1303,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
           },
           "revision": {
             "type": "integer",
-            "description": "Monotonic resource revision. Create operations start at 1, and update or rotate operations increment the revision.",
+            "description": "Monotonic resource revision: the etcd mod_revision of the entry, or the load generation in file mode.",
             "example": 1842
           }
         },
@@ -3473,31 +1401,6 @@ const OPENAPI_JSON_BASE: &str = r##"{
         },
         "description": "System timestamp serialized from Rust `SystemTime`."
       },
-      "ApiKeyEntry": {
-        "type": "object",
-        "required": [
-          "id",
-          "value",
-          "revision"
-        ],
-        "properties": {
-          "id": {
-            "type": "string",
-            "description": "Resource ID generated by the Admin API.",
-            "example": "9f3b2a70-7a3d-4d83-96e1-0c6e5ad4f280"
-          },
-          "value": {
-            "$ref": "#/components/schemas/PublicApiKey",
-            "description": "Stored caller API key configuration with plaintext credentials redacted."
-          },
-          "revision": {
-            "type": "integer",
-            "description": "Monotonic resource revision. Create operations start at 1, and update or rotate operations increment the revision.",
-            "example": 1843
-          }
-        },
-        "description": "Stored Admin API resource entry."
-      },
       "AdminError": {
         "type": "object",
         "required": [
@@ -3545,7 +1448,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
             "items": {
               "type": "string"
             },
-            "description": "MCP tools this key may call, as namespaced `<server>__<tool>` names (the form the gateway exposes). Entries are matched as single-`*` globs, mirroring `allowed_models`: `\"*\"` grants every tool and `\"<server>__*\"` grants every tool on one server (e.g. `\"github__*\"`); an entry without a `*` matches one tool exactly. When omitted, set to `null`, or set to an empty list, the key has no MCP tool access — access is granted explicitly."
+            "description": "MCP tools this key may call, as namespaced `<server>__<tool>` names (the form the gateway exposes). Entries are matched as single-`*` globs, mirroring `allowed_models`: `\"*\"` grants every tool and `\"<server>__*\"` grants every tool on one server (e.g. `\"github__*\"`); an entry without a `*` matches one tool exactly. When omitted, set to `null`, or set to an empty list, the key has no MCP tool access \u2014 access is granted explicitly."
           },
           "allowed_agents": {
             "type": [
@@ -3555,7 +1458,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
             "items": {
               "type": "string"
             },
-            "description": "A2A agents this key may reach, named by their registered names. Entries are matched as single-`*` globs: `\"*\"` grants every agent and an entry without a `*` matches one agent exactly. When omitted, set to `null`, or set to an empty list, the key has no A2A agent access — access is granted explicitly."
+            "description": "A2A agents this key may reach, named by their registered names. Entries are matched as single-`*` globs: `\"*\"` grants every agent and an entry without a `*` matches one agent exactly. When omitted, set to `null`, or set to an empty list, the key has no A2A agent access \u2014 access is granted explicitly."
           },
           "expires_at": {
             "type": [
@@ -3584,7 +1487,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
         "properties": {
           "id": {
             "type": "string",
-            "description": "Resource ID generated by the Admin API.",
+            "description": "Resource ID, as assigned by the active resource source.",
             "example": "9f3b2a70-7a3d-4d83-96e1-0c6e5ad4f280"
           },
           "value": {
@@ -3593,29 +1496,11 @@ const OPENAPI_JSON_BASE: &str = r##"{
           },
           "revision": {
             "type": "integer",
-            "description": "Monotonic resource revision. Create operations start at 1, and update or rotate operations increment the revision.",
+            "description": "Monotonic resource revision: the etcd mod_revision of the entry, or the load generation in file mode.",
             "example": 1843
           }
         },
         "description": "Stored Admin API resource entry."
-      },
-      "ApiKeyRotateResponse": {
-        "type": "object",
-        "required": [
-          "entry",
-          "plaintext"
-        ],
-        "properties": {
-          "entry": {
-            "$ref": "#/components/schemas/PublicApiKeyEntry",
-            "description": "Updated caller API key resource with the new key hash stored and plaintext credentials redacted."
-          },
-          "plaintext": {
-            "type": "string",
-            "description": "New plaintext bearer token. Returned only once after rotation.",
-            "example": "sk-aisix-6Nf9q4Yt7pR2mK8xD3vL"
-          }
-        }
       },
       "ProviderKeyEntry": {
         "type": "object",
@@ -3627,7 +1512,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
         "properties": {
           "id": {
             "type": "string",
-            "description": "Resource ID generated by the Admin API.",
+            "description": "Resource ID, as assigned by the active resource source.",
             "example": "4f8f70e7-0c6e-4f74-92c5-cd70d94f3a21"
           },
           "value": {
@@ -3636,7 +1521,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
           },
           "revision": {
             "type": "integer",
-            "description": "Monotonic resource revision. Create operations start at 1, and update or rotate operations increment the revision.",
+            "description": "Monotonic resource revision: the etcd mod_revision of the entry, or the load generation in file mode.",
             "example": 1844
           }
         },
@@ -3652,7 +1537,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
         "properties": {
           "id": {
             "type": "string",
-            "description": "Resource ID generated by the Admin API.",
+            "description": "Resource ID, as assigned by the active resource source.",
             "example": "1d95ac57-7f27-46a4-b5a3-55d3c3ad0a12"
           },
           "value": {
@@ -3661,7 +1546,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
           },
           "revision": {
             "type": "integer",
-            "description": "Monotonic resource revision. Create operations start at 1, and update operations increment the revision.",
+            "description": "Monotonic resource revision: the etcd mod_revision of the entry, or the load generation in file mode.",
             "example": 1845
           }
         },
@@ -3677,7 +1562,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
         "properties": {
           "id": {
             "type": "string",
-            "description": "Resource ID generated by the Admin API.",
+            "description": "Resource ID, as assigned by the active resource source.",
             "example": "1d95ac57-7f27-46a4-b5a3-55d3c3ad0a12"
           },
           "value": {
@@ -3686,7 +1571,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
           },
           "revision": {
             "type": "integer",
-            "description": "Monotonic resource revision. Create operations start at 1, and update operations increment the revision.",
+            "description": "Monotonic resource revision: the etcd mod_revision of the entry, or the load generation in file mode.",
             "example": 1845
           }
         },
@@ -3713,7 +1598,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
         "properties": {
           "id": {
             "type": "string",
-            "description": "Resource ID generated by the Admin API.",
+            "description": "Resource ID, as assigned by the active resource source.",
             "example": "b0c04774-216f-4fb2-96f0-5f7f0a75b76a"
           },
           "value": {
@@ -3722,7 +1607,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
           },
           "revision": {
             "type": "integer",
-            "description": "Monotonic resource revision. Create operations start at 1, and update or rotate operations increment the revision.",
+            "description": "Monotonic resource revision: the etcd mod_revision of the entry, or the load generation in file mode.",
             "example": 1845
           }
         },
@@ -3738,7 +1623,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
         "properties": {
           "id": {
             "type": "string",
-            "description": "Resource ID generated by the Admin API.",
+            "description": "Resource ID, as assigned by the active resource source.",
             "example": "6fdb4165-0970-47fb-9aa8-729f07889fd1"
           },
           "value": {
@@ -3747,7 +1632,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
           },
           "revision": {
             "type": "integer",
-            "description": "Monotonic resource revision. Create operations start at 1, and update or rotate operations increment the revision.",
+            "description": "Monotonic resource revision: the etcd mod_revision of the entry, or the load generation in file mode.",
             "example": 1846
           }
         },
@@ -3763,7 +1648,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
         "properties": {
           "id": {
             "type": "string",
-            "description": "Resource ID generated by the Admin API.",
+            "description": "Resource ID, as assigned by the active resource source.",
             "example": "b2b0c782-d81d-4ac9-b9f7-98e3b0e5b261"
           },
           "value": {
@@ -3772,32 +1657,11 @@ const OPENAPI_JSON_BASE: &str = r##"{
           },
           "revision": {
             "type": "integer",
-            "description": "Monotonic resource revision. Create operations start at 1, and update or rotate operations increment the revision.",
+            "description": "Monotonic resource revision: the etcd mod_revision of the entry, or the load generation in file mode.",
             "example": 1847
           }
         },
         "description": "Stored Admin API resource entry."
-      },
-      "DeleteResponse": {
-        "type": "object",
-        "required": [
-          "deleted",
-          "id"
-        ],
-        "properties": {
-          "deleted": {
-            "type": "boolean",
-            "enum": [
-              true
-            ],
-            "description": "Always `true` when the resource was deleted.",
-            "example": true
-          },
-          "id": {
-            "type": "string",
-            "description": "Resource ID that was deleted."
-          }
-        }
       },
       "ModelHealth": {
         "type": "object",
@@ -3878,76 +1742,6 @@ const OPENAPI_JSON_BASE: &str = r##"{
             "description": "Configuration watch freshness. Omitted when the watch supervisor is not wired into the admin state."
           }
         }
-      },
-      "ApiKeyRequest": {
-        "type": "object",
-        "required": [
-          "key_hash",
-          "allowed_models"
-        ],
-        "properties": {
-          "key_hash": {
-            "type": "string",
-            "description": "SHA-256 hash of the caller-facing plaintext key.",
-            "example": "8f434346648f6b96df89dda901c5176b10a6d83961dd3c1ac88b59b2dc327aa4"
-          },
-          "allowed_models": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            },
-            "description": "Model aliases this caller API key may use.",
-            "example": [
-              "gpt-4o"
-            ]
-          },
-          "rate_limit": {
-            "$ref": "#/components/schemas/RateLimit",
-            "description": "Request, token, and concurrency limits for this key."
-          },
-          "allowed_tools": {
-            "type": [
-              "array",
-              "null"
-            ],
-            "items": {
-              "type": "string"
-            },
-            "description": "MCP tools this key may call, as namespaced `<server>__<tool>` names (the form the gateway exposes). Entries are matched as single-`*` globs, mirroring `allowed_models`: `\"*\"` grants every tool and `\"<server>__*\"` grants every tool on one server (e.g. `\"github__*\"`); an entry without a `*` matches one tool exactly. When omitted, set to `null`, or set to an empty list, the key has no MCP tool access — access is granted explicitly.",
-            "example": [
-              "github__create_issue"
-            ]
-          },
-          "allowed_agents": {
-            "type": [
-              "array",
-              "null"
-            ],
-            "items": {
-              "type": "string"
-            },
-            "description": "A2A agents this key may reach, named by their registered names. Entries are matched as single-`*` globs: `\"*\"` grants every agent and an entry without a `*` matches one agent exactly. When omitted, set to `null`, or set to an empty list, the key has no A2A agent access — access is granted explicitly.",
-            "example": [
-              "invoice-processor"
-            ]
-          },
-          "expires_at": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "format": "date-time",
-            "description": "RFC 3339 timestamp after which the key stops authenticating. Requests presenting an expired key are rejected with `401`. When omitted or set to `null`, the key never expires.",
-            "example": "2027-01-01T00:00:00Z"
-          },
-          "disabled": {
-            "type": "boolean",
-            "default": false,
-            "description": "Administratively disabled. A disabled key is rejected with `401` until it is enabled again; the key itself is preserved."
-          }
-        },
-        "additionalProperties": false,
-        "description": "AISIX Admin API request body for creating or updating a caller API key on an open-source AISIX gateway. Ownership fields supplied by AISIX Cloud are not accepted by this API."
       }
     }
   },
@@ -3971,7 +1765,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
     },
     {
       "name": "Caller API Keys",
-      "description": "Caller-facing proxy API keys and key rotation."
+      "description": "Caller-facing proxy API keys."
     },
     {
       "name": "Provider Keys",
@@ -4123,7 +1917,6 @@ pub(crate) fn merged_openapi() -> &'static str {
         add_schema_defaults(&mut doc);
         add_schema_examples(&mut doc);
         document_former_apikeys_paths(&mut doc);
-        mark_admin_write_operations_deprecated(&mut doc);
         wrap_ref_siblings_for_redoc(&mut doc);
 
         serde_json::to_string(&doc).expect("merged OpenAPI must serialise")
@@ -4140,10 +1933,6 @@ fn document_former_apikeys_paths(doc: &mut Value) {
     const PATH_PAIRS: &[(&str, &str)] = &[
         ("/admin/v1/api_keys", "/admin/v1/apikeys"),
         ("/admin/v1/api_keys/{id}", "/admin/v1/apikeys/{id}"),
-        (
-            "/admin/v1/api_keys/{id}/rotate",
-            "/admin/v1/apikeys/{id}/rotate",
-        ),
     ];
     for (canonical, former) in PATH_PAIRS {
         let mut item = doc["paths"][*canonical].clone();
@@ -4177,49 +1966,6 @@ fn document_former_apikeys_paths(doc: &mut Value) {
             }
         }
         doc["paths"][*former] = item;
-    }
-}
-
-/// Mark every mutating `/admin/v1/*` operation (POST/PUT/DELETE,
-/// rotate included) as `deprecated: true` and point its description at
-/// the declarative configuration paths. One programmatic pass instead
-/// of thirty hand-edited operations, mirroring the router-level header
-/// chokepoint: a newly documented write route picks the marking up
-/// automatically. Runs after [`document_former_apikeys_paths`] so the
-/// former `apikeys` spelling is covered too. Read operations and
-/// non-resource endpoints (playground, health, OpenAPI) are untouched.
-fn mark_admin_write_operations_deprecated(doc: &mut Value) {
-    const NOTE: &str = "**Deprecated write path**: configure resources declaratively \
-         instead, either through a `resources_file` (`resources.yaml`) or by writing \
-         to etcd directly. This endpoint remains functional; mutating responses carry \
-         a `Deprecation` header (RFC 9745) and a `Link` header with `rel=\"deprecation\"` \
-         pointing at the migration documentation.";
-
-    let Some(paths) = doc["paths"].as_object_mut() else {
-        return;
-    };
-    for (path, item) in paths.iter_mut() {
-        if !path.starts_with("/admin/v1/") {
-            continue;
-        }
-        let Some(ops) = item.as_object_mut() else {
-            continue;
-        };
-        for method in ["post", "put", "delete"] {
-            let Some(op) = ops.get_mut(method).and_then(Value::as_object_mut) else {
-                continue;
-            };
-            op.insert("deprecated".to_string(), Value::Bool(true));
-            match op.get_mut("description") {
-                Some(Value::String(description)) => {
-                    description.push_str("\n\n");
-                    description.push_str(NOTE);
-                }
-                _ => {
-                    op.insert("description".to_string(), Value::String(NOTE.to_string()));
-                }
-            }
-        }
     }
 }
 
@@ -4682,10 +2428,8 @@ mod tests {
             "/admin/v1/models/status",
             "/admin/v1/api_keys",
             "/admin/v1/api_keys/{id}",
-            "/admin/v1/api_keys/{id}/rotate",
             "/admin/v1/apikeys",
             "/admin/v1/apikeys/{id}",
-            "/admin/v1/apikeys/{id}/rotate",
             "/admin/v1/provider_keys",
             "/admin/v1/provider_keys/{id}",
             "/admin/v1/mcp_servers",
@@ -4716,11 +2460,8 @@ mod tests {
             "RuntimeStatus",
             "SystemTime",
             "ApiKey",
-            "ApiKeyRequest",
-            "ApiKeyEntry",
             "PublicApiKey",
             "PublicApiKeyEntry",
-            "ApiKeyRotateResponse",
             "ProviderKey",
             "ProviderKeyEntry",
             "McpServer",
@@ -4736,7 +2477,6 @@ mod tests {
             "RateLimit",
             "Routing",
             "ModelCost",
-            "DeleteResponse",
             "ModelHealth",
             "ConfigStatus",
             "HealthResponse",
@@ -4771,10 +2511,8 @@ mod tests {
             "/admin/v1/models/status",
             "/admin/v1/api_keys",
             "/admin/v1/api_keys/{id}",
-            "/admin/v1/api_keys/{id}/rotate",
             "/admin/v1/apikeys",
             "/admin/v1/apikeys/{id}",
-            "/admin/v1/apikeys/{id}/rotate",
             "/admin/v1/provider_keys",
             "/admin/v1/provider_keys/{id}",
             "/admin/v1/mcp_servers",
@@ -4798,135 +2536,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn openapi_marks_every_admin_write_operation_deprecated() {
+    async fn openapi_documents_no_admin_write_operations() {
+        // The resource write path was removed: the published reference
+        // must document GET-only resource routes (the playground POST is
+        // the sole non-GET operation, and it is not under /admin/v1/).
         let parsed: serde_json::Value =
             serde_json::from_str(merged_openapi()).expect("merged_openapi must parse");
         let paths = parsed["paths"]
             .as_object()
             .expect("paths must be an object");
 
-        let mut write_ops = 0;
         for (path, item) in paths {
             let item = item.as_object().expect("path item must be an object");
             for (method, op) in item {
                 if method == "parameters" {
                     continue;
                 }
-                let is_admin_write = path.starts_with("/admin/v1/")
-                    && matches!(method.as_str(), "post" | "put" | "delete");
-                if is_admin_write {
-                    write_ops += 1;
+                if path.starts_with("/admin/v1/") {
                     assert_eq!(
-                        op["deprecated"], true,
-                        "{method} {path} is a resource write and must be marked deprecated"
-                    );
-                    let description = op["description"].as_str().unwrap_or_default();
-                    assert!(
-                        description.contains("resources_file"),
-                        "{method} {path} must point at the declarative configuration paths"
-                    );
-                } else {
-                    assert!(
-                        op.get("deprecated").is_none(),
-                        "{method} {path} is a read or non-resource operation and must NOT be marked deprecated"
+                        method, "get",
+                        "{method} {path}: resource routes are read-only after write removal"
                     );
                 }
+                assert!(
+                    op.get("deprecated").is_none(),
+                    "{method} {path}: nothing on the surviving surface is deprecated"
+                );
             }
         }
-        // 8 resource collections × (create + update + delete) + the
-        // api_keys rotate, plus the four write operations mirrored onto
-        // the former `apikeys` spelling. Update deliberately when the
-        // resource surface changes — like the exact path-set test above.
-        assert_eq!(
-            write_ops, 29,
-            "unexpected number of deprecated write operations"
-        );
-    }
 
-    #[tokio::test]
-    async fn openapi_uses_open_source_gateway_apikey_request_schema() {
-        let parsed: serde_json::Value =
-            serde_json::from_str(merged_openapi()).expect("merged_openapi must parse");
-        for (path, method) in [
-            ("/admin/v1/api_keys", "post"),
-            ("/admin/v1/api_keys/{id}", "put"),
-            ("/admin/v1/apikeys", "post"),
-            ("/admin/v1/apikeys/{id}", "put"),
-        ] {
-            assert_eq!(
-                parsed["paths"][path][method]["requestBody"]["content"]["application/json"]
-                    ["schema"]["$ref"],
-                "#/components/schemas/ApiKeyRequest",
-                "{method} {path} should document the open-source gateway Admin API request body"
-            );
+        // Schema prose must not resurrect the write lifecycle either:
+        // every documented `revision` field describes the read-side
+        // source (etcd mod_revision / file load generation), never
+        // create/update/rotate semantics.
+        for (name, schema) in parsed["components"]["schemas"]
+            .as_object()
+            .expect("schemas must be an object")
+        {
+            let Some(revision) = schema["properties"].get("revision") else {
+                continue;
+            };
+            let description = revision["description"].as_str().unwrap_or_default();
+            let lowered = description.to_lowercase();
+            for phrase in ["create", "update", "rotate", "generated by the admin api"] {
+                assert!(
+                    !lowered.contains(phrase),
+                    "{name}.revision description resurrects write-lifecycle prose ({phrase:?}): {description}"
+                );
+            }
         }
-
-        let request = &parsed["components"]["schemas"]["ApiKeyRequest"];
-        assert_eq!(request["required"][0], "key_hash");
-        assert_eq!(request["required"][1], "allowed_models");
-        assert!(
-            request["properties"].get("allowed_tools").is_some(),
-            "open-source gateway API key requests must document MCP tool access"
-        );
-        let request_allowed_tools = request["properties"]["allowed_tools"]["description"]
-            .as_str()
-            .unwrap();
-        assert!(
-            request_allowed_tools.contains("omitted, set to `null`, or set to an empty list"),
-            "open-source gateway API key request schema must document no-access tool-list behavior"
-        );
-        assert!(
-            request_allowed_tools.contains("<server>__*"),
-            "open-source gateway API key request schema must document the per-server wildcard"
-        );
-        assert!(
-            request["properties"].get("allowed_agents").is_some(),
-            "open-source gateway API key requests must document A2A agent access"
-        );
-        let request_allowed_agents = request["properties"]["allowed_agents"]["description"]
-            .as_str()
-            .unwrap();
-        assert!(
-            request_allowed_agents.contains("omitted, set to `null`, or set to an empty list"),
-            "open-source gateway API key request schema must document no-access agent-list behavior"
-        );
-        assert!(
-            request_allowed_agents.contains("grants every agent"),
-            "open-source gateway API key request schema must document wildcard agent access"
-        );
-        let public = &parsed["components"]["schemas"]["PublicApiKey"];
-        assert!(
-            public["properties"].get("allowed_tools").is_some(),
-            "API key responses must document MCP tool access"
-        );
-        let public_allowed_tools = public["properties"]["allowed_tools"]["description"]
-            .as_str()
-            .unwrap();
-        assert!(
-            public_allowed_tools.contains("omitted, set to `null`, or set to an empty list"),
-            "API key response schema must document no-access tool-list behavior"
-        );
-        assert!(
-            public_allowed_tools.contains("<server>__*"),
-            "API key response schema must document the per-server wildcard"
-        );
-        assert!(
-            public["properties"].get("allowed_agents").is_some(),
-            "API key responses must document A2A agent access"
-        );
-        let public_allowed_agents = public["properties"]["allowed_agents"]["description"]
-            .as_str()
-            .unwrap();
-        assert!(
-            public_allowed_agents.contains("omitted, set to `null`, or set to an empty list"),
-            "API key response schema must document no-access agent-list behavior"
-        );
-        assert!(
-            public_allowed_agents.contains("grants every agent"),
-            "API key response schema must document wildcard agent access"
-        );
-        assert!(request["properties"].get("team_id").is_none());
-        assert!(request["properties"].get("user_id").is_none());
     }
 
     #[tokio::test]
@@ -5132,10 +2790,6 @@ mod tests {
             );
         }
 
-        assert_eq!(
-            schemas["DeleteResponse"]["properties"]["deleted"]["description"],
-            "Always `true` when the resource was deleted."
-        );
         assert_eq!(
             schemas["HealthResponse"]["properties"]["status"]["description"],
             "Aggregate health summary derived from per-model health and config freshness. `ok` = all models healthy and config fresh; `degraded` = at least one model degraded or the config watch is stale/not yet applied; `unhealthy` = at least one model is down. Use `models[].health` and `config` for the per-dimension detail."
@@ -5416,69 +3070,6 @@ mod tests {
             assert!(
                 responses[status]["content"]["application/json"]["schema"].is_object(),
                 "playground should document forwarded proxy response {status}"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn openapi_documents_admin_json_body_limit_rejections() {
-        let parsed: serde_json::Value =
-            serde_json::from_str(merged_openapi()).expect("merged_openapi must parse");
-
-        for (path, method) in [
-            ("/admin/v1/models", "post"),
-            ("/admin/v1/models/{id}", "put"),
-            ("/admin/v1/apikeys", "post"),
-            ("/admin/v1/apikeys/{id}", "put"),
-            ("/admin/v1/provider_keys", "post"),
-            ("/admin/v1/provider_keys/{id}", "put"),
-            ("/admin/v1/mcp_servers", "post"),
-            ("/admin/v1/mcp_servers/{id}", "put"),
-            ("/admin/v1/a2a_agents", "post"),
-            ("/admin/v1/a2a_agents/{id}", "put"),
-            ("/admin/v1/guardrails", "post"),
-            ("/admin/v1/guardrails/{id}", "put"),
-            ("/admin/v1/cache_policies", "post"),
-            ("/admin/v1/cache_policies/{id}", "put"),
-            ("/admin/v1/observability_exporters", "post"),
-            ("/admin/v1/observability_exporters/{id}", "put"),
-        ] {
-            let response = &parsed["paths"][path][method]["responses"]["413"];
-            assert_eq!(
-                response["content"]["text/plain"]["schema"]["type"], "string",
-                "{method} {path} should document admin JSON body-limit rejections"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn openapi_documents_admin_duplicate_name_conflicts() {
-        let parsed: serde_json::Value =
-            serde_json::from_str(merged_openapi()).expect("merged_openapi must parse");
-
-        for (path, method) in [
-            ("/admin/v1/models", "post"),
-            ("/admin/v1/models/{id}", "put"),
-            ("/admin/v1/apikeys", "post"),
-            ("/admin/v1/apikeys/{id}", "put"),
-            ("/admin/v1/provider_keys", "post"),
-            ("/admin/v1/provider_keys/{id}", "put"),
-            ("/admin/v1/mcp_servers", "post"),
-            ("/admin/v1/mcp_servers/{id}", "put"),
-            ("/admin/v1/a2a_agents", "post"),
-            ("/admin/v1/a2a_agents/{id}", "put"),
-            ("/admin/v1/guardrails", "post"),
-            ("/admin/v1/guardrails/{id}", "put"),
-            ("/admin/v1/cache_policies", "post"),
-            ("/admin/v1/cache_policies/{id}", "put"),
-            ("/admin/v1/observability_exporters", "post"),
-            ("/admin/v1/observability_exporters/{id}", "put"),
-        ] {
-            let response = &parsed["paths"][path][method]["responses"]["409"];
-            assert_eq!(
-                response["content"]["application/json"]["schema"]["$ref"],
-                "#/components/schemas/AdminError",
-                "{method} {path} should document duplicate-name conflicts as 409/AdminError"
             );
         }
     }

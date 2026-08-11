@@ -18,10 +18,9 @@ export interface AppOverrides {
    * still returned but point at an unbound port. Resources are seeded
    * through `SeedClient`/`EtcdClient`, never the Admin API.
    *
-   * Only tests whose subject IS the Admin API surface (the held-back set —
-   * admin auth, write-rejection, deprecation headers, status-equivalence,
-   * key rotation) opt back in with `admin: true`; they stay admin-on until
-   * the Admin API is removed, then get deleted.
+   * Only tests whose subject IS the Admin API read surface (admin
+   * auth, the removed-write 405/404 contract, health, OpenAPI,
+   * status-equivalence) opt back in with `admin: true`.
    */
   admin?: boolean;
   /** Inserted into `admin.admin_keys`. Defaults to a fresh random key. */

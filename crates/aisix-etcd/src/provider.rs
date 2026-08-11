@@ -4,8 +4,8 @@
 //! plug in an in-memory provider so the supervisor can be exercised
 //! deterministically without a container.
 //!
-//! Decoupling the supervisor from the concrete client also means the
-//! future Admin API can write through the same trait on the happy path.
+//! Decoupling the supervisor from the concrete client also keeps the
+//! happy path exercisable through the same trait in tests.
 
 use async_trait::async_trait;
 use std::sync::Arc;

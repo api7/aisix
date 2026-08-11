@@ -12,11 +12,10 @@ import { EtcdClient } from "./etcd.js";
  *
  * The document written is exactly the caller-supplied body — the
  * canonical resource shape from `schemas/resources/`. The loader fills
- * serde defaults on load, so a sparse document loads identically to an
- * Admin-API-written one; that equivalence is pinned by
- * `cases/seed-vs-admin-characterization-e2e.test.ts`.
+ * serde defaults on load, so a sparse document loads with the same
+ * defaults the schema documents.
  *
- * Unlike the Admin API there is no synchronous validation: a malformed
+ * There is no synchronous validation on this path: a malformed
  * document is silently skipped by the loader and the test then times
  * out in `waitConfigPropagation`. Keep seed bodies aligned with the
  * schemas, and probe propagation with a positive condition.

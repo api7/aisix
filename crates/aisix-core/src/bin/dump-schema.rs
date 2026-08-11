@@ -38,12 +38,14 @@ fn main() {
     fs::create_dir_all(&out_dir).expect("create schemas/resources dir");
 
     // Every resource with a runtime validator goes through the SAME
-    // `resource_root_schema(name, strict: true)` producer the write-path
+    // `resource_root_schema(name, strict: true)` producer the strict
     // validators compile, so the published schema == the enforced write
     // contract by construction. The published files deliberately carry the
-    // STRICT shape: they document the Admin API write contract (unknown
-    // fields are a 400) and the etcd loader's lenient read tolerance is a
-    // runtime behavior, not a contract callers may write against.
+    // STRICT shape: they document the declarative write contract (unknown
+    // fields are rejected by `aisix validate` and the file source wherever
+    // a resource closes them) and the
+    // etcd loader's lenient read tolerance is a runtime behavior, not a
+    // contract callers may write against.
     // `ensemble`/`rate_limit`/`routing` have no standalone validator (they
     // are nested struct types) so they dump straight from the struct via
     // `schema_for!`, closed the same way.

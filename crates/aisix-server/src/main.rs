@@ -582,10 +582,10 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
                 .await
                 .map_err(|e| anyhow::anyhow!("etcd connect failed: {e}"))?,
             );
-            // Separate client for the admin write path — only needed when the
-            // admin surface is bound. We could share a single underlying
+            // Separate client for the admin read surface — only needed when
+            // the admin listener is bound. We could share a single underlying
             // connection via `Client::clone()` but keeping two is cleaner:
-            // writes and the watch stream don't contend on the same mutex.
+            // admin reads and the watch stream don't contend on the same mutex.
             // Skipped whenever the admin listener is not bound — managed mode,
             // or `admin.enabled = false` — so admin-off doesn't pay for (or
             // fail boot on) a connection it immediately drops; `/status/models`
@@ -962,19 +962,18 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
 
     // Admin router + listener are only built in standalone mode.
     // In managed mode (`cfg.managed.enabled = true`) the DP reads
-    // configuration exclusively from etcd; exposing admin writes or
-    // the Playground would bypass the aisix.cloud control plane.
+    // configuration exclusively from etcd; exposing the admin surface
+    // or the Playground would bypass the AISIX Cloud control plane.
     //
     // Which store backs the admin surface depends on the resource
-    // source: etcd standalone gets the writable etcd store; file mode
-    // gets a read-only view of the file-loaded snapshot (writes return
-    // 409 pointing at the file).
+    // source: etcd standalone reads the etcd store; file mode reads a
+    // view of the file-loaded snapshot. The admin resource surface is
+    // read-only — writes were removed with the Admin API write path.
     let admin_store: Option<Arc<dyn ConfigStore>> = match (admin_client, &file_source_path) {
         (Some((client, prefix)), _) => Some(Arc::new(EtcdConfigStore::new(client, prefix))),
-        (None, Some(path)) if !cfg.managed.is_managed() => Some(Arc::new(FileManagedStore::new(
-            snapshot_handle.clone(),
-            path.display().to_string(),
-        ))),
+        (None, Some(_)) if !cfg.managed.is_managed() => {
+            Some(Arc::new(FileManagedStore::new(snapshot_handle.clone())))
+        }
         _ => None,
     };
     // Per-model runtime health as an operational read on the metrics/status
@@ -982,15 +981,11 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     // surface's store handle, so the status-listener view and
     // `GET /admin/v1/models/status` read the very same source; managed mode
     // has no admin store and serves the applied snapshot through the same
-    // read-only view file mode uses (the path only appears in write
-    // rejections, which the read-only status listener never issues).
+    // read-only view file mode uses.
     let status_models_state = aisix_admin::ModelsStatusState {
         store: match &admin_store {
             Some(store) => Arc::clone(store),
-            None => Arc::new(FileManagedStore::new(
-                snapshot_handle.clone(),
-                "the control plane",
-            )),
+            None => Arc::new(FileManagedStore::new(snapshot_handle.clone())),
         },
         runtime_status_tracker: Some(runtime_status_tracker.clone()),
     };
@@ -1012,11 +1007,6 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
             // watch lets the gateway serve stale config indefinitely
             // while reporting healthy. See issue #114.
             admin_state = admin_state.with_watch_status(supervisor.watch_status());
-        }
-        if let Some(path) = &file_source_path {
-            // Arm the router-level write guard: every mutating
-            // /admin/v1/* request answers 409 naming the file.
-            admin_state = admin_state.with_file_managed_path(path.display().to_string());
         }
         let admin_router = aisix_admin::build_router(admin_state);
 

@@ -1,4 +1,4 @@
-//! End-to-end Admin → etcd → loader round-trip tests.
+//! End-to-end declarative-write → etcd → admin-read/loader tests.
 //!
 //! Bracketed by `ADMIN_TEST_ETCD_URL` (mirrors the
 //! `CACHE_TEST_REDIS_URL` pattern in `aisix-cache/tests/redis_integration.rs`):
@@ -6,17 +6,22 @@
 //! passes; CI sets the env var via the `etcd` service in
 //! `.github/workflows/ci.yml`.
 //!
-//! Why a real etcd instead of `InMemoryStore`:
+//! Resources reach etcd through direct writes (the declarative path —
+//! the same front door the control plane uses); the admin listener and
+//! `aisix-etcd::loader` are the read sides. Why a real etcd instead of
+//! `InMemoryStore`:
 //!
-//! 1. Verifies the byte shape `EtcdConfigStore` writes against the
-//!    shape `aisix-etcd::loader` reads — the subkey constants on the
-//!    two sides have drifted before, and unit tests against the
-//!    in-memory store wouldn't catch it.
-//! 2. Catches the `EtcdConfigStore` impls themselves (the in-memory
-//!    store doesn't exercise serde + grpc + revision plumbing).
-//! 3. Exercises the full Admin handler → ConfigStore → etcd path so a
-//!    handler that forgets to call `state.store.put_X` gets caught
-//!    here even if the in-memory tests don't.
+//! 1. Verifies the byte shape operators write (entity-value JSON at
+//!    `{prefix}/{kind}/{id}`) against the shape `EtcdConfigStore`
+//!    reads — the subkey constants on the two sides have drifted
+//!    before, and unit tests against the in-memory store wouldn't
+//!    catch it.
+//! 2. Catches the `EtcdConfigStore` read impls themselves (the
+//!    in-memory store doesn't exercise serde + grpc + revision
+//!    plumbing).
+//! 3. Exercises the full etcd → ConfigStore → Admin handler read path,
+//!    and separately etcd → `aisix-etcd::loader` — the two consumers
+//!    of the same key layout.
 
 #![allow(clippy::expect_used)]
 
@@ -50,10 +55,13 @@ fn unique_prefix() -> String {
     .replace(['(', ')', ' '], "")
 }
 
-async fn build_state_with_real_etcd(url: &str, prefix: &str) -> AdminState {
-    let client = etcd_client::Client::connect([url], None)
+async fn etcd_client_for(url: &str) -> etcd_client::Client {
+    etcd_client::Client::connect([url], None)
         .await
-        .expect("etcd connect");
+        .expect("etcd connect")
+}
+
+async fn build_state(client: etcd_client::Client, prefix: &str) -> AdminState {
     let store: Arc<dyn ConfigStore> = Arc::new(EtcdConfigStore::new(client, prefix));
     let handle = SnapshotHandle::new(AisixSnapshot::new());
     let cfg = AdminConfig {
@@ -65,14 +73,16 @@ async fn build_state_with_real_etcd(url: &str, prefix: &str) -> AdminState {
     AdminState::new(handle, store, &cfg)
 }
 
-fn auth_post(uri: &str, body: Value) -> Request<Body> {
-    Request::builder()
-        .method("POST")
-        .uri(uri)
-        .header("authorization", format!("Bearer {ADMIN_KEY}"))
-        .header("content-type", "application/json")
-        .body(Body::from(body.to_string()))
-        .unwrap()
+/// Direct declarative write: entity-value JSON at `{prefix}/{kind}/{id}`.
+async fn seed(client: &mut etcd_client::Client, prefix: &str, kind: &str, id: &str, doc: &Value) {
+    client
+        .put(
+            format!("{prefix}/{kind}/{id}"),
+            serde_json::to_vec(doc).expect("serialize"),
+            None,
+        )
+        .await
+        .expect("direct etcd put");
 }
 
 fn auth_get(uri: &str) -> Request<Body> {
@@ -84,12 +94,17 @@ fn auth_get(uri: &str) -> Request<Body> {
         .unwrap()
 }
 
-fn auth_delete(uri: &str) -> Request<Body> {
+fn auth_req(method: &str, uri: &str, body: Option<Value>) -> Request<Body> {
+    let body = match body {
+        Some(v) => Body::from(v.to_string()),
+        None => Body::empty(),
+    };
     Request::builder()
-        .method("DELETE")
+        .method(method)
         .uri(uri)
         .header("authorization", format!("Bearer {ADMIN_KEY}"))
-        .body(Body::empty())
+        .header("content-type", "application/json")
+        .body(body)
         .unwrap()
 }
 
@@ -98,43 +113,42 @@ async fn body_json(resp: axum::http::Response<Body>) -> Value {
     serde_json::from_slice(&bytes).unwrap()
 }
 
-/// Drive `(POST → list → DELETE → list)` through the Admin HTTP layer
-/// and assert the round-trip lands real entries in etcd. Returns `true`
-/// on success so the per-resource macro can assert.
-async fn admin_crud_round_trip(state: AdminState, list_uri: &str, payload: Value) {
-    let app = build_router(state.clone());
+/// Seed a document directly, read it back through the Admin HTTP layer
+/// (list + get), then delete it directly and assert the list empties.
+async fn direct_write_read_round_trip(
+    url: &str,
+    kind: &str,
+    list_uri: &str,
+    id: &str,
+    payload: Value,
+) {
+    let prefix = unique_prefix();
+    let mut client = etcd_client_for(url).await;
+    let state = build_state(client.clone(), &prefix).await;
 
-    // POST
-    let resp = app
-        .oneshot(auth_post(list_uri, payload.clone()))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK, "POST {list_uri}");
-    let created = body_json(resp).await;
-    let id = created["id"].as_str().expect("created.id").to_string();
-    assert!(created["revision"].as_i64().unwrap_or(0) >= 1);
+    seed(&mut client, &prefix, kind, id, &payload).await;
 
-    // LIST
+    // LIST serves the directly-written entry.
     let app = build_router(state.clone());
     let resp = app.oneshot(auth_get(list_uri)).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.status(), StatusCode::OK, "GET {list_uri}");
     let listed = body_json(resp).await;
     let arr = listed.as_array().expect("list array");
-    assert_eq!(
-        arr.len(),
-        1,
-        "list returned {} entries for {list_uri}",
-        arr.len()
-    );
+    assert_eq!(arr.len(), 1, "list for {list_uri}: {listed}");
     assert_eq!(arr[0]["id"], id);
+    assert!(arr[0]["revision"].as_i64().unwrap_or(0) >= 1);
 
-    // DELETE
+    // GET by id too.
     let app = build_router(state.clone());
     let item_uri = format!("{list_uri}/{id}");
-    let resp = app.oneshot(auth_delete(&item_uri)).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = app.oneshot(auth_get(&item_uri)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "GET {item_uri}");
 
-    // LIST again — empty
+    // Direct delete → the read surface empties.
+    client
+        .delete(format!("{prefix}/{kind}/{id}"), None)
+        .await
+        .expect("direct etcd delete");
     let app = build_router(state);
     let resp = app.oneshot(auth_get(list_uri)).await.unwrap();
     let listed = body_json(resp).await;
@@ -149,11 +163,11 @@ async fn models_round_trip_through_real_etcd() {
         eprintln!("skipping: ADMIN_TEST_ETCD_URL not set");
         return;
     };
-    let prefix = unique_prefix();
-    let state = build_state_with_real_etcd(&url, &prefix).await;
-    admin_crud_round_trip(
-        state,
+    direct_write_read_round_trip(
+        &url,
+        "models",
         "/admin/v1/models",
+        "m-it-1",
         json!({
             "display_name": "it-gpt4",
             "provider": "openai",
@@ -170,12 +184,14 @@ async fn apikeys_round_trip_through_real_etcd() {
         eprintln!("skipping: ADMIN_TEST_ETCD_URL not set");
         return;
     };
-    let prefix = unique_prefix();
-    let state = build_state_with_real_etcd(&url, &prefix).await;
     let key_hash = aisix_core::ApiKey::hash_bearer("sk-it-bearer");
-    admin_crud_round_trip(
-        state,
+    // Canonical kind is `api_keys`; the former `apikeys` route spelling
+    // reads the same store.
+    direct_write_read_round_trip(
+        &url,
+        "api_keys",
         "/admin/v1/apikeys",
+        "k-it-1",
         json!({
             "key_hash": key_hash,
             "allowed_models": ["it-gpt4"],
@@ -191,12 +207,17 @@ async fn provider_keys_round_trip_through_real_etcd() {
         eprintln!("skipping: ADMIN_TEST_ETCD_URL not set");
         return;
     };
-    let prefix = unique_prefix();
-    let state = build_state_with_real_etcd(&url, &prefix).await;
-    admin_crud_round_trip(
-        state,
+    direct_write_read_round_trip(
+        &url,
+        "provider_keys",
         "/admin/v1/provider_keys",
-        json!({"display_name": "openai-it", "secret": "sk-it"}),
+        "pk-it-1",
+        json!({
+            "display_name": "openai-it",
+            "provider": "openai",
+            "adapter": "openai",
+            "secret": "sk-it"
+        }),
     )
     .await;
 }
@@ -207,11 +228,11 @@ async fn mcp_servers_round_trip_through_real_etcd() {
         eprintln!("skipping: ADMIN_TEST_ETCD_URL not set");
         return;
     };
-    let prefix = unique_prefix();
-    let state = build_state_with_real_etcd(&url, &prefix).await;
-    admin_crud_round_trip(
-        state,
+    direct_write_read_round_trip(
+        &url,
+        "mcp_servers",
         "/admin/v1/mcp_servers",
+        "mcp-it-1",
         json!({
             "name": "github-it",
             "url": "https://api.example.com/mcp",
@@ -228,11 +249,11 @@ async fn guardrails_round_trip_through_real_etcd() {
         eprintln!("skipping: ADMIN_TEST_ETCD_URL not set");
         return;
     };
-    let prefix = unique_prefix();
-    let state = build_state_with_real_etcd(&url, &prefix).await;
-    admin_crud_round_trip(
-        state,
+    direct_write_read_round_trip(
+        &url,
+        "guardrails",
         "/admin/v1/guardrails",
+        "g-it-1",
         json!({
             "name": "it-block",
             "kind": "keyword",
@@ -248,11 +269,11 @@ async fn cache_policies_round_trip_through_real_etcd() {
         eprintln!("skipping: ADMIN_TEST_ETCD_URL not set");
         return;
     };
-    let prefix = unique_prefix();
-    let state = build_state_with_real_etcd(&url, &prefix).await;
-    admin_crud_round_trip(
-        state,
+    direct_write_read_round_trip(
+        &url,
+        "cache_policies",
         "/admin/v1/cache_policies",
+        "cp-it-1",
         json!({"name": "it-cache", "enabled": true, "ttl_seconds": 600}),
     )
     .await;
@@ -264,11 +285,11 @@ async fn observability_exporters_round_trip_through_real_etcd() {
         eprintln!("skipping: ADMIN_TEST_ETCD_URL not set");
         return;
     };
-    let prefix = unique_prefix();
-    let state = build_state_with_real_etcd(&url, &prefix).await;
-    admin_crud_round_trip(
-        state,
+    direct_write_read_round_trip(
+        &url,
+        "observability_exporters",
         "/admin/v1/observability_exporters",
+        "oe-it-1",
         json!({
             "name": "it-otel",
             "kind": "otlp_http",
@@ -278,36 +299,123 @@ async fn observability_exporters_round_trip_through_real_etcd() {
     .await;
 }
 
-// ─────────────────────────── Loader compatibility ───────────────────────────
-//
-// The most load-bearing assertion in this file: after the Admin path
-// writes one entry of every resource type, build a fresh snapshot via
-// `aisix-etcd::loader` from the SAME etcd prefix and verify every
-// resource table is populated. This catches:
-//
-//   - subkey constant drift between `EtcdConfigStore::*_SUBKEY` and the
-//     match arms in `aisix_etcd::loader::build_snapshot`
-//   - JSON shape drift between the admin write and the loader's serde
-//     parse (e.g. a field rename that misses one side)
-//   - schema validation drift — the loader re-validates on read; if
-//     the admin path persists a value the loader's schema rejects, the
-//     row gets logged + skipped silently in production. This test
-//     fails loudly instead.
-
 #[tokio::test]
-async fn loader_picks_up_every_admin_write() {
+async fn a2a_agents_round_trip_through_real_etcd() {
+    let Some(url) = etcd_url() else {
+        eprintln!("skipping: ADMIN_TEST_ETCD_URL not set");
+        return;
+    };
+    direct_write_read_round_trip(
+        &url,
+        "a2a_agents",
+        "/admin/v1/a2a_agents",
+        "a2a-it-1",
+        json!({
+            "name": "invoice-it",
+            "url": "https://agents.example.com/a2a"
+        }),
+    )
+    .await;
+}
+
+// ─────────────────────────── Removed write path ───────────────────────────
+
+/// The write contract holds against the real etcd-backed store too:
+/// resource writes answer 405 (`Allow: GET`), rotate is 404, and
+/// nothing lands in etcd.
+#[tokio::test]
+async fn admin_writes_are_refused_against_real_etcd() {
     let Some(url) = etcd_url() else {
         eprintln!("skipping: ADMIN_TEST_ETCD_URL not set");
         return;
     };
     let prefix = unique_prefix();
-    let state = build_state_with_real_etcd(&url, &prefix).await;
+    let mut client = etcd_client_for(&url).await;
+    let state = build_state(client.clone(), &prefix).await;
 
-    // Seed one of every resource through the Admin HTTP path.
+    let payload = json!({
+        "display_name": "sneaky",
+        "provider": "openai",
+        "model_name": "gpt-4o",
+        "provider_key_id": "11111111-1111-1111-1111-111111111111"
+    });
+    for (method, uri) in [
+        ("POST", "/admin/v1/models"),
+        ("PUT", "/admin/v1/models/any-id"),
+        ("DELETE", "/admin/v1/models/any-id"),
+    ] {
+        let app = build_router(state.clone());
+        let body = if method == "DELETE" {
+            None
+        } else {
+            Some(payload.clone())
+        };
+        let resp = app.oneshot(auth_req(method, uri, body)).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "{method} {uri}"
+        );
+        let allow = resp
+            .headers()
+            .get(axum::http::header::ALLOW)
+            .and_then(|v| v.to_str().ok())
+            .expect("Allow header");
+        assert!(allow.contains("GET"), "{method} {uri} Allow: {allow}");
+    }
+
+    // GET discriminates route absence from unknown-id: a surviving
+    // POST-only rotate route would answer GET with 405, not 404.
+    for method in ["POST", "GET"] {
+        let app = build_router(state.clone());
+        let resp = app
+            .oneshot(auth_req(method, "/admin/v1/api_keys/any-id/rotate", None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{method} rotate");
+    }
+
+    // Nothing was written.
+    let resp = client
+        .get(
+            prefix.as_bytes().to_vec(),
+            Some(etcd_client::GetOptions::new().with_prefix()),
+        )
+        .await
+        .expect("range get");
+    assert!(resp.kvs().is_empty(), "refused writes must not touch etcd");
+}
+
+// ─────────────────────────── Loader compatibility ───────────────────────────
+//
+// The most load-bearing assertion in this file: after direct writes of
+// one entry of every resource kind (the canonical documents operators
+// and the control plane write), build a fresh snapshot via
+// `aisix-etcd::loader` from the SAME etcd prefix and verify every
+// resource table is populated. This catches:
+//
+//   - subkey constant drift between the documented key layout and the
+//     match arms in `aisix_etcd::loader::build_snapshot`
+//   - JSON shape drift between the canonical documents and the
+//     loader's serde parse (e.g. a field rename that misses one side)
+//   - schema validation drift — the loader re-validates on read; if a
+//     canonical document stops validating, the row gets logged +
+//     skipped silently in production. This test fails loudly instead.
+
+#[tokio::test]
+async fn loader_picks_up_every_direct_write() {
+    let Some(url) = etcd_url() else {
+        eprintln!("skipping: ADMIN_TEST_ETCD_URL not set");
+        return;
+    };
+    let prefix = unique_prefix();
+    let mut client = etcd_client_for(&url).await;
+
     let key_hash = aisix_core::ApiKey::hash_bearer("sk-loader-it");
     let writes = [
         (
-            "/admin/v1/models",
+            "models",
+            "m-loader-1",
             json!({
                 "display_name": "loader-gpt4",
                 "provider": "openai",
@@ -316,15 +424,23 @@ async fn loader_picks_up_every_admin_write() {
             }),
         ),
         (
-            "/admin/v1/apikeys",
+            "api_keys",
+            "k-loader-1",
             json!({"key_hash": key_hash, "allowed_models": ["loader-gpt4"]}),
         ),
         (
-            "/admin/v1/provider_keys",
-            json!({"display_name": "loader-pk", "secret": "sk-loader"}),
+            "provider_keys",
+            "pk-loader-1",
+            json!({
+                "display_name": "loader-pk",
+                "provider": "openai",
+                "adapter": "openai",
+                "secret": "sk-loader"
+            }),
         ),
         (
-            "/admin/v1/guardrails",
+            "guardrails",
+            "g-loader-1",
             json!({
                 "name": "loader-block",
                 "kind": "keyword",
@@ -332,11 +448,13 @@ async fn loader_picks_up_every_admin_write() {
             }),
         ),
         (
-            "/admin/v1/cache_policies",
+            "cache_policies",
+            "cp-loader-1",
             json!({"name": "loader-cache", "enabled": true}),
         ),
         (
-            "/admin/v1/observability_exporters",
+            "observability_exporters",
+            "oe-loader-1",
             json!({
                 "name": "loader-otel",
                 "kind": "otlp_http",
@@ -344,21 +462,23 @@ async fn loader_picks_up_every_admin_write() {
             }),
         ),
         (
-            "/admin/v1/mcp_servers",
-            json!({"display_name": "loader-mcp", "url": "https://api.example.com/mcp"}),
+            "mcp_servers",
+            "mcp-loader-1",
+            json!({"name": "loader-mcp", "url": "https://api.example.com/mcp"}),
+        ),
+        (
+            "a2a_agents",
+            "a2a-loader-1",
+            json!({"name": "loader-a2a", "url": "https://agents.example.com/a2a"}),
         ),
     ];
-    for (uri, body) in writes {
-        let app = build_router(state.clone());
-        let resp = app.oneshot(auth_post(uri, body)).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK, "POST {uri}");
+    for (kind, id, doc) in &writes {
+        seed(&mut client, &prefix, kind, id, doc).await;
     }
 
     // Read the raw etcd entries back via a fresh client and run them
     // through the loader.
-    let client = etcd_client::Client::connect([url.as_str()], None)
-        .await
-        .expect("loader-side etcd client");
+    let client = etcd_client_for(&url).await;
     let mut kv = client.kv_client();
     let resp = kv
         .get(
@@ -381,19 +501,19 @@ async fn loader_picks_up_every_admin_write() {
     let (snap, stats) = aisix_etcd::build_snapshot(&prefix, &raw_entries);
     assert_eq!(
         stats.schema_rejected, 0,
-        "loader rejected an admin-written row: {stats:?}"
+        "loader rejected a canonical document: {stats:?}"
     );
     assert_eq!(
         stats.parse_rejected, 0,
-        "loader couldn't parse an admin-written row: {stats:?}"
+        "loader couldn't parse a canonical document: {stats:?}"
     );
     assert_eq!(
         stats.unknown_kind, 0,
-        "loader didn't recognise a kind written by the admin path — \
-         likely a subkey-constant drift between EtcdConfigStore::*_SUBKEY \
-         and the match arms in aisix_etcd::loader: {stats:?}"
+        "loader didn't recognise a kind in the documented key layout — \
+         likely a subkey drift against the match arms in \
+         aisix_etcd::loader: {stats:?}"
     );
-    assert_eq!(stats.accepted, 7, "expected 7 entries; got {stats:?}");
+    assert_eq!(stats.accepted, 8, "expected 8 entries; got {stats:?}");
 
     // Each resource table should now have exactly one entry.
     assert_eq!(snap.models.len(), 1);
@@ -403,4 +523,5 @@ async fn loader_picks_up_every_admin_write() {
     assert_eq!(snap.cache_policies.len(), 1);
     assert_eq!(snap.observability_exporters.len(), 1);
     assert_eq!(snap.mcp_servers.len(), 1);
+    assert_eq!(snap.a2a_agents.len(), 1);
 }

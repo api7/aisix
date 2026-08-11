@@ -68,14 +68,15 @@ guardrails:
 `;
 }
 
-describe("file resource source: smoke + admin write-guard", () => {
+describe("file resource source: smoke + read-only admin surface", () => {
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
 
   beforeAll(async () => {
     upstream = await startOpenAiUpstream();
-    // Held-back: exercises the file-mode admin write-rejection (409), so
-    // the admin listener stays bound (the suite default is now admin-off).
+    // Exercises the file-mode admin read surface (and pins that the
+    // removed write endpoints stay gone), so the admin listener stays
+    // bound (the suite default is admin-off).
     app = await spawnApp({
       admin: true,
       resourcesFile: fileModeResources(upstream.baseUrl),
@@ -130,8 +131,8 @@ describe("file resource source: smoke + admin write-guard", () => {
   test("playground forwards through the proxy stack in file mode", async () => {
     if (!app) throw new Error("setup failed");
     // The playground endpoint lives on the admin listener but
-    // authenticates with a *proxy* caller key and must not be caught
-    // by the file-managed write guard.
+    // authenticates with a *proxy* caller key — a POST that must keep
+    // working on the otherwise read-only admin listener.
     const res = await fetch(`${app.adminUrl}/playground/chat/completions`, {
       method: "POST",
       headers: {
@@ -150,7 +151,7 @@ describe("file resource source: smoke + admin write-guard", () => {
     expect(body.choices[0]?.message.role).toBe("assistant");
   });
 
-  test("admin write endpoints answer 409 file-managed; reads serve the file contents", async () => {
+  test("admin surface is read-only: reads serve the file contents, writes answer 405, rotate 404", async () => {
     if (!app) throw new Error("setup failed");
     const auth = { authorization: `Bearer ${app.adminKey}` };
 
@@ -163,7 +164,8 @@ describe("file resource source: smoke + admin write-guard", () => {
       "file-forbidden",
     ]);
 
-    // POST is refused with a clear 409 naming the file.
+    // The write endpoints were removed: the routes serve GET only, so
+    // POST/DELETE answer 405 with an Allow header advertising GET.
     const postRes = await fetch(`${app.adminUrl}/admin/v1/models`, {
       method: "POST",
       headers: { ...auth, "content-type": "application/json" },
@@ -174,38 +176,41 @@ describe("file resource source: smoke + admin write-guard", () => {
         provider_key_id: "11111111-1111-1111-1111-111111111111",
       }),
     });
-    expect(postRes.status).toBe(409);
-    const postBody = (await postRes.json()) as { error_msg: string };
-    expect(postBody.error_msg).toContain("file-managed");
-    expect(postBody.error_msg).toContain(app.resourcesPath!);
+    expect(postRes.status).toBe(405);
+    expect(postRes.headers.get("allow")).toContain("GET");
+    await postRes.text();
 
     // The refused write did not change the resource set.
     const relist = await fetch(`${app.adminUrl}/admin/v1/models`, { headers: auth });
     expect(((await relist.json()) as unknown[]).length).toBe(2);
 
-    // DELETE and rotate are covered by the same guard.
     const delRes = await fetch(`${app.adminUrl}/admin/v1/models/any-id`, {
       method: "DELETE",
       headers: auth,
     });
-    expect(delRes.status).toBe(409);
+    expect(delRes.status).toBe(405);
+    expect(delRes.headers.get("allow")).toContain("GET");
+    await delRes.text();
+
+    // The rotate route was removed outright (it was POST-only), so the
+    // path no longer exists at all.
     const rotateRes = await fetch(`${app.adminUrl}/admin/v1/api_keys/any-id/rotate`, {
       method: "POST",
       headers: auth,
     });
-    expect(rotateRes.status).toBe(409);
+    expect(rotateRes.status).toBe(404);
+    await rotateRes.text();
 
-    // Auth ordering: an UNAUTHENTICATED write still gets 401, and the
-    // 401 body must not leak the resources-file path (that detail is
-    // only for authenticated admins).
+    // Method routing answers before auth: an unauthenticated write gets
+    // the same 405 — there is no write endpoint left to protect, and
+    // the 405 body carries no resources-file detail to leak.
     const unauthed = await fetch(`${app.adminUrl}/admin/v1/models`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ display_name: "nope" }),
     });
-    expect(unauthed.status).toBe(401);
-    const unauthedBody = (await unauthed.json()) as { error_msg: string };
-    expect(unauthedBody.error_msg).not.toContain(app.resourcesPath!);
+    expect(unauthed.status).toBe(405);
+    expect((await unauthed.text())).not.toContain(app.resourcesPath!);
   });
 
   test("file-defined guardrail fires on matching input", async () => {
