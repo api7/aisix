@@ -281,22 +281,22 @@ describe("claim mapping e2e: verified claims resolve to an existing api key", ()
       resolve: { api_key_id: frozenKey.id },
     });
 
-    // Probe the LAST-written rule (`frozen-dept`, distinguishable by
-    // its error code flipping from jwt_identity_unmapped to
-    // api_key_disabled): watch events apply in revision order, so the
-    // final seed being live implies every earlier one is too. Probing
-    // the first rule would leave a window where later rules haven't
-    // landed yet.
+    // Readiness gate: a dedicated probe key seeded LAST. Watch events
+    // apply in revision order, so this key authenticating implies every
+    // earlier seed (all rules included) is live — without the gate
+    // exercising claim-mapping resolution itself, which is the behavior
+    // the tests below assert (a resolution regression must fail a
+    // targeted assertion, not a harness timeout).
+    await seed.createApiKey({
+      key_hash: createHash("sha256").update("sk-cm-ready-probe").digest("hex"),
+      allowed_models: [],
+    });
     await waitConfigPropagation(async () => {
-      const res = await chat(
-        app!,
-        idp!.sign(financeClaims({ department: "frozen" })),
-      );
-      if (res.status !== 401) {
-        await res.text();
-        return false;
-      }
-      return (await errorCode(res)) === "api_key_disabled";
+      const res = await fetch(`${app!.proxyUrl}/v1/models`, {
+        headers: { authorization: "Bearer sk-cm-ready-probe" },
+      });
+      await res.text();
+      return res.status === 200;
     });
   });
 

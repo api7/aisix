@@ -171,14 +171,8 @@ fn key_for_subject(
         e.value.jwt_subject.as_deref() == Some(subject)
             && e.value.jwt_provider.as_deref() == Some(provider_name)
     });
-    if ambiguous {
-        tracing::warn!(
-            target: "aisix::auth",
-            provider = %clip(provider_name),
-            "two API keys share one jwt binding; failing closed — the identity \
-             is ambiguous and neither key's limits can be applied",
-        );
-    }
+    // Ambiguity is not logged here: the caller's `deny` site carries the
+    // full request context (issuer, subject, route, source ip) in one line.
     (found, ambiguous)
 }
 
@@ -245,7 +239,17 @@ pub(crate) async fn authenticate_jwt(
     let d = Denier { state, ctx };
     let header = match jsonwebtoken::decode_header(token) {
         Ok(h) => h,
-        Err(_) => return Err(deny(d, "jwt_malformed", "", None, ProxyError::JwtInvalid)),
+        Err(_) => {
+            return Err(deny(
+                d,
+                "jwt_malformed",
+                "",
+                None,
+                None,
+                None,
+                ProxyError::JwtInvalid,
+            ))
+        }
     };
     let kid = header.kid.clone();
 
@@ -255,6 +259,8 @@ pub(crate) async fn authenticate_jwt(
             "jwt_missing_issuer",
             "",
             kid.as_deref(),
+            None,
+            None,
             ProxyError::JwtInvalid,
         ));
     };
@@ -265,6 +271,8 @@ pub(crate) async fn authenticate_jwt(
             "jwt_untrusted_issuer",
             &iss,
             kid.as_deref(),
+            None,
+            None,
             ProxyError::JwtInvalid,
         ));
     };
@@ -276,6 +284,8 @@ pub(crate) async fn authenticate_jwt(
             "jwt_alg_not_allowed",
             &iss,
             kid.as_deref(),
+            None,
+            None,
             ProxyError::JwtInvalid,
         ));
     }
@@ -296,6 +306,8 @@ pub(crate) async fn authenticate_jwt(
                 "jwks_unavailable",
                 &iss,
                 kid.as_deref(),
+                None,
+                None,
                 ProxyError::JwksUnavailable,
             ));
         }
@@ -315,6 +327,8 @@ pub(crate) async fn authenticate_jwt(
                 "jwks_unavailable",
                 &iss,
                 kid.as_deref(),
+                None,
+                None,
                 ProxyError::JwksUnavailable,
             ));
         }
@@ -334,6 +348,8 @@ pub(crate) async fn authenticate_jwt(
             "jwt_unknown_kid",
             &iss,
             kid.as_deref(),
+            None,
+            None,
             ProxyError::JwtInvalid,
         ));
     }
@@ -341,7 +357,7 @@ pub(crate) async fn authenticate_jwt(
     // ── Signature + registered claims ────────────────────────────────
     let claims = match validate_with_keys(token, header.alg, prov, &candidates) {
         Ok(c) => c,
-        Err((reason, err)) => return Err(deny(d, reason, &iss, kid.as_deref(), err)),
+        Err((reason, err)) => return Err(deny(d, reason, &iss, kid.as_deref(), None, None, err)),
     };
 
     // ── Provider claim requirements ──────────────────────────────────
@@ -351,6 +367,8 @@ pub(crate) async fn authenticate_jwt(
             reason,
             &iss,
             kid.as_deref(),
+            None,
+            None,
             ProxyError::JwtClaimsRejected,
         ));
     }
@@ -362,6 +380,8 @@ pub(crate) async fn authenticate_jwt(
             "jwt_identity_claim_missing",
             &iss,
             kid.as_deref(),
+            None,
+            None,
             ProxyError::JwtIdentityUnmapped,
         ));
     };
@@ -377,19 +397,15 @@ pub(crate) async fn authenticate_jwt(
     // grants.
     let (bound, ambiguous) = key_for_subject(snapshot, &prov.name, subject);
     if ambiguous {
-        tracing::warn!(
-            target: "aisix::auth",
-            method = "jwt",
-            reason = "jwt_binding_ambiguous",
-            provider = %clip(&prov.name),
-            issuer = %clip(&iss),
-            subject = ?clip(subject),
-            "rejected inbound JWT: two API keys claim this identity's binding",
-        );
-        state
-            .metrics
-            .record_auth_decision("jwt", false, "jwt_binding_ambiguous");
-        return Err(ProxyError::JwtIdentityUnmapped);
+        return Err(deny(
+            d,
+            "jwt_binding_ambiguous",
+            &iss,
+            kid.as_deref(),
+            Some(subject),
+            None,
+            ProxyError::JwtIdentityUnmapped,
+        ));
     }
     let (entry, claim_mapping) = match bound {
         Some(entry) => (entry, None),
@@ -399,41 +415,28 @@ pub(crate) async fn authenticate_jwt(
                     .apikeys
                     .get_by_id(&mapping.value.resolve.api_key_id)
                 else {
-                    tracing::warn!(
-                        target: "aisix::auth",
-                        method = "jwt",
-                        reason = "claim_mapping_target_missing",
-                        provider = %clip(&prov.name),
-                        issuer = %clip(&iss),
-                        subject = ?clip(subject),
-                        claim_mapping = %clip(&mapping.value.name),
-                        "rejected inbound JWT: the matched claim mapping resolves to \
-                         an api key that does not exist",
-                    );
-                    state.metrics.record_auth_decision(
-                        "jwt",
-                        false,
+                    return Err(deny(
+                        d,
                         "claim_mapping_target_missing",
-                    );
-                    return Err(ProxyError::JwtIdentityUnmapped);
+                        &iss,
+                        kid.as_deref(),
+                        Some(subject),
+                        Some(&mapping.value.name),
+                        ProxyError::JwtIdentityUnmapped,
+                    ));
                 };
                 (entry, Some(mapping.value.name.clone()))
             }
             None => {
-                tracing::warn!(
-                    target: "aisix::auth",
-                    method = "jwt",
-                    reason = "jwt_identity_unmapped",
-                    provider = %clip(&prov.name),
-                    issuer = %clip(&iss),
-                    subject = ?clip(subject),
-                    "rejected inbound JWT: no API key binds this identity to this \
-                     provider and no claim mapping matched",
-                );
-                state
-                    .metrics
-                    .record_auth_decision("jwt", false, "jwt_identity_unmapped");
-                return Err(ProxyError::JwtIdentityUnmapped);
+                return Err(deny(
+                    d,
+                    "jwt_identity_unmapped",
+                    &iss,
+                    kid.as_deref(),
+                    Some(subject),
+                    None,
+                    ProxyError::JwtIdentityUnmapped,
+                ));
             }
         },
     };
@@ -445,6 +448,8 @@ pub(crate) async fn authenticate_jwt(
             "key_disabled",
             &iss,
             kid.as_deref(),
+            None,
+            None,
             ProxyError::ApiKeyDisabled,
         ));
     }
@@ -454,6 +459,8 @@ pub(crate) async fn authenticate_jwt(
             "key_expired",
             &iss,
             kid.as_deref(),
+            None,
+            None,
             ProxyError::ApiKeyExpired,
         ));
     }
@@ -507,6 +514,8 @@ fn deny(
     reason: &'static str,
     issuer: &str,
     kid: Option<&str>,
+    subject: Option<&str>,
+    claim_mapping: Option<&str>,
     err: ProxyError,
 ) -> ProxyError {
     let Denier { state, ctx } = d;
@@ -535,6 +544,8 @@ fn deny(
             reason = %reason,
             issuer = ?clip(issuer),
             kid = ?clip(kid.unwrap_or("")),
+            subject = ?subject.map(clip),
+            claim_mapping = ?claim_mapping.map(clip),
             http_method = %ctx.method,
             path = %ctx.path,
             request_id = %ctx.request_id,
