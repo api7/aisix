@@ -50,6 +50,14 @@ proxy:
   # file: AISIX_PROXY__THREAD_PER_CORE, AISIX_PROXY__WORKERS.
   # thread_per_core: true
   # workers: 4
+  # Headers a caller may hand the gateway its own request id in; that id
+  # then becomes the x-aisix-request-id response header, the request_id on
+  # every attempt's usage event, and what the upstream sees. Defaults to
+  # ["x-aisix-request-id"]. Add x-request-id only if the gateway is NOT
+  # behind a proxy that stamps it. Comma-separated from the environment:
+  # AISIX_PROXY__REQUEST_ID__ACCEPT_HEADERS=x-aisix-request-id,x-request-id
+  # request_id:
+  #   accept_headers: ["x-aisix-request-id"]
   # Entry-level URL rewriting (first matching rule wins; `match` runs on
   # the raw, percent-encoded path; `rewrite` replaces the matched portion,
   # $1 = capture group; the query string is preserved). Lets clients keep

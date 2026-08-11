@@ -379,6 +379,7 @@ mod tests {
             request_body_limit_bytes: 1 << 20,
             tls: None,
             real_ip: Default::default(),
+            request_id: Default::default(),
             url_rewrites: Vec::new(),
         };
         crate::build_router(

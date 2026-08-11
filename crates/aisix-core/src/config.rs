@@ -412,6 +412,10 @@ pub struct ProxyConfig {
     /// an L7 LB / ingress that sets `x-forwarded-for`.
     #[serde(default)]
     pub real_ip: RealIpConfig,
+    /// Which inbound headers a caller may hand the gateway its own
+    /// request id in (AISIX-Cloud#1288).
+    #[serde(default)]
+    pub request_id: RequestIdConfig,
     /// Serve the proxy from independent worker threads — each with its
     /// own runtime, its own `SO_REUSEPORT` listener on `addr`, and its
     /// own upstream connection pool — instead of one shared runtime
@@ -664,6 +668,51 @@ impl RealIpConfig {
                     .or_else(|_| s.parse::<std::net::IpAddr>().map(ipnet::IpNet::from))
                     .map_err(|_| s.clone())
             })
+            .collect()
+    }
+}
+
+/// Where the gateway will accept a caller-supplied request id
+/// (AISIX-Cloud#1288).
+///
+/// The id a caller sends becomes THE id for the request: the
+/// `x-aisix-request-id` response header, every attempt's usage event, the
+/// access log, and the `x-aisix-request-id` the upstream sees. That is what
+/// lets a caller find a gateway request by an id its own business logs
+/// already carry, instead of maintaining a second mapping.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct RequestIdConfig {
+    /// Inbound headers consulted, in order; the first one carrying an
+    /// acceptable value wins. An unacceptable or absent value falls back
+    /// to a freshly minted UUID, which is the pre-#1288 behaviour.
+    ///
+    /// Defaults to the gateway's own `x-aisix-request-id` alone. Add
+    /// `x-request-id` to honour the de-facto standard header — deliberately
+    /// NOT a default, because every reverse proxy and ingress in front of
+    /// the gateway stamps that header automatically, so enabling it makes
+    /// the correlation id come from the infrastructure rather than from the
+    /// caller unless the operator meant it to. Set to `[]` to refuse
+    /// caller-supplied ids entirely and always mint a UUID.
+    pub accept_headers: Vec<String>,
+}
+
+impl Default for RequestIdConfig {
+    fn default() -> Self {
+        Self {
+            accept_headers: vec!["x-aisix-request-id".into()],
+        }
+    }
+}
+
+impl RequestIdConfig {
+    /// Parse `accept_headers` into header names, rejecting malformed
+    /// entries. Header names are case-insensitive on the wire, so the
+    /// parse also lowercases and gives the proxy ready-to-use keys.
+    pub fn parse_accept_headers(&self) -> Result<Vec<http::HeaderName>, String> {
+        self.accept_headers
+            .iter()
+            .map(|s| s.trim().parse::<http::HeaderName>().map_err(|_| s.clone()))
             .collect()
     }
 }
@@ -1304,6 +1353,7 @@ impl Config {
                 .with_list_parse_key("etcd.endpoints")
                 .with_list_parse_key("admin.admin_keys")
                 .with_list_parse_key("proxy.real_ip.trusted_proxies")
+                .with_list_parse_key("proxy.request_id.accept_headers")
                 .with_list_parse_key("observability.metrics.buckets.request_e2e_latency")
                 .with_list_parse_key("observability.metrics.buckets.request_ttft")
                 .with_list_parse_key("observability.metrics.buckets.guardrail_latency")
@@ -1432,6 +1482,14 @@ impl Config {
                 "proxy.real_ip.trusted_proxies invalid CIDR/IP: {bad}"
             )));
         }
+        // A malformed name here would otherwise just never match any
+        // inbound header, so the operator would see caller-supplied
+        // request ids silently ignored with nothing to point at.
+        if let Err(bad) = self.proxy.request_id.parse_accept_headers() {
+            return Err(BootstrapError::Config(format!(
+                "proxy.request_id.accept_headers invalid HTTP header name: {bad}"
+            )));
+        }
         // Zero workers would bind no listener at all: the proxy would
         // boot, report healthy, and refuse every connection.
         if self.proxy.workers == Some(0) {
@@ -1538,6 +1596,91 @@ admin:
         assert!(!cfg.proxy.real_ip.recursive);
         assert_eq!(cfg.proxy.real_ip.header, "x-forwarded-for");
         assert!(cfg.proxy.real_ip.parse_trusted().unwrap().is_empty());
+    }
+
+    #[test]
+    fn request_id_accept_headers_default_to_the_gateway_header_only() {
+        // The default is the contract from AISIX-Cloud#1288: a caller can
+        // reuse an id through OUR header, and `x-request-id` — which every
+        // ingress in front of the gateway stamps — stays opt-in.
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+  prefix: "/aisix"
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+"#,
+        );
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert_eq!(
+            cfg.proxy.request_id.accept_headers,
+            vec!["x-aisix-request-id"]
+        );
+        assert_eq!(
+            cfg.proxy
+                .request_id
+                .parse_accept_headers()
+                .unwrap()
+                .iter()
+                .map(|h| h.as_str().to_string())
+                .collect::<Vec<_>>(),
+            vec!["x-aisix-request-id"],
+        );
+    }
+
+    #[test]
+    fn request_id_accept_headers_are_configurable_and_validated() {
+        let with = |block: &str| {
+            write_yaml(&format!(
+                r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+  prefix: "/aisix"
+proxy:
+  addr: "0.0.0.0:3000"
+{block}
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+"#
+            ))
+        };
+
+        // Opting `x-request-id` in, and header names normalised to lower
+        // case so the lookup matches however the caller cased it.
+        let f =
+            with("  request_id:\n    accept_headers: [\"X-Aisix-Request-Id\", \"x-request-id\"]\n");
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert_eq!(
+            cfg.proxy
+                .request_id
+                .parse_accept_headers()
+                .unwrap()
+                .iter()
+                .map(|h| h.as_str().to_string())
+                .collect::<Vec<_>>(),
+            vec!["x-aisix-request-id", "x-request-id"],
+        );
+
+        // An empty list refuses caller-supplied ids entirely.
+        let f = with("  request_id:\n    accept_headers: []\n");
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert!(cfg.proxy.request_id.accept_headers.is_empty());
+
+        // A malformed name fails the boot instead of silently never
+        // matching an inbound header.
+        let f = with("  request_id:\n    accept_headers: [\"not a header\"]\n");
+        let err = Config::load_from_path(Some(f.path()))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("proxy.request_id.accept_headers"),
+            "expected the offending key in the error, got: {err}"
+        );
     }
 
     #[test]
@@ -1691,7 +1834,7 @@ admin:
         // registration. `proxy.real_ip.trusted_proxies` was registered
         // nowhere and shipped unreachable behind exactly that gap.
         const CHILD_MARKER: &str = "TEST_ENV_SEQUENCE_FIELDS_CHILD";
-        const ENV: [(&str, &str); 8] = [
+        const ENV: [(&str, &str); 9] = [
             ("AISIX_ETCD__ENDPOINTS", "http://127.0.0.1:2379"),
             ("AISIX_ADMIN__ADMIN_KEYS", "k1,k2"),
             ("AISIX_PROXY__ADDR", "0.0.0.0:3000"),
@@ -1699,6 +1842,10 @@ admin:
             (
                 "AISIX_PROXY__REAL_IP__TRUSTED_PROXIES",
                 "10.0.0.0/8,127.0.0.1/32",
+            ),
+            (
+                "AISIX_PROXY__REQUEST_ID__ACCEPT_HEADERS",
+                "x-aisix-request-id,x-request-id",
             ),
             (
                 "AISIX_PROXY__URL_REWRITES",
@@ -1743,6 +1890,10 @@ admin:
         assert_eq!(
             cfg.proxy.real_ip.trusted_proxies,
             vec!["10.0.0.0/8".to_string(), "127.0.0.1/32".to_string()],
+        );
+        assert_eq!(
+            cfg.proxy.request_id.accept_headers,
+            vec!["x-aisix-request-id".to_string(), "x-request-id".to_string()],
         );
         assert_eq!(cfg.proxy.url_rewrites.len(), 1);
         assert_eq!(cfg.observability.metrics.client_type_rules.len(), 1);

@@ -1834,6 +1834,7 @@ mod tests {
             addr: "127.0.0.1:0".into(),
             request_body_limit_bytes: 1_048_576,
             real_ip: Default::default(),
+            request_id: Default::default(),
             url_rewrites: Vec::new(),
             tls: None,
             thread_per_core: None,
@@ -2234,9 +2235,11 @@ mod tests {
         }
         assert_eq!(mgmt, 1);
         let agg = agg.expect("aggregated batch event must be emitted");
-        // The telemetry contract requires a UUID request_id (a non-UUID
-        // event 400s the whole flush on cp-api, dropping co-flushed
-        // events), and the id must stay deterministic for re-emission.
+        // cp-api accepts any visible-ASCII request_id since
+        // AISIX-Cloud#1288, so this is no longer a wire constraint — but a
+        // synthesised batch id has no caller behind it to correlate with,
+        // and minting a UUID keeps it distinguishable from a caller's own
+        // id in /logs. It must also stay deterministic for re-emission.
         uuid::Uuid::parse_str(&agg.request_id)
             .expect("batch attribution request_id must be a UUID");
         assert_eq!(

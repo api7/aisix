@@ -31,6 +31,9 @@ sha2.workspace = true
 hex.workspace = true
 # Trusted-proxy CIDR parsing/validation for proxy.real_ip (#492)
 ipnet.workspace = true
+# Header-name parsing/validation for proxy.request_id.accept_headers
+# (AISIX-Cloud#1288) — same role ipnet plays for real_ip.
+http.workspace = true
 # filesource: resources.yaml parsing + deterministic UUIDv5 resource ids
 yaml-rust2.workspace = true
 uuid.workspace = true

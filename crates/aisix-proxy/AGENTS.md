@@ -115,3 +115,25 @@ Whichever shape, the group's own gate stays enforced pre-dispatch — the two ti
 are additive, not either/or — and a caller-visible rejection must keep the
 direct-model envelope (`ModelIpRestricted` names no model and no CIDR), so a group
 never becomes a probe for which members exist.
+
+## `request_id` is caller-controlled input, not a gateway-minted UUID
+
+Since AISIX-Cloud#1288 a caller can supply the request id via a configured inbound
+header and `request_id::ensure_request_id` adopts it verbatim, so every
+`ClientContext.request_id` / `RequestId` value downstream may be a string the
+caller chose. It is only guaranteed to be 1..=256 bytes of visible ASCII
+(`request_id::is_acceptable`) — **not** a UUID, and not unique: nothing stops two
+requests carrying the same id, so an id is a grouping key, never an identity.
+
+New code that consumes it must therefore treat it as untrusted: escape it for the
+sink rather than interpolating it raw (a URL, a file path, a shell argument, a log
+format that isn't structured). Never make it a Prometheus label — unbounded
+cardinality straight from the caller. The existing sinks are already safe and show
+the shape: an OTLP span attribute, an HTTP header value, a `tracing` field, a
+parameterised SQL bind.
+
+`is_acceptable` is half of a cross-repo contract with cp-api's `validRequestID`
+(AISIX-Cloud `internal/dpmgr/api/telemetry.go`): tightening this side alone
+silently strands ids, and tightening THAT side alone silently drops the request
+from billing and /logs while the caller still gets a 200 carrying the id. Change
+both or neither.

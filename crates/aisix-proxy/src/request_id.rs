@@ -1,18 +1,73 @@
-use axum::extract::Request;
+use axum::extract::{Request, State};
 use axum::http::{HeaderName, HeaderValue};
 use axum::middleware::Next;
 use axum::response::Response;
 use tracing::Instrument as _;
 use uuid::Uuid;
 
+use crate::state::ProxyState;
+
 /// Response header carrying the gateway request id so a client can
 /// correlate a response to its usage event (both key on this id).
 pub(crate) const REQUEST_ID_HEADER: HeaderName = HeaderName::from_static("x-aisix-request-id");
 
-/// Gateway correlation IDs may be written to telemetry fields backed by UUID
-/// columns, so keep handler request IDs as plain UUID strings.
+/// The id minted when the caller supplies none. A UUID rather than
+/// something shorter so an id the gateway generated is recognisable as
+/// such next to one a caller chose.
 pub(crate) fn new_request_id() -> String {
     Uuid::new_v4().to_string()
+}
+
+/// Longest caller-supplied request id accepted. Matches cp-api's
+/// `maxRequestIDLen`.
+const MAX_REQUEST_ID_LEN: usize = 256;
+
+/// Whether a caller-supplied request id may be used as-is.
+///
+/// MUST stay byte-identical to cp-api's `validRequestID`
+/// (AISIX-Cloud internal/dpmgr/api/telemetry.go). This side decides what
+/// to hand back to the caller and stamp on every usage event; that side
+/// decides what to persist. If cp-api were stricter, a request the caller
+/// was told succeeded — with this id in its `x-aisix-request-id` — would be
+/// dropped at telemetry ingest and vanish from billing and /logs, which is
+/// the failure AISIX-Cloud#1288 exists to remove.
+///
+/// Visible ASCII only (0x21..=0x7E): no control characters, no spaces, no
+/// non-ASCII. Covers every id shape in the wild (UUID, ULID, `req_abc123`,
+/// nginx `$request_id`) while keeping the value safe to echo back onto the
+/// wire verbatim — in a response header, in the upstream request, and in a
+/// telemetry field.
+fn is_acceptable(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAX_REQUEST_ID_LEN
+        && id.bytes().all(|b| (0x21..=0x7E).contains(&b))
+}
+
+/// The caller's request id, if they sent an acceptable one in a header the
+/// operator allows it from. Headers are consulted in configured order and
+/// the first acceptable value wins.
+///
+/// An unacceptable value is ignored rather than rejected: it arrives from
+/// callers whose tracing predates the gateway, and failing their requests
+/// over a correlation id would be a worse outcome than correlating them by
+/// a minted one. The fallback is logged at debug so an operator chasing a
+/// missing id has something to find.
+fn client_request_id(headers: &axum::http::HeaderMap, accept: &[HeaderName]) -> Option<String> {
+    for name in accept {
+        let Some(raw) = headers.get(name) else {
+            continue;
+        };
+        match raw.to_str() {
+            Ok(id) if is_acceptable(id) => return Some(id.to_owned()),
+            _ => {
+                tracing::debug!(
+                    header = %name,
+                    "ignoring unusable client request id; minting one instead"
+                );
+            }
+        }
+    }
+    None
 }
 
 /// The per-request correlation id, stashed in the request extensions by
@@ -23,9 +78,22 @@ pub(crate) fn new_request_id() -> String {
 #[derive(Debug, Clone)]
 pub(crate) struct RequestId(pub String);
 
-/// Ingress+egress middleware that gives every proxied response an
-/// `x-aisix-request-id` header derived from the same id the handler
-/// attributes its usage event to.
+/// Ingress+egress middleware that resolves the request id — the caller's
+/// own when they supplied one, a fresh UUID otherwise — and gives every
+/// proxied response an `x-aisix-request-id` header derived from the same id
+/// the handler attributes its usage event to.
+///
+/// Reusing the caller's id (AISIX-Cloud#1288) happens HERE, at the single
+/// mint point, which is what makes it hold everywhere at once: the response
+/// header, every retry/failover attempt's usage event, the access log, the
+/// tracing span, and the `x-aisix-request-id` each bridge sends upstream all
+/// read this one value. A caller can therefore find a gateway request by an
+/// id its own logs already carry, instead of keeping a second mapping.
+///
+/// The caller's copy of the header is still never forwarded upstream by the
+/// `forward_client_headers` allowlist (`x-aisix-` is in
+/// `NEVER_FORWARD_PREFIXES`); the bridges insert this resolved id
+/// themselves, so the upstream sees exactly one value.
 ///
 /// One shared mechanism instead of a per-handler header insert: the
 /// family had drifted (some handlers set it, some didn't — chat /
@@ -48,11 +116,16 @@ pub(crate) struct RequestId(pub String);
 /// Response-body streams (SSE) are polled after this middleware returns,
 /// so they fall outside the span. Generators that moderate streamed
 /// output re-attach it explicitly — see `chat::build_sse_stream`.
-pub(crate) async fn ensure_request_id(mut request: Request, next: Next) -> Response {
+pub(crate) async fn ensure_request_id(
+    State(state): State<ProxyState>,
+    mut request: Request,
+    next: Next,
+) -> Response {
     let id = request
         .extensions()
         .get::<RequestId>()
         .map(|r| r.0.clone())
+        .or_else(|| client_request_id(request.headers(), &state.request_id_accept))
         .unwrap_or_else(new_request_id);
     request.extensions_mut().insert(RequestId(id.clone()));
 
@@ -118,10 +191,72 @@ pub(crate) fn in_request_span<T: 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aisix_core::snapshot::SnapshotHandle;
+    use aisix_core::{AisixSnapshot, ProxyConfig, RequestIdConfig};
+    use aisix_gateway::Hub;
     use axum::response::IntoResponse;
     use axum::routing::get;
     use axum::Router;
+    use std::sync::Arc;
     use tower::ServiceExt;
+
+    fn state_accepting(accept_headers: &[&str]) -> ProxyState {
+        ProxyState::new(
+            SnapshotHandle::new(AisixSnapshot::new()),
+            Arc::new(Hub::new()),
+            &ProxyConfig {
+                addr: "127.0.0.1:0".into(),
+                request_body_limit_bytes: 1_048_576,
+                tls: None,
+                real_ip: Default::default(),
+                request_id: RequestIdConfig {
+                    accept_headers: accept_headers.iter().map(|s| (*s).to_owned()).collect(),
+                },
+                thread_per_core: None,
+                workers: None,
+                url_rewrites: Vec::new(),
+            },
+        )
+    }
+
+    /// The shipped default: the gateway's own header, nothing else.
+    fn default_state() -> ProxyState {
+        state_accepting(
+            &RequestIdConfig::default()
+                .accept_headers
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    fn app_with(state: ProxyState) -> Router {
+        Router::new().route("/", get(echo_extension_id)).layer(
+            axum::middleware::from_fn_with_state(state, ensure_request_id),
+        )
+    }
+
+    /// Drive one request and return (response header, id the handler saw).
+    async fn run(app: Router, headers: &[(&str, &str)]) -> (String, String) {
+        let mut builder = Request::builder().uri("/");
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let resp = app
+            .oneshot(builder.body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let header = resp
+            .headers()
+            .get(&REQUEST_ID_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+            .expect("response must carry x-aisix-request-id");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (header, String::from_utf8(body.to_vec()).unwrap())
+    }
 
     // A handler that echoes the RequestId it sees in the extensions, so
     // the test can prove the middleware exposes the SAME id it stamps on
@@ -144,46 +279,119 @@ mod tests {
 
     #[tokio::test]
     async fn stamps_header_and_matches_the_extension_id() {
-        let app = Router::new()
-            .route("/", get(echo_extension_id))
-            .layer(axum::middleware::from_fn(ensure_request_id));
-
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/")
-                    .body(axum::body::Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        let header = resp
-            .headers()
-            .get(&REQUEST_ID_HEADER)
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_owned)
-            .expect("response must carry x-aisix-request-id");
+        let (header, seen_by_handler) = run(app_with(default_state()), &[]).await;
         assert!(
             uuid::Uuid::parse_str(&header).is_ok(),
             "stamped id must be a UUID, got {header:?}"
         );
-
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let seen_by_handler = String::from_utf8(body.to_vec()).unwrap();
         assert_eq!(
             header, seen_by_handler,
             "response header must equal the id the handler saw (correlation contract)"
         );
     }
 
+    // AISIX-Cloud#1288. The caller's id must become THE id — what the
+    // handler attributes its usage event to AND what comes back on the
+    // response — not merely be echoed back while telemetry uses another.
+    #[tokio::test]
+    async fn reuses_an_acceptable_client_request_id() {
+        for id in [
+            "req_abc123",
+            "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "9f8c2b1e4d7a6f3c0b5e8d1a2c4f7b9e",
+            "4d1f0f4e-9b6a-4a1e-9a0b-1c2d3e4f5a6b",
+        ] {
+            let (header, seen_by_handler) =
+                run(app_with(default_state()), &[("x-aisix-request-id", id)]).await;
+            assert_eq!(header, id, "response header must be the caller's id");
+            assert_eq!(
+                seen_by_handler, id,
+                "the handler (and so the usage event) must see the caller's id"
+            );
+        }
+    }
+
+    // An id the gateway cannot use must NOT fail the request — it degrades
+    // to a minted UUID, which is the pre-#1288 behaviour.
+    #[tokio::test]
+    async fn unusable_client_request_ids_fall_back_to_a_minted_uuid() {
+        let too_long = "a".repeat(MAX_REQUEST_ID_LEN + 1);
+        for id in ["", "req abc", "req\tabc", "请求-1", too_long.as_str()] {
+            let (header, seen_by_handler) =
+                run(app_with(default_state()), &[("x-aisix-request-id", id)]).await;
+            assert!(
+                uuid::Uuid::parse_str(&header).is_ok(),
+                "unusable id {id:?} must degrade to a minted UUID, got {header:?}"
+            );
+            assert_eq!(header, seen_by_handler);
+        }
+    }
+
+    // `x-request-id` is stamped by every ingress in front of the gateway,
+    // so honouring it is opt-in: on the default config it must be ignored.
+    #[tokio::test]
+    async fn x_request_id_is_ignored_unless_configured() {
+        let (header, _) = run(
+            app_with(default_state()),
+            &[("x-request-id", "from-the-ingress")],
+        )
+        .await;
+        assert_ne!(header, "from-the-ingress");
+        assert!(uuid::Uuid::parse_str(&header).is_ok());
+
+        let (header, seen_by_handler) = run(
+            app_with(state_accepting(&["x-aisix-request-id", "x-request-id"])),
+            &[("x-request-id", "from-the-ingress")],
+        )
+        .await;
+        assert_eq!(header, "from-the-ingress");
+        assert_eq!(seen_by_handler, "from-the-ingress");
+    }
+
+    // Configured order is priority order: the gateway's own header wins
+    // over the standard one when a caller sends both.
+    #[tokio::test]
+    async fn first_configured_header_wins() {
+        let (header, _) = run(
+            app_with(state_accepting(&["x-aisix-request-id", "x-request-id"])),
+            &[
+                ("x-request-id", "from-the-ingress"),
+                ("x-aisix-request-id", "from-the-caller"),
+            ],
+        )
+        .await;
+        assert_eq!(header, "from-the-caller");
+
+        // ...and an unusable value in the first header does not shadow a
+        // good value in the next one.
+        let (header, _) = run(
+            app_with(state_accepting(&["x-aisix-request-id", "x-request-id"])),
+            &[
+                ("x-request-id", "from-the-ingress"),
+                ("x-aisix-request-id", "bad value"),
+            ],
+        )
+        .await;
+        assert_eq!(header, "from-the-ingress");
+    }
+
+    // An operator can refuse caller-supplied ids outright.
+    #[tokio::test]
+    async fn empty_accept_headers_always_mints() {
+        let (header, _) = run(
+            app_with(state_accepting(&[])),
+            &[("x-aisix-request-id", "req_abc123")],
+        )
+        .await;
+        assert_ne!(header, "req_abc123");
+        assert!(uuid::Uuid::parse_str(&header).is_ok());
+    }
+
     #[tokio::test]
     async fn preserves_a_handler_set_header() {
-        let app = Router::new()
-            .route("/", get(sets_own_header))
-            .layer(axum::middleware::from_fn(ensure_request_id));
+        let app = Router::new().route("/", get(sets_own_header)).layer(
+            axum::middleware::from_fn_with_state(default_state(), ensure_request_id),
+        );
 
         let resp = app
             .oneshot(

@@ -42,6 +42,13 @@ export interface AppOverrides {
     header?: string;
   };
   /**
+   * `proxy.request_id` block (AISIX-Cloud#1288). Merged into the base
+   * proxy config like `realIp`. Names the inbound headers a caller may
+   * supply its own request id in; omitted, the binary's default
+   * (`["x-aisix-request-id"]`) applies.
+   */
+  requestId?: { accept_headers?: string[] };
+  /**
    * `proxy.url_rewrites` block. Merged into the base proxy config (like
    * `realIp`) so the listener addr is preserved. Entry-level path
    * rewriting: first matching rule wins, `rewrite` replaces the matched
@@ -271,6 +278,7 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
       addr: `127.0.0.1:${proxyPort}`,
       request_body_limit_bytes: overrides.requestBodyLimitBytes ?? 10485760,
       ...(overrides.realIp ? { real_ip: overrides.realIp } : {}),
+      ...(overrides.requestId ? { request_id: overrides.requestId } : {}),
       ...((overrides.threadPerCore ?? suiteThreadPerCore) !== undefined
         ? { thread_per_core: overrides.threadPerCore ?? suiteThreadPerCore }
         : {}),
