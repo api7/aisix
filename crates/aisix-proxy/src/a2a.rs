@@ -458,7 +458,11 @@ async fn dispatch_stream(
     };
     let agent_label = agent.to_string();
 
-    let sse = async_stream::stream! {
+    // Re-attach the request span: the body is polled after the request-id
+    // middleware has returned, so a mid-stream failure would otherwise be
+    // logged without its `request_id` and could not be joined to the rest of
+    // the request (AISIX-Cloud#1060).
+    let sse = crate::request_id::in_request_span(async_stream::stream! {
         let mut events = events;
         while let Some(event) = events.next().await {
             match event {
@@ -520,7 +524,7 @@ async fn dispatch_stream(
         // finished. Either way the caller was handed everything there was.
         guard.call.stream.reached_end = true;
         drop(guard);
-    };
+    });
 
     let mut response = axum::response::Sse::new(sse);
     if let Some(interval) = crate::sse_keepalive::interval() {
@@ -665,8 +669,16 @@ fn a2a_error_envelope(id: Option<serde_json::Value>, message: &str) -> serde_jso
 }
 
 /// Emit a usage event for a single A2A call into the same sink as LLM usage.
-/// A2A calls carry no token cost yet, so token/cost fields stay zero; the event
-/// records who called which agent with which method, the outcome, and latency.
+///
+/// The event records who called which agent with which operation, which task
+/// it touched, the outcome, and latency. Token counts are the gateway's own
+/// reading of the words that passed through — an agent reports none of its
+/// own — and are flagged `usage_estimated`; `cost_usd` stays zero, since what
+/// an agent charges is not something the gateway can know.
+///
+/// This is the chokepoint every A2A path emits through, so the metric
+/// families ride here too: a path that accounts for a call cannot skip
+/// metering it.
 fn emit_a2a_usage(
     state: &ProxyState,
     auth: &AuthenticatedKey,
