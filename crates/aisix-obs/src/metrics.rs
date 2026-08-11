@@ -24,13 +24,11 @@ use metrics_exporter_prometheus::{
     Matcher, PrometheusBuilder, PrometheusHandle, PrometheusRecorder,
 };
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
+use std::hash::Hasher;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::time::Duration;
-
-use parking_lot::RwLock;
 
 /// Metric names (public so the admin `/metrics` handler and tests can
 /// refer to them without typo risk).
@@ -382,8 +380,10 @@ struct MetricsInner {
     recorder: PrometheusRecorder,
     handle: PrometheusHandle,
     proxy_in_flight: Mutex<HashMap<(String, String), i64>>,
-    request_series: RwLock<RequestSeriesCache>,
-    usage_series: RwLock<UsageSeriesCache>,
+    /// Process-unique id prefixed onto every worker-cache key, so
+    /// thread-local entries minted for one instance's recorder can never
+    /// serve another instance (parallel tests build many `Metrics`).
+    instance: u64,
     /// Constant `env_id` label for the SLO latency histograms — one DP
     /// process serves exactly one environment. `"unknown"` when the DP
     /// runs standalone (no control plane).
@@ -403,37 +403,29 @@ struct ConfigLabelState {
     last_stale_kinds: std::collections::HashSet<String>,
 }
 
-const REQUEST_SERIES_CACHE_CAPACITY: usize = 1024;
-const USAGE_SERIES_CACHE_CAPACITY: usize = 1024;
+/// Per-thread cap on each worker-cache map. Label sets are bounded by
+/// construction (operator-configured names, fixed vocabularies), so
+/// production never approaches this; it is a safety valve against an
+/// unforeseen unbounded dimension pinning memory in every worker.
+const WORKER_CACHE_CAPACITY: usize = 1024;
 
+/// Separator joining label values into a worker-cache key — a control
+/// byte that no bounded label vocabulary contains. A value that DOES
+/// contain it (nothing today) falls back to the uncached emit path
+/// rather than risk two label sets aliasing one key.
+const WORKER_KEY_SEP: char = '\u{1f}';
+
+/// The per-request series handles every request-shaped emit resolves
+/// through. Each field registers lazily on first use so the proxy-only
+/// paths never mint `aisix_llm_*` series (and vice versa) — the same
+/// series-sparsity the plain macro path had.
 #[derive(Default)]
-struct RequestSeriesCache {
-    entries: HashMap<u64, Vec<CachedRequestSeries>>,
-    len: usize,
-}
-
-struct CachedRequestSeries {
-    labels: RequestLabelsOwned,
-    handles: RequestSeriesHandles,
-}
-
 struct RequestSeriesHandles {
-    proxy_requests: metrics::Counter,
-    proxy_failed_requests: Option<metrics::Counter>,
-    proxy_duration: metrics::Histogram,
-    llm_requests: metrics::Counter,
-    llm_duration: metrics::Histogram,
-}
-
-#[derive(Default)]
-struct UsageSeriesCache {
-    entries: HashMap<u64, Vec<CachedUsageSeries>>,
-    len: usize,
-}
-
-struct CachedUsageSeries {
-    labels: UsageLabelsOwned,
-    handles: UsageSeriesHandles,
+    proxy_requests: OnceLock<metrics::Counter>,
+    proxy_failed_requests: OnceLock<metrics::Counter>,
+    proxy_duration: OnceLock<metrics::Histogram>,
+    llm_requests: OnceLock<metrics::Counter>,
+    llm_duration: OnceLock<metrics::Histogram>,
 }
 
 /// Usage dimensions are registered independently so a zero-valued token or
@@ -446,157 +438,149 @@ struct UsageSeriesHandles {
     spend_micro_usd: OnceLock<metrics::Counter>,
 }
 
-struct RequestLabelsOwned {
-    endpoint: String,
-    inbound_protocol: String,
-    provider: String,
-    model: String,
-    upstream_model: String,
-    provider_key_id: String,
-    provider_key_name: String,
-    api_key_id: String,
-    team_id: String,
-    user_id: String,
-    user_name: String,
-    stream: bool,
-    is_fallback: bool,
-    status: u16,
-    outcome: RequestOutcome,
+// ── Per-worker handle cache ────────────────────────────────────────────────
+//
+// `metrics::counter!`-family macros rebuild a `Key` (one owned `String` per
+// label), hash it, and probe the recorder's sharded registry on EVERY emit.
+// `metrics::Counter`/`Gauge`/`Histogram` are `Arc`-backed handles wired
+// straight to the series' storage, so registering once per label set and
+// reusing the handle removes all of that from the steady-state path.
+//
+// The cache is `thread_local!`, not shared: this process runs one
+// current-thread runtime per pinned core (thread-per-core), and a shared
+// map — like the two `RwLock` caches this replaced — puts one contended
+// cache line (the lock word) in front of every emit on every worker. The
+// spike for AISIX-Cloud#1259 item 3b measured that shared-lock variant
+// recovering almost nothing (+0.5% throughput) while the thread-local
+// variant recovered +4.4%; per-worker duplication of a bounded handle set
+// is the whole trick.
+//
+// Correctness properties:
+// - Keys are `instance id \x1f site \x1f label values…`, so two `Metrics`
+//   instances on one thread (parallel tests) can never serve each other's
+//   recorder, and one site's entries can never answer another site.
+// - Values never alias: label values are joined with a control byte no
+//   bounded label vocabulary contains, and a value that does contain it
+//   falls back to the uncached emit instead of being cached.
+// - Eviction only drops OUR reference. The series and its value live in
+//   the recorder's registry; re-registering the same labels returns a
+//   handle to the SAME storage, so counts continue exactly where they
+//   left off.
+
+/// FNV-1a, hand-rolled: three instructions per byte, no dependency, and
+/// no DoS surface — every byte hashed here is operator-bounded config
+/// vocabulary, never attacker-chosen cardinality (#451 keeps raw client
+/// strings out of label values by contract).
+struct FnvHasher(u64);
+
+impl Default for FnvHasher {
+    fn default() -> Self {
+        Self(0xcbf2_9ce4_8422_2325)
+    }
 }
 
-impl RequestLabelsOwned {
-    fn new(labels: RequestLabels<'_>) -> Self {
-        Self {
-            endpoint: labels.endpoint.to_string(),
-            inbound_protocol: labels.inbound_protocol.to_string(),
-            provider: labels.provider.to_string(),
-            model: labels.model.to_string(),
-            upstream_model: labels.upstream_model.to_string(),
-            provider_key_id: labels.provider_key_id.to_string(),
-            provider_key_name: labels.provider_key_name.to_string(),
-            api_key_id: labels.api_key_id.to_string(),
-            team_id: labels.team_id.to_string(),
-            user_id: labels.user_id.to_string(),
-            user_name: labels.user_name.to_string(),
-            stream: labels.stream,
-            is_fallback: labels.is_fallback,
-            status: labels.status,
-            outcome: labels.outcome,
+impl Hasher for FnvHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 ^= u64::from(b);
+            self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
         }
     }
+}
 
-    fn matches(&self, labels: RequestLabels<'_>) -> bool {
-        self.endpoint == labels.endpoint
-            && self.inbound_protocol == labels.inbound_protocol
-            && self.provider == labels.provider
-            && self.model == labels.model
-            && self.upstream_model == labels.upstream_model
-            && self.provider_key_id == labels.provider_key_id
-            && self.provider_key_name == labels.provider_key_name
-            && self.api_key_id == labels.api_key_id
-            && self.team_id == labels.team_id
-            && self.user_id == labels.user_id
-            && self.user_name == labels.user_name
-            && self.stream == labels.stream
-            && self.is_fallback == labels.is_fallback
-            && self.status == labels.status
-            && self.outcome == labels.outcome
+type FnvMap<T> = HashMap<Box<str>, T, std::hash::BuildHasherDefault<FnvHasher>>;
+
+/// One worker's handle maps, one per handle shape. Field-per-shape rather
+/// than a value enum so every site gets its concrete handle type back
+/// without a runtime discriminant.
+#[derive(Default)]
+struct WorkerCache {
+    counters: FnvMap<metrics::Counter>,
+    gauges: FnvMap<metrics::Gauge>,
+    histograms: FnvMap<metrics::Histogram>,
+    request_series: FnvMap<RequestSeriesHandles>,
+    usage_series: FnvMap<UsageSeriesHandles>,
+    /// Reused key buffer: the steady-state emit builds its lookup key in
+    /// place and allocates nothing; only a first-sight miss allocates the
+    /// stored `Box<str>`.
+    key_buf: String,
+}
+
+thread_local! {
+    static WORKER_CACHE: std::cell::RefCell<WorkerCache> =
+        std::cell::RefCell::new(WorkerCache::default());
+}
+
+/// Selects which [`WorkerCache`] map a handle shape lives in.
+/// Hands back a handle-shape's map TOGETHER with the built key. The pair
+/// comes from disjoint `WorkerCache` fields, which the per-impl field
+/// split proves to the borrow checker — a `&mut WorkerCache -> &mut map`
+/// signature would pin the whole cache and forbid reading the key.
+trait WorkerCached: Sized {
+    fn slot_with_key(cache: &mut WorkerCache) -> (&mut FnvMap<Self>, &str);
+}
+
+impl WorkerCached for metrics::Counter {
+    fn slot_with_key(cache: &mut WorkerCache) -> (&mut FnvMap<Self>, &str) {
+        (&mut cache.counters, cache.key_buf.as_str())
     }
 }
 
-struct UsageLabelsOwned {
-    endpoint: String,
-    inbound_protocol: String,
-    provider: String,
-    model: String,
-    upstream_model: String,
-    provider_key_id: String,
-    provider_key_name: String,
-    api_key_id: String,
-    team_id: String,
-    user_id: String,
-    user_name: String,
+impl WorkerCached for metrics::Gauge {
+    fn slot_with_key(cache: &mut WorkerCache) -> (&mut FnvMap<Self>, &str) {
+        (&mut cache.gauges, cache.key_buf.as_str())
+    }
 }
 
-impl UsageLabelsOwned {
-    fn new(labels: UsageLabels<'_>) -> Self {
-        Self {
-            endpoint: labels.endpoint.to_string(),
-            inbound_protocol: labels.inbound_protocol.to_string(),
-            provider: labels.provider.to_string(),
-            model: labels.model.to_string(),
-            upstream_model: labels.upstream_model.to_string(),
-            provider_key_id: labels.provider_key_id.to_string(),
-            provider_key_name: labels.provider_key_name.to_string(),
-            api_key_id: labels.api_key_id.to_string(),
-            team_id: labels.team_id.to_string(),
-            user_id: labels.user_id.to_string(),
-            user_name: labels.user_name.to_string(),
+impl WorkerCached for metrics::Histogram {
+    fn slot_with_key(cache: &mut WorkerCache) -> (&mut FnvMap<Self>, &str) {
+        (&mut cache.histograms, cache.key_buf.as_str())
+    }
+}
+
+impl WorkerCached for RequestSeriesHandles {
+    fn slot_with_key(cache: &mut WorkerCache) -> (&mut FnvMap<Self>, &str) {
+        (&mut cache.request_series, cache.key_buf.as_str())
+    }
+}
+
+impl WorkerCached for UsageSeriesHandles {
+    fn slot_with_key(cache: &mut WorkerCache) -> (&mut FnvMap<Self>, &str) {
+        (&mut cache.usage_series, cache.key_buf.as_str())
+    }
+}
+
+/// Writes one emit's label values into the worker-cache key buffer.
+/// Numeric/bool writers exist so `u16` statuses and flags key without a
+/// heap allocation; `dirty` flips when a value contains the separator,
+/// which sends that emit down the uncached path.
+struct WorkerKey<'a> {
+    buf: &'a mut String,
+    dirty: bool,
+}
+
+impl WorkerKey<'_> {
+    fn label(&mut self, value: &str) {
+        if value.contains(WORKER_KEY_SEP) {
+            self.dirty = true;
         }
+        self.buf.push(WORKER_KEY_SEP);
+        self.buf.push_str(value);
     }
 
-    fn matches(&self, labels: UsageLabels<'_>) -> bool {
-        self.endpoint == labels.endpoint
-            && self.inbound_protocol == labels.inbound_protocol
-            && self.provider == labels.provider
-            && self.model == labels.model
-            && self.upstream_model == labels.upstream_model
-            && self.provider_key_id == labels.provider_key_id
-            && self.provider_key_name == labels.provider_key_name
-            && self.api_key_id == labels.api_key_id
-            && self.team_id == labels.team_id
-            && self.user_id == labels.user_id
-            && self.user_name == labels.user_name
-    }
-}
-
-impl RequestSeriesCache {
-    fn get(&self, hash: u64, labels: RequestLabels<'_>) -> Option<&RequestSeriesHandles> {
-        self.entries
-            .get(&hash)?
-            .iter()
-            .find(|entry| entry.labels.matches(labels))
-            .map(|entry| &entry.handles)
+    fn label_u16(&mut self, value: u16) {
+        use std::fmt::Write as _;
+        self.buf.push(WORKER_KEY_SEP);
+        let _ = write!(self.buf, "{value}");
     }
 
-    fn insert(&mut self, hash: u64, labels: RequestLabelsOwned, handles: RequestSeriesHandles) {
-        if self.len >= REQUEST_SERIES_CACHE_CAPACITY {
-            if let Some(evicted_hash) = self.entries.keys().next().copied() {
-                if let Some(evicted) = self.entries.remove(&evicted_hash) {
-                    self.len -= evicted.len();
-                }
-            }
-        }
-        self.entries
-            .entry(hash)
-            .or_default()
-            .push(CachedRequestSeries { labels, handles });
-        self.len += 1;
-    }
-}
-
-impl UsageSeriesCache {
-    fn get(&self, hash: u64, labels: UsageLabels<'_>) -> Option<&UsageSeriesHandles> {
-        self.entries
-            .get(&hash)?
-            .iter()
-            .find(|entry| entry.labels.matches(labels))
-            .map(|entry| &entry.handles)
-    }
-
-    fn insert(&mut self, hash: u64, labels: UsageLabelsOwned, handles: UsageSeriesHandles) {
-        if self.len >= USAGE_SERIES_CACHE_CAPACITY {
-            if let Some(evicted_hash) = self.entries.keys().next().copied() {
-                if let Some(evicted) = self.entries.remove(&evicted_hash) {
-                    self.len -= evicted.len();
-                }
-            }
-        }
-        self.entries
-            .entry(hash)
-            .or_default()
-            .push(CachedUsageSeries { labels, handles });
-        self.len += 1;
+    fn label_bool(&mut self, value: bool) {
+        self.buf.push(WORKER_KEY_SEP);
+        self.buf.push(if value { 't' } else { 'f' });
     }
 }
 
@@ -646,13 +630,13 @@ impl Metrics {
             .expect("bucket lists are validated non-empty")
             .build_recorder();
         let handle = recorder.handle();
+        static NEXT_INSTANCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         Self {
             inner: Arc::new(MetricsInner {
                 recorder,
                 handle,
                 proxy_in_flight: Mutex::new(HashMap::new()),
-                request_series: RwLock::new(RequestSeriesCache::default()),
-                usage_series: RwLock::new(UsageSeriesCache::default()),
+                instance: NEXT_INSTANCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                 env_id: if env_id.is_empty() {
                     "unknown".to_string()
                 } else {
@@ -791,23 +775,42 @@ impl Metrics {
         outcome: RequestOutcome,
         duration: Duration,
     ) {
-        metrics::with_local_recorder(&self.inner.recorder, || {
-            metrics::counter!(
-                M_REQUESTS_TOTAL,
-                "provider" => provider.to_string(),
-                "model" => model.to_string(),
-                "status" => status.to_string(),
-                "outcome" => outcome.as_str().to_string(),
-            )
-            .increment(1);
-            metrics::histogram!(
-                M_REQUEST_DURATION,
-                "provider" => provider.to_string(),
-                "model" => model.to_string(),
-                "status" => status.to_string(),
-            )
-            .record(duration.as_secs_f64());
-        });
+        self.cached_counter(
+            M_REQUESTS_TOTAL,
+            1,
+            |k| {
+                k.label(provider);
+                k.label(model);
+                k.label_u16(status);
+                k.label(outcome.as_str());
+            },
+            || {
+                metrics::counter!(
+                    M_REQUESTS_TOTAL,
+                    "provider" => provider.to_string(),
+                    "model" => model.to_string(),
+                    "status" => status.to_string(),
+                    "outcome" => outcome.as_str().to_string(),
+                )
+            },
+        );
+        self.cached_histogram(
+            M_REQUEST_DURATION,
+            duration.as_secs_f64(),
+            |k| {
+                k.label(provider);
+                k.label(model);
+                k.label_u16(status);
+            },
+            || {
+                metrics::histogram!(
+                    M_REQUEST_DURATION,
+                    "provider" => provider.to_string(),
+                    "model" => model.to_string(),
+                    "status" => status.to_string(),
+                )
+            },
+        );
     }
 
     /// Record one inbound authentication decision on
@@ -815,15 +818,25 @@ impl Metrics {
     /// proxy auth choke point for every credential judgment — allowed
     /// or denied, API-key and JWT paths alike.
     pub fn record_auth_decision(&self, method: &str, allowed: bool, reason: &str) {
-        metrics::with_local_recorder(&self.inner.recorder, || {
-            metrics::counter!(
-                M_AUTH_DECISIONS_TOTAL,
-                "method" => method.to_string(),
-                "result" => if allowed { "allowed" } else { "denied" }.to_string(),
-                "reason" => if reason.is_empty() { "none" } else { reason }.to_string(),
-            )
-            .increment(1);
-        });
+        let result = if allowed { "allowed" } else { "denied" };
+        let reason = if reason.is_empty() { "none" } else { reason };
+        self.cached_counter(
+            M_AUTH_DECISIONS_TOTAL,
+            1,
+            |k| {
+                k.label(method);
+                k.label(result);
+                k.label(reason);
+            },
+            || {
+                metrics::counter!(
+                    M_AUTH_DECISIONS_TOTAL,
+                    "method" => method.to_string(),
+                    "result" => result.to_string(),
+                    "reason" => reason.to_string(),
+                )
+            },
+        );
     }
 
     /// Record one request's guardrail outcome. Called once per request from
@@ -831,18 +844,27 @@ impl Metrics {
     /// `guardrail_blocked` / `guardrail_bypassed_reason` fields. An empty
     /// `bypass_reason` means no bypass occurred.
     pub fn record_guardrail_outcome(&self, blocked: bool, bypass_reason: &str) {
-        metrics::with_local_recorder(&self.inner.recorder, || {
-            if blocked {
-                metrics::counter!(M_GUARDRAIL_BLOCKS_TOTAL).increment(1);
-            }
-            if !bypass_reason.is_empty() {
-                metrics::counter!(
-                    M_GUARDRAIL_BYPASSES_TOTAL,
-                    "reason" => bypass_reason.to_string(),
-                )
-                .increment(1);
-            }
-        });
+        if blocked {
+            self.cached_counter(
+                M_GUARDRAIL_BLOCKS_TOTAL,
+                1,
+                |_| {},
+                || metrics::counter!(M_GUARDRAIL_BLOCKS_TOTAL),
+            );
+        }
+        if !bypass_reason.is_empty() {
+            self.cached_counter(
+                M_GUARDRAIL_BYPASSES_TOTAL,
+                1,
+                |k| k.label(bypass_reason),
+                || {
+                    metrics::counter!(
+                        M_GUARDRAIL_BYPASSES_TOTAL,
+                        "reason" => bypass_reason.to_string(),
+                    )
+                },
+            );
+        }
     }
 
     /// Record one guardrail member execution on
@@ -850,18 +872,30 @@ impl Metrics {
     /// chain fold through the `GuardrailMetricsSink` impl below — once per
     /// member per hook pass, on every handler.
     pub fn record_guardrail_execution(&self, exec: &aisix_core::GuardrailExecution<'_>) {
-        metrics::with_local_recorder(&self.inner.recorder, || {
-            metrics::histogram!(
-                M_GUARDRAIL_LATENCY_SECONDS,
-                "env_id" => self.inner.env_id.clone(),
-                "guardrail" => exec.guardrail_name.to_string(),
-                "kind" => exec.kind.to_string(),
-                "phase" => exec.phase.to_string(),
-                "result" => exec.result.to_string(),
-                "error_type" => exec.error_type.unwrap_or("none").to_string(),
-            )
-            .record(exec.elapsed.as_secs_f64());
-        });
+        // `env_id` is constant per instance and the cache key is already
+        // instance-scoped, so it stays out of the key.
+        self.cached_histogram(
+            M_GUARDRAIL_LATENCY_SECONDS,
+            exec.elapsed.as_secs_f64(),
+            |k| {
+                k.label(exec.guardrail_name);
+                k.label(exec.kind);
+                k.label(exec.phase);
+                k.label(exec.result);
+                k.label(exec.error_type.unwrap_or("none"));
+            },
+            || {
+                metrics::histogram!(
+                    M_GUARDRAIL_LATENCY_SECONDS,
+                    "env_id" => self.inner.env_id.clone(),
+                    "guardrail" => exec.guardrail_name.to_string(),
+                    "kind" => exec.kind.to_string(),
+                    "phase" => exec.phase.to_string(),
+                    "result" => exec.result.to_string(),
+                    "error_type" => exec.error_type.unwrap_or("none").to_string(),
+                )
+            },
+        );
     }
 
     /// Count one rate-limit rejection. `scope` is the exceeded
@@ -872,80 +906,118 @@ impl Metrics {
     /// Recorded at the quota gate, the one point every endpoint funnels
     /// through (AISIX-Cloud#892).
     pub fn record_ratelimit_rejection(&self, scope: &str, layer: &str, policy_id: Option<&str>) {
-        metrics::with_local_recorder(&self.inner.recorder, || {
-            metrics::counter!(
-                M_RATELIMIT_REJECTIONS,
-                "scope" => scope.to_string(),
-                "layer" => layer.to_string(),
-                "policy_id" => policy_id.unwrap_or_default().to_string(),
-            )
-            .increment(1);
-        });
+        let policy_id = policy_id.unwrap_or_default();
+        self.cached_counter(
+            M_RATELIMIT_REJECTIONS,
+            1,
+            |k| {
+                k.label(scope);
+                k.label(layer);
+                k.label(policy_id);
+            },
+            || {
+                metrics::counter!(
+                    M_RATELIMIT_REJECTIONS,
+                    "scope" => scope.to_string(),
+                    "layer" => layer.to_string(),
+                    "policy_id" => policy_id.to_string(),
+                )
+            },
+        );
     }
 
     /// Count one cache-gate outcome. `policy` is the matched policy's
     /// name, `outcome` one of the fixed [`M_CACHE_REQUESTS_TOTAL`]
     /// values.
     pub fn record_cache_event(&self, policy: &str, outcome: &str) {
-        metrics::with_local_recorder(&self.inner.recorder, || {
-            metrics::counter!(
-                M_CACHE_REQUESTS_TOTAL,
-                "policy" => policy.to_string(),
-                "outcome" => outcome.to_string(),
-            )
-            .increment(1);
-        });
+        self.cached_counter(
+            M_CACHE_REQUESTS_TOTAL,
+            1,
+            |k| {
+                k.label(policy);
+                k.label(outcome);
+            },
+            || {
+                metrics::counter!(
+                    M_CACHE_REQUESTS_TOTAL,
+                    "policy" => policy.to_string(),
+                    "outcome" => outcome.to_string(),
+                )
+            },
+        );
     }
 
     /// Record one successful cache semantic-layer embedding call.
     pub fn record_cache_semantic_embed(&self, policy: &str, elapsed: Duration) {
-        metrics::with_local_recorder(&self.inner.recorder, || {
-            metrics::histogram!(
-                M_CACHE_SEMANTIC_EMBED_SECONDS,
-                "policy" => policy.to_string(),
-            )
-            .record(elapsed.as_secs_f64());
-        });
+        self.cached_histogram(
+            M_CACHE_SEMANTIC_EMBED_SECONDS,
+            elapsed.as_secs_f64(),
+            |k| k.label(policy),
+            || {
+                metrics::histogram!(
+                    M_CACHE_SEMANTIC_EMBED_SECONDS,
+                    "policy" => policy.to_string(),
+                )
+            },
+        );
     }
 
     /// Count one failed cache semantic-layer embedding attempt. `cause`
     /// is one of the fixed [`M_CACHE_SEMANTIC_EMBED_FAILURES_TOTAL`]
     /// values.
     pub fn record_cache_semantic_embed_failure(&self, policy: &str, cause: &str) {
-        metrics::with_local_recorder(&self.inner.recorder, || {
-            metrics::counter!(
-                M_CACHE_SEMANTIC_EMBED_FAILURES_TOTAL,
-                "policy" => policy.to_string(),
-                "cause" => cause.to_string(),
-            )
-            .increment(1);
-        });
+        self.cached_counter(
+            M_CACHE_SEMANTIC_EMBED_FAILURES_TOTAL,
+            1,
+            |k| {
+                k.label(policy);
+                k.label(cause);
+            },
+            || {
+                metrics::counter!(
+                    M_CACHE_SEMANTIC_EMBED_FAILURES_TOTAL,
+                    "policy" => policy.to_string(),
+                    "cause" => cause.to_string(),
+                )
+            },
+        );
     }
 
     /// Count one failed semantic-store operation. `op` is one of the
     /// fixed [`M_CACHE_SEMANTIC_STORE_FAILURES_TOTAL`] values.
     pub fn record_cache_semantic_store_failure(&self, policy: &str, op: &str) {
-        metrics::with_local_recorder(&self.inner.recorder, || {
-            metrics::counter!(
-                M_CACHE_SEMANTIC_STORE_FAILURES_TOTAL,
-                "policy" => policy.to_string(),
-                "op" => op.to_string(),
-            )
-            .increment(1);
-        });
+        self.cached_counter(
+            M_CACHE_SEMANTIC_STORE_FAILURES_TOTAL,
+            1,
+            |k| {
+                k.label(policy);
+                k.label(op);
+            },
+            || {
+                metrics::counter!(
+                    M_CACHE_SEMANTIC_STORE_FAILURES_TOTAL,
+                    "policy" => policy.to_string(),
+                    "op" => op.to_string(),
+                )
+            },
+        );
     }
 
     /// Count a request the client abandoned before it produced a response
     /// head. `endpoint` must already be a bounded route template — see
     /// [`M_PROXY_CLIENT_CANCELLED_TOTAL`].
     pub fn record_client_cancelled(&self, endpoint: &str) {
-        metrics::with_local_recorder(&self.inner.recorder, || {
-            metrics::counter!(
-                M_PROXY_CLIENT_CANCELLED_TOTAL,
-                "endpoint" => endpoint.to_string(),
-            )
-            .increment(1);
-        });
+        self.cached_counter(
+            M_PROXY_CLIENT_CANCELLED_TOTAL,
+            1,
+            |k| k.label(endpoint),
+            || {
+                metrics::counter!(
+                    M_PROXY_CLIENT_CANCELLED_TOTAL,
+                    "endpoint" => endpoint.to_string(),
+                )
+            },
+        );
     }
 
     /// Count a request refused by the request-body cap. `endpoint` must
@@ -957,29 +1029,44 @@ impl Metrics {
         inbound_protocol: &str,
         outcome: &str,
     ) {
-        metrics::with_local_recorder(&self.inner.recorder, || {
-            metrics::counter!(
-                M_PROXY_BODY_LIMIT_REJECTIONS_TOTAL,
-                "endpoint" => endpoint.to_string(),
-                "inbound_protocol" => inbound_protocol.to_string(),
-                "outcome" => outcome.to_string(),
-            )
-            .increment(1);
-        });
+        self.cached_counter(
+            M_PROXY_BODY_LIMIT_REJECTIONS_TOTAL,
+            1,
+            |k| {
+                k.label(endpoint);
+                k.label(inbound_protocol);
+                k.label(outcome);
+            },
+            || {
+                metrics::counter!(
+                    M_PROXY_BODY_LIMIT_REJECTIONS_TOTAL,
+                    "endpoint" => endpoint.to_string(),
+                    "inbound_protocol" => inbound_protocol.to_string(),
+                    "outcome" => outcome.to_string(),
+                )
+            },
+        );
     }
 
     pub fn record_tokens(&self, provider: &str, model: &str, total_tokens: u64) {
         if total_tokens == 0 {
             return;
         }
-        metrics::with_local_recorder(&self.inner.recorder, || {
-            metrics::counter!(
-                M_TOKENS_CONSUMED,
-                "provider" => provider.to_string(),
-                "model" => model.to_string(),
-            )
-            .increment(total_tokens);
-        });
+        self.cached_counter(
+            M_TOKENS_CONSUMED,
+            total_tokens,
+            |k| {
+                k.label(provider);
+                k.label(model);
+            },
+            || {
+                metrics::counter!(
+                    M_TOKENS_CONSUMED,
+                    "provider" => provider.to_string(),
+                    "model" => model.to_string(),
+                )
+            },
+        );
     }
 
     pub fn increment_proxy_in_flight(&self, endpoint: &str, inbound_protocol: &str) {
@@ -991,14 +1078,7 @@ impl Metrics {
             *value += 1;
             *value
         };
-        metrics::with_local_recorder(&self.inner.recorder, || {
-            metrics::gauge!(
-                M_PROXY_IN_FLIGHT,
-                "endpoint" => endpoint.to_string(),
-                "inbound_protocol" => inbound_protocol.to_string(),
-            )
-            .set(value as f64);
-        });
+        self.set_proxy_in_flight_gauge(endpoint, inbound_protocol, value);
     }
 
     pub fn decrement_proxy_in_flight(&self, endpoint: &str, inbound_protocol: &str) {
@@ -1013,61 +1093,97 @@ impl Metrics {
             }
             current
         };
-        metrics::with_local_recorder(&self.inner.recorder, || {
-            metrics::gauge!(
-                M_PROXY_IN_FLIGHT,
-                "endpoint" => endpoint.to_string(),
-                "inbound_protocol" => inbound_protocol.to_string(),
-            )
-            .set(value as f64);
+        self.set_proxy_in_flight_gauge(endpoint, inbound_protocol, value);
+    }
+
+    /// Shared gauge emit for the increment/decrement pair — one cache
+    /// entry, since both sides address the same series.
+    fn set_proxy_in_flight_gauge(&self, endpoint: &str, inbound_protocol: &str, value: i64) {
+        self.cached_gauge(
+            M_PROXY_IN_FLIGHT,
+            value as f64,
+            |k| {
+                k.label(endpoint);
+                k.label(inbound_protocol);
+            },
+            || {
+                metrics::gauge!(
+                    M_PROXY_IN_FLIGHT,
+                    "endpoint" => endpoint.to_string(),
+                    "inbound_protocol" => inbound_protocol.to_string(),
+                )
+            },
+        );
+    }
+
+    /// Emit through this worker's cached handle for `(site, label values)`,
+    /// registering via `register` on the first sight of that label set on
+    /// this thread.
+    ///
+    /// `build_key` writes the label VALUES in a fixed per-site order;
+    /// `use_handle` performs the actual increment/set/record. On the
+    /// steady-state path this allocates nothing and touches no shared
+    /// state beyond the series' own value atomics.
+    ///
+    /// Invariant: `register` and `use_handle` must not re-enter any
+    /// `Metrics` emit (they would hit the `RefCell` re-borrow) — they only
+    /// register or write handles, and registration cannot emit.
+    fn with_worker_handle<H: WorkerCached>(
+        &self,
+        site: &'static str,
+        build_key: impl FnOnce(&mut WorkerKey<'_>),
+        register: impl FnOnce() -> H,
+        use_handle: impl FnOnce(&H),
+    ) {
+        WORKER_CACHE.with(|cell| {
+            let cache = &mut *cell.borrow_mut();
+            cache.key_buf.clear();
+            let dirty = {
+                use std::fmt::Write as _;
+                let mut key = WorkerKey {
+                    buf: &mut cache.key_buf,
+                    dirty: false,
+                };
+                let _ = write!(key.buf, "{:x}", self.inner.instance);
+                key.buf.push(WORKER_KEY_SEP);
+                key.buf.push_str(site);
+                build_key(&mut key);
+                key.dirty
+            };
+            if dirty {
+                // A label value contained the key separator: emit through
+                // a freshly registered handle instead of risking two label
+                // sets aliasing one cache key. Same series, slow path.
+                use_handle(&register());
+                return;
+            }
+            let (map, key) = H::slot_with_key(cache);
+            if let Some(handle) = map.get(key) {
+                use_handle(handle);
+                return;
+            }
+            let handle = register();
+            use_handle(&handle);
+            if map.len() >= WORKER_CACHE_CAPACITY {
+                if let Some(evicted) = map.keys().next().cloned() {
+                    map.remove(&evicted);
+                }
+            }
+            map.insert(Box::from(key), handle);
         });
     }
 
-    fn request_series_hash(labels: RequestLabels<'_>) -> u64 {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        labels.endpoint.hash(&mut hasher);
-        labels.inbound_protocol.hash(&mut hasher);
-        labels.provider.hash(&mut hasher);
-        labels.model.hash(&mut hasher);
-        labels.upstream_model.hash(&mut hasher);
-        labels.provider_key_id.hash(&mut hasher);
-        labels.provider_key_name.hash(&mut hasher);
-        labels.api_key_id.hash(&mut hasher);
-        labels.team_id.hash(&mut hasher);
-        labels.user_id.hash(&mut hasher);
-        labels.user_name.hash(&mut hasher);
-        labels.stream.hash(&mut hasher);
-        labels.is_fallback.hash(&mut hasher);
-        labels.status.hash(&mut hasher);
-        labels.outcome.as_str().hash(&mut hasher);
-        hasher.finish()
+    /// Test-only view of this thread's cached request-series entry count.
+    /// Each `#[test]` runs on its own thread, so the count starts at zero
+    /// and covers exactly that test's emits.
+    #[cfg(test)]
+    fn worker_request_series_len() -> usize {
+        WORKER_CACHE.with(|cell| cell.borrow().request_series.len())
     }
 
-    fn usage_series_hash(labels: UsageLabels<'_>) -> u64 {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        labels.endpoint.hash(&mut hasher);
-        labels.inbound_protocol.hash(&mut hasher);
-        labels.provider.hash(&mut hasher);
-        labels.model.hash(&mut hasher);
-        labels.upstream_model.hash(&mut hasher);
-        labels.provider_key_id.hash(&mut hasher);
-        labels.provider_key_name.hash(&mut hasher);
-        labels.api_key_id.hash(&mut hasher);
-        labels.team_id.hash(&mut hasher);
-        labels.user_id.hash(&mut hasher);
-        labels.user_name.hash(&mut hasher);
-        hasher.finish()
-    }
-
-    fn register_request_series(&self, labels: RequestLabels<'_>) -> RequestSeriesHandles {
-        metrics::with_local_recorder(&self.inner.recorder, || RequestSeriesHandles {
-            proxy_requests: labels.request_counter(M_PROXY_REQUESTS_TOTAL),
-            proxy_failed_requests: (labels.outcome != RequestOutcome::Success)
-                .then(|| labels.request_counter(M_PROXY_FAILED_REQUESTS_TOTAL)),
-            proxy_duration: labels.request_duration_histogram(M_PROXY_REQUEST_DURATION),
-            llm_requests: labels.request_counter(M_LLM_REQUESTS_TOTAL),
-            llm_duration: labels.request_duration_histogram(M_LLM_REQUEST_DURATION),
-        })
+    #[cfg(test)]
+    fn worker_usage_series_len() -> usize {
+        WORKER_CACHE.with(|cell| cell.borrow().usage_series.len())
     }
 
     fn with_request_series(
@@ -1075,74 +1191,137 @@ impl Metrics {
         labels: RequestLabels<'_>,
         record: impl FnOnce(&RequestSeriesHandles),
     ) {
-        let hash = Self::request_series_hash(labels);
-        {
-            let cache = self.inner.request_series.read();
-            if let Some(handles) = cache.get(hash, labels) {
-                record(handles);
-                return;
-            }
-        }
-
-        let handles = self.register_request_series(labels);
-        let mut cache = self.inner.request_series.write();
-        if let Some(existing) = cache.get(hash, labels) {
-            record(existing);
-            return;
-        }
-        cache.insert(hash, RequestLabelsOwned::new(labels), handles);
-        record(
-            cache
-                .get(hash, labels)
-                .expect("request series was just inserted"),
+        self.with_worker_handle(
+            "request_series",
+            |k| {
+                k.label(labels.endpoint);
+                k.label(labels.inbound_protocol);
+                k.label(labels.provider);
+                k.label(labels.model);
+                k.label(labels.upstream_model);
+                k.label(labels.provider_key_id);
+                k.label(labels.provider_key_name);
+                k.label(labels.api_key_id);
+                k.label(labels.team_id);
+                k.label(labels.user_id);
+                k.label(labels.user_name);
+                k.label_bool(labels.stream);
+                k.label_bool(labels.is_fallback);
+                k.label_u16(labels.status);
+                k.label(labels.outcome.as_str());
+            },
+            RequestSeriesHandles::default,
+            record,
         );
     }
 
     fn with_usage_series(&self, labels: UsageLabels<'_>, record: impl FnOnce(&UsageSeriesHandles)) {
-        let hash = Self::usage_series_hash(labels);
-        {
-            let cache = self.inner.usage_series.read();
-            if let Some(handles) = cache.get(hash, labels) {
-                record(handles);
-                return;
-            }
-        }
+        self.with_worker_handle(
+            "usage_series",
+            |k| {
+                k.label(labels.endpoint);
+                k.label(labels.inbound_protocol);
+                k.label(labels.provider);
+                k.label(labels.model);
+                k.label(labels.upstream_model);
+                k.label(labels.provider_key_id);
+                k.label(labels.provider_key_name);
+                k.label(labels.api_key_id);
+                k.label(labels.team_id);
+                k.label(labels.user_id);
+                k.label(labels.user_name);
+            },
+            UsageSeriesHandles::default,
+            record,
+        );
+    }
 
-        let mut cache = self.inner.usage_series.write();
-        if cache.get(hash, labels).is_none() {
-            cache.insert(
-                hash,
-                UsageLabelsOwned::new(labels),
-                UsageSeriesHandles::default(),
-            );
-        }
-        record(
-            cache
-                .get(hash, labels)
-                .expect("usage series was just inserted"),
+    /// Resolve one lazily-registered handle in a series bundle. The
+    /// recorder guard is paid only on the one-time init path; a cache-hit
+    /// emit never touches it.
+    fn init_handle<'h, T>(&self, slot: &'h OnceLock<T>, init: impl FnOnce() -> T) -> &'h T {
+        slot.get_or_init(|| metrics::with_local_recorder(&self.inner.recorder, init))
+    }
+
+    /// Increment a worker-cached counter. `register` runs under the
+    /// recorder guard on the one-time miss path only.
+    fn cached_counter(
+        &self,
+        site: &'static str,
+        by: u64,
+        build_key: impl FnOnce(&mut WorkerKey<'_>),
+        register: impl FnOnce() -> metrics::Counter,
+    ) {
+        self.with_worker_handle(
+            site,
+            build_key,
+            || metrics::with_local_recorder(&self.inner.recorder, register),
+            |counter| counter.increment(by),
+        );
+    }
+
+    /// Set a worker-cached gauge, same contract as [`Self::cached_counter`].
+    fn cached_gauge(
+        &self,
+        site: &'static str,
+        value: f64,
+        build_key: impl FnOnce(&mut WorkerKey<'_>),
+        register: impl FnOnce() -> metrics::Gauge,
+    ) {
+        self.with_worker_handle(
+            site,
+            build_key,
+            || metrics::with_local_recorder(&self.inner.recorder, register),
+            |gauge| gauge.set(value),
+        );
+    }
+
+    /// Record into a worker-cached histogram, same contract as
+    /// [`Self::cached_counter`].
+    fn cached_histogram(
+        &self,
+        site: &'static str,
+        value: f64,
+        build_key: impl FnOnce(&mut WorkerKey<'_>),
+        register: impl FnOnce() -> metrics::Histogram,
+    ) {
+        self.with_worker_handle(
+            site,
+            build_key,
+            || metrics::with_local_recorder(&self.inner.recorder, register),
+            |histogram| histogram.record(value),
         );
     }
 
     pub fn record_proxy_request(&self, labels: RequestLabels<'_>, duration: Duration) {
-        metrics::with_local_recorder(&self.inner.recorder, || {
-            labels.request_counter(M_PROXY_REQUESTS_TOTAL).increment(1);
-            labels
-                .request_duration_histogram(M_PROXY_REQUEST_DURATION)
-                .record(duration.as_secs_f64());
+        self.with_request_series(labels, |h| {
+            self.init_handle(&h.proxy_requests, || {
+                labels.request_counter(M_PROXY_REQUESTS_TOTAL)
+            })
+            .increment(1);
+            self.init_handle(&h.proxy_duration, || {
+                labels.request_duration_histogram(M_PROXY_REQUEST_DURATION)
+            })
+            .record(duration.as_secs_f64());
             if labels.outcome != RequestOutcome::Success {
-                labels
-                    .request_counter(M_PROXY_FAILED_REQUESTS_TOTAL)
-                    .increment(1);
+                self.init_handle(&h.proxy_failed_requests, || {
+                    labels.request_counter(M_PROXY_FAILED_REQUESTS_TOTAL)
+                })
+                .increment(1);
             }
         });
     }
 
     pub fn record_llm_request(&self, labels: RequestLabels<'_>, duration: Duration) {
-        metrics::with_local_recorder(&self.inner.recorder, || {
-            labels.request_counter(M_LLM_REQUESTS_TOTAL).increment(1);
-            labels
-                .request_duration_histogram(M_LLM_REQUEST_DURATION)
-                .record(duration.as_secs_f64());
+        self.with_request_series(labels, |h| {
+            self.init_handle(&h.llm_requests, || {
+                labels.request_counter(M_LLM_REQUESTS_TOTAL)
+            })
+            .increment(1);
+            self.init_handle(&h.llm_duration, || {
+                labels.request_duration_histogram(M_LLM_REQUEST_DURATION)
+            })
+            .record(duration.as_secs_f64());
         });
     }
 
@@ -1150,13 +1329,29 @@ impl Metrics {
     /// All request handlers emit these together with the same end-to-end
     /// duration.
     pub fn record_proxy_and_llm_request(&self, labels: RequestLabels<'_>, duration: Duration) {
-        self.with_request_series(labels, |handles| {
-            handles.proxy_requests.increment(1);
-            handles.proxy_duration.record(duration.as_secs_f64());
-            handles.llm_requests.increment(1);
-            handles.llm_duration.record(duration.as_secs_f64());
-            if let Some(failed) = &handles.proxy_failed_requests {
-                failed.increment(1);
+        let secs = duration.as_secs_f64();
+        self.with_request_series(labels, |h| {
+            self.init_handle(&h.proxy_requests, || {
+                labels.request_counter(M_PROXY_REQUESTS_TOTAL)
+            })
+            .increment(1);
+            self.init_handle(&h.proxy_duration, || {
+                labels.request_duration_histogram(M_PROXY_REQUEST_DURATION)
+            })
+            .record(secs);
+            self.init_handle(&h.llm_requests, || {
+                labels.request_counter(M_LLM_REQUESTS_TOTAL)
+            })
+            .increment(1);
+            self.init_handle(&h.llm_duration, || {
+                labels.request_duration_histogram(M_LLM_REQUEST_DURATION)
+            })
+            .record(secs);
+            if labels.outcome != RequestOutcome::Success {
+                self.init_handle(&h.proxy_failed_requests, || {
+                    labels.request_counter(M_PROXY_FAILED_REQUESTS_TOTAL)
+                })
+                .increment(1);
             }
         });
     }
@@ -1171,32 +1366,30 @@ impl Metrics {
             return;
         }
         self.with_usage_series(labels, |handles| {
-            metrics::with_local_recorder(&self.inner.recorder, || {
-                if usage.input_tokens > 0 {
-                    handles
-                        .input_tokens
-                        .get_or_init(|| labels.counter(M_LLM_INPUT_TOKENS_TOTAL))
-                        .increment(u64::from(usage.input_tokens));
-                }
-                if usage.output_tokens > 0 {
-                    handles
-                        .output_tokens
-                        .get_or_init(|| labels.counter(M_LLM_OUTPUT_TOKENS_TOTAL))
-                        .increment(u64::from(usage.output_tokens));
-                }
-                if usage.total_tokens > 0 {
-                    handles
-                        .total_tokens
-                        .get_or_init(|| labels.counter(M_LLM_TOTAL_TOKENS_TOTAL))
-                        .increment(u64::from(usage.total_tokens));
-                }
-                if let Some(value) = spend_micro_usd {
-                    handles
-                        .spend_micro_usd
-                        .get_or_init(|| labels.counter(M_LLM_SPEND_MICRO_USD_TOTAL))
-                        .increment(value);
-                }
-            });
+            if usage.input_tokens > 0 {
+                self.init_handle(&handles.input_tokens, || {
+                    labels.counter(M_LLM_INPUT_TOKENS_TOTAL)
+                })
+                .increment(u64::from(usage.input_tokens));
+            }
+            if usage.output_tokens > 0 {
+                self.init_handle(&handles.output_tokens, || {
+                    labels.counter(M_LLM_OUTPUT_TOKENS_TOTAL)
+                })
+                .increment(u64::from(usage.output_tokens));
+            }
+            if usage.total_tokens > 0 {
+                self.init_handle(&handles.total_tokens, || {
+                    labels.counter(M_LLM_TOTAL_TOKENS_TOTAL)
+                })
+                .increment(u64::from(usage.total_tokens));
+            }
+            if let Some(value) = spend_micro_usd {
+                self.init_handle(&handles.spend_micro_usd, || {
+                    labels.counter(M_LLM_SPEND_MICRO_USD_TOTAL)
+                })
+                .increment(value);
+            }
         });
     }
 
@@ -1204,23 +1397,39 @@ impl Metrics {
         if ttft.is_zero() {
             return;
         }
-        metrics::with_local_recorder(&self.inner.recorder, || {
-            metrics::histogram!(
-                M_LLM_TTFT,
-                "endpoint" => labels.endpoint.to_string(),
-                "inbound_protocol" => labels.inbound_protocol.to_string(),
-                "provider" => labels.provider.to_string(),
-                "model" => labels.model.to_string(),
-                "upstream_model" => labels.upstream_model.to_string(),
-                "provider_key_id" => labels.provider_key_id.to_string(),
-                "provider_key_name" => labels.provider_key_name.to_string(),
-                "api_key_id" => labels.api_key_id.to_string(),
-                "team_id" => labels.team_id.to_string(),
-                "user_id" => labels.user_id.to_string(),
-                "user_name" => labels.user_name.to_string(),
-            )
-            .record(ttft.as_secs_f64());
-        });
+        self.cached_histogram(
+            M_LLM_TTFT,
+            ttft.as_secs_f64(),
+            |k| {
+                k.label(labels.endpoint);
+                k.label(labels.inbound_protocol);
+                k.label(labels.provider);
+                k.label(labels.model);
+                k.label(labels.upstream_model);
+                k.label(labels.provider_key_id);
+                k.label(labels.provider_key_name);
+                k.label(labels.api_key_id);
+                k.label(labels.team_id);
+                k.label(labels.user_id);
+                k.label(labels.user_name);
+            },
+            || {
+                metrics::histogram!(
+                    M_LLM_TTFT,
+                    "endpoint" => labels.endpoint.to_string(),
+                    "inbound_protocol" => labels.inbound_protocol.to_string(),
+                    "provider" => labels.provider.to_string(),
+                    "model" => labels.model.to_string(),
+                    "upstream_model" => labels.upstream_model.to_string(),
+                    "provider_key_id" => labels.provider_key_id.to_string(),
+                    "provider_key_name" => labels.provider_key_name.to_string(),
+                    "api_key_id" => labels.api_key_id.to_string(),
+                    "team_id" => labels.team_id.to_string(),
+                    "user_id" => labels.user_id.to_string(),
+                    "user_name" => labels.user_name.to_string(),
+                )
+            },
+        );
     }
 
     /// #890 req-4: record token volume for the inbound `client_type` on the
@@ -1255,64 +1464,91 @@ impl Metrics {
         if input_tokens == 0 && output_tokens == 0 && total_tokens == 0 {
             return;
         }
-        metrics::with_local_recorder(&self.inner.recorder, || {
-            if input_tokens > 0 {
-                metrics::counter!(
-                    M_LLM_TOKENS_BY_CLIENT_TOTAL,
-                    "client_type" => client_type.to_string(),
-                    "model" => model.to_string(),
-                    "token_type" => "input",
-                )
-                .increment(input_tokens);
+        for (token_type, count) in [
+            ("input", input_tokens),
+            ("output", output_tokens),
+            ("total", total_tokens),
+        ] {
+            if count == 0 {
+                continue;
             }
-            if output_tokens > 0 {
+            self.cached_counter(
+                M_LLM_TOKENS_BY_CLIENT_TOTAL,
+                count,
+                |k| {
+                    k.label(client_type);
+                    k.label(model);
+                    k.label(token_type);
+                },
+                || {
+                    metrics::counter!(
+                        M_LLM_TOKENS_BY_CLIENT_TOTAL,
+                        "client_type" => client_type.to_string(),
+                        "model" => model.to_string(),
+                        "token_type" => token_type,
+                    )
+                },
+            );
+        }
+    }
+
+    /// Shared cached emit for the deployment counter family.
+    fn cached_deployment_counter(&self, metric: &'static str, labels: DeploymentLabels<'_>) {
+        self.cached_counter(
+            metric,
+            1,
+            |k| {
+                k.label(labels.provider);
+                k.label(labels.model);
+                k.label(labels.upstream_model);
+                k.label(labels.provider_key_id);
+            },
+            || {
                 metrics::counter!(
-                    M_LLM_TOKENS_BY_CLIENT_TOTAL,
-                    "client_type" => client_type.to_string(),
-                    "model" => model.to_string(),
-                    "token_type" => "output",
+                    metric,
+                    "provider" => labels.provider.to_string(),
+                    "model" => labels.model.to_string(),
+                    "upstream_model" => labels.upstream_model.to_string(),
+                    "provider_key_id" => labels.provider_key_id.to_string(),
                 )
-                .increment(output_tokens);
-            }
-            if total_tokens > 0 {
-                metrics::counter!(
-                    M_LLM_TOKENS_BY_CLIENT_TOTAL,
-                    "client_type" => client_type.to_string(),
-                    "model" => model.to_string(),
-                    "token_type" => "total",
-                )
-                .increment(total_tokens);
-            }
-        });
+            },
+        );
     }
 
     pub fn record_deployment_request(&self, labels: DeploymentLabels<'_>, outcome: RequestOutcome) {
-        metrics::with_local_recorder(&self.inner.recorder, || {
-            labels.record_counter(M_DEPLOYMENT_REQUESTS_TOTAL);
-            match outcome {
-                RequestOutcome::Success => labels.record_counter(M_DEPLOYMENT_SUCCESS_TOTAL),
-                _ => labels.record_counter(M_DEPLOYMENT_FAILURE_TOTAL),
+        self.cached_deployment_counter(M_DEPLOYMENT_REQUESTS_TOTAL, labels);
+        match outcome {
+            RequestOutcome::Success => {
+                self.cached_deployment_counter(M_DEPLOYMENT_SUCCESS_TOTAL, labels)
             }
-        });
+            _ => self.cached_deployment_counter(M_DEPLOYMENT_FAILURE_TOTAL, labels),
+        }
     }
 
     pub fn set_deployment_state(&self, labels: DeploymentLabels<'_>, state: DeploymentState) {
-        metrics::with_local_recorder(&self.inner.recorder, || {
-            metrics::gauge!(
-                M_DEPLOYMENT_STATE,
-                "provider" => labels.provider.to_string(),
-                "model" => labels.model.to_string(),
-                "upstream_model" => labels.upstream_model.to_string(),
-                "provider_key_id" => labels.provider_key_id.to_string(),
-            )
-            .set(state.as_f64());
-        });
+        self.cached_gauge(
+            M_DEPLOYMENT_STATE,
+            state.as_f64(),
+            |k| {
+                k.label(labels.provider);
+                k.label(labels.model);
+                k.label(labels.upstream_model);
+                k.label(labels.provider_key_id);
+            },
+            || {
+                metrics::gauge!(
+                    M_DEPLOYMENT_STATE,
+                    "provider" => labels.provider.to_string(),
+                    "model" => labels.model.to_string(),
+                    "upstream_model" => labels.upstream_model.to_string(),
+                    "provider_key_id" => labels.provider_key_id.to_string(),
+                )
+            },
+        );
     }
 
     pub fn record_deployment_cooldown(&self, labels: DeploymentLabels<'_>) {
-        metrics::with_local_recorder(&self.inner.recorder, || {
-            labels.record_counter(M_DEPLOYMENT_COOLED_DOWN_TOTAL);
-        });
+        self.cached_deployment_counter(M_DEPLOYMENT_COOLED_DOWN_TOTAL, labels);
     }
 
     pub fn record_routing_fallback(&self, success: bool, model: &str) {
@@ -1321,9 +1557,12 @@ impl Metrics {
         } else {
             M_ROUTING_FAILED_FALLBACKS_TOTAL
         };
-        metrics::with_local_recorder(&self.inner.recorder, || {
-            metrics::counter!(metric, "model" => model.to_string()).increment(1);
-        });
+        self.cached_counter(
+            metric,
+            1,
+            |k| k.label(model),
+            || metrics::counter!(metric, "model" => model.to_string()),
+        );
     }
 
     pub fn set_rate_limit_remaining(
@@ -1333,62 +1572,99 @@ impl Metrics {
         requests: Option<u64>,
         tokens: Option<u64>,
     ) {
-        metrics::with_local_recorder(&self.inner.recorder, || {
-            if let Some(value) = requests {
+        if let Some(value) = requests {
+            self.cached_gauge(
+                M_RATELIMIT_REMAINING_REQUESTS,
+                value as f64,
+                |k| {
+                    k.label(api_key_id);
+                    k.label(model);
+                },
+                || {
+                    metrics::gauge!(
+                        M_RATELIMIT_REMAINING_REQUESTS,
+                        "api_key_id" => api_key_id.to_string(),
+                        "model" => model.to_string(),
+                    )
+                },
+            );
+        }
+        if let Some(value) = tokens {
+            self.cached_gauge(
+                M_RATELIMIT_REMAINING_TOKENS,
+                value as f64,
+                |k| {
+                    k.label(api_key_id);
+                    k.label(model);
+                },
+                || {
+                    metrics::gauge!(
+                        M_RATELIMIT_REMAINING_TOKENS,
+                        "api_key_id" => api_key_id.to_string(),
+                        "model" => model.to_string(),
+                    )
+                },
+            );
+        }
+    }
+
+    /// Shared cached emit for the budget gauge family.
+    fn cached_budget_gauge(&self, metric: &'static str, labels: BudgetLabels<'_>, value: f64) {
+        self.cached_gauge(
+            metric,
+            value,
+            |k| {
+                k.label(labels.api_key_id);
+                k.label(labels.team_id);
+                k.label(labels.user_id);
+            },
+            || {
                 metrics::gauge!(
-                    M_RATELIMIT_REMAINING_REQUESTS,
-                    "api_key_id" => api_key_id.to_string(),
-                    "model" => model.to_string(),
+                    metric,
+                    "api_key_id" => labels.api_key_id.to_string(),
+                    "team_id" => labels.team_id.to_string(),
+                    "user_id" => labels.user_id.to_string(),
                 )
-                .set(value as f64);
-            }
-            if let Some(value) = tokens {
-                metrics::gauge!(
-                    M_RATELIMIT_REMAINING_TOKENS,
-                    "api_key_id" => api_key_id.to_string(),
-                    "model" => model.to_string(),
-                )
-                .set(value as f64);
-            }
-        });
+            },
+        );
     }
 
     pub fn set_budget_gauges(&self, labels: BudgetLabels<'_>, budget: BudgetGauges) {
-        metrics::with_local_recorder(&self.inner.recorder, || {
-            labels.record_gauge(M_BUDGET_DETAILS_PRESENT, 1.0);
-            if let Some(value) = budget.limit_usd {
-                labels.record_gauge(M_BUDGET_LIMIT_USD, value);
-            }
-            if let Some(value) = budget.spent_usd {
-                labels.record_gauge(M_BUDGET_SPENT_USD, value);
-            }
-            if let Some(value) = budget.remaining_usd {
-                labels.record_gauge(M_BUDGET_REMAINING_USD, value);
-            }
-            if let Some(value) = budget.reset_seconds {
-                labels.record_gauge(M_BUDGET_RESET_SECONDS, value as f64);
-            }
-        });
+        self.cached_budget_gauge(M_BUDGET_DETAILS_PRESENT, labels, 1.0);
+        if let Some(value) = budget.limit_usd {
+            self.cached_budget_gauge(M_BUDGET_LIMIT_USD, labels, value);
+        }
+        if let Some(value) = budget.spent_usd {
+            self.cached_budget_gauge(M_BUDGET_SPENT_USD, labels, value);
+        }
+        if let Some(value) = budget.remaining_usd {
+            self.cached_budget_gauge(M_BUDGET_REMAINING_USD, labels, value);
+        }
+        if let Some(value) = budget.reset_seconds {
+            self.cached_budget_gauge(M_BUDGET_RESET_SECONDS, labels, value as f64);
+        }
     }
 
     pub fn clear_budget_gauges(&self, labels: BudgetLabels<'_>) {
-        metrics::with_local_recorder(&self.inner.recorder, || {
-            labels.record_gauge(M_BUDGET_DETAILS_PRESENT, 0.0);
-        });
+        self.cached_budget_gauge(M_BUDGET_DETAILS_PRESENT, labels, 0.0);
     }
 
     pub fn record_redis_failure(&self, operation: &str) {
-        metrics::with_local_recorder(&self.inner.recorder, || {
-            metrics::counter!(M_REDIS_FAILURES_TOTAL, "operation" => operation.to_string())
-                .increment(1);
-        });
+        self.cached_counter(
+            M_REDIS_FAILURES_TOTAL,
+            1,
+            |k| k.label(operation),
+            || metrics::counter!(M_REDIS_FAILURES_TOTAL, "operation" => operation.to_string()),
+        );
     }
 
     pub fn record_usage_event_drop(&self, reason: &str) {
-        metrics::with_local_recorder(&self.inner.recorder, || {
-            metrics::counter!(M_USAGE_EVENT_DROPS_TOTAL, "reason" => reason.to_string())
-                .increment(1);
-        });
+        self.cached_counter(
+            M_USAGE_EVENT_DROPS_TOTAL,
+            1,
+            |k| k.label(reason),
+            || metrics::counter!(M_USAGE_EVENT_DROPS_TOTAL, "reason" => reason.to_string()),
+        );
     }
 
     /// Issue #408: bump on every `UsageSink::try_emit` call (the
@@ -1410,33 +1686,56 @@ impl Metrics {
         status_code: u16,
         inbound_protocol: &'static str,
     ) {
-        metrics::with_local_recorder(&self.inner.recorder, || {
-            metrics::counter!(
-                M_USAGE_EVENT_EMITS_TOTAL,
-                "handler" => handler,
-                "status_code" => status_bucket(status_code),
-                "inbound_protocol" => inbound_protocol,
-            )
-            .increment(1);
-        });
+        let status_class = status_bucket(status_code);
+        self.cached_counter(
+            M_USAGE_EVENT_EMITS_TOTAL,
+            1,
+            |k| {
+                k.label(handler);
+                k.label(status_class);
+                k.label(inbound_protocol);
+            },
+            || {
+                metrics::counter!(
+                    M_USAGE_EVENT_EMITS_TOTAL,
+                    "handler" => handler,
+                    "status_code" => status_class,
+                    "inbound_protocol" => inbound_protocol,
+                )
+            },
+        );
     }
 
     pub fn record_otlp_fanout_drop(&self, exporter: &str, reason: &str) {
-        metrics::with_local_recorder(&self.inner.recorder, || {
-            metrics::counter!(
-                M_OTLP_FANOUT_DROPS_TOTAL,
-                "exporter" => exporter.to_string(),
-                "reason" => reason.to_string(),
-            )
-            .increment(1);
-        });
+        self.cached_counter(
+            M_OTLP_FANOUT_DROPS_TOTAL,
+            1,
+            |k| {
+                k.label(exporter);
+                k.label(reason);
+            },
+            || {
+                metrics::counter!(
+                    M_OTLP_FANOUT_DROPS_TOTAL,
+                    "exporter" => exporter.to_string(),
+                    "reason" => reason.to_string(),
+                )
+            },
+        );
     }
 
     pub fn record_otlp_fanout_failure(&self, exporter: &str) {
-        metrics::with_local_recorder(&self.inner.recorder, || {
-            metrics::counter!(M_OTLP_FANOUT_FAILURES_TOTAL, "exporter" => exporter.to_string())
-                .increment(1);
-        });
+        self.cached_counter(
+            M_OTLP_FANOUT_FAILURES_TOTAL,
+            1,
+            |k| k.label(exporter),
+            || {
+                metrics::counter!(
+                    M_OTLP_FANOUT_FAILURES_TOTAL,
+                    "exporter" => exporter.to_string(),
+                )
+            },
+        );
     }
 
     /// Observe one request's client-perceived end-to-end latency on
@@ -1444,18 +1743,50 @@ impl Metrics {
     /// at handler return for non-streaming requests and failures, at
     /// stream completion for committed streams.
     pub fn record_request_e2e_latency(&self, labels: LatencyLabels<'_>, elapsed: Duration) {
-        metrics::with_local_recorder(&self.inner.recorder, || {
-            metrics::histogram!(
-                M_REQUEST_E2E_LATENCY_SECONDS,
-                "env_id" => self.inner.env_id.clone(),
-                "endpoint" => labels.endpoint.to_string(),
-                "model" => non_empty_or_unknown(labels.model),
-                "provider" => non_empty_or_unknown(labels.provider),
-                "status_class" => status_bucket(labels.status),
-                "streaming" => bool_str(labels.streaming),
-            )
-            .record(elapsed.as_secs_f64());
-        });
+        self.cached_latency_histogram(M_REQUEST_E2E_LATENCY_SECONDS, labels, elapsed);
+    }
+
+    /// Shared cached emit for the two SLO latency histograms — identical
+    /// label shape, `env_id` constant per instance (the cache key is
+    /// already instance-scoped, so it stays out of the key).
+    fn cached_latency_histogram(
+        &self,
+        metric: &'static str,
+        labels: LatencyLabels<'_>,
+        elapsed: Duration,
+    ) {
+        let model = if labels.model.is_empty() {
+            "unknown"
+        } else {
+            labels.model
+        };
+        let provider = if labels.provider.is_empty() {
+            "unknown"
+        } else {
+            labels.provider
+        };
+        self.cached_histogram(
+            metric,
+            elapsed.as_secs_f64(),
+            |k| {
+                k.label(labels.endpoint);
+                k.label(model);
+                k.label(provider);
+                k.label(status_bucket(labels.status));
+                k.label_bool(labels.streaming);
+            },
+            || {
+                metrics::histogram!(
+                    metric,
+                    "env_id" => self.inner.env_id.clone(),
+                    "endpoint" => labels.endpoint.to_string(),
+                    "model" => model.to_string(),
+                    "provider" => provider.to_string(),
+                    "status_class" => status_bucket(labels.status),
+                    "streaming" => bool_str(labels.streaming),
+                )
+            },
+        );
     }
 
     /// Observe a streaming request's time-to-first-token on
@@ -1465,18 +1796,7 @@ impl Metrics {
         if ttft.is_zero() {
             return;
         }
-        metrics::with_local_recorder(&self.inner.recorder, || {
-            metrics::histogram!(
-                M_REQUEST_TTFT_SECONDS,
-                "env_id" => self.inner.env_id.clone(),
-                "endpoint" => labels.endpoint.to_string(),
-                "model" => non_empty_or_unknown(labels.model),
-                "provider" => non_empty_or_unknown(labels.provider),
-                "status_class" => status_bucket(labels.status),
-                "streaming" => bool_str(labels.streaming),
-            )
-            .record(ttft.as_secs_f64());
-        });
+        self.cached_latency_histogram(M_REQUEST_TTFT_SECONDS, labels, ttft);
     }
 }
 
@@ -1507,14 +1827,6 @@ pub struct LatencyLabels<'a> {
 }
 
 /// Missing dimensions default to `"unknown"`, never an empty label value.
-fn non_empty_or_unknown(v: &str) -> String {
-    if v.is_empty() {
-        "unknown".to_string()
-    } else {
-        v.to_string()
-    }
-}
-
 /// Bucket an HTTP status code into one of `2xx` / `3xx` / `4xx` /
 /// `5xx` / `other` (the last covers 1xx and out-of-range). Used by
 /// the UsageEvent emission counter (#408) to keep prometheus label
@@ -1909,19 +2221,6 @@ impl Default for DeploymentLabels<'_> {
     }
 }
 
-impl DeploymentLabels<'_> {
-    fn record_counter(&self, metric: &'static str) {
-        metrics::counter!(
-            metric,
-            "provider" => self.provider.to_string(),
-            "model" => self.model.to_string(),
-            "upstream_model" => self.upstream_model.to_string(),
-            "provider_key_id" => self.provider_key_id.to_string(),
-        )
-        .increment(1);
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeploymentState {
     Healthy,
@@ -1953,18 +2252,6 @@ impl Default for BudgetLabels<'_> {
             team_id: "unknown",
             user_id: "unknown",
         }
-    }
-}
-
-impl BudgetLabels<'_> {
-    fn record_gauge(&self, metric: &'static str, value: f64) {
-        metrics::gauge!(
-            metric,
-            "api_key_id" => self.api_key_id.to_string(),
-            "team_id" => self.team_id.to_string(),
-            "user_id" => self.user_id.to_string(),
-        )
-        .set(value);
     }
 }
 
@@ -2181,11 +2468,11 @@ mod tests {
             user_id: "user-1",
             user_name: "alice",
         };
-        assert_eq!(m.inner.request_series.read().len, 0);
+        assert_eq!(Metrics::worker_request_series_len(), 0);
         m.record_proxy_and_llm_request(labels, Duration::from_millis(25));
         m.record_proxy_and_llm_request(labels, Duration::from_millis(20));
         assert_eq!(
-            m.inner.request_series.read().len,
+            Metrics::worker_request_series_len(),
             1,
             "repeated labels must reuse one registered handle set"
         );
@@ -2243,61 +2530,43 @@ mod tests {
     #[test]
     fn request_series_handle_cache_is_bounded() {
         let metrics = Metrics::new(false);
-        for index in 0..=REQUEST_SERIES_CACHE_CAPACITY {
-            let model = format!("model-{index}");
-            metrics.record_proxy_and_llm_request(
-                RequestLabels {
-                    model: &model,
-                    ..RequestLabels::default()
-                },
-                Duration::from_millis(1),
-            );
+        // Two passes over capacity+1 distinct label sets: pass one fills
+        // the worker cache and forces at least one eviction; pass two
+        // re-emits everything, so every evicted entry re-registers.
+        for _ in 0..2 {
+            for index in 0..=WORKER_CACHE_CAPACITY {
+                let model = format!("model-{index}");
+                metrics.record_proxy_and_llm_request(
+                    RequestLabels {
+                        model: &model,
+                        ..RequestLabels::default()
+                    },
+                    Duration::from_millis(1),
+                );
+            }
         }
 
         assert_eq!(
-            metrics.inner.request_series.read().len,
-            REQUEST_SERIES_CACHE_CAPACITY,
+            Metrics::worker_request_series_len(),
+            WORKER_CACHE_CAPACITY,
             "request series handle cache must stay at its fixed capacity"
         );
 
-        let evicted_model = (0..=REQUEST_SERIES_CACHE_CAPACITY)
-            .map(|index| format!("model-{index}"))
-            .find(|model| {
-                let labels = RequestLabels {
-                    model,
-                    ..RequestLabels::default()
-                };
-                let hash = Metrics::request_series_hash(labels);
-                metrics
-                    .inner
-                    .request_series
-                    .read()
-                    .get(hash, labels)
-                    .is_none()
-            })
-            .expect("one series must have been evicted");
-        metrics.record_proxy_and_llm_request(
-            RequestLabels {
-                model: &evicted_model,
-                ..RequestLabels::default()
-            },
-            Duration::from_millis(1),
-        );
-
-        assert_eq!(
-            metrics.inner.request_series.read().len,
-            REQUEST_SERIES_CACHE_CAPACITY,
-            "re-registering an evicted series must not grow the cache"
-        );
+        // Every label set — evicted or cached — must have continued its
+        // own Prometheus series: eviction drops our handle, never the
+        // series or its value.
         let rendered = metrics.render();
-        assert!(
-            rendered.lines().any(|line| {
-                line.starts_with(M_PROXY_REQUESTS_TOTAL)
-                    && line.contains(&format!("model=\"{evicted_model}\""))
-                    && line.ends_with(" 2")
-            }),
-            "re-registering an evicted handle must continue the existing Prometheus series"
-        );
+        for index in 0..=WORKER_CACHE_CAPACITY {
+            let model_label = format!("model=\"model-{index}\"");
+            assert!(
+                rendered.lines().any(|line| {
+                    line.starts_with(M_PROXY_REQUESTS_TOTAL)
+                        && line.contains(&model_label)
+                        && line.ends_with(" 2")
+                }),
+                "series for model-{index} must show both emits (eviction must not reset it)"
+            );
+        }
     }
 
     #[test]
@@ -2323,48 +2592,62 @@ mod tests {
     }
 
     #[test]
-    fn request_series_cache_distinguishes_hash_collisions() {
+    fn separator_bearing_label_values_never_alias_cached_series() {
         let metrics = Metrics::new(false);
+        // These two label sets join to the SAME byte sequence under the
+        // cache-key separator; the dirty-key fallback must keep them
+        // distinct series (uncached, correct) rather than folding them
+        // into one cache entry.
         let labels_a = RequestLabels {
-            model: "collision-a",
-            outcome: RequestOutcome::Success,
+            model: "x\u{1f}y",
+            upstream_model: "z",
             ..RequestLabels::default()
         };
         let labels_b = RequestLabels {
-            model: "collision-b",
-            outcome: RequestOutcome::Success,
+            model: "x",
+            upstream_model: "y\u{1f}z",
             ..RequestLabels::default()
         };
-        let handles_a = metrics.register_request_series(labels_a);
-        let handles_b = metrics.register_request_series(labels_b);
-        let forced_hash = 7;
-        {
-            let mut cache = metrics.inner.request_series.write();
-            cache.insert(forced_hash, RequestLabelsOwned::new(labels_a), handles_a);
-            cache.insert(forced_hash, RequestLabelsOwned::new(labels_b), handles_b);
-            cache
-                .get(forced_hash, labels_a)
-                .expect("first colliding label set must remain addressable")
-                .proxy_requests
-                .increment(1);
-            cache
-                .get(forced_hash, labels_b)
-                .expect("second colliding label set must remain addressable")
-                .proxy_requests
-                .increment(2);
-        }
+        metrics.record_proxy_and_llm_request(labels_a, Duration::from_millis(1));
+        metrics.record_proxy_and_llm_request(labels_b, Duration::from_millis(1));
+        metrics.record_proxy_and_llm_request(labels_b, Duration::from_millis(1));
 
+        assert_eq!(
+            Metrics::worker_request_series_len(),
+            0,
+            "a separator-bearing label value must never be cached"
+        );
         let rendered = metrics.render();
-        assert!(rendered.lines().any(|line| {
-            line.starts_with(M_PROXY_REQUESTS_TOTAL)
-                && line.contains("model=\"collision-a\"")
-                && line.ends_with(" 1")
-        }));
-        assert!(rendered.lines().any(|line| {
-            line.starts_with(M_PROXY_REQUESTS_TOTAL)
-                && line.contains("model=\"collision-b\"")
-                && line.ends_with(" 2")
-        }));
+        let series: Vec<&str> = rendered
+            .lines()
+            .filter(|line| line.starts_with(M_PROXY_REQUESTS_TOTAL))
+            .collect();
+        assert_eq!(
+            series.len(),
+            2,
+            "aliasing would fold the two label sets into one series: {series:?}"
+        );
+        assert!(series.iter().any(|line| line.ends_with(" 1")));
+        assert!(series.iter().any(|line| line.ends_with(" 2")));
+    }
+
+    #[test]
+    fn two_instances_on_one_thread_never_share_cached_handles() {
+        let a = Metrics::new(false);
+        let b = Metrics::new(false);
+        a.record_tokens("openai", "shared-model", 1);
+        b.record_tokens("openai", "shared-model", 2);
+
+        // If the worker cache ignored the instance id, `b`'s emit would
+        // land on `a`'s handle: `a` would render 3 and `b` nothing.
+        assert!(a
+            .render()
+            .lines()
+            .any(|line| line.starts_with(M_TOKENS_CONSUMED) && line.ends_with(" 1")));
+        assert!(b
+            .render()
+            .lines()
+            .any(|line| line.starts_with(M_TOKENS_CONSUMED) && line.ends_with(" 2")));
     }
 
     #[test]
@@ -2390,11 +2673,9 @@ mod tests {
             thread.join().expect("metric recording thread panicked");
         }
 
-        assert_eq!(
-            metrics.inner.request_series.read().len,
-            1,
-            "concurrent first misses must converge on one cached handle set"
-        );
+        // Each thread registers into its own worker cache, but every
+        // registration for the same labels resolves to the SAME registry
+        // series — the sums below are the contract.
         let rendered = metrics.render();
         for metric in [
             M_PROXY_REQUESTS_TOTAL,
@@ -2435,7 +2716,7 @@ mod tests {
             },
         );
         assert_eq!(
-            metrics.inner.usage_series.read().len,
+            Metrics::worker_usage_series_len(),
             1,
             "the first non-zero usage sample must create one cached label set"
         );
@@ -2466,7 +2747,7 @@ mod tests {
             },
         );
         assert_eq!(
-            metrics.inner.usage_series.read().len,
+            Metrics::worker_usage_series_len(),
             1,
             "repeated labels must reuse the cached usage handles"
         );
@@ -2516,11 +2797,7 @@ mod tests {
             thread.join().expect("metric recording thread panicked");
         }
 
-        assert_eq!(
-            metrics.inner.usage_series.read().len,
-            1,
-            "concurrent first misses must converge on one cached usage handle set"
-        );
+        // Per-thread caches; the shared-series sums below are the contract.
         let rendered = metrics.render();
         for (metric, value) in [
             (M_LLM_INPUT_TOKENS_TOTAL, THREADS),
@@ -2540,7 +2817,7 @@ mod tests {
     #[test]
     fn usage_series_handle_cache_is_bounded() {
         let metrics = Metrics::new(false);
-        for index in 0..=USAGE_SERIES_CACHE_CAPACITY {
+        for index in 0..=WORKER_CACHE_CAPACITY {
             let model = format!("usage-model-{index}");
             metrics.record_llm_usage(
                 UsageLabels {
@@ -2555,41 +2832,9 @@ mod tests {
         }
 
         assert_eq!(
-            metrics.inner.usage_series.read().len,
-            USAGE_SERIES_CACHE_CAPACITY,
+            Metrics::worker_usage_series_len(),
+            WORKER_CACHE_CAPACITY,
             "usage series handle cache must stay at its fixed capacity"
-        );
-    }
-
-    #[test]
-    fn usage_series_cache_distinguishes_hash_collisions() {
-        let labels_a = UsageLabels {
-            model: "usage-collision-a",
-            ..UsageLabels::default()
-        };
-        let labels_b = UsageLabels {
-            model: "usage-collision-b",
-            ..UsageLabels::default()
-        };
-        let forced_hash = 7;
-        let mut cache = UsageSeriesCache::default();
-        cache.insert(
-            forced_hash,
-            UsageLabelsOwned::new(labels_a),
-            UsageSeriesHandles::default(),
-        );
-        cache.insert(
-            forced_hash,
-            UsageLabelsOwned::new(labels_b),
-            UsageSeriesHandles::default(),
-        );
-
-        assert!(cache.get(forced_hash, labels_a).is_some());
-        assert!(cache.get(forced_hash, labels_b).is_some());
-        assert_eq!(
-            cache.entries[&forced_hash].len(),
-            2,
-            "colliding hashes must retain both exact label sets"
         );
     }
 
