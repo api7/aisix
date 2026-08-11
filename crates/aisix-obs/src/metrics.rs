@@ -694,6 +694,12 @@ impl Metrics {
     /// `source_connected`) are emitted only in etcd mode. Label churn on the
     /// info/rejected gauges (`hash_info`, `rejected_resources`) zeroes the
     /// prior label set so the exposition never carries two live samples.
+    ///
+    /// Deliberately NOT routed through the per-worker handle cache: this
+    /// runs once per scrape (not per request), and the zeroing discipline
+    /// above works on churning label sets — exactly the shape a
+    /// first-seen handle cache handles worst. The macro path's per-call
+    /// registration cost is irrelevant at scrape frequency.
     pub fn sync_config_status(&self, view: &aisix_core::ConfigMetricsView) {
         use aisix_core::SourceKind;
         let etcd = matches!(view.source_kind, SourceKind::Etcd);
@@ -1094,27 +1100,29 @@ impl Metrics {
     }
 
     pub fn increment_proxy_in_flight(&self, endpoint: &str, inbound_protocol: &str) {
-        let value = self.in_flight_delta(endpoint, inbound_protocol, 1);
-        self.set_proxy_in_flight_gauge(endpoint, inbound_protocol, value);
+        self.apply_in_flight_delta(endpoint, inbound_protocol, 1);
     }
 
     pub fn decrement_proxy_in_flight(&self, endpoint: &str, inbound_protocol: &str) {
-        let value = self.in_flight_delta(endpoint, inbound_protocol, -1);
-        self.set_proxy_in_flight_gauge(endpoint, inbound_protocol, value);
+        self.apply_in_flight_delta(endpoint, inbound_protocol, -1);
     }
 
-    /// Apply one in-flight edge and return the new count, clamped at zero
-    /// (a decrement without its increment — e.g. after a restart race —
-    /// must not wedge the gauge negative).
+    /// Apply one in-flight edge and publish the resulting count on the
+    /// gauge WHILE the slot lock is held, so concurrent edges on one pair
+    /// cannot publish out of order and strand a stale value on an
+    /// endpoint that then goes idle. The count clamps at zero (a
+    /// decrement without its increment must not wedge the gauge
+    /// negative). No path takes this lock from inside the worker cache,
+    /// so emitting under it cannot deadlock.
     ///
     /// Precondition: `endpoint` must already be a bounded route template
     /// (`normalize_endpoint_label` output, #451) and `inbound_protocol` a
     /// fixed vocabulary. The slot vector's boundedness — and the linear
     /// scan's cost — depend on it; a raw request path here would grow the
     /// vector without bound.
-    fn in_flight_delta(&self, endpoint: &str, inbound_protocol: &str, delta: i64) -> i64 {
+    fn apply_in_flight_delta(&self, endpoint: &str, inbound_protocol: &str, delta: i64) {
         let mut slots = self.inner.proxy_in_flight.lock().expect("lock in-flight");
-        if let Some(slot) = slots
+        let value = if let Some(slot) = slots
             .iter_mut()
             .find(|(e, p, _)| e == endpoint && p == inbound_protocol)
         {
@@ -1124,7 +1132,8 @@ impl Metrics {
             let value = delta.max(0);
             slots.push((endpoint.to_string(), inbound_protocol.to_string(), value));
             value
-        }
+        };
+        self.set_proxy_in_flight_gauge(endpoint, inbound_protocol, value);
     }
 
     /// Shared gauge emit for the increment/decrement pair — one cache
@@ -3352,6 +3361,55 @@ mod tests {
             3,
             "a dropped key label folds distinct endpoints/protocols into one gauge\n{rendered}"
         );
+    }
+
+    #[test]
+    fn in_flight_gauge_clamps_an_unmatched_decrement_at_zero() {
+        let m = Metrics::new(false);
+        m.decrement_proxy_in_flight("/v1/chat/completions", "openai");
+        let rendered = m.render();
+        let line = rendered
+            .lines()
+            .find(|l| l.starts_with(M_PROXY_IN_FLIGHT))
+            .expect("in-flight gauge must render");
+        assert!(
+            line.ends_with(" 0"),
+            "unmatched decrement must clamp: {line}"
+        );
+    }
+
+    /// Pins the slot predicate on BOTH fields: a regression comparing only
+    /// `endpoint` would route the anthropic edges through the openai slot,
+    /// corrupting VALUES while the series count (guarded above) stays 3.
+    #[test]
+    fn in_flight_slots_stay_distinct_per_endpoint_and_protocol() {
+        let m = Metrics::new(false);
+        m.increment_proxy_in_flight("/v1/chat/completions", "openai");
+        m.increment_proxy_in_flight("/v1/chat/completions", "anthropic");
+        m.increment_proxy_in_flight("/v1/messages", "anthropic");
+        m.decrement_proxy_in_flight("/v1/chat/completions", "anthropic");
+
+        let rendered = m.render();
+        let value = |endpoint: &str, protocol: &str| {
+            rendered
+                .lines()
+                .find(|l| {
+                    l.starts_with(M_PROXY_IN_FLIGHT)
+                        && l.contains(&format!("endpoint=\"{endpoint}\""))
+                        && l.contains(&format!("inbound_protocol=\"{protocol}\""))
+                })
+                .and_then(|l| l.rsplit(' ').next())
+                .map(str::to_owned)
+        };
+        assert_eq!(
+            value("/v1/chat/completions", "openai").as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            value("/v1/chat/completions", "anthropic").as_deref(),
+            Some("0")
+        );
+        assert_eq!(value("/v1/messages", "anthropic").as_deref(), Some("1"));
     }
 
     #[test]
