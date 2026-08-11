@@ -63,6 +63,39 @@ fn unique(name: &str) -> String {
 
 const TTL: Duration = Duration::from_secs(60);
 
+/// RediSearch indexes a write asynchronously relative to the command
+/// reply: an `FT.SEARCH` issued immediately after the `HSET` can miss
+/// the just-written document on a loaded runner (issue #922 — a
+/// different test failed each CI run, always at a lookup directly
+/// after a store). Bounded-retry a lookup the test REQUIRES to hit; a
+/// real regression still fails, at the deadline instead of instantly.
+/// Miss assertions stay direct — retrying a miss would prove nothing.
+async fn lookup_hit(
+    store: &RedisSemanticCache,
+    policy: &str,
+    generation: u32,
+    scope_fp: &str,
+    embedding: &[f32],
+    threshold: f32,
+    what: &str,
+) -> aisix_cache::SemanticHit {
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        if let Some(hit) = store
+            .lookup(policy, generation, scope_fp, embedding, threshold)
+            .await
+            .expect("lookup")
+        {
+            return hit;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{what}: no hit within the 2s index-visibility deadline",
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 #[tokio::test]
 async fn nearest_above_threshold_round_trips() {
     let Some(url) = vector_url() else { return };
@@ -82,11 +115,16 @@ async fn nearest_above_threshold_round_trips() {
         )
         .await
         .unwrap();
-    let hit = store
-        .lookup(&policy, 0, "fp", &[1.0, 0.0, 0.0, 0.0], 0.9)
-        .await
-        .unwrap()
-        .expect("identical vector must hit");
+    let hit = lookup_hit(
+        &store,
+        &policy,
+        0,
+        "fp",
+        &[1.0, 0.0, 0.0, 0.0],
+        0.9,
+        "identical vector must hit",
+    )
+    .await;
     assert_eq!(hit.response.message.content_str(), "a");
     assert!(hit.similarity > 0.999, "got {}", hit.similarity);
     // Remaining lifetime is reported for the backfill cap.
@@ -127,11 +165,16 @@ async fn scope_fp_partitions_candidates() {
         .await
         .unwrap();
     assert!(cross.is_none(), "entries must not cross scope fingerprints");
-    let same = store
-        .lookup(&policy, 0, "fp-a", &[1.0, 0.0], 0.5)
-        .await
-        .unwrap();
-    assert!(same.is_some());
+    lookup_hit(
+        &store,
+        &policy,
+        0,
+        "fp-a",
+        &[1.0, 0.0],
+        0.5,
+        "same-partition entry must hit",
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -166,11 +209,7 @@ async fn store_upserts_by_exact_key() {
         )
         .await
         .unwrap();
-    let hit = store
-        .lookup(&policy, 0, "fp", &[1.0, 0.0], 0.9)
-        .await
-        .unwrap()
-        .expect("hit");
+    let hit = lookup_hit(&store, &policy, 0, "fp", &[1.0, 0.0], 0.9, "upserted hit").await;
     assert_eq!(
         hit.response.message.content_str(),
         "v2",
@@ -218,11 +257,16 @@ async fn generation_rotation_orphans_old_entries() {
         )
         .await
         .unwrap();
-    let hit = store
-        .lookup(&policy, 1, "fp", &[0.0, 1.0], 0.9)
-        .await
-        .unwrap()
-        .expect("new-generation hit");
+    let hit = lookup_hit(
+        &store,
+        &policy,
+        1,
+        "fp",
+        &[0.0, 1.0],
+        0.9,
+        "new-generation hit",
+    )
+    .await;
     assert_eq!(hit.response.message.content_str(), "new");
     // The old generation's entries never resurface.
     let old = store
@@ -268,11 +312,16 @@ async fn stale_generation_never_rotates_backwards() {
         )
         .await
         .unwrap();
-    let hit = store
-        .lookup(&policy, 1, "fp", &[0.0, 1.0], 0.9)
-        .await
-        .unwrap()
-        .expect("generation-1 document must survive the stale write");
+    let hit = lookup_hit(
+        &store,
+        &policy,
+        1,
+        "fp",
+        &[0.0, 1.0],
+        0.9,
+        "generation-1 document must survive the stale write",
+    )
+    .await;
     assert_eq!(hit.response.message.content_str(), "new");
     // Stale lookups miss rather than rotating.
     let stale = store
@@ -321,11 +370,16 @@ async fn sweep_drops_only_empty_indexes() {
     }
     assert!(dropped >= 1, "the emptied index must be reclaimed");
     // The live policy still serves.
-    let hit = store
-        .lookup(&live, 0, "fp", &[1.0, 0.0], 0.9)
-        .await
-        .unwrap()
-        .expect("live index must survive the sweep");
+    let hit = lookup_hit(
+        &store,
+        &live,
+        0,
+        "fp",
+        &[1.0, 0.0],
+        0.9,
+        "live index must survive the sweep",
+    )
+    .await;
     assert_eq!(hit.response.message.content_str(), "live");
     // Even if the sweep raced the live index away, the store self-heals
     // on the next touch (missing-index guard) — pin that too by
@@ -343,11 +397,16 @@ async fn sweep_drops_only_empty_indexes() {
         )
         .await
         .unwrap();
-    assert!(store
-        .lookup(&live, 0, "fp", &[0.0, 1.0], 0.9)
-        .await
-        .unwrap()
-        .is_some());
+    lookup_hit(
+        &store,
+        &live,
+        0,
+        "fp",
+        &[0.0, 1.0],
+        0.9,
+        "self-healed index must serve the rewarmed entry",
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -390,11 +449,16 @@ async fn dims_change_rotates_the_index() {
         )
         .await
         .unwrap();
-    let hit = store
-        .lookup(&policy, 0, "fp", &[1.0, 0.0, 0.0], 0.9)
-        .await
-        .unwrap()
-        .expect("three-dim hit");
+    let hit = lookup_hit(
+        &store,
+        &policy,
+        0,
+        "fp",
+        &[1.0, 0.0, 0.0],
+        0.9,
+        "three-dim hit",
+    )
+    .await;
     assert_eq!(hit.response.message.content_str(), "three-dim");
 }
 
@@ -418,11 +482,16 @@ async fn entries_are_shared_across_store_instances() {
         )
         .await
         .unwrap();
-    let hit = store_b
-        .lookup(&policy, 0, "fp", &[1.0, 0.0], 0.9)
-        .await
-        .unwrap()
-        .expect("replica B must see replica A's entry");
+    let hit = lookup_hit(
+        &store_b,
+        &policy,
+        0,
+        "fp",
+        &[1.0, 0.0],
+        0.9,
+        "replica B must see replica A's entry",
+    )
+    .await;
     assert_eq!(hit.response.message.content_str(), "from-a");
 }
 
@@ -495,11 +564,16 @@ async fn lookup_recovers_after_external_index_loss() {
         .store(&policy, 0, "fp", "k1", vec![1.0, 0.0], resp("a"), TTL, 100)
         .await
         .unwrap();
-    assert!(store
-        .lookup(&policy, 0, "fp", &[1.0, 0.0], 0.9)
-        .await
-        .unwrap()
-        .is_some());
+    lookup_hit(
+        &store,
+        &policy,
+        0,
+        "fp",
+        &[1.0, 0.0],
+        0.9,
+        "seeded entry must hit before the index loss",
+    )
+    .await;
 
     // Simulate the loss out-of-band through a raw connection.
     let raw = aisix_redis::connect(&single(&url)).await.expect("raw conn");
@@ -528,9 +602,14 @@ async fn lookup_recovers_after_external_index_loss() {
         .store(&policy, 0, "fp", "k2", vec![0.0, 1.0], resp("b"), TTL, 100)
         .await
         .unwrap();
-    assert!(store
-        .lookup(&policy, 0, "fp", &[0.0, 1.0], 0.9)
-        .await
-        .unwrap()
-        .is_some());
+    lookup_hit(
+        &store,
+        &policy,
+        0,
+        "fp",
+        &[0.0, 1.0],
+        0.9,
+        "re-created index must serve the rewarmed entry",
+    )
+    .await;
 }
