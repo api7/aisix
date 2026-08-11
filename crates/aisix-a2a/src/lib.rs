@@ -20,9 +20,11 @@
 
 pub mod bridge;
 pub mod error;
+pub mod telemetry;
 
 pub use bridge::{
     upstream_from_a2a_agent, A2aAuth, A2aBridge, A2aEvent, A2aEventStream, A2aUpstream, AgentCard,
     HttpBridge, DEFAULT_UPSTREAM_TIMEOUT,
 };
 pub use error::A2aError;
+pub use telemetry::{canonical_operation, is_stream_end, is_streaming_operation, A2aCallFacts};

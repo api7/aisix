@@ -28,6 +28,18 @@ export interface A2aReceivedRequest {
  */
 export type A2aCardMount = "origin" | "path";
 
+/**
+ * Which wire shape the agent answers in.
+ *
+ * - `0.3` — the Task / update event sits directly at `result`, tagged with a
+ *   `kind` discriminator.
+ * - `1.0` — the same object is wrapped in the response's `oneof payload`,
+ *   which protobuf JSON renders as the set field's own name (`task`,
+ *   `statusUpdate`). This is the shape a 1.0 agent actually returns, so a test
+ *   that never uses it cannot see a reader that only understands 0.3.
+ */
+export type A2aWireShape = "0.3" | "1.0";
+
 export interface A2aUpstream {
   /** Register this as the agent's `url`: the A2A service endpoint. */
   url: string;
@@ -40,6 +52,8 @@ export interface A2aUpstreamOptions {
   cardMount?: A2aCardMount;
   /** When set, the agent is registered with `auth_type: bearer` and this token. */
   token?: string;
+  /** Wire shape of the results this agent returns. Defaults to `0.3`. */
+  wireShape?: A2aWireShape;
 }
 
 const PATH_PREFIX = "/v3/agents/serve/tenant-42";
@@ -88,6 +102,7 @@ export async function startA2aUpstream(
       servicePath,
       cardPath,
       token: options.token,
+      wireShape: options.wireShape ?? "0.3",
     }).catch((err: unknown) => {
       // `handle` rejects on a malformed body, and on a write to an already
       // closed socket. Unhandled, that terminates the test process; worse, the
@@ -122,6 +137,7 @@ async function handle(
     servicePath: string;
     cardPath: string;
     token?: string;
+    wireShape: A2aWireShape;
   },
 ): Promise<void> {
   const path = new URL(req.url ?? "/", "http://127.0.0.1").pathname;
@@ -150,6 +166,27 @@ async function handle(
     apiKey: header("x-api-key"),
     body,
   });
+
+  // The context the caller asked to continue, echoed back on every result the
+  // way a real agent does — so a test can prove the gateway correlated the
+  // call to that conversation rather than to one it invented.
+  const params = body?.params as Record<string, unknown> | undefined;
+  const message = params?.message as Record<string, unknown> | undefined;
+  const contextId =
+    typeof message?.contextId === "string" ? message.contextId : undefined;
+
+  /**
+   * Put a Task or an update event where this agent's wire version puts it:
+   * flat under `result` with a `kind` tag on 0.3, inside the response's
+   * payload wrapper on 1.0.
+   */
+  const payload = (
+    kind: "task" | "status-update",
+    obj: Record<string, unknown>,
+  ): Record<string, unknown> =>
+    ctx.wireShape === "1.0"
+      ? { [kind === "task" ? "task" : "statusUpdate"]: obj }
+      : { kind, ...obj };
 
   if (ctx.token !== undefined && header("authorization") !== `Bearer ${ctx.token}`) {
     send(401, { error: "unauthorized" });
@@ -192,27 +229,37 @@ async function handle(
     const envelope = (result: Record<string, unknown>) =>
       `data: ${JSON.stringify({ jsonrpc: "2.0", id: body?.id ?? null, result })}\n\n`;
     res.write(": open\n\n");
+    // The agent thinks before it says anything, like a real one. Without this
+    // the first event lands sub-millisecond and a time-to-first-event of 0 is
+    // indistinguishable from one that was never recorded.
+    await new Promise((resolve) => setTimeout(resolve, STREAM_GAP_MS));
     res.write(
-      envelope({
-        kind: "status-update",
-        taskId: "task-e2e-stream",
-        status: { state: "working" },
-        seq: 1,
-        sawVersion: header("a2a-version"),
-        sawAccept: header("accept"),
-      }),
+      envelope(
+        payload("status-update", {
+          taskId: "task-e2e-stream",
+          contextId,
+          status: { state: "working" },
+          seq: 1,
+          sawVersion: header("a2a-version"),
+          sawAccept: header("accept"),
+        }),
+      ),
     );
     await new Promise((resolve) => setTimeout(resolve, STREAM_GAP_MS));
     res.write("event: status-update\n");
-    res.write(envelope({ kind: "status-update", taskId: "task-e2e-stream", seq: 2 }));
+    res.write(
+      envelope(payload("status-update", { taskId: "task-e2e-stream", contextId, seq: 2 })),
+    );
     await new Promise((resolve) => setTimeout(resolve, STREAM_GAP_MS));
     res.write(
-      envelope({
-        kind: "task",
-        id: "task-e2e-stream",
-        status: { state: "completed" },
-        seq: 3,
-      }),
+      envelope(
+        payload("task", {
+          id: "task-e2e-stream",
+          contextId,
+          status: { state: "completed" },
+          seq: 3,
+        }),
+      ),
     );
     res.end();
     return;
@@ -222,15 +269,15 @@ async function handle(
     send(200, {
       jsonrpc: "2.0",
       id: body?.id ?? null,
-      result: {
-        kind: "task",
+      result: payload("task", {
         id: "task-e2e-1",
+        contextId,
         status: { state: "completed" },
         // Echoed so the gateway's forwarding can be asserted from the caller
         // side as well as from `requests`.
         sawVersion: header("a2a-version"),
         sawMethod: body?.method ?? null,
-      },
+      }),
     });
     return;
   }

@@ -613,7 +613,7 @@ fn build_otlp_span(record: &SinkRecord, exporter_name: &str) -> Value {
 
     let mut attributes = vec![
         attr_string("gen_ai.system", "aisix"),
-        attr_string("gen_ai.operation.name", "chat"),
+        attr_string("gen_ai.operation.name", operation_name(event)),
     ];
     // The model alias the client sent (`model` field) — a Model-Group
     // name for routed requests (AISIX-Cloud#790). Semconv key for the
@@ -731,6 +731,52 @@ fn build_otlp_span(record: &SinkRecord, exporter_name: &str) -> Value {
             &event.jwt_claim_mapping,
         ));
     }
+    // Gateway-protocol attribution. An A2A or MCP call is not a model
+    // inference, and encoding one as a bare `chat` span left every agent and
+    // tool call in a trace backend indistinguishable from an LLM request —
+    // with the agent, the method and the task it touched recorded nowhere at
+    // all (AISIX-Cloud#1215).
+    match event.inbound_protocol.as_str() {
+        "a2a" => {
+            if !event.a2a_agent_name.is_empty() {
+                attributes.push(attr_string("gen_ai.agent.name", &event.a2a_agent_name));
+            }
+            // An A2A context ties a multi-turn exchange's tasks together —
+            // exactly what semconv means by a conversation id.
+            if !event.a2a_context_id.is_empty() {
+                attributes.push(attr_string_capped(
+                    "gen_ai.conversation.id",
+                    &event.a2a_context_id,
+                ));
+            }
+            for (key, value) in [
+                ("aisix.a2a.method", &event.a2a_method),
+                ("aisix.a2a.operation", &event.a2a_operation),
+                ("aisix.a2a.protocol_version", &event.a2a_protocol_version),
+                ("aisix.a2a.task_id", &event.a2a_task_id),
+                ("aisix.a2a.task_state", &event.a2a_task_state),
+            ] {
+                if !value.is_empty() {
+                    attributes.push(attr_string_capped(key, value));
+                }
+            }
+            if event.a2a_stream_event_count > 0 {
+                attributes.push(attr_int(
+                    "aisix.a2a.stream_event_count",
+                    i64::from(event.a2a_stream_event_count),
+                ));
+            }
+        }
+        "mcp" => {
+            if !event.mcp_tool_name.is_empty() {
+                attributes.push(attr_string_capped("gen_ai.tool.name", &event.mcp_tool_name));
+            }
+            if !event.mcp_server_name.is_empty() {
+                attributes.push(attr_string("aisix.mcp.server_name", &event.mcp_server_name));
+            }
+        }
+        _ => {}
+    }
     // Opt-in captured content (#519 B.2) — present ONLY on a record built by
     // [`content_record`] for a `content_mode = full` exporter. Keys match the
     // Datadog sink's flattened content fields, so one query vocabulary works
@@ -746,13 +792,61 @@ fn build_otlp_span(record: &SinkRecord, exporter_name: &str) -> Value {
     json!({
         "traceId": trace_id,
         "spanId":  span_id,
-        "name":    "chat.completions",
-        "kind":    3, // SPAN_KIND_CLIENT (DP → upstream LLM)
+        "name":    span_name(event),
+        // SPAN_KIND_CLIENT for all three: the gateway is the client of a
+        // remote LLM, agent or MCP server. The conventions name INTERNAL for
+        // a tool executed in-process, which is not what this span describes.
+        "kind":    3,
         "startTimeUnixNano": start_unix_nano.to_string(),
         "endTimeUnixNano":   end_unix_nano.to_string(),
         "attributes": attributes,
         "status": { "code": status_code },
     })
+}
+
+/// The OpenTelemetry GenAI operation this event describes.
+///
+/// The gateway fronts three kinds of upstream, and only one of them is a model
+/// inference. `invoke_agent` and `execute_tool` are the semconv's own
+/// well-known values for the other two, so an A2A or MCP span lands in the
+/// same bucket a trace backend already understands.
+fn operation_name(event: &UsageEvent) -> &'static str {
+    match event.inbound_protocol.as_str() {
+        "a2a" => "invoke_agent",
+        "mcp" => "execute_tool",
+        _ => "chat",
+    }
+}
+
+/// Longest target this will append to a span name.
+///
+/// An A2A agent name is a registered resource, but an MCP tool name is the
+/// caller's own `tools/call` `params.name` and is recorded before the tool is
+/// known to exist — including on the quota-rejection path, which emits without
+/// ever contacting an upstream. A trace backend indexes span names and most
+/// derive RED metrics from them, so the one field a caller picks freely is
+/// bounded before it gets there.
+const MAX_SPAN_NAME_TARGET: usize = 64;
+
+/// The span's name: `{operation} {target}` where the target is low-cardinality
+/// and known, per the semconv's naming rule for agent and tool spans. LLM
+/// traffic keeps the name it has always had.
+///
+/// A target that is absent or outside [`MAX_SPAN_NAME_TARGET`] leaves the bare
+/// operation, which the conventions name as the fallback for exactly this
+/// case. The raw value is still on the span as an attribute either way.
+fn span_name(event: &UsageEvent) -> String {
+    let operation = operation_name(event);
+    let target = match event.inbound_protocol.as_str() {
+        "a2a" => &event.a2a_agent_name,
+        "mcp" => &event.mcp_tool_name,
+        _ => return "chat.completions".to_string(),
+    };
+    if target.is_empty() || target.len() > MAX_SPAN_NAME_TARGET {
+        operation.to_string()
+    } else {
+        format!("{operation} {target}")
+    }
 }
 
 /// Wrap one or more spans into an OTLP/HTTP-JSON `ExportTraceServiceRequest`.
@@ -787,6 +881,25 @@ fn attr_string(key: &str, value: &str) -> Value {
         "key": key,
         "value": { "stringValue": value },
     })
+}
+
+/// Longest caller-supplied attribute value carried on a span.
+///
+/// The gateway-protocol attributes below are copied from the caller's own
+/// JSON-RPC envelope (the method it invoked, the ids it named), and the
+/// request body limit defaults to unlimited, so their length is the caller's
+/// choice. Every span rides in a batched export, so an unbounded value is a
+/// delivery problem as much as a storage one.
+const MAX_PROTOCOL_ATTR_BYTES: usize = 256;
+
+/// [`attr_string`] for a value a caller controls, cut to
+/// [`MAX_PROTOCOL_ATTR_BYTES`] on a UTF-8 boundary.
+fn attr_string_capped(key: &str, value: &str) -> Value {
+    let mut end = MAX_PROTOCOL_ATTR_BYTES.min(value.len());
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    attr_string(key, &value[..end])
 }
 
 fn attr_int(key: &str, value: i64) -> Value {
@@ -1333,6 +1446,181 @@ mod tests {
         assert!(keys.contains(&"aisix.model_id"));
         assert!(keys.contains(&"aisix.exporter_name"));
         assert!(keys.contains(&"aisix.request_id"));
+    }
+
+    #[test]
+    fn an_a2a_call_exports_as_an_agent_span_not_a_chat_one() {
+        // Every gateway-protocol event used to be encoded as `chat` /
+        // `chat.completions`, so an agent call was indistinguishable from a
+        // model inference in a trace backend and the agent, method and task it
+        // touched appeared nowhere (AISIX-Cloud#1215).
+        let mut ev = sample_event();
+        ev.inbound_protocol = "a2a".into();
+        ev.a2a_agent_name = "invoice-processor".into();
+        ev.a2a_method = "SendStreamingMessage".into();
+        ev.a2a_operation = "message/stream".into();
+        ev.a2a_protocol_version = "1.0".into();
+        ev.a2a_task_id = "task-9".into();
+        ev.a2a_context_id = "ctx-4".into();
+        ev.a2a_task_state = "working".into();
+
+        let body = build_otlp_traces_payload(&ev, "test-exp");
+        let span = &body["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
+        assert_eq!(span["name"], "invoke_agent invoice-processor");
+        let attrs = span["attributes"].as_array().unwrap();
+        let find = |k: &str| attrs.iter().find(|a| a["key"] == k);
+        let string_at = |k: &str| find(k).unwrap()["value"]["stringValue"].clone();
+        assert_eq!(string_at("gen_ai.operation.name"), "invoke_agent");
+        assert_eq!(string_at("gen_ai.agent.name"), "invoice-processor");
+        // A2A's context id is semconv's conversation id — the thread a
+        // multi-turn exchange's tasks hang off.
+        assert_eq!(string_at("gen_ai.conversation.id"), "ctx-4");
+        assert_eq!(string_at("aisix.a2a.method"), "SendStreamingMessage");
+        assert_eq!(string_at("aisix.a2a.operation"), "message/stream");
+        assert_eq!(string_at("aisix.a2a.protocol_version"), "1.0");
+        assert_eq!(string_at("aisix.a2a.task_id"), "task-9");
+        assert_eq!(string_at("aisix.a2a.task_state"), "working");
+    }
+
+    #[test]
+    fn a_streamed_a2a_call_carries_its_event_count() {
+        // A unary call has no count, and exporting a zero would read as "the
+        // stream carried nothing" rather than "there was no stream".
+        let mut streamed = sample_event();
+        streamed.inbound_protocol = "a2a".into();
+        streamed.a2a_agent_name = "invoice-processor".into();
+        streamed.a2a_stream_event_count = 17;
+        let body = build_otlp_traces_payload(&streamed, "test-exp");
+        let attrs = body["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["attributes"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(
+            attrs
+                .iter()
+                .find(|a| a["key"] == "aisix.a2a.stream_event_count")
+                .unwrap()["value"]["intValue"],
+            "17"
+        );
+
+        let mut unary = sample_event();
+        unary.inbound_protocol = "a2a".into();
+        let body = build_otlp_traces_payload(&unary, "test-exp");
+        let attrs = body["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["attributes"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert!(attrs
+            .iter()
+            .all(|a| a["key"] != "aisix.a2a.stream_event_count"));
+    }
+
+    #[test]
+    fn an_mcp_call_exports_as_a_tool_span() {
+        let mut ev = sample_event();
+        ev.inbound_protocol = "mcp".into();
+        ev.mcp_server_name = "github".into();
+        ev.mcp_tool_name = "create_issue".into();
+
+        let body = build_otlp_traces_payload(&ev, "test-exp");
+        let span = &body["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
+        assert_eq!(span["name"], "execute_tool create_issue");
+        let attrs = span["attributes"].as_array().unwrap();
+        let find = |k: &str| attrs.iter().find(|a| a["key"] == k);
+        assert_eq!(
+            find("gen_ai.operation.name").unwrap()["value"]["stringValue"],
+            "execute_tool"
+        );
+        assert_eq!(
+            find("gen_ai.tool.name").unwrap()["value"]["stringValue"],
+            "create_issue"
+        );
+        assert_eq!(
+            find("aisix.mcp.server_name").unwrap()["value"]["stringValue"],
+            "github"
+        );
+    }
+
+    #[test]
+    fn a_caller_chosen_target_cannot_grow_the_span_name() {
+        // An MCP tool name is the caller's own `tools/call` `params.name`,
+        // recorded before the tool is known to exist, and the request body
+        // limit defaults to unlimited. A trace backend indexes span names, so
+        // an oversized one falls back to the bare operation and travels as an
+        // attribute instead — itself cut to a fixed cap.
+        let mut ev = sample_event();
+        ev.inbound_protocol = "mcp".into();
+        ev.mcp_tool_name = "t".repeat(4096);
+
+        let body = build_otlp_traces_payload(&ev, "test-exp");
+        let span = &body["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
+        assert_eq!(span["name"], "execute_tool");
+        let attrs = span["attributes"].as_array().unwrap();
+        let tool = attrs
+            .iter()
+            .find(|a| a["key"] == "gen_ai.tool.name")
+            .unwrap()["value"]["stringValue"]
+            .as_str()
+            .unwrap();
+        assert_eq!(tool.len(), MAX_PROTOCOL_ATTR_BYTES);
+    }
+
+    #[test]
+    fn a_capped_attribute_is_cut_on_a_char_boundary() {
+        // A multi-byte character straddling the cap must not produce invalid
+        // UTF-8 in the export body.
+        let mut ev = sample_event();
+        ev.inbound_protocol = "a2a".into();
+        ev.a2a_method = "情".repeat(200);
+
+        let body = build_otlp_traces_payload(&ev, "test-exp");
+        let attrs = body["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["attributes"]
+            .as_array()
+            .unwrap()
+            .clone();
+        let method = attrs
+            .iter()
+            .find(|a| a["key"] == "aisix.a2a.method")
+            .unwrap()["value"]["stringValue"]
+            .as_str()
+            .unwrap();
+        assert!(method.len() <= MAX_PROTOCOL_ATTR_BYTES);
+        assert!(method.chars().all(|c| c == '情'));
+    }
+
+    #[test]
+    fn a_gateway_protocol_span_without_a_target_keeps_a_bare_name() {
+        // A pre-dispatch rejection resolves no agent, so there is no
+        // low-cardinality target to append — semconv says name the span after
+        // the operation alone rather than inventing one.
+        let mut ev = sample_event();
+        ev.inbound_protocol = "a2a".into();
+        let body = build_otlp_traces_payload(&ev, "test-exp");
+        assert_eq!(
+            body["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["name"],
+            "invoke_agent"
+        );
+    }
+
+    #[test]
+    fn llm_traffic_keeps_its_chat_span_shape() {
+        // The protocol switch must not move LLM spans: dashboards and saved
+        // trace queries are written against these two values.
+        for protocol in ["", "openai", "anthropic"] {
+            let mut ev = sample_event();
+            ev.inbound_protocol = protocol.into();
+            let body = build_otlp_traces_payload(&ev, "test-exp");
+            let span = &body["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
+            assert_eq!(span["name"], "chat.completions", "protocol={protocol:?}");
+            let attrs = span["attributes"].as_array().unwrap();
+            assert_eq!(
+                attrs
+                    .iter()
+                    .find(|a| a["key"] == "gen_ai.operation.name")
+                    .unwrap()["value"]["stringValue"],
+                "chat"
+            );
+        }
     }
 
     #[test]
