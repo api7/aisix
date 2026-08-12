@@ -25,6 +25,19 @@ use crate::health::ModelRuntimeStatusTracker;
 /// accounts) is dampened.
 const MAX_CONCURRENT_BACKGROUND_CHECKS: usize = 4;
 
+/// Whether a direct model's upstream id is a concrete string the prober
+/// can send. A wildcard alias row whose `model_name` template is itself a
+/// glob (`openai/*` → `"*"`) or absent has no concrete id — probing would
+/// send the `*` verbatim, burn real quota every interval, and pin the row
+/// permanently Unhealthy. A wildcard alias pinned to a concrete template
+/// (`gpt-*` → `gpt-4o`) probes that template safely and keeps its check.
+fn upstream_template_is_probeable(model: &aisix_core::Model) -> bool {
+    model
+        .model_name
+        .as_deref()
+        .is_some_and(|m| !m.contains('*'))
+}
+
 pub async fn run_background_model_check_once(
     snapshot: Arc<AisixSnapshot>,
     hub: Arc<Hub>,
@@ -38,13 +51,7 @@ pub async fn run_background_model_check_once(
         if model.is_routing() {
             continue;
         }
-        // A wildcard alias row whose upstream TEMPLATE is itself a glob
-        // has no concrete model id to probe — the `*` would go upstream
-        // verbatim, burn real quota every interval, and pin the row
-        // permanently Unhealthy. A wildcard alias pinned to a concrete
-        // template (`gpt-*` → `gpt-4o`) probes that template safely and
-        // keeps its configured check.
-        if model.model_name.as_deref().is_none_or(|m| m.contains('*')) {
+        if !upstream_template_is_probeable(model) {
             continue;
         }
         let Some(cfg) = model.background_model_check.as_ref() else {
@@ -164,6 +171,29 @@ mod tests {
     use reqwest::Client;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn upstream_template_probeability() {
+        let model = |model_name: Option<&str>| -> aisix_core::Model {
+            let mut v = serde_json::json!({
+                "display_name": "d",
+                "provider": "openai",
+                "provider_key_id": "pk",
+            });
+            if let Some(m) = model_name {
+                v["model_name"] = serde_json::json!(m);
+            }
+            serde_json::from_value(v).unwrap()
+        };
+        // Concrete template probes safely — including a wildcard ALIAS
+        // pinned to a concrete upstream (`gpt-*` → `gpt-4o`).
+        assert!(upstream_template_is_probeable(&model(Some("gpt-4o"))));
+        // A glob template would send `*` verbatim — skip.
+        assert!(!upstream_template_is_probeable(&model(Some("*"))));
+        assert!(!upstream_template_is_probeable(&model(Some("gpt-*"))));
+        // No upstream id at all — skip.
+        assert!(!upstream_template_is_probeable(&model(None)));
+    }
 
     fn openai_test_bridge() -> OpenAiBridge {
         let client = Client::builder()

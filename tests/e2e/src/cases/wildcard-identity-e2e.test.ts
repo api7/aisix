@@ -89,6 +89,7 @@ describe("wildcard alias identity e2e", () => {
     // JSON per FIXTURE): drives the streaming-only TTFT/summary series
     // so the dump-wide assertions cover that family too.
     const sse = await startOpenAiUpstream({
+      eventDelayMs: 2,
       streamEvents: [
         JSON.stringify({
           id: "wid-sse",
