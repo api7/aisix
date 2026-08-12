@@ -157,7 +157,7 @@ describe("provider_key_name pairs with provider_key_id on every series (#941)", 
   }, 60_000);
 
   afterAll(async () => {
-    await app?.stop();
+    await app?.exit();
     await upstream?.close();
     await streamUpstream?.close();
     await embedUpstream?.close();
