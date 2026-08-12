@@ -76,6 +76,7 @@ start_gateway() {
         > "$OUT/gateway.log" 2>&1 &
     GW_PID=$!
     wait_http_200 "http://127.0.0.1:$GW_PORT$REQ_PATH" "gateway"
+    assert_listener "$GW_PORT" "$GW_PID" "gateway"
     sleep 3
     RSS_IDLE=$(rss_kb "$GW_PID")
     TPC_WORKERS=$(ps -T -p "$GW_PID" | grep -c 'tpc-' || true)

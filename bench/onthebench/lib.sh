@@ -144,15 +144,57 @@ wait_http_200() { # wait_http_200 <url> <label> [max_s]
     return 1
 }
 
+# An HTTP 200 says something is listening; it does not say the thing that is
+# listening is the thing this run started. A process that loses the bind race
+# exits, a stale listener from an earlier run keeps answering, and every
+# window afterwards measures a stranger with fail=0 throughout. Two checks,
+# because neither covers the other:
+#
+#   liveness    our own process is still up. This is the one that catches a
+#               lost bind race whatever the other listener is, since the
+#               loser exits on "Address already in use".
+#   ownership   the listener on the port is our pid. This catches a process
+#               that is alive but bound elsewhere, or answering from an
+#               earlier run of itself.
+#
+# Ownership degrades to a warning when ss cannot report the pid (a listener
+# owned by another user needs privilege to attribute); liveness never does.
+#
+# Response-shape fingerprinting deliberately not used: a stand-in mock built
+# from the same semantics answers byte-identically, so a fingerprint cannot
+# tell the two apart. The listening pid can.
+assert_listener() { # assert_listener <port> <pid> <label>
+    local port="$1" want="$2" label="$3" owners p
+    [ -d "/proc/$want" ] ||
+        { echo "FATAL: $label (pid $want) is not running after readiness - it likely lost the bind race on :$port; something else answered the readiness probe" >&2
+          exit 1; }
+    owners=$(ss -ltnpH "sport = :$port" 2>/dev/null | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u)
+    if [ -z "$owners" ]; then
+        echo "WARNING: cannot attribute the listener on :$port; $label identity unverified (liveness passed)" >&2
+        return 0
+    fi
+    grep -qx "$want" <<<"$owners" && return 0
+    # A launcher that forks the real listener is legitimate; a stranger is not.
+    for p in $owners; do
+        [ "$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')" = "$want" ] && return 0
+    done
+    echo "FATAL: :$port is held by pid $(echo "$owners" | paste -sd, -), not the $label this run started (pid $want) - measuring it would measure a foreign process" >&2
+    exit 1
+}
+
 start_mock() { # start_mock <ttft_ms>
     [ -n "$MOCK_PID" ] && { kill "$MOCK_PID" 2>/dev/null || true; wait "$MOCK_PID" 2>/dev/null || true; }
     MOCK_TTFT_MS="$1" taskset -c "$MOCK_CORES" "$TOOLS/mock" -port "$MOCK_PORT" \
         >> "$OUT/mock.log" 2>&1 &
     MOCK_PID=$!
     wait_http_200 "http://127.0.0.1:$MOCK_PORT$REQ_PATH" "mock (ttft=${1}ms)"
+    assert_listener "$MOCK_PORT" "$MOCK_PID" "mock"
     # A mock that ignores MOCK_TTFT_MS would make the delayed leg silently
     # measure a 0-delay upstream with fail=0 throughout; assert the delay is
-    # actually in effect before any window runs against it.
+    # actually in effect before any window runs against it. Note this only
+    # runs on a delayed tier: a grid trimmed to 0-delay points has no such
+    # assertion, which is exactly why the identity check above is
+    # unconditional rather than a side effect of running a delay tier.
     if [ "$1" -gt 0 ]; then
         local ttfb
         ttfb=$(curl -s --max-time 2 -o /dev/null -w '%{time_starttransfer}' -X POST \
