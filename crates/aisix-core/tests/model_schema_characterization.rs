@@ -111,7 +111,7 @@ fn accept_routing_minimal() {
 #[test]
 fn accept_routing_full() {
     accept(
-        "routing with all knobs + shared optionals",
+        "routing with all LIVE knobs + shared optionals",
         json!({
             "display_name": "r",
             "routing": {
@@ -124,8 +124,95 @@ fn accept_routing_full() {
             },
             "timeout": 1000,
             "rate_limit": {"rpm": 10},
-            "allowed_cidrs": ["10.0.0.0/8"],
-            "cost": {"input_per_1k": 0.0, "output_per_1k": 0.0}
+            "allowed_cidrs": ["10.0.0.0/8"]
+        }),
+    );
+}
+
+#[test]
+fn strict_rejects_dead_knobs_per_kind_but_lenient_loads_them() {
+    // Kind policy (model-kind audit): generic call knobs resolve
+    // member → group → deployment default wherever a group slot exists;
+    // model-specific knobs are direct-only. A knob the shape never
+    // resolves is REJECTED at write time — accepted-but-unread config is
+    // the #962 class — while the lenient read path keeps loading stored
+    // rows (the loader strips the field and reports partial compat).
+    let cases = [
+        (
+            "routing + top-level retries",
+            json!({
+                "display_name": "r",
+                "routing": {"targets": [{"model": "m"}]},
+                "retries": 2
+            }),
+        ),
+        (
+            "routing + cost",
+            json!({
+                "display_name": "r",
+                "routing": {"targets": [{"model": "m"}]},
+                "cost": {"input_per_1k": 0.0, "output_per_1k": 0.0}
+            }),
+        ),
+        (
+            "routing + auto_prompt_caching",
+            json!({
+                "display_name": "r",
+                "routing": {"targets": [{"model": "m"}]},
+                "auto_prompt_caching": {"enabled": true}
+            }),
+        ),
+        (
+            "ensemble + timeout",
+            json!({
+                "display_name": "e",
+                "ensemble": {"panel": [{"model": "m"}], "judge": {"model": "j"}},
+                "timeout": 1000
+            }),
+        ),
+        (
+            "ensemble + retries",
+            json!({
+                "display_name": "e",
+                "ensemble": {"panel": [{"model": "m"}], "judge": {"model": "j"}},
+                "retries": 1
+            }),
+        ),
+        (
+            "semantic + cost",
+            json!({
+                "display_name": "s",
+                "semantic": {
+                    "embedding_model": "emb",
+                    "routes": [{"name": "r", "target": "t", "examples": ["x"]}],
+                    "default": "d",
+                    "match": {"threshold": 0.5}
+                },
+                "cost": {"input_per_1k": 0.0, "output_per_1k": 0.0}
+            }),
+        ),
+    ];
+    for (label, value) in cases {
+        reject(label, value.clone());
+        if let Err(e) = aisix_core::models::validate_model_lenient(&value) {
+            panic!("expected lenient ACCEPT for `{label}`, got reject: {e}");
+        }
+    }
+    // The semantic group slots stay LIVE on the strict path — the write
+    // gate must not outlaw the knobs the runtime resolves.
+    accept(
+        "semantic + top-level timeout/retries (the group slots)",
+        json!({
+            "display_name": "s",
+            "semantic": {
+                "embedding_model": "emb",
+                "routes": [{"name": "r", "target": "t", "examples": ["x"]}],
+                "default": "d",
+                "match": {"threshold": 0.5}
+            },
+            "timeout": 1000,
+            "stream_timeout": 1000,
+            "retries": 2
         }),
     );
 }

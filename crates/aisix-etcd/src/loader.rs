@@ -238,7 +238,8 @@ pub fn build_snapshot(prefix: &str, entries: &[RawEntry]) -> (AisixSnapshot, Bui
 
         match parsed.kind {
             "models" => {
-                if let Some(entry) = validate_and_parse::<Model>(
+                let row_kind = parsed.kind;
+                if let Some(mut entry) = validate_and_parse::<Model>(
                     &raw.key,
                     raw.revision,
                     parsed,
@@ -246,6 +247,26 @@ pub fn build_snapshot(prefix: &str, entries: &[RawEntry]) -> (AisixSnapshot, Bui
                     validate_model_lenient,
                     &mut stats,
                 ) {
+                    // Known-but-kind-inapplicable knobs load stripped and
+                    // report through the same partially-compatible channel
+                    // as unknown fields — the strict write path rejects
+                    // these shapes, stored rows must keep loading.
+                    let stripped = entry.value.strip_kind_inapplicable();
+                    if !stripped.is_empty() {
+                        let fields: Vec<String> = stripped
+                            .iter()
+                            .map(|f| format!("inapplicable:{f}"))
+                            .collect();
+                        warn_partial_compat_deduped(&raw.key, row_kind, &fields);
+                        // MERGE into this key's existing partial-compat
+                        // row rather than pushing a second one: a row can
+                        // carry BOTH unknown fields (pushed inside
+                        // validate_and_parse) and inapplicable knobs, and
+                        // the supervisor keys its retained report by etcd
+                        // key — two rows for one key would drop one half
+                        // (resync overwrites, watch takes the first).
+                        merge_partial_compat_fields(&mut stats, &raw.key, row_kind, fields);
+                    }
                     snapshot.models.insert(entry);
                 }
             }
@@ -557,6 +578,27 @@ fn normalize_ignored_path(path: &str) -> String {
 /// combinations keep logging (never silently dropped) but are no longer
 /// remembered, so a pathological fleet re-logs on each resync instead
 /// of growing memory without bound.
+/// Add `fields` to the partial-compat row already recorded for `key`
+/// this build, or start one if none exists. Exactly one row per etcd key
+/// so the supervisor's key-addressed retained report never drops a half
+/// (a row with both unknown AND inapplicable fields). `rfind` because
+/// `validate_and_parse` pushes the unknown-fields row for this same key
+/// moments earlier — it is at or near the tail.
+fn merge_partial_compat_fields(stats: &mut BuildStats, key: &str, kind: &str, fields: Vec<String>) {
+    match stats.partial_rows.iter_mut().rfind(|r| r.key == key) {
+        Some(row) => {
+            row.fields.extend(fields);
+            row.fields.sort_unstable();
+            row.fields.dedup();
+        }
+        None => stats.partial_rows.push(PartialCompatRow {
+            key: key.to_string(),
+            kind: kind.to_string(),
+            fields,
+        }),
+    }
+}
+
 fn warn_partial_compat_deduped(key: &str, kind: &str, fields: &[String]) {
     use std::collections::HashSet;
     use std::sync::{Mutex, OnceLock};
@@ -983,6 +1025,63 @@ mod tests {
             stats.partially_compatible.is_empty(),
             "env_id is a registered cross-plane field, not version skew: {:?}",
             stats.partially_compatible
+        );
+    }
+
+    #[test]
+    fn model_dead_knob_strips_and_reports_inapplicable() {
+        // A routing group with a top-level `retries` (dead — the group
+        // slot is routing.retries) loads with the field stripped and
+        // reports it via the partial-compat channel.
+        let entries = vec![raw(
+            "/aisix/models/m-dead",
+            br#"{
+                "display_name": "grp",
+                "routing": {"targets": [{"model": "m"}]},
+                "retries": 3
+            }"#,
+            1,
+        )];
+        let (snap, stats) = build_snapshot("/aisix", &entries);
+        assert_eq!(stats.accepted, 1, "rejections: {:?}", stats.rejections);
+        let m = snap.models.get_by_name("grp").expect("row loaded");
+        assert!(m.value.retries.is_none(), "dead knob stripped from struct");
+        assert_eq!(
+            stats.partial_rows[0].fields,
+            vec!["inapplicable:retries".to_string()]
+        );
+    }
+
+    #[test]
+    fn model_unknown_and_inapplicable_fields_merge_into_one_row() {
+        // A row carrying BOTH an unknown field (future CP) and a dead
+        // knob must report BOTH under ONE key — two rows would let the
+        // supervisor's key-addressed retained map drop a half (M1).
+        let entries = vec![raw(
+            "/aisix/models/m-both",
+            br#"{
+                "display_name": "grp2",
+                "routing": {"targets": [{"model": "m"}]},
+                "retries": 3,
+                "zz_future_field": true
+            }"#,
+            1,
+        )];
+        let (_snap, stats) = build_snapshot("/aisix", &entries);
+        assert_eq!(stats.accepted, 1, "rejections: {:?}", stats.rejections);
+        let rows: Vec<_> = stats
+            .partial_rows
+            .iter()
+            .filter(|r| r.key == "/aisix/models/m-both")
+            .collect();
+        assert_eq!(rows.len(), 1, "one row per key: {:?}", stats.partial_rows);
+        assert_eq!(
+            rows[0].fields,
+            vec![
+                "inapplicable:retries".to_string(),
+                "zz_future_field".to_string()
+            ],
+            "both signals present and sorted"
         );
     }
 

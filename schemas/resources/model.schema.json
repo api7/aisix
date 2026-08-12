@@ -721,6 +721,21 @@
             "required": [
               "embedding"
             ]
+          },
+          {
+            "required": [
+              "retries"
+            ]
+          },
+          {
+            "required": [
+              "auto_prompt_caching"
+            ]
+          },
+          {
+            "required": [
+              "cost"
+            ]
           }
         ]
       },
@@ -796,6 +811,31 @@
             "required": [
               "embedding"
             ]
+          },
+          {
+            "required": [
+              "timeout"
+            ]
+          },
+          {
+            "required": [
+              "stream_timeout"
+            ]
+          },
+          {
+            "required": [
+              "retries"
+            ]
+          },
+          {
+            "required": [
+              "auto_prompt_caching"
+            ]
+          },
+          {
+            "required": [
+              "cost"
+            ]
           }
         ]
       },
@@ -844,6 +884,16 @@
           {
             "required": [
               "embedding"
+            ]
+          },
+          {
+            "required": [
+              "auto_prompt_caching"
+            ]
+          },
+          {
+            "required": [
+              "cost"
             ]
           }
         ]
