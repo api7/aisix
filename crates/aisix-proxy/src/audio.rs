@@ -698,10 +698,10 @@ async fn multipart_dispatch(
     let url = aisix_gateway::url_cache::cached_endpoint_url(
         &pk_entry.id,
         url_cache_key,
-        (
+        &[
             pk_entry.value.api_base.as_deref().unwrap_or(""),
             upstream_path,
-        ),
+        ],
         || {
             let base = crate::dispatch::resolve_base_url(&pk_entry.value)?;
             Ok::<_, crate::error::ProxyError>(crate::dispatch::build_openai_url(
@@ -1202,7 +1202,7 @@ async fn speech_dispatch(
     let speech_url = aisix_gateway::url_cache::cached_endpoint_url(
         &pk_entry.id,
         "proxy/audio/speech",
-        (pk_entry.value.api_base.as_deref().unwrap_or(""), ""),
+        &[pk_entry.value.api_base.as_deref().unwrap_or("")],
         || {
             let base = crate::dispatch::resolve_base_url(&pk_entry.value)?;
             Ok::<_, crate::error::ProxyError>(crate::dispatch::build_openai_url(

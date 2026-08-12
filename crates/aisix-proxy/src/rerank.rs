@@ -400,10 +400,10 @@ async fn dispatch(
     let url = aisix_gateway::url_cache::cached_endpoint_url(
         &pk_entry.id,
         "proxy/rerank",
-        (
+        &[
             pk_entry.value.api_base.as_deref().unwrap_or(""),
             &provider_label,
-        ),
+        ],
         || {
             let base = match pk_entry.value.api_base.as_deref() {
                 Some(b) if !b.trim().is_empty() => b.trim_end_matches('/').to_string(),
