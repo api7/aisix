@@ -600,7 +600,7 @@ fn emit_job_usage_event(
     );
     crate::usage_attr::apply_jwt_identity(&mut event, auth.jwt.as_ref());
     state.usage_sink.try_emit(label, event.clone());
-    let exporters = snap.observability_exporters.entries();
+    let exporters = crate::usage_attr::live_exporters(state, snap);
     state
         .otlp_fan_out
         .fan_out(&event, None, exporters.iter().map(|e| &e.value));
@@ -823,9 +823,9 @@ pub(crate) async fn create_file(
         }
     };
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
-
-    // One snapshot for the whole request (#941) — see `embeddings`.
-    let snapshot = state.snapshot.load();
+    // Loaded below, after the upload is drained — see the note in
+    // `audio::multipart_dispatch` (#941 audit M2).
+    let mut snapshot = None;
 
     let result = async {
         // Re-build the outbound multipart form, extracting the gateway-only
@@ -891,14 +891,15 @@ pub(crate) async fn create_file(
         })?;
 
         let wanted = form_model.or_else(|| explicit_model(&params, &headers));
-        let target = resolve_target(&snapshot, &auth, wanted.as_deref(), &client)?;
+        let snapshot = &**snapshot.insert(state.snapshot.load());
+        let target = resolve_target(snapshot, &auth, wanted.as_deref(), &client)?;
 
         // Batch/fine-tune input files carry end-user content — scan them
         // like any other inbound payload.
         scan_input_blob(&state, &auth, &target, &file_bytes, &mut monitor_hits).await?;
         let _reservation = crate::quota::enforce(
             &state,
-            &snapshot,
+            snapshot,
             &auth,
             Some(&crate::quota::ModelRateLimit::from_model(
                 target.display_name(),
@@ -929,7 +930,9 @@ pub(crate) async fn create_file(
 
     finish(
         &state,
-        &snapshot,
+        // A form that failed before the model field was read never loaded
+        // one.
+        &snapshot.unwrap_or_else(|| state.snapshot.load()),
         "files",
         Method::POST,
         "/v1/files".into(),
@@ -1815,6 +1818,8 @@ async fn attribute_batch_usage(
 
     let snap = state.snapshot.load();
     let pk = crate::usage_attr::ResolvedPk::resolve(&snap, pk_id);
+    // Same exporter set for every model slice of one batch.
+    let exporters = crate::usage_attr::live_exporters(state, &snap);
     let multi = per_model.len() > 1;
     for (idx, (provider_model, agg)) in per_model.iter().enumerate() {
         let request_id = batch_attribution_request_id(raw_batch_id, idx, multi);
@@ -1840,7 +1845,6 @@ async fn attribute_batch_usage(
         // same caller the event's api_key_id already reflects.
         crate::usage_attr::apply_jwt_identity(&mut event, jwt);
         state.usage_sink.try_emit("batch", event.clone());
-        let exporters = snap.observability_exporters.entries();
         state
             .otlp_fan_out
             .fan_out(&event, None, exporters.iter().map(|e| &e.value));

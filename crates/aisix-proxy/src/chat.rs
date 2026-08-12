@@ -2062,8 +2062,8 @@ async fn dispatch(
                         provider: &provider_for_metrics,
                         model: &model_for_metrics,
                         upstream_model: &upstream_model_for_metrics,
-                        provider_key_id: pk.labels().id,
-                        provider_key_name: pk.labels().name,
+                        provider_key_id: pk.labels().id(),
+                        provider_key_name: pk.labels().name(),
                         api_key_id: &api_key_id_for_telem,
                         team_id: team_id_for_metrics.as_deref().unwrap_or("unknown"),
                         user_id: user_id_for_metrics.as_deref().unwrap_or("unknown"),
@@ -4232,7 +4232,7 @@ fn emit_usage_event(
     // empty for envs that haven't configured any, so this is a cheap
     // no-op on the common path. Spawned tasks own the POST work and
     // never block the request return.
-    let exporters = snap.observability_exporters.entries();
+    let exporters = crate::usage_attr::live_exporters(state, snap);
     state
         .otlp_fan_out
         .fan_out(&event, content.as_ref(), exporters.iter().map(|e| &e.value));

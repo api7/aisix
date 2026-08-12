@@ -251,6 +251,9 @@ pub async fn responses(
                 &success.routing,
                 None,
             );
+            // ONE ProviderKey lookup for both the metric emit and the
+            // winner's usage event below (#941).
+            let pk = ResolvedPk::resolve(&snapshot, &success.provider_key_id);
             crate::request_metrics::record(
                 &state,
                 "/v1/responses",
@@ -259,9 +262,7 @@ pub async fn responses(
                     provider: &success.provider,
                     model: &model_name,
                     upstream_model: &success.upstream_model,
-                    // One ProviderKey lookup for this emit; the usage event
-                    // below resolves the attempt it reports (#941).
-                    pk: ResolvedPk::resolve(&snapshot, &success.provider_key_id).labels(),
+                    pk: pk.labels(),
                     stream: stream_requested,
                     is_fallback: success.routing.fallback_count() > 0,
                 },
@@ -329,11 +330,11 @@ pub async fn responses(
                     emit_usage_event(
                         &state,
                         &snapshot,
+                        &pk,
                         &request_id,
                         &success.model_id,
                         &model_name,
                         &api_key_id,
-                        &success.provider_key_id,
                         &success.provider,
                         &success.upstream_model,
                         status,
@@ -1551,14 +1552,16 @@ async fn responses_to_target(
                 // A stream can outlive several config generations, so the
                 // end-of-stream emit reads a FRESH snapshot rather than the
                 // one the request started on (#941).
+                let snap_c = state_c.snapshot.load();
+                let pk_c = ResolvedPk::resolve(&snap_c, &provider_key_id_c);
                 emit_usage_event(
                     &state_c,
-                    &state_c.snapshot.load(),
+                    &snap_c,
+                    &pk_c,
                     &request_id_c,
                     &model_id_c,
                     &requested_model_c,
                     &api_key_id_c,
-                    &provider_key_id_c,
                     &provider_c,
                     &upstream_model_c,
                     // A stream the consumer abandoned mid-flight is reported
@@ -2040,14 +2043,16 @@ async fn responses_cross_provider_to_target(
                 // A stream can outlive several config generations, so the
                 // end-of-stream emit reads a FRESH snapshot rather than the
                 // one the request started on (#941).
+                let snap_c = state_c.snapshot.load();
+                let pk_c = ResolvedPk::resolve(&snap_c, &provider_key_id_c);
                 emit_usage_event(
                     &state_c,
-                    &state_c.snapshot.load(),
+                    &snap_c,
+                    &pk_c,
                     &request_id_c,
                     &model_id_c,
                     &requested_model_c,
                     &api_key_id_c,
-                    &provider_key_id_c,
                     &provider_c,
                     &upstream_model_c,
                     status,
@@ -2938,11 +2943,14 @@ fn emit_usage_event(
     // but it is now ONE lookup feeding both the wire attribution tags and
     // the `provider_key_name` metric label.
     snap: &aisix_core::AisixSnapshot,
+    // Resolved by the caller so the winning attempt's row is read ONCE for
+    // both this event and the handler's `record` (#941 audit L2). The
+    // stream-end callers resolve their own against a fresh snapshot.
+    pk: &ResolvedPk<'_>,
     request_id: &str,
     model_id: &str,
     requested_model: &str,
     api_key_id: &str,
-    provider_key_id: &str,
     // Metric labels the UsageEvent has no field for (AISIX-Cloud#1234
     // follow-up): the wire struct is the CP contract, so they ride
     // alongside rather than in it.
@@ -2964,7 +2972,6 @@ fn emit_usage_event(
     // (AISIX-Cloud#947). Forwarded only to `fan_out`, never to the CP sink.
     content: Option<&CapturedContent>,
 ) {
-    let pk = ResolvedPk::resolve(snap, provider_key_id);
     let tags = pk.telemetry_tags();
     let mut event = UsageEvent {
         request_id: request_id.to_string(),
@@ -3006,7 +3013,7 @@ fn emit_usage_event(
     };
     crate::usage_attr::apply_jwt_identity(&mut event, client.jwt.as_ref());
     state.usage_sink.try_emit("responses", event.clone());
-    let exporters = snap.observability_exporters.entries();
+    let exporters = crate::usage_attr::live_exporters(state, snap);
     state
         .otlp_fan_out
         .fan_out(&event, content, exporters.iter().map(|e| &e.value));
@@ -3101,7 +3108,7 @@ fn emit_zero_token_event(
     };
     crate::usage_attr::apply_jwt_identity(&mut event, client.jwt.as_ref());
     state.usage_sink.try_emit("responses", event.clone());
-    let exporters = snap.observability_exporters.entries();
+    let exporters = crate::usage_attr::live_exporters(state, snap);
     state
         .otlp_fan_out
         .fan_out(&event, content.as_ref(), exporters.iter().map(|e| &e.value));

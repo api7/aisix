@@ -114,12 +114,13 @@ pub async fn transcriptions(
         }
     };
 
-    // One snapshot for the whole request (#941) — see `embeddings`.
-    let snapshot = state.snapshot.load();
+    // Loaded by `multipart_dispatch` AFTER the upload is drained, then
+    // reused by the emits below (#941) — see the note on its signature.
+    let mut snapshot = None;
 
     match multipart_dispatch(
         &state,
-        &snapshot,
+        &mut snapshot,
         &auth,
         multipart,
         // Version-independent path — multipart_dispatch's URL builder
@@ -131,6 +132,8 @@ pub async fn transcriptions(
     .await
     {
         Ok(success) => {
+            // `multipart_dispatch` loaded it once the upload was drained.
+            let snapshot = snapshot.unwrap_or_else(|| state.snapshot.load());
             let elapsed = started.elapsed();
             // Actual status, not a hardcoded 200 — the #696 billed-then-
             // output-blocked path returns Ok(success) carrying a 422.
@@ -146,9 +149,11 @@ pub async fn transcriptions(
                 &request_id,
                 None,
             );
+            // ONE ProviderKey lookup for both terminal emits (#941).
+            let pk = crate::usage_attr::ResolvedPk::resolve(&snapshot, &success.provider_key_id);
             record_audio_metrics(
                 &state,
-                &snapshot,
+                &pk,
                 "/v1/audio/transcriptions",
                 &auth,
                 &success,
@@ -158,6 +163,7 @@ pub async fn transcriptions(
             emit_audio_usage(
                 &state,
                 &snapshot,
+                &pk,
                 &request_id,
                 "/v1/audio/transcriptions",
                 &success,
@@ -169,6 +175,9 @@ pub async fn transcriptions(
             success.response
         }
         Err(err) => {
+            // The dispatch can fail before it ever loaded one (a malformed
+            // form), so fall back rather than assume.
+            let snapshot = snapshot.unwrap_or_else(|| state.snapshot.load());
             let status = err.status().as_u16();
             let elapsed = started.elapsed();
             emit_access_log(
@@ -243,12 +252,13 @@ pub async fn translations(
         }
     };
 
-    // One snapshot for the whole request (#941) — see `embeddings`.
-    let snapshot = state.snapshot.load();
+    // Loaded by `multipart_dispatch` AFTER the upload is drained, then
+    // reused by the emits below (#941) — see the note on its signature.
+    let mut snapshot = None;
 
     match multipart_dispatch(
         &state,
-        &snapshot,
+        &mut snapshot,
         &auth,
         multipart,
         // Version-independent path — multipart_dispatch's URL builder
@@ -260,6 +270,8 @@ pub async fn translations(
     .await
     {
         Ok(success) => {
+            // `multipart_dispatch` loaded it once the upload was drained.
+            let snapshot = snapshot.unwrap_or_else(|| state.snapshot.load());
             let elapsed = started.elapsed();
             // Actual status, not a hardcoded 200 — the #696 billed-then-
             // output-blocked path returns Ok(success) carrying a 422.
@@ -275,9 +287,11 @@ pub async fn translations(
                 &request_id,
                 None,
             );
+            // ONE ProviderKey lookup for both terminal emits (#941).
+            let pk = crate::usage_attr::ResolvedPk::resolve(&snapshot, &success.provider_key_id);
             record_audio_metrics(
                 &state,
-                &snapshot,
+                &pk,
                 "/v1/audio/translations",
                 &auth,
                 &success,
@@ -287,6 +301,7 @@ pub async fn translations(
             emit_audio_usage(
                 &state,
                 &snapshot,
+                &pk,
                 &request_id,
                 "/v1/audio/translations",
                 &success,
@@ -298,6 +313,9 @@ pub async fn translations(
             success.response
         }
         Err(err) => {
+            // The dispatch can fail before it ever loaded one (a malformed
+            // form), so fall back rather than assume.
+            let snapshot = snapshot.unwrap_or_else(|| state.snapshot.load());
             let status = err.status().as_u16();
             let elapsed = started.elapsed();
             emit_access_log(
@@ -496,7 +514,13 @@ pub async fn speech(
 /// model id, then rebuild and forward the multipart form.
 async fn multipart_dispatch(
     state: &ProxyState,
-    snapshot: &aisix_core::AisixSnapshot,
+    // Out-param, not an input: the snapshot is loaded HERE, once the
+    // upload has been drained, and handed back so the handler's terminal
+    // emits read the same one. Loading it at handler entry instead would
+    // resolve the model, the client-IP allowlist, the upstream credential
+    // and the rate-limit policies against config captured before a
+    // multi-minute upload began (#941 audit M2).
+    snapshot_out: &mut Option<std::sync::Arc<aisix_core::AisixSnapshot>>,
     auth: &AuthenticatedKey,
     mut multipart: Multipart,
     upstream_path: &str,
@@ -535,6 +559,7 @@ async fn multipart_dispatch(
         .map(|s| s.trim().to_string())
         .ok_or_else(|| ProxyError::InvalidRequest("`model` field missing from form".into()))?;
 
+    let snapshot = &**snapshot_out.insert(state.snapshot.load());
     let model_entry = crate::model_resolve::resolve_model(snapshot, &model_name)
         .ok_or_else(|| ProxyError::ModelNotFound(model_name.clone()))?;
 
@@ -1385,7 +1410,7 @@ fn probe_audio_duration_seconds(audio: &[u8]) -> Option<f64> {
 /// label set twice.
 fn record_audio_metrics(
     state: &ProxyState,
-    snapshot: &aisix_core::AisixSnapshot,
+    pk: &crate::usage_attr::ResolvedPk<'_>,
     endpoint: &'static str,
     auth: &AuthenticatedKey,
     success: &AudioDispatchSuccess,
@@ -1400,7 +1425,7 @@ fn record_audio_metrics(
             provider: &success.provider,
             model: &success.model_name,
             upstream_model: &success.upstream_model,
-            pk: crate::usage_attr::ResolvedPk::resolve(snapshot, &success.provider_key_id).labels(),
+            pk: pk.labels(),
             ..Default::default()
         },
         status,
@@ -1415,6 +1440,7 @@ fn record_audio_metrics(
 fn emit_audio_usage(
     state: &ProxyState,
     snapshot: &aisix_core::AisixSnapshot,
+    pk: &crate::usage_attr::ResolvedPk<'_>,
     request_id: &str,
     endpoint: &'static str,
     success: &AudioDispatchSuccess,
@@ -1424,11 +1450,10 @@ fn emit_audio_usage(
     client: &ClientContext,
 ) {
     let (prompt_tokens, completion_tokens) = success.usage.unwrap_or((0, 0));
-    let pk = crate::usage_attr::ResolvedPk::resolve(snapshot, &success.provider_key_id);
     emit_usage_event(
         state,
         snapshot,
-        &pk,
+        pk,
         request_id,
         &success.model_id,
         &success.model_name,
@@ -1522,7 +1547,7 @@ fn emit_usage_event(
     // Handler label "audio" — bucketed prometheus counter (#408).
     crate::usage_attr::apply_jwt_identity(&mut event, client.jwt.as_ref());
     state.usage_sink.try_emit("audio", event.clone());
-    let exporters = snap.observability_exporters.entries();
+    let exporters = crate::usage_attr::live_exporters(state, snap);
     state
         .otlp_fan_out
         .fan_out(&event, content, exporters.iter().map(|e| &e.value));

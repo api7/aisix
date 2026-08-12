@@ -186,6 +186,9 @@ pub async fn messages(
                 &routing,
                 None,
             );
+            // ONE ProviderKey lookup for both the metric emit and the
+            // winner's usage event below (#941).
+            let pk = crate::usage_attr::ResolvedPk::resolve(&snapshot, &provider_key_id);
             crate::request_metrics::record(
                 &state,
                 "/v1/messages",
@@ -194,8 +197,7 @@ pub async fn messages(
                     provider: &provider_label,
                     model: &model_name,
                     upstream_model: &upstream_model,
-                    pk: crate::usage_attr::ResolvedPk::resolve(&snapshot, &provider_key_id)
-                        .labels(),
+                    pk: pk.labels(),
                     stream: stream_requested,
                     is_fallback: routing.fallback_count() > 0,
                 },
@@ -264,12 +266,12 @@ pub async fn messages(
                 emit_anthropic_usage_event(
                     &state,
                     &snapshot,
+                    &pk,
                     &request_id,
                     event_model_id,
                     &api_key_id,
                     &provider_label,
                     &model_name,
-                    &provider_key_id,
                     &upstream_model,
                     auth.key().team_id.as_deref(),
                     auth.key().user_id.as_deref(),
@@ -385,12 +387,12 @@ pub async fn messages(
                 emit_anthropic_usage_event(
                     &state,
                     &snapshot,
+                    &crate::usage_attr::ResolvedPk::unresolved(),
                     &request_id,
                     &model_id,
                     &api_key_id,
                     "unknown",
                     &model_name,
-                    "unknown",
                     "unknown",
                     auth.key().team_id.as_deref(),
                     auth.key().user_id.as_deref(),
@@ -457,9 +459,11 @@ fn emit_failed_attempts_anthropic(
         } else {
             None
         };
+        let pk = crate::usage_attr::ResolvedPk::resolve(snap, &rec.provider_key_id);
         emit_anthropic_usage_event(
             state,
             snap,
+            &pk,
             request_id,
             // Each failed attempt records the TARGET it actually hit
             // (AISIX-Cloud#790), not the group it was resolved from.
@@ -467,7 +471,6 @@ fn emit_failed_attempts_anthropic(
             api_key_id,
             provider,
             model,
-            &rec.provider_key_id,
             upstream_model,
             team_id,
             user_id,
@@ -1365,15 +1368,17 @@ async fn anthropic_passthrough_dispatch(
                 // A stream can outlive several config generations, so the
                 // end-of-stream emit reads a FRESH snapshot rather than the
                 // one the request started on (#941).
+                let snap_c = state_c.snapshot.load();
+                let pk_c = crate::usage_attr::ResolvedPk::resolve(&snap_c, &provider_key_id_c);
                 emit_anthropic_usage_event(
                     &state_c,
-                    &state_c.snapshot.load(),
+                    &snap_c,
+                    &pk_c,
                     &request_id_c,
                     &model_id_c,
                     &api_key_id_c,
                     &provider_c,
                     &model_name_c,
-                    &provider_key_id_c,
                     &upstream_model_c,
                     team_id_c.as_deref(),
                     user_id_c.as_deref(),
@@ -2007,15 +2012,18 @@ async fn cross_provider_dispatch(
                     started_for_telem.elapsed(),
                 );
                 // Fresh snapshot at stream end — see the passthrough path.
+                let snap_telem = state_for_telem.snapshot.load();
+                let pk_telem =
+                    crate::usage_attr::ResolvedPk::resolve(&snap_telem, &provider_key_id_for_telem);
                 emit_anthropic_usage_event(
                     &state_for_telem,
-                    &state_for_telem.snapshot.load(),
+                    &snap_telem,
+                    &pk_telem,
                     &request_id_for_telem,
                     &model_id_for_telem,
                     &api_key_id_for_telem,
                     &provider_for_telem,
                     &model_for_telem,
-                    &provider_key_id_for_telem,
                     &upstream_model_for_telem,
                     team_id_for_telem.as_deref(),
                     user_id_for_telem.as_deref(),
@@ -2718,12 +2726,15 @@ fn emit_anthropic_usage_event(
     // but it is now ONE lookup feeding both the wire attribution tags and
     // the `provider_key_name` metric label, which used to look it up twice.
     snap: &aisix_core::AisixSnapshot,
+    // Resolved by the caller so the winning attempt's row is read ONCE for
+    // both this event and the handler's `record` (#941 audit L2). The
+    // failed-attempt and stream-end callers resolve their own.
+    pk: &crate::usage_attr::ResolvedPk<'_>,
     request_id: &str,
     model_id: &str,
     api_key_id: &str,
     provider: &str,
     model: &str,
-    provider_key_id: &str,
     upstream_model: &str,
     team_id: Option<&str>,
     user_id: Option<&str>,
@@ -2750,7 +2761,6 @@ fn emit_anthropic_usage_event(
     // resolved ProviderKey from the live snapshot and copy its
     // `telemetry_tags` into wire fields. Empty `provider_key_id`
     // (pre-dispatch error path) bypasses the lookup → wire NULL.
-    let pk = crate::usage_attr::ResolvedPk::resolve(snap, provider_key_id);
     let tags = pk.telemetry_tags();
     let mut event = UsageEvent {
         request_id: request_id.to_string(),
@@ -2794,7 +2804,7 @@ fn emit_anthropic_usage_event(
     // path. Bucketed prometheus counter (#408).
     crate::usage_attr::apply_jwt_identity(&mut event, client.jwt.as_ref());
     state.usage_sink.try_emit("messages", event.clone());
-    let exporters = snap.observability_exporters.entries();
+    let exporters = crate::usage_attr::live_exporters(state, snap);
     state
         .otlp_fan_out
         .fan_out(&event, content.as_ref(), exporters.iter().map(|e| &e.value));
@@ -2852,8 +2862,8 @@ fn emit_anthropic_usage_event(
                 provider,
                 model,
                 upstream_model,
-                provider_key_id,
-                provider_key_name: pk.labels().name,
+                provider_key_id: pk.labels().id(),
+                provider_key_name: pk.labels().name(),
                 api_key_id,
                 team_id: team_id.unwrap_or("unknown"),
                 user_id: user_id.unwrap_or("unknown"),

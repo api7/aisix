@@ -776,7 +776,7 @@ fn emit_a2a_usage(
         },
     );
     state.usage_sink.try_emit("a2a", event.clone());
-    let exporters = snap.observability_exporters.entries();
+    let exporters = crate::usage_attr::live_exporters(state, snap);
     // Opt-in content capture, on the same terms as every other endpoint: only
     // an exporter configured for full content sees the words, and they never
     // travel to the control plane — the usage event above carries counts

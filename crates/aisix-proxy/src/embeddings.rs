@@ -687,7 +687,7 @@ fn emit_usage_event(
     // Per-env OTLP/HTTP fan-out — same shape as chat.rs:1334. The
     // snapshot's exporter table is empty for envs that haven't
     // configured any, so this is a cheap no-op on the common path.
-    let exporters = snap.observability_exporters.entries();
+    let exporters = crate::usage_attr::live_exporters(state, snap);
     state
         .otlp_fan_out
         .fan_out(&event, content, exporters.iter().map(|e| &e.value));

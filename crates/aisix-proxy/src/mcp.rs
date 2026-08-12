@@ -517,7 +517,7 @@ fn emit_tool_call_usage(
     // every other emitter — pre-fix MCP usage reached only the CP sink, so
     // exporters never saw /mcp traffic. No content capture (tool args/results
     // are a separate surface from prompt/response).
-    let exporters = snap.observability_exporters.entries();
+    let exporters = crate::usage_attr::live_exporters(state, snap);
     state
         .otlp_fan_out
         .fan_out(&event, None, exporters.iter().map(|e| &e.value));

@@ -112,6 +112,13 @@ pub(crate) async fn realtime(
     // carries the credential in a subprotocol item), so a failure between
     // auth and dispatch must hand the resolved key back for attribution —
     // pre-#932 those errors were emitted as if anonymous.
+    //
+    // One snapshot for the whole pre-upgrade phase (#941): `prepare`
+    // resolves the model against it and the rejection arm below reports
+    // through it, so a refused upgrade cannot straddle two config
+    // generations. The detached session's terminal emit deliberately reads
+    // a fresh one — it can run for minutes.
+    let snapshot = state.snapshot.load();
     let outcome = match ws {
         Ok(ws) => match authenticate(&state, &headers, &client).await {
             Ok(auth) => {
@@ -119,7 +126,7 @@ pub(crate) async fn realtime(
                 // auth extractor; do the same here so the session clone
                 // and the error emits below attribute the JWT identity.
                 client.jwt = auth.jwt.clone();
-                prepare(&state, &params, &client, auth.clone())
+                prepare(&state, &snapshot, &params, &client, auth.clone())
                     .await
                     .map(|prep| (ws, prep))
                     .map_err(|err| (Some(auth), err))
@@ -185,7 +192,7 @@ pub(crate) async fn realtime(
             );
             crate::usage_attr::emit_error_usage_event(
                 &state,
-                &state.snapshot.load(),
+                &snapshot,
                 "realtime",
                 "realtime",
                 &request_id,
@@ -213,6 +220,7 @@ struct Prepared {
 
 async fn prepare(
     state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
     params: &HashMap<String, String>,
     client: &ClientContext,
     auth: AuthenticatedKey,
@@ -229,8 +237,7 @@ async fn prepare(
         ));
     }
 
-    let snapshot = state.snapshot.load();
-    let model_entry = crate::model_resolve::resolve_model(&snapshot, &requested_model)
+    let model_entry = crate::model_resolve::resolve_model(snapshot, &requested_model)
         .ok_or_else(|| ProxyError::ModelNotFound(format!("model {requested_model:?} not found")))?;
     if !auth.key().can_access(&requested_model) {
         return Err(ProxyError::ModelForbidden(format!(
@@ -245,7 +252,7 @@ async fn prepare(
     }
     crate::dispatch::check_ip_access(model, &client.source_ip)?;
 
-    let pk_entry = crate::dispatch::resolve_provider_key(&snapshot, model)?;
+    let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
     let secret = crate::dispatch::require_api_key(&pk_entry.value, model)?.to_string();
     let upstream_model = crate::dispatch::require_upstream_model(model)?.to_string();
 
@@ -315,7 +322,7 @@ async fn prepare(
     };
     let reservation = crate::quota::enforce(
         state,
-        &snapshot,
+        snapshot,
         &auth,
         Some(&crate::quota::ModelRateLimit::from_model(
             &model_entry.value.display_name,
@@ -764,7 +771,7 @@ async fn run_session(
     crate::usage_attr::apply_pk_telemetry(&mut event, &pk);
     crate::usage_attr::apply_jwt_identity(&mut event, auth.jwt.as_ref());
     state.usage_sink.try_emit("realtime", event.clone());
-    let exporters = snap.observability_exporters.entries();
+    let exporters = crate::usage_attr::live_exporters(&state, &snap);
     state
         .otlp_fan_out
         .fan_out(&event, None, exporters.iter().map(|e| &e.value));

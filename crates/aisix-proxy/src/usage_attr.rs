@@ -145,13 +145,25 @@ impl<'a> ResolvedPk<'a> {
 
 /// The ProviderKey dimensions of a metric label set: the id and the
 /// readable name that is 1:1 with it (so the pair adds no series).
-/// Produced by [`ResolvedPk::labels`] — the only constructor a handler
-/// should reach for, since a hand-built pair can put a name next to an id
-/// it does not belong to.
+///
+/// The fields are private on purpose. [`ResolvedPk::labels`] and
+/// [`PkLabels::default`] are the only ways to build one, so a name can
+/// never be paired with an id it was not read off — which is the whole
+/// reason `Upstream` takes this type instead of a bare id.
 #[derive(Clone, Copy)]
 pub(crate) struct PkLabels<'a> {
-    pub id: &'a str,
-    pub name: &'a str,
+    id: &'a str,
+    name: &'a str,
+}
+
+impl<'a> PkLabels<'a> {
+    pub(crate) fn id(self) -> &'a str {
+        self.id
+    }
+
+    pub(crate) fn name(self) -> &'a str {
+        self.name
+    }
 }
 
 impl Default for PkLabels<'_> {
@@ -161,6 +173,30 @@ impl Default for PkLabels<'_> {
             name: UNKNOWN_PK,
         }
     }
+}
+
+/// The exporter set a terminal emit fans out to.
+///
+/// Deliberately NOT read off the request's frozen snapshot (#941 audit
+/// M1). Exporter membership is a delivery-authorization decision, not a
+/// label: an operator who deletes an exporter — say one configured for
+/// full content capture, pointed at the wrong tenant — must stop it
+/// receiving events, including captured prompt and response text, from
+/// requests that are still in flight. A frozen list would keep feeding it
+/// for as long as the longest request runs.
+///
+/// The zero-config fast path still pays nothing: the emptiness check is
+/// one relaxed atomic load on the request's own snapshot
+/// (`ResourceTable::is_empty`), so a deployment with no exporters
+/// configured never reaches the reload.
+pub(crate) fn live_exporters(
+    state: &ProxyState,
+    snap: &AisixSnapshot,
+) -> Vec<Arc<ResourceEntry<aisix_core::ObservabilityExporter>>> {
+    if snap.observability_exporters.is_empty() {
+        return Vec::new();
+    }
+    state.snapshot.load().observability_exporters.entries()
 }
 
 /// Total token cost of a request as committed against TPM/TPD rate limits
@@ -283,7 +319,7 @@ pub(crate) fn emit_error_usage_event(
     };
     apply_jwt_identity(&mut event, client.jwt.as_ref());
     state.usage_sink.try_emit(label, event.clone());
-    let exporters = snap.observability_exporters.entries();
+    let exporters = live_exporters(state, snap);
     state
         .otlp_fan_out
         .fan_out(&event, None, exporters.iter().map(|e| &e.value));
