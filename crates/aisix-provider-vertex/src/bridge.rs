@@ -277,7 +277,7 @@ fn default_client() -> Client {
     aisix_gateway::dispatch_client_builder()
         .user_agent("aisix/0.1")
         .build()
-        .unwrap_or_else(|_| Client::new())
+        .unwrap_or_else(|_| aisix_gateway::dispatch_client_fallback())
 }
 
 /// The set of Vertex publishers we dispatch to.

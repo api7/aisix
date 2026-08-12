@@ -173,13 +173,31 @@ pub fn client_builder() -> reqwest::ClientBuilder {
 /// the redirect turns the upstream's 3xx into the 502 the error path
 /// already describes.
 ///
-/// Scoped to inference dispatch on purpose. The other outbound clients
-/// have callers for which a redirect is ordinary — an OpenAPI document
-/// fetched for the MCP surface, a telemetry endpoint behind a rewrite —
-/// and the ones for which it is not (JWKS, OAuth token, A2A) already
-/// refuse it at their own construction site.
+/// The same reasoning covers the guardrail vendors: an inspection call
+/// POSTs the caller's prompt to an operator-configured endpoint under a
+/// vendor credential header (`Ocp-Apim-Subscription-Key`, and the rest),
+/// none of which reqwest strips on a cross-host hop either.
+///
+/// Not applied to every outbound client. The remaining ones either
+/// already refuse redirects at their own construction site (JWKS/OIDC
+/// discovery, MCP OAuth token, MCP OpenAPI tool calls, A2A) or talk to
+/// an operator's own collector, where an endpoint behind a rewrite is
+/// ordinary (telemetry, heartbeat, OTLP export).
 pub fn dispatch_client_builder() -> reqwest::ClientBuilder {
     client_builder().redirect(reqwest::redirect::Policy::none())
+}
+
+/// The client to fall back to when [`dispatch_client_builder`] fails to
+/// build — a malformed deployment CA, say.
+///
+/// The connection settings are lost either way; what must not be lost is
+/// the redirect refusal, which `reqwest::Client::new()` would silently
+/// restore. Builds from a policy alone, which cannot fail.
+pub fn dispatch_client_fallback() -> reqwest::Client {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("a client with only a redirect policy always builds")
 }
 
 /// Layer the outbound trust decision onto a builder. Split out so the
@@ -300,6 +318,50 @@ mod tests {
         assert!(client.is_ok(), "{:?}", client.err());
     }
 
+    /// Both dispatch clients hand a 3xx back to the caller instead of
+    /// following it — including the fallback, which is reached when the
+    /// deployment's TLS material fails to apply and which
+    /// `reqwest::Client::new()` would have quietly restored to
+    /// following-by-default.
+    #[tokio::test]
+    async fn dispatch_clients_hand_back_a_redirect_instead_of_following_it() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().expect("accept");
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf);
+                let _ = socket.write_all(
+                    b"HTTP/1.1 301 Moved Permanently\r\n\
+                      Location: http://127.0.0.1:1/elsewhere\r\n\
+                      Content-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            }
+        });
+
+        for (label, client) in [
+            (
+                "dispatch_client_builder",
+                dispatch_client_builder().build().expect("builds"),
+            ),
+            ("dispatch_client_fallback", dispatch_client_fallback()),
+        ] {
+            let res = client
+                .post(format!("http://{addr}/v1/chat/completions"))
+                .body("{}")
+                .send()
+                .await
+                .unwrap_or_else(|e| panic!("{label}: {e}"));
+            // Following it would have dialed port 1, where nothing
+            // listens, and surfaced as a transport error instead.
+            assert_eq!(res.status(), 301, "{label} followed the redirect");
+        }
+        server.join().expect("server thread");
+    }
+
     /// Every outbound HTTP client in the workspace must be built from
     /// [`client_builder`], or it silently keeps reqwest's defaults — no
     /// connect timeout, TCP keepalive off, and a 90s pooled-connection
@@ -331,9 +393,16 @@ mod tests {
                 if sanctioned_rmcp_site && line.contains("rmcp_reqwest::Client::") {
                     continue;
                 }
-                if line.contains("reqwest::Client::builder()")
-                    || line.contains("reqwest::Client::new()")
-                {
+                // Prose about a constructor is not a call to one.
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                // `Client::new()` unqualified, too: every one of these
+                // files imports the type, and the fallback arm of a
+                // failed build is where a bare client hides
+                // (`.unwrap_or_else(|_| Client::new())` gives back
+                // reqwest's defaults, redirect following included).
+                if line.contains("reqwest::Client::builder()") || line.contains("Client::new()") {
                     offenders.push(format!("{}:{}", file.display(), n + 1));
                 }
             }
@@ -494,53 +563,109 @@ mod tests {
     /// the 502 the error path describes instead of a silent hop to
     /// whatever host the `Location` named.
     ///
-    /// Provider bridges are matched by shape rather than listed, so a new
-    /// vendor crate is covered the day its `bridge.rs` lands; the
-    /// gateway's per-worker and per-ProviderKey pools and the proxy's
-    /// passthrough client are named because they have no shape in common.
+    /// Stated as a whitelist rather than a pattern: **every**
+    /// `client_builder()` site in the workspace either builds a dispatch
+    /// client or is named below. A rule shaped the other way — "files
+    /// that look like a bridge must use the dispatch builder" — passes
+    /// silently for a client put in `src/client.rs`, or in
+    /// `src/bridge/mod.rs`, or in a surface nobody thought of, which is
+    /// how the guardrail clients were missed the first time.
     ///
-    /// Deliberately not every outbound client: an OpenAPI document
-    /// fetched for the MCP surface, or a telemetry endpoint behind a
-    /// rewrite, may legitimately redirect. The outbound clients that must
-    /// not (JWKS, OAuth token, A2A) already refuse at their own site.
+    /// Adding an outbound client therefore forces a decision here, and
+    /// the decision it forces is the safe-by-default one.
     #[test]
-    fn every_dispatch_client_refuses_redirects() {
-        fn is_dispatch_site(path: &std::path::Path) -> bool {
-            let p = path.to_string_lossy().replace('\\', "/");
-            (p.contains("/aisix-provider-") && p.ends_with("/src/bridge.rs"))
-                || p.ends_with("aisix-proxy/src/http_client.rs")
-                || p.ends_with("aisix-gateway/src/upstream_tls.rs")
-        }
+    fn every_outbound_client_is_classified_for_redirects() {
+        /// Sites that build a client from [`client_builder`] and are
+        /// *not* dispatch, with why a redirect there is not the same
+        /// question. Everything else must use
+        /// [`dispatch_client_builder`].
+        const NON_DISPATCH: &[(&str, &str)] = &[
+            (
+                "aisix-mcp/src/oauth.rs",
+                "sets `Policy::none()` itself; an OAuth token endpoint never \
+                 legitimately redirects",
+            ),
+            (
+                "aisix-mcp/src/openapi.rs",
+                "sets `Policy::none()` itself, for the generated tool calls",
+            ),
+            (
+                "aisix-proxy/src/jwt.rs",
+                "sets `Policy::none()` itself; a JWKS endpoint never \
+                 legitimately redirects",
+            ),
+            (
+                "aisix-a2a/src/bridge.rs",
+                "sets `Policy::none()` itself; an A2A agent does not redirect \
+                 its JSON-RPC endpoint",
+            ),
+            (
+                "aisix-obs/src/otlp_http_sink.rs",
+                "the operator's own collector; an endpoint behind a rewrite is \
+                 ordinary and carries no vendor credential of ours",
+            ),
+            (
+                "aisix-server/src/heartbeat.rs",
+                "the control plane the deployment is registered with",
+            ),
+            (
+                "aisix-server/src/telemetry.rs",
+                "the control plane the deployment is registered with",
+            ),
+        ];
 
         let crates_dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/.."));
-        let mut sites = 0;
+        let mut dispatch_sites = 0;
+        let mut classified = std::collections::HashSet::new();
         let mut offenders = Vec::new();
-        for file in rust_sources(crates_dir)
-            .into_iter()
-            .filter(|f| is_dispatch_site(f))
-        {
+        for file in rust_sources(crates_dir) {
+            // This module defines both builders.
+            if file.ends_with("upstream_http.rs") {
+                continue;
+            }
+            let path = file.to_string_lossy().replace('\\', "/");
             let src = std::fs::read_to_string(&file).expect("read source");
             for (n, line) in production_half(&src).lines().enumerate() {
-                if !line.contains("client_builder()") {
+                // Prose about the builders is not a call to one.
+                if !line.contains("client_builder()") || line.trim_start().starts_with("//") {
                     continue;
                 }
-                sites += 1;
-                if !line.contains("dispatch_client_builder()") {
+                if line.contains("dispatch_client_builder()") {
+                    dispatch_sites += 1;
+                } else if let Some((named, _why)) =
+                    NON_DISPATCH.iter().find(|(f, _)| path.ends_with(f))
+                {
+                    classified.insert(*named);
+                } else {
                     offenders.push(format!("{}:{}", file.display(), n + 1));
                 }
             }
         }
-        assert!(
-            sites >= 6,
-            "found {sites} dispatch client construction sites, expected at \
-             least 6 — the probe no longer matches the code and this test \
-             proves nothing",
-        );
+
         assert!(
             offenders.is_empty(),
-            "these dispatch a caller's request on a client that follows \
-             redirects; build them from `dispatch_client_builder()`:\n{}",
+            "these build an outbound client that follows redirects. If it \
+             carries a caller's payload or a gateway-held credential, build \
+             it from `dispatch_client_builder()`; if a redirect there is \
+             genuinely ordinary, add it to NON_DISPATCH with the reason:\n{}",
             offenders.join("\n"),
+        );
+        assert!(
+            dispatch_sites >= 13,
+            "found {dispatch_sites} dispatch client construction sites, \
+             expected at least 13 — the probe no longer matches the code and \
+             this test proves nothing",
+        );
+        let stale: Vec<_> = NON_DISPATCH
+            .iter()
+            .map(|(f, _)| *f)
+            .filter(|f| !classified.contains(f))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "these NON_DISPATCH entries no longer match a client_builder() \
+             site; drop them so the list keeps meaning something:\n{}",
+            stale.join("\n"),
         );
     }
 

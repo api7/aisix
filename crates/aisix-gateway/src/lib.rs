@@ -51,7 +51,7 @@ pub use upstream_headers::{
     RESERVED_UPSTREAM_HEADERS,
 };
 pub use upstream_http::{
-    client_builder, dispatch_client_builder, error_with_causes, transport_error_message,
-    UpstreamHttpConfig,
+    client_builder, dispatch_client_builder, dispatch_client_fallback, error_with_causes,
+    transport_error_message, UpstreamHttpConfig,
 };
 pub use upstream_tls::TlsSettings;

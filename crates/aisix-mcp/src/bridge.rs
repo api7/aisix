@@ -58,7 +58,12 @@ pub const DEFAULT_UPSTREAM_TIMEOUT: Duration = Duration::from_secs(30);
 ///   MCP server behind an enterprise CA is exactly as common as a model
 ///   endpoint behind one, and the PEM has to be re-parsed rather than
 ///   reused because rmcp's `Certificate` is a different crate version's
-///   type than the one `upstream_tls` caches for the workspace line.
+///   type than the one `upstream_tls` caches for the workspace line;
+/// - redirects are refused, as they are on every other client that
+///   carries a caller's payload under a gateway-held credential. A
+///   `tools/call` POSTs the caller's arguments under the MCP server's
+///   `x-api-key` or bearer, and reqwest does not strip either on a hop
+///   to whatever host a `Location` names.
 ///
 /// One client for all MCP upstreams = one shared pool, matching how the
 /// provider bridges share theirs (auth is injected per-request by the
@@ -69,6 +74,7 @@ fn shared_http_client() -> rmcp_reqwest::Client {
         .get_or_init(|| {
             let cfg = aisix_gateway::upstream_http::config();
             let mut b = rmcp_reqwest::Client::builder()
+                .redirect(rmcp_reqwest::redirect::Policy::none())
                 .pool_idle_timeout(cfg.pool_idle_timeout)
                 .tcp_keepalive(cfg.tcp_keepalive);
             if let Some(d) = cfg.connect_timeout {
@@ -112,7 +118,15 @@ fn shared_http_client() -> rmcp_reqwest::Client {
             if !cfg.tls.verify {
                 b = b.danger_accept_invalid_certs(true);
             }
-            b.build().unwrap_or_else(|_| rmcp_reqwest::Client::new())
+            // The connection settings are lost if the build fails; the
+            // redirect refusal must not be, which `Client::new()` would
+            // silently give back.
+            b.build().unwrap_or_else(|_| {
+                rmcp_reqwest::Client::builder()
+                    .redirect(rmcp_reqwest::redirect::Policy::none())
+                    .build()
+                    .expect("a client with only a redirect policy always builds")
+            })
         })
         .clone()
 }
