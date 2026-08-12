@@ -1,12 +1,34 @@
 //! Structured one-line access log. Called by the proxy handler once per
-//! completed request (success or error). Keeping the call explicit rather
-//! than inside a tower layer means the handler can attach `provider`,
-//! `model`, `api_key_id`, and `tokens` — fields the layer couldn't see.
+//! request (success or error). Keeping the call explicit rather than inside
+//! a tower layer means the handler can attach `provider`, `model`,
+//! `api_key_id`, and `tokens` — fields the layer couldn't see.
+//!
+//! # When the line is written, and what that costs
+//!
+//! WHEN differs by response type, and it decides which fields can be filled
+//! at all. The handler calls this on its way out, so:
+//!
+//! - **Non-streamed**: at the end of the request. Everything the handler
+//!   resolved is available.
+//! - **Streamed**: when the SSE body is handed to the server, before a
+//!   single frame is polled. The upstream has produced nothing yet, so the
+//!   token counts and `provider_request_id` are necessarily absent, and
+//!   `status` is the response-OPEN status — a stream that later aborts, or
+//!   whose consumer walks away, still logged `200` here.
+//!
+//! Do not add a field whose value only exists after the upstream responds
+//! and expect it on a streamed line; it will be silently empty there. The
+//! completion-time figures for a streamed request live on the per-attempt
+//! `UsageEvent` (and, for the provider response id, on the
+//! `provider call completed` line `UsageSink::try_emit` writes), keyed by
+//! the same `request_id`.
 
 use std::time::Duration;
 
-/// Canonical access-log fields. Constructed by the handler at the end of
-/// a request and passed to [`log_access`].
+/// Canonical access-log fields. Constructed by the handler on its way out of
+/// a request and passed to [`log_access`] — see the module docs for what
+/// "on its way out" means for a streamed response, and which fields that
+/// leaves empty.
 #[derive(Debug, Clone)]
 pub struct AccessLog<'a> {
     pub method: &'a str,
