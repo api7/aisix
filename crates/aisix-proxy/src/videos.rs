@@ -1459,6 +1459,12 @@ impl Telemetry<'_> {
             completion_tokens: None,
             total_tokens: None,
             request_id: &self.request_id,
+            // The provider's video-job id is a handle to a resource the
+            // caller keeps polling, not this call's response-object id;
+            // recording it here would repeat one id across every poll of the
+            // same job (AISIX-Cloud#1289). It already reaches the caller as
+            // the job's own `id`.
+            provider_request_id: None,
             served_by_model: None,
             routing_attempt_count: None,
             routing_fallback_count: None,

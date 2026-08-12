@@ -896,6 +896,11 @@ pub struct ResponsesStreamCompletion {
     pub cache_creation_tokens: u32,
     pub cache_read_tokens: u32,
     pub finish_reason: String,
+    /// Response object `id` reported by the **bridged upstream** — i.e. the
+    /// chat-completion id the provider sent, not the `resp_…` this encoder
+    /// mints for the client. The minted one is a gateway value and would be
+    /// useless in the provider's console (AISIX-Cloud#1289).
+    pub provider_request_id: String,
     /// Attempt-scoped time to the upstream's first generated chunk.
     pub upstream_ttft_ms: u32,
     /// Request-scoped time until the caller got its first response bytes.
@@ -1048,6 +1053,10 @@ pub fn build_responses_bridge_stream(
                     }
                     {
                         let comp = guard.comp();
+                        if !chunk.id.is_empty() {
+                            comp.provider_request_id =
+                                crate::usage_attr::sanitize_provider_response_id(&chunk.id);
+                        }
                         if let Some(fr) = chunk.finish_reason.as_ref() {
                             comp.finish_reason = finish_reason_label(fr);
                         }

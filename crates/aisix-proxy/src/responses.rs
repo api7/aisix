@@ -158,6 +158,10 @@ struct ResponseUsage {
     /// 0 until the stream forwards something (or the handler stamps it on
     /// the non-streaming paths).
     downstream_latency_ms: u32,
+    /// Responses-API response object `id` (`resp_…`), or the bridged
+    /// upstream's own id on the #825 cross-provider path. Empty when the
+    /// upstream returned no id (AISIX-Cloud#1289).
+    provider_request_id: String,
 }
 
 pub async fn responses(
@@ -233,6 +237,14 @@ pub async fn responses(
                 status,
                 elapsed,
                 &request_id,
+                // `None` on the streaming path — `usage` is filled by the
+                // stream's completion callback, long after this line. That
+                // case is covered by the per-attempt `provider call
+                // completed` line the usage sink emits (AISIX-Cloud#1289).
+                success
+                    .usage
+                    .as_ref()
+                    .map(|u| u.provider_request_id.as_str()),
                 &success.routing,
                 None,
             );
@@ -341,6 +353,7 @@ pub async fn responses(
                 status,
                 elapsed,
                 &request_id,
+                None,
                 &routing,
                 Some(&err),
             );
@@ -1294,6 +1307,12 @@ async fn responses_to_target(
             // telemetry only, the buffered bytes forward untouched.
             let usage = {
                 let mut u = responses_sse_usage(&buf).unwrap_or_default();
+                // The usage gate is independent of the id: a stream whose
+                // terminal frame reported no usage still names the upstream
+                // call it was (AISIX-Cloud#1289).
+                if u.provider_request_id.is_empty() {
+                    u.provider_request_id = responses_sse_provider_request_id(&buf);
+                }
                 if u.prompt_tokens == 0 || u.completion_tokens == 0 {
                     let est = crate::token_estimate::Estimator::new(
                         &upstream_model,
@@ -1589,6 +1608,13 @@ async fn responses_to_target(
         // object at all becomes a wholly-estimated record instead of None.
         let usage = {
             let mut u = extract_response_usage(&json_body).unwrap_or_default();
+            // `extract_response_usage` returns None on a body with no usable
+            // `usage` block, and the estimation fallback below then works off
+            // a default — which would drop a perfectly good top-level `id`
+            // (AISIX-Cloud#1289).
+            if u.provider_request_id.is_empty() {
+                u.provider_request_id = crate::usage_attr::provider_response_id(&json_body);
+            }
             if u.prompt_tokens == 0 || u.completion_tokens == 0 {
                 let est = crate::token_estimate::Estimator::new(
                     &upstream_model,
@@ -1958,6 +1984,7 @@ async fn responses_cross_provider_to_target(
                     usage_estimated: comp.usage_estimated,
                     upstream_ttft_ms: comp.upstream_ttft_ms,
                     downstream_latency_ms: comp.downstream_latency_ms,
+                    provider_request_id: comp.provider_request_id,
                 };
                 // A clean stream is a committed 200; an output-guardrail block
                 // (or fail-closed overflow) bills the upstream tokens but is
@@ -2075,6 +2102,10 @@ async fn responses_cross_provider_to_target(
             usage_estimated: false,
             upstream_ttft_ms: 0,
             downstream_latency_ms: 0,
+            // The bridged upstream's own id, not the `resp_…` re-encoded
+            // below — that one is minted here and means nothing to the
+            // provider (AISIX-Cloud#1289).
+            provider_request_id: crate::usage_attr::sanitize_provider_response_id(&resp.id),
         };
         // Token-estimation fallback (AISIX-Cloud#1074): fill counters the
         // bridged upstream never reported. Telemetry only — the re-encoded
@@ -2254,6 +2285,11 @@ fn extract_response_usage(body: &Value) -> Option<ResponseUsage> {
         // measured these before this terminal frame arrived.
         upstream_ttft_ms: 0,
         downstream_latency_ms: 0,
+        // `resp_…` straight off the upstream's own response object
+        // (AISIX-Cloud#1289). On the streaming path the caller carries the
+        // id it saw on an earlier frame across this replacement, so an
+        // upstream that only stamps it on `response.created` still records.
+        provider_request_id: crate::usage_attr::provider_response_id(body),
     })
 }
 
@@ -2299,6 +2335,31 @@ fn responses_sse_usage(bytes: &[u8]) -> Option<ResponseUsage> {
     usage
 }
 
+/// The `resp_…` carried by any frame of a fully-buffered Responses-API SSE
+/// body — `response.created` is the first, so this survives a stream whose
+/// terminal frame reported no usage and therefore produced no
+/// [`ResponseUsage`] (AISIX-Cloud#1289).
+fn responses_sse_provider_request_id(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    for line in text.lines() {
+        let Some(data) = line.strip_prefix("data:").map(str::trim) else {
+            continue;
+        };
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        if let Ok(json) = serde_json::from_str::<Value>(data) {
+            if let Some(r) = json.get("response") {
+                let id = crate::usage_attr::provider_response_id(r);
+                if !id.is_empty() {
+                    return id;
+                }
+            }
+        }
+    }
+    String::new()
+}
+
 /// Drain every complete SSE frame from `buf`, updating `acc` with the latest
 /// terminal-event usage (#808) and feeding each parsed event to the optional
 /// content capture (AISIX-Cloud#947). A frame ends at the first blank line;
@@ -2330,16 +2391,43 @@ fn drain_responses_sse_frames(
                     acc.get_or_insert_with(Default::default).upstream_ttft_ms =
                         attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
                 }
+                // `resp_…` off any frame that carries the response object —
+                // `response.created` is the first, so a stream that dies
+                // before its terminal frame still records which upstream call
+                // it was (AISIX-Cloud#1289).
+                if let Some(id) = json
+                    .get("response")
+                    .and_then(|r| r.get("id"))
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                {
+                    acc.get_or_insert_with(Default::default).provider_request_id =
+                        crate::usage_attr::sanitize_provider_response_id(id);
+                }
                 if let Some(u) = parse_responses_terminal_usage(&json) {
                     // The terminal frame replaces the token counters; carry
-                    // the two latency figures measured before it across.
-                    let (ttft, down) = acc
+                    // the latency figures and the id observed before it
+                    // across — an upstream that stamps the id only on
+                    // `response.created` would otherwise lose it here.
+                    let (ttft, down, prev_id) = acc
                         .as_ref()
-                        .map(|a| (a.upstream_ttft_ms, a.downstream_latency_ms))
+                        .map(|a| {
+                            (
+                                a.upstream_ttft_ms,
+                                a.downstream_latency_ms,
+                                a.provider_request_id.clone(),
+                            )
+                        })
                         .unwrap_or_default();
+                    let provider_request_id = if u.provider_request_id.is_empty() {
+                        prev_id
+                    } else {
+                        u.provider_request_id.clone()
+                    };
                     *acc = Some(ResponseUsage {
                         upstream_ttft_ms: ttft,
                         downstream_latency_ms: down,
+                        provider_request_id,
                         ..u
                     });
                 }
@@ -2801,8 +2889,8 @@ fn apply_passthrough_headers(
 /// Other fields left at `UsageEvent::default()`:
 ///   - cache_creation_tokens / cache_read_tokens — populated only on the
 ///     #825 cross-provider bridge path (Anthropic backends); 0 otherwise
-///   - provider_request_id / provider_model_version / finish_reason
-///     — not yet plumbed for non-chat handlers (follow-up)
+///   - provider_model_version / finish_reason — not yet plumbed for
+///     non-chat handlers (follow-up)
 ///   - cost_usd — cp-api computes server-side from pricing catalog
 ///   - cache_status / cache_hit_* / ttft_ms — no caching/streaming
 ///     surface on Responses API non-streaming
@@ -2864,6 +2952,7 @@ fn emit_usage_event(
         upstream_ttft_ms: usage.upstream_ttft_ms,
         downstream_latency_ms: usage.downstream_latency_ms,
         status_code,
+        provider_request_id: usage.provider_request_id.clone(),
         inbound_protocol: "openai".to_string(),
         attempt_index: attempt.index,
         attempt_kind: attempt.kind,
@@ -3043,6 +3132,9 @@ fn emit_access_log(
     status: u16,
     elapsed: Duration,
     request_id: &str,
+    // Winning attempt's provider response id; `None` when unknown at this
+    // point (streaming, guardrail block, pre-dispatch error).
+    provider_request_id: Option<&str>,
     routing: &RoutingTelemetry,
     error: Option<&ProxyError>,
 ) {
@@ -3071,6 +3163,7 @@ fn emit_access_log(
         completion_tokens: None,
         total_tokens: None,
         request_id,
+        provider_request_id: provider_request_id.filter(|s| !s.is_empty()),
         served_by_model: served_by,
         routing_attempt_count: match routing.attempt_count() {
             0 => None,
@@ -4712,6 +4805,196 @@ mod tests {
         assert_eq!(event.inbound_protocol, "openai");
         assert!(!event.request_id.is_empty());
         assert!(!event.occurred_at.is_empty());
+    }
+
+    /// AISIX-Cloud#1289: `/v1/responses` must record the upstream's own
+    /// response object id. Before this it was one of the fields the handler
+    /// left at `UsageEvent::default()` ("not yet plumbed for non-chat
+    /// handlers"), so a Codex-class call had no id an operator could take to
+    /// the provider's console. Fails before the fix (empty), passes after.
+    #[tokio::test]
+    async fn records_the_provider_response_id_non_streaming_1289() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "resp_1289_nonstream",
+                "object": "response",
+                "model": "gpt-4o-2024-08-06",
+                "output": [],
+                "usage": {"input_tokens": 4, "output_tokens": 2}
+            })))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_openai(&upstream.uri());
+        snap.models.insert(openai_model("gpt-4o-resp"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let state = crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+
+        let resp = crate::build_router(state)
+            .oneshot(make_req(serde_json::json!({
+                "model": "gpt-4o-resp",
+                "input": "hello"
+            })))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted")
+            .expect("usage_sink sender dropped");
+        assert_eq!(ev.provider_request_id, "resp_1289_nonstream");
+        // The gateway's own id must survive alongside it, not be replaced.
+        assert!(!ev.request_id.is_empty());
+        assert_ne!(ev.request_id, ev.provider_request_id);
+    }
+
+    /// AISIX-Cloud#1289 follow-up: `extract_response_usage` gates on a usable
+    /// `usage.input_tokens` and returns `None` without one, so the estimation
+    /// fallback (AISIX-Cloud#1074) works off a defaulted `ResponseUsage` — and
+    /// used to drop a perfectly good top-level `id` with it. The estimated
+    /// record must still name the upstream call it came from. Fails before the
+    /// follow-up (empty), passes after.
+    #[tokio::test]
+    async fn records_the_provider_response_id_when_usage_is_estimated_1289() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "resp_1289_estimated",
+                "object": "response",
+                "model": "gpt-4o-2024-08-06",
+                "output": [{
+                    "type": "message",
+                    "id": "msg_e",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "hello there"}]
+                }]
+                // No `usage` block at all — the estimator fills the counters.
+            })))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_openai(&upstream.uri());
+        snap.models.insert(openai_model("gpt-4o-resp"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let state = crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+
+        let resp = crate::build_router(state)
+            .oneshot(make_req(serde_json::json!({
+                "model": "gpt-4o-resp",
+                "input": "hello"
+            })))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted")
+            .expect("usage_sink sender dropped");
+        assert!(
+            ev.usage_estimated,
+            "fixture has no usage block, so this must be the estimated path",
+        );
+        assert_eq!(ev.provider_request_id, "resp_1289_estimated");
+    }
+
+    /// The buffered-SSE reader (the output-guardrail path holds the whole
+    /// response) must find the id on `response.created` even when no terminal
+    /// frame carried usage — that combination produces no `ResponseUsage` at
+    /// all, which is exactly where the id used to vanish.
+    #[test]
+    fn buffered_sse_id_survives_a_stream_with_no_terminal_usage_1289() {
+        let body = b"\
+data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1289_buffered\"}}\n\n\
+data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n\
+data: [DONE]\n\n";
+        assert!(
+            super::responses_sse_usage(body).is_none(),
+            "no terminal usage frame — the precondition for the lost-id case",
+        );
+        assert_eq!(
+            super::responses_sse_provider_request_id(body),
+            "resp_1289_buffered"
+        );
+    }
+
+    /// AISIX-Cloud#1289, streaming: the id arrives on `response.created` and
+    /// the terminal `response.completed` need not repeat it — this upstream
+    /// deliberately omits it there. A reader that only looked at the terminal
+    /// frame, or one that let the terminal frame overwrite what earlier
+    /// frames established, records nothing; both are the failure this pins.
+    #[tokio::test]
+    async fn streaming_records_the_provider_response_id_from_response_created_1289() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        let sse_body = "\
+data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1289_stream\"}}\n\n\
+data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n\
+data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":9,\"output_tokens\":3}}}\n\n\
+data: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse_body),
+            )
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_openai(&upstream.uri());
+        snap.models.insert(openai_model("gpt-4o-resp"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let state = crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+
+        let resp = crate::build_router(state)
+            .oneshot(make_req(serde_json::json!({
+                "model": "gpt-4o-resp",
+                "input": "hi",
+                "stream": true
+            })))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // Draining runs the stream to completion → the end-of-stream emit.
+        let _ = to_bytes(resp.into_body(), 65536).await.unwrap();
+
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted for a streaming 200")
+            .expect("usage event sender dropped");
+        assert_eq!(ev.prompt_tokens, 9, "terminal-frame usage must still win");
+        assert_eq!(
+            ev.provider_request_id, "resp_1289_stream",
+            "the id seen on response.created must survive the terminal frame",
+        );
     }
 
     /// AISIX-Cloud#867: the verbatim-OpenAI /v1/responses path must apply the

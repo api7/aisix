@@ -178,6 +178,11 @@ pub async fn chat_completions(
                 success.completion_tokens,
                 success.total_tokens,
                 &request_id,
+                // Empty on the streaming path — the id rides the first
+                // upstream frame, which has not arrived yet. That case is
+                // covered by the per-attempt `provider call completed` line
+                // the usage sink emits (AISIX-Cloud#1289).
+                Some(success.provider_request_id.as_str()),
                 &success.routing,
                 None,
             );
@@ -418,6 +423,7 @@ pub async fn chat_completions(
                 al_completion,
                 al_total,
                 &request_id,
+                None,
                 &routing,
                 Some(&err),
             );
@@ -2839,7 +2845,7 @@ async fn dispatch(
     let reasoning_tokens = upstream.usage.reasoning_tokens;
     let cache_creation_tokens = upstream.usage.cache_creation_tokens;
     let cache_read_tokens = upstream.usage.cache_read_tokens;
-    let provider_request_id = upstream.id.clone();
+    let provider_request_id = crate::usage_attr::sanitize_provider_response_id(&upstream.id);
     let provider_model_version = upstream.model.clone();
     let finish_reason = finish_reason_label(&upstream.finish_reason);
     // Fold the winning target's model-layer reservation in so one commit
@@ -3815,7 +3821,9 @@ async fn dispatch_ensemble(
                 cache_creation_tokens: judge_usage.cache_creation_tokens,
                 cache_read_tokens: judge_usage.cache_read_tokens,
                 usage_estimated: judge_estimated,
-                provider_request_id: outcome.response.id.clone(),
+                provider_request_id: crate::usage_attr::sanitize_provider_response_id(
+                    &outcome.response.id,
+                ),
                 provider_model_version: outcome.response.model.clone(),
                 finish_reason: finish_reason_label(&outcome.response.finish_reason),
                 bypass_reason: bypass.to_string(),
@@ -4387,6 +4395,9 @@ fn emit_access_log(
     completion_tokens: Option<u64>,
     total_tokens: Option<u64>,
     request_id: &str,
+    // Winning attempt's provider response id; empty when unknown at this
+    // point (streaming, cache hit, guardrail block, pre-dispatch error).
+    provider_request_id: Option<&str>,
     routing: &RoutingTelemetry,
     error: Option<&ProxyError>,
 ) {
@@ -4413,6 +4424,7 @@ fn emit_access_log(
         completion_tokens,
         total_tokens,
         request_id,
+        provider_request_id: provider_request_id.filter(|s| !s.is_empty()),
         served_by_model: served_by.filter(|s| !s.is_empty()),
         routing_attempt_count: match routing.attempt_count() {
             0 => None,
@@ -4831,7 +4843,8 @@ where
                     }
                     let comp = guard.comp();
                     if !chunk.id.is_empty() {
-                        comp.provider_request_id = chunk.id.clone();
+                        comp.provider_request_id =
+                            crate::usage_attr::sanitize_provider_response_id(&chunk.id);
                     }
                     if !chunk.model.is_empty() {
                         comp.provider_model_version = chunk.model.clone();
