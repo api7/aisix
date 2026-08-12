@@ -72,14 +72,17 @@ Every method knob is a `BENCH_*` environment variable (defaults in `lib.sh`
 match the #891 grid exactly): `BENCH_GRID` (`"ttft_ms:conc ..."`, e.g.
 `"20:1536 20:2048"` for an added delay tier, `"0:128"` for a spot-check),
 `BENCH_REPS`, `BENCH_WINDOW`, `BENCH_WARMUP`, `BENCH_MAX_TRIES`,
-`BENCH_FLOOR_REPS`, `BENCH_FLAMEGRAPH`. `bench.sh` forwards them to the rig.
+`BENCH_FLOOR_REPS`, `BENCH_FLAMEGRAPH`, `BENCH_PERF_STACK`. `bench.sh` forwards
+them to the rig.
 A changed knob is recorded in `meta.json`, so a non-default run can never
 pass silently as the standard grid.
 
 Values are validated at startup and nonsense refuses to run: grid entries
 must be `ttft_ms:conc` with a positive concurrency; window, reps, max tries
 and floor reps must be positive integers (warmup may be `0`);
-`BENCH_FLAMEGRAPH` is `0` or `1`.
+`BENCH_FLAMEGRAPH` is `0` or `1`. `BENCH_PERF_STACK` is the per-sample stack
+perf copies for dwarf unwinding (default 32768; a multiple of 8 up to 65528) -
+raise it if a capture reports a high unresolved-stack share.
 
 ## Measuring another target ("entrant")
 

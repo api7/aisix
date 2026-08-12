@@ -48,7 +48,7 @@ echo "== run baseline ($RUNID) =="
 # printf %q keeps values with spaces intact through the remote shell.
 ENVPASS="BENCH_SRC_COMMIT=$COMMIT BENCH_SRC_DIRTY=$DIRTY"
 for v in BENCH_GRID BENCH_REPS BENCH_WINDOW BENCH_WARMUP BENCH_MAX_TRIES \
-         BENCH_FLOOR_REPS BENCH_FLAMEGRAPH; do
+         BENCH_FLOOR_REPS BENCH_FLAMEGRAPH BENCH_PERF_STACK; do
     # if, not `[ ] &&`: harmless here, but the && form as a function's last
     # statement is exactly how the grid_concs regression happened once.
     if [ -n "${!v:-}" ]; then ENVPASS="$ENVPASS $v=$(printf %q "${!v}")"; fi

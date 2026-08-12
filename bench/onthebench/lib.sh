@@ -19,6 +19,9 @@ MAX_TRIES="${BENCH_MAX_TRIES:-8}"
 GRID="${BENCH_GRID:-0:16 0:32 0:128 10:768}"
 FLOOR_REPS="${BENCH_FLOOR_REPS:-2}"
 FLAMEGRAPH="${BENCH_FLAMEGRAPH:-1}"
+# Bytes of stack perf copies per sample for dwarf unwinding. See
+# flamegraph_point: the 8KB default is too small for this gateway's stacks.
+PERF_STACK="${BENCH_PERF_STACK:-32768}"
 
 # Request shape. An entrant overrides these before sourcing when its only
 # ingress speaks a different dialect (the pinned loadgen and mock both serve
@@ -49,6 +52,10 @@ is_pos_int "$WINDOW" || { echo "FATAL: BENCH_WINDOW must be a positive integer, 
 is_pos_int "$REPS" || { echo "FATAL: BENCH_REPS must be a positive integer, got '$REPS'"; exit 1; }
 is_pos_int "$MAX_TRIES" || { echo "FATAL: BENCH_MAX_TRIES must be a positive integer, got '$MAX_TRIES'"; exit 1; }
 is_pos_int "$FLOOR_REPS" || { echo "FATAL: BENCH_FLOOR_REPS must be a positive integer, got '$FLOOR_REPS'"; exit 1; }
+# perf rejects a non-multiple of 8 and silently caps above 64KB; refuse both
+# here rather than discovering it after a 45s capture window.
+is_pos_int "$PERF_STACK" && [ $((PERF_STACK % 8)) -eq 0 ] && [ "$PERF_STACK" -le 65528 ] ||
+    { echo "FATAL: BENCH_PERF_STACK must be a positive multiple of 8 up to 65528, got '$PERF_STACK'"; exit 1; }
 case "$FLAMEGRAPH" in 0|1) ;; *) echo "FATAL: BENCH_FLAMEGRAPH must be 0 or 1, got '$FLAMEGRAPH'"; exit 1 ;; esac
 [ -n "$GRID" ] || { echo "FATAL: BENCH_GRID is empty"; exit 1; }
 for _spec in $GRID; do
@@ -303,12 +310,46 @@ floor_tier() { # floor_tier <ttft>  -> the floor points this tier needs
 
 # ---- flamegraph --------------------------------------------------------------
 
+# A flamegraph whose stacks did not unwind is worse than no flamegraph: it
+# renders, it looks plausible, and every attribution taken from it is wrong.
+# The check is on the collapsed output rather than on perf's exit code
+# because that is where the failure is visible - frames that unwound to
+# nothing come back as [unknown]/[dso] entries with no symbol at any depth.
+check_symbolization() { # check_symbolization <folded-file>
+    local unresolved
+    unresolved=$(awk '
+        { n = $NF; total += n
+          # strip the count and the leading thread name, then look for any
+          # frame that carries a real symbol
+          sub(/ [0-9]+$/, ""); split($0, frames, ";")
+          resolved = 0
+          for (i = 2; i <= length(frames); i++)
+              if (frames[i] !~ /^\[/) { resolved = 1; break }
+          if (!resolved) bad += n }
+        END { if (total > 0) printf "%.1f", bad / total * 100; else print "100.0" }
+    ' "$1")
+    # 80% is where the two populations separate, measured over this repo's
+    # own captures: usable ones run 37-57% unresolved (kernel frames, which
+    # kptr_restrict keeps anonymous, plus stripped system libraries), the
+    # unwind-failure mode lands at 92-96%. A tighter threshold would flag
+    # healthy captures; a looser one would let the failure through.
+    awk -v u="$unresolved" 'BEGIN{exit !(u > 80)}' &&
+        echo "WARNING: $1 is $unresolved% unresolved stacks - unwinding likely failed; do not attribute from this flamegraph (try a larger BENCH_PERF_STACK)" >&2
+    echo "  flamegraph: $unresolved% unresolved stacks" >&2
+}
+
 flamegraph_point() { # flamegraph_point <conc> <title>  (0-delay mock running)
     local conc="$1" title="$2" load_bg
     echo "== flamegraph (c=$conc, 0-delay) ==" >&2
     loadgen "127.0.0.1:$GW_PORT" "$conc" 45 > "$OUT/flamegraph-window.txt" & load_bg=$!
     sleep 5
-    perf record -F 499 --call-graph dwarf -p "$GW_PID" -o "$OUT/perf.data" -- sleep 25 \
+    # Explicit stack dump size: perf's 8KB default is smaller than this
+    # gateway's async stacks under a fat-LTO build, and a stack that does not
+    # fit unwinds to nothing - every frame collapses to [unknown] and the SVG
+    # renders as one flat bar. That failure is silent (perf exits 0, inferno
+    # renders happily), which is why the size is pinned here rather than left
+    # to the default, and why the collapse output is checked below.
+    perf record -F 499 --call-graph "dwarf,$PERF_STACK" -p "$GW_PID" -o "$OUT/perf.data" -- sleep 25 \
         >> "$OUT/perf.log" 2>&1 || echo "WARNING: perf record failed" >&2
     wait "$load_bg" || true
     # Rendering must never kill the measurement: perf.data is kept on any
@@ -318,6 +359,7 @@ flamegraph_point() { # flamegraph_point <conc> <title>  (0-delay mock running)
                inferno-collapse-perf > "$OUT/flamegraph-c$conc.folded" 2>> "$OUT/perf.log" &&
            inferno-flamegraph --title "$title" \
                < "$OUT/flamegraph-c$conc.folded" > "$OUT/flamegraph-c$conc.svg" 2>> "$OUT/perf.log"; then
+            check_symbolization "$OUT/flamegraph-c$conc.folded"
             rm -f "$OUT/perf.data"
         else
             echo "WARNING: flamegraph rendering failed; perf.data kept" >&2
