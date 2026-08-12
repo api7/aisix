@@ -1477,6 +1477,27 @@ fn background_check_interval(snapshot: &aisix_core::AisixSnapshot) -> std::time:
     std::time::Duration::from_secs(min_interval.max(1))
 }
 
+/// Set on every connection the gateway accepts from a client.
+///
+/// Nagle's algorithm holds a small segment back until the previous one
+/// has been acknowledged. A short buffered answer leaves in a single
+/// segment and never notices — which is why this is invisible in the
+/// throughput benchmark — but a streamed one writes a frame at a time,
+/// and a frame that lands while an earlier one is still unacknowledged
+/// waits out the client's delayed ACK (up to 40ms on Linux) before it
+/// leaves the box. HTTP/2 control frames and the WebSocket surfaces run
+/// on the same accepted socket and inherit the option.
+///
+/// `axum_server` accepts with the option off, and the gateway had never
+/// turned it on. reqwest already sets it on the upstream side.
+///
+/// A `set_nodelay` failure fails that connection: on Linux the option
+/// carries no socket-state precondition and cannot fail, and elsewhere
+/// it reports a peer that has already gone away — a connection that was
+/// not answerable regardless.
+const DOWNSTREAM_NODELAY: axum_server::accept::NoDelayAcceptor =
+    axum_server::accept::NoDelayAcceptor;
+
 /// Completes when the process receives SIGINT or SIGTERM (best-effort on
 /// Windows — Ctrl+C only) OR when another part of the system has already
 /// flipped the cancel channel.
@@ -1556,13 +1577,17 @@ async fn serve_http(
     match tls_config {
         None => {
             tracing::info!(%addr, label, "aisix listening (http)");
-            let mut server = axum_server::from_tcp(listener).handle(handle);
+            let mut server = axum_server::from_tcp(listener)
+                .acceptor(DOWNSTREAM_NODELAY)
+                .handle(handle);
             apply_idle_timeout(server.http_builder(), idle_timeout);
             server.serve(make_service).await?;
         }
         Some(tls_config) => {
             tracing::info!(%addr, label, "aisix listening (https)");
-            let mut server = axum_server::from_tcp_rustls(listener, tls_config).handle(handle);
+            let mut server = axum_server::from_tcp_rustls(listener, tls_config)
+                .map(|tls| tls.acceptor(DOWNSTREAM_NODELAY))
+                .handle(handle);
             apply_idle_timeout(server.http_builder(), idle_timeout);
             server.serve(make_service).await?;
         }
@@ -1737,13 +1762,17 @@ fn run_tpc_worker(
         match tls_config {
             None => {
                 tracing::info!(%addr, label, worker, "aisix listening (http, thread-per-core)");
-                let mut server = axum_server::from_tcp(listener).handle(handle);
+                let mut server = axum_server::from_tcp(listener)
+                    .acceptor(DOWNSTREAM_NODELAY)
+                    .handle(handle);
                 apply_idle_timeout(server.http_builder(), idle_timeout);
                 server.serve(make_service).await?;
             }
             Some(tls_config) => {
                 tracing::info!(%addr, label, worker, "aisix listening (https, thread-per-core)");
-                let mut server = axum_server::from_tcp_rustls(listener, tls_config).handle(handle);
+                let mut server = axum_server::from_tcp_rustls(listener, tls_config)
+                    .map(|tls| tls.acceptor(DOWNSTREAM_NODELAY))
+                    .handle(handle);
                 apply_idle_timeout(server.http_builder(), idle_timeout);
                 server.serve(make_service).await?;
             }
@@ -2274,6 +2303,98 @@ models:
             bridge.name(),
             "anthropic",
             "specialized 'anthropic' MUST be `AnthropicBridge::new()` (bridge name 'anthropic')",
+        );
+    }
+
+    /// The acceptor has to leave `TCP_NODELAY` set on the socket the
+    /// gateway will write responses to. Asserted against a real accepted
+    /// connection, including that the option is off beforehand — the
+    /// default this exists to change.
+    #[tokio::test]
+    async fn the_downstream_acceptor_sets_tcp_nodelay() {
+        use axum_server::accept::Accept;
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let _client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let (accepted, _peer) = listener.accept().await.expect("accept");
+
+        assert!(
+            !accepted.nodelay().expect("read nodelay"),
+            "a plain accepted socket is expected to have Nagle on; if the \
+             platform default changed, this test no longer proves anything",
+        );
+        let (accepted, ()) = DOWNSTREAM_NODELAY
+            .accept(accepted, ())
+            .await
+            .expect("accept");
+        assert!(accepted.nodelay().expect("read nodelay"));
+    }
+
+    /// Four listeners are served — HTTP and HTTPS, on the shared runtime
+    /// and on each thread-per-core worker — and a fifth is one config
+    /// surface away. A listener wired without the acceptor fails in the
+    /// way nothing catches: it serves correctly, benchmarks identically,
+    /// and only pays the delayed-ACK tax on streamed responses.
+    ///
+    /// The TLS sites also have to wire it with `map`, not `acceptor`:
+    /// `Server::acceptor` *replaces* the acceptor, so
+    /// `from_tcp_rustls(..).acceptor(DOWNSTREAM_NODELAY)` compiles, drops
+    /// the rustls acceptor, and serves plaintext on the TLS port — while
+    /// satisfying a check that only looks for the constant's name.
+    #[test]
+    fn every_listener_sets_tcp_nodelay() {
+        let src = include_str!("main.rs");
+        let production = src
+            .split("\n#[cfg(test)]\nmod ")
+            .next()
+            .expect("production half");
+        // Spelled out at the call site rather than imported, so this
+        // probe sees every listener. (`use axum_server::…` in production
+        // would hide one from it.)
+        assert!(
+            !production.contains("use axum_server::"),
+            "importing the listener constructor hides the site from this \
+             check; call it as `axum_server::from_tcp…` instead",
+        );
+        let lines: Vec<&str> = production.lines().collect();
+
+        let mut sites = 0;
+        let mut offenders = Vec::new();
+        for (n, line) in lines.iter().enumerate() {
+            if !(line.contains("axum_server::from_tcp") || line.contains("axum_server::bind")) {
+                continue;
+            }
+            sites += 1;
+            // The acceptor is wired in the same statement, which the
+            // formatter keeps within the next two lines.
+            let statement = lines[n..(n + 3).min(lines.len())].join(" ");
+            if !statement.contains("DOWNSTREAM_NODELAY") {
+                offenders.push(format!("main.rs:{}: no TCP_NODELAY acceptor", n + 1));
+            } else if line.contains("_rustls") && !statement.contains(".map(") {
+                offenders.push(format!(
+                    "main.rs:{}: TLS listener must slot the acceptor under rustls with \
+                     `.map(|tls| tls.acceptor(DOWNSTREAM_NODELAY))`; `.acceptor(..)` \
+                     replaces the rustls acceptor and serves plaintext",
+                    n + 1
+                ));
+            }
+        }
+
+        assert!(
+            sites >= 4,
+            "found {sites} listener construction sites, expected at least 4 — \
+             the probe no longer matches the code and this test proves nothing. \
+             If the listeners were deliberately consolidated, lower this count \
+             on purpose",
+        );
+        assert!(
+            offenders.is_empty(),
+            "these listeners accept connections with Nagle left on, which \
+             delays streamed response frames; wire `DOWNSTREAM_NODELAY`:\n{}",
+            offenders.join("\n"),
         );
     }
 }
