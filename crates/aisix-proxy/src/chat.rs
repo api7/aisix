@@ -404,7 +404,7 @@ pub async fn chat_completions(
                 "/v1/chat/completions",
                 crate::request_metrics::Caller::new(&auth),
                 crate::request_metrics::Upstream {
-                    model: metric_model,
+                    model: metric_model.as_ref(),
                     stream: req.is_streaming(),
                     is_fallback: routing.fallback_count() > 0,
                     ..Default::default()
@@ -415,7 +415,7 @@ pub async fn chat_completions(
             state.metrics.record_request_e2e_latency(
                 LatencyLabels {
                     endpoint: "/v1/chat/completions",
-                    model: metric_model,
+                    model: metric_model.as_ref(),
                     provider: "unknown",
                     status,
                     streaming: req.is_streaming(),
@@ -1823,6 +1823,16 @@ async fn dispatch(
         let user_id_for_metrics = auth.key().user_id.clone();
         let provider_for_metrics = provider.to_ascii_lowercase();
         let model_for_metrics = req.model.clone();
+        // Latency histograms label with the BOUNDED model (emit-chokepoint
+        // rule): a wildcard-served alias must not mint per-suffix series.
+        let (bounded_model_for_metrics, bounded_upstream_for_metrics) = {
+            let (m, u) = crate::usage_attr::metric_model_label_pair(
+                snapshot,
+                &req.model,
+                model.upstream_model().unwrap_or("unknown"),
+            );
+            (m.into_owned(), u.into_owned())
+        };
         // #890 req-4: normalised inbound client type, captured for the
         // streaming on_complete metric emission (mirrors the non-streaming
         // `record_success` path).
@@ -2037,7 +2047,7 @@ async fn dispatch(
                     crate::request_metrics::Upstream {
                         provider: &provider_for_metrics,
                         model: &model_for_metrics,
-                        upstream_model: &upstream_model_for_metrics,
+                        upstream_model: &bounded_upstream_for_metrics,
                         pk: pk.labels(),
                         stream: true,
                         // The serving target is fixed once the stream
@@ -2056,7 +2066,7 @@ async fn dispatch(
                 metrics_for_stream.record_request_e2e_latency(
                     LatencyLabels {
                         endpoint: "/v1/chat/completions",
-                        model: &model_for_metrics,
+                        model: &bounded_model_for_metrics,
                         provider: &provider_for_metrics,
                         status: 200,
                         streaming: true,
@@ -2066,7 +2076,7 @@ async fn dispatch(
                 metrics_for_stream.record_request_ttft(
                     LatencyLabels {
                         endpoint: "/v1/chat/completions",
-                        model: &model_for_metrics,
+                        model: &bounded_model_for_metrics,
                         provider: &provider_for_metrics,
                         status: 200,
                         streaming: true,
@@ -2078,8 +2088,8 @@ async fn dispatch(
                         endpoint: "/v1/chat/completions",
                         inbound_protocol: "openai",
                         provider: &provider_for_metrics,
-                        model: &model_for_metrics,
-                        upstream_model: &upstream_model_for_metrics,
+                        model: &bounded_model_for_metrics,
+                        upstream_model: &bounded_upstream_for_metrics,
                         provider_key_id: pk.labels().id(),
                         provider_key_name: pk.labels().name(),
                         api_key_id: &api_key_id_for_telem,
@@ -3535,6 +3545,8 @@ async fn dispatch_ensemble(
         let state_for_telem = state.clone();
         let request_id_for_telem = request_id.to_string();
         let client_model_for_telem = req.model.clone();
+        let bounded_model_for_telem =
+            crate::usage_attr::metric_model_label(snapshot, &req.model).into_owned();
         let api_key_id_for_telem = api_key_id.to_string();
         let applied_guardrails_for_telem = applied_guardrails.to_vec();
         let client_for_telem = client.clone();
@@ -3704,7 +3716,7 @@ async fn dispatch_ensemble(
                 state_for_telem.metrics.record_request_e2e_latency(
                     LatencyLabels {
                         endpoint: "/v1/chat/completions",
-                        model: &client_model_for_telem,
+                        model: &bounded_model_for_telem,
                         // Matches the legacy series: no single provider
                         // governs an ensemble response.
                         provider: "ensemble",
@@ -3716,7 +3728,7 @@ async fn dispatch_ensemble(
                 state_for_telem.metrics.record_request_ttft(
                     LatencyLabels {
                         endpoint: "/v1/chat/completions",
-                        model: &client_model_for_telem,
+                        model: &bounded_model_for_telem,
                         provider: "ensemble",
                         status: 200,
                         streaming: true,
@@ -4087,10 +4099,11 @@ fn record_success(
     // `elapsed` for a stream is time-to-response-start; the stream's
     // on_complete records the full duration instead.
     if !stream {
+        let bounded_model = crate::usage_attr::metric_model_label(&state.snapshot.load(), model);
         metrics.record_request_e2e_latency(
             LatencyLabels {
                 endpoint: "/v1/chat/completions",
-                model,
+                model: bounded_model.as_ref(),
                 provider,
                 status,
                 streaming: false,

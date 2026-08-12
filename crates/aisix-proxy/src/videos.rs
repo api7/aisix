@@ -1566,7 +1566,7 @@ pub async fn create_video(
         Err(err) => {
             let status = err.status().as_u16();
             let metric_model = crate::usage_attr::metric_model_label(&snapshot, &model_name);
-            telemetry.finish(status, "unknown", metric_model, Some(&err));
+            telemetry.finish(status, "unknown", metric_model.as_ref(), Some(&err));
             // #655 parity: failed submits surface in Logs as zero-token
             // events instead of vanishing.
             crate::usage_attr::emit_error_usage_event(
@@ -1706,7 +1706,9 @@ async fn dispatch_create(
     reservation.commit_tokens(0).await;
     let resp = result?;
 
-    state.health.record_success(&body.model);
+    state
+        .health
+        .record_success(&target.model_entry.value.display_name);
     state.runtime_status.mark_healthy(&target.model_entry.id);
 
     let submit = target.provider.parse_submit(&resp)?;

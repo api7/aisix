@@ -481,7 +481,7 @@ pub async fn speech(
                 "/v1/audio/speech",
                 crate::request_metrics::Caller::new(&auth),
                 crate::request_metrics::Upstream {
-                    model: metric_model,
+                    model: metric_model.as_ref(),
                     ..Default::default()
                 },
                 status,
@@ -859,7 +859,7 @@ async fn multipart_dispatch(
             Err(err) => return Err(ProxyError::Bridge(err)),
         };
 
-    state.health.record_success(&model_name);
+    state.health.record_success(&model_entry.value.display_name);
     state.runtime_status.mark_healthy(&model_entry.id);
 
     // Parse the response body best-effort for a `usage` token block
@@ -1283,7 +1283,7 @@ async fn speech_dispatch(
             Err(err) => return Err(ProxyError::Bridge(err)),
         };
 
-    state.health.record_success(&model_name);
+    state.health.record_success(&model_entry.value.display_name);
     state.runtime_status.mark_healthy(&model_entry.id);
 
     // #911 [21]: speech synthesis (TTS) reports no token usage — it is billed

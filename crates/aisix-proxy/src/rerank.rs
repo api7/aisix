@@ -191,7 +191,7 @@ pub async fn rerank(
                 "/v1/rerank",
                 crate::request_metrics::Caller::new(&auth),
                 crate::request_metrics::Upstream {
-                    model: metric_model,
+                    model: metric_model.as_ref(),
                     ..Default::default()
                 },
                 status,
@@ -517,7 +517,7 @@ async fn dispatch(
             Err(err) => return Err(ProxyError::Bridge(err)),
         };
 
-    state.health.record_success(&model_name);
+    state.health.record_success(&model_entry.value.display_name);
     state.runtime_status.mark_healthy(&model_entry.id);
 
     // Extract usage from the upstream body BEFORE handing the bytes

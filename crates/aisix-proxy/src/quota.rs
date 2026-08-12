@@ -35,6 +35,13 @@ use crate::state::ProxyState;
 /// Optional model rate-limit info resolved by the caller before enforce.
 pub(crate) struct ModelRateLimit {
     pub name: String,
+    /// The resolved entry's `display_name` — the bucket identity. Equal
+    /// to `name` everywhere except a wildcard-served alias, where every
+    /// caller-minted concrete name must land in the wildcard row's ONE
+    /// bucket: keying on `name` there let any caller mint fresh
+    /// full-size buckets per suffix, unbounded-multiplying the declared
+    /// cap (the passthrough gate already keyed on `display_name`).
+    pub bucket_name: String,
     pub entry_id: String,
     pub limits: Option<RateLimit>,
     /// The model's `provider` — the value of the `provider` condition
@@ -60,6 +67,7 @@ impl ModelRateLimit {
             .cloned();
         Self {
             name: model_name.to_owned(),
+            bucket_name: model.display_name.clone(),
             entry_id: model_entry_id.to_owned(),
             limits,
             provider: model.provider.clone(),
@@ -333,7 +341,7 @@ async fn reserve_layers(
     // Layer 2: Model inline rate limit.
     if let Some(mrl) = model_rl {
         if let Some(ref limits) = mrl.limits {
-            let key = format!("model:{}", mrl.name);
+            let key = format!("model:{}", mrl.bucket_name);
             let r = state
                 .limiter
                 .pre_commit(&key, limits)
@@ -546,7 +554,7 @@ pub(crate) async fn reserve_model_only(
     // Inline model rate limit.
     let mrl = ModelRateLimit::from_model(model_name, model_entry_id, model);
     if let Some(ref limits) = mrl.limits {
-        let key = format!("model:{}", mrl.name);
+        let key = format!("model:{}", mrl.bucket_name);
         let r = state
             .limiter
             .pre_commit(&key, limits)
@@ -670,6 +678,7 @@ mod tests {
     fn make_model_rl(name: &str, entry_id: &str, provider: Option<&str>) -> ModelRateLimit {
         ModelRateLimit {
             name: name.to_owned(),
+            bucket_name: name.to_owned(),
             entry_id: entry_id.to_owned(),
             limits: None,
             provider: provider.map(str::to_owned),

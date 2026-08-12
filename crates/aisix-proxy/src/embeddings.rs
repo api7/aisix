@@ -212,7 +212,7 @@ pub async fn embeddings(
                 "/v1/embeddings",
                 crate::request_metrics::Caller::new(&auth),
                 crate::request_metrics::Upstream {
-                    model: metric_model,
+                    model: metric_model.as_ref(),
                     ..Default::default()
                 },
                 status,
@@ -442,7 +442,7 @@ async fn dispatch(
         Ok(embed_resp) => {
             // #701: clear any cooldown/unhealthy mark now the upstream
             // answered — same recovery signal as rerank/audio/chat.
-            state.health.record_success(&body.model);
+            state.health.record_success(&model_entry.value.display_name);
             state.runtime_status.mark_healthy(&model_entry.id);
             // Token accounting (#226 / AISIX-Cloud#1074). Embeddings are
             // input-only, so `prompt_tokens == total_tokens` on the OpenAI

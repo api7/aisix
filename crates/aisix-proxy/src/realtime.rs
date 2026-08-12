@@ -785,7 +785,10 @@ async fn run_session(
         crate::request_metrics::Caller::new(&auth),
         crate::request_metrics::Upstream {
             provider: &provider_label,
-            model: &model_entry.value.display_name,
+            // The requested string so the emit chokepoint folds a
+            // wildcard-served alias's pair to the row's identities
+            // (non-wildcard: requested == display_name, unchanged).
+            model: &requested_model,
             upstream_model: model_entry.value.upstream_model().unwrap_or("unknown"),
             pk: pk.labels(),
             ..Default::default()

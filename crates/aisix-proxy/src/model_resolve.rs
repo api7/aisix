@@ -29,8 +29,23 @@ pub(crate) fn resolve_model(
     if let Some(exact) = snapshot.models.get_by_name(requested) {
         return Some(exact);
     }
-    // Wildcard fallback: the most specific direct Model whose `*`-glob display
-    // name matches the request. Only runs when the exact lookup missed.
+    let (entry, upstream) = best_wildcard_row(snapshot, requested)?;
+    let mut model = entry.value.clone();
+    model.model_name = Some(upstream);
+    Some(Arc::new(ResourceEntry::new(
+        entry.id.clone(),
+        model,
+        entry.revision,
+    )))
+}
+
+/// Wildcard fallback: the most specific direct Model whose `*`-glob
+/// display name matches the request, plus the substituted upstream model
+/// id. Only meaningful when the exact lookup missed.
+fn best_wildcard_row(
+    snapshot: &AisixSnapshot,
+    requested: &str,
+) -> Option<(Arc<ResourceEntry<Model>>, String)> {
     let mut best: Option<(usize, Arc<ResourceEntry<Model>>, String)> = None;
     for entry in snapshot.models.entries() {
         let model = &entry.value;
@@ -52,14 +67,36 @@ pub(crate) fn resolve_model(
             best = Some((specificity, entry.clone(), upstream));
         }
     }
-    let (_, entry, upstream) = best?;
-    let mut model = entry.value.clone();
-    model.model_name = Some(upstream);
-    Some(Arc::new(ResourceEntry::new(
-        entry.id.clone(),
-        model,
-        entry.revision,
-    )))
+    best.map(|(_, entry, upstream)| (entry, upstream))
+}
+
+/// The `display_name` of the wildcard row that would serve `requested`,
+/// for metric-label bounding: successful wildcard traffic must label as
+/// the configured row (`openai/*`), never as the caller-minted concrete
+/// string — the #451 cardinality guard extended to resolvable names.
+pub(crate) fn wildcard_row_name(snapshot: &AisixSnapshot, requested: &str) -> Option<String> {
+    best_wildcard_row(snapshot, requested).map(|(entry, _)| entry.value.display_name.clone())
+}
+
+/// The `(display_name, model_name template)` pair of the wildcard row
+/// serving `requested` — the bounded identities for BOTH metric labels:
+/// with `model_name: "*"` the substituted upstream id is caller-derived
+/// too, so `upstream_model` must label as the configured template, not
+/// the capture.
+pub(crate) fn wildcard_row_identity(
+    snapshot: &AisixSnapshot,
+    requested: &str,
+) -> Option<(String, String)> {
+    best_wildcard_row(snapshot, requested).map(|(entry, _)| {
+        (
+            entry.value.display_name.clone(),
+            entry
+                .value
+                .model_name
+                .clone()
+                .unwrap_or_else(|| "*".to_string()),
+        )
+    })
 }
 
 /// Concrete upstream model id for a wildcard match: substitute the captured
@@ -121,6 +158,24 @@ mod tests {
         // Attribution stays on the wildcard Model; upstream id is the capture.
         assert_eq!(resolved.id, "m-star");
         assert_eq!(resolved.value.model_name.as_deref(), Some("gpt-4o"));
+        // The resolved clone keeps the ROW's display_name — the bounded
+        // identity metric labels and rate-limit buckets key on.
+        assert_eq!(resolved.value.display_name, "openai/*");
+    }
+
+    #[test]
+    fn wildcard_row_name_bounds_caller_minted_aliases() {
+        let snap = snapshot_with(vec![
+            ("m-star", direct_model("openai/*", Some("*"))),
+            ("m-exact", direct_model("openai/gpt-4o", Some("gpt-4o"))),
+        ]);
+        // A caller-minted suffix maps to the serving row's name…
+        assert_eq!(
+            wildcard_row_name(&snap, "openai/anything-i-like").as_deref(),
+            Some("openai/*")
+        );
+        // …and an unservable name maps to nothing.
+        assert_eq!(wildcard_row_name(&snap, "azure/gpt-4o"), None);
     }
 
     #[test]

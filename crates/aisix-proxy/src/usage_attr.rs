@@ -227,18 +227,67 @@ pub(crate) const UNRESOLVED_MODEL_LABEL: &str = "unresolved";
 
 /// Bound the `model` metric label to the configured set. A request's `model`
 /// field is arbitrary caller-controlled text until it resolves against the
-/// snapshot; on an error path that can fire *before* resolution (model-not-
-/// found), feeding the raw value into a Prometheus label lets a caller
-/// explode metric cardinality. Return the requested name only when it maps to
-/// a configured model (direct or virtual router — both live in `models`),
-/// else the fixed [`UNRESOLVED_MODEL_LABEL`] sentinel. This is the typed-
-/// endpoint analogue of passthrough's `PASSTHROUGH_MODEL_LABEL` guard (#451),
-/// shared here so the handler family can't drift.
-pub(crate) fn metric_model_label<'a>(snap: &AisixSnapshot, model_name: &'a str) -> &'a str {
+/// snapshot; feeding the raw value into a Prometheus label lets a caller
+/// explode metric cardinality. Three outcomes:
+/// - an exact configured name (direct or virtual router — both live in
+///   `models`) labels as itself;
+/// - a name only a WILDCARD row serves labels as that row's `display_name`
+///   (`openai/*`) — the caller can mint unlimited concrete suffixes, so the
+///   configured row is the only bounded identity, and it keeps success and
+///   failure series for one row under one label;
+/// - anything else is the fixed [`UNRESOLVED_MODEL_LABEL`] sentinel.
+///
+/// This is the typed-endpoint analogue of passthrough's
+/// `PASSTHROUGH_MODEL_LABEL` guard (#451); `request_metrics::record` /
+/// `record_usage` apply it at the emit chokepoint so no handler family
+/// member can drift.
+pub(crate) fn metric_model_label<'a>(snap: &AisixSnapshot, model_name: &'a str) -> Cow<'a, str> {
     if snap.models.get_by_name(model_name).is_some() {
-        model_name
-    } else {
-        UNRESOLVED_MODEL_LABEL
+        return Cow::Borrowed(model_name);
+    }
+    match crate::model_resolve::wildcard_row_name(snap, model_name) {
+        Some(row) => Cow::Owned(row),
+        None => Cow::Borrowed(UNRESOLVED_MODEL_LABEL),
+    }
+}
+
+/// Fixed non-model surface labels the emit chokepoint must pass through
+/// byte-identical: rewriting any of these would silently split every
+/// series that carries it (the `unknown` note below) and merge distinct
+/// surfaces into the `unresolved` bucket. Also an O(1) short-circuit so
+/// the tunnel hot paths (passthrough / MCP / A2A / jobs) never pay the
+/// wildcard scan.
+const FIXED_SURFACE_MODEL_LABELS: &[&str] = &[
+    UNRESOLVED_MODEL_LABEL,
+    "passthrough",
+    "mcp",
+    "a2a",
+    "unknown",
+    "files",
+    "batches",
+    "fine_tuning",
+];
+
+/// The `(model, upstream_model)` label pair for the emit chokepoint —
+/// COLLAPSE-ONLY: a name only a wildcard row serves folds to the row's
+/// `(display_name, model_name template)` (both halves of a wildcard hit
+/// are caller-derived); every other value passes through verbatim.
+/// Sentinel fallbacks stay a HANDLER decision (`metric_model_label` on
+/// the pre-resolution error paths) — the chokepoint must never rewrite
+/// a caller's fixed surface label.
+pub(crate) fn metric_model_label_pair<'a>(
+    snap: &AisixSnapshot,
+    model_name: &'a str,
+    upstream_model: &'a str,
+) -> (Cow<'a, str>, Cow<'a, str>) {
+    if FIXED_SURFACE_MODEL_LABELS.contains(&model_name)
+        || snap.models.get_by_name(model_name).is_some()
+    {
+        return (Cow::Borrowed(model_name), Cow::Borrowed(upstream_model));
+    }
+    match crate::model_resolve::wildcard_row_identity(snap, model_name) {
+        Some((row, template)) => (Cow::Owned(row), Cow::Owned(template)),
+        None => (Cow::Borrowed(model_name), Cow::Borrowed(upstream_model)),
     }
 }
 
@@ -328,6 +377,58 @@ pub(crate) fn emit_error_usage_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metric_model_label_three_outcomes() {
+        use aisix_core::resource::ResourceEntry;
+        use aisix_core::snapshot::ResourceTable;
+        let table = ResourceTable::default();
+        let wildcard: aisix_core::Model = serde_json::from_value(serde_json::json!({
+            "display_name": "openai/*",
+            "provider": "openai",
+            "model_name": "*",
+            "provider_key_id": "pk-1",
+        }))
+        .unwrap();
+        table.insert(ResourceEntry::new("m-star", wildcard, 1));
+        let snap = AisixSnapshot {
+            models: table,
+            ..Default::default()
+        };
+        // Exact configured name labels as itself (the wildcard row's own
+        // name IS an exact name).
+        assert_eq!(metric_model_label(&snap, "openai/*"), "openai/*");
+        // A caller-minted suffix a wildcard row serves labels as the ROW,
+        // not the unbounded concrete string (#451 class on the success
+        // path).
+        assert_eq!(metric_model_label(&snap, "openai/gpt-4o"), "openai/*");
+        assert_eq!(
+            metric_model_label(&snap, "openai/anything-else"),
+            "openai/*"
+        );
+        // Unservable text stays the sentinel.
+        assert_eq!(
+            metric_model_label(&snap, "no-such/model"),
+            UNRESOLVED_MODEL_LABEL
+        );
+
+        // The emit-chokepoint pair is COLLAPSE-ONLY: a wildcard hit folds
+        // BOTH halves to the row's configured identities…
+        let (m, u) = metric_model_label_pair(&snap, "openai/gpt-4o", "gpt-4o");
+        assert_eq!((m.as_ref(), u.as_ref()), ("openai/*", "*"));
+        // …an exact hit passes both through…
+        let (m, u) = metric_model_label_pair(&snap, "openai/*", "somemodel");
+        assert_eq!((m.as_ref(), u.as_ref()), ("openai/*", "somemodel"));
+        // …and fixed surface sentinels and unresolvable values are NEVER
+        // rewritten (rewriting `mcp`/`passthrough`/`unknown` would split
+        // every series that carries them).
+        for sentinel in ["passthrough", "mcp", "a2a", "unknown"] {
+            let (m, u) = metric_model_label_pair(&snap, sentinel, "x");
+            assert_eq!((m.as_ref(), u.as_ref()), (sentinel, "x"));
+        }
+        let (m, u) = metric_model_label_pair(&snap, "no-such/model", "raw-upstream");
+        assert_eq!((m.as_ref(), u.as_ref()), ("no-such/model", "raw-upstream"));
+    }
 
     /// AISIX-Cloud#1289: the id is upstream-controlled and reaches a log line
     /// and cp-api's `dpmgr_usage_events`. A newline in it would break the
