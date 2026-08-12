@@ -194,9 +194,24 @@ pub struct UsageEvent {
     /// HTTP status code the proxy returned to the downstream caller.
     pub status_code: u16,
 
-    /// Provider response `id` — OpenAI's `chat.completion.id` or
-    /// Anthropic's message `id`. Empty when the request never reached
-    /// the upstream (guardrail block / pre-dispatch error).
+    /// Provider response `id` — OpenAI's `chat.completion.id`, Anthropic's
+    /// message `id`, a Responses-API `resp_…`.
+    ///
+    /// Empty does NOT mean the request never reached an upstream. It means
+    /// no id was recorded, which happens on all of:
+    ///
+    /// - the request never reached an upstream (guardrail block,
+    ///   pre-dispatch error), or was served from cache;
+    /// - the attempt failed, so there was no response body to read one from;
+    /// - the endpoint's provider response carries no id at all — embeddings,
+    ///   audio, images, `count_tokens` — or the id it returns is a resource
+    ///   handle rather than a per-call response id (video jobs,
+    ///   files/batches/fine-tuning, the passthrough tunnel), which is
+    ///   deliberately not recorded here (AISIX-Cloud#1289);
+    /// - the upstream simply omitted it.
+    ///
+    /// So a consumer may not infer "reached an upstream" from a non-empty
+    /// value's absence: a successful `/v1/embeddings` call has none.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub provider_request_id: String,
 

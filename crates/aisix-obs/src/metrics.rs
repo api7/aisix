@@ -3,12 +3,19 @@
 //!
 //! Existing compatibility series cover spec §7:
 //! - `aisix_requests_total{provider,model,status,outcome}` — counter
-//!   incremented at the end of every proxy request.
+//!   incremented once per proxy request that produced a response. A request
+//!   the caller abandoned before the response head never reaches it; see
+//!   [`M_PROXY_CLIENT_CANCELLED`].
 //! - `aisix_request_duration_seconds{provider,model,status}` — histogram
-//!   of end-to-end proxy latency.
+//!   of proxy latency, recorded when the response is handed to the client.
+//!   That is the full request for a non-streamed response and only time to
+//!   response START for a streamed one; `aisix_request_e2e_latency_seconds`
+//!   is the series that is end-to-end on both. See `request_metrics`.
 //! - `aisix_ratelimit_rejections_total{scope}` — counter for 429 flows.
 //! - `aisix_tokens_consumed_total{provider,model}` — counter of
-//!   `usage.total_tokens` summed across completed non-streaming calls.
+//!   `usage.total_tokens` summed across completed calls. Streamed calls are
+//!   included: they contribute from the end-of-stream emit, not at response
+//!   open like the two series above.
 //!
 //! Newer AISIX-native series use `aisix_proxy_*` and `aisix_llm_*`
 //! names with bounded, DP-stable labels. They intentionally do not
@@ -60,9 +67,9 @@ pub const M_PROXY_REQUESTS_TOTAL: &str = "aisix_proxy_requests_total";
 pub const M_PROXY_FAILED_REQUESTS_TOTAL: &str = "aisix_proxy_failed_requests_total";
 pub const M_PROXY_REQUEST_DURATION: &str = "aisix_proxy_request_duration_seconds";
 /// Requests the client abandoned before the response head was written.
-/// Every other proxy series is emitted at the end of a handler, which a
-/// cancelled request never reaches — without this one those requests are
-/// absent from the metrics entirely, not counted as failures.
+/// Every other proxy series needs a handler to produce a response first,
+/// which a cancelled request never does — without this one those requests
+/// are absent from the metrics entirely, not counted as failures.
 ///
 /// The label set is `endpoint` ONLY. A cancelled request has no resolved
 /// model / provider key / team (the body may not even be parsed yet), so
