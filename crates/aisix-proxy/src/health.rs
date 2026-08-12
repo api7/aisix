@@ -430,11 +430,7 @@ impl BookkeepingFlags {
                     _ => {}
                 }
             }
-            if m
-                .background_model_check
-                .as_ref()
-                .is_some_and(|c| c.enabled)
-            {
+            if m.background_model_check.as_ref().is_some_and(|c| c.enabled) {
                 bits |= FLAG_HEALTH_CHECKS;
             }
         }
@@ -1073,7 +1069,10 @@ mod tests {
         let t = HealthTracker::with_flags(flags);
         // Happy path: no failures → no entry, no allocation.
         t.record_success("m");
-        assert!(t.all_levels().is_empty(), "no entry for a never-failed model");
+        assert!(
+            t.all_levels().is_empty(),
+            "no entry for a never-failed model"
+        );
         assert_eq!(t.level("m"), HealthLevel::Healthy);
         // Reset still works through the read guard.
         for _ in 0..10 {

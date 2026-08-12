@@ -63,7 +63,10 @@ pub(crate) struct DenialContext<'a> {
 #[derive(Clone, Copy)]
 pub(crate) enum LazySourceIp<'a> {
     /// Resolve from the request parts + real-ip config on first use.
-    Deferred(&'a axum::http::request::Parts, &'a crate::client_ip::ResolvedRealIp),
+    Deferred(
+        &'a axum::http::request::Parts,
+        &'a crate::client_ip::ResolvedRealIp,
+    ),
     /// Already resolved by the caller (WebSocket subprotocol auth, which
     /// has a `ClientContext` in hand).
     Ready(&'a str),
