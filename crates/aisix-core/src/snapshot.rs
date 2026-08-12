@@ -18,17 +18,38 @@
 use crate::resource::{Resource, ResourceEntry};
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// Per-kind table with primary id-index and secondary name-index.
 ///
 /// Both indices point at the same `Arc<ResourceEntry<T>>` so there is no
 /// duplicate storage — the name map just holds ids.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ResourceTable<T: Resource> {
     by_id: DashMap<String, Arc<ResourceEntry<T>>>,
     by_name: DashMap<String, String>,
+    /// Cached entry count, maintained by [`ResourceTable::insert`] /
+    /// [`ResourceTable::remove`]. DashMap's own `len()` / `is_empty()`
+    /// visit every shard (a CAS pair per shard), so per-request
+    /// emptiness checks on the hot path go through this counter
+    /// instead — one relaxed load, O(1) regardless of shard count.
+    count: AtomicUsize,
+}
+
+/// Manual impl: `AtomicUsize` is not `Clone`. The count is re-seeded
+/// from the cloned map's length, which the etcd watch supervisor's
+/// clone-then-mutate update cycle relies on being exact.
+impl<T: Resource> Clone for ResourceTable<T> {
+    fn clone(&self) -> Self {
+        let by_id = self.by_id.clone();
+        let count = AtomicUsize::new(by_id.len());
+        Self {
+            by_id,
+            by_name: self.by_name.clone(),
+            count,
+        }
+    }
 }
 
 impl<T: Resource> Default for ResourceTable<T> {
@@ -36,6 +57,7 @@ impl<T: Resource> Default for ResourceTable<T> {
         Self {
             by_id: DashMap::new(),
             by_name: DashMap::new(),
+            count: AtomicUsize::new(0),
         }
     }
 }
@@ -46,11 +68,11 @@ impl<T: Resource> ResourceTable<T> {
     }
 
     pub fn len(&self) -> usize {
-        self.by_id.len()
+        self.count.load(Ordering::Relaxed)
     }
 
     pub fn is_empty(&self) -> bool {
-        self.by_id.is_empty()
+        self.len() == 0
     }
 
     /// Insert or replace an entry, updating both indices.
@@ -70,12 +92,15 @@ impl<T: Resource> ResourceTable<T> {
         }
 
         self.by_name.insert(name, id.clone());
-        self.by_id.insert(id, Arc::new(entry));
+        if self.by_id.insert(id, Arc::new(entry)).is_none() {
+            self.count.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Remove by id; also removes the matching name index entry.
     pub fn remove(&self, id: &str) -> Option<Arc<ResourceEntry<T>>> {
         let (_, entry) = self.by_id.remove(id)?;
+        self.count.fetch_sub(1, Ordering::Relaxed);
         let name = entry.value.name().to_string();
         self.by_name.remove_if(&name, |_, v| v == id);
         Some(entry)
@@ -288,6 +313,42 @@ mod tests {
         assert!(t.remove("a-1").is_some());
         assert!(t.get_by_id("a-1").is_none());
         assert!(t.get_by_name("alpha").is_none());
+    }
+
+    /// The cached count must stay exact through every mutation shape:
+    /// fresh insert, same-id replace, remove, remove-miss, and clone.
+    #[test]
+    fn cached_count_tracks_all_mutations() {
+        let t = ResourceTable::<Item>::new();
+        assert_eq!(t.len(), 0);
+        assert!(t.is_empty());
+
+        t.insert(entry("a-1", "alpha"));
+        t.insert(entry("b-2", "beta"));
+        assert_eq!(t.len(), 2);
+        assert!(!t.is_empty());
+
+        // Same-id replace (update, incl. rename) must not double-count.
+        t.insert(entry("a-1", "aleph"));
+        assert_eq!(t.len(), 2);
+
+        // Remove-miss must not decrement.
+        assert!(t.remove("missing").is_none());
+        assert_eq!(t.len(), 2);
+
+        assert!(t.remove("a-1").is_some());
+        assert_eq!(t.len(), 1);
+
+        // Clone re-seeds the counter from the cloned map.
+        let c = t.clone();
+        assert_eq!(c.len(), 1);
+        c.insert(entry("c-3", "gamma"));
+        assert_eq!(c.len(), 2);
+        assert_eq!(t.len(), 1); // original untouched
+
+        assert!(t.remove("b-2").is_some());
+        assert_eq!(t.len(), 0);
+        assert!(t.is_empty());
     }
 
     #[test]

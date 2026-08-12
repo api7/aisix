@@ -288,7 +288,9 @@ async fn reserve_layers(
     model_rl: Option<&ModelRateLimit>,
     mcp_server: Option<&str>,
 ) -> Result<MultiReservation, ProxyError> {
-    let mut reservations = Vec::with_capacity(8);
+    // Starts empty so the common no-limits request never allocates;
+    // the first reservation (if any) grows it on demand.
+    let mut reservations = Vec::new();
 
     // Layer 1: API key inline rate limit.
     let key_limits = auth.key().rate_limit.clone().unwrap_or_default();
@@ -354,6 +356,13 @@ async fn reserve_policy_layers(
     reservations: &mut Vec<aisix_ratelimit::Reservation>,
 ) -> Result<(), ProxyError> {
     let snap = state.snapshot.load();
+    // O(1) empty check before anything else: deployments with no
+    // rate-limit policies (the default) skip the wall-clock read and
+    // the per-shard table scan below entirely. Covers both callers —
+    // the request gate and the per-target gate.
+    if snap.rate_limit_policies.is_empty() {
+        return Ok(());
+    }
     let now = chrono::Utc::now();
     for entry in snap.rate_limit_policies.entries() {
         let policy = &entry.value;
