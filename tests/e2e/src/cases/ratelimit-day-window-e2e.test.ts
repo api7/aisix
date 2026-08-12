@@ -3,7 +3,6 @@ import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
   SeedClient,
-  ProxyClient,
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
@@ -28,6 +27,7 @@ import {
 const KEY_A_PLAINTEXT = "sk-day-window-a";
 const KEY_B_PLAINTEXT = "sk-day-window-b";
 const KEY_C_PLAINTEXT = "sk-day-window-c";
+const SENTINEL_PLAINTEXT = "sk-day-window-sentinel";
 const TEAM_ID = "team-day-e2e";
 
 // Upstream-reported usage per call: 16 tokens > the 10-token day pool,
@@ -82,6 +82,16 @@ describe("rate limit e2e: day window (#771)", () => {
       provider_key_id: pk.id,
     });
 
+    // The team policy precedes every key so any key authenticating
+    // proves it applied (watch events apply in revision order).
+    await seed.createRateLimitPolicy({
+      name: "team-day-tokens",
+      scope: "team",
+      scope_ref: TEAM_ID,
+      window: "day",
+      max_tokens: 10,
+    });
+
     // Keys A and B pool on one team; the day-token policy targets it.
     // (The standalone Admin API accepts team_id directly — the CP writes
     // it when managed.)
@@ -96,16 +106,10 @@ describe("rate limit e2e: day window (#771)", () => {
         user_id: user,
       });
     }
-    await seed.createRateLimitPolicy({
-      name: "team-day-tokens",
-      scope: "team",
-      scope_ref: TEAM_ID,
-      window: "day",
-      max_tokens: 10,
-    });
 
     // Key C is teamless; its own day policy caps requests, not tokens.
-    // (api_key scope matches on the resource entry id.)
+    // (api_key scope matches on the resource entry id, so the policy
+    // must follow the key.)
     const keyC = await seed.createApiKey({
       key_hash: createHash("sha256").update(KEY_C_PLAINTEXT).digest("hex"),
       allowed_models: ["day-model"],
@@ -116,6 +120,20 @@ describe("rate limit e2e: day window (#771)", () => {
       scope_ref: keyC.id,
       window: "day",
       max_requests: 1,
+    });
+
+    // Readiness sentinel seeded LAST: once it authenticates, every seed
+    // above — both policies included — is live on the DP snapshot.
+    await seed.createApiKey({
+      key_hash: createHash("sha256").update(SENTINEL_PLAINTEXT).digest("hex"),
+      allowed_models: [],
+    });
+    await waitConfigPropagation(async () => {
+      const res = await fetch(`${app!.proxyUrl}/v1/models`, {
+        headers: { authorization: `Bearer ${SENTINEL_PLAINTEXT}` },
+      });
+      await res.text();
+      return res.status === 200;
     });
   });
 
@@ -143,14 +161,7 @@ describe("rate limit e2e: day window (#771)", () => {
       ctx.skip();
       return;
     }
-    // listModels doesn't consume the budget — a safe readiness probe.
-    const probe = new ProxyClient(app.proxyUrl, KEY_A_PLAINTEXT);
-    await waitConfigPropagation(async () => {
-      const res = await probe.listModels();
-      if (res.status !== 200) return false;
-      const data = (res.body as { data?: Array<{ id?: string }> }).data ?? [];
-      return data.some((m) => m.id === "day-model");
-    });
+    // Propagation is gated in beforeAll on the last-seeded sentinel key.
     await awaitDayWindowHeadroom();
 
     // Key A succeeds and commits 16 tokens against the team's 10/day.
@@ -169,11 +180,6 @@ describe("rate limit e2e: day window (#771)", () => {
       ctx.skip();
       return;
     }
-    const probe = new ProxyClient(app.proxyUrl, KEY_C_PLAINTEXT);
-    await waitConfigPropagation(async () => {
-      const res = await probe.listModels();
-      return res.status === 200;
-    });
     await awaitDayWindowHeadroom();
 
     const first = await chat(KEY_C_PLAINTEXT);
