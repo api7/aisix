@@ -281,22 +281,22 @@ describe("claim mapping e2e: verified claims resolve to an existing api key", ()
       resolve: { api_key_id: frozenKey.id },
     });
 
-    // Probe the LAST-written rule (`frozen-dept`, distinguishable by
-    // its error code flipping from jwt_identity_unmapped to
-    // api_key_disabled): watch events apply in revision order, so the
-    // final seed being live implies every earlier one is too. Probing
-    // the first rule would leave a window where later rules haven't
-    // landed yet.
+    // Readiness gate: a dedicated probe key seeded LAST. Watch events
+    // apply in revision order, so this key authenticating implies every
+    // earlier seed (all rules included) is live — without the gate
+    // exercising claim-mapping resolution itself, which is the behavior
+    // the tests below assert (a resolution regression must fail a
+    // targeted assertion, not a harness timeout).
+    await seed.createApiKey({
+      key_hash: createHash("sha256").update("sk-cm-ready-probe").digest("hex"),
+      allowed_models: [],
+    });
     await waitConfigPropagation(async () => {
-      const res = await chat(
-        app!,
-        idp!.sign(financeClaims({ department: "frozen" })),
-      );
-      if (res.status !== 401) {
-        await res.text();
-        return false;
-      }
-      return (await errorCode(res)) === "api_key_disabled";
+      const res = await fetch(`${app!.proxyUrl}/v1/models`, {
+        headers: { authorization: "Bearer sk-cm-ready-probe" },
+      });
+      await res.text();
+      return res.status === 200;
     });
   });
 
@@ -388,6 +388,7 @@ describe("claim mapping e2e: verified claims resolve to an existing api key", ()
     if (!requireSetup(ctx)) return;
     // agent-dup is bound to two keys; its claims match finance-dept —
     // the request must still be rejected.
+    const before = app!.output().length;
     const res = await chat(app!, idp!.sign(financeClaims({ sub: "agent-dup" })));
     expect(res.status).toBe(401);
     expect(await errorCode(res)).toBe("jwt_identity_unmapped");
@@ -396,6 +397,26 @@ describe("claim mapping e2e: verified claims resolve to an existing api key", ()
       r.text(),
     );
     expect(metrics).toContain('reason="jwt_binding_ambiguous"');
+
+    // Exactly ONE denial line, and it carries the request context an
+    // operator correlates by — the single-emit deny contract. Poll
+    // briefly: stderr flushes independently of the response.
+    let lines: string[] = [];
+    for (let i = 0; i < 20; i++) {
+      lines = app!
+        .output()
+        .slice(before)
+        .split("\n")
+        .filter((l) => l.includes("jwt_binding_ambiguous"));
+      if (lines.length > 0) break;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    expect(lines).toHaveLength(1);
+    const line = lines[0];
+    expect(line).toContain("path=/v1/chat/completions");
+    expect(line).toContain("source_ip=");
+    expect(line).toContain("request_id=");
+    expect(line).toContain("agent-dup");
   });
 
   test("claims matching no rule are rejected, never defaulted", async (ctx) => {
