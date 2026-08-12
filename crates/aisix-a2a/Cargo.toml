@@ -22,7 +22,6 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-http.workspace = true
 # A2A has no official Rust SDK (the reference SDKs are Python/JS/Java/Go/.NET),
 # so the JSON-RPC 2.0 + agent-card plumbing is hand-rolled directly on the
 # workspace HTTP client rather than pulled from an SDK.

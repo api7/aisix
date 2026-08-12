@@ -36,11 +36,13 @@ futures = "0.3"
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 async-trait = "0.1"
 
-# HTTP server
-axum = { version = "0.7", features = ["macros", "ws", "tracing", "multipart"] }
+# HTTP server. axum's `tracing` feature has no API surface — it gates
+# axum's internal logging of extractor rejections; a zero-hit grep is
+# its normal appearance, keep it.
+axum = { version = "0.7", features = ["ws", "tracing", "multipart"] }
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["trace", "cors", "limit", "compression-gzip", "set-header"] }
+tower-http = { version = "0.6", features = ["set-header"] }
 http = "1.2"
 http-body-util = "0.1"
 # Trusted-proxy CIDR matching for real-ip resolution (#492)
@@ -113,12 +115,12 @@ yaml-rust2 = "0.8"
 # Time / IDs
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
-uuid = { version = "1.11", features = ["v4", "v5", "serde"] }
+uuid = { version = "1.11", features = ["v4", "v5"] }
 hostname = "0.4"
 
 # Observability
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt", "registry"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "registry"] }
 metrics = "0.24"
 metrics-exporter-prometheus = "0.16"
 
