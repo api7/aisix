@@ -142,6 +142,7 @@ pub(crate) async fn resolve(
     snapshot: &AisixSnapshot,
     router_entry: &ResourceEntry<Model>,
     prompt: &str,
+    source_ip: &str,
     request_id: &str,
 ) -> Result<(Vec<AttemptModel>, Option<String>), ProxyError> {
     let semantic = router_entry
@@ -149,12 +150,15 @@ pub(crate) async fn resolve(
         .semantic
         .as_ref()
         .expect("resolve called on a non-semantic model");
+    let router = &router_entry.value;
 
     // No user text to classify (e.g. a system-only or tool-only request):
     // route to `default` without an embedding call rather than embedding an
     // empty string, which could spuriously match a route.
     if prompt.trim().is_empty() {
-        return Ok((vec![attempt_for_target(snapshot, &semantic.default)?], None));
+        let (attempt, _) =
+            select_eligible(state, snapshot, router, source_ip, &semantic.default, None)?;
+        return Ok((vec![attempt], None));
     }
 
     // Resolve the embedding model + its modality metadata. A dangling or
@@ -170,7 +174,7 @@ pub(crate) async fn resolve(
                 "semantic router references a missing or non-embedding embedding_model; \
                  applying on_embedding_failure",
             );
-            return fallback(semantic, snapshot);
+            return fallback(state, snapshot, router, source_ip, semantic);
         }
     };
     let dims = embed_entry
@@ -199,11 +203,18 @@ pub(crate) async fn resolve(
     to_embed.push(prompt.to_string());
     to_embed.extend(pending.iter().cloned());
 
+    // Deadline chain for the embed sub-call: the router-level knob wins,
+    // then the embedding model's own `timeout`, then the deployment
+    // default — previously only the router knob applied, so a hung
+    // embedding upstream stalled every semantic request unbounded.
+    let embed_deadline = semantic.embedding_timeout().or_else(|| {
+        crate::routing::effective_timeouts(&embed_entry.value, None, state.default_timeouts).request
+    });
     let vectors = match embed_texts(
         state,
         snapshot,
         &embed_entry,
-        semantic.embedding_timeout(),
+        embed_deadline,
         request_id,
         &to_embed,
     )
@@ -216,7 +227,7 @@ pub(crate) async fn resolve(
                 error = %e,
                 "semantic embedding call failed; applying on_embedding_failure",
             );
-            return fallback(semantic, snapshot);
+            return fallback(state, snapshot, router, source_ip, semantic);
         }
     };
 
@@ -245,31 +256,57 @@ pub(crate) async fn resolve(
         .collect();
 
     let decision = decide(semantic, &prompt_vec, &route_vecs);
-    let (target_alias, route_name): (&str, Option<String>) = match decision.winner {
-        Some(i) => (
-            semantic.routes[i].target.as_str(),
-            Some(semantic.routes[i].name.clone()),
-        ),
-        None => (semantic.default.as_str(), None),
+    let (attempt, route_name): (AttemptModel, Option<String>) = match decision.winner {
+        Some(i) => {
+            let (attempt, fell_back) = select_eligible(
+                state,
+                snapshot,
+                router,
+                source_ip,
+                semantic.routes[i].target.as_str(),
+                Some(semantic.default.as_str()),
+            )?;
+            // `x-aisix-route` reports the route that actually served the
+            // request: a winner displaced by its target's gates is a
+            // fall-through to `default`, not a served route.
+            let name = (!fell_back).then(|| semantic.routes[i].name.clone());
+            (attempt, name)
+        }
+        None => {
+            let (attempt, _) = select_eligible(
+                state,
+                snapshot,
+                router,
+                source_ip,
+                semantic.default.as_str(),
+                None,
+            )?;
+            (attempt, None)
+        }
     };
     tracing::debug!(
         router = %router_entry.value.display_name,
         resolved_route = ?route_name,
-        target = %target_alias,
+        target = %attempt.model.display_name,
         "semantic routing decision",
     );
-    let attempt = attempt_for_target(snapshot, target_alias)?;
     Ok((vec![attempt], route_name))
 }
 
 /// Apply the `on_embedding_failure` policy: route to the fallback target,
 /// or surface `503` when the policy is `fail`.
 fn fallback(
-    semantic: &Semantic,
+    state: &ProxyState,
     snapshot: &AisixSnapshot,
+    router: &Model,
+    source_ip: &str,
+    semantic: &Semantic,
 ) -> Result<(Vec<AttemptModel>, Option<String>), ProxyError> {
     match embedding_failure_target(semantic) {
-        Some(alias) => Ok((vec![attempt_for_target(snapshot, alias)?], None)),
+        Some(alias) => {
+            let (attempt, _) = select_eligible(state, snapshot, router, source_ip, alias, None)?;
+            Ok((vec![attempt], None))
+        }
         None => Err(ProxyError::ProviderUnavailable),
     }
 }
@@ -286,6 +323,85 @@ fn attempt_for_target(snapshot: &AisixSnapshot, alias: &str) -> Result<AttemptMo
         id: entry.id.clone(),
         model: entry.value.clone(),
     })
+}
+
+/// Pick the dispatchable target among `{primary, fallback}` — the
+/// semantic single-winner analogue of the group filter
+/// (`routing::targets_allowed_for_ip` + `filter_attempt_models`):
+///
+/// - the member's client-IP allowlist is a HARD gate: an excluded
+///   candidate is dropped, and with every candidate excluded the caller
+///   gets the same 403 as the entry gate, naming only the alias they
+///   addressed (`routing.rs` does the same for all-excluded groups, so
+///   a router never becomes a probe for which members exist);
+/// - member health (request-path cooldown / background-unhealthy) is a
+///   SOFT preference: prefer an available candidate, but with none
+///   available dispatch the primary anyway — the router has no
+///   `when_all_unavailable` knob, and the semantically-right target
+///   beats failing the request on an advisory signal.
+///
+/// Returns the attempt plus whether the fallback displaced the primary
+/// (so the caller can clear the served-route attribution).
+fn select_eligible(
+    state: &ProxyState,
+    snapshot: &AisixSnapshot,
+    router: &Model,
+    source_ip: &str,
+    primary: &str,
+    fallback_alias: Option<&str>,
+) -> Result<(AttemptModel, bool), ProxyError> {
+    let mut candidates: Vec<(AttemptModel, bool)> = Vec::with_capacity(2);
+    candidates.push((attempt_for_target(snapshot, primary)?, false));
+    if let Some(alias) = fallback_alias {
+        // A dangling `default` only matters when it must actually serve;
+        // as a mere fallback candidate it is skipped, not fatal.
+        if alias != primary {
+            if let Ok(attempt) = attempt_for_target(snapshot, alias) {
+                candidates.push((attempt, true));
+            }
+        }
+    }
+    candidates.retain(|(attempt, fell_back)| {
+        let allowed = attempt.model.ip_allowed(source_ip);
+        if !allowed {
+            tracing::debug!(
+                router = %router.display_name,
+                target = %attempt.model.display_name,
+                fallback = fell_back,
+                "semantic target excluded by its allowed_cidrs",
+            );
+        }
+        allowed
+    });
+    if candidates.is_empty() {
+        return Err(ProxyError::ModelIpRestricted(router.display_name.clone()));
+    }
+    let picked = candidates
+        .iter()
+        .position(|(attempt, _)| {
+            let stale_after = attempt
+                .model
+                .background_model_check
+                .as_ref()
+                .map(|cfg| std::time::Duration::from_secs(cfg.stale_after_seconds));
+            matches!(
+                state
+                    .runtime_status
+                    .status_with_stale(&attempt.id, stale_after)
+                    .status,
+                crate::RuntimeStatus::Healthy | crate::RuntimeStatus::NotApplicable
+            )
+        })
+        .unwrap_or(0);
+    let (attempt, fell_back) = candidates.swap_remove(picked);
+    if fell_back {
+        tracing::debug!(
+            router = %router.display_name,
+            served = %attempt.model.display_name,
+            "semantic route target unavailable; serving default",
+        );
+    }
+    Ok((attempt, fell_back))
 }
 
 /// Embed `texts` through the embedding model's bridge in one batched call,

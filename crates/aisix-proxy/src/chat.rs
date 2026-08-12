@@ -834,11 +834,19 @@ async fn cache_semantic_embed(
 ) -> Option<Vec<f32>> {
     let started = Instant::now();
     let texts = [sem.text.clone()];
+    // Same deadline chain as the semantic router's embed call: the
+    // policy knob wins, then the embedding model's own `timeout`, then
+    // the deployment default — a hung embedding upstream must not stall
+    // the cache gate unbounded either.
+    let embed_deadline = sem.cfg.embedding_timeout().or_else(|| {
+        crate::routing::effective_timeouts(&sem.embed_entry.value, None, state.default_timeouts)
+            .request
+    });
     match crate::semantic::embed_texts(
         state,
         snapshot,
         &sem.embed_entry,
-        sem.cfg.embedding_timeout(),
+        embed_deadline,
         request_id,
         &texts,
     )
@@ -1334,9 +1342,16 @@ async fn dispatch(
     let (attempt_models, semantic_route): (Vec<AttemptModel>, Option<String>) =
         if virtual_entry.value.is_semantic() {
             let prompt = last_user_message_text(req).unwrap_or_default();
-            crate::semantic::resolve(state, snapshot, &virtual_entry, &prompt, request_id)
-                .await
-                .map_err(&with_model)?
+            crate::semantic::resolve(
+                state,
+                snapshot,
+                &virtual_entry,
+                &prompt,
+                &client.source_ip,
+                request_id,
+            )
+            .await
+            .map_err(&with_model)?
         } else {
             let attempts = resolve_attempt_models(
                 &state.routing,
@@ -1539,7 +1554,7 @@ async fn dispatch(
             // existed on the group.
             let budget = crate::routing::effective_retries(
                 model,
-                virtual_entry.value.routing.as_ref(),
+                crate::routing::group_retries_of(&virtual_entry.value),
                 state.default_retries,
                 target_idx + 1 < attempt_models.len(),
             );
@@ -2615,7 +2630,7 @@ async fn dispatch(
         // Per-target retry budget — see the streaming loop above.
         let budget = crate::routing::effective_retries(
             model,
-            virtual_entry.value.routing.as_ref(),
+            crate::routing::group_retries_of(&virtual_entry.value),
             state.default_retries,
             target_idx + 1 < attempt_models.len(),
         );

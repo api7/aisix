@@ -657,7 +657,7 @@ async fn dispatch(
         // model gets a budget too.
         let budget = crate::routing::effective_retries(
             &target.model,
-            model_entry.value.routing.as_ref(),
+            crate::routing::group_retries_of(&model_entry.value),
             state.default_retries,
             target_idx + 1 < attempt_models.len(),
         );
