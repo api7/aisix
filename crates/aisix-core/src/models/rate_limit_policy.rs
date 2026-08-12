@@ -78,6 +78,7 @@ pub enum PolicyWindow {
     Second,
     Minute,
     Hour,
+    Day,
 }
 
 impl PolicyWindow {
@@ -86,6 +87,7 @@ impl PolicyWindow {
             Self::Second => "second",
             Self::Minute => "minute",
             Self::Hour => "hour",
+            Self::Day => "day",
         }
     }
 }

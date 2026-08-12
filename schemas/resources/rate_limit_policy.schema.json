@@ -236,7 +236,8 @@
       "enum": [
         "second",
         "minute",
-        "hour"
+        "hour",
+        "day"
       ],
       "type": "string"
     },

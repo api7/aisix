@@ -233,9 +233,14 @@ fn rate_limit_policy_corpus() {
                 json!({"name": "q", "scope": "region", "scope_ref": "t1", "window": "minute", "max_requests": 1}),
             ),
             (
+                "team + day window token quota (#771)",
+                true,
+                json!({"name": "q", "scope": "team", "scope_ref": "t1", "window": "day", "max_tokens": 100}),
+            ),
+            (
                 "unknown window enum",
                 false,
-                json!({"name": "q", "scope": "team", "scope_ref": "t1", "window": "day", "max_requests": 1}),
+                json!({"name": "q", "scope": "team", "scope_ref": "t1", "window": "week", "max_requests": 1}),
             ),
             (
                 "max_requests below minimum (0)",

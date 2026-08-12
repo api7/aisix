@@ -2813,11 +2813,12 @@ mod tests {
 
     #[test]
     fn rate_limit_policy_rejects_unknown_window() {
+        // "day" graduated into the enum (#771); "week" stays out.
         let v = json!({
             "name": "bad",
             "scope": "team",
             "scope_ref": "x",
-            "window": "day",
+            "window": "week",
             "max_requests": 10
         });
         assert!(validate_rate_limit_policy(&v).is_err());

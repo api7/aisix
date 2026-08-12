@@ -275,6 +275,14 @@ fn classic_rate_limit(policy: &RateLimitPolicy) -> Option<RateLimit> {
                 );
             }
         }
+        PolicyWindow::Day => {
+            // Both counters are native (`token_dims`, `KeyState`, and
+            // the Redis scripts handle `tpd` already) — day is the one
+            // window where a token cap on a team-capable policy was
+            // previously inexpressible (#771).
+            rl.rpd = policy.max_requests;
+            rl.tpd = policy.max_tokens;
+        }
     }
     Some(rl)
 }
@@ -721,6 +729,19 @@ mod tests {
             "hour window MUST NOT populate tpd (would 24× the cap)"
         );
         // tph intentionally deferred — see ai-gateway#396.
+    }
+
+    #[test]
+    fn day_maps_to_rpd_tpd() {
+        // #771: day is the one window whose token counter (`tpd`) is
+        // already native end to end, so both limits wire through.
+        let rl = classic_rate_limit(&make_policy("day", Some(10000), Some(2000000))).unwrap();
+        assert_eq!(rl.rpd, Some(10000));
+        assert_eq!(rl.tpd, Some(2000000));
+        assert!(rl.rpm.is_none());
+        assert!(rl.tpm.is_none());
+        assert!(rl.rps.is_none());
+        assert!(rl.rph.is_none());
     }
 
     #[test]
