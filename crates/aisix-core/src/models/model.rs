@@ -340,12 +340,15 @@ impl Model {
         if (self.is_routing() || self.is_ensemble()) && self.retries.take().is_some() {
             stripped.push("retries");
         }
+        // Pushed in lexicographic order so a pure-strip row's field list
+        // is already sorted (the loader's merge path re-sorts a combined
+        // unknown+inapplicable list, but a strip-only row bypasses that).
         if self.is_ensemble() {
-            if self.timeout.take().is_some() {
-                stripped.push("timeout");
-            }
             if self.stream_timeout.take().is_some() {
                 stripped.push("stream_timeout");
+            }
+            if self.timeout.take().is_some() {
+                stripped.push("timeout");
             }
         }
         stripped
@@ -664,8 +667,10 @@ mod tests {
             "retries": 1,
             "cost": {"input_per_1k": 0.0, "output_per_1k": 0.0}
         }));
-        let mut ens_stripped = ens.strip_kind_inapplicable();
-        ens_stripped.sort_unstable();
+        // Asserted WITHOUT a pre-sort: the strip output is already
+        // lexicographic (a pure-strip loader row keeps the fields
+        // "sorted" per PartialCompatRow's contract).
+        let ens_stripped = ens.strip_kind_inapplicable();
         assert_eq!(
             ens_stripped,
             ["cost", "retries", "stream_timeout", "timeout"]
