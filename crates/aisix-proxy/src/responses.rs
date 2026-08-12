@@ -1031,8 +1031,18 @@ async fn responses_to_target(
         );
     }
 
-    let base = crate::dispatch::resolve_base_url(&pk_entry.value)?;
-    let url = crate::dispatch::build_openai_url(&base, "/responses");
+    let url = aisix_gateway::url_cache::cached_endpoint_url(
+        &pk_entry.id,
+        "proxy/responses",
+        (pk_entry.value.api_base.as_deref().unwrap_or(""), ""),
+        || {
+            let base = crate::dispatch::resolve_base_url(&pk_entry.value)?;
+            Ok::<_, crate::error::ProxyError>(crate::dispatch::build_openai_url(
+                &base,
+                "/responses",
+            ))
+        },
+    )?;
 
     let is_stream = body
         .get("stream")
@@ -1073,7 +1083,7 @@ async fn responses_to_target(
     );
 
     let client = crate::http_client::client_for(pk_entry.value.tls.as_ref());
-    let mut req = client.post(&url).headers(headers).json(&body);
+    let mut req = url.post_on(&client).headers(headers).json(&body);
     // #554: non-streaming gets the E2E request timeout via reqwest's
     // request-level timeout. Streaming must NOT use it (it would cap the
     // whole stream); the streaming branch below enforces the per-chunk

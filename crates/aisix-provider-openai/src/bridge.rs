@@ -810,6 +810,56 @@ mod tests {
         ChatFormat::new("my-gpt4", vec![ChatMessage::user("hi")])
     }
 
+    async fn mount_ok(server: &MockServer) {
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-1",
+                "model": "gpt-4o",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })))
+            .mount(server)
+            .await;
+    }
+
+    /// The URL cache keys on the ProviderKey's resource id; an edited
+    /// `api_base` must take effect on the next request (fingerprint
+    /// revalidation), never serve the previously cached host.
+    #[tokio::test]
+    async fn url_cache_follows_api_base_edit_for_same_key_id() {
+        let s1 = MockServer::start().await;
+        let s2 = MockServer::start().await;
+        mount_ok(&s1).await;
+        mount_ok(&s2).await;
+
+        let bridge = OpenAiBridge::new();
+        let ctx1 = BridgeContext::new("r1", sample_model(), sample_provider_key(&s1.uri()))
+            .with_resource_ids("m-1", "pk-rewire-test");
+        bridge.chat(&req(), &ctx1).await.unwrap();
+
+        // Same resource id, api_base re-pointed at a different host.
+        let ctx2 = BridgeContext::new("r2", sample_model(), sample_provider_key(&s2.uri()))
+            .with_resource_ids("m-1", "pk-rewire-test");
+        bridge.chat(&req(), &ctx2).await.unwrap();
+
+        assert_eq!(
+            s1.received_requests().await.unwrap().len(),
+            1,
+            "first request hits the original host"
+        );
+        assert_eq!(
+            s2.received_requests().await.unwrap().len(),
+            1,
+            "after the edit the request follows the new host — a stale \
+             cached URL would have hit the original again"
+        );
+    }
+
     #[tokio::test]
     async fn non_streaming_happy_path() {
         let server = MockServer::start().await;

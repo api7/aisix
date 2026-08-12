@@ -87,24 +87,21 @@ pub fn cached_endpoint_url<E>(
     // Clone the inner Arc out of the outer guard so no outer shard lock
     // is held while reading, building, or parsing.
     let known = cache.get(provider_key_id).map(|g| Arc::clone(&g));
-    if let Some(per_key) = known {
-        if let Some(hit) = per_key.get(endpoint) {
-            if hit.fingerprint.0 == fingerprint.0 && hit.fingerprint.1 == fingerprint.1 {
-                return Ok(EndpointUrl::Parsed(hit.url.clone()));
+    let per_key = match known {
+        Some(per_key) => per_key,
+        None => {
+            // First sighting of this key: bound the outer map before
+            // inserting. `len()` walks shards, but only key-creation
+            // (admin-rate) pays it.
+            if cache.len() >= MAX_PROVIDER_KEYS {
+                cache.clear();
             }
+            cache
+                .entry(provider_key_id.to_string())
+                .or_insert_with(|| Arc::new(DashMap::new()))
+                .clone()
         }
-        return build_into(&per_key, endpoint, fingerprint, build);
-    }
-
-    // First sighting of this key: bound the outer map before inserting.
-    // `len()` walks shards, but only key-creation (admin-rate) pays it.
-    if cache.len() >= MAX_PROVIDER_KEYS {
-        cache.clear();
-    }
-    let per_key = cache
-        .entry(provider_key_id.to_string())
-        .or_insert_with(|| Arc::new(DashMap::new()))
-        .clone();
+    };
     build_into(&per_key, endpoint, fingerprint, build)
 }
 
@@ -116,26 +113,49 @@ fn parse_or_raw(raw: String) -> EndpointUrl {
     }
 }
 
-/// Build, parse, and (on parse success) cache the URL for `endpoint`.
+/// Hit-check, and on miss build/parse/cache — single-flight per
+/// (key, endpoint): the row's shard guard is held across the build, so
+/// concurrent cold requests (or requests racing a fingerprint change)
+/// serialize and the build closure runs once per transition. The
+/// closure is pure CPU (string assembly), so holding the inner shard
+/// lock across it is bounded and touches no other lock.
 fn build_into<E>(
     per_key: &DashMap<&'static str, CachedUrl>,
     endpoint: &'static str,
     fingerprint: (&str, &str),
     build: impl FnOnce() -> Result<String, E>,
 ) -> Result<EndpointUrl, E> {
-    let raw = build()?;
-    match Url::parse(&raw) {
-        Ok(url) => {
-            per_key.insert(
-                endpoint,
-                CachedUrl {
-                    fingerprint: (fingerprint.0.to_string(), fingerprint.1.to_string()),
-                    url: url.clone(),
-                },
-            );
-            Ok(EndpointUrl::Parsed(url))
+    match per_key.entry(endpoint) {
+        dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
+            let hit = occupied.get();
+            if hit.fingerprint.0 == fingerprint.0 && hit.fingerprint.1 == fingerprint.1 {
+                return Ok(EndpointUrl::Parsed(hit.url.clone()));
+            }
+            let raw = build()?;
+            match Url::parse(&raw) {
+                Ok(url) => {
+                    occupied.insert(CachedUrl {
+                        fingerprint: (fingerprint.0.to_string(), fingerprint.1.to_string()),
+                        url: url.clone(),
+                    });
+                    Ok(EndpointUrl::Parsed(url))
+                }
+                Err(_) => Ok(EndpointUrl::Unparsed(raw)),
+            }
         }
-        Err(_) => Ok(EndpointUrl::Unparsed(raw)),
+        dashmap::mapref::entry::Entry::Vacant(vacant) => {
+            let raw = build()?;
+            match Url::parse(&raw) {
+                Ok(url) => {
+                    vacant.insert(CachedUrl {
+                        fingerprint: (fingerprint.0.to_string(), fingerprint.1.to_string()),
+                        url: url.clone(),
+                    });
+                    Ok(EndpointUrl::Parsed(url))
+                }
+                Err(_) => Ok(EndpointUrl::Unparsed(raw)),
+            }
+        }
     }
 }
 
@@ -237,6 +257,28 @@ mod tests {
             matches!(again, EndpointUrl::Parsed(_)),
             "bad URL was cached"
         );
+    }
+
+    #[test]
+    fn concurrent_cold_misses_build_once() {
+        // Single-flight: the row's shard guard is held across the
+        // build, so N racing cold requests produce exactly one build.
+        let n = AtomicUsize::new(0);
+        let barrier = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    barrier.wait();
+                    let u = cached_endpoint_url("pk-url-sf", "test/chat", ("b", ""), || {
+                        n.fetch_add(1, Ordering::Relaxed);
+                        Ok::<_, ()>("https://sf.example.com/v1".to_string())
+                    })
+                    .unwrap();
+                    assert!(matches!(u, EndpointUrl::Parsed(_)));
+                });
+            }
+        });
+        assert_eq!(n.load(Ordering::Relaxed), 1, "one build across 8 racers");
     }
 
     #[test]

@@ -385,12 +385,22 @@ async fn dispatch(
     // gate without an arm in the helper; the audit-trail-friendly
     // default is OpenAI's host (it's a 4xx-from-OpenAI rather than
     // dispatching to a stale legacy domain).
-    let base = match pk_entry.value.api_base.as_deref() {
-        Some(b) if !b.trim().is_empty() => b.trim_end_matches('/').to_string(),
-        _ => default_base_for_provider(&provider_label)
-            .unwrap_or_else(|| "https://api.openai.com".to_string()),
-    };
-    let url = crate::dispatch::build_openai_url(&base, "/rerank");
+    let url = aisix_gateway::url_cache::cached_endpoint_url(
+        &pk_entry.id,
+        "proxy/rerank",
+        (
+            pk_entry.value.api_base.as_deref().unwrap_or(""),
+            &provider_label,
+        ),
+        || {
+            let base = match pk_entry.value.api_base.as_deref() {
+                Some(b) if !b.trim().is_empty() => b.trim_end_matches('/').to_string(),
+                _ => default_base_for_provider(&provider_label)
+                    .unwrap_or_else(|| "https://api.openai.com".to_string()),
+            };
+            Ok::<_, crate::error::ProxyError>(crate::dispatch::build_openai_url(&base, "/rerank"))
+        },
+    )?;
 
     // Build headers explicitly so the PK's `request.default_headers` and
     // `request.forward_client_headers` can inject operator/client headers
@@ -438,7 +448,11 @@ async fn dispatch(
     let cooldown_cfg = model.cooldown.as_ref();
     let (upstream_headers, body_bytes) =
         match crate::routing::retrying_dispatch(state, model, "/v1/rerank", || {
-            let mut req = client.post(&url).headers(headers.clone()).json(body);
+            let mut req = url
+                .clone()
+                .post_on(&client)
+                .headers(headers.clone())
+                .json(body);
             // #554: rerank is non-streaming; apply the E2E request timeout.
             if let Some(d) =
                 crate::routing::effective_timeouts(model, None, state.default_timeouts).request
