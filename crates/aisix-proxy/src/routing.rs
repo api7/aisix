@@ -188,11 +188,11 @@ pub fn retry_after_hint(err: &BridgeError) -> Option<Duration> {
 /// keeps the default for.
 pub fn effective_retries(
     target: &aisix_core::Model,
-    group: Option<&aisix_core::models::routing::Routing>,
+    group_retries: Option<u32>,
     deployment_default: u32,
     has_fallback_targets: bool,
 ) -> RetryBudget {
-    if let Some(explicit) = target.retries.or_else(|| group.and_then(|r| r.retries)) {
+    if let Some(explicit) = target.retries.or(group_retries) {
         return RetryBudget {
             attempts: explicit as usize,
             configured: true,
@@ -206,6 +206,20 @@ pub fn effective_retries(
         },
         configured: false,
     }
+}
+
+/// The group-level slot of the member → group → deployment-default
+/// retries chain, resolved from the caller-addressed parent entry:
+/// `routing.retries` for a Model Group, the parent's own top-level
+/// `retries` otherwise — a semantic router has no `routing` block, so
+/// its group level lives on the Model itself (the same place a routing
+/// group keeps its group-level `timeout`).
+pub fn group_retries_of(parent: &aisix_core::Model) -> Option<u32> {
+    parent
+        .routing
+        .as_ref()
+        .and_then(|r| r.retries)
+        .or(parent.retries)
 }
 
 /// How many same-target retries this dispatch may spend, and whether the
@@ -1581,9 +1595,44 @@ mod tests {
     ) -> RetryBudget {
         let m = model_with_retries(target);
         match group {
-            Some(g) => effective_retries(&m, Some(&group_with_retries(g)), default, has_fallback),
+            Some(g) => effective_retries(
+                &m,
+                group_retries_of(&{
+                    let mut parent = model_with_retries(None);
+                    parent.routing = Some(group_with_retries(g));
+                    parent
+                }),
+                default,
+                has_fallback,
+            ),
             None => effective_retries(&m, None, default, has_fallback),
         }
+    }
+
+    #[test]
+    fn group_retries_reads_the_routing_block_then_the_parent_model() {
+        // Model Group: the group slot is `routing.retries`; a stray
+        // top-level value on the parent stays shadowed by it.
+        let mut group_parent = model_with_retries(Some(7));
+        group_parent.routing = Some(group_with_retries(Some(3)));
+        assert_eq!(group_retries_of(&group_parent), Some(3));
+        // Semantic router (no routing block): the parent's own top-level
+        // `retries` IS the group slot — the member → group → default
+        // chain unified across virtual parents.
+        let semantic_parent = model_with_retries(Some(2));
+        assert_eq!(group_retries_of(&semantic_parent), Some(2));
+        assert_eq!(
+            effective_retries(
+                &model_with_retries(None),
+                group_retries_of(&semantic_parent),
+                9,
+                false
+            )
+            .attempts,
+            2
+        );
+        // Neither configured → no group level.
+        assert_eq!(group_retries_of(&model_with_retries(None)), None);
     }
 
     #[test]

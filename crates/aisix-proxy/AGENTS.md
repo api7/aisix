@@ -93,6 +93,12 @@ scoped to a member never runs for group traffic (measured: direct 422, via group
 is correct — input guardrails run before a target is picked, and under failover
 there is no single "winning member" to resolve against. Tracked in
 AISIX-Cloud#1090; do not cite it as precedent for scoping a new gate to the entry.
+The 2026-08 model-kind audit re-confirmed the same gap for **ensemble panel/judge
+sub-calls and semantic-router targets**, and the ruling (project decision) is that
+all three kinds stay under #1090's one unified design pass: the operator can
+attach the guardrail to the parent entry, so member scope is a mitigable gap, not
+an unavoidable bypass. Do not piecemeal-fix one kind ahead of that decision, and
+do not re-audit it as a new finding.
 
 Two shapes, both already implemented — copy the nearest one:
 
