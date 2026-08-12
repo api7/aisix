@@ -147,39 +147,65 @@ wait_http_200() { # wait_http_200 <url> <label> [max_s]
 # An HTTP 200 says something is listening; it does not say the thing that is
 # listening is the thing this run started. A process that loses the bind race
 # exits, a stale listener from an earlier run keeps answering, and every
-# window afterwards measures a stranger with fail=0 throughout. Two checks,
-# because neither covers the other:
+# window afterwards measures a stranger with fail=0 throughout.
 #
-#   liveness    our own process is still up. This is the one that catches a
-#               lost bind race whatever the other listener is, since the
-#               loser exits on "Address already in use".
-#   ownership   the listener on the port is our pid. This catches a process
-#               that is alive but bound elsewhere, or answering from an
-#               earlier run of itself.
-#
-# Ownership degrades to a warning when ss cannot report the pid (a listener
-# owned by another user needs privilege to attribute); liveness never does.
+#   ownership   the listener on the port is ours. This is the load-bearing
+#               check: readiness returns on the first 200, which a foreign
+#               listener answers in well under a millisecond, while a losing
+#               process takes milliseconds to reach its bind() and exit - so
+#               at this point the loser is usually still alive and liveness
+#               alone would wave it through.
+#   liveness    our own process is still up - the backstop for a target that
+#               died between launch and readiness for any other reason.
 #
 # Response-shape fingerprinting deliberately not used: a stand-in mock built
 # from the same semantics answers byte-identically, so a fingerprint cannot
 # tell the two apart. The listening pid can.
 assert_listener() { # assert_listener <port> <pid> <label>
-    local port="$1" want="$2" label="$3" owners p
+    local port="$1" want="$2" label="$3" listing owners p anc hops mine
     [ -d "/proc/$want" ] ||
         { echo "FATAL: $label (pid $want) is not running after readiness - it likely lost the bind race on :$port; something else answered the readiness probe" >&2
           exit 1; }
-    owners=$(ss -ltnpH "sport = :$port" 2>/dev/null | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u)
+    # `|| true` on both stages: under set -euo pipefail an ss that prints
+    # nothing, or a grep that matches nothing, fails the pipeline and the
+    # assignment aborts the runner with no message at all - which would turn
+    # every branch below into a silent exit. `,fd=` anchors the pid so a
+    # process whose own name contains "pid=" cannot inject a phantom owner.
+    listing=$(ss -ltnpH "sport = :$port" 2>/dev/null || true)
+    owners=$(printf '%s\n' "$listing" | grep -oE 'pid=[0-9]+,fd=' | cut -d= -f2 | cut -d, -f1 | sort -u || true)
+
+    # ss attributes any socket owned by our own uid, so for a target this
+    # harness started an empty owner set is not "unknown" - readiness proved
+    # something answered, and this proves that something is not ours. Degrade
+    # only when the target itself is out of reach: a containerized entrant's
+    # pid and its published port both belong to another user, and neither can
+    # be attributed without privilege.
     if [ -z "$owners" ]; then
-        echo "WARNING: cannot attribute the listener on :$port; $label identity unverified (liveness passed)" >&2
+        [ -r "/proc/$want/fd" ] &&
+            { echo "FATAL: nothing this user owns is listening on :$port, yet the readiness probe was answered - the responder is not the $label this run started (pid $want)" >&2
+              exit 1; }
+        echo "WARNING: the listener on :$port and $label (pid $want) both belong to another user; identity unverified (liveness passed)" >&2
         return 0
     fi
-    grep -qx "$want" <<<"$owners" && return 0
-    # A launcher that forks the real listener is legitimate; a stranger is not.
+
+    # Every owner must be us or a descendant, not merely "we are among them":
+    # under SO_REUSEPORT a stale instance co-binds instead of losing the race,
+    # and the kernel then splits the load between it and us.
     for p in $owners; do
-        [ "$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')" = "$want" ] && return 0
+        [ "$p" = "$want" ] && continue
+        mine=0; hops=0
+        anc=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ' || true)
+        while [ -n "$anc" ] && [ "$anc" != 0 ] && [ "$hops" -lt 10 ]; do
+            [ "$anc" = "$want" ] && { mine=1; break; }
+            anc=$(ps -o ppid= -p "$anc" 2>/dev/null | tr -d ' ' || true); hops=$((hops + 1))
+        done
+        [ "$mine" = 1 ] ||
+            { echo "FATAL: :$port is held by pid $(echo "$owners" | paste -sd, -), not (only) the $label this run started (pid $want) - measuring it would measure a foreign process" >&2
+              exit 1; }
+        # Same hazard run-entrant.sh already warns about for child processes:
+        # CPU% and RSS are sampled on GW_PID, not on the serving process.
+        echo "WARNING: :$port is served by pid $p, a descendant of $label (pid $want); CPU%/RSS cover pid $want only" >&2
     done
-    echo "FATAL: :$port is held by pid $(echo "$owners" | paste -sd, -), not the $label this run started (pid $want) - measuring it would measure a foreign process" >&2
-    exit 1
 }
 
 start_mock() { # start_mock <ttft_ms>

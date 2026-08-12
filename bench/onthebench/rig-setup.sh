@@ -27,10 +27,15 @@ sudo -n DEBIAN_FRONTEND=noninteractive apt-get update -q
 # build deps would silently drop ALL of them and fail much later in the build.
 sudo -n DEBIAN_FRONTEND=noninteractive apt-get install -y -q \
     git curl build-essential pkg-config libssl-dev protobuf-compiler \
-    python3 linux-tools-common
+    python3 linux-tools-common iproute2 procps
 sudo -n DEBIAN_FRONTEND=noninteractive apt-get install -y -q "linux-tools-$(uname -r)" ||
     sudo -n DEBIAN_FRONTEND=noninteractive apt-get install -y -q linux-tools-aws
 perf --version
+# The harness asserts that the process it measures is the one it started, and
+# that assertion reads ss and ps; without them the check degrades to a warning
+# nobody reads and the guard is silently off. Verify like perf above.
+command -v ss >/dev/null || { echo "FATAL: iproute2 (ss) missing"; exit 1; }
+command -v ps >/dev/null || { echo "FATAL: procps (ps) missing"; exit 1; }
 
 echo "== rust toolchain =="
 # Pinned, checksum-verified rustup-init instead of the curl|sh installer: the
