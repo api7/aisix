@@ -93,6 +93,48 @@ mod tests {
         assert_eq!(wildcard_capture("a/*/*", "a/b/c"), None);
     }
 
+    /// Differential oracle: `wildcard_matches` must agree with
+    /// `wildcard_capture(..).is_some()` for every pattern shape — the
+    /// two are duplicate decision procedures guarding the authz
+    /// allowlists, and a future edit to either must not let them
+    /// diverge silently.
+    #[test]
+    fn matches_agrees_with_capture_oracle() {
+        let pats = [
+            "*",
+            "openai/*",
+            "*-sfx",
+            "gpt-*-preview",
+            "aa*aa",
+            "a/*/*",
+            "**",
+            "lit",
+            "",
+        ];
+        let cands = [
+            "",
+            "openai/",
+            "openai/gpt-4o",
+            "aaa",
+            "aaaa",
+            "gpt-4o-preview",
+            "gpt-4o-final",
+            "a/b/c",
+            "-sfx",
+            "lit",
+        ];
+        for p in pats {
+            for c in cands {
+                let expected = if p.contains('*') {
+                    wildcard_capture(p, c).is_some()
+                } else {
+                    p == c
+                };
+                assert_eq!(wildcard_matches(p, c), expected, "p={p:?} c={c:?}");
+            }
+        }
+    }
+
     #[test]
     fn matches_handles_literals_and_globs() {
         assert!(wildcard_matches("*", "anything"));

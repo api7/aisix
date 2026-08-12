@@ -629,14 +629,15 @@ impl ModelRuntimeStatusTracker {
         }
         // Read-first path (no configured bookkeeping consumer): in the
         // steady state — entry clean, gauge already Healthy — a read
-        // guard and two field loads replace the per-request shard write
-        // lock + wall-clock read. The write path below still runs
-        // whenever there is anything to do, so cooldown early-recovery
-        // and the `aisix_deployment_state` series behave exactly as
-        // before. A missing entry takes the write path too: with the
-        // in-flight write gated off nothing pre-creates entries anymore,
-        // and publishing Healthy on a target's first success is what the
-        // begin_in_flight + mark_healthy pair used to produce.
+        // guard and a few field loads replace the per-request shard
+        // write lock + wall-clock read. The write path below still runs
+        // whenever there is anything to do (cooldown early-recovery,
+        // the first-success Healthy publish on an entry begin_in_flight
+        // created), so the `aisix_deployment_state` series behaves
+        // exactly as before. A MISSING entry stays a no-op, exactly as
+        // on the historical path: the single-attempt handlers call
+        // mark_healthy without begin_in_flight, and their targets must
+        // not grow a series they never had.
         let needs_write = match self.entries.get(model_id) {
             Some(e) => {
                 e.unhealthy
@@ -644,16 +645,17 @@ impl ModelRuntimeStatusTracker {
                     || e.status_reason.is_some()
                     || e.emitted_state != Some(DeploymentState::Healthy)
             }
-            None => true,
+            None => false,
         };
         if !needs_write {
             return;
         }
-        let mut entry = self.entries.entry(model_id.to_string()).or_default();
-        entry.unhealthy = false;
-        entry.cooldown_until = None;
-        entry.status_reason = None;
-        self.sync_deployment_state(model_id, &mut entry, SystemTime::now());
+        if let Some(mut entry) = self.entries.get_mut(model_id) {
+            entry.unhealthy = false;
+            entry.cooldown_until = None;
+            entry.status_reason = None;
+            self.sync_deployment_state(model_id, &mut entry, SystemTime::now());
+        }
     }
 
     /// Publish `aisix_deployment_state` for `model_id` when the entry's
@@ -823,12 +825,21 @@ impl ModelRuntimeStatusTracker {
     pub fn begin_in_flight(&self, model_id: &str) -> InFlightGuard {
         // The counter's only reader is `least_busy` target ordering; with
         // no such strategy configured, hand out a no-op guard instead of
-        // paying the key allocation + shard write lock + two RMWs per
-        // request. When the strategy is (re)configured, counting resumes
-        // for new requests; requests already in flight hold no-op guards,
-        // so the count transiently underreads until they drain — the same
+        // paying the counter RMWs and guard refcount per request. When
+        // the strategy is (re)configured, counting resumes for new
+        // requests; requests already in flight hold no-op guards, so the
+        // count transiently underreads until they drain — the same
         // cold-start the counter has on process start.
+        //
+        // The ENTRY-CREATION side effect is preserved: `mark_healthy`'s
+        // first-success Healthy publish keys off the entry this method
+        // creates, and only the endpoints that call begin_in_flight may
+        // publish that series (the single-attempt handlers never do).
+        // Steady state downgrades to a read-guard existence check.
         if !self.bookkeeping_active() {
+            if self.entries.get(model_id).is_none() {
+                self.entries.entry(model_id.to_string()).or_default();
+            }
             return InFlightGuard { counter: None };
         }
         let counter = Arc::clone(
@@ -1034,17 +1045,37 @@ mod tests {
     #[test]
     fn inactive_mark_healthy_publishes_healthy_once_then_reads() {
         let (_handle, t) = inactive_tracker();
-        // First success: creates the entry and records the Healthy
-        // publish — what the begin_in_flight + mark_healthy pair used to
-        // produce on a target's first request.
+        // Real multi-attempt-endpoint sequence: begin_in_flight creates
+        // the entry (no-op guard, but the side effect is preserved),
+        // then the first success publishes Healthy.
+        drop(t.begin_in_flight("d1"));
         t.mark_healthy("d1");
         {
-            let e = t.entries.get("d1").expect("entry created on first success");
+            let e = t
+                .entries
+                .get("d1")
+                .expect("entry created by begin_in_flight");
             assert_eq!(e.emitted_state, Some(DeploymentState::Healthy));
         }
         // Steady state: read-only, entry untouched.
         t.mark_healthy("d1");
         assert_eq!(t.status("d1").status, RuntimeStatus::Healthy);
+    }
+
+    /// The single-attempt handlers (embeddings, images, completions,
+    /// audio, rerank, count_tokens) call mark_healthy WITHOUT
+    /// begin_in_flight. On the historical path their targets never got
+    /// an entry — and therefore never published `aisix_deployment_state`
+    /// — so the inactive fast path must stay a no-op for a missing
+    /// entry, or zero-config deployments grow a series main never had.
+    #[test]
+    fn inactive_mark_healthy_without_begin_in_flight_stays_noop() {
+        let (_handle, t) = inactive_tracker();
+        t.mark_healthy("embeddings-only-target");
+        assert!(
+            t.entries.get("embeddings-only-target").is_none(),
+            "mark_healthy on a never-seen id must not create an entry"
+        );
     }
 
     #[test]

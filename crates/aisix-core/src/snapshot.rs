@@ -92,8 +92,14 @@ impl<T: Resource> ResourceTable<T> {
         }
 
         self.by_name.insert(name, id.clone());
-        if self.by_id.insert(id, Arc::new(entry)).is_none() {
-            self.count.fetch_add(1, Ordering::Relaxed);
+        // Provisional increment BEFORE the map insert, corrected after a
+        // replace. Orders the count so it can only ever read high during
+        // a mutation window, never low: the empty fast paths may take
+        // one redundant full scan, but can never skip an entry that is
+        // already visible in the map.
+        self.count.fetch_add(1, Ordering::Relaxed);
+        if self.by_id.insert(id, Arc::new(entry)).is_some() {
+            self.count.fetch_sub(1, Ordering::Relaxed);
         }
     }
 
