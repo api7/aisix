@@ -33,12 +33,23 @@ pub fn wildcard_capture(pattern: &str, candidate: &str) -> Option<String> {
 
 /// Whether `pattern` matches `candidate`. A pattern with a single `*` is
 /// glob-matched; any other pattern matches only an exactly-equal candidate.
+///
+/// Same decision as `wildcard_capture(..).is_some()` but without
+/// materialising the capture — this runs on the per-request authz path,
+/// where a bare `"*"` allowlist entry would otherwise copy the whole
+/// candidate just to discard it.
 pub fn wildcard_matches(pattern: &str, candidate: &str) -> bool {
-    if pattern.contains('*') {
-        wildcard_capture(pattern, candidate).is_some()
-    } else {
-        pattern == candidate
+    let Some(star) = pattern.find('*') else {
+        return pattern == candidate;
+    };
+    if pattern[star + 1..].contains('*') {
+        return false; // only a single '*' is supported
     }
+    let prefix = &pattern[..star];
+    let suffix = &pattern[star + 1..];
+    candidate.len() >= prefix.len() + suffix.len()
+        && candidate.starts_with(prefix)
+        && candidate.ends_with(suffix)
 }
 
 #[cfg(test)]

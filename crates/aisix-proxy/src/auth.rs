@@ -48,12 +48,36 @@ pub struct JwtIdentity {
 /// metric answers "how many" but not "who, when, against what" — so the
 /// denial log line, which an operator turns on precisely when investigating,
 /// carries the identifying detail instead.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 pub(crate) struct DenialContext<'a> {
     pub method: &'a str,
     pub path: &'a str,
     pub request_id: &'a str,
-    pub source_ip: &'a str,
+    pub source_ip: LazySourceIp<'a>,
+}
+
+/// Source IP for denial logs, resolved only when a denial actually logs
+/// it. The successful-auth path has no consumer for it, so it never pays
+/// the forwarded-header scan + IP formatting — `ClientContext` resolves
+/// the same value once for the handlers instead.
+#[derive(Clone, Copy)]
+pub(crate) enum LazySourceIp<'a> {
+    /// Resolve from the request parts + real-ip config on first use.
+    Deferred(&'a axum::http::request::Parts, &'a crate::client_ip::ResolvedRealIp),
+    /// Already resolved by the caller (WebSocket subprotocol auth, which
+    /// has a `ClientContext` in hand).
+    Ready(&'a str),
+}
+
+impl LazySourceIp<'_> {
+    pub(crate) fn resolve(&self) -> std::borrow::Cow<'_, str> {
+        match self {
+            Self::Deferred(parts, cfg) => {
+                std::borrow::Cow::Owned(crate::client_ip::source_ip_from_parts(parts, cfg))
+            }
+            Self::Ready(s) => std::borrow::Cow::Borrowed(s),
+        }
+    }
 }
 
 impl AuthenticatedKey {
@@ -72,7 +96,6 @@ where
 
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
         let proxy_state = ProxyState::from_ref(state);
-        let source_ip = crate::client_ip::source_ip_from_parts(parts, &proxy_state.real_ip);
         let request_id = parts
             .extensions
             .get::<crate::request_id::RequestId>()
@@ -82,7 +105,8 @@ where
             method: parts.method.as_str(),
             path: parts.uri.path(),
             request_id,
-            source_ip: &source_ip,
+            // Deferred: only a denial resolves the source IP.
+            source_ip: LazySourceIp::Deferred(&*parts, proxy_state.real_ip.as_ref()),
         };
         let token = match extract_bearer(parts) {
             Ok(t) => t,
@@ -100,7 +124,7 @@ where
                     http_method = %ctx.method,
                     path = %ctx.path,
                     request_id = %ctx.request_id,
-                    source_ip = %ctx.source_ip,
+                    source_ip = %ctx.source_ip.resolve(),
                     "rejected inbound request without a credential",
                 );
                 return Err(e);
@@ -137,7 +161,10 @@ pub(crate) async fn authenticate_token(
     ctx: DenialContext<'_>,
 ) -> Result<AuthenticatedKey, ProxyError> {
     let snapshot = state.snapshot.load();
-    if crate::jwt::looks_like_jwt(token) && crate::jwt::any_enabled_provider(&snapshot) {
+    // Provider gate first: it is O(1) when no trust provider is
+    // configured, so key-only deployments never pay the structural JWT
+    // probe (base64 + JSON decode of the header segment).
+    if crate::jwt::any_enabled_provider(&snapshot) && crate::jwt::looks_like_jwt(token) {
         return crate::jwt::authenticate_jwt(state, &snapshot, token, ctx).await;
         // No enabled trust provider: fall through to the key path so a
         // custom-imported key that happens to look like a JWT keeps
@@ -172,7 +199,9 @@ pub(crate) async fn authenticate_token(
             ProxyError::ApiKeyDisabled,
         ));
     }
-    if entry.value.is_expired_at(chrono::Utc::now()) {
+    // Read the wall clock only for keys that actually carry a deadline;
+    // enforcement is unchanged (`is_expired_at` is false for `None`).
+    if entry.value.expires_at.is_some() && entry.value.is_expired_at(chrono::Utc::now()) {
         return Err(deny_key(
             state,
             "key_expired",
@@ -217,7 +246,7 @@ fn deny_key(
             http_method = %ctx.method,
             path = %ctx.path,
             request_id = %ctx.request_id,
-            source_ip = %ctx.source_ip,
+            source_ip = %ctx.source_ip.resolve(),
             "rejected inbound credential",
         );
     } else {
@@ -229,7 +258,7 @@ fn deny_key(
             http_method = %ctx.method,
             path = %ctx.path,
             request_id = %ctx.request_id,
-            source_ip = %ctx.source_ip,
+            source_ip = %ctx.source_ip.resolve(),
             "rejected inbound credential",
         );
     }

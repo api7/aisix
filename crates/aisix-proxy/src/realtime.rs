@@ -328,7 +328,7 @@ async fn authenticate(
         method: "GET",
         path: "/v1/realtime",
         request_id: &client.request_id,
-        source_ip: &client.source_ip,
+        source_ip: crate::auth::LazySourceIp::Ready(&client.source_ip),
     };
     if let Some(auth) = headers.get(axum::http::header::AUTHORIZATION) {
         let s = auth.to_str().map_err(|_| ProxyError::MissingAuth)?;

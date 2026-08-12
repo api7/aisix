@@ -96,17 +96,25 @@ pub(crate) fn looks_like_jwt(token: &str) -> bool {
     if token.len() > MAX_JWT_BYTES {
         return false;
     }
-    let parts: Vec<&str> = token.splitn(4, '.').collect();
-    if parts.len() != 3 || parts.iter().any(|p| p.is_empty()) {
+    // Exactly three non-empty segments — checked on the iterator so the
+    // per-request path allocates nothing.
+    let mut parts = token.splitn(4, '.');
+    let (Some(header), Some(payload), Some(sig), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    if header.is_empty() || payload.is_empty() || sig.is_empty() {
         return false;
     }
-    matches!(b64url_json(parts[0]), Some(v) if v.get("alg").is_some())
+    matches!(b64url_json(header), Some(v) if v.get("alg").is_some())
 }
 
 /// True when the snapshot has at least one enabled trust provider — the
-/// gate for entering the JWT path at all.
+/// gate for entering the JWT path at all. O(1) on deployments with no
+/// providers configured (the common case).
 pub(crate) fn any_enabled_provider(snapshot: &AisixSnapshot) -> bool {
-    snapshot.oidc_providers.any(|e| e.value.enabled)
+    !snapshot.oidc_providers.is_empty() && snapshot.oidc_providers.any(|e| e.value.enabled)
 }
 
 fn b64url_json(segment: &str) -> Option<serde_json::Value> {
@@ -525,7 +533,7 @@ fn deny(
             http_method = %ctx.method,
             path = %ctx.path,
             request_id = %ctx.request_id,
-            source_ip = %ctx.source_ip,
+            source_ip = %ctx.source_ip.resolve(),
             "rejected inbound JWT (pre-verification)",
         );
     } else {
@@ -538,7 +546,7 @@ fn deny(
             http_method = %ctx.method,
             path = %ctx.path,
             request_id = %ctx.request_id,
-            source_ip = %ctx.source_ip,
+            source_ip = %ctx.source_ip.resolve(),
             "rejected inbound JWT",
         );
     }
