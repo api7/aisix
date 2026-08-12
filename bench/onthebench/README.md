@@ -61,10 +61,13 @@ Replicates the published onthebench setup (https://onthebench.ai/gateways/perfor
   VmHWM are in the metadata, alongside commit, binary sha256, instrument
   sha256s, core split, kernel, and the full method parameters.
 - **Flamegraph** — one on-CPU flamegraph at the c=128 saturation point per run
-  (`perf record -F 499 --call-graph dwarf` → inferno), the api7/aisix#847
+  (`perf record -F 499 --call-graph dwarf,32768` → inferno), the api7/aisix#847
   workflow. `rig-setup.sh` sets `kernel.perf_event_paranoid=1` (session-scoped,
   reverts on reboot) so an unprivileged run can sample its own process, and
-  `run-baseline.sh` refuses a stripped binary before wasting a run.
+  `run-baseline.sh` refuses a stripped binary before wasting a run. Every
+  capture reports the share of its stacks that failed to unwind, into both the
+  terminal and the collected `perf.log`; a capture that unwound poorly is
+  called out rather than left to look like a profile.
 
 ## Method overrides
 

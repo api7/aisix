@@ -19,8 +19,13 @@ MAX_TRIES="${BENCH_MAX_TRIES:-8}"
 GRID="${BENCH_GRID:-0:16 0:32 0:128 10:768}"
 FLOOR_REPS="${BENCH_FLOOR_REPS:-2}"
 FLAMEGRAPH="${BENCH_FLAMEGRAPH:-1}"
-# Bytes of stack perf copies per sample for dwarf unwinding. See
-# flamegraph_point: the 8KB default is too small for this gateway's stacks.
+# Bytes of stack perf copies per sample for dwarf unwinding. perf's 8KB
+# default has produced captures on this rig where 88-96% of the sampled
+# weight unwound to nothing; 32KB has not. The trigger is not isolated to a
+# build profile or a commit - the two worst captures are a thin-LTO build,
+# and one commit produced both a 42% and a 71% capture - so this size is a
+# mitigation, not a diagnosis, and check_symbolization measures every
+# capture rather than trusting it.
 PERF_STACK="${BENCH_PERF_STACK:-32768}"
 
 # Request shape. An entrant overrides these before sourcing when its only
@@ -52,8 +57,10 @@ is_pos_int "$WINDOW" || { echo "FATAL: BENCH_WINDOW must be a positive integer, 
 is_pos_int "$REPS" || { echo "FATAL: BENCH_REPS must be a positive integer, got '$REPS'"; exit 1; }
 is_pos_int "$MAX_TRIES" || { echo "FATAL: BENCH_MAX_TRIES must be a positive integer, got '$MAX_TRIES'"; exit 1; }
 is_pos_int "$FLOOR_REPS" || { echo "FATAL: BENCH_FLOOR_REPS must be a positive integer, got '$FLOOR_REPS'"; exit 1; }
-# perf rejects a non-multiple of 8 and silently caps above 64KB; refuse both
-# here rather than discovering it after a 45s capture window.
+# perf rounds a non-multiple of 8 up (callchain.c get_stack_size) and hard
+# errors above round_down(USHRT_MAX, 8) = 65528. Require the exact value so
+# the size recorded in meta.json is the size perf actually used, and so an
+# out-of-range value fails here rather than after a 45s capture window.
 is_pos_int "$PERF_STACK" && [ $((PERF_STACK % 8)) -eq 0 ] && [ "$PERF_STACK" -le 65528 ] ||
     { echo "FATAL: BENCH_PERF_STACK must be a positive multiple of 8 up to 65528, got '$PERF_STACK'"; exit 1; }
 case "$FLAMEGRAPH" in 0|1) ;; *) echo "FATAL: BENCH_FLAMEGRAPH must be 0 or 1, got '$FLAMEGRAPH'"; exit 1 ;; esac
@@ -314,41 +321,61 @@ floor_tier() { # floor_tier <ttft>  -> the floor points this tier needs
 # renders, it looks plausible, and every attribution taken from it is wrong.
 # The check is on the collapsed output rather than on perf's exit code
 # because that is where the failure is visible - frames that unwound to
-# nothing come back as [unknown]/[dso] entries with no symbol at any depth.
+# nothing come back as [unknown]/[dso] entries with no symbol.
+#
+# Two shares, because they fail differently. "no symbol at any depth" is the
+# coarse one and can pass a capture whose leaves are nearly all anonymous;
+# the leaf share is what a flamegraph attributes self-time to, and separates
+# this repo's own captures more widely. Both thresholds come from those
+# captures: usable ones measure up to 71% (any-depth) and 72% (leaf), the
+# failed ones start at 88% and 91% respectively.
 check_symbolization() { # check_symbolization <folded-file>
-    local unresolved
-    unresolved=$(awk '
+    local shares any leaf
+    shares=$(awk '
         { n = $NF; total += n
-          # strip the count and the leading thread name, then look for any
-          # frame that carries a real symbol
-          sub(/ [0-9]+$/, ""); split($0, frames, ";")
+          sub(/ [0-9]+$/, ""); nf = split($0, frames, ";")
           resolved = 0
-          for (i = 2; i <= length(frames); i++)
+          # frames[1] is the thread name and always resolves; start past it
+          for (i = 2; i <= nf; i++)
               if (frames[i] !~ /^\[/) { resolved = 1; break }
-          if (!resolved) bad += n }
-        END { if (total > 0) printf "%.1f", bad / total * 100; else print "100.0" }
-    ' "$1")
-    # 80% is where the two populations separate, measured over this repo's
-    # own captures: usable ones run 37-57% unresolved (kernel frames, which
-    # kptr_restrict keeps anonymous, plus stripped system libraries), the
-    # unwind-failure mode lands at 92-96%. A tighter threshold would flag
-    # healthy captures; a looser one would let the failure through.
-    awk -v u="$unresolved" 'BEGIN{exit !(u > 80)}' &&
-        echo "WARNING: $1 is $unresolved% unresolved stacks - unwinding likely failed; do not attribute from this flamegraph (try a larger BENCH_PERF_STACK)" >&2
-    echo "  flamegraph: $unresolved% unresolved stacks" >&2
+          if (!resolved) bad += n
+          if (nf >= 2 && frames[nf] ~ /^\[/) badleaf += n }
+        END { if (total > 0) printf "%.1f %.1f", bad / total * 100, badleaf / total * 100
+              else print "empty empty" }
+    ' "$1") || { echo "WARNING: cannot read $1 for the symbolization check" >&2; return 0; }
+    read -r any leaf <<<"$shares"
+    if [ "$any" = empty ]; then
+        echo "WARNING: $1 has no samples - the capture produced nothing to attribute" >&2
+        return 0
+    fi
+    # Reported into perf.log as well as the terminal: perf.log is collected
+    # off the rig, and the reader who most needs this number is the one
+    # opening the SVG months later, not the operator watching the run.
+    echo "  flamegraph: $any% unresolved stacks, $leaf% unresolved leaves" |
+        tee -a "$OUT/perf.log" >&2
+    awk -v a="$any" -v l="$leaf" 'BEGIN{exit !(a > 80 || l > 85)}' &&
+        echo "WARNING: $1 unwound poorly - do not attribute from this flamegraph (try a larger BENCH_PERF_STACK)" |
+            tee -a "$OUT/perf.log" >&2
+    return 0
 }
 
 flamegraph_point() { # flamegraph_point <conc> <title>  (0-delay mock running)
     local conc="$1" title="$2" load_bg
     echo "== flamegraph (c=$conc, 0-delay) ==" >&2
+    # A 32KB dump writes roughly 4x the perf.data of perf's 8KB default
+    # (~1.5GB over this window); the rig is shared and has run out of disk
+    # before. Warn rather than skip - a capture is worth attempting.
+    local avail_mb
+    avail_mb=$(df -Pm "$OUT" | awk 'NR==2{print $4}')
+    [ "${avail_mb:-0}" -ge 4096 ] ||
+        echo "WARNING: ${avail_mb}MB free at $OUT; a ${PERF_STACK}-byte dump may not fit" >&2
     loadgen "127.0.0.1:$GW_PORT" "$conc" 45 > "$OUT/flamegraph-window.txt" & load_bg=$!
     sleep 5
-    # Explicit stack dump size: perf's 8KB default is smaller than this
-    # gateway's async stacks under a fat-LTO build, and a stack that does not
-    # fit unwinds to nothing - every frame collapses to [unknown] and the SVG
-    # renders as one flat bar. That failure is silent (perf exits 0, inferno
-    # renders happily), which is why the size is pinned here rather than left
-    # to the default, and why the collapse output is checked below.
+    # Explicit stack dump size: a stack that does not fit in the dump unwinds
+    # to nothing - every frame collapses to [unknown] and the SVG renders as
+    # one flat bar. The failure is silent (perf exits 0, inferno renders
+    # happily), which is why the size is pinned here rather than left to the
+    # default, and why the collapsed output is checked below.
     perf record -F 499 --call-graph "dwarf,$PERF_STACK" -p "$GW_PID" -o "$OUT/perf.data" -- sleep 25 \
         >> "$OUT/perf.log" 2>&1 || echo "WARNING: perf record failed" >&2
     wait "$load_bg" || true
@@ -405,7 +432,7 @@ meta_method_json() {
     "grid": "$GRID", "body": $BODY_JSON,
     "path": "$REQ_PATH", "clk_tck": $CLK_TCK, "nofile": $(ulimit -n),
     "loadgen_headers": $HEADERS_JSON,
-    "flamegraph": {"enabled": $([ "$FLAMEGRAPH" = 1 ] && grid_has 0 128 && echo true || echo false), "freq_hz": 499, "callgraph": "dwarf", "window_s": 25, "conc": 128}
+    "flamegraph": {"enabled": $([ "$FLAMEGRAPH" = 1 ] && grid_has 0 128 && echo true || echo false), "freq_hz": 499, "callgraph": "dwarf,$PERF_STACK", "stack_bytes": $PERF_STACK, "window_s": 25, "conc": 128}
   }
 EOF
 }
