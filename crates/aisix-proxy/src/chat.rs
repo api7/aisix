@@ -4224,6 +4224,13 @@ pub(crate) fn sanitize_tag(s: String) -> String {
     if s.is_empty() {
         return s;
     }
+    // Clean-input fast path: within the cap (≤256 bytes ⇒ ≤256 chars)
+    // and no control characters means the filtered copy would be
+    // byte-identical — return the input without re-collecting. This
+    // runs several times per request (tags, user-agent, PK names).
+    if s.len() <= 256 && !s.chars().any(|c| c.is_control()) {
+        return s;
+    }
     s.chars().filter(|c| !c.is_control()).take(256).collect()
 }
 

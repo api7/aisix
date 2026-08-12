@@ -129,8 +129,13 @@ impl<T: Resource> ResourceTable<T> {
     }
 
     /// Snapshot of all entries. Callers get owned `Arc` clones, so iteration
-    /// does not hold DashMap shards.
+    /// does not hold DashMap shards. O(1) when the table is empty — the
+    /// per-request callers (exporter fan-out, policy scans) skip the
+    /// all-shards walk on unconfigured deployments.
     pub fn entries(&self) -> Vec<Arc<ResourceEntry<T>>> {
+        if self.is_empty() {
+            return Vec::new();
+        }
         self.by_id.iter().map(|kv| kv.value().clone()).collect()
     }
 
@@ -140,7 +145,7 @@ impl<T: Resource> ResourceTable<T> {
     /// guard is held during the scan, so `pred` must not call back into
     /// this table.
     pub fn any(&self, pred: impl Fn(&ResourceEntry<T>) -> bool) -> bool {
-        self.by_id.iter().any(|kv| pred(kv.value()))
+        !self.is_empty() && self.by_id.iter().any(|kv| pred(kv.value()))
     }
 
     /// The single entry satisfying `pred`, without materialising the
@@ -153,6 +158,9 @@ impl<T: Resource> ResourceTable<T> {
         &self,
         pred: impl Fn(&ResourceEntry<T>) -> bool,
     ) -> (Option<Arc<ResourceEntry<T>>>, bool) {
+        if self.is_empty() {
+            return (None, false);
+        }
         let mut found: Option<Arc<ResourceEntry<T>>> = None;
         for kv in self.by_id.iter() {
             if !pred(kv.value()) {
