@@ -371,10 +371,14 @@ impl ProxyState {
         // The bootstrap constructor is the one place the tracker gets a
         // metrics sink + snapshot handle, so cooldown transitions emit
         // `aisix_deployment_*`. Clone both before they are moved into the
-        // struct below.
+        // struct below. Both trackers consult one shared BookkeepingFlags
+        // so the "does any configured consumer read this?" answer can't
+        // drift between them.
+        let bookkeeping_flags = crate::health::BookkeepingFlags::new(snapshot.clone());
         let runtime_status = Arc::new(ModelRuntimeStatusTracker::with_observability(
             metrics.clone(),
             snapshot.clone(),
+            Arc::clone(&bookkeeping_flags),
         ));
         Self::from_inner(ProxyStateInner {
             snapshot,
@@ -386,7 +390,7 @@ impl ProxyState {
             semantic_cache: Arc::new(crate::semantic::SemanticVectorCache::default()),
             guardrail_index,
             budgets: Arc::new(BudgetClient::disabled()),
-            health: Arc::new(HealthTracker::new()),
+            health: Arc::new(HealthTracker::with_flags(bookkeeping_flags)),
             livez: Arc::new(LivezState::new()),
             config_apply_age: None,
             runtime_status,
