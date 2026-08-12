@@ -1,14 +1,22 @@
 import { createHash } from "node:crypto";
 import { WebSocket } from "undici";
-import { WebSocketServer, type WebSocket as WsSocket } from "ws";
+import {
+  WebSocket as WsClient,
+  WebSocketServer,
+  type WebSocket as WsSocket,
+} from "ws";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
+  agentClaims,
   EtcdClient,
   SeedClient,
   spawnApp,
+  startMockIdp,
   waitConfigPropagation,
+  type MockIdp,
   type SpawnedApp,
 } from "../harness/index.js";
+import { startMockOtlp, type MockOtlp } from "../harness/otlp-mock.js";
 
 // E2E: /v1/realtime WebSocket relay (#721, AISIX-Cloud#873 §⑤) against a
 // real `aisix` binary. Verifies with a live WS handshake what unit tests
@@ -84,6 +92,9 @@ describe("realtime e2e: /v1/realtime WebSocket relay (#721)", () => {
   let app: SpawnedApp | undefined;
   let seed: SeedClient | undefined;
   let upstream: RealtimeUpstream | undefined;
+  let idp: MockIdp | undefined;
+  let otlp: MockOtlp | undefined;
+  let restrictedKey: { id: string } | undefined;
   let etcdReachable = false;
 
   beforeAll(async () => {
@@ -94,6 +105,8 @@ describe("realtime e2e: /v1/realtime WebSocket relay (#721)", () => {
     app = await spawnApp();
     seed = new SeedClient(etcd, app.etcdPrefix);
     upstream = await startRealtimeUpstream();
+    idp = await startMockIdp();
+    otlp = await startMockOtlp();
 
     await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
@@ -111,6 +124,39 @@ describe("realtime e2e: /v1/realtime WebSocket relay (#721)", () => {
       provider_key_id: pk.id,
     });
 
+    // JWT identity resolving (via a claim mapping) to a key that may NOT
+    // use the realtime model — drives the post-auth refusal attribution
+    // test (#932). The OTLP receiver is how that test reads the error
+    // usage event.
+    await seed.createObservabilityExporter({
+      name: "rt-otlp",
+      kind: "otlp_http",
+      endpoint: otlp.url,
+    });
+    await seed.createOidcProvider({
+      name: "rt-idp",
+      issuer: idp.url,
+      audiences: ["aisix-gateway"],
+      jwks_uri: idp.jwksUrl,
+    });
+    restrictedKey = await seed.createApiKey({
+      key_hash: createHash("sha256").update("sk-rt-restricted").digest("hex"),
+      allowed_models: ["some-other-model"],
+    });
+    await seed.createClaimMapping({
+      name: "rt-dept",
+      jwt_provider: "rt-idp",
+      match: [{ claim: "department", op: "exact", values: ["realtime"] }],
+      resolve: { api_key_id: restrictedKey.id },
+    });
+    // Readiness probe seeded LAST: watch events apply in revision order,
+    // so this key authenticating implies every earlier seed is live (same
+    // pattern as claim-mapping-e2e).
+    await seed.createApiKey({
+      key_hash: createHash("sha256").update("sk-rt-ready-probe").digest("hex"),
+      allowed_models: [],
+    });
+
     // Gate on the DP snapshot via /v1/models — the WS upgrade below
     // authenticates against the same snapshot, and a handshake fired
     // before the caller key propagates is rejected outright.
@@ -122,11 +168,20 @@ describe("realtime e2e: /v1/realtime WebSocket relay (#721)", () => {
       const body = (await res.json()) as { data?: Array<{ id?: string }> };
       return (body.data ?? []).some((m) => m.id === "realtime-e2e-model");
     });
+    await waitConfigPropagation(async () => {
+      const res = await fetch(`${app!.proxyUrl}/v1/models`, {
+        headers: { authorization: "Bearer sk-rt-ready-probe" },
+      });
+      await res.text();
+      return res.status === 200;
+    });
   });
 
   afterAll(async () => {
     await app?.exit();
     await upstream?.close();
+    await idp?.close();
+    await otlp?.close();
   });
 
   test("browser-flow subprotocol auth + bidirectional relay + upstream credential swap", async (ctx) => {
@@ -193,6 +248,68 @@ describe("realtime e2e: /v1/realtime WebSocket relay (#721)", () => {
     expect(res.status).toBe(400);
     const body = (await res.json()) as { error?: { type?: string } };
     expect(body.error?.type).toBe("websocket_upgrade_required");
+  });
+
+  test("a post-auth refusal attributes the caller and JWT identity (#932)", async (ctx) => {
+    if (!etcdReachable || !app || !idp || !otlp || !restrictedKey) {
+      ctx.skip();
+      return;
+    }
+    // JWT auth resolves (through the `rt-dept` claim mapping) to a key
+    // that may not use the realtime model, so auth succeeds and the
+    // model ACL then refuses — the error usage event must carry the
+    // resolved key and the JWT identity, not an anonymous shape.
+    const token = idp.sign(
+      agentClaims(idp.url, { sub: "rt-alice", department: "realtime" }),
+    );
+    const wsUrl = `${app.proxyUrl.replace("http://", "ws://")}/v1/realtime?model=realtime-e2e-model`;
+    // The `ws` client can set headers (undici's browser-style client
+    // cannot), which also makes this the header-auth coverage for the
+    // endpoint — every other case rides the subprotocol flow.
+    const refusal = await new Promise<{ status: number; requestId: string }>(
+      (resolve, reject) => {
+        const c = new WsClient(wsUrl, {
+          headers: { authorization: `Bearer ${token}` },
+        });
+        c.on("unexpected-response", (_req, res) => {
+          res.resume();
+          resolve({
+            status: res.statusCode ?? 0,
+            requestId: String(res.headers["x-aisix-request-id"] ?? ""),
+          });
+          c.terminate();
+        });
+        c.on("open", () => {
+          c.terminate();
+          reject(new Error("handshake must fail on model ACL"));
+        });
+        c.on("error", (e) => reject(e));
+      },
+    );
+    expect(refusal.status).toBe(403);
+    expect(refusal.requestId).not.toBe("");
+
+    // The error event fans out to OTLP exporters like every other usage
+    // event; poll the mock for the span keyed on the handshake's id.
+    let span;
+    const deadline = Date.now() + 10_000;
+    while (Date.now() < deadline) {
+      span = otlp.spans.find(
+        (s) => s.attributes["aisix.request_id"] === refusal.requestId,
+      );
+      if (span) break;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    if (!span) {
+      throw new Error(
+        `no usage span for request_id=${refusal.requestId} ` +
+          `(spans=${otlp.spans.length}, parse failures=${otlp.parseFailures.length})`,
+      );
+    }
+    expect(span.attributes["aisix.api_key_id"]).toBe(restrictedKey.id);
+    expect(span.attributes["aisix.jwt_subject"]).toBe("rt-alice");
+    expect(span.attributes["aisix.jwt_provider"]).toBe("rt-idp");
+    expect(span.attributes["aisix.jwt_claim_mapping"]).toBe("rt-dept");
   });
 
   test("bad credentials reject the upgrade handshake", async (ctx) => {

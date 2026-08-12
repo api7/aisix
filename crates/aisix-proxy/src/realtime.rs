@@ -94,7 +94,7 @@ pub(crate) async fn realtime(
     method: Method,
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
-    client: ClientContext,
+    mut client: ClientContext,
     ws: Result<WebSocketUpgrade, axum::extract::ws::rejection::WebSocketUpgradeRejection>,
 ) -> Response {
     let request_id = client.request_id.clone();
@@ -107,14 +107,32 @@ pub(crate) async fn realtime(
     // collected (#885). Map it into this endpoint's normal error arm,
     // keeping axum's own status classification (400 / 426 / 405) and its
     // per-variant diagnostic.
+    //
+    // Auth runs here rather than through the extractor (the browser flow
+    // carries the credential in a subprotocol item), so a failure between
+    // auth and dispatch must hand the resolved key back for attribution —
+    // pre-#932 those errors were emitted as if anonymous.
     let outcome = match ws {
-        Ok(ws) => prepare(&state, &params, &headers, &client)
-            .await
-            .map(|prep| (ws, prep)),
-        Err(rejection) => Err(crate::error::ProxyError::WebSocketUpgradeRequired {
-            status: rejection.status(),
-            detail: rejection.body_text(),
-        }),
+        Ok(ws) => match authenticate(&state, &headers, &client).await {
+            Ok(auth) => {
+                // Every other family gets `client.jwt` published by the
+                // auth extractor; do the same here so the session clone
+                // and the error emits below attribute the JWT identity.
+                client.jwt = auth.jwt.clone();
+                prepare(&state, &params, &client, auth.clone())
+                    .await
+                    .map(|prep| (ws, prep))
+                    .map_err(|err| (Some(auth), err))
+            }
+            Err(err) => Err((None, err)),
+        },
+        Err(rejection) => Err((
+            None,
+            crate::error::ProxyError::WebSocketUpgradeRequired {
+                status: rejection.status(),
+                detail: rejection.body_text(),
+            },
+        )),
     };
 
     match outcome {
@@ -134,13 +152,15 @@ pub(crate) async fn realtime(
                 .instrument(span)
             })
         }
-        Err(err) => {
+        Err((auth, err)) => {
             let status = err.status().as_u16();
+            let api_key_id = auth.as_ref().map(|a| a.entry.id.as_str());
             emit_access_log(
                 &method,
                 status,
                 started.elapsed(),
                 &request_id,
+                api_key_id,
                 None,
                 Some(&err),
             );
@@ -148,11 +168,14 @@ pub(crate) async fn realtime(
             // (unresolved labels, same as `reject_before_dispatch`) — logs
             // and the request-rate metrics must not disagree about whether
             // these requests exist. Authentication may not have run, so the
-            // caller is attributed only when a key was resolved.
+            // caller is attributed only when a key was resolved (#932).
             crate::request_metrics::record(
                 &state,
                 "/v1/realtime",
-                crate::request_metrics::Caller::unattributed(None),
+                match auth.as_ref() {
+                    Some(a) => crate::request_metrics::Caller::new(a),
+                    None => crate::request_metrics::Caller::unattributed(None),
+                },
                 crate::request_metrics::Upstream {
                     model: crate::usage_attr::UNRESOLVED_MODEL_LABEL,
                     ..Default::default()
@@ -166,7 +189,7 @@ pub(crate) async fn realtime(
                 "realtime",
                 &request_id,
                 params.get("model").map(String::as_str).unwrap_or(""),
-                "",
+                api_key_id.unwrap_or(""),
                 status,
                 err.kind(),
                 &client,
@@ -190,11 +213,9 @@ struct Prepared {
 async fn prepare(
     state: &ProxyState,
     params: &HashMap<String, String>,
-    headers: &HeaderMap,
     client: &ClientContext,
+    auth: AuthenticatedKey,
 ) -> Result<Prepared, ProxyError> {
-    let auth = authenticate(state, headers, client).await?;
-
     let requested_model = params
         .get("model")
         .map(String::as_str)
@@ -494,6 +515,7 @@ async fn run_session(
                 502,
                 started.elapsed(),
                 &request_id,
+                Some(&auth.entry.id),
                 Some((&provider_label, &requested_model)),
                 Some(&connect_err),
             );
@@ -687,6 +709,7 @@ async fn run_session(
         close_status,
         elapsed,
         &request_id,
+        Some(&auth.entry.id),
         Some((&provider_label, &requested_model)),
         session_error.as_ref(),
     );
@@ -824,6 +847,7 @@ fn emit_access_log(
     status: u16,
     elapsed: Duration,
     request_id: &str,
+    api_key_id: Option<&str>,
     target: Option<(&str, &str)>,
     error: Option<&ProxyError>,
 ) {
@@ -841,7 +865,7 @@ fn emit_access_log(
         latency: elapsed,
         provider: target.map(|(p, _)| p).filter(|p| !p.is_empty()),
         model: target.map(|(_, m)| m),
-        api_key_id: None,
+        api_key_id,
         prompt_tokens: None,
         completion_tokens: None,
         total_tokens: None,
@@ -1145,7 +1169,7 @@ mod tests {
         let k_json = format!(r#"{{"key_hash":"{CALLER_HASH}","allowed_models":["other-model"]}}"#);
         let k: ApiKey = serde_json::from_str(&k_json).unwrap();
         snap.apikeys.insert(ResourceEntry::new("k-1", k, 2));
-        let (addr, _rx) = serve(snap).await;
+        let (addr, mut rx) = serve(snap).await;
 
         let mut req = format!("ws://{addr}/v1/realtime?model=rt-model")
             .into_client_request()
@@ -1156,6 +1180,18 @@ mod tests {
             .await
             .expect_err("handshake must fail on model ACL");
         assert!(err.to_string().contains("403"), "got: {err}");
+
+        // Auth succeeded before the ACL refused, so the error event must
+        // name the caller — pre-#932 it was emitted as if anonymous.
+        let ev = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("the refusal must emit an error UsageEvent")
+            .expect("sink closed");
+        assert_eq!(ev.status_code, 403);
+        assert_eq!(
+            ev.api_key_id, "k-1",
+            "a post-auth refusal must attribute the resolved key"
+        );
     }
 
     /// State + router + usage receiver for driving the endpoint's
