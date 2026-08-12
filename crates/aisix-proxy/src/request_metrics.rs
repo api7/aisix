@@ -247,9 +247,11 @@ pub(crate) fn record(
     // is caller-minted — collapse it to the configured row's name here
     // so no handler-family member can mint unbounded series.
     let snap = state.snapshot.load();
-    let model_label = crate::usage_attr::metric_model_label(&snap, upstream.model);
+    let (model_label, upstream_label) =
+        crate::usage_attr::metric_model_label_pair(&snap, upstream.model, upstream.upstream_model);
     let upstream = Upstream {
         model: model_label.as_ref(),
+        upstream_model: upstream_label.as_ref(),
         ..upstream
     };
     state
@@ -323,9 +325,11 @@ pub(crate) fn record_usage(
 ) {
     // Same emit-chokepoint bounding as `record` — see the note there.
     let snap = state.snapshot.load();
-    let model_label = crate::usage_attr::metric_model_label(&snap, upstream.model);
+    let (model_label, upstream_label) =
+        crate::usage_attr::metric_model_label_pair(&snap, upstream.model, upstream.upstream_model);
     let upstream = Upstream {
         model: model_label.as_ref(),
+        upstream_model: upstream_label.as_ref(),
         ..upstream
     };
     // Legacy compatibility series (provider × model).

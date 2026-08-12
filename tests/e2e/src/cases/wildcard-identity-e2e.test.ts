@@ -85,6 +85,35 @@ describe("wildcard alias identity e2e", () => {
       provider_key_id: pk.id,
       rate_limit: { rpm: 1 },
     });
+    // A second wildcard row with an SSE fixture (the mock picks SSE vs
+    // JSON per FIXTURE): drives the streaming-only TTFT/summary series
+    // so the dump-wide assertions cover that family too.
+    const sse = await startOpenAiUpstream({
+      streamEvents: [
+        JSON.stringify({
+          id: "wid-sse",
+          object: "chat.completion.chunk",
+          model: "gpt-4o-mini",
+          choices: [
+            { index: 0, delta: { content: "served-wid2" }, finish_reason: "stop" },
+          ],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        }),
+        "[DONE]",
+      ],
+    });
+    upstreams.push(sse);
+    const pk2 = await seed.createProviderKey({
+      display_name: "wid2-pk",
+      secret: "sk-mock",
+      api_base: `${sse.baseUrl}/v1`,
+    });
+    await seed.createModel({
+      display_name: "wid2/*",
+      provider: "openai",
+      model_name: "*",
+      provider_key_id: pk2.id,
+    });
 
     // Readiness via a wildcard-served alias: any suffix must resolve.
     // listModels hides wildcard patterns, so probe with a chat call —
@@ -105,7 +134,7 @@ describe("wildcard alias identity e2e", () => {
     await Promise.all(upstreams.map((u) => u.close()));
   });
 
-  test("every caller-minted alias shares the wildcard row's rate-limit bucket, and success metrics label as the row", async (ctx) => {
+  test("every caller-minted alias shares the wildcard row's rate-limit bucket, and success metrics label as the row", { timeout: 150_000 }, async (ctx) => {
     if (!etcdReachable || !app) {
       ctx.skip();
       return;
@@ -135,11 +164,39 @@ describe("wildcard alias identity e2e", () => {
     expect(second.status).toBe(429);
     expect(second.type).toBe("rate_limit_exceeded");
 
+    // Drive a STREAMING request too (fresh window; its own alias): the
+    // TTFT/summary families only emit on streamed completions, and the
+    // dump-wide assertion below must cover them.
+    const streamRes = await fetch(`${app.proxyUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${CALLER_PLAINTEXT}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "wid2/gamma",
+        messages: [{ role: "user", content: "hi" }],
+        stream: true,
+      }),
+    });
+    const streamBody = await streamRes.text();
+    expect(streamRes.status).toBe(200);
+    expect(streamRes.headers.get("content-type")).toContain("text/event-stream");
+    expect(streamBody).toContain("served-wid2");
+
     // Success + throttle series both label as the configured row; the
     // caller-minted suffixes never become label values.
     const metrics = await (await fetch(`${app.metricsUrl}/metrics`)).text();
     expect(metrics).toContain('model="wid/*"');
     expect(metrics).not.toContain('model="wid/alpha"');
     expect(metrics).not.toContain('model="wid/beta"');
+    expect(metrics).not.toContain('model="wid2/gamma"');
+    expect(metrics).toContain('model="wid2/*"');
+    // The upstream_model label is caller-derived on a wildcard hit too
+    // (the capture substitutes into the template) — it must collapse to
+    // the row's configured template, never the minted suffix.
+    expect(metrics).not.toContain('upstream_model="alpha"');
+    expect(metrics).not.toContain('upstream_model="beta"');
+    expect(metrics).not.toContain('upstream_model="gamma"');
   });
 });

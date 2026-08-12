@@ -370,7 +370,7 @@ async fn dispatch(
         Ok(resp_json) => {
             // #701: clear any cooldown/unhealthy mark now the upstream
             // answered — same recovery signal as rerank/audio/chat.
-            state.health.record_success(model_name);
+            state.health.record_success(&model_entry.value.display_name);
             state.runtime_status.mark_healthy(&model_entry.id);
             // Extract usage tokens (gpt-image-1 returns a `usage` block;
             // dall-e-3 doesn't) BEFORE moving resp_json into the

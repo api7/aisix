@@ -1905,7 +1905,7 @@ async fn cross_provider_dispatch(
         } else {
             upstream
         };
-        state.health.record_success(model_name);
+        state.health.record_success(&model.display_name);
         state.runtime_status.mark_healthy(model_id);
 
         let message_id = format!("msg_{}", Uuid::new_v4().simple());
@@ -2856,7 +2856,9 @@ fn emit_anthropic_usage_event(
         },
     );
     if metrics.upstream_ttft_ms > 0 {
-        let bounded_model = crate::usage_attr::metric_model_label(&state.snapshot.load(), model);
+        let snap_for_labels = state.snapshot.load();
+        let (bounded_model, bounded_upstream) =
+            crate::usage_attr::metric_model_label_pair(&snap_for_labels, model, upstream_model);
         state.metrics.record_request_ttft(
             LatencyLabels {
                 endpoint: "/v1/messages",
@@ -2872,8 +2874,8 @@ fn emit_anthropic_usage_event(
                 endpoint: "/v1/messages",
                 inbound_protocol: "anthropic",
                 provider,
-                model,
-                upstream_model,
+                model: bounded_model.as_ref(),
+                upstream_model: bounded_upstream.as_ref(),
                 provider_key_id: pk.labels().id(),
                 provider_key_name: pk.labels().name(),
                 api_key_id,

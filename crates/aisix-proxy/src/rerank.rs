@@ -517,7 +517,7 @@ async fn dispatch(
             Err(err) => return Err(ProxyError::Bridge(err)),
         };
 
-    state.health.record_success(&model_name);
+    state.health.record_success(&model_entry.value.display_name);
     state.runtime_status.mark_healthy(&model_entry.id);
 
     // Extract usage from the upstream body BEFORE handing the bytes

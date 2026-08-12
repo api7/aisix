@@ -1810,8 +1810,14 @@ async fn dispatch(
         let model_for_metrics = req.model.clone();
         // Latency histograms label with the BOUNDED model (emit-chokepoint
         // rule): a wildcard-served alias must not mint per-suffix series.
-        let bounded_model_for_metrics =
-            crate::usage_attr::metric_model_label(snapshot, &req.model).into_owned();
+        let (bounded_model_for_metrics, bounded_upstream_for_metrics) = {
+            let (m, u) = crate::usage_attr::metric_model_label_pair(
+                snapshot,
+                &req.model,
+                model.upstream_model().unwrap_or("unknown"),
+            );
+            (m.into_owned(), u.into_owned())
+        };
         // #890 req-4: normalised inbound client type, captured for the
         // streaming on_complete metric emission (mirrors the non-streaming
         // `record_success` path).
@@ -2026,7 +2032,7 @@ async fn dispatch(
                     crate::request_metrics::Upstream {
                         provider: &provider_for_metrics,
                         model: &model_for_metrics,
-                        upstream_model: &upstream_model_for_metrics,
+                        upstream_model: &bounded_upstream_for_metrics,
                         pk: pk.labels(),
                         stream: true,
                         // The serving target is fixed once the stream
@@ -2067,8 +2073,8 @@ async fn dispatch(
                         endpoint: "/v1/chat/completions",
                         inbound_protocol: "openai",
                         provider: &provider_for_metrics,
-                        model: &model_for_metrics,
-                        upstream_model: &upstream_model_for_metrics,
+                        model: &bounded_model_for_metrics,
+                        upstream_model: &bounded_upstream_for_metrics,
                         provider_key_id: pk.labels().id(),
                         provider_key_name: pk.labels().name(),
                         api_key_id: &api_key_id_for_telem,

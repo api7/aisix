@@ -78,6 +78,27 @@ pub(crate) fn wildcard_row_name(snapshot: &AisixSnapshot, requested: &str) -> Op
     best_wildcard_row(snapshot, requested).map(|(entry, _)| entry.value.display_name.clone())
 }
 
+/// The `(display_name, model_name template)` pair of the wildcard row
+/// serving `requested` — the bounded identities for BOTH metric labels:
+/// with `model_name: "*"` the substituted upstream id is caller-derived
+/// too, so `upstream_model` must label as the configured template, not
+/// the capture.
+pub(crate) fn wildcard_row_identity(
+    snapshot: &AisixSnapshot,
+    requested: &str,
+) -> Option<(String, String)> {
+    best_wildcard_row(snapshot, requested).map(|(entry, _)| {
+        (
+            entry.value.display_name.clone(),
+            entry
+                .value
+                .model_name
+                .clone()
+                .unwrap_or_else(|| "*".to_string()),
+        )
+    })
+}
+
 /// Concrete upstream model id for a wildcard match: substitute the captured
 /// segment into the `model_name` template's `*`, keep the template as-is when it
 /// has no `*` (a fixed upstream for every match), or send the captured segment
