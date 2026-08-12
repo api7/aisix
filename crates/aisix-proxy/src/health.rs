@@ -15,12 +15,12 @@
 
 use dashmap::DashMap;
 use std::sync::atomic::AtomicBool;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use aisix_core::snapshot::SnapshotHandle;
-use aisix_core::AisixSnapshot;
+use aisix_core::{AisixSnapshot, RoutingStrategy};
 use aisix_obs::{DeploymentLabels, DeploymentState, Metrics};
 use axum::http::header::{HeaderName, HeaderValue, CONTENT_TYPE};
 use axum::http::StatusCode;
@@ -366,10 +366,87 @@ impl Entry {
     }
 }
 
+/// Version-gated answer to "does any configured consumer depend on the
+/// exact per-request bookkeeping write path?"
+///
+/// Three predicates, all derived from the live snapshot:
+/// - a Model routes with `least_busy` (reads the in-flight counters,
+///   `crate::routing::order_attempts_by_metric`)
+/// - a Model routes with `least_latency` (reads the latency EWMA)
+/// - a Model has background health checks enabled (the background
+///   checker and the health surface observe tracker state)
+///
+/// While **any** predicate holds, every bookkeeping method below runs its
+/// historical write path unchanged, so configured deployments keep
+/// byte-identical behavior. Only when none holds do the trackers take the
+/// cheap read-first paths — writes whose consumers provably don't exist.
+///
+/// The predicate set is recomputed at most once per snapshot version
+/// (packed with the version into one atomic so the pair can never be
+/// observed torn). A racing store between the version read and the table
+/// walk can cache bits against a stale version; the next call detects the
+/// mismatch and recomputes, so the value converges immediately.
+#[derive(Debug)]
+pub struct BookkeepingFlags {
+    snapshot: SnapshotHandle<AisixSnapshot>,
+    /// `(snapshot version << 3) | predicate bits`, or [`UNCOMPUTED`].
+    packed: AtomicU64,
+}
+
+const FLAG_LEAST_BUSY: u64 = 1;
+const FLAG_LEAST_LATENCY: u64 = 1 << 1;
+const FLAG_HEALTH_CHECKS: u64 = 1 << 2;
+const FLAG_BITS: u64 = 0b111;
+const UNCOMPUTED: u64 = u64::MAX;
+
+impl BookkeepingFlags {
+    pub fn new(snapshot: SnapshotHandle<AisixSnapshot>) -> Arc<Self> {
+        Arc::new(Self {
+            snapshot,
+            packed: AtomicU64::new(UNCOMPUTED),
+        })
+    }
+
+    /// True when any predicate holds — the trackers then use their
+    /// historical write paths.
+    pub fn any_active(&self) -> bool {
+        self.bits() != 0
+    }
+
+    fn bits(&self) -> u64 {
+        let ver = self.snapshot.version();
+        let packed = self.packed.load(Ordering::Relaxed);
+        if packed != UNCOMPUTED && packed >> 3 == ver {
+            return packed & FLAG_BITS;
+        }
+        let snap = self.snapshot.load();
+        let mut bits = 0;
+        for entry in snap.models.entries() {
+            let m = &entry.value;
+            if let Some(routing) = &m.routing {
+                match routing.strategy {
+                    RoutingStrategy::LeastBusy => bits |= FLAG_LEAST_BUSY,
+                    RoutingStrategy::LeastLatency => bits |= FLAG_LEAST_LATENCY,
+                    _ => {}
+                }
+            }
+            if m.background_model_check.as_ref().is_some_and(|c| c.enabled) {
+                bits |= FLAG_HEALTH_CHECKS;
+            }
+        }
+        self.packed.store((ver << 3) | bits, Ordering::Relaxed);
+        bits
+    }
+}
+
 /// Shared tracker — one per `ProxyState`, cloned cheaply via `Arc`.
 #[derive(Default, Debug)]
 pub struct HealthTracker {
     entries: DashMap<String, Entry>,
+    /// `None` (tests, lightweight constructors) means "assume active":
+    /// the historical write path always runs. The production bootstrap
+    /// wires the shared [`BookkeepingFlags`].
+    flags: Option<Arc<BookkeepingFlags>>,
 }
 
 /// Smoothing factor for the per-target latency EWMA. Higher = more weight on
@@ -394,6 +471,10 @@ pub struct ModelRuntimeStatusTracker {
     /// only on a cooldown transition. `None` falls back to model-id-only
     /// labels.
     snapshot: Option<SnapshotHandle<AisixSnapshot>>,
+    /// `None` (tests, lightweight constructors) means "assume active":
+    /// every method runs its historical write path. See
+    /// [`BookkeepingFlags`].
+    flags: Option<Arc<BookkeepingFlags>>,
 }
 
 /// RAII guard that decrements a target's in-flight counter when dropped.
@@ -402,12 +483,19 @@ pub struct ModelRuntimeStatusTracker {
 /// stream body so the count stays raised until the stream ends or is
 /// cancelled, matching the request's true lifetime.
 pub struct InFlightGuard {
-    counter: Arc<AtomicUsize>,
+    /// `None` is the no-op guard handed out while bookkeeping is
+    /// inactive (no configured consumer); dropping it does nothing. A
+    /// guard armed before a config change that deactivates bookkeeping
+    /// still decrements the counter it incremented, so the count can
+    /// never go negative.
+    counter: Option<Arc<AtomicUsize>>,
 }
 
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
-        self.counter.fetch_sub(1, Ordering::Relaxed);
+        if let Some(counter) = &self.counter {
+            counter.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -416,12 +504,39 @@ impl HealthTracker {
         Self::default()
     }
 
+    /// Production constructor: consults the shared [`BookkeepingFlags`]
+    /// so the per-request success write can take the read-first path
+    /// when no configured consumer exists.
+    pub fn with_flags(flags: Arc<BookkeepingFlags>) -> Self {
+        Self {
+            entries: DashMap::new(),
+            flags: Some(flags),
+        }
+    }
+
+    fn bookkeeping_active(&self) -> bool {
+        self.flags.as_ref().is_none_or(|f| f.any_active())
+    }
+
     /// Record a successful upstream response for `model`.
     pub fn record_success(&self, model: &str) {
-        self.entries
-            .entry(model.to_string())
-            .or_default()
-            .on_success();
+        if self.bookkeeping_active() {
+            self.entries
+                .entry(model.to_string())
+                .or_default()
+                .on_success();
+            return;
+        }
+        // Read-first path: a model with no tracked failures is already
+        // Healthy — skip the key allocation and the shard write lock the
+        // `entry()` API pays on every call. The counter is atomic, so
+        // the reset happens under the read guard; a miss means the model
+        // never failed and there is nothing to reset.
+        if let Some(e) = self.entries.get(model) {
+            if e.consecutive_failures.load(Ordering::Relaxed) != 0 {
+                e.consecutive_failures.store(0, Ordering::Relaxed);
+            }
+        }
     }
 
     /// Record a failed upstream call (any non-4xx bridge error) for `model`.
@@ -465,12 +580,18 @@ impl ModelRuntimeStatusTracker {
     pub fn with_observability(
         metrics: Arc<Metrics>,
         snapshot: SnapshotHandle<AisixSnapshot>,
+        flags: Arc<BookkeepingFlags>,
     ) -> Self {
         Self {
             entries: DashMap::new(),
             metrics: Some(metrics),
             snapshot: Some(snapshot),
+            flags: Some(flags),
         }
+    }
+
+    fn bookkeeping_active(&self) -> bool {
+        self.flags.as_ref().is_none_or(|f| f.any_active())
     }
 
     pub fn mark_cooldown(&self, model_id: &str, ttl: Duration, reason: impl Into<String>) {
@@ -497,6 +618,38 @@ impl ModelRuntimeStatusTracker {
     }
 
     pub fn mark_healthy(&self, model_id: &str) {
+        if self.bookkeeping_active() {
+            if let Some(mut entry) = self.entries.get_mut(model_id) {
+                entry.unhealthy = false;
+                entry.cooldown_until = None;
+                entry.status_reason = None;
+                self.sync_deployment_state(model_id, &mut entry, SystemTime::now());
+            }
+            return;
+        }
+        // Read-first path (no configured bookkeeping consumer): in the
+        // steady state — entry clean, gauge already Healthy — a read
+        // guard and a few field loads replace the per-request shard
+        // write lock + wall-clock read. The write path below still runs
+        // whenever there is anything to do (cooldown early-recovery,
+        // the first-success Healthy publish on an entry begin_in_flight
+        // created), so the `aisix_deployment_state` series behaves
+        // exactly as before. A MISSING entry stays a no-op, exactly as
+        // on the historical path: the single-attempt handlers call
+        // mark_healthy without begin_in_flight, and their targets must
+        // not grow a series they never had.
+        let needs_write = match self.entries.get(model_id) {
+            Some(e) => {
+                e.unhealthy
+                    || e.cooldown_until.is_some()
+                    || e.status_reason.is_some()
+                    || e.emitted_state != Some(DeploymentState::Healthy)
+            }
+            None => false,
+        };
+        if !needs_write {
+            return;
+        }
         if let Some(mut entry) = self.entries.get_mut(model_id) {
             entry.unhealthy = false;
             entry.cooldown_until = None;
@@ -640,6 +793,13 @@ impl ModelRuntimeStatusTracker {
     /// each successful upstream attempt; drives the `least_latency` routing
     /// strategy. Independent of health/cooldown state.
     pub fn record_latency(&self, model_id: &str, latency_ms: u32) {
+        // The EWMA's only reader is `least_latency` target ordering; with
+        // no such strategy configured the sample has no consumer. When
+        // the strategy is (re)configured the EWMA cold-starts, exactly as
+        // it does on process start.
+        if !self.bookkeeping_active() {
+            return;
+        }
         let sample = f64::from(latency_ms);
         self.entries
             .entry(model_id.to_string())
@@ -663,6 +823,25 @@ impl ModelRuntimeStatusTracker {
     /// Mark one request as in flight to `model_id` and return a guard that
     /// decrements the count when dropped. Drives the `least_busy` strategy.
     pub fn begin_in_flight(&self, model_id: &str) -> InFlightGuard {
+        // The counter's only reader is `least_busy` target ordering; with
+        // no such strategy configured, hand out a no-op guard instead of
+        // paying the counter RMWs and guard refcount per request. When
+        // the strategy is (re)configured, counting resumes for new
+        // requests; requests already in flight hold no-op guards, so the
+        // count transiently underreads until they drain — the same
+        // cold-start the counter has on process start.
+        //
+        // The ENTRY-CREATION side effect is preserved: `mark_healthy`'s
+        // first-success Healthy publish keys off the entry this method
+        // creates, and only the endpoints that call begin_in_flight may
+        // publish that series (the single-attempt handlers never do).
+        // Steady state downgrades to a read-guard existence check.
+        if !self.bookkeeping_active() {
+            if self.entries.get(model_id).is_none() {
+                self.entries.entry(model_id.to_string()).or_default();
+            }
+            return InFlightGuard { counter: None };
+        }
         let counter = Arc::clone(
             &self
                 .entries
@@ -671,7 +850,9 @@ impl ModelRuntimeStatusTracker {
                 .in_flight,
         );
         counter.fetch_add(1, Ordering::Relaxed);
-        InFlightGuard { counter }
+        InFlightGuard {
+            counter: Some(counter),
+        }
     }
 
     /// Current in-flight request count for `model_id`.
@@ -762,6 +943,175 @@ mod tests {
         assert!(t.all_levels().is_empty());
         t.record_success("m");
         assert_eq!(t.all_levels().len(), 1);
+    }
+
+    // -------------------------------------------------------------------
+    // On-demand bookkeeping (BookkeepingFlags)
+    // -------------------------------------------------------------------
+
+    fn model_json(routing_strategy: Option<&str>, health_check: bool) -> aisix_core::Model {
+        let mut v = serde_json::json!({ "name": "vg", "display_name": "vg" });
+        if let Some(s) = routing_strategy {
+            v["routing"] = serde_json::json!({
+                "strategy": s,
+                "targets": [{ "model": "d1" }],
+            });
+        }
+        if health_check {
+            v["background_model_check"] = serde_json::json!({
+                "enabled": true,
+                "interval_seconds": 5,
+                "timeout_seconds": 1,
+                "prompt": "ping",
+                "max_tokens": 1,
+                "stale_after_seconds": 60,
+            });
+        }
+        serde_json::from_value(v).expect("test model json")
+    }
+
+    fn snapshot_with(model: Option<aisix_core::Model>) -> AisixSnapshot {
+        let snap = AisixSnapshot::new();
+        if let Some(m) = model {
+            snap.models
+                .insert(aisix_core::ResourceEntry::new("m-1", m, 1));
+        }
+        snap
+    }
+
+    fn inactive_tracker() -> (SnapshotHandle<AisixSnapshot>, ModelRuntimeStatusTracker) {
+        let handle = SnapshotHandle::new(snapshot_with(None));
+        let flags = BookkeepingFlags::new(handle.clone());
+        let t = ModelRuntimeStatusTracker {
+            entries: DashMap::new(),
+            metrics: None,
+            snapshot: None,
+            flags: Some(flags),
+        };
+        (handle, t)
+    }
+
+    #[test]
+    fn bookkeeping_flags_derive_from_snapshot() {
+        for (model, expect) in [
+            (None, false),
+            (Some(model_json(Some("round_robin"), false)), false),
+            (Some(model_json(Some("weighted"), false)), false),
+            (Some(model_json(Some("failover"), false)), false),
+            // least_cost ranks by static configured cost, not runtime
+            // bookkeeping — it must NOT activate the write paths.
+            (Some(model_json(Some("least_cost"), false)), false),
+            (Some(model_json(Some("least_busy"), false)), true),
+            (Some(model_json(Some("least_latency"), false)), true),
+            (Some(model_json(None, true)), true),
+        ] {
+            let described = format!("{model:?}");
+            let flags = BookkeepingFlags::new(SnapshotHandle::new(snapshot_with(model)));
+            assert_eq!(flags.any_active(), expect, "for {described}");
+        }
+    }
+
+    #[test]
+    fn inactive_bookkeeping_skips_inflight_and_latency() {
+        let (_handle, t) = inactive_tracker();
+        let g = t.begin_in_flight("d1");
+        assert_eq!(t.in_flight("d1"), 0, "no-op guard must not count");
+        drop(g);
+        assert_eq!(t.in_flight("d1"), 0, "no-op guard must not underflow");
+        t.record_latency("d1", 100);
+        assert_eq!(t.latency_ewma_ms("d1"), None);
+    }
+
+    #[test]
+    fn bookkeeping_reactivates_on_snapshot_swap() {
+        let (handle, t) = inactive_tracker();
+        let g = t.begin_in_flight("d1");
+        assert_eq!(t.in_flight("d1"), 0);
+        drop(g);
+
+        // Config change introduces a least_busy router → counting resumes
+        // (version-gated recompute, no restart needed).
+        handle.store(snapshot_with(Some(model_json(Some("least_busy"), false))));
+        let g = t.begin_in_flight("d1");
+        assert_eq!(t.in_flight("d1"), 1);
+        // Any active predicate takes the WHOLE family back to the old
+        // path — least_busy alone re-enables the EWMA write too.
+        t.record_latency("d1", 100);
+        assert_eq!(t.latency_ewma_ms("d1"), Some(100.0));
+        drop(g);
+        assert_eq!(t.in_flight("d1"), 0);
+    }
+
+    #[test]
+    fn inactive_mark_healthy_publishes_healthy_once_then_reads() {
+        let (_handle, t) = inactive_tracker();
+        // Real multi-attempt-endpoint sequence: begin_in_flight creates
+        // the entry (no-op guard, but the side effect is preserved),
+        // then the first success publishes Healthy.
+        drop(t.begin_in_flight("d1"));
+        t.mark_healthy("d1");
+        {
+            let e = t
+                .entries
+                .get("d1")
+                .expect("entry created by begin_in_flight");
+            assert_eq!(e.emitted_state, Some(DeploymentState::Healthy));
+        }
+        // Steady state: read-only, entry untouched.
+        t.mark_healthy("d1");
+        assert_eq!(t.status("d1").status, RuntimeStatus::Healthy);
+    }
+
+    /// The single-attempt handlers (embeddings, images, completions,
+    /// audio, rerank, count_tokens) call mark_healthy WITHOUT
+    /// begin_in_flight. On the historical path their targets never got
+    /// an entry — and therefore never published `aisix_deployment_state`
+    /// — so the inactive fast path must stay a no-op for a missing
+    /// entry, or zero-config deployments grow a series main never had.
+    #[test]
+    fn inactive_mark_healthy_without_begin_in_flight_stays_noop() {
+        let (_handle, t) = inactive_tracker();
+        t.mark_healthy("embeddings-only-target");
+        assert!(
+            t.entries.get("embeddings-only-target").is_none(),
+            "mark_healthy on a never-seen id must not create an entry"
+        );
+    }
+
+    #[test]
+    fn inactive_mark_healthy_still_recovers_cooldown_early() {
+        let (_handle, t) = inactive_tracker();
+        t.mark_cooldown("d1", Duration::from_secs(3600), "upstream failure");
+        assert_eq!(t.status("d1").status, RuntimeStatus::Cooldown);
+        // A success during cooldown still recovers immediately — the
+        // read-first path detects the dirty entry and takes the full
+        // write path.
+        t.mark_healthy("d1");
+        assert_eq!(t.status("d1").status, RuntimeStatus::Healthy);
+        assert_eq!(
+            t.entries.get("d1").unwrap().emitted_state,
+            Some(DeploymentState::Healthy)
+        );
+    }
+
+    #[test]
+    fn inactive_record_success_creates_no_entry_but_still_resets() {
+        let flags = BookkeepingFlags::new(SnapshotHandle::new(snapshot_with(None)));
+        let t = HealthTracker::with_flags(flags);
+        // Happy path: no failures → no entry, no allocation.
+        t.record_success("m");
+        assert!(
+            t.all_levels().is_empty(),
+            "no entry for a never-failed model"
+        );
+        assert_eq!(t.level("m"), HealthLevel::Healthy);
+        // Reset still works through the read guard.
+        for _ in 0..10 {
+            t.record_failure("m");
+        }
+        assert_eq!(t.level("m"), HealthLevel::Down);
+        t.record_success("m");
+        assert_eq!(t.level("m"), HealthLevel::Healthy);
     }
 
     #[tokio::test]
@@ -901,9 +1251,11 @@ mod tests {
             .insert(ResourceEntry::new("m-cool", model, 1));
 
         let metrics = Arc::new(Metrics::new(false));
+        let handle = SnapshotHandle::new(snapshot);
         let tracker = ModelRuntimeStatusTracker::with_observability(
             metrics.clone(),
-            SnapshotHandle::new(snapshot),
+            handle.clone(),
+            BookkeepingFlags::new(handle),
         );
 
         // First mark = a fresh transition (counter++, gauge → Down). The
@@ -949,9 +1301,11 @@ mod tests {
     #[test]
     fn gauge_returns_to_healthy_after_a_cooldown_expires_naturally() {
         let metrics = Arc::new(Metrics::new(false));
+        let handle = SnapshotHandle::new(AisixSnapshot::new());
         let tracker = ModelRuntimeStatusTracker::with_observability(
             metrics.clone(),
-            SnapshotHandle::new(AisixSnapshot::new()),
+            handle.clone(),
+            BookkeepingFlags::new(handle),
         );
 
         tracker.mark_cooldown(
@@ -982,9 +1336,11 @@ mod tests {
     #[test]
     fn gauge_tracks_background_check_failures_and_recovery() {
         let metrics = Arc::new(Metrics::new(false));
+        let handle = SnapshotHandle::new(AisixSnapshot::new());
         let tracker = ModelRuntimeStatusTracker::with_observability(
             metrics.clone(),
-            SnapshotHandle::new(AisixSnapshot::new()),
+            handle.clone(),
+            BookkeepingFlags::new(handle),
         );
 
         tracker.mark_unhealthy("m-bg", Some(503), "background_check_failed");
@@ -1000,12 +1356,16 @@ mod tests {
     #[test]
     fn repeated_success_neither_churns_the_gauge_nor_the_cooldown_counter() {
         let metrics = Arc::new(Metrics::new(false));
+        let handle = SnapshotHandle::new(AisixSnapshot::new());
         let tracker = ModelRuntimeStatusTracker::with_observability(
             metrics.clone(),
-            SnapshotHandle::new(AisixSnapshot::new()),
+            handle.clone(),
+            BookkeepingFlags::new(handle),
         );
 
-        // begin_in_flight is what creates the entry on the request path.
+        // With bookkeeping active begin_in_flight creates the entry; with
+        // it inactive (this tracker: empty snapshot) the first mark_healthy
+        // does. Either way the assertions below must hold.
         drop(tracker.begin_in_flight("m-ok"));
         tracker.mark_healthy("m-ok");
         tracker.mark_healthy("m-ok");

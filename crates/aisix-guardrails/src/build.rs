@@ -1174,8 +1174,19 @@ impl LiveGuardrailIndex {
     /// Cheap on the cache-hit path (one lock acquire + version compare +
     /// arc clone + `O(n)` linear walk over attachment rows). Rebuilds only
     /// on snapshot version change.
+    ///
+    /// An empty index (no guardrails configured — the default) resolves
+    /// to the same empty chain for every request, so that case returns
+    /// early: no resolve walk, no applied-set copy, no sink attach (a
+    /// chain with no members never reports to the sink). This is the one
+    /// chokepoint every endpoint family resolves through, so the fast
+    /// path covers them all.
     pub fn resolve(&self, ctx: &RequestContext<'_>) -> GuardrailChain {
-        self.current()
+        let index = self.current();
+        if index.is_empty() {
+            return GuardrailChain::empty();
+        }
+        index
             .resolve(ctx)
             .with_metrics_sink(self.metrics_sink.clone())
     }
@@ -2172,6 +2183,22 @@ mod tests {
             .await
             .is_block());
         assert!(!live.is_empty());
+    }
+
+    #[tokio::test]
+    async fn live_index_empty_fast_path_resolves_empty_chain() {
+        // Zero-config fast path: an empty index resolves to an empty
+        // chain with an empty applied set — the same observable shape
+        // the full resolve walk produces on an empty index.
+        let live = LiveGuardrailIndex::new(SnapshotHandle::new(AisixSnapshot::new()), None);
+        let chain = live.resolve(&RequestContext {
+            model_id: "m",
+            api_key_id: "k",
+            team_id: None,
+        });
+        assert!(chain.is_empty());
+        assert!(chain.applied().is_empty());
+        assert!(!chain.check_input(&req("anything")).await.is_block());
     }
 
     // -----------------------------------------------------------------------

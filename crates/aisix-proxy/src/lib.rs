@@ -197,19 +197,15 @@ pub fn build_router(state: ProxyState) -> Router {
             state.clone(),
             enforce_request_body_limit,
         ))
+        // One layer for both per-request telemetry guards: the in-flight
+        // gauge and the client-cancel recorder (see
+        // `record_request_telemetry`). Sits outside the body-limit layers
+        // so a hang-up during body upload is captured too, and inside
+        // `ensure_request_id` so the emitted line carries the same
+        // request id the caller was handed.
         .layer(middleware::from_fn_with_state(
             state.clone(),
-            record_in_flight_request,
-        ))
-        // Record requests the caller abandoned before any response head
-        // existed. Sits outside `record_in_flight_request` so a hang-up
-        // during body upload (which the body-limit layers above are
-        // awaiting) is captured too, and inside `ensure_request_id` so
-        // the emitted line carries the same request id the caller was
-        // handed. See `record_client_cancel`.
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            record_client_cancel,
+            record_request_telemetry,
         ))
         // Identify the data plane on every response, including error
         // envelopes and short-circuited responses from the layers
@@ -254,27 +250,6 @@ pub fn build_router(state: ProxyState) -> Router {
         state,
         request_id::ensure_request_id,
     ))
-}
-
-async fn record_in_flight_request(
-    State(state): State<ProxyState>,
-    request: Request<axum::body::Body>,
-    next: Next,
-) -> Response {
-    // Normalize to a bounded route template BEFORE using the path as a
-    // metric label. This middleware runs before authentication and before
-    // route matching, so the raw `request.uri().path()` is fully
-    // attacker-controlled — the `/passthrough/:provider/*rest` wildcard
-    // suffix (or any 404 path) would otherwise let an unauthenticated
-    // caller mint unbounded Prometheus time series (#451).
-    let endpoint = normalize_endpoint_label(request.uri().path());
-    let inbound_protocol = inbound_protocol_for_endpoint(endpoint).to_string();
-    let _guard = InFlightGuard::new(
-        state.metrics.clone(),
-        endpoint.to_string(),
-        inbound_protocol,
-    );
-    next.run(request).await
 }
 
 /// Collapse a raw request path to a fixed route template so metric labels
@@ -336,17 +311,21 @@ fn inbound_protocol_for_endpoint(endpoint: &str) -> &'static str {
 
 struct InFlightGuard {
     metrics: std::sync::Arc<aisix_obs::Metrics>,
-    endpoint: String,
-    inbound_protocol: String,
+    /// Bounded route template + protocol family — both `'static` by
+    /// construction (`normalize_endpoint_label` /
+    /// `inbound_protocol_for_endpoint`), so the guard owns no
+    /// allocations.
+    endpoint: &'static str,
+    inbound_protocol: &'static str,
 }
 
 impl InFlightGuard {
     fn new(
         metrics: std::sync::Arc<aisix_obs::Metrics>,
-        endpoint: String,
-        inbound_protocol: String,
+        endpoint: &'static str,
+        inbound_protocol: &'static str,
     ) -> Self {
-        metrics.increment_proxy_in_flight(&endpoint, &inbound_protocol);
+        metrics.increment_proxy_in_flight(endpoint, inbound_protocol);
         Self {
             metrics,
             endpoint,
@@ -358,7 +337,7 @@ impl InFlightGuard {
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
         self.metrics
-            .decrement_proxy_in_flight(&self.endpoint, &self.inbound_protocol);
+            .decrement_proxy_in_flight(self.endpoint, self.inbound_protocol);
     }
 }
 
@@ -372,22 +351,32 @@ pub(crate) const CLIENT_CLOSED_REQUEST: u16 = 499;
 /// `ClientDisconnected` error class.
 const CLIENT_DISCONNECTED_KIND: &str = "client_disconnected";
 
-/// Record a request whose caller hung up before the response head was
-/// written.
+/// One middleware for both per-request telemetry guards: the in-flight
+/// gauge and the client-cancel recorder. The two used to be separate
+/// layers; they sit at the same position in the stack with nothing
+/// between them, so a single layer arms both and the per-request boxed
+/// service hop (and one of two route-normalize calls) disappears.
 ///
-/// Every endpoint logs and meters itself at the end of its own handler —
-/// 29 `emit_access_log` call sites across 12 modules. When the client
-/// disconnects first, axum drops the handler future and *none* of that
-/// code runs: the request leaves no access-log line, no usage event and
-/// no metric. It is invisible exactly where an operator most needs it,
-/// because the usual reason a caller gives up is a long
-/// time-to-first-token.
+/// In-flight gauge: incremented before the inner service runs,
+/// decremented on guard drop — including cancellation.
+///
+/// Client-cancel: records a request whose caller hung up before the
+/// response head was written. Every endpoint logs and meters itself at
+/// the end of its own handler — 29 `emit_access_log` call sites across
+/// 12 modules. When the client disconnects first, axum drops the
+/// handler future and *none* of that code runs: the request leaves no
+/// access-log line, no usage event and no metric. It is invisible
+/// exactly where an operator most needs it, because the usual reason a
+/// caller gives up is a long time-to-first-token.
 ///
 /// A cancelled future is only observable from `Drop`, so arm a guard,
 /// disarm it once the inner service yields a response, and emit from
 /// `Drop` when it is still armed. Doing it in one layer rather than in
 /// each handler also keeps the endpoint family from drifting the way the
 /// request-id header did before `ensure_request_id` (see request_id.rs).
+/// On cancellation the in-flight guard (declared later) drops first,
+/// then the cancel guard emits — the same order the nested layers
+/// produced.
 ///
 /// This is NOT the streaming-disconnect path: once SSE bytes flow the
 /// response head is already committed, so the handler has logged and the
@@ -395,15 +384,22 @@ const CLIENT_DISCONNECTED_KIND: &str = "client_disconnected";
 /// `chat::build_sse_stream`). Response bodies are polled after this
 /// middleware has returned, so a mid-stream hang-up leaves the guard
 /// disarmed and is not double-counted here.
-async fn record_client_cancel(
+async fn record_request_telemetry(
     State(state): State<ProxyState>,
     request: Request<axum::body::Body>,
     next: Next,
 ) -> Response {
+    // Normalize to a bounded route template BEFORE using the path as a
+    // metric label. This middleware runs before authentication and before
+    // route matching, so the raw `request.uri().path()` is fully
+    // attacker-controlled — the `/passthrough/:provider/*rest` wildcard
+    // suffix (or any 404 path) would otherwise let an unauthenticated
+    // caller mint unbounded Prometheus time series (#451).
+    let endpoint = normalize_endpoint_label(request.uri().path());
     let mut guard = ClientCancelGuard {
         armed: true,
         metrics: state.metrics.clone(),
-        endpoint: normalize_endpoint_label(request.uri().path()),
+        endpoint,
         method: request.method().clone(),
         uri: request.uri().clone(),
         request_id: request
@@ -413,6 +409,11 @@ async fn record_client_cancel(
             .unwrap_or_default(),
         started: std::time::Instant::now(),
     };
+    let _in_flight = InFlightGuard::new(
+        state.metrics.clone(),
+        endpoint,
+        inbound_protocol_for_endpoint(endpoint),
+    );
     let response = next.run(request).await;
     guard.armed = false;
     response
