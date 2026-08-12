@@ -167,8 +167,11 @@ pub async fn passthrough(
     let path = format!("/passthrough/{provider}/{rest}");
 
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
+    // One snapshot for the whole request (#941) — see `embeddings`.
+    let snapshot = state.snapshot.load();
     match dispatch(
         state.clone(),
+        &snapshot,
         &auth,
         &provider,
         &rest,
@@ -192,6 +195,9 @@ pub async fn passthrough(
                 &request_id,
                 None,
             );
+            // One ProviderKey lookup for the metric emit + the usage event
+            // below (#941).
+            let pk = crate::usage_attr::ResolvedPk::resolve(&snapshot, &provider_key_id);
             crate::request_metrics::record(
                 &state,
                 "/passthrough/:provider/*rest",
@@ -203,7 +209,7 @@ pub async fn passthrough(
                     // cardinality. Passthrough has no resolved model, so
                     // record a fixed sentinel (#451).
                     model: PASSTHROUGH_MODEL_LABEL,
-                    provider_key_id: &provider_key_id,
+                    pk: pk.labels(),
                     ..Default::default()
                 },
                 status,
@@ -215,9 +221,10 @@ pub async fn passthrough(
             // the upstream's status is relayed verbatim and recorded as-is.
             emit_usage_event(
                 &state,
+                &snapshot,
+                &pk,
                 &request_id,
                 &api_key_id,
-                &provider_key_id,
                 status,
                 elapsed,
                 &client,
@@ -238,13 +245,12 @@ pub async fn passthrough(
                 &request_id,
                 Some(&err),
             );
-            let snap = state.snapshot.load();
             crate::request_metrics::record(
                 &state,
                 "/passthrough/:provider/*rest",
                 crate::request_metrics::Caller::new(&auth),
                 crate::request_metrics::Upstream {
-                    provider: provider_metric_label(&snap, &provider),
+                    provider: provider_metric_label(&snapshot, &provider),
                     model: PASSTHROUGH_MODEL_LABEL,
                     ..Default::default()
                 },
@@ -257,6 +263,7 @@ pub async fn passthrough(
             // error path.
             crate::usage_attr::emit_error_usage_event(
                 &state,
+                &snapshot,
                 "passthrough",
                 "passthrough",
                 &request_id,
@@ -274,6 +281,7 @@ pub async fn passthrough(
 #[allow(clippy::too_many_arguments)]
 async fn dispatch(
     state: ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
     auth: &AuthenticatedKey,
     provider: &str,
     rest: &str,
@@ -282,8 +290,6 @@ async fn dispatch(
     source_ip: &str,
     monitor_hits_out: &mut Vec<aisix_core::GuardrailMonitorHit>,
 ) -> Result<(Response, String, String), ProxyError> {
-    let snapshot = state.snapshot.load();
-
     // Find a model for this provider so we can borrow its provider_key.
     let provider_lower = provider.to_lowercase();
     let all_models = snapshot.models.entries();
@@ -324,7 +330,7 @@ async fn dispatch(
     // borrowed-model basis as the #911 [6] guardrail resolution below.
     crate::dispatch::check_ip_access(model, source_ip)?;
 
-    let pk_entry = crate::dispatch::resolve_provider_key(&snapshot, model)?;
+    let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
     let api_key = crate::dispatch::require_api_key(&pk_entry.value, model)?.to_string();
 
     // #911 [6]: resolve the guardrail chain for the model whose credentials
@@ -452,8 +458,8 @@ async fn dispatch(
     // keep the previous behavior: request-level layers only. The tunnel never
     // parses usage (tokens stay 0), so only the request-count dimensions
     // (rps/rpm/rph) ever draw from the model buckets here.
-    let model_rl = body_model_rate_limit(&snapshot, &provider_lower, &body_bytes);
-    let _reservation = crate::quota::enforce(&state, auth, model_rl.as_ref()).await?;
+    let model_rl = body_model_rate_limit(snapshot, &provider_lower, &body_bytes);
+    let _reservation = crate::quota::enforce(&state, snapshot, auth, model_rl.as_ref()).await?;
 
     let client = crate::http_client::client_for(pk_entry.value.tls.as_ref());
 
@@ -733,15 +739,17 @@ fn body_model_rate_limit(
 #[allow(clippy::too_many_arguments)]
 fn emit_usage_event(
     state: &ProxyState,
+    // The request's snapshot + its one ProviderKey observation, resolved
+    // by the handler (#941).
+    snap: &aisix_core::AisixSnapshot,
+    pk: &crate::usage_attr::ResolvedPk<'_>,
     request_id: &str,
     api_key_id: &str,
-    provider_key_id: &str,
     status_code: u16,
     elapsed: Duration,
     client: &crate::client_ip::ClientContext,
     guardrail_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
 ) {
-    let snap = state.snapshot.load();
     let mut event = aisix_obs::UsageEvent {
         request_id: request_id.to_string(),
         occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
@@ -757,10 +765,10 @@ fn emit_usage_event(
         guardrail_monitor_hits,
         ..Default::default()
     };
-    crate::usage_attr::apply_pk_telemetry(&mut event, &snap, provider_key_id);
+    crate::usage_attr::apply_pk_telemetry(&mut event, pk);
     crate::usage_attr::apply_jwt_identity(&mut event, client.jwt.as_ref());
     state.usage_sink.try_emit("passthrough", event.clone());
-    let exporters = snap.observability_exporters.entries();
+    let exporters = crate::usage_attr::live_exporters(state, snap);
     state
         .otlp_fan_out
         .fan_out(&event, None, exporters.iter().map(|e| &e.value));

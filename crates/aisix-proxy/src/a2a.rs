@@ -274,12 +274,13 @@ async fn dispatch(
     // is deliberate — inferring a spend limit from an estimate would throttle
     // callers on a number no provider ever confirmed. On 429 /
     // budget-exceeded this returns before the upstream is contacted.
-    let reservation = match crate::quota::enforce(state, &auth, None).await {
+    let reservation = match crate::quota::enforce(state, &snapshot, &auth, None).await {
         Ok(reservation) => reservation,
         Err(err) => {
             let response = err.into_response();
             emit_a2a_usage(
                 state,
+                &snapshot,
                 &auth,
                 request_id,
                 agent,
@@ -296,6 +297,7 @@ async fn dispatch(
             auth,
             agent,
             state,
+            &snapshot,
             request_id,
             upstream,
             value,
@@ -322,6 +324,7 @@ async fn dispatch(
             }
             emit_a2a_usage(
                 state,
+                &snapshot,
                 &auth,
                 request_id,
                 agent,
@@ -336,6 +339,7 @@ async fn dispatch(
             tracing::warn!(agent = %agent, error = %err, "A2A upstream call failed");
             emit_a2a_usage(
                 state,
+                &snapshot,
                 &auth,
                 request_id,
                 agent,
@@ -395,8 +399,12 @@ impl Drop for StreamUsageOnDrop {
         } else {
             crate::CLIENT_CLOSED_REQUEST
         };
+        // A stream can outlive several config generations, so the
+        // end-of-stream emit reads a FRESH snapshot rather than the one the
+        // request started on (#941).
         emit_a2a_usage(
             &self.state,
+            &self.state.snapshot.load(),
             &self.auth,
             &self.request_id,
             &self.agent,
@@ -417,6 +425,7 @@ async fn dispatch_stream(
     auth: AuthenticatedKey,
     agent: &str,
     state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
     request_id: &str,
     upstream: aisix_a2a::A2aUpstream,
     request: serde_json::Value,
@@ -436,6 +445,7 @@ async fn dispatch_stream(
             drop(reservation);
             emit_a2a_usage(
                 state,
+                snapshot,
                 &auth,
                 request_id,
                 agent,
@@ -680,8 +690,11 @@ fn a2a_error_envelope(id: Option<serde_json::Value>, message: &str) -> serde_jso
 /// This is the chokepoint every A2A path emits through, so the metric
 /// families ride here too: a path that accounts for a call cannot skip
 /// metering it.
+#[allow(clippy::too_many_arguments)]
 fn emit_a2a_usage(
     state: &ProxyState,
+    // The request's snapshot, loaded once by the caller (#941).
+    snap: &aisix_core::AisixSnapshot,
     auth: &AuthenticatedKey,
     request_id: &str,
     agent: &str,
@@ -763,8 +776,7 @@ fn emit_a2a_usage(
         },
     );
     state.usage_sink.try_emit("a2a", event.clone());
-    let snap = state.snapshot.load();
-    let exporters = snap.observability_exporters.entries();
+    let exporters = crate::usage_attr::live_exporters(state, snap);
     // Opt-in content capture, on the same terms as every other endpoint: only
     // an exporter configured for full content sees the words, and they never
     // travel to the control plane — the usage event above carries counts

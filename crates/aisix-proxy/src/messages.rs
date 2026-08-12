@@ -114,11 +114,13 @@ pub async fn messages(
         .unwrap_or("")
         .to_string();
 
+    // One snapshot for the whole request (#941): the handle this already
+    // loaded to resolve the model now also serves dispatch, the terminal
+    // metric emits and the usage events, instead of each loading its own.
     let snapshot = state.snapshot.load();
     let model_id = crate::model_resolve::resolve_model(&snapshot, &model_name)
         .map(|e| e.id.clone())
         .unwrap_or_default();
-    drop(snapshot);
 
     // Filled by `dispatch` once the per-request guardrail chain resolves;
     // read below to attach `applied_guardrails` to the telemetry event on both
@@ -139,6 +141,7 @@ pub async fn messages(
         .unwrap_or(false);
     match dispatch(
         &state,
+        &snapshot,
         &auth,
         &mut body,
         &request_id,
@@ -183,6 +186,9 @@ pub async fn messages(
                 &routing,
                 None,
             );
+            // ONE ProviderKey lookup for both the metric emit and the
+            // winner's usage event below (#941).
+            let pk = crate::usage_attr::ResolvedPk::resolve(&snapshot, &provider_key_id);
             crate::request_metrics::record(
                 &state,
                 "/v1/messages",
@@ -191,7 +197,7 @@ pub async fn messages(
                     provider: &provider_label,
                     model: &model_name,
                     upstream_model: &upstream_model,
-                    provider_key_id: &provider_key_id,
+                    pk: pk.labels(),
                     stream: stream_requested,
                     is_fallback: routing.fallback_count() > 0,
                 },
@@ -217,6 +223,7 @@ pub async fn messages(
             // first-try success and for the single-attempt streaming path.
             emit_failed_attempts_anthropic(
                 &state,
+                &snapshot,
                 &request_id,
                 &api_key_id,
                 &provider_label,
@@ -258,12 +265,13 @@ pub async fn messages(
                 metrics.downstream_latency_ms = elapsed.as_millis().min(u32::MAX as u128) as u32;
                 emit_anthropic_usage_event(
                     &state,
+                    &snapshot,
+                    &pk,
                     &request_id,
                     event_model_id,
                     &api_key_id,
                     &provider_label,
                     &model_name,
-                    &provider_key_id,
                     &upstream_model,
                     auth.key().team_id.as_deref(),
                     auth.key().user_id.as_deref(),
@@ -295,8 +303,7 @@ pub async fn messages(
                 &routing,
                 Some(&err),
             );
-            let snap = state.snapshot.load();
-            let metric_model = crate::usage_attr::metric_model_label(&snap, &model_name);
+            let metric_model = crate::usage_attr::metric_model_label(&snapshot, &model_name);
             // #890 req-2: count the FAILED request on the rich request metrics
             // so a success rate is computable (denominator incl. failures).
             // Provider/upstream/provider_key are unknown on the failure path.
@@ -333,7 +340,8 @@ pub async fn messages(
                 None
             } else {
                 content_capture_cap(
-                    snap.observability_exporters
+                    snapshot
+                        .observability_exporters
                         .entries()
                         .iter()
                         .map(|e| &e.value),
@@ -357,6 +365,7 @@ pub async fn messages(
             // the dashboard's Logs tab surfaces each failed upstream try.
             emit_failed_attempts_anthropic(
                 &state,
+                &snapshot,
                 &request_id,
                 &api_key_id,
                 "unknown",
@@ -377,12 +386,13 @@ pub async fn messages(
             if routing.attempts.is_empty() {
                 emit_anthropic_usage_event(
                     &state,
+                    &snapshot,
+                    &crate::usage_attr::ResolvedPk::unresolved(),
                     &request_id,
                     &model_id,
                     &api_key_id,
                     "unknown",
                     &model_name,
-                    "unknown",
                     "unknown",
                     auth.key().team_id.as_deref(),
                     auth.key().user_id.as_deref(),
@@ -419,6 +429,7 @@ pub async fn messages(
 #[allow(clippy::too_many_arguments)]
 fn emit_failed_attempts_anthropic(
     state: &ProxyState,
+    snap: &aisix_core::AisixSnapshot,
     request_id: &str,
     api_key_id: &str,
     provider: &str,
@@ -448,8 +459,11 @@ fn emit_failed_attempts_anthropic(
         } else {
             None
         };
+        let pk = crate::usage_attr::ResolvedPk::resolve(snap, &rec.provider_key_id);
         emit_anthropic_usage_event(
             state,
+            snap,
+            &pk,
             request_id,
             // Each failed attempt records the TARGET it actually hit
             // (AISIX-Cloud#790), not the group it was resolved from.
@@ -457,7 +471,6 @@ fn emit_failed_attempts_anthropic(
             api_key_id,
             provider,
             model,
-            &rec.provider_key_id,
             upstream_model,
             team_id,
             user_id,
@@ -480,6 +493,7 @@ fn emit_failed_attempts_anthropic(
 #[allow(clippy::too_many_arguments)]
 async fn dispatch(
     state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
     auth: &AuthenticatedKey,
     body: &mut Value,
     request_id: &str,
@@ -499,8 +513,6 @@ async fn dispatch(
     // same lifecycle as `redactions_out`.
     monitor_hits_out: &mut Vec<aisix_core::GuardrailMonitorHit>,
 ) -> Result<DispatchOutcome, MessagesDispatchError> {
-    let snapshot = state.snapshot.load();
-
     // Extract and resolve model.
     let model_name = body
         .get("model")
@@ -508,7 +520,7 @@ async fn dispatch(
         .ok_or_else(|| ProxyError::InvalidRequest("`model` field missing".into()))?
         .to_string();
 
-    let model_entry = crate::model_resolve::resolve_model(&snapshot, &model_name)
+    let model_entry = crate::model_resolve::resolve_model(snapshot, &model_name)
         .ok_or_else(|| ProxyError::ModelNotFound(model_name.clone()))?;
 
     if !auth.key().can_access(&model_name) {
@@ -601,7 +613,8 @@ async fn dispatch(
     // `Option` so the winning streaming attempt can `take()` the reservation
     // and carry it into the end-of-stream guard (#688); non-streaming / failed
     // attempts leave it in place for the post-dispatch commit or a retry.
-    let mut reservation = Some(crate::quota::enforce(state, auth, Some(&model_rl)).await?);
+    let mut reservation =
+        Some(crate::quota::enforce(state, snapshot, auth, Some(&model_rl)).await?);
 
     // Budget pre-check via cp-api (mirrors /v1/chat/completions).
     let budget_decision = state.budgets.check(&auth.entry.id).await;
@@ -621,7 +634,7 @@ async fn dispatch(
     let attempt_models = crate::routing::resolve_attempt_models(
         &state.routing,
         &state.runtime_status,
-        &snapshot,
+        snapshot,
         &model_name,
         &model_entry.id,
         &model_entry.value,
@@ -675,7 +688,7 @@ async fn dispatch(
     let n = attempt_models.len();
     let mut last_err: Option<ProxyError> = None;
     'targets: for (i, target) in attempt_models.iter().enumerate() {
-        let pk_id = crate::dispatch::resolve_provider_key(&snapshot, &target.model)
+        let pk_id = crate::dispatch::resolve_provider_key(snapshot, &target.model)
             .map(|e| e.id.clone())
             .unwrap_or_default();
         // How many times to re-hit the SAME target (with backoff) on a
@@ -720,6 +733,7 @@ async fn dispatch(
             // reset mid-loop).
             let mut member_reservation = match crate::quota::reserve_routing_target(
                 state,
+                snapshot,
                 auth,
                 is_routing_request,
                 &target.model.display_name,
@@ -749,7 +763,7 @@ async fn dispatch(
             let attempt_started = Instant::now();
             match dispatch_to_target(
                 state,
-                &snapshot,
+                snapshot,
                 body,
                 target,
                 timeouts,
@@ -923,6 +937,7 @@ async fn dispatch_to_target(
     if !crate::dispatch::speaks_anthropic(snapshot, model) {
         return cross_provider_dispatch(
             state,
+            snapshot,
             body,
             model,
             &target.id,
@@ -950,6 +965,7 @@ async fn dispatch_to_target(
 
     anthropic_passthrough_dispatch(
         state,
+        snapshot,
         body,
         model,
         &target.id,
@@ -982,6 +998,7 @@ async fn dispatch_to_target(
 #[allow(clippy::too_many_arguments)]
 async fn anthropic_passthrough_dispatch(
     state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
     body: &Value,
     model: &aisix_core::Model,
     model_id: &str,
@@ -1260,9 +1277,7 @@ async fn anthropic_passthrough_dispatch(
         // into `usage.response_text` by the frame parser and preserved (not
         // taken) when `content_cap` is set. Both gated.
         let content_cap = content_capture_cap(
-            state
-                .snapshot
-                .load()
+            snapshot
                 .observability_exporters
                 .entries()
                 .iter()
@@ -1350,14 +1365,20 @@ async fn anthropic_passthrough_dispatch(
                     },
                     started.elapsed(),
                 );
+                // A stream can outlive several config generations, so the
+                // end-of-stream emit reads a FRESH snapshot rather than the
+                // one the request started on (#941).
+                let snap_c = state_c.snapshot.load();
+                let pk_c = crate::usage_attr::ResolvedPk::resolve(&snap_c, &provider_key_id_c);
                 emit_anthropic_usage_event(
                     &state_c,
+                    &snap_c,
+                    &pk_c,
                     &request_id_c,
                     &model_id_c,
                     &api_key_id_c,
                     &provider_c,
                     &model_name_c,
-                    &provider_key_id_c,
                     &upstream_model_c,
                     team_id_c.as_deref(),
                     user_id_c.as_deref(),
@@ -1729,6 +1750,7 @@ fn anthropic_metrics_from_response_json(body: &Value) -> AnthropicUsageMetrics {
 #[allow(clippy::too_many_arguments)]
 async fn cross_provider_dispatch(
     state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
     body: &Value,
     model: &aisix_core::Model,
     model_id: &str,
@@ -1907,9 +1929,7 @@ async fn cross_provider_dispatch(
         // Content capture: prompt up front, response assembled in the stream
         // into `comp.response_text`. Both gated on `content_cap`.
         let content_cap = content_capture_cap(
-            state
-                .snapshot
-                .load()
+            snapshot
                 .observability_exporters
                 .entries()
                 .iter()
@@ -1991,14 +2011,19 @@ async fn cross_provider_dispatch(
                     },
                     started_for_telem.elapsed(),
                 );
+                // Fresh snapshot at stream end — see the passthrough path.
+                let snap_telem = state_for_telem.snapshot.load();
+                let pk_telem =
+                    crate::usage_attr::ResolvedPk::resolve(&snap_telem, &provider_key_id_for_telem);
                 emit_anthropic_usage_event(
                     &state_for_telem,
+                    &snap_telem,
+                    &pk_telem,
                     &request_id_for_telem,
                     &model_id_for_telem,
                     &api_key_id_for_telem,
                     &provider_for_telem,
                     &model_for_telem,
-                    &provider_key_id_for_telem,
                     &upstream_model_for_telem,
                     team_id_for_telem.as_deref(),
                     user_id_for_telem.as_deref(),
@@ -2150,9 +2175,7 @@ async fn cross_provider_dispatch(
     // text for content-capturing exporters (gated); threaded to `fan_out` via
     // `DispatchOutcome`, never to the CP sink.
     let captured_content = content_capture_cap(
-        state
-            .snapshot
-            .load()
+        snapshot
             .observability_exporters
             .entries()
             .iter()
@@ -2698,12 +2721,20 @@ struct AnthropicUsageMetrics {
 #[allow(clippy::too_many_arguments)]
 fn emit_anthropic_usage_event(
     state: &ProxyState,
+    // The request's snapshot, resolved by the caller (#941). Every event
+    // names its OWN attempt's ProviderKey, so the row lookup stays here —
+    // but it is now ONE lookup feeding both the wire attribution tags and
+    // the `provider_key_name` metric label, which used to look it up twice.
+    snap: &aisix_core::AisixSnapshot,
+    // Resolved by the caller so the winning attempt's row is read ONCE for
+    // both this event and the handler's `record` (#941 audit L2). The
+    // failed-attempt and stream-end callers resolve their own.
+    pk: &crate::usage_attr::ResolvedPk<'_>,
     request_id: &str,
     model_id: &str,
     api_key_id: &str,
     provider: &str,
     model: &str,
-    provider_key_id: &str,
     upstream_model: &str,
     team_id: Option<&str>,
     user_id: Option<&str>,
@@ -2730,18 +2761,7 @@ fn emit_anthropic_usage_event(
     // resolved ProviderKey from the live snapshot and copy its
     // `telemetry_tags` into wire fields. Empty `provider_key_id`
     // (pre-dispatch error path) bypasses the lookup → wire NULL.
-    let snap = state.snapshot.load();
-    let tags = if !provider_key_id.is_empty() {
-        snap.provider_keys
-            .get_by_id(provider_key_id)
-            .map(|e| e.value.telemetry_tags.clone())
-            .unwrap_or_default()
-    } else {
-        Default::default()
-    };
-    // #890 req-3: readable provider-key name for the metric label (shared
-    // resolver so chat + messages can't drift).
-    let provider_key_name = crate::usage_attr::provider_key_metric_name(&snap, provider_key_id);
+    let tags = pk.telemetry_tags();
     let mut event = UsageEvent {
         request_id: request_id.to_string(),
         occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
@@ -2784,7 +2804,7 @@ fn emit_anthropic_usage_event(
     // path. Bucketed prometheus counter (#408).
     crate::usage_attr::apply_jwt_identity(&mut event, client.jwt.as_ref());
     state.usage_sink.try_emit("messages", event.clone());
-    let exporters = snap.observability_exporters.entries();
+    let exporters = crate::usage_attr::live_exporters(state, snap);
     state
         .otlp_fan_out
         .fan_out(&event, content.as_ref(), exporters.iter().map(|e| &e.value));
@@ -2813,7 +2833,7 @@ fn emit_anthropic_usage_event(
             provider,
             model,
             upstream_model,
-            provider_key_id,
+            pk: pk.labels(),
             ..Default::default()
         },
         crate::request_metrics::Tokens {
@@ -2842,8 +2862,8 @@ fn emit_anthropic_usage_event(
                 provider,
                 model,
                 upstream_model,
-                provider_key_id,
-                provider_key_name: &provider_key_name,
+                provider_key_id: pk.labels().id(),
+                provider_key_name: pk.labels().name(),
                 api_key_id,
                 team_id: team_id.unwrap_or("unknown"),
                 user_id: user_id.unwrap_or("unknown"),

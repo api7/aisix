@@ -57,7 +57,7 @@ use aisix_obs::{LlmUsage, RequestLabels, RequestOutcome, UsageLabels};
 
 use crate::auth::AuthenticatedKey;
 use crate::state::ProxyState;
-use crate::usage_attr::provider_key_metric_name;
+use crate::usage_attr::PkLabels;
 
 /// Label value every `RequestLabels` field falls back to when the path
 /// never resolved it. Matches `RequestLabels::default()`.
@@ -153,7 +153,12 @@ pub(crate) struct Upstream<'a> {
     /// attacker-controlled cardinality (#451).
     pub model: &'a str,
     pub upstream_model: &'a str,
-    pub provider_key_id: &'a str,
+    /// The attempt's ProviderKey id AND its readable name, resolved
+    /// together by `usage_attr::ResolvedPk` (#941). Taking the pair rather
+    /// than a bare id is deliberate: the name used to be looked up inside
+    /// each emit, so a request paid one snapshot read per emit and a new
+    /// call site could not tell it was doing so.
+    pub pk: PkLabels<'a>,
     pub stream: bool,
     pub is_fallback: bool,
 }
@@ -164,7 +169,7 @@ impl Default for Upstream<'_> {
             provider: UNKNOWN,
             model: UNKNOWN,
             upstream_model: UNKNOWN,
-            provider_key_id: UNKNOWN,
+            pk: PkLabels::default(),
             stream: false,
             is_fallback: false,
         }
@@ -240,11 +245,6 @@ pub(crate) fn record(
     state
         .metrics
         .record_request(upstream.provider, upstream.model, status, outcome, elapsed);
-    // Held in a binding: `RequestLabels` borrows it.
-    let provider_key_name = {
-        let snap = state.snapshot.load();
-        provider_key_metric_name(&snap, upstream.provider_key_id)
-    };
     let labels = RequestLabels {
         endpoint,
         // Derived from the endpoint rather than passed in, so the detailed
@@ -254,8 +254,8 @@ pub(crate) fn record(
         provider: upstream.provider,
         model: upstream.model,
         upstream_model: upstream.upstream_model,
-        provider_key_id: upstream.provider_key_id,
-        provider_key_name: &provider_key_name,
+        provider_key_id: upstream.pk.id(),
+        provider_key_name: upstream.pk.name(),
         api_key_id: caller.api_key_id,
         team_id: caller.team_id,
         user_id: caller.user_id,
@@ -315,11 +315,6 @@ pub(crate) fn record_usage(
     state
         .metrics
         .record_tokens(upstream.provider, upstream.model, u64::from(tokens.total));
-    // Held in a binding: `UsageLabels` borrows it.
-    let provider_key_name = {
-        let snap = state.snapshot.load();
-        provider_key_metric_name(&snap, upstream.provider_key_id)
-    };
     state.metrics.record_llm_usage(
         UsageLabels {
             endpoint,
@@ -327,8 +322,8 @@ pub(crate) fn record_usage(
             provider: upstream.provider,
             model: upstream.model,
             upstream_model: upstream.upstream_model,
-            provider_key_id: upstream.provider_key_id,
-            provider_key_name: &provider_key_name,
+            provider_key_id: upstream.pk.id(),
+            provider_key_name: upstream.pk.name(),
             api_key_id: caller.api_key_id,
             team_id: caller.team_id,
             user_id: caller.user_id,

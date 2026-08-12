@@ -244,12 +244,13 @@ async fn dispatch(
     // returns before any upstream is contacted — and the rejected call is still
     // recorded.
     let _reservation = if is_tool_call {
-        match crate::quota::enforce_mcp(state, &auth, &mcp_server).await {
+        match crate::quota::enforce_mcp(state, &snapshot, &auth, &mcp_server).await {
             Ok(reservation) => Some(reservation),
             Err(err) => {
                 let response = err.into_response();
                 emit_tool_call_usage(
                     state,
+                    &snapshot,
                     &auth,
                     request_id,
                     &mcp_server,
@@ -310,6 +311,7 @@ async fn dispatch(
             );
             emit_tool_call_usage(
                 state,
+                &snapshot,
                 &auth,
                 request_id,
                 &mcp_server,
@@ -373,6 +375,7 @@ async fn dispatch(
         {
             emit_tool_call_usage(
                 state,
+                &snapshot,
                 &auth,
                 request_id,
                 &mcp_server,
@@ -392,6 +395,7 @@ async fn dispatch(
     if is_tool_call {
         emit_tool_call_usage(
             state,
+            &snapshot,
             &auth,
             request_id,
             &mcp_server,
@@ -480,6 +484,8 @@ async fn output_guardrail_block(
 #[allow(clippy::too_many_arguments)]
 fn emit_tool_call_usage(
     state: &ProxyState,
+    // The request's snapshot, loaded once by the handler (#941).
+    snap: &aisix_core::AisixSnapshot,
     auth: &AuthenticatedKey,
     request_id: &str,
     mcp_server: &str,
@@ -511,8 +517,7 @@ fn emit_tool_call_usage(
     // every other emitter — pre-fix MCP usage reached only the CP sink, so
     // exporters never saw /mcp traffic. No content capture (tool args/results
     // are a separate surface from prompt/response).
-    let snap = state.snapshot.load();
-    let exporters = snap.observability_exporters.entries();
+    let exporters = crate::usage_attr::live_exporters(state, snap);
     state
         .otlp_fan_out
         .fan_out(&event, None, exporters.iter().map(|e| &e.value));

@@ -108,7 +108,10 @@ pub async fn rerank(
         .unwrap_or("")
         .to_string();
 
-    match dispatch(&state, &auth, &mut body, &request_id, &client).await {
+    // One snapshot for the whole request (#941) — see `embeddings`.
+    let snapshot = state.snapshot.load();
+
+    match dispatch(&state, &snapshot, &auth, &mut body, &request_id, &client).await {
         Ok(success) => {
             let elapsed = started.elapsed();
             let status = success.response.status().as_u16();
@@ -122,6 +125,9 @@ pub async fn rerank(
                 Some(success.provider_request_id.as_str()),
                 None,
             );
+            // One ProviderKey lookup for the metric emit + the usage event
+            // below (#941).
+            let pk = crate::usage_attr::ResolvedPk::resolve(&snapshot, &success.provider_key_id);
             crate::request_metrics::record(
                 &state,
                 "/v1/rerank",
@@ -130,7 +136,7 @@ pub async fn rerank(
                     provider: &success.provider,
                     model: &model_name,
                     upstream_model: &success.upstream_model,
-                    provider_key_id: &success.provider_key_id,
+                    pk: pk.labels(),
                     ..Default::default()
                 },
                 status,
@@ -145,11 +151,12 @@ pub async fn rerank(
             if let Some(usage) = success.usage {
                 emit_usage_event(
                     &state,
+                    &snapshot,
+                    &pk,
                     &request_id,
                     &success.model_id,
                     &model_name,
                     &api_key_id,
-                    &success.provider_key_id,
                     &success.provider,
                     &success.upstream_model,
                     &success.applied_guardrails,
@@ -178,8 +185,7 @@ pub async fn rerank(
                 None,
                 Some(&err),
             );
-            let snap = state.snapshot.load();
-            let metric_model = crate::usage_attr::metric_model_label(&snap, &model_name);
+            let metric_model = crate::usage_attr::metric_model_label(&snapshot, &model_name);
             crate::request_metrics::record(
                 &state,
                 "/v1/rerank",
@@ -195,6 +201,7 @@ pub async fn rerank(
             // zero-token event (status + error class), instead of dropping it.
             crate::usage_attr::emit_error_usage_event(
                 &state,
+                &snapshot,
                 "rerank",
                 "openai",
                 &request_id,
@@ -236,20 +243,19 @@ fn rerank_input_to_chat(model: &str, body: &Value) -> aisix_gateway::ChatFormat 
 
 async fn dispatch(
     state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
     auth: &AuthenticatedKey,
     body: &mut Value,
     request_id: &str,
     client_ctx: &ClientContext,
 ) -> Result<RerankDispatchSuccess, ProxyError> {
-    let snapshot = state.snapshot.load();
-
     let model_name = body
         .get("model")
         .and_then(|v| v.as_str())
         .ok_or_else(|| ProxyError::InvalidRequest("`model` field missing".into()))?
         .to_string();
 
-    let model_entry = crate::model_resolve::resolve_model(&snapshot, &model_name)
+    let model_entry = crate::model_resolve::resolve_model(snapshot, &model_name)
         .ok_or_else(|| ProxyError::ModelNotFound(model_name.clone()))?;
 
     if !auth.key().can_access(&model_name) {
@@ -318,7 +324,7 @@ async fn dispatch(
 
     let model_rl =
         crate::quota::ModelRateLimit::from_model(&model_name, &model_entry.id, &model_entry.value);
-    let reservation = crate::quota::enforce(state, auth, Some(&model_rl)).await?;
+    let reservation = crate::quota::enforce(state, snapshot, auth, Some(&model_rl)).await?;
 
     let model = &model_entry.value;
 
@@ -362,7 +368,7 @@ async fn dispatch(
         )));
     }
 
-    let pk_entry = crate::dispatch::resolve_provider_key(&snapshot, model)?;
+    let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
     let api_key = crate::dispatch::require_api_key(&pk_entry.value, model)?.to_string();
     let upstream_model = crate::dispatch::require_upstream_model(model)?.to_string();
 
@@ -637,11 +643,14 @@ fn extract_rerank_usage(body: &Value) -> Option<RerankUsage> {
 #[allow(clippy::too_many_arguments)]
 fn emit_usage_event(
     state: &ProxyState,
+    // The request's snapshot + its one ProviderKey observation, resolved
+    // by the handler (#941).
+    snap: &aisix_core::AisixSnapshot,
+    pk: &crate::usage_attr::ResolvedPk<'_>,
     request_id: &str,
     model_id: &str,
     requested_model: &str,
     api_key_id: &str,
-    provider_key_id: &str,
     // Metric labels the UsageEvent has no field for (AISIX-Cloud#1234
     // follow-up): the wire struct is the CP contract, so they ride
     // alongside rather than in it.
@@ -661,7 +670,6 @@ fn emit_usage_event(
     // never to the CP sink.
     content: Option<&CapturedContent>,
 ) {
-    let snap = state.snapshot.load();
     let mut event = UsageEvent {
         request_id: request_id.to_string(),
         occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
@@ -686,14 +694,14 @@ fn emit_usage_event(
     // Per-PK attribution tags (provider_kind / provider_featured /
     // branded_provider / pk_label / byo_label) ARE populated — same lookup as
     // chat / messages / responses / embeddings (AISIX-Cloud#867 parity).
-    crate::usage_attr::apply_pk_telemetry(&mut event, &snap, provider_key_id);
+    crate::usage_attr::apply_pk_telemetry(&mut event, pk);
     crate::usage_attr::apply_jwt_identity(&mut event, client.jwt.as_ref());
     state.usage_sink.try_emit("rerank", event.clone());
-    let exporters = snap.observability_exporters.entries();
+    let exporters = crate::usage_attr::live_exporters(state, snap);
     state
         .otlp_fan_out
         .fan_out(&event, content, exporters.iter().map(|e| &e.value));
-    let owned_caller = crate::request_metrics::Caller::from_api_key_id(&snap, api_key_id);
+    let owned_caller = crate::request_metrics::Caller::from_api_key_id(snap, api_key_id);
     crate::request_metrics::record_usage(
         state,
         "/v1/rerank",
@@ -702,7 +710,7 @@ fn emit_usage_event(
             provider,
             model: requested_model,
             upstream_model,
-            provider_key_id,
+            pk: pk.labels(),
             ..Default::default()
         },
         crate::request_metrics::Tokens {

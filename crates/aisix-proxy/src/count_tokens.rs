@@ -96,7 +96,10 @@ pub async fn count_tokens(
         .unwrap_or("")
         .to_string();
 
-    match dispatch(&state, &auth, &body, &request_id, &client).await {
+    // One snapshot for the whole request (#941) — see `embeddings`.
+    let snapshot = state.snapshot.load();
+
+    match dispatch(&state, &snapshot, &auth, &body, &request_id, &client).await {
         Ok(success) => {
             let elapsed = started.elapsed();
             let status = success.response.status().as_u16();
@@ -109,6 +112,8 @@ pub async fn count_tokens(
                 &request_id,
                 None,
             );
+            // One ProviderKey lookup per completion (#941).
+            let pk = crate::usage_attr::ResolvedPk::resolve(&snapshot, &success.provider_key_id);
             crate::request_metrics::record(
                 &state,
                 "/v1/messages/count_tokens",
@@ -117,7 +122,7 @@ pub async fn count_tokens(
                     provider: &success.provider,
                     model: &model_name,
                     upstream_model: &success.upstream_model,
-                    provider_key_id: &success.provider_key_id,
+                    pk: pk.labels(),
                     ..Default::default()
                 },
                 status,
@@ -137,8 +142,7 @@ pub async fn count_tokens(
                 &request_id,
                 Some(&err),
             );
-            let snap = state.snapshot.load();
-            let metric_model = crate::usage_attr::metric_model_label(&snap, &model_name);
+            let metric_model = crate::usage_attr::metric_model_label(&snapshot, &model_name);
             crate::request_metrics::record(
                 &state,
                 "/v1/messages/count_tokens",
@@ -170,20 +174,19 @@ struct CountTokensSuccess {
 
 async fn dispatch(
     state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
     auth: &AuthenticatedKey,
     body: &Value,
     request_id: &str,
     client: &ClientContext,
 ) -> Result<CountTokensSuccess, ProxyError> {
-    let snapshot = state.snapshot.load();
-
     let model_name = body
         .get("model")
         .and_then(|v| v.as_str())
         .ok_or_else(|| ProxyError::InvalidRequest("`model` field missing".into()))?
         .to_string();
 
-    let model_entry = crate::model_resolve::resolve_model(&snapshot, &model_name)
+    let model_entry = crate::model_resolve::resolve_model(snapshot, &model_name)
         .ok_or_else(|| ProxyError::ModelNotFound(model_name.clone()))?;
 
     if !auth.key().can_access(&model_name) {
@@ -195,7 +198,7 @@ async fn dispatch(
 
     let model_rl =
         crate::quota::ModelRateLimit::from_model(&model_name, &model_entry.id, &model_entry.value);
-    let _reservation = crate::quota::enforce(state, auth, Some(&model_rl)).await?;
+    let _reservation = crate::quota::enforce(state, snapshot, auth, Some(&model_rl)).await?;
 
     // Resolve the attempt list (routing-aware). count_tokens is
     // Anthropic-only, so we attempt the group's Anthropic targets in
@@ -203,7 +206,7 @@ async fn dispatch(
     let attempt_models = crate::routing::resolve_attempt_models(
         &state.routing,
         &state.runtime_status,
-        &snapshot,
+        snapshot,
         &model_name,
         &model_entry.id,
         &model_entry.value,
@@ -246,7 +249,7 @@ async fn dispatch(
         // count_tokens has no upstream equivalent outside the Anthropic
         // protocol; skip foreign targets in a mixed group rather than
         // dispatching to an upstream that would 404.
-        if !crate::dispatch::speaks_anthropic(&snapshot, &target.model) {
+        if !crate::dispatch::speaks_anthropic(snapshot, &target.model) {
             continue;
         }
         any_anthropic = true;
@@ -257,6 +260,7 @@ async fn dispatch(
         // the drop at scope end releases the concurrency slot.
         let _member_reservation = match crate::quota::reserve_routing_target(
             state,
+            snapshot,
             auth,
             is_routing_request,
             &target.model.display_name,
@@ -283,7 +287,7 @@ async fn dispatch(
         // target that can actually serve the request.
         let has_usable_fallback = attempt_models[target_idx + 1..]
             .iter()
-            .any(|t| crate::dispatch::speaks_anthropic(&snapshot, &t.model));
+            .any(|t| crate::dispatch::speaks_anthropic(snapshot, &t.model));
         let budget = crate::routing::effective_retries(
             &target.model,
             model_entry.value.routing.as_ref(),
@@ -300,7 +304,7 @@ async fn dispatch(
             }
             match count_tokens_to_target(
                 state,
-                &snapshot,
+                snapshot,
                 body,
                 &target.model,
                 &target.id,

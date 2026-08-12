@@ -32,7 +32,7 @@ use crate::chat::sanitize_tag;
 use crate::client_ip::ClientContext;
 use crate::error::ProxyError;
 use crate::state::ProxyState;
-use crate::usage_attr::{provider_telemetry_tags, total_tokens_with_cache};
+use crate::usage_attr::{total_tokens_with_cache, ResolvedPk};
 
 /// Per-request payload from a successful dispatch — carries the
 /// response + provider label + the bits of usage data needed for
@@ -211,8 +211,11 @@ pub async fn responses(
     // Filled by `dispatch` with monitor-mode guardrail observations
     // (AISIX-Cloud#562), same lifecycle as `redaction_counts`.
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
+    // One snapshot for the whole request (#941) — see `embeddings`.
+    let snapshot = state.snapshot.load();
     match dispatch(
         &state,
+        &snapshot,
         &auth,
         &mut body,
         &request_id,
@@ -248,6 +251,9 @@ pub async fn responses(
                 &success.routing,
                 None,
             );
+            // ONE ProviderKey lookup for both the metric emit and the
+            // winner's usage event below (#941).
+            let pk = ResolvedPk::resolve(&snapshot, &success.provider_key_id);
             crate::request_metrics::record(
                 &state,
                 "/v1/responses",
@@ -256,7 +262,7 @@ pub async fn responses(
                     provider: &success.provider,
                     model: &model_name,
                     upstream_model: &success.upstream_model,
-                    provider_key_id: &success.provider_key_id,
+                    pk: pk.labels(),
                     stream: stream_requested,
                     is_fallback: success.routing.fallback_count() > 0,
                 },
@@ -267,6 +273,7 @@ pub async fn responses(
             // preceded the winner (non-streaming failover).
             emit_failed_attempts(
                 &state,
+                &snapshot,
                 &request_id,
                 &model_name,
                 &api_key_id,
@@ -322,11 +329,12 @@ pub async fn responses(
                         .unwrap_or(elapsed);
                     emit_usage_event(
                         &state,
+                        &snapshot,
+                        &pk,
                         &request_id,
                         &success.model_id,
                         &model_name,
                         &api_key_id,
-                        &success.provider_key_id,
                         &success.provider,
                         &success.upstream_model,
                         status,
@@ -357,8 +365,7 @@ pub async fn responses(
                 &routing,
                 Some(&err),
             );
-            let snap = state.snapshot.load();
-            let metric_model = crate::usage_attr::metric_model_label(&snap, &model_name);
+            let metric_model = crate::usage_attr::metric_model_label(&snapshot, &model_name);
             // The failed request counts on the detailed families too, so a
             // success rate over /v1/responses has the failures in its
             // denominator. Provider / upstream / provider-key never
@@ -396,7 +403,8 @@ pub async fn responses(
                 None
             } else {
                 content_capture_cap(
-                    snap.observability_exporters
+                    snapshot
+                        .observability_exporters
                         .entries()
                         .iter()
                         .map(|e| &e.value),
@@ -420,6 +428,7 @@ pub async fn responses(
             // the dashboard's Logs tab surfaces each failed upstream try.
             emit_failed_attempts(
                 &state,
+                &snapshot,
                 &request_id,
                 &model_name,
                 &api_key_id,
@@ -434,6 +443,7 @@ pub async fn responses(
             if routing.attempts.is_empty() {
                 emit_zero_token_event(
                     &state,
+                    &snapshot,
                     &request_id,
                     "",
                     &model_name,
@@ -462,6 +472,7 @@ pub async fn responses(
 #[allow(clippy::too_many_arguments)]
 async fn dispatch(
     state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
     auth: &AuthenticatedKey,
     // `&mut` so mask-action PII guardrails (#932) can rewrite the request
     // text in place before it reaches the upstream.
@@ -481,15 +492,13 @@ async fn dispatch(
     // same lifecycle as `redactions_out`.
     monitor_hits_out: &mut Vec<aisix_core::GuardrailMonitorHit>,
 ) -> Result<ResponseDispatchSuccess, ResponsesDispatchError> {
-    let snapshot = state.snapshot.load();
-
     let model_name = body
         .get("model")
         .and_then(|v| v.as_str())
         .ok_or_else(|| ProxyError::InvalidRequest("`model` field missing".into()))?
         .to_string();
 
-    let model_entry = crate::model_resolve::resolve_model(&snapshot, &model_name)
+    let model_entry = crate::model_resolve::resolve_model(snapshot, &model_name)
         .ok_or_else(|| ProxyError::ModelNotFound(model_name.clone()))?;
 
     if !auth.key().can_access(&model_name) {
@@ -583,7 +592,8 @@ async fn dispatch(
     // `Option` so the winning streaming attempt can `take()` the reservation
     // and carry it into the end-of-stream guard (#688); non-streaming / failed
     // attempts leave it in place for the post-dispatch commit or a retry.
-    let mut reservation = Some(crate::quota::enforce(state, auth, Some(&model_rl)).await?);
+    let mut reservation =
+        Some(crate::quota::enforce(state, snapshot, auth, Some(&model_rl)).await?);
 
     // Resolve the attempt list (routing-aware). A Model Group walks its
     // targets in order; a direct model resolves to itself (#471). OpenAI
@@ -593,7 +603,7 @@ async fn dispatch(
     let attempt_models = crate::routing::resolve_attempt_models(
         &state.routing,
         &state.runtime_status,
-        &snapshot,
+        snapshot,
         &model_name,
         &model_entry.id,
         &model_entry.value,
@@ -692,6 +702,7 @@ async fn dispatch(
             // reset mid-loop).
             let mut member_reservation = match crate::quota::reserve_routing_target(
                 state,
+                snapshot,
                 auth,
                 is_routing_request,
                 &target.model.display_name,
@@ -721,7 +732,7 @@ async fn dispatch(
             let result = if target.model.provider.as_deref() == Some("openai") {
                 responses_to_target(
                     state,
-                    &snapshot,
+                    snapshot,
                     body,
                     &target.model,
                     &target.id,
@@ -743,7 +754,7 @@ async fn dispatch(
             } else {
                 responses_cross_provider_to_target(
                     state,
-                    &snapshot,
+                    snapshot,
                     body,
                     &target.model,
                     &target.id,
@@ -1538,13 +1549,19 @@ async fn responses_to_target(
                 // with the input-side hits (AISIX-Cloud#1010).
                 let mut monitor_hits = input_monitor_hits.clone();
                 monitor_hits.extend(output_hits);
+                // A stream can outlive several config generations, so the
+                // end-of-stream emit reads a FRESH snapshot rather than the
+                // one the request started on (#941).
+                let snap_c = state_c.snapshot.load();
+                let pk_c = ResolvedPk::resolve(&snap_c, &provider_key_id_c);
                 emit_usage_event(
                     &state_c,
+                    &snap_c,
+                    &pk_c,
                     &request_id_c,
                     &model_id_c,
                     &requested_model_c,
                     &api_key_id_c,
-                    &provider_key_id_c,
                     &provider_c,
                     &upstream_model_c,
                     // A stream the consumer abandoned mid-flight is reported
@@ -2023,13 +2040,19 @@ async fn responses_cross_provider_to_target(
                     },
                     started.elapsed(),
                 );
+                // A stream can outlive several config generations, so the
+                // end-of-stream emit reads a FRESH snapshot rather than the
+                // one the request started on (#941).
+                let snap_c = state_c.snapshot.load();
+                let pk_c = ResolvedPk::resolve(&snap_c, &provider_key_id_c);
                 emit_usage_event(
                     &state_c,
+                    &snap_c,
+                    &pk_c,
                     &request_id_c,
                     &model_id_c,
                     &requested_model_c,
                     &api_key_id_c,
-                    &provider_key_id_c,
                     &provider_c,
                     &upstream_model_c,
                     status,
@@ -2915,11 +2938,19 @@ fn apply_passthrough_headers(
 #[allow(clippy::too_many_arguments)]
 fn emit_usage_event(
     state: &ProxyState,
+    // The request's snapshot, resolved by the caller (#941). The row
+    // lookup stays here because each event names its OWN attempt's key,
+    // but it is now ONE lookup feeding both the wire attribution tags and
+    // the `provider_key_name` metric label.
+    snap: &aisix_core::AisixSnapshot,
+    // Resolved by the caller so the winning attempt's row is read ONCE for
+    // both this event and the handler's `record` (#941 audit L2). The
+    // stream-end callers resolve their own against a fresh snapshot.
+    pk: &ResolvedPk<'_>,
     request_id: &str,
     model_id: &str,
     requested_model: &str,
     api_key_id: &str,
-    provider_key_id: &str,
     // Metric labels the UsageEvent has no field for (AISIX-Cloud#1234
     // follow-up): the wire struct is the CP contract, so they ride
     // alongside rather than in it.
@@ -2941,8 +2972,7 @@ fn emit_usage_event(
     // (AISIX-Cloud#947). Forwarded only to `fan_out`, never to the CP sink.
     content: Option<&CapturedContent>,
 ) {
-    let snap = state.snapshot.load();
-    let tags = provider_telemetry_tags(&snap, provider_key_id);
+    let tags = pk.telemetry_tags();
     let mut event = UsageEvent {
         request_id: request_id.to_string(),
         occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
@@ -2983,7 +3013,7 @@ fn emit_usage_event(
     };
     crate::usage_attr::apply_jwt_identity(&mut event, client.jwt.as_ref());
     state.usage_sink.try_emit("responses", event.clone());
-    let exporters = snap.observability_exporters.entries();
+    let exporters = crate::usage_attr::live_exporters(state, snap);
     state
         .otlp_fan_out
         .fan_out(&event, content, exporters.iter().map(|e| &e.value));
@@ -3003,7 +3033,7 @@ fn emit_usage_event(
         usage.cache_creation_tokens,
         usage.cache_read_tokens,
     );
-    let owned_caller = crate::request_metrics::Caller::from_api_key_id(&snap, api_key_id);
+    let owned_caller = crate::request_metrics::Caller::from_api_key_id(snap, api_key_id);
     crate::request_metrics::record_usage(
         state,
         "/v1/responses",
@@ -3012,7 +3042,7 @@ fn emit_usage_event(
             provider,
             model: requested_model,
             upstream_model,
-            provider_key_id,
+            pk: pk.labels(),
             ..Default::default()
         },
         crate::request_metrics::Tokens {
@@ -3030,6 +3060,7 @@ fn emit_usage_event(
 #[allow(clippy::too_many_arguments)]
 fn emit_zero_token_event(
     state: &ProxyState,
+    snap: &aisix_core::AisixSnapshot,
     request_id: &str,
     model_id: &str,
     requested_model: &str,
@@ -3049,8 +3080,7 @@ fn emit_zero_token_event(
     // requests. Forwarded only to `fan_out`, never to the CP sink.
     content: Option<CapturedContent>,
 ) {
-    let snap = state.snapshot.load();
-    let tags = provider_telemetry_tags(&snap, provider_key_id);
+    let tags = ResolvedPk::resolve(snap, provider_key_id).telemetry_tags();
     let mut event = UsageEvent {
         request_id: request_id.to_string(),
         occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
@@ -3078,7 +3108,7 @@ fn emit_zero_token_event(
     };
     crate::usage_attr::apply_jwt_identity(&mut event, client.jwt.as_ref());
     state.usage_sink.try_emit("responses", event.clone());
-    let exporters = snap.observability_exporters.entries();
+    let exporters = crate::usage_attr::live_exporters(state, snap);
     state
         .otlp_fan_out
         .fan_out(&event, content.as_ref(), exporters.iter().map(|e| &e.value));
@@ -3089,6 +3119,7 @@ fn emit_zero_token_event(
 #[allow(clippy::too_many_arguments)]
 fn emit_failed_attempts(
     state: &ProxyState,
+    snap: &aisix_core::AisixSnapshot,
     request_id: &str,
     requested_model: &str,
     api_key_id: &str,
@@ -3114,6 +3145,7 @@ fn emit_failed_attempts(
         };
         emit_zero_token_event(
             state,
+            snap,
             request_id,
             // Each failed attempt records the TARGET it actually hit
             // (AISIX-Cloud#790), not the group it was resolved from.
