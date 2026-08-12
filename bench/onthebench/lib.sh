@@ -380,16 +380,23 @@ flamegraph_point() { # flamegraph_point <conc> <title>  (0-delay mock running)
         >> "$OUT/perf.log" 2>&1 || echo "WARNING: perf record failed" >&2
     wait "$load_bg" || true
     # Rendering must never kill the measurement: perf.data is kept on any
-    # failure so the SVG can be produced off-rig.
+    # failure so the SVG can be produced off-rig. Collapse and render are
+    # separate steps because the symbolization check reads the folded file:
+    # a capture that collapsed but failed to render still has a share worth
+    # reporting, and gating the check on the SVG would lose exactly the
+    # diagnostic that explains why the capture is worth nothing.
     if [ -s "$OUT/perf.data" ]; then
         if perf script -i "$OUT/perf.data" 2>> "$OUT/perf.log" |
-               inferno-collapse-perf > "$OUT/flamegraph-c$conc.folded" 2>> "$OUT/perf.log" &&
-           inferno-flamegraph --title "$title" \
-               < "$OUT/flamegraph-c$conc.folded" > "$OUT/flamegraph-c$conc.svg" 2>> "$OUT/perf.log"; then
+               inferno-collapse-perf > "$OUT/flamegraph-c$conc.folded" 2>> "$OUT/perf.log"; then
             check_symbolization "$OUT/flamegraph-c$conc.folded"
-            rm -f "$OUT/perf.data"
+            if inferno-flamegraph --title "$title" \
+                   < "$OUT/flamegraph-c$conc.folded" > "$OUT/flamegraph-c$conc.svg" 2>> "$OUT/perf.log"; then
+                rm -f "$OUT/perf.data"
+            else
+                echo "WARNING: flamegraph rendering failed; perf.data kept" >&2
+            fi
         else
-            echo "WARNING: flamegraph rendering failed; perf.data kept" >&2
+            echo "WARNING: perf script or collapse failed; perf.data kept" >&2
         fi
     fi
 }
