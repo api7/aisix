@@ -324,8 +324,19 @@ impl HttpBridge {
     /// A registered URL that is already at the origin yields the origin
     /// candidates alone — the two bases coincide and probing twice is waste.
     fn agent_card_urls(&self) -> Result<Vec<reqwest::Url>, A2aError> {
-        let base = reqwest::Url::parse(&self.upstream.url)
-            .map_err(|e| A2aError::Connect(format!("invalid upstream url: {e}")))?;
+        // The same parse the POST path uses, so card discovery and the
+        // JSON-RPC call can never disagree about the agent's endpoint.
+        let base = match &self.endpoint {
+            aisix_gateway::url_cache::EndpointUrl::Parsed(url) => url.clone(),
+            aisix_gateway::url_cache::EndpointUrl::Unparsed(raw) => {
+                // `Unparsed` means the parse already failed; re-run it
+                // only to render the same message this returned before.
+                let cause = reqwest::Url::parse(raw)
+                    .err()
+                    .map_or_else(|| "not a valid URL".to_string(), |e| e.to_string());
+                return Err(A2aError::Connect(format!("invalid upstream url: {cause}")));
+            }
+        };
         let prefix = base.path().trim_end_matches('/').to_string();
         let mut urls = Vec::with_capacity(AGENT_CARD_PATHS.len() * 2);
         for path in AGENT_CARD_PATHS {

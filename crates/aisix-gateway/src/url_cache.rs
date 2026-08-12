@@ -134,14 +134,19 @@ pub fn cached_model_endpoint_url<E>(
         // (endpoint, model) pair. Same URL, uncached.
         return Ok(parse_or_raw(build()?));
     }
-    ROW_KEY.with(|buf| {
-        let mut buf = buf.borrow_mut();
-        buf.clear();
-        buf.push_str(endpoint);
-        buf.push(KEY_SEP);
-        buf.push_str(upstream_model);
-        resolve(&rows, &buf, fingerprint, build)
-    })
+    // Taken out of the cell rather than borrowed across `resolve`: a
+    // future `build` closure that reaches back into this cache would
+    // otherwise panic on the re-borrow, in the request path. Taking
+    // leaves an empty `String` behind, so a re-entrant call allocates
+    // its own buffer and this one is put back afterwards.
+    let mut buf = ROW_KEY.with(|cell| cell.take());
+    buf.clear();
+    buf.push_str(endpoint);
+    buf.push(KEY_SEP);
+    buf.push_str(upstream_model);
+    let resolved = resolve(&rows, &buf, fingerprint, build);
+    ROW_KEY.with(|cell| cell.replace(buf));
+    resolved
 }
 
 thread_local! {
@@ -240,8 +245,17 @@ fn resolve<E>(
     }
     // Miss or stale row. Bound this resource's rows here, where no guard
     // is held and where only a row transition (not a hit) pays `len()`.
-    if rows.len() > MAX_ROWS_PER_RESOURCE {
-        rows.clear();
+    //
+    // At the cap, serve this row uncached rather than evicting: a
+    // configuration that sits above the cap would otherwise clear every
+    // warm row each time a new one is asked for, so the next round
+    // rebuilds them all and clears again — a permanent 100% miss rate,
+    // plus a `len()` shard walk on every request. That is the exact
+    // failure this cache exists to remove, and it would be worse than
+    // not caching at all. Refusing the new row instead keeps the rows
+    // that are already warm, bounded and monotonic.
+    if rows.len() >= MAX_ROWS_PER_RESOURCE && !rows.contains_key(row) {
+        return Ok(parse_or_raw(build()?));
     }
     match rows.entry(Box::from(row)) {
         dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
@@ -537,12 +551,77 @@ mod tests {
         assert!(matches!(ok, EndpointUrl::Parsed(_)));
     }
 
-    /// One resource's rows cannot grow without bound: a key configured
-    /// with more models than the cap resets rather than accumulating.
+    /// A dispatch site that builds its URL inline and posts the string
+    /// re-parses it on every request — the cost this module exists to
+    /// remove — and nothing else notices: the request succeeds, the
+    /// tests pass, and the site is simply absent from the cache.
+    ///
+    /// The bridges are a family, and #945 shipped with three of them
+    /// unwired for exactly this reason. Posting a `url` variable is the
+    /// shape that regresses, so it is the shape this refuses.
     #[test]
-    fn rows_for_one_resource_are_bounded() {
+    fn no_dispatch_site_posts_an_unparsed_url_variable() {
+        fn rust_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    if path.file_name().is_some_and(|n| n == "target") {
+                        continue;
+                    }
+                    rust_sources(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+
+        let crates_dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/.."));
+        let mut files = Vec::new();
+        rust_sources(crates_dir, &mut files);
+        let mut offenders = Vec::new();
+        for file in files {
+            let path = file.to_string_lossy().replace('\\', "/");
+            if !(path.contains("/aisix-provider-") || path.contains("/aisix-proxy/")) {
+                continue;
+            }
+            let src = std::fs::read_to_string(&file).expect("read source");
+            let production = src
+                .split("\n#[cfg(test)]\nmod ")
+                .next()
+                .expect("production half");
+            for (n, line) in production.lines().enumerate() {
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                if line.contains(".post(&url)") || line.contains(".post(url)") {
+                    offenders.push(format!("{}:{}", file.display(), n + 1));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "these dispatch on a URL string, so reqwest re-parses it on \
+             every request; resolve it through `url_cache` and post it \
+             with `EndpointUrl::post_on`:\n{}",
+            offenders.join("\n"),
+        );
+    }
+
+    /// One resource's rows cannot grow without bound — and past the cap
+    /// the rows that are already warm must keep serving.
+    ///
+    /// Evicting instead (clearing the map to make room) turns a
+    /// configuration above the cap into a permanent 100% miss rate: each
+    /// new row wipes the warm ones, the next round rebuilds them all, and
+    /// the round after that wipes them again. That is worse than not
+    /// caching, so the row past the cap is served uncached instead.
+    #[test]
+    fn rows_past_the_cap_are_served_uncached_and_do_not_evict_warm_rows() {
         let n = AtomicUsize::new(0);
-        for i in 0..(MAX_ROWS_PER_RESOURCE + 2) {
+        for i in 0..MAX_ROWS_PER_RESOURCE {
             cached_model_endpoint_url(
                 "pk-bound",
                 "test/generate",
@@ -553,10 +632,40 @@ mod tests {
             .unwrap();
         }
         let rows = rows_for("pk-bound").expect("rows");
-        assert!(
-            rows.len() <= MAX_ROWS_PER_RESOURCE,
-            "rows grew to {} past the {MAX_ROWS_PER_RESOURCE} cap",
+        assert_eq!(rows.len(), MAX_ROWS_PER_RESOURCE);
+        let builds_at_cap = n.load(Ordering::Relaxed);
+
+        // Rows past the cap build every time…
+        for _ in 0..3 {
+            cached_model_endpoint_url(
+                "pk-bound",
+                "test/generate",
+                "one-model-too-many",
+                &["https://x.example.com"],
+                build_counted(&n, "https://x.example.com/m"),
+            )
+            .unwrap();
+        }
+        assert_eq!(n.load(Ordering::Relaxed), builds_at_cap + 3);
+        assert_eq!(
             rows.len(),
+            MAX_ROWS_PER_RESOURCE,
+            "the cap must hold without evicting",
+        );
+
+        // …and the warm rows are still warm.
+        cached_model_endpoint_url(
+            "pk-bound",
+            "test/generate",
+            "model-0",
+            &["https://x.example.com"],
+            build_counted(&n, "https://x.example.com/m"),
+        )
+        .unwrap();
+        assert_eq!(
+            n.load(Ordering::Relaxed),
+            builds_at_cap + 3,
+            "a warm row was evicted to make room for one past the cap",
         );
     }
 }

@@ -1313,6 +1313,92 @@ mod tests {
         )
     }
 
+    fn model_for_deployment(deployment: &str) -> Arc<Model> {
+        Arc::new(
+            serde_json::from_value(serde_json::json!({
+                "display_name": "my-azure-gpt4",
+                "provider": "openai",
+                "model_name": deployment,
+                "provider_key_id": "11111111-1111-1111-1111-111111111111",
+            }))
+            .unwrap(),
+        )
+    }
+
+    /// One Provider Key fronting two deployments. The URL embeds the
+    /// deployment name, so the endpoint URL cache has to hold a row per
+    /// deployment: keying it by Provider Key alone makes each deployment
+    /// invalidate the previous one's row — every request a miss, plus a
+    /// window in which a stale row answers with the *other* deployment's
+    /// URL.
+    ///
+    /// Deliberately built without `with_url_override`: that seam bypasses
+    /// the cache, so a test using it proves nothing about this. The
+    /// wiremock URI reaches the same code through
+    /// `AzureUpstreamRef::resolve`'s verbatim-override branch.
+    #[tokio::test]
+    async fn url_cache_holds_a_row_per_deployment() {
+        let server = MockServer::start().await;
+        for deployment in ["gpt4o-prod", "gpt4o-mini"] {
+            Mock::given(method("POST"))
+                .and(path(format!(
+                    "/openai/deployments/{deployment}/chat/completions"
+                )))
+                .and(query_param("api-version", "2024-10-21"))
+                .respond_with(CapturingResponder::default())
+                .expect(3)
+                .mount(&server)
+                .await;
+        }
+
+        let bridge = AzureOpenAiBridge::new();
+        let req = ChatFormat::new("my-azure-gpt4", vec![ChatMessage::user("hi")]);
+        for _ in 0..3 {
+            for deployment in ["gpt4o-prod", "gpt4o-mini"] {
+                let ctx = BridgeContext::new(
+                    "req-azure-1",
+                    model_for_deployment(deployment),
+                    sample_pk(Some(&server.uri())),
+                )
+                .with_resource_ids("m-1", "pk-azure-rows");
+                bridge.chat(&req, &ctx).await.unwrap();
+            }
+        }
+        // Each `.expect(3)` is verified when the server drops; a row
+        // keyed without the deployment cross-serves and fails both.
+    }
+
+    /// An edited `api_base` has to reach the deployment-keyed rows: a
+    /// cached URL that outlives the edit keeps sending the key's
+    /// credential to the host the operator just re-pointed away from.
+    #[tokio::test]
+    async fn url_cache_follows_an_api_base_edit_for_the_same_key_id() {
+        async fn mount(server: &MockServer) {
+            Mock::given(method("POST"))
+                .and(path("/openai/deployments/gpt4o-prod/chat/completions"))
+                .respond_with(CapturingResponder::default())
+                .expect(1)
+                .mount(server)
+                .await;
+        }
+        let first = MockServer::start().await;
+        let second = MockServer::start().await;
+        mount(&first).await;
+        mount(&second).await;
+
+        let bridge = AzureOpenAiBridge::new();
+        let req = ChatFormat::new("my-azure-gpt4", vec![ChatMessage::user("hi")]);
+        for host in [&first, &second] {
+            let ctx = BridgeContext::new(
+                "req-azure-1",
+                model_for_deployment("gpt4o-prod"),
+                sample_pk(Some(&host.uri())),
+            )
+            .with_resource_ids("m-1", "pk-azure-repoint");
+            bridge.chat(&req, &ctx).await.unwrap();
+        }
+    }
+
     #[test]
     fn build_request_headers_uses_api_key_not_bearer() {
         // Critical Azure-vs-OpenAI distinction: the auth header is

@@ -186,6 +186,23 @@ impl VertexBridge {
     /// operator sees an actionable message instead of a silent
     /// fall-through-to-canonical (which is what the original #390 bug
     /// was — exactly what we don't want to bring back).
+    /// The id this request's endpoint URLs are cached under, or `""` to
+    /// bypass the cache.
+    ///
+    /// The test-only `api_base_override` shadows `provider_key.api_base`
+    /// inside [`Self::resolve_api_base`] without being one of the
+    /// fingerprint inputs, so a row built under one override could answer
+    /// under another — a wiremock port belonging to a server an earlier
+    /// test already dropped. Bypassing keeps the seam invisible to the
+    /// cache, the way the Azure bridge's URL override does.
+    fn url_cache_key<'a>(&self, ctx: &'a BridgeContext) -> &'a str {
+        #[cfg(test)]
+        if self.api_base_override.is_some() {
+            return "";
+        }
+        &ctx.provider_key_id
+    }
+
     fn resolve_api_base(
         &self,
         region: &str,
@@ -714,7 +731,7 @@ impl Bridge for VertexBridge {
         validate_url_token("upstream_id", upstream_id)?;
 
         let url = aisix_gateway::url_cache::cached_model_endpoint_url(
-            &ctx.provider_key_id,
+            self.url_cache_key(ctx),
             "vertex/google-predict",
             upstream_id,
             &[
@@ -839,7 +856,7 @@ impl VertexBridge {
         validate_url_token("upstream_id", upstream_id)?;
 
         let url = aisix_gateway::url_cache::cached_model_endpoint_url(
-            &ctx.provider_key_id,
+            self.url_cache_key(ctx),
             "vertex/gemini-generate",
             upstream_id,
             &[
@@ -945,7 +962,7 @@ impl VertexBridge {
         validate_url_token("upstream_id", upstream_id)?;
 
         let url = aisix_gateway::url_cache::cached_model_endpoint_url(
-            &ctx.provider_key_id,
+            self.url_cache_key(ctx),
             "vertex/anthropic-rawpredict",
             upstream_id,
             &[
@@ -1042,7 +1059,7 @@ impl VertexBridge {
         validate_url_token("upstream_id", upstream_id)?;
 
         let url = aisix_gateway::url_cache::cached_model_endpoint_url(
-            &ctx.provider_key_id,
+            self.url_cache_key(ctx),
             "vertex/anthropic-stream-rawpredict",
             upstream_id,
             &[
@@ -1185,7 +1202,7 @@ impl VertexBridge {
         validate_url_token("region", &creds.region)?;
 
         let url = aisix_gateway::url_cache::cached_endpoint_url(
-            &ctx.provider_key_id,
+            self.url_cache_key(ctx),
             "vertex/openai-shim",
             &[
                 ctx.provider_key.api_base.as_deref().unwrap_or(""),
@@ -1246,7 +1263,7 @@ impl VertexBridge {
         validate_url_token("region", &creds.region)?;
 
         let url = aisix_gateway::url_cache::cached_endpoint_url(
-            &ctx.provider_key_id,
+            self.url_cache_key(ctx),
             "vertex/openai-shim",
             &[
                 ctx.provider_key.api_base.as_deref().unwrap_or(""),
@@ -1377,7 +1394,7 @@ impl VertexBridge {
             ))
         })?;
         let url = aisix_gateway::url_cache::cached_model_endpoint_url(
-            &ctx.provider_key_id,
+            self.url_cache_key(ctx),
             "vertex/partner-rawpredict",
             upstream_id,
             &[
@@ -1457,7 +1474,7 @@ impl VertexBridge {
             ))
         })?;
         let url = aisix_gateway::url_cache::cached_model_endpoint_url(
-            &ctx.provider_key_id,
+            self.url_cache_key(ctx),
             "vertex/partner-stream-rawpredict",
             upstream_id,
             &[
@@ -1571,7 +1588,7 @@ impl VertexBridge {
         validate_url_token("upstream_id", upstream_id)?;
 
         let url = aisix_gateway::url_cache::cached_model_endpoint_url(
-            &ctx.provider_key_id,
+            self.url_cache_key(ctx),
             "vertex/gemini-stream-generate",
             upstream_id,
             &[
