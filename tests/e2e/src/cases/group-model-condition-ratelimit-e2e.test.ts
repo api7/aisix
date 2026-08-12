@@ -103,6 +103,7 @@ describe("group-referencing model conditions e2e (AISIX-Cloud#1267)", () => {
   let memberAId = "";
   let groupMainId = "";
   let groupNegId = "";
+  let groupStreamId = "";
 
   async function newUpstream(body: string): Promise<OpenAiUpstream> {
     const u = await startOpenAiUpstream({ nonStreamBody: chatBody(body) });
@@ -159,6 +160,45 @@ describe("group-referencing model conditions e2e (AISIX-Cloud#1267)", () => {
         routing: { strategy: "failover", targets: [{ model: "m-1267-c" }] },
       })
     ).id;
+    // The streaming case gets its own member + group: the mock serves
+    // SSE or JSON per FIXTURE (not per request), so the shared members
+    // must stay non-streaming while this one answers real SSE.
+    const sse = await startOpenAiUpstream({
+      streamEvents: [
+        JSON.stringify({
+          id: "mock-1267-s",
+          object: "chat.completion.chunk",
+          model: "gpt-4o-mini",
+          choices: [{ index: 0, delta: { role: "assistant" } }],
+        }),
+        JSON.stringify({
+          id: "mock-1267-s",
+          object: "chat.completion.chunk",
+          model: "gpt-4o-mini",
+          choices: [{ index: 0, delta: { content: "served-s" }, finish_reason: "stop" }],
+          usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 },
+        }),
+        "[DONE]",
+      ],
+    });
+    upstreams.push(sse);
+    const sPk = await seed.createProviderKey({
+      display_name: "m-1267-s-pk",
+      secret: "sk-openai-mock",
+      api_base: `${sse.baseUrl}/v1`,
+    });
+    await seed.createModel({
+      display_name: "m-1267-s",
+      provider: "openai",
+      model_name: "gpt-4o-mini",
+      provider_key_id: sPk.id,
+    });
+    groupStreamId = (
+      await seed.createModel({
+        display_name: "grp-1267-stream",
+        routing: { strategy: "failover", targets: [{ model: "m-1267-s" }] },
+      })
+    ).id;
 
     const putPolicy = (id: string, policy: Record<string, unknown>) =>
       etcd!.put(
@@ -210,7 +250,7 @@ describe("group-referencing model conditions e2e (AISIX-Cloud#1267)", () => {
       name: "stream-cap-1267",
       conditions: [
         { dimension: "team", operator: "in", value: [TEAM_STREAM] },
-        { dimension: "model", operator: "in", value: [groupMainId] },
+        { dimension: "model", operator: "in", value: [groupStreamId] },
       ],
       limits: { rpm: 1 },
     });
@@ -274,8 +314,10 @@ describe("group-referencing model conditions e2e (AISIX-Cloud#1267)", () => {
       "m-1267-a",
       "m-1267-b",
       "m-1267-c",
+      "m-1267-s",
       "grp-1267-main",
       "grp-1267-neg",
+      "grp-1267-stream",
       "m-1267-canary",
     ]);
   });
@@ -442,7 +484,7 @@ describe("group-referencing model conditions e2e (AISIX-Cloud#1267)", () => {
     }
     await awaitWindowHeadroom(5);
 
-    const streamRaw = async (): Promise<number> => {
+    const streamRaw = async (): Promise<{ status: number; contentType: string }> => {
       const res = await fetch(`${app!.proxyUrl}/v1/chat/completions`, {
         method: "POST",
         headers: {
@@ -450,18 +492,22 @@ describe("group-referencing model conditions e2e (AISIX-Cloud#1267)", () => {
           "content-type": "application/json",
         },
         body: JSON.stringify({
-          model: "grp-1267-main",
+          model: "grp-1267-stream",
           messages: [{ role: "user", content: "hello" }],
           stream: true,
         }),
       });
       // Drain so the connection finalises before the next call.
       await res.text();
-      return res.status;
+      return { status: res.status, contentType: res.headers.get("content-type") ?? "" };
     };
 
-    expect(await streamRaw()).toBe(200);
-    expect(await streamRaw()).toBe(429);
+    const first = await streamRaw();
+    expect(first.status).toBe(200);
+    // Real SSE, so the streaming loop (not a JSON fallback) held the
+    // per-target reservation.
+    expect(first.contentType).toContain("text/event-stream");
+    expect((await streamRaw()).status).toBe(429);
   });
 
   test("/v1/responses drives the same per-target gate for group-id conditions", async (ctx) => {
