@@ -1044,8 +1044,18 @@ async fn anthropic_passthrough_dispatch(
     // where the customer mistakenly puts `/v1` in the Anthropic
     // api_base (the dashboard placeholder uses the OpenAI form, so
     // this is a copy-paste hazard).
-    let base = crate::dispatch::resolve_base_url(pk_value)?;
-    let url = crate::dispatch::build_anthropic_url(&base, "/messages");
+    let url = aisix_gateway::url_cache::cached_endpoint_url(
+        pk_id,
+        "proxy/messages",
+        (pk_value.api_base.as_deref().unwrap_or(""), ""),
+        || {
+            let base = crate::dispatch::resolve_base_url(pk_value)?;
+            Ok::<_, crate::error::ProxyError>(crate::dispatch::build_anthropic_url(
+                &base,
+                "/messages",
+            ))
+        },
+    )?;
 
     // Check if the request wants streaming.
     let is_stream = body
@@ -1089,7 +1099,7 @@ async fn anthropic_passthrough_dispatch(
     );
 
     let client = crate::http_client::client_for(pk_value.tls.as_ref());
-    let mut req_builder = client.post(&url).headers(headers).json(&body);
+    let mut req_builder = url.post_on(&client).headers(headers).json(&body);
     // #554: non-streaming gets the E2E request timeout via reqwest's
     // request-level timeout. Streaming must NOT use it (it would cap the
     // whole stream); the streaming branch below enforces the per-chunk

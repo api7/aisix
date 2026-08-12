@@ -14,6 +14,7 @@
 //! Error mapping is identical to OpenAi — the `BridgeError` contract from
 //! PR #6 applies verbatim.
 
+use aisix_gateway::url_cache::cached_endpoint_url;
 use aisix_gateway::{
     Bridge, BridgeContext, BridgeError, ChatChunk, ChatChunkStream, ChatFormat, ChatResponse,
     SseDecoder, SseEvent,
@@ -271,7 +272,6 @@ impl Bridge for AnthropicBridge {
         req: &ChatFormat,
         ctx: &BridgeContext,
     ) -> Result<ChatResponse, BridgeError> {
-        let base = resolve_base(ctx)?;
         let key = api_key(ctx)?;
         let upstream = upstream_model(ctx)?;
 
@@ -279,15 +279,23 @@ impl Bridge for AnthropicBridge {
             split_system(req).map_err(|e| BridgeError::InvalidUpstreamConfig(e.to_string()))?;
         let mut body = build_request(req, upstream, system, messages, false);
         maybe_inject_cache_breakpoints(&mut body, ctx);
-        let url = format!("{base}/v1/messages");
+        let url = cached_endpoint_url(
+            &ctx.provider_key_id,
+            "anthropic/messages",
+            (
+                ctx.provider_key.api_base.as_deref().unwrap_or(""),
+                &ctx.provider_key.provider,
+            ),
+            || Ok(format!("{}/v1/messages", resolve_base(ctx)?)),
+        )?;
         let client = self.client_for(ctx);
         let api_version = self.api_version;
         let started = Instant::now();
         let request_id = ctx.request_id.clone();
 
         with_deadline(ctx.deadline, started, async move {
-            let resp = client
-                .post(&url)
+            let resp = url
+                .post_on(&client)
                 .header("x-api-key", key)
                 .header("anthropic-version", api_version)
                 .header(header::CONTENT_TYPE, "application/json")
@@ -316,7 +324,6 @@ impl Bridge for AnthropicBridge {
         req: &ChatFormat,
         ctx: &BridgeContext,
     ) -> Result<ChatChunkStream, BridgeError> {
-        let base = resolve_base(ctx)?;
         let key = api_key(ctx)?;
         let upstream = upstream_model(ctx)?;
 
@@ -324,15 +331,22 @@ impl Bridge for AnthropicBridge {
             split_system(req).map_err(|e| BridgeError::InvalidUpstreamConfig(e.to_string()))?;
         let mut body = build_request(req, upstream, system, messages, true);
         maybe_inject_cache_breakpoints(&mut body, ctx);
-        let url = format!("{base}/v1/messages");
+        let url = cached_endpoint_url(
+            &ctx.provider_key_id,
+            "anthropic/messages",
+            (
+                ctx.provider_key.api_base.as_deref().unwrap_or(""),
+                &ctx.provider_key.provider,
+            ),
+            || Ok(format!("{}/v1/messages", resolve_base(ctx)?)),
+        )?;
         let client = self.client_for(ctx);
         let api_version = self.api_version;
         let started = Instant::now();
         let request_id = ctx.request_id.clone();
 
         let resp = with_deadline(ctx.deadline, started, async move {
-            client
-                .post(&url)
+            url.post_on(&client)
                 .header("x-api-key", key)
                 .header("anthropic-version", api_version)
                 .header(header::CONTENT_TYPE, "application/json")
