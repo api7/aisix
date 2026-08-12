@@ -400,8 +400,18 @@ async fn count_tokens_to_target(
     // `build_anthropic_url` tolerates an api_base with or without `/v1` (the
     // Anthropic dashboard placeholder and copy-pasted full URLs both
     // resolve to `…/v1/messages/count_tokens`).
-    let base = crate::dispatch::resolve_base_url(&pk_entry.value)?;
-    let url = crate::dispatch::build_anthropic_url(&base, "/messages/count_tokens");
+    let url = aisix_gateway::url_cache::cached_endpoint_url(
+        &pk_entry.id,
+        "proxy/messages/count_tokens",
+        (pk_entry.value.api_base.as_deref().unwrap_or(""), ""),
+        || {
+            let base = crate::dispatch::resolve_base_url(&pk_entry.value)?;
+            Ok::<_, crate::error::ProxyError>(crate::dispatch::build_anthropic_url(
+                &base,
+                "/messages/count_tokens",
+            ))
+        },
+    )?;
 
     // Build the outbound HeaderMap explicitly so the PK's
     // `request.default_headers` / `request.forward_client_headers` can
@@ -446,7 +456,7 @@ async fn count_tokens_to_target(
     );
 
     let client = crate::http_client::client_for(pk_entry.value.tls.as_ref());
-    let mut req = client.post(&url).headers(headers).json(&body);
+    let mut req = url.post_on(&client).headers(headers).json(&body);
     // #554: count_tokens is non-streaming; apply the E2E request timeout.
     if let Some(d) = timeouts.request {
         req = req.timeout(d);

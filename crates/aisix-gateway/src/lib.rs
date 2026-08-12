@@ -31,6 +31,7 @@ pub mod sse;
 pub mod upstream_headers;
 pub mod upstream_http;
 pub mod upstream_tls;
+pub mod url_cache;
 
 pub use bridge::{
     capture_in_band_error, capture_upstream_error_http, content_type_is_json, parse_retry_after,

@@ -643,8 +643,27 @@ async fn multipart_dispatch(
     let pk_entry = crate::dispatch::resolve_provider_key(&snapshot, model)?;
     let api_key = crate::dispatch::require_api_key(&pk_entry.value, model)?;
 
-    let base = crate::dispatch::resolve_base_url(&pk_entry.value)?;
-    let url = crate::dispatch::build_openai_url(&base, upstream_path);
+    // Cache key must be `'static`; both callers pass fixed literals.
+    let url_cache_key: &'static str = if upstream_path == "/audio/translations" {
+        "proxy/audio/translations"
+    } else {
+        "proxy/audio/transcriptions"
+    };
+    let url = aisix_gateway::url_cache::cached_endpoint_url(
+        &pk_entry.id,
+        url_cache_key,
+        (
+            pk_entry.value.api_base.as_deref().unwrap_or(""),
+            upstream_path,
+        ),
+        || {
+            let base = crate::dispatch::resolve_base_url(&pk_entry.value)?;
+            Ok::<_, crate::error::ProxyError>(crate::dispatch::build_openai_url(
+                &base,
+                upstream_path,
+            ))
+        },
+    )?;
     let provider_label = provider.to_ascii_lowercase();
     // Static label for retry tracing — this dispatch serves both audio
     // sub-routes, and logging translations under the transcription label
@@ -726,8 +745,9 @@ async fn multipart_dispatch(
     // the same shape in rerank.rs for why `note_failure` stays per attempt.
     let (upstream_headers, body_bytes) =
         match crate::routing::retrying_dispatch(state, model, retry_endpoint_label, || {
-            let mut req = client
-                .post(&url)
+            let mut req = url
+                .clone()
+                .post_on(&client)
                 .headers(headers.clone())
                 .multipart(build_form());
             // #554/#911: audio transcription/translation is non-streaming; apply
@@ -1080,7 +1100,6 @@ async fn speech_dispatch(
     let pk_entry = crate::dispatch::resolve_provider_key(&snapshot, model)?;
     let api_key = crate::dispatch::require_api_key(&pk_entry.value, model)?;
 
-    let base = crate::dispatch::resolve_base_url(&pk_entry.value)?;
     let provider_label = provider.to_ascii_lowercase();
 
     // Rewrite model field.
@@ -1134,7 +1153,18 @@ async fn speech_dispatch(
     );
 
     let client = crate::http_client::client_for(pk_entry.value.tls.as_ref());
-    let speech_url = crate::dispatch::build_openai_url(&base, "/audio/speech");
+    let speech_url = aisix_gateway::url_cache::cached_endpoint_url(
+        &pk_entry.id,
+        "proxy/audio/speech",
+        (pk_entry.value.api_base.as_deref().unwrap_or(""), ""),
+        || {
+            let base = crate::dispatch::resolve_base_url(&pk_entry.value)?;
+            Ok::<_, crate::error::ProxyError>(crate::dispatch::build_openai_url(
+                &base,
+                "/audio/speech",
+            ))
+        },
+    )?;
     let tracker = &state.runtime_status;
     let model_id: &str = &model_entry.id;
     let cooldown_cfg = model.cooldown.as_ref();
@@ -1142,8 +1172,9 @@ async fn speech_dispatch(
     // the same shape in rerank.rs for why `note_failure` stays per attempt.
     let (upstream_headers, body_bytes) =
         match crate::routing::retrying_dispatch(state, model, "/v1/audio/speech", || {
-            let mut req = client
-                .post(speech_url.clone())
+            let mut req = speech_url
+                .clone()
+                .post_on(&client)
                 .headers(headers.clone())
                 .json(&body);
             // #554/#911: speech synthesis is non-streaming; apply the per-model

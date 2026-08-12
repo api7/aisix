@@ -20,6 +20,7 @@
 //! - elapsed deadline → `BridgeError::Timeout { elapsed_ms }`
 
 use aisix_core::{RequestOverrides, ResponseOverrides, StreamDoneMarker};
+use aisix_gateway::url_cache::cached_endpoint_url;
 use aisix_gateway::{
     apply_request_headers, Bridge, BridgeContext, BridgeError, ChatChunk, ChatChunkStream,
     ChatFormat, ChatResponse, EmbeddingRequest, EmbeddingResponse, SseDecoder, SseEvent,
@@ -387,7 +388,6 @@ impl Bridge for OpenAiBridge {
         req: &ChatFormat,
         ctx: &BridgeContext,
     ) -> Result<ChatResponse, BridgeError> {
-        let base = self.resolve_base(ctx)?;
         let key = api_key(ctx)?;
         let upstream = upstream_model(ctx)?;
 
@@ -399,13 +399,21 @@ impl Bridge for OpenAiBridge {
             ctx.provider_key.response.as_ref(),
         )?;
         let headers = build_request_headers(key, &ctx.request_id, false, &ctx.header_ctx())?;
-        let url = format!("{base}/chat/completions");
+        let url = cached_endpoint_url(
+            &ctx.provider_key_id,
+            "openai/chat",
+            (
+                ctx.provider_key.api_base.as_deref().unwrap_or(""),
+                &ctx.provider_key.provider,
+            ),
+            || Ok(format!("{}/chat/completions", self.resolve_base(ctx)?)),
+        )?;
         let client = self.client_for(ctx);
         let started = Instant::now();
 
         with_deadline(ctx.deadline, started, async move {
-            let resp = client
-                .post(&url)
+            let resp = url
+                .post_on(&client)
                 .headers(headers)
                 .json(&body)
                 .send()
@@ -431,7 +439,6 @@ impl Bridge for OpenAiBridge {
         req: &EmbeddingRequest,
         ctx: &BridgeContext,
     ) -> Result<EmbeddingResponse, BridgeError> {
-        let base = self.resolve_base(ctx)?;
         let key = api_key(ctx)?;
         let upstream = upstream_model(ctx)?;
 
@@ -445,12 +452,20 @@ impl Bridge for OpenAiBridge {
             ctx.provider_key.response.as_ref(),
         )?;
         let headers = build_request_headers(key, &ctx.request_id, false, &ctx.header_ctx())?;
-        let url = format!("{base}/embeddings");
+        let url = cached_endpoint_url(
+            &ctx.provider_key_id,
+            "openai/embeddings",
+            (
+                ctx.provider_key.api_base.as_deref().unwrap_or(""),
+                &ctx.provider_key.provider,
+            ),
+            || Ok(format!("{}/embeddings", self.resolve_base(ctx)?)),
+        )?;
         let client = self.client_for(ctx);
         let started = Instant::now();
         with_deadline(ctx.deadline, started, async move {
-            let resp = client
-                .post(&url)
+            let resp = url
+                .post_on(&client)
                 .headers(headers)
                 .json(&body)
                 .send()
@@ -476,7 +491,6 @@ impl Bridge for OpenAiBridge {
         body: &serde_json::Value,
         ctx: &BridgeContext,
     ) -> Result<serde_json::Value, BridgeError> {
-        let base = self.resolve_base(ctx)?;
         let key = api_key(ctx)?;
         let upstream = upstream_model(ctx)?;
 
@@ -497,12 +511,20 @@ impl Bridge for OpenAiBridge {
         )?;
         let headers = build_request_headers(key, &ctx.request_id, false, &ctx.header_ctx())?;
 
-        let url = format!("{base}/completions");
+        let url = cached_endpoint_url(
+            &ctx.provider_key_id,
+            "openai/completions",
+            (
+                ctx.provider_key.api_base.as_deref().unwrap_or(""),
+                &ctx.provider_key.provider,
+            ),
+            || Ok(format!("{}/completions", self.resolve_base(ctx)?)),
+        )?;
         let client = self.client_for(ctx);
         let started = Instant::now();
         with_deadline(ctx.deadline, started, async move {
-            let resp = client
-                .post(&url)
+            let resp = url
+                .post_on(&client)
                 .headers(headers)
                 .json(&outbound)
                 .send()
@@ -526,7 +548,6 @@ impl Bridge for OpenAiBridge {
         body: &serde_json::Value,
         ctx: &BridgeContext,
     ) -> Result<serde_json::Value, BridgeError> {
-        let base = self.resolve_base(ctx)?;
         let key = api_key(ctx)?;
         let upstream = upstream_model(ctx)?;
 
@@ -547,12 +568,20 @@ impl Bridge for OpenAiBridge {
         )?;
         let headers = build_request_headers(key, &ctx.request_id, false, &ctx.header_ctx())?;
 
-        let url = format!("{base}/images/generations");
+        let url = cached_endpoint_url(
+            &ctx.provider_key_id,
+            "openai/images",
+            (
+                ctx.provider_key.api_base.as_deref().unwrap_or(""),
+                &ctx.provider_key.provider,
+            ),
+            || Ok(format!("{}/images/generations", self.resolve_base(ctx)?)),
+        )?;
         let client = self.client_for(ctx);
         let started = Instant::now();
         with_deadline(ctx.deadline, started, async move {
-            let resp = client
-                .post(&url)
+            let resp = url
+                .post_on(&client)
                 .headers(headers)
                 .json(&outbound)
                 .send()
@@ -576,7 +605,6 @@ impl Bridge for OpenAiBridge {
         req: &ChatFormat,
         ctx: &BridgeContext,
     ) -> Result<ChatChunkStream, BridgeError> {
-        let base = self.resolve_base(ctx)?;
         let key = api_key(ctx)?;
         let upstream = upstream_model(ctx)?;
 
@@ -588,13 +616,20 @@ impl Bridge for OpenAiBridge {
             ctx.provider_key.response.as_ref(),
         )?;
         let headers = build_request_headers(key, &ctx.request_id, true, &ctx.header_ctx())?;
-        let url = format!("{base}/chat/completions");
+        let url = cached_endpoint_url(
+            &ctx.provider_key_id,
+            "openai/chat",
+            (
+                ctx.provider_key.api_base.as_deref().unwrap_or(""),
+                &ctx.provider_key.provider,
+            ),
+            || Ok(format!("{}/chat/completions", self.resolve_base(ctx)?)),
+        )?;
         let client = self.client_for(ctx);
         let started = Instant::now();
 
         let resp = with_deadline(ctx.deadline, started, async move {
-            client
-                .post(&url)
+            url.post_on(&client)
                 .headers(headers)
                 .json(&body)
                 .send()
