@@ -88,7 +88,7 @@ fn closes_on_write(resource: &str) -> bool {
 /// `dump-schema` binary build from.
 pub fn resource_root_schema(resource: &str, strict: bool) -> Value {
     let mut schema = match resource {
-        "model" => model_root_schema(),
+        "model" => model_root_schema(strict),
         "api_key" => apikey_root_schema(),
         "provider_key" => provider_key_root_schema(),
         "guardrail" => guardrail_root_schema(),
@@ -329,14 +329,23 @@ fn struct_root_schema<T: schemars::JsonSchema>(nullable_options: bool) -> Value 
 /// Canonical JSON Schema for the `model` resource: the [`Model`] struct plus
 /// the one cross-field invariant `schemars` cannot express
 /// ([`super::model::model_one_of`] — the direct/routing/ensemble XOR).
+/// `strict` picks the write-path variant that additionally forbids the
+/// per-kind dead knobs ([`super::model::model_one_of_strict`]); the
+/// lenient read path keeps the base XOR so stored rows load (and strip)
+/// rather than drop.
 ///
 /// [`Model`]: crate::models::Model
-pub fn model_root_schema() -> Value {
+pub fn model_root_schema(strict: bool) -> Value {
     let mut schema = struct_root_schema::<crate::models::Model>(false);
+    let one_of = if strict {
+        super::model::model_one_of_strict()
+    } else {
+        super::model::model_one_of()
+    };
     schema
         .as_object_mut()
         .expect("model root schema is a JSON object")
-        .insert("oneOf".to_string(), super::model::model_one_of());
+        .insert("oneOf".to_string(), one_of);
     // `OnEmbeddingFailure` is `#[serde(untagged)]` with an object variant
     // (`{ "target": … }`): serde buffers untagged content and silently
     // swallows unknown fields inside it, invisible to both the write

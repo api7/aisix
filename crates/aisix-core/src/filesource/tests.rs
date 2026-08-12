@@ -278,6 +278,38 @@ rate_limit_policies:
 }
 
 #[test]
+fn dead_knob_on_a_group_is_a_declarative_load_error() {
+    // The strict write path (declarative resources file) rejects a knob
+    // the kind never resolves — a silently-dead `cost` on a Model Group
+    // was the #962 class. Stored etcd rows load leniently instead (the
+    // loader strips + reports); a file the operator edits fails fast
+    // with the field named.
+    let file = r#"
+_format_version: "1"
+
+provider_keys:
+  - display_name: pk
+    provider: openai
+    api_key: sk-x
+models:
+  - display_name: gpt-4o
+    provider: openai
+    model_name: gpt-4o
+    provider_key: pk
+  - display_name: balanced
+    routing:
+      targets:
+        - model: gpt-4o
+    cost:
+      input_per_1k: 0.5
+      output_per_1k: 1.5
+"#;
+    let errors = errors_of(load(file, &env_of(&[])));
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].contains("balanced"), "{errors:?}");
+}
+
+#[test]
 fn ids_are_deterministic_across_two_loads() {
     let env = full_env();
     let a = load(FULL_VALID_FILE, &env).unwrap();

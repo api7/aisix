@@ -320,6 +320,37 @@ impl Model {
         self.model_name.as_deref()
     }
 
+    /// Strip the per-kind DEAD knobs from a loaded document, returning
+    /// the stripped field names for the loader's partially-compatible
+    /// report. The strict write path rejects these shapes outright
+    /// ([`model_one_of_strict`]); rows stored before that keep loading —
+    /// minus the field, so no code path can half-honor a knob the shape
+    /// never resolved.
+    pub fn strip_kind_inapplicable(&mut self) -> Vec<&'static str> {
+        let mut stripped = Vec::new();
+        if !(self.is_routing() || self.is_ensemble() || self.is_semantic()) {
+            return stripped;
+        }
+        if self.auto_prompt_caching.take().is_some() {
+            stripped.push("auto_prompt_caching");
+        }
+        if self.cost.take().is_some() {
+            stripped.push("cost");
+        }
+        if (self.is_routing() || self.is_ensemble()) && self.retries.take().is_some() {
+            stripped.push("retries");
+        }
+        if self.is_ensemble() {
+            if self.timeout.take().is_some() {
+                stripped.push("timeout");
+            }
+            if self.stream_timeout.take().is_some() {
+                stripped.push("stream_timeout");
+            }
+        }
+        stripped
+    }
+
     /// This resource's own non-streaming deadline, as one level of the
     /// model → group → `upstream.timeout_ms` resolution performed by the
     /// proxy's `effective_timeouts`. Tri-state: `None` defers to the next
@@ -376,6 +407,57 @@ impl Model {
 /// `oneOf` into the generated schema, so the published schema and the
 /// runtime validator share this single definition.
 pub fn model_one_of() -> Value {
+    model_one_of_variant(false)
+}
+
+/// The write-path variant of [`model_one_of`]: additionally forbids the
+/// per-kind DEAD knobs — fields the runtime never reads on that shape,
+/// which the lenient read path keeps tolerating (loaded rows strip them
+/// with a partially-compatible warning instead of dropping the row; see
+/// [`Model::strip_kind_inapplicable`]). Kind policy (project decision):
+/// generic call knobs (`timeout`/`stream_timeout`/`retries`) resolve
+/// member → group → deployment default wherever a group slot exists;
+/// model-specific knobs (`auto_prompt_caching`, `cost`) are direct-only.
+pub fn model_one_of_strict() -> Value {
+    model_one_of_variant(true)
+}
+
+fn model_one_of_variant(strict: bool) -> Value {
+    let extend = |base: &mut Value, extra: &[&str]| {
+        let list = base["not"]["anyOf"].as_array_mut().expect("anyOf array");
+        for field in extra {
+            list.push(json!({ "required": [field] }));
+        }
+    };
+    let mut variants = model_one_of_base();
+    if strict {
+        let arr = variants.as_array_mut().expect("oneOf array");
+        // routing: the group slot for timeouts is the top-level pair
+        // (api7/aisix#844); retries' group slot is `routing.retries`, so a
+        // top-level value is dead — as are the model-specific knobs.
+        extend(&mut arr[0], &["retries", "auto_prompt_caching", "cost"]);
+        // direct (arr[1]): every knob is live.
+        // ensemble: sub-calls resolve member-level knobs only; the
+        // parent-level deadline is `ensemble.timeout_ms`.
+        extend(
+            &mut arr[2],
+            &[
+                "timeout",
+                "stream_timeout",
+                "retries",
+                "auto_prompt_caching",
+                "cost",
+            ],
+        );
+        // semantic: top-level timeout/stream_timeout/retries ARE the group
+        // slots (no routing block to carry them); the model-specific knobs
+        // stay direct-only.
+        extend(&mut arr[3], &["auto_prompt_caching", "cost"]);
+    }
+    variants
+}
+
+fn model_one_of_base() -> Value {
     json!([
         {
             "required": ["routing"],
@@ -525,6 +607,69 @@ mod tests {
         )
         .unwrap();
         assert_eq!(m.display_name, "x");
+    }
+
+    #[test]
+    fn strip_kind_inapplicable_per_kind() {
+        let load = |v: serde_json::Value| -> Model { serde_json::from_value(v).unwrap() };
+        // Routing parent: model-specific knobs + top-level retries strip;
+        // the group-level timeout pair stays (it IS the group slot).
+        let mut group = load(serde_json::json!({
+            "display_name": "g",
+            "routing": {"targets": [{"model": "m"}]},
+            "retries": 2,
+            "timeout": 1000,
+            "cost": {"input_per_1k": 0.0, "output_per_1k": 0.0},
+            "auto_prompt_caching": {"enabled": true}
+        }));
+        let mut stripped = group.strip_kind_inapplicable();
+        stripped.sort_unstable();
+        assert_eq!(stripped, ["auto_prompt_caching", "cost", "retries"]);
+        assert!(group.retries.is_none() && group.cost.is_none());
+        assert_eq!(group.timeout, Some(1000));
+        // Semantic parent: timeout/retries are the group slots and stay.
+        let mut sem = load(serde_json::json!({
+            "display_name": "s",
+            "semantic": {
+                "embedding_model": "e",
+                "routes": [{"name": "r", "target": "t", "examples": ["x"]}],
+                "default": "d",
+                "match": {"threshold": 0.5}
+            },
+            "retries": 2,
+            "timeout": 1000,
+            "cost": {"input_per_1k": 0.0, "output_per_1k": 0.0}
+        }));
+        assert_eq!(sem.strip_kind_inapplicable(), ["cost"]);
+        assert_eq!(sem.retries, Some(2));
+        assert_eq!(sem.timeout, Some(1000));
+        // Direct: nothing strips.
+        let mut direct = load(serde_json::json!({
+            "display_name": "m",
+            "provider": "openai",
+            "model_name": "gpt-4o",
+            "provider_key_id": "pk-1",
+            "retries": 2,
+            "cost": {"input_per_1k": 0.0, "output_per_1k": 0.0}
+        }));
+        assert!(direct.strip_kind_inapplicable().is_empty());
+        assert_eq!(direct.retries, Some(2));
+        // Ensemble parent: the whole generic set strips (its own
+        // deadline knob is `ensemble.timeout_ms`).
+        let mut ens = load(serde_json::json!({
+            "display_name": "e",
+            "ensemble": {"panel": [{"model": "m"}], "judge": {"model": "j"}},
+            "timeout": 1000,
+            "stream_timeout": 500,
+            "retries": 1,
+            "cost": {"input_per_1k": 0.0, "output_per_1k": 0.0}
+        }));
+        let mut ens_stripped = ens.strip_kind_inapplicable();
+        ens_stripped.sort_unstable();
+        assert_eq!(
+            ens_stripped,
+            ["cost", "retries", "stream_timeout", "timeout"]
+        );
     }
 
     #[test]

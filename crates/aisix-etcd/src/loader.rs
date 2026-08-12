@@ -238,7 +238,8 @@ pub fn build_snapshot(prefix: &str, entries: &[RawEntry]) -> (AisixSnapshot, Bui
 
         match parsed.kind {
             "models" => {
-                if let Some(entry) = validate_and_parse::<Model>(
+                let row_kind = parsed.kind;
+                if let Some(mut entry) = validate_and_parse::<Model>(
                     &raw.key,
                     raw.revision,
                     parsed,
@@ -246,6 +247,23 @@ pub fn build_snapshot(prefix: &str, entries: &[RawEntry]) -> (AisixSnapshot, Bui
                     validate_model_lenient,
                     &mut stats,
                 ) {
+                    // Known-but-kind-inapplicable knobs load stripped and
+                    // report through the same partially-compatible channel
+                    // as unknown fields — the strict write path rejects
+                    // these shapes, stored rows must keep loading.
+                    let stripped = entry.value.strip_kind_inapplicable();
+                    if !stripped.is_empty() {
+                        let fields: Vec<String> = stripped
+                            .iter()
+                            .map(|f| format!("inapplicable:{f}"))
+                            .collect();
+                        warn_partial_compat_deduped(&raw.key, row_kind, &fields);
+                        stats.partial_rows.push(PartialCompatRow {
+                            key: raw.key.clone(),
+                            kind: row_kind.to_string(),
+                            fields,
+                        });
+                    }
                     snapshot.models.insert(entry);
                 }
             }
