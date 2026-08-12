@@ -32,10 +32,13 @@
 //! - the model dimensions (`model` / `model_name`) evaluate against a
 //!   PAIR on a routing/ensemble/semantic dispatch: the dispatched
 //!   target and the caller-addressed parent entry (AISIX-Cloud#1267).
-//!   A leaf is raw-true when either identity satisfies its operator;
-//!   `negate` flips that combined result, so `!(model in [group])`
-//!   excludes every request addressed to the group instead of matching
-//!   all of them;
+//!   Positive operators are raw-true when EITHER identity satisfies
+//!   them (∃); `~=` is raw-true only when BOTH differ (∀ — the two
+//!   identities are distinct strings, so an ∃ reading would be
+//!   vacuously true on every routed request), preserving `a ~= b` ≡
+//!   `!(a == b)`. `negate` flips the combined result, so `!(model in
+//!   [group])` excludes every request addressed to the group instead
+//!   of matching all of them;
 //! - regexes are compiled once per distinct pattern into a process-wide
 //!   cache. Load-time validation guarantees compilability, so a cache
 //!   miss at evaluation time never fails in practice; a pattern that
@@ -473,13 +476,21 @@ fn eval_leaf(leaf: &PolicyCondition, input: &ConditionInput<'_>) -> bool {
         return false;
     };
     // Model dimensions carry a {dispatched target, requested parent}
-    // pair on a routing dispatch: raw-true when either satisfies the
-    // operator, and `negate` flips the combined result — so a negated
+    // pair on a routing dispatch — the request's model-identity SET.
+    // Positive operators (==/in/regex) ask "does ANY identity satisfy"
+    // (∃); the negative operator `~=` asks "do ALL identities differ"
+    // (∀) — the two identities are distinct strings, so an ∃ reading
+    // of `~=` would be vacuously true on every routed request. This
+    // keeps `a ~= b` ≡ `!(a == b)` over the pair, the equivalence the
+    // operator vocabulary (and the dashboard's normalization) is
+    // built on; `negate` then flips the combined result, so a negated
     // leaf excluding the parent excludes every request addressed to it.
-    let raw = eval_operator(leaf, var)
-        || input
-            .routing_parent(leaf.dimension)
-            .is_some_and(|parent| eval_operator(leaf, parent));
+    let parent = input.routing_parent(leaf.dimension);
+    let raw = if leaf.operator == ConditionOperator::Ne {
+        eval_operator(leaf, var) && parent.is_none_or(|p| eval_operator(leaf, p))
+    } else {
+        eval_operator(leaf, var) || parent.is_some_and(|p| eval_operator(leaf, p))
+    };
     raw != leaf.negate
 }
 
@@ -756,6 +767,37 @@ mod tests {
         assert!(!eval_condition_nodes(&nodes, &routed_input()));
         // The same member reached directly stays matched.
         assert!(eval_condition_nodes(&nodes, &input()));
+    }
+
+    #[test]
+    fn ne_leaf_requires_both_identities_to_differ() {
+        // `model ~= group-1` on a request ADDRESSED to group-1: the
+        // dispatched member differs from the value, but ∃-combining
+        // would make `~=` vacuously true on every routed request (the
+        // two identities are distinct strings). ∀-combining keeps the
+        // exclusion meaningful…
+        let ne = |v: &str| vec![leaf(PolicyDimension::Model, ConditionOperator::Ne, one(v))];
+        assert!(!eval_condition_nodes(&ne("group-1"), &routed_input()));
+        assert!(!eval_condition_nodes(&ne("model-1"), &routed_input()));
+        assert!(eval_condition_nodes(&ne("other"), &routed_input()));
+        // …and preserves `a ~= b` ≡ `!(a == b)` over the pair.
+        let neg_eq = |v: &str| {
+            vec![neg_leaf(
+                PolicyDimension::Model,
+                ConditionOperator::Eq,
+                one(v),
+            )]
+        };
+        for v in ["group-1", "model-1", "other"] {
+            assert_eq!(
+                eval_condition_nodes(&ne(v), &routed_input()),
+                eval_condition_nodes(&neg_eq(v), &routed_input()),
+                "~= and !(==) diverged for {v}"
+            );
+        }
+        // Direct dispatch (no parent): plain not-equal, unchanged.
+        assert!(eval_condition_nodes(&ne("group-1"), &input()));
+        assert!(!eval_condition_nodes(&ne("model-1"), &input()));
     }
 
     #[test]

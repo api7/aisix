@@ -46,12 +46,16 @@ const TEAM_NAME = "team-1267-name";
 const TEAM_NEG = "team-1267-neg";
 const TEAM_MEMBER = "team-1267-member";
 const TEAM_SIB = "team-1267-sib";
+const TEAM_STREAM = "team-1267-stream";
+const TEAM_RESP = "team-1267-resp";
 
 const POLICY_GROUP = "12670000-0000-0000-0000-00000000000a";
 const POLICY_NAME = "12670000-0000-0000-0000-00000000000b";
 const POLICY_NEG = "12670000-0000-0000-0000-00000000000c";
 const POLICY_MEMBER = "12670000-0000-0000-0000-00000000000d";
 const POLICY_SIB = "12670000-0000-0000-0000-00000000000e";
+const POLICY_STREAM = "12670000-0000-0000-0000-00000000000f";
+const POLICY_RESP = "12670000-0000-0000-0000-000000000010";
 
 const KEY_G1 = "sk-1267-g1";
 const KEY_G2 = "sk-1267-g2";
@@ -59,6 +63,8 @@ const KEY_NAME = "sk-1267-name";
 const KEY_NEG = "sk-1267-neg";
 const KEY_MEMBER = "sk-1267-member";
 const KEY_SIB = "sk-1267-sib";
+const KEY_STREAM = "sk-1267-stream";
+const KEY_RESP = "sk-1267-resp";
 const KEY_FREE = "sk-1267-free";
 
 function chatBody(content: string) {
@@ -200,6 +206,22 @@ describe("group-referencing model conditions e2e (AISIX-Cloud#1267)", () => {
       ],
       limits: { rpm: 1 },
     });
+    await putPolicy(POLICY_STREAM, {
+      name: "stream-cap-1267",
+      conditions: [
+        { dimension: "team", operator: "in", value: [TEAM_STREAM] },
+        { dimension: "model", operator: "in", value: [groupMainId] },
+      ],
+      limits: { rpm: 1 },
+    });
+    await putPolicy(POLICY_RESP, {
+      name: "responses-cap-1267",
+      conditions: [
+        { dimension: "team", operator: "in", value: [TEAM_RESP] },
+        { dimension: "model", operator: "in", value: [groupMainId] },
+      ],
+      limits: { rpm: 1 },
+    });
 
     // Caller keys (raw etcd: team_id/user_id are CP-written fields the
     // standalone Admin API omits).
@@ -237,6 +259,12 @@ describe("group-referencing model conditions e2e (AISIX-Cloud#1267)", () => {
       team_id: TEAM_SIB,
     });
     await seedKey("12670001-0000-0000-0000-000000000007", KEY_FREE);
+    await seedKey("12670001-0000-0000-0000-000000000008", KEY_STREAM, {
+      team_id: TEAM_STREAM,
+    });
+    await seedKey("12670001-0000-0000-0000-000000000009", KEY_RESP, {
+      team_id: TEAM_RESP,
+    });
 
     // Canary AFTER every policy/key write: revision order means its
     // visibility proves the rows above are applied.
@@ -405,5 +433,58 @@ describe("group-referencing model conditions e2e (AISIX-Cloud#1267)", () => {
 
     expect(await messagesRaw()).toBe(200);
     expect(await messagesRaw()).toBe(429);
+  });
+
+  test("streaming chat drives the same per-target gate for group-id conditions", async (ctx) => {
+    if (!etcdReachable || !app) {
+      ctx.skip();
+      return;
+    }
+    await awaitWindowHeadroom(5);
+
+    const streamRaw = async (): Promise<number> => {
+      const res = await fetch(`${app!.proxyUrl}/v1/chat/completions`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${KEY_STREAM}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "grp-1267-main",
+          messages: [{ role: "user", content: "hello" }],
+          stream: true,
+        }),
+      });
+      // Drain so the connection finalises before the next call.
+      await res.text();
+      return res.status;
+    };
+
+    expect(await streamRaw()).toBe(200);
+    expect(await streamRaw()).toBe(429);
+  });
+
+  test("/v1/responses drives the same per-target gate for group-id conditions", async (ctx) => {
+    if (!etcdReachable || !app) {
+      ctx.skip();
+      return;
+    }
+    await awaitWindowHeadroom(5);
+
+    const responsesRaw = async (): Promise<number> => {
+      const res = await fetch(`${app!.proxyUrl}/v1/responses`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${KEY_RESP}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ model: "grp-1267-main", input: "hello" }),
+      });
+      await res.text();
+      return res.status;
+    };
+
+    expect(await responsesRaw()).toBe(200);
+    expect(await responsesRaw()).toBe(429);
   });
 });
