@@ -102,7 +102,8 @@ describe("realtime e2e: /v1/realtime WebSocket relay (#721)", () => {
     etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
-    app = await spawnApp();
+    // The access log emits at `info` (asserted by the #932 case below).
+    app = await spawnApp({ logLevel: "info" });
     seed = new SeedClient(etcd, app.etcdPrefix);
     upstream = await startRealtimeUpstream();
     idp = await startMockIdp();
@@ -310,6 +311,20 @@ describe("realtime e2e: /v1/realtime WebSocket relay (#721)", () => {
     expect(span.attributes["aisix.jwt_subject"]).toBe("rt-alice");
     expect(span.attributes["aisix.jwt_provider"]).toBe("rt-idp");
     expect(span.attributes["aisix.jwt_claim_mapping"]).toBe("rt-dept");
+
+    // Third surface of the same fix: the refusal's access-log line must
+    // name the caller (the realtime access log carried no api_key_id on
+    // any path before #932).
+    const logLine = app
+      .output()
+      .split("\n")
+      .find(
+        (l) =>
+          l.includes("proxy request completed") &&
+          l.includes(refusal.requestId),
+      );
+    expect(logLine, "access log line for the refusal").toBeTruthy();
+    expect(logLine).toContain(restrictedKey.id);
   });
 
   test("bad credentials reject the upgrade handshake", async (ctx) => {

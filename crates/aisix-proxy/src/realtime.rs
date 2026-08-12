@@ -933,6 +933,7 @@ mod tests {
         snap: AisixSnapshot,
     ) -> (
         std::net::SocketAddr,
+        crate::ProxyState,
         tokio::sync::mpsc::Receiver<ObsUsageEvent>,
     ) {
         let (tx, rx) = tokio::sync::mpsc::channel::<ObsUsageEvent>(16);
@@ -941,7 +942,7 @@ mod tests {
         let state = crate::ProxyState::new(handle, hub, &cfg())
             .without_cache()
             .with_usage_sink(UsageSink::new(tx));
-        let app = crate::build_router(state);
+        let app = crate::build_router(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -949,7 +950,7 @@ mod tests {
                 .await
                 .unwrap();
         });
-        (addr, rx)
+        (addr, state, rx)
     }
 
     /// Scripted mock upstream: accepts ONE WebSocket, records the request
@@ -1014,7 +1015,7 @@ mod tests {
     async fn relays_frames_and_emits_aggregated_usage_event() {
         let (up_addr, handshake, frames) = spawn_upstream().await;
         let snap = snapshot(&format!("http://{up_addr}/v1"), "openai", "openai");
-        let (addr, mut rx) = serve(snap).await;
+        let (addr, _state, mut rx) = serve(snap).await;
 
         let mut req = format!("ws://{addr}/v1/realtime?model=rt-model")
             .into_client_request()
@@ -1077,7 +1078,7 @@ mod tests {
     async fn subprotocol_key_authenticates_and_realtime_is_echoed() {
         let (up_addr, _handshake, _frames) = spawn_upstream().await;
         let snap = snapshot(&format!("http://{up_addr}/v1"), "openai", "openai");
-        let (addr, _rx) = serve(snap).await;
+        let (addr, _state, _rx) = serve(snap).await;
 
         let mut req = format!("ws://{addr}/v1/realtime?model=rt-model")
             .into_client_request()
@@ -1105,7 +1106,7 @@ mod tests {
     #[tokio::test]
     async fn missing_auth_rejects_the_handshake() {
         let snap = snapshot("http://127.0.0.1:9/v1", "openai", "openai");
-        let (addr, _rx) = serve(snap).await;
+        let (addr, _state, _rx) = serve(snap).await;
 
         let req = format!("ws://{addr}/v1/realtime?model=rt-model")
             .into_client_request()
@@ -1120,7 +1121,7 @@ mod tests {
     #[tokio::test]
     async fn missing_model_param_rejects_with_400() {
         let snap = snapshot("http://127.0.0.1:9/v1", "openai", "openai");
-        let (addr, mut rx) = serve(snap).await;
+        let (addr, _state, mut rx) = serve(snap).await;
 
         let mut req = format!("ws://{addr}/v1/realtime")
             .into_client_request()
@@ -1148,7 +1149,7 @@ mod tests {
     #[tokio::test]
     async fn non_realtime_capable_adapter_is_rejected() {
         let snap = snapshot("http://127.0.0.1:9", "anthropic", "anthropic");
-        let (addr, _rx) = serve(snap).await;
+        let (addr, _state, _rx) = serve(snap).await;
 
         let mut req = format!("ws://{addr}/v1/realtime?model=rt-model")
             .into_client_request()
@@ -1169,7 +1170,7 @@ mod tests {
         let k_json = format!(r#"{{"key_hash":"{CALLER_HASH}","allowed_models":["other-model"]}}"#);
         let k: ApiKey = serde_json::from_str(&k_json).unwrap();
         snap.apikeys.insert(ResourceEntry::new("k-1", k, 2));
-        let (addr, mut rx) = serve(snap).await;
+        let (addr, state, mut rx) = serve(snap).await;
 
         let mut req = format!("ws://{addr}/v1/realtime?model=rt-model")
             .into_client_request()
@@ -1191,6 +1192,14 @@ mod tests {
         assert_eq!(
             ev.api_key_id, "k-1",
             "a post-auth refusal must attribute the resolved key"
+        );
+
+        // Second surface of the same fix: the request-rate metric label
+        // set names the caller instead of `unknown`.
+        let scrape = state.metrics.render();
+        assert!(
+            scrape.contains(r#"api_key_id="k-1""#),
+            "the refusal metric must carry the caller label, got: {scrape}"
         );
     }
 
@@ -1244,8 +1253,9 @@ mod tests {
         let event = rx.try_recv().expect("the refusal is recorded");
         assert_eq!(event.status_code, 400);
         assert_eq!(event.inbound_protocol, "realtime");
-        // Auth runs inside prepare(), which a rejected upgrade never
-        // reaches — no key is attributed; the requested model rides along.
+        // The handler authenticates only after the upgrade is accepted
+        // as upgradable, so a rejected upgrade never reaches auth — no
+        // key is attributed; the requested model rides along.
         assert_eq!(event.api_key_id, "");
         assert_eq!(event.requested_model, "probe-model");
 
