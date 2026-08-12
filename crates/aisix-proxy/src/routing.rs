@@ -215,11 +215,13 @@ pub fn effective_retries(
 /// its group level lives on the Model itself (the same place a routing
 /// group keeps its group-level `timeout`).
 pub fn group_retries_of(parent: &aisix_core::Model) -> Option<u32> {
-    parent
-        .routing
-        .as_ref()
-        .and_then(|r| r.retries)
-        .or(parent.retries)
+    match parent.routing.as_ref() {
+        // A Model Group's group slot is `routing.retries` alone — a
+        // stray top-level `retries` on the group Model stays inert
+        // (the schema-convergence work forbids that shape outright).
+        Some(routing) => routing.retries,
+        None => parent.retries,
+    }
 }
 
 /// How many same-target retries this dispatch may spend, and whether the
@@ -1616,6 +1618,13 @@ mod tests {
         let mut group_parent = model_with_retries(Some(7));
         group_parent.routing = Some(group_with_retries(Some(3)));
         assert_eq!(group_retries_of(&group_parent), Some(3));
+        // …and stays INERT even when `routing.retries` is unset — the
+        // routing block's presence pins the group slot, so the target →
+        // routing.retries → deployment-default chain is unchanged for
+        // every Model Group shape.
+        let mut sparse_group = model_with_retries(Some(7));
+        sparse_group.routing = Some(group_with_retries(None));
+        assert_eq!(group_retries_of(&sparse_group), None);
         // Semantic router (no routing block): the parent's own top-level
         // `retries` IS the group slot — the member → group → default
         // chain unified across virtual parents.

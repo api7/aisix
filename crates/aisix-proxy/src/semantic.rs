@@ -364,7 +364,7 @@ fn select_eligible(
     candidates.retain(|(attempt, fell_back)| {
         let allowed = attempt.model.ip_allowed(source_ip);
         if !allowed {
-            tracing::warn!(
+            tracing::debug!(
                 router = %router.display_name,
                 target = %attempt.model.display_name,
                 fallback = fell_back,

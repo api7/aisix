@@ -98,7 +98,12 @@ sub-calls and semantic-router targets**, and the ruling (project decision) is th
 all three kinds stay under #1090's one unified design pass: the operator can
 attach the guardrail to the parent entry, so member scope is a mitigable gap, not
 an unavoidable bypass. Do not piecemeal-fix one kind ahead of that decision, and
-do not re-audit it as a new finding.
+do not re-audit it as a new finding. The same project ruling holds for the OTHER
+member gates on **ensemble** sub-calls (member `allowed_cidrs`, cooldown/health
+consumption, Prometheus usage, caching): ensemble is an experimental surface and
+its parity gaps are deliberate TODOs, not fresh findings — semantic-router
+targets got these gates first because they share the single-winner dispatch
+shape; graduate ensemble deliberately, in one pass.
 
 Two shapes, both already implemented — copy the nearest one:
 

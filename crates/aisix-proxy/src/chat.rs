@@ -834,11 +834,19 @@ async fn cache_semantic_embed(
 ) -> Option<Vec<f32>> {
     let started = Instant::now();
     let texts = [sem.text.clone()];
+    // Same deadline chain as the semantic router's embed call: the
+    // policy knob wins, then the embedding model's own `timeout`, then
+    // the deployment default — a hung embedding upstream must not stall
+    // the cache gate unbounded either.
+    let embed_deadline = sem.cfg.embedding_timeout().or_else(|| {
+        crate::routing::effective_timeouts(&sem.embed_entry.value, None, state.default_timeouts)
+            .request
+    });
     match crate::semantic::embed_texts(
         state,
         snapshot,
         &sem.embed_entry,
-        sem.cfg.embedding_timeout(),
+        embed_deadline,
         request_id,
         &texts,
     )

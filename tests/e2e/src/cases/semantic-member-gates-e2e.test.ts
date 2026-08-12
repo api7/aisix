@@ -243,6 +243,49 @@ describe("semantic router member gates e2e", () => {
       }),
     );
 
+    // Streaming-loop twin of the retries case: 4 scripted 500s, then the
+    // static SSE fixture serves the success — recoverable only with the
+    // router-level budget of 4 through the STREAMING dispatch loop.
+    await directModel(
+      "smg-retry-stream-target",
+      await chatUpstream("unused-static", {
+        scriptedResponses: [
+          { status: 500, errorBody: { error: { message: "boom", type: "server_error" } } },
+          { status: 500, errorBody: { error: { message: "boom", type: "server_error" } } },
+          { status: 500, errorBody: { error: { message: "boom", type: "server_error" } } },
+          { status: 500, errorBody: { error: { message: "boom", type: "server_error" } } },
+        ],
+        streamEvents: [
+          JSON.stringify({
+            id: "smg-sse",
+            object: "chat.completion.chunk",
+            model: "gpt-4o-mini",
+            choices: [
+              { index: 0, delta: { content: "served-stream" }, finish_reason: "stop" },
+            ],
+            usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+          }),
+          "[DONE]",
+        ],
+      }),
+    );
+    // Background-unhealthy displacement: this member's upstream always
+    // 500s, request-path cooldown is DISABLED (so only the background
+    // prober's Unhealthy verdict can displace it), and the 1s probe
+    // interval marks it within a few seconds.
+    await directModel("smg-unhealthy", await chatUpstream("unused-500", { status: 500 }), {
+      cooldown: { enabled: false },
+      background_model_check: {
+        enabled: true,
+        // Schema minimum — the prober's first verdict lands within ~5s.
+        interval_seconds: 5,
+        stale_after_seconds: 300,
+        prompt: "ping",
+        max_tokens: 1,
+        timeout_seconds: 2,
+      },
+    });
+
     const router = (name: string, target: string, def: string, extra: Record<string, unknown> = {}) =>
       seed!.createModel({
         display_name: name,
@@ -261,6 +304,10 @@ describe("semantic router member gates e2e", () => {
     await router("smg-router-all-blocked", "smg-blocked", "smg-blocked-2");
     await router("smg-router-cooldown", "smg-flaky", "smg-open");
     await router("smg-router-retries", "smg-retry-target", "smg-open", { retries: 4 });
+    await router("smg-router-retries-stream", "smg-retry-stream-target", "smg-open", {
+      retries: 4,
+    });
+    await router("smg-router-unhealthy", "smg-unhealthy", "smg-open");
     await seed.createModel({
       display_name: "smg-router-slow-embed",
       semantic: {
@@ -344,6 +391,56 @@ describe("semantic router member gates e2e", () => {
     // ~500ms and on_embedding_failure serves the default.
     expect(r.content).toBe("served-t4-default");
     expect(elapsed).toBeLessThan(2500);
+  });
+
+  test("the streaming dispatch loop honors the router-level retry budget too", async (ctx) => {
+    if (!etcdReachable || !app) {
+      ctx.skip();
+      return;
+    }
+    const res = await fetch(`${app.proxyUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${CALLER_PLAINTEXT}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "smg-router-retries-stream",
+        messages: [{ role: "user", content: "write python code please" }],
+        stream: true,
+      }),
+    });
+    const body = await res.text();
+    // 4 scripted 500s exhaust only with the router's budget of 4; the
+    // 5th attempt opens the real SSE stream.
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("text/event-stream");
+    expect(body).toContain("served-stream");
+  });
+
+  test("a background-unhealthy route target is displaced by the healthy default", async (ctx) => {
+    if (!etcdReachable || !app) {
+      ctx.skip();
+      return;
+    }
+    // Cooldown is disabled on the member, so only the background
+    // prober's Unhealthy verdict can displace it. Poll until the 5s
+    // probe interval has marked it and selection serves the default.
+    const deadline = Date.now() + 30_000;
+    let displaced: { status: number; content: string; route: string | null } | undefined;
+    while (Date.now() < deadline) {
+      const r = await chat("smg-router-unhealthy", "write python code please");
+      if (r.status === 200 && r.content === "served-open") {
+        displaced = r;
+        break;
+      }
+      // Until the mark lands, the winner dispatches and its upstream
+      // 500s — cooldown being disabled keeps this the only mechanism.
+      expect(r.status).toBeGreaterThanOrEqual(500);
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+    expect(displaced).toBeDefined();
+    expect(displaced?.route).toBeNull();
   });
 
   test("the router's top-level retries is the group slot of the retry chain", async (ctx) => {
