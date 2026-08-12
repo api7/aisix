@@ -68,12 +68,28 @@ impl ModelRateLimit {
     }
 }
 
+/// Identity of the caller-addressed virtual parent (routing group /
+/// ensemble / semantic router), forwarded by the dispatch loops into the
+/// per-target condition input so `model` / `model_name` leaves match the
+/// parent as well as the concrete target (AISIX-Cloud#1267).
+#[derive(Clone, Copy)]
+pub(crate) struct RoutingParent<'a> {
+    /// The parent Model's `display_name` (the alias the caller sent).
+    pub name: &'a str,
+    /// The parent's resource entry id.
+    pub entry_id: &'a str,
+}
+
 /// The request's condition-dimension values at this gate point. Model
 /// dimensions are absent when no model is resolved (MCP, A2A) — leaves
 /// on them evaluate false while OR siblings can still match.
+/// `routing_parent` is set only at the per-target gate of a routing
+/// dispatch; the request gate passes `None` (there the primary values
+/// already ARE the requested entry).
 fn condition_input<'a>(
     auth: &'a AuthenticatedKey,
     model_rl: Option<&'a ModelRateLimit>,
+    routing_parent: Option<RoutingParent<'a>>,
 ) -> ConditionInput<'a> {
     ConditionInput {
         team: auth.key().team_id.as_deref(),
@@ -82,6 +98,8 @@ fn condition_input<'a>(
         model: model_rl.map(|m| m.entry_id.as_str()),
         model_name: model_rl.map(|m| m.name.as_str()),
         provider: model_rl.and_then(|m| m.provider.as_deref()),
+        routing_parent_model: routing_parent.map(|p| p.entry_id),
+        routing_parent_model_name: routing_parent.map(|p| p.name),
     }
 }
 
@@ -344,7 +362,7 @@ async fn reserve_layers(
     }
 
     // Layer 4+: Rate limit policies from snapshot.
-    let input = condition_input(auth, model_rl);
+    let input = condition_input(auth, model_rl, None);
     let phase = PolicyPhase::Request {
         defer_model_properties: model_rl.is_some_and(|m| m.routing_parent),
     };
@@ -521,6 +539,7 @@ pub(crate) async fn reserve_model_only(
     model_name: &str,
     model_entry_id: &str,
     model: &aisix_core::Model,
+    routing_parent: Option<RoutingParent<'_>>,
 ) -> Result<MultiReservation, ProxyError> {
     let mut reservations = Vec::new();
 
@@ -536,8 +555,11 @@ pub(crate) async fn reserve_model_only(
         reservations.push(r);
     }
 
-    // Policies that follow the model to this target.
-    let input = condition_input(auth, Some(&mrl));
+    // Policies that follow the model to this target. The condition
+    // input carries the {target, caller-addressed parent} pair so a
+    // policy pinning the parent's id or alias matches here too
+    // (AISIX-Cloud#1267).
+    let input = condition_input(auth, Some(&mrl), routing_parent);
     reserve_policy_layers(
         state,
         snapshot,
@@ -565,17 +587,25 @@ pub(crate) async fn reserve_routing_target(
     state: &ProxyState,
     snapshot: &aisix_core::AisixSnapshot,
     auth: &AuthenticatedKey,
-    is_routing_request: bool,
+    routing_parent: Option<RoutingParent<'_>>,
     target_name: &str,
     target_entry_id: &str,
     target: &aisix_core::Model,
 ) -> Result<Option<MultiReservation>, ProxyError> {
-    if !is_routing_request {
+    let Some(parent) = routing_parent else {
         return Ok(None);
-    }
-    reserve_model_only(state, snapshot, auth, target_name, target_entry_id, target)
-        .await
-        .map(Some)
+    };
+    reserve_model_only(
+        state,
+        snapshot,
+        auth,
+        target_name,
+        target_entry_id,
+        target,
+        Some(parent),
+    )
+    .await
+    .map(Some)
 }
 
 /// Seconds until the offending window reopens, for a
@@ -661,9 +691,14 @@ mod tests {
         entry_id: &str,
         auth: &AuthenticatedKey,
     ) -> String {
-        match_policy_layer(policy, entry_id, &condition_input(auth, None), REQUEST)
-            .expect("policy applies")
-            .bucket_key
+        match_policy_layer(
+            policy,
+            entry_id,
+            &condition_input(auth, None, None),
+            REQUEST,
+        )
+        .expect("policy applies")
+        .bucket_key
     }
 
     #[test]
@@ -805,8 +840,13 @@ mod tests {
             "limits": { "rpm": 100 },
         }));
         let auth = make_auth(Some("team-1"), Some("user-a"));
-        let layer = match_policy_layer(&policy, "pol-1", &condition_input(&auth, None), REQUEST)
-            .expect("matches");
+        let layer = match_policy_layer(
+            &policy,
+            "pol-1",
+            &condition_input(&auth, None, None),
+            REQUEST,
+        )
+        .expect("matches");
         // No group_by → one shared bucket for every matched request.
         assert_eq!(layer.bucket_key, "policy:v2:pol-1");
         assert_eq!(layer.limits.rpm, Some(100));
@@ -827,7 +867,7 @@ mod tests {
         let layer = match_policy_layer(
             &policy,
             "pol-2",
-            &condition_input(&auth, Some(&mrl)),
+            &condition_input(&auth, Some(&mrl), None),
             REQUEST,
         )
         .expect("matches");
@@ -850,9 +890,13 @@ mod tests {
             "limits": { "rpm": 20 },
         }));
         let auth = make_auth(Some("team-1"), None);
-        assert!(
-            match_policy_layer(&policy, "pol-3", &condition_input(&auth, None), REQUEST).is_none()
-        );
+        assert!(match_policy_layer(
+            &policy,
+            "pol-3",
+            &condition_input(&auth, None, None),
+            REQUEST
+        )
+        .is_none());
     }
 
     #[test]
@@ -866,16 +910,76 @@ mod tests {
         }));
         let auth = make_auth(Some("team-1"), None);
         let parent = make_model_rl("gpt4-group", "group-1", None);
-        let input = condition_input(&auth, Some(&parent));
+        let input = condition_input(&auth, Some(&parent), None);
         // Request gate of a routing dispatch: deferred even though the
         // parent's name would match — the concrete target decides.
         assert!(match_policy_layer(&policy, "pol-4", &input, REQUEST_DEFERRING).is_none());
         // Per-target gate: matches the concrete target.
         let target = make_model_rl("gpt-4.1-prod", "model-1", Some("openai"));
-        let target_input = condition_input(&auth, Some(&target));
+        let target_input = condition_input(&auth, Some(&target), None);
         let layer = match_policy_layer(&policy, "pol-4", &target_input, PolicyPhase::ModelTarget)
             .expect("target matches");
         assert_eq!(layer.bucket_key, "policy:v2:pol-4");
+    }
+
+    #[test]
+    fn group_referencing_policy_matches_at_target_phase_via_parent() {
+        // AISIX-Cloud#1267: `model in [group uuid]` reserves at the
+        // per-target gate because the condition input carries the
+        // {target, parent} pair — previously the parent id was compared
+        // nowhere and the policy never fired.
+        let policy = make_conditional_policy(serde_json::json!({
+            "name": "group-cap",
+            "conditions": [
+                { "dimension": "model", "operator": "in", "value": ["group-1"] }
+            ],
+            "group_by": ["member"],
+            "limits": { "rph": 3 },
+        }));
+        let auth = make_auth(Some("team-1"), Some("user-a"));
+        // Request gate of the routing dispatch: still deferred.
+        let gate = make_model_rl("chat-group", "group-1", None);
+        let gate_input = condition_input(&auth, Some(&gate), None);
+        assert!(match_policy_layer(&policy, "pol-9", &gate_input, REQUEST_DEFERRING).is_none());
+        // Per-target gate: the parent pair makes it match, bucketed per
+        // member.
+        let target = make_model_rl("gpt-4.1-prod", "model-1", Some("openai"));
+        let parent = RoutingParent {
+            name: "chat-group",
+            entry_id: "group-1",
+        };
+        let input = condition_input(&auth, Some(&target), Some(parent));
+        let layer = match_policy_layer(&policy, "pol-9", &input, PolicyPhase::ModelTarget)
+            .expect("group-referencing policy matches via the parent");
+        assert_eq!(layer.bucket_key, "policy:v2:pol-9:member=user-a");
+        // Direct dispatch to the member (no parent): must NOT match.
+        let direct = condition_input(&auth, Some(&target), None);
+        assert!(match_policy_layer(&policy, "pol-9", &direct, REQUEST).is_none());
+    }
+
+    #[test]
+    fn group_by_model_buckets_on_target_not_parent() {
+        // The pair extends MATCHING only: a group-referencing policy
+        // splitting by model still buckets on the dispatched target id,
+        // so per-member counters stay per concrete model.
+        let policy = make_conditional_policy(serde_json::json!({
+            "name": "group-per-model",
+            "conditions": [
+                { "dimension": "model", "operator": "in", "value": ["group-1"] }
+            ],
+            "group_by": ["model"],
+            "limits": { "rpm": 1 },
+        }));
+        let auth = make_auth(Some("team-1"), None);
+        let target = make_model_rl("gpt-4.1-prod", "model-1", Some("openai"));
+        let parent = RoutingParent {
+            name: "chat-group",
+            entry_id: "group-1",
+        };
+        let input = condition_input(&auth, Some(&target), Some(parent));
+        let layer = match_policy_layer(&policy, "pol-10", &input, PolicyPhase::ModelTarget)
+            .expect("matches via parent");
+        assert_eq!(layer.bucket_key, "policy:v2:pol-10:model=model-1");
     }
 
     #[test]
@@ -889,7 +993,7 @@ mod tests {
         }));
         let auth = make_auth(Some("team-1"), None);
         let target = make_model_rl("gpt-4.1-prod", "model-1", Some("openai"));
-        let input = condition_input(&auth, Some(&target));
+        let input = condition_input(&auth, Some(&target), None);
         // Reserved once at the request gate; the per-target scan must
         // not double-count it.
         assert!(match_policy_layer(&policy, "pol-5", &input, PolicyPhase::ModelTarget).is_none());
@@ -913,8 +1017,13 @@ mod tests {
             "limits": { "rpm": 50 },
         }));
         let auth = make_auth(Some("team-1"), None);
-        let layer = match_policy_layer(&policy, "pol-6", &condition_input(&auth, None), REQUEST)
-            .expect("matches via team branch");
+        let layer = match_policy_layer(
+            &policy,
+            "pol-6",
+            &condition_input(&auth, None, None),
+            REQUEST,
+        )
+        .expect("matches via team branch");
         assert_eq!(layer.bucket_key, "policy:v2:pol-6");
     }
 
@@ -923,7 +1032,7 @@ mod tests {
         let team_policy = make_scoped_policy("team", "team-1");
         let auth = make_auth(Some("team-1"), Some("user-a"));
         let target = make_model_rl("gpt-4.1-prod", "model-1", Some("openai"));
-        let input = condition_input(&auth, Some(&target));
+        let input = condition_input(&auth, Some(&target), None);
         assert!(
             match_policy_layer(&team_policy, "pol-7", &input, PolicyPhase::ModelTarget).is_none()
         );

@@ -735,7 +735,10 @@ async fn dispatch(
                 state,
                 snapshot,
                 auth,
-                is_routing_request,
+                is_routing_request.then_some(crate::quota::RoutingParent {
+                    name: &model_entry.value.display_name,
+                    entry_id: &model_entry.id,
+                }),
                 &target.model.display_name,
                 &target.id,
                 &target.model,

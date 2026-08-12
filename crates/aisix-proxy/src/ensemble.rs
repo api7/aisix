@@ -93,6 +93,9 @@ pub(crate) struct ProxyModelCaller<'a> {
     /// the caller's behalf, so they carry the same caller identity and
     /// forwardable client headers as a single-upstream dispatch would.
     pub client: &'a crate::client_ip::ClientContext,
+    /// The ensemble entry the caller addressed, so per-member policy
+    /// matching sees the {member, parent} pair (AISIX-Cloud#1267).
+    pub routing_parent: crate::quota::RoutingParent<'a>,
 }
 
 #[async_trait]
@@ -159,6 +162,7 @@ impl ModelCaller for ProxyModelCaller<'_> {
             target,
             &entry.id,
             model,
+            Some(self.routing_parent),
         )
         .await
         .map_err(|e| {

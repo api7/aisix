@@ -29,6 +29,13 @@
 //!   deliberately includes MCP/A2A traffic;
 //! - groups short-circuit (AND on the first false child, OR on the
 //!   first true child);
+//! - the model dimensions (`model` / `model_name`) evaluate against a
+//!   PAIR on a routing/ensemble/semantic dispatch: the dispatched
+//!   target and the caller-addressed parent entry (AISIX-Cloud#1267).
+//!   A leaf is raw-true when either identity satisfies its operator;
+//!   `negate` flips that combined result, so `!(model in [group])`
+//!   excludes every request addressed to the group instead of matching
+//!   all of them;
 //! - regexes are compiled once per distinct pattern into a process-wide
 //!   cache. Load-time validation guarantees compilability, so a cache
 //!   miss at evaluation time never fails in practice; a pattern that
@@ -62,11 +69,15 @@ pub enum PolicyDimension {
     Member,
     /// Authenticated api_key entry id (UUID).
     ApiKey,
-    /// Dispatched model entry id (UUID); routing/model groups match per
-    /// selected target, never the group entry itself.
+    /// Model entry id (UUID). Matches the dispatched model; on a
+    /// Model-Group / semantic-router / ensemble dispatch it also
+    /// matches the requested parent entry, so a group's own id selects
+    /// every request addressed to that group.
     Model,
-    /// Dispatched model display name — the string dimension for
-    /// regex/prefix matching ("every gpt-4-family alias").
+    /// Model display name — the string dimension for regex/prefix
+    /// matching ("every gpt-4-family alias"). Matches the dispatched
+    /// model's name, and on a virtual-parent dispatch also the
+    /// requested parent's name.
     ModelName,
     /// Dispatched model's `provider` (models.dev catalog id).
     Provider,
@@ -386,6 +397,17 @@ pub struct ConditionInput<'a> {
     pub model: Option<&'a str>,
     pub model_name: Option<&'a str>,
     pub provider: Option<&'a str>,
+    /// Entry id of the caller-addressed virtual parent (routing group /
+    /// ensemble / semantic router) when `model` below is a dispatch
+    /// target that parent selected. A `model` leaf matches when EITHER
+    /// id satisfies it (AISIX-Cloud#1267) — the group a caller
+    /// addressed is as much "the model" as the member it dispatched to.
+    /// `None` on direct dispatch and at the request gate (where `model`
+    /// already IS the requested entry).
+    pub routing_parent_model: Option<&'a str>,
+    /// Display name of that parent, the `model_name` twin of
+    /// [`Self::routing_parent_model`].
+    pub routing_parent_model_name: Option<&'a str>,
 }
 
 impl<'a> ConditionInput<'a> {
@@ -397,6 +419,19 @@ impl<'a> ConditionInput<'a> {
             PolicyDimension::Model => self.model,
             PolicyDimension::ModelName => self.model_name,
             PolicyDimension::Provider => self.provider,
+        }
+    }
+
+    /// The caller-addressed parent's value for a model-property
+    /// dimension, when the primary value describes a dispatch target
+    /// that parent selected. Identity/provider dimensions have no
+    /// parent variant (the parent shares the caller identity and
+    /// carries no provider).
+    fn routing_parent(&self, dimension: PolicyDimension) -> Option<&'a str> {
+        match dimension {
+            PolicyDimension::Model => self.routing_parent_model,
+            PolicyDimension::ModelName => self.routing_parent_model_name,
+            _ => None,
         }
     }
 
@@ -437,7 +472,19 @@ fn eval_leaf(leaf: &PolicyCondition, input: &ConditionInput<'_>) -> bool {
     let Some(var) = input.get(leaf.dimension) else {
         return false;
     };
-    let raw = match (leaf.operator, &leaf.value) {
+    // Model dimensions carry a {dispatched target, requested parent}
+    // pair on a routing dispatch: raw-true when either satisfies the
+    // operator, and `negate` flips the combined result — so a negated
+    // leaf excluding the parent excludes every request addressed to it.
+    let raw = eval_operator(leaf, var)
+        || input
+            .routing_parent(leaf.dimension)
+            .is_some_and(|parent| eval_operator(leaf, parent));
+    raw != leaf.negate
+}
+
+fn eval_operator(leaf: &PolicyCondition, var: &str) -> bool {
+    match (leaf.operator, &leaf.value) {
         (ConditionOperator::Eq, ConditionValue::One(v)) => var == v,
         (ConditionOperator::Ne, ConditionValue::One(v)) => var != v,
         (ConditionOperator::In, ConditionValue::Many(items)) => {
@@ -474,8 +521,7 @@ fn eval_leaf(leaf: &PolicyCondition, input: &ConditionInput<'_>) -> bool {
         (ConditionOperator::Has | ConditionOperator::IpMatch, _) => false,
         // Value shape mismatching the operator (validation rejects it).
         _ => false,
-    };
-    raw != leaf.negate
+    }
 }
 
 /// Process-wide compiled-regex caches, one per case-sensitivity
@@ -562,6 +608,19 @@ mod tests {
             model: Some("model-1"),
             model_name: Some("gpt-4.1-prod"),
             provider: Some("openai"),
+            routing_parent_model: None,
+            routing_parent_model_name: None,
+        }
+    }
+
+    /// `input()` as the per-target gate of a routing dispatch sees it:
+    /// the target as the primary values, the caller-addressed group as
+    /// the parent pair.
+    fn routed_input<'a>() -> ConditionInput<'a> {
+        ConditionInput {
+            routing_parent_model: Some("group-1"),
+            routing_parent_model_name: Some("chat-group"),
+            ..input()
         }
     }
 
@@ -654,6 +713,72 @@ mod tests {
         )];
         // team-1 ∉ {other-team} → negated `in` matches.
         assert!(eval_condition_nodes(&nodes, &input()));
+    }
+
+    #[test]
+    fn model_leaf_matches_routing_parent_id() {
+        // AISIX-Cloud#1267: `model in [group uuid]` must select requests
+        // dispatched THROUGH the group even though the per-target gate's
+        // primary value is the member id.
+        let nodes = vec![leaf(
+            PolicyDimension::Model,
+            ConditionOperator::In,
+            many(&["group-1"]),
+        )];
+        assert!(eval_condition_nodes(&nodes, &routed_input()));
+        // Direct dispatch to the member (no parent): the group condition
+        // must NOT capture it.
+        assert!(!eval_condition_nodes(&nodes, &input()));
+    }
+
+    #[test]
+    fn model_name_leaf_matches_routing_parent_name() {
+        let nodes = vec![leaf(
+            PolicyDimension::ModelName,
+            ConditionOperator::Regex,
+            one("^chat-"),
+        )];
+        assert!(eval_condition_nodes(&nodes, &routed_input()));
+        assert!(!eval_condition_nodes(&nodes, &input()));
+    }
+
+    #[test]
+    fn negated_model_leaf_excludes_parent_dispatch() {
+        // `!(model in [group-1])` means "everything except the group":
+        // negate flips the COMBINED pair result, so a request routed via
+        // the group is excluded — not (absurdly) matched because the
+        // member id alone misses the set.
+        let nodes = vec![neg_leaf(
+            PolicyDimension::Model,
+            ConditionOperator::In,
+            many(&["group-1"]),
+        )];
+        assert!(!eval_condition_nodes(&nodes, &routed_input()));
+        // The same member reached directly stays matched.
+        assert!(eval_condition_nodes(&nodes, &input()));
+    }
+
+    #[test]
+    fn member_leaf_still_matches_through_parent() {
+        // The 1087 principle survives the pair: a member-id condition
+        // keeps matching when the member is reached via a group.
+        let nodes = vec![leaf(
+            PolicyDimension::Model,
+            ConditionOperator::In,
+            many(&["model-1"]),
+        )];
+        assert!(eval_condition_nodes(&nodes, &routed_input()));
+    }
+
+    #[test]
+    fn parent_pair_never_leaks_into_identity_dimensions() {
+        // A team leaf must not consult the parent pair even when set.
+        let nodes = vec![leaf(
+            PolicyDimension::Team,
+            ConditionOperator::In,
+            many(&["group-1"]),
+        )];
+        assert!(!eval_condition_nodes(&nodes, &routed_input()));
     }
 
     #[test]
