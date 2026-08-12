@@ -37,8 +37,10 @@ tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 async-trait = "0.1"
 
 # HTTP server. axum's `tracing` feature has no API surface — it gates
-# axum's internal logging of extractor rejections; a zero-hit grep is
-# its normal appearance, keep it.
+# axum's internal logging of extractor rejections, so a zero-hit grep is
+# its normal appearance. It is also an axum default feature (defaults
+# stay on here), so the explicit entry documents intent rather than
+# being what enables it.
 axum = { version = "0.7", features = ["ws", "tracing", "multipart"] }
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 tower = "0.5"
