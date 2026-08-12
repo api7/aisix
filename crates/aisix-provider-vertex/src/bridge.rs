@@ -713,13 +713,26 @@ impl Bridge for VertexBridge {
         validate_url_token("region", &creds.region)?;
         validate_url_token("upstream_id", upstream_id)?;
 
-        let base = self.resolve_api_base(&creds.region, ctx.provider_key.api_base.as_deref())?;
-        let url = format!(
-            "{base}/v1/projects/{project}/locations/{region}/publishers/google/models/{model}:predict",
-            project = creds.project,
-            region = creds.region,
-            model = upstream_id,
-        );
+        let url = aisix_gateway::url_cache::cached_model_endpoint_url(
+            &ctx.provider_key_id,
+            "vertex/google-predict",
+            upstream_id,
+            &[
+                ctx.provider_key.api_base.as_deref().unwrap_or(""),
+                &creds.project,
+                &creds.region,
+            ],
+            || {
+                let base =
+                    self.resolve_api_base(&creds.region, ctx.provider_key.api_base.as_deref())?;
+                Ok::<_, BridgeError>(format!(
+                    "{base}/v1/projects/{project}/locations/{region}/publishers/google/models/{model}:predict",
+                    project = creds.project,
+                    region = creds.region,
+                    model = upstream_id,
+                ))
+            },
+        )?;
 
         let instances: Vec<serde_json::Value> = req
             .input
@@ -739,8 +752,8 @@ impl Bridge for VertexBridge {
         let model_echo = req.model.clone();
 
         with_deadline(ctx.deadline, started, async move {
-            let resp = client
-                .post(&url)
+            let resp = url
+                .post_on(&client)
                 .headers(headers)
                 .json(&body)
                 .send()
@@ -825,13 +838,26 @@ impl VertexBridge {
         validate_url_token("region", &creds.region)?;
         validate_url_token("upstream_id", upstream_id)?;
 
-        let base = self.resolve_api_base(&creds.region, ctx.provider_key.api_base.as_deref())?;
-        let url = format!(
-            "{base}/v1/projects/{project}/locations/{region}/publishers/google/models/{model}:generateContent",
-            project = creds.project,
-            region = creds.region,
-            model = upstream_id,
-        );
+        let url = aisix_gateway::url_cache::cached_model_endpoint_url(
+            &ctx.provider_key_id,
+            "vertex/gemini-generate",
+            upstream_id,
+            &[
+                ctx.provider_key.api_base.as_deref().unwrap_or(""),
+                &creds.project,
+                &creds.region,
+            ],
+            || {
+                let base =
+                    self.resolve_api_base(&creds.region, ctx.provider_key.api_base.as_deref())?;
+                Ok::<_, BridgeError>(format!(
+                    "{base}/v1/projects/{project}/locations/{region}/publishers/google/models/{model}:generateContent",
+                    project = creds.project,
+                    region = creds.region,
+                    model = upstream_id,
+                ))
+            },
+        )?;
 
         let typed = build_gemini_request(req);
         // Audit LOW-4: Gemini requires `contents` to be a non-empty
@@ -863,8 +889,8 @@ impl VertexBridge {
         let started = Instant::now();
 
         with_deadline(ctx.deadline, started, async move {
-            let resp = client
-                .post(&url)
+            let resp = url
+                .post_on(&client)
                 .headers(headers)
                 .json(&body)
                 .send()
@@ -918,13 +944,26 @@ impl VertexBridge {
         validate_url_token("region", &creds.region)?;
         validate_url_token("upstream_id", upstream_id)?;
 
-        let base = self.resolve_api_base(&creds.region, ctx.provider_key.api_base.as_deref())?;
-        let url = format!(
-            "{base}/v1/projects/{project}/locations/{region}/publishers/anthropic/models/{model}:rawPredict",
-            project = creds.project,
-            region = creds.region,
-            model = upstream_id,
-        );
+        let url = aisix_gateway::url_cache::cached_model_endpoint_url(
+            &ctx.provider_key_id,
+            "vertex/anthropic-rawpredict",
+            upstream_id,
+            &[
+                ctx.provider_key.api_base.as_deref().unwrap_or(""),
+                &creds.project,
+                &creds.region,
+            ],
+            || {
+                let base =
+                    self.resolve_api_base(&creds.region, ctx.provider_key.api_base.as_deref())?;
+                Ok::<_, BridgeError>(format!(
+                    "{base}/v1/projects/{project}/locations/{region}/publishers/anthropic/models/{model}:rawPredict",
+                    project = creds.project,
+                    region = creds.region,
+                    model = upstream_id,
+                ))
+            },
+        )?;
 
         // Build the Anthropic Messages body via the shared serializer,
         // then shape it for Vertex (strip model + stream, add the
@@ -955,8 +994,8 @@ impl VertexBridge {
         let started = Instant::now();
 
         with_deadline(ctx.deadline, started, async move {
-            let resp = client
-                .post(&url)
+            let resp = url
+                .post_on(&client)
                 .headers(headers)
                 .json(&body_value)
                 .send()
@@ -1002,13 +1041,26 @@ impl VertexBridge {
         validate_url_token("region", &creds.region)?;
         validate_url_token("upstream_id", upstream_id)?;
 
-        let base = self.resolve_api_base(&creds.region, ctx.provider_key.api_base.as_deref())?;
-        let url = format!(
-            "{base}/v1/projects/{project}/locations/{region}/publishers/anthropic/models/{model}:streamRawPredict",
-            project = creds.project,
-            region = creds.region,
-            model = upstream_id,
-        );
+        let url = aisix_gateway::url_cache::cached_model_endpoint_url(
+            &ctx.provider_key_id,
+            "vertex/anthropic-stream-rawpredict",
+            upstream_id,
+            &[
+                ctx.provider_key.api_base.as_deref().unwrap_or(""),
+                &creds.project,
+                &creds.region,
+            ],
+            || {
+                let base =
+                    self.resolve_api_base(&creds.region, ctx.provider_key.api_base.as_deref())?;
+                Ok::<_, BridgeError>(format!(
+                    "{base}/v1/projects/{project}/locations/{region}/publishers/anthropic/models/{model}:streamRawPredict",
+                    project = creds.project,
+                    region = creds.region,
+                    model = upstream_id,
+                ))
+            },
+        )?;
 
         // Same Anthropic Messages body as the non-stream path, but built
         // with stream=true and — unlike `:rawPredict` — `stream` is KEPT
@@ -1039,8 +1091,7 @@ impl VertexBridge {
         let started = Instant::now();
 
         let resp = with_deadline(ctx.deadline, started, async move {
-            client
-                .post(&url)
+            url.post_on(&client)
                 .headers(headers)
                 .json(&body_value)
                 .send()
@@ -1133,7 +1184,16 @@ impl VertexBridge {
         validate_url_token("project", &creds.project)?;
         validate_url_token("region", &creds.region)?;
 
-        let url = self.openai_shim_url(&creds, ctx.provider_key.api_base.as_deref())?;
+        let url = aisix_gateway::url_cache::cached_endpoint_url(
+            &ctx.provider_key_id,
+            "vertex/openai-shim",
+            &[
+                ctx.provider_key.api_base.as_deref().unwrap_or(""),
+                &creds.project,
+                &creds.region,
+            ],
+            || self.openai_shim_url(&creds, ctx.provider_key.api_base.as_deref()),
+        )?;
 
         let messages = openai_messages_from(req);
         let typed = build_openai_request(req, upstream_id, &messages, false);
@@ -1150,8 +1210,8 @@ impl VertexBridge {
         let started = Instant::now();
 
         with_deadline(ctx.deadline, started, async move {
-            let resp = client
-                .post(&url)
+            let resp = url
+                .post_on(&client)
                 .headers(headers)
                 .json(&body)
                 .send()
@@ -1185,7 +1245,16 @@ impl VertexBridge {
         validate_url_token("project", &creds.project)?;
         validate_url_token("region", &creds.region)?;
 
-        let url = self.openai_shim_url(&creds, ctx.provider_key.api_base.as_deref())?;
+        let url = aisix_gateway::url_cache::cached_endpoint_url(
+            &ctx.provider_key_id,
+            "vertex/openai-shim",
+            &[
+                ctx.provider_key.api_base.as_deref().unwrap_or(""),
+                &creds.project,
+                &creds.region,
+            ],
+            || self.openai_shim_url(&creds, ctx.provider_key.api_base.as_deref()),
+        )?;
 
         let messages = openai_messages_from(req);
         let typed = build_openai_request(req, upstream_id, &messages, true);
@@ -1203,8 +1272,7 @@ impl VertexBridge {
         let started = Instant::now();
 
         let resp = with_deadline(ctx.deadline, started, async move {
-            client
-                .post(&url)
+            url.post_on(&client)
                 .headers(headers)
                 .json(&body)
                 .send()
@@ -1308,12 +1376,25 @@ impl VertexBridge {
                 "vertex publisher {publisher:?} has no URL segment for the :rawPredict rail"
             ))
         })?;
-        let url = self.partner_rawpredict_url(
-            &creds,
-            ctx.provider_key.api_base.as_deref(),
-            segment,
+        let url = aisix_gateway::url_cache::cached_model_endpoint_url(
+            &ctx.provider_key_id,
+            "vertex/partner-rawpredict",
             upstream_id,
-            "rawPredict",
+            &[
+                ctx.provider_key.api_base.as_deref().unwrap_or(""),
+                &creds.project,
+                &creds.region,
+                segment,
+            ],
+            || {
+                self.partner_rawpredict_url(
+                    &creds,
+                    ctx.provider_key.api_base.as_deref(),
+                    segment,
+                    upstream_id,
+                    "rawPredict",
+                )
+            },
         )?;
 
         // OpenAI chat-completions body — same serializer the OpenAI-shim
@@ -1333,8 +1414,8 @@ impl VertexBridge {
         let started = Instant::now();
 
         with_deadline(ctx.deadline, started, async move {
-            let resp = client
-                .post(&url)
+            let resp = url
+                .post_on(&client)
                 .headers(headers)
                 .json(&body)
                 .send()
@@ -1375,12 +1456,25 @@ impl VertexBridge {
                 "vertex publisher {publisher:?} has no URL segment for the :streamRawPredict rail"
             ))
         })?;
-        let url = self.partner_rawpredict_url(
-            &creds,
-            ctx.provider_key.api_base.as_deref(),
-            segment,
+        let url = aisix_gateway::url_cache::cached_model_endpoint_url(
+            &ctx.provider_key_id,
+            "vertex/partner-stream-rawpredict",
             upstream_id,
-            "streamRawPredict",
+            &[
+                ctx.provider_key.api_base.as_deref().unwrap_or(""),
+                &creds.project,
+                &creds.region,
+                segment,
+            ],
+            || {
+                self.partner_rawpredict_url(
+                    &creds,
+                    ctx.provider_key.api_base.as_deref(),
+                    segment,
+                    upstream_id,
+                    "streamRawPredict",
+                )
+            },
         )?;
 
         let messages = openai_messages_from(req);
@@ -1399,8 +1493,7 @@ impl VertexBridge {
         let started = Instant::now();
 
         let resp = with_deadline(ctx.deadline, started, async move {
-            client
-                .post(&url)
+            url.post_on(&client)
                 .headers(headers)
                 .json(&body)
                 .send()
@@ -1477,13 +1570,26 @@ impl VertexBridge {
         validate_url_token("region", &creds.region)?;
         validate_url_token("upstream_id", upstream_id)?;
 
-        let base = self.resolve_api_base(&creds.region, ctx.provider_key.api_base.as_deref())?;
-        let url = format!(
-            "{base}/v1/projects/{project}/locations/{region}/publishers/google/models/{model}:streamGenerateContent?alt=sse",
-            project = creds.project,
-            region = creds.region,
-            model = upstream_id,
-        );
+        let url = aisix_gateway::url_cache::cached_model_endpoint_url(
+            &ctx.provider_key_id,
+            "vertex/gemini-stream-generate",
+            upstream_id,
+            &[
+                ctx.provider_key.api_base.as_deref().unwrap_or(""),
+                &creds.project,
+                &creds.region,
+            ],
+            || {
+                let base =
+                    self.resolve_api_base(&creds.region, ctx.provider_key.api_base.as_deref())?;
+                Ok::<_, BridgeError>(format!(
+                    "{base}/v1/projects/{project}/locations/{region}/publishers/google/models/{model}:streamGenerateContent?alt=sse",
+                    project = creds.project,
+                    region = creds.region,
+                    model = upstream_id,
+                ))
+            },
+        )?;
 
         let typed = build_gemini_request(req);
         if typed.contents.is_empty() {
@@ -1507,8 +1613,7 @@ impl VertexBridge {
         let started = Instant::now();
 
         let resp = with_deadline(ctx.deadline, started, async move {
-            client
-                .post(&url)
+            url.post_on(&client)
                 .headers(headers)
                 .json(&body)
                 .send()
@@ -3536,6 +3641,79 @@ mod tests {
         let req = ChatFormat::new("my-gemini", vec![ChatMessage::user("hi")]);
         let chat = bridge.chat(&req, &ctx).await.unwrap();
         assert_eq!(chat.message.content_str(), "hello from gemini");
+    }
+
+    /// The Vertex URL carries the upstream model in its path, so the
+    /// endpoint URL cache has to hold a row per model. Keying it by
+    /// Provider Key alone would make each model invalidate the previous
+    /// one's row — every request a miss, and a window in which a stale
+    /// row answers for the wrong model.
+    ///
+    /// Two models on one key id, alternating, three rounds: each must
+    /// land on its own path every time.
+    #[tokio::test]
+    async fn url_cache_holds_a_row_per_upstream_model() {
+        let server = MockServer::start().await;
+        for model in ["gemini-1.5-pro", "gemini-2.0-flash"] {
+            Mock::given(method("POST"))
+                .and(path(format!(
+                    "/v1/projects/my-proj/locations/us-central1/publishers/google/models/{model}:generateContent"
+                )))
+                .respond_with(CapturingResponder::default())
+                .expect(3)
+                .mount(&server)
+                .await;
+        }
+
+        let bridge = VertexBridge::new();
+        let req = ChatFormat::new("my-gemini", vec![ChatMessage::user("hi")]);
+        for _ in 0..3 {
+            for model in ["gemini-1.5-pro", "gemini-2.0-flash"] {
+                let ctx = BridgeContext::new(
+                    "req-1",
+                    sample_model_with(model),
+                    sample_pk_with_secret_and_api_base(valid_secret_json(), &server.uri()),
+                )
+                .with_resource_ids("m-1", "pk-vertex-rows");
+                bridge.chat(&req, &ctx).await.unwrap();
+            }
+        }
+        // Each `.expect(3)` is verified when the server drops.
+    }
+
+    /// An edited `api_base` has to reach the model-keyed rows too: a
+    /// cached URL that outlives the edit keeps dispatching to the host
+    /// the operator just re-pointed away from.
+    #[tokio::test]
+    async fn url_cache_follows_an_api_base_edit_for_the_same_key_id() {
+        async fn mount(server: &MockServer) {
+            Mock::given(method("POST"))
+                .and(path(
+                    "/v1/projects/my-proj/locations/us-central1/publishers/google/models/gemini-1.5-pro:generateContent",
+                ))
+                .respond_with(CapturingResponder::default())
+                .expect(1)
+                .mount(server)
+                .await;
+        }
+        let first = MockServer::start().await;
+        let second = MockServer::start().await;
+        mount(&first).await;
+        mount(&second).await;
+
+        let bridge = VertexBridge::new();
+        let req = ChatFormat::new("my-gemini", vec![ChatMessage::user("hi")]);
+        for host in [&first, &second] {
+            let ctx = BridgeContext::new(
+                "req-1",
+                sample_model_with("gemini-1.5-pro"),
+                sample_pk_with_secret_and_api_base(valid_secret_json(), &host.uri()),
+            )
+            .with_resource_ids("m-1", "pk-vertex-repoint");
+            bridge.chat(&req, &ctx).await.unwrap();
+        }
+        // Each `.expect(1)` fails on drop if the second request stayed
+        // on the first host.
     }
 
     /// Same as above but exercises the trailing-slash trim — a

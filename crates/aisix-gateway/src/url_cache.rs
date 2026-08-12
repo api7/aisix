@@ -151,6 +151,34 @@ thread_local! {
         const { std::cell::RefCell::new(String::new()) };
 }
 
+/// Parse `raw` once, for a caller whose URL *is* a configured string with
+/// nothing derived from the request — an A2A agent's JSON-RPC endpoint.
+///
+/// No resource id and no fingerprint: the string is its own identity, so
+/// an edited agent simply lands on a different row and a renamed or
+/// deleted one leaves a dead row behind, bounded by [`MAX_PARSED_URLS`].
+/// Callers whose URL is *built* from configuration want
+/// [`cached_endpoint_url`] instead, which revalidates against the inputs.
+pub fn cached_url(raw: &str) -> EndpointUrl {
+    static PARSED: OnceLock<DashMap<Box<str>, Url>> = OnceLock::new();
+    let cache = PARSED.get_or_init(DashMap::new);
+    if let Some(hit) = cache.get(raw) {
+        return EndpointUrl::Parsed(hit.clone());
+    }
+    let Ok(url) = Url::parse(raw) else {
+        return EndpointUrl::Unparsed(raw.to_string());
+    };
+    if cache.len() >= MAX_PARSED_URLS {
+        cache.clear();
+    }
+    cache.insert(Box::from(raw), url.clone());
+    EndpointUrl::Parsed(url)
+}
+
+/// Upper bound on [`cached_url`] rows, on the same reasoning as
+/// [`MAX_RESOURCES`].
+const MAX_PARSED_URLS: usize = 8192;
+
 /// This resource's rows, creating them on first sight. `None` means the
 /// caller passed no id and wants the cache bypassed.
 fn rows_for(resource_id: &str) -> Option<Arc<EndpointRows>> {

@@ -278,6 +278,10 @@ pub trait A2aBridge: Send + Sync {
 #[derive(Debug)]
 pub struct HttpBridge {
     upstream: A2aUpstream,
+    /// The agent's JSON-RPC endpoint, parsed once process-wide instead of
+    /// by reqwest on every call. A bridge is built per request, so this
+    /// is one cache lookup per request in place of one `Url` parse.
+    endpoint: aisix_gateway::url_cache::EndpointUrl,
     client: reqwest::Client,
 }
 
@@ -287,6 +291,7 @@ impl HttpBridge {
     /// per-request, so a shared client does not lose the per-agent deadline.
     pub fn new(upstream: A2aUpstream) -> Self {
         Self {
+            endpoint: aisix_gateway::url_cache::cached_url(&upstream.url),
             upstream,
             client: shared_client(),
         }
@@ -402,8 +407,9 @@ impl A2aBridge for HttpBridge {
     async fn send(&self, request: &serde_json::Value) -> Result<serde_json::Value, A2aError> {
         let resp = self
             .prepare(
-                self.client
-                    .post(&self.upstream.url)
+                self.endpoint
+                    .clone()
+                    .post_on(&self.client)
                     .timeout(self.upstream.timeout)
                     .json(request),
             )
@@ -438,8 +444,9 @@ impl A2aBridge for HttpBridge {
         let resp = tokio::time::timeout(
             self.upstream.timeout,
             self.prepare(
-                self.client
-                    .post(&self.upstream.url)
+                self.endpoint
+                    .clone()
+                    .post_on(&self.client)
                     .header(reqwest::header::ACCEPT, SSE_CONTENT_TYPE)
                     .json(request),
             )

@@ -115,12 +115,35 @@ impl AzureOpenAiBridge {
     /// Resolve the URL the bridge will POST to. Returns
     /// `upstream.chat_completions_url()` in production; tests can
     /// override via [`Self::with_url_override`].
-    fn resolve_url(&self, upstream: &AzureUpstreamRef) -> String {
+    ///
+    /// Cached per (Provider Key, deployment): the URL embeds the
+    /// deployment name, so a key fronting several deployments needs a row
+    /// each — keying only by Provider Key would make every deployment
+    /// invalidate the previous one's row and rebuild on every request.
+    /// The fingerprint is the raw `api_base`, the one input
+    /// `AzureUpstreamRef::resolve` derives the rest from; the api-version
+    /// is a pinned constant.
+    fn resolve_url(
+        &self,
+        ctx: &BridgeContext,
+        upstream: &AzureUpstreamRef,
+    ) -> aisix_gateway::url_cache::EndpointUrl {
         #[cfg(test)]
         if let Some(u) = &self.url_override {
-            return u.clone();
+            // Uncached, and handed over as a raw string so reqwest
+            // parses it exactly as it always did: the override exists so
+            // wiremock can stand in for a canonical Azure host, and each
+            // test server is a different port under one `api_base`.
+            return aisix_gateway::url_cache::EndpointUrl::Unparsed(u.clone());
         }
-        upstream.chat_completions_url()
+        aisix_gateway::url_cache::cached_model_endpoint_url(
+            &ctx.provider_key_id,
+            "azure/chat",
+            &upstream.deployment,
+            &[ctx.provider_key.api_base.as_deref().unwrap_or("")],
+            || Ok::<_, std::convert::Infallible>(upstream.chat_completions_url()),
+        )
+        .unwrap_or_else(|never| match never {})
     }
 
     /// Test-only seam: rewrite the POST URL so wiremock can stand
@@ -695,13 +718,13 @@ impl Bridge for AzureOpenAiBridge {
             ctx.provider_key.response.as_ref(),
         )?;
         let headers = build_request_headers(&auth, &ctx.request_id, false, &ctx.header_ctx())?;
-        let url = self.resolve_url(&upstream);
+        let url = self.resolve_url(ctx, &upstream);
         let client = self.client_for(ctx);
         let started = Instant::now();
 
         with_deadline(ctx.deadline, started, async move {
-            let resp = client
-                .post(&url)
+            let resp = url
+                .post_on(&client)
                 .headers(headers)
                 .json(&body)
                 .send()
@@ -747,13 +770,12 @@ impl Bridge for AzureOpenAiBridge {
             ctx.provider_key.response.as_ref(),
         )?;
         let headers = build_request_headers(&auth, &ctx.request_id, true, &ctx.header_ctx())?;
-        let url = self.resolve_url(&upstream);
+        let url = self.resolve_url(ctx, &upstream);
         let client = self.client_for(ctx);
         let started = Instant::now();
 
         let resp = with_deadline(ctx.deadline, started, async move {
-            client
-                .post(&url)
+            url.post_on(&client)
                 .headers(headers)
                 .json(&body)
                 .send()
