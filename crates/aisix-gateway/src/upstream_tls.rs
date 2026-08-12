@@ -257,7 +257,7 @@ fn worker_client() -> Option<reqwest::Client> {
     }
     WORKER_CLIENT.with(|cell| {
         cell.get_or_init(|| {
-            match crate::upstream_http::client_builder()
+            match crate::upstream_http::dispatch_client_builder()
                 .user_agent(DISPATCH_USER_AGENT)
                 .build()
             {
@@ -321,7 +321,8 @@ fn build_provider_key_client(tls: &ProviderKeyTls) -> Result<reqwest::Client, St
     // than replacing them: a deployment CA and a per-key CA are both
     // trust roots, and a client presenting the deployment's mTLS
     // identity must keep presenting it.
-    let mut builder = crate::upstream_http::client_builder().user_agent(PROVIDER_KEY_USER_AGENT);
+    let mut builder =
+        crate::upstream_http::dispatch_client_builder().user_agent(PROVIDER_KEY_USER_AGENT);
     if let Some(pem) = tls.ca_cert.as_ref().filter(|p| !p.trim().is_empty()) {
         let roots = reqwest::Certificate::from_pem_bundle(pem.as_bytes())
             .map_err(|e| format!("provider_key.tls.ca_cert: {e}"))?;

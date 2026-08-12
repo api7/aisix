@@ -153,6 +153,35 @@ pub fn client_builder() -> reqwest::ClientBuilder {
     apply_tls(b, &cfg.tls)
 }
 
+/// [`client_builder`] for the clients that carry a caller's request to an
+/// AI provider, which additionally refuse to follow redirects.
+///
+/// reqwest follows up to 10 redirects by default, and the gateway had
+/// never opted out. A provider answering a dispatched POST with a `301`
+/// or `302` therefore made reqwest re-issue it as a `GET` against the
+/// `Location` host and hand back that response as the completion; a `307`
+/// or `308` replayed the prompt body there verbatim. Only
+/// `authorization`, `cookie`, and the proxy-auth headers are dropped when
+/// the hop crosses hosts, so the vendor credential schemes that do not
+/// use `authorization` — Azure's `api-key`, Anthropic's `x-api-key` —
+/// were carried to whatever host the `Location` named.
+///
+/// Nothing in the gateway was written for that: a 3xx from an upstream
+/// collapses to a 502 in `BridgeError`, the access log records the
+/// configured endpoint rather than the one that answered, and an operator
+/// who never configured the redirect target has no way to see it. Refusing
+/// the redirect turns the upstream's 3xx into the 502 the error path
+/// already describes.
+///
+/// Scoped to inference dispatch on purpose. The other outbound clients
+/// have callers for which a redirect is ordinary — an OpenAPI document
+/// fetched for the MCP surface, a telemetry endpoint behind a rewrite —
+/// and the ones for which it is not (JWKS, OAuth token, A2A) already
+/// refuse it at their own construction site.
+pub fn dispatch_client_builder() -> reqwest::ClientBuilder {
+    client_builder().redirect(reqwest::redirect::Policy::none())
+}
+
 /// Layer the outbound trust decision onto a builder. Split out so the
 /// per-ProviderKey clients get byte-for-byte the same treatment as the
 /// shared one.
@@ -456,6 +485,61 @@ mod tests {
             "these dispatch clients present a user agent the per-worker \
              pool would replace with `{}`:\n{}",
             crate::upstream_tls::DISPATCH_USER_AGENT,
+            offenders.join("\n"),
+        );
+    }
+
+    /// A client that carries a caller's request to a provider must be
+    /// built from [`dispatch_client_builder`], so an upstream 3xx becomes
+    /// the 502 the error path describes instead of a silent hop to
+    /// whatever host the `Location` named.
+    ///
+    /// Provider bridges are matched by shape rather than listed, so a new
+    /// vendor crate is covered the day its `bridge.rs` lands; the
+    /// gateway's per-worker and per-ProviderKey pools and the proxy's
+    /// passthrough client are named because they have no shape in common.
+    ///
+    /// Deliberately not every outbound client: an OpenAPI document
+    /// fetched for the MCP surface, or a telemetry endpoint behind a
+    /// rewrite, may legitimately redirect. The outbound clients that must
+    /// not (JWKS, OAuth token, A2A) already refuse at their own site.
+    #[test]
+    fn every_dispatch_client_refuses_redirects() {
+        fn is_dispatch_site(path: &std::path::Path) -> bool {
+            let p = path.to_string_lossy().replace('\\', "/");
+            (p.contains("/aisix-provider-") && p.ends_with("/src/bridge.rs"))
+                || p.ends_with("aisix-proxy/src/http_client.rs")
+                || p.ends_with("aisix-gateway/src/upstream_tls.rs")
+        }
+
+        let crates_dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/.."));
+        let mut sites = 0;
+        let mut offenders = Vec::new();
+        for file in rust_sources(crates_dir)
+            .into_iter()
+            .filter(|f| is_dispatch_site(f))
+        {
+            let src = std::fs::read_to_string(&file).expect("read source");
+            for (n, line) in production_half(&src).lines().enumerate() {
+                if !line.contains("client_builder()") {
+                    continue;
+                }
+                sites += 1;
+                if !line.contains("dispatch_client_builder()") {
+                    offenders.push(format!("{}:{}", file.display(), n + 1));
+                }
+            }
+        }
+        assert!(
+            sites >= 6,
+            "found {sites} dispatch client construction sites, expected at \
+             least 6 — the probe no longer matches the code and this test \
+             proves nothing",
+        );
+        assert!(
+            offenders.is_empty(),
+            "these dispatch a caller's request on a client that follows \
+             redirects; build them from `dispatch_client_builder()`:\n{}",
             offenders.join("\n"),
         );
     }

@@ -274,7 +274,7 @@ impl Default for VertexBridge {
 }
 
 fn default_client() -> Client {
-    aisix_gateway::client_builder()
+    aisix_gateway::dispatch_client_builder()
         .user_agent("aisix/0.1")
         .build()
         .unwrap_or_else(|_| Client::new())
