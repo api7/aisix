@@ -282,10 +282,10 @@ impl Bridge for AnthropicBridge {
         let url = cached_endpoint_url(
             &ctx.provider_key_id,
             "anthropic/messages",
-            (
+            &[
                 ctx.provider_key.api_base.as_deref().unwrap_or(""),
                 &ctx.provider_key.provider,
-            ),
+            ],
             || Ok(format!("{}/v1/messages", resolve_base(ctx)?)),
         )?;
         let client = self.client_for(ctx);
@@ -334,10 +334,10 @@ impl Bridge for AnthropicBridge {
         let url = cached_endpoint_url(
             &ctx.provider_key_id,
             "anthropic/messages",
-            (
+            &[
                 ctx.provider_key.api_base.as_deref().unwrap_or(""),
                 &ctx.provider_key.provider,
-            ),
+            ],
             || Ok(format!("{}/v1/messages", resolve_base(ctx)?)),
         )?;
         let client = self.client_for(ctx);

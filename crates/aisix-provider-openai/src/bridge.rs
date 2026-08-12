@@ -402,10 +402,10 @@ impl Bridge for OpenAiBridge {
         let url = cached_endpoint_url(
             &ctx.provider_key_id,
             "openai/chat",
-            (
+            &[
                 ctx.provider_key.api_base.as_deref().unwrap_or(""),
                 &ctx.provider_key.provider,
-            ),
+            ],
             || Ok(format!("{}/chat/completions", self.resolve_base(ctx)?)),
         )?;
         let client = self.client_for(ctx);
@@ -455,10 +455,10 @@ impl Bridge for OpenAiBridge {
         let url = cached_endpoint_url(
             &ctx.provider_key_id,
             "openai/embeddings",
-            (
+            &[
                 ctx.provider_key.api_base.as_deref().unwrap_or(""),
                 &ctx.provider_key.provider,
-            ),
+            ],
             || Ok(format!("{}/embeddings", self.resolve_base(ctx)?)),
         )?;
         let client = self.client_for(ctx);
@@ -514,10 +514,10 @@ impl Bridge for OpenAiBridge {
         let url = cached_endpoint_url(
             &ctx.provider_key_id,
             "openai/completions",
-            (
+            &[
                 ctx.provider_key.api_base.as_deref().unwrap_or(""),
                 &ctx.provider_key.provider,
-            ),
+            ],
             || Ok(format!("{}/completions", self.resolve_base(ctx)?)),
         )?;
         let client = self.client_for(ctx);
@@ -571,10 +571,10 @@ impl Bridge for OpenAiBridge {
         let url = cached_endpoint_url(
             &ctx.provider_key_id,
             "openai/images",
-            (
+            &[
                 ctx.provider_key.api_base.as_deref().unwrap_or(""),
                 &ctx.provider_key.provider,
-            ),
+            ],
             || Ok(format!("{}/images/generations", self.resolve_base(ctx)?)),
         )?;
         let client = self.client_for(ctx);
@@ -619,10 +619,10 @@ impl Bridge for OpenAiBridge {
         let url = cached_endpoint_url(
             &ctx.provider_key_id,
             "openai/chat",
-            (
+            &[
                 ctx.provider_key.api_base.as_deref().unwrap_or(""),
                 &ctx.provider_key.provider,
-            ),
+            ],
             || Ok(format!("{}/chat/completions", self.resolve_base(ctx)?)),
         )?;
         let client = self.client_for(ctx);

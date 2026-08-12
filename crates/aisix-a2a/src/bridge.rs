@@ -278,6 +278,10 @@ pub trait A2aBridge: Send + Sync {
 #[derive(Debug)]
 pub struct HttpBridge {
     upstream: A2aUpstream,
+    /// The agent's JSON-RPC endpoint, parsed once process-wide instead of
+    /// by reqwest on every call. A bridge is built per request, so this
+    /// is one cache lookup per request in place of one `Url` parse.
+    endpoint: aisix_gateway::url_cache::EndpointUrl,
     client: reqwest::Client,
 }
 
@@ -287,6 +291,7 @@ impl HttpBridge {
     /// per-request, so a shared client does not lose the per-agent deadline.
     pub fn new(upstream: A2aUpstream) -> Self {
         Self {
+            endpoint: aisix_gateway::url_cache::cached_url(&upstream.url),
             upstream,
             client: shared_client(),
         }
@@ -319,8 +324,19 @@ impl HttpBridge {
     /// A registered URL that is already at the origin yields the origin
     /// candidates alone — the two bases coincide and probing twice is waste.
     fn agent_card_urls(&self) -> Result<Vec<reqwest::Url>, A2aError> {
-        let base = reqwest::Url::parse(&self.upstream.url)
-            .map_err(|e| A2aError::Connect(format!("invalid upstream url: {e}")))?;
+        // The same parse the POST path uses, so card discovery and the
+        // JSON-RPC call can never disagree about the agent's endpoint.
+        let base = match &self.endpoint {
+            aisix_gateway::url_cache::EndpointUrl::Parsed(url) => url.clone(),
+            aisix_gateway::url_cache::EndpointUrl::Unparsed(raw) => {
+                // `Unparsed` means the parse already failed; re-run it
+                // only to render the same message this returned before.
+                let cause = reqwest::Url::parse(raw)
+                    .err()
+                    .map_or_else(|| "not a valid URL".to_string(), |e| e.to_string());
+                return Err(A2aError::Connect(format!("invalid upstream url: {cause}")));
+            }
+        };
         let prefix = base.path().trim_end_matches('/').to_string();
         let mut urls = Vec::with_capacity(AGENT_CARD_PATHS.len() * 2);
         for path in AGENT_CARD_PATHS {
@@ -402,8 +418,9 @@ impl A2aBridge for HttpBridge {
     async fn send(&self, request: &serde_json::Value) -> Result<serde_json::Value, A2aError> {
         let resp = self
             .prepare(
-                self.client
-                    .post(&self.upstream.url)
+                self.endpoint
+                    .clone()
+                    .post_on(&self.client)
                     .timeout(self.upstream.timeout)
                     .json(request),
             )
@@ -438,8 +455,9 @@ impl A2aBridge for HttpBridge {
         let resp = tokio::time::timeout(
             self.upstream.timeout,
             self.prepare(
-                self.client
-                    .post(&self.upstream.url)
+                self.endpoint
+                    .clone()
+                    .post_on(&self.client)
                     .header(reqwest::header::ACCEPT, SSE_CONTENT_TYPE)
                     .json(request),
             )
