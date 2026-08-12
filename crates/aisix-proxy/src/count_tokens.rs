@@ -148,7 +148,7 @@ pub async fn count_tokens(
                 "/v1/messages/count_tokens",
                 crate::request_metrics::Caller::new(&auth),
                 crate::request_metrics::Upstream {
-                    model: metric_model,
+                    model: metric_model.as_ref(),
                     ..Default::default()
                 },
                 status,

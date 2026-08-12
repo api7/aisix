@@ -242,6 +242,16 @@ pub(crate) fn record(
     elapsed: Duration,
 ) {
     let outcome = RequestOutcome::from_status(status);
+    // Emit-chokepoint label bounding (#451 class): success paths hand in
+    // the caller's requested string, which for a wildcard-served alias
+    // is caller-minted — collapse it to the configured row's name here
+    // so no handler-family member can mint unbounded series.
+    let snap = state.snapshot.load();
+    let model_label = crate::usage_attr::metric_model_label(&snap, upstream.model);
+    let upstream = Upstream {
+        model: model_label.as_ref(),
+        ..upstream
+    };
     state
         .metrics
         .record_request(upstream.provider, upstream.model, status, outcome, elapsed);
@@ -311,6 +321,13 @@ pub(crate) fn record_usage(
     upstream: Upstream<'_>,
     tokens: Tokens<'_>,
 ) {
+    // Same emit-chokepoint bounding as `record` — see the note there.
+    let snap = state.snapshot.load();
+    let model_label = crate::usage_attr::metric_model_label(&snap, upstream.model);
+    let upstream = Upstream {
+        model: model_label.as_ref(),
+        ..upstream
+    };
     // Legacy compatibility series (provider × model).
     state
         .metrics

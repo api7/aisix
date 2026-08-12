@@ -300,10 +300,12 @@ pub async fn responses(
                 // SLO e2e histogram (AISIX-Cloud#1011): recorded even when
                 // the upstream response carried no parseable usage block —
                 // latency observation must not depend on token accounting.
+                let bounded_model =
+                    crate::usage_attr::metric_model_label(&state.snapshot.load(), &model_name);
                 state.metrics.record_request_e2e_latency(
                     LatencyLabels {
                         endpoint: "/v1/responses",
-                        model: &model_name,
+                        model: bounded_model.as_ref(),
                         provider: &success.provider,
                         status,
                         streaming: stream_requested,
@@ -375,7 +377,7 @@ pub async fn responses(
                 "/v1/responses",
                 crate::request_metrics::Caller::new(&auth),
                 crate::request_metrics::Upstream {
-                    model: metric_model,
+                    model: metric_model.as_ref(),
                     stream: stream_requested,
                     is_fallback: routing.fallback_count() > 0,
                     ..Default::default()
@@ -386,7 +388,7 @@ pub async fn responses(
             state.metrics.record_request_e2e_latency(
                 LatencyLabels {
                     endpoint: "/v1/responses",
-                    model: metric_model,
+                    model: metric_model.as_ref(),
                     provider: "unknown",
                     status,
                     streaming: stream_requested,
@@ -1444,6 +1446,9 @@ async fn responses_to_target(
         let request_id_c = request_id.to_string();
         let model_id_c = model_id.to_string();
         let requested_model_c = requested_model.to_string();
+        let bounded_model_c =
+            crate::usage_attr::metric_model_label(&state.snapshot.load(), requested_model)
+                .into_owned();
         let api_key_id_c = api_key_id.to_string();
         let provider_key_id_c = provider_key_id.clone();
         let provider_c = provider_label.clone();
@@ -1538,7 +1543,7 @@ async fn responses_to_target(
                 state_c.metrics.record_request_e2e_latency(
                     LatencyLabels {
                         endpoint: "/v1/responses",
-                        model: &requested_model_c,
+                        model: &bounded_model_c,
                         provider: &provider_c,
                         status: 200,
                         streaming: true,
@@ -1944,6 +1949,9 @@ async fn responses_cross_provider_to_target(
         let request_id_c = request_id.to_string();
         let model_id_c = model_id.to_string();
         let requested_model_c = requested_model.to_string();
+        let bounded_model_c =
+            crate::usage_attr::metric_model_label(&state.snapshot.load(), requested_model)
+                .into_owned();
         let api_key_id_c = api_key_id.to_string();
         let provider_key_id_c = provider_key_id.clone();
         let provider_c = provider_label.clone();
@@ -2036,7 +2044,7 @@ async fn responses_cross_provider_to_target(
                 state_c.metrics.record_request_e2e_latency(
                     LatencyLabels {
                         endpoint: "/v1/responses",
-                        model: &requested_model_c,
+                        model: &bounded_model_c,
                         provider: &provider_c,
                         status,
                         streaming: true,

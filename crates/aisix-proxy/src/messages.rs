@@ -207,10 +207,12 @@ pub async fn messages(
             // SLO e2e histogram (AISIX-Cloud#1011): non-streaming only —
             // a stream records its full duration at completion instead.
             if !stream_requested {
+                let bounded_model =
+                    crate::usage_attr::metric_model_label(&state.snapshot.load(), &model_name);
                 state.metrics.record_request_e2e_latency(
                     LatencyLabels {
                         endpoint: "/v1/messages",
-                        model: &model_name,
+                        model: bounded_model.as_ref(),
                         provider: &provider_label,
                         status,
                         streaming: false,
@@ -312,7 +314,7 @@ pub async fn messages(
                 "/v1/messages",
                 crate::request_metrics::Caller::new(&auth),
                 crate::request_metrics::Upstream {
-                    model: metric_model,
+                    model: metric_model.as_ref(),
                     stream: stream_requested,
                     is_fallback: routing.fallback_count() > 0,
                     ..Default::default()
@@ -323,7 +325,7 @@ pub async fn messages(
             state.metrics.record_request_e2e_latency(
                 LatencyLabels {
                     endpoint: "/v1/messages",
-                    model: metric_model,
+                    model: metric_model.as_ref(),
                     provider: "unknown",
                     status,
                     streaming: stream_requested,
@@ -1258,6 +1260,10 @@ async fn anthropic_passthrough_dispatch(
         let api_key_id_c = api_key_id.to_string();
         let provider_c = provider_label.clone();
         let model_name_c = model_name.to_string();
+        // Bounded twin for the latency-histogram label (emit-chokepoint
+        // rule) — usage events keep the raw requested string.
+        let bounded_model_c =
+            crate::usage_attr::metric_model_label(&state.snapshot.load(), model_name).into_owned();
         let provider_key_id_c = pk_id.to_string();
         let upstream_model_c = upstream_model.clone();
         let team_id_c = team_id.clone();
@@ -1361,7 +1367,7 @@ async fn anthropic_passthrough_dispatch(
                 state_c.metrics.record_request_e2e_latency(
                     LatencyLabels {
                         endpoint: "/v1/messages",
-                        model: &model_name_c,
+                        model: &bounded_model_c,
                         provider: &provider_c,
                         status: 200,
                         streaming: true,
@@ -1910,6 +1916,8 @@ async fn cross_provider_dispatch(
         let api_key_id_for_telem = api_key_id.to_string();
         let provider_for_telem = provider_label.clone();
         let model_for_telem = model_name.to_string();
+        let bounded_model_for_telem =
+            crate::usage_attr::metric_model_label(&state.snapshot.load(), model_name).into_owned();
         let provider_key_id_for_telem = provider_key_id.to_string();
         let upstream_model_for_telem = upstream_model.clone();
         let team_id_for_telem = team_id;
@@ -2007,7 +2015,7 @@ async fn cross_provider_dispatch(
                 state_for_telem.metrics.record_request_e2e_latency(
                     LatencyLabels {
                         endpoint: "/v1/messages",
-                        model: &model_for_telem,
+                        model: &bounded_model_for_telem,
                         provider: &provider_for_telem,
                         status: 200,
                         streaming: true,
@@ -2848,10 +2856,11 @@ fn emit_anthropic_usage_event(
         },
     );
     if metrics.upstream_ttft_ms > 0 {
+        let bounded_model = crate::usage_attr::metric_model_label(&state.snapshot.load(), model);
         state.metrics.record_request_ttft(
             LatencyLabels {
                 endpoint: "/v1/messages",
-                model,
+                model: bounded_model.as_ref(),
                 provider,
                 status: status_code,
                 streaming: true,

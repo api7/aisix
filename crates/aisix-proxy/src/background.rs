@@ -38,6 +38,14 @@ pub async fn run_background_model_check_once(
         if model.is_routing() {
             continue;
         }
+        // A wildcard alias row has no concrete upstream id of its own —
+        // probing would send the `*` template verbatim, burn real quota
+        // every interval, and pin the row permanently Unhealthy.
+        if model.display_name.contains('*')
+            || model.model_name.as_deref().is_some_and(|m| m.contains('*'))
+        {
+            continue;
+        }
         let Some(cfg) = model.background_model_check.as_ref() else {
             continue;
         };

@@ -191,7 +191,7 @@ pub async fn rerank(
                 "/v1/rerank",
                 crate::request_metrics::Caller::new(&auth),
                 crate::request_metrics::Upstream {
-                    model: metric_model,
+                    model: metric_model.as_ref(),
                     ..Default::default()
                 },
                 status,
