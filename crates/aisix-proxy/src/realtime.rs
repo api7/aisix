@@ -185,6 +185,7 @@ pub(crate) async fn realtime(
             );
             crate::usage_attr::emit_error_usage_event(
                 &state,
+                &state.snapshot.load(),
                 "realtime",
                 "realtime",
                 &request_id,
@@ -314,6 +315,7 @@ async fn prepare(
     };
     let reservation = crate::quota::enforce(
         state,
+        &snapshot,
         &auth,
         Some(&crate::quota::ModelRateLimit::from_model(
             &model_entry.value.display_name,
@@ -521,6 +523,7 @@ async fn run_session(
             );
             crate::usage_attr::emit_error_usage_event(
                 &state,
+                &state.snapshot.load(),
                 "realtime",
                 "realtime",
                 &request_id,
@@ -726,7 +729,12 @@ async fn run_session(
         elapsed,
     );
 
+    // A realtime session can run for minutes, so its terminal emits read a
+    // FRESH snapshot rather than the one `prepare` resolved against (#941) —
+    // one load and one ProviderKey lookup shared by the usage event and
+    // `record_usage` below, where each used to do its own.
     let snap = state.snapshot.load();
+    let pk = crate::usage_attr::ResolvedPk::resolve(&snap, &pk_id);
     let mut event = UsageEvent {
         request_id: request_id.clone(),
         occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
@@ -753,7 +761,7 @@ async fn run_session(
         guardrail_monitor_hits: monitor_hits,
         ..Default::default()
     };
-    crate::usage_attr::apply_pk_telemetry(&mut event, &snap, &pk_id);
+    crate::usage_attr::apply_pk_telemetry(&mut event, &pk);
     crate::usage_attr::apply_jwt_identity(&mut event, auth.jwt.as_ref());
     state.usage_sink.try_emit("realtime", event.clone());
     let exporters = snap.observability_exporters.entries();
@@ -772,7 +780,7 @@ async fn run_session(
             provider: &provider_label,
             model: &model_entry.value.display_name,
             upstream_model: model_entry.value.upstream_model().unwrap_or("unknown"),
-            provider_key_id: &pk_id,
+            pk: pk.labels(),
             ..Default::default()
         },
         crate::request_metrics::Tokens {

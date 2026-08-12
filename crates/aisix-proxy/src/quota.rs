@@ -292,6 +292,7 @@ fn classic_rate_limit(policy: &RateLimitPolicy) -> Option<RateLimit> {
 /// `tools/call` targets; `None` for every non-MCP endpoint.
 async fn reserve_layers(
     state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
     auth: &AuthenticatedKey,
     model_rl: Option<&ModelRateLimit>,
     mcp_server: Option<&str>,
@@ -347,7 +348,7 @@ async fn reserve_layers(
     let phase = PolicyPhase::Request {
         defer_model_properties: model_rl.is_some_and(|m| m.routing_parent),
     };
-    reserve_policy_layers(state, &input, phase, &mut reservations).await?;
+    reserve_policy_layers(state, snapshot, &input, phase, &mut reservations).await?;
 
     Ok(MultiReservation::new(reservations))
 }
@@ -359,11 +360,14 @@ async fn reserve_layers(
 /// once already — AISIX-Cloud#1104).
 async fn reserve_policy_layers(
     state: &ProxyState,
+    // The caller's request snapshot (#941). This gate used to load its
+    // own, which on a zero-policy deployment was the entire cost of the
+    // call — the emptiness check below is O(1).
+    snap: &aisix_core::AisixSnapshot,
     input: &ConditionInput<'_>,
     phase: PolicyPhase,
     reservations: &mut Vec<aisix_ratelimit::Reservation>,
 ) -> Result<(), ProxyError> {
-    let snap = state.snapshot.load();
     // O(1) empty check before anything else: deployments with no
     // rate-limit policies (the default) skip the wall-clock read and
     // the per-shard table scan below entirely. Covers both callers —
@@ -425,11 +429,12 @@ fn reject(
 /// don't resolve a model (e.g. passthrough).
 pub(crate) async fn enforce(
     state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
     auth: &AuthenticatedKey,
     model_rl: Option<&ModelRateLimit>,
 ) -> Result<MultiReservation, ProxyError> {
     check_budget(state, auth).await?;
-    reserve_layers(state, auth, model_rl, None).await
+    reserve_layers(state, snapshot, auth, model_rl, None).await
 }
 
 /// Apply budget + multi-layer rate-limit checks for one MCP `tools/call`
@@ -438,11 +443,12 @@ pub(crate) async fn enforce(
 /// so the model layers are never engaged.
 pub(crate) async fn enforce_mcp(
     state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
     auth: &AuthenticatedKey,
     mcp_server: &str,
 ) -> Result<MultiReservation, ProxyError> {
     check_budget(state, auth).await?;
-    reserve_layers(state, auth, None, Some(mcp_server)).await
+    reserve_layers(state, snapshot, auth, None, Some(mcp_server)).await
 }
 
 /// Budget pre-check shared by the enforce entry points: refreshes the
@@ -482,10 +488,11 @@ async fn check_budget(state: &ProxyState, auth: &AuthenticatedKey) -> Result<(),
 /// which handles budget separately.
 pub(crate) async fn enforce_rate_limit(
     state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
     auth: &AuthenticatedKey,
     model_rl: Option<&ModelRateLimit>,
 ) -> Result<MultiReservation, ProxyError> {
-    reserve_layers(state, auth, model_rl, None).await
+    reserve_layers(state, snapshot, auth, model_rl, None).await
 }
 
 /// Reserve ONLY the model-scoped layers for one model, identified by its
@@ -509,6 +516,7 @@ pub(crate) async fn enforce_rate_limit(
 /// never splits per user).
 pub(crate) async fn reserve_model_only(
     state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
     auth: &AuthenticatedKey,
     model_name: &str,
     model_entry_id: &str,
@@ -530,7 +538,14 @@ pub(crate) async fn reserve_model_only(
 
     // Policies that follow the model to this target.
     let input = condition_input(auth, Some(&mrl));
-    reserve_policy_layers(state, &input, PolicyPhase::ModelTarget, &mut reservations).await?;
+    reserve_policy_layers(
+        state,
+        snapshot,
+        &input,
+        PolicyPhase::ModelTarget,
+        &mut reservations,
+    )
+    .await?;
 
     Ok(MultiReservation::new(reservations))
 }
@@ -548,6 +563,7 @@ pub(crate) async fn reserve_model_only(
 /// deployments out of the candidate set).
 pub(crate) async fn reserve_routing_target(
     state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
     auth: &AuthenticatedKey,
     is_routing_request: bool,
     target_name: &str,
@@ -557,7 +573,7 @@ pub(crate) async fn reserve_routing_target(
     if !is_routing_request {
         return Ok(None);
     }
-    reserve_model_only(state, auth, target_name, target_entry_id, target)
+    reserve_model_only(state, snapshot, auth, target_name, target_entry_id, target)
         .await
         .map(Some)
 }

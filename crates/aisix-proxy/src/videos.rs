@@ -1051,14 +1051,12 @@ impl VideoTarget {
 /// against (the requested alias on submit, the stored display name on the
 /// GET routes).
 fn resolve_video_target(
-    state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
     auth: &AuthenticatedKey,
     model_entry: std::sync::Arc<aisix_core::ResourceEntry<aisix_core::Model>>,
     acl_name: &str,
     client_ctx: &ClientContext,
 ) -> Result<Result<VideoTarget, Response>, ProxyError> {
-    let snapshot = state.snapshot.load();
-
     if !auth.key().can_access(acl_name) {
         return Err(ProxyError::ModelForbidden(acl_name.to_string()));
     }
@@ -1077,7 +1075,7 @@ fn resolve_video_target(
         return Ok(Err((StatusCode::NOT_IMPLEMENTED, Json(env)).into_response()));
     };
 
-    let pk_entry = crate::dispatch::resolve_provider_key(&snapshot, &model_entry.value)?;
+    let pk_entry = crate::dispatch::resolve_provider_key(snapshot, &model_entry.value)?;
     // Of the mapped vendors only OpenAI has a built-in default api_base (the
     // same one the chat path uses) — an openai video Model with no `api_base`
     // falls back to it. The other four express regional endpoints, so their
@@ -1524,7 +1522,10 @@ pub async fn create_video(
     };
     let model_name = body.model.clone();
 
-    match dispatch_create(&state, &auth, body, &client).await {
+    // One snapshot for the whole request (#941) — see `embeddings`.
+    let snapshot = state.snapshot.load();
+
+    match dispatch_create(&state, &snapshot, &auth, body, &client).await {
         Ok(success) => {
             let status = success.response.status().as_u16();
             // Label by the RESOLVED entry's display_name, not the requested
@@ -1533,8 +1534,7 @@ pub async fn create_video(
             // #451 cardinality failure. Exact-match requests are unchanged
             // (alias == display_name); wildcard traffic aggregates under
             // the pattern itself.
-            let snap = state.snapshot.load();
-            let model_label = snap
+            let model_label = snapshot
                 .models
                 .get_by_id(&success.model_id)
                 .map(|e| e.value.display_name.clone())
@@ -1549,6 +1549,7 @@ pub async fn create_video(
             if success.upstream_called {
                 emit_submit_usage_event(
                     &state,
+                    &snapshot,
                     &client,
                     &auth.entry.id,
                     &success.model_id,
@@ -1564,13 +1565,13 @@ pub async fn create_video(
         }
         Err(err) => {
             let status = err.status().as_u16();
-            let snap = state.snapshot.load();
-            let metric_model = crate::usage_attr::metric_model_label(&snap, &model_name);
+            let metric_model = crate::usage_attr::metric_model_label(&snapshot, &model_name);
             telemetry.finish(status, "unknown", metric_model, Some(&err));
             // #655 parity: failed submits surface in Logs as zero-token
             // events instead of vanishing.
             crate::usage_attr::emit_error_usage_event(
                 &state,
+                &snapshot,
                 "videos",
                 "openai",
                 &client.request_id,
@@ -1599,12 +1600,12 @@ struct CreateSuccess {
 
 async fn dispatch_create(
     state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
     auth: &AuthenticatedKey,
     body: VideoCreateBody,
     client: &ClientContext,
 ) -> Result<CreateSuccess, ProxyError> {
-    let snapshot = state.snapshot.load();
-    let model_entry = crate::model_resolve::resolve_model(&snapshot, &body.model)
+    let model_entry = crate::model_resolve::resolve_model(snapshot, &body.model)
         .ok_or_else(|| ProxyError::ModelNotFound(body.model.clone()))?;
     let model_id = model_entry.id.to_string();
 
@@ -1620,7 +1621,7 @@ async fn dispatch_create(
         ));
     }
 
-    let target = match resolve_video_target(state, auth, model_entry, &body.model, client)? {
+    let target = match resolve_video_target(snapshot, auth, model_entry, &body.model, client)? {
         Ok(t) => t,
         Err(resp) => {
             return Ok(CreateSuccess {
@@ -1679,7 +1680,7 @@ async fn dispatch_create(
         &target.model_entry.id,
         &target.model_entry.value,
     );
-    let reservation = crate::quota::enforce(state, auth, Some(&model_rl)).await?;
+    let reservation = crate::quota::enforce(state, snapshot, auth, Some(&model_rl)).await?;
 
     let upstream_model =
         crate::dispatch::require_upstream_model(&target.model_entry.value)?.to_string();
@@ -1757,19 +1758,18 @@ async fn dispatch_create(
 /// caller already knows the model name they asked for, so there is
 /// nothing to disclose.
 fn resolve_get_target(
-    state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
     auth: &AuthenticatedKey,
     video_id: &str,
     client_ctx: &ClientContext,
 ) -> Result<(VideoTarget, String), ProxyError> {
     let (entry_id, alias, task_id) =
         decode_video_id(video_id).ok_or_else(|| ProxyError::VideoNotFound(video_id.to_string()))?;
-    let snapshot = state.snapshot.load();
     let model_entry = snapshot
         .models
         .get_by_id(&entry_id)
         .ok_or_else(|| ProxyError::VideoNotFound(video_id.to_string()))?;
-    match resolve_video_target(state, auth, model_entry, &alias, client_ctx) {
+    match resolve_video_target(snapshot, auth, model_entry, &alias, client_ctx) {
         Ok(Ok(target)) => Ok((target, task_id)),
         // Unsupported provider → uniform 404 (oracle fold, see above).
         Ok(Err(_)) => Err(ProxyError::VideoNotFound(video_id.to_string())),
@@ -1794,14 +1794,16 @@ pub async fn get_video(
         request_id: client.request_id.clone(),
         started: Instant::now(),
     };
+    // One snapshot for the whole request (#941) — see `embeddings`.
+    let snapshot = state.snapshot.load();
 
     let result: Result<(Response, String, String), ProxyError> = async {
-        let (target, task_id) = resolve_get_target(&state, &auth, &video_id, &client)?;
+        let (target, task_id) = resolve_get_target(&snapshot, &auth, &video_id, &client)?;
         // Poll traffic is exempt from model-level limits BY DESIGN
         // (AISIX-Cloud#1118 decision 3): a client polling a task it
         // already paid an RPM slot to submit must not starve itself.
         // Key-level layers still apply.
-        let reservation = crate::quota::enforce(&state, &auth, None).await?;
+        let reservation = crate::quota::enforce(&state, &snapshot, &auth, None).await?;
         let result = poll_task(&state, &target, &task_id, &client.request_id).await;
         reservation.commit_tokens(0).await;
         let poll = result?;
@@ -1848,11 +1850,13 @@ pub async fn video_content(
         request_id: client.request_id.clone(),
         started: Instant::now(),
     };
+    // One snapshot for the whole request (#941) — see `embeddings`.
+    let snapshot = state.snapshot.load();
 
     let result: Result<(Response, String, String), ProxyError> = async {
-        let (target, task_id) = resolve_get_target(&state, &auth, &video_id, &client)?;
+        let (target, task_id) = resolve_get_target(&snapshot, &auth, &video_id, &client)?;
         // Same model-layer exemption as the poll route (see get_video).
-        let reservation = crate::quota::enforce(&state, &auth, None).await?;
+        let reservation = crate::quota::enforce(&state, &snapshot, &auth, None).await?;
         let result = poll_task(&state, &target, &task_id, &client.request_id).await;
         reservation.commit_tokens(0).await;
         let poll = result?;
@@ -1958,6 +1962,8 @@ pub async fn video_content(
 #[allow(clippy::too_many_arguments)]
 fn emit_submit_usage_event(
     state: &ProxyState,
+    // The request's snapshot, loaded once by the handler (#941).
+    snap: &aisix_core::AisixSnapshot,
     client: &ClientContext,
     api_key_id: &str,
     model_id: &str,
@@ -1968,7 +1974,6 @@ fn emit_submit_usage_event(
     status_code: u16,
     elapsed: Duration,
 ) {
-    let snap = state.snapshot.load();
     let mut event = UsageEvent {
         request_id: client.request_id.clone(),
         occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
@@ -1987,7 +1992,10 @@ fn emit_submit_usage_event(
         client_user_agent: client.user_agent.clone(),
         ..Default::default()
     };
-    crate::usage_attr::apply_pk_telemetry(&mut event, &snap, provider_key_id);
+    crate::usage_attr::apply_pk_telemetry(
+        &mut event,
+        &crate::usage_attr::ResolvedPk::resolve(snap, provider_key_id),
+    );
     crate::usage_attr::apply_jwt_identity(&mut event, client.jwt.as_ref());
     state.usage_sink.try_emit("videos", event.clone());
     let exporters = snap.observability_exporters.entries();

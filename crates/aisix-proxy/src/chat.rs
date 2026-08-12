@@ -135,8 +135,14 @@ pub async fn chat_completions(
     // Filled by `dispatch` with monitor-mode guardrail observations
     // (AISIX-Cloud#562), same dual-path lifecycle as `applied_guardrails`.
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
+    // One snapshot for the whole request (#941). Dispatch, the quota gate,
+    // the terminal metric emits and the usage events all read this handle
+    // instead of loading their own, so a request sees ONE config generation
+    // rather than one per emit.
+    let snapshot = state.snapshot.load();
     let outcome = dispatch(
         &state,
+        &snapshot,
         &auth,
         &mut req,
         &request_id,
@@ -154,8 +160,12 @@ pub async fn chat_completions(
             let elapsed = started.elapsed();
             // #890 req-4: normalise the inbound client type once.
             let client_type = state.client_classifier.classify(&client.user_agent);
+            // One ProviderKey lookup for both terminal metric emits and the
+            // winner's usage event below (#941).
+            let pk = crate::usage_attr::ResolvedPk::resolve(&snapshot, &success.provider_key_id);
             record_success(
                 &state,
+                &pk,
                 &auth,
                 &success.provider,
                 &model_name,
@@ -192,6 +202,7 @@ pub async fn chat_completions(
             // streaming path.
             emit_failed_attempts(
                 &state,
+                &snapshot,
                 &request_id,
                 &model_name,
                 &api_key_id,
@@ -226,6 +237,8 @@ pub async fn chat_completions(
                     .unwrap_or(&success.model_id);
                 emit_usage_event(
                     &state,
+                    &snapshot,
+                    &pk,
                     &request_id,
                     event_model_id,
                     &model_name,
@@ -263,7 +276,6 @@ pub async fn chat_completions(
                         error_class: String::new(),
                         error_message: String::new(),
                         applied_guardrails: applied_guardrails.clone(),
-                        provider_key_id: success.provider_key_id.clone(),
                         redacted_entity_counts: redaction_counts.clone(),
                         guardrail_monitor_hits: monitor_hits.clone(),
                     },
@@ -358,8 +370,7 @@ pub async fn chat_completions(
             // label (unbounded cardinality). The raw name still flows to the
             // per-request access log + usage events below (bounded by request
             // volume, not label cardinality).
-            let snap = state.snapshot.load();
-            let metric_model = crate::usage_attr::metric_model_label(&snap, &model_name);
+            let metric_model = crate::usage_attr::metric_model_label(&snapshot, &model_name);
             // Access log: surface the upstream-billed counts when the
             // error fired AFTER the upstream call (output-content-filter
             // block). Pre-upstream errors (input filter, budget,
@@ -446,7 +457,8 @@ pub async fn chat_completions(
                 None
             } else {
                 content_capture_cap(
-                    snap.observability_exporters
+                    snapshot
+                        .observability_exporters
                         .entries()
                         .iter()
                         .map(|e| &e.value),
@@ -472,6 +484,7 @@ pub async fn chat_completions(
             // reports which guardrails governed it.
             emit_failed_attempts(
                 &state,
+                &snapshot,
                 &request_id,
                 &model_name,
                 &api_key_id,
@@ -502,8 +515,11 @@ pub async fn chat_completions(
                     let winner_latency = winner
                         .map(|w| Duration::from_millis(u64::from(w.latency_ms)))
                         .unwrap_or(elapsed);
+                    let pk = crate::usage_attr::ResolvedPk::resolve(&snapshot, &c.provider_key_id);
                     emit_usage_event(
                         &state,
+                        &snapshot,
+                        &pk,
                         &request_id,
                         event_model_id,
                         &model_name,
@@ -541,7 +557,6 @@ pub async fn chat_completions(
                             // The chain governed the request even though it
                             // ultimately blocked on the output filter.
                             applied_guardrails: applied_guardrails.clone(),
-                            provider_key_id: c.provider_key_id,
                             // Input-side masking happened before the output
                             // block — the audit trail keeps it.
                             redacted_entity_counts: redaction_counts.clone(),
@@ -556,6 +571,8 @@ pub async fn chat_completions(
                 None if routing.attempts.is_empty() => {
                     emit_usage_event(
                         &state,
+                        &snapshot,
+                        &crate::usage_attr::ResolvedPk::unresolved(),
                         &request_id,
                         model_id_str,
                         &model_name,
@@ -1134,6 +1151,7 @@ struct UpstreamCharge {
 #[allow(clippy::too_many_arguments)]
 async fn dispatch(
     state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
     auth: &AuthenticatedKey,
     // `&mut` so mask-action PII guardrails (#932) can rewrite the request
     // text in place before it reaches semantic routing, the cache key, or
@@ -1166,7 +1184,6 @@ async fn dispatch(
         ));
     }
 
-    let snapshot = state.snapshot.load();
     // Largest content cap any enabled content-capturing exporter wants, or
     // `None` when none do — computed once so each response path (cache hit /
     // upstream) only captures when an exporter actually consumes it.
@@ -1178,7 +1195,7 @@ async fn dispatch(
             .map(|e| &e.value),
     );
     let virtual_entry =
-        crate::model_resolve::resolve_model(&snapshot, &req.model).ok_or_else(|| {
+        crate::model_resolve::resolve_model(snapshot, &req.model).ok_or_else(|| {
             DispatchFailure::new(None, None, ProxyError::ModelNotFound(req.model.clone()))
         })?;
     let model_id = virtual_entry.id.clone();
@@ -1317,14 +1334,14 @@ async fn dispatch(
     let (attempt_models, semantic_route): (Vec<AttemptModel>, Option<String>) =
         if virtual_entry.value.is_semantic() {
             let prompt = last_user_message_text(req).unwrap_or_default();
-            crate::semantic::resolve(state, &snapshot, &virtual_entry, &prompt, request_id)
+            crate::semantic::resolve(state, snapshot, &virtual_entry, &prompt, request_id)
                 .await
                 .map_err(&with_model)?
         } else {
             let attempts = resolve_attempt_models(
                 &state.routing,
                 &state.runtime_status,
-                &snapshot,
+                snapshot,
                 &req.model,
                 &virtual_entry.id,
                 &virtual_entry.value,
@@ -1358,8 +1375,7 @@ async fn dispatch(
         // Pre-flight the PK-based two-tier dispatch so a missing
         // family/specialized bridge surfaces as 503 here, before
         // we commit to a long upstream call.
-        let pk_entry =
-            crate::dispatch::resolve_provider_key(&snapshot, only).map_err(with_model)?;
+        let pk_entry = crate::dispatch::resolve_provider_key(snapshot, only).map_err(with_model)?;
         if crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value).is_none() {
             return Err(with_model(ProxyError::ProviderUnavailable));
         }
@@ -1373,7 +1389,7 @@ async fn dispatch(
         &virtual_entry.id,
         &virtual_entry.value,
     );
-    let mut reservation = crate::quota::enforce_rate_limit(state, auth, Some(&model_rl))
+    let mut reservation = crate::quota::enforce_rate_limit(state, snapshot, auth, Some(&model_rl))
         .await
         .map_err(&with_model)?;
 
@@ -1390,7 +1406,7 @@ async fn dispatch(
         return dispatch_ensemble(
             state,
             auth,
-            &snapshot,
+            snapshot,
             &virtual_entry,
             req,
             request_id,
@@ -1472,7 +1488,7 @@ async fn dispatch(
                 last_err = Some(BridgeError::Config("model has no provider".into()));
                 continue 'targets;
             };
-            let Ok(pk_entry) = crate::dispatch::resolve_provider_key(&snapshot, model) else {
+            let Ok(pk_entry) = crate::dispatch::resolve_provider_key(snapshot, model) else {
                 last_reserve_reject = None;
                 last_err = Some(BridgeError::Config(
                     "model references unknown provider_key_id".into(),
@@ -1542,6 +1558,7 @@ async fn dispatch(
                 // reset mid-loop).
                 let member_reservation = match crate::quota::reserve_routing_target(
                     state,
+                    snapshot,
                     auth,
                     is_routing_request,
                     &model.display_name,
@@ -1788,14 +1805,9 @@ async fn dispatch(
         let user_id_for_metrics = auth.key().user_id.clone();
         let provider_for_metrics = provider.to_ascii_lowercase();
         let model_for_metrics = req.model.clone();
-        let provider_key_id_for_metrics = pk_id.clone();
-        // #890 req-3/req-4: readable provider-key name + normalised inbound
-        // client type, captured for the streaming on_complete metric emission
-        // (mirrors the non-streaming `record_success` path).
-        let provider_key_name_for_metrics = {
-            let snap = state.snapshot.load();
-            crate::usage_attr::provider_key_metric_name(&snap, &pk_id)
-        };
+        // #890 req-4: normalised inbound client type, captured for the
+        // streaming on_complete metric emission (mirrors the non-streaming
+        // `record_success` path).
         let user_name_for_metrics = auth.key().user_name.clone();
         let client_type_for_metrics = state
             .client_classifier
@@ -1889,12 +1901,22 @@ async fn dispatch(
                 for key in &post_stream_keys {
                     limiter.add_tokens_post_stream(key, comp.total_tokens);
                 }
+                // A stream can outlive several config generations, so the
+                // terminal emits read a FRESH snapshot rather than the one
+                // the request started on (#941) — one load and one
+                // ProviderKey lookup for the usage event, `record_usage`
+                // and the TTFT labels below, which each used to do their
+                // own.
+                let snap = state_for_telem.snapshot.load();
+                let pk = crate::usage_attr::ResolvedPk::resolve(&snap, &provider_key_id_for_telem);
                 // Telemetry: emit with the actual upstream-reported counts.
                 // cost_usd stays 0.0; cp-api recomputes server-side from
                 // its model_pricing catalog (same pattern as the non-
                 // streaming path's cost_usd handling).
                 emit_usage_event(
                     &state_for_telem,
+                    &snap,
+                    &pk,
                     &request_id_for_telem,
                     &model_id_for_telem,
                     &model_for_metrics,
@@ -1957,7 +1979,6 @@ async fn dispatch(
                         error_class: String::new(),
                         error_message: String::new(),
                         applied_guardrails: applied_guardrails_for_telem.clone(),
-                        provider_key_id: provider_key_id_for_telem.clone(),
                         redacted_entity_counts: {
                             let mut merged = input_redactions_for_telem.clone();
                             crate::redact::merge_counts(&mut merged, comp.redacted_entity_counts);
@@ -1999,7 +2020,7 @@ async fn dispatch(
                         provider: &provider_for_metrics,
                         model: &model_for_metrics,
                         upstream_model: &upstream_model_for_metrics,
-                        provider_key_id: &provider_key_id_for_metrics,
+                        pk: pk.labels(),
                         stream: true,
                         // The serving target is fixed once the stream
                         // commits, so fallback attribution is the
@@ -2041,8 +2062,8 @@ async fn dispatch(
                         provider: &provider_for_metrics,
                         model: &model_for_metrics,
                         upstream_model: &upstream_model_for_metrics,
-                        provider_key_id: &provider_key_id_for_metrics,
-                        provider_key_name: &provider_key_name_for_metrics,
+                        provider_key_id: pk.labels().id,
+                        provider_key_name: pk.labels().name,
                         api_key_id: &api_key_id_for_telem,
                         team_id: team_id_for_metrics.as_deref().unwrap_or("unknown"),
                         user_id: user_id_for_metrics.as_deref().unwrap_or("unknown"),
@@ -2276,7 +2297,7 @@ async fn dispatch(
         } else {
             resolve_cache_hit(
                 state,
-                &snapshot,
+                snapshot,
                 cache,
                 key,
                 matched_policy_ttl,
@@ -2544,7 +2565,7 @@ async fn dispatch(
             last_err = Some(BridgeError::Config("model has no provider".into()));
             continue;
         };
-        let pk_entry = match crate::dispatch::resolve_provider_key(&snapshot, model) {
+        let pk_entry = match crate::dispatch::resolve_provider_key(snapshot, model) {
             Ok(pk) => pk,
             Err(_) => {
                 last_reserve_reject = None;
@@ -2616,6 +2637,7 @@ async fn dispatch(
             // reset mid-loop).
             let member_reservation = match crate::quota::reserve_routing_target(
                 state,
+                snapshot,
                 auth,
                 is_routing_request,
                 &model.display_name,
@@ -2978,9 +3000,7 @@ async fn dispatch(
         if let Some(sem) = semantic_gate.as_ref() {
             let vector = match semantic_embedding.take() {
                 Some(v) => Some(v),
-                None if cc.no_cache => {
-                    cache_semantic_embed(state, &snapshot, sem, request_id).await
-                }
+                None if cc.no_cache => cache_semantic_embed(state, snapshot, sem, request_id).await,
                 None => None,
             };
             if let Some(vector) = vector {
@@ -3200,8 +3220,11 @@ async fn dispatch_ensemble(
                 &member.usage,
                 &member.est_output_text,
             );
+            let pk = crate::usage_attr::ResolvedPk::resolve(snapshot, &sub_provider_key_id);
             emit_usage_event(
                 state,
+                snapshot,
+                &pk,
                 request_id,
                 &sub_model_id,
                 &req.model,
@@ -3222,7 +3245,6 @@ async fn dispatch_ensemble(
                     attempt_kind: "panel".to_string(),
                     attempt_model: member.model.clone(),
                     applied_guardrails: applied_guardrails.to_vec(),
-                    provider_key_id: sub_provider_key_id,
                     ..UsageExtras::default()
                 },
                 /* cost_usd */ 0.0,
@@ -3367,6 +3389,7 @@ async fn dispatch_ensemble(
         // tokens are added post-stream, mirroring the entry reservation below.
         let judge_reservation = match crate::quota::reserve_model_only(
             state,
+            snapshot,
             auth,
             &ensemble_cfg.judge.model,
             &judge_entry.id,
@@ -3536,6 +3559,9 @@ async fn dispatch_ensemble(
                 for key in &judge_post_stream_keys {
                     limiter.add_tokens_post_stream(key, comp.total_tokens);
                 }
+                // Fresh snapshot at stream end, shared by every emit in this
+                // closure (#941) — see the single-model streaming path.
+                let snap = state_for_telem.snapshot.load();
                 // Telemetry: one event per panel member (attempt_kind "panel",
                 // index 0..N) carrying that member's own buffered usage, then
                 // one judge event (attempt_kind "judge", index N) from the
@@ -3555,8 +3581,11 @@ async fn dispatch_ensemble(
                             &member.usage,
                             &member.est_output_text,
                         );
+                    let pk = crate::usage_attr::ResolvedPk::resolve(&snap, &member.provider_key_id);
                     emit_usage_event(
                         &state_for_telem,
+                        &snap,
+                        &pk,
                         &request_id_for_telem,
                         &member.model_id,
                         &client_model_for_telem,
@@ -3577,7 +3606,6 @@ async fn dispatch_ensemble(
                             attempt_kind: "panel".to_string(),
                             attempt_model: member.attempt_model.clone(),
                             applied_guardrails: applied_guardrails_for_telem.clone(),
-                            provider_key_id: member.provider_key_id.clone(),
                             ..UsageExtras::default()
                         },
                         /* cost_usd */ 0.0,
@@ -3586,8 +3614,12 @@ async fn dispatch_ensemble(
                         /* content */ None,
                     );
                 }
+                let judge_pk =
+                    crate::usage_attr::ResolvedPk::resolve(&snap, &judge_provider_key_id);
                 emit_usage_event(
                     &state_for_telem,
+                    &snap,
+                    &judge_pk,
                     &request_id_for_telem,
                     &judge_model_id,
                     &client_model_for_telem,
@@ -3620,7 +3652,6 @@ async fn dispatch_ensemble(
                         attempt_kind: "judge".to_string(),
                         attempt_model: judge_attempt_model.clone(),
                         applied_guardrails: applied_guardrails_for_telem.clone(),
-                        provider_key_id: judge_provider_key_id.clone(),
                         redacted_entity_counts: {
                             let mut merged = input_redactions_for_telem.clone();
                             crate::redact::merge_counts(&mut merged, comp.redacted_entity_counts);
@@ -3805,8 +3836,11 @@ async fn dispatch_ensemble(
             &judge_usage,
             &estimation_output_text(&outcome.response),
         );
+        let judge_pk = crate::usage_attr::ResolvedPk::resolve(snapshot, &judge_provider_key_id);
         emit_usage_event(
             state,
+            snapshot,
+            &judge_pk,
             request_id,
             &judge_model_id,
             &req.model,
@@ -3832,7 +3866,6 @@ async fn dispatch_ensemble(
                 attempt_kind: "judge".to_string(),
                 attempt_model: outcome.judge_model.clone(),
                 applied_guardrails: applied_guardrails.to_vec(),
-                provider_key_id: judge_provider_key_id,
                 redacted_entity_counts: redactions.clone(),
                 guardrail_monitor_hits: hits.to_vec(),
                 ..UsageExtras::default()
@@ -3990,11 +4023,13 @@ fn finish_reason_label(reason: &aisix_gateway::FinishReason) -> String {
 #[allow(clippy::too_many_arguments)]
 fn record_success(
     state: &ProxyState,
+    // Resolved once by the caller and shared by `record` + `record_usage`
+    // below, which each used to look the same row up (#941).
+    pk: &crate::usage_attr::ResolvedPk<'_>,
     auth: &AuthenticatedKey,
     provider: &str,
     model: &str,
-    // #890 req-4 client type + req-1/req-2 dimensions. The readable
-    // provider-key name is resolved inside `request_metrics`.
+    // #890 req-4 client type + req-1/req-2 dimensions.
     client_type: &str,
     stream: bool,
     is_fallback: bool,
@@ -4012,7 +4047,7 @@ fn record_success(
             provider,
             model,
             upstream_model: &s.upstream_model,
-            provider_key_id: &s.provider_key_id,
+            pk: pk.labels(),
             stream,
             is_fallback,
         },
@@ -4046,7 +4081,7 @@ fn record_success(
             provider,
             model,
             upstream_model: &s.upstream_model,
-            provider_key_id: &s.provider_key_id,
+            pk: pk.labels(),
             stream,
             is_fallback,
         },
@@ -4094,6 +4129,12 @@ fn record_budget_gauges(
 #[allow(clippy::too_many_arguments)]
 fn emit_usage_event(
     state: &ProxyState,
+    // The request's snapshot and the attempt's ProviderKey, both resolved
+    // by the caller (#941). Each event names its OWN attempt's key — a
+    // panel member, a judge, a failed fallback — so the resolution belongs
+    // at the call site, not here.
+    snap: &aisix_core::AisixSnapshot,
+    pk: &crate::usage_attr::ResolvedPk<'_>,
     request_id: &str,
     model_id: &str,
     requested_model: &str,
@@ -4108,19 +4149,11 @@ fn emit_usage_event(
     client: &ClientContext,
     content: Option<CapturedContent>,
 ) {
-    // Look up per-PK telemetry attribution tags from the live snapshot.
-    // Empty `provider_key_id` (pre-dispatch error paths) → default
-    // tags (all empty / false) → wire fields skip-serialize → cp-api
-    // stores NULL. See AISIX-Cloud#436.
-    let snap = state.snapshot.load();
-    let tags = if !extras.provider_key_id.is_empty() {
-        snap.provider_keys
-            .get_by_id(&extras.provider_key_id)
-            .map(|e| e.value.telemetry_tags.clone())
-            .unwrap_or_default()
-    } else {
-        Default::default()
-    };
+    // Per-PK telemetry attribution tags. An unresolved key (the
+    // pre-dispatch error paths) yields default (all empty / false) tags →
+    // wire fields skip-serialize → cp-api stores NULL. See
+    // AISIX-Cloud#436.
+    let tags = pk.telemetry_tags();
     let mut event = UsageEvent {
         request_id: request_id.to_string(),
         // RFC 3339 UTC. cp-api parses with time.Parse(time.RFC3339, ...);
@@ -4306,15 +4339,6 @@ struct UsageExtras {
     /// which guardrails ran (#379). Empty for the guardrail-free path and
     /// for requests rejected before resolution.
     applied_guardrails: Vec<AppliedGuardrail>,
-    /// UUID of the resolved ProviderKey. Used at emit time to look up
-    /// `telemetry_tags` from the snapshot and populate UsageEvent's
-    /// per-PK attribution fields (`provider_kind` / `provider_featured`
-    /// / `branded_provider` / `pk_label` / `byo_label`).
-    /// Empty for pre-dispatch error paths (auth fail, guardrail block
-    /// before dispatch) where no ProviderKey was resolved — those
-    /// emit events land in cp-api with the tag columns NULL.
-    /// See AISIX-Cloud#436 / #302 M17.
-    provider_key_id: String,
     /// Per-detector PII mask counts for this request, input + output
     /// merged (#932). Lands on `usage_events.redacted_entity_counts`.
     /// Detector names only, never matched values. Empty = no redaction.
@@ -4334,6 +4358,7 @@ struct UsageExtras {
 #[allow(clippy::too_many_arguments)]
 fn emit_failed_attempts(
     state: &ProxyState,
+    snap: &aisix_core::AisixSnapshot,
     request_id: &str,
     requested_model: &str,
     api_key_id: &str,
@@ -4359,8 +4384,12 @@ fn emit_failed_attempts(
         } else {
             None
         };
+        // Each failed attempt hit its own target, hence its own key.
+        let pk = crate::usage_attr::ResolvedPk::resolve(snap, &rec.provider_key_id);
         emit_usage_event(
             state,
+            snap,
+            &pk,
             request_id,
             // Each failed attempt records the TARGET it actually hit
             // (AISIX-Cloud#790), not the group it was resolved from.
@@ -4378,7 +4407,6 @@ fn emit_failed_attempts(
                 error_class: rec.error_class.clone(),
                 error_message: rec.error_message.clone(),
                 applied_guardrails: applied_guardrails.to_vec(),
-                provider_key_id: rec.provider_key_id.clone(),
                 ..UsageExtras::default()
             },
             /* cost_usd */ 0.0,

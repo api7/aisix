@@ -98,7 +98,10 @@ pub async fn image_generations(
         .unwrap_or("unknown")
         .to_string();
 
-    match dispatch(&state, &auth, body, &request_id, &client).await {
+    // One snapshot for the whole request (#941) — see `embeddings`.
+    let snapshot = state.snapshot.load();
+
+    match dispatch(&state, &snapshot, &auth, body, &request_id, &client).await {
         Ok(success) => {
             let elapsed = started.elapsed();
             // The actual response status, not a hardcoded 200: the 501
@@ -116,6 +119,9 @@ pub async fn image_generations(
                 &request_id,
                 None,
             );
+            // One ProviderKey lookup for the metric emit + the usage event
+            // below (#941).
+            let pk = crate::usage_attr::ResolvedPk::resolve(&snapshot, &success.provider_key_id);
             crate::request_metrics::record(
                 &state,
                 "/v1/images/generations",
@@ -124,7 +130,7 @@ pub async fn image_generations(
                     provider: &success.provider,
                     model: &model_name,
                     upstream_model: &success.upstream_model,
-                    provider_key_id: &success.provider_key_id,
+                    pk: pk.labels(),
                     ..Default::default()
                 },
                 status,
@@ -143,11 +149,12 @@ pub async fn image_generations(
                 let (prompt_tokens, completion_tokens) = success.usage.unwrap_or((0, 0));
                 emit_usage_event(
                     &state,
+                    &snapshot,
+                    &pk,
                     &request_id,
                     &success.model_id,
                     &model_name,
                     &api_key_id,
-                    &success.provider_key_id,
                     &success.provider,
                     &success.upstream_model,
                     &success.applied_guardrails,
@@ -175,8 +182,7 @@ pub async fn image_generations(
                 &request_id,
                 Some(&err),
             );
-            let snap = state.snapshot.load();
-            let metric_model = crate::usage_attr::metric_model_label(&snap, &model_name);
+            let metric_model = crate::usage_attr::metric_model_label(&snapshot, &model_name);
             crate::request_metrics::record(
                 &state,
                 "/v1/images/generations",
@@ -192,6 +198,7 @@ pub async fn image_generations(
             // zero-token event (status + error class), instead of dropping it.
             crate::usage_attr::emit_error_usage_event(
                 &state,
+                &snapshot,
                 "images",
                 "openai",
                 &request_id,
@@ -219,6 +226,7 @@ fn images_input_to_chat(model: &str, body: &Value) -> aisix_gateway::ChatFormat 
 
 async fn dispatch(
     state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
     auth: &AuthenticatedKey,
     mut body: Value,
     request_id: &str,
@@ -233,9 +241,7 @@ async fn dispatch(
         .to_string();
     let model_name = model_name.as_str();
 
-    let snapshot = state.snapshot.load();
-
-    let model_entry = crate::model_resolve::resolve_model(&snapshot, model_name)
+    let model_entry = crate::model_resolve::resolve_model(snapshot, model_name)
         .ok_or_else(|| ProxyError::ModelNotFound(model_name.to_string()))?;
 
     if !auth.key().can_access(model_name) {
@@ -305,7 +311,7 @@ async fn dispatch(
 
     let model_rl =
         crate::quota::ModelRateLimit::from_model(model_name, &model_entry.id, &model_entry.value);
-    let reservation = crate::quota::enforce(state, auth, Some(&model_rl)).await?;
+    let reservation = crate::quota::enforce(state, snapshot, auth, Some(&model_rl)).await?;
 
     let model = &model_entry.value;
 
@@ -328,7 +334,7 @@ async fn dispatch(
     }
 
     let provider = crate::dispatch::require_provider(model)?.to_string();
-    let pk_entry = crate::dispatch::resolve_provider_key(&snapshot, model)?;
+    let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
 
     let bridge = crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value)
         .ok_or(ProxyError::ProviderUnavailable)?;
@@ -458,11 +464,14 @@ fn extract_token_usage(body: &Value) -> Option<(u32, u32)> {
 #[allow(clippy::too_many_arguments)]
 fn emit_usage_event(
     state: &ProxyState,
+    // The request's snapshot + its one ProviderKey observation, resolved
+    // by the handler (#941).
+    snap: &aisix_core::AisixSnapshot,
+    pk: &crate::usage_attr::ResolvedPk<'_>,
     request_id: &str,
     model_id: &str,
     requested_model: &str,
     api_key_id: &str,
-    provider_key_id: &str,
     // Metric labels the UsageEvent has no field for (AISIX-Cloud#1234
     // follow-up): the wire struct is the CP contract, so they ride
     // alongside rather than in it.
@@ -482,7 +491,6 @@ fn emit_usage_event(
     // never to the CP sink.
     content: Option<&CapturedContent>,
 ) {
-    let snap = state.snapshot.load();
     let mut event = UsageEvent {
         request_id: request_id.to_string(),
         occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
@@ -504,7 +512,7 @@ fn emit_usage_event(
         guardrail_monitor_hits,
         ..Default::default()
     };
-    crate::usage_attr::apply_pk_telemetry(&mut event, &snap, provider_key_id);
+    crate::usage_attr::apply_pk_telemetry(&mut event, pk);
     // Handler label "images" — bucketed prometheus counter (#408).
     crate::usage_attr::apply_jwt_identity(&mut event, client.jwt.as_ref());
     state.usage_sink.try_emit("images", event.clone());
@@ -512,7 +520,7 @@ fn emit_usage_event(
     state
         .otlp_fan_out
         .fan_out(&event, content, exporters.iter().map(|e| &e.value));
-    let owned_caller = crate::request_metrics::Caller::from_api_key_id(&snap, api_key_id);
+    let owned_caller = crate::request_metrics::Caller::from_api_key_id(snap, api_key_id);
     crate::request_metrics::record_usage(
         state,
         "/v1/images/generations",
@@ -521,7 +529,7 @@ fn emit_usage_event(
             provider,
             model: requested_model,
             upstream_model,
-            provider_key_id,
+            pk: pk.labels(),
             ..Default::default()
         },
         crate::request_metrics::Tokens {

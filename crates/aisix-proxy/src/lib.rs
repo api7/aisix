@@ -3776,8 +3776,15 @@ data: [DONE]\n\n"
         // (pre_commit counts stick even when the reservation drops
         // uncommitted) — both succeed because nothing is reserved.
         for _ in 0..2 {
-            let r =
-                quota::reserve_model_only(&state, &auth, "mg-member", "model-id-1", &target).await;
+            let r = quota::reserve_model_only(
+                &state,
+                &state.snapshot.load(),
+                &auth,
+                "mg-member",
+                "model-id-1",
+                &target,
+            )
+            .await;
             assert!(r.is_ok(), "suspended policy must reserve nothing");
         }
 
@@ -3791,15 +3798,27 @@ data: [DONE]\n\n"
                 2,
             ));
 
+        assert!(quota::reserve_model_only(
+            &state,
+            &state.snapshot.load(),
+            &auth,
+            "mg-member",
+            "model-id-1",
+            &target,
+        )
+        .await
+        .is_ok());
         assert!(
-            quota::reserve_model_only(&state, &auth, "mg-member", "model-id-1", &target)
-                .await
-                .is_ok()
-        );
-        assert!(
-            quota::reserve_model_only(&state, &auth, "mg-member", "model-id-1", &target)
-                .await
-                .is_err(),
+            quota::reserve_model_only(
+                &state,
+                &state.snapshot.load(),
+                &auth,
+                "mg-member",
+                "model-id-1",
+                &target,
+            )
+            .await
+            .is_err(),
             "policy outside its windows must throttle the second reservation",
         );
     }

@@ -115,8 +115,13 @@ pub async fn embeddings(
         }
     };
     let model_name = body.model.clone();
+    // One snapshot for the whole request (#941): dispatch, the terminal
+    // metric emit and the usage event all read this handle instead of
+    // loading their own. The request's view of config is therefore frozen
+    // at entry — see the module note on `ProxyState::snapshot`.
+    let snapshot = state.snapshot.load();
 
-    match dispatch(&state, &auth, body, &request_id, &client).await {
+    match dispatch(&state, &snapshot, &auth, body, &request_id, &client).await {
         Ok(success) => {
             let elapsed = started.elapsed();
             // The actual response status, not a hardcoded 200: the 501
@@ -134,6 +139,9 @@ pub async fn embeddings(
                 &request_id,
                 None,
             );
+            // One ProviderKey lookup for the metric emit + the usage event
+            // below (#941).
+            let pk = crate::usage_attr::ResolvedPk::resolve(&snapshot, &success.provider_key_id);
             crate::request_metrics::record(
                 &state,
                 "/v1/embeddings",
@@ -142,7 +150,7 @@ pub async fn embeddings(
                     provider: &success.provider,
                     model: &model_name,
                     upstream_model: &success.upstream_model,
-                    provider_key_id: &success.provider_key_id,
+                    pk: pk.labels(),
                     ..Default::default()
                 },
                 status,
@@ -165,11 +173,12 @@ pub async fn embeddings(
             if success.upstream_called {
                 emit_usage_event(
                     &state,
+                    &snapshot,
+                    &pk,
                     &request_id,
                     &success.model_id,
                     &model_name,
                     &api_key_id,
-                    &success.provider_key_id,
                     &success.provider,
                     &success.upstream_model,
                     &success.applied_guardrails,
@@ -197,8 +206,7 @@ pub async fn embeddings(
                 &request_id,
                 Some(&err),
             );
-            let snap = state.snapshot.load();
-            let metric_model = crate::usage_attr::metric_model_label(&snap, &model_name);
+            let metric_model = crate::usage_attr::metric_model_label(&snapshot, &model_name);
             crate::request_metrics::record(
                 &state,
                 "/v1/embeddings",
@@ -214,6 +222,7 @@ pub async fn embeddings(
             // zero-token event (status + error class), instead of dropping it.
             crate::usage_attr::emit_error_usage_event(
                 &state,
+                &snapshot,
                 "embeddings",
                 "openai",
                 &request_id,
@@ -274,14 +283,13 @@ struct EmbedDispatchSuccess {
 
 async fn dispatch(
     state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
     auth: &AuthenticatedKey,
     mut body: EmbeddingRequestBody,
     request_id: &str,
     client_ctx: &ClientContext,
 ) -> Result<EmbedDispatchSuccess, ProxyError> {
-    let snapshot = state.snapshot.load();
-
-    let model_entry = crate::model_resolve::resolve_model(&snapshot, &body.model)
+    let model_entry = crate::model_resolve::resolve_model(snapshot, &body.model)
         .ok_or_else(|| ProxyError::ModelNotFound(body.model.clone()))?;
 
     if !auth.key().can_access(&body.model) {
@@ -293,7 +301,7 @@ async fn dispatch(
 
     let model = &model_entry.value;
     let provider = crate::dispatch::require_provider(model)?;
-    let pk_entry = crate::dispatch::resolve_provider_key(&snapshot, model)?;
+    let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
 
     let bridge = crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value)
         .ok_or(ProxyError::ProviderUnavailable)?;
@@ -385,7 +393,7 @@ async fn dispatch(
 
     let model_rl =
         crate::quota::ModelRateLimit::from_model(&body.model, &model_entry.id, &model_entry.value);
-    let reservation = crate::quota::enforce(state, auth, Some(&model_rl)).await?;
+    let reservation = crate::quota::enforce(state, snapshot, auth, Some(&model_rl)).await?;
 
     let upstream_model_id = crate::dispatch::require_upstream_model(model)?.to_string();
 
@@ -597,11 +605,15 @@ fn emit_access_log(
 #[allow(clippy::too_many_arguments)]
 fn emit_usage_event(
     state: &ProxyState,
+    // The request's snapshot + its one ProviderKey observation, resolved
+    // by the handler (#941) — this emitter used to load and look up both
+    // itself, on top of the metric emit that had already done the same.
+    snap: &aisix_core::AisixSnapshot,
+    pk: &crate::usage_attr::ResolvedPk<'_>,
     request_id: &str,
     model_id: &str,
     requested_model: &str,
     api_key_id: &str,
-    provider_key_id: &str,
     // Metric labels the UsageEvent has no field for (AISIX-Cloud#1234
     // follow-up): the wire struct is the CP contract, so they ride
     // alongside rather than in it.
@@ -645,7 +657,6 @@ fn emit_usage_event(
     // branded_provider / pk_label / byo_label) ARE populated — same lookup as
     // chat / messages / responses (AISIX-Cloud#867 parity) via
     // `usage_attr::apply_pk_telemetry` below.
-    let snap = state.snapshot.load();
     let mut event = UsageEvent {
         request_id: request_id.to_string(),
         // RFC 3339 UTC. cp-api parses with time.Parse(time.RFC3339, ...);
@@ -669,7 +680,7 @@ fn emit_usage_event(
         client_user_agent: client.user_agent.clone(),
         ..Default::default()
     };
-    crate::usage_attr::apply_pk_telemetry(&mut event, &snap, provider_key_id);
+    crate::usage_attr::apply_pk_telemetry(&mut event, pk);
     // Handler label "embeddings" — bucketed prometheus counter (#408).
     crate::usage_attr::apply_jwt_identity(&mut event, client.jwt.as_ref());
     state.usage_sink.try_emit("embeddings", event.clone());
@@ -680,7 +691,7 @@ fn emit_usage_event(
     state
         .otlp_fan_out
         .fan_out(&event, content, exporters.iter().map(|e| &e.value));
-    let owned_caller = crate::request_metrics::Caller::from_api_key_id(&snap, api_key_id);
+    let owned_caller = crate::request_metrics::Caller::from_api_key_id(snap, api_key_id);
     crate::request_metrics::record_usage(
         state,
         "/v1/embeddings",
@@ -689,7 +700,7 @@ fn emit_usage_event(
             provider,
             model: requested_model,
             upstream_model,
-            provider_key_id,
+            pk: pk.labels(),
             ..Default::default()
         },
         crate::request_metrics::Tokens {

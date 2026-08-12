@@ -188,16 +188,14 @@ fn explicit_model(params: &HashMap<String, String>, headers: &HeaderMap) -> Opti
 /// `custom_llm_provider="openai"` default). Deterministic operation
 /// should pass an explicit model — documented in the proxy docs.
 pub(crate) fn resolve_target(
-    state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
     auth: &AuthenticatedKey,
     wanted: Option<&str>,
     client_ctx: &ClientContext,
 ) -> Result<JobTarget, ProxyError> {
-    let snapshot = state.snapshot.load();
-
     let model_entry = match wanted {
         Some(name) => {
-            let entry = crate::model_resolve::resolve_model(&snapshot, name)
+            let entry = crate::model_resolve::resolve_model(snapshot, name)
                 .ok_or_else(|| ProxyError::ModelNotFound(format!("model {name:?} not found")))?;
             if !auth.key().can_access(name) {
                 return Err(ProxyError::ModelForbidden(format!(
@@ -241,7 +239,7 @@ pub(crate) fn resolve_target(
     let model = &model_entry.value;
     crate::dispatch::check_ip_access(model, &client_ctx.source_ip)?;
 
-    let pk_entry = crate::dispatch::resolve_provider_key(&snapshot, model)?;
+    let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
     let adapter = supported_adapter(&pk_entry.value).ok_or_else(|| {
         ProxyError::InvalidRequest(format!(
             "model {:?} uses provider {:?} which is not supported on the \
@@ -568,6 +566,8 @@ fn rewrite_response_ids(v: &mut Value, model: &str) {
 #[allow(clippy::too_many_arguments)]
 fn emit_job_usage_event(
     state: &ProxyState,
+    // The request's snapshot, loaded once by the handler (#941).
+    snap: &aisix_core::AisixSnapshot,
     label: &'static str,
     request_id: &str,
     auth: &AuthenticatedKey,
@@ -577,7 +577,6 @@ fn emit_job_usage_event(
     client: &ClientContext,
     guardrail_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
 ) {
-    let snap = state.snapshot.load();
     let mut event = UsageEvent {
         request_id: request_id.to_string(),
         occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
@@ -595,7 +594,10 @@ fn emit_job_usage_event(
         guardrail_monitor_hits,
         ..Default::default()
     };
-    crate::usage_attr::apply_pk_telemetry(&mut event, &snap, &target.pk_entry.id);
+    crate::usage_attr::apply_pk_telemetry(
+        &mut event,
+        &crate::usage_attr::ResolvedPk::resolve(snap, &target.pk_entry.id),
+    );
     crate::usage_attr::apply_jwt_identity(&mut event, auth.jwt.as_ref());
     state.usage_sink.try_emit(label, event.clone());
     let exporters = snap.observability_exporters.entries();
@@ -652,6 +654,7 @@ fn emit_access_log(
 #[allow(clippy::too_many_arguments)]
 fn finish(
     state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
     label: &'static str,
     method: Method,
     path: String,
@@ -692,6 +695,7 @@ fn finish(
             );
             emit_job_usage_event(
                 state,
+                snapshot,
                 label,
                 &request_id,
                 auth,
@@ -732,6 +736,7 @@ fn finish(
             );
             crate::usage_attr::emit_error_usage_event(
                 state,
+                snapshot,
                 label,
                 "openai",
                 &request_id,
@@ -819,6 +824,9 @@ pub(crate) async fn create_file(
     };
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
 
+    // One snapshot for the whole request (#941) — see `embeddings`.
+    let snapshot = state.snapshot.load();
+
     let result = async {
         // Re-build the outbound multipart form, extracting the gateway-only
         // `model` routing field. Text fields (purpose, expires_after[...])
@@ -883,13 +891,14 @@ pub(crate) async fn create_file(
         })?;
 
         let wanted = form_model.or_else(|| explicit_model(&params, &headers));
-        let target = resolve_target(&state, &auth, wanted.as_deref(), &client)?;
+        let target = resolve_target(&snapshot, &auth, wanted.as_deref(), &client)?;
 
         // Batch/fine-tune input files carry end-user content — scan them
         // like any other inbound payload.
         scan_input_blob(&state, &auth, &target, &file_bytes, &mut monitor_hits).await?;
         let _reservation = crate::quota::enforce(
             &state,
+            &snapshot,
             &auth,
             Some(&crate::quota::ModelRateLimit::from_model(
                 target.display_name(),
@@ -920,6 +929,7 @@ pub(crate) async fn create_file(
 
     finish(
         &state,
+        &snapshot,
         "files",
         Method::POST,
         "/v1/files".into(),
@@ -1084,6 +1094,9 @@ pub(crate) async fn create_batch(
     let request_id = client.request_id.clone();
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
 
+    // One snapshot for the whole request (#941) — see `embeddings`.
+    let snapshot = state.snapshot.load();
+
     let result = async {
         let mut req_json: Value = serde_json::from_slice(&body)
             .map_err(|e| ProxyError::InvalidRequest(format!("invalid JSON body: {e}")))?;
@@ -1112,7 +1125,7 @@ pub(crate) async fn create_batch(
         let wanted = embedded
             .or(body_model)
             .or_else(|| explicit_model(&params, &headers));
-        let target = resolve_target(&state, &auth, wanted.as_deref(), &client)?;
+        let target = resolve_target(&snapshot, &auth, wanted.as_deref(), &client)?;
 
         // Forward the provider wire shape: raw file id, no gateway-only
         // routing fields.
@@ -1126,6 +1139,7 @@ pub(crate) async fn create_batch(
         scan_input_blob(&state, &auth, &target, &out_body, &mut monitor_hits).await?;
         let _reservation = crate::quota::enforce(
             &state,
+            &snapshot,
             &auth,
             Some(&crate::quota::ModelRateLimit::from_model(
                 target.display_name(),
@@ -1156,6 +1170,7 @@ pub(crate) async fn create_batch(
 
     finish(
         &state,
+        &snapshot,
         "batches",
         Method::POST,
         "/v1/batches".into(),
@@ -1181,12 +1196,16 @@ pub(crate) async fn get_batch(
     let (raw, embedded) = routed_model_hint(&id, &params, &headers);
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
 
+    // One snapshot for the whole request (#941) — see `embeddings`.
+    let snapshot = state.snapshot.load();
+
     let result = async {
         require_safe_upstream_id(&raw)?;
         let wanted = embedded.or_else(|| explicit_model(&params, &headers));
-        let target = resolve_target(&state, &auth, wanted.as_deref(), &client)?;
+        let target = resolve_target(&snapshot, &auth, wanted.as_deref(), &client)?;
         let _reservation = crate::quota::enforce(
             &state,
+            &snapshot,
             &auth,
             Some(&crate::quota::ModelRateLimit::from_model(
                 target.display_name(),
@@ -1226,6 +1245,7 @@ pub(crate) async fn get_batch(
 
     finish(
         &state,
+        &snapshot,
         "batches",
         Method::GET,
         format!("/v1/batches/{id}"),
@@ -1330,6 +1350,9 @@ pub(crate) async fn create_ft_job(
     let request_id = client.request_id.clone();
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
 
+    // One snapshot for the whole request (#941) — see `embeddings`.
+    let snapshot = state.snapshot.load();
+
     let result = async {
         let mut req_json: Value = serde_json::from_slice(&body)
             .map_err(|e| ProxyError::InvalidRequest(format!("invalid JSON body: {e}")))?;
@@ -1352,7 +1375,7 @@ pub(crate) async fn create_ft_job(
             .unwrap_or((training_file.clone(), None));
         require_safe_upstream_id(&raw_training)?;
         let wanted = embedded.or_else(|| explicit_model(&params, &headers));
-        let target = resolve_target(&state, &auth, wanted.as_deref(), &client)?;
+        let target = resolve_target(&snapshot, &auth, wanted.as_deref(), &client)?;
 
         if let Some(obj) = req_json.as_object_mut() {
             obj.insert("training_file".into(), Value::String(raw_training));
@@ -1369,6 +1392,7 @@ pub(crate) async fn create_ft_job(
         scan_input_blob(&state, &auth, &target, &out_body, &mut monitor_hits).await?;
         let _reservation = crate::quota::enforce(
             &state,
+            &snapshot,
             &auth,
             Some(&crate::quota::ModelRateLimit::from_model(
                 target.display_name(),
@@ -1399,6 +1423,7 @@ pub(crate) async fn create_ft_job(
 
     finish(
         &state,
+        &snapshot,
         "fine_tuning",
         Method::POST,
         "/v1/fine_tuning/jobs".into(),
@@ -1533,6 +1558,9 @@ async fn forward_simple(
     let label = spec.label;
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
 
+    // One snapshot for the whole request (#941) — see `embeddings`.
+    let snapshot = state.snapshot.load();
+
     let result = async {
         let embedded = match &spec.id {
             Some((raw, embedded)) => {
@@ -1542,13 +1570,14 @@ async fn forward_simple(
             None => None,
         };
         let wanted = embedded.or_else(|| explicit_model(&params, &headers));
-        let target = resolve_target(&state, &auth, wanted.as_deref(), &client)?;
+        let target = resolve_target(&snapshot, &auth, wanted.as_deref(), &client)?;
 
         if let Some(body) = &spec.body {
             scan_input_blob(&state, &auth, &target, body, &mut monitor_hits).await?;
         }
         let _reservation = crate::quota::enforce(
             &state,
+            &snapshot,
             &auth,
             Some(&crate::quota::ModelRateLimit::from_model(
                 target.display_name(),
@@ -1587,6 +1616,7 @@ async fn forward_simple(
 
     finish(
         &state,
+        &snapshot,
         label,
         method,
         log_path,
@@ -1784,6 +1814,7 @@ async fn attribute_batch_usage(
     }
 
     let snap = state.snapshot.load();
+    let pk = crate::usage_attr::ResolvedPk::resolve(&snap, pk_id);
     let multi = per_model.len() > 1;
     for (idx, (provider_model, agg)) in per_model.iter().enumerate() {
         let request_id = batch_attribution_request_id(raw_batch_id, idx, multi);
@@ -1804,7 +1835,7 @@ async fn attribute_batch_usage(
             inbound_protocol: "batch".to_string(),
             ..Default::default()
         };
-        crate::usage_attr::apply_pk_telemetry(&mut event, &snap, pk_id);
+        crate::usage_attr::apply_pk_telemetry(&mut event, &pk);
         // Attribution names the identity that observed completion — the
         // same caller the event's api_key_id already reflects.
         crate::usage_attr::apply_jwt_identity(&mut event, jwt);

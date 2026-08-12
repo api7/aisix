@@ -8,8 +8,17 @@
 //! (chat / messages / responses / completions / embeddings / rerank / audio /
 //! images) from drifting apart again — the exact bug #867 fixed for
 //! `/v1/responses` after it had already been fixed for chat + messages.
+//!
+//! [`ResolvedPk`] is the second half of that anti-drift move (#941): the
+//! attempt's ProviderKey row is looked up ONCE per completion and the
+//! result is handed to every terminal emitter, so the metric label and
+//! the usage-event attribution can neither disagree nor pay for the same
+//! `DashMap` read three times.
 
-use aisix_core::AisixSnapshot;
+use std::borrow::Cow;
+use std::sync::Arc;
+
+use aisix_core::{AisixSnapshot, ProviderKey, ResourceEntry};
 use aisix_obs::UsageEvent;
 
 use crate::chat::sanitize_tag;
@@ -48,42 +57,109 @@ pub(crate) fn sanitize_provider_response_id(id: &str) -> String {
     sanitize_tag(id.to_string())
 }
 
-/// Resolve a ProviderKey's telemetry attribution tags from the live snapshot.
-/// An empty `provider_key_id` (pre-dispatch error paths) or an id with no
-/// matching row yields the default (all-empty) tags, which serialise to wire
-/// NULL — same contract as the chat / messages emitters.
-pub(crate) fn provider_telemetry_tags(
-    snap: &AisixSnapshot,
-    provider_key_id: &str,
-) -> aisix_core::TelemetryTags {
-    if provider_key_id.is_empty() {
-        return Default::default();
-    }
-    snap.provider_keys
-        .get_by_id(provider_key_id)
-        .map(|e| e.value.telemetry_tags.clone())
-        .unwrap_or_default()
+/// Label value the `provider_key_id` / `provider_key_name` pair falls back
+/// to when the request never resolved a ProviderKey. Matches
+/// `request_metrics::UNKNOWN` and [`PkLabels::default`].
+pub(crate) const UNKNOWN_PK: &str = "unknown";
+
+/// The attempt's ProviderKey, resolved ONCE per completion.
+///
+/// Three terminal emitters want something off the same row: `record` and
+/// `record_usage` want the readable `provider_key_name` label (#890 req-3),
+/// and the usage-event emitters want `telemetry_tags` (AISIX-Cloud#867).
+/// Each used to look the row up itself — three `DashMap` reads and two
+/// `display_name` clones for one request (#941). Resolving here and passing
+/// the result down replaces them with one read, and makes the two emits
+/// provably agree: they now read the same row observation, not two lookups
+/// that a concurrent snapshot swap can separate.
+///
+/// The borrow is the anti-drift device: [`crate::request_metrics::Upstream`]
+/// takes [`PkLabels`], not a bare id, so a new call site cannot reintroduce
+/// a per-emit lookup without saying so.
+pub(crate) struct ResolvedPk<'a> {
+    id: &'a str,
+    /// `display_name`, control-char stripped and length-capped via
+    /// [`sanitize_tag`]; [`UNKNOWN_PK`] when the id is empty, unresolved
+    /// or names a row with a blank display name. Borrowed in the
+    /// fallback case so the common pre-dispatch failure allocates nothing.
+    name: Cow<'a, str>,
+    entry: Option<Arc<ResourceEntry<ProviderKey>>>,
 }
 
-/// Resolve the readable provider-key NAME for the #890 req-3 metric label
-/// (`provider_key_name`). Returns the ProviderKey's `display_name`
-/// (control-char stripped + length-capped via [`sanitize_tag`]) or
-/// `"unknown"` when the id is empty / unresolved / blank. 1:1 with the
-/// `provider_key_id`, so it adds no metric series. Shared by the chat +
-/// messages metric emitters so the value can't drift between handlers.
-pub(crate) fn provider_key_metric_name(snap: &AisixSnapshot, provider_key_id: &str) -> String {
-    if provider_key_id.is_empty() {
-        return "unknown".to_string();
+impl<'a> ResolvedPk<'a> {
+    /// Look the row up once. `id` reaches the metric label verbatim —
+    /// including the empty string the pre-dispatch failure paths pass —
+    /// so the emitted series is byte-identical to the per-emitter lookups
+    /// this replaced.
+    pub(crate) fn resolve(snap: &AisixSnapshot, id: &'a str) -> Self {
+        let entry = if id.is_empty() {
+            None
+        } else {
+            snap.provider_keys.get_by_id(id)
+        };
+        let name = match entry.as_ref() {
+            Some(e) => {
+                let name = sanitize_tag(e.value.display_name.clone());
+                if name.is_empty() {
+                    Cow::Borrowed(UNKNOWN_PK)
+                } else {
+                    Cow::Owned(name)
+                }
+            }
+            None => Cow::Borrowed(UNKNOWN_PK),
+        };
+        Self { id, name, entry }
     }
-    let name = snap
-        .provider_keys
-        .get_by_id(provider_key_id)
-        .map(|e| sanitize_tag(e.value.display_name.clone()))
-        .unwrap_or_default();
-    if name.is_empty() {
-        "unknown".to_string()
-    } else {
-        name
+
+    /// A completion that never reached a ProviderKey — the pre-dispatch
+    /// rejections and the endpoints that have no upstream key at all.
+    /// Same labels the per-emitter lookup produced for an empty id, with
+    /// no snapshot read.
+    pub(crate) fn unresolved() -> ResolvedPk<'static> {
+        ResolvedPk {
+            id: "",
+            name: Cow::Borrowed(UNKNOWN_PK),
+            entry: None,
+        }
+    }
+
+    /// The id + name pair for the metric label set.
+    pub(crate) fn labels(&self) -> PkLabels<'_> {
+        PkLabels {
+            id: self.id,
+            name: &self.name,
+        }
+    }
+
+    /// Attribution tags for the usage event. Cloned on demand: the tag
+    /// strings only reach the wire on the paths that emit an event, so a
+    /// bare metric emit pays nothing for them. An unresolved key yields
+    /// the default (all-empty) tags, which skip-serialize to wire NULL.
+    pub(crate) fn telemetry_tags(&self) -> aisix_core::TelemetryTags {
+        self.entry
+            .as_ref()
+            .map(|e| e.value.telemetry_tags.clone())
+            .unwrap_or_default()
+    }
+}
+
+/// The ProviderKey dimensions of a metric label set: the id and the
+/// readable name that is 1:1 with it (so the pair adds no series).
+/// Produced by [`ResolvedPk::labels`] — the only constructor a handler
+/// should reach for, since a hand-built pair can put a name next to an id
+/// it does not belong to.
+#[derive(Clone, Copy)]
+pub(crate) struct PkLabels<'a> {
+    pub id: &'a str,
+    pub name: &'a str,
+}
+
+impl Default for PkLabels<'_> {
+    fn default() -> Self {
+        Self {
+            id: UNKNOWN_PK,
+            name: UNKNOWN_PK,
+        }
     }
 }
 
@@ -134,12 +210,8 @@ pub(crate) fn metric_model_label<'a>(snap: &AisixSnapshot, model_name: &'a str) 
 /// sanitising the operator-controlled tag strings (control-char strip + length
 /// cap) before they hit the wire. One source of truth for the mapping so the
 /// non-chat handlers can't diverge from chat / messages.
-pub(crate) fn apply_pk_telemetry(
-    event: &mut UsageEvent,
-    snap: &AisixSnapshot,
-    provider_key_id: &str,
-) {
-    let tags = provider_telemetry_tags(snap, provider_key_id);
+pub(crate) fn apply_pk_telemetry(event: &mut UsageEvent, pk: &ResolvedPk<'_>) {
+    let tags = pk.telemetry_tags();
     event.provider_kind =
         sanitize_tag(tags.kind.map(|k| k.as_str().to_owned()).unwrap_or_default());
     event.provider_featured = tags.featured;
@@ -187,6 +259,7 @@ pub(crate) fn apply_jwt_identity(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_error_usage_event(
     state: &ProxyState,
+    snap: &AisixSnapshot,
     label: &'static str,
     inbound_protocol: &'static str,
     request_id: &str,
@@ -210,7 +283,6 @@ pub(crate) fn emit_error_usage_event(
     };
     apply_jwt_identity(&mut event, client.jwt.as_ref());
     state.usage_sink.try_emit(label, event.clone());
-    let snap = state.snapshot.load();
     let exporters = snap.observability_exporters.entries();
     state
         .otlp_fan_out
@@ -258,5 +330,93 @@ mod tests {
         assert_eq!(provider_response_id(&serde_json::json!({})), "");
         assert_eq!(provider_response_id(&serde_json::json!({ "id": 42 })), "");
         assert_eq!(provider_response_id(&serde_json::json!({ "id": null })), "");
+    }
+
+    const PK_ID: &str = "22222222-2222-2222-2222-222222222222";
+
+    fn snap_with_pk(display_name: &str, tags: &str) -> AisixSnapshot {
+        let json = format!(
+            r#"{{"display_name":{},"secret":"sk-up","api_base":"http://up","provider":"openai","adapter":"openai"{}}}"#,
+            serde_json::to_string(display_name).unwrap(),
+            tags,
+        );
+        let pk: ProviderKey = serde_json::from_str(&json).unwrap();
+        let snap = AisixSnapshot::new();
+        snap.provider_keys.insert(ResourceEntry::new(PK_ID, pk, 1));
+        snap
+    }
+
+    /// The `provider_key_id` / `provider_key_name` pair is a metric label
+    /// set — a changed fallback would silently split every series that
+    /// carries it. Both halves report `"unknown"` when nothing resolved,
+    /// which is what `Upstream::default()` and the pre-dispatch rejection
+    /// paths rely on.
+    #[test]
+    fn unresolved_key_labels_both_halves_unknown() {
+        let snap = AisixSnapshot::new();
+        for pk in [
+            ResolvedPk::unresolved(),
+            ResolvedPk::resolve(&snap, ""),
+            ResolvedPk::resolve(&snap, UNKNOWN_PK),
+            ResolvedPk::resolve(&snap, PK_ID),
+        ] {
+            assert_eq!(pk.labels().name, "unknown");
+            assert_eq!(pk.telemetry_tags(), aisix_core::TelemetryTags::default());
+        }
+        assert_eq!(PkLabels::default().id, "unknown");
+        assert_eq!(PkLabels::default().name, "unknown");
+    }
+
+    /// The id reaches the label verbatim even when it resolves to nothing —
+    /// an id the operator deleted mid-request still names which key the
+    /// request tried to use, and rewriting it to `"unknown"` would merge
+    /// those samples with the never-resolved ones.
+    #[test]
+    fn unresolvable_id_still_reaches_the_label() {
+        let snap = AisixSnapshot::new();
+        assert_eq!(
+            ResolvedPk::resolve(&snap, "pk-deleted").labels().id,
+            "pk-deleted"
+        );
+        assert_eq!(ResolvedPk::resolve(&snap, "").labels().id, "");
+    }
+
+    /// One lookup now feeds the metric label AND the wire attribution tags,
+    /// so both have to come off the same row.
+    #[test]
+    fn one_resolve_serves_both_the_label_and_the_tags() {
+        let snap = snap_with_pk(
+            "prod-openai",
+            r#","telemetry_tags":{"kind":"catalog","featured":true,"branded_provider":"openai","pk_label":"prod"}"#,
+        );
+        let pk = ResolvedPk::resolve(&snap, PK_ID);
+        assert_eq!(pk.labels().id, PK_ID);
+        assert_eq!(pk.labels().name, "prod-openai");
+        let tags = pk.telemetry_tags();
+        assert!(tags.featured);
+        assert_eq!(tags.branded_provider.as_deref(), Some("openai"));
+        assert_eq!(tags.pk_label.as_deref(), Some("prod"));
+    }
+
+    /// `display_name` is operator-controlled and reaches a Prometheus label,
+    /// so it keeps the `sanitize_tag` treatment the per-emit lookup applied:
+    /// control characters stripped, 256 chars max. A name that sanitises
+    /// away entirely falls back to `"unknown"` rather than emitting a blank
+    /// label value.
+    #[test]
+    fn display_name_is_sanitised_and_blank_falls_back() {
+        let snap = snap_with_pk("prod\nopenai", "");
+        assert_eq!(
+            ResolvedPk::resolve(&snap, PK_ID).labels().name,
+            "prodopenai"
+        );
+
+        let long = "x".repeat(1000);
+        let snap = snap_with_pk(&long, "");
+        let pk = ResolvedPk::resolve(&snap, PK_ID);
+        assert_eq!(pk.labels().name.chars().count(), 256);
+
+        let snap = snap_with_pk("\u{1}\u{2}", "");
+        assert_eq!(ResolvedPk::resolve(&snap, PK_ID).labels().name, "unknown");
     }
 }
