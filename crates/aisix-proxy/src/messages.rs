@@ -1687,11 +1687,7 @@ fn anthropic_metrics_from_response_json(body: &Value) -> AnthropicUsageMetrics {
             .and_then(|u| u.get("cache_read_input_tokens"))
             .and_then(Value::as_u64)
             .unwrap_or(0) as u32,
-        provider_request_id: body
-            .get("id")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string(),
+        provider_request_id: crate::usage_attr::provider_response_id(body),
         provider_model_version: body
             .get("model")
             .and_then(Value::as_str)
@@ -2127,7 +2123,7 @@ async fn cross_provider_dispatch(
         cache_creation_tokens: resp.usage.cache_creation_tokens,
         cache_read_tokens: resp.usage.cache_read_tokens,
         usage_estimated: false,
-        provider_request_id: resp.id.clone(),
+        provider_request_id: crate::usage_attr::sanitize_provider_response_id(&resp.id),
         provider_model_version: resp.model.clone(),
         finish_reason: finish_reason_label(&resp.finish_reason),
         upstream_ttft_ms: 0,
@@ -2265,7 +2261,8 @@ fn build_anthropic_sse_stream(
                     }
                     let comp = guard.comp();
                     if !chunk.id.is_empty() {
-                        comp.provider_request_id = chunk.id.clone();
+                        comp.provider_request_id =
+                        crate::usage_attr::sanitize_provider_response_id(&chunk.id);
                     }
                     if !chunk.model.is_empty() {
                         comp.provider_model_version = chunk.model.clone();
@@ -2965,7 +2962,7 @@ fn update_anthropic_usage(
                 }
             }
             if let Some(id) = msg.and_then(|m| m.get("id")).and_then(Value::as_str) {
-                acc.provider_request_id = id.to_string();
+                acc.provider_request_id = crate::usage_attr::sanitize_provider_response_id(id);
             }
             if let Some(m) = msg.and_then(|m| m.get("model")).and_then(Value::as_str) {
                 acc.provider_model_version = m.to_string();

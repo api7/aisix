@@ -34,12 +34,18 @@ use crate::state::ProxyState;
 /// stripped, 256-char cap) — an unescaped newline in an id would otherwise
 /// let an upstream forge whole log records.
 pub(crate) fn provider_response_id(body: &serde_json::Value) -> String {
-    sanitize_tag(
-        body.get("id")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string(),
-    )
+    sanitize_provider_response_id(body.get("id").and_then(|v| v.as_str()).unwrap_or_default())
+}
+
+/// [`provider_response_id`] for a value already decoded into a typed struct
+/// (a bridge `Response.id`, a stream chunk `id`). Every producer must route
+/// through one of the two, or the cap and control-char stripping the field's
+/// consumers assume are not actually applied to that path.
+pub(crate) fn sanitize_provider_response_id(id: &str) -> String {
+    if id.is_empty() {
+        return String::new();
+    }
+    sanitize_tag(id.to_string())
 }
 
 /// Resolve a ProviderKey's telemetry attribution tags from the live snapshot.
@@ -188,4 +194,48 @@ pub(crate) fn emit_error_usage_event(
     state
         .otlp_fan_out
         .fan_out(&event, None, exporters.iter().map(|e| &e.value));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// AISIX-Cloud#1289: the id is upstream-controlled and reaches a log line
+    /// and cp-api's `dpmgr_usage_events`. A newline in it would break the
+    /// one-record-per-line shape every log consumer relies on, and an
+    /// unbounded id would ride every line for the request. Both entry points
+    /// must normalise, because producers use whichever fits their decode:
+    /// JSON bodies take the `Value` form, bridge/stream structs the `&str`.
+    #[test]
+    fn both_entry_points_strip_control_chars_and_cap_length() {
+        let injected = "chatcmpl-1\nfake-log-line status=200";
+        assert_eq!(
+            sanitize_provider_response_id(injected),
+            "chatcmpl-1fake-log-line status=200",
+        );
+        assert_eq!(
+            provider_response_id(&serde_json::json!({ "id": injected })),
+            "chatcmpl-1fake-log-line status=200",
+        );
+
+        let long = "x".repeat(1000);
+        assert_eq!(sanitize_provider_response_id(&long).chars().count(), 256);
+        assert_eq!(
+            provider_response_id(&serde_json::json!({ "id": long }))
+                .chars()
+                .count(),
+            256,
+        );
+    }
+
+    /// A response with no id — the normal case on several endpoints — must
+    /// stay empty rather than becoming a placeholder, and a non-string `id`
+    /// must not be coerced into one.
+    #[test]
+    fn absent_or_non_string_id_stays_empty() {
+        assert_eq!(sanitize_provider_response_id(""), "");
+        assert_eq!(provider_response_id(&serde_json::json!({})), "");
+        assert_eq!(provider_response_id(&serde_json::json!({ "id": 42 })), "");
+        assert_eq!(provider_response_id(&serde_json::json!({ "id": null })), "");
+    }
 }

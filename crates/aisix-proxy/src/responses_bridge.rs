@@ -1054,7 +1054,8 @@ pub fn build_responses_bridge_stream(
                     {
                         let comp = guard.comp();
                         if !chunk.id.is_empty() {
-                            comp.provider_request_id = chunk.id.clone();
+                            comp.provider_request_id =
+                                crate::usage_attr::sanitize_provider_response_id(&chunk.id);
                         }
                         if let Some(fr) = chunk.finish_reason.as_ref() {
                             comp.finish_reason = finish_reason_label(fr);
