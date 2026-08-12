@@ -142,14 +142,14 @@
           "type": "string"
         },
         {
-          "description": "Dispatched model entry id (UUID); routing/model groups match per selected target, never the group entry itself.",
+          "description": "Model entry id (UUID). Matches the dispatched model; on a Model-Group / semantic-router / ensemble dispatch it also matches the requested parent entry, so a group's own id selects every request addressed to that group.",
           "enum": [
             "model"
           ],
           "type": "string"
         },
         {
-          "description": "Dispatched model display name — the string dimension for regex/prefix matching (\"every gpt-4-family alias\").",
+          "description": "Model display name — the string dimension for regex/prefix matching (\"every gpt-4-family alias\"). Matches the dispatched model's name, and on a virtual-parent dispatch also the requested parent's name.",
           "enum": [
             "model_name"
           ],

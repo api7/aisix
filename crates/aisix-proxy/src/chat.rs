@@ -1560,7 +1560,10 @@ async fn dispatch(
                     state,
                     snapshot,
                     auth,
-                    is_routing_request,
+                    is_routing_request.then_some(crate::quota::RoutingParent {
+                        name: &virtual_entry.value.display_name,
+                        entry_id: &virtual_entry.id,
+                    }),
                     &model.display_name,
                     &attempt.id,
                     model,
@@ -2639,7 +2642,10 @@ async fn dispatch(
                 state,
                 snapshot,
                 auth,
-                is_routing_request,
+                is_routing_request.then_some(crate::quota::RoutingParent {
+                    name: &virtual_entry.value.display_name,
+                    entry_id: &virtual_entry.id,
+                }),
                 &model.display_name,
                 &attempt.id,
                 model,
@@ -3260,6 +3266,10 @@ async fn dispatch_ensemble(
         snapshot,
         request_id,
         client,
+        routing_parent: crate::quota::RoutingParent {
+            name: &virtual_entry.value.display_name,
+            entry_id: &virtual_entry.id,
+        },
     };
 
     // Streaming ensemble (OPTION A): the panel must be buffered to synthesize,
@@ -3394,6 +3404,10 @@ async fn dispatch_ensemble(
             &ensemble_cfg.judge.model,
             &judge_entry.id,
             judge_model,
+            Some(crate::quota::RoutingParent {
+                name: &virtual_entry.value.display_name,
+                entry_id: &virtual_entry.id,
+            }),
         )
         .await
         {
