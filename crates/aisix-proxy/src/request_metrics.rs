@@ -1,5 +1,20 @@
 //! The one chokepoint for the per-request outcome metrics every handler
-//! emits at the end of dispatch.
+//! emits once dispatch has produced a response.
+//!
+//! # What `elapsed` measures, and why it is not end-to-end
+//!
+//! Handlers call [`record`] on their way out, so for a **streamed** response
+//! the `elapsed` they pass is time to response START, not the full
+//! generation — the SSE body has not been polled yet. Every duration series
+//! fed from here therefore mixes two scopes: full request time for
+//! non-streamed traffic, time-to-response-start for streamed. `chat.rs`
+//! guards the SLO histogram against exactly this
+//! (`record_request_e2e_latency` is called with the stream's own duration at
+//! completion instead); nothing guards the three families below.
+//!
+//! Read a streaming p99 off `aisix_request_e2e_latency_seconds`, which is
+//! recorded at stream completion. Do not read one off
+//! `aisix_llm_request_duration_seconds` and expect end-to-end.
 //!
 //! Three families ride on a single call:
 //!
@@ -205,7 +220,10 @@ fn is_llm_endpoint(endpoint: &str) -> bool {
     LLM_ENDPOINTS.contains(&endpoint)
 }
 
-/// Terminal request-metric emit, shared by every handler.
+/// The one request-metric emit, shared by every handler.
+///
+/// Called on the handler's way out — see the module docs for why `elapsed`
+/// is NOT the end-to-end figure on a streamed response.
 ///
 /// `endpoint` must be a bounded route template — a literal for the fixed
 /// routes, or [`crate::normalize_endpoint_label`] output for the `:param` /
