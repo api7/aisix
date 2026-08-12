@@ -36,8 +36,10 @@ tokio.workspace = true
 axum.workspace = true
 reqwest.workspace = true
 # Inbound OIDC/JWT verification on the proxy auth path (jwt.rs). Same
-# major as the vertex provider's service-account signer.
-jsonwebtoken = "9"
+# major as the vertex provider's service-account signer. `aws_lc_rs`
+# reuses the aws-lc backend already installed as the process-wide rustls
+# provider, so no second crypto stack enters the tree.
+jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
 tower.workspace = true
 tower-http.workspace = true
 http-body-util.workspace = true
