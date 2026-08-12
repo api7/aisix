@@ -1,34 +1,43 @@
-//! Structured one-line access log. Called by the proxy handler once per
-//! request (success or error). Keeping the call explicit rather than inside
-//! a tower layer means the handler can attach `provider`, `model`,
-//! `api_key_id`, and `tokens` — fields the layer couldn't see.
+//! Structured one-line access log — one line per request, success or error.
+//! Keeping the call explicit rather than inside a tower layer means the
+//! caller can attach `provider`, `model`, `api_key_id`, and `tokens` —
+//! fields the layer couldn't see.
 //!
 //! # When the line is written, and what that costs
 //!
-//! WHEN differs by response type, and it decides which fields can be filled
-//! at all. The handler calls this on its way out, so:
+//! WHEN differs by path, and it decides which fields can be filled at all.
+//! Four cases, and only the first is "at the end of the request":
 //!
-//! - **Non-streamed**: at the end of the request. Everything the handler
-//!   resolved is available.
-//! - **Streamed**: when the SSE body is handed to the server, before a
-//!   single frame is polled. The upstream has produced nothing yet, so the
-//!   token counts and `provider_request_id` are necessarily absent, and
-//!   `status` is the response-OPEN status — a stream that later aborts, or
-//!   whose consumer walks away, still logged `200` here.
+//! - **Non-streamed response** — from the handler, on its way out, with
+//!   everything it resolved available.
+//! - **Streamed response** — from the handler too, but when the SSE body is
+//!   handed to the server, BEFORE a single frame is polled. The upstream has
+//!   produced nothing yet, so the token counts and `provider_request_id` are
+//!   necessarily absent, and `status` is the response-OPEN status: a stream
+//!   that later aborts, or whose consumer walks away, still logged `200`.
+//! - **`/v1/realtime`** — the opposite extreme. The handler returns the
+//!   WebSocket upgrade immediately; the line is written by `run_session` on
+//!   a detached task once the session closes, so it carries the close status
+//!   and the session's real token totals.
+//! - **Caller hung up before the response head** — written from
+//!   `ClientCancelGuard::drop`, with no handler involved. Status is `499`
+//!   and every resolved field is `None`, because the handler future was
+//!   dropped before it could fill any of them.
 //!
-//! Do not add a field whose value only exists after the upstream responds
-//! and expect it on a streamed line; it will be silently empty there. The
-//! completion-time figures for a streamed request live on the per-attempt
-//! `UsageEvent` (and, for the provider response id, on the
-//! `provider call completed` line `UsageSink::try_emit` writes), keyed by
-//! the same `request_id`.
+//! So do not add a field whose value only exists once the upstream has
+//! responded and expect it on every line: it is silently empty on the
+//! streamed and cancelled ones. A streamed request's completion-time figures
+//! live on the per-attempt `UsageEvent` (and, for the provider response id,
+//! on the `provider call completed` line `UsageSink::try_emit` writes),
+//! keyed by the same `request_id`.
 
 use std::time::Duration;
 
-/// Canonical access-log fields. Constructed by the handler on its way out of
-/// a request and passed to [`log_access`] — see the module docs for what
-/// "on its way out" means for a streamed response, and which fields that
-/// leaves empty.
+/// Canonical access-log fields, passed to [`log_access`].
+///
+/// Constructed at the point a request's outcome becomes known — which is not
+/// the same moment, nor even the same caller, on every path. See the module
+/// docs before assuming a field is available here.
 #[derive(Debug, Clone)]
 pub struct AccessLog<'a> {
     pub method: &'a str,
