@@ -379,12 +379,16 @@ decay_leg() { # decay_leg <conc> <burst_s> <decay_s>  (0-delay mock + gateway up
     local conc="$1" burst_s="$2" decay_s="$3"
     local rssfile="$OUT/.rss-decay.$$" line rss0 hwm0 pss0 lz0 rss_peak
     local rps fail ok p50 p99 rigref budget spawn valid t_end t_now t_s
-    local rss hwm pss lz i corrected delta
+    local rss hwm pss lz i corrected delta gw_birth
 
     echo "== decay leg (c=$conc, burst=${burst_s}s, decay=${decay_s}s, body=${#BODY}B) ==" >&2
 
     read -r rss0 hwm0 <<<"$(status_mem_kb "$GW_PID")"
     read -r pss0 lz0 <<<"$(smaps_mem_kb "$GW_PID")"
+    # starttime (field 22 of /proc/<pid>/stat) pins the pid to this incarnation:
+    # over a 120s idle window a dead gateway's pid can be reused, and /proc
+    # existence alone would then sample a stranger.
+    gw_birth=$(awk '{print $22}' "/proc/$GW_PID/stat" 2>/dev/null || echo "")
     printf '{"kind":"decay_anchor","entrant":"%s","conc":%s,"burst_s":%s,"decay_s":%s,"body_bytes":%s,"rss_kb":%s,"hwm_kb":%s,"pss_kb":%s,"lazyfree_kb":%s}\n' \
         "$ENTRANT_NAME" "$conc" "$burst_s" "$decay_s" "${#BODY}" "$rss0" "$hwm0" "$pss0" "$lz0" >> "$RESULTS"
 
@@ -446,9 +450,11 @@ decay_leg() { # decay_leg <conc> <burst_s> <decay_s>  (0-delay mock + gateway up
     done
 
     # One final full sample is the gate input: corrected residency and its
-    # distance from the idle anchor (RSS_IDLE is the sourcing runner's).
-    if [ ! -d "/proc/$GW_PID" ]; then
-        echo "WARNING: gateway died before the final decay sample" >&2
+    # distance from the corrected pre-burst anchor (same LazyFree correction
+    # on both sides, so an anchor that itself holds lazily-freed pages cannot
+    # understate the residual).
+    if [ "$(awk '{print $22}' "/proc/$GW_PID/stat" 2>/dev/null || echo x)" != "$gw_birth" ]; then
+        echo "WARNING: gateway died or its pid was reused during the decay window - no summary" >&2
         HARNESS_RC=1
         return 0
     fi
@@ -457,7 +463,9 @@ decay_leg() { # decay_leg <conc> <burst_s> <decay_s>  (0-delay mock + gateway up
     corrected=null; delta=null
     if [ "$rss" != null ] && [ "$lz" != null ]; then
         corrected=$((rss - lz))
-        [ -n "${RSS_IDLE:-}" ] && delta=$((corrected - RSS_IDLE))
+        if [ "$rss0" != null ] && [ "$lz0" != null ]; then
+            delta=$((corrected - (rss0 - lz0)))
+        fi
     fi
     printf '{"kind":"decay_summary","entrant":"%s","conc":%s,"burst_s":%s,"decay_s":%s,"rss_idle_kb":%s,"pre_rss_kb":%s,"burst_peak_kb":%s,"final_rss_kb":%s,"final_hwm_kb":%s,"final_pss_kb":%s,"final_lazyfree_kb":%s,"final_corrected_kb":%s,"residual_vs_idle_kb":%s}\n' \
         "$ENTRANT_NAME" "$conc" "$burst_s" "$decay_s" "${RSS_IDLE:-null}" "$rss0" "$rss_peak" \

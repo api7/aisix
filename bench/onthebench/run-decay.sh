@@ -21,19 +21,22 @@ OUT="${2:?usage: run-decay.sh <aisix-src-dir> <out-dir>}"
 DECAY_CONC="${BENCH_DECAY_CONC:-64}"
 DECAY_BURST_S="${BENCH_DECAY_BURST_S:-60}"
 DECAY_S="${BENCH_DECAY_S:-120}"
-BODY_KB="${BENCH_DECAY_BODY_KB:-120}"
+DECAY_BODY_KB="${BENCH_DECAY_BODY_KB:-120}"
 
 # Same refuse-don't-collect policy as the lib.sh knobs: nonsense must fail
-# here, not after a gateway is up. The body cap is a transport limit, not a
-# taste choice: the body travels to otb as one argv string and Linux
-# MAX_ARG_STRLEN is 128 KiB, so MB-scale bodies need an @file mode in otb
-# first (out of scope for #968; 126 leaves room for the JSON envelope).
-for _k in DECAY_CONC:"$DECAY_CONC" DECAY_BURST_S:"$DECAY_BURST_S" DECAY_S:"$DECAY_S" DECAY_BODY_KB:"$BODY_KB"; do
-    [[ "${_k#*:}" =~ ^[1-9][0-9]*$ ]] ||
-        { echo "FATAL: BENCH_${_k%%:*} must be a positive integer, got '${_k#*:}'"; exit 1; }
+# here, not after a gateway is up. Indirect expansion, not word-splitting a
+# name:value list — a value with embedded whitespace ("64 128") must be
+# refused, not leak into the JSONL as non-numeric fields. The body cap is a
+# transport limit, not a taste choice: the body travels to otb as one argv
+# string and Linux MAX_ARG_STRLEN is 128 KiB, so MB-scale bodies need an
+# @file mode in otb first (out of scope for #968; 126 leaves room for the
+# JSON envelope).
+for _k in DECAY_CONC DECAY_BURST_S DECAY_S DECAY_BODY_KB; do
+    [[ "${!_k}" =~ ^[1-9][0-9]*$ ]] ||
+        { echo "FATAL: BENCH_$_k must be a positive integer, got '${!_k}'"; exit 1; }
 done
-[ "$BODY_KB" -le 126 ] ||
-    { echo "FATAL: BENCH_DECAY_BODY_KB must be <= 126 (argv transport limit), got '$BODY_KB'"; exit 1; }
+[ "$DECAY_BODY_KB" -le 126 ] ||
+    { echo "FATAL: BENCH_DECAY_BODY_KB must be <= 126 (argv transport limit), got '$DECAY_BODY_KB'"; exit 1; }
 
 # A legal chat-completions request padded to ~BODY_KB, standing in for an
 # inline-base64 multimodal payload — the traffic shape the issue names as the
@@ -43,7 +46,7 @@ BODY=$(python3 -c 'import json, sys
 pad = "x" * (int(sys.argv[1]) * 1024)
 print(json.dumps({"model": "gpt-4o-mini",
                   "messages": [{"role": "user", "content": pad}],
-                  "max_tokens": 16}))' "$BODY_KB")
+                  "max_tokens": 16}))' "$DECAY_BODY_KB")
 
 ENTRANT_NAME=aisix
 # shellcheck source=lib.sh
