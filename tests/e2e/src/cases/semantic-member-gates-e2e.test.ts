@@ -329,6 +329,7 @@ describe("semantic router member gates e2e", () => {
       const res = await fetch(`${app!.proxyUrl}/v1/models`, {
         headers: { authorization: `Bearer ${CALLER_PLAINTEXT}` },
       });
+      await res.arrayBuffer(); // release the socket between polls
       return res.status === 200;
     });
   });
