@@ -122,9 +122,12 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
             cargo build --locked --release --bin aisix; \
         cp /src/target-pgo/release/aisix /usr/local/bin/aisix; \
         cp /tmp/pgo-data/train-manifest.json /usr/local/share/aisix/pgo-verified.json; \
-    else \
+    elif [ "$PGO" = "off" ]; then \
         cargo build --locked --release --bin aisix; \
         cp target/release/aisix /usr/local/bin/aisix; \
+    else \
+        echo "unsupported PGO value: '$PGO' (use on|off)" >&2; \
+        exit 2; \
     fi
 
 # --- Stage 2: runtime --------------------------------------------------------

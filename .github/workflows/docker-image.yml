@@ -78,8 +78,12 @@ jobs:
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             mode=off
             git fetch --no-tags --depth=1 origin "$BASE_SHA"
+            # Root build inputs (workspace manifest with [profile.release],
+            # lockfile, toolchain pin) are PGO inputs too: a bump can break
+            # the instrumented/profile-use build or the training run while
+            # the plain PGO=off compile stays green.
             if git diff --name-only "$BASE_SHA" HEAD \
-                | grep -qE '^(Dockerfile|\.dockerignore|bench/pgo-training/|\.github/workflows/docker-image\.ya?ml)'; then
+                | grep -qE '^(Dockerfile|\.dockerignore|Cargo\.(toml|lock)|rust-toolchain\.toml|bench/pgo-training/|\.github/workflows/docker-image\.ya?ml)'; then
               mode=on
             fi
           fi
