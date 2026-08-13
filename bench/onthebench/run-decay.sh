@@ -56,7 +56,10 @@ BIN="$SRC/target/release/aisix"
 
 # ---- sanity -----------------------------------------------------------------
 
-[ -x "$BIN" ] || { echo "FATAL: $BIN missing - build first"; exit 1; }
+# Rebuild instead of trusting mtime — same stale-binary gate as
+# run-baseline.sh; a no-op when the binary is already current.
+( cd "$SRC" && cargo build --locked --release --bin aisix )
+[ -x "$BIN" ] || { echo "FATAL: $BIN missing after build"; exit 1; }
 rig_sanity
 
 bench_init

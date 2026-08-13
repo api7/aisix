@@ -27,7 +27,12 @@ BIN="$SRC/target/release/aisix"
 
 # ---- sanity -----------------------------------------------------------------
 
-[ -x "$BIN" ] || { echo "FATAL: $BIN missing - build first"; exit 1; }
+# Rebuild instead of trusting mtime: with iteration builds living in
+# target/release-dev, a stale target/release binary is silent poison —
+# meta.json would attribute the numbers to the wrong commit. A no-op
+# when the binary is already current.
+( cd "$SRC" && cargo build --locked --release --bin aisix )
+[ -x "$BIN" ] || { echo "FATAL: $BIN missing after build"; exit 1; }
 rig_sanity
 if [ "$FLAMEGRAPH" = 1 ]; then require_symbols "$BIN"; fi
 

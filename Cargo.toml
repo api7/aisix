@@ -207,10 +207,11 @@ strip = "debuginfo"
 
 # Iteration-speed sibling of `release`: thin LTO parallelizes the LTO
 # stage across cores instead of fat LTO's single-threaded whole-graph
-# pass, cutting link-heavy rebuilds from minutes to tens of seconds.
-# Functionally identical output, slightly less optimized — so any number
-# that gets reported, compared against a baseline, or fed into the
-# saturation grid MUST come from `--release`, never from this profile.
+# pass — measured cold builds of the aisix binary on a 12-core host:
+# 6m37s (release) vs 2m27s (release-dev). Functionally identical output,
+# slightly less optimized — so any number that gets reported, compared
+# against a baseline, or fed into the saturation grid MUST come from
+# `--release`, never from this profile.
 [profile.release-dev]
 inherits = "release"
 lto = "thin"
