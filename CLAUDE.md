@@ -88,6 +88,10 @@ After every `gh pr create` or force-push, spawn a fresh `general-purpose` Agent 
 
 Output HIGH/MEDIUM/LOW per finding with **concrete suggested code**, not vague "consider". **Merge gate:** every HIGH and MEDIUM is either fixed in code or explicitly justified in the PR (e.g. "feature gap, filed as #N, agreed not to block"); silent merge is not enough. For findings that surface gateway/product-behavior gaps, file separate issues and link them. Self-review misses the author's blind spots — an independent agent catches them.
 
+## PR Batching — One PR per Session by Default
+
+This repo is developed end-to-end by agents — no human reviewer needs small review units — and CodeRabbit bills and rate-limits **per PR**. Fanning one effort into many small PRs burns review quota and stalls the session on throttled bot reviews. Keep ONE open PR per session and push follow-up and related work to it as additional commits (rule and doc riders included) instead of opening another. Split only when a fix must merge independently ahead of the batch, or when the user asks for separate delivery.
+
 ## Handler Families Stay in Lockstep — Fix the Whole Class
 
 **The client-facing endpoint handlers come in families that share dispatch, auth, routing, telemetry, and guardrail logic — `/v1/chat/completions`, `/v1/messages` (+`count_tokens`), `/v1/responses`, plus embeddings/rerank/audio/images and the jobs surface (files/batches/fine-tuning). A bug or feature landed on one almost always applies to the others, and a gap on the unfixed siblings is SILENT: nothing errors, the behavior just quietly degrades.**
