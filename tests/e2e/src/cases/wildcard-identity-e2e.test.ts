@@ -142,8 +142,11 @@ describe("wildcard alias identity e2e", () => {
     await awaitWindowHeadroom(5);
 
     // Align on a window that admits `wid/alpha` — that 200 is alias
-    // #1's slot in the SHARED bucket (rpm=1, fixed windows keyed on
-    // unix time, so the first attempt may land in a spent window).
+    // #1's slot in the SHARED bucket. Nothing has consumed the bucket
+    // yet (the readiness gate sends no chat traffic), so the first
+    // attempt normally succeeds; the loop stays as cheap insurance
+    // should an earlier consumer ever be added (rpm=1, fixed windows
+    // keyed on unix time).
     const deadline = Date.now() + 90_000;
     let aligned = false;
     while (Date.now() < deadline) {
