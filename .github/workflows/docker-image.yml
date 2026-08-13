@@ -79,7 +79,7 @@ jobs:
             mode=off
             git fetch --no-tags --depth=1 origin "$BASE_SHA"
             if git diff --name-only "$BASE_SHA" HEAD \
-                | grep -qE '^(Dockerfile|bench/pgo-training/|\.github/workflows/docker-image\.ya?ml)'; then
+                | grep -qE '^(Dockerfile|\.dockerignore|bench/pgo-training/|\.github/workflows/docker-image\.ya?ml)'; then
               mode=on
             fi
           fi
@@ -195,14 +195,21 @@ jobs:
       # profile-optimized build succeeds. An absent marker, a short shape
       # list, or an undersized merged profile fails the workflow here —
       # before signing, and before any human treats the artifact as good.
+      # The `if` is deliberately NOT just `pgomode == 'on'`: every push build
+      # asserts unconditionally, so a future bug in the pgomode step itself
+      # (empty output, renamed id) cannot skip both the PGO build AND its
+      # guard in the same breath.
       - name: Assert PGO proof marker (#967)
-        if: steps.pgomode.outputs.value == 'on'
+        if: github.event_name != 'pull_request' || steps.pgomode.outputs.value == 'on'
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+          DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           set -eux
           if [ "${{ github.event_name }}" = "pull_request" ]; then
-            IMG="$(printf '%s\n' "${{ steps.meta.outputs.tags }}" | head -n1)"
+            IMG="$(printf '%s\n' "$TAGS" | head -n1)"
           else
-            IMG="${REGISTRY}/${IMAGE_NAME}@${{ steps.build.outputs.digest }}"
+            IMG="${REGISTRY}/${IMAGE_NAME}@${DIGEST}"
             docker pull "$IMG"
           fi
           docker run --rm --entrypoint cat "$IMG" /usr/local/share/aisix/pgo-verified.json \
@@ -261,12 +268,15 @@ jobs:
       # must provably keep the profiling contract, not just the PR variant.
       - name: Verify shipped binary keeps its symbol table (#847)
         if: github.event_name == 'pull_request' || startsWith(github.ref, 'refs/tags/v')
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+          DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           set -eux
           if [ "${{ github.event_name }}" = "pull_request" ]; then
-            IMAGE="$(printf '%s\n' "${{ steps.meta.outputs.tags }}" | head -n1)"
+            IMAGE="$(printf '%s\n' "$TAGS" | head -n1)"
           else
-            IMAGE="${REGISTRY}/${IMAGE_NAME}@${{ steps.build.outputs.digest }}"
+            IMAGE="${REGISTRY}/${IMAGE_NAME}@${DIGEST}"
             docker pull "$IMAGE"
           fi
           cid="$(docker create "$IMAGE")"

@@ -12,6 +12,7 @@
 #
 # Build:
 #   docker build -t aisix:dev .
+#   docker build --build-arg PGO=off -t aisix:dev .   # quick local build, skips PGO
 #
 # Run, standalone (mount your own config):
 #   docker run --rm -v $(pwd)/config.example.yaml:/etc/aisix/config.yaml \

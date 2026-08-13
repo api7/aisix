@@ -44,6 +44,10 @@ docker run --rm --entrypoint cat ghcr.io/api7/aisix:X.Y.Z \
   /usr/local/share/aisix/pgo-verified.json
 ```
 
+Local note: each retrained profile is content-addressed, so repeated local
+PGO builds accumulate build artifacts in the persistent BuildKit cache
+mounts; reclaim with `docker builder prune`.
+
 ## 2. Polish the release notes
 
 Edit the draft before publishing. The Get-started/Download header and the

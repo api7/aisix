@@ -141,9 +141,13 @@ for shape in "${SHAPES[@]}"; do
     fi
 
     # Graceful shutdown is what flushes the profile counters to disk; a
-    # non-zero exit means the flush cannot be trusted.
+    # non-zero exit means the flush cannot be trusted. The watchdog bounds a
+    # hung shutdown at 120s instead of burning the whole CI job timeout —
+    # SIGKILL forces rc=137 and the FATAL path below.
     kill -TERM "$GW_PID"
+    ( sleep 120; kill -KILL "$GW_PID" 2>/dev/null ) & WATCHDOG=$!
     rc=0; wait "$GW_PID" || rc=$?
+    kill "$WATCHDOG" 2>/dev/null || true
     if [ "$rc" -ne 0 ]; then
         echo "FATAL: gateway exited rc=$rc after shape '$shape'; log tail:" >&2
         tail -n 40 "$PGO_DIR/gateway-$shape.log" >&2 || true
