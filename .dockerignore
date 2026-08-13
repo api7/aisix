@@ -1,6 +1,7 @@
 .git
 .github
 target
+bench/pgo-training/trainer/target
 
 docs
 tests/fixtures/tmp

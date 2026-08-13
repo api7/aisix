@@ -68,18 +68,63 @@ COPY crates ./crates
 # Docker context must carry this directory or the release build fails.
 COPY schemas ./schemas
 
+# PGO training assets (#967): trainer tool + train.sh. Copied separately from
+# crates/ so editing training assets doesn't invalidate the dependency layers
+# above.
+COPY bench/pgo-training ./bench/pgo-training
+
+# Profile-guided optimization gate. Default ON: release artifacts are always
+# PGO-built, and a forgotten build-arg ships a PGO'd image — never a silently
+# un-optimized one. CI passes PGO=off only for pull-request smoke builds.
+ARG PGO=on
+
 # `--locked` forces the build to use the exact versions in Cargo.lock —
 # fails fast if the lockfile is stale rather than silently resolving
 # fresh deps in CI.
 #
+# PGO=on runs the three-phase build (#967):
+#   A. instrumented build (-Cprofile-generate) in its own target dir;
+#   B. train.sh drives the committed 12-shape matrix through the
+#      instrumented gateway against the trainer's local mock, then merges
+#      the .profraw files with the pinned toolchain's own llvm-profdata
+#      (llvm-tools-preview — exact LLVM match with rustc, no extra deps);
+#   C. optimized build (-Cprofile-use) in a third target dir, so profile
+#      builds never share cargo fingerprints with plain builds.
+# FAIL-CLOSED: any phase failing fails this RUN and nothing is shipped.
+# The proof marker (pgo-verified.json) is written only after phase C
+# succeeds; the push workflows assert it before trusting the image.
+# The merged profile is content-addressed (merged-<sha>.profdata) because
+# cargo fingerprints the -Cprofile-use PATH, not the file content — a
+# retrained profile at a fixed path would silently reuse stale artifacts
+# from the persistent target cache mount.
+#
 # If this ever builds for linux/arm64: jemalloc bakes the build host's
 # page size into the binary, and QEMU reports 4K — set
 # JEMALLOC_SYS_WITH_LG_PAGE=16 here or the image aborts at startup on
-# 64K-page kernels (see crates/aisix-server/src/main.rs).
+# 64K-page kernels (see crates/aisix-server/src/main.rs). PGO training
+# additionally requires a native arm64 builder: an instrumented binary
+# cannot self-train under QEMU emulation.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --locked --release --bin aisix \
-    && cp target/release/aisix /usr/local/bin/aisix
+    --mount=type=cache,target=/src/target-pgo-gen \
+    --mount=type=cache,target=/src/target-pgo \
+    set -eu; \
+    mkdir -p /usr/local/share/aisix; \
+    if [ "$PGO" = "on" ]; then \
+        RUSTFLAGS="-Cprofile-generate=/tmp/pgo-data" CARGO_TARGET_DIR=/src/target-pgo-gen \
+            cargo build --locked --release --bin aisix; \
+        cargo build --locked --release \
+            --manifest-path bench/pgo-training/trainer/Cargo.toml; \
+        bash bench/pgo-training/train.sh /src/target-pgo-gen/release/aisix /tmp/pgo-data; \
+        PROFDATA="$(ls /tmp/pgo-data/merged-*.profdata)"; \
+        RUSTFLAGS="-Cprofile-use=$PROFDATA" CARGO_TARGET_DIR=/src/target-pgo \
+            cargo build --locked --release --bin aisix; \
+        cp /src/target-pgo/release/aisix /usr/local/bin/aisix; \
+        cp /tmp/pgo-data/train-manifest.json /usr/local/share/aisix/pgo-verified.json; \
+    else \
+        cargo build --locked --release --bin aisix; \
+        cp target/release/aisix /usr/local/bin/aisix; \
+    fi
 
 # --- Stage 2: runtime --------------------------------------------------------
 FROM debian:bookworm-slim AS runtime
@@ -100,11 +145,19 @@ RUN apt-get update \
 # missing from the container's bounding set — it is in the default
 # Docker/containerd cap set, but `capabilities: {drop: [ALL]}` pod
 # specs must add NET_BIND_SERVICE back.
+# The PGO proof marker (#967) ships with the image: written by the builder
+# only after a successful profile-optimized build, asserted by the push
+# workflows before an image is trusted. Absent on PGO=off (PR smoke) builds.
 RUN --mount=type=bind,from=builder,source=/usr/local/bin/aisix,target=/mnt/aisix \
+    --mount=type=bind,from=builder,source=/usr/local/share/aisix,target=/mnt/aisix-share \
     apt-get update \
     && apt-get install -y --no-install-recommends libcap2-bin \
     && install -m 0755 /mnt/aisix /usr/local/bin/aisix \
     && setcap 'cap_net_bind_service=+ep' /usr/local/bin/aisix \
+    && mkdir -p /usr/local/share/aisix \
+    && if [ -f /mnt/aisix-share/pgo-verified.json ]; then \
+         install -m 0644 /mnt/aisix-share/pgo-verified.json /usr/local/share/aisix/pgo-verified.json; \
+       fi \
     && apt-get purge -y --auto-remove libcap2-bin \
     && rm -rf /var/lib/apt/lists/*
 

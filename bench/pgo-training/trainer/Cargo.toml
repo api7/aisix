@@ -1,0 +1,16 @@
+[package]
+name = "pgo-trainer"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.93"
+publish = false
+description = "Mock upstream + deterministic load driver for the PGO release build (#967). Std-only on purpose: no network fetch, no workspace lockfile impact."
+
+# Standalone workspace root: stops cargo's upward workspace discovery at this
+# manifest, so the tool builds identically whether the checkout is the repo
+# root (Docker/CI) or a git worktree nested under another checkout.
+[workspace]
+
+[[bin]]
+name = "pgo-trainer"
+path = "src/main.rs"

@@ -20,6 +20,9 @@ members = [
     "crates/aisix-guardrails",
     "crates/aisix-server",
 ]
+# Build-time tool for the PGO release pipeline (#967): own manifest + lockfile,
+# never part of the product build graph.
+exclude = ["bench/pgo-training/trainer"]
 
 [workspace.package]
 version = "0.3.0"
