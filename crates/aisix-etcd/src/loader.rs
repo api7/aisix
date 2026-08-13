@@ -572,12 +572,6 @@ fn normalize_ignored_path(path: &str) -> String {
         .join(".")
 }
 
-/// WARN once per (kind, field-set) for the process lifetime. Resyncs
-/// rebuild the whole snapshot on a cadence; without dedup every cycle
-/// would re-log every YELLOW row. The set is capped: past the cap new
-/// combinations keep logging (never silently dropped) but are no longer
-/// remembered, so a pathological fleet re-logs on each resync instead
-/// of growing memory without bound.
 /// Add `fields` to the partial-compat row already recorded for `key`
 /// this build, or start one if none exists. Exactly one row per etcd key
 /// so the supervisor's key-addressed retained report never drops a half
@@ -599,6 +593,12 @@ fn merge_partial_compat_fields(stats: &mut BuildStats, key: &str, kind: &str, fi
     }
 }
 
+/// WARN once per (kind, field-set) for the process lifetime. Resyncs
+/// rebuild the whole snapshot on a cadence; without dedup every cycle
+/// would re-log every YELLOW row. The set is capped: past the cap new
+/// combinations keep logging (never silently dropped) but are no longer
+/// remembered, so a pathological fleet re-logs on each resync instead
+/// of growing memory without bound.
 fn warn_partial_compat_deduped(key: &str, kind: &str, fields: &[String]) {
     use std::collections::HashSet;
     use std::sync::{Mutex, OnceLock};

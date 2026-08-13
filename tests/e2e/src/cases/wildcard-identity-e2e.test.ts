@@ -69,7 +69,6 @@ describe("wildcard alias identity e2e", () => {
 
     app = await spawnApp();
     seed = new SeedClient(etcd, app.etcdPrefix);
-    await seed.createApiKey({ key_hash: CALLER_KEY_HASH, allowed_models: ["*"] });
 
     const upstream = await startOpenAiUpstream({ nonStreamBody: chatBody("served-wid") });
     upstreams.push(upstream);
@@ -116,17 +115,16 @@ describe("wildcard alias identity e2e", () => {
       provider_key_id: pk2.id,
     });
 
-    // Readiness via a wildcard-served alias: any suffix must resolve.
-    // listModels hides wildcard patterns, so probe with a chat call —
-    // 404 until the row propagates. The probe consumes the shared rpm
-    // slot, so tests below re-align on a fresh window first.
+    // The caller key is seeded LAST: once it authenticates, revision
+    // order implies both wildcard rows above are in the snapshot
+    // (tests/e2e/AGENTS.md). The gate neither resolves a wildcard alias
+    // nor consumes the shared rpm bucket under test.
+    await seed.createApiKey({ key_hash: CALLER_KEY_HASH, allowed_models: ["*"] });
     await waitConfigPropagation(async () => {
-      try {
-        const r = await chat("wid/readiness-probe");
-        return r.status === 200 || r.status === 429;
-      } catch {
-        return false;
-      }
+      const res = await fetch(`${app!.proxyUrl}/v1/models`, {
+        headers: { authorization: `Bearer ${CALLER_PLAINTEXT}` },
+      });
+      return res.status === 200;
     });
   });
 
@@ -142,9 +140,9 @@ describe("wildcard alias identity e2e", () => {
     }
     await awaitWindowHeadroom(5);
 
-    // The readiness probe already consumed a slot of the SHARED bucket
-    // (itself evidence of the fix), so align by burning `wid/alpha`
-    // until a fresh window admits it — that 200 is alias #1's slot.
+    // Align on a window that admits `wid/alpha` — that 200 is alias
+    // #1's slot in the SHARED bucket (rpm=1, fixed windows keyed on
+    // unix time, so the first attempt may land in a spent window).
     const deadline = Date.now() + 90_000;
     let aligned = false;
     while (Date.now() < deadline) {
