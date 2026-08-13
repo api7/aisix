@@ -89,6 +89,7 @@ start_target() {
     [ -n "$GW_PID" ] && [ -d "/proc/$GW_PID" ] ||
         { echo "FATAL: entrant_start did not leave a live pid in GW_PID"; exit 1; }
     wait_http_200 "http://127.0.0.1:$GW_PORT$REQ_PATH" "$ENTRANT_NAME"
+    assert_listener "$GW_PORT" "$GW_PID" "$ENTRANT_NAME"
     sleep 3
     RSS_IDLE=$(rss_kb "$GW_PID")
     THREADS=$(ps -T -p "$GW_PID" 2>/dev/null | tail -n +2 | wc -l) || THREADS=0
