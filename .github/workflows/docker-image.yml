@@ -78,11 +78,17 @@ jobs:
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             mode=off
             git fetch --no-tags --depth=1 origin "$BASE_SHA"
+            # Capture the diff as a CHECKED command before matching: inside
+            # an `if` condition a git failure is exempt from `set -e` and
+            # would silently leave mode=off (fail-open). As an assignment,
+            # a diff failure kills the step instead. Captured text also
+            # avoids grep -q closing the pipe under git (SIGPIPE).
+            changed="$(git diff --name-only "$BASE_SHA" HEAD)"
             # Root build inputs (workspace manifest with [profile.release],
             # lockfile, toolchain pin) are PGO inputs too: a bump can break
             # the instrumented/profile-use build or the training run while
             # the plain PGO=off compile stays green.
-            if git diff --name-only "$BASE_SHA" HEAD \
+            if printf '%s\n' "$changed" \
                 | grep -qE '^(Dockerfile|\.dockerignore|Cargo\.(toml|lock)|rust-toolchain\.toml|bench/pgo-training/|\.github/workflows/docker-image\.ya?ml)'; then
               mode=on
             fi
