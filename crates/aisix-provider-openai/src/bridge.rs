@@ -159,10 +159,10 @@ impl Default for OpenAiBridge {
 }
 
 fn default_client() -> Client {
-    aisix_gateway::client_builder()
+    aisix_gateway::dispatch_client_builder()
         .user_agent("aisix/0.1")
         .build()
-        .unwrap_or_else(|_| Client::new())
+        .unwrap_or_else(|_| aisix_gateway::dispatch_client_fallback())
 }
 
 /// Strip a known endpoint suffix from `base`. Idempotent: if no known
@@ -911,6 +911,50 @@ mod tests {
             }
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    /// An upstream 3xx has to surface as an upstream status, which the
+    /// proxy renders as a 502 — the behavior `BridgeError::http_status`
+    /// has always described. reqwest follows up to 10 redirects by
+    /// default and the gateway had never opted out, so a redirected POST
+    /// was silently re-issued as a `GET` against the `Location` host
+    /// (RFC 9110 §15.4.2, as tower-http's follow-redirect middleware
+    /// implements it) and that host's answer came back as the completion.
+    ///
+    /// The second assertion is the one that matters: the redirect target
+    /// must never be dialed at all.
+    #[tokio::test]
+    async fn upstream_redirects_are_not_followed() {
+        let elsewhere = MockServer::start().await;
+        mount_ok(&elsewhere).await;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(301).insert_header(
+                "location",
+                format!("{}/chat/completions", elsewhere.uri()).as_str(),
+            ))
+            .mount(&server)
+            .await;
+
+        let bridge = OpenAiBridge::new();
+        let ctx = sample_ctx(&server.uri());
+        let err = bridge.chat(&req(), &ctx).await.unwrap_err();
+        assert_eq!(
+            err.http_status(),
+            502,
+            "a redirect the gateway does not follow is 502-worthy: {err:?}",
+        );
+        match err {
+            BridgeError::UpstreamStatus { status, .. } => assert_eq!(status, 301),
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert!(
+            elsewhere.received_requests().await.unwrap().is_empty(),
+            "the redirect target was dialed; the request and the key's \
+             credential left for a host the operator never configured",
+        );
     }
 
     /// Audit fix (PR #323): the [`aisix_gateway::MAX_UPSTREAM_ERROR_BODY_BYTES`]

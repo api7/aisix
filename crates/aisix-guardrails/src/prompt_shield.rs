@@ -101,7 +101,7 @@ impl PromptShieldGuardrail {
         // Per-call timeout is enforced via tokio::time::timeout in
         // call_api(); the connection layer is the shared one, so a pooled
         // connection expires before a hop in front of the service reaps it.
-        let client = aisix_gateway::client_builder()
+        let client = aisix_gateway::dispatch_client_builder()
             .build()
             .expect("guardrail http client builds");
         Self {
