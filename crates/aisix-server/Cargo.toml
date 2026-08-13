@@ -60,8 +60,13 @@ hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
 # bench (Linux glibc — the Docker image and both supported production
 # arches). Other targets (macOS dev builds, musl) keep the system
 # allocator rather than carry an allocator we never run in production.
+# The ctl crate exists for one runtime mallctl at startup (enable the
+# background purge thread, #968); it drags in the unmaintained `paste`
+# proc-macro (RUSTSEC-2024-0436, build-time only) — accepted until
+# jemalloc-ctl drops it upstream.
 [target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
 tikv-jemallocator = "0.6"
+tikv-jemalloc-ctl = "0.6"
 
 [dev-dependencies]
 tempfile = "3"
