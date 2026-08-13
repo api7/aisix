@@ -61,10 +61,13 @@ Replicates the published onthebench setup (https://onthebench.ai/gateways/perfor
   VmHWM are in the metadata, alongside commit, binary sha256, instrument
   sha256s, core split, kernel, and the full method parameters.
 - **Flamegraph** — one on-CPU flamegraph at the c=128 saturation point per run
-  (`perf record -F 499 --call-graph dwarf` → inferno), the api7/aisix#847
+  (`perf record -F 499 --call-graph dwarf,32768` → inferno), the api7/aisix#847
   workflow. `rig-setup.sh` sets `kernel.perf_event_paranoid=1` (session-scoped,
   reverts on reboot) so an unprivileged run can sample its own process, and
-  `run-baseline.sh` refuses a stripped binary before wasting a run.
+  `run-baseline.sh` refuses a stripped binary before wasting a run. Every
+  capture reports the share of its stacks that failed to unwind, into both the
+  terminal and the collected `perf.log`; a capture that unwound poorly is
+  called out rather than left to look like a profile.
 
 ## Method overrides
 
@@ -72,14 +75,17 @@ Every method knob is a `BENCH_*` environment variable (defaults in `lib.sh`
 match the #891 grid exactly): `BENCH_GRID` (`"ttft_ms:conc ..."`, e.g.
 `"20:1536 20:2048"` for an added delay tier, `"0:128"` for a spot-check),
 `BENCH_REPS`, `BENCH_WINDOW`, `BENCH_WARMUP`, `BENCH_MAX_TRIES`,
-`BENCH_FLOOR_REPS`, `BENCH_FLAMEGRAPH`. `bench.sh` forwards them to the rig.
+`BENCH_FLOOR_REPS`, `BENCH_FLAMEGRAPH`, `BENCH_PERF_STACK`. `bench.sh` forwards
+them to the rig.
 A changed knob is recorded in `meta.json`, so a non-default run can never
 pass silently as the standard grid.
 
 Values are validated at startup and nonsense refuses to run: grid entries
 must be `ttft_ms:conc` with a positive concurrency; window, reps, max tries
 and floor reps must be positive integers (warmup may be `0`);
-`BENCH_FLAMEGRAPH` is `0` or `1`.
+`BENCH_FLAMEGRAPH` is `0` or `1`. `BENCH_PERF_STACK` is the per-sample stack
+perf copies for dwarf unwinding (default 32768; a multiple of 8 up to 65528) -
+raise it if a capture reports a high unresolved-stack share.
 
 ## Measuring another target ("entrant")
 
