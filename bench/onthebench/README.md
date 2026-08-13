@@ -101,10 +101,30 @@ part of this repository; flamegraphs default off for entrants because shipped
 release binaries are usually stripped (a stripped target skips the flamegraph
 with a warning rather than failing the run).
 
+## Post-load decay leg (`run-decay.sh`)
+
+`run-decay.sh <aisix-src-dir> <out-dir>` measures the axis the load grid
+cannot see: what happens to gateway RSS *after* the load stops
+(api7/aisix#968). One saturating burst of large bodies (default: c=64 for 60s,
+~120 KiB legal chat-completions requests standing in for inline-base64
+multimodal payloads), then 120s of idle sampling — VmRSS/VmHWM at ~2 Hz plus
+`smaps_rollup` Pss/LazyFree at ~1 Hz, because pages an allocator returns with
+`MADV_FREE` stay in VmRSS until the kernel reclaims them, and the corrected
+series `rss - lazyfree` is the residency an OOM limit actually enforces.
+Deliberately a separate runner: the large bodies drive VmHWM far above the
+baseline grid's, so sharing a process lifetime with `run-baseline.sh` would
+poison `rss_hwm_kb` against every historical baseline. Knobs:
+`BENCH_DECAY_CONC`, `BENCH_DECAY_BURST_S`, `BENCH_DECAY_S`,
+`BENCH_DECAY_BODY_KB` (≤126: the body travels as one argv string under
+Linux's 128 KiB `MAX_ARG_STRLEN`). A burst window with any failed request is
+recorded, marked invalid, and produces no decay curve; a curve cut short by a
+dead gateway exits nonzero like any incomplete run.
+
 ## Output
 
 One directory per run: `results.jsonl` (one JSON object per measured window,
-`kind` gateway/floor, `entrant` naming the measured target), `meta.json`, the
+`kind` gateway/floor — or decay_anchor/decay_burst/decay/decay_summary from
+the decay runner, `entrant` naming the measured target), `meta.json`, the
 generated config files, and the gateway/mock logs. `flamegraph-c128.svg` is
 present when Inferno rendering succeeded; on a rendering failure the run
 keeps `perf.data` instead, so the SVG can be produced off-rig.

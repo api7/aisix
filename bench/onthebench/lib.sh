@@ -348,6 +348,123 @@ run_point() { # run_point <ttft> <conc>
           HARNESS_RC=1; }
 }
 
+# ---- decay leg ---------------------------------------------------------------
+
+# Post-load RSS decay (api7/aisix#968): one saturating burst of large bodies,
+# then sample the idle process's memory for a fixed window. VmRSS alone cannot
+# answer "did the allocator hand the pages back" — pages released with
+# MADV_FREE stay resident until the kernel reclaims them, so a pure VmRSS
+# curve reads "already reclaimable" as "never returned". Every 1s sample
+# therefore also reads smaps_rollup's Pss and LazyFree; rss_kb - lazyfree_kb
+# is the residency that memory pressure cannot take back for free — the
+# OOM-relevant series. smaps_rollup walks the VMA list (~ms per read), which
+# is why it must never run inside a measured load window; the decay phase is
+# idle by definition, so there it costs nothing.
+
+status_mem_kb() { # status_mem_kb <pid>  -> "rss_kb hwm_kb" (or "null null")
+    awk '/^VmRSS:/{r=$2} /^VmHWM:/{h=$2}
+         END{print (r==""?"null":r), (h==""?"null":h)}' \
+        "/proc/$1/status" 2>/dev/null || echo "null null"
+}
+
+smaps_mem_kb() { # smaps_mem_kb <pid>  -> "pss_kb lazyfree_kb" (or "null null")
+    # LazyFree missing but Pss present is an old kernel without the field,
+    # not a read failure: report 0, the corrected series then equals VmRSS.
+    awk '/^Pss:/{p=$2} /^LazyFree:/{l=$2}
+         END{if (p=="") print "null null"; else print p, (l==""?0:l)}' \
+        "/proc/$1/smaps_rollup" 2>/dev/null || echo "null null"
+}
+
+decay_leg() { # decay_leg <conc> <burst_s> <decay_s>  (0-delay mock + gateway up)
+    local conc="$1" burst_s="$2" decay_s="$3"
+    local rssfile="$OUT/.rss-decay.$$" line rss0 hwm0 pss0 lz0 rss_peak
+    local rps fail ok p50 p99 rigref budget spawn valid t_end t_now t_s
+    local rss hwm pss lz i corrected delta
+
+    echo "== decay leg (c=$conc, burst=${burst_s}s, decay=${decay_s}s, body=${#BODY}B) ==" >&2
+
+    read -r rss0 hwm0 <<<"$(status_mem_kb "$GW_PID")"
+    read -r pss0 lz0 <<<"$(smaps_mem_kb "$GW_PID")"
+    printf '{"kind":"decay_anchor","entrant":"%s","conc":%s,"burst_s":%s,"decay_s":%s,"body_bytes":%s,"rss_kb":%s,"hwm_kb":%s,"pss_kb":%s,"lazyfree_kb":%s}\n' \
+        "$ENTRANT_NAME" "$conc" "$burst_s" "$decay_s" "${#BODY}" "$rss0" "$hwm0" "$pss0" "$lz0" >> "$RESULTS"
+
+    # The burst, with the same peak-RSS sampler and validity policy as
+    # measured_window. An invalid burst (any failed request) is recorded and
+    # marked but produces no decay curve: a refusal or a 413 means the heap
+    # was never driven to the state the curve would claim to describe.
+    ( max=0; while [ -d "/proc/$GW_PID" ]; do
+          v=$(awk '/VmRSS/{print $2}' "/proc/$GW_PID/status" 2>/dev/null || true)
+          v="${v:-0}"
+          if [ "$v" -gt "$max" ]; then max="$v"; echo "$max" > "$rssfile"; fi
+          sleep 0.2
+      done ) & SAMPLER_PID=$!
+    line=$(loadgen "127.0.0.1:$GW_PORT" "$conc" "$burst_s") || line=""
+    line=${line//[\"\\]/ }
+    t_end=$(date +%s.%N)
+    kill "$SAMPLER_PID" 2>/dev/null || true; wait "$SAMPLER_PID" 2>/dev/null || true; SAMPLER_PID=""
+    rss_peak=$(cat "$rssfile" 2>/dev/null || echo 0); rm -f "$rssfile"
+
+    rps=$(field rps "$line"); fail=$(field fail "$line"); ok=$(field ok "$line")
+    p50=$(field p50us "$line"); p99=$(field p99us "$line")
+    rigref=$(field rigrefused "$line"); budget=$(field budgetexceeded "$line"); spawn=$(field spawnfailed "$line")
+    valid=true
+    [ "${fail:-1}" = "0" ] && [ "${rigref:-0}" = "0" ] && [ "${budget:-0}" = "0" ] \
+        && [ "${spawn:-0}" = "0" ] || valid=false
+    printf '{"kind":"decay_burst","entrant":"%s","conc":%s,"burst_s":%s,"valid":%s,"rps":%s,"fail":%s,"ok":%s,"p50_us":%s,"p99_us":%s,"gw_rss_peak_kb":%s,"otb_line":"%s"}\n' \
+        "$ENTRANT_NAME" "$conc" "$burst_s" "$valid" "${rps:-null}" "${fail:-null}" "${ok:-null}" \
+        "${p50:-null}" "${p99:-null}" "$rss_peak" "$line" >> "$RESULTS"
+    echo "  [burst] rps=$rps fail=$fail peak=${rss_peak}kB valid=$valid" >&2
+    if [ "$valid" != true ]; then
+        echo "WARNING: burst window invalid - no decay curve from this run" >&2
+        HARNESS_RC=1
+        return 0
+    fi
+
+    # Idle sampling. Timestamps are measured against the burst's end rather
+    # than accumulated from sleeps, so a slow smaps read cannot silently
+    # stretch the curve. Status (VmRSS/VmHWM) at ~2 Hz, smaps_rollup at ~1 Hz.
+    i=0
+    while :; do
+        t_now=$(date +%s.%N)
+        t_s=$(awk -v a="$t_end" -v b="$t_now" 'BEGIN{printf "%.1f", b-a}')
+        awk -v t="$t_s" -v d="$decay_s" 'BEGIN{exit !(t >= d)}' && break
+        if [ ! -d "/proc/$GW_PID" ]; then
+            echo "WARNING: gateway died ${t_s}s into the ${decay_s}s decay window - curve incomplete" >&2
+            HARNESS_RC=1
+            return 0
+        fi
+        read -r rss hwm <<<"$(status_mem_kb "$GW_PID")"
+        if [ $((i % 2)) -eq 0 ]; then
+            read -r pss lz <<<"$(smaps_mem_kb "$GW_PID")"
+        else
+            pss=null; lz=null
+        fi
+        printf '{"kind":"decay","entrant":"%s","t_s":%s,"rss_kb":%s,"hwm_kb":%s,"pss_kb":%s,"lazyfree_kb":%s}\n' \
+            "$ENTRANT_NAME" "$t_s" "$rss" "$hwm" "$pss" "$lz" >> "$RESULTS"
+        i=$((i + 1))
+        sleep 0.5
+    done
+
+    # One final full sample is the gate input: corrected residency and its
+    # distance from the idle anchor (RSS_IDLE is the sourcing runner's).
+    if [ ! -d "/proc/$GW_PID" ]; then
+        echo "WARNING: gateway died before the final decay sample" >&2
+        HARNESS_RC=1
+        return 0
+    fi
+    read -r rss hwm <<<"$(status_mem_kb "$GW_PID")"
+    read -r pss lz <<<"$(smaps_mem_kb "$GW_PID")"
+    corrected=null; delta=null
+    if [ "$rss" != null ] && [ "$lz" != null ]; then
+        corrected=$((rss - lz))
+        [ -n "${RSS_IDLE:-}" ] && delta=$((corrected - RSS_IDLE))
+    fi
+    printf '{"kind":"decay_summary","entrant":"%s","conc":%s,"burst_s":%s,"decay_s":%s,"rss_idle_kb":%s,"pre_rss_kb":%s,"burst_peak_kb":%s,"final_rss_kb":%s,"final_hwm_kb":%s,"final_pss_kb":%s,"final_lazyfree_kb":%s,"final_corrected_kb":%s,"residual_vs_idle_kb":%s}\n' \
+        "$ENTRANT_NAME" "$conc" "$burst_s" "$decay_s" "${RSS_IDLE:-null}" "$rss0" "$rss_peak" \
+        "$rss" "$hwm" "$pss" "$lz" "$corrected" "$delta" >> "$RESULTS"
+    echo "  [decay] idle=${RSS_IDLE:-?}kB pre=${rss0}kB peak=${rss_peak}kB final=${rss}kB lazyfree=${lz}kB corrected=${corrected}kB residual_vs_idle=${delta}kB" >&2
+}
+
 # ---- grid helpers ------------------------------------------------------------
 
 grid_ttfts() { # distinct delay tiers, in grid order
