@@ -1464,7 +1464,7 @@ async fn dispatch(
             .unwrap_or(&[]);
         let is_routing_request =
             virtual_entry.value.routing.is_some() || virtual_entry.value.is_semantic();
-        let mut stream_routing = RoutingTelemetry::default();
+        let mut stream_routing = RoutingTelemetry::for_request(&virtual_entry.value.display_name);
         let mut last_err: Option<BridgeError> = None;
         // The un-flattened per-target quota rejection, kept only while it
         // is the loop's LATEST failure: on exhaustion it is surfaced
@@ -1590,18 +1590,22 @@ async fn dispatch(
                         r
                     }
                     Err(e) => {
-                        stream_routing.attempts.push(AttemptRecord {
-                            index: idx,
-                            kind,
-                            target_model,
-                            target_model_id: attempt.id.clone(),
-                            provider_key_id: pk_entry.id.clone(),
-                            status: 429,
-                            success: false,
-                            error_class: "rate_limit_exceeded".to_string(),
-                            error_message: e.to_string(),
-                            latency_ms: 0,
-                        });
+                        stream_routing.record(
+                            state,
+                            AttemptRecord {
+                                index: idx,
+                                kind,
+                                target_model,
+                                target_model_id: attempt.id.clone(),
+                                provider_key_id: pk_entry.id.clone(),
+                                status: 429,
+                                success: false,
+                                error_class: "rate_limit_exceeded".to_string(),
+                                error_message: e.to_string(),
+                                latency_ms: 0,
+                                dispatched: false,
+                            },
+                        );
                         // Keep the limiter's own Retry-After hint on the wire:
                         // when every target is exhausted this error becomes the
                         // client's 429, and SDKs back off on that header.
@@ -1670,18 +1674,22 @@ async fn dispatch(
                         // time-to-first-response (upstream stream established) —
                         // the routing-relevant latency signal.
                         state.runtime_status.record_latency(&attempt.id, latency_ms);
-                        stream_routing.attempts.push(AttemptRecord {
-                            index: idx,
-                            kind,
-                            target_model,
-                            target_model_id: attempt.id.clone(),
-                            provider_key_id: pk_entry.id.clone(),
-                            status: 200,
-                            success: true,
-                            error_class: String::new(),
-                            error_message: String::new(),
-                            latency_ms,
-                        });
+                        stream_routing.record(
+                            state,
+                            AttemptRecord {
+                                index: idx,
+                                kind,
+                                target_model,
+                                target_model_id: attempt.id.clone(),
+                                provider_key_id: pk_entry.id.clone(),
+                                status: 200,
+                                success: true,
+                                error_class: String::new(),
+                                error_message: String::new(),
+                                latency_ms,
+                                dispatched: true,
+                            },
+                        );
                         won = Some(StreamWin {
                             model: model.clone(),
                             target_id: attempt.id.clone(),
@@ -1696,18 +1704,22 @@ async fn dispatch(
                         break 'targets;
                     }
                     Err(err) => {
-                        stream_routing.attempts.push(AttemptRecord {
-                            index: idx,
-                            kind,
-                            target_model,
-                            target_model_id: attempt.id.clone(),
-                            provider_key_id: pk_entry.id.clone(),
-                            status: err.http_status(),
-                            success: false,
-                            error_class: routing_error_class(&err).to_string(),
-                            error_message: attempt_error_message(&err),
-                            latency_ms,
-                        });
+                        stream_routing.record(
+                            state,
+                            AttemptRecord {
+                                index: idx,
+                                kind,
+                                target_model,
+                                target_model_id: attempt.id.clone(),
+                                provider_key_id: pk_entry.id.clone(),
+                                status: err.http_status(),
+                                success: false,
+                                error_class: routing_error_class(&err).to_string(),
+                                error_message: attempt_error_message(&err),
+                                latency_ms,
+                                dispatched: true,
+                            },
+                        );
                         let retryable = is_retryable(&err, retry_on_429, fallback_statuses);
                         tracing::warn!(
                             target_model = %model.display_name,
@@ -2579,7 +2591,7 @@ async fn dispatch(
         .unwrap_or(&[]);
     let is_routing_request =
         virtual_entry.value.routing.is_some() || virtual_entry.value.is_semantic();
-    let mut routing = RoutingTelemetry::default();
+    let mut routing = RoutingTelemetry::for_request(&virtual_entry.value.display_name);
     // The winning target's own model-layer reservation (routing dispatch
     // only) — folded into `reservation` at the commit point below so the
     // member's TPM/TPD bills with the request-level layers
@@ -2682,18 +2694,22 @@ async fn dispatch(
                     r
                 }
                 Err(e) => {
-                    routing.attempts.push(AttemptRecord {
-                        index: attempt_index,
-                        kind,
-                        target_model,
-                        target_model_id: attempt.id.clone(),
-                        provider_key_id: pk_entry.id.clone(),
-                        status: 429,
-                        success: false,
-                        error_class: "rate_limit_exceeded".to_string(),
-                        error_message: e.to_string(),
-                        latency_ms: 0,
-                    });
+                    routing.record(
+                        state,
+                        AttemptRecord {
+                            index: attempt_index,
+                            kind,
+                            target_model,
+                            target_model_id: attempt.id.clone(),
+                            provider_key_id: pk_entry.id.clone(),
+                            status: 429,
+                            success: false,
+                            error_class: "rate_limit_exceeded".to_string(),
+                            error_message: e.to_string(),
+                            latency_ms: 0,
+                            dispatched: false,
+                        },
+                    );
                     // Keep the limiter's own Retry-After hint on the wire:
                     // when every target is exhausted this error becomes the
                     // client's 429, and SDKs back off on that header.
@@ -2738,35 +2754,43 @@ async fn dispatch(
                     chosen_upstream_model =
                         Some(model.upstream_model().unwrap_or("unknown").to_string());
                     chosen_target_display_name = Some(model.display_name.clone());
-                    routing.attempts.push(AttemptRecord {
-                        index: attempt_index,
-                        kind,
-                        target_model,
-                        target_model_id: attempt.id.clone(),
-                        provider_key_id: pk_entry.id.clone(),
-                        status: 200,
-                        success: true,
-                        error_class: String::new(),
-                        error_message: String::new(),
-                        latency_ms: attempt_latency_ms,
-                    });
+                    routing.record(
+                        state,
+                        AttemptRecord {
+                            index: attempt_index,
+                            kind,
+                            target_model,
+                            target_model_id: attempt.id.clone(),
+                            provider_key_id: pk_entry.id.clone(),
+                            status: 200,
+                            success: true,
+                            error_class: String::new(),
+                            error_message: String::new(),
+                            latency_ms: attempt_latency_ms,
+                            dispatched: true,
+                        },
+                    );
                     won_member_reservation = member_reservation;
                     upstream = Some(resp);
                     break;
                 }
                 Err(err) => {
-                    routing.attempts.push(AttemptRecord {
-                        index: attempt_index,
-                        kind,
-                        target_model,
-                        target_model_id: attempt.id.clone(),
-                        provider_key_id: pk_entry.id.clone(),
-                        status: err.http_status(),
-                        success: false,
-                        error_class: routing_error_class(&err).to_string(),
-                        error_message: attempt_error_message(&err),
-                        latency_ms: attempt_latency_ms,
-                    });
+                    routing.record(
+                        state,
+                        AttemptRecord {
+                            index: attempt_index,
+                            kind,
+                            target_model,
+                            target_model_id: attempt.id.clone(),
+                            provider_key_id: pk_entry.id.clone(),
+                            status: err.http_status(),
+                            success: false,
+                            error_class: routing_error_class(&err).to_string(),
+                            error_message: attempt_error_message(&err),
+                            latency_ms: attempt_latency_ms,
+                            dispatched: true,
+                        },
+                    );
                     let retryable = is_retryable(&err, retry_on_429, fallback_statuses);
                     tracing::warn!(
                         target_model = %model.display_name,

@@ -90,11 +90,44 @@ pub const M_PROXY_CLIENT_CANCELLED_TOTAL: &str = "aisix_proxy_client_cancelled_r
 /// template (#451) and `outcome` a fixed vocabulary.
 pub const M_PROXY_BODY_LIMIT_REJECTIONS_TOTAL: &str =
     "aisix_proxy_request_body_limit_rejections_total";
+/// Per-DEPLOYMENT (one concrete Model row = one upstream target) call
+/// counters, incremented once per upstream ATTEMPT rather than once per
+/// client request — the granularity the `aisix_proxy_*` / `aisix_llm_*`
+/// families deliberately do NOT have. A request that fails over across
+/// three targets is one sample there and three here.
+///
+/// That difference is the whole point of the family, and the reason a
+/// gateway-wide 5xx count read off `aisix_proxy_requests_total` can sit
+/// orders of magnitude below the number of failed attempts an operator
+/// sees in the usage log (AISIX-Cloud#1299): most failed attempts belong
+/// to requests a fallback went on to serve, and those requests are a
+/// `status="200"` sample in the request families.
+///
+/// Scope: emitted from the Model-Group dispatch loops
+/// (`/v1/chat/completions`, `/v1/messages`, `/v1/responses`) — the
+/// endpoints that keep per-attempt telemetry at all. The single-target
+/// handlers dispatch once per request and are already covered by the
+/// request families.
+///
+/// Only attempts that REACHED the upstream are counted: an attempt
+/// refused by its target's own rate-limit layers before dispatch
+/// produced no upstream response, so counting it would put a gateway-side
+/// refusal into a family operators read as upstream health. It is still a
+/// real attempt in the usage log and in the fallback classification below.
 pub const M_DEPLOYMENT_REQUESTS_TOTAL: &str = "aisix_deployment_requests_total";
 pub const M_DEPLOYMENT_SUCCESS_TOTAL: &str = "aisix_deployment_success_responses_total";
 pub const M_DEPLOYMENT_FAILURE_TOTAL: &str = "aisix_deployment_failure_responses_total";
 pub const M_DEPLOYMENT_STATE: &str = "aisix_deployment_state";
 pub const M_DEPLOYMENT_COOLED_DOWN_TOTAL: &str = "aisix_deployment_cooled_down_total";
+/// Fallback outcomes, counted once per fallback ATTEMPT — the attempt
+/// that moved to a different target than the previous one. The attempt
+/// that served the request bumps the successful family, one that failed
+/// in turn bumps the failed family, so a request rescued by its second
+/// fallback contributes one of each.
+///
+/// `model` is what the caller asked for (the Model-Group name);
+/// `fallback_model` is the target the gateway moved to. Both are
+/// configured names, so the label set is bounded by the resource set.
 pub const M_ROUTING_SUCCESSFUL_FALLBACKS_TOTAL: &str = "aisix_routing_successful_fallbacks_total";
 pub const M_ROUTING_FAILED_FALLBACKS_TOTAL: &str = "aisix_routing_failed_fallbacks_total";
 pub const M_RATELIMIT_REMAINING_REQUESTS: &str = "aisix_ratelimit_remaining_requests";
@@ -1732,7 +1765,7 @@ impl Metrics {
         self.cached_deployment_counter(M_DEPLOYMENT_COOLED_DOWN_TOTAL, labels);
     }
 
-    pub fn record_routing_fallback(&self, success: bool, model: &str) {
+    pub fn record_routing_fallback(&self, success: bool, model: &str, fallback_model: &str) {
         let metric = if success {
             M_ROUTING_SUCCESSFUL_FALLBACKS_TOTAL
         } else {
@@ -1741,8 +1774,17 @@ impl Metrics {
         self.cached_counter(
             metric,
             1,
-            |k| k.label(model),
-            || metrics::counter!(metric, "model" => model.to_string()),
+            |k| {
+                k.label(model);
+                k.label(fallback_model);
+            },
+            || {
+                metrics::counter!(
+                    metric,
+                    "model" => model.to_string(),
+                    "fallback_model" => fallback_model.to_string(),
+                )
+            },
         );
     }
 
@@ -2966,6 +3008,41 @@ mod tests {
         // The outcome split must not cross-pollinate.
         assert!(series(M_DEPLOYMENT_SUCCESS_TOTAL, "pk-b").is_none());
         assert!(series(M_DEPLOYMENT_FAILURE_TOTAL, "pk-a").is_none());
+    }
+
+    /// Same cache-key/label drift guard for the fallback family, whose
+    /// second label (`fallback_model`) is the one a group with several
+    /// targets differs on: dropping it from the KEY would fold "fell back
+    /// to B" and "fell back to C" into one series and make the counter
+    /// useless for the question it exists to answer.
+    #[test]
+    fn fallback_counters_stay_distinct_per_target() {
+        let metrics = Metrics::new(false);
+        metrics.record_routing_fallback(true, "group", "target-b");
+        metrics.record_routing_fallback(true, "group", "target-b");
+        metrics.record_routing_fallback(true, "group", "target-c");
+        metrics.record_routing_fallback(false, "group", "target-c");
+
+        let rendered = metrics.render();
+        let series = |metric: &str, target: &str| {
+            rendered
+                .lines()
+                .find(|l| {
+                    l.starts_with(metric) && l.contains(&format!("fallback_model=\"{target}\""))
+                })
+                .map(str::to_owned)
+        };
+        let to_b = series(M_ROUTING_SUCCESSFUL_FALLBACKS_TOTAL, "target-b")
+            .expect("fallbacks to target-b must have their own series");
+        assert!(to_b.ends_with(" 2"), "got: {to_b}");
+        assert!(to_b.contains("model=\"group\""), "got: {to_b}");
+        assert!(series(M_ROUTING_SUCCESSFUL_FALLBACKS_TOTAL, "target-c")
+            .is_some_and(|l| l.ends_with(" 1")));
+        assert!(
+            series(M_ROUTING_FAILED_FALLBACKS_TOTAL, "target-c").is_some_and(|l| l.ends_with(" 1"))
+        );
+        // The success/failure split must not cross-pollinate.
+        assert!(series(M_ROUTING_FAILED_FALLBACKS_TOTAL, "target-b").is_none());
     }
 
     /// Pins the budget gauge family's values, field gating and clear

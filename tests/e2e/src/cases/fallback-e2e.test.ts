@@ -193,4 +193,145 @@ describe("fallback e2e: virtual routing fails over from 5xx to next target", () 
     expect(badUpstream.receivedRequests.length - badBaseline).toBe(1);
     expect(goodUpstream.receivedRequests.length - goodBaseline).toBe(1);
   });
+
+  // AISIX-Cloud#1299: an operator compared a 5xx count from the usage log
+  // against `sum(increase(aisix_proxy_requests_total{status=~"5.."}[24h]))`
+  // and found the metric two orders of magnitude lower. The request family
+  // is per-REQUEST and carries the status the caller saw, so a request its
+  // fallback rescued is a `status="200"` sample there and the 502 its first
+  // target returned appears in NO request-level series at all.
+  //
+  // That is by design, but until this test the per-ATTEMPT counters which
+  // do see it — `aisix_deployment_*`, `aisix_routing_*_fallbacks_total` —
+  // had no caller anywhere in the workspace and never appeared in a scrape,
+  // so an operator had nothing in Prometheus to reconcile the log against.
+  // Every assertion below is on the delta of ONE request, and each of the
+  // four families is checked against the same event, which is what makes
+  // the test a statement about their relationship rather than about any one
+  // counter.
+  test("one rescued request: the attempt counters see the 502 the request counter cannot", async (ctx) => {
+    if (!etcdReachable || !app || !badUpstream || !goodUpstream) {
+      ctx.skip();
+      return;
+    }
+
+    const client = new OpenAI({
+      apiKey: CALLER_PLAINTEXT,
+      baseURL: `${app.proxyUrl}/v1`,
+      maxRetries: 0,
+    });
+    await waitConfigPropagation(async () => {
+      try {
+        const probe = await client.chat.completions.create({
+          model: "fb-virtual",
+          messages: [{ role: "user", content: "ready-probe-metrics" }],
+        });
+        return probe.choices[0]?.message.content === "fallback worked";
+      } catch {
+        return false;
+      }
+    });
+
+    const before = await scrapeCounters(app.metricsUrl);
+    const completion = await client.chat.completions.create({
+      model: "fb-virtual",
+      messages: [{ role: "user", content: "metrics" }],
+    });
+    expect(completion.choices[0]?.message.content).toBe("fallback worked");
+    const after = await scrapeCounters(app.metricsUrl);
+    const delta = (name: string, labels: Record<string, string> = {}) =>
+      sum(after, name, labels) - sum(before, name, labels);
+
+    // The attempt that failed and the attempt that served it, each filed
+    // under the TARGET it hit — not under the group the caller named.
+    expect(delta("aisix_deployment_requests_total", { model: "fb-bad" })).toBe(
+      1,
+    );
+    expect(
+      delta("aisix_deployment_failure_responses_total", { model: "fb-bad" }),
+    ).toBe(1);
+    expect(delta("aisix_deployment_requests_total", { model: "fb-good" })).toBe(
+      1,
+    );
+    expect(
+      delta("aisix_deployment_success_responses_total", { model: "fb-good" }),
+    ).toBe(1);
+
+    // The move to the second target, labelled by what the caller asked for
+    // and where it went.
+    expect(
+      delta("aisix_routing_successful_fallbacks_total", {
+        model: "fb-virtual",
+        fallback_model: "fb-good",
+      }),
+    ).toBe(1);
+    expect(delta("aisix_routing_failed_fallbacks_total")).toBe(0);
+
+    // The contrast that provoked the issue: one request-level sample, and
+    // it is a 200. A 5xx count taken from this family legitimately does not
+    // include the failed attempt above.
+    expect(delta("aisix_proxy_requests_total")).toBe(1);
+    expect(delta("aisix_proxy_requests_total", { status: "200" })).toBe(1);
+    expect(
+      after.filter(
+        (s) =>
+          s.name === "aisix_proxy_requests_total" &&
+          /^5\d\d$/.test(s.labels.status ?? ""),
+      ).length,
+    ).toBe(0);
+
+    // …while the per-attempt usage events — the rows the dashboard log
+    // counts — do carry it. This counter is the one an operator should
+    // reconcile a 5xx log-row count against.
+    expect(
+      delta("aisix_usage_events_emitted_total", { status_code: "5xx" }),
+    ).toBe(1);
+    expect(
+      delta("aisix_usage_events_emitted_total", { status_code: "2xx" }),
+    ).toBe(1);
+  });
 });
+
+interface Series {
+  name: string;
+  labels: Record<string, string>;
+  value: number;
+}
+
+/** Parse a prometheus text scrape into its counter samples. */
+async function scrapeCounters(metricsUrl: string): Promise<Series[]> {
+  const res = await fetch(`${metricsUrl}/metrics`);
+  expect(res.status).toBe(200);
+  const out: Series[] = [];
+  for (const line of (await res.text()).split("\n")) {
+    const m = /^([a-z_]+)(\{(.*)\})? ([0-9.e+-]+)$/.exec(line.trim());
+    if (!m) continue;
+    const labels: Record<string, string> = {};
+    for (const pair of m[3]?.match(/[a-z_]+="[^"]*"/g) ?? []) {
+      const [k, v] = pair.split("=");
+      labels[k] = v.slice(1, -1);
+    }
+    out.push({ name: m[1], labels, value: Number(m[4]) });
+  }
+  return out;
+}
+
+/**
+ * Total of every sample of `name` whose labels include `want`. Summing
+ * rather than requiring a single series on purpose: these families carry
+ * label dimensions this test says nothing about, and pinning the full
+ * tuple would make the test fail the next time one is added.
+ */
+function sum(
+  series: Series[],
+  name: string,
+  want: Record<string, string> = {},
+): number {
+  return series
+    .filter(
+      (s) =>
+        s.name === name &&
+        Object.entries(want).every(([k, v]) => s.labels[k] === v),
+    )
+    .reduce((acc, s) => acc + s.value, 0);
+}
