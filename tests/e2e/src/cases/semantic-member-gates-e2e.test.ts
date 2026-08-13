@@ -206,7 +206,6 @@ describe("semantic router member gates e2e", () => {
 
     app = await spawnApp();
     seed = new SeedClient(etcd, app.etcdPrefix);
-    await seed.createApiKey({ key_hash: CALLER_KEY_HASH, allowed_models: ["*"] });
 
     const embed = await startEmbeddingMock();
     const slowEmbed = await startEmbeddingMock({ delayMs: 3000 });
@@ -271,8 +270,8 @@ describe("semantic router member gates e2e", () => {
     );
     // Background-unhealthy displacement: this member's upstream always
     // 500s, request-path cooldown is DISABLED (so only the background
-    // prober's Unhealthy verdict can displace it), and the 1s probe
-    // interval marks it within a few seconds.
+    // prober's Unhealthy verdict can displace it), and the 5s probe
+    // interval marks it within the test's 30s poll budget.
     await directModel("smg-unhealthy", await chatUpstream("unused-500", { status: 500 }), {
       cooldown: { enabled: false },
       background_model_check: {
@@ -320,15 +319,18 @@ describe("semantic router member gates e2e", () => {
       },
     });
 
-    // Readiness: an unmatched prompt on the IP router falls through to
-    // the open default → 200 once everything propagated.
+    // The caller key is seeded LAST: once it authenticates, revision
+    // order implies every resource above is in the snapshot
+    // (tests/e2e/AGENTS.md). The gate exercises none of the member-gate
+    // behavior under test, so a defect there fails its own case by name
+    // instead of surfacing as a propagation timeout here.
+    await seed.createApiKey({ key_hash: CALLER_KEY_HASH, allowed_models: ["*"] });
     await waitConfigPropagation(async () => {
-      try {
-        const r = await chat("smg-router-ip", "hello there");
-        return r.status === 200 && r.content === "served-open";
-      } catch {
-        return false;
-      }
+      const res = await fetch(`${app!.proxyUrl}/v1/models`, {
+        headers: { authorization: `Bearer ${CALLER_PLAINTEXT}` },
+      });
+      await res.arrayBuffer(); // release the socket between polls
+      return res.status === 200;
     });
   });
 
