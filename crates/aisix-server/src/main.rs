@@ -39,10 +39,13 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 // fatal — foreground decay still bounds RSS under load; only idle-time
 // reclamation is lost, which the warning makes visible.
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
-fn enable_jemalloc_background_thread() {
+fn enable_jemalloc_background_thread() -> Result<bool, tikv_jemalloc_ctl::Error> {
     use tikv_jemalloc_ctl::background_thread;
     // Write-then-read-back: the write is a request, the read is the fact.
-    match background_thread::write(true).and_then(|()| background_thread::read()) {
+    // The outcome is returned so the unit test exercises this function
+    // itself — a broken body must fail the test, not stay silently green.
+    let outcome = background_thread::write(true).and_then(|()| background_thread::read());
+    match &outcome {
         Ok(true) => tracing::info!("jemalloc background purge thread enabled"),
         Ok(false) => tracing::warn!(
             "jemalloc background purge thread did not enable on this target; \
@@ -54,6 +57,7 @@ fn enable_jemalloc_background_thread() {
              will not return to the OS while the process is idle"
         ),
     }
+    outcome
 }
 
 mod cert_bundle;
@@ -216,9 +220,10 @@ async fn async_main(cfg: Config) -> anyhow::Result<()> {
     let _otlp = install_otlp_tracer(&cfg.observability)
         .map_err(|e| anyhow::anyhow!("otlp init failed: {e}"))?;
 
-    // After tracing so the enable outcome is observable in the logs.
+    // After tracing so the enable outcome is observable in the logs; the
+    // returned outcome is already logged inside.
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    enable_jemalloc_background_thread();
+    let _ = enable_jemalloc_background_thread();
 
     // Before any bridge builds its `reqwest::Client` — the connection
     // pools are constructed once and can't be reconfigured afterwards.
@@ -1920,17 +1925,16 @@ mod tests {
     use super::*;
     use clap::Parser;
 
-    // The shipped-target contract for enable_jemalloc_background_thread():
-    // the runtime mallctl enable must actually take effect here — an
-    // Ok(false) read-back would mean the #968 fix silently does nothing.
-    // The test binary links the same #[global_allocator] as the shipped one.
+    // The shipped-target contract: the runtime mallctl enable must actually
+    // take effect here — an Ok(false) read-back would mean the #968 fix
+    // silently does nothing. Drives the delivered function, not an inline
+    // re-implementation of the mallctl pair; the test binary links the same
+    // #[global_allocator] as the shipped one.
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     #[test]
     fn jemalloc_background_thread_enables_at_runtime() {
-        use tikv_jemalloc_ctl::background_thread;
-        background_thread::write(true).expect("mallctl write background_thread");
         assert!(
-            background_thread::read().expect("mallctl read background_thread"),
+            matches!(enable_jemalloc_background_thread(), Ok(true)),
             "background_thread did not enable on a linux-gnu target"
         );
     }
