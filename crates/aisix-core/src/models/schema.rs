@@ -211,6 +211,13 @@ pub fn validate(validator: &Validator, value: &Value) -> Result<(), SchemaError>
 /// not deserialise at all, and keeps the generic message. Only the field
 /// NAMES are added, never instance values, so this respects the masking
 /// contract in [`validate`].
+///
+/// A dead knob is only reported when it is the WHOLE story: the document
+/// is re-validated with exactly those fields removed, and the message is
+/// replaced only if it then passes. A document that carries a dead knob
+/// AND an independent violation keeps the original error, which points
+/// at the other problem and is the more useful of the two — replacing it
+/// would leave `path` and `message` describing different fields.
 pub fn validate_model(value: &Value) -> Result<(), SchemaError> {
     let err = match validate(&SCHEMAS.model, value) {
         Ok(()) => return Ok(()),
@@ -221,6 +228,23 @@ pub fn validate_model(value: &Value) -> Result<(), SchemaError> {
     };
     let dead = model.strip_kind_inapplicable();
     if dead.is_empty() {
+        return Err(err);
+    }
+    // Probe the ORIGINAL document minus the dead fields rather than
+    // re-serialising `model`: a serde round-trip drops unknown fields
+    // and materialises defaults, either of which could make the probe
+    // pass while the real document still fails. Every dead knob is a
+    // top-level field.
+    let mut probe = value.clone();
+    match probe.as_object_mut() {
+        Some(obj) => {
+            for field in &dead {
+                obj.remove(*field);
+            }
+        }
+        None => return Err(err),
+    }
+    if validate(&SCHEMAS.model, &probe).is_err() {
         return Err(err);
     }
     // strip_kind_inapplicable only reports on these three kinds.
@@ -3582,5 +3606,36 @@ mod tests {
         assert!(msg.contains("`cost`"), "{msg}");
         assert!(!msg.contains("12345"), "instance value leaked: {msg}");
         assert!(!msg.contains("99999"), "instance value leaked: {msg}");
+    }
+
+    #[test]
+    fn model_dead_knob_with_an_independent_failure_keeps_the_original_error() {
+        // A dead knob is only named when it is the WHOLE story. Here the
+        // group also has an empty display_name (minLength 1) — which
+        // `Model` deserialises fine, so the enrichment is reachable.
+        // Replacing the message would report `retries` while `path` still
+        // points at /display_name: two different fields in one error.
+        let v = json!({
+            "display_name": "",
+            "routing": {"strategy": "failover", "targets": [{"model": "m"}]},
+            "retries": 3
+        });
+        let err = validate_model(&v).unwrap_err();
+        assert_eq!(err.path, "/display_name", "{err:?}");
+        assert!(
+            !err.message.contains("`retries`"),
+            "the independent failure must win: {err:?}"
+        );
+        assert!(err.message.contains("shorter than 1 character"), "{err:?}");
+
+        // With the independent violation fixed, the dead knob is the whole
+        // story again and gets named.
+        let v = json!({
+            "display_name": "g",
+            "routing": {"strategy": "failover", "targets": [{"model": "m"}]},
+            "retries": 3
+        });
+        let err = validate_model(&v).unwrap_err();
+        assert!(err.message.contains("`retries`"), "{err:?}");
     }
 }
