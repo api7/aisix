@@ -7,6 +7,8 @@ import {
   spawnApp,
   startOpenAiUpstream,
   awaitWindowHeadroom,
+  metricDelta,
+  scrapeMetrics,
   waitConfigPropagation,
   type OpenAiUpstream,
   type SpawnedApp,
@@ -219,7 +221,32 @@ describe("model group member rate limit e2e (AISIX-Cloud#1087)", () => {
     // RPM=1, so dispatch must fail over to the backup. Pre-fix the
     // member's limit was never consulted and this still returned
     // "served-by-limited".
+    const metricsBefore = await scrapeMetrics(app!.metricsUrl);
     expect(servedContent(await callGroup("mgrl-group"))).toBe("served-by-backup");
+
+    // An over-limit member is refused by the GATEWAY before anything is
+    // sent, so it must not appear in the deployment counters at all —
+    // that family is read as upstream health, and a member sitting out its
+    // own rate-limit window is not an unhealthy upstream
+    // (AISIX-Cloud#1299). It is still a real attempt in the usage log, and
+    // still the reason the next target counts as a fallback.
+    const metricsAfter = await scrapeMetrics(app!.metricsUrl);
+    const delta = (name: string, want: Record<string, string>) =>
+      metricDelta(metricsBefore, metricsAfter, name, want);
+    expect(delta("aisix_deployment_requests_total", { model: "mgrl-limited" })).toBe(0);
+    expect(
+      delta("aisix_deployment_failure_responses_total", { model: "mgrl-limited" }),
+    ).toBe(0);
+    expect(delta("aisix_deployment_requests_total", { model: "mgrl-backup" })).toBe(1);
+    expect(
+      delta("aisix_deployment_success_responses_total", { model: "mgrl-backup" }),
+    ).toBe(1);
+    expect(
+      delta("aisix_routing_successful_fallbacks_total", {
+        model: "mgrl-group",
+        fallback_model: "mgrl-backup",
+      }),
+    ).toBe(1);
   });
 
   test("all members over limit surfaces as 429", async (ctx) => {

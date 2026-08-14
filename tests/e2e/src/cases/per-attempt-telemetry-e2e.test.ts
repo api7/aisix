@@ -481,6 +481,8 @@ describe("per-attempt telemetry e2e (#655): one UsageEvent per upstream attempt"
       return res.status === 200;
     });
 
+    const metricsBefore = await scrapeMetrics(app.metricsUrl);
+
     const res = await fetch(`${app.proxyUrl}/v1/chat/completions`, {
       method: "POST",
       headers: {
@@ -508,5 +510,50 @@ describe("per-attempt telemetry e2e (#655): one UsageEvent per upstream attempt"
     expect(spans[0].latencyMs).toBeGreaterThanOrEqual(SLOW_PRIMARY_MS - 100);
     expect(spans[1].latencyMs).toBeLessThan(SLOW_PRIMARY_MS / 2);
     expect(spans[1].latencyMs).toBeLessThan(spans[0].latencyMs);
+
+
+    // The streaming dispatch loop is written separately from the
+
+    // non-streaming one and was rewired separately too, so the counters
+
+    // need their own real-traffic assertion here (AISIX-Cloud#1299).
+
+    const metricsAfter = await scrapeMetrics(app.metricsUrl);
+
+    const delta = (name: string, want: Record<string, string>) =>
+
+      metricDelta(metricsBefore, metricsAfter, name, want);
+
+    expect(
+
+      delta("aisix_deployment_failure_responses_total", {
+
+        model: "latency-stream-primary",
+
+      }),
+
+    ).toBe(1);
+
+    expect(
+
+      delta("aisix_deployment_success_responses_total", {
+
+        model: "latency-stream-secondary",
+
+      }),
+
+    ).toBe(1);
+
+    expect(
+
+      delta("aisix_routing_successful_fallbacks_total", {
+
+        model: "latency-stream-virtual",
+
+        fallback_model: "latency-stream-secondary",
+
+      }),
+
+    ).toBe(1);
   });
 });
