@@ -25,7 +25,8 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use crate::attempt::{
-    attempt_error_from_proxy, ms_since, AttemptInfo, AttemptRecord, RoutingTelemetry,
+    attempt_error_from_proxy, attempt_reached_upstream, ms_since, AttemptInfo, AttemptRecord,
+    RoutingTelemetry,
 };
 use crate::auth::AuthenticatedKey;
 use crate::chat::sanitize_tag;
@@ -857,7 +858,7 @@ async fn dispatch(
                             error_class,
                             error_message,
                             latency_ms: ms_since(attempt_started),
-                            dispatched: true,
+                            dispatched: attempt_reached_upstream(&e),
                         },
                     );
                     // See `RetryBudget::covers`: a default budget skips

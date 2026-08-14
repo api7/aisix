@@ -1717,7 +1717,7 @@ async fn dispatch(
                                 error_class: routing_error_class(&err).to_string(),
                                 error_message: attempt_error_message(&err),
                                 latency_ms,
-                                dispatched: true,
+                                dispatched: err.reached_upstream(),
                             },
                         );
                         let retryable = is_retryable(&err, retry_on_429, fallback_statuses);
@@ -2788,7 +2788,7 @@ async fn dispatch(
                             error_class: routing_error_class(&err).to_string(),
                             error_message: attempt_error_message(&err),
                             latency_ms: attempt_latency_ms,
-                            dispatched: true,
+                            dispatched: err.reached_upstream(),
                         },
                     );
                     let retryable = is_retryable(&err, retry_on_429, fallback_statuses);

@@ -586,6 +586,38 @@ impl BridgeError {
         }
     }
 
+    /// Whether the request actually left for the upstream before this
+    /// error was raised.
+    ///
+    /// Gates the `aisix_deployment_*` families, which read as **upstream
+    /// health** for one deployment target. The three config/credential
+    /// variants are raised while the request is still being assembled — an
+    /// empty or unusable `api_key`, a missing `model_name`/`api_base`, a
+    /// body that would not serialize, a `split_system` shape the provider
+    /// cannot express — so no provider was ever contacted, and counting
+    /// them against a deployment reports our own misconfiguration as
+    /// provider degradation.
+    ///
+    /// `Timeout` and `Transport` stay `true` on purpose: a connect timeout
+    /// or a refused connection means we did try to reach the upstream, and
+    /// "unreachable" is exactly the kind of health this family exists to
+    /// show. Kept exhaustive (like [`http_status`](Self::http_status) and
+    /// `routing_error_class`) so a new variant has to declare which side of
+    /// the network boundary it sits on instead of inheriting a default.
+    pub fn reached_upstream(&self) -> bool {
+        match self {
+            BridgeError::Timeout { .. }
+            | BridgeError::UpstreamStatus { .. }
+            | BridgeError::UpstreamDecode(_)
+            | BridgeError::UpstreamInBand { .. }
+            | BridgeError::Transport(_)
+            | BridgeError::StreamAborted => true,
+            BridgeError::Config(_)
+            | BridgeError::InvalidUpstreamConfig(_)
+            | BridgeError::InvalidUpstreamCredentials(_) => false,
+        }
+    }
+
     /// Stable error-type token for the error envelope's `type` field.
     pub fn error_type(&self) -> &'static str {
         match self {
