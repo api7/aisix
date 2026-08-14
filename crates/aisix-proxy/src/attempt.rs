@@ -11,10 +11,20 @@
 //! The type lives in its own module so `/v1/chat/completions`,
 //! `/v1/messages`, and `/v1/responses` cannot drift apart on how they
 //! classify and emit attempts.
+//!
+//! [`RoutingTelemetry::record`] is the single place an attempt is
+//! recorded, and therefore the single place the per-attempt METRICS are
+//! emitted — the `aisix_deployment_*` and `aisix_routing_*_fallbacks_total`
+//! families. Read them together with the request families rather than
+//! against them: `aisix_proxy_requests_total` samples once per client
+//! request with the status the caller saw, so a request whose first
+//! target 502'd and whose fallback succeeded is one `status="200"` sample
+//! there, one failure here, and two rows in the usage log.
 
 use std::time::Instant;
 
 use aisix_gateway::BridgeError;
+use aisix_obs::RequestOutcome;
 
 use crate::error::ProxyError;
 
@@ -49,6 +59,15 @@ pub(crate) struct AttemptRecord {
     pub error_message: String,
     /// This attempt's own wall-clock duration in ms.
     pub latency_ms: u32,
+    /// Whether this attempt actually reached the upstream.
+    ///
+    /// False for an attempt the target's own rate-limit layers refused
+    /// before dispatch: it produced no upstream response, so it stays out
+    /// of the `aisix_deployment_*_responses_total` families an operator
+    /// reads as upstream health. It is still a real attempt everywhere
+    /// else — the per-attempt usage event, and the initial/retry/fallback
+    /// classification the next attempt is measured against.
+    pub dispatched: bool,
 }
 
 /// Per-attempt telemetry accumulated while serving one request. Direct
@@ -60,9 +79,51 @@ pub(crate) struct RoutingTelemetry {
     /// Display name of the most recently attempted target — drives the
     /// initial/retry/fallback classification in [`Self::begin_attempt`].
     last_target: Option<String>,
+    /// What the CALLER asked for — the Model-Group name for a routed
+    /// request. Labels the fallback counters, which answer "how often did
+    /// THIS group have to fall back", so the group is the useful key and
+    /// the target it moved to is the second label.
+    requested_model: String,
 }
 
 impl RoutingTelemetry {
+    /// Start a request's telemetry knowing what the caller asked for.
+    /// Use in place of `default()` on the dispatch loops so the fallback
+    /// counters have a group to file under.
+    pub fn for_request(requested_model: &str) -> Self {
+        Self {
+            requested_model: requested_model.to_string(),
+            ..Self::default()
+        }
+    }
+
+    /// Record one resolved attempt: emit its per-attempt metrics, then
+    /// keep the record for the per-attempt usage events.
+    ///
+    /// THE chokepoint for everything counted per attempt. Handlers call
+    /// this instead of pushing onto `attempts` directly, so a new dispatch
+    /// path cannot land recording usage events but no metrics — which is
+    /// exactly how `aisix_deployment_*` and `aisix_routing_*_fallbacks_total`
+    /// shipped as never-emitted series (AISIX-Cloud#1299): the emit
+    /// functions existed on `Metrics` from the start and simply had no
+    /// caller.
+    pub fn record(&mut self, state: &crate::state::ProxyState, rec: AttemptRecord) {
+        if rec.dispatched {
+            state.runtime_status.record_deployment_attempt(
+                &rec.target_model_id,
+                RequestOutcome::from_status(rec.status),
+            );
+        }
+        if rec.kind == "fallback" {
+            state.metrics.record_routing_fallback(
+                rec.success,
+                &self.requested_model,
+                &rec.target_model,
+            );
+        }
+        self.attempts.push(rec);
+    }
+
     /// Classify the next attempt against `display_name` and advance the
     /// last-target tracker. Returns `(index, kind)` to stamp onto the
     /// `AttemptRecord` the caller pushes once the attempt resolves. Call

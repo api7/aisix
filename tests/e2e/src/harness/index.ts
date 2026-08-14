@@ -14,6 +14,12 @@ export {
 export { startRestUpstream, type RestUpstream } from "./upstream-rest.js";
 export { pickFreePort, pickFreePorts } from "./ports.js";
 export {
+  scrapeMetrics,
+  sumMetric,
+  metricDelta,
+  type MetricSample,
+} from "./metrics.js";
+export {
   startMockSls,
   decodedTextFor,
   waitForLogstore,

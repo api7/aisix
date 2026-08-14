@@ -4,6 +4,8 @@ import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
   SeedClient,
+  metricDelta,
+  scrapeMetrics,
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
@@ -333,6 +335,7 @@ describe("model group via passthrough endpoints e2e (#471)", () => {
 
     const openaiBaseline = openaiDown.receivedRequests.length;
     const anthropicBaseline = anthropicGood.receivedRequests.length;
+    const metricsBefore = await scrapeMetrics(app.metricsUrl);
 
     const result = await callMessages("mg-failover");
 
@@ -343,6 +346,30 @@ describe("model group via passthrough endpoints e2e (#471)", () => {
     // Anthropic target which served the response.
     expect(openaiDown.receivedRequests.length - openaiBaseline).toBe(1);
     expect(anthropicGood.receivedRequests.length - anthropicBaseline).toBe(1);
+
+    // The per-attempt counters are emitted from one chokepoint shared by
+    // chat, messages and responses, but each handler passes it its own
+    // requested-model reference — so the fallback label is only correct on
+    // this endpoint if THIS endpoint is driven (AISIX-Cloud#1299).
+    const metricsAfter = await scrapeMetrics(app.metricsUrl);
+    const delta = (name: string, want: Record<string, string>) =>
+      metricDelta(metricsBefore, metricsAfter, name, want);
+    expect(
+      delta("aisix_deployment_failure_responses_total", {
+        model: "mg-fo-openai",
+      }),
+    ).toBe(1);
+    expect(
+      delta("aisix_deployment_success_responses_total", {
+        model: "mg-fo-anthropic",
+      }),
+    ).toBe(1);
+    expect(
+      delta("aisix_routing_successful_fallbacks_total", {
+        model: "mg-failover",
+        fallback_model: "mg-fo-anthropic",
+      }),
+    ).toBe(1);
   });
 
   test("Anthropic group is reachable via /v1/messages/count_tokens", async (ctx) => {

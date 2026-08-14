@@ -641,7 +641,7 @@ async fn dispatch(
     // pre-dispatch 4xx); if this endpoint ever grows semantic support,
     // widen this flag or the deferred policies are silently skipped.
     let is_routing_request = model_entry.value.routing.is_some();
-    let mut routing = RoutingTelemetry::default();
+    let mut routing = RoutingTelemetry::for_request(&model_entry.value.display_name);
     // Walk the targets, failing over on a retryable failure. Streaming and
     // non-streaming share this loop: the per-target dispatch branches
     // internally and, for streaming, only returns Ok once the first chunk
@@ -718,18 +718,22 @@ async fn dispatch(
             {
                 Ok(r) => r,
                 Err(e) => {
-                    routing.attempts.push(AttemptRecord {
-                        index: idx,
-                        kind,
-                        target_model,
-                        target_model_id: target.id.clone(),
-                        provider_key_id: pk_id.clone(),
-                        status: 429,
-                        success: false,
-                        error_class: "rate_limit_exceeded".to_string(),
-                        error_message: e.to_string(),
-                        latency_ms: 0,
-                    });
+                    routing.record(
+                        state,
+                        AttemptRecord {
+                            index: idx,
+                            kind,
+                            target_model,
+                            target_model_id: target.id.clone(),
+                            provider_key_id: pk_id.clone(),
+                            status: 429,
+                            success: false,
+                            error_class: "rate_limit_exceeded".to_string(),
+                            error_message: e.to_string(),
+                            latency_ms: 0,
+                            dispatched: false,
+                        },
+                    );
                     last_err = Some(e);
                     continue 'targets;
                 }
@@ -784,18 +788,22 @@ async fn dispatch(
                     let latency_ms = ms_since(attempt_started);
                     // Feed the least_latency EWMA for this target.
                     state.runtime_status.record_latency(&target.id, latency_ms);
-                    routing.attempts.push(AttemptRecord {
-                        index: idx,
-                        kind,
-                        target_model,
-                        target_model_id: target.id.clone(),
-                        provider_key_id: pk_id.clone(),
-                        status: success.response.status().as_u16(),
-                        success: true,
-                        error_class: String::new(),
-                        error_message: String::new(),
-                        latency_ms,
-                    });
+                    routing.record(
+                        state,
+                        AttemptRecord {
+                            index: idx,
+                            kind,
+                            target_model,
+                            target_model_id: target.id.clone(),
+                            provider_key_id: pk_id.clone(),
+                            status: success.response.status().as_u16(),
+                            success: true,
+                            error_class: String::new(),
+                            error_message: String::new(),
+                            latency_ms,
+                            dispatched: true,
+                        },
+                    );
                     success.routing = routing;
                     // #911 [21]: commit the reserved layers with the actual
                     // token cost so TPM/TPD is enforced for /v1/responses like
@@ -836,18 +844,22 @@ async fn dispatch(
                         ProxyError::Bridge(be) if crate::routing::is_retryable(be, retry_on_429, fallback_statuses)
                     );
                     let (error_class, error_message) = attempt_error_from_proxy(&e);
-                    routing.attempts.push(AttemptRecord {
-                        index: idx,
-                        kind,
-                        target_model,
-                        target_model_id: target.id.clone(),
-                        provider_key_id: pk_id.clone(),
-                        status: e.status().as_u16(),
-                        success: false,
-                        error_class,
-                        error_message,
-                        latency_ms: ms_since(attempt_started),
-                    });
+                    routing.record(
+                        state,
+                        AttemptRecord {
+                            index: idx,
+                            kind,
+                            target_model,
+                            target_model_id: target.id.clone(),
+                            provider_key_id: pk_id.clone(),
+                            status: e.status().as_u16(),
+                            success: false,
+                            error_class,
+                            error_message,
+                            latency_ms: ms_since(attempt_started),
+                            dispatched: true,
+                        },
+                    );
                     // See `RetryBudget::covers`: a default budget skips
                     // same-target retries for timeouts; fail-over is unaffected.
                     let budget_covers = match &e {

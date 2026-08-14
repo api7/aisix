@@ -21,7 +21,7 @@ use std::time::{Duration, SystemTime};
 
 use aisix_core::snapshot::SnapshotHandle;
 use aisix_core::{AisixSnapshot, RoutingStrategy};
-use aisix_obs::{DeploymentLabels, DeploymentState, Metrics};
+use aisix_obs::{DeploymentLabels, DeploymentState, Metrics, RequestOutcome};
 use axum::http::header::{HeaderName, HeaderValue, CONTENT_TYPE};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -676,6 +676,20 @@ impl ModelRuntimeStatusTracker {
         }
         entry.emitted_state = Some(state);
         self.emit_deployment_state(model_id, state);
+    }
+
+    /// Bump the `aisix_deployment_{requests,success_responses,failure_responses}_total`
+    /// families for one upstream attempt against `model_id`.
+    ///
+    /// Deliberately keyed on the model id rather than on labels the caller
+    /// assembles: `aisix_deployment_state` and `_cooled_down_total` already
+    /// resolve their labels here, and a target has to carry the SAME label
+    /// tuple across all four or an operator cannot join "this deployment is
+    /// cooled down" to "this deployment is failing".
+    pub(crate) fn record_deployment_attempt(&self, model_id: &str, outcome: RequestOutcome) {
+        self.with_deployment_labels(model_id, |metrics, labels| {
+            metrics.record_deployment_request(labels, outcome);
+        });
     }
 
     /// Bump `aisix_deployment_cooled_down_total` for `model_id`.
