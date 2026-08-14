@@ -775,7 +775,7 @@ impl Bridge for VertexBridge {
                 .json(&body)
                 .send()
                 .await
-                .map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
+                .map_err(aisix_gateway::send_error)?;
             let status = resp.status();
             if !status.is_success() {
                 return Err(map_http_error(status, resp).await);
@@ -912,7 +912,7 @@ impl VertexBridge {
                 .json(&body)
                 .send()
                 .await
-                .map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
+                .map_err(aisix_gateway::send_error)?;
 
             let status = resp.status();
             if !status.is_success() {
@@ -1017,7 +1017,7 @@ impl VertexBridge {
                 .json(&body_value)
                 .send()
                 .await
-                .map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
+                .map_err(aisix_gateway::send_error)?;
 
             let status = resp.status();
             if !status.is_success() {
@@ -1113,7 +1113,7 @@ impl VertexBridge {
                 .json(&body_value)
                 .send()
                 .await
-                .map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))
+                .map_err(aisix_gateway::send_error)
         })
         .await?;
 
@@ -1233,7 +1233,7 @@ impl VertexBridge {
                 .json(&body)
                 .send()
                 .await
-                .map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
+                .map_err(aisix_gateway::send_error)?;
             let status = resp.status();
             if !status.is_success() {
                 return Err(map_http_error(status, resp).await);
@@ -1294,7 +1294,7 @@ impl VertexBridge {
                 .json(&body)
                 .send()
                 .await
-                .map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))
+                .map_err(aisix_gateway::send_error)
         })
         .await?;
 
@@ -1437,7 +1437,7 @@ impl VertexBridge {
                 .json(&body)
                 .send()
                 .await
-                .map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
+                .map_err(aisix_gateway::send_error)?;
             let status = resp.status();
             if !status.is_success() {
                 return Err(map_http_error(status, resp).await);
@@ -1515,7 +1515,7 @@ impl VertexBridge {
                 .json(&body)
                 .send()
                 .await
-                .map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))
+                .map_err(aisix_gateway::send_error)
         })
         .await?;
 
@@ -1635,7 +1635,7 @@ impl VertexBridge {
                 .json(&body)
                 .send()
                 .await
-                .map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))
+                .map_err(aisix_gateway::send_error)
         })
         .await?;
 
