@@ -18,6 +18,7 @@
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use crate::bridge::BridgeError;
 use crate::upstream_tls::TlsSettings;
 
 /// Suffixes marking a query parameter whose value is a credential and must
@@ -192,6 +193,33 @@ pub fn transport_error_message(err: &reqwest::Error) -> String {
     }
     append_source_chain(&mut msg, err);
     msg
+}
+
+/// Classify a `reqwest` **send** failure into its [`BridgeError`].
+///
+/// reqwest reports a *builder* error when the request could not even be
+/// constructed. In practice that is an `api_base` that does not parse as a
+/// URL: [`crate::url_cache::EndpointUrl::Unparsed`] deliberately hands the
+/// raw string to the request builder so the message stays exactly what it
+/// always was, and the parse failure then surfaces here at `send()` with
+/// `is_builder()` set and no URL attached.
+///
+/// Nothing was sent, so this is customer-fixable upstream config — the same
+/// class as a *missing* `api_base`, which already maps to
+/// [`BridgeError::InvalidUpstreamConfig`] — rather than a transport failure.
+/// Calling it `Transport` would report a 502 for an operator's typo, retry
+/// a URL that can never parse, and (via
+/// [`BridgeError::reached_upstream`]) count it against the target's
+/// `aisix_deployment_*` health even though no provider was contacted.
+///
+/// Use at `send()` sites only. A failure reading an already-open response
+/// body or stream is never a builder error and stays [`BridgeError::Transport`].
+pub fn send_error(err: reqwest::Error) -> BridgeError {
+    if err.is_builder() {
+        BridgeError::InvalidUpstreamConfig(transport_error_message(&err))
+    } else {
+        BridgeError::Transport(transport_error_message(&err))
+    }
 }
 
 /// Same as [`transport_error_message`] for error types that aren't
@@ -634,5 +662,36 @@ mod tests {
             with_causes.len() > top_level.len(),
             "causes must add information"
         );
+    }
+
+    /// The distinction `send_error` exists to make. `EndpointUrl::Unparsed`
+    /// hands a malformed `api_base` to the request builder verbatim, and
+    /// reqwest reports the parse failure only here, at `send()`, as a
+    /// builder error with no URL attached. Classifying it as `Transport`
+    /// would 502 an operator's typo, retry a URL that can never parse, and
+    /// count it against the target's upstream health.
+    #[tokio::test]
+    async fn builder_errors_are_upstream_config_not_transport() {
+        let client = reqwest::Client::new();
+        let builder_err = crate::url_cache::EndpointUrl::Unparsed("ht tp://not a url".to_string())
+            .post_on(&client)
+            .send()
+            .await
+            .expect_err("a malformed api_base cannot produce a response");
+        assert!(builder_err.is_builder());
+        assert!(matches!(
+            send_error(builder_err),
+            BridgeError::InvalidUpstreamConfig(_)
+        ));
+
+        // A real connection attempt to a closed port stays transport: we
+        // did try to reach the provider, and that is upstream health.
+        let io_err = client
+            .post("http://127.0.0.1:1/v1/chat/completions")
+            .send()
+            .await
+            .expect_err("nothing listens on port 1");
+        assert!(!io_err.is_builder());
+        assert!(matches!(send_error(io_err), BridgeError::Transport(_)));
     }
 }

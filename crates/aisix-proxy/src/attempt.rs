@@ -62,11 +62,17 @@ pub(crate) struct AttemptRecord {
     /// Whether this attempt actually reached the upstream.
     ///
     /// False for an attempt the target's own rate-limit layers refused
-    /// before dispatch: it produced no upstream response, so it stays out
-    /// of the `aisix_deployment_*_responses_total` families an operator
-    /// reads as upstream health. It is still a real attempt everywhere
-    /// else — the per-attempt usage event, and the initial/retry/fallback
-    /// classification the next attempt is measured against.
+    /// before dispatch, and equally for one the bridge rejected while still
+    /// assembling the request — an unusable `api_key`, a missing
+    /// `model_name`/`api_base`, a body that would not serialize (see
+    /// [`BridgeError::reached_upstream`] and `attempt_reached_upstream`,
+    /// which decide this per error variant). Neither produced an upstream
+    /// response, so both stay out of the `aisix_deployment_*_responses_total`
+    /// families an operator reads as upstream health; counting them there
+    /// reports our own misconfiguration as provider degradation. Such an
+    /// attempt is still real everywhere else — the per-attempt usage event,
+    /// and the initial/retry/fallback classification the next attempt is
+    /// measured against.
     pub dispatched: bool,
 }
 
@@ -265,6 +271,49 @@ pub(crate) fn attempt_error_from_proxy(err: &ProxyError) -> (String, String) {
     }
 }
 
+/// Whether a failed attempt actually reached its upstream — the
+/// `AttemptRecord::dispatched` value for the `ProxyError`-typed dispatch
+/// loops (`/v1/messages`, `/v1/responses`), mirroring
+/// [`BridgeError::reached_upstream`] for the `BridgeError`-typed one.
+///
+/// `ContentFiltered` is `true` because only the **output** hook can fire
+/// inside a dispatch call — the input hook runs once, before the loop — so
+/// the provider had already answered when we blocked it. (That attempt is
+/// therefore counted as a deployment *failure* by
+/// `RequestOutcome::from_status`, even though the upstream was healthy;
+/// that is a defect in the outcome mapping, not in this predicate, and
+/// fixing it needs the error to carry which hook fired.) Every remaining
+/// variant is a gateway-side decision — auth, ACL, budget, rate limit,
+/// unknown model — taken without contacting any provider. Exhaustive so a
+/// new variant has to declare its side of the network boundary.
+pub(crate) fn attempt_reached_upstream(err: &ProxyError) -> bool {
+    match err {
+        ProxyError::Bridge(be) => be.reached_upstream(),
+        ProxyError::ContentFiltered(_) => true,
+        ProxyError::MissingAuth
+        | ProxyError::InvalidApiKey
+        | ProxyError::ApiKeyExpired
+        | ProxyError::ApiKeyDisabled
+        | ProxyError::JwtInvalid
+        | ProxyError::JwtExpired
+        | ProxyError::JwtClaimsRejected
+        | ProxyError::JwtIdentityUnmapped
+        | ProxyError::JwksUnavailable
+        | ProxyError::ModelNotFound(_)
+        | ProxyError::VideoNotFound(_)
+        | ProxyError::ModelForbidden(_)
+        | ProxyError::ModelIpRestricted(_)
+        | ProxyError::InvalidRequest(_)
+        | ProxyError::WebSocketUpgradeRequired { .. }
+        | ProxyError::ProviderUnavailable
+        | ProxyError::AllCandidatesUnavailable { .. }
+        | ProxyError::BudgetExceeded(_)
+        | ProxyError::RequestTooLarge { .. }
+        | ProxyError::RateLimit(_)
+        | ProxyError::PolicyRateLimit { .. } => false,
+    }
+}
+
 /// Milliseconds elapsed since `started`, saturating at `u32::MAX`.
 pub(crate) fn ms_since(started: Instant) -> u32 {
     started.elapsed().as_millis().min(u32::MAX as u128) as u32
@@ -274,6 +323,62 @@ pub(crate) fn ms_since(started: Instant) -> u32 {
 mod tests {
     use super::*;
     use aisix_gateway::{UpstreamWire, MAX_UPSTREAM_ERROR_MESSAGE_BYTES};
+
+    /// The `aisix_deployment_*` families read as upstream health, so an
+    /// error raised while the request was still being assembled has to stay
+    /// out of them. Both matches are exhaustive, so a NEW variant is already
+    /// a compile error; this pins the classification of the existing ones,
+    /// which is what a well-meaning refactor would silently flip.
+    #[test]
+    fn only_errors_that_reached_the_provider_count_as_upstream_attempts() {
+        for err in [
+            BridgeError::Config("serialize request body: eof".into()),
+            BridgeError::InvalidUpstreamConfig("model.model_name missing".into()),
+            BridgeError::InvalidUpstreamCredentials("provider_key.api_key is empty".into()),
+        ] {
+            assert!(
+                !err.reached_upstream(),
+                "{err} is raised before the request is sent"
+            );
+            assert!(!attempt_reached_upstream(&ProxyError::Bridge(err)));
+        }
+
+        // A timeout or a refused connection IS upstream health: we tried to
+        // reach the provider and could not. Excluding these would hide the
+        // outage the family exists to show.
+        for err in [
+            BridgeError::Timeout {
+                elapsed_ms: 7167,
+                cause: String::new(),
+            },
+            BridgeError::Transport("connection refused".into()),
+            BridgeError::upstream_status(502, "bad gateway"),
+            BridgeError::UpstreamDecode("unparseable body".into()),
+            BridgeError::UpstreamInBand {
+                status: Some(500),
+                message: "overloaded".into(),
+                parsed: None,
+                wire: UpstreamWire::Unknown,
+            },
+            BridgeError::StreamAborted,
+        ] {
+            assert!(
+                err.reached_upstream(),
+                "{err} means the provider was contacted"
+            );
+            assert!(attempt_reached_upstream(&ProxyError::Bridge(err)));
+        }
+
+        // Only the output hook can fire inside a dispatch call, so the
+        // provider had already answered — the attempt did reach it.
+        assert!(attempt_reached_upstream(&ProxyError::ContentFiltered(
+            "blocked by response guardrail".into()
+        )));
+        // Gateway-side refusals never contacted anyone.
+        assert!(!attempt_reached_upstream(&ProxyError::ModelNotFound(
+            "nope".into()
+        )));
+    }
 
     /// AISIX-Cloud#1093: the access log is the one line an operator gets
     /// per request, so EVERY failure has to name itself there — including
