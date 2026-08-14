@@ -4,6 +4,8 @@ import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
   SeedClient,
+  metricDelta,
+  scrapeMetrics,
   pickFreePort,
   spawnApp,
   startOpenAiUpstream,
@@ -364,6 +366,7 @@ describe("per-attempt telemetry e2e (#655): one UsageEvent per upstream attempt"
       return res.status === 200;
     });
 
+    const metricsBefore = await scrapeMetrics(app.metricsUrl);
     const res = await fetch(`${app.proxyUrl}/v1/responses`, {
       method: "POST",
       headers: {
@@ -391,6 +394,31 @@ describe("per-attempt telemetry e2e (#655): one UsageEvent per upstream attempt"
     // Request-scoped it would be >= the primary's delay instead.
     expect(spans[1].latencyMs).toBeLessThan(SLOW_PRIMARY_MS / 2);
     expect(spans[1].latencyMs).toBeLessThan(spans[0].latencyMs);
+
+    // The same failover, seen through the per-attempt COUNTERS
+    // (AISIX-Cloud#1299). Driven here rather than in a fixture of its own
+    // because the emit chokepoint is shared with chat and messages, while
+    // the requested-model reference each handler hands it is not — so the
+    // fallback label is only pinned on this endpoint by driving it.
+    const metricsAfter = await scrapeMetrics(app.metricsUrl);
+    const delta = (name: string, want: Record<string, string>) =>
+      metricDelta(metricsBefore, metricsAfter, name, want);
+    expect(
+      delta("aisix_deployment_failure_responses_total", {
+        model: "latency-scope-primary",
+      }),
+    ).toBe(1);
+    expect(
+      delta("aisix_deployment_success_responses_total", {
+        model: "latency-scope-secondary",
+      }),
+    ).toBe(1);
+    expect(
+      delta("aisix_routing_successful_fallbacks_total", {
+        model: "latency-scope-virtual",
+        fallback_model: "latency-scope-secondary",
+      }),
+    ).toBe(1);
   });
 
   test("a streamed winner's latency_ms is attempt-scoped too (end-of-stream emit)", async (ctx) => {

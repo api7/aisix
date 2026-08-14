@@ -4,6 +4,8 @@ import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
   SeedClient,
+  metricDelta,
+  scrapeMetrics,
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
@@ -232,15 +234,17 @@ describe("fallback e2e: virtual routing fails over from 5xx to next target", () 
       }
     });
 
-    const before = await scrapeCounters(app.metricsUrl);
+    const before = await scrapeMetrics(app.metricsUrl);
     const completion = await client.chat.completions.create({
       model: "fb-virtual",
       messages: [{ role: "user", content: "metrics" }],
     });
     expect(completion.choices[0]?.message.content).toBe("fallback worked");
-    const after = await scrapeCounters(app.metricsUrl);
-    const delta = (name: string, labels: Record<string, string> = {}) =>
-      sum(after, name, labels) - sum(before, name, labels);
+    const after = await scrapeMetrics(app.metricsUrl);
+    const delta = (
+      name: string,
+      want?: Record<string, string> | ((l: Record<string, string>) => boolean),
+    ) => metricDelta(before, after, name, want);
 
     // The attempt that failed and the attempt that served it, each filed
     // under the TARGET it hit — not under the group the caller named.
@@ -273,11 +277,7 @@ describe("fallback e2e: virtual routing fails over from 5xx to next target", () 
     expect(delta("aisix_proxy_requests_total")).toBe(1);
     expect(delta("aisix_proxy_requests_total", { status: "200" })).toBe(1);
     expect(
-      after.filter(
-        (s) =>
-          s.name === "aisix_proxy_requests_total" &&
-          /^5\d\d$/.test(s.labels.status ?? ""),
-      ).length,
+      delta("aisix_proxy_requests_total", (l) => /^5\d\d$/.test(l.status ?? "")),
     ).toBe(0);
 
     // …while the per-attempt usage events — the rows the dashboard log
@@ -292,46 +292,3 @@ describe("fallback e2e: virtual routing fails over from 5xx to next target", () 
   });
 });
 
-interface Series {
-  name: string;
-  labels: Record<string, string>;
-  value: number;
-}
-
-/** Parse a prometheus text scrape into its counter samples. */
-async function scrapeCounters(metricsUrl: string): Promise<Series[]> {
-  const res = await fetch(`${metricsUrl}/metrics`);
-  expect(res.status).toBe(200);
-  const out: Series[] = [];
-  for (const line of (await res.text()).split("\n")) {
-    const m = /^([a-z_]+)(\{(.*)\})? ([0-9.e+-]+)$/.exec(line.trim());
-    if (!m) continue;
-    const labels: Record<string, string> = {};
-    for (const pair of m[3]?.match(/[a-z_]+="[^"]*"/g) ?? []) {
-      const [k, v] = pair.split("=");
-      labels[k] = v.slice(1, -1);
-    }
-    out.push({ name: m[1], labels, value: Number(m[4]) });
-  }
-  return out;
-}
-
-/**
- * Total of every sample of `name` whose labels include `want`. Summing
- * rather than requiring a single series on purpose: these families carry
- * label dimensions this test says nothing about, and pinning the full
- * tuple would make the test fail the next time one is added.
- */
-function sum(
-  series: Series[],
-  name: string,
-  want: Record<string, string> = {},
-): number {
-  return series
-    .filter(
-      (s) =>
-        s.name === name &&
-        Object.entries(want).every(([k, v]) => s.labels[k] === v),
-    )
-    .reduce((acc, s) => acc + s.value, 0);
-}
