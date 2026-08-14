@@ -36,6 +36,7 @@
 //! The watch path reuses step 2 on incoming events — malformed payloads are
 //! skipped with a warning and do not take down the gateway.
 
+use crate::models::model::Model;
 use jsonschema::Validator;
 use once_cell::sync::Lazy;
 use serde_json::{json, Value};
@@ -192,8 +193,78 @@ pub fn validate(validator: &Validator, value: &Value) -> Result<(), SchemaError>
     Ok(())
 }
 
+/// Strict model validation, with the per-kind dead-knob case named.
+///
+/// The model schema is a five-branch `oneOf` (one per kind), so when a
+/// document carries a knob its kind never resolves, EVERY branch fails
+/// and the first error `jsonschema` reports is the root-level "not valid
+/// under any of the schemas" — true, but it does not say which field is
+/// at fault. That is the one failure mode the strict path exists to
+/// produce (`model_one_of_strict`), so it is worth naming.
+///
+/// The field list comes from [`Model::strip_kind_inapplicable`], the same
+/// function the lenient loader uses to strip and report these knobs, so
+/// the two paths cannot disagree about which knob is dead on which kind.
+///
+/// Best-effort by construction: a document that fails for any other
+/// reason — an unknown field, a wrong type, a missing requirement — may
+/// not deserialise at all, and keeps the generic message. Only the field
+/// NAMES are added, never instance values, so this respects the masking
+/// contract in [`validate`].
+///
+/// A dead knob is only reported when it is the WHOLE story: the document
+/// is re-validated with exactly those fields removed, and the message is
+/// replaced only if it then passes. A document that carries a dead knob
+/// AND an independent violation keeps the original error, which points
+/// at the other problem and is the more useful of the two — replacing it
+/// would leave `path` and `message` describing different fields.
 pub fn validate_model(value: &Value) -> Result<(), SchemaError> {
-    validate(&SCHEMAS.model, value)
+    let err = match validate(&SCHEMAS.model, value) {
+        Ok(()) => return Ok(()),
+        Err(err) => err,
+    };
+    let Ok(mut model) = serde_json::from_value::<Model>(value.clone()) else {
+        return Err(err);
+    };
+    let dead = model.strip_kind_inapplicable();
+    if dead.is_empty() {
+        return Err(err);
+    }
+    // Probe the ORIGINAL document minus the dead fields rather than
+    // re-serialising `model`: a serde round-trip drops unknown fields
+    // and materialises defaults, either of which could make the probe
+    // pass while the real document still fails. Every dead knob is a
+    // top-level field.
+    let mut probe = value.clone();
+    match probe.as_object_mut() {
+        Some(obj) => {
+            for field in &dead {
+                obj.remove(*field);
+            }
+        }
+        None => return Err(err),
+    }
+    if validate(&SCHEMAS.model, &probe).is_err() {
+        return Err(err);
+    }
+    // strip_kind_inapplicable only reports on these three kinds.
+    let kind = if model.is_routing() {
+        "model group"
+    } else if model.is_ensemble() {
+        "ensemble"
+    } else {
+        "semantic router"
+    };
+    Err(SchemaError {
+        path: err.path,
+        message: format!(
+            "{} not accepted on a {kind}",
+            dead.iter()
+                .map(|f| format!("`{f}`"))
+                .collect::<Vec<_>>()
+                .join(", "),
+        ),
+    })
 }
 
 pub fn validate_apikey(value: &Value) -> Result<(), SchemaError> {
@@ -3444,5 +3515,127 @@ mod tests {
             "timeout_ms": 0
         });
         assert!(validate_mcp_server(&v).is_err());
+    }
+
+    #[test]
+    fn model_dead_knob_error_names_the_field_and_kind() {
+        // The five-branch `oneOf` makes every branch fail, so the raw
+        // jsonschema error is the root-level "not valid under any of the
+        // schemas". The dead knob is the case the strict path exists to
+        // catch, so it must be named.
+        let group = json!({
+            "display_name": "g",
+            "routing": {"strategy": "failover", "targets": [{"model": "m"}]},
+            "retries": 3,
+            "cost": {"input_per_1k": 0.5, "output_per_1k": 1.5}
+        });
+        let msg = validate_model(&group).unwrap_err().message;
+        assert!(msg.contains("`cost`"), "{msg}");
+        assert!(msg.contains("`retries`"), "{msg}");
+        assert!(msg.contains("model group"), "{msg}");
+        assert!(
+            !msg.contains("oneOf"),
+            "generic message should be replaced: {msg}"
+        );
+
+        let ensemble = json!({
+            "display_name": "e",
+            "ensemble": {"panel": [{"model": "m"}], "judge": {"model": "m"}},
+            "timeout": 1000
+        });
+        let msg = validate_model(&ensemble).unwrap_err().message;
+        assert!(msg.contains("`timeout`"), "{msg}");
+        assert!(msg.contains("ensemble"), "{msg}");
+
+        let semantic = json!({
+            "display_name": "s",
+            "semantic": {
+                "embedding_model": "e",
+                "routes": [{"name": "a", "target": "m", "examples": ["x"]}],
+                "default": "d",
+                "match": {"threshold": 0.5},
+                "on_embedding_failure": {"target": "t"}
+            },
+            "auto_prompt_caching": {"enabled": true}
+        });
+        let msg = validate_model(&semantic).unwrap_err().message;
+        assert!(msg.contains("`auto_prompt_caching`"), "{msg}");
+        assert!(msg.contains("semantic router"), "{msg}");
+    }
+
+    #[test]
+    fn model_non_dead_knob_failures_keep_the_generic_message() {
+        // A failure that is NOT a dead knob must not be relabelled: the
+        // enrichment is best-effort and only speaks for the case it can
+        // prove. An unknown field on a direct model is rejected by
+        // `additionalProperties: false`, and strip_kind_inapplicable has
+        // nothing to say about it.
+        let unknown = json!({
+            "display_name": "d",
+            "provider": "openai",
+            "model_name": "gpt-4o-mini",
+            "provider_key_id": "pk",
+            "definitely_not_a_field": 1
+        });
+        let msg = validate_model(&unknown).unwrap_err().message;
+        assert!(!msg.contains("not accepted on a"), "{msg}");
+
+        // A dead knob on a DIRECT model is not dead at all — it resolves
+        // there — so a direct model carrying `retries` must still VALIDATE.
+        let direct = json!({
+            "display_name": "d",
+            "provider": "openai",
+            "model_name": "gpt-4o-mini",
+            "provider_key_id": "pk",
+            "retries": 3
+        });
+        validate_model(&direct).unwrap();
+    }
+
+    #[test]
+    fn model_dead_knob_error_carries_no_instance_values() {
+        // The masking contract: validation errors reach logs, the
+        // rejection buffer and admin 400 bodies, and model documents can
+        // carry credentials. Only field NAMES may be added.
+        let group = json!({
+            "display_name": "g",
+            "routing": {"strategy": "failover", "targets": [{"model": "m"}]},
+            "cost": {"input_per_1k": 12345.678, "output_per_1k": 99999.111}
+        });
+        let msg = validate_model(&group).unwrap_err().message;
+        assert!(msg.contains("`cost`"), "{msg}");
+        assert!(!msg.contains("12345"), "instance value leaked: {msg}");
+        assert!(!msg.contains("99999"), "instance value leaked: {msg}");
+    }
+
+    #[test]
+    fn model_dead_knob_with_an_independent_failure_keeps_the_original_error() {
+        // A dead knob is only named when it is the WHOLE story. Here the
+        // group also has an empty display_name (minLength 1) — which
+        // `Model` deserialises fine, so the enrichment is reachable.
+        // Replacing the message would report `retries` while `path` still
+        // points at /display_name: two different fields in one error.
+        let v = json!({
+            "display_name": "",
+            "routing": {"strategy": "failover", "targets": [{"model": "m"}]},
+            "retries": 3
+        });
+        let err = validate_model(&v).unwrap_err();
+        assert_eq!(err.path, "/display_name", "{err:?}");
+        assert!(
+            !err.message.contains("`retries`"),
+            "the independent failure must win: {err:?}"
+        );
+        assert!(err.message.contains("shorter than 1 character"), "{err:?}");
+
+        // With the independent violation fixed, the dead knob is the whole
+        // story again and gets named.
+        let v = json!({
+            "display_name": "g",
+            "routing": {"strategy": "failover", "targets": [{"model": "m"}]},
+            "retries": 3
+        });
+        let err = validate_model(&v).unwrap_err();
+        assert!(err.message.contains("`retries`"), "{err:?}");
     }
 }

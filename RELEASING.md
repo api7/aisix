@@ -27,6 +27,27 @@ Pushing the tag triggers two workflows:
   curated-notes scaffold to fill in, then GitHub's auto-generated **What's
   Changed** list as a starting skeleton.
 
+### PGO is mandatory and fail-closed
+
+Published images are profile-guided-optimized (#967): the Docker build
+compiles an instrumented gateway, drives the committed training matrix
+(`bench/pgo-training/`) against it, and rebuilds with the merged profile.
+Any phase failing — instrumented build, training, profile merge, optimized
+build — fails the image build; there is no fallback to a plain build. After
+the push, the workflow asserts the `pgo-verified.json` proof marker inside
+the image (shape count, profile size) before signing. If a release build
+fails in a PGO phase, fix the cause; never ship around it. To inspect a
+shipped image's marker:
+
+```bash
+docker run --rm --entrypoint cat ghcr.io/api7/aisix:X.Y.Z \
+  /usr/local/share/aisix/pgo-verified.json
+```
+
+Local note: each retrained profile is content-addressed, so repeated local
+PGO builds accumulate build artifacts in the persistent BuildKit cache
+mounts; reclaim with `docker builder prune`.
+
 ## 2. Polish the release notes
 
 Edit the draft before publishing. The Get-started/Download header and the

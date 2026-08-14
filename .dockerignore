@@ -1,6 +1,9 @@
 .git
 .github
 target
+target-pgo-gen
+target-pgo
+bench/pgo-training/trainer/target
 
 docs
 tests/fixtures/tmp
