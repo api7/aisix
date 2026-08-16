@@ -28,7 +28,7 @@ pub struct AisixSnapshot {
     pub guardrails: ResourceTable<Guardrail>,
     /// Attachment rows: `/aisix/<env>/guardrail_attachments/<uuid>`.
     /// Each row binds a guardrail definition to a scope (env / model /
-    /// api_key / team). `GuardrailIndex::build_from_snapshot` consumes
+    /// mcp_server / api_key / team). `GuardrailIndex::build_from_snapshot` consumes
     /// both this table and `guardrails` to build the per-request resolver.
     pub guardrail_attachments: ResourceTable<GuardrailAttachment>,
     /// Per-env cache policies. Stage 2 honors only the existence of an

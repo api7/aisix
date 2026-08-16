@@ -294,6 +294,7 @@ async fn dispatch(
     // (matching /v1/chat/completions).
     let guardrail_ctx = aisix_guardrails::RequestContext {
         model_id: &model_entry.id,
+        mcp_server_id: "",
         api_key_id: &auth.entry.id,
         team_id: auth.key().team_id.as_deref(),
     };

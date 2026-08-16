@@ -1641,6 +1641,7 @@ async fn dispatch_create(
     // block doesn't burn an RPM slot (#542).
     let guardrail_ctx = aisix_guardrails::RequestContext {
         model_id: &target.model_entry.id,
+        mcp_server_id: "",
         api_key_id: &auth.entry.id,
         team_id: auth.key().team_id.as_deref(),
     };

@@ -18,6 +18,16 @@ export interface McpUpstream {
   close(): Promise<void>;
 }
 
+export interface McpUpstreamOptions {
+  /**
+   * Also expose a `lookup` tool whose result carries `structuredContent`
+   * alongside a fixed, always-clean text block — the shape a tool uses to
+   * return machine-readable output. Off by default so the tool inventory
+   * every other suite asserts on stays `echo` + `reverse`.
+   */
+  structuredTool?: boolean;
+}
+
 /**
  * A real MCP upstream server built on the official TypeScript SDK, speaking
  * the stateless Streamable HTTP transport with JSON responses — the exact
@@ -31,9 +41,12 @@ export interface McpUpstream {
  * A fresh SDK `Server` + transport is built per request (the SDK's stateless
  * pattern); the gateway reconnects per operation, so nothing is shared.
  */
-export async function startMcpUpstream(label: string): Promise<McpUpstream> {
+export async function startMcpUpstream(
+  label: string,
+  options: McpUpstreamOptions = {},
+): Promise<McpUpstream> {
   const httpServer: HttpServer = createServer((req, res) => {
-    void handle(label, req, res);
+    void handle(label, req, res, options);
   });
   await new Promise<void>((resolve) =>
     httpServer.listen(0, "127.0.0.1", resolve),
@@ -53,6 +66,7 @@ async function handle(
   label: string,
   req: IncomingMessage,
   res: ServerResponse,
+  options: McpUpstreamOptions,
 ): Promise<void> {
   try {
     if (req.method !== "POST") {
@@ -85,10 +99,31 @@ async function handle(
             properties: { text: { type: "string" } },
           },
         },
+        ...(options.structuredTool
+          ? [
+              {
+                name: "lookup",
+                description: "return the text as structured output",
+                inputSchema: {
+                  type: "object" as const,
+                  properties: { text: { type: "string" } },
+                },
+              },
+            ]
+          : []),
       ],
     }));
     server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const text = String(request.params.arguments?.text ?? "");
+      if (request.params.name === "lookup") {
+        // The text block is deliberately constant and clean: only
+        // `structuredContent` carries the caller's value, which is exactly
+        // the case a content-blocks-only scan would miss.
+        return {
+          content: [{ type: "text", text: "lookup ok" }],
+          structuredContent: { record: { note: text } },
+        };
+      }
       const out =
         request.params.name === "reverse"
           ? [...text].reverse().join("")
