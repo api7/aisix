@@ -270,14 +270,23 @@ async fn dispatch(
     // Resolve the guardrail chain once and run BOTH directions through the SAME
     // chain as LLM traffic: the tool arguments (input) before the call, and the
     // tool result (output) after. MCP has no model, so an empty `model_id`
-    // matches env / api-key / team-scoped guardrails, never a Model-scoped one.
+    // never matches a Model-scoped guardrail; the called server's id carries
+    // the MCP-side dimension instead, so env / mcp-server / api-key / team
+    // scopes all apply. An unregistered server name (a malformed namespaced
+    // tool) leaves the id empty and simply matches no MCP-server scope.
     // An empty chain short-circuits, keeping the no-guardrail path cheap (and
     // skipping the response buffering the output check needs).
     let rpc_id = peek.as_ref().and_then(|p| p.id.clone());
     let guardrail_chain = is_tool_call
         .then(|| {
+            let mcp_server_id = snapshot
+                .mcp_servers
+                .get_by_name(&mcp_server)
+                .map(|entry| entry.id.clone())
+                .unwrap_or_default();
             let ctx = aisix_guardrails::RequestContext {
                 model_id: "",
+                mcp_server_id: &mcp_server_id,
                 api_key_id: &auth.entry.id,
                 team_id: auth.key().team_id.as_deref(),
             };
@@ -437,9 +446,7 @@ async fn output_guardrail_block(
     // and LLM output on the same representation: a keyword guardrail sees the
     // decoded prose, so envelope field names (`content`, `type`, `text`) can't
     // trip a false positive, and escaped characters can't hide blocked content.
-    // Fall back to the whole serialized result for non-standard shapes so
-    // nothing escapes inspection.
-    let result_text = result
+    let mut scanned: Vec<String> = result
         .get("content")
         .and_then(|c| c.as_array())
         .map(|blocks| {
@@ -447,11 +454,26 @@ async fn output_guardrail_block(
                 .iter()
                 .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
                 .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
-                .collect::<Vec<_>>()
-                .join("\n")
+                .filter(|text| !text.is_empty())
+                .map(str::to_owned)
+                .collect()
         })
-        .filter(|text| !text.is_empty())
-        .unwrap_or_else(|| result.to_string());
+        .unwrap_or_default();
+    // `structuredContent` is serialized to the client ALONGSIDE `content`, and
+    // the spec only RECOMMENDS mirroring it into a text block — so a tool can
+    // return clean prose and carry the sensitive value here. Scan its string
+    // leaves, for the same reason the content blocks are decoded first: the
+    // values are the tool's data, while the object keys are its output schema.
+    if let Some(structured) = result.get("structuredContent") {
+        collect_string_leaves(structured, &mut scanned);
+    }
+    // Fall back to the whole serialized result for non-standard shapes so
+    // nothing escapes inspection.
+    let result_text = if scanned.is_empty() {
+        result.to_string()
+    } else {
+        scanned.join("\n")
+    };
     let resp = aisix_gateway::ChatResponse {
         id: String::new(),
         model: String::new(),
@@ -475,6 +497,24 @@ async fn output_guardrail_block(
             Some(guardrail_name)
         }
         _ => None,
+    }
+}
+
+/// Push every non-empty string leaf of `value` — walking objects and arrays —
+/// onto `out`, in document order. Object KEYS are skipped: they are the tool's
+/// declared output-schema field names rather than its data, so scanning them
+/// would reintroduce the field-name false positives that decoding the content
+/// blocks avoids. The walk is iterative, so a deeply nested result cannot
+/// recurse the handler's stack.
+fn collect_string_leaves(value: &serde_json::Value, out: &mut Vec<String>) {
+    let mut stack = vec![value];
+    while let Some(node) = stack.pop() {
+        match node {
+            serde_json::Value::String(text) if !text.is_empty() => out.push(text.clone()),
+            serde_json::Value::Array(items) => stack.extend(items.iter().rev()),
+            serde_json::Value::Object(map) => stack.extend(map.values().rev()),
+            _ => {}
+        }
     }
 }
 
@@ -523,12 +563,18 @@ fn emit_tool_call_usage(
         .fan_out(&event, None, exporters.iter().map(|e| &e.value));
 }
 
-/// Build the MCP-native response for a guardrail block: a JSON-RPC error
-/// echoing the request id, served as HTTP 200 with a JSON body (the MCP
-/// Streamable HTTP shape). Both the input and output hooks funnel through here;
-/// `side` (`"tool call"` for input arguments, `"tool result"` for output)
-/// selects the caller-visible wording. Unlike the LLM path's 422, an MCP client
-/// expects a JSON-RPC envelope, so the block surfaces as an error it can handle.
+/// Build the MCP-native response for a guardrail block: a `tools/call` result
+/// flagged `isError`, echoing the request id, served as HTTP 200 with a JSON
+/// body (the MCP Streamable HTTP shape). Both the input and output hooks funnel
+/// through here; `side` (`"tool call"` for input arguments, `"tool result"` for
+/// output) selects the caller-visible wording.
+///
+/// A tool-execution error rather than a JSON-RPC protocol error: MCP separates
+/// "this request was not valid" (a protocol error, which a client surfaces as a
+/// transport-level failure) from "the tool call did not succeed" (`isError` on
+/// the result, which the calling agent reads as tool output and can adapt to).
+/// A policy rejection is the second kind — the request was well-formed and the
+/// caller should learn, in-band, that content policy stopped it.
 fn jsonrpc_guardrail_block(
     id: Option<serde_json::Value>,
     side: &str,
@@ -538,7 +584,10 @@ fn jsonrpc_guardrail_block(
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "id": id.unwrap_or(serde_json::Value::Null),
-        "error": { "code": -32600, "message": message }
+        "result": {
+            "content": [{ "type": "text", "text": message }],
+            "isError": true,
+        }
     });
     (
         StatusCode::OK,
@@ -1147,11 +1196,42 @@ mod tests {
     /// Seed an env-scoped guardrail (from its JSON) by RCU-inserting it + an
     /// attachment into the live snapshot handle.
     fn seed_guardrail(handle: &SnapshotHandle<AisixSnapshot>, guardrail_json: &str) {
+        seed_guardrail_with_attachment(
+            handle,
+            guardrail_json,
+            r#"{"guardrail_id":"g1","scope_type":"env","priority":50}"#,
+        );
+    }
+
+    /// Register an MCP server under `name` with the resource id `id`, so a
+    /// tool call naming it resolves the id an `mcp_server`-scoped attachment
+    /// matches on.
+    fn seed_mcp_server(handle: &SnapshotHandle<AisixSnapshot>, id: &'static str, name: &str) {
+        use aisix_core::models::McpServer;
+        let server: McpServer = serde_json::from_value(serde_json::json!({
+            "name": name,
+            // Never dialled: the guardrail verdicts under test are decided
+            // before the gateway is built (input) or on a synthesized body
+            // (output).
+            "url": "http://127.0.0.1:1/mcp",
+        }))
+        .expect("valid mcp server");
+        handle.rcu(|snap| {
+            let new = snap.clone();
+            new.mcp_servers
+                .insert(ResourceEntry::new(id, server.clone(), 1));
+            new
+        });
+    }
+
+    fn seed_guardrail_with_attachment(
+        handle: &SnapshotHandle<AisixSnapshot>,
+        guardrail_json: &str,
+        attachment_json: &str,
+    ) {
         use aisix_core::models::{Guardrail, GuardrailAttachment};
         let guardrail: Guardrail = serde_json::from_str(guardrail_json).unwrap();
-        let attachment: GuardrailAttachment =
-            serde_json::from_str(r#"{"guardrail_id":"g1","scope_type":"env","priority":50}"#)
-                .unwrap();
+        let attachment: GuardrailAttachment = serde_json::from_str(attachment_json).unwrap();
         handle.rcu(|snap| {
             let new = snap.clone();
             new.guardrails
@@ -1181,10 +1261,10 @@ mod tests {
         seed_guardrail(&handle, INPUT_GUARD);
 
         // Arguments carrying the forbidden token are blocked by the same
-        // guardrail chain LLM input uses — surfaced as an MCP-native JSON-RPC
-        // error (HTTP 200) before the gateway/upstream is reached. A distinctive
-        // request id (7) proves the handler echoes the caller's id (not a
-        // constant) through the block envelope both hooks funnel through.
+        // guardrail chain LLM input uses — surfaced as an MCP-native tool-error
+        // result (HTTP 200) before the gateway/upstream is reached. A
+        // distinctive request id (7) proves the handler echoes the caller's id
+        // (not a constant) through the block envelope both hooks funnel through.
         let blocked = router
             .clone()
             .oneshot(mcp_request_with_id(
@@ -1206,13 +1286,17 @@ mod tests {
             serde_json::json!(7),
             "the block must echo the request id"
         );
-        assert_eq!(envelope["error"]["code"], -32600);
-        assert!(
-            envelope.get("result").is_none(),
-            "a guardrail block carries no result"
+        assert_eq!(
+            envelope["result"]["isError"],
+            serde_json::json!(true),
+            "a policy rejection is a tool-execution error, not a protocol error"
         );
         assert!(
-            envelope["error"]["message"]
+            envelope.get("error").is_none(),
+            "a guardrail block must not surface as a JSON-RPC protocol error"
+        );
+        assert!(
+            envelope["result"]["content"][0]["text"]
                 .as_str()
                 .unwrap_or_default()
                 .contains("content policy"),
@@ -1244,6 +1328,7 @@ mod tests {
         let index = LiveGuardrailIndex::new(handle, None);
         let chain = index.resolve(&RequestContext {
             model_id: "",
+            mcp_server_id: "",
             api_key_id: "ak-1",
             team_id: None,
         });
@@ -1301,6 +1386,7 @@ mod tests {
         seed_guardrail(&handle, FIELD_NAME_GUARD);
         let chain = LiveGuardrailIndex::new(handle, None).resolve(&RequestContext {
             model_id: "",
+            mcp_server_id: "",
             api_key_id: "ak-1",
             team_id: None,
         });
@@ -1330,7 +1416,8 @@ mod tests {
     async fn output_block_envelope_echoes_id_and_shape() {
         // Both hooks funnel the block through `jsonrpc_guardrail_block`; assert
         // the wire envelope directly so a regression that nulls the id or shifts
-        // the code/status/content-type is caught without an rmcp upstream.
+        // the result shape/status/content-type is caught without an rmcp
+        // upstream.
         let resp = jsonrpc_guardrail_block(
             Some(serde_json::json!(42)),
             "tool result",
@@ -1353,17 +1440,151 @@ mod tests {
             serde_json::json!(42),
             "the original JSON-RPC id must be echoed, not nulled"
         );
-        assert_eq!(v["error"]["code"], -32600);
+        // A tool-execution error (`isError` on the result), not a JSON-RPC
+        // protocol error: the calling agent reads the rejection as tool output
+        // it can react to instead of a transport-level failure.
+        assert_eq!(v["result"]["isError"], serde_json::json!(true));
         assert!(
-            v.get("result").is_none(),
-            "a block envelope carries no result"
+            v.get("error").is_none(),
+            "a block envelope carries no protocol error"
         );
+        assert_eq!(v["result"]["content"][0]["type"], "text");
         assert!(
-            v["error"]["message"]
+            v["result"]["content"][0]["text"]
                 .as_str()
                 .unwrap_or_default()
                 .contains("tool result blocked by content policy"),
             "expected the output-side wording, got: {v}"
+        );
+    }
+
+    /// A tool result can carry data in `structuredContent` that is NOT mirrored
+    /// into a text content block (the spec only recommends mirroring), and the
+    /// gateway relays that field to the client verbatim. Scanning only the
+    /// content blocks would therefore let it through unread.
+    #[tokio::test]
+    async fn output_guardrail_scans_structured_content() {
+        use aisix_guardrails::{LiveGuardrailIndex, RequestContext};
+
+        let handle = SnapshotHandle::new(snapshot_with_key());
+        seed_guardrail(&handle, OUTPUT_GUARD);
+        let chain = LiveGuardrailIndex::new(handle, None).resolve(&RequestContext {
+            model_id: "",
+            mcp_server_id: "",
+            api_key_id: "ak-1",
+            team_id: None,
+        });
+
+        // Clean prose, sensitive structured payload — the client sees both.
+        let structured_only = br#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"lookup ok"}],"structuredContent":{"record":{"notes":["forbidden-token"]}}}}"#;
+        assert!(
+            output_guardrail_block(&chain, structured_only, "lookup", &mut Vec::new())
+                .await
+                .is_some(),
+            "structuredContent reaches the client, so it must be scanned"
+        );
+
+        // A result with no content blocks at all — a tool may return only
+        // structured output — is scanned through the same path.
+        let no_content = br#"{"jsonrpc":"2.0","id":1,"result":{"content":[],"structuredContent":{"note":"forbidden-token"}}}"#;
+        assert!(
+            output_guardrail_block(&chain, no_content, "lookup", &mut Vec::new())
+                .await
+                .is_some(),
+            "a structured-only result must still be scanned"
+        );
+
+        // Clean on both sides passes.
+        let clean = br#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"lookup ok"}],"structuredContent":{"record":{"notes":["all good"]}}}}"#;
+        assert!(
+            output_guardrail_block(&chain, clean, "lookup", &mut Vec::new())
+                .await
+                .is_none(),
+            "a clean structured result must not be blocked"
+        );
+    }
+
+    /// The structured walk carries the same "scan data, not field names" rule
+    /// the content blocks follow: an object KEY matching the pattern is the
+    /// tool's output schema, not its data, and must not fire.
+    #[tokio::test]
+    async fn structured_content_keys_do_not_trip_the_guardrail() {
+        use aisix_guardrails::{LiveGuardrailIndex, RequestContext};
+
+        const KEY_NAME_GUARD: &str = r#"{"name":"key-name-guard","kind":"keyword","hook_point":"output","patterns":[{"kind":"literal","value":"ssn"}]}"#;
+        let handle = SnapshotHandle::new(snapshot_with_key());
+        seed_guardrail(&handle, KEY_NAME_GUARD);
+        let chain = LiveGuardrailIndex::new(handle, None).resolve(&RequestContext {
+            model_id: "",
+            mcp_server_id: "",
+            api_key_id: "ak-1",
+            team_id: None,
+        });
+
+        let key_only = br#"{"jsonrpc":"2.0","id":1,"result":{"content":[],"structuredContent":{"ssn":"redacted upstream"}}}"#;
+        assert!(
+            output_guardrail_block(&chain, key_only, "lookup", &mut Vec::new())
+                .await
+                .is_none(),
+            "a schema field name must not be treated as tool data"
+        );
+
+        // The same pattern in a VALUE fires, proving the guardrail is live here.
+        let value_hit = br#"{"jsonrpc":"2.0","id":1,"result":{"content":[],"structuredContent":{"field":"ssn 123-45-6789"}}}"#;
+        assert!(
+            output_guardrail_block(&chain, value_hit, "lookup", &mut Vec::new())
+                .await
+                .is_some(),
+            "the pattern in a structured VALUE must block"
+        );
+    }
+
+    /// An `mcp_server`-scoped attachment governs only the tool calls routed to
+    /// that server — the dimension a Model scope cannot express for MCP.
+    #[tokio::test]
+    async fn mcp_server_scoped_guardrail_applies_only_to_that_server() {
+        let handle = SnapshotHandle::new(snapshot_with_key());
+        let hub = Arc::new(aisix_gateway::Hub::new());
+        let state = ProxyState::new(handle.clone(), hub, &cfg()).without_cache();
+        let router = build_router(state);
+        seed_mcp_server(&handle, "mcp-ghost", "ghost");
+        seed_mcp_server(&handle, "mcp-other", "other");
+        seed_guardrail_with_attachment(
+            &handle,
+            INPUT_GUARD,
+            r#"{"guardrail_id":"g1","scope_type":"mcp_server","scope_id":"mcp-ghost","priority":50}"#,
+        );
+
+        let blocked_body = |name: &str| {
+            mcp_request(
+                "tools/call",
+                serde_json::json!({ "name": name, "arguments": { "q": "forbidden-token" } }),
+            )
+        };
+        let body_text = |resp: Response| async move {
+            let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                .await
+                .expect("read body");
+            String::from_utf8_lossy(&bytes).into_owned()
+        };
+
+        let scoped = router
+            .clone()
+            .oneshot(blocked_body("ghost__tool"))
+            .await
+            .expect("router responds");
+        assert!(
+            body_text(scoped).await.contains("content policy"),
+            "the attached server's tool call must be blocked"
+        );
+
+        let other = router
+            .oneshot(blocked_body("other__tool"))
+            .await
+            .expect("router responds");
+        assert!(
+            !body_text(other).await.contains("content policy"),
+            "a server the guardrail is not attached to must be untouched"
         );
     }
 

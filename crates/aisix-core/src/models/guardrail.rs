@@ -962,20 +962,26 @@ impl Resource for Guardrail {
 /// Which dimension of the request a guardrail attachment is scoped to.
 ///
 /// `Env` applies to every request in the environment. The narrower scopes let
-/// operators attach a guardrail to only the models, API keys, or teams that
-/// need it.
+/// operators attach a guardrail to only the models, MCP servers, API keys, or
+/// teams that need it.
+///
+/// `Model` and `McpServer` select dimensions a request carries only one of: an
+/// MCP tool call resolves no model, and an LLM request routes to no MCP server.
+/// A `Model`-scoped guardrail therefore never inspects MCP traffic, and an
+/// `McpServer`-scoped one never inspects model traffic.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum GuardrailScopeType {
     Env,
     Model,
+    McpServer,
     ApiKey,
     Team,
 }
 
 /// Guardrail attachment that scopes one guardrail to an environment, model,
-/// caller API key, or team. AISIX loads attachments with the guardrail
-/// definitions and uses `scope_type` plus `scope_id` to decide which
+/// MCP server, caller API key, or team. AISIX loads attachments with the
+/// guardrail definitions and uses `scope_type` plus `scope_id` to decide which
 /// guardrails apply to each request.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 pub struct GuardrailAttachment {
@@ -986,8 +992,8 @@ pub struct GuardrailAttachment {
     /// What dimension of the request this attachment is scoped to.
     pub scope_type: GuardrailScopeType,
 
-    /// The UUID of the specific resource (model / api_key / team).
-    /// `None` when `scope_type` is `Env` (applies to all requests).
+    /// The UUID of the specific resource (model / mcp_server / api_key /
+    /// team). `None` when `scope_type` is `Env` (applies to all requests).
     pub scope_id: Option<String>,
 
     /// Higher number = higher precedence. When the same guardrail appears

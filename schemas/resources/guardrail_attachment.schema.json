@@ -2,17 +2,18 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "definitions": {
     "GuardrailScopeType": {
-      "description": "Which dimension of the request a guardrail attachment is scoped to.\n\n`Env` applies to every request in the environment. The narrower scopes let operators attach a guardrail to only the models, API keys, or teams that need it.",
+      "description": "Which dimension of the request a guardrail attachment is scoped to.\n\n`Env` applies to every request in the environment. The narrower scopes let operators attach a guardrail to only the models, MCP servers, API keys, or teams that need it.\n\n`Model` and `McpServer` select dimensions a request carries only one of: an MCP tool call resolves no model, and an LLM request routes to no MCP server. A `Model`-scoped guardrail therefore never inspects MCP traffic, and an `McpServer`-scoped one never inspects model traffic.",
       "enum": [
         "env",
         "model",
+        "mcp_server",
         "api_key",
         "team"
       ],
       "type": "string"
     }
   },
-  "description": "Guardrail attachment that scopes one guardrail to an environment, model, caller API key, or team. AISIX loads attachments with the guardrail definitions and uses `scope_type` plus `scope_id` to decide which guardrails apply to each request.",
+  "description": "Guardrail attachment that scopes one guardrail to an environment, model, MCP server, caller API key, or team. AISIX loads attachments with the guardrail definitions and uses `scope_type` plus `scope_id` to decide which guardrails apply to each request.",
   "properties": {
     "enabled": {
       "default": true,
@@ -37,7 +38,7 @@
       "type": "integer"
     },
     "scope_id": {
-      "description": "The UUID of the specific resource (model / api_key / team). `None` when `scope_type` is `Env` (applies to all requests).",
+      "description": "The UUID of the specific resource (model / mcp_server / api_key / team). `None` when `scope_type` is `Env` (applies to all requests).",
       "type": [
         "string",
         "null"

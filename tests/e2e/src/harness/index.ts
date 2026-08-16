@@ -4,7 +4,11 @@ export { ProxyClient } from "./proxy.js";
 export { EtcdClient } from "./etcd.js";
 export { SeedClient } from "./seed.js";
 export { startOpenAiUpstream, type OpenAiUpstream, type ReceivedRequest } from "./upstream-openai.js";
-export { startMcpUpstream, type McpUpstream } from "./upstream-mcp.js";
+export {
+  startMcpUpstream,
+  type McpUpstream,
+  type McpUpstreamOptions,
+} from "./upstream-mcp.js";
 export {
   startA2aUpstream,
   type A2aUpstream,

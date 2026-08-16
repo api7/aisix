@@ -306,9 +306,11 @@ pub enum ProxyError {
 /// metadata, safe to surface (#519 B.4b) — but never the matched-pattern
 /// detail (per #153 that detail stays in `tracing` only; echoing it lets
 /// callers enumerate the blocklist or extract the blocked output).
-/// `side` is `"request"` (input hook) or `"response"` (output hook).
-/// Every proxy endpoint family builds its 422 / SSE-error message through
-/// this helper so the envelope shape can't drift between siblings.
+/// `side` is `"request"` (input hook) or `"response"` (output hook) — the MCP
+/// endpoints pass `"tool call"` / `"tool result"` instead. Every endpoint
+/// family builds its rejection text through this helper so the wording can't
+/// drift between siblings, even where the envelope differs (422 or an SSE
+/// error event on the LLM routes; an `isError` tool result on `/mcp`).
 pub(crate) fn guardrail_block_message(side: &str, guardrail_name: Option<&str>) -> String {
     match guardrail_name {
         Some(name) => format!("{side} blocked by content policy (guardrail '{name}')"),

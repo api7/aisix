@@ -995,6 +995,7 @@ pub fn build_index_from_snapshot(
         let scope_kind = match attachment.scope_type {
             GuardrailScopeType::Env => ScopeKind::Env,
             GuardrailScopeType::Model => ScopeKind::Model,
+            GuardrailScopeType::McpServer => ScopeKind::McpServer,
             GuardrailScopeType::ApiKey => ScopeKind::ApiKey,
             GuardrailScopeType::Team => ScopeKind::Team,
         };
@@ -1887,6 +1888,7 @@ mod tests {
         let index = build_index_from_snapshot(&shuffled_table(), &attachments, None);
         let chain = index.resolve(&RequestContext {
             model_id: "m",
+            mcp_server_id: "",
             api_key_id: "k",
             team_id: None,
         });
@@ -1937,6 +1939,7 @@ mod tests {
 
         let ctx = RequestContext {
             model_id: "m1",
+            mcp_server_id: "",
             api_key_id: "k1",
             team_id: None,
         };
@@ -1977,6 +1980,7 @@ mod tests {
         // Verify the guardrail does not fire (not just that the index is empty).
         let ctx = RequestContext {
             model_id: "m",
+            mcp_server_id: "",
             api_key_id: "k",
             team_id: None,
         };
@@ -2025,6 +2029,7 @@ mod tests {
         );
         let ctx = RequestContext {
             model_id: "any",
+            mcp_server_id: "",
             api_key_id: "any",
             team_id: None,
         };
@@ -2066,6 +2071,7 @@ mod tests {
 
         let ctx = RequestContext {
             model_id: "any-model",
+            mcp_server_id: "",
             api_key_id: "any-key",
             team_id: None,
         };
@@ -2140,6 +2146,7 @@ mod tests {
 
         let ctx = RequestContext {
             model_id: "m1",
+            mcp_server_id: "",
             api_key_id: "k1",
             team_id: None,
         };
@@ -2193,6 +2200,7 @@ mod tests {
         let live = LiveGuardrailIndex::new(SnapshotHandle::new(AisixSnapshot::new()), None);
         let chain = live.resolve(&RequestContext {
             model_id: "m",
+            mcp_server_id: "",
             api_key_id: "k",
             team_id: None,
         });
@@ -2259,6 +2267,7 @@ mod tests {
             LiveGuardrailIndex::new_with_sink(SnapshotHandle::new(snap), None, Some(sink.clone()));
         let ctx = RequestContext {
             model_id: "m1",
+            mcp_server_id: "",
             api_key_id: "k1",
             team_id: None,
         };
@@ -2481,6 +2490,7 @@ mod tests {
         let index = build_index_from_snapshot(&guardrails, &attachments, None);
         let chain = index.resolve(&RequestContext {
             model_id: "m-A",
+            mcp_server_id: "",
             api_key_id: "k",
             team_id: None,
         });
@@ -2493,6 +2503,59 @@ mod tests {
             }],
             "applied mirrors the deduplicated chain, not the raw entry count",
         );
+    }
+
+    #[tokio::test]
+    async fn mcp_server_attachment_builds_into_the_index() {
+        // The wire `scope_type: "mcp_server"` survives the snapshot build and
+        // selects on the called server, leaving model traffic alone.
+        let guardrails: ResourceTable<DomainGuardrail> = ResourceTable::default();
+        guardrails.insert(entry(
+            "kw",
+            "g-1",
+            parse(
+                r#"{
+                    "name": "kw",
+                    "kind": "keyword",
+                    "hook_point": "input",
+                    "patterns": [{ "kind": "literal", "value": "AKIA" }]
+                }"#,
+            ),
+        ));
+        let attachments: ResourceTable<GuardrailAttachment> = ResourceTable::default();
+        attachments.insert(attachment_entry(
+            "a-mcp",
+            parse_attachment(
+                r#"{ "guardrail_id": "g-1", "scope_type": "mcp_server", "scope_id": "mcp-A", "priority": 50 }"#,
+            ),
+        ));
+
+        let index = build_index_from_snapshot(&guardrails, &attachments, None);
+        assert_eq!(index.len(), 1, "the attachment must not be skipped");
+
+        let matched = index.resolve(&RequestContext {
+            model_id: "",
+            mcp_server_id: "mcp-A",
+            api_key_id: "k",
+            team_id: None,
+        });
+        assert_eq!(matched.len(), 1);
+
+        let other_server = index.resolve(&RequestContext {
+            model_id: "",
+            mcp_server_id: "mcp-B",
+            api_key_id: "k",
+            team_id: None,
+        });
+        assert!(other_server.is_empty());
+
+        let llm = index.resolve(&RequestContext {
+            model_id: "m-A",
+            mcp_server_id: "",
+            api_key_id: "k",
+            team_id: None,
+        });
+        assert!(llm.is_empty(), "model traffic carries no MCP server");
     }
 
     #[tokio::test]
@@ -2524,6 +2587,7 @@ mod tests {
         let index = build_index_from_snapshot(&guardrails, &attachments, None);
         let chain = index.resolve(&RequestContext {
             model_id: "m-OTHER",
+            mcp_server_id: "",
             api_key_id: "k",
             team_id: None,
         });
