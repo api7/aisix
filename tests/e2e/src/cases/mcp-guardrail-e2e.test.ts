@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
+  ProxyClient,
   SeedClient,
   spawnApp,
   startMcpUpstream,
@@ -89,10 +90,6 @@ describe("mcp guardrails e2e: /mcp", () => {
     });
   };
 
-  const blockedByPolicy = (reply: RpcReply): boolean =>
-    reply.json?.result?.isError === true &&
-    (reply.json.result.content?.[0]?.text ?? "").includes("content policy");
-
   beforeAll(async () => {
     const etcd = new EtcdClient();
     etcdReachable = await etcd.ping();
@@ -114,12 +111,6 @@ describe("mcp guardrails e2e: /mcp", () => {
       url: beta.url,
       enabled: true,
     });
-    await seed.createApiKey({
-      key_hash: sha256(KEY),
-      allowed_models: [],
-      allowed_tools: ["*"],
-    });
-
     // One guardrail per behaviour under test, each with its own pattern, so
     // all three can be attached at once without interfering.
     const alphaOnly = await seed.createGuardrail({
@@ -153,11 +144,17 @@ describe("mcp guardrails e2e: /mcp", () => {
       });
     }
 
-    // Probe the narrowest condition — the server-scoped attachment matching
-    // alpha — so no assertion races a row that has not landed yet.
-    await waitConfigPropagation(async () =>
-      blockedByPolicy(await callTool("alpha__echo", ALPHA_ONLY_PATTERN)),
-    );
+    // The caller key is written LAST, so the key authenticating implies every
+    // row above it is already in the snapshot (etcd applies in revision
+    // order). The gate deliberately touches neither `/mcp` nor a guardrail:
+    // a broken assertion must fail as an assertion, not as a gate timeout.
+    await seed.createApiKey({
+      key_hash: sha256(KEY),
+      allowed_models: [],
+      allowed_tools: ["*"],
+    });
+    const proxy = new ProxyClient(app.proxyUrl, KEY);
+    await waitConfigPropagation(async () => (await proxy.listModels()).status === 200);
   }, 60_000);
 
   afterAll(async () => {
