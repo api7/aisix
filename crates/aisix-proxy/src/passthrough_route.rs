@@ -2184,11 +2184,9 @@ mod tests {
             .await;
 
         let snap = AisixSnapshot::new();
-        let pk_json = format!(
-            r#"{{"display_name":"openai-up","secret":"sk-upstream","api_base":"http://unused",
-                 "provider":"openai","adapter":"openai","strip_headers":[]}}"#
-        );
-        let pk: ProviderKey = serde_json::from_str(&pk_json).unwrap();
+        let pk_json = r#"{"display_name":"openai-up","secret":"sk-upstream","api_base":"http://unused",
+                 "provider":"openai","adapter":"openai","strip_headers":[]}"#;
+        let pk: ProviderKey = serde_json::from_str(pk_json).unwrap();
         snap.provider_keys.insert(ResourceEntry::new(PK_ID, pk, 1));
         snap.apikeys.insert(apikey_entry("sk-caller", Some(&["*"])));
         snap.passthrough_routes

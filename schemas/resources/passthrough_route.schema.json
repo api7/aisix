@@ -21,6 +21,21 @@
     {
       "if": {
         "required": [
+          "path_prefix"
+        ]
+      },
+      "then": {
+        "properties": {
+          "path_prefix": {
+            "minLength": 1,
+            "type": "string"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
           "hosts"
         ]
       },
@@ -29,6 +44,7 @@
           "hosts": {
             "items": {
               "minLength": 1,
+              "pattern": "^(\\*\\.)?([A-Za-z0-9-]+\\.)+[A-Za-z0-9-]+$|^[A-Za-z0-9-]+$",
               "type": "string"
             },
             "minItems": 1,
@@ -117,7 +133,54 @@
       "then": {
         "properties": {
           "target_url": {
-            "pattern": "^https?://"
+            "pattern": "^https?://",
+            "type": "string"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "auth_header_name"
+        ]
+      },
+      "then": {
+        "properties": {
+          "auth_header_name": {
+            "not": {
+              "enum": [
+                "authorization",
+                "proxy-authorization",
+                "cookie",
+                "set-cookie",
+                "x-api-key"
+              ]
+            },
+            "type": "string"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "identity_header"
+        ]
+      },
+      "then": {
+        "properties": {
+          "identity_header": {
+            "not": {
+              "enum": [
+                "authorization",
+                "proxy-authorization",
+                "cookie",
+                "set-cookie",
+                "x-api-key"
+              ]
+            },
+            "type": "string"
           }
         }
       }
@@ -134,6 +197,12 @@
         ]
       },
       "then": {
+        "properties": {
+          "auth_header_name": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
         "required": [
           "auth_header_name"
         ]
@@ -152,6 +221,10 @@
       },
       "then": {
         "properties": {
+          "anonymous_key_id": {
+            "minLength": 1,
+            "type": "string"
+          },
           "source_cidrs": {
             "items": {
               "minLength": 1,
@@ -192,6 +265,12 @@
         ]
       },
       "then": {
+        "properties": {
+          "provider_key_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
         "required": [
           "provider_key_id"
         ]
@@ -322,9 +401,9 @@
       ]
     },
     "auth_header_name": {
-      "description": "Header carrying the gateway credential (API key or JWT) when `auth_mode` is `header_key`, e.g. `x-aisix-api-key`. Lets `Authorization` carry the caller's own upstream credential. The header is stripped before forwarding. Required for `header_key`; ignored otherwise.",
+      "description": "Header carrying the gateway credential (API key or JWT) when `auth_mode` is `header_key`, e.g. `x-aisix-api-key`. Lets `Authorization` carry the caller's own upstream credential. The header is stripped before forwarding. Lowercase-only so the forbidden credential-slot list in the coupling is exhaustive (matching is case-insensitive on the wire regardless). Required for `header_key`; ignored otherwise.",
       "minLength": 1,
-      "pattern": "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$",
+      "pattern": "^[!#$%&'*+.^_`|~0-9a-z-]+$",
       "type": [
         "string",
         "null"
@@ -369,9 +448,9 @@
       ]
     },
     "identity_header": {
-      "description": "Optional header carrying the end-user identity injected by the upstream network device (e.g. `x-aisix-user`). Its value is recorded on the usage event for per-employee audit attribution and stripped before forwarding.",
+      "description": "Optional header carrying the end-user identity injected by the upstream network device (e.g. `x-aisix-user`). Its value is recorded on the usage event for per-employee audit attribution and stripped before forwarding. Lowercase-only so the forbidden credential-slot list in the coupling is exhaustive; credential-bearing names (`authorization`, `cookie`, …) are rejected outright — their value on the usage event would be credential retention, not identity.",
       "minLength": 1,
-      "pattern": "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$",
+      "pattern": "^[!#$%&'*+.^_`|~0-9a-z-]+$",
       "type": [
         "string",
         "null"
@@ -436,7 +515,7 @@
       ]
     },
     "timeout_ms": {
-      "description": "Maximum time, in milliseconds, for a non-streaming upstream exchange. Streaming responses are not bounded by this (the relay ends when the upstream stream ends or the client disconnects). When omitted, the gateway default request timeout applies.",
+      "description": "Maximum time, in milliseconds, for a non-streaming upstream exchange. On a streaming route it bounds the response-header phase and any non-SSE body read, but never a healthy SSE relay (which ends with the upstream stream or the client hanging up). When omitted, the gateway default request timeout applies to non-streaming exchanges only.",
       "format": "uint64",
       "minimum": 1.0,
       "type": [
