@@ -303,6 +303,9 @@ pub(crate) fn attempt_reached_upstream(err: &ProxyError) -> bool {
         | ProxyError::VideoNotFound(_)
         | ProxyError::ModelForbidden(_)
         | ProxyError::ModelIpRestricted(_)
+        | ProxyError::RouteIpRestricted(_)
+        | ProxyError::RouteForbidden(_)
+        | ProxyError::Gone(_)
         | ProxyError::InvalidRequest(_)
         | ProxyError::WebSocketUpgradeRequired { .. }
         | ProxyError::ProviderUnavailable

@@ -47,9 +47,10 @@ use yaml_rust2::{Yaml, YamlLoader};
 use crate::models::{
     validate_a2a_agent, validate_apikey, validate_cache_policy, validate_claim_mapping,
     validate_guardrail, validate_mcp_server, validate_model, validate_observability_exporter,
-    validate_oidc_provider, validate_provider_key, validate_rate_limit_policy, A2aAgent, ApiKey,
-    CachePolicy, ClaimMapping, Guardrail, McpServer, Model, ObservabilityExporter, OidcProvider,
-    ProviderKey, RateLimitPolicy, SchemaError,
+    validate_oidc_provider, validate_passthrough_route, validate_provider_key,
+    validate_rate_limit_policy, A2aAgent, ApiKey, CachePolicy, ClaimMapping, Guardrail, McpServer,
+    Model, ObservabilityExporter, OidcProvider, PassthroughRoute, ProviderKey, RateLimitPolicy,
+    SchemaError,
 };
 use crate::resource::ResourceEntry;
 use crate::AisixSnapshot;
@@ -130,8 +131,8 @@ pub(crate) fn url_has_credentials(url: &str) -> bool {
     false
 }
 
-/// Fixed processing order for the eleven resource collections.
-const KINDS: [(&str, IdentityField); 11] = [
+/// Fixed processing order for the twelve resource collections.
+const KINDS: [(&str, IdentityField); 12] = [
     ("provider_keys", IdentityField::DisplayName),
     ("models", IdentityField::DisplayName),
     ("api_keys", IdentityField::DisplayName),
@@ -143,6 +144,7 @@ const KINDS: [(&str, IdentityField); 11] = [
     ("rate_limit_policies", IdentityField::Name),
     ("oidc_providers", IdentityField::Name),
     ("claim_mappings", IdentityField::Name),
+    ("passthrough_routes", IdentityField::NameOrDisplayName),
 ];
 
 /// Load `path` into a fresh [`AisixSnapshot`], resolving `${VAR}`
@@ -348,6 +350,7 @@ pub fn load_from_str(
     let mut rate_limit_policies: Vec<(String, String, RateLimitPolicy)> = Vec::new();
     let mut oidc_providers: Vec<(String, String, OidcProvider)> = Vec::new();
     let mut claim_mappings: Vec<(String, String, ClaimMapping)> = Vec::new();
+    let mut passthrough_routes: Vec<(String, String, PassthroughRoute)> = Vec::new();
 
     for mut entry in prepared {
         let id = derive_id(entry.kind, &entry.identity);
@@ -411,6 +414,12 @@ pub fn load_from_str(
             "a2a_agents" => {
                 if let Some(t) = finish(&scope, &entry.doc, validate_a2a_agent, &mut errors) {
                     a2a_agents.push((id, scope, t));
+                }
+            }
+            "passthrough_routes" => {
+                if let Some(t) = finish(&scope, &entry.doc, validate_passthrough_route, &mut errors)
+                {
+                    passthrough_routes.push((id, scope, t));
                 }
             }
             "cache_policies" => {
@@ -738,6 +747,11 @@ pub fn load_from_str(
     for (id, _, v) in claim_mappings {
         snapshot
             .claim_mappings
+            .insert(ResourceEntry::new(id, v, revision));
+    }
+    for (id, _, v) in passthrough_routes {
+        snapshot
+            .passthrough_routes
             .insert(ResourceEntry::new(id, v, revision));
     }
     Ok(snapshot)

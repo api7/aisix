@@ -21,7 +21,8 @@
 
 use aisix_core::resource::ResourceEntry;
 use aisix_core::{
-    A2aAgent, ApiKey, CachePolicy, Guardrail, McpServer, Model, ObservabilityExporter, ProviderKey,
+    A2aAgent, ApiKey, CachePolicy, Guardrail, McpServer, Model, ObservabilityExporter,
+    PassthroughRoute, ProviderKey,
 };
 use etcd_client::{Client, GetOptions};
 use serde::de::DeserializeOwned;
@@ -39,6 +40,7 @@ pub const CACHE_POLICIES_SUBKEY: &str = "cache_policies";
 pub const OBSERVABILITY_EXPORTERS_SUBKEY: &str = "observability_exporters";
 pub const MCP_SERVERS_SUBKEY: &str = "mcp_servers";
 pub const A2A_AGENTS_SUBKEY: &str = "a2a_agents";
+pub const PASSTHROUGH_ROUTES_SUBKEY: &str = "passthrough_routes";
 
 pub struct EtcdConfigStore {
     client: Mutex<Client>,
@@ -287,6 +289,28 @@ impl ConfigStore for EtcdConfigStore {
     async fn list_a2a_agents(&self) -> Result<Vec<ResourceEntry<A2aAgent>>, StoreError> {
         Ok(self
             .list_range::<A2aAgent>(A2A_AGENTS_SUBKEY)
+            .await?
+            .into_iter()
+            .map(|(id, v, rev)| ResourceEntry::new(id, v, rev))
+            .collect())
+    }
+
+    async fn get_passthrough_route(
+        &self,
+        id: &str,
+    ) -> Result<Option<ResourceEntry<PassthroughRoute>>, StoreError> {
+        let key = self.key_for(PASSTHROUGH_ROUTES_SUBKEY, id);
+        Ok(self
+            .get_one::<PassthroughRoute>(&key)
+            .await?
+            .map(|(v, rev)| ResourceEntry::new(id, v, rev)))
+    }
+
+    async fn list_passthrough_routes(
+        &self,
+    ) -> Result<Vec<ResourceEntry<PassthroughRoute>>, StoreError> {
+        Ok(self
+            .list_range::<PassthroughRoute>(PASSTHROUGH_ROUTES_SUBKEY)
             .await?
             .into_iter()
             .map(|(id, v, rev)| ResourceEntry::new(id, v, rev))

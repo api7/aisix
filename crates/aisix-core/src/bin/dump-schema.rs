@@ -63,6 +63,7 @@ fn main() {
         "a2a_agent",
         "oidc_provider",
         "claim_mapping",
+        "passthrough_route",
     ] {
         dump_value(
             &out_dir,

@@ -1,0 +1,451 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "anyOf": [
+        {
+          "required": [
+            "path_prefix"
+          ],
+          "title": "Path-prefix match"
+        },
+        {
+          "required": [
+            "hosts"
+          ],
+          "title": "Host match"
+        }
+      ]
+    },
+    {
+      "if": {
+        "required": [
+          "hosts"
+        ]
+      },
+      "then": {
+        "properties": {
+          "hosts": {
+            "items": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "minItems": 1,
+            "type": "array"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "path_prefix"
+        ]
+      },
+      "then": {
+        "properties": {
+          "path_prefix": {
+            "not": {
+              "pattern": "^/(v1|mcp|a2a|admin|livez|readyz|metrics)(/|$)"
+            }
+          }
+        }
+      }
+    },
+    {
+      "oneOf": [
+        {
+          "not": {
+            "properties": {
+              "preserve_host": {
+                "const": true,
+                "description": "Set when the route derives its target from the inbound Host instead of target_url."
+              }
+            },
+            "required": [
+              "preserve_host"
+            ]
+          },
+          "required": [
+            "target_url"
+          ],
+          "title": "Explicit target URL"
+        },
+        {
+          "not": {
+            "required": [
+              "target_url"
+            ]
+          },
+          "properties": {
+            "preserve_host": {
+              "const": true,
+              "description": "Set when the route derives its target from the inbound Host instead of target_url."
+            }
+          },
+          "required": [
+            "preserve_host"
+          ],
+          "title": "Preserve inbound host"
+        }
+      ]
+    },
+    {
+      "if": {
+        "properties": {
+          "preserve_host": {
+            "const": true
+          }
+        },
+        "required": [
+          "preserve_host"
+        ]
+      },
+      "then": {
+        "required": [
+          "hosts"
+        ]
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "target_url"
+        ]
+      },
+      "then": {
+        "properties": {
+          "target_url": {
+            "pattern": "^https?://"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "auth_mode": {
+            "const": "header_key"
+          }
+        },
+        "required": [
+          "auth_mode"
+        ]
+      },
+      "then": {
+        "required": [
+          "auth_header_name"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "auth_mode": {
+            "const": "anonymous"
+          }
+        },
+        "required": [
+          "auth_mode"
+        ]
+      },
+      "then": {
+        "properties": {
+          "source_cidrs": {
+            "items": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "minItems": 1,
+            "type": "array"
+          }
+        },
+        "required": [
+          "anonymous_key_id",
+          "source_cidrs"
+        ]
+      }
+    },
+    {
+      "if": {
+        "anyOf": [
+          {
+            "not": {
+              "required": [
+                "credential_mode"
+              ]
+            },
+            "title": "credential_mode omitted (defaults to inject)"
+          },
+          {
+            "properties": {
+              "credential_mode": {
+                "const": "inject"
+              }
+            },
+            "required": [
+              "credential_mode"
+            ],
+            "title": "credential_mode: inject"
+          }
+        ]
+      },
+      "then": {
+        "required": [
+          "provider_key_id"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "credential_mode": {
+            "const": "forward_client"
+          }
+        },
+        "required": [
+          "credential_mode"
+        ]
+      },
+      "then": {
+        "not": {
+          "required": [
+            "provider_key_id"
+          ]
+        }
+      }
+    }
+  ],
+  "anyOf": [
+    {
+      "required": [
+        "name"
+      ],
+      "title": "name"
+    },
+    {
+      "required": [
+        "display_name"
+      ],
+      "title": "display_name"
+    }
+  ],
+  "definitions": {
+    "PassthroughAuthMode": {
+      "description": "How the gateway authenticates callers of a passthrough route.",
+      "oneOf": [
+        {
+          "description": "Standard gateway auth: an API key or JWT in `Authorization: Bearer` or `x-api-key`, exactly like the typed endpoints.",
+          "enum": [
+            "gateway_key"
+          ],
+          "title": "Standard gateway credential",
+          "type": "string"
+        },
+        {
+          "description": "Gateway credential in the route's `auth_header_name` header; `Authorization` is left untouched for the upstream credential.",
+          "enum": [
+            "header_key"
+          ],
+          "title": "Gateway credential in a dedicated header",
+          "type": "string"
+        },
+        {
+          "description": "No inbound gateway credential. The request runs as the route's `anonymous_key_id` principal, restricted to `source_cidrs`.",
+          "enum": [
+            "anonymous"
+          ],
+          "title": "Anonymous (bound principal)",
+          "type": "string"
+        }
+      ]
+    },
+    "PassthroughCredentialMode": {
+      "description": "How the upstream credential of a passthrough route is produced.",
+      "oneOf": [
+        {
+          "description": "Strip inbound credential headers and inject the configured ProviderKey's secret (the legacy tunnel's behavior, now explicit).",
+          "enum": [
+            "inject"
+          ],
+          "title": "Inject the ProviderKey secret",
+          "type": "string"
+        },
+        {
+          "description": "Forward the caller's own `Authorization` (and other credential headers) verbatim — bring-your-own-credential. Gateway side-channel headers are still stripped so the gateway credential never leaks upstream.",
+          "enum": [
+            "forward_client"
+          ],
+          "title": "Forward the caller's own credential",
+          "type": "string"
+        }
+      ]
+    },
+    "PassthroughProtocol": {
+      "description": "Body-shape hint for a passthrough route.",
+      "oneOf": [
+        {
+          "description": "No parsing: bodies are opaque byte blobs (guardrails scan them as one lossy-UTF-8 text).",
+          "enum": [
+            "raw"
+          ],
+          "title": "Opaque body",
+          "type": "string"
+        },
+        {
+          "description": "OpenAI-compatible chat envelope (`messages`, streamed `choices[].delta.content`, final-chunk / response `usage`).",
+          "enum": [
+            "openai_chat"
+          ],
+          "title": "OpenAI-compatible chat",
+          "type": "string"
+        },
+        {
+          "description": "OpenAI-compatible legacy completions / FIM envelope (`prompt` [+ `suffix`], streamed `choices[].text`, `usage`).",
+          "enum": [
+            "openai_completions"
+          ],
+          "title": "OpenAI-compatible completions / FIM",
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "properties": {
+    "anonymous_key_id": {
+      "description": "The API key this route's traffic runs as when `auth_mode` is `anonymous`: its `allowed_routes`, rate limits, budget and usage attribution all apply, so anonymous traffic keeps a stable, governable principal. Required for `anonymous`; ignored otherwise.",
+      "minLength": 1,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "auth_header_name": {
+      "description": "Header carrying the gateway credential (API key or JWT) when `auth_mode` is `header_key`, e.g. `x-aisix-api-key`. Lets `Authorization` carry the caller's own upstream credential. The header is stripped before forwarding. Required for `header_key`; ignored otherwise.",
+      "minLength": 1,
+      "pattern": "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "auth_mode": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/PassthroughAuthMode"
+        }
+      ],
+      "default": "gateway_key",
+      "description": "How the gateway authenticates the caller on this route."
+    },
+    "credential_mode": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/PassthroughCredentialMode"
+        }
+      ],
+      "default": "inject",
+      "description": "How the upstream credential is produced."
+    },
+    "display_name": {
+      "description": "Accepted as an alternative spelling of `name`. Provide the label under exactly one of the two names.",
+      "minLength": 1,
+      "type": "string"
+    },
+    "enabled": {
+      "default": true,
+      "description": "Whether this route is active. A disabled route matches nothing.",
+      "type": "boolean"
+    },
+    "hosts": {
+      "description": "Inbound `Host` values this route serves (the forward-proxy entry: a TLS-terminating device delivers plaintext traffic with the original host, e.g. `api.githubcopilot.com`). Matched case-insensitively, ignoring any `:port` suffix; a leading `*.` wildcard matches exactly one extra label (`*.githubcopilot.com` matches `proxy.githubcopilot.com`). Host-matched requests keep their full path (no prefix stripping unless `path_prefix` also matched).",
+      "items": {
+        "type": "string"
+      },
+      "type": [
+        "array",
+        "null"
+      ]
+    },
+    "identity_header": {
+      "description": "Optional header carrying the end-user identity injected by the upstream network device (e.g. `x-aisix-user`). Its value is recorded on the usage event for per-employee audit attribution and stripped before forwarding.",
+      "minLength": 1,
+      "pattern": "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "name": {
+      "description": "Operator-facing label, unique within the gateway. Referenced by API keys' `allowed_routes` globs and used for usage attribution.",
+      "minLength": 1,
+      "type": "string"
+    },
+    "path_prefix": {
+      "description": "Gateway path prefix this route serves, e.g. `/passthrough/openai`. The prefix is stripped before the remainder is joined to the target URL. Must start with `/` and must not claim a reserved gateway namespace (`/v1`, `/mcp`, `/a2a`, health probes). At least one of `path_prefix` / `hosts` is required; when both are set the request must satisfy both.",
+      "minLength": 1,
+      "pattern": "^/",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "preserve_host": {
+      "description": "Derive the target from the request's own `Host` header (`https://<host>`), for forward-proxy routes that fan one route out over several official hosts. Only legal when `hosts` is set — the matched allowlist is what makes the derived target non-attacker- controlled (SSRF guard).",
+      "type": "boolean"
+    },
+    "protocol": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/PassthroughProtocol"
+        }
+      ],
+      "default": "raw",
+      "description": "Body-shape hint for auditing, guardrails and usage extraction. Parsing is best-effort: a body that does not match the declared shape degrades to `raw` handling, it is never rejected for shape."
+    },
+    "provider_key_id": {
+      "description": "ProviderKey whose secret is injected upstream when `credential_mode` is `inject` (per-provider auth shape: `x-api-key` + `anthropic-version` for Anthropic, `Authorization: Bearer` otherwise; its `strip_headers` and TLS settings apply). Required for `inject`; forbidden for `forward_client`.",
+      "minLength": 1,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "source_cidrs": {
+      "description": "Client source CIDRs allowed to use this route. Required (non-empty) when `auth_mode` is `anonymous` — network reachability is the only gate left in front of the anonymous principal. Optional hardening for the other modes; unset means no route-level restriction.",
+      "items": {
+        "type": "string"
+      },
+      "type": [
+        "array",
+        "null"
+      ]
+    },
+    "streaming": {
+      "default": true,
+      "description": "Relay `text/event-stream` upstream responses incrementally. When `false` streaming responses are fully buffered like any other body.",
+      "type": "boolean"
+    },
+    "target_url": {
+      "description": "Explicit upstream base URL, e.g. `https://api.openai.com`. The matched request's remainder path and query are appended. Exactly one of `target_url` / `preserve_host` must be configured.",
+      "minLength": 1,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "timeout_ms": {
+      "description": "Maximum time, in milliseconds, for a non-streaming upstream exchange. Streaming responses are not bounded by this (the relay ends when the upstream stream ends or the client disconnects). When omitted, the gateway default request timeout applies.",
+      "format": "uint64",
+      "minimum": 1.0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    }
+  },
+  "required": [],
+  "title": "PassthroughRoute",
+  "type": "object"
+}

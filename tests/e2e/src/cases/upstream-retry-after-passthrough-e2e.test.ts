@@ -56,9 +56,16 @@ describe("upstream 429 Retry-After passthrough e2e", () => {
       model_name: "gpt-4o-mini",
       provider_key_id: pk.id,
     });
+    await seed.createPassthroughRoute({
+      name: "retry-after-tunnel",
+      path_prefix: "/passthrough/openai",
+      target_url: `${upstream.baseUrl}/v1`,
+      provider_key_id: pk.id,
+    });
     await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["retry-after-model"],
+      allowed_routes: ["*"],
     });
   });
 

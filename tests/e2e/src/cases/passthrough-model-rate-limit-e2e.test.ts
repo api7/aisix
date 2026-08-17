@@ -101,11 +101,20 @@ describe("passthrough e2e: body-model rate limiting on the raw tunnel", () => {
       provider_key_id: pk.id,
       rate_limit: { rpm: 1 },
     });
+    // The explicit route serving the old alibaba tunnel prefix: the body
+    // model probe is scoped to the route's ProviderKey provider.
+    await seed.createPassthroughRoute({
+      name: "pt-rl-alibaba-tunnel",
+      path_prefix: "/passthrough/alibaba",
+      target_url: upstream.baseUrl,
+      provider_key_id: pk.id,
+    });
     // Caller key carries NO rate limit of its own — the only cap in
     // play is the Model's, which is exactly the layer under test.
     await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["*"],
+      allowed_routes: ["*"],
     });
 
     // Readiness probe uses an UNREGISTERED model name so it never

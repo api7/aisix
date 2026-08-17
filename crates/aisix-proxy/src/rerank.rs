@@ -272,6 +272,7 @@ async fn dispatch(
     // content-policy refusal doesn't burn an RPM slot. (Output is reranked
     // indices/scores, not generated text, so there is no output hook.)
     let guardrail_ctx = aisix_guardrails::RequestContext {
+        passthrough_route_id: "",
         model_id: &model_entry.id,
         mcp_server_id: "",
         api_key_id: &auth.entry.id,

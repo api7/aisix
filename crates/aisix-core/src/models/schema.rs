@@ -60,6 +60,7 @@ pub struct Schemas {
     pub a2a_agent: Validator,
     pub oidc_provider: Validator,
     pub claim_mapping: Validator,
+    pub passthrough_route: Validator,
 }
 
 pub static SCHEMAS: Lazy<Arc<Schemas>> = Lazy::new(|| Arc::new(Schemas::compile(true)));
@@ -102,6 +103,7 @@ pub fn resource_root_schema(resource: &str, strict: bool) -> Value {
         "a2a_agent" => a2a_agent_root_schema(),
         "oidc_provider" => oidc_provider_root_schema(),
         "claim_mapping" => claim_mapping_root_schema(),
+        "passthrough_route" => passthrough_route_root_schema(),
         other => panic!("unknown resource {other:?}"),
     };
     if strict && closes_on_write(resource) {
@@ -131,6 +133,7 @@ impl Schemas {
             a2a_agent: build("a2a_agent"),
             oidc_provider: build("oidc_provider"),
             claim_mapping: build("claim_mapping"),
+            passthrough_route: build("passthrough_route"),
         }
     }
 }
@@ -315,6 +318,10 @@ pub fn validate_claim_mapping(value: &Value) -> Result<(), SchemaError> {
     validate(&SCHEMAS.claim_mapping, value)
 }
 
+pub fn validate_passthrough_route(value: &Value) -> Result<(), SchemaError> {
+    validate(&SCHEMAS.passthrough_route, value)
+}
+
 // ---- lenient variants (etcd snapshot loader only, issue #871) ----
 //
 // Unknown fields pass; every other constraint still applies. The loader
@@ -371,6 +378,10 @@ pub fn validate_oidc_provider_lenient(value: &Value) -> Result<(), SchemaError> 
 
 pub fn validate_claim_mapping_lenient(value: &Value) -> Result<(), SchemaError> {
     validate(&LENIENT_SCHEMAS.claim_mapping, value)
+}
+
+pub fn validate_passthrough_route_lenient(value: &Value) -> Result<(), SchemaError> {
+    validate(&LENIENT_SCHEMAS.passthrough_route, value)
 }
 
 /// Build a resource's canonical JSON Schema from its struct via `schemars`,
@@ -696,6 +707,63 @@ pub fn claim_mapping_root_schema() -> Value {
         .and_then(Value::as_object_mut)
     {
         priority.insert("default".to_string(), json!(0));
+    }
+    schema
+}
+
+/// Canonical JSON Schema for the `passthrough_route` resource, derived from
+/// the [`PassthroughRoute`](crate::models::PassthroughRoute) struct. Uses the
+/// nullable `Option` representation (`true`) so unset optional fields accept
+/// an explicit `null` as well as being absent. The `auth_mode` /
+/// `credential_mode` / `protocol` closed sets come from their enums; every
+/// cross-field invariant (match dimensions, target shape, per-mode required
+/// companions) is injected as an `allOf` (see
+/// [`super::passthrough_route::passthrough_route_coupling`]) so the strict
+/// write path and the lenient etcd read path enforce the same coupling. The
+/// label is accepted under both `name` and its `display_name` alias.
+pub fn passthrough_route_root_schema() -> Value {
+    let mut schema = struct_root_schema::<crate::models::PassthroughRoute>(true);
+    schema
+        .as_object_mut()
+        .expect("passthrough route root schema is a JSON object")
+        .insert(
+            "allOf".to_string(),
+            super::passthrough_route::passthrough_route_coupling(),
+        );
+    accept_renamed_field(
+        &mut schema,
+        "name",
+        "display_name",
+        "Accepted as an alternative spelling of `name`. \
+         Provide the label under exactly one of the two names.",
+    );
+    if let Some(Value::Object(defs)) = schema.get_mut("definitions") {
+        title_single_value_enum_variants(
+            defs,
+            "PassthroughAuthMode",
+            &[
+                ("gateway_key", "Standard gateway credential"),
+                ("header_key", "Gateway credential in a dedicated header"),
+                ("anonymous", "Anonymous (bound principal)"),
+            ],
+        );
+        title_single_value_enum_variants(
+            defs,
+            "PassthroughCredentialMode",
+            &[
+                ("inject", "Inject the ProviderKey secret"),
+                ("forward_client", "Forward the caller's own credential"),
+            ],
+        );
+        title_single_value_enum_variants(
+            defs,
+            "PassthroughProtocol",
+            &[
+                ("raw", "Opaque body"),
+                ("openai_chat", "OpenAI-compatible chat"),
+                ("openai_completions", "OpenAI-compatible completions / FIM"),
+            ],
+        );
     }
     schema
 }

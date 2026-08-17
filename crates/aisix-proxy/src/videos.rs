@@ -1640,6 +1640,7 @@ async fn dispatch_create(
     // embeddings, run BEFORE the rate-limit reservation so a policy
     // block doesn't burn an RPM slot (#542).
     let guardrail_ctx = aisix_guardrails::RequestContext {
+        passthrough_route_id: "",
         model_id: &target.model_entry.id,
         mcp_server_id: "",
         api_key_id: &auth.entry.id,

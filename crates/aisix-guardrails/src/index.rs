@@ -41,6 +41,7 @@ pub enum ScopeKind {
     McpServer,
     ApiKey,
     Team,
+    PassthroughRoute,
 }
 
 /// One entry in the index: a pre-built runtime guardrail associated with
@@ -88,6 +89,9 @@ impl IndexEntry {
             // the dimension — compare only non-empty ids.
             ScopeKind::Model => matches_id(self.scope_id.as_deref(), ctx.model_id),
             ScopeKind::McpServer => matches_id(self.scope_id.as_deref(), ctx.mcp_server_id),
+            ScopeKind::PassthroughRoute => {
+                matches_id(self.scope_id.as_deref(), ctx.passthrough_route_id)
+            }
             ScopeKind::ApiKey => self.scope_id.as_deref() == Some(ctx.api_key_id),
             ScopeKind::Team => ctx
                 .team_id
@@ -114,6 +118,9 @@ pub struct RequestContext<'a> {
     /// UUID of the registered MCP server an MCP tool call is routed to.
     /// Empty for every request that is not an MCP tool call.
     pub mcp_server_id: &'a str,
+    /// UUID of the passthrough route serving the request. Empty for every
+    /// request that is not passthrough-route traffic.
+    pub passthrough_route_id: &'a str,
     /// UUID of the API key used to authenticate the request.
     pub api_key_id: &'a str,
     /// UUID of the team the API key belongs to. `None` if the key is not
@@ -134,14 +141,16 @@ pub struct GuardrailIndex {
 
 /// Scope specificity rank: higher = more specific → wins dedup on equal priority.
 /// ApiKey > Team > Model > Env, matching the P0c spec in #379. `McpServer`
-/// shares `Model`'s rank: the two dimensions are mutually exclusive within a
-/// request (an MCP tool call resolves no model and an LLM request routes to no
-/// MCP server), so their relative order can never decide a deduplication.
+/// and `PassthroughRoute` share `Model`'s rank: the three dimensions are
+/// mutually exclusive within a request (an MCP tool call resolves no model,
+/// an LLM request routes to no MCP server, and passthrough-route traffic
+/// resolves neither), so their relative order can never decide a
+/// deduplication.
 fn scope_specificity(k: &ScopeKind) -> u8 {
     match k {
         ScopeKind::ApiKey => 3,
         ScopeKind::Team => 2,
-        ScopeKind::Model | ScopeKind::McpServer => 1,
+        ScopeKind::Model | ScopeKind::McpServer | ScopeKind::PassthroughRoute => 1,
         ScopeKind::Env => 0,
     }
 }
@@ -251,6 +260,7 @@ mod tests {
 
     fn ctx<'a>(model: &'a str, apikey: &'a str, team: Option<&'a str>) -> RequestContext<'a> {
         RequestContext {
+            passthrough_route_id: "",
             model_id: model,
             mcp_server_id: "",
             api_key_id: apikey,
@@ -345,6 +355,7 @@ mod tests {
         )]);
 
         let mcp_ctx = |server: &'static str| RequestContext {
+            passthrough_route_id: "",
             model_id: "",
             mcp_server_id: server,
             api_key_id: "k1",
@@ -380,6 +391,7 @@ mod tests {
 
         // An MCP tool call has no model; an LLM request has no MCP server.
         let mcp_chain = idx.resolve(&RequestContext {
+            passthrough_route_id: "",
             model_id: "",
             mcp_server_id: "mcp-A",
             api_key_id: "k1",
@@ -656,6 +668,7 @@ mod tests {
             let key = format!("scope-{}", (i + 3) % 10);
             let team = format!("scope-{}", (i + 7) % 10);
             let _ = idx.resolve(&RequestContext {
+                passthrough_route_id: "",
                 model_id: &model,
                 mcp_server_id: "",
                 api_key_id: &key,

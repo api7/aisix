@@ -28,6 +28,7 @@ pub mod mcp_server;
 pub mod model;
 pub mod observability_exporter;
 pub mod oidc_provider;
+pub mod passthrough_route;
 pub mod policy_conditions;
 pub mod provider_key;
 pub mod rate_limit;
@@ -61,6 +62,9 @@ pub use observability_exporter::{
     ObjectStoreProvider, ObservabilityExporter, OtlpHttpConfig, SlsContentMode,
 };
 pub use oidc_provider::{BoundClaimExpect, OidcProvider};
+pub use passthrough_route::{
+    PassthroughAuthMode, PassthroughCredentialMode, PassthroughProtocol, PassthroughRoute,
+};
 pub use policy_conditions::{
     eval_condition_nodes, validate_condition_nodes, ConditionGroup, ConditionInput, ConditionLogic,
     ConditionNode, ConditionOperator, ConditionValue, GroupByDimension, PolicyAction,
@@ -81,8 +85,9 @@ pub use schema::{
     validate_mcp_policy_lenient, validate_mcp_server, validate_mcp_server_lenient, validate_model,
     validate_model_lenient, validate_observability_exporter,
     validate_observability_exporter_lenient, validate_oidc_provider,
-    validate_oidc_provider_lenient, validate_provider_key, validate_provider_key_lenient,
-    validate_rate_limit_policy, validate_rate_limit_policy_lenient, SchemaError,
+    validate_oidc_provider_lenient, validate_passthrough_route, validate_passthrough_route_lenient,
+    validate_provider_key, validate_provider_key_lenient, validate_rate_limit_policy,
+    validate_rate_limit_policy_lenient, SchemaError,
 };
 pub use semantic::{
     Aggregation, DistanceMetric, EmbeddingFailureMode, OnEmbeddingFailure, Semantic, SemanticMatch,

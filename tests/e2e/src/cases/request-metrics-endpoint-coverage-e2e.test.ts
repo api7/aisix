@@ -157,9 +157,9 @@ describe("request metrics endpoint coverage e2e", () => {
       return;
     }
 
-    // An unconfigured provider: the request fails, which is the path that
-    // used to put the caller-supplied `:provider` segment straight into the
-    // `provider` label.
+    // An unclaimed tunnel path: the 410 tombstone is still counted, and
+    // the caller-supplied path segment must never become a label — the
+    // same #451 contract the old tunnel's failure path carried.
     const res = await fetch(
       `${app.proxyUrl}/passthrough/reqmetrics-bogus-provider/v1/anything`,
       {
@@ -171,10 +171,10 @@ describe("request metrics endpoint coverage e2e", () => {
         body: JSON.stringify({ hello: "world" }),
       },
     );
-    expect(res.status).toBeGreaterThanOrEqual(400);
+    expect(res.status).toBe(410);
 
     const text = await scrape(app);
-    const endpoint = "/passthrough/:provider/*rest";
+    const endpoint = "/passthrough_route";
 
     expect(seriesFor(text, "aisix_proxy_requests_total", endpoint)).not.toHaveLength(
       0,

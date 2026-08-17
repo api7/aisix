@@ -20,6 +20,8 @@
 //!   `GET /admin/v1/observability_exporters/:id`
 //! - `GET /admin/v1/mcp_servers` and `GET /admin/v1/mcp_servers/:id`
 //! - `GET /admin/v1/a2a_agents` and `GET /admin/v1/a2a_agents/:id`
+//! - `GET /admin/v1/passthrough_routes` and
+//!   `GET /admin/v1/passthrough_routes/:id`
 //! - `GET /admin/v1/models/status`, `GET /admin/v1/health`
 //!
 //! The resource write endpoints (POST/PUT/DELETE, including api-key
@@ -50,6 +52,7 @@ mod models_handlers;
 mod models_status_handler;
 mod observability_exporters_handlers;
 mod openapi;
+mod passthrough_routes_handlers;
 mod playground_handler;
 mod provider_keys_handlers;
 mod state;
@@ -162,6 +165,14 @@ pub fn build_router(state: AdminState) -> Router {
         .route(
             "/admin/v1/a2a_agents/:id",
             get(a2a_agents_handlers::get_a2a_agent),
+        )
+        .route(
+            "/admin/v1/passthrough_routes",
+            get(passthrough_routes_handlers::list_passthrough_routes),
+        )
+        .route(
+            "/admin/v1/passthrough_routes/:id",
+            get(passthrough_routes_handlers::get_passthrough_route),
         )
         .route(
             "/admin/v1/guardrails",
@@ -909,7 +920,7 @@ mod tests {
         use aisix_core::resource::ResourceEntry;
         use aisix_core::{
             A2aAgent, ApiKey, CachePolicy, Guardrail, McpServer, Model, ObservabilityExporter,
-            ProviderKey,
+            PassthroughRoute, ProviderKey,
         };
 
         // A store whose every call fails with backend detail an anonymous
@@ -945,6 +956,7 @@ mod tests {
             { ObservabilityExporter, get_observability_exporter, list_observability_exporters }
             { McpServer, get_mcp_server, list_mcp_servers }
             { A2aAgent, get_a2a_agent, list_a2a_agents }
+            { PassthroughRoute, get_passthrough_route, list_passthrough_routes }
         }
 
         let app = metrics_router(
@@ -983,7 +995,7 @@ mod tests {
         use aisix_core::resource::ResourceEntry;
         use aisix_core::{
             A2aAgent, ApiKey, CachePolicy, Guardrail, McpServer, Model, ObservabilityExporter,
-            ProviderKey,
+            PassthroughRoute, ProviderKey,
         };
 
         // A store whose every call never resolves (mimics a blackholed
@@ -1019,6 +1031,7 @@ mod tests {
             { ObservabilityExporter, get_observability_exporter, list_observability_exporters }
             { McpServer, get_mcp_server, list_mcp_servers }
             { A2aAgent, get_a2a_agent, list_a2a_agents }
+            { PassthroughRoute, get_passthrough_route, list_passthrough_routes }
         }
 
         let app = metrics_router(

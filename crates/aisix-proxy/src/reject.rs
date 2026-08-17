@@ -266,7 +266,6 @@ mod tests {
             ("POST", "/v1/fine_tuning/jobs/%ff/cancel"),
             ("GET", "/v1/videos/%ff"),
             ("GET", "/v1/videos/%ff/content"),
-            ("POST", "/passthrough/%ff/v1/chat"),
         ] {
             let (status, body) = send(router.clone(), method, path, true).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{method} {path}: {body}");

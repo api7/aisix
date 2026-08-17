@@ -14,6 +14,7 @@ use super::mcp_server::McpServer;
 use super::model::Model;
 use super::observability_exporter::ObservabilityExporter;
 use super::oidc_provider::OidcProvider;
+use super::passthrough_route::PassthroughRoute;
 use super::provider_key::ProviderKey;
 use super::rate_limit_policy::RateLimitPolicy;
 use crate::snapshot::ResourceTable;
@@ -62,6 +63,12 @@ pub struct AisixSnapshot {
     /// rules for the matched trust provider are evaluated in priority
     /// order and the first match selects the key the request runs as.
     pub claim_mappings: ResourceTable<ClaimMapping>,
+    /// Explicit passthrough bindings: `/aisix/<env>/passthrough_routes/<uuid>`.
+    /// Each row maps a gateway entry (path prefix and/or inbound `Host`) to
+    /// one upstream target with its own auth and credential handling; the
+    /// proxy matches them after the typed routes (path) or before them
+    /// (foreign `Host`).
+    pub passthrough_routes: ResourceTable<PassthroughRoute>,
 }
 
 impl AisixSnapshot {
@@ -85,6 +92,7 @@ impl AisixSnapshot {
             + self.a2a_agents.len()
             + self.oidc_providers.len()
             + self.claim_mappings.len()
+            + self.passthrough_routes.len()
     }
 }
 

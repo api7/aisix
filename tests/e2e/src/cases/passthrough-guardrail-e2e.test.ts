@@ -20,6 +20,9 @@ import {
 //     blocked 422 before the upstream is ever called.
 //   - OUTPUT: a clean request whose upstream reply carries a forbidden word is
 //     blocked 422 and the word never reaches the caller.
+//   - STREAMING OUTPUT: on an SSE relay the keyword chain folds to the
+//     fail-closed BufferFull hold-back — held frames are dropped on a hit
+//     and the caller sees only the error frame, never the forbidden text.
 
 const CALLER_PLAINTEXT = "sk-pt-gr-caller";
 const CALLER_KEY_HASH = createHash("sha256")
@@ -34,6 +37,7 @@ const OUTPUT_GUARDRAIL = "pt-gr-output-keyword";
 describe("passthrough guardrail (#911 [6])", () => {
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
+  let sseUpstream: OpenAiUpstream | undefined;
   let seed: SeedClient | undefined;
   let etcdReachable = false;
 
@@ -75,9 +79,16 @@ describe("passthrough guardrail (#911 [6])", () => {
       model_name: "gpt-4o-mini",
       provider_key_id: pk.id,
     });
+    await seed.createPassthroughRoute({
+      name: "pt-gr-tunnel",
+      path_prefix: "/passthrough/openai",
+      target_url: `${upstream.baseUrl}/v1`,
+      provider_key_id: pk.id,
+    });
     await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["pt-gr"],
+      allowed_routes: ["*"],
     });
     await seed.createGuardrail({
       name: INPUT_GUARDRAIL,
@@ -93,11 +104,27 @@ describe("passthrough guardrail (#911 [6])", () => {
       kind: "keyword",
       patterns: [{ kind: "literal", value: FORBIDDEN_OUTPUT }],
     });
+
+    sseUpstream = await startOpenAiUpstream({
+      streamEvents: [
+        JSON.stringify({ choices: [{ delta: { content: "prelude " } }] }),
+        JSON.stringify({ choices: [{ delta: { content: FORBIDDEN_OUTPUT } }] }),
+        "[DONE]",
+      ],
+    });
+    await seed.createPassthroughRoute({
+      name: "pt-gr-sse-tunnel",
+      path_prefix: "/pt-gr-sse",
+      target_url: sseUpstream.baseUrl,
+      provider_key_id: pk.id,
+      protocol: "openai_chat",
+    });
   });
 
   afterAll(async () => {
     await app?.exit();
     await upstream?.close();
+    await sseUpstream?.close();
   });
 
   function passthrough(body: unknown): Promise<Response> {
@@ -178,4 +205,43 @@ describe("passthrough guardrail (#911 [6])", () => {
     // not reach the provider.
     expect(upstream.receivedRequests.length - hitsBefore).toBe(0);
   });
+
+  test("streaming output block: held frames are dropped, only the error frame reaches the caller", async (ctx) => {
+    if (!etcdReachable || !app || !sseUpstream) {
+      ctx.skip();
+      return;
+    }
+
+    const call = () =>
+      fetch(`${app!.proxyUrl}/pt-gr-sse/chat/completions`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${CALLER_PLAINTEXT}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ model: "gpt-4o", stream: true, messages: [] }),
+      });
+
+    await waitConfigPropagation(async () => {
+      try {
+        const r = await call();
+        const ok = r.status === 200;
+        await r.text();
+        return ok;
+      } catch {
+        return false;
+      }
+    });
+
+    const res = await call();
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    // The keyword chain's default policy is fail-closed BufferFull: the
+    // forbidden delta (and everything held with it) must never be
+    // relayed; the caller sees the SSE error frame instead.
+    expect(text).not.toContain(FORBIDDEN_OUTPUT);
+    expect(text).not.toContain("prelude");
+    expect(text).toContain("event: error");
+    expect(text).toContain("content_filter");
+  }, 30_000);
 });

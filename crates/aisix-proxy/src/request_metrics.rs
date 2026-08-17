@@ -185,8 +185,8 @@ impl Default for Upstream<'_> {
 ///
 /// Deliberately absent, and why:
 /// - `/mcp`, `/mcp/{server}`, `/a2a` — tool and agent calls, no model.
-/// - `/passthrough/:provider/*rest` — an opaque tunnel; the gateway parses
-///   nothing and cannot attribute a model.
+/// - `/passthrough_route` — an opaque relay; even a `protocol`-aware route
+///   resolves no configured Model to attribute.
 /// - `/v1/files`, `/v1/batches`, `/v1/fine_tuning/jobs` — management calls.
 ///
 /// `/v1/realtime` was in that list until the token families reached it too.

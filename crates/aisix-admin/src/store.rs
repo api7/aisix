@@ -9,7 +9,8 @@
 
 use aisix_core::resource::ResourceEntry;
 use aisix_core::{
-    A2aAgent, ApiKey, CachePolicy, Guardrail, McpServer, Model, ObservabilityExporter, ProviderKey,
+    A2aAgent, ApiKey, CachePolicy, Guardrail, McpServer, Model, ObservabilityExporter,
+    PassthroughRoute, ProviderKey,
 };
 use dashmap::DashMap;
 use std::sync::Arc;
@@ -62,6 +63,14 @@ pub trait ConfigStore: Send + Sync + 'static {
 
     async fn get_a2a_agent(&self, id: &str) -> Result<Option<ResourceEntry<A2aAgent>>, StoreError>;
     async fn list_a2a_agents(&self) -> Result<Vec<ResourceEntry<A2aAgent>>, StoreError>;
+
+    async fn get_passthrough_route(
+        &self,
+        id: &str,
+    ) -> Result<Option<ResourceEntry<PassthroughRoute>>, StoreError>;
+    async fn list_passthrough_routes(
+        &self,
+    ) -> Result<Vec<ResourceEntry<PassthroughRoute>>, StoreError>;
 }
 
 /// In-memory store. Thread-safe via DashMap; mainly used by tests, but
@@ -76,6 +85,7 @@ pub struct InMemoryStore {
     observability_exporters: DashMap<String, ResourceEntry<ObservabilityExporter>>,
     mcp_servers: DashMap<String, ResourceEntry<McpServer>>,
     a2a_agents: DashMap<String, ResourceEntry<A2aAgent>>,
+    passthrough_routes: DashMap<String, ResourceEntry<PassthroughRoute>>,
 }
 
 impl InMemoryStore {
@@ -169,6 +179,19 @@ impl ConfigStore for InMemoryStore {
 
     async fn list_a2a_agents(&self) -> Result<Vec<ResourceEntry<A2aAgent>>, StoreError> {
         Ok(self.a2a_agents.iter().map(|r| r.clone()).collect())
+    }
+
+    async fn get_passthrough_route(
+        &self,
+        id: &str,
+    ) -> Result<Option<ResourceEntry<PassthroughRoute>>, StoreError> {
+        Ok(self.passthrough_routes.get(id).map(|r| r.clone()))
+    }
+
+    async fn list_passthrough_routes(
+        &self,
+    ) -> Result<Vec<ResourceEntry<PassthroughRoute>>, StoreError> {
+        Ok(self.passthrough_routes.iter().map(|r| r.clone()).collect())
     }
 }
 

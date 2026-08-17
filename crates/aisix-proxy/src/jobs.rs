@@ -444,6 +444,7 @@ async fn scan_input_blob(
     monitor_hits: &mut Vec<aisix_core::GuardrailMonitorHit>,
 ) -> Result<(), ProxyError> {
     let ctx = aisix_guardrails::RequestContext {
+        passthrough_route_id: "",
         model_id: &target.model_entry.id,
         mcp_server_id: "",
         api_key_id: &auth.entry.id,
@@ -488,6 +489,7 @@ async fn scan_output_blob(
     monitor_hits: &mut Vec<aisix_core::GuardrailMonitorHit>,
 ) -> Result<(), ProxyError> {
     let ctx = aisix_guardrails::RequestContext {
+        passthrough_route_id: "",
         model_id: &target.model_entry.id,
         mcp_server_id: "",
         api_key_id: &auth.entry.id,

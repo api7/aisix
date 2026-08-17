@@ -576,6 +576,7 @@ async fn multipart_dispatch(
     // (input hook, before the reservation per #542) and mask it (#932).
     // The transcript RESPONSE is scanned/masked after the upstream call.
     let guardrail_ctx = aisix_guardrails::RequestContext {
+        passthrough_route_id: "",
         model_id: &model_entry.id,
         mcp_server_id: "",
         api_key_id: &auth.entry.id,
@@ -1082,6 +1083,7 @@ async fn speech_dispatch(
     // the rate-limit reservation so a content-policy refusal doesn't burn an
     // RPM slot. (Output is binary audio, not scannable text — no output hook.)
     let guardrail_ctx = aisix_guardrails::RequestContext {
+        passthrough_route_id: "",
         model_id: &model_entry.id,
         mcp_server_id: "",
         api_key_id: &auth.entry.id,

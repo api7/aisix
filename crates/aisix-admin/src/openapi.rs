@@ -753,6 +753,113 @@ const OPENAPI_JSON_BASE: &str = r##"{
         "description": "Get an upstream A2A agent resource by ID."
       }
     },
+    "/admin/v1/passthrough_routes": {
+      "get": {
+        "summary": "List Passthrough Routes",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/PassthroughRouteEntry"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Configuration store operation failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Passthrough Routes"
+        ],
+        "description": "List explicit passthrough route resources."
+      }
+    },
+    "/admin/v1/passthrough_routes/{id}": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          },
+          "description": "Passthrough route resource ID, as assigned by the active resource source (a UUIDv5 derived from the entry name in file mode; the etcd key's ID segment otherwise).",
+          "example": "1d95ac57-7f27-46a4-b5a3-55d3c3ad0a12"
+        }
+      ],
+      "get": {
+        "summary": "Get Passthrough Route by ID",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PassthroughRouteEntry"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Resource not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Configuration store operation failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Passthrough Routes"
+        ],
+        "description": "Get an explicit passthrough route resource by ID."
+      }
+    },
     "/admin/v1/guardrails": {
       "get": {
         "summary": "List Guardrails",
@@ -1552,6 +1659,31 @@ const OPENAPI_JSON_BASE: &str = r##"{
         },
         "description": "Stored Admin API resource entry."
       },
+      "PassthroughRouteEntry": {
+        "type": "object",
+        "required": [
+          "id",
+          "value",
+          "revision"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Resource ID, as assigned by the active resource source.",
+            "example": "1d95ac57-7f27-46a4-b5a3-55d3c3ad0a12"
+          },
+          "value": {
+            "$ref": "#/components/schemas/PassthroughRoute",
+            "description": "Stored passthrough route configuration."
+          },
+          "revision": {
+            "type": "integer",
+            "description": "Monotonic resource revision: the etcd mod_revision of the entry, or the load generation in file mode.",
+            "example": 1845
+          }
+        },
+        "description": "Stored Admin API resource entry."
+      },
       "A2aAgentEntry": {
         "type": "object",
         "required": [
@@ -1839,6 +1971,10 @@ const RESOURCE_SCHEMAS: &[(&str, &str)] = &[
     (
         "A2aAgent",
         include_str!("../../../schemas/resources/a2a_agent.schema.json"),
+    ),
+    (
+        "PassthroughRoute",
+        include_str!("../../../schemas/resources/passthrough_route.schema.json"),
     ),
     (
         "Guardrail",
@@ -2440,6 +2576,8 @@ mod tests {
             "/admin/v1/mcp_servers/{id}",
             "/admin/v1/a2a_agents",
             "/admin/v1/a2a_agents/{id}",
+            "/admin/v1/passthrough_routes",
+            "/admin/v1/passthrough_routes/{id}",
             "/admin/v1/guardrails",
             "/admin/v1/guardrails/{id}",
             "/admin/v1/cache_policies",
@@ -2472,6 +2610,8 @@ mod tests {
             "McpServerEntry",
             "A2aAgent",
             "A2aAgentEntry",
+            "PassthroughRoute",
+            "PassthroughRouteEntry",
             "Guardrail",
             "GuardrailEntry",
             "CachePolicy",
@@ -2523,6 +2663,8 @@ mod tests {
             "/admin/v1/mcp_servers/{id}",
             "/admin/v1/a2a_agents",
             "/admin/v1/a2a_agents/{id}",
+            "/admin/v1/passthrough_routes",
+            "/admin/v1/passthrough_routes/{id}",
             "/admin/v1/guardrails",
             "/admin/v1/guardrails/{id}",
             "/admin/v1/cache_policies",
