@@ -743,6 +743,16 @@ fn build_otlp_span(record: &SinkRecord, exporter_name: &str) -> Value {
             &event.client_user_agent,
         ));
     }
+    // End-user identity a passthrough route's `identity_header` extracted —
+    // the per-employee attribution of the forward-proxy scenario. Not gated
+    // on the protocol so a future handler that learns to populate it exports
+    // it without touching this sink.
+    if !event.client_identity.is_empty() {
+        attributes.push(attr_string_capped(
+            "aisix.client_identity",
+            &event.client_identity,
+        ));
+    }
     // JWT identity attribution (AISIX-Cloud#564): who the request ran as
     // when it authenticated with a JWT — the identity behind the (possibly
     // shared) api_key_id.
@@ -802,6 +812,14 @@ fn build_otlp_span(record: &SinkRecord, exporter_name: &str) -> Value {
                 attributes.push(attr_string("aisix.mcp.server_name", &event.mcp_server_name));
             }
         }
+        "passthrough" => {
+            if !event.passthrough_route_name.is_empty() {
+                attributes.push(attr_string(
+                    "aisix.passthrough.route_name",
+                    &event.passthrough_route_name,
+                ));
+            }
+        }
         _ => {}
     }
     // Opt-in captured content (#519 B.2) — present ONLY on a record built by
@@ -841,6 +859,7 @@ fn operation_name(event: &UsageEvent) -> &'static str {
     match event.inbound_protocol.as_str() {
         "a2a" => "invoke_agent",
         "mcp" => "execute_tool",
+        "passthrough" => "passthrough",
         _ => "chat",
     }
 }
@@ -867,6 +886,9 @@ fn span_name(event: &UsageEvent) -> String {
     let target = match event.inbound_protocol.as_str() {
         "a2a" => &event.a2a_agent_name,
         "mcp" => &event.mcp_tool_name,
+        // A route name is a registered resource like an agent name, so it is
+        // operator-bounded — but it still passes the length cap below.
+        "passthrough" => &event.passthrough_route_name,
         _ => return "chat.completions".to_string(),
     };
     if target.is_empty() || target.len() > MAX_SPAN_NAME_TARGET {
@@ -1533,6 +1555,44 @@ mod tests {
         assert_eq!(string_at("aisix.a2a.protocol_version"), "1.0");
         assert_eq!(string_at("aisix.a2a.task_id"), "task-9");
         assert_eq!(string_at("aisix.a2a.task_state"), "working");
+    }
+
+    #[test]
+    fn a_passthrough_relay_exports_route_and_identity_not_a_chat_span() {
+        // The passthrough handler emits usage events with
+        // `inbound_protocol = "passthrough"`; without the explicit branch a
+        // Copilot relay exported as a bare `chat.completions` span with the
+        // route and the device-injected end-user identity recorded nowhere.
+        let mut ev = sample_event();
+        ev.inbound_protocol = "passthrough".into();
+        ev.passthrough_route_name = "copilot-chat".into();
+        ev.client_identity = "alice@example.com".into();
+
+        let body = build_otlp_traces_payload(&ev, "test-exp");
+        let span = &body["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
+        assert_eq!(span["name"], "passthrough copilot-chat");
+        let attrs = span["attributes"].as_array().unwrap();
+        let find = |k: &str| attrs.iter().find(|a| a["key"] == k);
+        let string_at = |k: &str| find(k).unwrap()["value"]["stringValue"].clone();
+        assert_eq!(string_at("gen_ai.operation.name"), "passthrough");
+        assert_eq!(string_at("aisix.passthrough.route_name"), "copilot-chat");
+        assert_eq!(string_at("aisix.client_identity"), "alice@example.com");
+    }
+
+    #[test]
+    fn client_identity_exports_without_a_protocol_gate() {
+        // The identity attribute must not depend on the passthrough branch:
+        // any handler that populates the field gets it exported.
+        let mut ev = sample_event();
+        ev.client_identity = "bob@example.com".into();
+        let body = build_otlp_traces_payload(&ev, "test-exp");
+        let span = &body["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
+        let attrs = span["attributes"].as_array().unwrap();
+        let id = attrs
+            .iter()
+            .find(|a| a["key"] == "aisix.client_identity")
+            .unwrap();
+        assert_eq!(id["value"]["stringValue"], "bob@example.com");
     }
 
     #[test]

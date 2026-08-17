@@ -354,6 +354,30 @@ pub(crate) fn emit_error_usage_event(
     error_class: &str,
     client: &ClientContext,
 ) {
+    let event = build_error_usage_event(
+        inbound_protocol,
+        request_id,
+        requested_model,
+        api_key_id,
+        status_code,
+        error_class,
+        client,
+    );
+    emit_prepared_usage_event(state, snap, label, event);
+}
+
+/// The [`emit_error_usage_event`] event without the emission, for a caller
+/// that attributes handler-specific fields (e.g. the passthrough route name)
+/// before handing it to [`emit_prepared_usage_event`].
+pub(crate) fn build_error_usage_event(
+    inbound_protocol: &'static str,
+    request_id: &str,
+    requested_model: &str,
+    api_key_id: &str,
+    status_code: u16,
+    error_class: &str,
+    client: &ClientContext,
+) -> UsageEvent {
     let mut event = UsageEvent {
         request_id: request_id.to_string(),
         occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
@@ -367,6 +391,15 @@ pub(crate) fn emit_error_usage_event(
         ..Default::default()
     };
     apply_jwt_identity(&mut event, client.jwt.as_ref());
+    event
+}
+
+pub(crate) fn emit_prepared_usage_event(
+    state: &ProxyState,
+    snap: &AisixSnapshot,
+    label: &'static str,
+    event: UsageEvent,
+) {
     state.usage_sink.try_emit(label, event.clone());
     let exporters = live_exporters(state, snap);
     state

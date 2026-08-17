@@ -379,6 +379,30 @@ pub fn passthrough_route_coupling() -> Value {
                 }
             }
         },
+        // Cross-mode leftovers are configuration errors, not ignored
+        // fields: a companion outside its mode is never consulted, so a
+        // row carrying one is rejected rather than half-honored. The CP
+        // enforces the identical rule on create and patch.
+        {
+            "title": "auth_header_name only in header_key mode",
+            "if": {
+                "anyOf": [
+                    { "title": "auth_mode omitted (defaults to gateway_key)", "not": { "required": ["auth_mode"] } },
+                    { "title": "auth_mode: gateway_key or anonymous", "properties": { "auth_mode": { "enum": ["gateway_key", "anonymous"] } }, "required": ["auth_mode"] }
+                ]
+            },
+            "then": { "not": { "required": ["auth_header_name"] } }
+        },
+        {
+            "title": "anonymous_key_id only in anonymous mode",
+            "if": {
+                "anyOf": [
+                    { "title": "auth_mode omitted (defaults to gateway_key)", "not": { "required": ["auth_mode"] } },
+                    { "title": "auth_mode: gateway_key or header_key", "properties": { "auth_mode": { "enum": ["gateway_key", "header_key"] } }, "required": ["auth_mode"] }
+                ]
+            },
+            "then": { "not": { "required": ["anonymous_key_id"] } }
+        },
         // credential_mode couplings: inject needs a real ProviderKey id; a
         // forward_client route carrying one is a configuration error, not
         // an ignored field.
@@ -514,6 +538,39 @@ mod coupling_tests {
             "source_cidrs": ["10.0.0.0/8"]
         });
         assert!(validate_passthrough_route(&doc).is_err());
+    }
+
+    #[test]
+    fn cross_mode_leftover_companions_are_rejected() {
+        // A companion outside its mode is never consulted at runtime, so
+        // both validators refuse the row instead of half-honoring it.
+        // auth_header_name without header_key (auth_mode absent = gateway_key).
+        let mut doc = base();
+        doc["auth_header_name"] = json!("x-aisix-api-key");
+        assert!(validate_passthrough_route(&doc).is_err());
+        assert!(validate_passthrough_route_lenient(&doc).is_err());
+        // anonymous_key_id on an explicit header_key route.
+        let doc = json!({
+            "name": "r", "path_prefix": "/p",
+            "target_url": "https://u.example", "provider_key_id": "pk",
+            "auth_mode": "header_key", "auth_header_name": "x-aisix-api-key",
+            "anonymous_key_id": "ak-1"
+        });
+        assert!(validate_passthrough_route(&doc).is_err());
+        // auth_header_name on an anonymous route.
+        let doc = json!({
+            "name": "r", "path_prefix": "/p",
+            "target_url": "https://u.example", "provider_key_id": "pk",
+            "auth_mode": "anonymous", "anonymous_key_id": "ak-1",
+            "source_cidrs": ["10.0.0.0/8"],
+            "auth_header_name": "x-aisix-api-key"
+        });
+        assert!(validate_passthrough_route(&doc).is_err());
+        // source_cidrs is deliberately NOT mode-coupled: an extra IP
+        // allowlist is honored on every mode.
+        let mut doc = base();
+        doc["source_cidrs"] = json!(["10.0.0.0/8"]);
+        assert!(validate_passthrough_route(&doc).is_ok());
     }
 
     #[test]

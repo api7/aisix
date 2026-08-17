@@ -352,10 +352,7 @@ pub async fn entry(
                 status,
                 elapsed,
             );
-            crate::usage_attr::emit_error_usage_event(
-                &state,
-                &snapshot,
-                "passthrough_route",
+            let mut event = crate::usage_attr::build_error_usage_event(
                 "passthrough",
                 &request_id,
                 "",
@@ -363,6 +360,16 @@ pub async fn entry(
                 status,
                 error.kind(),
                 &client,
+            );
+            // The route matched before the pipeline failed, so a rejected
+            // request still attributes to it — an operator triaging 401s
+            // per route needs the name on the event, not just in the log.
+            event.passthrough_route_name = route_name.clone();
+            crate::usage_attr::emit_prepared_usage_event(
+                &state,
+                &snapshot,
+                "passthrough_route",
+                event,
             );
             error.into_response()
         }
@@ -917,7 +924,7 @@ async fn authenticate(
                 .and_then(|v| v.to_str().ok())
                 .map(|v| v.strip_prefix("Bearer ").unwrap_or(v).trim().to_string())
                 .filter(|v| !v.is_empty())
-                .ok_or(ProxyError::MissingAuth)?;
+                .ok_or_else(|| ProxyError::MissingRouteAuthHeader(name.to_string()))?;
             crate::auth::authenticate_token(state, &token, ctx).await
         }
         PassthroughAuthMode::Anonymous => {

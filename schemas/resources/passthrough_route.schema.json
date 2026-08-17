@@ -246,6 +246,78 @@
           {
             "not": {
               "required": [
+                "auth_mode"
+              ]
+            },
+            "title": "auth_mode omitted (defaults to gateway_key)"
+          },
+          {
+            "properties": {
+              "auth_mode": {
+                "enum": [
+                  "gateway_key",
+                  "anonymous"
+                ]
+              }
+            },
+            "required": [
+              "auth_mode"
+            ],
+            "title": "auth_mode: gateway_key or anonymous"
+          }
+        ]
+      },
+      "then": {
+        "not": {
+          "required": [
+            "auth_header_name"
+          ]
+        }
+      },
+      "title": "auth_header_name only in header_key mode"
+    },
+    {
+      "if": {
+        "anyOf": [
+          {
+            "not": {
+              "required": [
+                "auth_mode"
+              ]
+            },
+            "title": "auth_mode omitted (defaults to gateway_key)"
+          },
+          {
+            "properties": {
+              "auth_mode": {
+                "enum": [
+                  "gateway_key",
+                  "header_key"
+                ]
+              }
+            },
+            "required": [
+              "auth_mode"
+            ],
+            "title": "auth_mode: gateway_key or header_key"
+          }
+        ]
+      },
+      "then": {
+        "not": {
+          "required": [
+            "anonymous_key_id"
+          ]
+        }
+      },
+      "title": "anonymous_key_id only in anonymous mode"
+    },
+    {
+      "if": {
+        "anyOf": [
+          {
+            "not": {
+              "required": [
                 "credential_mode"
               ]
             },
