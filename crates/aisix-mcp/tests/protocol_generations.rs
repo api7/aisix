@@ -360,6 +360,17 @@ async fn legacy_results_keep_their_wire_shape() {
         body["result"].get("resultType").is_none(),
         "legacy results must keep the pre-2026 shape: {body}"
     );
+    // The 2026-07-28 cache-hint fields must not appear either: rmcp strips
+    // only `resultType` for legacy peers, so the gateway version-gates the
+    // hints itself.
+    assert!(
+        body["result"].get("ttlMs").is_none(),
+        "no ttlMs on a legacy response: {body}"
+    );
+    assert!(
+        body["result"].get("cacheScope").is_none(),
+        "no cacheScope on a legacy response: {body}"
+    );
 }
 
 /// The end-to-end modern lifecycle through rmcp's own client: `Discover`

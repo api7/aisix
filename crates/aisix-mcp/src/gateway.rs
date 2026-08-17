@@ -405,7 +405,7 @@ impl ServerHandler for McpGateway {
     async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
         // Fan out concurrently; each upstream call is already deadline-bounded
         // by its bridge, so a slow upstream cannot stall the aggregate.
@@ -463,9 +463,22 @@ impl ServerHandler for McpGateway {
         // CALLER's per-key ACL (so it is `private` to that authorization
         // context), and upstream tool sets can change between requests (so
         // its freshness window is zero).
-        Ok(ListToolsResult::with_all_items(tools)
-            .with_ttl_ms(0)
-            .with_cache_scope(CacheScope::Private))
+        //
+        // Version-gated because rmcp only strips `resultType` for legacy
+        // peers, not these fields — setting them unconditionally would add
+        // two fields legacy clients have never seen. Modern requests carry
+        // the version in `_meta`; legacy sessions fall back to the
+        // handshake's negotiated version. (ISO `YYYY-MM-DD` versions compare
+        // lexically the same as chronologically.)
+        let result = ListToolsResult::with_all_items(tools);
+        let modern = context
+            .protocol_version()
+            .is_some_and(|v| v.as_str() >= ProtocolVersion::V_2026_07_28.as_str());
+        Ok(if modern {
+            result.with_ttl_ms(0).with_cache_scope(CacheScope::Private)
+        } else {
+            result
+        })
     }
 
     async fn call_tool(
