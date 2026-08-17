@@ -4,6 +4,8 @@
 //!
 //! ```text
 //! cargo run -p aisix-mcp --example conformance_server
+//! # optional: bind a different address (default 127.0.0.1:3111)
+//! cargo run -p aisix-mcp --example conformance_server -- 127.0.0.1:4000
 //! npx -y @modelcontextprotocol/conformance server --url http://127.0.0.1:3111/mcp
 //! ```
 //!
