@@ -45,12 +45,13 @@ npm ci --prefix "$HARNESS_DIR" --ignore-scripts --no-audit --no-fund >/dev/null
 CONFORMANCE_BIN="$HARNESS_DIR/node_modules/.bin/conformance"
 [ -x "$CONFORMANCE_BIN" ] || { echo "::error::conformance binary missing after npm ci"; exit 1; }
 
-# Per-scenario wall-clock bound. GNU coreutils `timeout` exists on the CI
-# runners; degrade to unbounded where it is absent (macOS dev machines).
+# Per-scenario wall-clock bound. GNU coreutils `timeout` on the CI
+# runners; perl's alarm as the portable fallback (macOS dev machines) so
+# a hung scenario is bounded on every platform.
 if command -v timeout >/dev/null; then
   BOUND=(timeout 120)
 else
-  BOUND=()
+  BOUND=(perl -e 'alarm shift; exec @ARGV' 120)
 fi
 
 "$BIN" "$ADDR" &
@@ -86,10 +87,12 @@ for scenario in "${SCENARIOS[@]}"; do
   # `"${BOUND[@]}"` trips `set -u` on bash 3.2 (macOS dev machines).
   out=$(${BOUND[@]+"${BOUND[@]}"} "$CONFORMANCE_BIN" server --url "http://$ADDR/mcp" --scenario "$scenario" 2>&1) || rc=$?
   echo "$out" | grep -A2 'Test Results:' || true
-  # Pass = the CLI exited 0 AND at least one check ran AND none failed.
-  # Each leg matters: a nonzero exit with a clean-looking summary, or a
-  # 0/0 not-applicable run, must not count as coverage.
-  if [ "$rc" != 0 ] || ! echo "$out" | grep -qE 'Passed: [0-9]+/[1-9][0-9]*, 0 failed'; then
+  # Pass = the CLI exited 0 AND at least one check ran AND none failed
+  # AND no warnings. Each leg matters: a nonzero exit with a clean-looking
+  # summary, a 0/0 not-applicable run, or a warning-only pass must not
+  # count as coverage (the pinned suite is deterministic, so a new warning
+  # is a real behavior change worth a red build).
+  if [ "$rc" != 0 ] || ! echo "$out" | grep -qE 'Passed: [0-9]+/[1-9][0-9]*, 0 failed, 0 warnings'; then
     echo "::error::conformance scenario '$scenario' failed (exit $rc)"
     echo "$out" | tail -30
     failed=1

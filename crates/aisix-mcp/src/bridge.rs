@@ -357,7 +357,9 @@ fn transport_config(url: &str) -> StreamableHttpClientTransportConfig {
 impl RmcpBridge {
     /// Open a session to `upstream`: build the Streamable HTTP transport
     /// (injecting gateway-held auth — for `oauth2` this mints or reuses a
-    /// cached access token first) and run the `initialize` handshake. The
+    /// cached access token first) and run the startup lifecycle selected by
+    /// [`McpUpstream::protocol`] — the `initialize` handshake by default,
+    /// or handshake-free `server/discover` for `2026-07-28` upstreams. The
     /// whole sequence, token minting included, is bounded by the upstream's
     /// timeout.
     pub async fn connect(upstream: &McpUpstream) -> Result<Self, McpError> {

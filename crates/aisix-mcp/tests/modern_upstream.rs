@@ -66,6 +66,21 @@ async fn stub_mcp(
     };
     let method = message["method"].as_str().unwrap_or_default().to_string();
     let id = message["id"].clone();
+    // A STATEFUL legacy server enforces its session: every post-initialize
+    // request must carry the exact minted id, or the sequence test would
+    // pass even if the bridge dropped the session header entirely.
+    if let StubGeneration::Legacy { stateful: true } = stub.generation {
+        if method != "initialize" {
+            let session = headers.get("mcp-session-id").and_then(|v| v.to_str().ok());
+            if session != Some("sess-legacy-1") {
+                return (
+                    axum::http::StatusCode::NOT_FOUND,
+                    format!("missing or wrong session id on {method}: {session:?}"),
+                )
+                    .into_response();
+            }
+        }
+    }
     stub.recorder
         .sequence
         .lock()
@@ -321,27 +336,27 @@ async fn downstream_context_never_crosses_to_the_upstream() {
     let (stub_addr, recorder) = spawn_stub(StubGeneration::Legacy { stateful: false }).await;
     let headers = upstream_headers_after_gateway_call(stub_addr, &recorder).await;
 
-    let get = |name: &str| {
+    // Collect EVERY value per name: a duplicated header (bridge's own plus
+    // a forwarded downstream copy) must fail, not hide behind first-match.
+    let values = |name: &str| -> Vec<&str> {
         headers
             .iter()
-            .find(|(n, _)| n == name)
+            .filter(|(n, _)| n == name)
             .map(|(_, v)| v.as_str())
+            .collect()
     };
-    assert_eq!(
-        get("authorization"),
-        None,
+    assert!(
+        values("authorization").is_empty(),
         "the caller's credential must never be forwarded (upstream auth is \
          gateway-held): {headers:?}"
     );
-    assert_eq!(
-        get("mcp-session-id"),
-        None,
+    assert!(
+        values("mcp-session-id").is_empty(),
         "a downstream session id must never leak into the upstream session: {headers:?}"
     );
-    let upstream_version = get("mcp-protocol-version");
-    assert_ne!(
-        upstream_version,
-        Some("2026-07-28"),
+    let versions = values("mcp-protocol-version");
+    assert!(
+        !versions.contains(&"2026-07-28"),
         "the downstream protocol version must not be mirrored upstream — the \
          bridge negotiated its own (legacy) session: {headers:?}"
     );
