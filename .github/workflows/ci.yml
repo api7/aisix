@@ -362,6 +362,26 @@ jobs:
             exit 1
           fi
 
+  mcp-conformance:
+    # The OFFICIAL MCP conformance suite against the shipped /mcp chain
+    # (scoped gateway + bridge + in-process upstream). Scenario list and
+    # deliberate exclusions live in scripts/mcp-conformance.sh; the suite
+    # needs Node >= 22 (fs.globSync).
+    name: mcp conformance (official suite)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-protoc
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - name: build the conformance target
+        run: cargo build -p aisix-mcp --example conformance_server
+      - name: run the applicable server scenarios
+        run: bash scripts/mcp-conformance.sh
+
   coverage-gate:
     name: coverage >= 90%
     needs: [rust-unit, e2e]

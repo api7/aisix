@@ -105,6 +105,19 @@ pub struct McpServer {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scopes: Option<Vec<String>>,
 
+    /// MCP protocol revision the gateway uses when connecting to this
+    /// upstream server. When omitted, the gateway opens the session with the
+    /// `initialize` handshake, which negotiates among the pre-2026 protocol
+    /// revisions — the right choice for most servers, including `2026-07-28`
+    /// servers that keep backward compatibility. Set `2026-07-28` for a
+    /// server that requires the stateless MCP `2026-07-28` revision
+    /// (handshake-free `server/discover` startup); the connection fails
+    /// rather than silently downgrading when the server does not support the
+    /// configured revision. Only used when `type` is `mcp`; ignored for
+    /// `type: openapi`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_version: Option<McpProtocolVersion>,
+
     /// Maximum time, in milliseconds, to wait for a single upstream operation
     /// (establishing the session, listing tools, or calling a tool). Must be at
     /// least `1` when set. When omitted, the gateway applies a built-in default.
@@ -138,6 +151,18 @@ pub enum McpServerType {
     /// A REST API described by an OpenAPI document; the gateway generates the
     /// tools itself and issues plain HTTP requests against `url`.
     Openapi,
+}
+
+/// MCP protocol revision used for an upstream connection. Values are the
+/// specification's dated version identifiers; revisions before `2026-07-28`
+/// need no entry here because the `initialize` handshake negotiates among
+/// them automatically when `protocol_version` is omitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub enum McpProtocolVersion {
+    /// The stateless MCP `2026-07-28` revision: handshake-free startup via
+    /// `server/discover`, with self-contained per-request metadata.
+    #[serde(rename = "2026-07-28")]
+    V20260728,
 }
 
 /// Transport used to reach an upstream MCP server.
@@ -620,6 +645,7 @@ mod tests {
             client_id: None,
             token_url: None,
             scopes: None,
+            protocol_version: None,
             timeout_ms: None,
             enabled: true,
             runtime_id: String::new(),

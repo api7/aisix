@@ -2036,6 +2036,10 @@ fn add_variant_titles(doc: &mut Value) {
             &["Inherit", "Restrict", "Deny"],
         ),
         (
+            "/components/schemas/McpProtocolVersion/oneOf",
+            &["MCP 2026-07-28"],
+        ),
+        (
             // Model's top-level direct/routing/ensemble/semantic
             // mutual-exclusion `oneOf` (injected by
             // `aisix_core::models::schema::model_root_schema`). Order must
