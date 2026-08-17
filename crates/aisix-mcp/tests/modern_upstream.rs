@@ -347,6 +347,64 @@ async fn downstream_context_never_crosses_to_the_upstream() {
     );
 }
 
+/// The full user-facing chain for the new field: a registered row carrying
+/// `protocol_version: "2026-07-28"` — the exact wire value a control plane
+/// writes — is deserialized, loaded through `from_snapshot_scoped`, and
+/// reaches a modern-only upstream through the production bridge. Pins
+/// deserialization → snapshot → lifecycle selection in one, so no single
+/// link of the mapping can be reverted silently.
+#[tokio::test]
+async fn snapshot_row_with_protocol_version_reaches_modern_only_upstream() {
+    let (stub_addr, recorder) = spawn_stub(StubGeneration::ModernOnly).await;
+    let server: aisix_core::McpServer = serde_json::from_value(serde_json::json!({
+        "display_name": "modern",
+        "url": format!("http://{stub_addr}/mcp"),
+        "protocol_version": "2026-07-28",
+    }))
+    .expect("valid mcp_servers row");
+    let snapshot = aisix_core::AisixSnapshot::new();
+    snapshot
+        .mcp_servers
+        .insert(aisix_core::ResourceEntry::new("mcp-modern", server, 1));
+    let gateway = McpGateway::from_snapshot_scoped(&snapshot, "modern")
+        .expect("scoped gateway over the registered row");
+    let app = axum::Router::new().nest_service("/mcp", streamable_http_service(gateway, 0));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind gateway port");
+    let gw_addr = listener.local_addr().expect("gateway addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve gateway");
+    });
+
+    // Downstream generation is independent of the upstream lifecycle: a
+    // plain stateless legacy call is enough to force one bridge session.
+    let response = reqwest::Client::new()
+        .post(format!("http://{gw_addr}/mcp"))
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .body(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": { "name": "echo", "arguments": {} }
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .expect("send");
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+
+    assert_eq!(
+        recorder.initialize.load(Ordering::SeqCst),
+        0,
+        "the configured revision must select the discover lifecycle end to end"
+    );
+    assert!(recorder.discover.load(Ordering::SeqCst) >= 1);
+}
+
 /// A stateful legacy upstream sees the COMPLETE handshake sequence for the
 /// bridge's session — never a bare `tools/call` riding on a session the
 /// upstream doesn't have.

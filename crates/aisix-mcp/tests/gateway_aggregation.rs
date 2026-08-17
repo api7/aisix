@@ -16,7 +16,7 @@ use std::sync::Arc;
 use aisix_core::{AisixSnapshot, McpServer, ResourceEntry};
 use aisix_mcp::{
     streamable_http_service, upstream_from_mcp_server, McpAuth, McpBridge, McpError, McpGateway,
-    McpTool, McpToolResult, McpUpstream, RmcpBridge, ToolAcl,
+    McpProtocol, McpTool, McpToolResult, McpUpstream, RmcpBridge, ToolAcl,
 };
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorData,
@@ -313,6 +313,42 @@ fn upstream_from_mcp_server_maps_auth_and_timeout() {
         upstream_from_mcp_server(&plain).auth,
         McpAuth::None
     ));
+}
+
+/// The configured `protocol_version` — the wire value a control plane
+/// writes — selects the bridge lifecycle, and its absence keeps the legacy
+/// handshake. Pins the deserialize → upstream mapping itself, so reverting
+/// the mapping (not just the lifecycle switch) fails a test.
+#[test]
+fn upstream_from_mcp_server_maps_protocol_version() {
+    let modern: McpServer = serde_json::from_value(serde_json::json!({
+        "display_name": "m",
+        "url": "https://api.example.com/mcp",
+        "protocol_version": "2026-07-28"
+    }))
+    .unwrap();
+    assert_eq!(
+        upstream_from_mcp_server(&modern).protocol,
+        McpProtocol::V20260728
+    );
+
+    let dflt: McpServer = serde_json::from_value(serde_json::json!({
+        "display_name": "d", "url": "https://api.example.com/mcp"
+    }))
+    .unwrap();
+    assert_eq!(
+        upstream_from_mcp_server(&dflt).protocol,
+        McpProtocol::LegacyHandshake
+    );
+
+    // An unknown revision is a hard deserialization error, not a silent
+    // fallback to some default lifecycle.
+    let unknown = serde_json::from_value::<McpServer>(serde_json::json!({
+        "display_name": "u",
+        "url": "https://api.example.com/mcp",
+        "protocol_version": "2099-01-01"
+    }));
+    assert!(unknown.is_err(), "unknown revisions must be rejected");
 }
 
 #[test]
