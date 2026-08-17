@@ -178,50 +178,20 @@ pub fn build_router(state: ProxyState) -> Router {
         // `/passthrough/*` 410 migration tombstone) inside the handler.
         // Registered before the layers so fallback traffic gets the same
         // body-limit / telemetry / Server-header treatment as the routes.
-        .fallback(passthrough_route::entry)
-        // Wire the configured cap into axum's request-body extractor
-        // chain (`Json<T>` defers to `Bytes` which honors this layer).
-        // Without this, axum 0.7's `DefaultBodyLimit` falls back to
-        // its built-in 2 MiB default, which silently rejects bodies
-        // in the 2 MiB-to-cap band with a stock `BytesRejection`
-        // response (NOT the OpenAI envelope). The middleware below
-        // catches the Content-Length-known case ahead of the
-        // extractor; this layer catches chunked / size-mismatched
-        // bodies once their actual byte count exceeds the cap.
-        // `0` = no cap — `disable()` rather than omitting the layer,
-        // because omitting it would fall back to axum's 2 MiB, not to
-        // "unlimited".
-        .layer(if body_limit > 0 {
-            axum::extract::DefaultBodyLimit::max(body_limit)
-        } else {
-            axum::extract::DefaultBodyLimit::disable()
-        })
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            enforce_request_body_limit,
-        ))
-        // One layer for both per-request telemetry guards: the in-flight
-        // gauge and the client-cancel recorder (see
-        // `record_request_telemetry`). Sits outside the body-limit layers
-        // so a hang-up during body upload is captured too, and inside
-        // `ensure_request_id` so the emitted line carries the same
-        // request id the caller was handed.
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            record_request_telemetry,
-        ))
-        // Identify the data plane on every response, including error
-        // envelopes and short-circuited responses from the layers
-        // above. `overriding` (vs `if_not_present`) ensures the
-        // gateway's identity is authoritative — any Server header set
-        // by inner handlers or accidentally proxied from upstream is
-        // replaced, so client-visible Server never leaks provider
-        // identity.
-        .layer(SetResponseHeaderLayer::overriding(
-            header::SERVER,
-            SERVER_HEADER_VALUE.clone(),
-        ))
-        .with_state(state.clone());
+        .fallback(passthrough_route::entry);
+    let router = apply_shared_proxy_layers(router, &state, body_limit).with_state(state.clone());
+
+    // The host-dispatch target: the same fallback handler behind the SAME
+    // shared layer stack, so a foreign-host request keeps the body-limit
+    // fast path, the in-flight/cancel telemetry, and the Server-header
+    // override — dispatching to the bare handler would silently shed all
+    // three (and let an upstream Server header leak through).
+    let host_entry_stack = apply_shared_proxy_layers(
+        Router::new().fallback(passthrough_route::entry),
+        &state,
+        body_limit,
+    )
+    .with_state(state.clone());
 
     // Pre-routing URL rewriting (`proxy.url_rewrites`). `Router::layer`
     // middleware runs AFTER route matching, so a URI rewritten there could
@@ -250,11 +220,13 @@ pub fn build_router(state: ProxyState) -> Router {
     // the rewrite layer, so `url_rewrites` never touches foreign-host
     // paths. Wrapped unconditionally: routes arrive dynamically via the
     // snapshot, and the per-request probe is one arc-swap load plus a
-    // scan of the (typically tiny) route table.
+    // scan of the (typically tiny) route table. Matched requests go to
+    // `host_entry_stack`, which carries the same shared layers as the
+    // main stack (see above).
     let router = Router::new()
         .fallback_service(router)
         .layer(middleware::from_fn_with_state(
-            state.clone(),
+            (state.clone(), host_entry_stack),
             passthrough_route::host_dispatch,
         ));
 
@@ -269,6 +241,57 @@ pub fn build_router(state: ProxyState) -> Router {
         state,
         request_id::ensure_request_id,
     ))
+}
+
+/// The per-request layers every proxy-listener path shares, applied to the
+/// main route stack AND the host-dispatch entry stack so the two cannot
+/// drift (a layer added to one but not the other silently exempts
+/// foreign-host traffic from it). Innermost→outermost:
+///
+/// - `DefaultBodyLimit`: wire the configured cap into axum's request-body
+///   extractor chain (`Json<T>` defers to `Bytes`, which honors this
+///   layer). Without it, axum 0.7 falls back to its built-in 2 MiB
+///   default, which silently rejects bodies in the 2 MiB-to-cap band with
+///   a stock `BytesRejection` (NOT the OpenAI envelope). `0` = no cap —
+///   `disable()` rather than omitting the layer, because omitting it
+///   would fall back to axum's 2 MiB, not to "unlimited".
+/// - `enforce_request_body_limit`: short-circuits the Content-Length-known
+///   oversize case ahead of the extractors; the extractor-chain layer
+///   above catches chunked / size-mismatched bodies.
+/// - `record_request_telemetry`: one layer for both per-request telemetry
+///   guards — the in-flight gauge and the client-cancel recorder. Sits
+///   outside the body-limit layers so a hang-up during body upload is
+///   captured too, and inside `ensure_request_id` so the emitted line
+///   carries the same request id the caller was handed.
+/// - `SetResponseHeaderLayer(Server)`: identify the data plane on every
+///   response, including error envelopes and short-circuited responses.
+///   `overriding` (vs `if_not_present`) ensures the gateway's identity is
+///   authoritative — any Server header set by inner handlers or proxied
+///   from an upstream is replaced, so client-visible Server never leaks
+///   provider identity.
+fn apply_shared_proxy_layers(
+    router: Router<ProxyState>,
+    state: &ProxyState,
+    body_limit: usize,
+) -> Router<ProxyState> {
+    router
+        .layer(if body_limit > 0 {
+            axum::extract::DefaultBodyLimit::max(body_limit)
+        } else {
+            axum::extract::DefaultBodyLimit::disable()
+        })
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            enforce_request_body_limit,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            record_request_telemetry,
+        ))
+        .layer(SetResponseHeaderLayer::overriding(
+            header::SERVER,
+            SERVER_HEADER_VALUE.clone(),
+        ))
 }
 
 /// Collapse a raw request path to a fixed route template so metric labels

@@ -85,11 +85,6 @@ describe("passthrough guardrail (#911 [6])", () => {
       target_url: `${upstream.baseUrl}/v1`,
       provider_key_id: pk.id,
     });
-    await seed.createApiKey({
-      key_hash: CALLER_KEY_HASH,
-      allowed_models: ["pt-gr"],
-      allowed_routes: ["*"],
-    });
     await seed.createGuardrail({
       name: INPUT_GUARDRAIL,
       enabled: true,
@@ -118,6 +113,15 @@ describe("passthrough guardrail (#911 [6])", () => {
       target_url: sseUpstream.baseUrl,
       provider_key_id: pk.id,
       protocol: "openai_chat",
+    });
+
+    // Caller key LAST: etcd applies writes in revision order, so a key
+    // seeded after every resource it must reach doubles as the
+    // propagation barrier for all of them.
+    await seed.createApiKey({
+      key_hash: CALLER_KEY_HASH,
+      allowed_models: ["pt-gr"],
+      allowed_routes: ["*"],
     });
   });
 

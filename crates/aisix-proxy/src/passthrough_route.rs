@@ -95,6 +95,10 @@ const ALWAYS_STRIP: &[&str] = &[
     "trailer",
     "transfer-encoding",
     "upgrade",
+    // Gateway-owned correlation id: the dispatch sets its own value, and
+    // `RequestBuilder::header` appends — an inbound copy would reach the
+    // upstream as a duplicate.
+    "x-aisix-request-id",
 ];
 
 /// Fixed 410 message for the removed implicit tunnel. One release of
@@ -141,15 +145,28 @@ fn inbound_host(req: &Request) -> Option<String> {
     Some(no_port.trim_end_matches('.').to_ascii_lowercase())
 }
 
-/// Pre-routing middleware: dispatch foreign-host traffic to [`entry`]
-/// before the typed router can match on the path. See the module doc.
-pub async fn host_dispatch(State(state): State<ProxyState>, req: Request, next: Next) -> Response {
+/// Pre-routing middleware: dispatch foreign-host traffic to the entry
+/// stack before the typed router can match on the path. See the module
+/// doc. The dispatch target is a layered router carrying the same shared
+/// per-request layers as the main stack (body limits, in-flight/cancel
+/// telemetry, the Server-header override) — calling the bare handler here
+/// would silently exempt foreign-host traffic from all of them.
+pub async fn host_dispatch(
+    State((state, entry_stack)): State<(ProxyState, axum::Router)>,
+    req: Request,
+    next: Next,
+) -> Response {
     let snapshot = state.snapshot.load();
-    if has_host_match(&snapshot, inbound_host(&req).as_deref()) {
-        drop(snapshot);
-        return axum::handler::Handler::call(entry, req, state).await;
-    }
+    let matched = has_host_match(&snapshot, inbound_host(&req).as_deref());
     drop(snapshot);
+    if matched {
+        use tower::ServiceExt;
+        return match entry_stack.oneshot(req).await {
+            Ok(resp) => resp,
+            // `Router`'s service error is `Infallible`.
+            Err(never) => match never {},
+        };
+    }
     next.run(req).await
 }
 
@@ -628,6 +645,14 @@ async fn dispatch(
                         .map(|s| s.to_ascii_lowercase()),
                 );
             }
+            // The two slots the injection below writes are stripped
+            // UNCONDITIONALLY — `RequestBuilder::header` appends, so a
+            // `strip_headers` override that keeps `authorization` would
+            // put the caller's credential on the wire beside the injected
+            // one. Explicit client-credential forwarding is what
+            // `forward_client` is for; inject never double-sends.
+            strip.insert("authorization".into());
+            strip.insert("x-api-key".into());
             // The header-key slot never goes upstream either.
             if let Some(h) = route.auth_header_name.as_deref() {
                 strip.insert(h.to_ascii_lowercase());
@@ -1151,21 +1176,41 @@ fn strip_redundant_version_segment<'a>(base: &str, rest: &'a str) -> &'a str {
 /// Incremental splitter of an SSE byte stream into complete frames
 /// (terminated by a blank line). Bytes after the last complete frame stay
 /// buffered until more arrive; `take_rest` drains them at end-of-stream.
+/// Cap on bytes buffered while waiting for one SSE frame terminator, and on
+/// bytes held back by the `Window` policy while its char threshold has not
+/// been reached. Both accumulators would otherwise grow without bound on an
+/// upstream that never terminates a frame (or streams only delta-free
+/// frames) — and a streaming route carries no reqwest-level timeout to end
+/// the read. On overflow the oversized run is handed on as if it were a
+/// complete frame (splitter) or force-scanned (window), so memory stays
+/// bounded while the policy semantics degrade gracefully.
+const MAX_HELD_STREAM_BYTES: usize = 1024 * 1024;
+
 struct SseFrameSplitter {
     buf: Vec<u8>,
+    /// Resume offset for the boundary scan: everything before it was
+    /// already checked in an earlier `push`, so an unterminated frame
+    /// costs O(n), not O(n²).
+    scanned: usize,
 }
 
 impl SseFrameSplitter {
     fn new() -> Self {
-        Self { buf: Vec::new() }
+        Self {
+            buf: Vec::new(),
+            scanned: 0,
+        }
     }
 
     fn push(&mut self, chunk: &[u8]) -> Vec<Vec<u8>> {
         self.buf.extend_from_slice(chunk);
         let mut frames = Vec::new();
         loop {
-            let lf = find_subsequence(&self.buf, b"\n\n").map(|i| (i, 2));
-            let crlf = find_subsequence(&self.buf, b"\r\n\r\n").map(|i| (i, 4));
+            // Rescan the last 3 already-checked bytes: a boundary can
+            // straddle the previous chunk edge.
+            let from = self.scanned.saturating_sub(3);
+            let lf = find_subsequence(&self.buf[from..], b"\n\n").map(|i| (from + i, 2));
+            let crlf = find_subsequence(&self.buf[from..], b"\r\n\r\n").map(|i| (from + i, 4));
             let boundary = match (lf, crlf) {
                 (Some((li, ll)), Some((ci, cl))) => {
                     if ci < li {
@@ -1175,16 +1220,27 @@ impl SseFrameSplitter {
                     }
                 }
                 (Some(x), None) | (None, Some(x)) => x,
-                (None, None) => break,
+                (None, None) => {
+                    self.scanned = self.buf.len();
+                    // Frame-terminator starvation: hand the oversized run on
+                    // as-is rather than buffering without bound.
+                    if self.buf.len() > MAX_HELD_STREAM_BYTES {
+                        frames.push(std::mem::take(&mut self.buf));
+                        self.scanned = 0;
+                    }
+                    break;
+                }
             };
             let end = boundary.0 + boundary.1;
             let frame: Vec<u8> = self.buf.drain(..end).collect();
+            self.scanned = 0;
             frames.push(frame);
         }
         frames
     }
 
     fn take_rest(&mut self) -> Vec<u8> {
+        self.scanned = 0;
         std::mem::take(&mut self.buf)
     }
 }
@@ -1323,7 +1379,14 @@ fn stream_response(
                         scan_buf.push_str(&delta);
                         held_bytes += frame.len();
                         pending.push(frame);
-                        if scan_buf.chars().count() >= *size_chars {
+                        // The char threshold only advances on extracted delta
+                        // text, so a run of delta-free frames (role-only,
+                        // keep-alives, usage-only) would hold frames without
+                        // bound — force the scan once the held BYTES cross
+                        // the cap, mirroring BufferFull's self-bound.
+                        if scan_buf.chars().count() >= *size_chars
+                            || held_bytes > MAX_HELD_STREAM_BYTES
+                        {
                             let text = format!("{overlap_tail}{scan_buf}");
                             match scan_output(&chain, &route_name, &text, &mut telemetry).await {
                                 GuardrailVerdict::Block { reason, guardrail_name } => {
@@ -1614,6 +1677,9 @@ impl Drop for RouteTelemetry {
 }
 
 /// Copy response headers that are safe to relay to the downstream caller.
+/// `append`, not `insert`: `HeaderMap` iteration yields one entry per
+/// value, and a header the upstream sent several times (`Set-Cookie`,
+/// `WWW-Authenticate`, `Vary`) must keep every value on a relay.
 fn copy_safe_headers(src: &HeaderMap, dst: &mut HeaderMap) {
     for (name, value) in src {
         let n = name.as_str().to_lowercase();
@@ -1630,7 +1696,7 @@ fn copy_safe_headers(src: &HeaderMap, dst: &mut HeaderMap) {
         ) {
             continue;
         }
-        dst.insert(name.clone(), value.clone());
+        dst.append(name.clone(), value.clone());
     }
 }
 
@@ -2102,6 +2168,89 @@ mod tests {
             Some((9, 4))
         );
         assert_eq!(response_usage(PassthroughProtocol::Raw, openai), None);
+    }
+
+    #[tokio::test]
+    async fn inject_strips_caller_credentials_even_with_empty_strip_headers() {
+        // A ProviderKey whose strip_headers is explicitly EMPTY: the
+        // legacy tunnel documented that as "forward the caller's
+        // credential beside the injected one"; routes never double-send —
+        // forward_client is the explicit BYO mode.
+        let upstream = MockServer::start().await;
+        Mock::given(wm_method("GET"))
+            .and(wm_path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&upstream)
+            .await;
+
+        let snap = AisixSnapshot::new();
+        let pk_json = format!(
+            r#"{{"display_name":"openai-up","secret":"sk-upstream","api_base":"http://unused",
+                 "provider":"openai","adapter":"openai","strip_headers":[]}}"#
+        );
+        let pk: ProviderKey = serde_json::from_str(&pk_json).unwrap();
+        snap.provider_keys.insert(ResourceEntry::new(PK_ID, pk, 1));
+        snap.apikeys.insert(apikey_entry("sk-caller", Some(&["*"])));
+        snap.passthrough_routes
+            .insert(inject_route(&upstream.uri()));
+        let app = build_app(snap);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/passthrough/openai/v1/models")
+            .header("authorization", "Bearer sk-caller")
+            .header("x-api-key", "caller-alt-cred")
+            .header("x-aisix-request-id", "caller-forged-id")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let received = &upstream.received_requests().await.unwrap()[0];
+        let auths: Vec<_> = received.headers.get_all("authorization").iter().collect();
+        assert_eq!(auths.len(), 1, "exactly one Authorization on the wire");
+        assert_eq!(auths[0], "Bearer sk-upstream");
+        assert!(received.headers.get("x-api-key").is_none());
+        // Exactly one correlation id on the wire: the inbound copy is
+        // stripped and the dispatch sets the request's resolved id (which
+        // `ensure_request_id` may legitimately adopt from the caller) —
+        // pre-fix the upstream saw BOTH values as duplicates.
+        let rid: Vec<_> = received
+            .headers
+            .get_all("x-aisix-request-id")
+            .iter()
+            .collect();
+        assert_eq!(rid.len(), 1);
+    }
+
+    #[test]
+    fn copy_safe_headers_preserves_repeated_values() {
+        let mut src = HeaderMap::new();
+        src.append("set-cookie", HeaderValue::from_static("a=1"));
+        src.append("set-cookie", HeaderValue::from_static("b=2"));
+        src.append("vary", HeaderValue::from_static("accept"));
+        let mut dst = HeaderMap::new();
+        copy_safe_headers(&src, &mut dst);
+        let cookies: Vec<_> = dst.get_all("set-cookie").iter().collect();
+        assert_eq!(cookies.len(), 2, "both Set-Cookie values must relay");
+    }
+
+    #[test]
+    fn sse_splitter_bounds_an_unterminated_frame() {
+        let mut s = SseFrameSplitter::new();
+        // Feed > MAX_HELD_STREAM_BYTES without a frame terminator: the
+        // splitter must hand the oversized run on instead of buffering
+        // without bound.
+        let chunk = vec![b'x'; 256 * 1024];
+        let mut emitted = 0usize;
+        for _ in 0..8 {
+            emitted += s.push(&chunk).iter().map(Vec::len).sum::<usize>();
+        }
+        assert!(
+            emitted >= MAX_HELD_STREAM_BYTES,
+            "oversized unterminated run must be flushed ({emitted} emitted)"
+        );
+        assert!(s.take_rest().len() <= MAX_HELD_STREAM_BYTES);
     }
 
     #[test]

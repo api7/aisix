@@ -65,10 +65,12 @@ pub struct PassthroughRoute {
     /// Header carrying the gateway credential (API key or JWT) when
     /// `auth_mode` is `header_key`, e.g. `x-aisix-api-key`. Lets
     /// `Authorization` carry the caller's own upstream credential. The
-    /// header is stripped before forwarding. Required for `header_key`;
-    /// ignored otherwise.
+    /// header is stripped before forwarding. Lowercase-only so the
+    /// forbidden credential-slot list in the coupling is exhaustive
+    /// (matching is case-insensitive on the wire regardless). Required
+    /// for `header_key`; ignored otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(regex(pattern = "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"), length(min = 1))]
+    #[schemars(regex(pattern = "^[!#$%&'*+.^_`|~0-9a-z-]+$"), length(min = 1))]
     pub auth_header_name: Option<String>,
 
     /// The API key this route's traffic runs as when `auth_mode` is
@@ -113,15 +115,20 @@ pub struct PassthroughRoute {
     /// Optional header carrying the end-user identity injected by the
     /// upstream network device (e.g. `x-aisix-user`). Its value is recorded
     /// on the usage event for per-employee audit attribution and stripped
-    /// before forwarding.
+    /// before forwarding. Lowercase-only so the forbidden credential-slot
+    /// list in the coupling is exhaustive; credential-bearing names
+    /// (`authorization`, `cookie`, …) are rejected outright — their value
+    /// on the usage event would be credential retention, not identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(regex(pattern = "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"), length(min = 1))]
+    #[schemars(regex(pattern = "^[!#$%&'*+.^_`|~0-9a-z-]+$"), length(min = 1))]
     pub identity_header: Option<String>,
 
-    /// Maximum time, in milliseconds, for a non-streaming upstream exchange.
-    /// Streaming responses are not bounded by this (the relay ends when the
-    /// upstream stream ends or the client disconnects). When omitted, the
-    /// gateway default request timeout applies.
+    /// Maximum time, in milliseconds, for a non-streaming upstream
+    /// exchange. On a streaming route it bounds the response-header phase
+    /// and any non-SSE body read, but never a healthy SSE relay (which
+    /// ends with the upstream stream or the client hanging up). When
+    /// omitted, the gateway default request timeout applies to
+    /// non-streaming exchanges only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1))]
     pub timeout_ms: Option<u64>,
@@ -238,6 +245,20 @@ impl PassthroughRoute {
 /// (same pattern as [`super::mcp_server::mcp_server_credential_coupling`]).
 /// Every rule here is enforced on both the strict declarative path and the
 /// lenient etcd path so a route is never half-configured at dispatch time.
+/// Header names a route's `identity_header` / `auth_header_name` may never
+/// take: the value of any of these IS a credential, and the identity slot
+/// records its value onto the usage event (credential retention) while the
+/// auth slot would repurpose a credential channel the modes already own.
+/// The fields' schemars pattern forces lowercase, so this lowercase list is
+/// exhaustive on every configuration path.
+const FORBIDDEN_HEADER_SLOTS: [&str; 5] = [
+    "authorization",
+    "proxy-authorization",
+    "cookie",
+    "set-cookie",
+    "x-api-key",
+];
+
 pub fn passthrough_route_coupling() -> Value {
     json!([
         // At least one match dimension.
@@ -245,12 +266,28 @@ pub fn passthrough_route_coupling() -> Value {
             { "title": "Path-prefix match", "required": ["path_prefix"] },
             { "title": "Host match", "required": ["hosts"] }
         ] },
-        // hosts, when present, is a non-empty list of non-empty strings.
+        // path_prefix, when present, is a real non-null string (the
+        // match-dimension `required` alone would accept an explicit null,
+        // which deserializes as absent and voids the rule).
+        {
+            "if": { "required": ["path_prefix"] },
+            "then": { "properties": { "path_prefix": {
+                "type": "string", "minLength": 1
+            } } }
+        },
+        // hosts, when present, is a non-empty list of non-empty,
+        // non-wildcard-only host patterns: exact hosts, or a `*.` prefix
+        // that keeps at least two literal labels (`*.example.com` — never
+        // `*.com` or a bare `*`, which would make a `preserve_host` target
+        // effectively unbounded).
         {
             "if": { "required": ["hosts"] },
             "then": { "properties": { "hosts": {
                 "type": "array", "minItems": 1,
-                "items": { "type": "string", "minLength": 1 }
+                "items": {
+                    "type": "string", "minLength": 1,
+                    "pattern": "^(\\*\\.)?([A-Za-z0-9-]+\\.)+[A-Za-z0-9-]+$|^[A-Za-z0-9-]+$"
+                }
             } } }
         },
         // path_prefix must not claim a reserved gateway namespace. The
@@ -294,27 +331,55 @@ pub fn passthrough_route_coupling() -> Value {
             "if": { "properties": { "preserve_host": { "const": true } }, "required": ["preserve_host"] },
             "then": { "required": ["hosts"] }
         },
-        // target_url must be http(s).
+        // target_url must be a real http(s) string — never an explicit
+        // null, which `required` alone would accept (it deserializes as
+        // absent and the dispatch would build an empty base).
         {
             "if": { "required": ["target_url"] },
-            "then": { "properties": { "target_url": { "pattern": "^https?://" } } }
+            "then": { "properties": { "target_url": {
+                "type": "string", "pattern": "^https?://"
+            } } }
         },
-        // auth_mode couplings.
+        // The header-slot fields must be real lowercase header names and
+        // never a credential channel: recording `Authorization` as the
+        // identity would persist the caller's credential onto the usage
+        // event, and consuming it as the gateway slot belongs to the
+        // modes themselves.
+        {
+            "if": { "required": ["auth_header_name"] },
+            "then": { "properties": { "auth_header_name": {
+                "type": "string", "not": { "enum": FORBIDDEN_HEADER_SLOTS }
+            } } }
+        },
+        {
+            "if": { "required": ["identity_header"] },
+            "then": { "properties": { "identity_header": {
+                "type": "string", "not": { "enum": FORBIDDEN_HEADER_SLOTS }
+            } } }
+        },
+        // auth_mode couplings. The mode-required companions are pinned to
+        // non-null strings for the same explicit-null reason as target_url.
         {
             "if": { "properties": { "auth_mode": { "const": "header_key" } }, "required": ["auth_mode"] },
-            "then": { "required": ["auth_header_name"] }
+            "then": {
+                "required": ["auth_header_name"],
+                "properties": { "auth_header_name": { "type": "string", "minLength": 1 } }
+            }
         },
         {
             "if": { "properties": { "auth_mode": { "const": "anonymous" } }, "required": ["auth_mode"] },
             "then": {
                 "required": ["anonymous_key_id", "source_cidrs"],
-                "properties": { "source_cidrs": {
-                    "type": "array", "minItems": 1,
-                    "items": { "type": "string", "minLength": 1 }
-                } }
+                "properties": {
+                    "anonymous_key_id": { "type": "string", "minLength": 1 },
+                    "source_cidrs": {
+                        "type": "array", "minItems": 1,
+                        "items": { "type": "string", "minLength": 1 }
+                    }
+                }
             }
         },
-        // credential_mode couplings: inject needs a ProviderKey; a
+        // credential_mode couplings: inject needs a real ProviderKey id; a
         // forward_client route carrying one is a configuration error, not
         // an ignored field.
         {
@@ -324,7 +389,10 @@ pub fn passthrough_route_coupling() -> Value {
                     { "title": "credential_mode: inject", "properties": { "credential_mode": { "const": "inject" } }, "required": ["credential_mode"] }
                 ]
             },
-            "then": { "required": ["provider_key_id"] }
+            "then": {
+                "required": ["provider_key_id"],
+                "properties": { "provider_key_id": { "type": "string", "minLength": 1 } }
+            }
         },
         {
             "if": { "properties": { "credential_mode": { "const": "forward_client" } }, "required": ["credential_mode"] },
@@ -394,5 +462,112 @@ mod tests {
         .unwrap();
         // Callers pass the already-lowercased inbound host.
         assert!(r.matches_host("api.example.com"));
+    }
+}
+
+#[cfg(test)]
+mod coupling_tests {
+    use crate::models::schema::{validate_passthrough_route, validate_passthrough_route_lenient};
+    use serde_json::json;
+
+    fn base() -> serde_json::Value {
+        json!({
+            "name": "r",
+            "path_prefix": "/p",
+            "target_url": "https://u.example",
+            "provider_key_id": "pk-1"
+        })
+    }
+
+    #[test]
+    fn explicit_null_on_coupled_fields_is_rejected() {
+        // `required` alone would accept null (deserializes as absent) and
+        // void the coupling — both validators must refuse it.
+        for (field, value) in [
+            ("target_url", json!(null)),
+            ("provider_key_id", json!(null)),
+            ("path_prefix", json!(null)),
+        ] {
+            let mut doc = base();
+            doc[field] = value;
+            assert!(
+                validate_passthrough_route(&doc).is_err(),
+                "strict must reject null {field}"
+            );
+            assert!(
+                validate_passthrough_route_lenient(&doc).is_err(),
+                "lenient must reject null {field}"
+            );
+        }
+        // Mode-required companions: header_key with a null header name.
+        let doc = json!({
+            "name": "r", "path_prefix": "/p",
+            "target_url": "https://u.example", "provider_key_id": "pk",
+            "auth_mode": "header_key", "auth_header_name": null
+        });
+        assert!(validate_passthrough_route(&doc).is_err());
+        // Anonymous with a null principal.
+        let doc = json!({
+            "name": "r", "path_prefix": "/p",
+            "target_url": "https://u.example", "provider_key_id": "pk",
+            "auth_mode": "anonymous", "anonymous_key_id": null,
+            "source_cidrs": ["10.0.0.0/8"]
+        });
+        assert!(validate_passthrough_route(&doc).is_err());
+    }
+
+    #[test]
+    fn credential_bearing_header_slots_are_rejected() {
+        for field in ["auth_header_name", "identity_header"] {
+            for name in [
+                "authorization",
+                "proxy-authorization",
+                "cookie",
+                "set-cookie",
+                "x-api-key",
+                // The field pattern is lowercase-only, so a case variant
+                // cannot sneak past the forbidden list either.
+                "Authorization",
+            ] {
+                let mut doc = base();
+                if field == "auth_header_name" {
+                    doc["auth_mode"] = json!("header_key");
+                }
+                doc[field] = json!(name);
+                assert!(
+                    validate_passthrough_route(&doc).is_err(),
+                    "{field}={name} must be rejected"
+                );
+            }
+            // A benign custom header passes.
+            let mut doc = base();
+            if field == "auth_header_name" {
+                doc["auth_mode"] = json!("header_key");
+            }
+            doc[field] = json!("x-aisix-user");
+            assert!(
+                validate_passthrough_route(&doc).is_ok(),
+                "{field}=x-aisix-user must pass"
+            );
+        }
+    }
+
+    #[test]
+    fn preserve_host_wildcards_need_two_literal_labels() {
+        let mk = |host: &str| {
+            json!({
+                "name": "r",
+                "hosts": [host],
+                "preserve_host": true,
+                "credential_mode": "forward_client"
+            })
+        };
+        assert!(validate_passthrough_route(&mk("api.example.com")).is_ok());
+        assert!(validate_passthrough_route(&mk("*.githubcopilot.com")).is_ok());
+        // A single-label wildcard tail widens the derived target to any
+        // registrable domain — rejected on every configuration path.
+        assert!(validate_passthrough_route(&mk("*.com")).is_err());
+        assert!(validate_passthrough_route(&mk("*")).is_err());
+        assert!(validate_passthrough_route_lenient(&mk("*.com")).is_err());
     }
 }

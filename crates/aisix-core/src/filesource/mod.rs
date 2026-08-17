@@ -378,6 +378,9 @@ pub fn load_from_str(
                 desugar::desugar_rate_limit_policy(&mut entry.doc, &identity_maps)
             }
             "claim_mappings" => desugar::desugar_claim_mapping(&mut entry.doc, &identity_maps),
+            "passthrough_routes" => {
+                desugar::desugar_passthrough_route(&mut entry.doc, &identity_maps)
+            }
             _ => Ok(()),
         };
         if let Err(message) = sugar_result {
@@ -526,6 +529,32 @@ pub fn load_from_str(
             {
                 check_model_ref(scope, "semantic on_embedding_failure target", target);
             }
+        }
+    }
+
+    // Same load-time protection for route grants: an `allowed_routes`
+    // entry naming no defined route (globs exempt) is a typo that would
+    // otherwise surface as a silent runtime 403.
+    let route_names = identity_maps.get("passthrough_routes").unwrap_or(&empty);
+    for (_, scope, key) in &apikeys {
+        for entry in key.allowed_routes.iter().flatten() {
+            if entry.contains('*') || route_names.contains_key(entry) {
+                continue;
+            }
+            let mut known: Vec<&str> = route_names.keys().map(String::as_str).collect();
+            known.sort_unstable();
+            errors.push(LoadError {
+                scope: scope.to_string(),
+                message: format!(
+                    "allowed_routes entry references unknown passthrough route {entry:?} \
+                     (defined routes: {})",
+                    if known.is_empty() {
+                        "none".to_string()
+                    } else {
+                        known.join(", ")
+                    }
+                ),
+            });
         }
     }
 

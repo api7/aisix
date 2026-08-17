@@ -1912,6 +1912,10 @@ const OPENAPI_JSON_BASE: &str = r##"{
       "description": "Upstream A2A agents exposed through the gateway Agent Gateway endpoint."
     },
     {
+      "name": "Passthrough Routes",
+      "description": "Explicit passthrough routes that forward matching requests to one upstream target."
+    },
+    {
       "name": "Guardrails",
       "description": "Guardrail policies attached to proxy traffic."
     },
@@ -2829,6 +2833,15 @@ mod tests {
         let paths = parsed["paths"]
             .as_object()
             .expect("paths must be an object");
+        // Every operation tag must be DECLARED in the top-level tags
+        // array — an undeclared tag renders as an unordered, undescribed
+        // group in the reference, and nothing else fails.
+        let declared_tags: std::collections::BTreeSet<&str> = parsed["tags"]
+            .as_array()
+            .expect("top-level tags must be an array")
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .collect();
 
         for (path, path_item) in paths {
             let path_item = path_item.as_object().expect("path item must be an object");
@@ -2842,6 +2855,14 @@ mod tests {
                         .is_some_and(|tags| !tags.is_empty()),
                     "{method} {path} missing tags"
                 );
+                for tag in operation["tags"].as_array().into_iter().flatten() {
+                    let tag = tag.as_str().unwrap_or_default();
+                    assert!(
+                        declared_tags.contains(tag),
+                        "{method} {path} uses undeclared tag {tag:?} — add it to the \
+                         top-level tags array"
+                    );
+                }
                 assert!(
                     operation["description"]
                         .as_str()
