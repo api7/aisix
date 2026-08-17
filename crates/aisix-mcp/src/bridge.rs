@@ -17,12 +17,13 @@ use std::time::Duration;
 use aisix_core::{McpAuthType, McpServer};
 use async_trait::async_trait;
 use http::{HeaderName, HeaderValue};
-use rmcp::model::CallToolRequestParams;
+use rmcp::model::{CallToolRequestParams, CallToolResponse};
 use rmcp::service::{ClientInitializeError, RoleClient, RunningService};
 use rmcp::transport::streamable_http_client::{
     StreamableHttpClientTransportConfig, StreamableHttpError,
 };
 use rmcp::transport::StreamableHttpClientTransport;
+use rmcp::ClientCacheConfig;
 use rmcp::ServiceExt;
 
 use crate::error::McpError;
@@ -368,6 +369,20 @@ impl RmcpBridge {
         let running = tokio::time::timeout(upstream.timeout, establish)
             .await
             .map_err(|_| McpError::Connect("upstream MCP connect timed out".to_string()))??;
+        // rmcp 3.x ships a client response cache that is ENABLED by default
+        // (`ClientCacheConfig::default()`), keyed per peer and honoring the
+        // server's `ttlMs`/`cacheScope` hints. This bridge is shared across
+        // every AISIX caller that reaches the same upstream, so any cached
+        // upstream response would be served across principals — a
+        // cross-tenant leak the SDK's own migration guide warns about
+        // (`private_partition`). The gateway's caching story is a wire-level
+        // hint only (no cache engine), so the cache is disabled outright
+        // rather than partitioned. Do not re-enable without keying the
+        // partition to the calling principal.
+        running
+            .peer()
+            .set_response_cache_config(ClientCacheConfig::disabled())
+            .await;
         Ok(Self {
             running,
             timeout: upstream.timeout,
@@ -454,10 +469,43 @@ impl McpBridge for RmcpBridge {
                 ))
             }
         };
-        let result = tokio::time::timeout(self.timeout, self.running.call_tool(params))
+        // `call_tool_once`, NOT `call_tool`: the 3.x high-level helper drives
+        // MRTR (SEP-2322) automatically — on an `input_required` result it
+        // re-sends the request with client-fulfilled inputs, up to
+        // `DEFAULT_MRTR_MAX_ROUNDS` (10) upstream round trips for ONE inbound
+        // call. That would silently multiply upstream cost and defeat every
+        // per-call quota, budget, and timeout assumption in the gateway. The
+        // `_once` variant sends exactly one request; a non-final response is
+        // surfaced as a clean tool failure instead of a hidden retry loop.
+        let response = tokio::time::timeout(self.timeout, self.running.call_tool_once(params))
             .await
             .map_err(|_| McpError::Request("upstream tools/call timed out".to_string()))?
             .map_err(|e| McpError::Request(e.to_string()))?;
+        let result = match response {
+            CallToolResponse::Complete(result) => result,
+            CallToolResponse::InputRequired(_) => {
+                return Err(McpError::Request(
+                    "upstream tool requires additional interactive input (MRTR), which the \
+                     gateway does not relay"
+                        .to_string(),
+                ))
+            }
+            CallToolResponse::Task(_) => {
+                return Err(McpError::Request(
+                    "upstream tool deferred to an asynchronous task, which the gateway does \
+                     not support"
+                        .to_string(),
+                ))
+            }
+            // `CallToolResponse` is #[non_exhaustive]; treat future variants
+            // as unsupported rather than mis-mapping them to a result. Kept
+            // payload-free: the message lands in gateway logs verbatim.
+            _ => {
+                return Err(McpError::Request(
+                    "upstream returned an unsupported tools/call response kind".to_string(),
+                ))
+            }
+        };
         let content = serde_json::to_value(&result.content)
             .map_err(|e| McpError::Request(format!("failed to encode tool result: {e}")))?;
         Ok(McpToolResult {

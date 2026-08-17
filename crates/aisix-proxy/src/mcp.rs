@@ -208,6 +208,21 @@ async fn dispatch(
     };
 
     let peek = serde_json::from_slice::<JsonRpcPeek>(&bytes).ok();
+
+    // Converge the accepted `MCP-Protocol-Version` set before any quota,
+    // guardrail, or upstream work (AISIX-Cloud#1148). rmcp's own transport
+    // check admits its whole hardcoded KNOWN_VERSIONS list — including
+    // `2024-11-05`, whose HTTP+SSE transport this endpoint has never served —
+    // and renders violations as a bare text/plain 400 outside the JSON-RPC
+    // envelope. This gate rejects against the SAME list that `initialize`
+    // negotiation and `server/discover` advertise, in the same envelope every
+    // other synthesized `/mcp` error uses. An absent header passes: the
+    // spec's backwards-compatibility rule (assume `2025-03-26`) applies
+    // downstream.
+    if let Some(response) = reject_unsupported_protocol_version(&parts.headers, peek.as_ref()) {
+        return response;
+    }
+
     let is_tool_call = peek.as_ref().and_then(|p| p.method.as_deref()) == Some("tools/call");
     // Resolve the called (server, tool) up front, owned, so it survives the
     // body being consumed when the request is rebuilt. Aggregated: split the
@@ -575,6 +590,57 @@ fn emit_tool_call_usage(
 /// the result, which the calling agent reads as tool output and can adapt to).
 /// A policy rejection is the second kind — the request was well-formed and the
 /// caller should learn, in-band, that content policy stopped it.
+/// Reject a request whose `MCP-Protocol-Version` header names a version
+/// `/mcp` does not serve: HTTP 400 with a JSON-RPC error envelope (echoing
+/// the request id when one was parseable), listing the supported versions.
+/// Returns `None` when the header is absent (spec backwards-compatibility:
+/// treated as `2025-03-26` downstream) or names a supported version.
+///
+/// The header value is caller-controlled; the echo in the message is
+/// control-stripped and length-bounded so a hostile value cannot inject log
+/// lines or bloat the response.
+fn reject_unsupported_protocol_version(
+    headers: &axum::http::HeaderMap,
+    peek: Option<&JsonRpcPeek>,
+) -> Option<Response> {
+    const MAX_ECHO: usize = 64;
+    let value = headers.get("mcp-protocol-version")?;
+    let message = match value.to_str() {
+        Ok(v) if aisix_mcp::SUPPORTED_PROTOCOL_VERSION_NAMES.contains(&v) => return None,
+        Ok(v) => {
+            let echoed: String = v
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(MAX_ECHO)
+                .collect();
+            format!("unsupported MCP-Protocol-Version: {echoed}")
+        }
+        Err(_) => "invalid MCP-Protocol-Version header".to_string(),
+    };
+    let id = peek
+        .and_then(|p| p.id.clone())
+        .unwrap_or(serde_json::Value::Null);
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            // JSON-RPC 2.0 "Invalid Request": defined identically across
+            // every MCP generation, unlike the 2026-07-28-only -32022.
+            "code": -32600,
+            "message": message,
+            "data": { "supported": aisix_mcp::SUPPORTED_PROTOCOL_VERSION_NAMES },
+        }
+    });
+    Some(
+        (
+            StatusCode::BAD_REQUEST,
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            body.to_string(),
+        )
+            .into_response(),
+    )
+}
+
 fn jsonrpc_guardrail_block(
     id: Option<serde_json::Value>,
     side: &str,
@@ -1843,5 +1909,129 @@ mod tests {
             .await
             .expect("router responds");
         assert_eq!(scoped.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    /// A `/mcp` request for `method` carrying an explicit
+    /// `MCP-Protocol-Version` header (and matching request `_meta` for the
+    /// stateless `2026-07-28` shape when `modern` is set).
+    fn versioned_request(
+        version: &str,
+        method: &str,
+        params: serde_json::Value,
+    ) -> HttpRequest<Body> {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": method,
+            "params": params
+        });
+        HttpRequest::post("/mcp")
+            .header("host", "mcp.aisix.example.com")
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("authorization", format!("Bearer {TOKEN}"))
+            .header("mcp-protocol-version", version)
+            .header("mcp-method", method)
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    /// A version outside the served set — including `2024-11-05`, which
+    /// rmcp's own transport check would ADMIT (it is in KNOWN_VERSIONS) —
+    /// is rejected by the proxy gate: HTTP 400, JSON-RPC envelope, the
+    /// request id echoed, the supported list attached
+    /// (AISIX-Cloud#1148 / #1144).
+    #[tokio::test]
+    async fn unsupported_protocol_version_header_is_rejected_in_the_envelope() {
+        let router = router_with(snapshot_with_key());
+        for version in ["2024-11-05", "not-a-version"] {
+            let response = router
+                .clone()
+                .oneshot(versioned_request(
+                    version,
+                    "tools/list",
+                    serde_json::json!({}),
+                ))
+                .await
+                .expect("router responds");
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "{version} must be rejected"
+            );
+            let content_type = response
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            assert!(
+                content_type.starts_with("application/json"),
+                "the rejection must use the JSON envelope, not text/plain \
+                 (got {content_type})"
+            );
+            let bytes = to_bytes(response.into_body(), 1_048_576)
+                .await
+                .expect("read body");
+            let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
+            assert_eq!(body["jsonrpc"], "2.0", "{body}");
+            assert_eq!(body["id"], 7, "request id must be echoed: {body}");
+            assert_eq!(body["error"]["code"], -32600, "{body}");
+            let supported: Vec<&str> = body["error"]["data"]["supported"]
+                .as_array()
+                .unwrap_or_else(|| panic!("supported list missing: {body}"))
+                .iter()
+                .filter_map(|v| v.as_str())
+                .collect();
+            assert_eq!(
+                supported,
+                aisix_mcp::SUPPORTED_PROTOCOL_VERSION_NAMES.to_vec()
+            );
+        }
+    }
+
+    /// Every version the endpoint serves passes the gate end-to-end: the
+    /// legacy generations as plain stateless requests, `2026-07-28` with its
+    /// required per-request metadata.
+    #[tokio::test]
+    async fn supported_protocol_version_headers_pass_the_gate() {
+        let router = router_with(snapshot_with_key());
+        for version in ["2025-03-26", "2025-06-18", "2025-11-25"] {
+            let response = router
+                .clone()
+                .oneshot(versioned_request(
+                    version,
+                    "tools/list",
+                    serde_json::json!({}),
+                ))
+                .await
+                .expect("router responds");
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "legacy {version} tools/list must be served"
+            );
+        }
+        let modern = router
+            .oneshot(versioned_request(
+                "2026-07-28",
+                "tools/list",
+                serde_json::json!({
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                        "io.modelcontextprotocol/clientInfo": {
+                            "name": "gate-test", "version": "0.0.0"
+                        },
+                        "io.modelcontextprotocol/clientCapabilities": {},
+                    }
+                }),
+            ))
+            .await
+            .expect("router responds");
+        assert_eq!(
+            modern.status(),
+            StatusCode::OK,
+            "a stateless 2026-07-28 tools/list must be served"
+        );
     }
 }

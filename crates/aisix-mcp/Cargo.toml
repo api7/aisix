@@ -43,21 +43,24 @@ hex.workspace = true
 # Path-parameter encoding for OpenAPI-backed tool calls (`crate::openapi`).
 percent-encoding.workspace = true
 
-# Official MCP Rust SDK. Pinned exactly: rmcp is <16 months old and still
+# Official MCP Rust SDK. Pinned exactly: rmcp is <2 years old and still
 # ships breaking changes on a roughly-monthly cadence, so we hold a fixed
 # version and keep all rmcp types behind this crate's own surface (the
 # `McpBridge` trait and the gateway DTOs) to absorb API drift.
+#
+# The 3.x line implements the MCP 2026-07-28 revision (stateless serving,
+# `resultType`, cache hints, `Mcp-Method`/`Mcp-Name` header validation) and
+# passes the official conformance suite's dated 2026-07-28 core suites.
 #
 # The gateway is dual-role — an MCP client to upstream servers AND an MCP
 # server to downstream agents — so both the `client` and `server` halves are
 # production dependencies.
 [dependencies.rmcp]
-version = "=1.8.0"
+version = "=3.1.2"
 default-features = false
 features = [
     "client",
     "server",
-    "base64",
     "transport-streamable-http-client",
     "transport-streamable-http-client-reqwest",
     # `transport-streamable-http-client-reqwest` only wires `dep:reqwest`
@@ -74,3 +77,6 @@ aisix-core = { path = "../aisix-core" }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 axum.workspace = true
 async-trait.workspace = true
+# Raw-HTTP wire-shape assertions in tests/protocol_generations.rs: real
+# clients hide the headers and envelope details those tests pin.
+reqwest.workspace = true
