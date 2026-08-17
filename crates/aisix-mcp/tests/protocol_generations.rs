@@ -69,7 +69,7 @@ async fn spawn_gateway() -> SocketAddr {
         "alpha".to_string(),
         Arc::new(StaticEcho) as Arc<dyn McpBridge>,
     )]);
-    let app = axum::Router::new().nest_service("/mcp", streamable_http_service(gateway));
+    let app = axum::Router::new().nest_service("/mcp", streamable_http_service(gateway, 0));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind ephemeral port");
@@ -327,8 +327,11 @@ async fn modern_header_body_mismatch_is_rejected() {
     );
 }
 
-/// Legacy responses keep their historical wire shape: no `resultType`
-/// discriminator on a `2025-11-25` session's results.
+/// Legacy responses keep their historical wire shape across EVERY legacy
+/// generation this endpoint serves, on both `tools/list` and `tools/call`:
+/// no `resultType` discriminator, and no `2026-07-28` cache-hint fields
+/// (rmcp strips only `resultType` for legacy peers, so the gateway
+/// version-gates the hints itself).
 #[tokio::test]
 async fn legacy_results_keep_their_wire_shape() {
     let addr = spawn_gateway().await;
@@ -342,35 +345,47 @@ async fn legacy_results_keep_their_wire_shape() {
     assert_eq!(tools.len(), 1);
     assert_eq!(tools[0].name.as_ref(), "alpha__echo");
 
-    // Raw legacy request (header names the negotiated legacy version):
-    // the result must NOT carry the 2026-07-28 discriminator.
-    let (status, _headers, body) = post_raw(
-        addr,
-        &[("mcp-protocol-version", "2025-11-25")],
-        serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 5,
-            "method": "tools/list",
-            "params": {}
-        }),
-    )
-    .await;
-    assert_eq!(status, 200, "legacy tools/list: {body}");
-    assert!(
-        body["result"].get("resultType").is_none(),
-        "legacy results must keep the pre-2026 shape: {body}"
-    );
-    // The 2026-07-28 cache-hint fields must not appear either: rmcp strips
-    // only `resultType` for legacy peers, so the gateway version-gates the
-    // hints itself.
-    assert!(
-        body["result"].get("ttlMs").is_none(),
-        "no ttlMs on a legacy response: {body}"
-    );
-    assert!(
-        body["result"].get("cacheScope").is_none(),
-        "no cacheScope on a legacy response: {body}"
-    );
+    for version in ["2025-03-26", "2025-06-18", "2025-11-25"] {
+        let (status, _headers, body) = post_raw(
+            addr,
+            &[("mcp-protocol-version", version)],
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 5,
+                "method": "tools/list",
+                "params": {}
+            }),
+        )
+        .await;
+        assert_eq!(status, 200, "legacy {version} tools/list: {body}");
+        for field in ["resultType", "ttlMs", "cacheScope"] {
+            assert!(
+                body["result"].get(field).is_none(),
+                "no {field} on a legacy {version} tools/list response: {body}"
+            );
+        }
+
+        let (status, _headers, body) = post_raw(
+            addr,
+            &[("mcp-protocol-version", version)],
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 6,
+                "method": "tools/call",
+                "params": { "name": "alpha__echo", "arguments": { "text": "legacy" } }
+            }),
+        )
+        .await;
+        assert_eq!(status, 200, "legacy {version} tools/call: {body}");
+        assert_eq!(
+            body["result"]["content"][0]["text"], "legacy",
+            "legacy {version} call executes: {body}"
+        );
+        assert!(
+            body["result"].get("resultType").is_none(),
+            "no resultType on a legacy {version} tools/call response: {body}"
+        );
+    }
 }
 
 /// The end-to-end modern lifecycle through rmcp's own client: `Discover`
@@ -402,4 +417,122 @@ async fn modern_rmcp_client_lifecycle_works_end_to_end() {
     let result = client.call_tool(params).await.expect("call tool");
     let content = serde_json::to_value(&result.content).expect("encode");
     assert_eq!(content[0]["text"], "modern-lifecycle");
+}
+
+/// A real MCP server for the full-chain test below: one `echo` tool served
+/// over actual Streamable HTTP.
+#[derive(Clone, Default)]
+struct UpstreamEcho;
+
+impl rmcp::ServerHandler for UpstreamEcho {
+    async fn list_tools(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::ListToolsResult, rmcp::ErrorData> {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "text": { "type": "string" } },
+        });
+        let schema_obj = schema.as_object().expect("schema is an object").clone();
+        let tool = rmcp::model::Tool::new("echo", "Echo the text argument", schema_obj);
+        Ok(rmcp::model::ListToolsResult::with_all_items(vec![tool]))
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
+        let text = request
+            .arguments
+            .as_ref()
+            .and_then(|m| m.get("text"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        Ok(
+            rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text(text)])
+                .into(),
+        )
+    }
+
+    fn get_info(&self) -> rmcp::model::ServerInfo {
+        let mut info = rmcp::model::ServerInfo::default();
+        info.capabilities = rmcp::model::ServerCapabilities::builder()
+            .enable_tools()
+            .build();
+        info
+    }
+}
+
+/// The full shipped chain under a modern client: `Discover`-lifecycle
+/// client → gateway → `EphemeralBridge` (real connect/list/call per
+/// operation, legacy handshake) → real upstream MCP server over HTTP. Pins
+/// that the modern downstream surface composes with the production bridge —
+/// not just with an in-process stub — including the cross-generation seam
+/// (modern downstream, legacy upstream session).
+#[tokio::test]
+async fn modern_client_through_real_bridge_and_upstream() {
+    use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+    use rmcp::transport::streamable_http_server::{
+        StreamableHttpServerConfig, StreamableHttpService,
+    };
+
+    // Real upstream server on an ephemeral port.
+    let upstream_service = StreamableHttpService::new(
+        move || Ok(UpstreamEcho),
+        Arc::new(LocalSessionManager::default()),
+        StreamableHttpServerConfig::default(),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind upstream port");
+    let upstream_addr = listener.local_addr().expect("upstream addr");
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            axum::Router::new().nest_service("/mcp", upstream_service),
+        )
+        .await
+        .expect("serve upstream");
+    });
+
+    // Gateway fronting it through the production bridge type.
+    let bridge = aisix_mcp::EphemeralBridge::new(aisix_mcp::McpUpstream::new(format!(
+        "http://{upstream_addr}/mcp"
+    )));
+    let gateway = McpGateway::new([("alpha".to_string(), Arc::new(bridge) as Arc<dyn McpBridge>)]);
+    let app = axum::Router::new().nest_service("/mcp", streamable_http_service(gateway, 0));
+    let gw_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind gateway port");
+    let gw_addr = gw_listener.local_addr().expect("gateway addr");
+    tokio::spawn(async move {
+        axum::serve(gw_listener, app).await.expect("serve gateway");
+    });
+
+    let client = ClientInfo::default()
+        .serve_with_lifecycle(
+            StreamableHttpClientTransport::from_uri(format!("http://{gw_addr}/mcp")),
+            ClientLifecycleMode::Discover {
+                preferred_versions: vec![ProtocolVersion::V_2026_07_28],
+            },
+        )
+        .await
+        .expect("modern client startup against the real chain");
+
+    let tools = client.list_all_tools().await.expect("list tools");
+    let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+    assert_eq!(names, ["alpha__echo"], "real upstream tool aggregated");
+
+    let mut params = CallToolRequestParams::new("alpha__echo".to_string());
+    params = params.with_arguments(
+        serde_json::json!({ "text": "through-the-real-chain" })
+            .as_object()
+            .expect("object")
+            .clone(),
+    );
+    let result = client.call_tool(params).await.expect("call tool");
+    let content = serde_json::to_value(&result.content).expect("encode");
+    assert_eq!(content[0]["text"], "through-the-real-chain");
 }

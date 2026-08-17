@@ -128,7 +128,7 @@ fn openapi_entry(id: &str, config: Value) -> ResourceEntry<McpServer> {
 }
 
 async fn spawn_gateway(gateway: McpGateway) -> SocketAddr {
-    serve(axum::Router::new().nest_service("/mcp", streamable_http_service(gateway))).await
+    serve(axum::Router::new().nest_service("/mcp", streamable_http_service(gateway, 0))).await
 }
 
 fn first_text(result: &CallToolResult) -> String {

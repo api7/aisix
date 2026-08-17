@@ -39,6 +39,12 @@ struct StubCounters {
 enum CallBehavior {
     /// Answer with a SEP-2322 `input_required` result (non-final).
     InputRequired,
+    /// Answer with a SEP-2663 `task` result (asynchronous execution).
+    Task,
+    /// Answer `404 Not Found` — the Streamable HTTP signal for an expired
+    /// session (the stub also mints a session id on `initialize` so the
+    /// bridge's requests are session-bearing).
+    ExpiredSession,
 }
 
 #[derive(Clone)]
@@ -64,11 +70,29 @@ async fn stub_mcp(State(stub): State<Stub>, body: axum::body::Bytes) -> axum::re
             .into_response()
     };
     match method {
-        "initialize" => respond(serde_json::json!({
-            "protocolVersion": "2025-11-25",
-            "capabilities": { "tools": {} },
-            "serverInfo": { "name": "stub", "version": "0.0.0" },
-        })),
+        "initialize" => {
+            let result = serde_json::json!({
+                "protocolVersion": "2025-11-25",
+                "capabilities": { "tools": {} },
+                "serverInfo": { "name": "stub", "version": "0.0.0" },
+            });
+            // The expired-session scenario needs session-BEARING requests,
+            // so its handshake mints a session id like a stateful server.
+            if matches!(stub.call_behavior, Some(CallBehavior::ExpiredSession)) {
+                return (
+                    [
+                        (axum::http::header::CONTENT_TYPE, "application/json"),
+                        (
+                            axum::http::HeaderName::from_static("mcp-session-id"),
+                            "sess-1",
+                        ),
+                    ],
+                    serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result }).to_string(),
+                )
+                    .into_response();
+            }
+            respond(result)
+        }
         "notifications/initialized" => axum::http::StatusCode::ACCEPTED.into_response(),
         "tools/list" => {
             // Distinct payload per hit + a huge freshness hint: if any layer
@@ -98,6 +122,19 @@ async fn stub_mcp(State(stub): State<Stub>, body: axum::body::Bytes) -> axum::re
                     "resultType": "input_required",
                     "requestState": "opaque-state",
                 })),
+                // A minimal SEP-2663 `CreateTaskResult`: `resultType: "task"`
+                // is its parse discriminator, with the task fields flattened.
+                Some(CallBehavior::Task) => respond(serde_json::json!({
+                    "resultType": "task",
+                    "taskId": "task-1",
+                    "status": "working",
+                    "createdAt": "2026-08-17T00:00:00Z",
+                    "lastUpdatedAt": "2026-08-17T00:00:00Z",
+                    "ttlMs": null,
+                })),
+                Some(CallBehavior::ExpiredSession) => {
+                    axum::http::StatusCode::NOT_FOUND.into_response()
+                }
                 None => respond(serde_json::json!({
                     "content": [{ "type": "text", "text": "ok" }],
                     "isError": false,
@@ -155,6 +192,53 @@ async fn input_required_is_one_round_trip_and_a_clean_error() {
         counters.call.load(Ordering::SeqCst),
         1,
         "the bridge must not silently retry an input_required response"
+    );
+}
+
+/// A tool call the upstream defers to a SEP-2663 asynchronous task is a
+/// clean error (the gateway does not poll tasks) — and still exactly one
+/// upstream request.
+#[tokio::test]
+async fn task_response_is_one_round_trip_and_a_clean_error() {
+    let (addr, counters) = spawn_stub(Some(CallBehavior::Task)).await;
+    let bridge = RmcpBridge::connect(&McpUpstream::new(format!("http://{addr}/mcp")))
+        .await
+        .expect("connect");
+
+    let error = bridge
+        .call_tool("echo", serde_json::json!({ "text": "x" }))
+        .await
+        .expect_err("a task handle must surface as an error");
+    assert!(
+        error.to_string().contains("asynchronous task"),
+        "error names the task condition: {error}"
+    );
+    assert_eq!(counters.call.load(Ordering::SeqCst), 1);
+}
+
+/// A session-expired `404` on `tools/call` must NOT be answered by silently
+/// re-initializing and REPLAYING the call — for a side-effectful tool that
+/// would be a second execution outside quota/budget accounting. rmcp's
+/// transport default (`reinit_on_expired_session: true`) does exactly that;
+/// the bridge pins it off and surfaces the failure instead.
+#[tokio::test]
+async fn expired_session_does_not_replay_the_tool_call() {
+    let (addr, counters) = spawn_stub(Some(CallBehavior::ExpiredSession)).await;
+    let bridge = RmcpBridge::connect(&McpUpstream::new(format!("http://{addr}/mcp")))
+        .await
+        .expect("connect");
+
+    let result = bridge
+        .call_tool("echo", serde_json::json!({ "text": "x" }))
+        .await;
+    assert!(
+        result.is_err(),
+        "an expired upstream session must surface as an error, got {result:?}"
+    );
+    assert_eq!(
+        counters.call.load(Ordering::SeqCst),
+        1,
+        "the SDK must not re-initialize and replay the tools/call"
     );
 }
 

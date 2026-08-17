@@ -193,7 +193,7 @@ async fn main() {
     let addr = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "127.0.0.1:3111".to_string());
-    let app = axum::Router::new().nest_service("/mcp", streamable_http_service(gateway));
+    let app = axum::Router::new().nest_service("/mcp", streamable_http_service(gateway, 0));
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .unwrap_or_else(|e| panic!("bind {addr}: {e}"));

@@ -634,10 +634,23 @@ impl ServerHandler for McpGateway {
 /// Configured stateless (no sticky session, JSON responses): the aggregator
 /// keeps no per-session state, so the endpoint can sit behind a plain load
 /// balancer — matching the MCP 2026-07-28 transport direction.
+///
+/// `request_body_limit_bytes` is the deployment's request-body cap
+/// (`0` = unlimited, the same convention as everywhere else in the data
+/// plane). It must be threaded in because rmcp 3.x added its OWN inbound
+/// cap (4 MiB default) inside this service — beneath the gateway's limit
+/// middleware — which would silently override any configured limit above
+/// 4 MiB (and the documented unlimited mode) with a plain-text 413.
 pub fn streamable_http_service(
     gateway: McpGateway,
+    request_body_limit_bytes: usize,
 ) -> StreamableHttpService<McpGateway, LocalSessionManager> {
     let mut config = StreamableHttpServerConfig::default();
+    config.max_request_body_bytes = if request_body_limit_bytes == 0 {
+        usize::MAX
+    } else {
+        request_body_limit_bytes
+    };
     // rmcp 3.x rename of `stateful_mode` (same semantics for legacy
     // protocol versions; 2026-07-28 requests are stateless regardless, per
     // SEP-2567). Kept `false`: the aggregator holds no session state, so
@@ -716,5 +729,20 @@ mod tests {
     fn http_sse_generation_stays_unsupported() {
         assert!(!SUPPORTED_PROTOCOL_VERSION_NAMES.contains(&"2024-11-05"));
         assert!(!SUPPORTED_PROTOCOL_VERSIONS.contains(&ProtocolVersion::V_2024_11_05));
+    }
+
+    /// The exact served set, as literals: growing or shrinking it is a
+    /// deliberate protocol-surface decision that must show up as a failing
+    /// test, not ride along inside a refactor that edits the constants.
+    /// (The lockstep test above only proves the two constants AGREE — it
+    /// would pass if a fifth version were added to both.)
+    #[test]
+    fn supported_version_set_is_pinned() {
+        assert_eq!(
+            SUPPORTED_PROTOCOL_VERSION_NAMES,
+            &["2025-03-26", "2025-06-18", "2025-11-25", "2026-07-28"],
+            "update this pin together with the negotiation/discover/header-gate \
+             docs and the tracking issue when the served set changes"
+        );
     }
 }

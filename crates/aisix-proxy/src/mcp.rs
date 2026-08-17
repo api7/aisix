@@ -368,7 +368,10 @@ async fn dispatch(
         None => aisix_mcp::McpGateway::from_snapshot(&snapshot),
     }
     .with_tool_acl(acl);
-    let service = aisix_mcp::streamable_http_service(gateway);
+    // The deployment's body cap replaces rmcp's own 4 MiB default inside
+    // the service; the proxy-level read above already enforced the same
+    // limit, so the two layers can never disagree.
+    let service = aisix_mcp::streamable_http_service(gateway, state.request_body_limit_bytes);
     let request = Request::from_parts(parts, Body::from(bytes));
     // `StreamableHttpService` is a tower service that dispatches on method and
     // never fails (`Error = Infallible`); map its boxed body back to axum's.
@@ -578,18 +581,6 @@ fn emit_tool_call_usage(
         .fan_out(&event, None, exporters.iter().map(|e| &e.value));
 }
 
-/// Build the MCP-native response for a guardrail block: a `tools/call` result
-/// flagged `isError`, echoing the request id, served as HTTP 200 with a JSON
-/// body (the MCP Streamable HTTP shape). Both the input and output hooks funnel
-/// through here; `side` (`"tool call"` for input arguments, `"tool result"` for
-/// output) selects the caller-visible wording.
-///
-/// A tool-execution error rather than a JSON-RPC protocol error: MCP separates
-/// "this request was not valid" (a protocol error, which a client surfaces as a
-/// transport-level failure) from "the tool call did not succeed" (`isError` on
-/// the result, which the calling agent reads as tool output and can adapt to).
-/// A policy rejection is the second kind — the request was well-formed and the
-/// caller should learn, in-band, that content policy stopped it.
 /// Reject a request whose `MCP-Protocol-Version` header names a version
 /// `/mcp` does not serve: HTTP 400 with a JSON-RPC error envelope (echoing
 /// the request id when one was parseable), listing the supported versions.
@@ -617,8 +608,12 @@ fn reject_unsupported_protocol_version(
         }
         Err(_) => "invalid MCP-Protocol-Version header".to_string(),
     };
+    // Echo only a VALID JSON-RPC id (string or number). A malformed request
+    // carrying an object/array id would otherwise be reflected into an
+    // id-invalid response envelope.
     let id = peek
         .and_then(|p| p.id.clone())
+        .filter(|id| id.is_string() || id.is_number())
         .unwrap_or(serde_json::Value::Null);
     let body = serde_json::json!({
         "jsonrpc": "2.0",
@@ -641,6 +636,18 @@ fn reject_unsupported_protocol_version(
     )
 }
 
+/// Build the MCP-native response for a guardrail block: a `tools/call` result
+/// flagged `isError`, echoing the request id, served as HTTP 200 with a JSON
+/// body (the MCP Streamable HTTP shape). Both the input and output hooks funnel
+/// through here; `side` (`"tool call"` for input arguments, `"tool result"` for
+/// output) selects the caller-visible wording.
+///
+/// A tool-execution error rather than a JSON-RPC protocol error: MCP separates
+/// "this request was not valid" (a protocol error, which a client surfaces as a
+/// transport-level failure) from "the tool call did not succeed" (`isError` on
+/// the result, which the calling agent reads as tool output and can adapt to).
+/// A policy rejection is the second kind — the request was well-formed and the
+/// caller should learn, in-band, that content policy stopped it.
 fn jsonrpc_guardrail_block(
     id: Option<serde_json::Value>,
     side: &str,
@@ -1988,6 +1995,102 @@ mod tests {
                 aisix_mcp::SUPPORTED_PROTOCOL_VERSION_NAMES.to_vec()
             );
         }
+    }
+
+    /// Hostile header values cannot abuse the rejection envelope: an
+    /// overlong value is truncated to 64 echoed characters, a non-ASCII
+    /// (obs-text) value gets the static message (never echoed), and an
+    /// object request id — invalid JSON-RPC — is sanitized to `null`
+    /// rather than reflected.
+    #[tokio::test]
+    async fn version_gate_rejection_envelope_is_hardened() {
+        let router = router_with(snapshot_with_key());
+
+        // Overlong: 300 chars in, at most 64 echoed back out.
+        let long_version = "v".repeat(300);
+        let response = router
+            .clone()
+            .oneshot(versioned_request(
+                &long_version,
+                "tools/list",
+                serde_json::json!({}),
+            ))
+            .await
+            .expect("router responds");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = to_bytes(response.into_body(), 1_048_576)
+            .await
+            .expect("read body");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
+        let message = body["error"]["message"].as_str().unwrap_or_default();
+        let echoed = message
+            .strip_prefix("unsupported MCP-Protocol-Version: ")
+            .unwrap_or_else(|| panic!("unexpected message shape: {message}"));
+        assert_eq!(echoed.chars().count(), 64, "echo must be truncated");
+
+        // Non-ASCII (obs-text) header bytes: `to_str()` fails, the static
+        // message is used, nothing of the value is reflected.
+        let request = HttpRequest::post("/mcp")
+            .header("host", "mcp.aisix.example.com")
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("authorization", format!("Bearer {TOKEN}"))
+            .header(
+                "mcp-protocol-version",
+                axum::http::HeaderValue::from_bytes(&[0x32, 0x30, 0x32, 0x35, 0x80, 0xff])
+                    .expect("obs-text bytes are valid header bytes"),
+            )
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0", "id": 9, "method": "tools/list", "params": {}
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = router
+            .clone()
+            .oneshot(request)
+            .await
+            .expect("router responds");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = to_bytes(response.into_body(), 1_048_576)
+            .await
+            .expect("read body");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
+        assert_eq!(
+            body["error"]["message"], "invalid MCP-Protocol-Version header",
+            "non-UTF8 values must never be echoed: {body}"
+        );
+
+        // Object id: invalid per JSON-RPC — sanitized to null, not echoed.
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": { "not": "a valid id" },
+            "method": "tools/list",
+            "params": {}
+        });
+        let request = HttpRequest::post("/mcp")
+            .header("host", "mcp.aisix.example.com")
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("authorization", format!("Bearer {TOKEN}"))
+            .header("mcp-protocol-version", "2024-11-05")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let response = router_with(snapshot_with_key())
+            .oneshot(request)
+            .await
+            .expect("router responds");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = to_bytes(response.into_body(), 1_048_576)
+            .await
+            .expect("read body");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
+        assert_eq!(
+            body["id"],
+            serde_json::Value::Null,
+            "an object id is not a valid JSON-RPC id and must not be reflected: {body}"
+        );
     }
 
     /// Every version the endpoint serves passes the gate end-to-end: the

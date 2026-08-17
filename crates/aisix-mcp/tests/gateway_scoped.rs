@@ -97,7 +97,7 @@ async fn spawn_upstream(label: &'static str, tool_name: &'static str) -> SocketA
 
 /// Serve the gateway itself; return its bound address.
 async fn spawn_gateway(gateway: McpGateway) -> SocketAddr {
-    serve(axum::Router::new().nest_service("/mcp", streamable_http_service(gateway))).await
+    serve(axum::Router::new().nest_service("/mcp", streamable_http_service(gateway, 0))).await
 }
 
 async fn serve(app: axum::Router) -> SocketAddr {
