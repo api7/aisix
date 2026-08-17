@@ -17,12 +17,13 @@ use std::time::Duration;
 use aisix_core::{McpAuthType, McpServer};
 use async_trait::async_trait;
 use http::{HeaderName, HeaderValue};
-use rmcp::model::CallToolRequestParams;
+use rmcp::model::{CallToolRequestParams, CallToolResponse};
 use rmcp::service::{ClientInitializeError, RoleClient, RunningService};
 use rmcp::transport::streamable_http_client::{
     StreamableHttpClientTransportConfig, StreamableHttpError,
 };
 use rmcp::transport::StreamableHttpClientTransport;
+use rmcp::ClientCacheConfig;
 use rmcp::ServiceExt;
 
 use crate::error::McpError;
@@ -299,6 +300,29 @@ pub struct RmcpBridge {
     timeout: Duration,
 }
 
+/// Base transport configuration for one upstream connection. Two rmcp
+/// defaults are deliberately overridden, both to keep "one inbound call =
+/// one upstream execution" true and the 1.8-era transport behavior stable:
+///
+/// - `reinit_on_expired_session = false`. On a session-expired 404 the SDK
+///   default transparently re-runs `initialize` and RE-SENDS the in-flight
+///   request — for `tools/call` that is a silent second execution of a
+///   possibly side-effectful tool, outside quota and budget accounting
+///   (the session-layer sibling of the MRTR auto-retry disabled in
+///   [`McpBridge::call_tool`]). The gateway surfaces the failure instead;
+///   [`EphemeralBridge`] opens a fresh session on the next operation anyway.
+/// - `max_sse_event_size = usize::MAX`. 3.x introduced a 16 MiB per-event
+///   cap on upstream SSE frames that 1.8 never had — a large image/audio
+///   tool result delivered over SSE would fail while the identical JSON
+///   response succeeds. Unbounded preserves the shipped behavior; the
+///   per-operation deadline still bounds the read.
+fn transport_config(url: &str) -> StreamableHttpClientTransportConfig {
+    let mut config = StreamableHttpClientTransportConfig::with_uri(url.to_string());
+    config.reinit_on_expired_session = false;
+    config.max_sse_event_size = usize::MAX;
+    config
+}
+
 impl RmcpBridge {
     /// Open a session to `upstream`: build the Streamable HTTP transport
     /// (injecting gateway-held auth — for `oauth2` this mints or reuses a
@@ -310,16 +334,16 @@ impl RmcpBridge {
             // Every arm goes through `with_client(shared_http_client(), ..)`
             // so the transport inherits the deployment's `upstream.*`
             // connection settings — `from_uri`/`from_config` would build
-            // rmcp's own default client with none of them.
+            // rmcp's own default client with none of them — and through
+            // `transport_config` for the pinned transport defaults.
             let transport = match &upstream.auth {
                 McpAuth::None => StreamableHttpClientTransport::with_client(
                     shared_http_client(),
-                    StreamableHttpClientTransportConfig::with_uri(upstream.url.clone()),
+                    transport_config(&upstream.url),
                 ),
                 McpAuth::Bearer(token) => StreamableHttpClientTransport::with_client(
                     shared_http_client(),
-                    StreamableHttpClientTransportConfig::with_uri(upstream.url.clone())
-                        .auth_header(token.clone()),
+                    transport_config(&upstream.url).auth_header(token.clone()),
                 ),
                 McpAuth::ApiKey(key) => {
                     // A key with non-header-safe bytes is a clean config error,
@@ -335,16 +359,14 @@ impl RmcpBridge {
                     let headers = HashMap::from([(HeaderName::from_static(API_KEY_HEADER), value)]);
                     StreamableHttpClientTransport::with_client(
                         shared_http_client(),
-                        StreamableHttpClientTransportConfig::with_uri(upstream.url.clone())
-                            .custom_headers(headers),
+                        transport_config(&upstream.url).custom_headers(headers),
                     )
                 }
                 McpAuth::OAuth2(cfg) => {
                     let token = crate::oauth::get_or_fetch(cfg).await?;
                     StreamableHttpClientTransport::with_client(
                         shared_http_client(),
-                        StreamableHttpClientTransportConfig::with_uri(upstream.url.clone())
-                            .auth_header(token),
+                        transport_config(&upstream.url).auth_header(token),
                     )
                 }
             };
@@ -368,6 +390,23 @@ impl RmcpBridge {
         let running = tokio::time::timeout(upstream.timeout, establish)
             .await
             .map_err(|_| McpError::Connect("upstream MCP connect timed out".to_string()))??;
+        // rmcp 3.x ships a client response cache that is ENABLED by default
+        // (`ClientCacheConfig::default()`), keyed per peer and honoring the
+        // server's `ttlMs`/`cacheScope` hints. A pooled or persistent bridge
+        // is shared across every AISIX caller that reaches the same
+        // upstream, so a cached upstream response would be served across
+        // principals — a cross-tenant leak the SDK's own migration guide
+        // warns about (`private_partition`). Today's production path
+        // (`EphemeralBridge`) reconnects per operation, so this pins the
+        // posture BEFORE the "connection pooling is a later optimization"
+        // note above ever lands. The gateway's caching story is a wire-level
+        // hint only (no cache engine), so the cache is disabled outright
+        // rather than partitioned. Do not re-enable without keying the
+        // partition to the calling principal.
+        running
+            .peer()
+            .set_response_cache_config(ClientCacheConfig::disabled())
+            .await;
         Ok(Self {
             running,
             timeout: upstream.timeout,
@@ -454,10 +493,43 @@ impl McpBridge for RmcpBridge {
                 ))
             }
         };
-        let result = tokio::time::timeout(self.timeout, self.running.call_tool(params))
+        // `call_tool_once`, NOT `call_tool`: the 3.x high-level helper drives
+        // MRTR (SEP-2322) automatically — on an `input_required` result it
+        // re-sends the request with client-fulfilled inputs, up to
+        // `DEFAULT_MRTR_MAX_ROUNDS` (10) upstream round trips for ONE inbound
+        // call. That would silently multiply upstream cost and defeat every
+        // per-call quota, budget, and timeout assumption in the gateway. The
+        // `_once` variant sends exactly one request; a non-final response is
+        // surfaced as a clean tool failure instead of a hidden retry loop.
+        let response = tokio::time::timeout(self.timeout, self.running.call_tool_once(params))
             .await
             .map_err(|_| McpError::Request("upstream tools/call timed out".to_string()))?
             .map_err(|e| McpError::Request(e.to_string()))?;
+        let result = match response {
+            CallToolResponse::Complete(result) => result,
+            CallToolResponse::InputRequired(_) => {
+                return Err(McpError::Request(
+                    "upstream tool requires additional interactive input (MRTR), which the \
+                     gateway does not relay"
+                        .to_string(),
+                ))
+            }
+            CallToolResponse::Task(_) => {
+                return Err(McpError::Request(
+                    "upstream tool deferred to an asynchronous task, which the gateway does \
+                     not support"
+                        .to_string(),
+                ))
+            }
+            // `CallToolResponse` is #[non_exhaustive]; treat future variants
+            // as unsupported rather than mis-mapping them to a result. Kept
+            // payload-free: the message lands in gateway logs verbatim.
+            _ => {
+                return Err(McpError::Request(
+                    "upstream returned an unsupported tools/call response kind".to_string(),
+                ))
+            }
+        };
         let content = serde_json::to_value(&result.content)
             .map_err(|e| McpError::Request(format!("failed to encode tool result: {e}")))?;
         Ok(McpToolResult {

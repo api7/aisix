@@ -19,8 +19,8 @@ use std::sync::Arc;
 use aisix_core::{AisixSnapshot, McpServer, ResourceEntry};
 use aisix_mcp::{streamable_http_service, McpGateway, ToolAcl};
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, Content, ErrorData, ListToolsResult,
-    PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
+    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorData,
+    ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
 };
 use rmcp::service::RequestContext;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
@@ -59,7 +59,7 @@ impl ServerHandler for LabeledEcho {
         &self,
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, ErrorData> {
+    ) -> Result<CallToolResponse, ErrorData> {
         if request.name != self.tool_name {
             return Err(ErrorData::invalid_params(
                 format!("unknown tool: {}", request.name),
@@ -72,10 +72,10 @@ impl ServerHandler for LabeledEcho {
             .and_then(|m| m.get("text"))
             .and_then(|v| v.as_str())
             .unwrap_or_default();
-        Ok(CallToolResult::success(vec![Content::text(format!(
-            "{}:{text}",
-            self.label
-        ))]))
+        Ok(
+            CallToolResult::success(vec![ContentBlock::text(format!("{}:{text}", self.label))])
+                .into(),
+        )
     }
 
     fn get_info(&self) -> ServerInfo {
@@ -97,7 +97,7 @@ async fn spawn_upstream(label: &'static str, tool_name: &'static str) -> SocketA
 
 /// Serve the gateway itself; return its bound address.
 async fn spawn_gateway(gateway: McpGateway) -> SocketAddr {
-    serve(axum::Router::new().nest_service("/mcp", streamable_http_service(gateway))).await
+    serve(axum::Router::new().nest_service("/mcp", streamable_http_service(gateway, 0))).await
 }
 
 async fn serve(app: axum::Router) -> SocketAddr {
@@ -165,7 +165,11 @@ async fn scoped_serves_original_names_and_accepts_both_call_forms() {
 
     // `initialize` presents the scoped server, not the aggregate.
     let info = client.peer_info().expect("initialize completed");
-    assert_eq!(info.server_info.name, "alpha");
+    let server_info = info
+        .server_info
+        .as_ref()
+        .expect("legacy initialize always reports server identity");
+    assert_eq!(server_info.name, "alpha");
 
     // tools/list carries the upstream's original names — no `alpha__` prefix.
     let tools = client.list_all_tools().await.expect("list tools");

@@ -19,8 +19,8 @@ use aisix_mcp::{
     McpTool, McpToolResult, McpUpstream, RmcpBridge, ToolAcl,
 };
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, Content, ErrorData, ListToolsResult,
-    PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
+    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorData,
+    ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
 };
 use rmcp::service::RequestContext;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
@@ -58,7 +58,7 @@ impl ServerHandler for LabeledEcho {
         &self,
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, ErrorData> {
+    ) -> Result<CallToolResponse, ErrorData> {
         if request.name != "echo" {
             return Err(ErrorData::invalid_params(
                 format!("unknown tool: {}", request.name),
@@ -74,12 +74,12 @@ impl ServerHandler for LabeledEcho {
         // `fail` drives the tool-level-error path: a valid call whose tool
         // reports failure, returned as `Ok(CallToolResult::error(..))`.
         if text == "fail" {
-            return Ok(CallToolResult::error(vec![Content::text("boom")]));
+            return Ok(CallToolResult::error(vec![ContentBlock::text("boom")]).into());
         }
-        Ok(CallToolResult::success(vec![Content::text(format!(
-            "{}:{text}",
-            self.label
-        ))]))
+        Ok(
+            CallToolResult::success(vec![ContentBlock::text(format!("{}:{text}", self.label))])
+                .into(),
+        )
     }
 
     fn get_info(&self) -> ServerInfo {
@@ -101,7 +101,7 @@ async fn spawn_upstream(label: &'static str) -> SocketAddr {
 
 /// Serve the gateway itself; return its bound address.
 async fn spawn_gateway(gateway: McpGateway) -> SocketAddr {
-    serve(axum::Router::new().nest_service("/mcp", streamable_http_service(gateway))).await
+    serve(axum::Router::new().nest_service("/mcp", streamable_http_service(gateway, 0))).await
 }
 
 async fn serve(app: axum::Router) -> SocketAddr {

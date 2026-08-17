@@ -25,6 +25,7 @@ pub use bridge::{
 };
 pub use error::McpError;
 pub use gateway::{
-    streamable_http_service, strip_server_prefix, McpGateway, ToolAcl, TOOL_NAMESPACE_SEPARATOR,
+    streamable_http_service, strip_server_prefix, McpGateway, ToolAcl,
+    SUPPORTED_PROTOCOL_VERSION_NAMES, TOOL_NAMESPACE_SEPARATOR,
 };
 pub use openapi::{validate_spec, OpenApiBridge};

@@ -32,8 +32,8 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, Content, ErrorData, ListToolsResult,
-    PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
+    CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorData,
+    ListToolsResult, PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerInfo, Tool,
 };
 use rmcp::service::RequestContext;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
@@ -52,6 +52,24 @@ use crate::openapi::OpenApiBridge;
 /// the aggregated namespace, e.g. `github__create_issue`. Server names must
 /// not contain it; tool names may (we split on the first occurrence).
 pub const TOOL_NAMESPACE_SEPARATOR: &str = "__";
+
+/// Every protocol version `/mcp` serves, oldest first: the Streamable HTTP
+/// generations (`2025-03-26` onward) plus the stateless `2026-07-28`
+/// revision. The single source of truth for `initialize` negotiation,
+/// `server/discover`, and the proxy layer's `MCP-Protocol-Version` header
+/// gate — one list so the three can never drift.
+pub const SUPPORTED_PROTOCOL_VERSIONS: &[ProtocolVersion] = &[
+    ProtocolVersion::V_2025_03_26,
+    ProtocolVersion::V_2025_06_18,
+    ProtocolVersion::V_2025_11_25,
+    ProtocolVersion::V_2026_07_28,
+];
+
+/// [`SUPPORTED_PROTOCOL_VERSIONS`] as plain strings, for callers that gate on
+/// the `MCP-Protocol-Version` HTTP header without depending on rmcp types
+/// (the proxy layer). Kept in lockstep by `supported_version_lists_agree`.
+pub const SUPPORTED_PROTOCOL_VERSION_NAMES: &[&str] =
+    &["2025-03-26", "2025-06-18", "2025-11-25", "2026-07-28"];
 
 /// One registered upstream: its gateway-facing name and the live bridge to it.
 struct NamedUpstream {
@@ -387,7 +405,7 @@ impl ServerHandler for McpGateway {
     async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
         // Fan out concurrently; each upstream call is already deadline-bounded
         // by its bridge, so a slow upstream cannot stall the aggregate.
@@ -439,14 +457,35 @@ impl ServerHandler for McpGateway {
                 }
             }
         }
-        Ok(ListToolsResult::with_all_items(tools))
+        // Cache hints (SEP-2549, required on 2026-07-28 list results) are a
+        // wire-level statement only — the gateway runs no cache engine. The
+        // honest values here are "do not cache": the list is filtered by the
+        // CALLER's per-key ACL (so it is `private` to that authorization
+        // context), and upstream tool sets can change between requests (so
+        // its freshness window is zero).
+        //
+        // Version-gated because rmcp only strips `resultType` for legacy
+        // peers, not these fields — setting them unconditionally would add
+        // two fields legacy clients have never seen. Modern requests carry
+        // the version in `_meta`; legacy sessions fall back to the
+        // handshake's negotiated version. (ISO `YYYY-MM-DD` versions compare
+        // lexically the same as chronologically.)
+        let result = ListToolsResult::with_all_items(tools);
+        let modern = context
+            .protocol_version()
+            .is_some_and(|v| v.as_str() >= ProtocolVersion::V_2026_07_28.as_str());
+        Ok(if modern {
+            result.with_ttl_ms(0).with_cache_scope(CacheScope::Private)
+        } else {
+            result
+        })
     }
 
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, ErrorData> {
+    ) -> Result<CallToolResponse, ErrorData> {
         // Resolve `(server, tool, namespaced)` from the caller's tool name.
         // Scoped: the name is the upstream's original one, but a caller that
         // sends the namespaced form anyway (an aggregated-endpoint client
@@ -537,11 +576,34 @@ impl ServerHandler for McpGateway {
             )
         })?;
 
-        into_call_tool_result(result)
+        // Always a final (`Complete`) response: the gateway never asks the
+        // downstream agent for more input (MRTR stays un-relayed — see
+        // `RmcpBridge::call_tool`), so `InputRequired` is never produced here.
+        into_call_tool_result(result).map(CallToolResponse::from)
+    }
+
+    /// The protocol versions this endpoint implements, replacing the SDK
+    /// default (`ProtocolVersion::KNOWN_VERSIONS`, which would advertise
+    /// every version rmcp has ever heard of — including ones this endpoint
+    /// does not serve). Consulted by rmcp for `initialize` negotiation (an
+    /// exact match is echoed; anything else falls back to
+    /// `get_info().protocol_version`) and advertised verbatim in
+    /// `server/discover`.
+    ///
+    /// `2024-11-05` is deliberately absent: that generation's transport is
+    /// HTTP+SSE, which this Streamable-HTTP-only endpoint has never served.
+    fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
+        Cow::Borrowed(SUPPORTED_PROTOCOL_VERSIONS)
     }
 
     fn get_info(&self) -> ServerInfo {
         let mut info = ServerInfo::default();
+        // Pinned, not `ProtocolVersion::default()`: this is the version a
+        // legacy `initialize` falls back to when the client requests one we
+        // don't list in `supported_protocol_versions` — the same answer the
+        // endpoint has always given. Riding the SDK's `LATEST` alias would
+        // silently move this fallback whenever rmcp bumps it.
+        info.protocol_version = ProtocolVersion::V_2025_11_25;
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
         match &self.scoped {
             // The scoped endpoint presents as the upstream server itself, so
@@ -572,11 +634,29 @@ impl ServerHandler for McpGateway {
 /// Configured stateless (no sticky session, JSON responses): the aggregator
 /// keeps no per-session state, so the endpoint can sit behind a plain load
 /// balancer — matching the MCP 2026-07-28 transport direction.
+///
+/// `request_body_limit_bytes` is the deployment's request-body cap
+/// (`0` = unlimited, the same convention as everywhere else in the data
+/// plane). It must be threaded in because rmcp 3.x added its OWN inbound
+/// cap (4 MiB default) inside this service — beneath the gateway's limit
+/// middleware — which would silently override any configured limit above
+/// 4 MiB (and the documented unlimited mode) with a plain-text 413.
 pub fn streamable_http_service(
     gateway: McpGateway,
+    request_body_limit_bytes: usize,
 ) -> StreamableHttpService<McpGateway, LocalSessionManager> {
     let mut config = StreamableHttpServerConfig::default();
-    config.stateful_mode = false;
+    config.max_request_body_bytes = if request_body_limit_bytes == 0 {
+        usize::MAX
+    } else {
+        request_body_limit_bytes
+    };
+    // rmcp 3.x rename of `stateful_mode` (same semantics for legacy
+    // protocol versions; 2026-07-28 requests are stateless regardless, per
+    // SEP-2567). Kept `false`: the aggregator holds no session state, so
+    // legacy clients get sessionless serving too and the endpoint stays
+    // safe behind a plain load balancer.
+    config.legacy_session_mode = false;
     config.json_response = true;
     // Disable rmcp's `Host`-header allowlist. Its default
     // (`localhost`/`127.0.0.1`/`::1`) is a DNS-rebinding guard for
@@ -614,7 +694,7 @@ fn prefixed_tool(server: &str, tool: crate::McpTool) -> Tool {
 /// preserving the upstream's tool-level error flag (a tool-level error is
 /// propagated as `Ok(error_result)`, not turned into a protocol error).
 fn into_call_tool_result(result: crate::McpToolResult) -> Result<CallToolResult, ErrorData> {
-    let content: Vec<Content> = serde_json::from_value(result.content).map_err(|e| {
+    let content: Vec<ContentBlock> = serde_json::from_value(result.content).map_err(|e| {
         ErrorData::internal_error(format!("malformed tool content from upstream: {e}"), None)
     })?;
     let mut call_result = if result.is_error {
@@ -624,4 +704,45 @@ fn into_call_tool_result(result: crate::McpToolResult) -> Result<CallToolResult,
     };
     call_result.structured_content = result.structured_content;
     Ok(call_result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The rmcp-typed list (initialize negotiation, `server/discover`) and
+    /// the string list (the proxy's `MCP-Protocol-Version` header gate) are
+    /// two spellings of ONE decision; a version added to either alone is a
+    /// drift bug.
+    #[test]
+    fn supported_version_lists_agree() {
+        let typed: Vec<&str> = SUPPORTED_PROTOCOL_VERSIONS
+            .iter()
+            .map(|v| v.as_str())
+            .collect();
+        assert_eq!(typed, SUPPORTED_PROTOCOL_VERSION_NAMES);
+    }
+
+    /// `2024-11-05` (the HTTP+SSE generation) must stay excluded: this
+    /// endpoint serves Streamable HTTP only.
+    #[test]
+    fn http_sse_generation_stays_unsupported() {
+        assert!(!SUPPORTED_PROTOCOL_VERSION_NAMES.contains(&"2024-11-05"));
+        assert!(!SUPPORTED_PROTOCOL_VERSIONS.contains(&ProtocolVersion::V_2024_11_05));
+    }
+
+    /// The exact served set, as literals: growing or shrinking it is a
+    /// deliberate protocol-surface decision that must show up as a failing
+    /// test, not ride along inside a refactor that edits the constants.
+    /// (The lockstep test above only proves the two constants AGREE — it
+    /// would pass if a fifth version were added to both.)
+    #[test]
+    fn supported_version_set_is_pinned() {
+        assert_eq!(
+            SUPPORTED_PROTOCOL_VERSION_NAMES,
+            &["2025-03-26", "2025-06-18", "2025-11-25", "2026-07-28"],
+            "update this pin together with the negotiation/discover/header-gate \
+             docs and the tracking issue when the served set changes"
+        );
+    }
 }
