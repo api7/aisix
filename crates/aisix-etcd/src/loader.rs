@@ -28,10 +28,11 @@ use aisix_core::models::{
     validate_claim_mapping_lenient, validate_guardrail_attachment_lenient,
     validate_guardrail_lenient, validate_mcp_policy_lenient, validate_mcp_server_lenient,
     validate_model_lenient, validate_observability_exporter_lenient,
-    validate_oidc_provider_lenient, validate_provider_key_lenient,
-    validate_rate_limit_policy_lenient, A2aAgent, ApiKey, CachePolicy, ClaimMapping, Guardrail,
-    GuardrailAttachment, McpPolicy, McpServer, Model, ObservabilityExporter, OidcProvider,
-    ProviderKey, RateLimitPolicy, SchemaError,
+    validate_oidc_provider_lenient, validate_passthrough_route_lenient,
+    validate_provider_key_lenient, validate_rate_limit_policy_lenient, A2aAgent, ApiKey,
+    CachePolicy, ClaimMapping, Guardrail, GuardrailAttachment, McpPolicy, McpServer, Model,
+    ObservabilityExporter, OidcProvider, PassthroughRoute, ProviderKey, RateLimitPolicy,
+    SchemaError,
 };
 use aisix_core::resource::ResourceEntry;
 use aisix_core::AisixSnapshot;
@@ -385,6 +386,18 @@ pub fn build_snapshot(prefix: &str, entries: &[RawEntry]) -> (AisixSnapshot, Bui
                     &mut stats,
                 ) {
                     snapshot.mcp_policies.insert(entry);
+                }
+            }
+            "passthrough_routes" => {
+                if let Some(entry) = validate_and_parse::<PassthroughRoute>(
+                    &raw.key,
+                    raw.revision,
+                    parsed,
+                    &value,
+                    validate_passthrough_route_lenient,
+                    &mut stats,
+                ) {
+                    snapshot.passthrough_routes.insert(entry);
                 }
             }
             "a2a_agents" => {

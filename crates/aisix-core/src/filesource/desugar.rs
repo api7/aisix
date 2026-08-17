@@ -143,6 +143,58 @@ pub(crate) fn desugar_model(doc: &mut Value, maps: &IdentityMaps) -> Result<(), 
     Ok(())
 }
 
+/// `passthrough_routes[].provider_key` (name) → `provider_key_id` and
+/// `passthrough_routes[].anonymous_key` (name) → `anonymous_key_id`
+/// (derived ids). Name references are the file-mode ergonomic form; an
+/// unknown name is a load error listing the candidates, so a typo can
+/// never become a route that 400s on every request at runtime.
+pub(crate) fn desugar_passthrough_route(
+    doc: &mut Value,
+    maps: &IdentityMaps,
+) -> Result<(), String> {
+    let Some(obj) = doc.as_object_mut() else {
+        return Ok(()); // non-object entries error upstream
+    };
+    for (name_field, id_field, kind, noun) in [
+        (
+            "provider_key",
+            "provider_key_id",
+            "provider_keys",
+            "provider key",
+        ),
+        ("anonymous_key", "anonymous_key_id", "api_keys", "api key"),
+    ] {
+        let Some(name_value) = obj.get(name_field) else {
+            continue;
+        };
+        let Some(name) = name_value.as_str() else {
+            return Err(format!(
+                "`{name_field}` must be a string (a {noun} display_name)"
+            ));
+        };
+        if obj.contains_key(id_field) {
+            return Err(format!(
+                "`{name_field}` (a name reference) and `{id_field}` are mutually \
+                 exclusive — set exactly one"
+            ));
+        }
+        let resolved = maps
+            .get(kind)
+            .and_then(|m| m.get(name))
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "`{name_field}` references unknown {noun} {name:?} ({})",
+                    known_names(maps, kind)
+                )
+            })?;
+        let name_owned = name_field.to_string();
+        obj.remove(&name_owned);
+        obj.insert(id_field.into(), Value::String(resolved));
+    }
+    Ok(())
+}
+
 /// `claim_mappings[].resolve.api_key` (name) → `resolve.api_key_id`
 /// (derived id).
 pub(crate) fn desugar_claim_mapping(doc: &mut Value, maps: &IdentityMaps) -> Result<(), String> {

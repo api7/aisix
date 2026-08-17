@@ -83,6 +83,12 @@ export class SeedClient {
     return this.put("claim_mappings", mapping);
   }
 
+  async createPassthroughRoute(
+    route: Record<string, unknown>,
+  ): Promise<{ id: string; value: Record<string, unknown> }> {
+    return this.put("passthrough_routes", route);
+  }
+
   /**
    * Overwrite the document at `<prefix>/<kind>/<id>` — the seed-side
    * equivalent of an Admin API PUT. Propagation is asynchronous; probe

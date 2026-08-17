@@ -998,6 +998,7 @@ pub fn build_index_from_snapshot(
             GuardrailScopeType::McpServer => ScopeKind::McpServer,
             GuardrailScopeType::ApiKey => ScopeKind::ApiKey,
             GuardrailScopeType::Team => ScopeKind::Team,
+            GuardrailScopeType::PassthroughRoute => ScopeKind::PassthroughRoute,
         };
 
         entries.push(GuardrailIndex::push_entry(
@@ -1887,6 +1888,7 @@ mod tests {
         let attachments: ResourceTable<GuardrailAttachment> = ResourceTable::default();
         let index = build_index_from_snapshot(&shuffled_table(), &attachments, None);
         let chain = index.resolve(&RequestContext {
+            passthrough_route_id: "",
             model_id: "m",
             mcp_server_id: "",
             api_key_id: "k",
@@ -1938,6 +1940,7 @@ mod tests {
         assert_eq!(index.len(), 1);
 
         let ctx = RequestContext {
+            passthrough_route_id: "",
             model_id: "m1",
             mcp_server_id: "",
             api_key_id: "k1",
@@ -1979,6 +1982,7 @@ mod tests {
         assert_eq!(index.len(), 0);
         // Verify the guardrail does not fire (not just that the index is empty).
         let ctx = RequestContext {
+            passthrough_route_id: "",
             model_id: "m",
             mcp_server_id: "",
             api_key_id: "k",
@@ -2028,6 +2032,7 @@ mod tests {
             "enabled+disabled attachments: exactly 1 entry expected",
         );
         let ctx = RequestContext {
+            passthrough_route_id: "",
             model_id: "any",
             mcp_server_id: "",
             api_key_id: "any",
@@ -2070,6 +2075,7 @@ mod tests {
         );
 
         let ctx = RequestContext {
+            passthrough_route_id: "",
             model_id: "any-model",
             mcp_server_id: "",
             api_key_id: "any-key",
@@ -2145,6 +2151,7 @@ mod tests {
         let live = LiveGuardrailIndex::new(handle.clone(), None);
 
         let ctx = RequestContext {
+            passthrough_route_id: "",
             model_id: "m1",
             mcp_server_id: "",
             api_key_id: "k1",
@@ -2199,6 +2206,7 @@ mod tests {
         // the full resolve walk produces on an empty index.
         let live = LiveGuardrailIndex::new(SnapshotHandle::new(AisixSnapshot::new()), None);
         let chain = live.resolve(&RequestContext {
+            passthrough_route_id: "",
             model_id: "m",
             mcp_server_id: "",
             api_key_id: "k",
@@ -2266,6 +2274,7 @@ mod tests {
         let live =
             LiveGuardrailIndex::new_with_sink(SnapshotHandle::new(snap), None, Some(sink.clone()));
         let ctx = RequestContext {
+            passthrough_route_id: "",
             model_id: "m1",
             mcp_server_id: "",
             api_key_id: "k1",
@@ -2489,6 +2498,7 @@ mod tests {
 
         let index = build_index_from_snapshot(&guardrails, &attachments, None);
         let chain = index.resolve(&RequestContext {
+            passthrough_route_id: "",
             model_id: "m-A",
             mcp_server_id: "",
             api_key_id: "k",
@@ -2534,6 +2544,7 @@ mod tests {
         assert_eq!(index.len(), 1, "the attachment must not be skipped");
 
         let matched = index.resolve(&RequestContext {
+            passthrough_route_id: "",
             model_id: "",
             mcp_server_id: "mcp-A",
             api_key_id: "k",
@@ -2542,6 +2553,7 @@ mod tests {
         assert_eq!(matched.len(), 1);
 
         let other_server = index.resolve(&RequestContext {
+            passthrough_route_id: "",
             model_id: "",
             mcp_server_id: "mcp-B",
             api_key_id: "k",
@@ -2550,6 +2562,7 @@ mod tests {
         assert!(other_server.is_empty());
 
         let llm = index.resolve(&RequestContext {
+            passthrough_route_id: "",
             model_id: "m-A",
             mcp_server_id: "",
             api_key_id: "k",
@@ -2586,6 +2599,7 @@ mod tests {
 
         let index = build_index_from_snapshot(&guardrails, &attachments, None);
         let chain = index.resolve(&RequestContext {
+            passthrough_route_id: "",
             model_id: "m-OTHER",
             mcp_server_id: "",
             api_key_id: "k",

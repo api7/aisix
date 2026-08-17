@@ -114,6 +114,7 @@ fn resource_counts(snap: &AisixSnapshot) -> std::collections::BTreeMap<String, u
         ("rate_limit_policies", snap.rate_limit_policies.len()),
         ("mcp_servers", snap.mcp_servers.len()),
         ("a2a_agents", snap.a2a_agents.len()),
+        ("passthrough_routes", snap.passthrough_routes.len()),
     ] {
         if n > 0 {
             counts.insert(kind.to_string(), n);

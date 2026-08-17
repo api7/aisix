@@ -115,6 +115,14 @@ pub struct ApiKey {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_agents: Option<Vec<String>>,
 
+    /// Passthrough routes this key may use, named by their registered names.
+    /// Entries are matched as single-`*` globs, mirroring `allowed_tools`:
+    /// `"*"` grants every route and an entry without a `*` matches one route
+    /// exactly. When omitted, set to `null`, or set to an empty list, the key
+    /// may use no passthrough route — access is granted explicitly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_routes: Option<Vec<String>>,
+
     /// RFC 3339 timestamp after which the key stops authenticating.
     /// Requests presenting an expired key are rejected with `401`.
     /// When omitted or set to `null`, the key never expires.
@@ -213,6 +221,22 @@ impl ApiKey {
         }
     }
 
+    /// True if this key may use the given passthrough route, named by its
+    /// registered name.
+    ///
+    /// Semantics mirror [`ApiKey::can_access_agent`]: entries are single-`*`
+    /// globs, so `"*"` grants every route; entries without a `*` match
+    /// exactly. A key with no `allowed_routes` (or an empty list) may use no
+    /// passthrough route — access is granted explicitly.
+    pub fn can_access_route(&self, route: &str) -> bool {
+        match &self.allowed_routes {
+            None => false,
+            Some(allowed) => allowed
+                .iter()
+                .any(|r| crate::wildcard::wildcard_matches(r, route)),
+        }
+    }
+
     /// Iterate over the names of models this key may access, filtering them
     /// against a known universe of model names. Delegates to [`Self::can_access`]
     /// so glob entries stay consistent with per-request authz: `*` expands to
@@ -299,6 +323,7 @@ mod tests {
             jwt_provider: None,
             allowed_tools: None,
             mcp_access: None,
+            allowed_routes: None,
             mcp_rate_limits: None,
             allowed_agents: None,
             expires_at: None,

@@ -1231,6 +1231,7 @@ async fn dispatch(
     // check below, the output check later, and the streaming output
     // guardrail context.
     let guardrail_ctx = aisix_guardrails::RequestContext {
+        passthrough_route_id: "",
         model_id: &model_id,
         mcp_server_id: "",
         api_key_id: &auth.entry.id,

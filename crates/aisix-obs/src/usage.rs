@@ -544,6 +544,22 @@ pub struct UsageEvent {
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub a2a_stream_event_count: u32,
 
+    // ─── Passthrough-route attribution (AISIX-Cloud#1312) ───
+    /// Registered name of the passthrough route that served the request.
+    /// Empty for non-passthrough events; cp-api stores empty as NULL.
+    /// Older cp-api images that predate this field ignore it (DP-first
+    /// rollout).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub passthrough_route_name: String,
+
+    /// End-user identity injected by the upstream network device via the
+    /// route's `identity_header` (forward-proxy deployments, where the
+    /// caller carries no gateway credential of its own). Empty when the
+    /// route configures no identity header or the client sent none;
+    /// cp-api stores empty as NULL.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub client_identity: String,
+
     // ─── JWT identity attribution (AISIX-Cloud#564) ───
     /// Value of the OIDC trust provider's identity claim (`sub` by
     /// default) when the request authenticated with a JWT. Claim

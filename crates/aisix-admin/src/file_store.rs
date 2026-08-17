@@ -15,7 +15,7 @@ use aisix_core::resource::ResourceEntry;
 use aisix_core::snapshot::{ResourceTable, SnapshotHandle};
 use aisix_core::{
     A2aAgent, AisixSnapshot, ApiKey, CachePolicy, Guardrail, McpServer, Model,
-    ObservabilityExporter, ProviderKey,
+    ObservabilityExporter, PassthroughRoute, ProviderKey,
 };
 
 use crate::store::{ConfigStore, StoreError};
@@ -78,6 +78,7 @@ impl_file_managed_store! {
     { ObservabilityExporter, observability_exporters, get_observability_exporter, list_observability_exporters }
     { McpServer, mcp_servers, get_mcp_server, list_mcp_servers }
     { A2aAgent, a2a_agents, get_a2a_agent, list_a2a_agents }
+    { PassthroughRoute, passthrough_routes, get_passthrough_route, list_passthrough_routes }
 }
 
 #[cfg(test)]

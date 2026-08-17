@@ -965,10 +965,12 @@ impl Resource for Guardrail {
 /// operators attach a guardrail to only the models, MCP servers, API keys, or
 /// teams that need it.
 ///
-/// `Model` and `McpServer` select dimensions a request carries only one of: an
-/// MCP tool call resolves no model, and an LLM request routes to no MCP server.
-/// A `Model`-scoped guardrail therefore never inspects MCP traffic, and an
-/// `McpServer`-scoped one never inspects model traffic.
+/// `Model`, `McpServer` and `PassthroughRoute` select dimensions a request
+/// carries only one of: an MCP tool call resolves no model, an LLM request
+/// routes to no MCP server, and a passthrough-route request resolves neither.
+/// A `Model`-scoped guardrail therefore never inspects MCP or passthrough
+/// traffic, an `McpServer`-scoped one never inspects model traffic, and a
+/// `PassthroughRoute`-scoped one inspects only the traffic of that route.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum GuardrailScopeType {
@@ -977,6 +979,7 @@ pub enum GuardrailScopeType {
     McpServer,
     ApiKey,
     Team,
+    PassthroughRoute,
 }
 
 /// Guardrail attachment that scopes one guardrail to an environment, model,
@@ -993,7 +996,8 @@ pub struct GuardrailAttachment {
     pub scope_type: GuardrailScopeType,
 
     /// The UUID of the specific resource (model / mcp_server / api_key /
-    /// team). `None` when `scope_type` is `Env` (applies to all requests).
+    /// team / passthrough_route). `None` when `scope_type` is `Env`
+    /// (applies to all requests).
     pub scope_id: Option<String>,
 
     /// Higher number = higher precedence. When the same guardrail appears

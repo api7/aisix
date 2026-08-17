@@ -300,6 +300,7 @@ async fn dispatch(
                 .map(|entry| entry.id.clone())
                 .unwrap_or_default();
             let ctx = aisix_guardrails::RequestContext {
+                passthrough_route_id: "",
                 model_id: "",
                 mcp_server_id: &mcp_server_id,
                 api_key_id: &auth.entry.id,
@@ -1400,6 +1401,7 @@ mod tests {
         seed_guardrail(&handle, OUTPUT_GUARD);
         let index = LiveGuardrailIndex::new(handle, None);
         let chain = index.resolve(&RequestContext {
+            passthrough_route_id: "",
             model_id: "",
             mcp_server_id: "",
             api_key_id: "ak-1",
@@ -1458,6 +1460,7 @@ mod tests {
         let handle = SnapshotHandle::new(snapshot_with_key());
         seed_guardrail(&handle, FIELD_NAME_GUARD);
         let chain = LiveGuardrailIndex::new(handle, None).resolve(&RequestContext {
+            passthrough_route_id: "",
             model_id: "",
             mcp_server_id: "",
             api_key_id: "ak-1",
@@ -1542,6 +1545,7 @@ mod tests {
         let handle = SnapshotHandle::new(snapshot_with_key());
         seed_guardrail(&handle, OUTPUT_GUARD);
         let chain = LiveGuardrailIndex::new(handle, None).resolve(&RequestContext {
+            passthrough_route_id: "",
             model_id: "",
             mcp_server_id: "",
             api_key_id: "ak-1",
@@ -1588,6 +1592,7 @@ mod tests {
         let handle = SnapshotHandle::new(snapshot_with_key());
         seed_guardrail(&handle, KEY_NAME_GUARD);
         let chain = LiveGuardrailIndex::new(handle, None).resolve(&RequestContext {
+            passthrough_route_id: "",
             model_id: "",
             mcp_server_id: "",
             api_key_id: "ak-1",

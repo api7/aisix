@@ -58,7 +58,8 @@ describe("path-param rejection e2e: :param routes answer the envelope", () => {
       ["GET", "/v1/batches/%ff"],
       ["GET", "/v1/fine_tuning/jobs/%ff"],
       ["GET", "/v1/videos/%ff"],
-      ["POST", "/passthrough/%ff/v1/chat"],
+      // `/passthrough/*` left the :param family with the implicit tunnel's
+      // removal — unclaimed paths there answer the 410 tombstone instead.
     ] as const) {
       const res = await fetch(`${app.proxyUrl}${path}`, {
         method,
