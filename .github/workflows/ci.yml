@@ -348,7 +348,7 @@ jobs:
     # other open PRs still report the old name and would all break the
     # moment the required contexts were renamed to the two leg names.
     name: e2e (vitest) + coverage
-    needs: [e2e]
+    needs: [e2e, mcp-conformance]
     # A skipped required check counts as satisfied, so this must still run
     # when the matrix fails — otherwise the gate would vanish exactly when
     # it matters.
@@ -361,6 +361,43 @@ jobs:
             echo "::error::e2e matrix result: ${{ needs.e2e.result }}"
             exit 1
           fi
+      - name: assert MCP conformance passed
+        # Folded into this required aggregate so the official-suite gate is
+        # merge-blocking without renaming the branch-protection contexts.
+        run: |
+          if [ "${{ needs.mcp-conformance.result }}" != "success" ]; then
+            echo "::error::mcp conformance result: ${{ needs.mcp-conformance.result }}"
+            exit 1
+          fi
+
+  mcp-conformance:
+    # The OFFICIAL MCP conformance suite against the shipped /mcp chain
+    # (scoped gateway + bridge + in-process upstream). Scenario list and
+    # deliberate exclusions live in scripts/mcp-conformance.sh; the suite
+    # and its transitive graph are pinned by tools/mcp-conformance/
+    # package-lock.json; needs Node >= 22 (fs.globSync). Merge-blocking
+    # through the e2e-gate aggregate below.
+    name: mcp conformance (official suite)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # This job executes third-party code (npm ci + cargo build scripts):
+    # keep the token read-only and out of the checkout's git config.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-protoc
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - name: build the conformance target
+        run: cargo build -p aisix-mcp --example conformance_server
+      - name: run the applicable server scenarios
+        run: bash scripts/mcp-conformance.sh
 
   coverage-gate:
     name: coverage >= 90%

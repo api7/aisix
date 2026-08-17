@@ -17,14 +17,14 @@ use std::time::Duration;
 use aisix_core::{McpAuthType, McpServer};
 use async_trait::async_trait;
 use http::{HeaderName, HeaderValue};
-use rmcp::model::{CallToolRequestParams, CallToolResponse};
+use rmcp::model::{CallToolRequestParams, CallToolResponse, ClientInfo, ProtocolVersion};
 use rmcp::service::{ClientInitializeError, RoleClient, RunningService};
 use rmcp::transport::streamable_http_client::{
     StreamableHttpClientTransportConfig, StreamableHttpError,
 };
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::ClientCacheConfig;
-use rmcp::ServiceExt;
+use rmcp::{ClientLifecycleMode, ClientServiceExt};
 
 use crate::error::McpError;
 
@@ -187,6 +187,26 @@ impl std::fmt::Debug for McpAuth {
     }
 }
 
+/// The MCP protocol revision the bridge opens an upstream session with.
+///
+/// Explicit, never probed: a server that does not speak the configured
+/// revision produces a visible connect failure instead of a silent
+/// cross-generation downgrade. (Automatic fallback is how version and
+/// session context ends up crossing the protocol boundary — the bug class
+/// sibling gateways are currently working through.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum McpProtocol {
+    /// Open with the `initialize` handshake and negotiate among the
+    /// pre-2026 protocol revisions. Works with every legacy server and with
+    /// `2026-07-28` servers that keep backward compatibility.
+    #[default]
+    LegacyHandshake,
+    /// The stateless MCP `2026-07-28` revision: handshake-free
+    /// `server/discover` startup, self-contained per-request metadata.
+    /// Required for servers that no longer answer `initialize`.
+    V20260728,
+}
+
 /// Connection parameters for a single upstream MCP server.
 #[derive(Clone)]
 pub struct McpUpstream {
@@ -197,6 +217,9 @@ pub struct McpUpstream {
     pub auth: McpAuth,
     /// Per-operation deadline. Defaults to [`DEFAULT_UPSTREAM_TIMEOUT`].
     pub timeout: Duration,
+    /// Protocol revision the session is opened with. Defaults to the
+    /// legacy `initialize` handshake.
+    pub protocol: McpProtocol,
 }
 
 // Manual so a `Bearer` token cannot leak through `McpUpstream`'s `Debug`
@@ -207,6 +230,7 @@ impl std::fmt::Debug for McpUpstream {
             .field("url", &self.url)
             .field("auth", &self.auth)
             .field("timeout", &self.timeout)
+            .field("protocol", &self.protocol)
             .finish()
     }
 }
@@ -218,7 +242,14 @@ impl McpUpstream {
             url: url.into(),
             auth: McpAuth::None,
             timeout: DEFAULT_UPSTREAM_TIMEOUT,
+            protocol: McpProtocol::default(),
         }
+    }
+
+    /// Select the protocol revision the session is opened with.
+    pub fn with_protocol(mut self, protocol: McpProtocol) -> Self {
+        self.protocol = protocol;
+        self
     }
 
     /// Set Bearer auth (raw token, no `Bearer ` prefix).
@@ -296,7 +327,7 @@ pub trait McpBridge: Send + Sync {
 /// `rmcp`-backed [`McpBridge`]: holds one running client session to the
 /// upstream. Dropping it tears the session down.
 pub struct RmcpBridge {
-    running: RunningService<RoleClient, ()>,
+    running: RunningService<RoleClient, ClientInfo>,
     timeout: Duration,
 }
 
@@ -326,7 +357,9 @@ fn transport_config(url: &str) -> StreamableHttpClientTransportConfig {
 impl RmcpBridge {
     /// Open a session to `upstream`: build the Streamable HTTP transport
     /// (injecting gateway-held auth — for `oauth2` this mints or reuses a
-    /// cached access token first) and run the `initialize` handshake. The
+    /// cached access token first) and run the startup lifecycle selected by
+    /// [`McpUpstream::protocol`] — the `initialize` handshake by default,
+    /// or handshake-free `server/discover` for `2026-07-28` upstreams. The
     /// whole sequence, token minting included, is bounded by the upstream's
     /// timeout.
     pub async fn connect(upstream: &McpUpstream) -> Result<Self, McpError> {
@@ -370,22 +403,40 @@ impl RmcpBridge {
                     )
                 }
             };
-            ().serve(transport).await.map_err(|e| {
-                // An upstream 401 against a minted token means the token was
-                // revoked or expired earlier than promised: drop the cache
-                // entry so the next attempt re-mints instead of replaying it.
-                if let McpAuth::OAuth2(cfg) = &upstream.auth {
-                    if init_error_is_unauthorized(&e) {
-                        crate::oauth::invalidate(cfg);
+            // Lifecycle follows the configured protocol revision. The
+            // handler is `ClientInfo::default()` on BOTH paths — identical
+            // handshake bytes to the previous unit handler (whose default
+            // `get_info()` returns exactly `ClientInfo::default()`), plus
+            // the per-request metadata the Discover lifecycle needs.
+            let lifecycle = match upstream.protocol {
+                McpProtocol::LegacyHandshake => ClientLifecycleMode::Initialize,
+                // Discover, NOT Auto: a server that answers `server/discover`
+                // with an error must fail the connect visibly. `Auto` would
+                // silently retry the legacy handshake, hiding real
+                // misconfiguration and version drift.
+                McpProtocol::V20260728 => ClientLifecycleMode::Discover {
+                    preferred_versions: vec![ProtocolVersion::V_2026_07_28],
+                },
+            };
+            ClientInfo::default()
+                .serve_with_lifecycle(transport, lifecycle)
+                .await
+                .map_err(|e| {
+                    // An upstream 401 against a minted token means the token was
+                    // revoked or expired earlier than promised: drop the cache
+                    // entry so the next attempt re-mints instead of replaying it.
+                    if let McpAuth::OAuth2(cfg) = &upstream.auth {
+                        if init_error_is_unauthorized(&e) {
+                            crate::oauth::invalidate(cfg);
+                        }
                     }
-                }
-                // Bound + sanitize: a bare-401 shape embeds the upstream's
-                // response body in the error text, which lands in gateway
-                // logs. An upstream that reflects request headers into its
-                // error body (or emits control characters for log injection)
-                // must not get either past this point verbatim.
-                McpError::Connect(sanitize_error_message(&e.to_string()))
-            })
+                    // Bound + sanitize: a bare-401 shape embeds the upstream's
+                    // response body in the error text, which lands in gateway
+                    // logs. An upstream that reflects request headers into its
+                    // error body (or emits control characters for log injection)
+                    // must not get either past this point verbatim.
+                    McpError::Connect(sanitize_error_message(&e.to_string()))
+                })
         };
         let running = tokio::time::timeout(upstream.timeout, establish)
             .await
@@ -633,10 +684,18 @@ pub fn upstream_from_mcp_server(server: &McpServer) -> McpUpstream {
         .timeout_ms
         .map(Duration::from_millis)
         .unwrap_or(DEFAULT_UPSTREAM_TIMEOUT);
+    // Dated spec revisions map one-to-one onto session lifecycles; absent
+    // means the legacy handshake (which negotiates among the pre-2026
+    // revisions on its own).
+    let protocol = match server.protocol_version {
+        None => McpProtocol::LegacyHandshake,
+        Some(aisix_core::McpProtocolVersion::V20260728) => McpProtocol::V20260728,
+    };
     McpUpstream {
         url: server.url.clone(),
         auth,
         timeout,
+        protocol,
     }
 }
 

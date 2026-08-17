@@ -1,0 +1,8 @@
+{
+  "name": "aisix-mcp-conformance-harness",
+  "private": true,
+  "description": "Pins the official MCP conformance suite (and its full transitive graph, via the committed lockfile) for scripts/mcp-conformance.sh. Bump deliberately; re-review the scenario list on every bump.",
+  "dependencies": {
+    "@modelcontextprotocol/conformance": "0.1.16"
+  }
+}
