@@ -281,6 +281,25 @@ describe("passthrough-route e2e: explicit routes, BYO credentials, 410 tombstone
     // …and the gateway's side-channel headers did not.
     expect(hit.headers["x-aisix-api-key"]).toBeUndefined();
     expect(hit.headers["x-aisix-user"]).toBeUndefined();
+
+    // Missing gateway key: the 401 must point at the route's configured
+    // header, not `Authorization` — on this route Authorization carries the
+    // caller's own upstream credential and is exactly the wrong thing to fix.
+    const noKey = await harnessRequest(`${app!.proxyUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        host: "ai-upstream.example.com",
+        authorization: "Bearer employee-official-token",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ model: "gpt-4o", messages: [] }),
+    });
+    expect(noKey.statusCode).toBe(401);
+    const noKeyBody = (await noKey.body.json()) as {
+      error?: { message?: string };
+    };
+    expect(noKeyBody.error?.message).toContain("x-aisix-api-key");
+    expect(noKeyBody.error?.message).not.toContain("Authorization");
   });
 
   test("anonymous route binds the configured principal behind source_cidrs", async (ctx) => {

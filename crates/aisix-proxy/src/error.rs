@@ -166,6 +166,13 @@ impl ErrorEnvelope {
 pub enum ProxyError {
     #[error("missing or malformed Authorization header")]
     MissingAuth,
+    /// A `header_key` passthrough route saw no gateway key in its configured
+    /// header. Named separately from [`ProxyError::MissingAuth`] because on
+    /// these routes `Authorization` deliberately carries the caller's own
+    /// upstream credential — telling the integrator to fix `Authorization`
+    /// points at exactly the wrong header.
+    #[error("missing or malformed {0} header (this route's gateway API key header)")]
+    MissingRouteAuthHeader(String),
     #[error("invalid API key")]
     InvalidApiKey,
     /// The presented key exists but its `expires_at` deadline has
@@ -336,7 +343,8 @@ pub(crate) fn guardrail_block_message(side: &str, guardrail_name: Option<&str>) 
 impl ProxyError {
     pub fn status(&self) -> StatusCode {
         match self {
-            ProxyError::MissingAuth
+            ProxyError::MissingRouteAuthHeader(_)
+            | ProxyError::MissingAuth
             | ProxyError::InvalidApiKey
             | ProxyError::ApiKeyExpired
             | ProxyError::ApiKeyDisabled
@@ -369,7 +377,8 @@ impl ProxyError {
 
     pub fn kind(&self) -> &'static str {
         match self {
-            ProxyError::MissingAuth
+            ProxyError::MissingRouteAuthHeader(_)
+            | ProxyError::MissingAuth
             | ProxyError::InvalidApiKey
             | ProxyError::ApiKeyExpired
             | ProxyError::ApiKeyDisabled

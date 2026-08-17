@@ -291,6 +291,7 @@ pub(crate) fn attempt_reached_upstream(err: &ProxyError) -> bool {
         ProxyError::Bridge(be) => be.reached_upstream(),
         ProxyError::ContentFiltered(_) => true,
         ProxyError::MissingAuth
+        | ProxyError::MissingRouteAuthHeader(_)
         | ProxyError::InvalidApiKey
         | ProxyError::ApiKeyExpired
         | ProxyError::ApiKeyDisabled
