@@ -302,6 +302,80 @@ describe("passthrough-route e2e: explicit routes, BYO credentials, 410 tombstone
     expect(noKeyBody.error?.message).not.toContain("Authorization");
   });
 
+  test("a prefixed host route claims a reserved namespace and mirrors the path", async (ctx) => {
+    if (!etcdReachable || !app || !seed) {
+      ctx.skip();
+      return;
+    }
+
+    // The forward-proxy shape an agent CLI needs: one upstream host serving
+    // several protocols under different prefixes (GitHub Copilot's CLI talks
+    // to its MCP server at /mcp/readonly on the very host it uses for chat).
+    //
+    // What this pins end-to-end: a host-matched route MAY claim `/mcp`,
+    // which the typed routes own for host-less traffic — host dispatch runs
+    // ahead of them — and such a route still mounts normally, stripping its
+    // prefix onto the target base.
+    //
+    // The mirroring half of the pair (a `preserve_host` route forwards the
+    // COMPLETE path) cannot run here: `preserve_host` dials
+    // `https://<inbound host>`, and this mock listens on 127.0.0.1 with no
+    // way to own a public name. It is covered by the `match_route` unit test
+    // (`longest_prefix_and_host_specificity_win`) and by the live
+    // Copilot-CLI verification behind AISIX-Cloud#1312.
+    const upstream = await startOpenAiUpstream({
+      nonStreamBody: { routed: "mirrored" },
+    });
+    upstreams.push(upstream);
+
+    await seed.createPassthroughRoute({
+      name: "ptr-mirror-mcp",
+      hosts: ["agent-upstream.example.com"],
+      path_prefix: "/mcp",
+      target_url: upstream.baseUrl,
+      auth_mode: "header_key",
+      auth_header_name: "x-aisix-api-key",
+      credential_mode: "forward_client",
+    });
+
+    const call = async () =>
+      harnessRequest(`${app!.proxyUrl}/mcp/readonly`, {
+        method: "POST",
+        headers: {
+          host: "agent-upstream.example.com",
+          "x-aisix-api-key": CALLER_PLAINTEXT,
+          authorization: "Bearer caller-own-upstream-token",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ jsonrpc: "2.0", method: "initialize", id: 1 }),
+      });
+
+    await waitConfigPropagation(async () => {
+      try {
+        const r = await call();
+        const ok = r.statusCode === 200;
+        await r.body.text();
+        return ok;
+      } catch {
+        return false;
+      }
+    });
+
+    const baseline = upstream.receivedRequests.length;
+    const res = await call();
+    expect(res.statusCode).toBe(200);
+    expect(await res.body.json()).toMatchObject({ routed: "mirrored" });
+
+    const hit = upstream.receivedRequests.slice(baseline).at(-1)!;
+    // A target_url route mounts at its prefix, so the upstream sees the
+    // remainder. (A preserve_host route on the same prefix would relay
+    // "/mcp/readonly" whole — see the note above.)
+    expect(hit.path).toBe("/readonly");
+    // BYO credential relayed verbatim; the gateway key never leaves.
+    expect(hit.headers["authorization"]).toBe("Bearer caller-own-upstream-token");
+    expect(hit.headers["x-aisix-api-key"]).toBeUndefined();
+  });
+
   test("anonymous route binds the configured principal behind source_cidrs", async (ctx) => {
     if (!etcdReachable || !app || !seed) {
       ctx.skip();

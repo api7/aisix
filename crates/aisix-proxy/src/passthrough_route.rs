@@ -178,8 +178,10 @@ struct MatchedRoute {
     /// match used one; the full path for host-only matches. Empty or
     /// `/`-leading.
     remainder: String,
-    /// Whether a `path_prefix` participated in the match (enables the
-    /// `/v1` dedup against an explicit `target_url`).
+    /// Whether the route's `path_prefix` was STRIPPED from the path (a
+    /// `target_url` mount). Enables the `/v1` dedup, which only makes
+    /// sense when an operator-written prefix joins an operator-written
+    /// target — never for a `preserve_host` mirror of the caller's URL.
     prefix_matched: bool,
     /// The inbound host, when one was present. Needed for
     /// `preserve_host` targets.
@@ -250,7 +252,12 @@ fn match_route(
         });
     }
     best.map(|(_, prefix_len, entry)| {
-        let prefix_matched = prefix_len > 0;
+        // A `preserve_host` route mirrors an upstream that owns its own
+        // path space (the forward-proxy shape): the prefix is a MATCH
+        // condition there, not a mount point, so the path is relayed whole.
+        // Stripping is for `target_url` routes, where the prefix is the
+        // gateway-side mount and the remainder joins the target's base.
+        let prefix_matched = prefix_len > 0 && !entry.value.preserve_host;
         let remainder = if prefix_matched {
             path[prefix_len..].to_string()
         } else {
@@ -2100,6 +2107,26 @@ mod tests {
         assert_eq!(m.entry.value.name, "hosty");
         assert_eq!(m.remainder, "/p/deep/x");
         assert!(!m.prefix_matched);
+
+        // A preserve_host route narrowed by a prefix relays the WHOLE path:
+        // the prefix is a match condition on an upstream that owns its own
+        // path space, not a gateway mount point. GitHub Copilot's CLI needs
+        // this — its MCP server answers on /mcp/readonly of the same host it
+        // serves chat from, and a stripped "/readonly" 404s.
+        mk(
+            "r-mirror",
+            serde_json::json!({
+                "name":"mirror","hosts":["m.example"],"path_prefix":"/mcp",
+                "preserve_host":true,"credential_mode":"forward_client"
+            }),
+        );
+        let m = match_route(&snap, Some("m.example"), "/mcp/readonly").unwrap();
+        assert_eq!(m.entry.value.name, "mirror");
+        assert_eq!(m.remainder, "/mcp/readonly");
+        assert!(
+            !m.prefix_matched,
+            "a mirrored path is never version-deduped"
+        );
     }
 
     #[test]

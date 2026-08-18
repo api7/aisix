@@ -23,11 +23,23 @@ pub struct PassthroughRoute {
     pub name: String,
 
     /// Gateway path prefix this route serves, e.g. `/passthrough/openai`.
-    /// The prefix is stripped before the remainder is joined to the target
-    /// URL. Must start with `/` and must not claim a reserved gateway
-    /// namespace (`/v1`, `/mcp`, `/a2a`, health probes). At least one of
-    /// `path_prefix` / `hosts` is required; when both are set the request
-    /// must satisfy both.
+    /// Must start with `/`.
+    ///
+    /// How the prefix is treated depends on the target shape: a
+    /// `target_url` route MOUNTS at the prefix, so it is stripped before
+    /// the remainder is joined to the target base; a `preserve_host` route
+    /// MIRRORS an upstream that owns its own path space, so the prefix only
+    /// selects which requests the route claims and the complete path is
+    /// forwarded unchanged.
+    ///
+    /// A route WITHOUT `hosts` must not claim a
+    /// reserved gateway namespace (`/v1`, `/mcp`, `/a2a`, health probes) —
+    /// the typed routes would shadow it. A route WITH `hosts` may use any
+    /// prefix: host-matched requests dispatch ahead of the typed routes,
+    /// which is what lets a forward proxy relay an upstream's own
+    /// namespace (e.g. Copilot's `/mcp/...` on its chat host).
+    /// At least one of `path_prefix` / `hosts` is required; when both are
+    /// set the request must satisfy both.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(regex(pattern = "^/"), length(min = 1))]
     pub path_prefix: Option<String>,
@@ -290,12 +302,24 @@ pub fn passthrough_route_coupling() -> Value {
                 }
             } } }
         },
-        // path_prefix must not claim a reserved gateway namespace. The
-        // proxy's typed routes always win over the fallback matcher anyway;
-        // this rule keeps a shadowed-by-construction route from being
-        // configured at all.
+        // A path-only route must not claim a reserved gateway namespace:
+        // the proxy's typed routes win over the fallback matcher, so such a
+        // route is shadowed by construction and better rejected outright.
+        //
+        // A route that ALSO matches on `hosts` is exempt, and deliberately
+        // so: host-matched requests are dispatched by the host middleware
+        // wrapping the whole router, ahead of the typed routes, so the
+        // prefix is reachable. Forward-proxy deployments need this — an
+        // upstream owns its own path space, and GitHub Copilot's CLI
+        // reaches its MCP server at `/mcp/readonly` on the same host it
+        // uses for chat inference. Requiring `hosts` keeps the exemption
+        // narrow: it cannot be used to shadow the gateway's own endpoints
+        // for ordinary (host-less) traffic.
         {
-            "if": { "required": ["path_prefix"] },
+            "if": {
+                "required": ["path_prefix"],
+                "not": { "required": ["hosts"] }
+            },
             "then": { "properties": { "path_prefix": {
                 "not": { "pattern": "^/(v1|mcp|a2a|admin|livez|readyz|metrics)(/|$)" }
             } } }
@@ -538,6 +562,44 @@ mod coupling_tests {
             "source_cidrs": ["10.0.0.0/8"]
         });
         assert!(validate_passthrough_route(&doc).is_err());
+    }
+
+    #[test]
+    fn reserved_prefix_is_rejected_only_without_hosts() {
+        // A host-less route on a gateway namespace is shadowed by the typed
+        // routes, so it stays rejected…
+        let mut doc = base();
+        for p in [
+            "/mcp",
+            "/mcp/readonly",
+            "/v1/chat/completions",
+            "/a2a",
+            "/metrics",
+        ] {
+            doc["path_prefix"] = json!(p);
+            assert!(
+                validate_passthrough_route(&doc).is_err(),
+                "host-less route on {p} must stay rejected"
+            );
+        }
+        // …but the same prefix WITH a host allowlist is exactly the
+        // forward-proxy shape (Copilot CLI's MCP server sits at /mcp on the
+        // same host as chat) and host dispatch runs before the typed routes.
+        let doc = json!({
+            "name": "copilot-cli-mcp",
+            "hosts": ["api.business.githubcopilot.com"],
+            "path_prefix": "/mcp",
+            "preserve_host": true,
+            "auth_mode": "header_key",
+            "auth_header_name": "x-aisix-api-key",
+            "credential_mode": "forward_client"
+        });
+        assert!(
+            validate_passthrough_route(&doc).is_ok(),
+            "host-matched route on /mcp must be accepted: {:?}",
+            validate_passthrough_route(&doc)
+        );
+        assert!(validate_passthrough_route_lenient(&doc).is_ok());
     }
 
     #[test]
