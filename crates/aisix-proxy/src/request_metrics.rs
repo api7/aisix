@@ -178,6 +178,13 @@ impl Default for Upstream<'_> {
     }
 }
 
+/// Whether the caller addressed an ensemble model. See [`LastTarget::new`].
+fn is_ensemble(snap: &AisixSnapshot, requested_model: &str) -> bool {
+    !requested_model.is_empty()
+        && crate::model_resolve::resolve_model(snap, requested_model)
+            .is_some_and(|entry| entry.value.is_ensemble())
+}
+
 /// The upstream a request had committed to when it FAILED, recovered from
 /// the request's attribution cell.
 ///
@@ -207,6 +214,20 @@ impl<'a> LastTarget<'a> {
     /// `resolved` has to outlive the emit — read it into a local first
     /// (`let resolved = attribution::current().unwrap_or_default();`).
     pub(crate) fn new(snap: &AisixSnapshot, resolved: &'a crate::attribution::Resolved) -> Self {
+        // An ensemble has no single terminal target: its panel members run
+        // concurrently and all of them are attempted, so the cell just holds
+        // whichever resolved last. Naming that one would read as "this key
+        // is what failed" — a plausible-looking wrong answer, which is worse
+        // than the placeholder. Suppressed rather than deferred to the
+        // ensemble design pass, because it is this change that would
+        // otherwise introduce it.
+        if is_ensemble(snap, &resolved.requested_model) {
+            return Self {
+                provider: UNKNOWN.to_string(),
+                upstream_model: Cow::Borrowed(UNKNOWN),
+                pk: None,
+            };
+        }
         Self {
             // Lowercased here because the success path lowercases at its
             // own emit; a failure that spelled the vendor differently
@@ -475,6 +496,88 @@ pub(crate) fn record_usage(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use aisix_core::{Model, ResourceEntry};
+
+    fn snapshot_with(display_name: &str, body: serde_json::Value) -> AisixSnapshot {
+        let model: Model = serde_json::from_value(body).unwrap();
+        let snap = AisixSnapshot::new();
+        snap.models
+            .insert(ResourceEntry::new(display_name, model, 1));
+        snap
+    }
+
+    fn resolved(requested: &str) -> crate::attribution::Resolved {
+        crate::attribution::Resolved {
+            requested_model: requested.to_string(),
+            provider: "OpenAI".to_string(),
+            upstream_model: "gpt-4o-mini".to_string(),
+            provider_key_id: "pk-1".to_string(),
+        }
+    }
+
+    /// The vendor id reaches the label lowercased, because the success path
+    /// lowercases at its own emit — a failure spelling it differently would
+    /// put one provider on two series, which is the bug this recovers from.
+    #[test]
+    fn a_recovered_target_matches_the_success_paths_spelling() {
+        let snap = snapshot_with(
+            "direct",
+            serde_json::json!({
+                "display_name": "direct",
+                "provider": "openai",
+                "model_name": "gpt-4o-mini",
+                "provider_key_id": "pk-1",
+            }),
+        );
+        let r = resolved("direct");
+        let target = LastTarget::new(&snap, &r);
+        let upstream = target.upstream("direct", false, false);
+        assert_eq!(target.provider(), "openai");
+        assert_eq!(upstream.provider, "openai");
+        assert_eq!(upstream.upstream_model, "gpt-4o-mini");
+        assert_eq!(upstream.pk.id(), "pk-1");
+    }
+
+    /// An ensemble's panel members all run, so the cell holds whichever
+    /// resolved last. Naming it would read as "this key is what failed" —
+    /// a plausible-looking wrong answer. The placeholder is the honest one.
+    #[test]
+    fn an_ensemble_failure_is_not_attributed_to_one_of_its_members() {
+        let snap = snapshot_with(
+            "panel",
+            serde_json::json!({
+                "display_name": "panel",
+                "ensemble": {
+                    "panel": [{"model": "gpt4"}],
+                    "judge": {"model": "gpt4"},
+                },
+            }),
+        );
+        let r = resolved("panel");
+        let target = LastTarget::new(&snap, &r);
+        let upstream = target.upstream("panel", false, false);
+        assert_eq!(upstream.provider, UNKNOWN);
+        assert_eq!(upstream.upstream_model, UNKNOWN);
+        assert_eq!(upstream.pk.id(), UNKNOWN);
+        assert_eq!(upstream.pk.name(), UNKNOWN);
+    }
+
+    /// A request that never selected a target keeps the placeholder, and the
+    /// ProviderKey id must be `unknown` rather than the empty string an
+    /// unresolved `ResolvedPk` reports verbatim — an empty label value would
+    /// be a second "nothing resolved" series alongside it.
+    #[test]
+    fn nothing_resolved_collapses_to_one_placeholder() {
+        let snap = AisixSnapshot::new();
+        let nothing = crate::attribution::Resolved::default();
+        let target = LastTarget::new(&snap, &nothing);
+        let upstream = target.upstream(crate::usage_attr::UNRESOLVED_MODEL_LABEL, false, false);
+        assert_eq!(upstream.provider, UNKNOWN);
+        assert_eq!(upstream.upstream_model, UNKNOWN);
+        assert_eq!(upstream.pk.id(), UNKNOWN);
+        assert_eq!(upstream.pk.name(), UNKNOWN);
+    }
 
     /// Every registered proxy route, as its raw request path. Adding a route
     /// to `build_router` without adding it here leaves the tests below
