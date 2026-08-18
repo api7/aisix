@@ -33,7 +33,6 @@ use axum::extract::{Request, State};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use serde_json::json;
 
 use crate::error::AuthChallenge;
@@ -301,7 +300,25 @@ pub(crate) async fn protected_resource_metadata(
             .insert(header::ALLOW, HeaderValue::from_static("GET, HEAD"));
         return response;
     }
-    Json(prm_document(&snapshot, &identity)).into_response()
+    // RFC 9110 §9.3.2: a HEAD response carries the header fields GET
+    // would send, and no content. `any(...)` gets none of the body
+    // stripping axum applies to a `get()` route, and hyper's own HEAD
+    // handling sits downstream of this function — so state the contract
+    // here rather than inherit it, keeping `content-length` at the
+    // length a GET would report (that number is the point of a HEAD
+    // probe).
+    let body = serde_json::to_vec(&prm_document(&snapshot, &identity))
+        .expect("PRM document is serializable");
+    let length = body.len();
+    Response::builder()
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::CONTENT_LENGTH, length)
+        .body(if method == axum::http::Method::HEAD {
+            axum::body::Body::empty()
+        } else {
+            axum::body::Body::from(body)
+        })
+        .expect("well-formed PRM response")
 }
 
 /// The `WWW-Authenticate` value for one challenge classification.

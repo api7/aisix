@@ -1291,6 +1291,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prm_head_carries_the_get_headers_and_no_body() {
+        // RFC 9110 §9.3.2. The routes are `any(...)`, so none of axum's
+        // `get()` body stripping applies and the handler owns this.
+        let hub = Arc::new(Hub::new());
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
+        seed_oauth_discovery(&snap);
+        let app = build_router(build_state(snap, hub));
+
+        for path in [
+            "/.well-known/oauth-protected-resource",
+            "/.well-known/oauth-protected-resource/mcp",
+        ] {
+            let get = run(
+                app.clone(),
+                Request::builder()
+                    .method("GET")
+                    .uri(path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+            let get_length = get
+                .headers()
+                .get("content-length")
+                .expect("GET reports a length")
+                .clone();
+
+            let head = run(
+                app.clone(),
+                Request::builder()
+                    .method("HEAD")
+                    .uri(path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(head.status(), StatusCode::OK, "{path}");
+            assert_eq!(
+                head.headers().get("content-length"),
+                Some(&get_length),
+                "{path}: HEAD reports the length GET would send"
+            );
+            assert_eq!(
+                head.headers().get("content-type").map(|v| v.as_bytes()),
+                Some(&b"application/json"[..]),
+                "{path}"
+            );
+            let body = to_bytes(head.into_body(), 4096).await.unwrap();
+            assert!(body.is_empty(), "{path}: HEAD must send no content");
+        }
+    }
+
+    #[tokio::test]
     async fn prm_endpoints_404_while_dormant() {
         let hub = Arc::new(Hub::new());
         // No mcp_auth_settings row: pre-#1143 state, byte-identical.
@@ -4096,7 +4149,6 @@ data: [DONE]\n\n"
         ));
         let state = build_state(snap, hub);
         let auth = AuthenticatedKey {
-            anonymous: false,
             entry: Arc::new(ResourceEntry::new(
                 "key-entry-1",
                 serde_json::from_value::<aisix_core::ApiKey>(serde_json::json!({
