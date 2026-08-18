@@ -309,7 +309,6 @@ pub async fn messages(
             let metric_model = crate::usage_attr::metric_model_label(&snapshot, &model_name);
             // #890 req-2: count the FAILED request on the rich request metrics
             // so a success rate is computable (denominator incl. failures).
-            // Provider/upstream/provider_key are unknown on the failure path.
             // AISIX-Cloud#1325: name the target the request died on. This
             // branch used to emit `Upstream::default()`, so a 502 from a
             // real provider landed on `provider="unknown"` while the same

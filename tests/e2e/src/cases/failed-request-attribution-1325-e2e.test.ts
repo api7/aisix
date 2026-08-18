@@ -31,6 +31,8 @@ const FAIL_PK = "attr1325-fail-pk";
 const FAIL2_PK = "attr1325-fail2-pk";
 const EMBED_PK = "attr1325-embed-pk";
 const WILD_PK = "attr1325-wild-pk";
+const GROUP_A_PK = "attr1325-group-a-pk";
+const CT_PK = "attr1325-ct-pk";
 
 const OK_MODEL = "attr1325-ok";
 const FAIL_MODEL = "attr1325-fail";
@@ -38,6 +40,8 @@ const FAIL2_MODEL = "attr1325-fail2";
 const GROUP_MODEL = "attr1325-group";
 const EMBED_MODEL = "attr1325-embed";
 const WILD_ROW = "attr1325-wild/*";
+const GROUP_A_MODEL = "attr1325-group-a";
+const CT_MODEL = "attr1325-count-tokens";
 
 describe("failed-request upstream attribution #1325 e2e", () => {
   let app: SpawnedApp | undefined;
@@ -91,12 +95,33 @@ describe("failed-request upstream attribution #1325 e2e", () => {
 
     await seedPair(OK_PK, OK_MODEL, ok);
     await seedPair(FAIL_PK, FAIL_MODEL, failing);
+    // The group's first target is its own model: every failed dispatch feeds
+    // the target's cooldown, so a target shared with the other specs would be
+    // out of rotation by the time the group runs and the request would never
+    // fail OVER at all.
+    await seedPair(GROUP_A_PK, GROUP_A_MODEL, failing);
     await seedPair(FAIL2_PK, FAIL2_MODEL, failing2);
     await seedPair(EMBED_PK, EMBED_MODEL, embedFailing, "text-embedding-3-small");
     // A wildcard row: `resolve_model` hands dispatch a synthetic Model whose
     // upstream id is the caller's own suffix, so the failure path has to
     // collapse it back to the row's template.
     await seedPair(WILD_PK, WILD_ROW, failing, "*");
+    // `/v1/messages/count_tokens` is Anthropic-only and refuses a
+    // non-Anthropic adapter at the boundary, so it needs a key that claims
+    // one to reach an upstream at all.
+    const ctPk = await seed.createProviderKey({
+      display_name: CT_PK,
+      secret: "sk-mock",
+      api_base: `${failing.baseUrl}/v1`,
+      provider: "anthropic",
+      adapter: "anthropic",
+    });
+    await seed.createModel({
+      display_name: CT_MODEL,
+      provider: "anthropic",
+      model_name: "claude-3-5-haiku",
+      provider_key_id: ctPk.id,
+    });
 
     // Failover group whose targets both fail: the terminal metric must name
     // the LAST attempt, the one whose error the caller was served.
@@ -104,7 +129,7 @@ describe("failed-request upstream attribution #1325 e2e", () => {
       display_name: GROUP_MODEL,
       routing: {
         strategy: "failover",
-        targets: [{ model: FAIL_MODEL }, { model: FAIL2_MODEL }],
+        targets: [{ model: GROUP_A_MODEL }, { model: FAIL2_MODEL }],
       },
     });
 
@@ -117,7 +142,18 @@ describe("failed-request upstream attribution #1325 e2e", () => {
         GROUP_MODEL,
         EMBED_MODEL,
         WILD_ROW,
+        GROUP_A_MODEL,
+        CT_MODEL,
       ],
+    });
+
+    // The caller key is seeded last, so `GET /v1/models` answering 200 implies
+    // every model and ProviderKey above is already in the snapshot. Gating on
+    // a failing request instead would make a handler regression surface as a
+    // propagation timeout (tests/e2e/AGENTS.md).
+    const proxy = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
+    await waitConfigPropagation(async () => {
+      return (await proxy.listModels()).status === 200;
     });
   });
 
@@ -132,16 +168,6 @@ describe("failed-request upstream attribution #1325 e2e", () => {
       return;
     }
     const proxy = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
-    await waitConfigPropagation(async () => {
-      const probe = await proxy.chat({
-        model: FAIL_MODEL,
-        messages: [{ role: "user", content: "ready" }],
-      });
-      // >= 500 distinguishes "reached the failing upstream" from the 404 an
-      // un-propagated snapshot would answer with.
-      return probe.status >= 500;
-    });
-
     const ok = await proxy.chat({
       model: OK_MODEL,
       messages: [{ role: "user", content: "hi" }],
@@ -207,15 +233,6 @@ describe("failed-request upstream attribution #1325 e2e", () => {
       ctx.skip();
       return;
     }
-    // Both targets have to be loaded before the group can actually fail
-    // OVER: a snapshot that carries the group and only its second target
-    // would attempt that one first, which is a different scenario.
-    await waitConfigPropagation(async () => {
-      const first = await proxyChat(app!, FAIL_MODEL);
-      const second = await proxyChat(app!, FAIL2_MODEL);
-      const group = await proxyChat(app!, GROUP_MODEL);
-      return first >= 500 && second >= 500 && group >= 500;
-    });
     expect(await proxyChat(app, GROUP_MODEL)).toBeGreaterThanOrEqual(500);
 
     const text = await scrape(app);
@@ -232,18 +249,14 @@ describe("failed-request upstream attribution #1325 e2e", () => {
       `no failed-over request sample for ${GROUP_MODEL}:\n${text}`,
     ).toBeTruthy();
     expect(sample).toContain(`provider_key_name="${FAIL2_PK}"`);
-    expect(sample).not.toContain(`provider_key_name="${FAIL_PK}"`);
+    expect(sample).not.toContain(`provider_key_name="${GROUP_A_PK}"`);
   });
 
-  test("the fix spans the handler family, not just chat", async (ctx) => {
+  test("a second model's failure is attributed to its own key, not the first", async (ctx) => {
     if (!etcdReachable || !app) {
       ctx.skip();
       return;
     }
-    await waitConfigPropagation(async () => {
-      const probe = await embed(app!, EMBED_MODEL);
-      return probe >= 500;
-    });
     expect(await embed(app, EMBED_MODEL)).toBeGreaterThanOrEqual(500);
 
     const text = await scrape(app);
@@ -253,6 +266,107 @@ describe("failed-request upstream attribution #1325 e2e", () => {
     expect(sample).toContain(`provider_key_name="${EMBED_PK}"`);
     expect(sample).toContain('upstream_model="text-embedding-3-small"');
   });
+
+  // Each handler's failure branch calls the shared recovery separately, so a
+  // new endpoint — or an edited one — can land unwired and be invisible.
+  // Every route whose failure branch this PR touched and that an OpenAI-shape
+  // mock can drive is exercised here.
+  //
+  // `/v1/videos` and `/v1/realtime` are absent: the first needs a
+  // video-capable provider and the second a WebSocket upgrade, neither of
+  // which this mock serves. Their failure branches read the same recovery
+  // helper, which carries its own unit tests.
+  const FAMILY: Array<{
+    endpoint: string;
+    path: string;
+    body: unknown;
+    model?: string;
+    pk?: string;
+    upstreamModel?: string;
+    provider?: string;
+  }> = [
+    {
+      endpoint: "/v1/chat/completions",
+      path: "/v1/chat/completions",
+      body: { messages: [{ role: "user", content: "hi" }] },
+    },
+    {
+      endpoint: "/v1/completions",
+      path: "/v1/completions",
+      body: { prompt: "hi" },
+    },
+    { endpoint: "/v1/embeddings", path: "/v1/embeddings", body: { input: "hi" } },
+    {
+      endpoint: "/v1/rerank",
+      path: "/v1/rerank",
+      body: { query: "hi", documents: ["a", "b"] },
+    },
+    {
+      endpoint: "/v1/images/generations",
+      path: "/v1/images/generations",
+      body: { prompt: "a cat" },
+    },
+    {
+      endpoint: "/v1/messages",
+      path: "/v1/messages",
+      body: { max_tokens: 16, messages: [{ role: "user", content: "hi" }] },
+    },
+    {
+      endpoint: "/v1/messages/count_tokens",
+      path: "/v1/messages/count_tokens",
+      body: { messages: [{ role: "user", content: "hi" }] },
+      model: CT_MODEL,
+      pk: CT_PK,
+      upstreamModel: "claude-3-5-haiku",
+      provider: "anthropic",
+    },
+    {
+      endpoint: "/v1/responses",
+      path: "/v1/responses",
+      body: { input: "hi" },
+    },
+    {
+      endpoint: "/v1/audio/speech",
+      path: "/v1/audio/speech",
+      body: { input: "hi", voice: "alloy" },
+    },
+  ];
+
+  for (const route of FAMILY) {
+    const model = route.model ?? FAIL_MODEL;
+    const pkName = route.pk ?? FAIL_PK;
+    const provider = route.provider ?? "openai";
+    const upstreamModel = route.upstreamModel ?? "gpt-4o-mini";
+    test(`${route.endpoint} attributes its upstream failure`, async (ctx) => {
+      if (!etcdReachable || !app) {
+        ctx.skip();
+        return;
+      }
+      const res = await fetch(`${app.proxyUrl}${route.path}`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${CALLER_PLAINTEXT}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ model, ...(route.body as object) }),
+      });
+      const detail = await res.text();
+      expect(
+        res.status,
+        `${route.endpoint} did not reach the failing upstream: ${detail}`,
+      ).toBeGreaterThanOrEqual(500);
+
+      const text = await scrape(app);
+      const sample = requestSample(text, { endpoint: route.endpoint, model });
+      expect(
+        sample,
+        `no request sample for ${route.endpoint}:\n${text}`,
+      ).toBeTruthy();
+      expect(sample).toContain(`provider="${provider}"`);
+      expect(sample).toContain(`provider_key_name="${pkName}"`);
+      expect(sample).toContain(`upstream_model="${upstreamModel}"`);
+    });
+  }
 
   test("a failed wildcard request is attributed without minting a series", async (ctx) => {
     if (!etcdReachable || !app) {
@@ -265,9 +379,6 @@ describe("failed-request upstream attribution #1325 e2e", () => {
     // configured template, or a failing wildcard model becomes a cardinality
     // bomb (#451) reachable by anyone who can send a request.
     const minted = ["attr1325-wild/alpha", "attr1325-wild/beta"];
-    await waitConfigPropagation(async () => {
-      return (await proxyChat(app!, minted[0])) >= 500;
-    });
     for (const name of minted) {
       expect(await proxyChat(app, name)).toBeGreaterThanOrEqual(500);
     }

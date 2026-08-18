@@ -191,8 +191,6 @@ pub async fn transcriptions(
                 &request_id,
                 Some(&err),
             );
-            // The model is never extracted from the multipart form on this
-            // path, so every label but the caller's stays `unknown`.
             // AISIX-Cloud#1325: the multipart form is parsed inside the
             // dispatch that failed, so this branch never sees the model —
             // but the request's attribution cell recorded it along with the
@@ -339,7 +337,6 @@ pub async fn translations(
                 &request_id,
                 Some(&err),
             );
-            // Same as transcriptions: nothing resolved off the multipart form.
             // AISIX-Cloud#1325: the multipart form is parsed inside the
             // dispatch that failed, so this branch never sees the model —
             // but the request's attribution cell recorded it along with the

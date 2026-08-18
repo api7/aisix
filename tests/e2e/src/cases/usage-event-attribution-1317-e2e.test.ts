@@ -33,13 +33,16 @@ const CALLER_KEY_HASH = createHash("sha256")
   .digest("hex");
 
 const PK_NAME = "usage1317-pk";
+const EMBED_PK_NAME = "usage1317-embed-pk";
 const SLOW_PK_NAME = "usage1317-slow-pk";
 const MODEL = "usage1317-chat";
+const EMBED_MODEL = "usage1317-embed";
 const SLOW_MODEL = "usage1317-slow";
 
 describe("usage-event and cancel attribution #1317 e2e", () => {
   let app: SpawnedApp | undefined;
   const upstreams: OpenAiUpstream[] = [];
+  let slowUpstream: OpenAiUpstream | undefined;
   let etcdReachable = false;
 
   beforeAll(async () => {
@@ -55,7 +58,11 @@ describe("usage-event and cancel attribution #1317 e2e", () => {
       nonStreamBody: chatBody(),
       responseDelayMs: 10_000,
     });
-    upstreams.push(fast, slow);
+    // The mock answers every route with one canned body, so the embeddings
+    // family needs its own upstream to return an embeddings-shaped one.
+    const embeddings = await startOpenAiUpstream({ nonStreamBody: embeddingBody() });
+    upstreams.push(fast, slow, embeddings);
+    slowUpstream = slow;
 
     app = await spawnApp();
     const seed = new SeedClient(etcd, app.etcdPrefix);
@@ -71,6 +78,17 @@ describe("usage-event and cancel attribution #1317 e2e", () => {
       model_name: "gpt-4o-mini",
       provider_key_id: fastPk.id,
     });
+    const embedPk = await seed.createProviderKey({
+      display_name: EMBED_PK_NAME,
+      secret: "sk-mock",
+      api_base: `${embeddings.baseUrl}/v1`,
+    });
+    await seed.createModel({
+      display_name: EMBED_MODEL,
+      provider: "openai",
+      model_name: "text-embedding-3-small",
+      provider_key_id: embedPk.id,
+    });
     const slowPk = await seed.createProviderKey({
       display_name: SLOW_PK_NAME,
       secret: "sk-mock",
@@ -85,7 +103,16 @@ describe("usage-event and cancel attribution #1317 e2e", () => {
 
     await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
-      allowed_models: [MODEL, SLOW_MODEL],
+      allowed_models: [MODEL, SLOW_MODEL, EMBED_MODEL],
+    });
+
+    // The caller key is seeded last, so `GET /v1/models` answering 200 implies
+    // every model and ProviderKey above is already in the snapshot. Gating on
+    // a request that exercises the behavior under test would make a handler
+    // regression surface as a propagation timeout (tests/e2e/AGENTS.md).
+    const proxy = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
+    await waitConfigPropagation(async () => {
+      return (await proxy.listModels()).status === 200;
     });
   });
 
@@ -100,13 +127,6 @@ describe("usage-event and cancel attribution #1317 e2e", () => {
       return;
     }
     const proxy = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
-    await waitConfigPropagation(async () => {
-      const probe = await proxy.chat({
-        model: MODEL,
-        messages: [{ role: "user", content: "ready" }],
-      });
-      return probe.status === 200;
-    });
     const res = await proxy.chat({
       model: MODEL,
       messages: [{ role: "user", content: "hi" }],
@@ -137,6 +157,39 @@ describe("usage-event and cancel attribution #1317 e2e", () => {
     expect(labelOf(dropped!, "provider_key_id")).toBe(pkId);
     const request = sample(text, "aisix_proxy_requests_total", { model: MODEL });
     expect(labelOf(request!, "provider_key_id")).toBe(pkId);
+  });
+
+  test("the emit labels are wired per handler, not just on chat", async (ctx) => {
+    if (!etcdReachable || !app) {
+      ctx.skip();
+      return;
+    }
+    // Every handler calls `try_emit` itself, so a family member can land with
+    // the attribution argument left at its placeholder.
+    const res = await fetch(`${app.proxyUrl}/v1/embeddings`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${CALLER_PLAINTEXT}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ model: EMBED_MODEL, input: "hi" }),
+    });
+    expect(res.status, await res.clone().text()).toBe(200);
+    await res.text();
+
+    const text = await scrape(app);
+    const emitted = sample(text, "aisix_usage_events_emitted_total", {
+      handler: "embeddings",
+      model: EMBED_MODEL,
+      provider_key_name: EMBED_PK_NAME,
+    });
+    expect(emitted, `no attributed embeddings emit sample:\n${text}`).toBeTruthy();
+    const dropped = sample(text, "aisix_usage_event_drops_total", {
+      reason: "sink_disabled",
+      model: EMBED_MODEL,
+      provider_key_name: EMBED_PK_NAME,
+    });
+    expect(dropped, `no attributed embeddings drop sample:\n${text}`).toBeTruthy();
   });
 
   test("a request with no resolvable model still carries a bounded placeholder", async (ctx) => {
@@ -190,10 +243,18 @@ describe("usage-event and cancel attribution #1317 e2e", () => {
       }),
       signal: controller.signal,
     });
-    // Long enough for the gateway to authenticate, resolve the model and
-    // pick the target; far short of the upstream's 10s head delay, so the
-    // response head is still unwritten when the caller goes away.
-    await new Promise((r) => setTimeout(r, 500));
+    // Abort once the upstream has actually received the call: by then the
+    // gateway has authenticated, resolved the model and picked the target,
+    // and the upstream is still 10s away from answering — so the response
+    // head is unwritten when the caller goes away. A fixed delay could fire
+    // before target selection on a slow machine and silently test nothing.
+    for (let i = 0; i < 100 && slowUpstream!.receivedRequests.length === 0; i++) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    expect(
+      slowUpstream!.receivedRequests.length,
+      "the gateway never dispatched to the slow upstream",
+    ).toBeGreaterThan(0);
     controller.abort();
     await expect(inflight).rejects.toThrow();
 
@@ -235,6 +296,15 @@ function sample(
 
 function labelOf(line: string, label: string): string | undefined {
   return new RegExp(`${label}="([^"]*)"`).exec(line)?.[1];
+}
+
+function embeddingBody() {
+  return {
+    object: "list",
+    model: "text-embedding-3-small",
+    data: [{ object: "embedding", index: 0, embedding: [0.1, 0.2, 0.3] }],
+    usage: { prompt_tokens: 7, total_tokens: 7 },
+  };
 }
 
 function chatBody() {
