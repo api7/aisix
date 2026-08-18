@@ -470,6 +470,7 @@
           "enum": [
             "openai_responses"
           ],
+          "title": "OpenAI Responses API",
           "type": "string"
         }
       ]

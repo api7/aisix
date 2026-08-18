@@ -762,6 +762,7 @@ pub fn passthrough_route_root_schema() -> Value {
                 ("raw", "Opaque body"),
                 ("openai_chat", "OpenAI-compatible chat"),
                 ("openai_completions", "OpenAI-compatible completions / FIM"),
+                ("openai_responses", "OpenAI Responses API"),
             ],
         );
     }
