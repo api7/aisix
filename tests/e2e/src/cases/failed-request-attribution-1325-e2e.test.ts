@@ -30,12 +30,14 @@ const OK_PK = "attr1325-ok-pk";
 const FAIL_PK = "attr1325-fail-pk";
 const FAIL2_PK = "attr1325-fail2-pk";
 const EMBED_PK = "attr1325-embed-pk";
+const WILD_PK = "attr1325-wild-pk";
 
 const OK_MODEL = "attr1325-ok";
 const FAIL_MODEL = "attr1325-fail";
 const FAIL2_MODEL = "attr1325-fail2";
 const GROUP_MODEL = "attr1325-group";
 const EMBED_MODEL = "attr1325-embed";
+const WILD_ROW = "attr1325-wild/*";
 
 describe("failed-request upstream attribution #1325 e2e", () => {
   let app: SpawnedApp | undefined;
@@ -91,6 +93,10 @@ describe("failed-request upstream attribution #1325 e2e", () => {
     await seedPair(FAIL_PK, FAIL_MODEL, failing);
     await seedPair(FAIL2_PK, FAIL2_MODEL, failing2);
     await seedPair(EMBED_PK, EMBED_MODEL, embedFailing, "text-embedding-3-small");
+    // A wildcard row: `resolve_model` hands dispatch a synthetic Model whose
+    // upstream id is the caller's own suffix, so the failure path has to
+    // collapse it back to the row's template.
+    await seedPair(WILD_PK, WILD_ROW, failing, "*");
 
     // Failover group whose targets both fail: the terminal metric must name
     // the LAST attempt, the one whose error the caller was served.
@@ -110,6 +116,7 @@ describe("failed-request upstream attribution #1325 e2e", () => {
         FAIL2_MODEL,
         GROUP_MODEL,
         EMBED_MODEL,
+        WILD_ROW,
       ],
     });
   });
@@ -245,6 +252,34 @@ describe("failed-request upstream attribution #1325 e2e", () => {
     expect(sample).toContain('provider="openai"');
     expect(sample).toContain(`provider_key_name="${EMBED_PK}"`);
     expect(sample).toContain('upstream_model="text-embedding-3-small"');
+  });
+
+  test("a failed wildcard request is attributed without minting a series", async (ctx) => {
+    if (!etcdReachable || !app) {
+      ctx.skip();
+      return;
+    }
+    // The attribution the failure path reads comes off the target the
+    // request selected — and for a wildcard row that target's upstream id is
+    // whatever suffix the caller typed. It must reach the label as the row's
+    // configured template, or a failing wildcard model becomes a cardinality
+    // bomb (#451) reachable by anyone who can send a request.
+    const minted = ["attr1325-wild/alpha", "attr1325-wild/beta"];
+    await waitConfigPropagation(async () => {
+      return (await proxyChat(app!, minted[0])) >= 500;
+    });
+    for (const name of minted) {
+      expect(await proxyChat(app, name)).toBeGreaterThanOrEqual(500);
+    }
+
+    const text = await scrape(app);
+    const sample = requestSample(text, { model: WILD_ROW });
+    expect(sample, `no request sample for ${WILD_ROW}:\n${text}`).toBeTruthy();
+    expect(sample).toContain(`provider_key_name="${WILD_PK}"`);
+    expect(sample).toContain('upstream_model="*"');
+    for (const name of minted) {
+      expect(text, `caller-minted name leaked into a label`).not.toContain(name);
+    }
   });
 
   test("a request that never reached an upstream still reports unknown", async (ctx) => {

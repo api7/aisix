@@ -199,7 +199,7 @@ impl Default for Upstream<'_> {
 /// placeholder is the honest answer.
 pub(crate) struct LastTarget<'a> {
     provider: String,
-    upstream_model: &'a str,
+    upstream_model: Cow<'a, str>,
     pk: Option<crate::usage_attr::ResolvedPk<'a>>,
 }
 
@@ -216,10 +216,19 @@ impl<'a> LastTarget<'a> {
             } else {
                 resolved.provider.to_ascii_lowercase()
             },
+            // A wildcard row resolves to a SUBSTITUTED upstream id — the
+            // caller's own suffix — so it goes through the same collapse the
+            // success path's emit applies, or a failed request could mint one
+            // series per made-up suffix (#451).
             upstream_model: if resolved.upstream_model.is_empty() {
-                UNKNOWN
+                Cow::Borrowed(UNKNOWN)
             } else {
-                &resolved.upstream_model
+                crate::usage_attr::metric_model_label_pair(
+                    snap,
+                    &resolved.requested_model,
+                    &resolved.upstream_model,
+                )
+                .1
             },
             // An empty id must fall back to `PkLabels::default()`, NOT to
             // `ResolvedPk::resolve(snap, "")` — that one reports the id
@@ -248,7 +257,7 @@ impl<'a> LastTarget<'a> {
         Upstream {
             provider: &self.provider,
             model,
-            upstream_model: self.upstream_model,
+            upstream_model: &self.upstream_model,
             pk: self.pk.as_ref().map(|p| p.labels()).unwrap_or_default(),
             stream,
             is_fallback,
