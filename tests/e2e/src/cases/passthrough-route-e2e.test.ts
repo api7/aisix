@@ -10,6 +10,7 @@ import {
   type OpenAiUpstream,
   type SpawnedApp,
 } from "../harness/index.js";
+import { startMockOtlp, type MockOtlp } from "../harness/otlp-mock.js";
 
 // E2E: explicit PassthroughRoute resources — the successor of the removed
 // implicit `/passthrough/{provider}/*rest` tunnel. A route binds a gateway
@@ -36,6 +37,10 @@ import {
 //      gated by `source_cidrs` (real TCP, so 127.0.0.1 resolves).
 //   6. SSE relay: a streaming upstream is forwarded as SSE with the
 //      frames intact.
+//   7. Envelope auto-detection: a route has NO protocol/streaming
+//      configuration — usage extraction follows the request body's own
+//      envelope (chat buffered, Responses streamed) and a non-LLM
+//      exchange is never probed for phantom usage.
 
 const CALLER_PLAINTEXT = "sk-ptr-e2e-caller";
 const CALLER_KEY_HASH = createHash("sha256")
@@ -47,6 +52,7 @@ describe("passthrough-route e2e: explicit routes, BYO credentials, 410 tombstone
   let seed: SeedClient | undefined;
   let etcdReachable = false;
   const upstreams: OpenAiUpstream[] = [];
+  const otlps: MockOtlp[] = [];
 
   beforeAll(async () => {
     const etcd = new EtcdClient();
@@ -65,6 +71,7 @@ describe("passthrough-route e2e: explicit routes, BYO credentials, 410 tombstone
   afterAll(async () => {
     await app?.exit();
     await Promise.all(upstreams.map((u) => u.close()));
+    await Promise.all(otlps.map((o) => o.close()));
   });
 
   test("inject route on the legacy prefix: /v1 dedup, verbatim body, Bearer injection", async (ctx) => {
@@ -451,7 +458,6 @@ describe("passthrough-route e2e: explicit routes, BYO credentials, 410 tombstone
       path_prefix: "/sse-tunnel",
       target_url: upstream.baseUrl,
       provider_key_id: pk.id,
-      protocol: "openai_chat",
     });
 
     const headers = {
@@ -462,7 +468,11 @@ describe("passthrough-route e2e: explicit routes, BYO credentials, 410 tombstone
       fetch(`${app!.proxyUrl}/sse-tunnel/chat/completions`, {
         method: "POST",
         headers,
-        body: JSON.stringify({ model: "gpt-4o", stream: true }),
+        body: JSON.stringify({
+          model: "gpt-4o",
+          messages: [{ role: "user", content: "hi" }],
+          stream: true,
+        }),
       });
 
     await waitConfigPropagation(async () => {
@@ -486,5 +496,152 @@ describe("passthrough-route e2e: explicit routes, BYO credentials, 410 tombstone
     expect(text).toContain('"content":"hel"');
     expect(text).toContain('"content":"lo"');
     expect(text).toContain("[DONE]");
+  });
+
+  test("envelope auto-detection: usage follows the request body, never the config", async (ctx) => {
+    if (!etcdReachable || !app || !seed) {
+      ctx.skip();
+      return;
+    }
+
+    // A route carries NO protocol or streaming configuration — the
+    // envelope is detected per exchange from the request body's top-level
+    // keys. Three exchanges through three identical-config routes:
+    //
+    //   - chat-shaped request, buffered response  → `usage` extracted
+    //   - Responses-shaped request, SSE response  → nested usage on the
+    //     terminal `response.completed` event extracted (the shape the
+    //     GitHub Copilot CLI streams)
+    //   - JSON-RPC request (MCP)                  → raw: a usage-looking
+    //     object in the response is NOT probed (no phantom tokens)
+    const otlp = await startMockOtlp();
+    otlps.push(otlp);
+    await seed.createObservabilityExporter({
+      name: "ptr-auto-otlp",
+      enabled: true,
+      kind: "otlp_http",
+      endpoint: otlp.url,
+    });
+
+    const chatUpstream = await startOpenAiUpstream({
+      nonStreamBody: {
+        id: "chatcmpl-auto",
+        choices: [{ message: { role: "assistant", content: "ok" } }],
+        usage: { prompt_tokens: 7, completion_tokens: 3 },
+      },
+    });
+    const responsesUpstream = await startOpenAiUpstream({
+      streamEvents: [
+        JSON.stringify({ type: "response.output_text.delta", delta: "he" }),
+        JSON.stringify({ type: "response.output_text.delta", delta: "y" }),
+        JSON.stringify({
+          type: "response.completed",
+          response: { usage: { input_tokens: 11, output_tokens: 4 } },
+        }),
+      ],
+    });
+    const rpcUpstream = await startOpenAiUpstream({
+      nonStreamBody: {
+        jsonrpc: "2.0",
+        id: 1,
+        result: { usage: { prompt_tokens: 99, completion_tokens: 99 } },
+      },
+    });
+    upstreams.push(chatUpstream, responsesUpstream, rpcUpstream);
+
+    const pk = await seed.createProviderKey({
+      display_name: "ptr-auto-pk",
+      secret: "sk-mock",
+      api_base: "http://unused-on-routes",
+    });
+    for (const [name, prefix, upstream] of [
+      ["ptr-auto-chat", "/auto-chat", chatUpstream],
+      ["ptr-auto-resp", "/auto-resp", responsesUpstream],
+      ["ptr-auto-rpc", "/auto-rpc", rpcUpstream],
+    ] as const) {
+      await seed.createPassthroughRoute({
+        name,
+        path_prefix: prefix,
+        target_url: upstream.baseUrl,
+        provider_key_id: pk.id,
+      });
+    }
+
+    // Readiness sentinel, seeded LAST: the snapshot watch applies etcd
+    // revisions in order, so this route serving proves every resource
+    // seeded before it (exporter, the three routes under test) is live —
+    // without the probe exercising any exchange the test asserts on.
+    await seed.createPassthroughRoute({
+      name: "ptr-auto-ready",
+      path_prefix: "/auto-ready",
+      target_url: rpcUpstream.baseUrl,
+      provider_key_id: pk.id,
+    });
+
+    const headers = {
+      authorization: `Bearer ${CALLER_PLAINTEXT}`,
+      "content-type": "application/json",
+    };
+    const post = (path: string, body: unknown) =>
+      fetch(`${app!.proxyUrl}${path}`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(body),
+      });
+
+    await waitConfigPropagation(async () => {
+      try {
+        const r = await post("/auto-ready/ping", {});
+        await r.text();
+        return r.status === 200;
+      } catch {
+        return false;
+      }
+    });
+
+    const chatRes = await post("/auto-chat/chat/completions", {
+      model: "m",
+      messages: [{ role: "user", content: "hi" }],
+    });
+    expect(chatRes.status).toBe(200);
+    await chatRes.text();
+    const responsesRes = await post("/auto-resp/responses", {
+      model: "m",
+      input: [{ role: "user", content: "hi" }],
+      stream: true,
+    });
+    expect(responsesRes.status).toBe(200);
+    await responsesRes.text();
+    const rpcRes = await post("/auto-rpc/mcp", {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/list",
+    });
+    expect(rpcRes.status).toBe(200);
+    await rpcRes.text();
+
+    const spanFor = async (route: string) => {
+      const deadline = Date.now() + 10_000;
+      while (Date.now() < deadline) {
+        const hit = otlp.spans.find(
+          (s) => s.attributes["aisix.passthrough.route_name"] === route,
+        );
+        if (hit) return hit;
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      throw new Error(`no OTLP span for route ${route}`);
+    };
+
+    const chatSpan = await spanFor("ptr-auto-chat");
+    expect(chatSpan.attributes["gen_ai.usage.input_tokens"]).toBe(7);
+    expect(chatSpan.attributes["gen_ai.usage.output_tokens"]).toBe(3);
+
+    const respSpan = await spanFor("ptr-auto-resp");
+    expect(respSpan.attributes["gen_ai.usage.input_tokens"]).toBe(11);
+    expect(respSpan.attributes["gen_ai.usage.output_tokens"]).toBe(4);
+
+    const rpcSpan = await spanFor("ptr-auto-rpc");
+    expect(rpcSpan.attributes["gen_ai.usage.input_tokens"] ?? 0).toBe(0);
+    expect(rpcSpan.attributes["gen_ai.usage.output_tokens"] ?? 0).toBe(0);
   });
 });

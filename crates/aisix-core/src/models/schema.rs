@@ -715,7 +715,7 @@ pub fn claim_mapping_root_schema() -> Value {
 /// the [`PassthroughRoute`](crate::models::PassthroughRoute) struct. Uses the
 /// nullable `Option` representation (`true`) so unset optional fields accept
 /// an explicit `null` as well as being absent. The `auth_mode` /
-/// `credential_mode` / `protocol` closed sets come from their enums; every
+/// `credential_mode` closed sets come from their enums; every
 /// cross-field invariant (match dimensions, target shape, per-mode required
 /// companions) is injected as an `allOf` (see
 /// [`super::passthrough_route::passthrough_route_coupling`]) so the strict
@@ -753,16 +753,6 @@ pub fn passthrough_route_root_schema() -> Value {
             &[
                 ("inject", "Inject the ProviderKey secret"),
                 ("forward_client", "Forward the caller's own credential"),
-            ],
-        );
-        title_single_value_enum_variants(
-            defs,
-            "PassthroughProtocol",
-            &[
-                ("raw", "Opaque body"),
-                ("openai_chat", "OpenAI-compatible chat"),
-                ("openai_completions", "OpenAI-compatible completions / FIM"),
-                ("openai_responses", "OpenAI Responses API"),
             ],
         );
     }

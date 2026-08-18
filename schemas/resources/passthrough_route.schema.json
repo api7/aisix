@@ -437,43 +437,6 @@
           "type": "string"
         }
       ]
-    },
-    "PassthroughProtocol": {
-      "description": "Body-shape hint for a passthrough route.",
-      "oneOf": [
-        {
-          "description": "No parsing: bodies are opaque byte blobs (guardrails scan them as one lossy-UTF-8 text).",
-          "enum": [
-            "raw"
-          ],
-          "title": "Opaque body",
-          "type": "string"
-        },
-        {
-          "description": "OpenAI-compatible chat envelope (`messages`, streamed `choices[].delta.content`, final-chunk / response `usage`).",
-          "enum": [
-            "openai_chat"
-          ],
-          "title": "OpenAI-compatible chat",
-          "type": "string"
-        },
-        {
-          "description": "OpenAI-compatible legacy completions / FIM envelope (`prompt` [+ `suffix`], streamed `choices[].text`, `usage`).",
-          "enum": [
-            "openai_completions"
-          ],
-          "title": "OpenAI-compatible completions / FIM",
-          "type": "string"
-        },
-        {
-          "description": "OpenAI Responses API envelope: `input` items on the request, `output` items on the response, `response.output_text.delta` events while streaming, and `usage` in the `input_tokens`/`output_tokens` spelling — carried on the terminal `response.completed` event when the response streams.",
-          "enum": [
-            "openai_responses"
-          ],
-          "title": "OpenAI Responses API",
-          "type": "string"
-        }
-      ]
     }
   },
   "properties": {
@@ -559,15 +522,6 @@
       "description": "Derive the target from the request's own `Host` header (`https://<host>`), for forward-proxy routes that fan one route out over several official hosts. Only legal when `hosts` is set — the matched allowlist is what makes the derived target non-attacker- controlled (SSRF guard).",
       "type": "boolean"
     },
-    "protocol": {
-      "allOf": [
-        {
-          "$ref": "#/definitions/PassthroughProtocol"
-        }
-      ],
-      "default": "raw",
-      "description": "Body-shape hint for auditing, guardrails and usage extraction. Parsing is best-effort: a body that does not match the declared shape degrades to `raw` handling, it is never rejected for shape."
-    },
     "provider_key_id": {
       "description": "ProviderKey whose secret is injected upstream when `credential_mode` is `inject` (per-provider auth shape: `x-api-key` + `anthropic-version` for Anthropic, `Authorization: Bearer` otherwise; its `strip_headers` and TLS settings apply). Required for `inject`; forbidden for `forward_client`.",
       "minLength": 1,
@@ -586,11 +540,6 @@
         "null"
       ]
     },
-    "streaming": {
-      "default": true,
-      "description": "Relay `text/event-stream` upstream responses incrementally. When `false` streaming responses are fully buffered like any other body.",
-      "type": "boolean"
-    },
     "target_url": {
       "description": "Explicit upstream base URL, e.g. `https://api.openai.com`. The matched request's remainder path and query are appended. Exactly one of `target_url` / `preserve_host` must be configured.",
       "minLength": 1,
@@ -600,7 +549,7 @@
       ]
     },
     "timeout_ms": {
-      "description": "Maximum time, in milliseconds, for a non-streaming upstream exchange. On a streaming route it bounds the response-header phase and any non-SSE body read, but never a healthy SSE relay (which ends with the upstream stream or the client hanging up). When omitted, the gateway default request timeout applies to non-streaming exchanges only.",
+      "description": "Maximum time, in milliseconds, for the upstream exchange. Bounds the response-header phase and any non-SSE body read, but never a healthy SSE relay (which ends with the upstream stream or the client hanging up). When omitted, the gateway default request timeout applies the same way.",
       "format": "uint64",
       "minimum": 1.0,
       "type": [

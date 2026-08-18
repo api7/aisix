@@ -62,9 +62,7 @@ pub use observability_exporter::{
     ObjectStoreProvider, ObservabilityExporter, OtlpHttpConfig, SlsContentMode,
 };
 pub use oidc_provider::{BoundClaimExpect, OidcProvider};
-pub use passthrough_route::{
-    PassthroughAuthMode, PassthroughCredentialMode, PassthroughProtocol, PassthroughRoute,
-};
+pub use passthrough_route::{PassthroughAuthMode, PassthroughCredentialMode, PassthroughRoute};
 pub use policy_conditions::{
     eval_condition_nodes, validate_condition_nodes, ConditionGroup, ConditionInput, ConditionLogic,
     ConditionNode, ConditionOperator, ConditionValue, GroupByDimension, PolicyAction,

@@ -2,10 +2,22 @@
 //!
 //! Replaces the removed implicit `/passthrough/:provider/*rest` tunnel: a
 //! route binds a gateway entry (path prefix and/or inbound `Host`) to ONE
-//! upstream target with its own gateway-auth mode, credential handling,
-//! protocol hint, and streaming behavior. There is no implicit
-//! provider→Model credential borrowing (AISIX-Cloud#1127) and no forced
-//! `Authorization` replacement (AISIX-Cloud#1312).
+//! upstream target with its own gateway-auth mode and credential handling.
+//! There is no implicit provider→Model credential borrowing
+//! (AISIX-Cloud#1127) and no forced `Authorization` replacement
+//! (AISIX-Cloud#1312).
+//!
+//! ## Envelope detection
+//!
+//! The request body's envelope is detected once per exchange from its
+//! top-level keys ([`detect_protocol`]) and drives guardrail text
+//! extraction, content capture and usage extraction for both the request
+//! and the response (buffered or streamed). Detection never affects the
+//! relay itself — bodies are forwarded verbatim regardless — and every
+//! extraction degrades to the whole lossy-UTF-8 body when the detected
+//! shape yields no text, so a mis-detected envelope loses no audit
+//! coverage. SSE upstream responses are always relayed incrementally;
+//! anything else is buffered (guardrails and usage need the whole body).
 //!
 //! ## Entry points
 //!
@@ -51,9 +63,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 
 use aisix_core::resource::ResourceEntry;
-use aisix_core::{
-    PassthroughAuthMode, PassthroughCredentialMode, PassthroughProtocol, PassthroughRoute,
-};
+use aisix_core::{PassthroughAuthMode, PassthroughCredentialMode, PassthroughRoute};
 
 use crate::auth::AuthenticatedKey;
 use crate::error::ProxyError;
@@ -577,9 +587,13 @@ async fn dispatch(
     let resolved_chain = state.guardrail_index.resolve(&guardrail_ctx);
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
 
-    // INPUT guardrails on the (protocol-extracted) request text.
+    // Envelope detection: once per exchange, from the request body's
+    // top-level keys; the response and stream frames reuse it.
+    let protocol = detect_protocol(&body_bytes);
+
+    // INPUT guardrails on the (envelope-extracted) request text.
     if !resolved_chain.is_empty() {
-        let text = request_guardrail_text(route.protocol, &body_bytes);
+        let text = request_guardrail_text(protocol, &body_bytes);
         let chat = aisix_gateway::ChatFormat::new(
             route.name.clone(),
             vec![aisix_gateway::ChatMessage::user(text)],
@@ -619,7 +633,7 @@ async fn dispatch(
             .iter()
             .map(|e| &e.value),
     );
-    let captured_prompt = content_cap.map(|_| request_guardrail_text(route.protocol, &body_bytes));
+    let captured_prompt = content_cap.map(|_| request_guardrail_text(protocol, &body_bytes));
 
     // Rate limits AFTER the input guardrail so a content block doesn't burn
     // an RPM slot (matching the typed endpoints). The body's `model` field
@@ -720,33 +734,27 @@ async fn dispatch(
         builder = builder.body(body_bytes.clone());
     }
 
-    // Exchange bound. A non-streaming route carries a plain total-exchange
-    // timeout (route override, else the gateway default). A streaming
-    // route must not bound the relay itself — a healthy long-lived SSE
+    // Exchange bound. The timeout (route override, else the gateway
+    // default) must not bound the relay itself — a healthy long-lived SSE
     // stream is the point — but a blackholed upstream still can't pin the
     // connection: the header phase (and, below, a non-SSE body read) get
-    // the same bound via an explicit timer.
+    // the bound via an explicit timer.
     let exchange_timeout = route
         .timeout_ms
         .map(Duration::from_millis)
         .or(state.default_timeouts.request);
-    if !route.streaming {
-        if let Some(d) = exchange_timeout {
-            builder = builder.timeout(d);
-        }
-    }
 
     let bridge_timeout = |d: Duration| aisix_gateway::BridgeError::Timeout {
         elapsed_ms: d.as_millis().min(u64::MAX as u128) as u64,
         cause: "passthrough route upstream exchange".into(),
     };
     let send_fut = builder.send();
-    let sent = match (route.streaming, exchange_timeout) {
-        (true, Some(d)) => match tokio::time::timeout(d, send_fut).await {
+    let sent = match exchange_timeout {
+        Some(d) => match tokio::time::timeout(d, send_fut).await {
             Ok(r) => r,
             Err(_) => return Err(RouteError::of(ProxyError::Bridge(bridge_timeout(d)), &auth)),
         },
-        _ => send_fut.await,
+        None => send_fut.await,
     };
     let upstream_resp = sent.map_err(|e| {
         RouteError::of(
@@ -799,9 +807,9 @@ async fn dispatch(
         emitted: false,
     };
 
-    if route.streaming && is_sse {
+    if is_sse {
         return Ok(stream_response(
-            route.protocol,
+            protocol,
             resolved_chain,
             upstream_resp,
             resp_headers,
@@ -813,19 +821,19 @@ async fn dispatch(
 
     // ----- buffered response -----
 
-    // A streaming route reaching this branch got a non-SSE answer; its
-    // reqwest request carries no built-in timeout, so the body read gets
-    // the exchange bound explicitly (same blackhole guard as the send).
+    // A non-SSE answer: the reqwest request carries no built-in timeout,
+    // so the body read gets the exchange bound explicitly (same blackhole
+    // guard as the send).
     let body_fut = upstream_resp.bytes();
-    let read = match (route.streaming, exchange_timeout) {
-        (true, Some(d)) => match tokio::time::timeout(d, body_fut).await {
+    let read = match exchange_timeout {
+        Some(d) => match tokio::time::timeout(d, body_fut).await {
             Ok(r) => r,
             Err(_) => {
                 telemetry.emitted = true;
                 return Err(RouteError::of(ProxyError::Bridge(bridge_timeout(d)), &auth));
             }
         },
-        _ => body_fut.await,
+        None => body_fut.await,
     };
     let resp_body = read.map_err(|e| {
         telemetry.emitted = true;
@@ -835,9 +843,9 @@ async fn dispatch(
         )
     })?;
 
-    // OUTPUT guardrails on the (protocol-extracted) response text.
+    // OUTPUT guardrails on the (envelope-extracted) response text.
     if !resolved_chain.is_empty() {
-        let text = response_guardrail_text(route.protocol, &resp_body);
+        let text = response_guardrail_text(protocol, &resp_body);
         let synth = aisix_gateway::ChatResponse {
             id: String::new(),
             model: route.name.clone(),
@@ -873,12 +881,12 @@ async fn dispatch(
         }
     }
 
-    if let Some((p, c)) = response_usage(route.protocol, &resp_body) {
+    if let Some((p, c)) = response_usage(protocol, &resp_body) {
         telemetry.prompt_tokens = p;
         telemetry.completion_tokens = c;
     }
     if telemetry.content_cap.is_some() {
-        telemetry.response_text = response_guardrail_text(route.protocol, &resp_body);
+        telemetry.response_text = response_guardrail_text(protocol, &resp_body);
     }
 
     let mut response = Response::builder()
@@ -1007,43 +1015,92 @@ fn content_text(v: &serde_json::Value) -> String {
     }
 }
 
-/// The request text a guardrail scans, per the route's protocol hint.
-/// Parsing is best-effort: anything that doesn't match the declared shape
-/// degrades to the raw lossy-UTF-8 body.
+/// The body envelope detected for one exchange. Not configuration:
+/// detected per request from the body's top-level keys
+/// ([`detect_protocol`]) and sticky for the exchange — the buffered
+/// response and every stream frame are read with the same detection. It
+/// drives extraction (guardrail text, capture, usage) only; the relay
+/// forwards bytes verbatim regardless.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PassthroughProtocol {
+    /// No recognized envelope: bodies are opaque (guardrails scan them as
+    /// one lossy-UTF-8 text; buffered responses are not probed for usage).
+    Raw,
+    /// OpenAI-compatible chat envelope (`messages`, streamed
+    /// `choices[].delta.content`, final-chunk / response `usage`).
+    OpenaiChat,
+    /// OpenAI-compatible legacy completions / FIM envelope (`prompt` [+
+    /// `suffix`], streamed `choices[].text`, `usage`).
+    OpenaiCompletions,
+    /// OpenAI Responses API envelope: `input` on the request, `output`
+    /// items on the response, `response.output_text.delta` events while
+    /// streaming, and `usage` in the `input_tokens`/`output_tokens`
+    /// spelling — carried on the terminal `response.completed` event when
+    /// the response streams.
+    OpenaiResponses,
+}
+
+/// Detect the request envelope from the body's top-level keys. The three
+/// LLM envelopes are structurally exclusive — `messages`, `input` and
+/// `prompt` are each the required carrier field of exactly one API — so
+/// real LLM traffic detects unambiguously, and everything else (JSON-RPC,
+/// REST, non-JSON, empty/GET bodies) is `Raw`. An unknown API colliding
+/// with a carrier key costs nothing: detection drives extraction only,
+/// and extraction degrades to the whole body when the detected shape
+/// yields no text.
+fn detect_protocol(body: &[u8]) -> PassthroughProtocol {
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return PassthroughProtocol::Raw;
+    };
+    if v.get("messages").is_some_and(serde_json::Value::is_array) {
+        PassthroughProtocol::OpenaiChat
+    } else if v
+        .get("input")
+        .is_some_and(|i| i.is_string() || i.is_array())
+    {
+        PassthroughProtocol::OpenaiResponses
+    } else if v
+        .get("prompt")
+        .is_some_and(|p| p.is_string() || p.is_array())
+    {
+        PassthroughProtocol::OpenaiCompletions
+    } else {
+        PassthroughProtocol::Raw
+    }
+}
+
+/// The request text a guardrail scans, per the detected envelope.
+/// Extraction is best-effort: a shape that yields no text degrades to the
+/// raw lossy-UTF-8 body, so detection never loses audit coverage.
 fn request_guardrail_text(protocol: PassthroughProtocol, body: &[u8]) -> String {
     let raw = || String::from_utf8_lossy(body).into_owned();
     let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else {
         return raw();
     };
-    match protocol {
-        PassthroughProtocol::Raw => raw(),
-        PassthroughProtocol::OpenaiChat => match v.get("messages").and_then(|m| m.as_array()) {
-            Some(msgs) => msgs
-                .iter()
-                .filter_map(|m| m.get("content").map(content_text))
-                .filter(|t| !t.is_empty())
-                .collect::<Vec<_>>()
-                .join("\n"),
-            None => raw(),
-        },
+    let extracted = match protocol {
+        PassthroughProtocol::Raw => return raw(),
+        PassthroughProtocol::OpenaiChat => v
+            .get("messages")
+            .and_then(|m| m.as_array())
+            .map(|msgs| {
+                msgs.iter()
+                    .filter_map(|m| m.get("content").map(content_text))
+                    .filter(|t| !t.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default(),
         // Responses API: `input` is either a bare string or an array of
         // items whose `content` parts carry the text.
         PassthroughProtocol::OpenaiResponses => match v.get("input") {
             Some(serde_json::Value::String(t)) => t.clone(),
-            Some(serde_json::Value::Array(items)) => {
-                let joined = items
-                    .iter()
-                    .filter_map(|i| i.get("content").map(content_text))
-                    .filter(|t| !t.is_empty())
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                if joined.is_empty() {
-                    raw()
-                } else {
-                    joined
-                }
-            }
-            _ => raw(),
+            Some(serde_json::Value::Array(items)) => items
+                .iter()
+                .filter_map(|i| i.get("content").map(content_text))
+                .filter(|t| !t.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => String::new(),
         },
         PassthroughProtocol::OpenaiCompletions => {
             let prompt = v.get("prompt").map(|p| match p {
@@ -1055,20 +1112,20 @@ fn request_guardrail_text(protocol: PassthroughProtocol, body: &[u8]) -> String 
                 other => content_text(other),
             });
             let suffix = v.get("suffix").and_then(|s| s.as_str());
-            match (prompt, suffix) {
-                (None, None) => raw(),
-                (p, s) => {
-                    let mut out = p.unwrap_or_default();
-                    if let Some(s) = s {
-                        if !out.is_empty() {
-                            out.push('\n');
-                        }
-                        out.push_str(s);
-                    }
-                    out
+            let mut out = prompt.unwrap_or_default();
+            if let Some(s) = suffix {
+                if !out.is_empty() {
+                    out.push('\n');
                 }
+                out.push_str(s);
             }
+            out
         }
+    };
+    if extracted.is_empty() {
+        raw()
+    } else {
+        extracted
     }
 }
 
@@ -1566,9 +1623,17 @@ fn stream_response(
         telemetry.emit();
     };
 
+    // Re-attach the request span (the body is polled after the request-id
+    // middleware returns, so end-of-stream telemetry would otherwise log
+    // without a request_id) and heartbeat silence gaps — this branch is
+    // SSE-only, where a comment frame is protocol-legal and identical to
+    // what the typed endpoints emit; relayed frames are untouched.
     let mut response = Response::builder()
         .status(status)
-        .body(Body::from_stream(stream))
+        .body(Body::from_stream(crate::sse_keepalive::with_heartbeat(
+            crate::request_id::in_request_span(stream),
+            crate::sse_keepalive::interval(),
+        )))
         .unwrap();
     copy_safe_headers(&resp_headers, response.headers_mut());
     // The relay re-chunks the body; a stale upstream length must not ride
@@ -2250,6 +2315,59 @@ mod tests {
             request_guardrail_text(PassthroughProtocol::OpenaiChat, not_chat),
             r#"{"input":"x"}"#
         );
+        // A detected envelope whose items carry no text ALSO degrades to
+        // the raw body — detection must never scan less than raw would.
+        let empty_chat = br#"{"messages":[{"role":"tool","tool_call_id":"1"}]}"#;
+        assert_eq!(
+            request_guardrail_text(PassthroughProtocol::OpenaiChat, empty_chat),
+            String::from_utf8_lossy(empty_chat)
+        );
+    }
+
+    #[test]
+    fn detect_protocol_from_request_envelope() {
+        // The real Copilot CLI surface, one shape per endpoint family.
+        let cases: [(&[u8], PassthroughProtocol); 8] = [
+            // Chat: `messages` array.
+            (
+                br#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#,
+                PassthroughProtocol::OpenaiChat,
+            ),
+            // Responses API: `input` as items or a bare string.
+            (
+                br#"{"model":"m","input":[{"role":"user","content":"hi"}]}"#,
+                PassthroughProtocol::OpenaiResponses,
+            ),
+            (
+                br#"{"model":"m","input":"hi"}"#,
+                PassthroughProtocol::OpenaiResponses,
+            ),
+            // FIM / legacy completions: `prompt`.
+            (
+                br#"{"prompt":"def f(","suffix":"return"}"#,
+                PassthroughProtocol::OpenaiCompletions,
+            ),
+            // MCP JSON-RPC relays as raw.
+            (
+                br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+                PassthroughProtocol::Raw,
+            ),
+            // Plain REST / unrecognized JSON relays as raw.
+            (br#"{"ref":"main","inputs":{}}"#, PassthroughProtocol::Raw),
+            // Carrier keys of the wrong TYPE stay raw: only the API's own
+            // shape (array/string) counts as that envelope.
+            (br#"{"messages":"not-an-array"}"#, PassthroughProtocol::Raw),
+            // Non-JSON / empty (GET) bodies are raw.
+            (b"", PassthroughProtocol::Raw),
+        ];
+        for (body, want) in cases {
+            assert_eq!(
+                detect_protocol(body),
+                want,
+                "body {:?}",
+                String::from_utf8_lossy(body)
+            );
+        }
     }
 
     #[test]
