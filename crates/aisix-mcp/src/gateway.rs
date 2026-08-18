@@ -149,6 +149,33 @@ impl ToolAcl {
         }
     }
 
+    /// Narrow this ACL to the tools of `servers`, as an additional
+    /// conjunctive allow layer: the result permits a tool only if the
+    /// ACL already did AND the tool belongs to one of the named servers.
+    ///
+    /// Used for anonymous callers (AISIX-Cloud#1313), whose configured
+    /// server allowlist is a ceiling on the bound principal rather than
+    /// just an entry gate. Expressing it as a layer — instead of
+    /// filtering `tools/list` at the endpoint — is what makes the
+    /// aggregated and scoped endpoints agree: `permits` is the single
+    /// point both listing and calling go through, and it evaluates the
+    /// namespaced form on either endpoint.
+    ///
+    /// An empty list admits nothing, which is exactly right: an
+    /// anonymous principal with no listed server has no tools.
+    pub fn narrowed_to_servers(mut self, servers: &[String]) -> Self {
+        // Built directly rather than via `from_patterns`: every entry
+        // here is `<server>__*`, never a bare `*`, so the all-admitting
+        // fold that helper performs must not apply.
+        self.allow.push(AllowLayer::Patterns(
+            servers
+                .iter()
+                .map(|s| format!("{s}{TOOL_NAMESPACE_SEPARATOR}*"))
+                .collect(),
+        ));
+        self
+    }
+
     /// Build a legacy ACL from an API key's `allowed_tools` list alone:
     /// `None` or an empty list grants no tools; a list containing `"*"`
     /// grants all; otherwise the listed patterns. Entries are matched as
@@ -729,6 +756,47 @@ mod tests {
     fn http_sse_generation_stays_unsupported() {
         assert!(!SUPPORTED_PROTOCOL_VERSION_NAMES.contains(&"2024-11-05"));
         assert!(!SUPPORTED_PROTOCOL_VERSIONS.contains(&ProtocolVersion::V_2024_11_05));
+    }
+
+    /// The anonymous ceiling intersects — it can only ever remove tools.
+    /// A principal whose own grant is `*` must still be confined to the
+    /// listed servers, which is what stops an anonymous caller from
+    /// reaching an unlisted server by naming `<server>__<tool>` on the
+    /// aggregated endpoint while its scoped entry is closed.
+    #[test]
+    fn server_ceiling_narrows_a_wide_grant() {
+        let wide = ToolAcl::from_allowed(Some(&["*".to_string()]));
+        assert!(wide.permits("kb__search"));
+
+        let capped = ToolAcl::from_allowed(Some(&["*".to_string()]))
+            .narrowed_to_servers(&["docs".to_string()]);
+        assert!(capped.permits("docs__search"));
+        assert!(!capped.permits("kb__search"));
+        // A bare tool name belongs to no server and is never admitted.
+        assert!(!capped.permits("search"));
+        // The `__` boundary is respected: a server whose name merely
+        // starts with an allowed one does not inherit its grant.
+        assert!(!capped.permits("docsecret__search"));
+    }
+
+    /// The ceiling never widens: a narrow grant stays narrow even when
+    /// the allowlist names more servers than the key can reach.
+    #[test]
+    fn server_ceiling_cannot_widen_a_grant() {
+        let acl = ToolAcl::from_allowed(Some(&["docs__search".to_string()]))
+            .narrowed_to_servers(&["docs".to_string(), "kb".to_string()]);
+        assert!(acl.permits("docs__search"));
+        assert!(!acl.permits("docs__write"));
+        assert!(!acl.permits("kb__search"));
+    }
+
+    /// An empty allowlist admits nothing — an anonymous principal with
+    /// no listed server has no tools, rather than all of them.
+    #[test]
+    fn server_ceiling_with_no_servers_admits_nothing() {
+        let acl = ToolAcl::from_allowed(Some(&["*".to_string()])).narrowed_to_servers(&[]);
+        assert!(!acl.permits("docs__search"));
+        assert!(!acl.permits("anything"));
     }
 
     /// The exact served set, as literals: growing or shrinking it is a

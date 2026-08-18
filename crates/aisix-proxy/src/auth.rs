@@ -25,6 +25,18 @@ pub struct AuthenticatedKey {
     /// cannot name the subject once claim mappings let many identities
     /// share one key (AISIX-Cloud#564).
     pub jwt: Option<Arc<JwtIdentity>>,
+    /// `true` when the principal came from an entry's anonymous
+    /// configuration instead of a credential the caller presented —
+    /// the MCP anonymous entries (AISIX-Cloud#1313) and passthrough
+    /// routes in `auth_mode: anonymous`.
+    ///
+    /// `entry` names the principal either way; this says whether the
+    /// caller PROVED it, which `entry` alone cannot tell once a key
+    /// doubles as an anonymous principal. A handler that sets it must
+    /// also stamp `UsageEvent::auth_type` (see
+    /// `usage_attr::apply_auth_type`), or anonymous traffic becomes
+    /// indistinguishable from the key's own in the usage record.
+    pub anonymous: bool,
 }
 
 /// The verified JWT identity a request authenticated as.
@@ -214,7 +226,11 @@ pub(crate) async fn authenticate_token(
         ));
     }
     state.metrics.record_auth_decision("api_key", true, "");
-    Ok(AuthenticatedKey { entry, jwt: None })
+    Ok(AuthenticatedKey {
+        entry,
+        jwt: None,
+        anonymous: false,
+    })
 }
 
 /// Record an API-key denial on the decision metric + log
@@ -266,6 +282,25 @@ fn deny_key(
         );
     }
     err
+}
+
+/// Whether the request OFFERS an inbound gateway credential at all.
+///
+/// Deliberately wider than [`extract_bearer`]: a present-but-unusable
+/// `Authorization` — wrong scheme, empty value, bytes that are not
+/// ASCII — counts as offered. Anonymous entry (AISIX-Cloud#1313) is the
+/// no-credential path, so a caller that tried to authenticate and got
+/// it wrong must be rejected rather than quietly succeed as the
+/// anonymous principal with a different grant than it asked for.
+pub(crate) fn credential_offered(parts: &Parts) -> bool {
+    [axum::http::header::AUTHORIZATION.as_str(), "x-api-key"]
+        .iter()
+        .any(|name| {
+            parts
+                .headers
+                .get(*name)
+                .is_some_and(|v| v.to_str().map_or(true, |s| !s.trim().is_empty()))
+        })
 }
 
 fn extract_bearer(parts: &Parts) -> Result<String, ProxyError> {
@@ -555,6 +590,36 @@ mod tests {
             extract_bearer(&parts),
             Err(ProxyError::MissingAuth)
         ));
+    }
+
+    #[test]
+    fn credential_offered_covers_unusable_credentials() {
+        // Absent → not offered: the anonymous path may serve these.
+        assert!(!credential_offered(&parts_with(HeaderMap::new())));
+        let mut empty = HeaderMap::new();
+        empty.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("   "),
+        );
+        assert!(!credential_offered(&parts_with(empty)));
+
+        // Present but unusable → offered: must fail, never downgrade.
+        for (name, value) in [
+            (axum::http::header::AUTHORIZATION.as_str(), "Bearer sk-abc"),
+            (axum::http::header::AUTHORIZATION.as_str(), "Bearer   "),
+            (
+                axum::http::header::AUTHORIZATION.as_str(),
+                "Basic dXNlcjpwdw==",
+            ),
+            ("x-api-key", "sk-abc"),
+        ] {
+            let mut h = HeaderMap::new();
+            h.insert(name, HeaderValue::from_str(value).unwrap());
+            assert!(
+                credential_offered(&parts_with(h)),
+                "{name}: {value:?} must count as an offered credential"
+            );
+        }
     }
 
     #[test]

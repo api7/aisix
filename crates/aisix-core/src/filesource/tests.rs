@@ -665,7 +665,10 @@ mcp_auth_settings:
     let snapshot = load(contents, &env_of(&[])).expect("loads");
     assert_eq!(snapshot.mcp_auth_settings.len(), 1);
     let entry = snapshot.mcp_auth_settings.entries().pop().unwrap();
-    assert_eq!(entry.value.resource_url, "https://gw.example.com/mcp");
+    assert_eq!(
+        entry.value.resource_url.as_deref(),
+        Some("https://gw.example.com/mcp")
+    );
 }
 
 #[test]

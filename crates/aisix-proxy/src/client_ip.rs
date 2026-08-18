@@ -254,8 +254,42 @@ fn parse_routing_tags(raw: &str) -> Vec<String> {
         .collect()
 }
 
+/// Whether `source_ip` — as resolved by the real-ip chain above, never a
+/// raw caller-supplied header — falls inside one of `cidrs`.
+///
+/// An unparseable source IP is OUT: callers gate access on this, so a
+/// peer address the proxy could not resolve must not pass an allowlist.
+/// An unparseable CIDR entry is skipped rather than opening the list.
+/// An EMPTY list is also out — "allowlist everything" has to be spelled
+/// by the caller (passthrough routes treat an unset list as
+/// unrestricted; the MCP anonymous block requires a non-empty one), so
+/// this primitive never has to guess which of the two an empty list means.
+pub(crate) fn ip_in_cidrs(source_ip: &str, cidrs: &[String]) -> bool {
+    let Ok(ip) = source_ip.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    cidrs
+        .iter()
+        .filter_map(|cidr| cidr.parse::<ipnet::IpNet>().ok())
+        .any(|net| net.contains(&ip))
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cidr_match_is_closed_on_bad_input() {
+        let cidrs = vec!["10.0.0.0/8".to_string(), "2001:db8::/32".to_string()];
+        assert!(super::ip_in_cidrs("10.1.2.3", &cidrs));
+        assert!(super::ip_in_cidrs("2001:db8::5", &cidrs));
+        assert!(!super::ip_in_cidrs("192.0.2.1", &cidrs));
+        // Unresolvable source, empty list, and a malformed entry all
+        // fail closed rather than passing the allowlist.
+        assert!(!super::ip_in_cidrs("", &cidrs));
+        assert!(!super::ip_in_cidrs("not-an-ip", &cidrs));
+        assert!(!super::ip_in_cidrs("10.1.2.3", &[]));
+        assert!(!super::ip_in_cidrs("10.1.2.3", &["nonsense".to_string()]));
+    }
+
     use super::*;
 
     fn nets(cidrs: &[&str]) -> Vec<IpNet> {

@@ -60,12 +60,8 @@ struct PeekParams {
 /// current snapshot's `mcp_servers`, and a usage event is emitted into the same
 /// pipeline as LLM calls. The `initialize` / `tools/list` handshake and discovery
 /// methods pass through ungated and unmetered.
-pub async fn mcp_endpoint(
-    auth: AuthenticatedKey,
-    State(state): State<ProxyState>,
-    request: Request,
-) -> Response {
-    serve(auth, state, request, None).await
+pub async fn mcp_endpoint(State(state): State<ProxyState>, request: Request) -> Response {
+    serve(state, request, None).await
 }
 
 /// Serve a `/mcp/{server}` request: the single-server variant of
@@ -77,20 +73,88 @@ pub async fn mcp_endpoint(
 /// disabled server is `404` (after auth, so an unauthenticated caller learns
 /// nothing about which servers exist).
 pub async fn mcp_scoped_endpoint(
-    auth: AuthenticatedKey,
     crate::reject::AisixPath(server): crate::reject::AisixPath<String>,
     State(state): State<ProxyState>,
     request: Request,
 ) -> Response {
-    serve(auth, state, request, Some(server)).await
+    serve(state, request, Some(server)).await
 }
 
-async fn serve(
+/// The resolved caller of a `/mcp` request.
+struct McpCaller {
     auth: AuthenticatedKey,
-    state: ProxyState,
-    request: Request,
-    scope: Option<String>,
-) -> Response {
+    /// The anonymous entry's server allowlist, which caps what this
+    /// caller may see and call. `None` when the caller authenticated —
+    /// an authenticated principal is bounded by its own grant alone.
+    anonymous_servers: Option<Vec<String>>,
+}
+
+/// Authenticate the caller of a `/mcp` entry.
+///
+/// Order matters, and it is the whole security argument of the feature:
+///
+/// 1. A request that OFFERS a credential is authenticated, full stop. A
+///    bad, expired, disabled or malformed one is rejected — it never
+///    falls through to the anonymous principal, which would silently
+///    swap the caller's identity for a different grant.
+/// 2. Only a request offering nothing at all consults the anonymous
+///    configuration for the addressed entry.
+/// 3. Anything else takes the standard extractor path, whose 401 (and
+///    `missing_credentials` metric) is what the endpoint answered
+///    before this feature existed.
+///
+/// Step 3 is also what keeps the registered server set invisible: the
+/// scoped handler resolves the path's server only after this returns, so
+/// an unknown server and a known-but-not-anonymous one both answer 401
+/// to an anonymous prober, never 404.
+async fn resolve_caller(
+    state: &ProxyState,
+    parts: &mut axum::http::request::Parts,
+    scope: Option<&str>,
+) -> Result<McpCaller, crate::error::ProxyError> {
+    if !crate::auth::credential_offered(parts) {
+        let snapshot = state.snapshot.load();
+        if let Some(anon) = crate::mcp_auth::anonymous_entry(state, &snapshot, parts, scope) {
+            // Publish the principal the way the extractor does, so the
+            // extractors running after this one — `ClientContext` and
+            // the `${request.api_key.*}` header templates — see the
+            // caller without re-authenticating.
+            parts.extensions.insert(anon.auth.entry.clone());
+            return Ok(McpCaller {
+                auth: anon.auth,
+                anonymous_servers: Some(anon.servers),
+            });
+        }
+    }
+    let auth =
+        <AuthenticatedKey as axum::extract::FromRequestParts<ProxyState>>::from_request_parts(
+            parts, state,
+        )
+        .await?;
+    Ok(McpCaller {
+        auth,
+        anonymous_servers: None,
+    })
+}
+
+async fn serve(state: ProxyState, request: Request, scope: Option<String>) -> Response {
+    // Authentication runs here rather than as an extractor because the
+    // decision depends on which entry was addressed: a no-credential
+    // request may be served anonymously on an entry configured for it
+    // (AISIX-Cloud#1313). A rejection short-circuits WITHOUT an access
+    // log or request metric, exactly as the extractor's 401 did before
+    // — an internet-facing DP would otherwise drown in scanner probes
+    // (AISIX-Cloud#1081); `aisix_auth_decisions_total` records it.
+    let (mut parts, body) = request.into_parts();
+    let caller = match resolve_caller(&state, &mut parts, scope.as_deref()).await {
+        Ok(caller) => caller,
+        Err(err) => return err.into_response(),
+    };
+    let McpCaller {
+        auth,
+        anonymous_servers,
+    } = caller;
+    let request = Request::from_parts(parts, body);
     // #698: /mcp emits the same access log + request metrics as every other
     // handler — pre-fix the endpoint was invisible in both. One wrapper
     // around `dispatch` covers every early-return path (quota, guardrail
@@ -107,7 +171,15 @@ async fn serve(
     // the caller's team / user labels (the handle is an `Arc` clone).
     let caller_auth = auth.clone();
 
-    let response = dispatch(auth, scope.as_deref(), &state, request, &request_id).await;
+    let response = dispatch(
+        auth,
+        anonymous_servers.as_deref(),
+        scope.as_deref(),
+        &state,
+        request,
+        &request_id,
+    )
+    .await;
 
     let elapsed = started.elapsed();
     let status = response.status().as_u16();
@@ -158,6 +230,7 @@ async fn serve(
 
 async fn dispatch(
     auth: AuthenticatedKey,
+    anonymous_servers: Option<&[String]>,
     scope: Option<&str>,
     state: &ProxyState,
     request: Request,
@@ -353,7 +426,19 @@ async fn dispatch(
     // Scope the gateway to the tools this caller's key permits — resolved
     // from the key together with the environment/team MCP access policies —
     // so MCP tool access is governed by the same key object as LLM access.
-    let acl = aisix_mcp::ToolAcl::resolve(&snapshot, auth.key());
+    let acl = {
+        let resolved = aisix_mcp::ToolAcl::resolve(&snapshot, auth.key());
+        // The anonymous allowlist is a CEILING on the bound principal,
+        // not just the entry gate. Applied here — one layer on the ACL
+        // both endpoints share — it constrains `tools/list` and
+        // `tools/call` alike, so an anonymous caller cannot reach an
+        // unlisted server by naming `<server>__<tool>` on the
+        // aggregated endpoint while its scoped entry stays closed.
+        match anonymous_servers {
+            Some(servers) => resolved.narrowed_to_servers(servers),
+            None => resolved,
+        }
+    };
     let gateway = match scope {
         // Same snapshot as the resolution above, so the entry is still there.
         Some(server) => match aisix_mcp::McpGateway::from_snapshot_scoped(&snapshot, server) {
@@ -571,6 +656,7 @@ fn emit_tool_call_usage(
         ..Default::default()
     };
     crate::usage_attr::apply_jwt_identity(&mut event, auth.jwt.as_ref());
+    crate::usage_attr::apply_auth_type(&mut event, auth);
     // A tool call resolves neither a model nor a ProviderKey, so the
     // attribution labels are the placeholder — present so this family has
     // ONE label set across every handler (AISIX-Cloud#1317).
@@ -1169,6 +1255,253 @@ mod tests {
         assert_eq!(v["error"]["type"], "invalid_request_error");
     }
 
+    // ─── Anonymous access (AISIX-Cloud#1313) ─────────────────────────
+
+    /// A snapshot whose environment serves anonymous callers as `ak-1`,
+    /// with `anon` merged into the anonymous block.
+    fn snapshot_with_anonymous(anon: serde_json::Value) -> AisixSnapshot {
+        let snapshot = snapshot_with_key();
+        let mut block = serde_json::json!({
+            "api_key_id": "ak-1",
+            "source_cidrs": ["10.0.0.0/8"],
+        });
+        let obj = block.as_object_mut().unwrap();
+        for (k, v) in anon.as_object().expect("anonymous overrides") {
+            obj.insert(k.clone(), v.clone());
+        }
+        let settings: aisix_core::models::McpAuthSettings =
+            serde_json::from_value(serde_json::json!({ "anonymous": block }))
+                .expect("valid mcp_auth_settings");
+        snapshot
+            .mcp_auth_settings
+            .insert(ResourceEntry::new("env-1", settings, 1));
+        // Both registered: `docs` is the allowlisted entry, `kb` the one
+        // that exists but is not offered anonymously — so a refusal for
+        // `kb` proves the gate, not a missing row.
+        insert_mcp_server(&snapshot, "mcp-docs", "docs", true);
+        insert_mcp_server(&snapshot, "mcp-kb", "kb", true);
+        snapshot
+    }
+
+    /// Attach a client socket, since an in-process request carries none
+    /// and the anonymous CIDR gate fails closed without a source IP.
+    fn from_ip(mut request: HttpRequest<Body>, ip: &str) -> HttpRequest<Body> {
+        request
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo(std::net::SocketAddr::new(
+                ip.parse().expect("test source ip"),
+                40000,
+            )));
+        request
+    }
+
+    #[tokio::test]
+    async fn anonymous_scoped_entry_serves_a_request_without_credentials() {
+        let router = router_with(snapshot_with_anonymous(
+            serde_json::json!({ "servers": ["docs"] }),
+        ));
+        let response = router
+            .oneshot(from_ip(
+                scoped_request("docs", None, "initialize", serde_json::json!({})),
+                "10.1.2.3",
+            ))
+            .await
+            .expect("router responds");
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "a listed server must serve a caller that presents no credential"
+        );
+    }
+
+    #[tokio::test]
+    async fn anonymous_does_not_reach_an_unlisted_scoped_entry() {
+        // `kb` IS registered — it is simply not offered anonymously. It
+        // must answer exactly like a server that does not exist at all,
+        // so an anonymous prober cannot map the registered set by
+        // telling 401 from 404.
+        let router = router_with(snapshot_with_anonymous(
+            serde_json::json!({ "servers": ["docs"] }),
+        ));
+        for server in ["kb", "ghost"] {
+            let response = router
+                .clone()
+                .oneshot(from_ip(
+                    scoped_request(server, None, "initialize", serde_json::json!({})),
+                    "10.1.2.3",
+                ))
+                .await
+                .expect("router responds");
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{server} must be indistinguishable from an unknown server"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn anonymous_aggregated_entry_is_opt_in() {
+        // Listing a server opens `/mcp/docs`, never the aggregated
+        // endpoint: that one is the OAuth-discovery entry and carries
+        // its own switch.
+        let router = router_with(snapshot_with_anonymous(
+            serde_json::json!({ "servers": ["docs"] }),
+        ));
+        let response = router
+            .oneshot(from_ip(initialize_request(None), "10.1.2.3"))
+            .await
+            .expect("router responds");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let router = router_with(snapshot_with_anonymous(
+            serde_json::json!({ "servers": ["docs"], "aggregate_entry": true }),
+        ));
+        let response = router
+            .oneshot(from_ip(initialize_request(None), "10.1.2.3"))
+            .await
+            .expect("router responds");
+        assert_ne!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn a_bad_credential_never_downgrades_to_anonymous() {
+        // The whole security argument of the feature: anonymous is the
+        // no-credential path. A caller that presents something and gets
+        // it wrong must fail, or an attacker could probe with garbage
+        // and silently land on the anonymous principal's grant.
+        let router = router_with(snapshot_with_anonymous(
+            serde_json::json!({ "servers": ["docs"], "aggregate_entry": true }),
+        ));
+        for bad in ["Bearer sk-not-a-real-key", "Basic dXNlcjpwdw==", "Bearer "] {
+            let mut request = from_ip(initialize_request(None), "10.1.2.3");
+            request.headers_mut().insert(
+                axum::http::header::AUTHORIZATION,
+                axum::http::HeaderValue::from_str(bad).unwrap(),
+            );
+            let response = router
+                .clone()
+                .oneshot(request)
+                .await
+                .expect("router responds");
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{bad:?} must be rejected, not served anonymously"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn anonymous_requires_the_source_to_match_the_allowlist() {
+        let router = router_with(snapshot_with_anonymous(
+            serde_json::json!({ "servers": ["docs"] }),
+        ));
+        let response = router
+            .oneshot(from_ip(
+                scoped_request("docs", None, "initialize", serde_json::json!({})),
+                "192.0.2.9",
+            ))
+            .await
+            .expect("router responds");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn anonymous_fails_closed_without_a_resolvable_source() {
+        // No client socket: the CIDR gate is the only thing in front of
+        // the principal, so an unresolvable source must not pass it.
+        let router = router_with(snapshot_with_anonymous(
+            serde_json::json!({ "servers": ["docs"] }),
+        ));
+        let response = router
+            .oneshot(scoped_request(
+                "docs",
+                None,
+                "initialize",
+                serde_json::json!({}),
+            ))
+            .await
+            .expect("router responds");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn disabling_the_block_closes_anonymous_access() {
+        let router = router_with(snapshot_with_anonymous(
+            serde_json::json!({ "servers": ["docs"], "enabled": false }),
+        ));
+        let response = router
+            .oneshot(from_ip(
+                scoped_request("docs", None, "initialize", serde_json::json!({})),
+                "10.1.2.3",
+            ))
+            .await
+            .expect("router responds");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn the_anonymous_principal_keeps_its_lifecycle() {
+        // A deleted, disabled or expired principal closes the door
+        // rather than opening it — the key is the whole governance
+        // handle on anonymous traffic.
+        for (label, key) in [
+            ("missing", serde_json::json!(null)),
+            (
+                "disabled",
+                serde_json::json!({"key_hash": "h", "allowed_models": ["*"], "disabled": true}),
+            ),
+            (
+                "expired",
+                serde_json::json!({
+                    "key_hash": "h", "allowed_models": ["*"],
+                    "expires_at": "2020-01-01T00:00:00Z"
+                }),
+            ),
+        ] {
+            let snapshot = snapshot_with_anonymous(serde_json::json!({ "servers": ["docs"] }));
+            snapshot.apikeys.remove("ak-1");
+            if let Some(doc) = key.as_object() {
+                let apikey: ApiKey =
+                    serde_json::from_value(serde_json::Value::Object(doc.clone())).unwrap();
+                snapshot
+                    .apikeys
+                    .insert(ResourceEntry::new("ak-1", apikey, 1));
+            }
+            let response = router_with(snapshot)
+                .oneshot(from_ip(
+                    scoped_request("docs", None, "initialize", serde_json::json!({})),
+                    "10.1.2.3",
+                ))
+                .await
+                .expect("router responds");
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "a {label} anonymous principal must close the entry"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_valid_credential_still_authenticates_where_anonymous_is_open() {
+        // Anonymous does not shadow the normal path: a real key keeps
+        // its own identity (and its own, wider grant) on the same entry.
+        let router = router_with(snapshot_with_anonymous(
+            serde_json::json!({ "servers": ["docs"], "aggregate_entry": true }),
+        ));
+        let response = router
+            .oneshot(from_ip(initialize_request(Some(TOKEN)), "192.0.2.9"))
+            .await
+            .expect("router responds");
+        assert_ne!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "an authenticated caller is not subject to the anonymous CIDR gate"
+        );
+    }
+
     #[tokio::test]
     async fn authenticated_request_reaches_the_mcp_gateway() {
         let router = router_with(snapshot_with_key());
@@ -1234,6 +1567,49 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "initialize must not emit a usage event"
+        );
+    }
+
+    #[tokio::test]
+    async fn anonymous_tool_call_is_marked_on_the_usage_event() {
+        use aisix_obs::{UsageEvent, UsageSink};
+
+        // The principal is a normal key row, so `api_key_id` alone cannot
+        // say whether the caller proved it or inherited it from the
+        // anonymous entry — `auth_type` is what keeps the two apart in
+        // the usage record.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<UsageEvent>(8);
+        let snapshot = snapshot_with_anonymous(serde_json::json!({
+            "servers": ["docs"], "aggregate_entry": true
+        }));
+        let handle = SnapshotHandle::new(snapshot);
+        let hub = Arc::new(aisix_gateway::Hub::new());
+        let state = ProxyState::new(handle, hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let router = build_router(state);
+
+        let mut anonymous = tools_call_request();
+        anonymous.headers_mut().remove("authorization");
+        let _ = router
+            .clone()
+            .oneshot(from_ip(anonymous, "10.1.2.3"))
+            .await
+            .expect("router responds");
+        let event = rx.try_recv().expect("anonymous tool call is recorded");
+        assert_eq!(event.api_key_id, "ak-1");
+        assert_eq!(event.auth_type, "anonymous");
+
+        // The same principal reached with its own credential is not.
+        let _ = router
+            .oneshot(tools_call_request())
+            .await
+            .expect("router responds");
+        let event = rx.try_recv().expect("authenticated tool call is recorded");
+        assert_eq!(event.api_key_id, "ak-1");
+        assert_eq!(
+            event.auth_type, "",
+            "the ordinary credential path leaves the field off the wire"
         );
     }
 
