@@ -1722,7 +1722,7 @@ fn stream_response(
                     let bridge = crate::dispatch::reqwest_error_to_bridge(&err, telemetry.started);
                     telemetry.error_class =
                         crate::attempt::routing_error_class(&bridge).to_string();
-                    telemetry.error_message = bridge.to_string();
+                    telemetry.error_message = crate::attempt::attempt_error_message(&bridge);
                     tracing::warn!(
                         route = %route_name,
                         error = %telemetry.error_message,
