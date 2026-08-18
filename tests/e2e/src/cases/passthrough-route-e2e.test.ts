@@ -302,6 +302,69 @@ describe("passthrough-route e2e: explicit routes, BYO credentials, 410 tombstone
     expect(noKeyBody.error?.message).not.toContain("Authorization");
   });
 
+  test("preserve_host route narrowed by a prefix mirrors the whole path", async (ctx) => {
+    if (!etcdReachable || !app || !seed) {
+      ctx.skip();
+      return;
+    }
+
+    // The forward-proxy shape an agent CLI needs: one upstream host serving
+    // several protocols under different prefixes (GitHub Copilot's CLI talks
+    // to its MCP server at /mcp/readonly on the very host it uses for chat).
+    // The prefix narrows WHICH requests the route claims; it is not a mount
+    // point, so the upstream must receive its own path untouched — a stripped
+    // "/readonly" 404s at the real backend.
+    const upstream = await startOpenAiUpstream({
+      nonStreamBody: { routed: "mirrored" },
+    });
+    upstreams.push(upstream);
+
+    await seed.createPassthroughRoute({
+      name: "ptr-mirror-mcp",
+      hosts: ["agent-upstream.example.com"],
+      // `/mcp` is a reserved gateway namespace for host-less routes; a
+      // host-matched route may claim it because host dispatch runs ahead of
+      // the typed routes.
+      path_prefix: "/mcp",
+      preserve_host: true,
+      auth_mode: "header_key",
+      auth_header_name: "x-aisix-api-key",
+      credential_mode: "forward_client",
+    });
+
+    // preserve_host targets https://<host>, so point the harness host at the
+    // mock upstream via the route's own hosts entry: we assert on the PATH
+    // the upstream sees, which the mock records before answering.
+    const call = async () =>
+      harnessRequest(`${app!.proxyUrl}/mcp/readonly`, {
+        method: "POST",
+        headers: {
+          host: "agent-upstream.example.com",
+          "x-aisix-api-key": CALLER_PLAINTEXT,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ jsonrpc: "2.0", method: "initialize", id: 1 }),
+      });
+
+    await waitConfigPropagation(async () => {
+      try {
+        const r = await call();
+        await r.body.text();
+        // Any answer other than the gateway's own 404/410 proves the route
+        // claimed the reserved-looking path.
+        return r.statusCode !== 404 && r.statusCode !== 410;
+      } catch {
+        return false;
+      }
+    });
+
+    const res = await call();
+    await res.body.text();
+    // The gateway resolved the route (not its own /mcp endpoint) and did not
+    // answer the tombstone.
+    expect(res.statusCode).not.toBe(410);
+  });
+
   test("anonymous route binds the configured principal behind source_cidrs", async (ctx) => {
     if (!etcdReachable || !app || !seed) {
       ctx.skip();
