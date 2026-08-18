@@ -1026,6 +1026,25 @@ fn request_guardrail_text(protocol: PassthroughProtocol, body: &[u8]) -> String 
                 .join("\n"),
             None => raw(),
         },
+        // Responses API: `input` is either a bare string or an array of
+        // items whose `content` parts carry the text.
+        PassthroughProtocol::OpenaiResponses => match v.get("input") {
+            Some(serde_json::Value::String(t)) => t.clone(),
+            Some(serde_json::Value::Array(items)) => {
+                let joined = items
+                    .iter()
+                    .filter_map(|i| i.get("content").map(content_text))
+                    .filter(|t| !t.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if joined.is_empty() {
+                    raw()
+                } else {
+                    joined
+                }
+            }
+            _ => raw(),
+        },
         PassthroughProtocol::OpenaiCompletions => {
             let prompt = v.get("prompt").map(|p| match p {
                 serde_json::Value::Array(items) => items
@@ -1060,6 +1079,22 @@ fn response_guardrail_text(protocol: PassthroughProtocol, body: &[u8]) -> String
     let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else {
         return raw();
     };
+    // Responses answers with `output` items, not `choices`.
+    if matches!(protocol, PassthroughProtocol::OpenaiResponses) {
+        let joined = v
+            .get("output")
+            .and_then(|o| o.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|i| i.get("content").map(content_text))
+                    .filter(|t| !t.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default();
+        return if joined.is_empty() { raw() } else { joined };
+    }
     let choices = match protocol {
         PassthroughProtocol::Raw => return raw(),
         _ => v.get("choices").and_then(|c| c.as_array()),
@@ -1075,7 +1110,8 @@ fn response_guardrail_text(protocol: PassthroughProtocol, body: &[u8]) -> String
             PassthroughProtocol::OpenaiCompletions => {
                 c.get("text").and_then(|t| t.as_str()).map(str::to_string)
             }
-            PassthroughProtocol::Raw => None,
+            // Unreachable: handled above by the `output` branch.
+            PassthroughProtocol::OpenaiResponses | PassthroughProtocol::Raw => None,
         })
         .filter(|t| !t.is_empty())
         .collect();
@@ -1285,6 +1321,14 @@ fn frame_delta(protocol: PassthroughProtocol, frame: &[u8]) -> (String, Option<(
         };
         if let Some(u) = v.get("usage").and_then(usage_of) {
             usage = Some(u);
+        } else if let Some(u) = v
+            .get("response")
+            .and_then(|r| r.get("usage"))
+            .and_then(usage_of)
+        {
+            // Responses streams carry usage on the terminal
+            // `response.completed` event's embedded response object.
+            usage = Some(u);
         }
         match protocol {
             PassthroughProtocol::Raw => text.push_str(payload),
@@ -1307,6 +1351,20 @@ fn frame_delta(protocol: PassthroughProtocol, frame: &[u8]) -> (String, Option<(
                         if let Some(t) = c.get("text").and_then(|t| t.as_str()) {
                             text.push_str(t);
                         }
+                    }
+                }
+            }
+            PassthroughProtocol::OpenaiResponses => {
+                // Text arrives as `response.output_text.delta` events; the
+                // terminal `response.completed` repeats the whole output,
+                // which would double the captured text, so take deltas only.
+                let is_delta = v
+                    .get("type")
+                    .and_then(|t| t.as_str())
+                    .is_some_and(|t| t.ends_with("output_text.delta"));
+                if is_delta {
+                    if let Some(t) = v.get("delta").and_then(|d| d.as_str()) {
+                        text.push_str(t);
                     }
                 }
             }
@@ -2187,6 +2245,65 @@ mod tests {
             request_guardrail_text(PassthroughProtocol::OpenaiChat, not_chat),
             r#"{"input":"x"}"#
         );
+    }
+
+    #[test]
+    fn responses_protocol_extracts_prompt_completion_and_usage() {
+        // GitHub's Copilot CLI sends every inference turn to POST
+        // /responses, so a forward-proxy route left on `openai_chat`
+        // recorded that traffic with zero tokens and no captured text.
+        let req = br#"{"model":"gpt-5","input":[
+            {"role":"user","content":[{"type":"input_text","text":"list the files"}]}
+        ]}"#;
+        assert_eq!(
+            request_guardrail_text(PassthroughProtocol::OpenaiResponses, req),
+            "list the files"
+        );
+        // A bare-string input is equally valid.
+        let req_str = br#"{"model":"gpt-5","input":"hello there"}"#;
+        assert_eq!(
+            request_guardrail_text(PassthroughProtocol::OpenaiResponses, req_str),
+            "hello there"
+        );
+
+        let resp = br#"{"output":[
+            {"type":"message","content":[{"type":"output_text","text":"done"}]}
+        ],"usage":{"input_tokens":11,"output_tokens":3}}"#;
+        assert_eq!(
+            response_guardrail_text(PassthroughProtocol::OpenaiResponses, resp),
+            "done"
+        );
+        assert_eq!(
+            response_usage(PassthroughProtocol::OpenaiResponses, resp),
+            Some((11, 3))
+        );
+    }
+
+    #[test]
+    fn responses_stream_accumulates_deltas_and_terminal_usage() {
+        // Text arrives as output_text.delta events; the terminal
+        // response.completed event repeats the full output (which must NOT
+        // be appended again) and carries usage nested under `response`.
+        let (t1, u1) = frame_delta(
+            PassthroughProtocol::OpenaiResponses,
+            br#"data: {"type":"response.output_text.delta","delta":"he"}"#,
+        );
+        assert_eq!(t1, "he");
+        assert_eq!(u1, None);
+        let (t2, _) = frame_delta(
+            PassthroughProtocol::OpenaiResponses,
+            br#"data: {"type":"response.output_text.delta","delta":"llo"}"#,
+        );
+        assert_eq!(t2, "llo");
+        let (t3, u3) = frame_delta(
+            PassthroughProtocol::OpenaiResponses,
+            br#"data: {"type":"response.completed","response":{"output":[{"content":[{"text":"hello"}]}],"usage":{"input_tokens":7,"output_tokens":2}}}"#,
+        );
+        assert_eq!(
+            t3, "",
+            "terminal event must not duplicate the streamed text"
+        );
+        assert_eq!(u3, Some((7, 2)));
     }
 
     #[test]
