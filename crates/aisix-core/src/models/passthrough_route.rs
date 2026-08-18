@@ -209,12 +209,11 @@ pub enum PassthroughProtocol {
     /// OpenAI-compatible legacy completions / FIM envelope (`prompt` [+
     /// `suffix`], streamed `choices[].text`, `usage`).
     OpenaiCompletions,
-    /// OpenAI Responses API envelope (`input` items, `output` items,
-    /// streamed `response.output_text.delta` events, `usage` in the
-    /// `input_tokens`/`output_tokens` spelling). Terminal coding agents
-    /// use this shape — GitHub's Copilot CLI sends every inference turn to
-    /// `POST /responses`, so a route left on `openai_chat` records the
-    /// traffic with no tokens at all.
+    /// OpenAI Responses API envelope: `input` items on the request,
+    /// `output` items on the response, `response.output_text.delta`
+    /// events while streaming, and `usage` in the
+    /// `input_tokens`/`output_tokens` spelling — carried on the terminal
+    /// `response.completed` event when the response streams.
     OpenaiResponses,
 }
 

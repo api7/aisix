@@ -1321,14 +1321,19 @@ fn frame_delta(protocol: PassthroughProtocol, frame: &[u8]) -> (String, Option<(
         };
         if let Some(u) = v.get("usage").and_then(usage_of) {
             usage = Some(u);
-        } else if let Some(u) = v
-            .get("response")
-            .and_then(|r| r.get("usage"))
-            .and_then(usage_of)
-        {
+        } else if matches!(protocol, PassthroughProtocol::OpenaiResponses) {
             // Responses streams carry usage on the terminal
-            // `response.completed` event's embedded response object.
-            usage = Some(u);
+            // `response.completed` event's embedded response object. Read
+            // that shape ONLY here: another protocol's frame that happens
+            // to nest `response.usage` must not overwrite what it reported
+            // at the top level.
+            if let Some(u) = v
+                .get("response")
+                .and_then(|r| r.get("usage"))
+                .and_then(usage_of)
+            {
+                usage = Some(u);
+            }
         }
         match protocol {
             PassthroughProtocol::Raw => text.push_str(payload),
@@ -2295,15 +2300,25 @@ mod tests {
             br#"data: {"type":"response.output_text.delta","delta":"llo"}"#,
         );
         assert_eq!(t2, "llo");
-        let (t3, u3) = frame_delta(
-            PassthroughProtocol::OpenaiResponses,
-            br#"data: {"type":"response.completed","response":{"output":[{"content":[{"text":"hello"}]}],"usage":{"input_tokens":7,"output_tokens":2}}}"#,
-        );
+        let terminal = br#"data: {"type":"response.completed","response":{"output":[{"content":[{"text":"hello"}]}],"usage":{"input_tokens":7,"output_tokens":2}}}"#;
+        let (t3, u3) = frame_delta(PassthroughProtocol::OpenaiResponses, terminal);
         assert_eq!(
             t3, "",
             "terminal event must not duplicate the streamed text"
         );
         assert_eq!(u3, Some((7, 2)));
+
+        // The nested shape is read ONLY for Responses: another protocol's
+        // frame that happens to carry `response.usage` must not have its
+        // reported usage overwritten from there.
+        for other in [
+            PassthroughProtocol::Raw,
+            PassthroughProtocol::OpenaiChat,
+            PassthroughProtocol::OpenaiCompletions,
+        ] {
+            let (_, u) = frame_delta(other, terminal);
+            assert_eq!(u, None, "{other:?} must ignore nested response.usage");
+        }
     }
 
     #[test]
