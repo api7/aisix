@@ -771,6 +771,11 @@ async fn dispatch(
         elapsed_ms: d.as_millis().min(u64::MAX as u128) as u64,
         cause: "passthrough route upstream exchange".into(),
     };
+    // The attempt begins here. `upstream_latency_ms` / `upstream_ttft_ms`
+    // are attempt-scoped by contract, so they must not count the gateway's
+    // own pre-dispatch work (auth, guardrail scan, rate-limit reservation)
+    // — that belongs to `downstream_latency_ms`, which runs from `started`.
+    let attempt_started = Instant::now();
     let send_fut = builder.send();
     let sent = match exchange_timeout {
         Some(d) => match tokio::time::timeout(d, send_fut).await {
@@ -819,10 +824,12 @@ async fn dispatch(
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),
         started,
+        attempt_started,
         status: status.as_u16(),
         usage: PassthroughUsage::default(),
         requested_model,
         upstream_ttft_ms: 0,
+        downstream_first_ms: None,
         stream_reached_end: false,
         streaming: false,
         error_class: String::new(),
@@ -1735,8 +1742,11 @@ fn stream_response(
             // TTFT on the first upstream chunk of any type — the same
             // convention the typed streaming endpoints stamp.
             if telemetry.upstream_ttft_ms == 0 {
-                telemetry.upstream_ttft_ms =
-                    telemetry.started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+                telemetry.upstream_ttft_ms = telemetry
+                    .attempt_started
+                    .elapsed()
+                    .as_millis()
+                    .min(u32::MAX as u128) as u32;
             }
             for frame in splitter.push(&chunk) {
                 let (delta, usage) = frame_delta(protocol, &frame);
@@ -1748,9 +1758,13 @@ fn stream_response(
                 }
                 let frame = Bytes::from(frame);
                 match &policy {
-                    _ if fail_opened => yield Ok::<_, std::convert::Infallible>(frame),
+                    _ if fail_opened => {
+                        telemetry.mark_first_delivery();
+                        yield Ok::<_, std::convert::Infallible>(frame);
+                    }
                     StreamOutputPolicy::EndOfStreamCheck => {
                         scan_buf.push_str(&delta);
+                        telemetry.mark_first_delivery();
                         yield Ok(frame);
                     }
                     StreamOutputPolicy::Window { size_chars, overlap_chars } => {
@@ -1780,6 +1794,7 @@ fn stream_response(
                                 }
                                 _ => {
                                     for f in pending.drain(..) {
+                                        telemetry.mark_first_delivery();
                                         yield Ok(f);
                                     }
                                     held_bytes = 0;
@@ -1797,6 +1812,7 @@ fn stream_response(
                         if held_bytes > *max_buffer_bytes {
                             if *on_exceeded_fail_open {
                                 for f in pending.drain(..) {
+                                    telemetry.mark_first_delivery();
                                     yield Ok(f);
                                 }
                                 held_bytes = 0;
@@ -1833,6 +1849,7 @@ fn stream_response(
                 if policy.holds_back() && !fail_opened {
                     pending.push(rest);
                 } else {
+                    telemetry.mark_first_delivery();
                     yield Ok(rest);
                 }
             }
@@ -1859,6 +1876,7 @@ fn stream_response(
                 }
             }
             for f in pending.drain(..) {
+                telemetry.mark_first_delivery();
                 yield Ok(f);
             }
         } else {
@@ -1967,6 +1985,9 @@ struct RouteTelemetry {
     client_source_ip: String,
     client_user_agent: String,
     started: Instant,
+    /// When the upstream call itself began — the scope the two `upstream_*`
+    /// figures are measured in, distinct from `started` (request receipt).
+    attempt_started: Instant,
     status: u16,
     /// Every token dimension the exchange reported, accumulated field-wise
     /// across the response (buffered) or its frames (streamed).
@@ -1976,9 +1997,14 @@ struct RouteTelemetry {
     /// serving that envelope records. Empty for an opaque body, whose
     /// `model`-shaped key means nothing the gateway can trust.
     requested_model: String,
-    /// Time from the request reaching the gateway to the upstream's first
-    /// streamed frame. Zero on the buffered path, where there is none.
+    /// Time from the START OF THE ATTEMPT to the upstream's first streamed
+    /// frame. Zero on the buffered path, where there is none.
     upstream_ttft_ms: u32,
+    /// What the caller waited for on a streamed relay: the moment the first
+    /// relayed frame was handed downstream, measured from `started`. `None`
+    /// until one is, so a stream that delivered nothing reports no
+    /// caller-wait at all rather than an invented one.
+    downstream_first_ms: Option<u32>,
     /// `true` once the relay generator reached its own end — upstream EOF,
     /// upstream error, or a guardrail block. It stays `false` only when the
     /// CLIENT went away first, which is what the emit turns into a 499
@@ -2001,6 +2027,26 @@ struct RouteTelemetry {
 }
 
 impl RouteTelemetry {
+    /// Stamp the caller's wait at the first RELAYED frame handed
+    /// downstream.
+    ///
+    /// Deliberately here and not where the frame was read off the upstream:
+    /// a hold-back guardrail policy sits between the two, and
+    /// `UsageEvent::downstream_latency_ms` counts that hold-back as part of
+    /// what the caller waited for. Called on both the live-forward and the
+    /// hold-back release paths, so it catches the first frame either way.
+    ///
+    /// A synthetic frame (a guardrail block's error event) deliberately
+    /// does NOT stamp: nothing the caller asked for was delivered. Same
+    /// rule as the typed streaming endpoints, which stamp only in the
+    /// chunk renderer.
+    fn mark_first_delivery(&mut self) {
+        if self.downstream_first_ms.is_none() {
+            self.downstream_first_ms =
+                Some(self.started.elapsed().as_millis().min(u32::MAX as u128) as u32);
+        }
+    }
+
     fn emit(&mut self) {
         if self.emitted {
             return;
@@ -2060,9 +2106,23 @@ impl RouteTelemetry {
             reasoning_tokens: usage.reasoning_tokens,
             cache_creation_tokens: usage.cache_creation_tokens,
             cache_read_tokens: usage.cache_read_tokens,
-            upstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
+            upstream_latency_ms: self
+                .attempt_started
+                .elapsed()
+                .as_millis()
+                .min(u32::MAX as u128) as u32,
             upstream_ttft_ms: self.upstream_ttft_ms,
-            downstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
+            // Streaming reports the caller's wait to the FIRST relayed
+            // frame, per the field's contract — a relay is a delivery
+            // mechanism for a response, not the response itself, so it is
+            // not the `/a2a` exception. Absent when a stream delivered
+            // nothing. The buffered path has no first frame: there the
+            // caller waited for the whole response to be written.
+            downstream_latency_ms: if self.streaming {
+                self.downstream_first_ms.unwrap_or(0)
+            } else {
+                elapsed.as_millis().min(u32::MAX as u128) as u32
+            },
             error_class: std::mem::take(&mut self.error_class),
             error_message: std::mem::take(&mut self.error_message),
             inbound_protocol: "passthrough".to_string(),

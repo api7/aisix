@@ -164,7 +164,9 @@ pub struct UsageEvent {
     /// it can use —
     ///
     /// - non-streaming: the complete response is written;
-    /// - streaming: the first token is forwarded downstream.
+    /// - streaming: the first token is forwarded downstream — for a
+    ///   passthrough route, which relays an opaque byte stream and has no
+    ///   token to recognise, the first relayed frame handed to the client.
     ///
     /// Request-scoped (unlike the two `upstream_*` fields above), so it
     /// spans request parsing, guardrail scans, every failed attempt,

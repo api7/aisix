@@ -103,7 +103,7 @@ async function startMockDatadog(): Promise<MockDatadog> {
   };
 }
 
-describe("passthrough-route usage: every token dimension reaches the event", () => {
+describe("passthrough-route usage event: token dimensions and the caller's wait", () => {
   let app: SpawnedApp | undefined;
   let seed: SeedClient | undefined;
   let dd: MockDatadog | undefined;
@@ -113,6 +113,12 @@ describe("passthrough-route usage: every token dimension reaches the event", () 
   // The agent-backend shape observed on a real forward-proxied IDE: a flat
   // token object on the server's own `token_usage` event, cache-read
   // dominating the prompt.
+  // The upstream holds the first frame this long, then spaces the
+  // remaining four out — so the whole stream runs far longer than the wait
+  // the caller actually experienced.
+  const FIRST_FRAME_MS = 120;
+  const TAIL_STEP_MS = 400;
+
   const AGENT_USAGE = {
     prompt_tokens: 14603,
     completion_tokens: 8,
@@ -181,7 +187,24 @@ describe("passthrough-route usage: every token dimension reaches the event", () 
         },
       },
     });
-    upstreams.push(labelled, unlabelled, chat);
+    // 4. A stream whose frames are far apart: the caller's wait ends at the
+    //    FIRST frame, but the exchange runs for the whole stream.
+    const slow = await startOpenAiUpstream({
+      streamEvents: [
+        JSON.stringify({ choices: [{ delta: { content: "a" } }] }),
+        JSON.stringify({ choices: [{ delta: { content: "b" } }] }),
+        JSON.stringify({ choices: [{ delta: { content: "c" } }] }),
+        JSON.stringify({ choices: [{ delta: { content: "d" } }] }),
+        JSON.stringify({
+          choices: [],
+          usage: { prompt_tokens: 3, completion_tokens: 4 },
+        }),
+      ],
+      // A real (measurable) wait before the first frame, then a long tail.
+      firstEventDelayMs: FIRST_FRAME_MS,
+      eventDelayMs: TAIL_STEP_MS,
+    });
+    upstreams.push(labelled, unlabelled, chat, slow);
 
     const pk = await seed.createProviderKey({
       display_name: "ptr-dims-pk",
@@ -192,6 +215,7 @@ describe("passthrough-route usage: every token dimension reaches the event", () 
       ["ptr-dims-labelled", "/dims-labelled", labelled],
       ["ptr-dims-unlabelled", "/dims-unlabelled", unlabelled],
       ["ptr-dims-chat", "/dims-chat", chat],
+      ["ptr-dims-slow", "/dims-slow", slow],
     ] as const) {
       await seed.createPassthroughRoute({
         name,
@@ -320,5 +344,54 @@ describe("passthrough-route usage: every token dimension reaches the event", () 
     expect(chat["aisix.cached_prompt_tokens"]).toBe(768);
     expect(chat["aisix.reasoning_tokens"]).toBe(17);
     expect(chat["aisix.requested_model"]).toBe("gpt-4o-mini");
+  });
+
+  test("a streamed relay reports the caller's wait to the first frame, not the whole stream", async (ctx) => {
+    if (!etcdReachable || !app || !seed || !dd) {
+      ctx.skip();
+      return;
+    }
+
+    // `downstream_latency_ms` means "what the caller waited for before it
+    // got something it can use": the complete body when buffered, the first
+    // token when streamed. `/a2a` is the ONE documented exception, because
+    // an agent's stream of task updates is the call's product — a relay is
+    // a delivery mechanism for a response, so it follows the normal rule.
+    // Pre-fix a route stamped BOTH `upstream_latency_ms` and
+    // `downstream_latency_ms` with the whole-request elapsed at
+    // end-of-stream, so a long stream reported the caller as having waited
+    // for all of it.
+    const started = Date.now();
+    const res = await post("/dims-slow/v1/chat/completions", {
+      model: "gpt-4o-mini",
+      messages: [{ role: "user", content: "hi" }],
+      stream: true,
+    });
+    expect(res.status).toBe(200);
+    await res.text();
+    const wallMs = Date.now() - started;
+
+    // The exchange really did run for the whole spaced-out stream, so a
+    // whole-stream figure and a first-frame figure are far apart here.
+    const tailMs = TAIL_STEP_MS * 4;
+    expect(wallMs).toBeGreaterThan(tailMs);
+
+    const slow = await logFor("ptr-dims-slow");
+    const downstream = Number(slow["aisix.downstream_latency_ms"] ?? 0);
+    const upstreamTotal = Number(slow["aisix.upstream_latency_ms"] ?? 0);
+    const ttft = Number(slow["aisix.upstream_ttft_ms"] ?? 0);
+
+    // The caller's wait is the first frame's arrival — bounded well below
+    // the tail the stream went on to spend.
+    expect(downstream).toBeGreaterThanOrEqual(FIRST_FRAME_MS / 2);
+    expect(downstream).toBeLessThan(tailMs);
+    // ...while the attempt itself ran for the whole stream.
+    expect(upstreamTotal).toBeGreaterThan(tailMs);
+
+    // TTFT is attempt-scoped and the caller's wait is request-scoped over
+    // the same first frame, so gateway-side work is exactly their
+    // difference — never negative.
+    expect(ttft).toBeGreaterThanOrEqual(FIRST_FRAME_MS / 2);
+    expect(ttft).toBeLessThanOrEqual(downstream);
   });
 });
