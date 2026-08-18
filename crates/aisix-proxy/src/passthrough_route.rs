@@ -798,6 +798,7 @@ async fn dispatch(
         request_id: client.request_id.clone(),
         api_key_id: auth.entry.id.clone(),
         jwt: auth.jwt.clone(),
+        anonymous: auth.anonymous,
         client_identity,
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),
@@ -967,7 +968,11 @@ async fn authenticate(
                 return Err(ProxyError::ApiKeyExpired);
             }
             state.metrics.record_auth_decision("anonymous", true, "");
-            Ok(AuthenticatedKey { entry, jwt: None })
+            Ok(AuthenticatedKey {
+                entry,
+                jwt: None,
+                anonymous: true,
+            })
         }
     }
 }
@@ -1713,6 +1718,11 @@ struct RouteTelemetry {
     request_id: String,
     api_key_id: String,
     jwt: Option<Arc<crate::auth::JwtIdentity>>,
+    /// Whether the caller reached this route through `auth_mode:
+    /// anonymous` rather than a credential of its own. Stamped onto the
+    /// usage event so anonymous traffic stays distinguishable from the
+    /// bound key's own (see `usage_attr::apply_auth_type`).
+    anonymous: bool,
     client_identity: String,
     client_source_ip: String,
     client_user_agent: String,
@@ -1784,6 +1794,9 @@ impl RouteTelemetry {
         };
         crate::usage_attr::apply_pk_telemetry(&mut event, &pk);
         crate::usage_attr::apply_jwt_identity(&mut event, self.jwt.as_ref());
+        if self.anonymous {
+            event.auth_type = "anonymous".to_string();
+        }
         let usage_model = crate::usage_attr::usage_event_model_label(
             &self.state.snapshot.load(),
             &event.requested_model,

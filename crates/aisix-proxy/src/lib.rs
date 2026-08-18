@@ -4096,6 +4096,7 @@ data: [DONE]\n\n"
         ));
         let state = build_state(snap, hub);
         let auth = AuthenticatedKey {
+            anonymous: false,
             entry: Arc::new(ResourceEntry::new(
                 "key-entry-1",
                 serde_json::from_value::<aisix_core::ApiKey>(serde_json::json!({

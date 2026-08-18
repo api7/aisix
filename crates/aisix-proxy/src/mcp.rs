@@ -656,6 +656,7 @@ fn emit_tool_call_usage(
         ..Default::default()
     };
     crate::usage_attr::apply_jwt_identity(&mut event, auth.jwt.as_ref());
+    crate::usage_attr::apply_auth_type(&mut event, auth);
     // A tool call resolves neither a model nor a ProviderKey, so the
     // attribution labels are the placeholder — present so this family has
     // ONE label set across every handler (AISIX-Cloud#1317).
@@ -1566,6 +1567,49 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "initialize must not emit a usage event"
+        );
+    }
+
+    #[tokio::test]
+    async fn anonymous_tool_call_is_marked_on_the_usage_event() {
+        use aisix_obs::{UsageEvent, UsageSink};
+
+        // The principal is a normal key row, so `api_key_id` alone cannot
+        // say whether the caller proved it or inherited it from the
+        // anonymous entry — `auth_type` is what keeps the two apart in
+        // the usage record.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<UsageEvent>(8);
+        let snapshot = snapshot_with_anonymous(serde_json::json!({
+            "servers": ["docs"], "aggregate_entry": true
+        }));
+        let handle = SnapshotHandle::new(snapshot);
+        let hub = Arc::new(aisix_gateway::Hub::new());
+        let state = ProxyState::new(handle, hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let router = build_router(state);
+
+        let mut anonymous = tools_call_request();
+        anonymous.headers_mut().remove("authorization");
+        let _ = router
+            .clone()
+            .oneshot(from_ip(anonymous, "10.1.2.3"))
+            .await
+            .expect("router responds");
+        let event = rx.try_recv().expect("anonymous tool call is recorded");
+        assert_eq!(event.api_key_id, "ak-1");
+        assert_eq!(event.auth_type, "anonymous");
+
+        // The same principal reached with its own credential is not.
+        let _ = router
+            .oneshot(tools_call_request())
+            .await
+            .expect("router responds");
+        let event = rx.try_recv().expect("authenticated tool call is recorded");
+        assert_eq!(event.api_key_id, "ak-1");
+        assert_eq!(
+            event.auth_type, "",
+            "the ordinary credential path leaves the field off the wire"
         );
     }
 

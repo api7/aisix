@@ -25,6 +25,18 @@ pub struct AuthenticatedKey {
     /// cannot name the subject once claim mappings let many identities
     /// share one key (AISIX-Cloud#564).
     pub jwt: Option<Arc<JwtIdentity>>,
+    /// `true` when the principal came from an entry's anonymous
+    /// configuration instead of a credential the caller presented —
+    /// the MCP anonymous entries (AISIX-Cloud#1313) and passthrough
+    /// routes in `auth_mode: anonymous`.
+    ///
+    /// `entry` names the principal either way; this says whether the
+    /// caller PROVED it, which `entry` alone cannot tell once a key
+    /// doubles as an anonymous principal. A handler that sets it must
+    /// also stamp `UsageEvent::auth_type` (see
+    /// `usage_attr::apply_auth_type`), or anonymous traffic becomes
+    /// indistinguishable from the key's own in the usage record.
+    pub anonymous: bool,
 }
 
 /// The verified JWT identity a request authenticated as.
@@ -214,7 +226,11 @@ pub(crate) async fn authenticate_token(
         ));
     }
     state.metrics.record_auth_decision("api_key", true, "");
-    Ok(AuthenticatedKey { entry, jwt: None })
+    Ok(AuthenticatedKey {
+        entry,
+        jwt: None,
+        anonymous: false,
+    })
 }
 
 /// Record an API-key denial on the decision metric + log

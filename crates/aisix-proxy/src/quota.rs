@@ -662,6 +662,7 @@ mod tests {
         }))
         .unwrap();
         AuthenticatedKey {
+            anonymous: false,
             entry: std::sync::Arc::new(aisix_core::resource::ResourceEntry::new(
                 "key-entry-1",
                 key,
