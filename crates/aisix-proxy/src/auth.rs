@@ -268,6 +268,25 @@ fn deny_key(
     err
 }
 
+/// Whether the request OFFERS an inbound gateway credential at all.
+///
+/// Deliberately wider than [`extract_bearer`]: a present-but-unusable
+/// `Authorization` — wrong scheme, empty value, bytes that are not
+/// ASCII — counts as offered. Anonymous entry (AISIX-Cloud#1313) is the
+/// no-credential path, so a caller that tried to authenticate and got
+/// it wrong must be rejected rather than quietly succeed as the
+/// anonymous principal with a different grant than it asked for.
+pub(crate) fn credential_offered(parts: &Parts) -> bool {
+    [axum::http::header::AUTHORIZATION.as_str(), "x-api-key"]
+        .iter()
+        .any(|name| {
+            parts
+                .headers
+                .get(*name)
+                .is_some_and(|v| v.to_str().map_or(true, |s| !s.trim().is_empty()))
+        })
+}
+
 fn extract_bearer(parts: &Parts) -> Result<String, ProxyError> {
     if let Some(auth) = parts.headers.get(axum::http::header::AUTHORIZATION) {
         let s = auth.to_str().map_err(|_| ProxyError::MissingAuth)?;
@@ -555,6 +574,36 @@ mod tests {
             extract_bearer(&parts),
             Err(ProxyError::MissingAuth)
         ));
+    }
+
+    #[test]
+    fn credential_offered_covers_unusable_credentials() {
+        // Absent → not offered: the anonymous path may serve these.
+        assert!(!credential_offered(&parts_with(HeaderMap::new())));
+        let mut empty = HeaderMap::new();
+        empty.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("   "),
+        );
+        assert!(!credential_offered(&parts_with(empty)));
+
+        // Present but unusable → offered: must fail, never downgrade.
+        for (name, value) in [
+            (axum::http::header::AUTHORIZATION.as_str(), "Bearer sk-abc"),
+            (axum::http::header::AUTHORIZATION.as_str(), "Bearer   "),
+            (
+                axum::http::header::AUTHORIZATION.as_str(),
+                "Basic dXNlcjpwdw==",
+            ),
+            ("x-api-key", "sk-abc"),
+        ] {
+            let mut h = HeaderMap::new();
+            h.insert(name, HeaderValue::from_str(value).unwrap());
+            assert!(
+                credential_offered(&parts_with(h)),
+                "{name}: {value:?} must count as an offered credential"
+            );
+        }
     }
 
     #[test]

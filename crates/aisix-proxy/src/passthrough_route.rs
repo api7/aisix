@@ -989,18 +989,10 @@ fn raw_of(v: Option<&HeaderValue>) -> Option<String> {
 /// Route-level source allowlist: unset means unrestricted (the schema
 /// forces a non-empty list for `anonymous` routes).
 fn source_allowed(route: &PassthroughRoute, source_ip: &str) -> bool {
-    let ranges = match route.source_cidrs.as_deref() {
-        Some(r) if !r.is_empty() => r,
-        _ => return true,
-    };
-    let ip: std::net::IpAddr = match source_ip.parse() {
-        Ok(ip) => ip,
-        Err(_) => return false,
-    };
-    ranges
-        .iter()
-        .filter_map(|cidr| cidr.parse::<ipnet::IpNet>().ok())
-        .any(|net| net.contains(&ip))
+    match route.source_cidrs.as_deref() {
+        Some(ranges) if !ranges.is_empty() => crate::client_ip::ip_in_cidrs(source_ip, ranges),
+        _ => true,
+    }
 }
 
 // ---------------------------------------------------------------------------

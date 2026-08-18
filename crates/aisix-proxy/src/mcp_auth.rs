@@ -7,11 +7,15 @@
 //! `WWW-Authenticate` challenges on `/mcp` auth failures so a standard
 //! MCP client can discover the authorization server from a bare 401.
 //!
-//! The surface is ACTIVE only when the environment projects a valid
-//! [`McpAuthSettings`] row (the canonical `/mcp` resource URL) AND at
-//! least one enabled `oidc_providers` row exists. Dormant otherwise:
-//! the well-known routes 404 and no challenge header is attached, so
-//! every pre-#1143 environment is byte-identical to before.
+//! The surface is ACTIVE only when the environment's
+//! [`McpAuthSettings`] row carries a valid `resource_url` AND at least
+//! one enabled `oidc_providers` row exists. Dormant otherwise: the
+//! well-known routes 404 and no challenge header is attached, so every
+//! pre-#1143 environment is byte-identical to before.
+//!
+//! The same row carries this environment's anonymous-access settings
+//! (AISIX-Cloud#1313), resolved by [`anonymous_entry`] — the two are
+//! independent, and either can be configured without the other.
 //!
 //! Token validation itself is unchanged — `crate::jwt` already enforces
 //! signature/`iss`/`exp`/`aud` (inclusion semantics) and maps the
@@ -19,9 +23,11 @@
 //! face in front of it.
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
 use std::sync::Once;
 
 use aisix_core::models::McpAuthSettings;
+use aisix_core::resource::ResourceEntry;
 use aisix_core::AisixSnapshot;
 use axum::extract::{Request, State};
 use axum::http::{header, HeaderValue, StatusCode};
@@ -55,36 +61,13 @@ pub(crate) struct DiscoveryIdentity {
 /// request. The absent-row state is a legitimate steady state (every
 /// pre-#1143 environment) and logs nothing.
 pub(crate) fn discovery_identity(snapshot: &AisixSnapshot) -> Option<DiscoveryIdentity> {
-    let entries = snapshot.mcp_auth_settings.entries();
-    if entries.is_empty() {
-        return None;
-    }
-    if entries.len() > 1 {
-        // The CP keys the row by the environment id, so a second row can
-        // only be a stale/migrated or hand-written key — and no ordering
-        // over the ids says which one is current. Publishing either would
-        // put a coin-flip URI in the PRM `resource` and in the audience
-        // the tokens are checked against, so fail closed instead: the
-        // surface stays dormant until the duplicate is removed.
-        //
-        // The check belongs here, not in the loader: the watch supervisor
-        // applies puts incrementally and never re-runs the full-load path,
-        // so a duplicate can appear in a live snapshot without the loader
-        // ever seeing both rows together.
-        static MULTI_WARN: Once = Once::new();
-        MULTI_WARN.call_once(|| {
-            tracing::warn!(
-                target: "aisix::mcp_auth",
-                count = entries.len(),
-                "multiple mcp_auth_settings rows in snapshot; the OAuth discovery \
-                 surface stays dormant until exactly one remains",
-            );
-        });
-        return None;
-    }
-    let settings = &entries[0];
+    let settings = settings_row(snapshot)?;
+    // No resource URL configured: the row exists for its other setting
+    // (anonymous access). A legitimate steady state, so it logs nothing
+    // — only a URL that IS configured and unusable warns.
+    let resource_url = settings.value.resource_url.as_deref()?;
 
-    let Some(identity) = validate_resource_url(&settings.value) else {
+    let Some(identity) = validate_resource_url(resource_url) else {
         static MALFORMED_WARN: Once = Once::new();
         MALFORMED_WARN.call_once(|| {
             tracing::warn!(
@@ -103,12 +86,142 @@ pub(crate) fn discovery_identity(snapshot: &AisixSnapshot) -> Option<DiscoveryId
     Some(identity)
 }
 
+/// The environment's `mcp_auth_settings` row, shared by both settings it
+/// carries (OAuth discovery and anonymous access).
+///
+/// `None` when there is no row, and — deliberately — when there is more
+/// than one.
+fn settings_row(snapshot: &AisixSnapshot) -> Option<Arc<ResourceEntry<McpAuthSettings>>> {
+    let mut entries = snapshot.mcp_auth_settings.entries();
+    if entries.is_empty() {
+        return None;
+    }
+    if entries.len() > 1 {
+        // The CP keys the row by the environment id, so a second row can
+        // only be a stale/migrated or hand-written key — and no ordering
+        // over the ids says which one is current. Picking one would put a
+        // coin-flip URI in the PRM `resource` (and in the audience tokens
+        // are checked against), and a coin-flip principal and allowlist
+        // in front of anonymous access, so fail closed instead: both
+        // settings stay dormant until the duplicate is removed.
+        //
+        // The check belongs here, not in the loader: the watch supervisor
+        // applies puts incrementally and never re-runs the full-load path,
+        // so a duplicate can appear in a live snapshot without the loader
+        // ever seeing both rows together.
+        static MULTI_WARN: Once = Once::new();
+        MULTI_WARN.call_once(|| {
+            tracing::warn!(
+                target: "aisix::mcp_auth",
+                count = entries.len(),
+                "multiple mcp_auth_settings rows in snapshot; both the OAuth \
+                 discovery surface and anonymous MCP access stay dormant until \
+                 exactly one remains",
+            );
+        });
+        return None;
+    }
+    Some(entries.remove(0))
+}
+
+/// The anonymous principal for a `/mcp` request that carries no
+/// credential, or `None` when this entry does not serve anonymous
+/// callers.
+///
+/// Callers must consult this ONLY after establishing that the request
+/// offers no credential at all (`crate::auth::credential_offered`): a
+/// credential that fails to authenticate is a rejection, never a
+/// downgrade to the anonymous principal.
+///
+/// Every refusal here answers the same way the endpoint would without
+/// any anonymous configuration — a plain 401 from the standard auth
+/// path — so an anonymous probe cannot tell "not configured" from "not
+/// allowed from your network" or "the principal was deleted". The
+/// reason is recorded on `aisix_auth_decisions_total` instead, where an
+/// operator can see it and a caller cannot.
+pub(crate) fn anonymous_entry(
+    state: &ProxyState,
+    snapshot: &AisixSnapshot,
+    parts: &axum::http::request::Parts,
+    scope: Option<&str>,
+) -> Option<AnonymousEntry> {
+    let settings = settings_row(snapshot)?;
+    let anon = settings.value.anonymous.as_ref()?;
+    if !anon.enabled {
+        return None;
+    }
+    // Entry gate. The aggregated endpoint has no server dimension to key
+    // on — `initialize` and `tools/list` name none — so it carries its
+    // own opt-in; a scoped entry is served only when its server is
+    // listed. An unlisted (or unknown) server answers exactly like a
+    // configured-but-unreachable one: 401 before the 404, so the
+    // registered set stays invisible to an anonymous prober.
+    let entry_allowed = match scope {
+        Some(server) => anon.servers.iter().any(|s| s == server),
+        None => anon.aggregate_entry,
+    };
+    if !entry_allowed {
+        return None;
+    }
+    // Source gate. With no credential to check this is the only thing in
+    // front of the principal, which is why the schema forces a non-empty
+    // list. The address comes from the proxy's real-ip chain, never from
+    // a caller-supplied header the gateway does not trust.
+    let source_ip = crate::client_ip::source_ip_from_parts(parts, state.real_ip.as_ref());
+    if !crate::client_ip::ip_in_cidrs(&source_ip, &anon.source_cidrs) {
+        state
+            .metrics
+            .record_auth_decision("anonymous", false, "source_not_allowed");
+        return None;
+    }
+    // The bound principal keeps its full lifecycle: a deleted, disabled
+    // or expired key closes anonymous access rather than opening it.
+    let Some(entry) = snapshot.apikeys.get_by_id(&anon.api_key_id) else {
+        state
+            .metrics
+            .record_auth_decision("anonymous", false, "principal_missing");
+        return None;
+    };
+    if entry.value.disabled {
+        state
+            .metrics
+            .record_auth_decision("anonymous", false, "principal_disabled");
+        return None;
+    }
+    if entry.value.expires_at.is_some() && entry.value.is_expired_at(chrono::Utc::now()) {
+        state
+            .metrics
+            .record_auth_decision("anonymous", false, "principal_expired");
+        return None;
+    }
+    state.metrics.record_auth_decision("anonymous", true, "");
+    Some(AnonymousEntry {
+        auth: crate::auth::AuthenticatedKey { entry, jwt: None },
+        servers: anon.servers.clone(),
+    })
+}
+
+/// A resolved anonymous caller.
+pub(crate) struct AnonymousEntry {
+    /// The principal the request runs as. Indistinguishable from an
+    /// authenticated one downstream, which is the point: ACL, quota,
+    /// guardrails, budget and usage all key on it unchanged.
+    pub auth: crate::auth::AuthenticatedKey,
+    /// The configured server allowlist. It is not only the entry gate
+    /// but the principal's CEILING: the caller may reach these servers'
+    /// tools and no others, on the aggregated endpoint as much as the
+    /// scoped one. Without that, a principal whose own grant is wider
+    /// than the list could name `<unlisted>__<tool>` on the aggregated
+    /// endpoint and reach a server whose scoped entry is closed.
+    pub servers: Vec<String>,
+}
+
 /// Parse and validate the configured resource URL: absolute `http`/
 /// `https`, no query, no fragment, path exactly `/mcp` (the gateway's
 /// fixed MCP route — the CP rejects anything else at write time; this
 /// is defense in depth on the projected row).
-fn validate_resource_url(settings: &McpAuthSettings) -> Option<DiscoveryIdentity> {
-    let parsed = url::Url::parse(&settings.resource_url).ok()?;
+fn validate_resource_url(resource_url: &str) -> Option<DiscoveryIdentity> {
+    let parsed = url::Url::parse(resource_url).ok()?;
     if !matches!(parsed.scheme(), "http" | "https") {
         return None;
     }
@@ -129,7 +242,7 @@ fn validate_resource_url(settings: &McpAuthSettings) -> Option<DiscoveryIdentity
     // reachable under.
     let origin = parsed.origin().ascii_serialization();
     Some(DiscoveryIdentity {
-        resource_url: settings.resource_url.clone(),
+        resource_url: resource_url.to_string(),
         challenge_url: format!("{origin}/.well-known/oauth-protected-resource/mcp"),
     })
 }

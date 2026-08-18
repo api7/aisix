@@ -1,16 +1,102 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "required": [
+          "anonymous"
+        ]
+      },
+      "then": {
+        "properties": {
+          "anonymous": {
+            "anyOf": [
+              {
+                "properties": {
+                  "servers": {
+                    "minItems": 1
+                  }
+                },
+                "required": [
+                  "servers"
+                ],
+                "title": "Scoped entries"
+              },
+              {
+                "properties": {
+                  "aggregate_entry": {
+                    "const": true
+                  }
+                },
+                "required": [
+                  "aggregate_entry"
+                ],
+                "title": "Aggregated entry"
+              }
+            ]
+          }
+        }
+      }
+    }
+  ],
+  "definitions": {
+    "McpAnonymousAccess": {
+      "additionalProperties": false,
+      "description": "Anonymous access configuration for this environment's `/mcp` entries.\n\nA request that carries NO gateway credential and arrives from `source_cidrs` runs as the `api_key_id` principal: its MCP tool grant, rate limits, budget, guardrails and usage attribution all apply, so anonymous traffic stays governable instead of bypassing the pipeline. A request carrying a credential is authenticated normally and a bad one is rejected — never downgraded to anonymous.",
+      "properties": {
+        "aggregate_entry": {
+          "description": "Whether the aggregated `/mcp` endpoint serves anonymous callers. Off by default: it is the entry a standard MCP client uses for OAuth discovery, and its tools carry the `<server>__<tool>` namespace that a client migrating from a single-server endpoint does not use. Turning it on suppresses the `WWW-Authenticate` discovery hint there, since a no-credential request succeeds instead of producing the 401 that carries it.",
+          "type": "boolean"
+        },
+        "api_key_id": {
+          "description": "The API key anonymous traffic runs as. Everything keyed on a principal — MCP tool ACL, per-server and per-key rate limits, budget, guardrail scopes, usage events — resolves through this key, which is why anonymous callers stay attributable. The key must carry an explicit MCP grant: a key left on `inherit` would pick up the environment-default policy, so an `all` default would silently hand every registered tool to anonymous callers (the control plane rejects that at write time).",
+          "minLength": 1,
+          "type": "string"
+        },
+        "enabled": {
+          "default": true,
+          "description": "Whether anonymous access is served. `false` keeps the configuration but closes the door, so an operator can suspend it without losing the principal and allowlists.",
+          "type": "boolean"
+        },
+        "servers": {
+          "description": "Registered MCP server names reachable anonymously at `/mcp/{server}`.\n\nThis list is ALSO the anonymous principal's ceiling: the tools of the listed servers are intersected with the key's own grant on BOTH entries. Without that, a key whose grant is wider than the list would let an anonymous caller reach an unlisted server's tools through the aggregated endpoint by naming `<server>__<tool>` directly — `/mcp/{server}` closed, aggregated `/mcp` open. Empty means no scoped entry is served (and, with `aggregate_entry`, that the aggregated one exposes nothing).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "source_cidrs": {
+          "description": "Client source CIDRs allowed to enter anonymously. Required and non-empty: with no credential to check, network reachability is the only gate in front of the principal. Matched against the source IP the proxy's real-ip chain resolves, never against a caller-supplied header value.",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": "array"
+        }
+      },
+      "required": [
+        "api_key_id",
+        "source_cidrs"
+      ],
+      "type": "object"
+    }
+  },
   "properties": {
+    "anonymous": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/McpAnonymousAccess"
+        }
+      ],
+      "description": "Anonymous access to named `/mcp` entries. Unset (the default) means every `/mcp` request needs a valid gateway credential."
+    },
     "resource_url": {
-      "description": "Canonical URI of this environment's `/mcp` endpoint, e.g. `https://gw.example.com/mcp`. Published verbatim as the PRM document's `resource` (never derived from the request Host header) and the value the trust providers' `audiences` must include for OAuth-for-MCP tokens to validate. The URL path must be exactly `/mcp` — the gateway's fixed MCP route.",
+      "description": "Canonical URI of this environment's `/mcp` endpoint, e.g. `https://gw.example.com/mcp`. Published verbatim as the PRM document's `resource` (never derived from the request Host header) and the value the trust providers' `audiences` must include for OAuth-for-MCP tokens to validate. The URL path must be exactly `/mcp` — the gateway's fixed MCP route. Unset leaves the OAuth discovery surface dormant.",
       "minLength": 1,
       "type": "string"
     }
   },
-  "required": [
-    "resource_url"
-  ],
   "title": "McpAuthSettings",
   "type": "object"
 }

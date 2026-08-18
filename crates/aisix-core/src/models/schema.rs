@@ -772,12 +772,25 @@ pub fn passthrough_route_root_schema() -> Value {
 
 /// Canonical JSON Schema for the `mcp_auth_settings` resource, derived
 /// from the [`McpAuthSettings`](crate::models::McpAuthSettings) struct.
+/// Both settings it carries (`resource_url` for OAuth discovery,
+/// `anonymous` for credential-less access) are optional; the
+/// cross-field rule that an anonymous block must name at least one
+/// entry is injected as an `allOf` (see
+/// [`super::mcp_auth_settings::mcp_auth_settings_coupling`]).
 /// The singleton-per-environment invariant is enforced by the writers
 /// (cp-api keys the row by the environment id; the resources file
-/// rejects duplicates at load) and, at read time, by the resolver
+/// rejects duplicates at load) and, at read time, by the resolvers
 /// failing closed — not by the document schema.
 pub fn mcp_auth_settings_root_schema() -> Value {
-    struct_root_schema::<crate::models::McpAuthSettings>(false)
+    let mut schema = struct_root_schema::<crate::models::McpAuthSettings>(false);
+    schema
+        .as_object_mut()
+        .expect("mcp_auth_settings root schema is a JSON object")
+        .insert(
+            "allOf".to_string(),
+            super::mcp_auth_settings::mcp_auth_settings_coupling(),
+        );
+    schema
 }
 
 /// Canonical JSON Schema for the `mcp_policy` resource, derived from the
