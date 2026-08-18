@@ -482,6 +482,7 @@ pub(crate) async fn authenticate_jwt(
         "jwt authentication succeeded",
     );
     Ok(AuthenticatedKey {
+        anonymous: false,
         entry,
         jwt: Some(Arc::new(JwtIdentity {
             subject: subject.to_string(),

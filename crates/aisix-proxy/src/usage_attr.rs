@@ -25,6 +25,20 @@ use crate::chat::sanitize_tag;
 use crate::client_ip::ClientContext;
 use crate::state::ProxyState;
 
+/// Stamp how the caller established its principal onto a usage event.
+///
+/// The ordinary credential path leaves the field empty (the shape on the
+/// wire for the overwhelming majority of events); a principal inherited
+/// from an entry's anonymous configuration is marked, so a key that
+/// doubles as an anonymous principal can still be told apart in the
+/// usage record. Every handler that can serve an anonymous caller —
+/// today `/mcp` and the passthrough routes — calls this on its emitter.
+pub(crate) fn apply_auth_type(event: &mut UsageEvent, auth: &crate::auth::AuthenticatedKey) {
+    if auth.anonymous {
+        event.auth_type = "anonymous".to_string();
+    }
+}
+
 /// The provider's own response object `id`, read off a JSON response body —
 /// OpenAI's `chat.completion.id`, a Responses-API `resp_…`, a legacy
 /// completions `cmpl-…`, a Cohere rerank `id`.

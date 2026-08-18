@@ -714,7 +714,10 @@ pub fn load_from_str(
     // on the unauthenticated protected-resource-metadata endpoint, so an
     // embedded credential would be world-readable.
     for (_, scope, settings) in &mcp_auth_settings {
-        if url_has_credentials(&settings.resource_url) {
+        let Some(resource_url) = settings.resource_url.as_deref() else {
+            continue;
+        };
+        if url_has_credentials(resource_url) {
             errors.push(LoadError {
                 scope: scope.clone(),
                 message: "mcp_auth_settings resource_url must not embed credentials (user \

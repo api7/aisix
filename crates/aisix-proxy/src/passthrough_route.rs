@@ -820,6 +820,7 @@ async fn dispatch(
         request_id: client.request_id.clone(),
         api_key_id: auth.entry.id.clone(),
         jwt: auth.jwt.clone(),
+        anonymous: auth.anonymous,
         client_identity,
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),
@@ -996,7 +997,11 @@ async fn authenticate(
                 return Err(ProxyError::ApiKeyExpired);
             }
             state.metrics.record_auth_decision("anonymous", true, "");
-            Ok(AuthenticatedKey { entry, jwt: None })
+            Ok(AuthenticatedKey {
+                entry,
+                jwt: None,
+                anonymous: true,
+            })
         }
     }
 }
@@ -1018,18 +1023,10 @@ fn raw_of(v: Option<&HeaderValue>) -> Option<String> {
 /// Route-level source allowlist: unset means unrestricted (the schema
 /// forces a non-empty list for `anonymous` routes).
 fn source_allowed(route: &PassthroughRoute, source_ip: &str) -> bool {
-    let ranges = match route.source_cidrs.as_deref() {
-        Some(r) if !r.is_empty() => r,
-        _ => return true,
-    };
-    let ip: std::net::IpAddr = match source_ip.parse() {
-        Ok(ip) => ip,
-        Err(_) => return false,
-    };
-    ranges
-        .iter()
-        .filter_map(|cidr| cidr.parse::<ipnet::IpNet>().ok())
-        .any(|net| net.contains(&ip))
+    match route.source_cidrs.as_deref() {
+        Some(ranges) if !ranges.is_empty() => crate::client_ip::ip_in_cidrs(source_ip, ranges),
+        _ => true,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1981,6 +1978,11 @@ struct RouteTelemetry {
     request_id: String,
     api_key_id: String,
     jwt: Option<Arc<crate::auth::JwtIdentity>>,
+    /// Whether the caller reached this route through `auth_mode:
+    /// anonymous` rather than a credential of its own. Stamped onto the
+    /// usage event so anonymous traffic stays distinguishable from the
+    /// bound key's own (see `usage_attr::apply_auth_type`).
+    anonymous: bool,
     client_identity: String,
     client_source_ip: String,
     client_user_agent: String,
@@ -2136,6 +2138,9 @@ impl RouteTelemetry {
         };
         crate::usage_attr::apply_pk_telemetry(&mut event, &pk);
         crate::usage_attr::apply_jwt_identity(&mut event, self.jwt.as_ref());
+        if self.anonymous {
+            event.auth_type = "anonymous".to_string();
+        }
         let usage_model = crate::usage_attr::usage_event_model_label(
             &self.state.snapshot.load(),
             &event.requested_model,

@@ -454,6 +454,21 @@ pub struct UsageEvent {
     /// right-to-left when the peer is a trusted proxy (nginx
     /// `set_real_ip_from` + `real_ip_recursive` parity). Empty when the
     /// peer address was unavailable. cp-api stores empty as NULL.
+    /// How the caller authenticated, when it was NOT the ordinary
+    /// credential path: `anonymous` for a request admitted with no
+    /// credential at all by a gateway entry configured for it (the MCP
+    /// anonymous entries, AISIX-Cloud#1313). Empty means the request
+    /// presented and passed a credential of its own — the overwhelming
+    /// majority, so the field stays off the wire for them.
+    ///
+    /// `api_key_id` names the principal either way; this says whether
+    /// the caller PROVED it or inherited it from the entry, which
+    /// `api_key_id` alone cannot distinguish once a key doubles as an
+    /// anonymous principal. Older cp-api images that predate the field
+    /// ignore it (DP-first rollout).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub auth_type: String,
+
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub client_source_ip: String,
 
