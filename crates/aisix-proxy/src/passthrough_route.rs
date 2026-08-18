@@ -2348,10 +2348,7 @@ mod tests {
             (br#"{"ref":"main","inputs":{}}"#, PassthroughProtocol::Raw),
             // Carrier keys of the wrong TYPE stay raw: only the API's own
             // shape (array/string) counts as that envelope.
-            (
-                br#"{"messages":"not-an-array"}"#,
-                PassthroughProtocol::Raw,
-            ),
+            (br#"{"messages":"not-an-array"}"#, PassthroughProtocol::Raw),
             // Non-JSON / empty (GET) bodies are raw.
             (b"", PassthroughProtocol::Raw),
         ];
