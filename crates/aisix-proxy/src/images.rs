@@ -520,7 +520,13 @@ fn emit_usage_event(
     crate::usage_attr::apply_pk_telemetry(&mut event, pk);
     // Handler label "images" — bucketed prometheus counter (#408).
     crate::usage_attr::apply_jwt_identity(&mut event, client.jwt.as_ref());
-    state.usage_sink.try_emit("images", event.clone());
+    let usage_model =
+        crate::usage_attr::usage_event_model_label(snap, &event.requested_model);
+    state.usage_sink.try_emit(
+        "images",
+        event.clone(),
+        crate::usage_attr::usage_event_labels(&usage_model, pk),
+    );
     let exporters = crate::usage_attr::live_exporters(state, snap);
     state
         .otlp_fan_out

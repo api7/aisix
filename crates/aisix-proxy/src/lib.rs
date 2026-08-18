@@ -7333,13 +7333,14 @@ data: [DONE]\n\n";
     /// let the panic's own signal stand.
     #[test]
     fn cancel_guard_stays_silent_during_unwind() {
-        let metrics = std::sync::Arc::new(aisix_obs::Metrics::new(false));
-        let probe = metrics.clone();
+        let state = build_state(AisixSnapshot::new(), Arc::new(Hub::new()));
+        let probe = state.metrics.clone();
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _guard = ClientCancelGuard {
                 armed: true,
-                metrics: metrics.clone(),
+                state: state.clone(),
+                attribution: std::sync::Arc::new(attribution::RequestAttribution::default()),
                 endpoint: "/v1/chat/completions",
                 method: axum::http::Method::POST,
                 uri: "/v1/chat/completions".parse().unwrap(),

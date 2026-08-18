@@ -63,7 +63,7 @@ use crate::usage_attr::PkLabels;
 
 /// Label value every `RequestLabels` field falls back to when the path
 /// never resolved it. Matches `RequestLabels::default()`.
-const UNKNOWN: &str = "unknown";
+pub(crate) const UNKNOWN: &str = "unknown";
 
 /// Caller identity for the detailed label set.
 #[derive(Clone, Copy)]

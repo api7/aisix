@@ -4291,7 +4291,13 @@ fn emit_usage_event(
     // Handler label "chat" matches the documented enumeration for
     // `aisix_usage_events_emitted_total` (#408). Keep `&'static str`
     // so prometheus cardinality stays bounded.
-    state.usage_sink.try_emit("chat", event.clone());
+    let usage_model =
+        crate::usage_attr::usage_event_model_label(snap, &event.requested_model);
+    state.usage_sink.try_emit(
+        "chat",
+        event.clone(),
+        crate::usage_attr::usage_event_labels(&usage_model, pk),
+    );
     // Guardrail outcome counters (#379). Recorded here — the one place every
     // chat path (success / error / streaming / cache-hit) funnels through —
     // from the same guardrail fields the UsageEvent carries.

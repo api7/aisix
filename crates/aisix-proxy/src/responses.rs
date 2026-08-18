@@ -3043,7 +3043,13 @@ fn emit_usage_event(
         ..Default::default()
     };
     crate::usage_attr::apply_jwt_identity(&mut event, client.jwt.as_ref());
-    state.usage_sink.try_emit("responses", event.clone());
+    let usage_model =
+        crate::usage_attr::usage_event_model_label(snap, &event.requested_model);
+    state.usage_sink.try_emit(
+        "responses",
+        event.clone(),
+        crate::usage_attr::usage_event_labels(&usage_model, pk),
+    );
     let exporters = crate::usage_attr::live_exporters(state, snap);
     state
         .otlp_fan_out
@@ -3111,7 +3117,8 @@ fn emit_zero_token_event(
     // requests. Forwarded only to `fan_out`, never to the CP sink.
     content: Option<CapturedContent>,
 ) {
-    let tags = ResolvedPk::resolve(snap, provider_key_id).telemetry_tags();
+    let pk = ResolvedPk::resolve(snap, provider_key_id);
+    let tags = pk.telemetry_tags();
     let mut event = UsageEvent {
         request_id: request_id.to_string(),
         occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
@@ -3138,7 +3145,13 @@ fn emit_zero_token_event(
         ..Default::default()
     };
     crate::usage_attr::apply_jwt_identity(&mut event, client.jwt.as_ref());
-    state.usage_sink.try_emit("responses", event.clone());
+    let usage_model =
+        crate::usage_attr::usage_event_model_label(snap, &event.requested_model);
+    state.usage_sink.try_emit(
+        "responses",
+        event.clone(),
+        crate::usage_attr::usage_event_labels(&usage_model, &pk),
+    );
     let exporters = crate::usage_attr::live_exporters(state, snap);
     state
         .otlp_fan_out

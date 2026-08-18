@@ -1897,12 +1897,29 @@ impl Metrics {
         );
     }
 
-    pub fn record_usage_event_drop(&self, reason: &str) {
+    /// Count a usage event that never made it into the queue. Carries the
+    /// same attribution as the emit counter (AISIX-Cloud#1317): a dropped
+    /// event is a hole in the usage record, and the operator's question is
+    /// whose data is missing, which `reason` alone cannot answer.
+    pub fn record_usage_event_drop(&self, reason: &str, labels: UsageEventLabels<'_>) {
         self.cached_counter(
             M_USAGE_EVENT_DROPS_TOTAL,
             1,
-            |k| k.label(reason),
-            || metrics::counter!(M_USAGE_EVENT_DROPS_TOTAL, "reason" => reason.to_string()),
+            |k| {
+                k.label(reason);
+                k.label(labels.model);
+                k.label(labels.provider_key_id);
+                k.label(labels.provider_key_name);
+            },
+            || {
+                metrics::counter!(
+                    M_USAGE_EVENT_DROPS_TOTAL,
+                    "reason" => reason.to_string(),
+                    "model" => labels.model.to_string(),
+                    "provider_key_id" => labels.provider_key_id.to_string(),
+                    "provider_key_name" => labels.provider_key_name.to_string(),
+                )
+            },
         );
     }
 
@@ -1910,8 +1927,8 @@ impl Metrics {
     /// handler's emission intent — paired with the drops counter so
     /// the invariant `emitted == delivered + dropped` holds strictly).
     ///
-    /// All three labels are `&'static str` so prometheus cardinality
-    /// is type-system-bounded:
+    /// The surface labels are `&'static str` so prometheus cardinality is
+    /// type-system-bounded:
     /// - `handler`: OpenAI-shape endpoint name (`chat`, `embeddings`,
     ///   `messages`, etc.)
     /// - `status_code`: bucketed by `status_bucket()` (one of `2xx` /
@@ -1919,11 +1936,19 @@ impl Metrics {
     /// - `inbound_protocol`: normalised by the caller to one of
     ///   `"openai"` / `"anthropic"` / `"other"` (audit MEDIUM-3 —
     ///   `&'static str` here prevents user-controlled cardinality)
+    ///
+    /// [`UsageEventLabels`] adds the model and ProviderKey the event was
+    /// attributed to (AISIX-Cloud#1317). Those cannot be `&'static str`,
+    /// so they are bounded at the proxy's emit chokepoint instead — see
+    /// that type. The dimensions they add are ones
+    /// `aisix_llm_requests_total` already carries, so this counter stays
+    /// well inside the request families' series count.
     pub fn record_usage_event_emit(
         &self,
         handler: &'static str,
         status_code: u16,
         inbound_protocol: &'static str,
+        labels: UsageEventLabels<'_>,
     ) {
         let status_class = status_bucket(status_code);
         self.cached_counter(
@@ -1933,6 +1958,9 @@ impl Metrics {
                 k.label(handler);
                 k.label(status_class);
                 k.label(inbound_protocol);
+                k.label(labels.model);
+                k.label(labels.provider_key_id);
+                k.label(labels.provider_key_name);
             },
             || {
                 metrics::counter!(
@@ -1940,6 +1968,9 @@ impl Metrics {
                     "handler" => handler,
                     "status_code" => status_class,
                     "inbound_protocol" => inbound_protocol,
+                    "model" => labels.model.to_string(),
+                    "provider_key_id" => labels.provider_key_id.to_string(),
+                    "provider_key_name" => labels.provider_key_name.to_string(),
                 )
             },
         );
@@ -2463,6 +2494,37 @@ impl LlmUsage {
         }
         let micro_usd = (self.spend_usd * 1_000_000.0).round();
         (micro_usd > 0.0).then_some(micro_usd as u64)
+    }
+}
+
+/// The attribution dimensions `aisix_usage_events_emitted_total` and
+/// `aisix_usage_event_drops_total` share (AISIX-Cloud#1317).
+///
+/// The two counters are read as one — `emitted == delivered + dropped` —
+/// so they have to carry the SAME labels or the invariant only holds
+/// after summing away every dimension, and "which model's usage records
+/// were lost" stays unanswerable. Both take this one struct for that
+/// reason.
+///
+/// Bounded by the caller, which is the proxy's emit chokepoint: `model`
+/// is `usage_attr::metric_model_label` output (the configured set, never
+/// the caller's raw `model` field — #451), and the ProviderKey pair is
+/// read off one snapshot row so the name can never be paired with an id
+/// it did not come from.
+#[derive(Debug, Clone, Copy)]
+pub struct UsageEventLabels<'a> {
+    pub model: &'a str,
+    pub provider_key_id: &'a str,
+    pub provider_key_name: &'a str,
+}
+
+impl Default for UsageEventLabels<'_> {
+    fn default() -> Self {
+        Self {
+            model: "unknown",
+            provider_key_id: "unknown",
+            provider_key_name: "unknown",
+        }
     }
 }
 
@@ -3672,15 +3734,83 @@ mod tests {
         assert_one_series_per_label_set(&m.render(), M_TOKENS_CONSUMED, 3);
     }
 
+    const PK_A: UsageEventLabels<'static> = UsageEventLabels {
+        model: "gpt-4o",
+        provider_key_id: "pk-1",
+        provider_key_name: "openai-prod",
+    };
+
     #[test]
     fn usage_event_emit_key_covers_every_label() {
         let m = Metrics::new(false);
-        m.record_usage_event_emit("chat", 200, "openai");
-        m.record_usage_event_emit("chat", 200, "openai");
-        m.record_usage_event_emit("embeddings", 200, "openai");
-        m.record_usage_event_emit("chat", 404, "openai");
-        m.record_usage_event_emit("chat", 200, "anthropic");
-        assert_one_series_per_label_set(&m.render(), M_USAGE_EVENT_EMITS_TOTAL, 4);
+        m.record_usage_event_emit("chat", 200, "openai", PK_A);
+        m.record_usage_event_emit("chat", 200, "openai", PK_A);
+        m.record_usage_event_emit("embeddings", 200, "openai", PK_A);
+        m.record_usage_event_emit("chat", 404, "openai", PK_A);
+        m.record_usage_event_emit("chat", 200, "anthropic", PK_A);
+        // AISIX-Cloud#1317: the attribution dimensions belong to the key
+        // too. Leaving one out of it folds two models' — or two keys' —
+        // emissions into whichever series was cached first.
+        m.record_usage_event_emit(
+            "chat",
+            200,
+            "openai",
+            UsageEventLabels {
+                model: "gpt-4o-mini",
+                ..PK_A
+            },
+        );
+        m.record_usage_event_emit(
+            "chat",
+            200,
+            "openai",
+            UsageEventLabels {
+                provider_key_id: "pk-2",
+                provider_key_name: "openai-backup",
+                ..PK_A
+            },
+        );
+        assert_one_series_per_label_set(&m.render(), M_USAGE_EVENT_EMITS_TOTAL, 6);
+    }
+
+    #[test]
+    fn usage_event_drop_key_covers_every_label() {
+        let m = Metrics::new(false);
+        m.record_usage_event_drop("sink_full", PK_A);
+        m.record_usage_event_drop("sink_full", PK_A);
+        m.record_usage_event_drop("sink_closed", PK_A);
+        m.record_usage_event_drop(
+            "sink_full",
+            UsageEventLabels {
+                model: "gpt-4o-mini",
+                ..PK_A
+            },
+        );
+        assert_one_series_per_label_set(&m.render(), M_USAGE_EVENT_DROPS_TOTAL, 3);
+    }
+
+    /// AISIX-Cloud#1317: the two counters are read as one pair —
+    /// `emitted == delivered + dropped`. A per-model or per-key slice of
+    /// that invariant only exists if BOTH sides carry the same attribution,
+    /// which is why `try_emit` hands one label set to both.
+    #[test]
+    fn emits_and_drops_carry_the_same_attribution_labels() {
+        let m = Metrics::new(false);
+        m.record_usage_event_emit("chat", 200, "openai", PK_A);
+        m.record_usage_event_drop("sink_full", PK_A);
+        let rendered = m.render();
+        for metric in [M_USAGE_EVENT_EMITS_TOTAL, M_USAGE_EVENT_DROPS_TOTAL] {
+            let line = series_lines(&rendered, metric)
+                .pop()
+                .unwrap_or_else(|| panic!("{metric} must render\n{rendered}"));
+            for want in [
+                r#"model="gpt-4o""#,
+                r#"provider_key_id="pk-1""#,
+                r#"provider_key_name="openai-prod""#,
+            ] {
+                assert!(line.contains(want), "{metric} is missing {want}: {line}");
+            }
+        }
     }
 
     #[test]
