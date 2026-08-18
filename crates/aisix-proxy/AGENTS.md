@@ -58,6 +58,29 @@ writes the legacy `aisix_requests_total` **and** the detailed `aisix_proxy_*` /
 directly silently produces a request that exists in one family and not the
 others — the bug AISIX-Cloud#1234 fixed across ten endpoints.
 
+## A passthrough route that detects an envelope must observe what the typed endpoint does
+
+`passthrough_route.rs` relays bytes verbatim, but it *detects* the request
+envelope and extracts from it. Whatever it extracts is the whole observation —
+there is no bridge behind it to fill anything in. So a new observation added to
+a typed endpoint has a second home: a new `UsageEvent` token dimension needs
+reading in `usage_of`, a new guardrail scan input needs adding to
+`message_scan_text` / `request_guardrail_text`, a new attribution field needs
+setting on `RouteTelemetry`. Miss it and the route keeps answering 200 while
+metering and enforcement silently weaken — the shape of #988, where the cache
+and reasoning counters existed everywhere except here.
+
+Two rules bound the extraction:
+
+- An **opaque** (`Raw`) body is never mined for meaning. Buffered opaque
+  responses are not probed for usage at all, and an opaque stream's flat token
+  fields count only on a frame the server itself labelled one
+  (`event: token_usage`) — a caller-shaped body must not be able to mint tokens.
+- Usage accumulates **field-wise max** across frames, never last-wins: one
+  stream reports it in pieces (Anthropic's `message_start` carries the input
+  and cache counters, its `message_delta` only the output ones), so an
+  assignment truncates whatever arrived earlier.
+
 ## A new proxy route has to be declared in three places
 
 Adding a `.route(…)` in `build_router` is not enough, and nothing fails loudly

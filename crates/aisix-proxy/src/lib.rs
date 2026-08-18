@@ -380,6 +380,12 @@ fn inbound_protocol_for_endpoint(endpoint: &str) -> &'static str {
         "a2a"
     } else if endpoint == "/v1/realtime" {
         "realtime"
+    } else if endpoint == "/passthrough_route" {
+        // Whatever API a route relays, it is not the gateway's own OpenAI
+        // surface — and the usage event already tags these rows
+        // `passthrough`, so labelling the metric `openai` put the two
+        // halves of one request on different protocols.
+        "passthrough"
     } else {
         "openai"
     }
@@ -2415,7 +2421,13 @@ mod tests {
             "the caller's path must not reach the label: {sample}"
         );
         assert!(sample.contains(r#"outcome="completed""#), "{sample}");
-        assert!(sample.contains(r#"inbound_protocol="openai""#), "{sample}");
+        // A relayed API is not the gateway's own OpenAI surface, and the
+        // usage event already tags these rows `passthrough` — the two must
+        // not put one request on different protocols.
+        assert!(
+            sample.contains(r#"inbound_protocol="passthrough""#),
+            "{sample}"
+        );
     }
 
     /// The chunked path reaches the handler, which rejects at its body

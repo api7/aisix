@@ -19,6 +19,13 @@
 //! coverage. SSE upstream responses are always relayed incrementally;
 //! anything else is buffered (guardrails and usage need the whole body).
 //!
+//! A DETECTED envelope must observe what the typed endpoint serving that
+//! same envelope observes — every token dimension of
+//! [`aisix_obs::UsageEvent`], the caller's model alias, the guardrail text
+//! including tool calls, TTFT, and a 499 for a stream the client
+//! abandoned. Anything less makes a route a place where enforcement and
+//! metering quietly weaken.
+//!
 //! ## Entry points
 //!
 //! - [`entry`] — the proxy router's **fallback** handler. Path-prefix
@@ -319,6 +326,7 @@ pub async fn entry(
                 status,
                 elapsed,
                 &request_id,
+                None,
                 Some(&err),
             );
             crate::request_metrics::record(
@@ -355,6 +363,7 @@ pub async fn entry(
                 status,
                 elapsed,
                 &request_id,
+                None,
                 Some(&error),
             );
             crate::request_metrics::record(
@@ -639,7 +648,15 @@ async fn dispatch(
             .iter()
             .map(|e| &e.value),
     );
-    let captured_prompt = content_cap.map(|_| request_guardrail_text(protocol, &body_bytes));
+    // The whole request body, as the typed endpoints capture it — they
+    // serialize the parsed request, not the text they extracted from it.
+    // Structure matters to an audit (roles, tool definitions, parameters),
+    // and the capture truncator is JSON-aware, so it reduces the body
+    // rather than cutting it mid-token.
+    let captured_prompt = content_cap.map(|_| String::from_utf8_lossy(&body_bytes).into_owned());
+
+    // The alias the caller addressed, for the usage event's attribution.
+    let requested_model = body_model_name(protocol, &body_bytes);
 
     // Rate limits AFTER the input guardrail so a content block doesn't burn
     // an RPM slot (matching the typed endpoints). The body's `model` field
@@ -754,6 +771,11 @@ async fn dispatch(
         elapsed_ms: d.as_millis().min(u64::MAX as u128) as u64,
         cause: "passthrough route upstream exchange".into(),
     };
+    // The attempt begins here. `upstream_latency_ms` / `upstream_ttft_ms`
+    // are attempt-scoped by contract, so they must not count the gateway's
+    // own pre-dispatch work (auth, guardrail scan, rate-limit reservation)
+    // — that belongs to `downstream_latency_ms`, which runs from `started`.
+    let attempt_started = Instant::now();
     let send_fut = builder.send();
     let sent = match exchange_timeout {
         Some(d) => match tokio::time::timeout(d, send_fut).await {
@@ -803,9 +825,16 @@ async fn dispatch(
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),
         started,
+        attempt_started,
         status: status.as_u16(),
-        prompt_tokens: 0,
-        completion_tokens: 0,
+        usage: PassthroughUsage::default(),
+        requested_model,
+        upstream_ttft_ms: 0,
+        downstream_first_ms: None,
+        stream_reached_end: false,
+        streaming: false,
+        error_class: String::new(),
+        error_message: String::new(),
         monitor_hits,
         captured_prompt,
         content_cap: content_cap.map(|c| c as usize),
@@ -815,6 +844,7 @@ async fn dispatch(
     };
 
     if is_sse {
+        telemetry.streaming = true;
         return Ok(stream_response(
             protocol,
             resolved_chain,
@@ -888,9 +918,8 @@ async fn dispatch(
         }
     }
 
-    if let Some((p, c)) = response_usage(protocol, &resp_body) {
-        telemetry.prompt_tokens = p;
-        telemetry.completion_tokens = c;
+    if let Some(u) = response_usage(protocol, &resp_body) {
+        telemetry.usage.merge(u);
     }
     if telemetry.content_cap.is_some() {
         telemetry.response_text = response_guardrail_text(protocol, &resp_body);
@@ -1018,6 +1047,27 @@ fn content_text(v: &serde_json::Value) -> String {
     }
 }
 
+/// The text a guardrail scans from ONE chat-envelope message: its content
+/// plus the whole serialized `tool_calls` payload.
+///
+/// The tool-call half is what the typed endpoints scan (`message_scan_text`
+/// in the guardrails crate), and it is not optional: a request whose only
+/// sensitive text sits in a tool call's `arguments` would otherwise pass a
+/// deny-list that the same body sent to `/v1/chat/completions` trips.
+/// Serialising the whole payload means no function name or argument can
+/// escape inspection regardless of the provider-specific shape.
+fn message_scan_text(msg: &serde_json::Value) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let content = msg.get("content").map(content_text).unwrap_or_default();
+    if !content.is_empty() {
+        parts.push(content);
+    }
+    if let Some(tool_calls) = msg.get("tool_calls").filter(|t| !t.is_null()) {
+        parts.push(tool_calls.to_string());
+    }
+    parts.join("\n")
+}
+
 /// The body envelope detected for one exchange. Not configuration:
 /// detected per request from the body's top-level keys
 /// ([`detect_protocol`]) and sticky for the exchange — the buffered
@@ -1028,9 +1078,16 @@ fn content_text(v: &serde_json::Value) -> String {
 enum PassthroughProtocol {
     /// No recognized envelope: bodies are opaque (guardrails scan them as
     /// one lossy-UTF-8 text; buffered responses are not probed for usage).
+    /// A streamed opaque response reports usage from an explicit `usage`
+    /// object, or — for the flat token shape agent backends use — only
+    /// from a frame the server itself labels one (`event: token_usage`),
+    /// see [`frame_delta`].
     Raw,
     /// OpenAI-compatible chat envelope (`messages`, streamed
-    /// `choices[].delta.content`, final-chunk / response `usage`).
+    /// `choices[].delta.content`, final-chunk / response `usage`). Also
+    /// carries Anthropic Messages traffic, whose request is the same
+    /// `messages` shape: its usage spellings and its `message_start` /
+    /// `message_delta` split are read alongside the OpenAI ones.
     OpenaiChat,
     /// OpenAI-compatible legacy completions / FIM envelope (`prompt` [+
     /// `suffix`], streamed `choices[].text`, `usage`).
@@ -1072,6 +1129,37 @@ fn detect_protocol(body: &[u8]) -> PassthroughProtocol {
     }
 }
 
+/// Cap on the recorded `requested_model` value. The body is the caller's,
+/// so the alias is bounded before it reaches telemetry.
+const REQUESTED_MODEL_CAP: usize = 128;
+
+/// The model alias the caller addressed, from a DETECTED envelope's own
+/// `model` field — what the typed endpoint serving that envelope records
+/// as `UsageEvent::requested_model`.
+///
+/// Read only for a recognised envelope: an opaque body's `model`-shaped key
+/// belongs to some other API and means nothing the gateway can attribute.
+/// The Prometheus side is already collapse-guarded (an unregistered name
+/// folds to the `unresolved` sentinel), so an arbitrary alias here cannot
+/// mint label cardinality.
+fn body_model_name(protocol: PassthroughProtocol, body: &[u8]) -> String {
+    if matches!(protocol, PassthroughProtocol::Raw) {
+        return String::new();
+    }
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return String::new();
+    };
+    v.get("model")
+        .and_then(|m| m.as_str())
+        .map(|m| {
+            m.chars()
+                .filter(|c| !c.is_control())
+                .take(REQUESTED_MODEL_CAP)
+                .collect::<String>()
+        })
+        .unwrap_or_default()
+}
+
 /// The request text a guardrail scans, per the detected envelope.
 /// Extraction is best-effort: a shape that yields no text degrades to the
 /// raw lossy-UTF-8 body, so detection never loses audit coverage.
@@ -1087,7 +1175,7 @@ fn request_guardrail_text(protocol: PassthroughProtocol, body: &[u8]) -> String 
             .and_then(|m| m.as_array())
             .map(|msgs| {
                 msgs.iter()
-                    .filter_map(|m| m.get("content").map(content_text))
+                    .map(message_scan_text)
                     .filter(|t| !t.is_empty())
                     .collect::<Vec<_>>()
                     .join("\n")
@@ -1163,10 +1251,7 @@ fn response_guardrail_text(protocol: PassthroughProtocol, body: &[u8]) -> String
     let texts: Vec<String> = choices
         .iter()
         .filter_map(|c| match protocol {
-            PassthroughProtocol::OpenaiChat => c
-                .get("message")
-                .and_then(|m| m.get("content"))
-                .map(content_text),
+            PassthroughProtocol::OpenaiChat => c.get("message").map(message_scan_text),
             PassthroughProtocol::OpenaiCompletions => {
                 c.get("text").and_then(|t| t.as_str()).map(str::to_string)
             }
@@ -1182,8 +1267,46 @@ fn response_guardrail_text(protocol: PassthroughProtocol, body: &[u8]) -> String
     }
 }
 
+/// Every token dimension a passthrough exchange can report, mirroring the
+/// token fields of [`aisix_obs::UsageEvent`] 1:1 so a route reports what
+/// the typed endpoint serving the same envelope would.
+///
+/// Populated from the union of spellings the relayed APIs use — OpenAI's
+/// nested `*_tokens_details`, the Responses API's `input`/`output`
+/// spelling, Anthropic's separate cache counters, DeepSeek's native
+/// `prompt_cache_hit_tokens`, and the flat token object agent backends
+/// report on their own SSE event.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PassthroughUsage {
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    cached_prompt_tokens: u32,
+    reasoning_tokens: u32,
+    cache_creation_tokens: u32,
+    cache_read_tokens: u32,
+}
+
+impl PassthroughUsage {
+    /// Field-wise max, the accumulation the typed streaming paths use.
+    ///
+    /// One stream reports usage across several frames — Anthropic's
+    /// `message_start` carries the input and cache counters while its
+    /// terminal `message_delta` carries only the output ones — so a later
+    /// partial report must EXTEND the record rather than replace it. Max
+    /// also makes a provider that repeats a cumulative usage object
+    /// harmless.
+    fn merge(&mut self, other: Self) {
+        self.prompt_tokens = self.prompt_tokens.max(other.prompt_tokens);
+        self.completion_tokens = self.completion_tokens.max(other.completion_tokens);
+        self.cached_prompt_tokens = self.cached_prompt_tokens.max(other.cached_prompt_tokens);
+        self.reasoning_tokens = self.reasoning_tokens.max(other.reasoning_tokens);
+        self.cache_creation_tokens = self.cache_creation_tokens.max(other.cache_creation_tokens);
+        self.cache_read_tokens = self.cache_read_tokens.max(other.cache_read_tokens);
+    }
+}
+
 /// `usage` figures from a buffered protocol-aware response body.
-fn response_usage(protocol: PassthroughProtocol, body: &[u8]) -> Option<(u32, u32)> {
+fn response_usage(protocol: PassthroughProtocol, body: &[u8]) -> Option<PassthroughUsage> {
     if matches!(protocol, PassthroughProtocol::Raw) {
         return None;
     }
@@ -1191,21 +1314,67 @@ fn response_usage(protocol: PassthroughProtocol, body: &[u8]) -> Option<(u32, u3
     usage_of(v.get("usage")?)
 }
 
-/// `{prompt_tokens, completion_tokens}` (or the `input/output` spelling)
-/// from a `usage` object.
-fn usage_of(usage: &serde_json::Value) -> Option<(u32, u32)> {
-    let read = |names: [&str; 2]| {
-        names
-            .iter()
-            .find_map(|n| usage.get(n).and_then(|x| x.as_u64()))
+/// Read every token dimension out of one `usage` object (or, for the
+/// labelled frame of an opaque stream, a flat token object).
+///
+/// The spellings are read as a union rather than per protocol because a
+/// passthrough route relays whichever API the caller addressed: the same
+/// route carries an OpenAI chat envelope, an Anthropic one, and an agent
+/// backend's private shape. They do not collide — each name belongs to
+/// exactly one API — so reading them all costs nothing and a detected
+/// envelope reports what its typed endpoint would.
+///
+/// `None` when the object carries no recognised counter at all, which is
+/// what keeps a `usage`-shaped object that is not a usage report from
+/// minting zeros.
+fn usage_of(usage: &serde_json::Value) -> Option<PassthroughUsage> {
+    let num = |v: Option<&serde_json::Value>| {
+        v.and_then(serde_json::Value::as_u64)
             .map(|n| n.min(u32::MAX as u64) as u32)
     };
-    let prompt = read(["prompt_tokens", "input_tokens"]);
-    let completion = read(["completion_tokens", "output_tokens"]);
-    match (prompt, completion) {
-        (None, None) => None,
-        (p, c) => Some((p.unwrap_or(0), c.unwrap_or(0))),
+    // Flat counter under any of `names`, first hit wins.
+    let flat = |names: &[&str]| names.iter().find_map(|n| num(usage.get(*n)));
+    // `parent.child` counter, e.g. `prompt_tokens_details.cached_tokens`.
+    let nested = |parent: &str, child: &str| num(usage.get(parent).and_then(|d| d.get(child)));
+
+    let prompt = flat(&["prompt_tokens", "input_tokens"]);
+    let completion = flat(&["completion_tokens", "output_tokens"]);
+    // OpenAI nests the cache hit under `prompt_tokens_details`, the
+    // Responses API under `input_tokens_details`, DeepSeek reports it flat
+    // as `prompt_cache_hit_tokens`. A nested ZERO must not mask a real
+    // native count (the typed OpenAI bridge takes the same precedence).
+    let cached_prompt = nested("prompt_tokens_details", "cached_tokens")
+        .filter(|&n| n > 0)
+        .or_else(|| nested("input_tokens_details", "cached_tokens").filter(|&n| n > 0))
+        .or_else(|| flat(&["prompt_cache_hit_tokens", "cached_tokens"]));
+    let reasoning = nested("completion_tokens_details", "reasoning_tokens")
+        .filter(|&n| n > 0)
+        .or_else(|| nested("output_tokens_details", "reasoning_tokens").filter(|&n| n > 0))
+        .or_else(|| flat(&["reasoning_tokens"]));
+    // Anthropic's two cache counters sit beside `input_tokens`, and are
+    // ADDITIVE to it rather than a subset.
+    let cache_creation = flat(&["cache_creation_input_tokens", "cache_creation_tokens"]);
+    let cache_read = flat(&["cache_read_input_tokens", "cache_read_tokens"]);
+
+    let dims = [
+        prompt,
+        completion,
+        cached_prompt,
+        reasoning,
+        cache_creation,
+        cache_read,
+    ];
+    if dims.iter().all(Option::is_none) {
+        return None;
     }
+    Some(PassthroughUsage {
+        prompt_tokens: prompt.unwrap_or(0),
+        completion_tokens: completion.unwrap_or(0),
+        cached_prompt_tokens: cached_prompt.unwrap_or(0),
+        reasoning_tokens: reasoning.unwrap_or(0),
+        cache_creation_tokens: cache_creation.unwrap_or(0),
+        cache_read_tokens: cache_read.unwrap_or(0),
+    })
 }
 
 /// Model-level rate-limit identity from the JSON body's top-level `model`
@@ -1361,12 +1530,50 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
+/// `true` when the frame carries an `event:` line the server itself names
+/// a usage report. The only evidence an opaque stream offers that a
+/// token-shaped payload IS usage — see [`frame_delta`].
+fn is_usage_labelled_frame(frame_text: &str) -> bool {
+    frame_text.lines().any(|line| {
+        line.strip_prefix("event:").is_some_and(|name| {
+            let name = name.trim();
+            name.eq_ignore_ascii_case("token_usage") || name.eq_ignore_ascii_case("usage")
+        })
+    })
+}
+
 /// Text a guardrail scans from one SSE frame, per the protocol hint, plus
 /// a usage probe on the same parsed payload.
-fn frame_delta(protocol: PassthroughProtocol, frame: &[u8]) -> (String, Option<(u32, u32)>) {
+///
+/// Usage is read from, in order of specificity:
+///
+/// - the payload's own top-level `usage` object (every OpenAI-shape
+///   stream, and Anthropic's terminal `message_delta`);
+/// - `message.usage` on an Anthropic `message_start`, which is where the
+///   input and cache counters arrive — its `message_delta` reports only
+///   the output ones, so reading just the top level loses the prompt side
+///   of every Anthropic stream;
+/// - `response.usage` on a Responses stream's terminal event;
+/// - for an OPAQUE (`Raw`) stream only, a FLAT token object on a frame the
+///   server labelled a usage report (`event: token_usage`). An opaque
+///   stream has no envelope to authenticate a payload against, so the
+///   server's own label is the evidence — a payload that merely happens to
+///   carry token-shaped fields must never mint billed tokens.
+///
+/// Frames accumulate field-wise (see [`PassthroughUsage::merge`]) at the
+/// call site, so a partial report never truncates an earlier one.
+fn frame_delta(protocol: PassthroughProtocol, frame: &[u8]) -> (String, Option<PassthroughUsage>) {
+    let frame_text = String::from_utf8_lossy(frame);
+    let usage_labelled = matches!(protocol, PassthroughProtocol::Raw)
+        && is_usage_labelled_frame(frame_text.as_ref());
     let mut text = String::new();
-    let mut usage = None;
-    for line in String::from_utf8_lossy(frame).lines() {
+    let mut usage: Option<PassthroughUsage> = None;
+    let mut merge = |found: PassthroughUsage| {
+        usage
+            .get_or_insert_with(PassthroughUsage::default)
+            .merge(found);
+    };
+    for line in frame_text.lines() {
         let Some(payload) = line.strip_prefix("data:").map(str::trim_start) else {
             continue;
         };
@@ -1380,19 +1587,38 @@ fn frame_delta(protocol: PassthroughProtocol, frame: &[u8]) -> (String, Option<(
             continue;
         };
         if let Some(u) = v.get("usage").and_then(usage_of) {
-            usage = Some(u);
-        } else if matches!(protocol, PassthroughProtocol::OpenaiResponses) {
+            merge(u);
+        }
+        // Anthropic opens its stream with the prompt + cache counters
+        // nested on `message_start`. Gated on the event type so no other
+        // envelope's `message` object can be read as usage.
+        if v.get("type").and_then(|t| t.as_str()) == Some("message_start") {
+            if let Some(u) = v
+                .get("message")
+                .and_then(|m| m.get("usage"))
+                .and_then(usage_of)
+            {
+                merge(u);
+            }
+        }
+        if matches!(protocol, PassthroughProtocol::OpenaiResponses) {
             // Responses streams carry usage on the terminal
             // `response.completed` event's embedded response object. Read
             // that shape ONLY here: another protocol's frame that happens
-            // to nest `response.usage` must not overwrite what it reported
-            // at the top level.
+            // to nest `response.usage` must not be read as usage.
             if let Some(u) = v
                 .get("response")
                 .and_then(|r| r.get("usage"))
                 .and_then(usage_of)
             {
-                usage = Some(u);
+                merge(u);
+            }
+        }
+        if usage_labelled {
+            // The agent-backend shape: a flat token object on the
+            // server's own usage event, with no `usage` wrapper.
+            if let Some(u) = usage_of(&v) {
+                merge(u);
             }
         }
         match protocol {
@@ -1493,23 +1719,49 @@ fn stream_response(
         'outer: loop {
             let chunk = match upstream.next().await {
                 Some(Ok(c)) => c,
-                Some(Err(_)) => break,
+                Some(Err(err)) => {
+                    // The response head is already on the wire, so there is
+                    // no status left to carry the failure — record it on the
+                    // event instead of ending as a silent success.
+                    let bridge = crate::dispatch::reqwest_error_to_bridge(&err, telemetry.started);
+                    telemetry.error_class =
+                        crate::attempt::routing_error_class(&bridge).to_string();
+                    telemetry.error_message = crate::attempt::attempt_error_message(&bridge);
+                    tracing::warn!(
+                        route = %route_name,
+                        error = %telemetry.error_message,
+                        "passthrough-route upstream stream failed mid-relay",
+                    );
+                    break;
+                }
                 None => break,
             };
+            // TTFT on the first upstream chunk of any type — the same
+            // convention the typed streaming endpoints stamp.
+            if telemetry.upstream_ttft_ms == 0 {
+                telemetry.upstream_ttft_ms = telemetry
+                    .attempt_started
+                    .elapsed()
+                    .as_millis()
+                    .min(u32::MAX as u128) as u32;
+            }
             for frame in splitter.push(&chunk) {
                 let (delta, usage) = frame_delta(protocol, &frame);
-                if let Some((p, c)) = usage {
-                    telemetry.prompt_tokens = p;
-                    telemetry.completion_tokens = c;
+                if let Some(u) = usage {
+                    telemetry.usage.merge(u);
                 }
                 if capture_cap.is_some() {
                     push_capped(&mut telemetry.response_text, &delta, capture_cap);
                 }
                 let frame = Bytes::from(frame);
                 match &policy {
-                    _ if fail_opened => yield Ok::<_, std::convert::Infallible>(frame),
+                    _ if fail_opened => {
+                        telemetry.mark_first_delivery();
+                        yield Ok::<_, std::convert::Infallible>(frame);
+                    }
                     StreamOutputPolicy::EndOfStreamCheck => {
                         scan_buf.push_str(&delta);
+                        telemetry.mark_first_delivery();
                         yield Ok(frame);
                     }
                     StreamOutputPolicy::Window { size_chars, overlap_chars } => {
@@ -1539,6 +1791,7 @@ fn stream_response(
                                 }
                                 _ => {
                                     for f in pending.drain(..) {
+                                        telemetry.mark_first_delivery();
                                         yield Ok(f);
                                     }
                                     held_bytes = 0;
@@ -1556,6 +1809,7 @@ fn stream_response(
                         if held_bytes > *max_buffer_bytes {
                             if *on_exceeded_fail_open {
                                 for f in pending.drain(..) {
+                                    telemetry.mark_first_delivery();
                                     yield Ok(f);
                                 }
                                 held_bytes = 0;
@@ -1581,9 +1835,8 @@ fn stream_response(
             let rest = splitter.take_rest();
             if !rest.is_empty() {
                 let (delta, usage) = frame_delta(protocol, &rest);
-                if let Some((p, c)) = usage {
-                    telemetry.prompt_tokens = p;
-                    telemetry.completion_tokens = c;
+                if let Some(u) = usage {
+                    telemetry.usage.merge(u);
                 }
                 if capture_cap.is_some() {
                     push_capped(&mut telemetry.response_text, &delta, capture_cap);
@@ -1593,6 +1846,7 @@ fn stream_response(
                 if policy.holds_back() && !fail_opened {
                     pending.push(rest);
                 } else {
+                    telemetry.mark_first_delivery();
                     yield Ok(rest);
                 }
             }
@@ -1613,16 +1867,22 @@ fn stream_response(
                     pending.clear();
                     yield Ok(guardrail_error_frame(guardrail_name.as_deref()));
                     telemetry.guardrail_blocked = true;
+                    telemetry.stream_reached_end = true;
                     telemetry.emit();
                     return;
                 }
             }
             for f in pending.drain(..) {
+                telemetry.mark_first_delivery();
                 yield Ok(f);
             }
         } else {
             telemetry.guardrail_blocked = true;
         }
+        // The generator ran to its own end (upstream EOF, upstream error, or
+        // a guardrail block); only a client that went away first leaves this
+        // unset, and the emit turns that into a 499.
+        telemetry.stream_reached_end = true;
         telemetry.emit();
     };
 
@@ -1727,9 +1987,39 @@ struct RouteTelemetry {
     client_source_ip: String,
     client_user_agent: String,
     started: Instant,
+    /// When the upstream call itself began — the scope the two `upstream_*`
+    /// figures are measured in, distinct from `started` (request receipt).
+    attempt_started: Instant,
     status: u16,
-    prompt_tokens: u32,
-    completion_tokens: u32,
+    /// Every token dimension the exchange reported, accumulated field-wise
+    /// across the response (buffered) or its frames (streamed).
+    usage: PassthroughUsage,
+    /// The model alias the caller addressed, read from a DETECTED
+    /// envelope's own `model` field — the same value the typed endpoint
+    /// serving that envelope records. Empty for an opaque body, whose
+    /// `model`-shaped key means nothing the gateway can trust.
+    requested_model: String,
+    /// Time from the START OF THE ATTEMPT to the upstream's first streamed
+    /// frame. Zero on the buffered path, where there is none.
+    upstream_ttft_ms: u32,
+    /// What the caller waited for on a streamed relay: the moment the first
+    /// relayed frame was handed downstream, measured from `started`. `None`
+    /// until one is, so a stream that delivered nothing reports no
+    /// caller-wait at all rather than an invented one.
+    downstream_first_ms: Option<u32>,
+    /// `true` once the relay generator reached its own end — upstream EOF,
+    /// upstream error, or a guardrail block. It stays `false` only when the
+    /// CLIENT went away first, which is what the emit turns into a 499
+    /// (same signal the typed streaming endpoints record).
+    stream_reached_end: bool,
+    /// Set on a streamed relay so the `Drop` emit can tell an abandoned
+    /// stream from the buffered path, which never streams at all.
+    streaming: bool,
+    /// Bounded error class + message for a failure the relay could not
+    /// answer with a status code — an upstream that dies mid-stream, after
+    /// the response head is already on the wire.
+    error_class: String,
+    error_message: String,
     monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
     captured_prompt: Option<String>,
     content_cap: Option<usize>,
@@ -1739,13 +2029,41 @@ struct RouteTelemetry {
 }
 
 impl RouteTelemetry {
+    /// Stamp the caller's wait at the first RELAYED frame handed
+    /// downstream.
+    ///
+    /// Deliberately here and not where the frame was read off the upstream:
+    /// a hold-back guardrail policy sits between the two, and
+    /// `UsageEvent::downstream_latency_ms` counts that hold-back as part of
+    /// what the caller waited for. Called on both the live-forward and the
+    /// hold-back release paths, so it catches the first frame either way.
+    ///
+    /// A synthetic frame (a guardrail block's error event) deliberately
+    /// does NOT stamp: nothing the caller asked for was delivered. Same
+    /// rule as the typed streaming endpoints, which stamp only in the
+    /// chunk renderer.
+    fn mark_first_delivery(&mut self) {
+        if self.downstream_first_ms.is_none() {
+            self.downstream_first_ms =
+                Some(self.started.elapsed().as_millis().min(u32::MAX as u128) as u32);
+        }
+    }
+
     fn emit(&mut self) {
         if self.emitted {
             return;
         }
         self.emitted = true;
+        // A streamed relay the CLIENT abandoned never reached the
+        // generator's end. The upstream status is then not what happened
+        // to the request, so record the same 499 the typed streaming
+        // endpoints do rather than a success the caller never received.
+        if self.streaming && !self.stream_reached_end {
+            self.status = crate::CLIENT_CLOSED_REQUEST;
+        }
         let elapsed = self.started.elapsed();
         let snapshot = self.state.snapshot.load();
+        let usage = self.usage;
 
         emit_access_log(
             &self.method,
@@ -1755,6 +2073,10 @@ impl RouteTelemetry {
             self.status,
             elapsed,
             &self.request_id,
+            Some(AccessLogTokens {
+                prompt: usage.prompt_tokens,
+                completion: usage.completion_tokens,
+            }),
             None,
         );
 
@@ -1779,10 +2101,32 @@ impl RouteTelemetry {
             occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
             api_key_id: self.api_key_id.clone(),
             status_code: self.status,
-            prompt_tokens: self.prompt_tokens,
-            completion_tokens: self.completion_tokens,
-            upstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
-            downstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
+            requested_model: self.requested_model.clone(),
+            prompt_tokens: usage.prompt_tokens,
+            completion_tokens: usage.completion_tokens,
+            cached_prompt_tokens: usage.cached_prompt_tokens,
+            reasoning_tokens: usage.reasoning_tokens,
+            cache_creation_tokens: usage.cache_creation_tokens,
+            cache_read_tokens: usage.cache_read_tokens,
+            upstream_latency_ms: self
+                .attempt_started
+                .elapsed()
+                .as_millis()
+                .min(u32::MAX as u128) as u32,
+            upstream_ttft_ms: self.upstream_ttft_ms,
+            // Streaming reports the caller's wait to the FIRST relayed
+            // frame, per the field's contract — a relay is a delivery
+            // mechanism for a response, not the response itself, so it is
+            // not the `/a2a` exception. Absent when a stream delivered
+            // nothing. The buffered path has no first frame: there the
+            // caller waited for the whole response to be written.
+            downstream_latency_ms: if self.streaming {
+                self.downstream_first_ms.unwrap_or(0)
+            } else {
+                elapsed.as_millis().min(u32::MAX as u128) as u32
+            },
+            error_class: std::mem::take(&mut self.error_class),
+            error_message: std::mem::take(&mut self.error_message),
             inbound_protocol: "passthrough".to_string(),
             passthrough_route_name: self.route_name.clone(),
             client_identity: self.client_identity.clone(),
@@ -1859,6 +2203,14 @@ fn copy_safe_headers(src: &HeaderMap, dst: &mut HeaderMap) {
     }
 }
 
+/// Token counts for one access-log line. `None` on the paths that never
+/// reached an upstream, which is what keeps a rejected request out of the
+/// token columns instead of logging it as a zero-token success.
+struct AccessLogTokens {
+    prompt: u32,
+    completion: u32,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_access_log(
     method: &Method,
@@ -1868,6 +2220,7 @@ fn emit_access_log(
     status: u16,
     elapsed: Duration,
     request_id: &str,
+    tokens: Option<AccessLogTokens>,
     error: Option<&ProxyError>,
 ) {
     let (error_kind, error) = match error {
@@ -1885,9 +2238,11 @@ fn emit_access_log(
         provider: Some(route),
         model: None,
         api_key_id: Some(api_key_id),
-        prompt_tokens: None,
-        completion_tokens: None,
-        total_tokens: None,
+        prompt_tokens: tokens.as_ref().map(|t| u64::from(t.prompt)),
+        completion_tokens: tokens.as_ref().map(|t| u64::from(t.completion)),
+        total_tokens: tokens
+            .as_ref()
+            .map(|t| u64::from(t.prompt) + u64::from(t.completion)),
         request_id,
         provider_request_id: None,
         served_by_model: None,
@@ -1927,6 +2282,15 @@ mod tests {
     }
 
     const PK_ID: &str = "11111111-1111-1111-1111-111111111111";
+
+    /// A usage record carrying only the two canonical counters.
+    fn usage_dims(prompt: u32, completion: u32) -> PassthroughUsage {
+        PassthroughUsage {
+            prompt_tokens: prompt,
+            completion_tokens: completion,
+            ..Default::default()
+        }
+    }
 
     fn provider_key_entry(api_base_unused: &str) -> ResourceEntry<ProviderKey> {
         let json = format!(
@@ -2305,13 +2669,262 @@ mod tests {
 "#;
         let (text, usage) = frame_delta(PassthroughProtocol::OpenaiChat, done);
         assert_eq!(text, "");
-        assert_eq!(usage, Some((7, 3)));
+        assert_eq!(usage, Some(usage_dims(7, 3)));
 
         let fim = br#"data: {"choices":[{"text":"def "}]}
 
 "#;
         let (text, _) = frame_delta(PassthroughProtocol::OpenaiCompletions, fim);
         assert_eq!(text, "def ");
+    }
+
+    #[test]
+    fn usage_of_reads_every_dimension_in_every_spelling() {
+        // OpenAI chat: the cache hit is nested under `prompt_tokens_details`
+        // and the reasoning count under `completion_tokens_details`.
+        let openai = serde_json::json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 20,
+            "prompt_tokens_details": {"cached_tokens": 80},
+            "completion_tokens_details": {"reasoning_tokens": 12},
+        });
+        assert_eq!(
+            usage_of(&openai),
+            Some(PassthroughUsage {
+                prompt_tokens: 100,
+                completion_tokens: 20,
+                cached_prompt_tokens: 80,
+                reasoning_tokens: 12,
+                ..Default::default()
+            })
+        );
+
+        // Responses API: the `input`/`output` spelling, details nested under
+        // the matching names.
+        let responses = serde_json::json!({
+            "input_tokens": 30,
+            "output_tokens": 9,
+            "input_tokens_details": {"cached_tokens": 25},
+            "output_tokens_details": {"reasoning_tokens": 4},
+        });
+        assert_eq!(
+            usage_of(&responses),
+            Some(PassthroughUsage {
+                prompt_tokens: 30,
+                completion_tokens: 9,
+                cached_prompt_tokens: 25,
+                reasoning_tokens: 4,
+                ..Default::default()
+            })
+        );
+
+        // Anthropic: cache counters are separate, additive fields.
+        let anthropic = serde_json::json!({
+            "input_tokens": 11,
+            "output_tokens": 5,
+            "cache_creation_input_tokens": 300,
+            "cache_read_input_tokens": 1200,
+        });
+        assert_eq!(
+            usage_of(&anthropic),
+            Some(PassthroughUsage {
+                prompt_tokens: 11,
+                completion_tokens: 5,
+                cache_creation_tokens: 300,
+                cache_read_tokens: 1200,
+                ..Default::default()
+            })
+        );
+
+        // DeepSeek reports the cache hit flat, and a ZEROED nested detail
+        // must not mask it (same precedence the typed OpenAI bridge uses).
+        let deepseek = serde_json::json!({
+            "prompt_tokens": 40,
+            "completion_tokens": 6,
+            "prompt_tokens_details": {"cached_tokens": 0},
+            "prompt_cache_hit_tokens": 32,
+        });
+        assert_eq!(usage_of(&deepseek).unwrap().cached_prompt_tokens, 32);
+
+        // The flat agent-backend shape, all five dimensions at the root.
+        let flat = serde_json::json!({
+            "prompt_tokens": 14603,
+            "completion_tokens": 8,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 14272,
+            "reasoning_tokens": 8,
+        });
+        assert_eq!(
+            usage_of(&flat),
+            Some(PassthroughUsage {
+                prompt_tokens: 14603,
+                completion_tokens: 8,
+                cache_read_tokens: 14272,
+                reasoning_tokens: 8,
+                ..Default::default()
+            })
+        );
+
+        // An object with no recognised counter mints nothing.
+        assert_eq!(usage_of(&serde_json::json!({"disk": "80%"})), None);
+        assert_eq!(usage_of(&serde_json::Value::Null), None);
+    }
+
+    #[test]
+    fn anthropic_stream_reports_the_prompt_side_from_message_start() {
+        // Anthropic splits usage across two frames: `message_start` carries
+        // the input + cache counters, the terminal `message_delta` only the
+        // output ones. Reading the top level alone loses the prompt side.
+        let start = br#"data: {"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":12,"cache_creation_input_tokens":300,"cache_read_input_tokens":1200}}}
+
+"#;
+        let (_, start_usage) = frame_delta(PassthroughProtocol::OpenaiChat, start);
+        let start_usage = start_usage.expect("message_start must report usage");
+        assert_eq!(start_usage.prompt_tokens, 12);
+        assert_eq!(start_usage.cache_creation_tokens, 300);
+        assert_eq!(start_usage.cache_read_tokens, 1200);
+
+        let delta = br#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":7}}
+
+"#;
+        let (_, delta_usage) = frame_delta(PassthroughProtocol::OpenaiChat, delta);
+        let mut acc = start_usage;
+        acc.merge(delta_usage.expect("message_delta must report usage"));
+        // The later, partial report EXTENDS the record instead of
+        // truncating the prompt side to zero.
+        assert_eq!(
+            acc,
+            PassthroughUsage {
+                prompt_tokens: 12,
+                completion_tokens: 7,
+                cache_creation_tokens: 300,
+                cache_read_tokens: 1200,
+                ..Default::default()
+            }
+        );
+
+        // The nested read is gated on the event type: a `message` object on
+        // any other frame is not a usage report.
+        let other = br#"data: {"type":"conversation","message":{"usage":{"input_tokens":999}}}
+
+"#;
+        assert_eq!(frame_delta(PassthroughProtocol::OpenaiChat, other).1, None);
+    }
+
+    #[test]
+    fn opaque_stream_reads_flat_usage_only_from_a_labelled_frame() {
+        // An agent backend reached through a forward-proxy route has no
+        // recognisable envelope, and reports usage on its own event as a
+        // flat token object with no `usage` wrapper.
+        let labelled = b"event:token_usage\ndata:{\"name\":\"\",\"prompt_tokens\":14603,\"completion_tokens\":8,\"cache_read_input_tokens\":14272,\"reasoning_tokens\":8}\n\n";
+        let usage = frame_delta(PassthroughProtocol::Raw, labelled)
+            .1
+            .expect("a server-labelled usage frame must report usage");
+        assert_eq!(usage.prompt_tokens, 14603);
+        assert_eq!(usage.completion_tokens, 8);
+        assert_eq!(usage.cache_read_tokens, 14272);
+        assert_eq!(usage.reasoning_tokens, 8);
+
+        // The same flat shape on a frame the server did NOT name a usage
+        // report mints nothing: an opaque stream has no envelope to
+        // authenticate token-shaped fields against.
+        let unlabelled = b"event:history\ndata:{\"prompt_tokens\":99,\"completion_tokens\":9}\n\n";
+        assert_eq!(frame_delta(PassthroughProtocol::Raw, unlabelled).1, None);
+
+        // The flat allowance is Raw-only — a detected envelope keeps
+        // reading usage from its own shape.
+        assert_eq!(
+            frame_delta(PassthroughProtocol::OpenaiChat, labelled).1,
+            None
+        );
+
+        // An explicit `usage` OBJECT is still read from any opaque frame:
+        // it is self-describing, and this is the pre-existing behaviour.
+        let wrapped =
+            b"event:done\ndata:{\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":2}}\n\n";
+        assert_eq!(
+            frame_delta(PassthroughProtocol::Raw, wrapped).1,
+            Some(usage_dims(4, 2))
+        );
+    }
+
+    #[test]
+    fn buffered_opaque_responses_are_never_probed_for_usage() {
+        // The no-phantom-tokens guarantee: a REST body that happens to carry
+        // a usage-shaped object is not a usage report.
+        let rpc = br#"{"jsonrpc":"2.0","id":1,"result":{"usage":{"prompt_tokens":99}}}"#;
+        assert_eq!(response_usage(PassthroughProtocol::Raw, rpc), None);
+        let top_level = br#"{"usage":{"prompt_tokens":99,"completion_tokens":9}}"#;
+        assert_eq!(response_usage(PassthroughProtocol::Raw, top_level), None);
+    }
+
+    #[test]
+    fn usage_merge_is_field_wise_max() {
+        let mut acc = PassthroughUsage {
+            prompt_tokens: 10,
+            completion_tokens: 4,
+            cache_read_tokens: 100,
+            ..Default::default()
+        };
+        // A repeat of a cumulative usage object, and a partial one, are both
+        // harmless: no dimension ever regresses.
+        acc.merge(PassthroughUsage {
+            prompt_tokens: 10,
+            completion_tokens: 9,
+            reasoning_tokens: 3,
+            ..Default::default()
+        });
+        assert_eq!(
+            acc,
+            PassthroughUsage {
+                prompt_tokens: 10,
+                completion_tokens: 9,
+                reasoning_tokens: 3,
+                cache_read_tokens: 100,
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn guardrail_text_covers_tool_calls_on_both_hooks() {
+        // A deny-listed string hidden in a tool call's arguments must be
+        // scanned — a benign `content` beside it would otherwise make the
+        // extraction non-empty and skip the raw-body fallback, letting the
+        // request pass a check the typed endpoint enforces.
+        let req = br#"{"model":"m","messages":[{"role":"assistant","content":"ok","tool_calls":[{"function":{"name":"run","arguments":"{\"cmd\":\"SECRET\"}"}}]}]}"#;
+        let text = request_guardrail_text(PassthroughProtocol::OpenaiChat, req);
+        assert!(text.contains("ok"), "content still scanned: {text}");
+        assert!(
+            text.contains("SECRET"),
+            "tool-call arguments scanned: {text}"
+        );
+
+        let resp = br#"{"choices":[{"message":{"content":"sure","tool_calls":[{"function":{"name":"run","arguments":"{\"cmd\":\"SECRET\"}"}}]}}]}"#;
+        let text = response_guardrail_text(PassthroughProtocol::OpenaiChat, resp);
+        assert!(text.contains("sure"));
+        assert!(text.contains("SECRET"), "tool-call output scanned: {text}");
+    }
+
+    #[test]
+    fn requested_model_comes_only_from_a_detected_envelope() {
+        let chat = br#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}"#;
+        assert_eq!(
+            body_model_name(PassthroughProtocol::OpenaiChat, chat),
+            "gpt-4o"
+        );
+        // An opaque body's `model`-shaped key belongs to some other API.
+        let opaque = br#"{"model":"whatever","config_name":"x"}"#;
+        assert_eq!(body_model_name(PassthroughProtocol::Raw, opaque), "");
+        // Caller-supplied, so bounded and control-char free before it
+        // reaches telemetry.
+        let hostile = format!(
+            r#"{{"input":"x","model":"a\u0000b{}"}}"#,
+            "z".repeat(REQUESTED_MODEL_CAP * 2)
+        );
+        let name = body_model_name(PassthroughProtocol::OpenaiResponses, hostile.as_bytes());
+        assert_eq!(name.chars().count(), REQUESTED_MODEL_CAP);
+        assert!(!name.contains('\0'));
     }
 
     #[test]
@@ -2415,7 +3028,7 @@ mod tests {
         );
         assert_eq!(
             response_usage(PassthroughProtocol::OpenaiResponses, resp),
-            Some((11, 3))
+            Some(usage_dims(11, 3))
         );
     }
 
@@ -2441,7 +3054,7 @@ mod tests {
             t3, "",
             "terminal event must not duplicate the streamed text"
         );
-        assert_eq!(u3, Some((7, 2)));
+        assert_eq!(u3, Some(usage_dims(7, 2)));
 
         // The nested shape is read ONLY for Responses: another protocol's
         // frame that happens to carry `response.usage` must not have its
@@ -2461,12 +3074,12 @@ mod tests {
         let openai = br#"{"usage":{"prompt_tokens":5,"completion_tokens":2}}"#;
         assert_eq!(
             response_usage(PassthroughProtocol::OpenaiChat, openai),
-            Some((5, 2))
+            Some(usage_dims(5, 2))
         );
         let anthropicish = br#"{"usage":{"input_tokens":9,"output_tokens":4}}"#;
         assert_eq!(
             response_usage(PassthroughProtocol::OpenaiChat, anthropicish),
-            Some((9, 4))
+            Some(usage_dims(9, 4))
         );
         assert_eq!(response_usage(PassthroughProtocol::Raw, openai), None);
     }
