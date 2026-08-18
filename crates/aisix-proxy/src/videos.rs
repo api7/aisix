@@ -1470,14 +1470,26 @@ impl Telemetry<'_> {
             error: error.as_deref(),
         }
         .emit();
+        // AISIX-Cloud#1325: this tail never took `upstream_model` or the
+        // ProviderKey pair, and its error sites pass `provider: "unknown"`.
+        // All three come off the request's attribution cell, which the
+        // dispatch filled when it selected the target — so a failed video
+        // job is attributable to the same key its successes are.
+        let snap = self.state.snapshot.load();
+        let attributed = crate::attribution::current().unwrap_or_default();
+        let last_target = crate::request_metrics::LastTarget::new(&snap, &attributed);
+        let provider = if provider == "unknown" {
+            last_target.provider()
+        } else {
+            provider
+        };
         crate::request_metrics::record(
             self.state,
             self.endpoint,
             crate::request_metrics::Caller::new(self.auth),
             crate::request_metrics::Upstream {
                 provider,
-                model: model_label,
-                ..Default::default()
+                ..last_target.upstream(model_label, false, false)
             },
             status,
             elapsed,
@@ -1996,12 +2008,15 @@ fn emit_submit_usage_event(
         client_user_agent: client.user_agent.clone(),
         ..Default::default()
     };
-    crate::usage_attr::apply_pk_telemetry(
-        &mut event,
-        &crate::usage_attr::ResolvedPk::resolve(snap, provider_key_id),
-    );
+    let pk = crate::usage_attr::ResolvedPk::resolve(snap, provider_key_id);
+    crate::usage_attr::apply_pk_telemetry(&mut event, &pk);
     crate::usage_attr::apply_jwt_identity(&mut event, client.jwt.as_ref());
-    state.usage_sink.try_emit("videos", event.clone());
+    let usage_model = crate::usage_attr::usage_event_model_label(snap, &event.requested_model);
+    state.usage_sink.try_emit(
+        "videos",
+        event.clone(),
+        crate::usage_attr::usage_event_labels(&usage_model, &pk),
+    );
     let exporters = crate::usage_attr::live_exporters(state, snap);
     state
         .otlp_fan_out

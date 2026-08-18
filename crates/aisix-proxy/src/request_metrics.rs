@@ -51,8 +51,10 @@
 //! families, so aggregate tokens-per-request is only meaningful per
 //! `endpoint`, never summed across all of them.
 
+use std::borrow::Cow;
 use std::time::Duration;
 
+use aisix_core::AisixSnapshot;
 use aisix_obs::{LlmUsage, RequestLabels, RequestOutcome, UsageLabels};
 
 use crate::auth::AuthenticatedKey;
@@ -61,7 +63,7 @@ use crate::usage_attr::PkLabels;
 
 /// Label value every `RequestLabels` field falls back to when the path
 /// never resolved it. Matches `RequestLabels::default()`.
-const UNKNOWN: &str = "unknown";
+pub(crate) const UNKNOWN: &str = "unknown";
 
 /// Caller identity for the detailed label set.
 #[derive(Clone, Copy)]
@@ -172,6 +174,128 @@ impl Default for Upstream<'_> {
             pk: PkLabels::default(),
             stream: false,
             is_fallback: false,
+        }
+    }
+}
+
+/// Whether the caller addressed an ensemble model. See [`LastTarget::new`].
+fn is_ensemble(snap: &AisixSnapshot, requested_model: &str) -> bool {
+    !requested_model.is_empty()
+        && crate::model_resolve::resolve_model(snap, requested_model)
+            .is_some_and(|entry| entry.value.is_ensemble())
+}
+
+/// The upstream a request had committed to when it FAILED, recovered from
+/// the request's attribution cell.
+///
+/// A handler's failure branch holds a `ProxyError`, which carries no
+/// upstream identity, so every failed request used to emit
+/// [`Upstream::default()`] — `provider="unknown"`, no ProviderKey — even
+/// when it had reached a real provider and been answered 5xx. That split
+/// one ProviderKey's successes and failures across two label sets, so a
+/// failure rate grouped by `provider` reported 0% for every real provider
+/// and 100% for `unknown` (AISIX-Cloud#1325).
+///
+/// Names the LAST target the request selected. Under retry / fallback that
+/// is the attempt whose error the caller was actually served, which is the
+/// same attempt the access log's routing telemetry ends on.
+///
+/// Still `unknown` for a request that failed BEFORE selecting a target —
+/// model-not-found, an input guardrail block, a budget refusal. Those
+/// never reached a provider, so there is nothing to attribute and the
+/// placeholder is the honest answer.
+pub(crate) struct LastTarget<'a> {
+    provider: String,
+    upstream_model: Cow<'a, str>,
+    pk: Option<crate::usage_attr::ResolvedPk<'a>>,
+}
+
+impl<'a> LastTarget<'a> {
+    /// `resolved` has to outlive the emit — read it into a local first
+    /// (`let resolved = attribution::current().unwrap_or_default();`).
+    pub(crate) fn new(snap: &AisixSnapshot, resolved: &'a crate::attribution::Resolved) -> Self {
+        // An ensemble has no single terminal target: its panel members run
+        // concurrently and all of them are attempted, so the cell just holds
+        // whichever resolved last. Naming that one would read as "this key
+        // is what failed" — a plausible-looking wrong answer, which is worse
+        // than the placeholder. Suppressed rather than deferred to the
+        // ensemble design pass, because it is this change that would
+        // otherwise introduce it.
+        if is_ensemble(snap, &resolved.requested_model) {
+            return Self {
+                provider: UNKNOWN.to_string(),
+                upstream_model: Cow::Borrowed(UNKNOWN),
+                pk: None,
+            };
+        }
+        Self {
+            // Lowercased here because the success path lowercases at its
+            // own emit; a failure that spelled the vendor differently
+            // would land on a second series for the same provider.
+            provider: if resolved.provider.is_empty() {
+                UNKNOWN.to_string()
+            } else {
+                resolved.provider.to_ascii_lowercase()
+            },
+            // A wildcard row resolves to a SUBSTITUTED upstream id — the
+            // caller's own suffix — so it goes through the same collapse the
+            // success path's emit applies, or a failed request could mint one
+            // series per made-up suffix (#451).
+            upstream_model: if resolved.upstream_model.is_empty() {
+                Cow::Borrowed(UNKNOWN)
+            } else {
+                crate::usage_attr::metric_model_label_pair(
+                    snap,
+                    &resolved.requested_model,
+                    &resolved.upstream_model,
+                )
+                .1
+            },
+            // An empty id must fall back to `PkLabels::default()`, NOT to
+            // `ResolvedPk::resolve(snap, "")` — that one reports the id
+            // verbatim, and an empty `provider_key_id` label would be a
+            // third value alongside `unknown` and the real ids.
+            pk: (!resolved.provider_key_id.is_empty())
+                .then(|| crate::usage_attr::ResolvedPk::resolve(snap, &resolved.provider_key_id)),
+        }
+    }
+
+    /// For the SLO latency histogram, which carries `provider` but no
+    /// ProviderKey (per-key dimensions multiply every bucket).
+    pub(crate) fn provider(&self) -> &str {
+        &self.provider
+    }
+
+    /// The failure's labels, keeping the handler's own `model` / `stream`
+    /// / `is_fallback` decisions — those are request-level facts the cell
+    /// has no better answer for.
+    pub(crate) fn upstream<'b>(
+        &'b self,
+        model: &'b str,
+        stream: bool,
+        is_fallback: bool,
+    ) -> Upstream<'b> {
+        Upstream {
+            provider: &self.provider,
+            model,
+            upstream_model: &self.upstream_model,
+            pk: self.pk.as_ref().map(|p| p.labels()).unwrap_or_default(),
+            stream,
+            is_fallback,
+        }
+    }
+
+    /// The model the caller addressed, bounded to the configured set —
+    /// for the failure paths that could not recover it locally (the
+    /// multipart audio routes parse it inside the dispatch that failed).
+    pub(crate) fn requested_model<'b>(
+        snap: &AisixSnapshot,
+        resolved: &'b crate::attribution::Resolved,
+    ) -> Cow<'b, str> {
+        if resolved.requested_model.is_empty() {
+            Cow::Borrowed(UNKNOWN)
+        } else {
+            crate::usage_attr::metric_model_label(snap, &resolved.requested_model)
         }
     }
 }
@@ -372,6 +496,88 @@ pub(crate) fn record_usage(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use aisix_core::{Model, ResourceEntry};
+
+    fn snapshot_with(display_name: &str, body: serde_json::Value) -> AisixSnapshot {
+        let model: Model = serde_json::from_value(body).unwrap();
+        let snap = AisixSnapshot::new();
+        snap.models
+            .insert(ResourceEntry::new(display_name, model, 1));
+        snap
+    }
+
+    fn resolved(requested: &str) -> crate::attribution::Resolved {
+        crate::attribution::Resolved {
+            requested_model: requested.to_string(),
+            provider: "OpenAI".to_string(),
+            upstream_model: "gpt-4o-mini".to_string(),
+            provider_key_id: "pk-1".to_string(),
+        }
+    }
+
+    /// The vendor id reaches the label lowercased, because the success path
+    /// lowercases at its own emit — a failure spelling it differently would
+    /// put one provider on two series, which is the bug this recovers from.
+    #[test]
+    fn a_recovered_target_matches_the_success_paths_spelling() {
+        let snap = snapshot_with(
+            "direct",
+            serde_json::json!({
+                "display_name": "direct",
+                "provider": "openai",
+                "model_name": "gpt-4o-mini",
+                "provider_key_id": "pk-1",
+            }),
+        );
+        let r = resolved("direct");
+        let target = LastTarget::new(&snap, &r);
+        let upstream = target.upstream("direct", false, false);
+        assert_eq!(target.provider(), "openai");
+        assert_eq!(upstream.provider, "openai");
+        assert_eq!(upstream.upstream_model, "gpt-4o-mini");
+        assert_eq!(upstream.pk.id(), "pk-1");
+    }
+
+    /// An ensemble's panel members all run, so the cell holds whichever
+    /// resolved last. Naming it would read as "this key is what failed" —
+    /// a plausible-looking wrong answer. The placeholder is the honest one.
+    #[test]
+    fn an_ensemble_failure_is_not_attributed_to_one_of_its_members() {
+        let snap = snapshot_with(
+            "panel",
+            serde_json::json!({
+                "display_name": "panel",
+                "ensemble": {
+                    "panel": [{"model": "gpt4"}],
+                    "judge": {"model": "gpt4"},
+                },
+            }),
+        );
+        let r = resolved("panel");
+        let target = LastTarget::new(&snap, &r);
+        let upstream = target.upstream("panel", false, false);
+        assert_eq!(upstream.provider, UNKNOWN);
+        assert_eq!(upstream.upstream_model, UNKNOWN);
+        assert_eq!(upstream.pk.id(), UNKNOWN);
+        assert_eq!(upstream.pk.name(), UNKNOWN);
+    }
+
+    /// A request that never selected a target keeps the placeholder, and the
+    /// ProviderKey id must be `unknown` rather than the empty string an
+    /// unresolved `ResolvedPk` reports verbatim — an empty label value would
+    /// be a second "nothing resolved" series alongside it.
+    #[test]
+    fn nothing_resolved_collapses_to_one_placeholder() {
+        let snap = AisixSnapshot::new();
+        let nothing = crate::attribution::Resolved::default();
+        let target = LastTarget::new(&snap, &nothing);
+        let upstream = target.upstream(crate::usage_attr::UNRESOLVED_MODEL_LABEL, false, false);
+        assert_eq!(upstream.provider, UNKNOWN);
+        assert_eq!(upstream.upstream_model, UNKNOWN);
+        assert_eq!(upstream.pk.id(), UNKNOWN);
+        assert_eq!(upstream.pk.name(), UNKNOWN);
+    }
 
     /// Every registered proxy route, as its raw request path. Adding a route
     /// to `build_router` without adding it here leaves the tests below

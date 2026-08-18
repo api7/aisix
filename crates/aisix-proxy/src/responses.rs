@@ -371,18 +371,22 @@ pub async fn responses(
             let metric_model = crate::usage_attr::metric_model_label(&snapshot, &model_name);
             // The failed request counts on the detailed families too, so a
             // success rate over /v1/responses has the failures in its
-            // denominator. Provider / upstream / provider-key never
-            // resolved on this path.
+            // denominator.
+            // AISIX-Cloud#1325: name the target the request died on. This
+            // branch used to emit `Upstream::default()`, so a 502 from a
+            // real provider landed on `provider="unknown"` while the same
+            // key's successes landed on the real one.
+            let attributed = crate::attribution::current().unwrap_or_default();
+            let last_target = crate::request_metrics::LastTarget::new(&snapshot, &attributed);
             crate::request_metrics::record(
                 &state,
                 "/v1/responses",
                 crate::request_metrics::Caller::new(&auth),
-                crate::request_metrics::Upstream {
-                    model: metric_model.as_ref(),
-                    stream: stream_requested,
-                    is_fallback: routing.fallback_count() > 0,
-                    ..Default::default()
-                },
+                last_target.upstream(
+                    metric_model.as_ref(),
+                    stream_requested,
+                    routing.fallback_count() > 0,
+                ),
                 status,
                 elapsed,
             );
@@ -390,7 +394,7 @@ pub async fn responses(
                 LatencyLabels {
                     endpoint: "/v1/responses",
                     model: metric_model.as_ref(),
-                    provider: "unknown",
+                    provider: last_target.provider(),
                     status,
                     streaming: stream_requested,
                 },
@@ -3038,7 +3042,12 @@ fn emit_usage_event(
         ..Default::default()
     };
     crate::usage_attr::apply_jwt_identity(&mut event, client.jwt.as_ref());
-    state.usage_sink.try_emit("responses", event.clone());
+    let usage_model = crate::usage_attr::usage_event_model_label(snap, &event.requested_model);
+    state.usage_sink.try_emit(
+        "responses",
+        event.clone(),
+        crate::usage_attr::usage_event_labels(&usage_model, pk),
+    );
     let exporters = crate::usage_attr::live_exporters(state, snap);
     state
         .otlp_fan_out
@@ -3106,7 +3115,8 @@ fn emit_zero_token_event(
     // requests. Forwarded only to `fan_out`, never to the CP sink.
     content: Option<CapturedContent>,
 ) {
-    let tags = ResolvedPk::resolve(snap, provider_key_id).telemetry_tags();
+    let pk = ResolvedPk::resolve(snap, provider_key_id);
+    let tags = pk.telemetry_tags();
     let mut event = UsageEvent {
         request_id: request_id.to_string(),
         occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
@@ -3133,7 +3143,12 @@ fn emit_zero_token_event(
         ..Default::default()
     };
     crate::usage_attr::apply_jwt_identity(&mut event, client.jwt.as_ref());
-    state.usage_sink.try_emit("responses", event.clone());
+    let usage_model = crate::usage_attr::usage_event_model_label(snap, &event.requested_model);
+    state.usage_sink.try_emit(
+        "responses",
+        event.clone(),
+        crate::usage_attr::usage_event_labels(&usage_model, &pk),
+    );
     let exporters = crate::usage_attr::live_exporters(state, snap);
     state
         .otlp_fan_out

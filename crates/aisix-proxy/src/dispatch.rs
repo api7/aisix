@@ -82,12 +82,19 @@ pub(crate) fn resolve_provider_key(
             model.display_name
         ))
     })?;
-    snapshot.provider_keys.get_by_id(pk_id).ok_or_else(|| {
+    let entry = snapshot.provider_keys.get_by_id(pk_id).ok_or_else(|| {
         ProxyError::InvalidRequest(format!(
             "model {:?} references unknown provider_key_id {pk_id:?}",
             model.display_name
         ))
-    })
+    })?;
+    // The request has now committed to a concrete target. Everything that
+    // can still go wrong from here — an unusable credential, the upstream
+    // itself — produces an error that carries no upstream identity, so the
+    // attribution is recorded at the last point that has it
+    // (AISIX-Cloud#1325).
+    crate::attribution::note_target(model, &entry.id);
+    Ok(entry)
 }
 
 /// Required `provider` (vendor id, free-form string) for a non-routing

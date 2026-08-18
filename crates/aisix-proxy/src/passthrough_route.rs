@@ -382,11 +382,17 @@ pub async fn entry(
             // request still attributes to it — an operator triaging 401s
             // per route needs the name on the event, not just in the log.
             event.passthrough_route_name = route_name.clone();
+            let usage_model =
+                crate::usage_attr::usage_event_model_label(&snapshot, &event.requested_model);
             crate::usage_attr::emit_prepared_usage_event(
                 &state,
                 &snapshot,
                 "passthrough_route",
-                event,
+                event.clone(),
+                crate::usage_attr::usage_event_labels(
+                    &usage_model,
+                    &crate::usage_attr::ResolvedPk::unresolved(),
+                ),
             );
             error.into_response()
         }
@@ -1786,9 +1792,15 @@ impl RouteTelemetry {
         };
         crate::usage_attr::apply_pk_telemetry(&mut event, &pk);
         crate::usage_attr::apply_jwt_identity(&mut event, self.jwt.as_ref());
-        self.state
-            .usage_sink
-            .try_emit("passthrough_route", event.clone());
+        let usage_model = crate::usage_attr::usage_event_model_label(
+            &self.state.snapshot.load(),
+            &event.requested_model,
+        );
+        self.state.usage_sink.try_emit(
+            "passthrough_route",
+            event.clone(),
+            crate::usage_attr::usage_event_labels(&usage_model, &pk),
+        );
 
         // Captured content rides ONLY on the exporter fan-out, per the
         // content_mode invariant (never the CP telemetry path above).

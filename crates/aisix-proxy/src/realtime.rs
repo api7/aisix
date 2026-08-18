@@ -725,6 +725,12 @@ async fn run_session(
         Some((&provider_label, &requested_model)),
         session_error.as_ref(),
     );
+    // A realtime session can run for minutes, so its terminal emits read a
+    // FRESH snapshot rather than the one `prepare` resolved against (#941) —
+    // one load and one ProviderKey lookup shared by the request metric, the
+    // usage event and `record_usage` below, where each used to do its own.
+    let snap = state.snapshot.load();
+    let pk = crate::usage_attr::ResolvedPk::resolve(&snap, &pk_id);
     crate::request_metrics::record(
         &state,
         "/v1/realtime",
@@ -732,18 +738,16 @@ async fn run_session(
         crate::request_metrics::Upstream {
             provider: &provider_label,
             model: &model_entry.value.display_name,
+            // AISIX-Cloud#1325: a session that ends on an upstream error
+            // still names the key it was talking to — these two used to be
+            // `unknown` on every realtime sample, success included.
+            upstream_model: model_entry.value.upstream_model().unwrap_or("unknown"),
+            pk: pk.labels(),
             ..Default::default()
         },
         close_status,
         elapsed,
     );
-
-    // A realtime session can run for minutes, so its terminal emits read a
-    // FRESH snapshot rather than the one `prepare` resolved against (#941) —
-    // one load and one ProviderKey lookup shared by the usage event and
-    // `record_usage` below, where each used to do its own.
-    let snap = state.snapshot.load();
-    let pk = crate::usage_attr::ResolvedPk::resolve(&snap, &pk_id);
     let mut event = UsageEvent {
         request_id: request_id.clone(),
         occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
@@ -772,7 +776,12 @@ async fn run_session(
     };
     crate::usage_attr::apply_pk_telemetry(&mut event, &pk);
     crate::usage_attr::apply_jwt_identity(&mut event, auth.jwt.as_ref());
-    state.usage_sink.try_emit("realtime", event.clone());
+    let usage_model = crate::usage_attr::usage_event_model_label(&snap, &event.requested_model);
+    state.usage_sink.try_emit(
+        "realtime",
+        event.clone(),
+        crate::usage_attr::usage_event_labels(&usage_model, &pk),
+    );
     let exporters = crate::usage_attr::live_exporters(&state, &snap);
     state
         .otlp_fan_out

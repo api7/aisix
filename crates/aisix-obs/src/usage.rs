@@ -27,6 +27,7 @@
 //! batch contract (5s interval / 100-event ceiling) lives in the worker
 //! (aisix-server), not here.
 
+use crate::metrics::UsageEventLabels;
 use aisix_core::{AppliedGuardrail, GuardrailMonitorHit};
 use serde::Serialize;
 
@@ -712,7 +713,15 @@ impl UsageSink {
     /// `aisix_usage_events_emitted_total` counter (#408): `"chat"`,
     /// `"embeddings"`, `"messages"`, `"responses"`, etc. Keep it
     /// `&'static str` so cardinality stays bounded.
-    pub fn try_emit(&self, handler: &'static str, event: UsageEvent) {
+    ///
+    /// `labels` carries the model and ProviderKey the event is attributed
+    /// to (AISIX-Cloud#1317). Both counters below take the SAME set, so
+    /// `emitted == delivered + dropped` still holds per model and per key
+    /// rather than only in aggregate — which is what makes "whose usage
+    /// records did we lose" answerable. The event itself cannot supply
+    /// them: its `requested_model` is caller-controlled text (#451) and it
+    /// carries no ProviderKey id at all.
+    pub fn try_emit(&self, handler: &'static str, event: UsageEvent, labels: UsageEventLabels<'_>) {
         log_provider_call(handler, &event);
         // Normalise inbound_protocol to a fixed `&'static str` set at
         // the boundary (audit MEDIUM-3). This both kills the heap
@@ -731,7 +740,7 @@ impl UsageSink {
         // failure path (including `sink_disabled`) so the invariant
         // `emitted == delivered + dropped` holds strictly.
         if let Some(m) = &self.metrics {
-            m.record_usage_event_emit(handler, event.status_code, bounded_protocol);
+            m.record_usage_event_emit(handler, event.status_code, bounded_protocol, labels);
         }
 
         let Some(tx) = &self.tx else {
@@ -740,7 +749,7 @@ impl UsageSink {
             // intended to emit but no sink was wired" — silent
             // zeros would otherwise hide the misconfiguration.
             if let Some(m) = &self.metrics {
-                m.record_usage_event_drop("sink_disabled");
+                m.record_usage_event_drop("sink_disabled", labels);
             }
             return;
         };
@@ -754,7 +763,7 @@ impl UsageSink {
                 tokio::sync::mpsc::error::TrySendError::Closed(_) => "sink_closed",
             };
             if let Some(m) = &self.metrics {
-                m.record_usage_event_drop(reason);
+                m.record_usage_event_drop(reason, labels);
             }
             tracing::warn!(reason = reason, "usage event dropped");
         }
@@ -770,8 +779,8 @@ mod tests {
         let sink = UsageSink::disabled();
         // Doesn't panic; doesn't allocate a worker. Two emits in a
         // row also fine.
-        sink.try_emit("test", sample_event("req-1"));
-        sink.try_emit("test", sample_event("req-2"));
+        sink.try_emit("test", sample_event("req-1"), UsageEventLabels::default());
+        sink.try_emit("test", sample_event("req-2"), UsageEventLabels::default());
     }
 
     /// Keep every callsite emittable for the whole test binary.
@@ -839,7 +848,9 @@ mod tests {
         ev.attempt_kind = "fallback".into();
         ev.status_code = 200;
 
-        let out = capture_logs(|| UsageSink::disabled().try_emit("chat", ev));
+        let out = capture_logs(|| {
+            UsageSink::disabled().try_emit("chat", ev, UsageEventLabels::default())
+        });
 
         assert!(out.contains("provider call completed"), "{out}");
         assert!(
@@ -866,7 +877,13 @@ mod tests {
     /// worse still.
     #[test]
     fn try_emit_is_silent_when_there_is_no_provider_id() {
-        let out = capture_logs(|| UsageSink::disabled().try_emit("chat", sample_event("req-none")));
+        let out = capture_logs(|| {
+            UsageSink::disabled().try_emit(
+                "chat",
+                sample_event("req-none"),
+                UsageEventLabels::default(),
+            )
+        });
         assert!(!out.contains("provider call completed"), "{out}");
     }
 
@@ -877,7 +894,9 @@ mod tests {
     fn provider_call_log_defaults_a_blank_attempt_kind() {
         let mut ev = sample_event("req-blank");
         ev.provider_request_id = "cmpl-1".into();
-        let out = capture_logs(|| UsageSink::disabled().try_emit("completions", ev));
+        let out = capture_logs(|| {
+            UsageSink::disabled().try_emit("completions", ev, UsageEventLabels::default())
+        });
         assert!(
             out.contains("attempt_kind=\"initial\"") || out.contains("attempt_kind=initial"),
             "{out}"
@@ -888,8 +907,8 @@ mod tests {
     async fn emit_into_real_channel_arrives_in_order() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let sink = UsageSink::new(tx);
-        sink.try_emit("test", sample_event("req-a"));
-        sink.try_emit("test", sample_event("req-b"));
+        sink.try_emit("test", sample_event("req-a"), UsageEventLabels::default());
+        sink.try_emit("test", sample_event("req-b"), UsageEventLabels::default());
         let a = rx.recv().await.unwrap();
         let b = rx.recv().await.unwrap();
         assert_eq!(a.request_id, "req-a");
@@ -903,8 +922,9 @@ mod tests {
         // hot path.
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         let sink = UsageSink::new(tx);
-        sink.try_emit("test", sample_event("req-1"));
-        sink.try_emit("test", sample_event("req-2")); // dropped, logged
+        sink.try_emit("test", sample_event("req-1"), UsageEventLabels::default());
+        sink.try_emit("test", sample_event("req-2"), UsageEventLabels::default());
+        // dropped, logged
     }
 
     /// Issue #408: a `try_emit` call with a Metrics handle attached
@@ -924,6 +944,7 @@ mod tests {
                 inbound_protocol: "openai".into(),
                 ..Default::default()
             },
+            UsageEventLabels::default(),
         );
         sink.try_emit(
             "embeddings",
@@ -932,6 +953,7 @@ mod tests {
                 inbound_protocol: "openai".into(),
                 ..Default::default()
             },
+            UsageEventLabels::default(),
         );
 
         let rendered = metrics.render();
@@ -976,8 +998,8 @@ mod tests {
             ..Default::default()
         };
 
-        sink.try_emit("chat", event()); // delivered
-        sink.try_emit("chat", event()); // dropped (channel full)
+        sink.try_emit("chat", event(), UsageEventLabels::default()); // delivered
+        sink.try_emit("chat", event(), UsageEventLabels::default()); // dropped (channel full)
 
         let rendered = metrics.render();
         // Numeric assertions (audit HIGH-2): name-only checks let a
@@ -1018,6 +1040,7 @@ mod tests {
                 inbound_protocol: "openai".into(),
                 ..Default::default()
             },
+            UsageEventLabels::default(),
         );
 
         let rendered = metrics.render();
@@ -1049,6 +1072,7 @@ mod tests {
                 inbound_protocol: "openai".into(),
                 ..Default::default()
             },
+            UsageEventLabels::default(),
         );
         sink.try_emit(
             "chat",
@@ -1057,6 +1081,7 @@ mod tests {
                 inbound_protocol: "openai".into(),
                 ..Default::default()
             },
+            UsageEventLabels::default(),
         );
 
         let rendered = metrics.render();
@@ -1083,6 +1108,58 @@ mod tests {
         );
     }
 
+    /// AISIX-Cloud#1317: the attribution handed to `try_emit` has to reach
+    /// BOTH counters. Asserted here rather than on `Metrics` directly
+    /// because the wiring is the part that can silently rot: an emit that
+    /// carries the model and a drop that does not looks, once you group by
+    /// model, exactly like a request whose usage record was delivered.
+    #[tokio::test]
+    async fn a_dropped_event_is_attributed_like_the_emit_it_came_from() {
+        let metrics = crate::metrics::Metrics::new(false);
+        let sink = UsageSink::disabled().with_metrics(metrics.clone());
+
+        sink.try_emit(
+            "chat",
+            UsageEvent {
+                status_code: 200,
+                inbound_protocol: "openai".into(),
+                ..Default::default()
+            },
+            UsageEventLabels {
+                model: "customer-chat",
+                provider_key_id: "pk-1",
+                provider_key_name: "openai-prod",
+            },
+        );
+
+        let rendered = metrics.render();
+        let emitted = parse_counter_value(
+            &rendered,
+            "aisix_usage_events_emitted_total",
+            &[
+                ("handler", "chat"),
+                ("model", "customer-chat"),
+                ("provider_key_id", "pk-1"),
+                ("provider_key_name", "openai-prod"),
+            ],
+        );
+        let dropped = parse_counter_value(
+            &rendered,
+            "aisix_usage_event_drops_total",
+            &[
+                ("reason", "sink_disabled"),
+                ("model", "customer-chat"),
+                ("provider_key_id", "pk-1"),
+                ("provider_key_name", "openai-prod"),
+            ],
+        );
+        assert_eq!(
+            (emitted, dropped),
+            (1, 1),
+            "emit and drop must both carry the request's attribution:\n{rendered}"
+        );
+    }
+
     /// Issue #408 audit MEDIUM-3: a wire-level `inbound_protocol`
     /// outside the documented set must be normalised to `"other"`
     /// rather than landing on the metric as a user-controlled
@@ -1103,6 +1180,7 @@ mod tests {
                 inbound_protocol: "evil-cardinality-bomb".into(),
                 ..Default::default()
             },
+            UsageEventLabels::default(),
         );
 
         let rendered = metrics.render();

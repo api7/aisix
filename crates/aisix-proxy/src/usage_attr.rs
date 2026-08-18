@@ -19,7 +19,7 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use aisix_core::{AisixSnapshot, ProviderKey, ResourceEntry};
-use aisix_obs::UsageEvent;
+use aisix_obs::{UsageEvent, UsageEventLabels};
 
 use crate::chat::sanitize_tag;
 use crate::client_ip::ClientContext;
@@ -363,7 +363,14 @@ pub(crate) fn emit_error_usage_event(
         error_class,
         client,
     );
-    emit_prepared_usage_event(state, snap, label, event);
+    // The failed request's own attribution, off the same cell
+    // `request_metrics::LastTarget` reads — so the usage-event counters and
+    // the request counters agree on which key a failure belongs to
+    // (AISIX-Cloud#1317 / #1325).
+    let attributed = crate::attribution::current().unwrap_or_default();
+    let pk = ResolvedPk::resolve(snap, &attributed.provider_key_id);
+    let model = usage_event_model_label(snap, requested_model);
+    emit_prepared_usage_event(state, snap, label, event, usage_event_labels(&model, &pk));
 }
 
 /// The [`emit_error_usage_event`] event without the emission, for a caller
@@ -394,13 +401,57 @@ pub(crate) fn build_error_usage_event(
     event
 }
 
+/// The `model` label for the usage-event counters (AISIX-Cloud#1317).
+///
+/// `unknown` when the request carried no model at all — the MCP, A2A and
+/// passthrough tunnels, and every path that failed before resolution —
+/// otherwise collapsed to the configured set exactly like the request
+/// families do, because `UsageEvent::requested_model` is caller-controlled
+/// text and would otherwise mint one series per made-up name (#451).
+pub(crate) fn usage_event_model_label<'a>(
+    snap: &AisixSnapshot,
+    requested_model: &'a str,
+) -> Cow<'a, str> {
+    if requested_model.is_empty() {
+        Cow::Borrowed(crate::request_metrics::UNKNOWN)
+    } else {
+        metric_model_label(snap, requested_model)
+    }
+}
+
+/// Pair that label with the ProviderKey the event is attributed to.
+///
+/// Takes the resolved key rather than an id for the same reason
+/// `request_metrics::Upstream` does: the readable name can only come off
+/// the row its id names.
+pub(crate) fn usage_event_labels<'a>(
+    model: &'a str,
+    pk: &'a ResolvedPk<'_>,
+) -> UsageEventLabels<'a> {
+    let labels = pk.labels();
+    UsageEventLabels {
+        model,
+        // `ResolvedPk` reports an unresolved id verbatim, including the
+        // empty string the pre-dispatch paths pass. An empty label value
+        // would sit next to `unknown` as a second "nothing resolved"
+        // series, so collapse it here.
+        provider_key_id: if labels.id().is_empty() {
+            UNKNOWN_PK
+        } else {
+            labels.id()
+        },
+        provider_key_name: labels.name(),
+    }
+}
+
 pub(crate) fn emit_prepared_usage_event(
     state: &ProxyState,
     snap: &AisixSnapshot,
     label: &'static str,
     event: UsageEvent,
+    labels: UsageEventLabels<'_>,
 ) {
-    state.usage_sink.try_emit(label, event.clone());
+    state.usage_sink.try_emit(label, event.clone(), labels);
     let exporters = live_exporters(state, snap);
     state
         .otlp_fan_out

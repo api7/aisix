@@ -598,12 +598,15 @@ fn emit_job_usage_event(
         guardrail_monitor_hits,
         ..Default::default()
     };
-    crate::usage_attr::apply_pk_telemetry(
-        &mut event,
-        &crate::usage_attr::ResolvedPk::resolve(snap, &target.pk_entry.id),
-    );
+    let pk = crate::usage_attr::ResolvedPk::resolve(snap, &target.pk_entry.id);
+    crate::usage_attr::apply_pk_telemetry(&mut event, &pk);
     crate::usage_attr::apply_jwt_identity(&mut event, auth.jwt.as_ref());
-    state.usage_sink.try_emit(label, event.clone());
+    let usage_model = crate::usage_attr::usage_event_model_label(snap, &event.requested_model);
+    state.usage_sink.try_emit(
+        label,
+        event.clone(),
+        crate::usage_attr::usage_event_labels(&usage_model, &pk),
+    );
     let exporters = crate::usage_attr::live_exporters(state, snap);
     state
         .otlp_fan_out
@@ -1848,7 +1851,12 @@ async fn attribute_batch_usage(
         // Attribution names the identity that observed completion — the
         // same caller the event's api_key_id already reflects.
         crate::usage_attr::apply_jwt_identity(&mut event, jwt);
-        state.usage_sink.try_emit("batch", event.clone());
+        let usage_model = crate::usage_attr::usage_event_model_label(&snap, &event.requested_model);
+        state.usage_sink.try_emit(
+            "batch",
+            event.clone(),
+            crate::usage_attr::usage_event_labels(&usage_model, &pk),
+        );
         state
             .otlp_fan_out
             .fan_out(&event, None, exporters.iter().map(|e| &e.value));

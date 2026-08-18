@@ -775,7 +775,11 @@ fn emit_a2a_usage(
             task_state: call.facts.task_state,
         },
     );
-    state.usage_sink.try_emit("a2a", event.clone());
+    // As with MCP: an agent call has no model and no ProviderKey, so the
+    // attribution labels are the placeholder (AISIX-Cloud#1317).
+    state
+        .usage_sink
+        .try_emit("a2a", event.clone(), aisix_obs::UsageEventLabels::default());
     let exporters = crate::usage_attr::live_exporters(state, snap);
     // Opt-in content capture, on the same terms as every other endpoint: only
     // an exporter configured for full content sees the words, and they never
