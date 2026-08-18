@@ -9,6 +9,7 @@ use super::apikey::ApiKey;
 use super::cache_policy::CachePolicy;
 use super::claim_mapping::ClaimMapping;
 use super::guardrail::{Guardrail, GuardrailAttachment};
+use super::mcp_auth_settings::McpAuthSettings;
 use super::mcp_policy::McpPolicy;
 use super::mcp_server::McpServer;
 use super::model::Model;
@@ -69,6 +70,12 @@ pub struct AisixSnapshot {
     /// proxy matches them after the typed routes (path) or before them
     /// (foreign `Host`).
     pub passthrough_routes: ResourceTable<PassthroughRoute>,
+    /// The environment's inbound MCP OAuth discovery identity:
+    /// `/aisix/<env>/mcp_auth_settings/<env-uuid>` — a singleton row
+    /// (cp-api keys it by the environment id). Together with at least
+    /// one enabled `oidc_providers` row it activates the `/mcp`
+    /// RFC 9728 discovery surface (AISIX-Cloud#1143).
+    pub mcp_auth_settings: ResourceTable<McpAuthSettings>,
 }
 
 impl AisixSnapshot {
@@ -93,6 +100,7 @@ impl AisixSnapshot {
             + self.oidc_providers.len()
             + self.claim_mappings.len()
             + self.passthrough_routes.len()
+            + self.mcp_auth_settings.len()
     }
 }
 

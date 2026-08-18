@@ -61,6 +61,7 @@ pub struct Schemas {
     pub oidc_provider: Validator,
     pub claim_mapping: Validator,
     pub passthrough_route: Validator,
+    pub mcp_auth_settings: Validator,
 }
 
 pub static SCHEMAS: Lazy<Arc<Schemas>> = Lazy::new(|| Arc::new(Schemas::compile(true)));
@@ -104,6 +105,7 @@ pub fn resource_root_schema(resource: &str, strict: bool) -> Value {
         "oidc_provider" => oidc_provider_root_schema(),
         "claim_mapping" => claim_mapping_root_schema(),
         "passthrough_route" => passthrough_route_root_schema(),
+        "mcp_auth_settings" => mcp_auth_settings_root_schema(),
         other => panic!("unknown resource {other:?}"),
     };
     if strict && closes_on_write(resource) {
@@ -134,6 +136,7 @@ impl Schemas {
             oidc_provider: build("oidc_provider"),
             claim_mapping: build("claim_mapping"),
             passthrough_route: build("passthrough_route"),
+            mcp_auth_settings: build("mcp_auth_settings"),
         }
     }
 }
@@ -382,6 +385,14 @@ pub fn validate_claim_mapping_lenient(value: &Value) -> Result<(), SchemaError> 
 
 pub fn validate_passthrough_route_lenient(value: &Value) -> Result<(), SchemaError> {
     validate(&LENIENT_SCHEMAS.passthrough_route, value)
+}
+
+pub fn validate_mcp_auth_settings(value: &Value) -> Result<(), SchemaError> {
+    validate(&SCHEMAS.mcp_auth_settings, value)
+}
+
+pub fn validate_mcp_auth_settings_lenient(value: &Value) -> Result<(), SchemaError> {
+    validate(&LENIENT_SCHEMAS.mcp_auth_settings, value)
 }
 
 /// Build a resource's canonical JSON Schema from its struct via `schemars`,
@@ -757,6 +768,16 @@ pub fn passthrough_route_root_schema() -> Value {
         );
     }
     schema
+}
+
+/// Canonical JSON Schema for the `mcp_auth_settings` resource, derived
+/// from the [`McpAuthSettings`](crate::models::McpAuthSettings) struct.
+/// The singleton-per-environment invariant is enforced by the writers
+/// (cp-api keys the row by the environment id; the resources file
+/// rejects duplicates at load) and, at read time, by the resolver
+/// failing closed — not by the document schema.
+pub fn mcp_auth_settings_root_schema() -> Value {
+    struct_root_schema::<crate::models::McpAuthSettings>(false)
 }
 
 /// Canonical JSON Schema for the `mcp_policy` resource, derived from the

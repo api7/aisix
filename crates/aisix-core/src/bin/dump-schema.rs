@@ -64,6 +64,7 @@ fn main() {
         "oidc_provider",
         "claim_mapping",
         "passthrough_route",
+        "mcp_auth_settings",
     ] {
         dump_value(
             &out_dir,

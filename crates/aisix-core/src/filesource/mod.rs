@@ -46,11 +46,11 @@ use yaml_rust2::{Yaml, YamlLoader};
 
 use crate::models::{
     validate_a2a_agent, validate_apikey, validate_cache_policy, validate_claim_mapping,
-    validate_guardrail, validate_mcp_server, validate_model, validate_observability_exporter,
-    validate_oidc_provider, validate_passthrough_route, validate_provider_key,
-    validate_rate_limit_policy, A2aAgent, ApiKey, CachePolicy, ClaimMapping, Guardrail, McpServer,
-    Model, ObservabilityExporter, OidcProvider, PassthroughRoute, ProviderKey, RateLimitPolicy,
-    SchemaError,
+    validate_guardrail, validate_mcp_auth_settings, validate_mcp_server, validate_model,
+    validate_observability_exporter, validate_oidc_provider, validate_passthrough_route,
+    validate_provider_key, validate_rate_limit_policy, A2aAgent, ApiKey, CachePolicy, ClaimMapping,
+    Guardrail, McpAuthSettings, McpServer, Model, ObservabilityExporter, OidcProvider,
+    PassthroughRoute, ProviderKey, RateLimitPolicy, SchemaError,
 };
 use crate::resource::ResourceEntry;
 use crate::AisixSnapshot;
@@ -131,8 +131,8 @@ pub(crate) fn url_has_credentials(url: &str) -> bool {
     false
 }
 
-/// Fixed processing order for the twelve resource collections.
-const KINDS: [(&str, IdentityField); 12] = [
+/// Fixed processing order for the thirteen resource collections.
+const KINDS: [(&str, IdentityField); 13] = [
     ("provider_keys", IdentityField::DisplayName),
     ("models", IdentityField::DisplayName),
     ("api_keys", IdentityField::DisplayName),
@@ -145,6 +145,12 @@ const KINDS: [(&str, IdentityField); 12] = [
     ("oidc_providers", IdentityField::Name),
     ("claim_mappings", IdentityField::Name),
     ("passthrough_routes", IdentityField::NameOrDisplayName),
+    // Singleton: the fixed identity makes a second entry a duplicate
+    // at pass 1, enforcing at-most-one row per file.
+    (
+        "mcp_auth_settings",
+        IdentityField::Fixed("mcp_auth_settings"),
+    ),
 ];
 
 /// Load `path` into a fresh [`AisixSnapshot`], resolving `${VAR}`
@@ -351,6 +357,7 @@ pub fn load_from_str(
     let mut oidc_providers: Vec<(String, String, OidcProvider)> = Vec::new();
     let mut claim_mappings: Vec<(String, String, ClaimMapping)> = Vec::new();
     let mut passthrough_routes: Vec<(String, String, PassthroughRoute)> = Vec::new();
+    let mut mcp_auth_settings: Vec<(String, String, McpAuthSettings)> = Vec::new();
 
     for mut entry in prepared {
         let id = derive_id(entry.kind, &entry.identity);
@@ -466,6 +473,12 @@ pub fn load_from_str(
             "claim_mappings" => {
                 if let Some(t) = finish(&scope, &entry.doc, validate_claim_mapping, &mut errors) {
                     claim_mappings.push((id, scope, t));
+                }
+            }
+            "mcp_auth_settings" => {
+                if let Some(t) = finish(&scope, &entry.doc, validate_mcp_auth_settings, &mut errors)
+                {
+                    mcp_auth_settings.push((id, scope, t));
                 }
             }
             other => unreachable!("kind {other} is not in KINDS"),
@@ -697,6 +710,21 @@ pub fn load_from_str(
         }
     }
 
+    // Same rule for the MCP OAuth resource URL: it is published verbatim
+    // on the unauthenticated protected-resource-metadata endpoint, so an
+    // embedded credential would be world-readable.
+    for (_, scope, settings) in &mcp_auth_settings {
+        if url_has_credentials(&settings.resource_url) {
+            errors.push(LoadError {
+                scope: scope.clone(),
+                message: "mcp_auth_settings resource_url must not embed credentials (user \
+                          info or a token query parameter) — protected resource metadata \
+                          is public"
+                    .into(),
+            });
+        }
+    }
+
     // An explicit `provider_key_id` must also resolve: in file mode every
     // provider-key id is derived from its name, so any other value is
     // guaranteed dangling and would only surface per-request.
@@ -781,6 +809,11 @@ pub fn load_from_str(
     for (id, _, v) in passthrough_routes {
         snapshot
             .passthrough_routes
+            .insert(ResourceEntry::new(id, v, revision));
+    }
+    for (id, _, v) in mcp_auth_settings {
+        snapshot
+            .mcp_auth_settings
             .insert(ResourceEntry::new(id, v, revision));
     }
     Ok(snapshot)
