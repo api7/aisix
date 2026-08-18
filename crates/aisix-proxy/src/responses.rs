@@ -373,16 +373,21 @@ pub async fn responses(
             // success rate over /v1/responses has the failures in its
             // denominator. Provider / upstream / provider-key never
             // resolved on this path.
+            // AISIX-Cloud#1325: name the target the request died on. This
+            // branch used to emit `Upstream::default()`, so a 502 from a
+            // real provider landed on `provider="unknown"` while the same
+            // key's successes landed on the real one.
+            let attributed = crate::attribution::current().unwrap_or_default();
+            let last_target = crate::request_metrics::LastTarget::new(&snapshot, &attributed);
             crate::request_metrics::record(
                 &state,
                 "/v1/responses",
                 crate::request_metrics::Caller::new(&auth),
-                crate::request_metrics::Upstream {
-                    model: metric_model.as_ref(),
-                    stream: stream_requested,
-                    is_fallback: routing.fallback_count() > 0,
-                    ..Default::default()
-                },
+                last_target.upstream(
+                    metric_model.as_ref(),
+                    stream_requested,
+                    routing.fallback_count() > 0,
+                ),
                 status,
                 elapsed,
             );
@@ -390,7 +395,7 @@ pub async fn responses(
                 LatencyLabels {
                     endpoint: "/v1/responses",
                     model: metric_model.as_ref(),
-                    provider: "unknown",
+                    provider: last_target.provider(),
                     status,
                     streaming: stream_requested,
                 },

@@ -27,9 +27,11 @@ pub(crate) fn resolve_model(
     requested: &str,
 ) -> Option<Arc<ResourceEntry<Model>>> {
     if let Some(exact) = snapshot.models.get_by_name(requested) {
+        crate::attribution::note_requested_model(requested);
         return Some(exact);
     }
     let (entry, upstream) = best_wildcard_row(snapshot, requested)?;
+    crate::attribution::note_requested_model(requested);
     let mut model = entry.value.clone();
     model.model_name = Some(upstream);
     Some(Arc::new(ResourceEntry::new(

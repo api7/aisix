@@ -71,11 +71,19 @@ pub const M_PROXY_REQUEST_DURATION: &str = "aisix_proxy_request_duration_seconds
 /// which a cancelled request never does — without this one those requests
 /// are absent from the metrics entirely, not counted as failures.
 ///
-/// The label set is `endpoint` ONLY. A cancelled request has no resolved
-/// model / provider key / team (the body may not even be parsed yet), so
-/// the `RequestLabels` families cannot represent it; and `endpoint`
-/// arrives already collapsed to a bounded route template by the proxy
-/// layer, keeping this series low-cardinality by construction (#451).
+/// Labelled by `endpoint` plus whatever the request had resolved before
+/// the caller hung up — the model it addressed and the ProviderKey of the
+/// target it was waiting on, `unknown` when it was cancelled before
+/// reaching them (AISIX-Cloud#1317). Without those, "which model do
+/// callers give up on" was unanswerable, which is the question this
+/// series exists to answer. Every value arrives already bounded from the
+/// proxy layer — the route template, the configured model set, and a
+/// ProviderKey name read off the row its id names (#451).
+///
+/// Deliberately NOT the full `RequestLabels` set: a cancelled request has
+/// no status, no outcome and often no team / user, so the caller-identity
+/// dimensions would be `unknown` on every sample and cost series for
+/// nothing.
 pub const M_PROXY_CLIENT_CANCELLED_TOTAL: &str = "aisix_proxy_client_cancelled_requests_total";
 /// Requests refused by the `request_body_limit_bytes` cap before any
 /// handler ran, split by how the gateway's drain of the refused body
@@ -1209,17 +1217,25 @@ impl Metrics {
     }
 
     /// Count a request the client abandoned before it produced a response
-    /// head. `endpoint` must already be a bounded route template — see
+    /// head. Every label must already be bounded by the caller — see
     /// [`M_PROXY_CLIENT_CANCELLED_TOTAL`].
-    pub fn record_client_cancelled(&self, endpoint: &str) {
+    pub fn record_client_cancelled(&self, labels: CancelledLabels<'_>) {
         self.cached_counter(
             M_PROXY_CLIENT_CANCELLED_TOTAL,
             1,
-            |k| k.label(endpoint),
+            |k| {
+                k.label(labels.endpoint);
+                k.label(labels.model);
+                k.label(labels.provider_key_id);
+                k.label(labels.provider_key_name);
+            },
             || {
                 metrics::counter!(
                     M_PROXY_CLIENT_CANCELLED_TOTAL,
-                    "endpoint" => endpoint.to_string(),
+                    "endpoint" => labels.endpoint.to_string(),
+                    "model" => labels.model.to_string(),
+                    "provider_key_id" => labels.provider_key_id.to_string(),
+                    "provider_key_name" => labels.provider_key_name.to_string(),
                 )
             },
         );
@@ -2448,6 +2464,21 @@ impl LlmUsage {
         let micro_usd = (self.spend_usd * 1_000_000.0).round();
         (micro_usd > 0.0).then_some(micro_usd as u64)
     }
+}
+
+/// Label set for [`M_PROXY_CLIENT_CANCELLED_TOTAL`]. Every field is a
+/// value the proxy has already bounded — see that constant.
+#[derive(Debug, Clone, Copy)]
+pub struct CancelledLabels<'a> {
+    pub endpoint: &'a str,
+    /// What the caller addressed, collapsed to the configured model set;
+    /// `unknown` when the request was cancelled before it resolved one.
+    pub model: &'a str,
+    /// The ProviderKey of the target the request was waiting on, and the
+    /// readable name read off that same row. Both `unknown` when the
+    /// request never selected a target.
+    pub provider_key_id: &'a str,
+    pub provider_key_name: &'a str,
 }
 
 #[derive(Debug, Clone, Copy)]

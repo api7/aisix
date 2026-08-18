@@ -26,6 +26,7 @@
 
 mod a2a;
 mod attempt;
+mod attribution;
 mod audio;
 mod auth;
 pub mod background;
@@ -79,7 +80,7 @@ pub use health::{
 };
 pub use state::{CacheBackends, ProxyState};
 
-use aisix_obs::AccessLog;
+use aisix_obs::{AccessLog, CancelledLabels};
 use axum::extract::State;
 use axum::http::{header, HeaderValue, Request};
 use axum::middleware::{self, Next};
@@ -441,9 +442,15 @@ async fn record_request_telemetry(
     // suffix (or any 404 path) would otherwise let an unauthenticated
     // caller mint unbounded Prometheus time series (#451).
     let endpoint = normalize_endpoint_label(request.uri().path());
+    // The cell the handler fills in as it resolves the model and picks a
+    // target, so this layer can attribute a cancelled request to them
+    // (AISIX-Cloud#1317). Installed here because a cancelled handler
+    // future never gets to hand anything back.
+    let attribution = std::sync::Arc::new(attribution::RequestAttribution::default());
     let mut guard = ClientCancelGuard {
         armed: true,
-        metrics: state.metrics.clone(),
+        state: state.clone(),
+        attribution: attribution.clone(),
         endpoint,
         method: request.method().clone(),
         uri: request.uri().clone(),
@@ -459,7 +466,7 @@ async fn record_request_telemetry(
         endpoint,
         inbound_protocol_for_endpoint(endpoint),
     );
-    let response = next.run(request).await;
+    let response = attribution::scope(attribution, next.run(request)).await;
     guard.armed = false;
     response
 }
@@ -468,7 +475,11 @@ struct ClientCancelGuard {
     /// Cleared when the inner service returns. Still set at drop time
     /// means the future was cancelled rather than completed.
     armed: bool,
-    metrics: std::sync::Arc<aisix_obs::Metrics>,
+    /// Held for the metrics sink AND the snapshot the attribution labels
+    /// are resolved against at drop time.
+    state: ProxyState,
+    /// What the cancelled request had resolved before the caller hung up.
+    attribution: std::sync::Arc<attribution::RequestAttribution>,
     /// Bounded route template — safe as a metric label (#451).
     endpoint: &'static str,
     method: axum::http::Method,
@@ -493,13 +504,18 @@ impl Drop for ClientCancelGuard {
             return;
         }
         let latency = self.started.elapsed();
+        let resolved = self.attribution.get();
         AccessLog {
             method: self.method.as_str(),
             path: self.uri.path(),
             status: CLIENT_CLOSED_REQUEST,
             latency,
-            provider: None,
-            model: None,
+            // The log line takes the RAW names: it is bounded by request
+            // volume, not by label cardinality, so it can say exactly
+            // which target the abandoned request was waiting on.
+            provider: (!resolved.provider.is_empty()).then_some(resolved.provider.as_str()),
+            model: (!resolved.requested_model.is_empty())
+                .then_some(resolved.requested_model.as_str()),
             api_key_id: None,
             prompt_tokens: None,
             completion_tokens: None,
@@ -513,7 +529,29 @@ impl Drop for ClientCancelGuard {
             error: Some("client closed the request before the response head was written"),
         }
         .emit();
-        self.metrics.record_client_cancelled(self.endpoint);
+        // Bound the labels the same way every other emit does: the model
+        // through the configured set, the ProviderKey name off the row its
+        // id names — a cancelled request must not be able to mint series
+        // (#451), and its samples must land on the SAME label values the
+        // request families use for the same target.
+        let snap = self.state.snapshot.load();
+        let model = if resolved.requested_model.is_empty() {
+            std::borrow::Cow::Borrowed("unknown")
+        } else {
+            usage_attr::metric_model_label(&snap, &resolved.requested_model)
+        };
+        let resolved_pk = usage_attr::ResolvedPk::resolve(&snap, &resolved.provider_key_id);
+        let pk = if resolved.provider_key_id.is_empty() {
+            usage_attr::PkLabels::default()
+        } else {
+            resolved_pk.labels()
+        };
+        self.state.metrics.record_client_cancelled(CancelledLabels {
+            endpoint: self.endpoint,
+            model: model.as_ref(),
+            provider_key_id: pk.id(),
+            provider_key_name: pk.name(),
+        });
     }
 }
 

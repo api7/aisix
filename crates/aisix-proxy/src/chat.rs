@@ -396,19 +396,21 @@ pub async fn chat_completions(
             // metrics successes use, so a success rate is computable
             // (numerator outcome="success" over a denominator that includes
             // failures — previously these series were success-path-only).
-            // Provider / upstream_model / provider_key are unknown on the
-            // failure path; identity + status + outcome + stream + is_fallback
-            // are what the success-rate query needs.
+            // AISIX-Cloud#1325: name the target the request died on. This
+            // branch used to emit `Upstream::default()`, so a 502 from a
+            // real provider landed on `provider="unknown"` while the same
+            // key's successes landed on the real one.
+            let attributed = crate::attribution::current().unwrap_or_default();
+            let last_target = crate::request_metrics::LastTarget::new(&snapshot, &attributed);
             crate::request_metrics::record(
                 &state,
                 "/v1/chat/completions",
                 crate::request_metrics::Caller::new(&auth),
-                crate::request_metrics::Upstream {
-                    model: metric_model.as_ref(),
-                    stream: req.is_streaming(),
-                    is_fallback: routing.fallback_count() > 0,
-                    ..Default::default()
-                },
+                last_target.upstream(
+                    metric_model.as_ref(),
+                    req.is_streaming(),
+                    routing.fallback_count() > 0,
+                ),
                 status,
                 elapsed,
             );
@@ -416,7 +418,7 @@ pub async fn chat_completions(
                 LatencyLabels {
                     endpoint: "/v1/chat/completions",
                     model: metric_model.as_ref(),
-                    provider: "unknown",
+                    provider: last_target.provider(),
                     status,
                     streaming: req.is_streaming(),
                 },

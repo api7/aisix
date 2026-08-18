@@ -193,11 +193,21 @@ pub async fn transcriptions(
             );
             // The model is never extracted from the multipart form on this
             // path, so every label but the caller's stays `unknown`.
+            // AISIX-Cloud#1325: the multipart form is parsed inside the
+            // dispatch that failed, so this branch never sees the model —
+            // but the request's attribution cell recorded it along with the
+            // target it selected, so an upstream failure here is attributed
+            // exactly like on the JSON endpoints instead of landing wholly
+            // on `unknown`.
+            let attributed = crate::attribution::current().unwrap_or_default();
+            let metric_model =
+                crate::request_metrics::LastTarget::requested_model(&snapshot, &attributed);
+            let last_target = crate::request_metrics::LastTarget::new(&snapshot, &attributed);
             crate::request_metrics::record(
                 &state,
                 "/v1/audio/transcriptions",
                 crate::request_metrics::Caller::new(&auth),
-                crate::request_metrics::Upstream::default(),
+                last_target.upstream(metric_model.as_ref(), false, false),
                 status,
                 elapsed,
             );
@@ -330,11 +340,21 @@ pub async fn translations(
                 Some(&err),
             );
             // Same as transcriptions: nothing resolved off the multipart form.
+            // AISIX-Cloud#1325: the multipart form is parsed inside the
+            // dispatch that failed, so this branch never sees the model —
+            // but the request's attribution cell recorded it along with the
+            // target it selected, so an upstream failure here is attributed
+            // exactly like on the JSON endpoints instead of landing wholly
+            // on `unknown`.
+            let attributed = crate::attribution::current().unwrap_or_default();
+            let metric_model =
+                crate::request_metrics::LastTarget::requested_model(&snapshot, &attributed);
+            let last_target = crate::request_metrics::LastTarget::new(&snapshot, &attributed);
             crate::request_metrics::record(
                 &state,
                 "/v1/audio/translations",
                 crate::request_metrics::Caller::new(&auth),
-                crate::request_metrics::Upstream::default(),
+                last_target.upstream(metric_model.as_ref(), false, false),
                 status,
                 elapsed,
             );
@@ -476,14 +496,17 @@ pub async fn speech(
                 Some(&err),
             );
             let metric_model = crate::usage_attr::metric_model_label(&snapshot, &model_name);
+            // AISIX-Cloud#1325: name the target the request died on. This
+            // branch used to emit `Upstream::default()`, so a 502 from a
+            // real provider landed on `provider="unknown"` while the same
+            // key's successes landed on the real one.
+            let attributed = crate::attribution::current().unwrap_or_default();
+            let last_target = crate::request_metrics::LastTarget::new(&snapshot, &attributed);
             crate::request_metrics::record(
                 &state,
                 "/v1/audio/speech",
                 crate::request_metrics::Caller::new(&auth),
-                crate::request_metrics::Upstream {
-                    model: metric_model.as_ref(),
-                    ..Default::default()
-                },
+                last_target.upstream(metric_model.as_ref(), false, false),
                 status,
                 elapsed,
             );

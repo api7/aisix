@@ -1470,14 +1470,26 @@ impl Telemetry<'_> {
             error: error.as_deref(),
         }
         .emit();
+        // AISIX-Cloud#1325: this tail never took `upstream_model` or the
+        // ProviderKey pair, and its error sites pass `provider: "unknown"`.
+        // All three come off the request's attribution cell, which the
+        // dispatch filled when it selected the target — so a failed video
+        // job is attributable to the same key its successes are.
+        let snap = self.state.snapshot.load();
+        let attributed = crate::attribution::current().unwrap_or_default();
+        let last_target = crate::request_metrics::LastTarget::new(&snap, &attributed);
+        let provider = if provider == "unknown" {
+            last_target.provider()
+        } else {
+            provider
+        };
         crate::request_metrics::record(
             self.state,
             self.endpoint,
             crate::request_metrics::Caller::new(self.auth),
             crate::request_metrics::Upstream {
                 provider,
-                model: model_label,
-                ..Default::default()
+                ..last_target.upstream(model_label, false, false)
             },
             status,
             elapsed,

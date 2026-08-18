@@ -51,8 +51,10 @@
 //! families, so aggregate tokens-per-request is only meaningful per
 //! `endpoint`, never summed across all of them.
 
+use std::borrow::Cow;
 use std::time::Duration;
 
+use aisix_core::AisixSnapshot;
 use aisix_obs::{LlmUsage, RequestLabels, RequestOutcome, UsageLabels};
 
 use crate::auth::AuthenticatedKey;
@@ -172,6 +174,98 @@ impl Default for Upstream<'_> {
             pk: PkLabels::default(),
             stream: false,
             is_fallback: false,
+        }
+    }
+}
+
+/// The upstream a request had committed to when it FAILED, recovered from
+/// the request's attribution cell.
+///
+/// A handler's failure branch holds a `ProxyError`, which carries no
+/// upstream identity, so every failed request used to emit
+/// [`Upstream::default()`] — `provider="unknown"`, no ProviderKey — even
+/// when it had reached a real provider and been answered 5xx. That split
+/// one ProviderKey's successes and failures across two label sets, so a
+/// failure rate grouped by `provider` reported 0% for every real provider
+/// and 100% for `unknown` (AISIX-Cloud#1325).
+///
+/// Names the LAST target the request selected. Under retry / fallback that
+/// is the attempt whose error the caller was actually served, which is the
+/// same attempt the access log's routing telemetry ends on.
+///
+/// Still `unknown` for a request that failed BEFORE selecting a target —
+/// model-not-found, an input guardrail block, a budget refusal. Those
+/// never reached a provider, so there is nothing to attribute and the
+/// placeholder is the honest answer.
+pub(crate) struct LastTarget<'a> {
+    provider: String,
+    upstream_model: &'a str,
+    pk: Option<crate::usage_attr::ResolvedPk<'a>>,
+}
+
+impl<'a> LastTarget<'a> {
+    /// `resolved` has to outlive the emit — read it into a local first
+    /// (`let resolved = attribution::current().unwrap_or_default();`).
+    pub(crate) fn new(snap: &AisixSnapshot, resolved: &'a crate::attribution::Resolved) -> Self {
+        Self {
+            // Lowercased here because the success path lowercases at its
+            // own emit; a failure that spelled the vendor differently
+            // would land on a second series for the same provider.
+            provider: if resolved.provider.is_empty() {
+                UNKNOWN.to_string()
+            } else {
+                resolved.provider.to_ascii_lowercase()
+            },
+            upstream_model: if resolved.upstream_model.is_empty() {
+                UNKNOWN
+            } else {
+                &resolved.upstream_model
+            },
+            // An empty id must fall back to `PkLabels::default()`, NOT to
+            // `ResolvedPk::resolve(snap, "")` — that one reports the id
+            // verbatim, and an empty `provider_key_id` label would be a
+            // third value alongside `unknown` and the real ids.
+            pk: (!resolved.provider_key_id.is_empty())
+                .then(|| crate::usage_attr::ResolvedPk::resolve(snap, &resolved.provider_key_id)),
+        }
+    }
+
+    /// For the SLO latency histogram, which carries `provider` but no
+    /// ProviderKey (per-key dimensions multiply every bucket).
+    pub(crate) fn provider(&self) -> &str {
+        &self.provider
+    }
+
+    /// The failure's labels, keeping the handler's own `model` / `stream`
+    /// / `is_fallback` decisions — those are request-level facts the cell
+    /// has no better answer for.
+    pub(crate) fn upstream<'b>(
+        &'b self,
+        model: &'b str,
+        stream: bool,
+        is_fallback: bool,
+    ) -> Upstream<'b> {
+        Upstream {
+            provider: &self.provider,
+            model,
+            upstream_model: self.upstream_model,
+            pk: self.pk.as_ref().map(|p| p.labels()).unwrap_or_default(),
+            stream,
+            is_fallback,
+        }
+    }
+
+    /// The model the caller addressed, bounded to the configured set —
+    /// for the failure paths that could not recover it locally (the
+    /// multipart audio routes parse it inside the dispatch that failed).
+    pub(crate) fn requested_model<'b>(
+        snap: &AisixSnapshot,
+        resolved: &'b crate::attribution::Resolved,
+    ) -> Cow<'b, str> {
+        if resolved.requested_model.is_empty() {
+            Cow::Borrowed(UNKNOWN)
+        } else {
+            crate::usage_attr::metric_model_label(snap, &resolved.requested_model)
         }
     }
 }
