@@ -23,8 +23,16 @@ pub struct PassthroughRoute {
     pub name: String,
 
     /// Gateway path prefix this route serves, e.g. `/passthrough/openai`.
-    /// The prefix is stripped before the remainder is joined to the target
-    /// URL. Must start with `/`. A route WITHOUT `hosts` must not claim a
+    /// Must start with `/`.
+    ///
+    /// How the prefix is treated depends on the target shape: a
+    /// `target_url` route MOUNTS at the prefix, so it is stripped before
+    /// the remainder is joined to the target base; a `preserve_host` route
+    /// MIRRORS an upstream that owns its own path space, so the prefix only
+    /// selects which requests the route claims and the complete path is
+    /// forwarded unchanged.
+    ///
+    /// A route WITHOUT `hosts` must not claim a
     /// reserved gateway namespace (`/v1`, `/mcp`, `/a2a`, health probes) —
     /// the typed routes would shadow it. A route WITH `hosts` may use any
     /// prefix: host-matched requests dispatch ahead of the typed routes,

@@ -539,7 +539,7 @@
       "type": "string"
     },
     "path_prefix": {
-      "description": "Gateway path prefix this route serves, e.g. `/passthrough/openai`. The prefix is stripped before the remainder is joined to the target URL. Must start with `/`. A route WITHOUT `hosts` must not claim a reserved gateway namespace (`/v1`, `/mcp`, `/a2a`, health probes) — the typed routes would shadow it. A route WITH `hosts` may use any prefix: host-matched requests dispatch ahead of the typed routes, which is what lets a forward proxy relay an upstream's own namespace (e.g. Copilot's `/mcp/...` on its chat host). At least one of `path_prefix` / `hosts` is required; when both are set the request must satisfy both.",
+      "description": "Gateway path prefix this route serves, e.g. `/passthrough/openai`. Must start with `/`.\n\nHow the prefix is treated depends on the target shape: a `target_url` route MOUNTS at the prefix, so it is stripped before the remainder is joined to the target base; a `preserve_host` route MIRRORS an upstream that owns its own path space, so the prefix only selects which requests the route claims and the complete path is forwarded unchanged.\n\nA route WITHOUT `hosts` must not claim a reserved gateway namespace (`/v1`, `/mcp`, `/a2a`, health probes) — the typed routes would shadow it. A route WITH `hosts` may use any prefix: host-matched requests dispatch ahead of the typed routes, which is what lets a forward proxy relay an upstream's own namespace (e.g. Copilot's `/mcp/...` on its chat host). At least one of `path_prefix` / `hosts` is required; when both are set the request must satisfy both.",
       "minLength": 1,
       "pattern": "^/",
       "type": [
