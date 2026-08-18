@@ -298,6 +298,7 @@ pub(crate) fn attempt_reached_upstream(err: &ProxyError) -> bool {
         | ProxyError::JwtInvalid
         | ProxyError::JwtExpired
         | ProxyError::JwtClaimsRejected
+        | ProxyError::JwtInsufficientScope { .. }
         | ProxyError::JwtIdentityUnmapped
         | ProxyError::JwksUnavailable
         | ProxyError::ModelNotFound(_)

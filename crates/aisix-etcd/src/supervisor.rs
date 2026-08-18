@@ -837,6 +837,9 @@ impl<P: ConfigProvider> Supervisor<P> {
                 "passthrough_routes" => {
                     new.passthrough_routes.remove(parsed.id);
                 }
+                "mcp_auth_settings" => {
+                    new.mcp_auth_settings.remove(parsed.id);
+                }
                 _ => {}
             }
             new
@@ -1173,6 +1176,7 @@ fn merge_snapshot(dst: &AisixSnapshot, src: &AisixSnapshot) {
         oidc_providers,
         claim_mappings,
         passthrough_routes,
+        mcp_auth_settings,
     } = src;
     for e in models.entries() {
         dst.models.insert(clone_entry(&e));
@@ -1216,6 +1220,9 @@ fn merge_snapshot(dst: &AisixSnapshot, src: &AisixSnapshot) {
     for e in passthrough_routes.entries() {
         dst.passthrough_routes.insert(clone_entry(&e));
     }
+    for e in mcp_auth_settings.entries() {
+        dst.mcp_auth_settings.insert(clone_entry(&e));
+    }
 }
 
 /// Whether the snapshot holds an entry for `(kind, id)`. An unknown
@@ -1238,6 +1245,7 @@ fn snapshot_has(snap: &AisixSnapshot, kind: &str, id: &str) -> bool {
         oidc_providers,
         claim_mappings,
         passthrough_routes,
+        mcp_auth_settings,
     } = snap;
     match kind {
         "models" => models.get_by_id(id).is_some(),
@@ -1254,6 +1262,7 @@ fn snapshot_has(snap: &AisixSnapshot, kind: &str, id: &str) -> bool {
         "oidc_providers" => oidc_providers.get_by_id(id).is_some(),
         "claim_mappings" => claim_mappings.get_by_id(id).is_some(),
         "passthrough_routes" => passthrough_routes.get_by_id(id).is_some(),
+        "mcp_auth_settings" => mcp_auth_settings.get_by_id(id).is_some(),
         _ => false,
     }
 }
@@ -1289,6 +1298,7 @@ fn resource_counts(snap: &AisixSnapshot) -> BTreeMap<String, usize> {
         ("oidc_providers", snap.oidc_providers.len()),
         ("claim_mappings", snap.claim_mappings.len()),
         ("passthrough_routes", snap.passthrough_routes.len()),
+        ("mcp_auth_settings", snap.mcp_auth_settings.len()),
     ] {
         if n > 0 {
             counts.insert(kind.to_string(), n);
@@ -1440,6 +1450,12 @@ mod tests {
             "issuer": "https://idp.example.com/realms/agents",
             "audiences": ["aisix-gateway"]
         }"#;
+        // The MCP OAuth discovery settings row (AISIX-Cloud#1143) —
+        // configuring the resource URL mid-run must activate the
+        // discovery surface without a resync.
+        const VALID_MCP_AUTH_SETTINGS: &[u8] = br#"{
+            "resource_url": "https://gw.example.com/mcp"
+        }"#;
         // A claim mapping created mid-run (AISIX-Cloud#564) — same
         // guard: a rule added via watch must be live without a resync.
         const VALID_CLAIM_MAPPING: &[u8] = br#"{
@@ -1477,6 +1493,11 @@ mod tests {
                 "OidcProvider",
             ),
             (
+                "/aisix/mcp_auth_settings/env-1",
+                VALID_MCP_AUTH_SETTINGS,
+                "McpAuthSettings",
+            ),
+            (
                 "/aisix/claim_mappings/cm-1",
                 VALID_CLAIM_MAPPING,
                 "ClaimMapping",
@@ -1504,6 +1525,11 @@ mod tests {
         );
         assert_eq!(snap.oidc_providers.len(), 1, "OidcProvider not merged");
         assert_eq!(snap.claim_mappings.len(), 1, "ClaimMapping not merged");
+        assert_eq!(
+            snap.mcp_auth_settings.len(),
+            1,
+            "McpAuthSettings not merged"
+        );
     }
 
     #[tokio::test]
@@ -1530,6 +1556,13 @@ mod tests {
                     br#"{"name":"idp","issuer":"https://idp.example.com","audiences":["aisix"]}"#,
                     1,
                 ),
+                // AISIX-Cloud#1143: clearing the resource URL projects a
+                // delete; it must deactivate the discovery surface.
+                entry(
+                    "/aisix/mcp_auth_settings/env-1",
+                    br#"{"resource_url":"https://gw.example.com/mcp"}"#,
+                    1,
+                ),
                 // AISIX-Cloud#564: deleting a claim mapping must reach
                 // the snapshot, or revoking a rule never takes effect.
                 entry(
@@ -1554,6 +1587,8 @@ mod tests {
         assert_eq!(sup.handle().load().claim_mappings.len(), 1);
         assert!(sup.apply_delete("/aisix/claim_mappings/cm-1"));
         assert!(sup.handle().load().claim_mappings.is_empty());
+        assert!(sup.apply_delete("/aisix/mcp_auth_settings/env-1"));
+        assert!(sup.handle().load().mcp_auth_settings.is_empty());
     }
 
     #[tokio::test]

@@ -26,13 +26,13 @@
 use aisix_core::models::{
     validate_a2a_agent_lenient, validate_apikey_lenient, validate_cache_policy_lenient,
     validate_claim_mapping_lenient, validate_guardrail_attachment_lenient,
-    validate_guardrail_lenient, validate_mcp_policy_lenient, validate_mcp_server_lenient,
-    validate_model_lenient, validate_observability_exporter_lenient,
+    validate_guardrail_lenient, validate_mcp_auth_settings_lenient, validate_mcp_policy_lenient,
+    validate_mcp_server_lenient, validate_model_lenient, validate_observability_exporter_lenient,
     validate_oidc_provider_lenient, validate_passthrough_route_lenient,
     validate_provider_key_lenient, validate_rate_limit_policy_lenient, A2aAgent, ApiKey,
-    CachePolicy, ClaimMapping, Guardrail, GuardrailAttachment, McpPolicy, McpServer, Model,
-    ObservabilityExporter, OidcProvider, PassthroughRoute, ProviderKey, RateLimitPolicy,
-    SchemaError,
+    CachePolicy, ClaimMapping, Guardrail, GuardrailAttachment, McpAuthSettings, McpPolicy,
+    McpServer, Model, ObservabilityExporter, OidcProvider, PassthroughRoute, ProviderKey,
+    RateLimitPolicy, SchemaError,
 };
 use aisix_core::resource::ResourceEntry;
 use aisix_core::AisixSnapshot;
@@ -434,6 +434,18 @@ pub fn build_snapshot(prefix: &str, entries: &[RawEntry]) -> (AisixSnapshot, Bui
                     &mut stats,
                 ) {
                     snapshot.claim_mappings.insert(entry);
+                }
+            }
+            "mcp_auth_settings" => {
+                if let Some(entry) = validate_and_parse::<McpAuthSettings>(
+                    &raw.key,
+                    raw.revision,
+                    parsed,
+                    &value,
+                    validate_mcp_auth_settings_lenient,
+                    &mut stats,
+                ) {
+                    snapshot.mcp_auth_settings.insert(entry);
                 }
             }
             other => {

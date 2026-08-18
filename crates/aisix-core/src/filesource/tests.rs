@@ -656,6 +656,55 @@ oidc_providers:
 }
 
 #[test]
+fn mcp_auth_settings_singleton_loads() {
+    let contents = r#"
+_format_version: "1"
+mcp_auth_settings:
+  - resource_url: https://gw.example.com/mcp
+"#;
+    let snapshot = load(contents, &env_of(&[])).expect("loads");
+    assert_eq!(snapshot.mcp_auth_settings.len(), 1);
+    let entry = snapshot.mcp_auth_settings.entries().pop().unwrap();
+    assert_eq!(entry.value.resource_url, "https://gw.example.com/mcp");
+}
+
+#[test]
+fn mcp_auth_settings_resource_url_with_credentials_is_a_load_error() {
+    // The resource URL is served verbatim on the unauthenticated PRM
+    // endpoint, so embedded credentials must fail the load — same rule
+    // as OIDC issuer/jwks_uri.
+    let contents = r#"
+_format_version: "1"
+mcp_auth_settings:
+  - resource_url: https://user:s3cret@gw.example.com/mcp
+"#;
+    let errs = errors_of(load(contents, &env_of(&[])));
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("must not embed credentials")),
+        "{errs:?}"
+    );
+}
+
+#[test]
+fn duplicate_mcp_auth_settings_is_a_load_error() {
+    // The kind is a per-environment singleton: its fixed identity makes
+    // any second entry a pass-1 duplicate (AISIX-Cloud#1143).
+    let contents = r#"
+_format_version: "1"
+mcp_auth_settings:
+  - resource_url: https://gw.example.com/mcp
+  - resource_url: https://other.example.com/mcp
+"#;
+    let errs = errors_of(load(contents, &env_of(&[])));
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    assert!(
+        errs[0].contains("duplicate mcp_auth_settings entry"),
+        "{errs:?}"
+    );
+}
+
+#[test]
 fn oidc_url_with_embedded_credentials_is_a_load_error() {
     let contents = r#"
 _format_version: "1"
