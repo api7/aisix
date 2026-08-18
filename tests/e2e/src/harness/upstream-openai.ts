@@ -7,6 +7,14 @@ export interface OpenAiUpstreamOptions {
   nonStreamBody?: unknown;
   /** Sequence of SSE event payloads (already-stringified JSON or `[DONE]`). */
   streamEvents?: string[];
+  /**
+   * Complete SSE frames written VERBATIM, terminators included. Unlike
+   * `streamEvents` (which the mock wraps in `data: …\n\n`) this lets a spec
+   * reproduce a server that labels its frames — e.g. the `event: token_usage`
+   * frame an IDE agent backend reports its token counts on. Takes precedence
+   * over `streamEvents` when both are set.
+   */
+  rawStreamFrames?: string[];
   /** Inserted before the response is written (delays status + headers). */
   responseDelayMs?: number;
   /**
@@ -62,6 +70,8 @@ export interface OpenAiUpstreamOptions {
 export interface OpenAiUpstreamStep {
   nonStreamBody?: unknown;
   streamEvents?: string[];
+  /** See `OpenAiUpstreamOptions.rawStreamFrames`. */
+  rawStreamFrames?: string[];
   responseDelayMs?: number;
   /** See `OpenAiUpstreamOptions.firstEventDelayMs`. */
   firstEventDelayMs?: number;
@@ -168,7 +178,7 @@ export async function startOpenAiUpstream(
         return;
       }
 
-      const isStream = !!step.streamEvents;
+      const isStream = !!step.streamEvents || !!step.rawStreamFrames;
       if (isStream) {
         res.statusCode = 200;
         res.setHeader("content-type", "text/event-stream");
@@ -178,7 +188,10 @@ export async function startOpenAiUpstream(
         // first token (TTFT timeout) independently of the headers (#554).
         res.flushHeaders();
         if (step.firstEventDelayMs) await sleep(step.firstEventDelayMs);
-        const events = step.streamEvents ?? [];
+        // Verbatim frames carry their own `event:`/`data:` lines and
+        // terminators; `streamEvents` are payloads the mock wraps.
+        const raw = step.rawStreamFrames;
+        const events = raw ?? step.streamEvents ?? [];
         for (let i = 0; i < events.length; i++) {
           // The gateway may have abandoned a stalled stream (#554 read
           // timeout) and closed the connection; stop writing rather than
@@ -191,7 +204,7 @@ export async function startOpenAiUpstream(
             res.destroy();
             return;
           }
-          res.write(`data: ${events[i]}\n\n`);
+          res.write(raw ? events[i] : `data: ${events[i]}\n\n`);
           if (step.eventDelayMs) await sleep(step.eventDelayMs);
         }
         if (!res.writableEnded && !res.destroyed) res.end();
