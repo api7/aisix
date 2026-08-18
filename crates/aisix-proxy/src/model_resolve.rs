@@ -26,6 +26,10 @@ pub(crate) fn resolve_model(
     snapshot: &AisixSnapshot,
     requested: &str,
 ) -> Option<Arc<ResourceEntry<Model>>> {
+    // Every client-facing handler resolves the caller's `model` here, which
+    // makes this the one place that knows what a request ASKED for — the
+    // terminal emitters that run after the handler is gone read it back off
+    // the request's attribution cell (see `attribution`).
     if let Some(exact) = snapshot.models.get_by_name(requested) {
         crate::attribution::note_requested_model(requested);
         return Some(exact);
