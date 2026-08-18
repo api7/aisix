@@ -34,9 +34,13 @@ const CALLER_KEY_HASH = createHash("sha256")
 
 const PK_NAME = "usage1317-pk";
 const EMBED_PK_NAME = "usage1317-embed-pk";
+const MSG_PK_NAME = "usage1317-messages-pk";
+const RESP_PK_NAME = "usage1317-responses-pk";
 const SLOW_PK_NAME = "usage1317-slow-pk";
 const MODEL = "usage1317-chat";
 const EMBED_MODEL = "usage1317-embed";
+const MSG_MODEL = "usage1317-messages";
+const RESP_MODEL = "usage1317-responses";
 const SLOW_MODEL = "usage1317-slow";
 
 describe("usage-event and cancel attribution #1317 e2e", () => {
@@ -61,7 +65,8 @@ describe("usage-event and cancel attribution #1317 e2e", () => {
     // The mock answers every route with one canned body, so the embeddings
     // family needs its own upstream to return an embeddings-shaped one.
     const embeddings = await startOpenAiUpstream({ nonStreamBody: embeddingBody() });
-    upstreams.push(fast, slow, embeddings);
+    const responses = await startOpenAiUpstream({ nonStreamBody: responsesBody() });
+    upstreams.push(fast, slow, embeddings, responses);
     slowUpstream = slow;
 
     app = await spawnApp();
@@ -89,6 +94,30 @@ describe("usage-event and cancel attribution #1317 e2e", () => {
       model_name: "text-embedding-3-small",
       provider_key_id: embedPk.id,
     });
+    // `/v1/messages` bridges an Anthropic-shape request onto this
+    // OpenAI upstream, so it reuses the chat-shaped mock.
+    const msgPk = await seed.createProviderKey({
+      display_name: MSG_PK_NAME,
+      secret: "sk-mock",
+      api_base: `${fast.baseUrl}/v1`,
+    });
+    await seed.createModel({
+      display_name: MSG_MODEL,
+      provider: "openai",
+      model_name: "gpt-4o-mini",
+      provider_key_id: msgPk.id,
+    });
+    const respPk = await seed.createProviderKey({
+      display_name: RESP_PK_NAME,
+      secret: "sk-mock",
+      api_base: `${responses.baseUrl}/v1`,
+    });
+    await seed.createModel({
+      display_name: RESP_MODEL,
+      provider: "openai",
+      model_name: "gpt-4o-mini",
+      provider_key_id: respPk.id,
+    });
     const slowPk = await seed.createProviderKey({
       display_name: SLOW_PK_NAME,
       secret: "sk-mock",
@@ -103,7 +132,7 @@ describe("usage-event and cancel attribution #1317 e2e", () => {
 
     await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
-      allowed_models: [MODEL, SLOW_MODEL, EMBED_MODEL],
+      allowed_models: [MODEL, SLOW_MODEL, EMBED_MODEL, MSG_MODEL, RESP_MODEL],
     });
 
     // The caller key is seeded last, so `GET /v1/models` answering 200 implies
@@ -159,38 +188,80 @@ describe("usage-event and cancel attribution #1317 e2e", () => {
     expect(labelOf(request!, "provider_key_id")).toBe(pkId);
   });
 
-  test("the emit labels are wired per handler, not just on chat", async (ctx) => {
-    if (!etcdReachable || !app) {
-      ctx.skip();
-      return;
-    }
-    // Every handler calls `try_emit` itself, so a family member can land with
-    // the attribution argument left at its placeholder.
-    const res = await fetch(`${app.proxyUrl}/v1/embeddings`, {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${CALLER_PLAINTEXT}`,
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({ model: EMBED_MODEL, input: "hi" }),
-    });
-    expect(res.status, await res.clone().text()).toBe(200);
-    await res.text();
-
-    const text = await scrape(app);
-    const emitted = sample(text, "aisix_usage_events_emitted_total", {
+  // Every handler calls `try_emit` itself, so each one decides separately
+  // whether to pass the request's attribution or the placeholder — the
+  // compiler makes it supply an argument, not the RIGHT one. These are the
+  // families the repo's endpoint-coverage rule names, plus embeddings.
+  const HANDLERS: Array<{
+    handler: string;
+    path: string;
+    model: string;
+    pk: string;
+    body: unknown;
+  }> = [
+    {
       handler: "embeddings",
+      path: "/v1/embeddings",
       model: EMBED_MODEL,
-      provider_key_name: EMBED_PK_NAME,
+      pk: EMBED_PK_NAME,
+      body: { input: "hi" },
+    },
+    {
+      handler: "messages",
+      path: "/v1/messages",
+      model: MSG_MODEL,
+      pk: MSG_PK_NAME,
+      body: { max_tokens: 16, messages: [{ role: "user", content: "hi" }] },
+    },
+    {
+      handler: "responses",
+      path: "/v1/responses",
+      model: RESP_MODEL,
+      pk: RESP_PK_NAME,
+      body: { input: "hi" },
+    },
+  ];
+
+  for (const route of HANDLERS) {
+    test(`the ${route.handler} handler emits its own attribution`, async (ctx) => {
+      if (!etcdReachable || !app) {
+        ctx.skip();
+        return;
+      }
+      const res = await fetch(`${app.proxyUrl}${route.path}`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${CALLER_PLAINTEXT}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ model: route.model, ...(route.body as object) }),
+      });
+      const detail = await res.text();
+      expect(res.status, detail).toBe(200);
+
+      const text = await scrape(app);
+      const attribution = {
+        model: route.model,
+        provider_key_name: route.pk,
+      };
+      expect(
+        sample(text, "aisix_usage_events_emitted_total", {
+          handler: route.handler,
+          ...attribution,
+        }),
+        `no attributed ${route.handler} emit sample:\n${text}`,
+      ).toBeTruthy();
+      // This gateway wires no sink, so the same request must also land on
+      // the drops counter under the same attribution.
+      expect(
+        sample(text, "aisix_usage_event_drops_total", {
+          reason: "sink_disabled",
+          ...attribution,
+        }),
+        `no attributed ${route.handler} drop sample:\n${text}`,
+      ).toBeTruthy();
     });
-    expect(emitted, `no attributed embeddings emit sample:\n${text}`).toBeTruthy();
-    const dropped = sample(text, "aisix_usage_event_drops_total", {
-      reason: "sink_disabled",
-      model: EMBED_MODEL,
-      provider_key_name: EMBED_PK_NAME,
-    });
-    expect(dropped, `no attributed embeddings drop sample:\n${text}`).toBeTruthy();
-  });
+  }
 
   test("a request with no resolvable model still carries a bounded placeholder", async (ctx) => {
     if (!etcdReachable || !app) {
@@ -296,6 +367,25 @@ function sample(
 
 function labelOf(line: string, label: string): string | undefined {
   return new RegExp(`${label}="([^"]*)"`).exec(line)?.[1];
+}
+
+function responsesBody() {
+  return {
+    id: "resp_usage1317",
+    object: "response",
+    created_at: 0,
+    status: "completed",
+    model: "gpt-4o-mini",
+    output: [
+      {
+        id: "msg_usage1317",
+        type: "message",
+        role: "assistant",
+        content: [{ type: "output_text", text: "hello" }],
+      },
+    ],
+    usage: { input_tokens: 11, output_tokens: 13, total_tokens: 24 },
+  };
 }
 
 function embeddingBody() {
