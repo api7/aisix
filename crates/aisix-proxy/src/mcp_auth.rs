@@ -46,30 +46,41 @@ pub(crate) struct DiscoveryIdentity {
 }
 
 /// Resolve the discovery identity, or `None` while the surface is
-/// dormant (no settings row, no enabled provider, or a malformed row).
+/// dormant (no settings row, duplicate settings rows, no enabled
+/// provider, or a malformed row).
 ///
 /// A malformed row (unparseable URL, non-http(s) scheme, query or
-/// fragment, path ≠ `/mcp`) keeps the surface dormant and logs one
-/// process-wide warning — never per request. The absent-row state is a
-/// legitimate steady state (every pre-#1143 environment) and logs
-/// nothing.
+/// fragment, path ≠ `/mcp`) and a duplicated singleton both keep the
+/// surface dormant and log one process-wide warning — never per
+/// request. The absent-row state is a legitimate steady state (every
+/// pre-#1143 environment) and logs nothing.
 pub(crate) fn discovery_identity(snapshot: &AisixSnapshot) -> Option<DiscoveryIdentity> {
-    let mut entries = snapshot.mcp_auth_settings.entries();
+    let entries = snapshot.mcp_auth_settings.entries();
     if entries.is_empty() {
         return None;
     }
     if entries.len() > 1 {
-        // The CP keys the row by the environment id, so a second row
-        // should be impossible; pick deterministically and say so once.
+        // The CP keys the row by the environment id, so a second row can
+        // only be a stale/migrated or hand-written key — and no ordering
+        // over the ids says which one is current. Publishing either would
+        // put a coin-flip URI in the PRM `resource` and in the audience
+        // the tokens are checked against, so fail closed instead: the
+        // surface stays dormant until the duplicate is removed.
+        //
+        // The check belongs here, not in the loader: the watch supervisor
+        // applies puts incrementally and never re-runs the full-load path,
+        // so a duplicate can appear in a live snapshot without the loader
+        // ever seeing both rows together.
         static MULTI_WARN: Once = Once::new();
         MULTI_WARN.call_once(|| {
             tracing::warn!(
                 target: "aisix::mcp_auth",
                 count = entries.len(),
-                "multiple mcp_auth_settings rows in snapshot; using the smallest id",
+                "multiple mcp_auth_settings rows in snapshot; the OAuth discovery \
+                 surface stays dormant until exactly one remains",
             );
         });
-        entries.sort_by(|a, b| a.id.cmp(&b.id));
+        return None;
     }
     let settings = &entries[0];
 
@@ -299,6 +310,22 @@ mod tests {
     }
 
     #[test]
+    fn dormant_with_duplicate_settings_rows() {
+        // The row is a per-environment singleton. A second one (a stale
+        // or migrated key) must not be resolved by picking an id order:
+        // that would publish a coin-flip `resource` URI and audience
+        // target. Fail closed until exactly one row remains.
+        let snap = active_snapshot();
+        assert!(discovery_identity(&snap).is_some());
+        // The stale row deliberately sorts BEFORE the live one, so a
+        // reintroduced "smallest id wins" would resolve the stale URL.
+        snap.mcp_auth_settings
+            .insert(settings_entry("env-0", "https://stale.example.com/mcp"));
+        assert_eq!(snap.mcp_auth_settings.entries().len(), 2);
+        assert_eq!(discovery_identity(&snap), None);
+    }
+
+    #[test]
     fn dormant_on_malformed_resource_url() {
         for bad in [
             "not a url",
@@ -330,18 +357,6 @@ mod tests {
             identity.challenge_url,
             "https://gw.example.com/.well-known/oauth-protected-resource/mcp"
         );
-    }
-
-    #[test]
-    fn multiple_rows_pick_the_smallest_id_deterministically() {
-        // The CP keys the row by the environment id so a second row
-        // should be impossible; if one ever appears the pick must be
-        // stable across processes, not insertion-ordered.
-        let snap = active_snapshot(); // row id "env-1"
-        snap.mcp_auth_settings
-            .insert(settings_entry("env-0", "http://first.example.com/mcp"));
-        let identity = discovery_identity(&snap).expect("active");
-        assert_eq!(identity.resource_url, "http://first.example.com/mcp");
     }
 
     #[test]
