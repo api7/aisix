@@ -464,6 +464,14 @@
           ],
           "title": "OpenAI-compatible completions / FIM",
           "type": "string"
+        },
+        {
+          "description": "OpenAI Responses API envelope: `input` items on the request, `output` items on the response, `response.output_text.delta` events while streaming, and `usage` in the `input_tokens`/`output_tokens` spelling — carried on the terminal `response.completed` event when the response streams.",
+          "enum": [
+            "openai_responses"
+          ],
+          "title": "OpenAI Responses API",
+          "type": "string"
         }
       ]
     }

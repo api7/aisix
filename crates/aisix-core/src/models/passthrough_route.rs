@@ -209,6 +209,12 @@ pub enum PassthroughProtocol {
     /// OpenAI-compatible legacy completions / FIM envelope (`prompt` [+
     /// `suffix`], streamed `choices[].text`, `usage`).
     OpenaiCompletions,
+    /// OpenAI Responses API envelope: `input` items on the request,
+    /// `output` items on the response, `response.output_text.delta`
+    /// events while streaming, and `usage` in the
+    /// `input_tokens`/`output_tokens` spelling — carried on the terminal
+    /// `response.completed` event when the response streams.
+    OpenaiResponses,
 }
 
 impl Resource for PassthroughRoute {
