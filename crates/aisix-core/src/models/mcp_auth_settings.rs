@@ -26,7 +26,6 @@
 //! anyway (a stale etcd key), rather than picking one by id order.
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
 
 use crate::resource::Resource;
 
@@ -95,60 +94,41 @@ pub struct McpAnonymousAccess {
     #[schemars(length(min = 1))]
     pub source_cidrs: Vec<String>,
 
-    /// Registered MCP server names reachable anonymously at
-    /// `/mcp/{server}`.
+    /// Registered MCP server names anonymous callers may reach.
     ///
-    /// This list is ALSO the anonymous principal's ceiling: the tools of
-    /// the listed servers are intersected with the key's own grant on
-    /// BOTH entries. Without that, a key whose grant is wider than the
-    /// list would let an anonymous caller reach an unlisted server's
-    /// tools through the aggregated endpoint by naming
-    /// `<server>__<tool>` directly — `/mcp/{server}` closed, aggregated
-    /// `/mcp` open. Empty means no scoped entry is served (and, with
-    /// `aggregate_entry`, that the aggregated one exposes nothing).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// This is the anonymous principal's CEILING, not merely the list of
+    /// scoped entries to open: the listed servers' tools are
+    /// intersected with the key's own grant on BOTH entries. Without
+    /// that, a key whose grant is wider than the list would let an
+    /// anonymous caller reach an unlisted server's tools through the
+    /// aggregated endpoint by naming `<server>__<tool>` directly —
+    /// `/mcp/{server}` closed, aggregated `/mcp` open.
+    ///
+    /// Required and non-empty, because an empty ceiling admits no tool
+    /// on either entry: an anonymous block listing no server could
+    /// never serve a useful request, including through
+    /// `aggregate_entry`. It is also why a newly registered server is
+    /// never anonymous by default — reaching anonymous callers is
+    /// always a name added here.
+    #[schemars(length(min = 1))]
     pub servers: Vec<String>,
 
-    /// Whether the aggregated `/mcp` endpoint serves anonymous callers.
+    /// Whether the aggregated `/mcp` endpoint ALSO serves anonymous
+    /// callers. It exposes the same `servers`, under their
+    /// `<server>__<tool>` namespaced names.
+    ///
     /// Off by default: it is the entry a standard MCP client uses for
-    /// OAuth discovery, and its tools carry the `<server>__<tool>`
-    /// namespace that a client migrating from a single-server endpoint
-    /// does not use. Turning it on suppresses the `WWW-Authenticate`
-    /// discovery hint there, since a no-credential request succeeds
-    /// instead of producing the 401 that carries it.
+    /// OAuth discovery, and the namespaced names are not what a client
+    /// migrating from a single-server endpoint uses. Turning it on
+    /// suppresses the `WWW-Authenticate` discovery hint there, since a
+    /// no-credential request succeeds instead of producing the 401 that
+    /// carries it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub aggregate_entry: bool,
 }
 
 fn default_enabled() -> bool {
     true
-}
-
-/// Cross-field rules for [`McpAnonymousAccess`], injected as an `allOf`
-/// on the produced schema so the strict write path and the lenient etcd
-/// read path enforce the same coupling.
-pub fn mcp_auth_settings_coupling() -> Value {
-    json!([
-        // An anonymous block that names no entry can never serve a
-        // request. Rejecting it beats accepting configuration that
-        // silently does nothing (the operator's next move is to wonder
-        // why anonymous "does not work").
-        {
-            "if": { "required": ["anonymous"] },
-            "then": { "properties": { "anonymous": { "anyOf": [
-                {
-                    "title": "Scoped entries",
-                    "required": ["servers"],
-                    "properties": { "servers": { "minItems": 1 } }
-                },
-                {
-                    "title": "Aggregated entry",
-                    "required": ["aggregate_entry"],
-                    "properties": { "aggregate_entry": { "const": true } }
-                }
-            ] } } }
-        }
-    ])
 }
 
 impl Resource for McpAuthSettings {
@@ -229,10 +209,14 @@ mod tests {
             }
         }))
         .is_err());
+        assert!(validate_mcp_auth_settings(&serde_json::json!({
+            "anonymous": { "api_key_id": "ak-1", "source_cidrs": ["10.0.0.0/8"] }
+        }))
+        .is_err());
     }
 
     #[test]
-    fn anonymous_must_name_at_least_one_entry() {
+    fn anonymous_must_name_at_least_one_server() {
         let base = |extra: serde_json::Value| {
             let mut anon = serde_json::json!({
                 "api_key_id": "ak-1",
@@ -244,21 +228,28 @@ mod tests {
             }
             serde_json::json!({ "anonymous": anon })
         };
-        // Neither entry named: the block could never serve a request.
+        // The list is the principal's CEILING, so an absent or empty one
+        // admits no tool on either entry. `aggregate_entry` cannot stand
+        // in for it: on its own it would be an open door onto an empty
+        // room, which reads as enabled and serves nothing.
         assert!(validate_mcp_auth_settings(&base(serde_json::json!({}))).is_err());
         assert!(validate_mcp_auth_settings(&base(serde_json::json!({ "servers": [] }))).is_err());
         assert!(
-            validate_mcp_auth_settings(&base(serde_json::json!({ "aggregate_entry": false })))
+            validate_mcp_auth_settings(&base(serde_json::json!({ "aggregate_entry": true })))
                 .is_err()
         );
-        // Either one alone is enough.
+        assert!(validate_mcp_auth_settings(&base(
+            serde_json::json!({ "servers": [], "aggregate_entry": true })
+        ))
+        .is_err());
+
         assert!(
             validate_mcp_auth_settings(&base(serde_json::json!({ "servers": ["docs"] }))).is_ok()
         );
-        assert!(
-            validate_mcp_auth_settings(&base(serde_json::json!({ "aggregate_entry": true })))
-                .is_ok()
-        );
+        assert!(validate_mcp_auth_settings(&base(
+            serde_json::json!({ "servers": ["docs"], "aggregate_entry": true })
+        ))
+        .is_ok());
     }
 
     #[test]

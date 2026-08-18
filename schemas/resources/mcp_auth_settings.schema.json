@@ -1,52 +1,13 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "additionalProperties": false,
-  "allOf": [
-    {
-      "if": {
-        "required": [
-          "anonymous"
-        ]
-      },
-      "then": {
-        "properties": {
-          "anonymous": {
-            "anyOf": [
-              {
-                "properties": {
-                  "servers": {
-                    "minItems": 1
-                  }
-                },
-                "required": [
-                  "servers"
-                ],
-                "title": "Scoped entries"
-              },
-              {
-                "properties": {
-                  "aggregate_entry": {
-                    "const": true
-                  }
-                },
-                "required": [
-                  "aggregate_entry"
-                ],
-                "title": "Aggregated entry"
-              }
-            ]
-          }
-        }
-      }
-    }
-  ],
   "definitions": {
     "McpAnonymousAccess": {
       "additionalProperties": false,
       "description": "Anonymous access configuration for this environment's `/mcp` entries.\n\nA request that carries NO gateway credential and arrives from `source_cidrs` runs as the `api_key_id` principal: its MCP tool grant, rate limits, budget, guardrails and usage attribution all apply, so anonymous traffic stays governable instead of bypassing the pipeline. A request carrying a credential is authenticated normally and a bad one is rejected — never downgraded to anonymous.",
       "properties": {
         "aggregate_entry": {
-          "description": "Whether the aggregated `/mcp` endpoint serves anonymous callers. Off by default: it is the entry a standard MCP client uses for OAuth discovery, and its tools carry the `<server>__<tool>` namespace that a client migrating from a single-server endpoint does not use. Turning it on suppresses the `WWW-Authenticate` discovery hint there, since a no-credential request succeeds instead of producing the 401 that carries it.",
+          "description": "Whether the aggregated `/mcp` endpoint ALSO serves anonymous callers. It exposes the same `servers`, under their `<server>__<tool>` namespaced names.\n\nOff by default: it is the entry a standard MCP client uses for OAuth discovery, and the namespaced names are not what a client migrating from a single-server endpoint uses. Turning it on suppresses the `WWW-Authenticate` discovery hint there, since a no-credential request succeeds instead of producing the 401 that carries it.",
           "type": "boolean"
         },
         "api_key_id": {
@@ -60,10 +21,11 @@
           "type": "boolean"
         },
         "servers": {
-          "description": "Registered MCP server names reachable anonymously at `/mcp/{server}`.\n\nThis list is ALSO the anonymous principal's ceiling: the tools of the listed servers are intersected with the key's own grant on BOTH entries. Without that, a key whose grant is wider than the list would let an anonymous caller reach an unlisted server's tools through the aggregated endpoint by naming `<server>__<tool>` directly — `/mcp/{server}` closed, aggregated `/mcp` open. Empty means no scoped entry is served (and, with `aggregate_entry`, that the aggregated one exposes nothing).",
+          "description": "Registered MCP server names anonymous callers may reach.\n\nThis is the anonymous principal's CEILING, not merely the list of scoped entries to open: the listed servers' tools are intersected with the key's own grant on BOTH entries. Without that, a key whose grant is wider than the list would let an anonymous caller reach an unlisted server's tools through the aggregated endpoint by naming `<server>__<tool>` directly — `/mcp/{server}` closed, aggregated `/mcp` open.\n\nRequired and non-empty, because an empty ceiling admits no tool on either entry: an anonymous block listing no server could never serve a useful request, including through `aggregate_entry`. It is also why a newly registered server is never anonymous by default — reaching anonymous callers is always a name added here.",
           "items": {
             "type": "string"
           },
+          "minItems": 1,
           "type": "array"
         },
         "source_cidrs": {
@@ -77,6 +39,7 @@
       },
       "required": [
         "api_key_id",
+        "servers",
         "source_cidrs"
       ],
       "type": "object"
