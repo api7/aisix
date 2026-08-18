@@ -721,12 +721,7 @@ impl UsageSink {
     /// records did we lose" answerable. The event itself cannot supply
     /// them: its `requested_model` is caller-controlled text (#451) and it
     /// carries no ProviderKey id at all.
-    pub fn try_emit(
-        &self,
-        handler: &'static str,
-        event: UsageEvent,
-        labels: UsageEventLabels<'_>,
-    ) {
+    pub fn try_emit(&self, handler: &'static str, event: UsageEvent, labels: UsageEventLabels<'_>) {
         log_provider_call(handler, &event);
         // Normalise inbound_protocol to a fixed `&'static str` set at
         // the boundary (audit MEDIUM-3). This both kills the heap
@@ -853,7 +848,9 @@ mod tests {
         ev.attempt_kind = "fallback".into();
         ev.status_code = 200;
 
-        let out = capture_logs(|| UsageSink::disabled().try_emit("chat", ev, UsageEventLabels::default()));
+        let out = capture_logs(|| {
+            UsageSink::disabled().try_emit("chat", ev, UsageEventLabels::default())
+        });
 
         assert!(out.contains("provider call completed"), "{out}");
         assert!(
@@ -880,7 +877,13 @@ mod tests {
     /// worse still.
     #[test]
     fn try_emit_is_silent_when_there_is_no_provider_id() {
-        let out = capture_logs(|| UsageSink::disabled().try_emit("chat", sample_event("req-none"), UsageEventLabels::default()));
+        let out = capture_logs(|| {
+            UsageSink::disabled().try_emit(
+                "chat",
+                sample_event("req-none"),
+                UsageEventLabels::default(),
+            )
+        });
         assert!(!out.contains("provider call completed"), "{out}");
     }
 
@@ -891,7 +894,9 @@ mod tests {
     fn provider_call_log_defaults_a_blank_attempt_kind() {
         let mut ev = sample_event("req-blank");
         ev.provider_request_id = "cmpl-1".into();
-        let out = capture_logs(|| UsageSink::disabled().try_emit("completions", ev, UsageEventLabels::default()));
+        let out = capture_logs(|| {
+            UsageSink::disabled().try_emit("completions", ev, UsageEventLabels::default())
+        });
         assert!(
             out.contains("attempt_kind=\"initial\"") || out.contains("attempt_kind=initial"),
             "{out}"
@@ -918,7 +923,8 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         let sink = UsageSink::new(tx);
         sink.try_emit("test", sample_event("req-1"), UsageEventLabels::default());
-        sink.try_emit("test", sample_event("req-2"), UsageEventLabels::default()); // dropped, logged
+        sink.try_emit("test", sample_event("req-2"), UsageEventLabels::default());
+        // dropped, logged
     }
 
     /// Issue #408: a `try_emit` call with a Metrics handle attached

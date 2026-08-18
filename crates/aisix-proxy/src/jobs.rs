@@ -601,8 +601,7 @@ fn emit_job_usage_event(
     let pk = crate::usage_attr::ResolvedPk::resolve(snap, &target.pk_entry.id);
     crate::usage_attr::apply_pk_telemetry(&mut event, &pk);
     crate::usage_attr::apply_jwt_identity(&mut event, auth.jwt.as_ref());
-    let usage_model =
-        crate::usage_attr::usage_event_model_label(snap, &event.requested_model);
+    let usage_model = crate::usage_attr::usage_event_model_label(snap, &event.requested_model);
     state.usage_sink.try_emit(
         label,
         event.clone(),
@@ -1852,8 +1851,7 @@ async fn attribute_batch_usage(
         // Attribution names the identity that observed completion — the
         // same caller the event's api_key_id already reflects.
         crate::usage_attr::apply_jwt_identity(&mut event, jwt);
-        let usage_model =
-            crate::usage_attr::usage_event_model_label(&snap, &event.requested_model);
+        let usage_model = crate::usage_attr::usage_event_model_label(&snap, &event.requested_model);
         state.usage_sink.try_emit(
             "batch",
             event.clone(),

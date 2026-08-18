@@ -4291,8 +4291,7 @@ fn emit_usage_event(
     // Handler label "chat" matches the documented enumeration for
     // `aisix_usage_events_emitted_total` (#408). Keep `&'static str`
     // so prometheus cardinality stays bounded.
-    let usage_model =
-        crate::usage_attr::usage_event_model_label(snap, &event.requested_model);
+    let usage_model = crate::usage_attr::usage_event_model_label(snap, &event.requested_model);
     state.usage_sink.try_emit(
         "chat",
         event.clone(),

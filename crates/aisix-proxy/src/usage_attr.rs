@@ -370,13 +370,7 @@ pub(crate) fn emit_error_usage_event(
     let attributed = crate::attribution::current().unwrap_or_default();
     let pk = ResolvedPk::resolve(snap, &attributed.provider_key_id);
     let model = usage_event_model_label(snap, requested_model);
-    emit_prepared_usage_event(
-        state,
-        snap,
-        label,
-        event,
-        usage_event_labels(&model, &pk),
-    );
+    emit_prepared_usage_event(state, snap, label, event, usage_event_labels(&model, &pk));
 }
 
 /// The [`emit_error_usage_event`] event without the emission, for a caller

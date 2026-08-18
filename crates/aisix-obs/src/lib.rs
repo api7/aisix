@@ -31,8 +31,7 @@ pub use access_log::AccessLog;
 pub use metrics::{
     client_type_from_user_agent, A2aCallOutcome, A2aLabels, BudgetGauges, BudgetLabels,
     CancelledLabels, ClientTypeClassifier, DeploymentLabels, DeploymentState, HistogramBuckets,
-    LatencyLabels,
-    LlmUsage, Metrics, RequestLabels, RequestOutcome, UsageEventLabels, UsageLabels,
+    LatencyLabels, LlmUsage, Metrics, RequestLabels, RequestOutcome, UsageEventLabels, UsageLabels,
 };
 pub use otlp::{install_otlp_tracer, shutdown_otlp, OtlpError, OtlpHandle};
 pub use otlp_http_sink::{content_capture_cap, OtlpHttpFanOut, OtlpSink};

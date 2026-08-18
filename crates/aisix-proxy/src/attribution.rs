@@ -64,7 +64,9 @@ impl RequestAttribution {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Resolved> {
-        self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 

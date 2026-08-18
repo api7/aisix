@@ -574,11 +574,9 @@ fn emit_tool_call_usage(
     // A tool call resolves neither a model nor a ProviderKey, so the
     // attribution labels are the placeholder — present so this family has
     // ONE label set across every handler (AISIX-Cloud#1317).
-    state.usage_sink.try_emit(
-        "mcp",
-        event.clone(),
-        aisix_obs::UsageEventLabels::default(),
-    );
+    state
+        .usage_sink
+        .try_emit("mcp", event.clone(), aisix_obs::UsageEventLabels::default());
     // #698: fan the event out to the per-env OTLP/SLS/Datadog exporters like
     // every other emitter — pre-fix MCP usage reached only the CP sink, so
     // exporters never saw /mcp traffic. No content capture (tool args/results

@@ -382,10 +382,8 @@ pub async fn entry(
             // request still attributes to it — an operator triaging 401s
             // per route needs the name on the event, not just in the log.
             event.passthrough_route_name = route_name.clone();
-            let usage_model = crate::usage_attr::usage_event_model_label(
-                &snapshot,
-                &event.requested_model,
-            );
+            let usage_model =
+                crate::usage_attr::usage_event_model_label(&snapshot, &event.requested_model);
             crate::usage_attr::emit_prepared_usage_event(
                 &state,
                 &snapshot,

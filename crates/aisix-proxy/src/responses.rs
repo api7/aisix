@@ -3043,8 +3043,7 @@ fn emit_usage_event(
         ..Default::default()
     };
     crate::usage_attr::apply_jwt_identity(&mut event, client.jwt.as_ref());
-    let usage_model =
-        crate::usage_attr::usage_event_model_label(snap, &event.requested_model);
+    let usage_model = crate::usage_attr::usage_event_model_label(snap, &event.requested_model);
     state.usage_sink.try_emit(
         "responses",
         event.clone(),
@@ -3145,8 +3144,7 @@ fn emit_zero_token_event(
         ..Default::default()
     };
     crate::usage_attr::apply_jwt_identity(&mut event, client.jwt.as_ref());
-    let usage_model =
-        crate::usage_attr::usage_event_model_label(snap, &event.requested_model);
+    let usage_model = crate::usage_attr::usage_event_model_label(snap, &event.requested_model);
     state.usage_sink.try_emit(
         "responses",
         event.clone(),

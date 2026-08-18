@@ -776,8 +776,7 @@ async fn run_session(
     };
     crate::usage_attr::apply_pk_telemetry(&mut event, &pk);
     crate::usage_attr::apply_jwt_identity(&mut event, auth.jwt.as_ref());
-    let usage_model =
-        crate::usage_attr::usage_event_model_label(&snap, &event.requested_model);
+    let usage_model = crate::usage_attr::usage_event_model_label(&snap, &event.requested_model);
     state.usage_sink.try_emit(
         "realtime",
         event.clone(),
