@@ -28,6 +28,51 @@ interval) so a model that is slow to its first token doesn't look like an
 abandoned connection to a proxy in front. Only for SSE: the same wrapper on an
 opaque binary passthrough (audio, images) corrupts it.
 
+## Every terminal path emits the access log — including the ones that give up early
+
+The access log and `request_metrics::record` are emitted **by the handler**, at
+the end of dispatch, because that is the only place that knows the provider, model
+and token counts. A path that returns before reaching that tail therefore logs
+nothing, and nothing errors: the caller gets a correct status while the gateway
+keeps no record of the request, which is indistinguishable from the request never
+arriving.
+
+Two shapes give up early, and both must answer through
+`reject::reject_before_dispatch` (it renders the envelope *and* emits the
+telemetry, so the two can't drift apart):
+
+- **Middleware short-circuits** — anything that returns instead of calling
+  `next.run(request)` (see `enforce_request_body_limit`). These run ahead of
+  authentication, so they pass `api_key_id: None`.
+- **Extractor rejections a handler unwraps at its top** — the
+  `Result<Json<T>, JsonRejection>` / `Result<Bytes, BytesRejection>` parameters.
+  Auth already ran here, so pass the key id.
+
+A handler that instead wraps its whole dispatch and logs the wrapper's status
+(`/mcp`, `/a2a`, `/passthrough`, `/v1/videos`, `/v1/files`) is already covered —
+don't add a second emit to those, or the request logs twice.
+
+Emit the request metrics through `request_metrics::record` and nothing else. It
+writes the legacy `aisix_requests_total` **and** the detailed `aisix_proxy_*` /
+`aisix_llm_*` families from one call, so calling `Metrics::record_request`
+directly silently produces a request that exists in one family and not the
+others — the bug AISIX-Cloud#1234 fixed across ten endpoints.
+
+## A new proxy route has to be declared in three places
+
+Adding a `.route(…)` in `build_router` is not enough, and nothing fails loudly
+if you stop there:
+
+1. `normalize_endpoint_label` — an unlisted path collapses to `"other"`, so the
+   route is invisible per-endpoint in every request series (how `/v1/videos`
+   shipped).
+2. `request_metrics::LLM_ENDPOINTS` — decides whether the route counts as model
+   inference. Unlisted means proxy-only, which is the safe default but a silent
+   one.
+3. The `ROUTES` table in `request_metrics`' tests — the only thing that makes
+   (1) and (2) fail loudly. It is a hand-maintained list of every route; a route
+   missing from it is a route the tests cannot check.
+
 ## A per-model gate must say whether it binds the requested entry or each target
 
 `resolve_attempt_models` expands a routing model into targets, so `model_entry` /
@@ -48,6 +93,17 @@ scoped to a member never runs for group traffic (measured: direct 422, via group
 is correct — input guardrails run before a target is picked, and under failover
 there is no single "winning member" to resolve against. Tracked in
 AISIX-Cloud#1090; do not cite it as precedent for scoping a new gate to the entry.
+The 2026-08 model-kind audit re-confirmed the same gap for **ensemble panel/judge
+sub-calls and semantic-router targets**, and the ruling (project decision) is that
+all three kinds stay under #1090's one unified design pass: the operator can
+attach the guardrail to the parent entry, so member scope is a mitigable gap, not
+an unavoidable bypass. Do not piecemeal-fix one kind ahead of that decision, and
+do not re-audit it as a new finding. The same project ruling holds for the OTHER
+member gates on **ensemble** sub-calls (member `allowed_cidrs`, cooldown/health
+consumption, Prometheus usage, caching): ensemble is an experimental surface and
+its parity gaps are deliberate TODOs, not fresh findings — semantic-router
+targets got these gates first because they share the single-winner dispatch
+shape; graduate ensemble deliberately, in one pass.
 
 Two shapes, both already implemented — copy the nearest one:
 
@@ -70,3 +126,25 @@ Whichever shape, the group's own gate stays enforced pre-dispatch — the two ti
 are additive, not either/or — and a caller-visible rejection must keep the
 direct-model envelope (`ModelIpRestricted` names no model and no CIDR), so a group
 never becomes a probe for which members exist.
+
+## `request_id` is caller-controlled input, not a gateway-minted UUID
+
+Since AISIX-Cloud#1288 a caller can supply the request id via a configured inbound
+header and `request_id::ensure_request_id` adopts it verbatim, so every
+`ClientContext.request_id` / `RequestId` value downstream may be a string the
+caller chose. It is only guaranteed to be 1..=256 bytes of visible ASCII
+(`request_id::is_acceptable`) — **not** a UUID, and not unique: nothing stops two
+requests carrying the same id, so an id is a grouping key, never an identity.
+
+New code that consumes it must therefore treat it as untrusted: escape it for the
+sink rather than interpolating it raw (a URL, a file path, a shell argument, a log
+format that isn't structured). Never make it a Prometheus label — unbounded
+cardinality straight from the caller. The existing sinks are already safe and show
+the shape: an OTLP span attribute, an HTTP header value, a `tracing` field, a
+parameterised SQL bind.
+
+`is_acceptable` is half of a cross-repo contract with cp-api's `validRequestID`
+(AISIX-Cloud `internal/dpmgr/api/telemetry.go`): tightening this side alone
+silently strands ids, and tightening THAT side alone silently drops the request
+from billing and /logs while the caller still gets a 200 carrying the id. Change
+both or neither.

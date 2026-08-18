@@ -3,12 +3,19 @@
 //!
 //! Existing compatibility series cover spec §7:
 //! - `aisix_requests_total{provider,model,status,outcome}` — counter
-//!   incremented at the end of every proxy request.
+//!   incremented once per proxy request that produced a response. A request
+//!   the caller abandoned before the response head never reaches it; see
+//!   [`M_PROXY_CLIENT_CANCELLED`].
 //! - `aisix_request_duration_seconds{provider,model,status}` — histogram
-//!   of end-to-end proxy latency.
+//!   of proxy latency, recorded when the response is handed to the client.
+//!   That is the full request for a non-streamed response and only time to
+//!   response START for a streamed one; `aisix_request_e2e_latency_seconds`
+//!   is the series that is end-to-end on both. See `request_metrics`.
 //! - `aisix_ratelimit_rejections_total{scope}` — counter for 429 flows.
 //! - `aisix_tokens_consumed_total{provider,model}` — counter of
-//!   `usage.total_tokens` summed across completed non-streaming calls.
+//!   `usage.total_tokens` summed across completed calls. Streamed calls are
+//!   included: they contribute from the end-of-stream emit, not at response
+//!   open like the two series above.
 //!
 //! Newer AISIX-native series use `aisix_proxy_*` and `aisix_llm_*`
 //! names with bounded, DP-stable labels. They intentionally do not
@@ -24,8 +31,10 @@ use metrics_exporter_prometheus::{
     Matcher, PrometheusBuilder, PrometheusHandle, PrometheusRecorder,
 };
 use std::collections::HashMap;
+use std::hash::Hasher;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 /// Metric names (public so the admin `/metrics` handler and tests can
@@ -57,11 +66,76 @@ pub const M_PROXY_IN_FLIGHT: &str = "aisix_proxy_in_flight_requests";
 pub const M_PROXY_REQUESTS_TOTAL: &str = "aisix_proxy_requests_total";
 pub const M_PROXY_FAILED_REQUESTS_TOTAL: &str = "aisix_proxy_failed_requests_total";
 pub const M_PROXY_REQUEST_DURATION: &str = "aisix_proxy_request_duration_seconds";
+/// Requests the client abandoned before the response head was written.
+/// Every other proxy series needs a handler to produce a response first,
+/// which a cancelled request never does — without this one those requests
+/// are absent from the metrics entirely, not counted as failures.
+///
+/// Labelled by `endpoint` plus whatever the request had resolved before
+/// the caller hung up — the model it addressed and the ProviderKey of the
+/// target it was waiting on, `unknown` when it was cancelled before
+/// reaching them (AISIX-Cloud#1317). Without those, "which model do
+/// callers give up on" was unanswerable, which is the question this
+/// series exists to answer. Every value arrives already bounded from the
+/// proxy layer — the route template, the configured model set, and a
+/// ProviderKey name read off the row its id names (#451).
+///
+/// Deliberately NOT the full `RequestLabels` set: a cancelled request has
+/// no status, no outcome and often no team / user, so the caller-identity
+/// dimensions would be `unknown` on every sample and cost series for
+/// nothing.
+pub const M_PROXY_CLIENT_CANCELLED_TOTAL: &str = "aisix_proxy_client_cancelled_requests_total";
+/// Requests refused by the `request_body_limit_bytes` cap before any
+/// handler ran, split by how the gateway's drain of the refused body
+/// ended. `outcome != "completed"` means the gateway stopped reading
+/// while the caller was still sending, so that caller most likely saw a
+/// connection reset instead of the 413 it was owed.
+///
+/// This is the amplification-safe channel for the same event the
+/// `aisix::body_limit` log carries: a flood of oversize requests can
+/// suppress the log's rate-limited warnings, never this counter. Both
+/// label sets are bounded by construction — `endpoint` is a route
+/// template (#451) and `outcome` a fixed vocabulary.
+pub const M_PROXY_BODY_LIMIT_REJECTIONS_TOTAL: &str =
+    "aisix_proxy_request_body_limit_rejections_total";
+/// Per-DEPLOYMENT (one concrete Model row = one upstream target) call
+/// counters, incremented once per upstream ATTEMPT rather than once per
+/// client request — the granularity the `aisix_proxy_*` / `aisix_llm_*`
+/// families deliberately do NOT have. A request that fails over across
+/// three targets is one sample there and three here.
+///
+/// That difference is the whole point of the family, and the reason a
+/// gateway-wide 5xx count read off `aisix_proxy_requests_total` can sit
+/// orders of magnitude below the number of failed attempts an operator
+/// sees in the usage log (AISIX-Cloud#1299): most failed attempts belong
+/// to requests a fallback went on to serve, and those requests are a
+/// `status="200"` sample in the request families.
+///
+/// Scope: emitted from the Model-Group dispatch loops
+/// (`/v1/chat/completions`, `/v1/messages`, `/v1/responses`) — the
+/// endpoints that keep per-attempt telemetry at all. The single-target
+/// handlers dispatch once per request and are already covered by the
+/// request families.
+///
+/// Only attempts that REACHED the upstream are counted: an attempt
+/// refused by its target's own rate-limit layers before dispatch
+/// produced no upstream response, so counting it would put a gateway-side
+/// refusal into a family operators read as upstream health. It is still a
+/// real attempt in the usage log and in the fallback classification below.
 pub const M_DEPLOYMENT_REQUESTS_TOTAL: &str = "aisix_deployment_requests_total";
 pub const M_DEPLOYMENT_SUCCESS_TOTAL: &str = "aisix_deployment_success_responses_total";
 pub const M_DEPLOYMENT_FAILURE_TOTAL: &str = "aisix_deployment_failure_responses_total";
 pub const M_DEPLOYMENT_STATE: &str = "aisix_deployment_state";
 pub const M_DEPLOYMENT_COOLED_DOWN_TOTAL: &str = "aisix_deployment_cooled_down_total";
+/// Fallback outcomes, counted once per fallback ATTEMPT — the attempt
+/// that moved to a different target than the previous one. The attempt
+/// that served the request bumps the successful family, one that failed
+/// in turn bumps the failed family, so a request rescued by its second
+/// fallback contributes one of each.
+///
+/// `model` is what the caller asked for (the Model-Group name);
+/// `fallback_model` is the target the gateway moved to. Both are
+/// configured names, so the label set is bounded by the resource set.
 pub const M_ROUTING_SUCCESSFUL_FALLBACKS_TOTAL: &str = "aisix_routing_successful_fallbacks_total";
 pub const M_ROUTING_FAILED_FALLBACKS_TOTAL: &str = "aisix_routing_failed_fallbacks_total";
 pub const M_RATELIMIT_REMAINING_REQUESTS: &str = "aisix_ratelimit_remaining_requests";
@@ -130,6 +204,37 @@ pub const M_GUARDRAIL_LATENCY_SECONDS: &str = "aisix_guardrail_latency_seconds";
 /// Paired with `aisix_usage_event_drops_total{reason}` for the
 /// `try_send` failure paths (sink full / closed).
 pub const M_USAGE_EVENT_EMITS_TOTAL: &str = "aisix_usage_events_emitted_total";
+/// Cache gate outcomes, one increment per request that reached an
+/// enabled cache policy with an available backend. Labels:
+/// - `policy`: the policy's operator-facing name (bounded by the
+///   configured policy count).
+/// - `outcome`: `hit_exact` / `hit_semantic` / `miss` / `bypass`
+///   (`bypass` = the caller's `Cache-Control: no-cache` skipped the
+///   read path).
+///
+/// Requests with no matching policy or an unavailable backend
+/// (`cache_status=disabled`) are not counted — the gate never opened.
+pub const M_CACHE_REQUESTS_TOTAL: &str = "aisix_cache_requests_total";
+/// Latency of the cache semantic layer's embedding calls, by `policy`.
+/// Summary series (no fixed buckets), like the other legacy
+/// `histogram!` series here.
+pub const M_CACHE_SEMANTIC_EMBED_SECONDS: &str = "aisix_cache_semantic_embedding_seconds";
+/// Embedding failures on the cache semantic layer, by `policy` and
+/// `cause`. `resolve` (embedding model missing or not an embedding
+/// model) is counted once per eligible request — including requests
+/// that then hit the exact layer; `embed` (provider call failed or
+/// timed out) is counted per attempted call. Each failure leaves that
+/// request exact-only, so a nonzero rate here with a flat
+/// `hit_semantic` outcome is the "semantic layer silently down"
+/// signal.
+pub const M_CACHE_SEMANTIC_EMBED_FAILURES_TOTAL: &str =
+    "aisix_cache_semantic_embedding_failures_total";
+/// Semantic-store operation failures, by `policy` and `op`
+/// (`lookup` / `store`). Failures degrade to an ordinary miss, which
+/// makes a broken store indistinguishable from a healthy low hit rate
+/// in the outcome counter alone — this series is the disambiguator.
+/// The in-process store cannot fail today; shared (redis) stores can.
+pub const M_CACHE_SEMANTIC_STORE_FAILURES_TOTAL: &str = "aisix_cache_semantic_store_failures_total";
 pub const M_OTLP_FANOUT_DROPS_TOTAL: &str = "aisix_otlp_fanout_drops_total";
 pub const M_OTLP_FANOUT_FAILURES_TOTAL: &str = "aisix_otlp_fanout_failures_total";
 /// AISIX-Cloud#1011: SLO-grade latency distributions as REAL bucketed
@@ -153,6 +258,49 @@ pub const M_REQUEST_E2E_LATENCY_SECONDS: &str = "aisix_request_e2e_latency_secon
 /// [`M_REQUEST_E2E_LATENCY_SECONDS`] (with `streaming="true"` always).
 pub const M_REQUEST_TTFT_SECONDS: &str = "aisix_request_ttft_seconds";
 
+// ── A2A gateway series (AISIX-Cloud#1215) ──────────────────────────────────
+//
+// The `aisix_proxy_*` families already count `/a2a` traffic and time it, but
+// only by route: which agent was reached and which operation was invoked are
+// not labels there, so "is the invoice agent's `message/stream` failing?" —
+// the question an agent-platform operator actually asks — cannot be answered
+// from them. These four carry that dimension and nothing else, so they stay
+// bounded: `agent` is a registered resource name, `operation` the canonical
+// bounded set, `state` the specification's task states. Task, context and
+// JSON-RPC request ids are deliberately absent — they belong in logs and
+// traces, never in a label.
+//
+// Request DURATION is not repeated here: `aisix_proxy_request_duration_seconds`
+// already times `/a2a` end to end, and a second histogram of the same quantity
+// would only be a second thing to keep in sync.
+/// A2A calls by agent, canonical operation and status class.
+///
+/// It does NOT agree with `aisix_proxy_requests_total{endpoint="/a2a"}`, and
+/// two differences are deliberate. A call refused before its agent is resolved
+/// — a bad key, a denied agent, an unknown one — has no agent or operation to
+/// file under, so it is counted there and not here. And a stream the caller
+/// abandoned is `4xx` here but `2xx` there, because the response head really
+/// did go out as a 200. Read this family for agent health and that one for
+/// route traffic; do not expect the totals to match.
+pub const M_A2A_REQUESTS_TOTAL: &str = "aisix_a2a_requests_total";
+/// Time from an A2A streaming call starting to the FIRST event the upstream
+/// agent pushed — the agent's own "time to first byte".
+///
+/// Named for the event rather than a token because an agent stream carries
+/// task updates, not tokens. It defaults to [`M_REQUEST_TTFT_SECONDS`]'s
+/// bucket edges — the same shape of wait — but takes its own `a2a_ttfb`
+/// operator override, so tuning one histogram never silently retunes the
+/// other.
+pub const M_A2A_TTFB_SECONDS: &str = "aisix_a2a_ttfb_seconds";
+/// Events relayed downstream on A2A streaming calls. Divided by
+/// [`M_A2A_REQUESTS_TOTAL`] over the streaming operations it gives events per
+/// call — how chatty an agent is, and whether that changed.
+pub const M_A2A_STREAM_EVENTS_TOTAL: &str = "aisix_a2a_stream_events_total";
+/// A2A calls by the task state they ended on, normalized to the
+/// specification's set plus `unknown`. The series an operator watches for
+/// tasks piling up in `input-required` or `failed`.
+pub const M_A2A_TASK_STATE_TOTAL: &str = "aisix_a2a_task_state_total";
+
 // ── Config load-observability series (load-observability contract) ─────────
 // Reflected from [`aisix_core::ConfigMetricsView`] at scrape time via
 // [`Metrics::sync_config_status`]. Standard Prometheus config-reload naming so
@@ -163,27 +311,155 @@ pub const M_CONFIG_LAST_RELOAD_SUCCESS_TIMESTAMP: &str =
 pub const M_CONFIG_RELOADS_TOTAL: &str = "aisix_config_reloads_total";
 pub const M_CONFIG_RELOAD_FAILURES_TOTAL: &str = "aisix_config_reload_failures_total";
 pub const M_CONFIG_REJECTED_RESOURCES: &str = "aisix_config_rejected_resources";
+/// Served resources per kind carrying fields this gateway version does not
+/// know (loaded with those fields ignored — partially compatible, #871).
+/// Non-zero typically means a newer control plane is writing ahead of this
+/// data plane's rollout.
+pub const M_CONFIG_PARTIALLY_COMPATIBLE_RESOURCES: &str =
+    "aisix_config_partially_compatible_resources";
+/// Served resources per kind whose latest source bytes are rejected and
+/// whose last known good value serves instead (#871). Non-zero means the
+/// gateway is running stale config for those rows; the per-row detail
+/// (which resource, stale since when) lives in `/status/config`
+/// `rejected[]`.
+pub const M_CONFIG_STALE_SERVED_RESOURCES: &str = "aisix_config_stale_served_resources";
 pub const M_CONFIG_OBSERVED_REVISION: &str = "aisix_config_observed_revision";
 pub const M_CONFIG_APPLIED_REVISION: &str = "aisix_config_applied_revision";
 pub const M_CONFIG_HASH_INFO: &str = "aisix_config_hash_info";
 pub const M_CONFIG_SOURCE_CONNECTED: &str = "aisix_config_source_connected";
 
-/// Bucket edges for the two SLO histograms, spanning LLM latency ranges:
-/// sub-100ms cache hits / TTFT through multi-minute long generations.
-/// 14 edges → 15 `_bucket` series per label combination; keep
+/// Default bucket edges for [`M_REQUEST_E2E_LATENCY_SECONDS`], spanning the
+/// full client-perceived range: a millisecond-scale rejection or cache hit
+/// through a multi-minute generation. The low edges earn their keep here —
+/// requests refused before dispatch and cache hits really do return in
+/// single-digit milliseconds — and the 420/600 s edges keep
+/// `histogram_quantile()` interpolating instead of pinning P99 at the top
+/// edge, since `upstream.timeout_ms` allows far longer requests.
+/// 17 edges → 18 `_bucket` series per label combination; keep
 /// [`LatencyLabels`] lean before adding edges.
-pub const LATENCY_HISTOGRAM_BUCKETS: &[f64] = &[
-    0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0,
+pub const DEFAULT_E2E_LATENCY_BUCKETS: &[f64] = &[
+    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 420.0,
+    600.0,
 ];
 
-/// Bucket edges for [`M_GUARDRAIL_LATENCY_SECONDS`] — shifted an order of
-/// magnitude below the SLO buckets: local (keyword/pii) checks run in
-/// microseconds, the added-latency budget under scrutiny is ~50 ms
-/// (AISIX-Cloud#1076), and remote guardrail timeouts default to 5 s. The
-/// 30 s top edge outlives any configurable guardrail timeout.
-pub const GUARDRAIL_LATENCY_BUCKETS: &[f64] = &[
+/// Default bucket edges for [`M_REQUEST_TTFT_SECONDS`] (AISIX-Cloud#1226).
+/// Deliberately NOT the same set as [`DEFAULT_E2E_LATENCY_BUCKETS`]: this
+/// histogram observes the *upstream* time-to-first-token, so a request the
+/// gateway answers itself (cache hit, pre-dispatch rejection) never lands
+/// here at all and the millisecond edges stay empty forever against a
+/// hosted provider — one dead series per label combination each. The floor
+/// stays at 50 ms rather than higher so a co-located self-hosted upstream
+/// (vLLM / Ollama) remains distinguishable; deployments that only ever call
+/// hosted providers can raise it via `observability.metrics.buckets`.
+/// The top edge stays at 300 s where the e2e set continues to 600 s:
+/// time-to-*first*-token beyond five minutes is not a range worth two more
+/// permanently-empty series.
+pub const DEFAULT_TTFT_BUCKETS: &[f64] = &[
+    0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0,
+];
+
+/// Default bucket edges for [`M_GUARDRAIL_LATENCY_SECONDS`] — shifted an
+/// order of magnitude below the request-latency sets: local (keyword/pii)
+/// checks run in microseconds, the added-latency budget under scrutiny is
+/// ~50 ms (AISIX-Cloud#1076), and remote guardrail timeouts default to 5 s.
+/// The 30 s top edge outlives any configurable guardrail timeout.
+pub const DEFAULT_GUARDRAIL_LATENCY_BUCKETS: &[f64] = &[
     0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
 ];
+
+/// Resolved bucket edges for the three real (non-summary) histograms,
+/// each either the default above or an operator override from
+/// `observability.metrics.buckets` (AISIX-Cloud#1226).
+///
+/// Every edge here costs one `_bucket` time series **per label
+/// combination** on a metric labelled by endpoint × model × provider ×
+/// status_class × streaming, so an override is a cardinality decision as
+/// much as a resolution one.
+#[derive(Debug, Clone)]
+pub struct HistogramBuckets {
+    pub request_e2e_latency: Vec<f64>,
+    pub request_ttft: Vec<f64>,
+    pub guardrail_latency: Vec<f64>,
+    pub a2a_ttfb: Vec<f64>,
+}
+
+impl Default for HistogramBuckets {
+    fn default() -> Self {
+        Self {
+            request_e2e_latency: DEFAULT_E2E_LATENCY_BUCKETS.to_vec(),
+            request_ttft: DEFAULT_TTFT_BUCKETS.to_vec(),
+            guardrail_latency: DEFAULT_GUARDRAIL_LATENCY_BUCKETS.to_vec(),
+            a2a_ttfb: DEFAULT_TTFT_BUCKETS.to_vec(),
+        }
+    }
+}
+
+impl HistogramBuckets {
+    /// Upper bound on operator-supplied edges. Prometheus wants a bucket
+    /// count in the tens, not the hundreds; the built-in sets use 12–17.
+    pub const MAX_EDGES: usize = 64;
+
+    /// Resolve `observability.metrics.buckets`, falling back to the
+    /// defaults per metric. Errors are boot-fatal by design: a silently
+    /// ignored override would leave the deployment reading quantiles off
+    /// bucket edges it did not choose.
+    pub fn from_config(cfg: &aisix_core::HistogramBucketsConfig) -> Result<Self, String> {
+        Ok(Self {
+            request_e2e_latency: resolve_edges(
+                "request_e2e_latency",
+                cfg.request_e2e_latency.as_deref(),
+                DEFAULT_E2E_LATENCY_BUCKETS,
+            )?,
+            request_ttft: resolve_edges(
+                "request_ttft",
+                cfg.request_ttft.as_deref(),
+                DEFAULT_TTFT_BUCKETS,
+            )?,
+            guardrail_latency: resolve_edges(
+                "guardrail_latency",
+                cfg.guardrail_latency.as_deref(),
+                DEFAULT_GUARDRAIL_LATENCY_BUCKETS,
+            )?,
+            a2a_ttfb: resolve_edges("a2a_ttfb", cfg.a2a_ttfb.as_deref(), DEFAULT_TTFT_BUCKETS)?,
+        })
+    }
+}
+
+/// Validate one override list, or hand back the default when unset.
+/// `+Inf` is rejected rather than tolerated: the exporter appends it
+/// itself, so accepting one here would emit a duplicate `le="+Inf"`.
+fn resolve_edges(field: &str, edges: Option<&[f64]>, default: &[f64]) -> Result<Vec<f64>, String> {
+    let Some(edges) = edges else {
+        return Ok(default.to_vec());
+    };
+    let ctx = format!("observability.metrics.buckets.{field}");
+    if edges.is_empty() {
+        return Err(format!("{ctx}: must list at least one bucket edge"));
+    }
+    if edges.len() > HistogramBuckets::MAX_EDGES {
+        return Err(format!(
+            "{ctx}: {} edges exceed the limit of {}",
+            edges.len(),
+            HistogramBuckets::MAX_EDGES
+        ));
+    }
+    for (i, &edge) in edges.iter().enumerate() {
+        if !edge.is_finite() || edge <= 0.0 {
+            return Err(format!(
+                "{ctx}[{i}]: {edge} must be a finite positive number of seconds \
+                 (the +Inf bucket is added automatically)"
+            ));
+        }
+        if i > 0 && edge <= edges[i - 1] {
+            return Err(format!(
+                "{ctx}[{i}]: {edge} must be greater than the preceding edge {} \
+                 — bucket edges are cumulative and must strictly ascend",
+                edges[i - 1]
+            ));
+        }
+    }
+    Ok(edges.to_vec())
+}
 
 /// Holds an isolated `PrometheusRecorder` plus its render handle.
 /// `metrics::*` macros talk to whatever recorder is in scope; we use
@@ -197,7 +473,19 @@ pub struct Metrics {
 struct MetricsInner {
     recorder: PrometheusRecorder,
     handle: PrometheusHandle,
-    proxy_in_flight: Mutex<HashMap<(String, String), i64>>,
+    /// Per-(endpoint, protocol) in-flight counts. A linear scan over a
+    /// bounded slot list (route templates × protocols): the steady-state
+    /// hit is two pointer-length string compares with no allocation and
+    /// no hashing, where the map this replaced allocated two `String`
+    /// keys and ran SipHash on every request edge. Slots for drained
+    /// pairs stay at zero rather than being removed — the set is bounded,
+    /// and reuse beats churn.
+    proxy_in_flight: Mutex<Vec<(String, String, i64)>>,
+    /// Process-unique id prefixed onto every worker-cache key, so
+    /// thread-local entries minted for one instance's recorder can never
+    /// serve another instance (parallel tests build many `Metrics`).
+    /// Pre-formatted once — per-emit `fmt::write` was a visible cost.
+    worker_key_prefix: String,
     /// Constant `env_id` label for the SLO latency histograms — one DP
     /// process serves exactly one environment. `"unknown"` when the DP
     /// runs standalone (no control plane).
@@ -213,6 +501,202 @@ struct MetricsInner {
 struct ConfigLabelState {
     last_hash: Option<String>,
     last_rejected_kinds: std::collections::HashSet<String>,
+    last_partial_kinds: std::collections::HashSet<String>,
+    last_stale_kinds: std::collections::HashSet<String>,
+}
+
+/// Per-thread cap on each worker-cache map. Label sets are bounded by
+/// construction (operator-configured names, fixed vocabularies), so
+/// production never approaches this; it is a safety valve against an
+/// unforeseen unbounded dimension pinning memory in every worker.
+const WORKER_CACHE_CAPACITY: usize = 1024;
+
+/// Separator joining label values into a worker-cache key — a control
+/// byte that no bounded label vocabulary contains. A value that DOES
+/// contain it (nothing today) falls back to the uncached emit path
+/// rather than risk two label sets aliasing one key.
+const WORKER_KEY_SEP: char = '\u{1f}';
+
+/// The per-request series handles every request-shaped emit resolves
+/// through. Each field registers lazily on first use so the proxy-only
+/// paths never mint `aisix_llm_*` series (and vice versa) — the same
+/// series-sparsity the plain macro path had.
+#[derive(Default)]
+struct RequestSeriesHandles {
+    proxy_requests: OnceLock<metrics::Counter>,
+    proxy_failed_requests: OnceLock<metrics::Counter>,
+    proxy_duration: OnceLock<metrics::Histogram>,
+    llm_requests: OnceLock<metrics::Counter>,
+    llm_duration: OnceLock<metrics::Histogram>,
+}
+
+/// Usage dimensions are registered independently so a zero-valued token or
+/// spend field does not create an otherwise absent Prometheus series.
+#[derive(Default)]
+struct UsageSeriesHandles {
+    input_tokens: OnceLock<metrics::Counter>,
+    output_tokens: OnceLock<metrics::Counter>,
+    total_tokens: OnceLock<metrics::Counter>,
+    spend_micro_usd: OnceLock<metrics::Counter>,
+}
+
+// ── Per-worker handle cache ────────────────────────────────────────────────
+//
+// `metrics::counter!`-family macros rebuild a `Key` (one owned `String` per
+// label), hash it, and probe the recorder's sharded registry on EVERY emit.
+// `metrics::Counter`/`Gauge`/`Histogram` are `Arc`-backed handles wired
+// straight to the series' storage, so registering once per label set and
+// reusing the handle removes all of that from the steady-state path.
+//
+// The cache is `thread_local!`, not shared: this process runs one
+// current-thread runtime per pinned core (thread-per-core), and a shared
+// map — like the two `RwLock` caches this replaced — puts one contended
+// cache line (the lock word) in front of every emit on every worker. The
+// spike for AISIX-Cloud#1259 item 3b measured that shared-lock variant
+// recovering almost nothing (+0.5% throughput) while the thread-local
+// variant recovered +4.4%; per-worker duplication of a bounded handle set
+// is the whole trick.
+//
+// Correctness properties:
+// - Keys are `instance id \x1f site \x1f label values…`, so two `Metrics`
+//   instances on one thread (parallel tests) can never serve each other's
+//   recorder, and one site's entries can never answer another site.
+// - Values never alias: label values are joined with a control byte no
+//   bounded label vocabulary contains, and a value that does contain it
+//   falls back to the uncached emit instead of being cached.
+// - Eviction only drops OUR reference. The series and its value live in
+//   the recorder's registry; re-registering the same labels returns a
+//   handle to the SAME storage, so counts continue exactly where they
+//   left off.
+
+/// FNV-1a, hand-rolled: three instructions per byte, no dependency, and
+/// no DoS surface — every byte hashed here is operator-bounded config
+/// vocabulary, never attacker-chosen cardinality (#451 keeps raw client
+/// strings out of label values by contract).
+struct FnvHasher(u64);
+
+impl Default for FnvHasher {
+    fn default() -> Self {
+        Self(0xcbf2_9ce4_8422_2325)
+    }
+}
+
+impl Hasher for FnvHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 ^= u64::from(b);
+            self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+}
+
+type FnvMap<T> = HashMap<Box<str>, T, std::hash::BuildHasherDefault<FnvHasher>>;
+
+/// One worker's handle maps, one per handle shape. Field-per-shape rather
+/// than a value enum so every site gets its concrete handle type back
+/// without a runtime discriminant.
+#[derive(Default)]
+struct WorkerCache {
+    counters: FnvMap<metrics::Counter>,
+    gauges: FnvMap<metrics::Gauge>,
+    histograms: FnvMap<metrics::Histogram>,
+    request_series: FnvMap<RequestSeriesHandles>,
+    usage_series: FnvMap<UsageSeriesHandles>,
+    /// Reused key buffer: the steady-state emit builds its lookup key in
+    /// place and allocates nothing; only a first-sight miss allocates the
+    /// stored `Box<str>`.
+    key_buf: String,
+}
+
+thread_local! {
+    static WORKER_CACHE: std::cell::RefCell<WorkerCache> =
+        std::cell::RefCell::new(WorkerCache::default());
+}
+
+/// Selects which [`WorkerCache`] map a handle shape lives in.
+/// Hands back a handle-shape's map TOGETHER with the built key. The pair
+/// comes from disjoint `WorkerCache` fields, which the per-impl field
+/// split proves to the borrow checker — a `&mut WorkerCache -> &mut map`
+/// signature would pin the whole cache and forbid reading the key.
+trait WorkerCached: Sized {
+    fn slot_with_key(cache: &mut WorkerCache) -> (&mut FnvMap<Self>, &str);
+}
+
+impl WorkerCached for metrics::Counter {
+    fn slot_with_key(cache: &mut WorkerCache) -> (&mut FnvMap<Self>, &str) {
+        (&mut cache.counters, cache.key_buf.as_str())
+    }
+}
+
+impl WorkerCached for metrics::Gauge {
+    fn slot_with_key(cache: &mut WorkerCache) -> (&mut FnvMap<Self>, &str) {
+        (&mut cache.gauges, cache.key_buf.as_str())
+    }
+}
+
+impl WorkerCached for metrics::Histogram {
+    fn slot_with_key(cache: &mut WorkerCache) -> (&mut FnvMap<Self>, &str) {
+        (&mut cache.histograms, cache.key_buf.as_str())
+    }
+}
+
+impl WorkerCached for RequestSeriesHandles {
+    fn slot_with_key(cache: &mut WorkerCache) -> (&mut FnvMap<Self>, &str) {
+        (&mut cache.request_series, cache.key_buf.as_str())
+    }
+}
+
+impl WorkerCached for UsageSeriesHandles {
+    fn slot_with_key(cache: &mut WorkerCache) -> (&mut FnvMap<Self>, &str) {
+        (&mut cache.usage_series, cache.key_buf.as_str())
+    }
+}
+
+/// Writes one emit's label values into the worker-cache key buffer.
+/// Numeric/bool writers exist so `u16` statuses and flags key without a
+/// heap allocation; `dirty` flips when a value contains the separator,
+/// which sends that emit down the uncached path.
+struct WorkerKey<'a> {
+    buf: &'a mut String,
+    dirty: bool,
+}
+
+impl WorkerKey<'_> {
+    fn label(&mut self, value: &str) {
+        if value.contains(WORKER_KEY_SEP) {
+            self.dirty = true;
+        }
+        self.buf.push(WORKER_KEY_SEP);
+        self.buf.push_str(value);
+    }
+
+    fn label_u16(&mut self, value: u16) {
+        self.buf.push(WORKER_KEY_SEP);
+        // Hand-rolled digits: `fmt::write` machinery was a visible
+        // per-emit cost for what is a five-byte-max ASCII render.
+        let mut digits = [0u8; 5];
+        let mut i = digits.len();
+        let mut v = value;
+        loop {
+            i -= 1;
+            digits[i] = b'0' + (v % 10) as u8;
+            v /= 10;
+            if v == 0 {
+                break;
+            }
+        }
+        self.buf
+            .push_str(std::str::from_utf8(&digits[i..]).expect("ascii digits"));
+    }
+
+    fn label_bool(&mut self, value: bool) {
+        self.buf.push(WORKER_KEY_SEP);
+        self.buf.push(if value { 't' } else { 'f' });
+    }
 }
 
 impl std::fmt::Debug for Metrics {
@@ -233,6 +717,12 @@ impl Metrics {
     /// histograms. Empty ids (standalone DP) collapse to `"unknown"`,
     /// matching the missing-dimension convention used elsewhere.
     pub fn new_with_env_id(env_id: &str) -> Self {
+        Self::new_with_buckets(env_id, &HistogramBuckets::default())
+    }
+
+    /// Like [`Metrics::new_with_env_id`], with operator-supplied histogram
+    /// bucket edges (`observability.metrics.buckets`, AISIX-Cloud#1226).
+    pub fn new_with_buckets(env_id: &str, buckets: &HistogramBuckets) -> Self {
         // Buckets ONLY for the SLO histograms and the guardrail latency
         // histogram: with `metrics-exporter-prometheus`, a distribution
         // without configured buckets renders as a summary — which is what
@@ -240,26 +730,36 @@ impl Metrics {
         let recorder = PrometheusBuilder::new()
             .set_buckets_for_metric(
                 Matcher::Full(M_REQUEST_E2E_LATENCY_SECONDS.to_string()),
-                LATENCY_HISTOGRAM_BUCKETS,
+                &buckets.request_e2e_latency,
             )
-            .expect("static bucket list is non-empty")
+            .expect("bucket lists are validated non-empty")
             .set_buckets_for_metric(
                 Matcher::Full(M_REQUEST_TTFT_SECONDS.to_string()),
-                LATENCY_HISTOGRAM_BUCKETS,
+                &buckets.request_ttft,
             )
-            .expect("static bucket list is non-empty")
+            .expect("bucket lists are validated non-empty")
             .set_buckets_for_metric(
                 Matcher::Full(M_GUARDRAIL_LATENCY_SECONDS.to_string()),
-                GUARDRAIL_LATENCY_BUCKETS,
+                &buckets.guardrail_latency,
             )
-            .expect("static bucket list is non-empty")
+            .expect("bucket lists are validated non-empty")
+            .set_buckets_for_metric(
+                Matcher::Full(M_A2A_TTFB_SECONDS.to_string()),
+                &buckets.a2a_ttfb,
+            )
+            .expect("bucket lists are validated non-empty")
             .build_recorder();
         let handle = recorder.handle();
+        static NEXT_INSTANCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         Self {
             inner: Arc::new(MetricsInner {
                 recorder,
                 handle,
-                proxy_in_flight: Mutex::new(HashMap::new()),
+                proxy_in_flight: Mutex::new(Vec::new()),
+                worker_key_prefix: format!(
+                    "{:x}",
+                    NEXT_INSTANCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                ),
                 env_id: if env_id.is_empty() {
                     "unknown".to_string()
                 } else {
@@ -275,6 +775,15 @@ impl Metrics {
         self.inner.handle.render()
     }
 
+    /// Drain pending histogram samples into their distributions.
+    ///
+    /// `PrometheusBuilder::build_recorder` does not start the exporter's
+    /// background upkeep task, so the server must call this periodically
+    /// even when no Prometheus server is scraping the metrics endpoint.
+    pub fn run_upkeep(&self) {
+        self.inner.handle.run_upkeep();
+    }
+
     /// Reflect the config load-observability state into the recorder. Called
     /// at scrape time by the metrics/status listener so `aisix_config_*`
     /// series always mirror the live [`aisix_core::ConfigStatus`]. Idempotent
@@ -284,6 +793,12 @@ impl Metrics {
     /// `source_connected`) are emitted only in etcd mode. Label churn on the
     /// info/rejected gauges (`hash_info`, `rejected_resources`) zeroes the
     /// prior label set so the exposition never carries two live samples.
+    ///
+    /// Deliberately NOT routed through the per-worker handle cache: this
+    /// runs once per scrape (not per request), and the zeroing discipline
+    /// above works on churning label sets — exactly the shape a
+    /// first-seen handle cache handles worst. The macro path's per-call
+    /// registration cost is irrelevant at scrape frequency.
     pub fn sync_config_status(&self, view: &aisix_core::ConfigMetricsView) {
         use aisix_core::SourceKind;
         let etcd = matches!(view.source_kind, SourceKind::Etcd);
@@ -349,6 +864,34 @@ impl Metrics {
                     .set(*count as f64);
             }
             labels.last_rejected_kinds = view.rejected_by_kind.keys().cloned().collect();
+
+            // Partially-compatible gauge per kind, same zeroing discipline.
+            // Per-field detail deliberately stays off the labels (field paths
+            // are not a bounded set) — it lives in `/status/config`.
+            for kind in &labels.last_partial_kinds {
+                if !view.partially_compatible_by_kind.contains_key(kind) {
+                    metrics::gauge!(M_CONFIG_PARTIALLY_COMPATIBLE_RESOURCES, "kind" => kind.clone())
+                        .set(0.0);
+                }
+            }
+            for (kind, count) in &view.partially_compatible_by_kind {
+                metrics::gauge!(M_CONFIG_PARTIALLY_COMPATIBLE_RESOURCES, "kind" => kind.clone())
+                    .set(*count as f64);
+            }
+            labels.last_partial_kinds = view.partially_compatible_by_kind.keys().cloned().collect();
+
+            // Stale-served gauge per kind (#871), same zeroing discipline.
+            for kind in &labels.last_stale_kinds {
+                if !view.stale_served_by_kind.contains_key(kind) {
+                    metrics::gauge!(M_CONFIG_STALE_SERVED_RESOURCES, "kind" => kind.clone())
+                        .set(0.0);
+                }
+            }
+            for (kind, count) in &view.stale_served_by_kind {
+                metrics::gauge!(M_CONFIG_STALE_SERVED_RESOURCES, "kind" => kind.clone())
+                    .set(*count as f64);
+            }
+            labels.last_stale_kinds = view.stale_served_by_kind.keys().cloned().collect();
         });
     }
 
@@ -361,23 +904,42 @@ impl Metrics {
         outcome: RequestOutcome,
         duration: Duration,
     ) {
-        metrics::with_local_recorder(&self.inner.recorder, || {
-            metrics::counter!(
-                M_REQUESTS_TOTAL,
-                "provider" => provider.to_string(),
-                "model" => model.to_string(),
-                "status" => status.to_string(),
-                "outcome" => outcome.as_str().to_string(),
-            )
-            .increment(1);
-            metrics::histogram!(
-                M_REQUEST_DURATION,
-                "provider" => provider.to_string(),
-                "model" => model.to_string(),
-                "status" => status.to_string(),
-            )
-            .record(duration.as_secs_f64());
-        });
+        self.cached_counter(
+            M_REQUESTS_TOTAL,
+            1,
+            |k| {
+                k.label(provider);
+                k.label(model);
+                k.label_u16(status);
+                k.label(outcome.as_str());
+            },
+            || {
+                metrics::counter!(
+                    M_REQUESTS_TOTAL,
+                    "provider" => provider.to_string(),
+                    "model" => model.to_string(),
+                    "status" => status.to_string(),
+                    "outcome" => outcome.as_str().to_string(),
+                )
+            },
+        );
+        self.cached_histogram(
+            M_REQUEST_DURATION,
+            duration.as_secs_f64(),
+            |k| {
+                k.label(provider);
+                k.label(model);
+                k.label_u16(status);
+            },
+            || {
+                metrics::histogram!(
+                    M_REQUEST_DURATION,
+                    "provider" => provider.to_string(),
+                    "model" => model.to_string(),
+                    "status" => status.to_string(),
+                )
+            },
+        );
     }
 
     /// Record one inbound authentication decision on
@@ -385,15 +947,25 @@ impl Metrics {
     /// proxy auth choke point for every credential judgment — allowed
     /// or denied, API-key and JWT paths alike.
     pub fn record_auth_decision(&self, method: &str, allowed: bool, reason: &str) {
-        metrics::with_local_recorder(&self.inner.recorder, || {
-            metrics::counter!(
-                M_AUTH_DECISIONS_TOTAL,
-                "method" => method.to_string(),
-                "result" => if allowed { "allowed" } else { "denied" }.to_string(),
-                "reason" => if reason.is_empty() { "none" } else { reason }.to_string(),
-            )
-            .increment(1);
-        });
+        let result = if allowed { "allowed" } else { "denied" };
+        let reason = if reason.is_empty() { "none" } else { reason };
+        self.cached_counter(
+            M_AUTH_DECISIONS_TOTAL,
+            1,
+            |k| {
+                k.label(method);
+                k.label(result);
+                k.label(reason);
+            },
+            || {
+                metrics::counter!(
+                    M_AUTH_DECISIONS_TOTAL,
+                    "method" => method.to_string(),
+                    "result" => result.to_string(),
+                    "reason" => reason.to_string(),
+                )
+            },
+        );
     }
 
     /// Record one request's guardrail outcome. Called once per request from
@@ -401,18 +973,27 @@ impl Metrics {
     /// `guardrail_blocked` / `guardrail_bypassed_reason` fields. An empty
     /// `bypass_reason` means no bypass occurred.
     pub fn record_guardrail_outcome(&self, blocked: bool, bypass_reason: &str) {
-        metrics::with_local_recorder(&self.inner.recorder, || {
-            if blocked {
-                metrics::counter!(M_GUARDRAIL_BLOCKS_TOTAL).increment(1);
-            }
-            if !bypass_reason.is_empty() {
-                metrics::counter!(
-                    M_GUARDRAIL_BYPASSES_TOTAL,
-                    "reason" => bypass_reason.to_string(),
-                )
-                .increment(1);
-            }
-        });
+        if blocked {
+            self.cached_counter(
+                M_GUARDRAIL_BLOCKS_TOTAL,
+                1,
+                |_| {},
+                || metrics::counter!(M_GUARDRAIL_BLOCKS_TOTAL),
+            );
+        }
+        if !bypass_reason.is_empty() {
+            self.cached_counter(
+                M_GUARDRAIL_BYPASSES_TOTAL,
+                1,
+                |k| k.label(bypass_reason),
+                || {
+                    metrics::counter!(
+                        M_GUARDRAIL_BYPASSES_TOTAL,
+                        "reason" => bypass_reason.to_string(),
+                    )
+                },
+            );
+        }
     }
 
     /// Record one guardrail member execution on
@@ -420,152 +1001,624 @@ impl Metrics {
     /// chain fold through the `GuardrailMetricsSink` impl below — once per
     /// member per hook pass, on every handler.
     pub fn record_guardrail_execution(&self, exec: &aisix_core::GuardrailExecution<'_>) {
-        metrics::with_local_recorder(&self.inner.recorder, || {
-            metrics::histogram!(
-                M_GUARDRAIL_LATENCY_SECONDS,
-                "env_id" => self.inner.env_id.clone(),
-                "guardrail" => exec.guardrail_name.to_string(),
-                "kind" => exec.kind.to_string(),
-                "phase" => exec.phase.to_string(),
-                "result" => exec.result.to_string(),
-                "error_type" => exec.error_type.unwrap_or("none").to_string(),
-            )
-            .record(exec.elapsed.as_secs_f64());
-        });
+        // `env_id` is constant per instance and the cache key is already
+        // instance-scoped, so it stays out of the key.
+        self.cached_histogram(
+            M_GUARDRAIL_LATENCY_SECONDS,
+            exec.elapsed.as_secs_f64(),
+            |k| {
+                k.label(exec.guardrail_name);
+                k.label(exec.kind);
+                k.label(exec.phase);
+                k.label(exec.result);
+                k.label(exec.error_type.unwrap_or("none"));
+            },
+            || {
+                metrics::histogram!(
+                    M_GUARDRAIL_LATENCY_SECONDS,
+                    "env_id" => self.inner.env_id.clone(),
+                    "guardrail" => exec.guardrail_name.to_string(),
+                    "kind" => exec.kind.to_string(),
+                    "phase" => exec.phase.to_string(),
+                    "result" => exec.result.to_string(),
+                    "error_type" => exec.error_type.unwrap_or("none").to_string(),
+                )
+            },
+        );
     }
 
-    pub fn record_ratelimit_rejection(&self, scope: &str) {
-        metrics::with_local_recorder(&self.inner.recorder, || {
-            metrics::counter!(
-                M_RATELIMIT_REJECTIONS,
-                "scope" => scope.to_string(),
-            )
-            .increment(1);
-        });
+    /// Count one rate-limit rejection. `scope` is the exceeded
+    /// dimension (`requests`/`tokens`/`concurrency`); `layer` names the
+    /// limit source (`api_key`/`model`/`mcp`/`policy`); `policy_id`
+    /// identifies the offending policy on the `policy` layer (bounded
+    /// by the configured policy count) and is empty elsewhere.
+    /// Recorded at the quota gate, the one point every endpoint funnels
+    /// through (AISIX-Cloud#892).
+    pub fn record_ratelimit_rejection(&self, scope: &str, layer: &str, policy_id: Option<&str>) {
+        let policy_id = policy_id.unwrap_or_default();
+        self.cached_counter(
+            M_RATELIMIT_REJECTIONS,
+            1,
+            |k| {
+                k.label(scope);
+                k.label(layer);
+                k.label(policy_id);
+            },
+            || {
+                metrics::counter!(
+                    M_RATELIMIT_REJECTIONS,
+                    "scope" => scope.to_string(),
+                    "layer" => layer.to_string(),
+                    "policy_id" => policy_id.to_string(),
+                )
+            },
+        );
+    }
+
+    /// Count one cache-gate outcome. `policy` is the matched policy's
+    /// name, `outcome` one of the fixed [`M_CACHE_REQUESTS_TOTAL`]
+    /// values.
+    pub fn record_cache_event(&self, policy: &str, outcome: &str) {
+        self.cached_counter(
+            M_CACHE_REQUESTS_TOTAL,
+            1,
+            |k| {
+                k.label(policy);
+                k.label(outcome);
+            },
+            || {
+                metrics::counter!(
+                    M_CACHE_REQUESTS_TOTAL,
+                    "policy" => policy.to_string(),
+                    "outcome" => outcome.to_string(),
+                )
+            },
+        );
+    }
+
+    /// Record one successful cache semantic-layer embedding call.
+    pub fn record_cache_semantic_embed(&self, policy: &str, elapsed: Duration) {
+        self.cached_histogram(
+            M_CACHE_SEMANTIC_EMBED_SECONDS,
+            elapsed.as_secs_f64(),
+            |k| k.label(policy),
+            || {
+                metrics::histogram!(
+                    M_CACHE_SEMANTIC_EMBED_SECONDS,
+                    "policy" => policy.to_string(),
+                )
+            },
+        );
+    }
+
+    /// Count one failed cache semantic-layer embedding attempt. `cause`
+    /// is one of the fixed [`M_CACHE_SEMANTIC_EMBED_FAILURES_TOTAL`]
+    /// values.
+    pub fn record_cache_semantic_embed_failure(&self, policy: &str, cause: &str) {
+        self.cached_counter(
+            M_CACHE_SEMANTIC_EMBED_FAILURES_TOTAL,
+            1,
+            |k| {
+                k.label(policy);
+                k.label(cause);
+            },
+            || {
+                metrics::counter!(
+                    M_CACHE_SEMANTIC_EMBED_FAILURES_TOTAL,
+                    "policy" => policy.to_string(),
+                    "cause" => cause.to_string(),
+                )
+            },
+        );
+    }
+
+    /// Count one failed semantic-store operation. `op` is one of the
+    /// fixed [`M_CACHE_SEMANTIC_STORE_FAILURES_TOTAL`] values.
+    pub fn record_cache_semantic_store_failure(&self, policy: &str, op: &str) {
+        self.cached_counter(
+            M_CACHE_SEMANTIC_STORE_FAILURES_TOTAL,
+            1,
+            |k| {
+                k.label(policy);
+                k.label(op);
+            },
+            || {
+                metrics::counter!(
+                    M_CACHE_SEMANTIC_STORE_FAILURES_TOTAL,
+                    "policy" => policy.to_string(),
+                    "op" => op.to_string(),
+                )
+            },
+        );
+    }
+
+    /// Record one finished A2A call across the whole `aisix_a2a_*` family.
+    ///
+    /// A single entry point rather than four, so a new call site cannot land
+    /// with half the series wired — the same anti-drift move
+    /// [`crate::metrics`]' request families make. Every label here is bounded
+    /// by construction: `agent` is a registered resource, `operation` and
+    /// `task_state` come from fixed sets.
+    ///
+    /// `ttfb` and `stream_events` are `None` / `0` for a unary call, which
+    /// observes neither series.
+    pub fn record_a2a_call(&self, labels: A2aLabels<'_>, call: A2aCallOutcome) {
+        let status = status_bucket(labels.status);
+        self.cached_counter(
+            M_A2A_REQUESTS_TOTAL,
+            1,
+            |k| {
+                k.label(labels.agent);
+                k.label(labels.operation);
+                k.label(status);
+            },
+            || {
+                metrics::counter!(
+                    M_A2A_REQUESTS_TOTAL,
+                    "agent" => labels.agent.to_string(),
+                    "operation" => labels.operation.to_string(),
+                    "status" => status.to_string(),
+                )
+            },
+        );
+        if let Some(ttfb) = call.ttfb {
+            self.cached_histogram(
+                M_A2A_TTFB_SECONDS,
+                ttfb.as_secs_f64(),
+                |k| {
+                    k.label(labels.agent);
+                    k.label(labels.operation);
+                },
+                || {
+                    metrics::histogram!(
+                        M_A2A_TTFB_SECONDS,
+                        "agent" => labels.agent.to_string(),
+                        "operation" => labels.operation.to_string(),
+                    )
+                },
+            );
+        }
+        if call.stream_events > 0 {
+            self.cached_counter(
+                M_A2A_STREAM_EVENTS_TOTAL,
+                u64::from(call.stream_events),
+                |k| {
+                    k.label(labels.agent);
+                    k.label(labels.operation);
+                },
+                || {
+                    metrics::counter!(
+                        M_A2A_STREAM_EVENTS_TOTAL,
+                        "agent" => labels.agent.to_string(),
+                        "operation" => labels.operation.to_string(),
+                    )
+                },
+            );
+        }
+        // Only a call that reached a task has a state to report; counting an
+        // empty one would invent a bucket for "the upstream never answered".
+        if !call.task_state.is_empty() {
+            self.cached_counter(
+                M_A2A_TASK_STATE_TOTAL,
+                1,
+                |k| {
+                    k.label(labels.agent);
+                    k.label(call.task_state);
+                },
+                || {
+                    metrics::counter!(
+                        M_A2A_TASK_STATE_TOTAL,
+                        "agent" => labels.agent.to_string(),
+                        "state" => call.task_state.to_string(),
+                    )
+                },
+            );
+        }
+    }
+
+    /// Count a request the client abandoned before it produced a response
+    /// head. Every label must already be bounded by the caller — see
+    /// [`M_PROXY_CLIENT_CANCELLED_TOTAL`].
+    pub fn record_client_cancelled(&self, labels: CancelledLabels<'_>) {
+        self.cached_counter(
+            M_PROXY_CLIENT_CANCELLED_TOTAL,
+            1,
+            |k| {
+                k.label(labels.endpoint);
+                k.label(labels.model);
+                k.label(labels.provider_key_id);
+                k.label(labels.provider_key_name);
+            },
+            || {
+                metrics::counter!(
+                    M_PROXY_CLIENT_CANCELLED_TOTAL,
+                    "endpoint" => labels.endpoint.to_string(),
+                    "model" => labels.model.to_string(),
+                    "provider_key_id" => labels.provider_key_id.to_string(),
+                    "provider_key_name" => labels.provider_key_name.to_string(),
+                )
+            },
+        );
+    }
+
+    /// Count a request refused by the request-body cap. `endpoint` must
+    /// already be a bounded route template and `outcome` one of the fixed
+    /// drain outcomes — see [`M_PROXY_BODY_LIMIT_REJECTIONS_TOTAL`].
+    pub fn record_body_limit_rejection(
+        &self,
+        endpoint: &str,
+        inbound_protocol: &str,
+        outcome: &str,
+    ) {
+        self.cached_counter(
+            M_PROXY_BODY_LIMIT_REJECTIONS_TOTAL,
+            1,
+            |k| {
+                k.label(endpoint);
+                k.label(inbound_protocol);
+                k.label(outcome);
+            },
+            || {
+                metrics::counter!(
+                    M_PROXY_BODY_LIMIT_REJECTIONS_TOTAL,
+                    "endpoint" => endpoint.to_string(),
+                    "inbound_protocol" => inbound_protocol.to_string(),
+                    "outcome" => outcome.to_string(),
+                )
+            },
+        );
     }
 
     pub fn record_tokens(&self, provider: &str, model: &str, total_tokens: u64) {
         if total_tokens == 0 {
             return;
         }
-        metrics::with_local_recorder(&self.inner.recorder, || {
-            metrics::counter!(
-                M_TOKENS_CONSUMED,
-                "provider" => provider.to_string(),
-                "model" => model.to_string(),
-            )
-            .increment(total_tokens);
-        });
+        self.cached_counter(
+            M_TOKENS_CONSUMED,
+            total_tokens,
+            |k| {
+                k.label(provider);
+                k.label(model);
+            },
+            || {
+                metrics::counter!(
+                    M_TOKENS_CONSUMED,
+                    "provider" => provider.to_string(),
+                    "model" => model.to_string(),
+                )
+            },
+        );
     }
 
     pub fn increment_proxy_in_flight(&self, endpoint: &str, inbound_protocol: &str) {
-        let value = {
-            let mut counters = self.inner.proxy_in_flight.lock().expect("lock in-flight");
-            let value = counters
-                .entry((endpoint.to_string(), inbound_protocol.to_string()))
-                .or_insert(0);
-            *value += 1;
-            *value
-        };
-        metrics::with_local_recorder(&self.inner.recorder, || {
-            metrics::gauge!(
-                M_PROXY_IN_FLIGHT,
-                "endpoint" => endpoint.to_string(),
-                "inbound_protocol" => inbound_protocol.to_string(),
-            )
-            .set(value as f64);
-        });
+        self.apply_in_flight_delta(endpoint, inbound_protocol, 1);
     }
 
     pub fn decrement_proxy_in_flight(&self, endpoint: &str, inbound_protocol: &str) {
-        let value = {
-            let mut counters = self.inner.proxy_in_flight.lock().expect("lock in-flight");
-            let key = (endpoint.to_string(), inbound_protocol.to_string());
-            let value = counters.entry(key.clone()).or_insert(0);
-            *value = (*value - 1).max(0);
-            let current = *value;
-            if current == 0 {
-                counters.remove(&key);
-            }
-            current
+        self.apply_in_flight_delta(endpoint, inbound_protocol, -1);
+    }
+
+    /// Apply one in-flight edge and publish the resulting count on the
+    /// gauge WHILE the slot lock is held, so concurrent edges on one pair
+    /// cannot publish out of order and strand a stale value on an
+    /// endpoint that then goes idle. The count clamps at zero (a
+    /// decrement without its increment must not wedge the gauge
+    /// negative). No path takes this lock from inside the worker cache,
+    /// so emitting under it cannot deadlock.
+    ///
+    /// Precondition: `endpoint` must already be a bounded route template
+    /// (`normalize_endpoint_label` output, #451) and `inbound_protocol` a
+    /// fixed vocabulary. The slot vector's boundedness — and the linear
+    /// scan's cost — depend on it; a raw request path here would grow the
+    /// vector without bound.
+    fn apply_in_flight_delta(&self, endpoint: &str, inbound_protocol: &str, delta: i64) {
+        let mut slots = self.inner.proxy_in_flight.lock().expect("lock in-flight");
+        let value = if let Some(slot) = slots
+            .iter_mut()
+            .find(|(e, p, _)| e == endpoint && p == inbound_protocol)
+        {
+            slot.2 = (slot.2 + delta).max(0);
+            slot.2
+        } else {
+            let value = delta.max(0);
+            slots.push((endpoint.to_string(), inbound_protocol.to_string(), value));
+            value
         };
-        metrics::with_local_recorder(&self.inner.recorder, || {
-            metrics::gauge!(
-                M_PROXY_IN_FLIGHT,
-                "endpoint" => endpoint.to_string(),
-                "inbound_protocol" => inbound_protocol.to_string(),
-            )
-            .set(value as f64);
+        self.set_proxy_in_flight_gauge(endpoint, inbound_protocol, value);
+    }
+
+    /// Shared gauge emit for the increment/decrement pair — one cache
+    /// entry, since both sides address the same series.
+    fn set_proxy_in_flight_gauge(&self, endpoint: &str, inbound_protocol: &str, value: i64) {
+        self.cached_gauge(
+            M_PROXY_IN_FLIGHT,
+            value as f64,
+            |k| {
+                k.label(endpoint);
+                k.label(inbound_protocol);
+            },
+            || {
+                metrics::gauge!(
+                    M_PROXY_IN_FLIGHT,
+                    "endpoint" => endpoint.to_string(),
+                    "inbound_protocol" => inbound_protocol.to_string(),
+                )
+            },
+        );
+    }
+
+    /// Emit through this worker's cached handle for `(site, label values)`,
+    /// registering via `register` on the first sight of that label set on
+    /// this thread.
+    ///
+    /// `build_key` writes the label VALUES in a fixed per-site order;
+    /// `use_handle` performs the actual increment/set/record. On the
+    /// steady-state path this allocates nothing and touches no shared
+    /// state beyond the series' own value atomics.
+    ///
+    /// Invariant: `register` and `use_handle` must not re-enter any
+    /// `Metrics` emit (they would hit the `RefCell` re-borrow) — they only
+    /// register or write handles, and registration cannot emit.
+    fn with_worker_handle<H: WorkerCached>(
+        &self,
+        site: &'static str,
+        build_key: impl FnOnce(&mut WorkerKey<'_>),
+        register: impl FnOnce() -> H,
+        use_handle: impl FnOnce(&H),
+    ) {
+        WORKER_CACHE.with(|cell| {
+            let cache = &mut *cell.borrow_mut();
+            cache.key_buf.clear();
+            let dirty = {
+                let mut key = WorkerKey {
+                    buf: &mut cache.key_buf,
+                    dirty: false,
+                };
+                key.buf.push_str(&self.inner.worker_key_prefix);
+                key.buf.push(WORKER_KEY_SEP);
+                key.buf.push_str(site);
+                build_key(&mut key);
+                key.dirty
+            };
+            if dirty {
+                // A label value contained the key separator: emit through
+                // a freshly registered handle instead of risking two label
+                // sets aliasing one cache key. Same series, slow path.
+                use_handle(&register());
+                return;
+            }
+            let (map, key) = H::slot_with_key(cache);
+            if let Some(handle) = map.get(key) {
+                use_handle(handle);
+                return;
+            }
+            let handle = register();
+            use_handle(&handle);
+            if map.len() >= WORKER_CACHE_CAPACITY {
+                if let Some(evicted) = map.keys().next().cloned() {
+                    map.remove(&evicted);
+                }
+            }
+            map.insert(Box::from(key), handle);
         });
     }
 
+    /// Test-only view of this thread's cached request-series entry count.
+    /// Each `#[test]` runs on its own thread, so the count starts at zero
+    /// and covers exactly that test's emits.
+    #[cfg(test)]
+    fn worker_request_series_len() -> usize {
+        WORKER_CACHE.with(|cell| cell.borrow().request_series.len())
+    }
+
+    #[cfg(test)]
+    fn worker_usage_series_len() -> usize {
+        WORKER_CACHE.with(|cell| cell.borrow().usage_series.len())
+    }
+
+    fn with_request_series(
+        &self,
+        labels: RequestLabels<'_>,
+        record: impl FnOnce(&RequestSeriesHandles),
+    ) {
+        self.with_worker_handle(
+            "request_series",
+            |k| {
+                k.label(labels.endpoint);
+                k.label(labels.inbound_protocol);
+                k.label(labels.provider);
+                k.label(labels.model);
+                k.label(labels.upstream_model);
+                k.label(labels.provider_key_id);
+                k.label(labels.provider_key_name);
+                k.label(labels.api_key_id);
+                k.label(labels.team_id);
+                k.label(labels.user_id);
+                k.label(labels.user_name);
+                k.label_bool(labels.stream);
+                k.label_bool(labels.is_fallback);
+                k.label_u16(labels.status);
+                k.label(labels.outcome.as_str());
+            },
+            RequestSeriesHandles::default,
+            record,
+        );
+    }
+
+    fn with_usage_series(&self, labels: UsageLabels<'_>, record: impl FnOnce(&UsageSeriesHandles)) {
+        self.with_worker_handle(
+            "usage_series",
+            |k| {
+                k.label(labels.endpoint);
+                k.label(labels.inbound_protocol);
+                k.label(labels.provider);
+                k.label(labels.model);
+                k.label(labels.upstream_model);
+                k.label(labels.provider_key_id);
+                k.label(labels.provider_key_name);
+                k.label(labels.api_key_id);
+                k.label(labels.team_id);
+                k.label(labels.user_id);
+                k.label(labels.user_name);
+            },
+            UsageSeriesHandles::default,
+            record,
+        );
+    }
+
+    /// Resolve one lazily-registered handle in a series bundle. The
+    /// recorder guard is paid only on the one-time init path; a cache-hit
+    /// emit never touches it.
+    fn init_handle<'h, T>(&self, slot: &'h OnceLock<T>, init: impl FnOnce() -> T) -> &'h T {
+        slot.get_or_init(|| metrics::with_local_recorder(&self.inner.recorder, init))
+    }
+
+    /// Increment a worker-cached counter. `register` runs under the
+    /// recorder guard on the one-time miss path only.
+    fn cached_counter(
+        &self,
+        site: &'static str,
+        by: u64,
+        build_key: impl FnOnce(&mut WorkerKey<'_>),
+        register: impl FnOnce() -> metrics::Counter,
+    ) {
+        self.with_worker_handle(
+            site,
+            build_key,
+            || metrics::with_local_recorder(&self.inner.recorder, register),
+            |counter| counter.increment(by),
+        );
+    }
+
+    /// Set a worker-cached gauge, same contract as [`Self::cached_counter`].
+    fn cached_gauge(
+        &self,
+        site: &'static str,
+        value: f64,
+        build_key: impl FnOnce(&mut WorkerKey<'_>),
+        register: impl FnOnce() -> metrics::Gauge,
+    ) {
+        self.with_worker_handle(
+            site,
+            build_key,
+            || metrics::with_local_recorder(&self.inner.recorder, register),
+            |gauge| gauge.set(value),
+        );
+    }
+
+    /// Record into a worker-cached histogram, same contract as
+    /// [`Self::cached_counter`].
+    fn cached_histogram(
+        &self,
+        site: &'static str,
+        value: f64,
+        build_key: impl FnOnce(&mut WorkerKey<'_>),
+        register: impl FnOnce() -> metrics::Histogram,
+    ) {
+        self.with_worker_handle(
+            site,
+            build_key,
+            || metrics::with_local_recorder(&self.inner.recorder, register),
+            |histogram| histogram.record(value),
+        );
+    }
+
     pub fn record_proxy_request(&self, labels: RequestLabels<'_>, duration: Duration) {
-        metrics::with_local_recorder(&self.inner.recorder, || {
-            labels.record_request_counter(M_PROXY_REQUESTS_TOTAL);
-            metrics::histogram!(
-                M_PROXY_REQUEST_DURATION,
-                "endpoint" => labels.endpoint.to_string(),
-                "inbound_protocol" => labels.inbound_protocol.to_string(),
-                "provider" => labels.provider.to_string(),
-                "model" => labels.model.to_string(),
-                "upstream_model" => labels.upstream_model.to_string(),
-                "provider_key_id" => labels.provider_key_id.to_string(),
-                "provider_key_name" => labels.provider_key_name.to_string(),
-                "api_key_id" => labels.api_key_id.to_string(),
-                "team_id" => labels.team_id.to_string(),
-                "user_id" => labels.user_id.to_string(),
-                "user_name" => labels.user_name.to_string(),
-                "stream" => bool_str(labels.stream),
-                "status" => labels.status.to_string(),
-                "outcome" => labels.outcome.as_str().to_string(),
-            )
+        self.with_request_series(labels, |h| {
+            self.init_handle(&h.proxy_requests, || {
+                labels.request_counter(M_PROXY_REQUESTS_TOTAL)
+            })
+            .increment(1);
+            self.init_handle(&h.proxy_duration, || {
+                labels.request_duration_histogram(M_PROXY_REQUEST_DURATION)
+            })
             .record(duration.as_secs_f64());
             if labels.outcome != RequestOutcome::Success {
-                labels.record_request_counter(M_PROXY_FAILED_REQUESTS_TOTAL);
+                self.init_handle(&h.proxy_failed_requests, || {
+                    labels.request_counter(M_PROXY_FAILED_REQUESTS_TOTAL)
+                })
+                .increment(1);
             }
         });
     }
 
     pub fn record_llm_request(&self, labels: RequestLabels<'_>, duration: Duration) {
-        metrics::with_local_recorder(&self.inner.recorder, || {
-            labels.record_request_counter(M_LLM_REQUESTS_TOTAL);
-            metrics::histogram!(
-                M_LLM_REQUEST_DURATION,
-                "endpoint" => labels.endpoint.to_string(),
-                "inbound_protocol" => labels.inbound_protocol.to_string(),
-                "provider" => labels.provider.to_string(),
-                "model" => labels.model.to_string(),
-                "upstream_model" => labels.upstream_model.to_string(),
-                "provider_key_id" => labels.provider_key_id.to_string(),
-                "provider_key_name" => labels.provider_key_name.to_string(),
-                "api_key_id" => labels.api_key_id.to_string(),
-                "team_id" => labels.team_id.to_string(),
-                "user_id" => labels.user_id.to_string(),
-                "user_name" => labels.user_name.to_string(),
-                "stream" => bool_str(labels.stream),
-                "status" => labels.status.to_string(),
-                "outcome" => labels.outcome.as_str().to_string(),
-            )
+        self.with_request_series(labels, |h| {
+            self.init_handle(&h.llm_requests, || {
+                labels.request_counter(M_LLM_REQUESTS_TOTAL)
+            })
+            .increment(1);
+            self.init_handle(&h.llm_duration, || {
+                labels.request_duration_histogram(M_LLM_REQUEST_DURATION)
+            })
             .record(duration.as_secs_f64());
         });
     }
 
+    /// Record the paired proxy and LLM request series with one cache lookup.
+    /// All request handlers emit these together with the same end-to-end
+    /// duration.
+    pub fn record_proxy_and_llm_request(&self, labels: RequestLabels<'_>, duration: Duration) {
+        let secs = duration.as_secs_f64();
+        self.with_request_series(labels, |h| {
+            self.init_handle(&h.proxy_requests, || {
+                labels.request_counter(M_PROXY_REQUESTS_TOTAL)
+            })
+            .increment(1);
+            self.init_handle(&h.proxy_duration, || {
+                labels.request_duration_histogram(M_PROXY_REQUEST_DURATION)
+            })
+            .record(secs);
+            self.init_handle(&h.llm_requests, || {
+                labels.request_counter(M_LLM_REQUESTS_TOTAL)
+            })
+            .increment(1);
+            self.init_handle(&h.llm_duration, || {
+                labels.request_duration_histogram(M_LLM_REQUEST_DURATION)
+            })
+            .record(secs);
+            if labels.outcome != RequestOutcome::Success {
+                self.init_handle(&h.proxy_failed_requests, || {
+                    labels.request_counter(M_PROXY_FAILED_REQUESTS_TOTAL)
+                })
+                .increment(1);
+            }
+        });
+    }
+
     pub fn record_llm_usage(&self, labels: UsageLabels<'_>, usage: LlmUsage) {
-        if usage.is_empty() {
+        let spend_micro_usd = usage.spend_micro_usd();
+        if usage.input_tokens == 0
+            && usage.output_tokens == 0
+            && usage.total_tokens == 0
+            && spend_micro_usd.is_none()
+        {
             return;
         }
-        metrics::with_local_recorder(&self.inner.recorder, || {
+        self.with_usage_series(labels, |handles| {
             if usage.input_tokens > 0 {
-                labels.record_counter(M_LLM_INPUT_TOKENS_TOTAL, u64::from(usage.input_tokens));
+                self.init_handle(&handles.input_tokens, || {
+                    labels.counter(M_LLM_INPUT_TOKENS_TOTAL)
+                })
+                .increment(u64::from(usage.input_tokens));
             }
             if usage.output_tokens > 0 {
-                labels.record_counter(M_LLM_OUTPUT_TOKENS_TOTAL, u64::from(usage.output_tokens));
+                self.init_handle(&handles.output_tokens, || {
+                    labels.counter(M_LLM_OUTPUT_TOKENS_TOTAL)
+                })
+                .increment(u64::from(usage.output_tokens));
             }
             if usage.total_tokens > 0 {
-                labels.record_counter(M_LLM_TOTAL_TOKENS_TOTAL, u64::from(usage.total_tokens));
+                self.init_handle(&handles.total_tokens, || {
+                    labels.counter(M_LLM_TOTAL_TOKENS_TOTAL)
+                })
+                .increment(u64::from(usage.total_tokens));
             }
-            if usage.spend_usd > 0.0 {
-                labels.record_spend_usd(usage.spend_usd);
+            if let Some(value) = spend_micro_usd {
+                self.init_handle(&handles.spend_micro_usd, || {
+                    labels.counter(M_LLM_SPEND_MICRO_USD_TOTAL)
+                })
+                .increment(value);
             }
         });
     }
@@ -574,23 +1627,39 @@ impl Metrics {
         if ttft.is_zero() {
             return;
         }
-        metrics::with_local_recorder(&self.inner.recorder, || {
-            metrics::histogram!(
-                M_LLM_TTFT,
-                "endpoint" => labels.endpoint.to_string(),
-                "inbound_protocol" => labels.inbound_protocol.to_string(),
-                "provider" => labels.provider.to_string(),
-                "model" => labels.model.to_string(),
-                "upstream_model" => labels.upstream_model.to_string(),
-                "provider_key_id" => labels.provider_key_id.to_string(),
-                "provider_key_name" => labels.provider_key_name.to_string(),
-                "api_key_id" => labels.api_key_id.to_string(),
-                "team_id" => labels.team_id.to_string(),
-                "user_id" => labels.user_id.to_string(),
-                "user_name" => labels.user_name.to_string(),
-            )
-            .record(ttft.as_secs_f64());
-        });
+        self.cached_histogram(
+            M_LLM_TTFT,
+            ttft.as_secs_f64(),
+            |k| {
+                k.label(labels.endpoint);
+                k.label(labels.inbound_protocol);
+                k.label(labels.provider);
+                k.label(labels.model);
+                k.label(labels.upstream_model);
+                k.label(labels.provider_key_id);
+                k.label(labels.provider_key_name);
+                k.label(labels.api_key_id);
+                k.label(labels.team_id);
+                k.label(labels.user_id);
+                k.label(labels.user_name);
+            },
+            || {
+                metrics::histogram!(
+                    M_LLM_TTFT,
+                    "endpoint" => labels.endpoint.to_string(),
+                    "inbound_protocol" => labels.inbound_protocol.to_string(),
+                    "provider" => labels.provider.to_string(),
+                    "model" => labels.model.to_string(),
+                    "upstream_model" => labels.upstream_model.to_string(),
+                    "provider_key_id" => labels.provider_key_id.to_string(),
+                    "provider_key_name" => labels.provider_key_name.to_string(),
+                    "api_key_id" => labels.api_key_id.to_string(),
+                    "team_id" => labels.team_id.to_string(),
+                    "user_id" => labels.user_id.to_string(),
+                    "user_name" => labels.user_name.to_string(),
+                )
+            },
+        );
     }
 
     /// #890 req-4: record token volume for the inbound `client_type` on the
@@ -625,75 +1694,114 @@ impl Metrics {
         if input_tokens == 0 && output_tokens == 0 && total_tokens == 0 {
             return;
         }
-        metrics::with_local_recorder(&self.inner.recorder, || {
-            if input_tokens > 0 {
-                metrics::counter!(
-                    M_LLM_TOKENS_BY_CLIENT_TOTAL,
-                    "client_type" => client_type.to_string(),
-                    "model" => model.to_string(),
-                    "token_type" => "input",
-                )
-                .increment(input_tokens);
+        for (token_type, count) in [
+            ("input", input_tokens),
+            ("output", output_tokens),
+            ("total", total_tokens),
+        ] {
+            if count == 0 {
+                continue;
             }
-            if output_tokens > 0 {
+            self.cached_counter(
+                M_LLM_TOKENS_BY_CLIENT_TOTAL,
+                count,
+                |k| {
+                    k.label(client_type);
+                    k.label(model);
+                    k.label(token_type);
+                },
+                || {
+                    metrics::counter!(
+                        M_LLM_TOKENS_BY_CLIENT_TOTAL,
+                        "client_type" => client_type.to_string(),
+                        "model" => model.to_string(),
+                        "token_type" => token_type,
+                    )
+                },
+            );
+        }
+    }
+
+    /// Shared cached emit for the deployment counter family.
+    fn cached_deployment_counter(&self, metric: &'static str, labels: DeploymentLabels<'_>) {
+        self.cached_counter(
+            metric,
+            1,
+            |k| {
+                k.label(labels.provider);
+                k.label(labels.model);
+                k.label(labels.upstream_model);
+                k.label(labels.provider_key_id);
+            },
+            || {
                 metrics::counter!(
-                    M_LLM_TOKENS_BY_CLIENT_TOTAL,
-                    "client_type" => client_type.to_string(),
-                    "model" => model.to_string(),
-                    "token_type" => "output",
+                    metric,
+                    "provider" => labels.provider.to_string(),
+                    "model" => labels.model.to_string(),
+                    "upstream_model" => labels.upstream_model.to_string(),
+                    "provider_key_id" => labels.provider_key_id.to_string(),
                 )
-                .increment(output_tokens);
-            }
-            if total_tokens > 0 {
-                metrics::counter!(
-                    M_LLM_TOKENS_BY_CLIENT_TOTAL,
-                    "client_type" => client_type.to_string(),
-                    "model" => model.to_string(),
-                    "token_type" => "total",
-                )
-                .increment(total_tokens);
-            }
-        });
+            },
+        );
     }
 
     pub fn record_deployment_request(&self, labels: DeploymentLabels<'_>, outcome: RequestOutcome) {
-        metrics::with_local_recorder(&self.inner.recorder, || {
-            labels.record_counter(M_DEPLOYMENT_REQUESTS_TOTAL);
-            match outcome {
-                RequestOutcome::Success => labels.record_counter(M_DEPLOYMENT_SUCCESS_TOTAL),
-                _ => labels.record_counter(M_DEPLOYMENT_FAILURE_TOTAL),
+        self.cached_deployment_counter(M_DEPLOYMENT_REQUESTS_TOTAL, labels);
+        match outcome {
+            RequestOutcome::Success => {
+                self.cached_deployment_counter(M_DEPLOYMENT_SUCCESS_TOTAL, labels)
             }
-        });
+            _ => self.cached_deployment_counter(M_DEPLOYMENT_FAILURE_TOTAL, labels),
+        }
     }
 
     pub fn set_deployment_state(&self, labels: DeploymentLabels<'_>, state: DeploymentState) {
-        metrics::with_local_recorder(&self.inner.recorder, || {
-            metrics::gauge!(
-                M_DEPLOYMENT_STATE,
-                "provider" => labels.provider.to_string(),
-                "model" => labels.model.to_string(),
-                "upstream_model" => labels.upstream_model.to_string(),
-                "provider_key_id" => labels.provider_key_id.to_string(),
-            )
-            .set(state.as_f64());
-        });
+        self.cached_gauge(
+            M_DEPLOYMENT_STATE,
+            state.as_f64(),
+            |k| {
+                k.label(labels.provider);
+                k.label(labels.model);
+                k.label(labels.upstream_model);
+                k.label(labels.provider_key_id);
+            },
+            || {
+                metrics::gauge!(
+                    M_DEPLOYMENT_STATE,
+                    "provider" => labels.provider.to_string(),
+                    "model" => labels.model.to_string(),
+                    "upstream_model" => labels.upstream_model.to_string(),
+                    "provider_key_id" => labels.provider_key_id.to_string(),
+                )
+            },
+        );
     }
 
     pub fn record_deployment_cooldown(&self, labels: DeploymentLabels<'_>) {
-        metrics::with_local_recorder(&self.inner.recorder, || {
-            labels.record_counter(M_DEPLOYMENT_COOLED_DOWN_TOTAL);
-        });
+        self.cached_deployment_counter(M_DEPLOYMENT_COOLED_DOWN_TOTAL, labels);
     }
 
-    pub fn record_routing_fallback(&self, success: bool, model: &str) {
+    pub fn record_routing_fallback(&self, success: bool, model: &str, fallback_model: &str) {
         let metric = if success {
             M_ROUTING_SUCCESSFUL_FALLBACKS_TOTAL
         } else {
             M_ROUTING_FAILED_FALLBACKS_TOTAL
         };
-        metrics::with_local_recorder(&self.inner.recorder, || {
-            metrics::counter!(metric, "model" => model.to_string()).increment(1);
-        });
+        self.cached_counter(
+            metric,
+            1,
+            |k| {
+                k.label(model);
+                k.label(fallback_model);
+            },
+            || {
+                metrics::counter!(
+                    metric,
+                    "model" => model.to_string(),
+                    "fallback_model" => fallback_model.to_string(),
+                )
+            },
+        );
     }
 
     pub fn set_rate_limit_remaining(
@@ -703,70 +1811,124 @@ impl Metrics {
         requests: Option<u64>,
         tokens: Option<u64>,
     ) {
-        metrics::with_local_recorder(&self.inner.recorder, || {
-            if let Some(value) = requests {
+        if let Some(value) = requests {
+            self.cached_gauge(
+                M_RATELIMIT_REMAINING_REQUESTS,
+                value as f64,
+                |k| {
+                    k.label(api_key_id);
+                    k.label(model);
+                },
+                || {
+                    metrics::gauge!(
+                        M_RATELIMIT_REMAINING_REQUESTS,
+                        "api_key_id" => api_key_id.to_string(),
+                        "model" => model.to_string(),
+                    )
+                },
+            );
+        }
+        if let Some(value) = tokens {
+            self.cached_gauge(
+                M_RATELIMIT_REMAINING_TOKENS,
+                value as f64,
+                |k| {
+                    k.label(api_key_id);
+                    k.label(model);
+                },
+                || {
+                    metrics::gauge!(
+                        M_RATELIMIT_REMAINING_TOKENS,
+                        "api_key_id" => api_key_id.to_string(),
+                        "model" => model.to_string(),
+                    )
+                },
+            );
+        }
+    }
+
+    /// Shared cached emit for the budget gauge family.
+    fn cached_budget_gauge(&self, metric: &'static str, labels: BudgetLabels<'_>, value: f64) {
+        self.cached_gauge(
+            metric,
+            value,
+            |k| {
+                k.label(labels.api_key_id);
+                k.label(labels.team_id);
+                k.label(labels.user_id);
+            },
+            || {
                 metrics::gauge!(
-                    M_RATELIMIT_REMAINING_REQUESTS,
-                    "api_key_id" => api_key_id.to_string(),
-                    "model" => model.to_string(),
+                    metric,
+                    "api_key_id" => labels.api_key_id.to_string(),
+                    "team_id" => labels.team_id.to_string(),
+                    "user_id" => labels.user_id.to_string(),
                 )
-                .set(value as f64);
-            }
-            if let Some(value) = tokens {
-                metrics::gauge!(
-                    M_RATELIMIT_REMAINING_TOKENS,
-                    "api_key_id" => api_key_id.to_string(),
-                    "model" => model.to_string(),
-                )
-                .set(value as f64);
-            }
-        });
+            },
+        );
     }
 
     pub fn set_budget_gauges(&self, labels: BudgetLabels<'_>, budget: BudgetGauges) {
-        metrics::with_local_recorder(&self.inner.recorder, || {
-            labels.record_gauge(M_BUDGET_DETAILS_PRESENT, 1.0);
-            if let Some(value) = budget.limit_usd {
-                labels.record_gauge(M_BUDGET_LIMIT_USD, value);
-            }
-            if let Some(value) = budget.spent_usd {
-                labels.record_gauge(M_BUDGET_SPENT_USD, value);
-            }
-            if let Some(value) = budget.remaining_usd {
-                labels.record_gauge(M_BUDGET_REMAINING_USD, value);
-            }
-            if let Some(value) = budget.reset_seconds {
-                labels.record_gauge(M_BUDGET_RESET_SECONDS, value as f64);
-            }
-        });
+        self.cached_budget_gauge(M_BUDGET_DETAILS_PRESENT, labels, 1.0);
+        if let Some(value) = budget.limit_usd {
+            self.cached_budget_gauge(M_BUDGET_LIMIT_USD, labels, value);
+        }
+        if let Some(value) = budget.spent_usd {
+            self.cached_budget_gauge(M_BUDGET_SPENT_USD, labels, value);
+        }
+        if let Some(value) = budget.remaining_usd {
+            self.cached_budget_gauge(M_BUDGET_REMAINING_USD, labels, value);
+        }
+        if let Some(value) = budget.reset_seconds {
+            self.cached_budget_gauge(M_BUDGET_RESET_SECONDS, labels, value as f64);
+        }
     }
 
     pub fn clear_budget_gauges(&self, labels: BudgetLabels<'_>) {
-        metrics::with_local_recorder(&self.inner.recorder, || {
-            labels.record_gauge(M_BUDGET_DETAILS_PRESENT, 0.0);
-        });
+        self.cached_budget_gauge(M_BUDGET_DETAILS_PRESENT, labels, 0.0);
     }
 
     pub fn record_redis_failure(&self, operation: &str) {
-        metrics::with_local_recorder(&self.inner.recorder, || {
-            metrics::counter!(M_REDIS_FAILURES_TOTAL, "operation" => operation.to_string())
-                .increment(1);
-        });
+        self.cached_counter(
+            M_REDIS_FAILURES_TOTAL,
+            1,
+            |k| k.label(operation),
+            || metrics::counter!(M_REDIS_FAILURES_TOTAL, "operation" => operation.to_string()),
+        );
     }
 
-    pub fn record_usage_event_drop(&self, reason: &str) {
-        metrics::with_local_recorder(&self.inner.recorder, || {
-            metrics::counter!(M_USAGE_EVENT_DROPS_TOTAL, "reason" => reason.to_string())
-                .increment(1);
-        });
+    /// Count a usage event that never made it into the queue. Carries the
+    /// same attribution as the emit counter (AISIX-Cloud#1317): a dropped
+    /// event is a hole in the usage record, and the operator's question is
+    /// whose data is missing, which `reason` alone cannot answer.
+    pub fn record_usage_event_drop(&self, reason: &str, labels: UsageEventLabels<'_>) {
+        self.cached_counter(
+            M_USAGE_EVENT_DROPS_TOTAL,
+            1,
+            |k| {
+                k.label(reason);
+                k.label(labels.model);
+                k.label(labels.provider_key_id);
+                k.label(labels.provider_key_name);
+            },
+            || {
+                metrics::counter!(
+                    M_USAGE_EVENT_DROPS_TOTAL,
+                    "reason" => reason.to_string(),
+                    "model" => labels.model.to_string(),
+                    "provider_key_id" => labels.provider_key_id.to_string(),
+                    "provider_key_name" => labels.provider_key_name.to_string(),
+                )
+            },
+        );
     }
 
     /// Issue #408: bump on every `UsageSink::try_emit` call (the
     /// handler's emission intent — paired with the drops counter so
     /// the invariant `emitted == delivered + dropped` holds strictly).
     ///
-    /// All three labels are `&'static str` so prometheus cardinality
-    /// is type-system-bounded:
+    /// The surface labels are `&'static str` so prometheus cardinality is
+    /// type-system-bounded:
     /// - `handler`: OpenAI-shape endpoint name (`chat`, `embeddings`,
     ///   `messages`, etc.)
     /// - `status_code`: bucketed by `status_bucket()` (one of `2xx` /
@@ -774,39 +1936,76 @@ impl Metrics {
     /// - `inbound_protocol`: normalised by the caller to one of
     ///   `"openai"` / `"anthropic"` / `"other"` (audit MEDIUM-3 —
     ///   `&'static str` here prevents user-controlled cardinality)
+    ///
+    /// [`UsageEventLabels`] adds the model and ProviderKey the event was
+    /// attributed to (AISIX-Cloud#1317). Those cannot be `&'static str`,
+    /// so they are bounded at the proxy's emit chokepoint instead — see
+    /// that type. The dimensions they add are ones
+    /// `aisix_llm_requests_total` already carries, so this counter stays
+    /// well inside the request families' series count.
     pub fn record_usage_event_emit(
         &self,
         handler: &'static str,
         status_code: u16,
         inbound_protocol: &'static str,
+        labels: UsageEventLabels<'_>,
     ) {
-        metrics::with_local_recorder(&self.inner.recorder, || {
-            metrics::counter!(
-                M_USAGE_EVENT_EMITS_TOTAL,
-                "handler" => handler,
-                "status_code" => status_bucket(status_code),
-                "inbound_protocol" => inbound_protocol,
-            )
-            .increment(1);
-        });
+        let status_class = status_bucket(status_code);
+        self.cached_counter(
+            M_USAGE_EVENT_EMITS_TOTAL,
+            1,
+            |k| {
+                k.label(handler);
+                k.label(status_class);
+                k.label(inbound_protocol);
+                k.label(labels.model);
+                k.label(labels.provider_key_id);
+                k.label(labels.provider_key_name);
+            },
+            || {
+                metrics::counter!(
+                    M_USAGE_EVENT_EMITS_TOTAL,
+                    "handler" => handler,
+                    "status_code" => status_class,
+                    "inbound_protocol" => inbound_protocol,
+                    "model" => labels.model.to_string(),
+                    "provider_key_id" => labels.provider_key_id.to_string(),
+                    "provider_key_name" => labels.provider_key_name.to_string(),
+                )
+            },
+        );
     }
 
     pub fn record_otlp_fanout_drop(&self, exporter: &str, reason: &str) {
-        metrics::with_local_recorder(&self.inner.recorder, || {
-            metrics::counter!(
-                M_OTLP_FANOUT_DROPS_TOTAL,
-                "exporter" => exporter.to_string(),
-                "reason" => reason.to_string(),
-            )
-            .increment(1);
-        });
+        self.cached_counter(
+            M_OTLP_FANOUT_DROPS_TOTAL,
+            1,
+            |k| {
+                k.label(exporter);
+                k.label(reason);
+            },
+            || {
+                metrics::counter!(
+                    M_OTLP_FANOUT_DROPS_TOTAL,
+                    "exporter" => exporter.to_string(),
+                    "reason" => reason.to_string(),
+                )
+            },
+        );
     }
 
     pub fn record_otlp_fanout_failure(&self, exporter: &str) {
-        metrics::with_local_recorder(&self.inner.recorder, || {
-            metrics::counter!(M_OTLP_FANOUT_FAILURES_TOTAL, "exporter" => exporter.to_string())
-                .increment(1);
-        });
+        self.cached_counter(
+            M_OTLP_FANOUT_FAILURES_TOTAL,
+            1,
+            |k| k.label(exporter),
+            || {
+                metrics::counter!(
+                    M_OTLP_FANOUT_FAILURES_TOTAL,
+                    "exporter" => exporter.to_string(),
+                )
+            },
+        );
     }
 
     /// Observe one request's client-perceived end-to-end latency on
@@ -814,18 +2013,50 @@ impl Metrics {
     /// at handler return for non-streaming requests and failures, at
     /// stream completion for committed streams.
     pub fn record_request_e2e_latency(&self, labels: LatencyLabels<'_>, elapsed: Duration) {
-        metrics::with_local_recorder(&self.inner.recorder, || {
-            metrics::histogram!(
-                M_REQUEST_E2E_LATENCY_SECONDS,
-                "env_id" => self.inner.env_id.clone(),
-                "endpoint" => labels.endpoint.to_string(),
-                "model" => non_empty_or_unknown(labels.model),
-                "provider" => non_empty_or_unknown(labels.provider),
-                "status_class" => status_bucket(labels.status),
-                "streaming" => bool_str(labels.streaming),
-            )
-            .record(elapsed.as_secs_f64());
-        });
+        self.cached_latency_histogram(M_REQUEST_E2E_LATENCY_SECONDS, labels, elapsed);
+    }
+
+    /// Shared cached emit for the two SLO latency histograms — identical
+    /// label shape, `env_id` constant per instance (the cache key is
+    /// already instance-scoped, so it stays out of the key).
+    fn cached_latency_histogram(
+        &self,
+        metric: &'static str,
+        labels: LatencyLabels<'_>,
+        elapsed: Duration,
+    ) {
+        let model = if labels.model.is_empty() {
+            "unknown"
+        } else {
+            labels.model
+        };
+        let provider = if labels.provider.is_empty() {
+            "unknown"
+        } else {
+            labels.provider
+        };
+        self.cached_histogram(
+            metric,
+            elapsed.as_secs_f64(),
+            |k| {
+                k.label(labels.endpoint);
+                k.label(model);
+                k.label(provider);
+                k.label(status_bucket(labels.status));
+                k.label_bool(labels.streaming);
+            },
+            || {
+                metrics::histogram!(
+                    metric,
+                    "env_id" => self.inner.env_id.clone(),
+                    "endpoint" => labels.endpoint.to_string(),
+                    "model" => model.to_string(),
+                    "provider" => provider.to_string(),
+                    "status_class" => status_bucket(labels.status),
+                    "streaming" => bool_str(labels.streaming),
+                )
+            },
+        );
     }
 
     /// Observe a streaming request's time-to-first-token on
@@ -835,18 +2066,7 @@ impl Metrics {
         if ttft.is_zero() {
             return;
         }
-        metrics::with_local_recorder(&self.inner.recorder, || {
-            metrics::histogram!(
-                M_REQUEST_TTFT_SECONDS,
-                "env_id" => self.inner.env_id.clone(),
-                "endpoint" => labels.endpoint.to_string(),
-                "model" => non_empty_or_unknown(labels.model),
-                "provider" => non_empty_or_unknown(labels.provider),
-                "status_class" => status_bucket(labels.status),
-                "streaming" => bool_str(labels.streaming),
-            )
-            .record(ttft.as_secs_f64());
-        });
+        self.cached_latency_histogram(M_REQUEST_TTFT_SECONDS, labels, ttft);
     }
 }
 
@@ -859,10 +2079,35 @@ impl aisix_core::GuardrailMetricsSink for Metrics {
     }
 }
 
-/// Labels for the SLO latency histograms (AISIX-Cloud#1011). Deliberately
-/// low-cardinality: bounded endpoint set, configured model/provider names,
-/// bucketed status — never per-key / per-user dimensions, which would
-/// multiply every bucket edge.
+/// Who was called and how, for the `aisix_a2a_*` family. Every field is
+/// bounded: a registered agent name and the canonical operation set.
+#[derive(Clone, Copy)]
+pub struct A2aLabels<'a> {
+    /// Registered agent name. Borrowed: it comes from the snapshot, and an
+    /// unregistered agent is refused before any call is metered.
+    pub agent: &'a str,
+    /// Canonical operation. `&'static str` so the fixed set is enforced by the
+    /// compiler rather than by a comment — the same reason
+    /// `record_usage_event_emit` takes its handler that way.
+    pub operation: &'static str,
+    /// Raw HTTP status; bucketed to `2xx` / `4xx` / … at record time.
+    pub status: u16,
+}
+
+/// What one A2A call did, for the series that only some calls observe.
+#[derive(Clone, Copy, Default)]
+pub struct A2aCallOutcome {
+    /// Time to the upstream agent's first streamed event. `None` for a unary
+    /// call and for a stream that never produced one.
+    pub ttfb: Option<Duration>,
+    /// Events relayed downstream. 0 for a unary call.
+    pub stream_events: u32,
+    /// Normalized task state the call ended on; empty when no response
+    /// carried one. `&'static str` for the same reason as
+    /// [`A2aLabels::operation`].
+    pub task_state: &'static str,
+}
+
 #[derive(Clone, Copy)]
 pub struct LatencyLabels<'a> {
     /// Route template, e.g. `/v1/chat/completions`. Bounded set.
@@ -877,14 +2122,6 @@ pub struct LatencyLabels<'a> {
 }
 
 /// Missing dimensions default to `"unknown"`, never an empty label value.
-fn non_empty_or_unknown(v: &str) -> String {
-    if v.is_empty() {
-        "unknown".to_string()
-    } else {
-        v.to_string()
-    }
-}
-
 /// Bucket an HTTP status code into one of `2xx` / `3xx` / `4xx` /
 /// `5xx` / `other` (the last covers 1xx and out-of-range). Used by
 /// the UsageEvent emission counter (#408) to keep prometheus label
@@ -1146,7 +2383,7 @@ impl Default for RequestLabels<'_> {
 }
 
 impl RequestLabels<'_> {
-    fn record_request_counter(&self, metric: &'static str) {
+    fn request_counter(&self, metric: &'static str) -> metrics::Counter {
         metrics::counter!(
             metric,
             "endpoint" => self.endpoint.to_string(),
@@ -1165,7 +2402,26 @@ impl RequestLabels<'_> {
             "status" => self.status.to_string(),
             "outcome" => self.outcome.as_str().to_string(),
         )
-        .increment(1);
+    }
+
+    fn request_duration_histogram(&self, metric: &'static str) -> metrics::Histogram {
+        metrics::histogram!(
+            metric,
+            "endpoint" => self.endpoint.to_string(),
+            "inbound_protocol" => self.inbound_protocol.to_string(),
+            "provider" => self.provider.to_string(),
+            "model" => self.model.to_string(),
+            "upstream_model" => self.upstream_model.to_string(),
+            "provider_key_id" => self.provider_key_id.to_string(),
+            "provider_key_name" => self.provider_key_name.to_string(),
+            "api_key_id" => self.api_key_id.to_string(),
+            "team_id" => self.team_id.to_string(),
+            "user_id" => self.user_id.to_string(),
+            "user_name" => self.user_name.to_string(),
+            "stream" => bool_str(self.stream),
+            "status" => self.status.to_string(),
+            "outcome" => self.outcome.as_str().to_string(),
+        )
     }
 }
 
@@ -1205,7 +2461,7 @@ impl Default for UsageLabels<'_> {
 }
 
 impl UsageLabels<'_> {
-    fn record_counter(&self, metric: &'static str, value: u64) {
+    fn counter(&self, metric: &'static str) -> metrics::Counter {
         metrics::counter!(
             metric,
             "endpoint" => self.endpoint.to_string(),
@@ -1220,32 +2476,6 @@ impl UsageLabels<'_> {
             "user_id" => self.user_id.to_string(),
             "user_name" => self.user_name.to_string(),
         )
-        .increment(value);
-    }
-
-    fn record_spend_usd(&self, value: f64) {
-        if !value.is_finite() || value <= 0.0 {
-            return;
-        }
-        let micro_usd = (value * 1_000_000.0).round();
-        if micro_usd <= 0.0 {
-            return;
-        }
-        metrics::counter!(
-            M_LLM_SPEND_MICRO_USD_TOTAL,
-            "endpoint" => self.endpoint.to_string(),
-            "inbound_protocol" => self.inbound_protocol.to_string(),
-            "provider" => self.provider.to_string(),
-            "model" => self.model.to_string(),
-            "upstream_model" => self.upstream_model.to_string(),
-            "provider_key_id" => self.provider_key_id.to_string(),
-            "provider_key_name" => self.provider_key_name.to_string(),
-            "api_key_id" => self.api_key_id.to_string(),
-            "team_id" => self.team_id.to_string(),
-            "user_id" => self.user_id.to_string(),
-            "user_name" => self.user_name.to_string(),
-        )
-        .increment(micro_usd as u64);
     }
 }
 
@@ -1258,12 +2488,59 @@ pub struct LlmUsage {
 }
 
 impl LlmUsage {
-    fn is_empty(self) -> bool {
-        self.input_tokens == 0
-            && self.output_tokens == 0
-            && self.total_tokens == 0
-            && self.spend_usd <= 0.0
+    fn spend_micro_usd(self) -> Option<u64> {
+        if !self.spend_usd.is_finite() || self.spend_usd <= 0.0 {
+            return None;
+        }
+        let micro_usd = (self.spend_usd * 1_000_000.0).round();
+        (micro_usd > 0.0).then_some(micro_usd as u64)
     }
+}
+
+/// The attribution dimensions `aisix_usage_events_emitted_total` and
+/// `aisix_usage_event_drops_total` share (AISIX-Cloud#1317).
+///
+/// The two counters are read as one — `emitted == delivered + dropped` —
+/// so they have to carry the SAME labels or the invariant only holds
+/// after summing away every dimension, and "which model's usage records
+/// were lost" stays unanswerable. Both take this one struct for that
+/// reason.
+///
+/// Bounded by the caller, which is the proxy's emit chokepoint: `model`
+/// is `usage_attr::metric_model_label` output (the configured set, never
+/// the caller's raw `model` field — #451), and the ProviderKey pair is
+/// read off one snapshot row so the name can never be paired with an id
+/// it did not come from.
+#[derive(Debug, Clone, Copy)]
+pub struct UsageEventLabels<'a> {
+    pub model: &'a str,
+    pub provider_key_id: &'a str,
+    pub provider_key_name: &'a str,
+}
+
+impl Default for UsageEventLabels<'_> {
+    fn default() -> Self {
+        Self {
+            model: "unknown",
+            provider_key_id: "unknown",
+            provider_key_name: "unknown",
+        }
+    }
+}
+
+/// Label set for [`M_PROXY_CLIENT_CANCELLED_TOTAL`]. Every field is a
+/// value the proxy has already bounded — see that constant.
+#[derive(Debug, Clone, Copy)]
+pub struct CancelledLabels<'a> {
+    pub endpoint: &'a str,
+    /// What the caller addressed, collapsed to the configured model set;
+    /// `unknown` when the request was cancelled before it resolved one.
+    pub model: &'a str,
+    /// The ProviderKey of the target the request was waiting on, and the
+    /// readable name read off that same row. Both `unknown` when the
+    /// request never selected a target.
+    pub provider_key_id: &'a str,
+    pub provider_key_name: &'a str,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1282,19 +2559,6 @@ impl Default for DeploymentLabels<'_> {
             upstream_model: "unknown",
             provider_key_id: "unknown",
         }
-    }
-}
-
-impl DeploymentLabels<'_> {
-    fn record_counter(&self, metric: &'static str) {
-        metrics::counter!(
-            metric,
-            "provider" => self.provider.to_string(),
-            "model" => self.model.to_string(),
-            "upstream_model" => self.upstream_model.to_string(),
-            "provider_key_id" => self.provider_key_id.to_string(),
-        )
-        .increment(1);
     }
 }
 
@@ -1329,18 +2593,6 @@ impl Default for BudgetLabels<'_> {
             team_id: "unknown",
             user_id: "unknown",
         }
-    }
-}
-
-impl BudgetLabels<'_> {
-    fn record_gauge(&self, metric: &'static str, value: f64) {
-        metrics::gauge!(
-            metric,
-            "api_key_id" => self.api_key_id.to_string(),
-            "team_id" => self.team_id.to_string(),
-            "user_id" => self.user_id.to_string(),
-        )
-        .set(value);
     }
 }
 
@@ -1466,11 +2718,76 @@ mod tests {
     #[test]
     fn ratelimit_rejection_counter_increments() {
         let m = Metrics::new(false);
-        m.record_ratelimit_rejection("requests");
-        m.record_ratelimit_rejection("requests");
+        m.record_ratelimit_rejection("requests", "api_key", None);
+        m.record_ratelimit_rejection("requests", "api_key", None);
+        m.record_ratelimit_rejection("requests", "policy", Some("pol-1"));
         let rendered = m.render();
         assert!(rendered.contains(M_RATELIMIT_REJECTIONS));
         assert!(rendered.contains("scope=\"requests\""));
+        assert!(rendered.contains("layer=\"api_key\""));
+        // Policy-layer rejections carry the offending policy id; other
+        // layers leave the label empty.
+        assert!(rendered.contains("policy_id=\"pol-1\""));
+        assert!(rendered.contains("policy_id=\"\""));
+    }
+
+    #[test]
+    fn a2a_family_slices_by_agent_and_operation() {
+        let m = Metrics::new(false);
+        m.record_a2a_call(
+            A2aLabels {
+                agent: "invoices",
+                operation: "message/stream",
+                status: 200,
+            },
+            A2aCallOutcome {
+                ttfb: Some(Duration::from_millis(80)),
+                stream_events: 17,
+                task_state: "completed",
+            },
+        );
+        let rendered = m.render();
+        // The dimension the proxy families cannot answer: which agent, which
+        // operation.
+        assert!(rendered.contains(&format!(
+            "{M_A2A_REQUESTS_TOTAL}{{agent=\"invoices\",operation=\"message/stream\",status=\"2xx\"}} 1"
+        )));
+        assert!(rendered.contains(&format!(
+            "{M_A2A_STREAM_EVENTS_TOTAL}{{agent=\"invoices\",operation=\"message/stream\"}} 17"
+        )));
+        assert!(rendered.contains(&format!(
+            "{M_A2A_TASK_STATE_TOTAL}{{agent=\"invoices\",state=\"completed\"}} 1"
+        )));
+        // A real histogram, not a summary — the buckets are registered.
+        assert!(rendered.contains(&format!("{M_A2A_TTFB_SECONDS}_bucket")));
+        // Task and context ids are the whole reason this family is safe to
+        // label; neither may ever appear.
+        assert!(!rendered.contains("task_id="));
+        assert!(!rendered.contains("context_id="));
+    }
+
+    #[test]
+    fn a2a_unary_call_observes_only_the_series_it_has_data_for() {
+        let m = Metrics::new(false);
+        m.record_a2a_call(
+            A2aLabels {
+                agent: "invoices",
+                operation: "tasks/get",
+                status: 502,
+            },
+            // No stream, and the upstream never answered, so no task state.
+            A2aCallOutcome::default(),
+        );
+        let rendered = m.render();
+        assert!(rendered.contains(&format!(
+            "{M_A2A_REQUESTS_TOTAL}{{agent=\"invoices\",operation=\"tasks/get\",status=\"5xx\"}} 1"
+        )));
+        // An absent figure must not be recorded as zero: a call with no stream
+        // is not a call whose stream carried nothing, and a call with no
+        // answer has no task state to bucket.
+        assert!(!rendered.contains(M_A2A_STREAM_EVENTS_TOTAL));
+        assert!(!rendered.contains(M_A2A_TASK_STATE_TOTAL));
+        assert!(!rendered.contains(M_A2A_TTFB_SECONDS));
     }
 
     #[test]
@@ -1551,8 +2868,14 @@ mod tests {
             user_id: "user-1",
             user_name: "alice",
         };
-        m.record_proxy_request(labels, Duration::from_millis(25));
-        m.record_llm_request(labels, Duration::from_millis(20));
+        assert_eq!(Metrics::worker_request_series_len(), 0);
+        m.record_proxy_and_llm_request(labels, Duration::from_millis(25));
+        m.record_proxy_and_llm_request(labels, Duration::from_millis(20));
+        assert_eq!(
+            Metrics::worker_request_series_len(),
+            1,
+            "repeated labels must reuse one registered handle set"
+        );
         m.record_llm_usage(
             usage_labels,
             LlmUsage {
@@ -1567,6 +2890,14 @@ mod tests {
         let rendered = m.render();
         assert!(rendered.contains(M_PROXY_REQUESTS_TOTAL));
         assert!(rendered.contains(M_LLM_REQUESTS_TOTAL));
+        assert!(rendered
+            .lines()
+            .filter(|line| line.starts_with(M_PROXY_REQUESTS_TOTAL))
+            .all(|line| line.ends_with(" 2")));
+        assert!(rendered
+            .lines()
+            .filter(|line| line.starts_with(M_LLM_REQUESTS_TOTAL))
+            .all(|line| line.ends_with(" 2")));
         assert!(rendered.contains(M_LLM_INPUT_TOKENS_TOTAL));
         assert!(rendered.contains(M_LLM_OUTPUT_TOKENS_TOTAL));
         assert!(rendered.contains(M_LLM_TOTAL_TOKENS_TOTAL));
@@ -1594,6 +2925,1165 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn request_series_handle_cache_is_bounded() {
+        let metrics = Metrics::new(false);
+        // Two passes over capacity+1 distinct label sets: pass one fills
+        // the worker cache and forces at least one eviction; pass two
+        // re-emits everything, so every evicted entry re-registers.
+        for _ in 0..2 {
+            for index in 0..=WORKER_CACHE_CAPACITY {
+                let model = format!("model-{index}");
+                metrics.record_proxy_and_llm_request(
+                    RequestLabels {
+                        model: &model,
+                        ..RequestLabels::default()
+                    },
+                    Duration::from_millis(1),
+                );
+            }
+        }
+
+        assert_eq!(
+            Metrics::worker_request_series_len(),
+            WORKER_CACHE_CAPACITY,
+            "request series handle cache must stay at its fixed capacity"
+        );
+
+        // Every label set — evicted or cached — must have continued its
+        // own Prometheus series: eviction drops our handle, never the
+        // series or its value.
+        let rendered = metrics.render();
+        for index in 0..=WORKER_CACHE_CAPACITY {
+            let model_label = format!("model=\"model-{index}\"");
+            assert!(
+                rendered.lines().any(|line| {
+                    line.starts_with(M_PROXY_REQUESTS_TOTAL)
+                        && line.contains(&model_label)
+                        && line.ends_with(" 2")
+                }),
+                "series for model-{index} must show both emits (eviction must not reset it)"
+            );
+        }
+    }
+
+    #[test]
+    fn paired_request_metrics_increment_the_failure_counter_once() {
+        let metrics = Metrics::new(false);
+        metrics.record_proxy_and_llm_request(
+            RequestLabels {
+                status: 502,
+                outcome: RequestOutcome::UpstreamError,
+                ..RequestLabels::default()
+            },
+            Duration::from_millis(10),
+        );
+
+        let rendered = metrics.render();
+        assert!(
+            rendered
+                .lines()
+                .any(|line| line.starts_with(M_PROXY_FAILED_REQUESTS_TOTAL)
+                    && line.ends_with(" 1")),
+            "failed request counter was not incremented:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn separator_bearing_label_values_never_alias_cached_series() {
+        let metrics = Metrics::new(false);
+        // These two label sets join to the SAME byte sequence under the
+        // cache-key separator; the dirty-key fallback must keep them
+        // distinct series (uncached, correct) rather than folding them
+        // into one cache entry.
+        let labels_a = RequestLabels {
+            model: "x\u{1f}y",
+            upstream_model: "z",
+            ..RequestLabels::default()
+        };
+        let labels_b = RequestLabels {
+            model: "x",
+            upstream_model: "y\u{1f}z",
+            ..RequestLabels::default()
+        };
+        metrics.record_proxy_and_llm_request(labels_a, Duration::from_millis(1));
+        metrics.record_proxy_and_llm_request(labels_b, Duration::from_millis(1));
+        metrics.record_proxy_and_llm_request(labels_b, Duration::from_millis(1));
+
+        assert_eq!(
+            Metrics::worker_request_series_len(),
+            0,
+            "a separator-bearing label value must never be cached"
+        );
+        let rendered = metrics.render();
+        let series: Vec<&str> = rendered
+            .lines()
+            .filter(|line| line.starts_with(M_PROXY_REQUESTS_TOTAL))
+            .collect();
+        assert_eq!(
+            series.len(),
+            2,
+            "aliasing would fold the two label sets into one series: {series:?}"
+        );
+        assert!(series.iter().any(|line| line.ends_with(" 1")));
+        assert!(series.iter().any(|line| line.ends_with(" 2")));
+    }
+
+    #[test]
+    fn two_instances_on_one_thread_never_share_cached_handles() {
+        let a = Metrics::new(false);
+        let b = Metrics::new(false);
+        a.record_tokens("openai", "shared-model", 1);
+        b.record_tokens("openai", "shared-model", 2);
+
+        // If the worker cache ignored the instance id, `b`'s emit would
+        // land on `a`'s handle: `a` would render 3 and `b` nothing.
+        assert!(a
+            .render()
+            .lines()
+            .any(|line| line.starts_with(M_TOKENS_CONSUMED) && line.ends_with(" 1")));
+        assert!(b
+            .render()
+            .lines()
+            .any(|line| line.starts_with(M_TOKENS_CONSUMED) && line.ends_with(" 2")));
+    }
+
+    /// Pins the deployment counter family against a cache-key/label
+    /// drift: the key builder and the register closure in
+    /// `cached_deployment_counter` list the labels independently, and
+    /// dropping one from the KEY would silently alias two deployments
+    /// onto one series while every single-label-set test stayed green.
+    #[test]
+    fn deployment_counters_stay_distinct_per_label_set() {
+        let metrics = Metrics::new(false);
+        let dep_a = DeploymentLabels {
+            provider: "openai",
+            model: "gpt",
+            upstream_model: "gpt-4o",
+            provider_key_id: "pk-a",
+        };
+        // Differs ONLY in provider_key_id — the label a key-builder
+        // regression is most likely to drop.
+        let dep_b = DeploymentLabels {
+            provider_key_id: "pk-b",
+            ..dep_a
+        };
+        metrics.record_deployment_request(dep_a, RequestOutcome::Success);
+        metrics.record_deployment_request(dep_a, RequestOutcome::Success);
+        metrics.record_deployment_request(dep_b, RequestOutcome::UpstreamError);
+
+        let rendered = metrics.render();
+        let series = |metric: &str, key: &str| {
+            rendered
+                .lines()
+                .find(|l| {
+                    l.starts_with(metric) && l.contains(&format!("provider_key_id=\"{key}\""))
+                })
+                .map(str::to_owned)
+        };
+        let requests_a = series(M_DEPLOYMENT_REQUESTS_TOTAL, "pk-a")
+            .expect("deployment A must have its own requests series");
+        assert!(requests_a.ends_with(" 2"), "got: {requests_a}");
+        for label in [
+            "provider=\"openai\"",
+            "model=\"gpt\"",
+            "upstream_model=\"gpt-4o\"",
+        ] {
+            assert!(requests_a.contains(label), "missing {label}: {requests_a}");
+        }
+        let requests_b = series(M_DEPLOYMENT_REQUESTS_TOTAL, "pk-b")
+            .expect("deployment B must have its own requests series");
+        assert!(requests_b.ends_with(" 1"), "got: {requests_b}");
+        assert!(series(M_DEPLOYMENT_SUCCESS_TOTAL, "pk-a").is_some_and(|l| l.ends_with(" 2")));
+        assert!(series(M_DEPLOYMENT_FAILURE_TOTAL, "pk-b").is_some_and(|l| l.ends_with(" 1")));
+        // The outcome split must not cross-pollinate.
+        assert!(series(M_DEPLOYMENT_SUCCESS_TOTAL, "pk-b").is_none());
+        assert!(series(M_DEPLOYMENT_FAILURE_TOTAL, "pk-a").is_none());
+    }
+
+    /// Same cache-key/label drift guard for the fallback family, whose
+    /// second label (`fallback_model`) is the one a group with several
+    /// targets differs on: dropping it from the KEY would fold "fell back
+    /// to B" and "fell back to C" into one series and make the counter
+    /// useless for the question it exists to answer.
+    #[test]
+    fn fallback_counters_stay_distinct_per_target() {
+        let metrics = Metrics::new(false);
+        metrics.record_routing_fallback(true, "group", "target-b");
+        metrics.record_routing_fallback(true, "group", "target-b");
+        metrics.record_routing_fallback(true, "group", "target-c");
+        metrics.record_routing_fallback(false, "group", "target-c");
+
+        let rendered = metrics.render();
+        let series = |metric: &str, target: &str| {
+            rendered
+                .lines()
+                .find(|l| {
+                    l.starts_with(metric) && l.contains(&format!("fallback_model=\"{target}\""))
+                })
+                .map(str::to_owned)
+        };
+        let to_b = series(M_ROUTING_SUCCESSFUL_FALLBACKS_TOTAL, "target-b")
+            .expect("fallbacks to target-b must have their own series");
+        assert!(to_b.ends_with(" 2"), "got: {to_b}");
+        assert!(to_b.contains("model=\"group\""), "got: {to_b}");
+        assert!(series(M_ROUTING_SUCCESSFUL_FALLBACKS_TOTAL, "target-c")
+            .is_some_and(|l| l.ends_with(" 1")));
+        assert!(
+            series(M_ROUTING_FAILED_FALLBACKS_TOTAL, "target-c").is_some_and(|l| l.ends_with(" 1"))
+        );
+        // The success/failure split must not cross-pollinate.
+        assert!(series(M_ROUTING_FAILED_FALLBACKS_TOTAL, "target-b").is_none());
+    }
+
+    /// Pins the budget gauge family's values, field gating and clear
+    /// semantics. (Key-drift protection is NOT this test's job — its two
+    /// label sets differ in every dimension, so dropping one key label
+    /// still yields distinct keys; `budget_gauge_key_covers_every_label`
+    /// below is the drift guard.)
+    #[test]
+    fn budget_gauges_stay_distinct_per_label_set_and_clear() {
+        let metrics = Metrics::new(false);
+        let key_a = BudgetLabels {
+            api_key_id: "ak-a",
+            team_id: "team-a",
+            user_id: "user-a",
+        };
+        let key_b = BudgetLabels {
+            api_key_id: "ak-b",
+            team_id: "team-b",
+            user_id: "user-b",
+        };
+        metrics.set_budget_gauges(
+            key_a,
+            BudgetGauges {
+                limit_usd: Some(100.0),
+                spent_usd: Some(40.0),
+                remaining_usd: Some(60.0),
+                reset_seconds: Some(3600),
+            },
+        );
+        metrics.set_budget_gauges(
+            key_b,
+            BudgetGauges {
+                spent_usd: Some(7.0),
+                ..BudgetGauges::default()
+            },
+        );
+
+        let rendered = metrics.render();
+        let series = |metric: &str, team: &str| {
+            rendered
+                .lines()
+                .find(|l| l.starts_with(metric) && l.contains(&format!("team_id=\"{team}\"")))
+                .map(str::to_owned)
+        };
+        for (metric, value) in [
+            (M_BUDGET_DETAILS_PRESENT, "1"),
+            (M_BUDGET_LIMIT_USD, "100"),
+            (M_BUDGET_SPENT_USD, "40"),
+            (M_BUDGET_REMAINING_USD, "60"),
+            (M_BUDGET_RESET_SECONDS, "3600"),
+        ] {
+            let line = series(metric, "team-a")
+                .unwrap_or_else(|| panic!("{metric} missing for team-a:\n{rendered}"));
+            assert!(line.ends_with(&format!(" {value}")), "got: {line}");
+            assert!(line.contains("api_key_id=\"ak-a\"") && line.contains("user_id=\"user-a\""));
+        }
+        // Key B must have its OWN spent series, not overwrite A's.
+        assert!(series(M_BUDGET_SPENT_USD, "team-b").is_some_and(|l| l.ends_with(" 7")));
+        // Unset dimensions register nothing for B.
+        assert!(series(M_BUDGET_LIMIT_USD, "team-b").is_none());
+
+        metrics.clear_budget_gauges(key_a);
+        let rendered = metrics.render();
+        let details = |team: &str| {
+            rendered
+                .lines()
+                .find(|l| {
+                    l.starts_with(M_BUDGET_DETAILS_PRESENT)
+                        && l.contains(&format!("team_id=\"{team}\""))
+                })
+                .map(str::to_owned)
+        };
+        assert!(details("team-a").is_some_and(|l| l.ends_with(" 0")));
+        assert!(details("team-b").is_some_and(|l| l.ends_with(" 1")));
+    }
+
+    /// Pins the legacy spec-7 pair's full label sets, accumulation, and
+    /// the outcome-stays-off-durations invariant. (Its two label sets
+    /// differ in several dimensions at once, so this test cannot catch a
+    /// single dropped key label; `legacy_request_key_covers_every_label`
+    /// below is the drift guard.)
+    #[test]
+    fn legacy_request_series_stay_fully_labelled_and_distinct() {
+        let metrics = Metrics::new(false);
+        metrics.record_request(
+            "openai",
+            "my-gpt4",
+            200,
+            RequestOutcome::Success,
+            Duration::from_millis(120),
+        );
+        metrics.record_request(
+            "openai",
+            "my-gpt4",
+            200,
+            RequestOutcome::Success,
+            Duration::from_millis(80),
+        );
+        metrics.record_request(
+            "openai",
+            "other-model",
+            404,
+            RequestOutcome::ClientError,
+            Duration::from_millis(5),
+        );
+
+        let rendered = metrics.render();
+        let counter_a = rendered
+            .lines()
+            .find(|l| l.starts_with(M_REQUESTS_TOTAL) && l.contains("status=\"200\""))
+            .expect("200 series must render");
+        assert!(
+            counter_a.ends_with(" 2"),
+            "cached handle must accumulate: {counter_a}"
+        );
+        for label in [
+            "provider=\"openai\"",
+            "model=\"my-gpt4\"",
+            "outcome=\"success\"",
+        ] {
+            assert!(counter_a.contains(label), "missing {label}: {counter_a}");
+        }
+        let counter_b = rendered
+            .lines()
+            .find(|l| l.starts_with(M_REQUESTS_TOTAL) && l.contains("status=\"404\""))
+            .expect("404 series must render distinctly");
+        assert!(counter_b.ends_with(" 1"), "got: {counter_b}");
+        assert!(counter_b.contains("model=\"other-model\""));
+
+        // Duration summary: carries provider/model/status, never outcome,
+        // and counts per (model, status) series independently.
+        let dur_count_a = rendered
+            .lines()
+            .find(|l| {
+                l.starts_with(&format!("{M_REQUEST_DURATION}_count"))
+                    && l.contains("model=\"my-gpt4\"")
+            })
+            .expect("duration count for my-gpt4 must render");
+        assert!(dur_count_a.ends_with(" 2") && dur_count_a.contains("status=\"200\""));
+        let dur_count_b = rendered
+            .lines()
+            .find(|l| {
+                l.starts_with(&format!("{M_REQUEST_DURATION}_count"))
+                    && l.contains("model=\"other-model\"")
+            })
+            .expect("duration count for other-model must render");
+        assert!(dur_count_b.ends_with(" 1") && dur_count_b.contains("status=\"404\""));
+        for line in rendered.lines() {
+            if line.starts_with(M_REQUEST_DURATION) {
+                assert!(
+                    !line.contains("outcome="),
+                    "outcome must stay off durations: {line}"
+                );
+            }
+        }
+    }
+
+    // ── Vary-one-label key-drift guards ────────────────────────────────
+    //
+    // The worker cache duplicates each family's label list in two places:
+    // the key builder and the register closure. A label present in the
+    // register closure but DROPPED from the key builder aliases every
+    // pair of label sets that differ only in that label — silently, with
+    // correct-looking output for single-label-set traffic. These tests
+    // emit a base label set twice plus one variant per label differing
+    // ONLY in that label, then assert one rendered series per label set:
+    // any single dropped key label folds its variant into the base series
+    // and fails both the count and the base-total assertion.
+    // (An independent audit demonstrated by mutation that multi-dimension
+    // pairs do NOT catch single-label drops; each variant here differs in
+    // exactly one.)
+
+    /// Rendered value lines for one exact metric name (brace-delimited,
+    /// so `aisix_x` never matches `aisix_x_count` and vice versa).
+    fn series_lines<'r>(rendered: &'r str, metric: &str) -> Vec<&'r str> {
+        rendered
+            .lines()
+            .filter(|l| l.starts_with(metric) && l.as_bytes().get(metric.len()) == Some(&b'{'))
+            .collect()
+    }
+
+    #[track_caller]
+    fn assert_one_series_per_label_set(rendered: &str, metric: &str, expected: usize) {
+        let series = series_lines(rendered, metric);
+        assert_eq!(
+            series.len(),
+            expected,
+            "{metric}: a dropped key label folds a variant into the base series\n{rendered}"
+        );
+        assert_eq!(
+            series.iter().filter(|l| l.ends_with(" 2")).count(),
+            1,
+            "{metric}: exactly the base series must show both base emits\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn request_series_key_covers_every_label() {
+        let base = RequestLabels::default();
+        let variants = [
+            RequestLabels {
+                endpoint: "/v1/messages",
+                ..base
+            },
+            RequestLabels {
+                inbound_protocol: "anthropic",
+                ..base
+            },
+            RequestLabels {
+                provider: "p2",
+                ..base
+            },
+            RequestLabels {
+                model: "m2",
+                ..base
+            },
+            RequestLabels {
+                upstream_model: "um2",
+                ..base
+            },
+            RequestLabels {
+                provider_key_id: "pk2",
+                ..base
+            },
+            RequestLabels {
+                provider_key_name: "pkn2",
+                ..base
+            },
+            RequestLabels {
+                api_key_id: "ak2",
+                ..base
+            },
+            RequestLabels {
+                team_id: "t2",
+                ..base
+            },
+            RequestLabels {
+                user_id: "u2",
+                ..base
+            },
+            RequestLabels {
+                user_name: "n2",
+                ..base
+            },
+            RequestLabels {
+                stream: true,
+                ..base
+            },
+            RequestLabels {
+                is_fallback: true,
+                ..base
+            },
+            RequestLabels {
+                status: 201,
+                ..base
+            },
+            RequestLabels {
+                outcome: RequestOutcome::ClientError,
+                ..base
+            },
+        ];
+        let m = Metrics::new(false);
+        m.record_proxy_and_llm_request(base, Duration::from_millis(1));
+        m.record_proxy_and_llm_request(base, Duration::from_millis(1));
+        for v in &variants {
+            m.record_proxy_and_llm_request(*v, Duration::from_millis(1));
+        }
+        assert_one_series_per_label_set(&m.render(), M_PROXY_REQUESTS_TOTAL, 1 + variants.len());
+    }
+
+    #[test]
+    fn usage_series_key_covers_every_label() {
+        let base = UsageLabels::default();
+        let variants = [
+            UsageLabels {
+                endpoint: "/v1/messages",
+                ..base
+            },
+            UsageLabels {
+                inbound_protocol: "anthropic",
+                ..base
+            },
+            UsageLabels {
+                provider: "p2",
+                ..base
+            },
+            UsageLabels {
+                model: "m2",
+                ..base
+            },
+            UsageLabels {
+                upstream_model: "um2",
+                ..base
+            },
+            UsageLabels {
+                provider_key_id: "pk2",
+                ..base
+            },
+            UsageLabels {
+                provider_key_name: "pkn2",
+                ..base
+            },
+            UsageLabels {
+                api_key_id: "ak2",
+                ..base
+            },
+            UsageLabels {
+                team_id: "t2",
+                ..base
+            },
+            UsageLabels {
+                user_id: "u2",
+                ..base
+            },
+            UsageLabels {
+                user_name: "n2",
+                ..base
+            },
+        ];
+        let m = Metrics::new(false);
+        let one_token = LlmUsage {
+            input_tokens: 1,
+            ..LlmUsage::default()
+        };
+        m.record_llm_usage(base, one_token);
+        m.record_llm_usage(base, one_token);
+        for v in &variants {
+            m.record_llm_usage(*v, one_token);
+        }
+        assert_one_series_per_label_set(&m.render(), M_LLM_INPUT_TOKENS_TOTAL, 1 + variants.len());
+    }
+
+    #[test]
+    fn legacy_request_key_covers_every_label() {
+        let m = Metrics::new(false);
+        let emit = |provider, model, status, outcome| {
+            m.record_request(provider, model, status, outcome, Duration::from_millis(1));
+        };
+        emit("openai", "m", 200, RequestOutcome::Success);
+        emit("openai", "m", 200, RequestOutcome::Success);
+        emit("p2", "m", 200, RequestOutcome::Success);
+        emit("openai", "m2", 200, RequestOutcome::Success);
+        emit("openai", "m", 201, RequestOutcome::Success);
+        emit("openai", "m", 200, RequestOutcome::ClientError);
+
+        let rendered = m.render();
+        assert_one_series_per_label_set(&rendered, M_REQUESTS_TOTAL, 5);
+        // The duration histogram keys on (provider, model, status) only:
+        // the outcome variant lands on the base duration series, so the
+        // base count is 3 across 4 series. A status/model/provider drop
+        // from the HISTOGRAM key collapses its series count below 4.
+        let dur = series_lines(&rendered, &format!("{M_REQUEST_DURATION}_count"));
+        assert_eq!(dur.len(), 4, "{rendered}");
+        assert_eq!(
+            dur.iter().filter(|l| l.ends_with(" 3")).count(),
+            1,
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn budget_gauge_key_covers_every_label() {
+        let m = Metrics::new(false);
+        let base = BudgetLabels {
+            api_key_id: "ak",
+            team_id: "t",
+            user_id: "u",
+        };
+        let variants = [
+            BudgetLabels {
+                api_key_id: "ak2",
+                ..base
+            },
+            BudgetLabels {
+                team_id: "t2",
+                ..base
+            },
+            BudgetLabels {
+                user_id: "u2",
+                ..base
+            },
+        ];
+        let spend = |v| BudgetGauges {
+            spent_usd: Some(v),
+            ..BudgetGauges::default()
+        };
+        m.set_budget_gauges(base, spend(1.0));
+        for (i, v) in variants.iter().enumerate() {
+            m.set_budget_gauges(*v, spend(2.0 + i as f64));
+        }
+        let rendered = m.render();
+        let series = series_lines(&rendered, M_BUDGET_SPENT_USD);
+        assert_eq!(series.len(), 1 + variants.len(), "{rendered}");
+        // Gauges overwrite rather than sum: a dropped key label makes the
+        // LAST variant's value land on the base series instead.
+        assert!(
+            series.iter().any(|l| l.contains("api_key_id=\"ak\"")
+                && l.contains("team_id=\"t\"")
+                && l.ends_with(" 1")),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn llm_ttft_key_covers_every_label() {
+        let base = UsageLabels::default();
+        let variants = [
+            UsageLabels {
+                endpoint: "/v1/messages",
+                ..base
+            },
+            UsageLabels {
+                inbound_protocol: "anthropic",
+                ..base
+            },
+            UsageLabels {
+                provider: "p2",
+                ..base
+            },
+            UsageLabels {
+                model: "m2",
+                ..base
+            },
+            UsageLabels {
+                upstream_model: "um2",
+                ..base
+            },
+            UsageLabels {
+                provider_key_id: "pk2",
+                ..base
+            },
+            UsageLabels {
+                provider_key_name: "pkn2",
+                ..base
+            },
+            UsageLabels {
+                api_key_id: "ak2",
+                ..base
+            },
+            UsageLabels {
+                team_id: "t2",
+                ..base
+            },
+            UsageLabels {
+                user_id: "u2",
+                ..base
+            },
+            UsageLabels {
+                user_name: "n2",
+                ..base
+            },
+        ];
+        let m = Metrics::new(false);
+        m.record_time_to_first_token(base, Duration::from_millis(1));
+        m.record_time_to_first_token(base, Duration::from_millis(1));
+        for v in &variants {
+            m.record_time_to_first_token(*v, Duration::from_millis(1));
+        }
+        assert_one_series_per_label_set(
+            &m.render(),
+            &format!("{M_LLM_TTFT}_count"),
+            1 + variants.len(),
+        );
+    }
+
+    #[test]
+    fn latency_histogram_key_covers_every_label() {
+        let base = LatencyLabels {
+            endpoint: "/v1/chat/completions",
+            model: "m",
+            provider: "p",
+            status: 200,
+            streaming: false,
+        };
+        let variants = [
+            LatencyLabels {
+                endpoint: "/v1/messages",
+                ..base
+            },
+            LatencyLabels {
+                model: "m2",
+                ..base
+            },
+            LatencyLabels {
+                provider: "p2",
+                ..base
+            },
+            // The key uses the status CLASS, so the variant must change
+            // the bucket, not just the code.
+            LatencyLabels {
+                status: 404,
+                ..base
+            },
+            LatencyLabels {
+                streaming: true,
+                ..base
+            },
+        ];
+        let m = Metrics::new(false);
+        m.record_request_e2e_latency(base, Duration::from_millis(1));
+        m.record_request_e2e_latency(base, Duration::from_millis(1));
+        for v in &variants {
+            m.record_request_e2e_latency(*v, Duration::from_millis(1));
+        }
+        assert_one_series_per_label_set(
+            &m.render(),
+            &format!("{M_REQUEST_E2E_LATENCY_SECONDS}_count"),
+            1 + variants.len(),
+        );
+    }
+
+    #[test]
+    fn auth_decision_key_covers_every_label() {
+        let m = Metrics::new(false);
+        m.record_auth_decision("api_key", true, "");
+        m.record_auth_decision("api_key", true, "");
+        m.record_auth_decision("jwt", true, "");
+        m.record_auth_decision("api_key", false, "");
+        m.record_auth_decision("api_key", true, "key_expired");
+        assert_one_series_per_label_set(&m.render(), M_AUTH_DECISIONS_TOTAL, 4);
+    }
+
+    #[test]
+    fn guardrail_latency_key_covers_every_label() {
+        let base = aisix_core::GuardrailExecution {
+            guardrail_name: "g",
+            kind: "keyword",
+            phase: "input",
+            result: "allowed",
+            error_type: None,
+            elapsed: Duration::from_millis(1),
+        };
+        let variants = [
+            aisix_core::GuardrailExecution {
+                guardrail_name: "g2",
+                ..base
+            },
+            aisix_core::GuardrailExecution {
+                kind: "pii",
+                ..base
+            },
+            aisix_core::GuardrailExecution {
+                phase: "output",
+                ..base
+            },
+            aisix_core::GuardrailExecution {
+                result: "blocked",
+                ..base
+            },
+            aisix_core::GuardrailExecution {
+                error_type: Some("timeout"),
+                ..base
+            },
+        ];
+        let m = Metrics::new(false);
+        m.record_guardrail_execution(&base);
+        m.record_guardrail_execution(&base);
+        for v in &variants {
+            m.record_guardrail_execution(v);
+        }
+        assert_one_series_per_label_set(
+            &m.render(),
+            &format!("{M_GUARDRAIL_LATENCY_SECONDS}_count"),
+            1 + variants.len(),
+        );
+    }
+
+    #[test]
+    fn ratelimit_rejection_key_covers_every_label() {
+        let m = Metrics::new(false);
+        m.record_ratelimit_rejection("requests", "api_key", None);
+        m.record_ratelimit_rejection("requests", "api_key", None);
+        m.record_ratelimit_rejection("tokens", "api_key", None);
+        m.record_ratelimit_rejection("requests", "model", None);
+        m.record_ratelimit_rejection("requests", "api_key", Some("p1"));
+        assert_one_series_per_label_set(&m.render(), M_RATELIMIT_REJECTIONS, 4);
+    }
+
+    #[test]
+    fn tokens_by_client_key_covers_every_label() {
+        let m = Metrics::new(false);
+        m.record_llm_tokens_by_client("cli", "m", 1, 0, 0);
+        m.record_llm_tokens_by_client("cli", "m", 1, 0, 0);
+        m.record_llm_tokens_by_client("cli2", "m", 1, 0, 0);
+        m.record_llm_tokens_by_client("cli", "m2", 1, 0, 0);
+        assert_one_series_per_label_set(&m.render(), M_LLM_TOKENS_BY_CLIENT_TOTAL, 3);
+    }
+
+    #[test]
+    fn consumed_tokens_key_covers_every_label() {
+        let m = Metrics::new(false);
+        m.record_tokens("p", "m", 1);
+        m.record_tokens("p", "m", 1);
+        m.record_tokens("p2", "m", 1);
+        m.record_tokens("p", "m2", 1);
+        assert_one_series_per_label_set(&m.render(), M_TOKENS_CONSUMED, 3);
+    }
+
+    const PK_A: UsageEventLabels<'static> = UsageEventLabels {
+        model: "gpt-4o",
+        provider_key_id: "pk-1",
+        provider_key_name: "openai-prod",
+    };
+
+    #[test]
+    fn usage_event_emit_key_covers_every_label() {
+        let m = Metrics::new(false);
+        m.record_usage_event_emit("chat", 200, "openai", PK_A);
+        m.record_usage_event_emit("chat", 200, "openai", PK_A);
+        m.record_usage_event_emit("embeddings", 200, "openai", PK_A);
+        m.record_usage_event_emit("chat", 404, "openai", PK_A);
+        m.record_usage_event_emit("chat", 200, "anthropic", PK_A);
+        // AISIX-Cloud#1317: the attribution dimensions belong to the key
+        // too. Leaving one out of it folds two models' — or two keys' —
+        // emissions into whichever series was cached first.
+        m.record_usage_event_emit(
+            "chat",
+            200,
+            "openai",
+            UsageEventLabels {
+                model: "gpt-4o-mini",
+                ..PK_A
+            },
+        );
+        m.record_usage_event_emit(
+            "chat",
+            200,
+            "openai",
+            UsageEventLabels {
+                provider_key_id: "pk-2",
+                provider_key_name: "openai-backup",
+                ..PK_A
+            },
+        );
+        assert_one_series_per_label_set(&m.render(), M_USAGE_EVENT_EMITS_TOTAL, 6);
+    }
+
+    #[test]
+    fn usage_event_drop_key_covers_every_label() {
+        let m = Metrics::new(false);
+        m.record_usage_event_drop("sink_full", PK_A);
+        m.record_usage_event_drop("sink_full", PK_A);
+        m.record_usage_event_drop("sink_closed", PK_A);
+        m.record_usage_event_drop(
+            "sink_full",
+            UsageEventLabels {
+                model: "gpt-4o-mini",
+                ..PK_A
+            },
+        );
+        assert_one_series_per_label_set(&m.render(), M_USAGE_EVENT_DROPS_TOTAL, 3);
+    }
+
+    /// AISIX-Cloud#1317: the two counters are read as one pair —
+    /// `emitted == delivered + dropped`. A per-model or per-key slice of
+    /// that invariant only exists if BOTH sides carry the same attribution,
+    /// which is why `try_emit` hands one label set to both.
+    #[test]
+    fn emits_and_drops_carry_the_same_attribution_labels() {
+        let m = Metrics::new(false);
+        m.record_usage_event_emit("chat", 200, "openai", PK_A);
+        m.record_usage_event_drop("sink_full", PK_A);
+        let rendered = m.render();
+        for metric in [M_USAGE_EVENT_EMITS_TOTAL, M_USAGE_EVENT_DROPS_TOTAL] {
+            let line = series_lines(&rendered, metric)
+                .pop()
+                .unwrap_or_else(|| panic!("{metric} must render\n{rendered}"));
+            for want in [
+                r#"model="gpt-4o""#,
+                r#"provider_key_id="pk-1""#,
+                r#"provider_key_name="openai-prod""#,
+            ] {
+                assert!(line.contains(want), "{metric} is missing {want}: {line}");
+            }
+        }
+    }
+
+    #[test]
+    fn in_flight_gauge_key_covers_every_label() {
+        let m = Metrics::new(false);
+        m.increment_proxy_in_flight("/v1/chat/completions", "openai");
+        m.increment_proxy_in_flight("/v1/messages", "openai");
+        m.increment_proxy_in_flight("/v1/chat/completions", "anthropic");
+        let rendered = m.render();
+        assert_eq!(
+            series_lines(&rendered, M_PROXY_IN_FLIGHT).len(),
+            3,
+            "a dropped key label folds distinct endpoints/protocols into one gauge\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn in_flight_gauge_clamps_an_unmatched_decrement_at_zero() {
+        let m = Metrics::new(false);
+        m.decrement_proxy_in_flight("/v1/chat/completions", "openai");
+        let rendered = m.render();
+        let line = rendered
+            .lines()
+            .find(|l| l.starts_with(M_PROXY_IN_FLIGHT))
+            .expect("in-flight gauge must render");
+        assert!(
+            line.ends_with(" 0"),
+            "unmatched decrement must clamp: {line}"
+        );
+    }
+
+    /// Pins the slot predicate on BOTH fields: a regression comparing only
+    /// `endpoint` would route the anthropic edges through the openai slot,
+    /// corrupting VALUES while the series count (guarded above) stays 3.
+    #[test]
+    fn in_flight_slots_stay_distinct_per_endpoint_and_protocol() {
+        let m = Metrics::new(false);
+        m.increment_proxy_in_flight("/v1/chat/completions", "openai");
+        m.increment_proxy_in_flight("/v1/chat/completions", "anthropic");
+        m.increment_proxy_in_flight("/v1/messages", "anthropic");
+        m.decrement_proxy_in_flight("/v1/chat/completions", "anthropic");
+
+        let rendered = m.render();
+        let value = |endpoint: &str, protocol: &str| {
+            rendered
+                .lines()
+                .find(|l| {
+                    l.starts_with(M_PROXY_IN_FLIGHT)
+                        && l.contains(&format!("endpoint=\"{endpoint}\""))
+                        && l.contains(&format!("inbound_protocol=\"{protocol}\""))
+                })
+                .and_then(|l| l.rsplit(' ').next())
+                .map(str::to_owned)
+        };
+        assert_eq!(
+            value("/v1/chat/completions", "openai").as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            value("/v1/chat/completions", "anthropic").as_deref(),
+            Some("0")
+        );
+        assert_eq!(value("/v1/messages", "anthropic").as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn concurrent_request_series_misses_register_once_and_record_every_call() {
+        const THREADS: usize = 16;
+
+        let metrics = Metrics::new(false);
+        let barrier = Arc::new(std::sync::Barrier::new(THREADS));
+        let threads = (0..THREADS)
+            .map(|_| {
+                let metrics = metrics.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    metrics.record_proxy_and_llm_request(
+                        RequestLabels::default(),
+                        Duration::from_millis(1),
+                    );
+                })
+            })
+            .collect::<Vec<_>>();
+        for thread in threads {
+            thread.join().expect("metric recording thread panicked");
+        }
+
+        // Each thread registers into its own worker cache, but every
+        // registration for the same labels resolves to the SAME registry
+        // series — the sums below are the contract.
+        let rendered = metrics.render();
+        for metric in [
+            M_PROXY_REQUESTS_TOTAL,
+            M_LLM_REQUESTS_TOTAL,
+            M_PROXY_FAILED_REQUESTS_TOTAL,
+        ] {
+            assert!(
+                rendered
+                    .lines()
+                    .any(|line| line.starts_with(metric) && line.ends_with(" 16")),
+                "{metric} did not record every concurrent call:\n{rendered}"
+            );
+        }
+        for metric in [M_PROXY_REQUEST_DURATION, M_LLM_REQUEST_DURATION] {
+            let count = format!("{metric}_count");
+            assert!(
+                rendered
+                    .lines()
+                    .any(|line| line.starts_with(&count) && line.ends_with(" 16")),
+                "{metric} did not record every concurrent call:\n{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn usage_series_cache_is_lazy_and_reuses_handles() {
+        let metrics = Metrics::new(false);
+        let labels = UsageLabels {
+            model: "cached-usage-model",
+            ..UsageLabels::default()
+        };
+
+        metrics.record_llm_usage(
+            labels,
+            LlmUsage {
+                input_tokens: 5,
+                ..LlmUsage::default()
+            },
+        );
+        assert_eq!(
+            Metrics::worker_usage_series_len(),
+            1,
+            "the first non-zero usage sample must create one cached label set"
+        );
+        let rendered = metrics.render();
+        assert!(rendered.lines().any(|line| {
+            line.starts_with(M_LLM_INPUT_TOKENS_TOTAL)
+                && line.contains("model=\"cached-usage-model\"")
+                && line.ends_with(" 5")
+        }));
+        for absent in [
+            M_LLM_OUTPUT_TOKENS_TOTAL,
+            M_LLM_TOTAL_TOKENS_TOTAL,
+            M_LLM_SPEND_MICRO_USD_TOTAL,
+        ] {
+            assert!(
+                !rendered.contains(absent),
+                "a zero-valued usage dimension must not register {absent}"
+            );
+        }
+
+        metrics.record_llm_usage(
+            labels,
+            LlmUsage {
+                output_tokens: 7,
+                total_tokens: 7,
+                spend_usd: 0.001,
+                ..LlmUsage::default()
+            },
+        );
+        assert_eq!(
+            Metrics::worker_usage_series_len(),
+            1,
+            "repeated labels must reuse the cached usage handles"
+        );
+        let rendered = metrics.render();
+        for (metric, value) in [
+            (M_LLM_INPUT_TOKENS_TOTAL, 5),
+            (M_LLM_OUTPUT_TOKENS_TOTAL, 7),
+            (M_LLM_TOTAL_TOKENS_TOTAL, 7),
+            (M_LLM_SPEND_MICRO_USD_TOTAL, 1000),
+        ] {
+            assert!(
+                rendered.lines().any(|line| {
+                    line.starts_with(metric)
+                        && line.contains("model=\"cached-usage-model\"")
+                        && line.ends_with(&format!(" {value}"))
+                }),
+                "{metric} did not retain the expected value:\n{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_usage_series_misses_register_once_and_record_every_call() {
+        const THREADS: usize = 16;
+
+        let metrics = Metrics::new(false);
+        let barrier = Arc::new(std::sync::Barrier::new(THREADS));
+        let threads = (0..THREADS)
+            .map(|_| {
+                let metrics = metrics.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    metrics.record_llm_usage(
+                        UsageLabels::default(),
+                        LlmUsage {
+                            input_tokens: 1,
+                            output_tokens: 2,
+                            total_tokens: 3,
+                            spend_usd: 0.000001,
+                        },
+                    );
+                })
+            })
+            .collect::<Vec<_>>();
+        for thread in threads {
+            thread.join().expect("metric recording thread panicked");
+        }
+
+        // Per-thread caches; the shared-series sums below are the contract.
+        let rendered = metrics.render();
+        for (metric, value) in [
+            (M_LLM_INPUT_TOKENS_TOTAL, THREADS),
+            (M_LLM_OUTPUT_TOKENS_TOTAL, THREADS * 2),
+            (M_LLM_TOTAL_TOKENS_TOTAL, THREADS * 3),
+            (M_LLM_SPEND_MICRO_USD_TOTAL, THREADS),
+        ] {
+            assert!(
+                rendered
+                    .lines()
+                    .any(|line| line.starts_with(metric) && line.ends_with(&format!(" {value}"))),
+                "{metric} did not record every concurrent call:\n{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn usage_series_handle_cache_is_bounded() {
+        let metrics = Metrics::new(false);
+        for index in 0..=WORKER_CACHE_CAPACITY {
+            let model = format!("usage-model-{index}");
+            metrics.record_llm_usage(
+                UsageLabels {
+                    model: &model,
+                    ..UsageLabels::default()
+                },
+                LlmUsage {
+                    input_tokens: 1,
+                    ..LlmUsage::default()
+                },
+            );
+        }
+
+        assert_eq!(
+            Metrics::worker_usage_series_len(),
+            WORKER_CACHE_CAPACITY,
+            "usage series handle cache must stay at its fixed capacity"
+        );
+    }
+
+    #[test]
+    fn individual_request_recorders_do_not_create_unrelated_metric_families() {
+        let proxy_only = Metrics::new(false);
+        proxy_only.record_proxy_request(
+            RequestLabels {
+                outcome: RequestOutcome::Success,
+                ..RequestLabels::default()
+            },
+            Duration::from_millis(1),
+        );
+        let rendered = proxy_only.render();
+        assert!(!rendered.contains(M_LLM_REQUESTS_TOTAL));
+        assert!(!rendered.contains(M_LLM_REQUEST_DURATION));
+
+        let llm_only = Metrics::new(false);
+        llm_only.record_llm_request(RequestLabels::default(), Duration::from_millis(1));
+        let rendered = llm_only.render();
+        assert!(!rendered.contains(M_PROXY_REQUESTS_TOTAL));
+        assert!(!rendered.contains(M_PROXY_FAILED_REQUESTS_TOTAL));
+        assert!(!rendered.contains(M_PROXY_REQUEST_DURATION));
     }
 
     #[test]
@@ -1914,10 +4404,7 @@ mod tests {
         assert!(out.contains("aisix_request_e2e_latency_seconds_sum"));
         assert!(out.contains("aisix_request_e2e_latency_seconds_count"));
         assert!(out.contains("aisix_request_ttft_seconds_bucket"));
-        assert!(
-            out.contains("le=\"2.5\""),
-            "configured bucket edges present"
-        );
+        assert!(out.contains("le=\"2\""), "configured bucket edges present");
 
         // The label contract: constant env_id, bucketed status, bounded
         // dims — and none of the per-key/per-user dimensions.
@@ -1935,7 +4422,7 @@ mod tests {
         }
     }
 
-    /// A 1.5s observation lands in the 2.5 bucket but not the 1.0 bucket —
+    /// A 1.5s observation lands in the 2.0 bucket but not the 1.0 bucket —
     /// pins that the configured edges actually apply (a default-bucket
     /// fallback would place them differently or render a summary).
     #[test]
@@ -1963,7 +4450,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("no bucket le={le} in:\n{out}"))
         };
         assert_eq!(bucket_val("1"), 0, "1.5s must not land in le=1");
-        assert_eq!(bucket_val("2.5"), 1, "1.5s must land in le=2.5");
+        assert_eq!(bucket_val("2"), 1, "1.5s must land in le=2");
         // Empty env_id collapses to the missing-dimension convention.
         assert!(out.contains("env_id=\"unknown\""));
         assert!(out.contains("status_class=\"5xx\""));
@@ -2003,6 +4490,179 @@ mod tests {
         assert!(out.contains("aisix_request_duration_seconds"));
     }
 
+    /// Every `le` value exposed for `metric`, in exposition order.
+    fn rendered_edges(out: &str, metric: &str) -> Vec<String> {
+        let prefix = format!("{metric}_bucket");
+        out.lines()
+            .filter(|l| l.starts_with(&prefix))
+            .filter_map(|l| l.split("le=\"").nth(1))
+            .filter_map(|rest| rest.split('"').next())
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// AISIX-Cloud#1226: TTFT no longer borrows the end-to-end latency
+    /// edges. The two sets are pinned here because they are a public
+    /// metric contract — a dashboard that hardcodes an `le` breaks when
+    /// they move, so moving them must be a deliberate edit to this list.
+    #[test]
+    fn ttft_and_e2e_expose_their_own_default_bucket_edges() {
+        let m = Metrics::new_with_env_id("env-1");
+        let labels = LatencyLabels {
+            endpoint: "/v1/chat/completions",
+            model: "gpt-4o",
+            provider: "openai",
+            status: 200,
+            streaming: true,
+        };
+        m.record_request_e2e_latency(labels, Duration::from_millis(1500));
+        m.record_request_ttft(labels, Duration::from_millis(1500));
+        let out = m.render();
+
+        assert_eq!(
+            rendered_edges(&out, "aisix_request_e2e_latency_seconds"),
+            [
+                "0.005", "0.01", "0.025", "0.05", "0.1", "0.25", "0.5", "1", "2", "5", "10", "30",
+                "60", "120", "300", "420", "600", "+Inf",
+            ],
+        );
+        assert_eq!(
+            rendered_edges(&out, "aisix_request_ttft_seconds"),
+            [
+                "0.05", "0.1", "0.25", "0.5", "1", "2", "5", "10", "30", "60", "120", "300",
+                "+Inf",
+            ],
+        );
+    }
+
+    /// The observation-placement contract for TTFT, the metric #1226 is
+    /// about: 1.5s lands in `le=2` and not in the edge below it.
+    #[test]
+    fn ttft_observation_lands_in_the_right_bucket() {
+        let m = Metrics::new_with_env_id("env-1");
+        m.record_request_ttft(
+            LatencyLabels {
+                endpoint: "/v1/messages",
+                model: "claude",
+                provider: "anthropic",
+                status: 200,
+                streaming: true,
+            },
+            Duration::from_millis(1500),
+        );
+        let out = m.render();
+        let bucket_val = |le: &str| -> u64 {
+            out.lines()
+                .find(|l| {
+                    l.starts_with("aisix_request_ttft_seconds_bucket")
+                        && l.contains(&format!("le=\"{le}\""))
+                })
+                .and_then(|l| l.rsplit(' ').next())
+                .and_then(|v| v.parse().ok())
+                .unwrap_or_else(|| panic!("no bucket le={le} in:\n{out}"))
+        };
+        assert_eq!(bucket_val("1"), 0, "1.5s must not land in le=1");
+        assert_eq!(bucket_val("2"), 1, "1.5s must land in le=2");
+        assert_eq!(bucket_val("+Inf"), 1);
+    }
+
+    /// An override replaces only the metric it names; the other two keep
+    /// their defaults. This is the whole point of the per-metric shape —
+    /// tuning TTFT must not silently re-cut the e2e or guardrail series.
+    #[test]
+    fn bucket_override_applies_to_only_the_named_metric() {
+        let buckets = HistogramBuckets::from_config(&aisix_core::HistogramBucketsConfig {
+            request_ttft: Some(vec![0.5, 3.0]),
+            ..Default::default()
+        })
+        .expect("valid override");
+        let m = Metrics::new_with_buckets("env-1", &buckets);
+        let labels = LatencyLabels {
+            endpoint: "/v1/chat/completions",
+            model: "gpt-4o",
+            provider: "openai",
+            status: 200,
+            streaming: true,
+        };
+        m.record_request_e2e_latency(labels, Duration::from_millis(1500));
+        m.record_request_ttft(labels, Duration::from_millis(1500));
+        m.record_guardrail_execution(&aisix_core::GuardrailExecution {
+            guardrail_name: "g",
+            kind: "keyword",
+            phase: "input",
+            result: "passed",
+            error_type: None,
+            elapsed: Duration::from_millis(3),
+        });
+        let out = m.render();
+
+        assert_eq!(
+            rendered_edges(&out, "aisix_request_ttft_seconds"),
+            ["0.5", "3", "+Inf"],
+        );
+        assert_eq!(
+            rendered_edges(&out, "aisix_request_e2e_latency_seconds").first(),
+            Some(&"0.005".to_string()),
+            "e2e keeps its default edges",
+        );
+        assert_eq!(
+            rendered_edges(&out, "aisix_guardrail_latency_seconds").first(),
+            Some(&"0.001".to_string()),
+            "guardrail keeps its default edges",
+        );
+    }
+
+    /// Unset fields fall back to the built-in defaults rather than to an
+    /// empty (summary-rendering) list.
+    #[test]
+    fn empty_bucket_config_resolves_to_the_defaults() {
+        let resolved =
+            HistogramBuckets::from_config(&aisix_core::HistogramBucketsConfig::default())
+                .expect("empty config is valid");
+        assert_eq!(resolved.request_e2e_latency, DEFAULT_E2E_LATENCY_BUCKETS);
+        assert_eq!(resolved.request_ttft, DEFAULT_TTFT_BUCKETS);
+        assert_eq!(
+            resolved.guardrail_latency,
+            DEFAULT_GUARDRAIL_LATENCY_BUCKETS
+        );
+    }
+
+    /// Boot-fatal validation: every shape Prometheus cannot express, or
+    /// that would silently produce a broken exposition, is rejected with
+    /// the offending field named.
+    #[test]
+    fn invalid_bucket_overrides_are_rejected() {
+        let cases: [(Vec<f64>, &str); 6] = [
+            (vec![], "at least one"),
+            (vec![0.1, 0.1], "strictly ascend"),
+            (vec![1.0, 0.5], "strictly ascend"),
+            (vec![0.0, 1.0], "finite positive"),
+            (vec![-1.0, 1.0], "finite positive"),
+            (vec![0.1, f64::INFINITY], "finite positive"),
+        ];
+        for (edges, needle) in cases {
+            let err = HistogramBuckets::from_config(&aisix_core::HistogramBucketsConfig {
+                request_ttft: Some(edges.clone()),
+                ..Default::default()
+            })
+            .expect_err(&format!("{edges:?} must be rejected"));
+            assert!(
+                err.contains(needle) && err.contains("buckets.request_ttft"),
+                "{edges:?} → {err:?} must name the field and mention {needle:?}",
+            );
+        }
+
+        let too_many: Vec<f64> = (1..=HistogramBuckets::MAX_EDGES + 1)
+            .map(|i| i as f64)
+            .collect();
+        let err = HistogramBuckets::from_config(&aisix_core::HistogramBucketsConfig {
+            guardrail_latency: Some(too_many),
+            ..Default::default()
+        })
+        .expect_err("over-long list must be rejected");
+        assert!(err.contains("exceed the limit of 64"), "{err}");
+    }
+
     fn config_metrics_view(source_kind: aisix_core::SourceKind) -> aisix_core::ConfigMetricsView {
         aisix_core::ConfigMetricsView {
             source_kind,
@@ -2011,6 +4671,8 @@ mod tests {
             reloads_total: 3,
             reload_failures: std::collections::BTreeMap::new(),
             rejected_by_kind: std::collections::BTreeMap::new(),
+            partially_compatible_by_kind: std::collections::BTreeMap::new(),
+            stale_served_by_kind: std::collections::BTreeMap::new(),
             observed_revision: Some(42),
             applied_revision: Some(42),
             config_hash: Some("abc123".into()),
@@ -2025,6 +4687,9 @@ mod tests {
         view.last_reload_successful = false;
         view.reload_failures.insert("validate", 2);
         view.rejected_by_kind.insert("models".to_string(), 1);
+        view.partially_compatible_by_kind
+            .insert("api_keys".to_string(), 3);
+        view.stale_served_by_kind.insert("models".to_string(), 1);
         m.sync_config_status(&view);
         let out = m.render();
 
@@ -2036,6 +4701,12 @@ mod tests {
         )));
         assert!(out.contains(&format!(
             "{M_CONFIG_REJECTED_RESOURCES}{{kind=\"models\"}} 1"
+        )));
+        assert!(out.contains(&format!(
+            "{M_CONFIG_PARTIALLY_COMPATIBLE_RESOURCES}{{kind=\"api_keys\"}} 3"
+        )));
+        assert!(out.contains(&format!(
+            "{M_CONFIG_STALE_SERVED_RESOURCES}{{kind=\"models\"}} 1"
         )));
         assert!(out.contains(&format!("{M_CONFIG_OBSERVED_REVISION} 42")));
         assert!(out.contains(&format!("{M_CONFIG_APPLIED_REVISION} 42")));
@@ -2064,6 +4735,10 @@ mod tests {
         let mut first = config_metrics_view(aisix_core::SourceKind::Etcd);
         first.config_hash = Some("hash-A".into());
         first.rejected_by_kind.insert("models".to_string(), 2);
+        first
+            .partially_compatible_by_kind
+            .insert("api_keys".to_string(), 1);
+        first.stale_served_by_kind.insert("models".to_string(), 1);
         m.sync_config_status(&first);
 
         // The applied config changes and the models rejection clears.
@@ -2079,6 +4754,14 @@ mod tests {
         // The cleared kind is zeroed, not left at its stale count.
         assert!(out.contains(&format!(
             "{M_CONFIG_REJECTED_RESOURCES}{{kind=\"models\"}} 0"
+        )));
+        // Same zeroing discipline for the partially-compatible gauge.
+        assert!(out.contains(&format!(
+            "{M_CONFIG_PARTIALLY_COMPATIBLE_RESOURCES}{{kind=\"api_keys\"}} 0"
+        )));
+        // And for the stale-served gauge (#871).
+        assert!(out.contains(&format!(
+            "{M_CONFIG_STALE_SERVED_RESOURCES}{{kind=\"models\"}} 0"
         )));
     }
 

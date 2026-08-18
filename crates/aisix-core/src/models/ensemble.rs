@@ -15,7 +15,6 @@ use serde::{Deserialize, Serialize};
 
 /// One member of an ensemble panel. `model` references a direct model alias.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
-#[serde(deny_unknown_fields)]
 pub struct PanelMember {
     /// Model alias for a direct model that receives one panel request.
     #[schemars(length(min = 1))]
@@ -47,7 +46,6 @@ impl PanelMember {
 /// The judge model that synthesizes the panel responses into one answer.
 /// `model` references a direct model alias.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct Judge {
     /// Model alias for the direct model that synthesizes panel responses.
     #[schemars(length(min = 1))]
@@ -74,7 +72,6 @@ impl Judge {
 const DEFAULT_MIN_RESPONSES: usize = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
-#[serde(deny_unknown_fields)]
 pub struct EnsembleConfig {
     /// Direct models called concurrently for each ensemble request.
     #[schemars(length(min = 1))]
@@ -103,8 +100,7 @@ impl EnsembleConfig {
     }
 
     /// Per-call upstream deadline applied to each panel member and the
-    /// judge call. Folds the `0`/absent sentinel into `None` like
-    /// [`Model::request_timeout`](super::Model::request_timeout) so callers
+    /// judge call. Folds the `0`/absent sentinel into `None` so callers
     /// can apply it unconditionally.
     pub fn timeout(&self) -> Option<std::time::Duration> {
         self.timeout_ms
@@ -182,22 +178,26 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_ensemble_field() {
-        let r: Result<EnsembleConfig, _> =
-            serde_json::from_str(r#"{"panel":[{"model":"a"}],"judge":{"model":"j"},"foo":1}"#);
-        assert!(r.is_err());
+    fn tolerates_unknown_ensemble_field_for_forward_compat() {
+        // cp-api may ship new fields ahead of the DP rolling out; serde must
+        // accept them. The write path still rejects them via validate_model
+        // in models/schema.rs.
+        let e: EnsembleConfig =
+            serde_json::from_str(r#"{"panel":[{"model":"a"}],"judge":{"model":"j"},"foo":1}"#)
+                .unwrap();
+        assert_eq!(e.judge.model, "j");
     }
 
     #[test]
-    fn rejects_unknown_panel_member_field() {
-        let r: Result<PanelMember, _> = serde_json::from_str(r#"{"model":"a","bogus":true}"#);
-        assert!(r.is_err());
+    fn tolerates_unknown_panel_member_field_for_forward_compat() {
+        let m: PanelMember = serde_json::from_str(r#"{"model":"a","bogus":true}"#).unwrap();
+        assert_eq!(m.model, "a");
     }
 
     #[test]
-    fn rejects_unknown_judge_field() {
-        let r: Result<Judge, _> = serde_json::from_str(r#"{"model":"j","bogus":true}"#);
-        assert!(r.is_err());
+    fn tolerates_unknown_judge_field_for_forward_compat() {
+        let j: Judge = serde_json::from_str(r#"{"model":"j","bogus":true}"#).unwrap();
+        assert_eq!(j.model, "j");
     }
 
     #[test]

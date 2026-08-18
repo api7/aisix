@@ -29,8 +29,9 @@ pub mod wildcard;
 
 pub use config::{
     AdminConfig, CacheBackend, CacheConfig, ClientTypeRule, Config, EtcdConfig, EtcdTlsConfig,
-    ManagedConfig, ObservabilityConfig, ProxyConfig, RateLimitBackend, RateLimitConfig,
-    RealIpConfig, RedisConnConfig, RedisMode, TlsConfig,
+    HistogramBucketsConfig, ManagedConfig, ObservabilityConfig, ProxyConfig, RateLimitBackend,
+    RateLimitConfig, RealIpConfig, RedisConnConfig, RedisMode, RequestIdConfig, TlsConfig,
+    UrlRewriteRule, RESERVED_UPSTREAM_HEADERS,
 };
 pub use config_status::{
     hash_bytes, hash_entries, AppliedSnapshot, ConfigMetricsView, ConfigState, ConfigStatus,
@@ -46,11 +47,12 @@ pub use models::{
     validate_rate_limit_policy, A2aAgent, A2aAuthType, A2aProtocolVersion, Adapter, AisixSnapshot,
     ApiKey, AppliedGuardrail, CachePolicy, CooldownConfig, ExporterKind, Guardrail,
     GuardrailExecution, GuardrailHookPoint, GuardrailKind, GuardrailMetricsSink,
-    GuardrailMonitorHit, KeywordConfig, KeywordPattern, McpAuthType, McpRateLimit, McpServer,
-    McpServerType, McpTransport, Model, ObservabilityExporter, ParamConstraints, PolicyScope,
-    PolicyWindow, ProviderKey, RateLimit, RateLimitPolicy, RequestOverrides, ResponseOverrides,
-    Routing, RoutingStrategy, RoutingTarget, SchemaError, StreamDoneMarker, TelemetryKind,
-    TelemetryTags, WhenAllUnavailablePolicy, DEFAULT_COOLDOWN_TRIGGER_STATUSES,
+    GuardrailMonitorHit, KeywordConfig, KeywordPattern, McpAuthType, McpProtocolVersion,
+    McpRateLimit, McpServer, McpServerType, McpTransport, Model, ObservabilityExporter,
+    ParamConstraints, PassthroughAuthMode, PassthroughCredentialMode, PassthroughRoute,
+    PolicyScope, PolicyWindow, ProviderKey, RateLimit, RateLimitPolicy, RequestOverrides,
+    ResponseOverrides, Routing, RoutingStrategy, RoutingTarget, SchemaError, StreamDoneMarker,
+    TelemetryKind, TelemetryTags, WhenAllUnavailablePolicy, DEFAULT_COOLDOWN_TRIGGER_STATUSES,
 };
 pub use resource::{Resource, ResourceEntry};
 pub use snapshot::{ResourceTable, SnapshotHandle};

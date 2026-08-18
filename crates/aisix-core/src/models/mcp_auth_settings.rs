@@ -17,8 +17,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::resource::Resource;
 
+// No `deny_unknown_fields`: since issue #871 strictness lives in the
+// schema layer, not the structs. The strict write schema closes the
+// root while the lenient read schema does not, which is what lets the
+// etcd loader report a row carrying a newer cp-api field as partially
+// compatible instead of dropping it.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
 pub struct McpAuthSettings {
     /// Canonical URI of this environment's `/mcp` endpoint, e.g.
     /// `https://gw.example.com/mcp`. Published verbatim as the PRM
@@ -63,10 +67,16 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_fields() {
-        let r: Result<McpAuthSettings, _> =
-            serde_json::from_str(r#"{"resource_url": "https://gw.example.com/mcp", "extra": 1}"#);
-        assert!(r.is_err());
+    fn unknown_fields_close_on_write_and_stay_tolerated_on_read() {
+        // #871: the write contract rejects an unknown field, the etcd
+        // read path tolerates it (and reports it), and serde must not
+        // pre-empt either decision.
+        let doc =
+            serde_json::json!({"resource_url": "https://gw.example.com/mcp", "future_field": 1});
+        assert!(crate::models::schema::validate_mcp_auth_settings(&doc).is_err());
+        assert!(crate::models::schema::validate_mcp_auth_settings_lenient(&doc).is_ok());
+        let parsed: McpAuthSettings = serde_json::from_value(doc).expect("serde stays tolerant");
+        assert_eq!(parsed.resource_url, "https://gw.example.com/mcp");
     }
 
     #[test]

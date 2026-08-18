@@ -5,11 +5,14 @@ import { EtcdClient, spawnApp, type SpawnedApp } from "../harness/index.js";
 // series (#451). The in-flight middleware runs before auth and before
 // route matching; pre-fix it used the raw request path as the `endpoint`
 // label, so each unique /passthrough/<provider>/<unique> path created a
-// new Prometheus time series — an unauthenticated cardinality DoS.
+// new Prometheus time series — an unauthenticated cardinality DoS. The
+// namespace now belongs to explicit passthrough routes (unclaimed paths
+// answer the 410 tombstone), and every shape collapses to the single
+// `/passthrough_route` label.
 //
 // We fire many unique unauthenticated passthrough paths, then scrape
-// /metrics and assert the endpoint label is collapsed to the route
-// template (no unique suffix leaks into a label).
+// /metrics and assert the endpoint label is collapsed to the family
+// label (no unique suffix leaks into a label).
 
 describe("metric label cardinality for passthrough (#451)", () => {
   let app: SpawnedApp | undefined;
@@ -56,7 +59,7 @@ describe("metric label cardinality for passthrough (#451)", () => {
     );
     expect(passthroughLabels.size).toBeLessThanOrEqual(1);
     if (passthroughLabels.size === 1) {
-      expect([...passthroughLabels][0]).toBe("/passthrough/:provider/*rest");
+      expect([...passthroughLabels][0]).toBe("/passthrough_route");
     }
   });
 });

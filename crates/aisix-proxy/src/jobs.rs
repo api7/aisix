@@ -53,9 +53,9 @@ use std::time::{Duration, Instant};
 use aisix_core::models::model::Adapter;
 use aisix_core::resource::ResourceEntry;
 use aisix_core::{Model, ProviderKey};
-use aisix_obs::{AccessLog, RequestOutcome, UsageEvent};
+use aisix_obs::{AccessLog, UsageEvent};
 use axum::body::Body;
-use axum::extract::{Multipart, Path, Query, State};
+use axum::extract::{Multipart, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -66,6 +66,7 @@ use serde_json::Value;
 use crate::auth::AuthenticatedKey;
 use crate::client_ip::ClientContext;
 use crate::error::ProxyError;
+use crate::reject::AisixPath;
 use crate::state::ProxyState;
 
 /// Marker prefix for gateway-minted routed ids.
@@ -187,16 +188,14 @@ fn explicit_model(params: &HashMap<String, String>, headers: &HeaderMap) -> Opti
 /// `custom_llm_provider="openai"` default). Deterministic operation
 /// should pass an explicit model — documented in the proxy docs.
 pub(crate) fn resolve_target(
-    state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
     auth: &AuthenticatedKey,
     wanted: Option<&str>,
     client_ctx: &ClientContext,
 ) -> Result<JobTarget, ProxyError> {
-    let snapshot = state.snapshot.load();
-
     let model_entry = match wanted {
         Some(name) => {
-            let entry = crate::model_resolve::resolve_model(&snapshot, name)
+            let entry = crate::model_resolve::resolve_model(snapshot, name)
                 .ok_or_else(|| ProxyError::ModelNotFound(format!("model {name:?} not found")))?;
             if !auth.key().can_access(name) {
                 return Err(ProxyError::ModelForbidden(format!(
@@ -240,7 +239,7 @@ pub(crate) fn resolve_target(
     let model = &model_entry.value;
     crate::dispatch::check_ip_access(model, &client_ctx.source_ip)?;
 
-    let pk_entry = crate::dispatch::resolve_provider_key(&snapshot, model)?;
+    let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
     let adapter = supported_adapter(&pk_entry.value).ok_or_else(|| {
         ProxyError::InvalidRequest(format!(
             "model {:?} uses provider {:?} which is not supported on the \
@@ -279,7 +278,7 @@ fn upstream_url(target: &JobTarget, path: &str, query: &str) -> Result<String, P
     match target.adapter {
         Adapter::Openai => {
             let base = crate::dispatch::resolve_base_url(&target.pk_entry.value)?;
-            let url = crate::dispatch::build_v1_url(&base, path);
+            let url = crate::dispatch::build_openai_url(&base, path);
             if query.is_empty() {
                 Ok(url)
             } else {
@@ -352,7 +351,7 @@ async fn send_upstream(
     body: UpstreamBody,
     request_id: &str,
 ) -> Result<(StatusCode, HeaderMap, Bytes), ProxyError> {
-    let client = crate::http_client::client();
+    let client = crate::http_client::client_for(target.pk_entry.value.tls.as_ref());
     let mut builder = client.request(
         reqwest::Method::from_bytes(method.as_str().as_bytes())
             .map_err(|_| ProxyError::InvalidRequest("unsupported method".into()))?,
@@ -393,7 +392,10 @@ async fn send_upstream(
         UpstreamBody::Multipart(form) => builder.multipart(form),
     };
 
-    if let Some(d) = target.model_entry.value.request_timeout() {
+    if let Some(d) =
+        crate::routing::effective_timeouts(&target.model_entry.value, None, state.default_timeouts)
+            .request
+    {
         builder = builder.timeout(d);
     }
 
@@ -442,7 +444,9 @@ async fn scan_input_blob(
     monitor_hits: &mut Vec<aisix_core::GuardrailMonitorHit>,
 ) -> Result<(), ProxyError> {
     let ctx = aisix_guardrails::RequestContext {
+        passthrough_route_id: "",
         model_id: &target.model_entry.id,
+        mcp_server_id: "",
         api_key_id: &auth.entry.id,
         team_id: auth.key().team_id.as_deref(),
     };
@@ -485,7 +489,9 @@ async fn scan_output_blob(
     monitor_hits: &mut Vec<aisix_core::GuardrailMonitorHit>,
 ) -> Result<(), ProxyError> {
     let ctx = aisix_guardrails::RequestContext {
+        passthrough_route_id: "",
         model_id: &target.model_entry.id,
+        mcp_server_id: "",
         api_key_id: &auth.entry.id,
         team_id: auth.key().team_id.as_deref(),
     };
@@ -564,6 +570,8 @@ fn rewrite_response_ids(v: &mut Value, model: &str) {
 #[allow(clippy::too_many_arguments)]
 fn emit_job_usage_event(
     state: &ProxyState,
+    // The request's snapshot, loaded once by the handler (#941).
+    snap: &aisix_core::AisixSnapshot,
     label: &'static str,
     request_id: &str,
     auth: &AuthenticatedKey,
@@ -573,7 +581,6 @@ fn emit_job_usage_event(
     client: &ClientContext,
     guardrail_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
 ) {
-    let snap = state.snapshot.load();
     let mut event = UsageEvent {
         request_id: request_id.to_string(),
         occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
@@ -591,9 +598,16 @@ fn emit_job_usage_event(
         guardrail_monitor_hits,
         ..Default::default()
     };
-    crate::usage_attr::apply_pk_telemetry(&mut event, &snap, &target.pk_entry.id);
-    state.usage_sink.try_emit(label, event.clone());
-    let exporters = snap.observability_exporters.entries();
+    let pk = crate::usage_attr::ResolvedPk::resolve(snap, &target.pk_entry.id);
+    crate::usage_attr::apply_pk_telemetry(&mut event, &pk);
+    crate::usage_attr::apply_jwt_identity(&mut event, auth.jwt.as_ref());
+    let usage_model = crate::usage_attr::usage_event_model_label(snap, &event.requested_model);
+    state.usage_sink.try_emit(
+        label,
+        event.clone(),
+        crate::usage_attr::usage_event_labels(&usage_model, &pk),
+    );
+    let exporters = crate::usage_attr::live_exporters(state, snap);
     state
         .otlp_fan_out
         .fan_out(&event, None, exporters.iter().map(|e| &e.value));
@@ -629,6 +643,10 @@ fn emit_access_log(
         completion_tokens: None,
         total_tokens: None,
         request_id,
+        // Files / batches / fine-tuning return resource ids the caller keeps
+        // using, not a per-call response-object id — same reasoning as the
+        // video-job id (AISIX-Cloud#1289).
+        provider_request_id: None,
         served_by_model: None,
         routing_attempt_count: None,
         routing_fallback_count: None,
@@ -643,6 +661,7 @@ fn emit_access_log(
 #[allow(clippy::too_many_arguments)]
 fn finish(
     state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
     label: &'static str,
     method: Method,
     path: String,
@@ -654,6 +673,8 @@ fn finish(
     monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
 ) -> Response {
     let elapsed = started.elapsed();
+    // `path` carries the real job/file id — bounded route template only.
+    let endpoint = crate::normalize_endpoint_label(&path);
     match result {
         Ok((mut resp, target)) => {
             let status = resp.status().as_u16();
@@ -667,15 +688,21 @@ fn finish(
                 &request_id,
                 None,
             );
-            state.metrics.record_request(
-                target.provider_label(),
-                target.display_name(),
+            crate::request_metrics::record(
+                state,
+                endpoint,
+                crate::request_metrics::Caller::new(auth),
+                crate::request_metrics::Upstream {
+                    provider: target.provider_label(),
+                    model: target.display_name(),
+                    ..Default::default()
+                },
                 status,
-                RequestOutcome::from_status(status),
                 elapsed,
             );
             emit_job_usage_event(
                 state,
+                snapshot,
                 label,
                 &request_id,
                 auth,
@@ -702,15 +729,21 @@ fn finish(
                 &request_id,
                 Some(&err),
             );
-            state.metrics.record_request(
-                "",
-                label,
+            crate::request_metrics::record(
+                state,
+                endpoint,
+                crate::request_metrics::Caller::new(auth),
+                crate::request_metrics::Upstream {
+                    provider: "",
+                    model: label,
+                    ..Default::default()
+                },
                 status,
-                RequestOutcome::from_status(status),
                 elapsed,
             );
             crate::usage_attr::emit_error_usage_event(
                 state,
+                snapshot,
                 label,
                 "openai",
                 &request_id,
@@ -773,11 +806,33 @@ pub(crate) async fn create_file(
     client: ClientContext,
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
-    mut multipart: Multipart,
+    multipart: Result<Multipart, axum::extract::multipart::MultipartRejection>,
 ) -> Response {
     let started = Instant::now();
     let request_id = client.request_id.clone();
+
+    // Same silent class as the body-extractor rejections #863 collected: a
+    // non-multipart content-type answered axum's bare 400 with no access
+    // log, metrics, or envelope.
+    let mut multipart = match multipart {
+        Ok(multipart) => multipart,
+        Err(_) => {
+            return crate::reject::reject_before_dispatch(
+                &state,
+                "POST",
+                "/v1/files",
+                &request_id,
+                Some(&auth.entry.id),
+                started,
+                crate::reject::Envelope::OpenAi,
+                ProxyError::InvalidRequest("invalid multipart form data".into()),
+            );
+        }
+    };
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
+    // Loaded below, after the upload is drained — see the note in
+    // `audio::multipart_dispatch` (#941 audit M2).
+    let mut snapshot = None;
 
     let result = async {
         // Re-build the outbound multipart form, extracting the gateway-only
@@ -787,15 +842,21 @@ pub(crate) async fn create_file(
         let mut form_model: Option<String> = None;
         let mut file_bytes: Option<Bytes> = None;
 
-        while let Some(field) = multipart
-            .next_field()
-            .await
-            .map_err(|e| ProxyError::InvalidRequest(format!("malformed multipart body: {e}")))?
-        {
+        while let Some(field) = multipart.next_field().await.map_err(|e| {
+            crate::error::proxy_error_from_multipart(
+                e,
+                state.request_body_limit_bytes,
+                "malformed multipart body",
+            )
+        })? {
             let name = field.name().unwrap_or_default().to_string();
             if name == "model" {
                 let v = field.text().await.map_err(|e| {
-                    ProxyError::InvalidRequest(format!("malformed multipart field: {e}"))
+                    crate::error::proxy_error_from_multipart(
+                        e,
+                        state.request_body_limit_bytes,
+                        "malformed multipart field",
+                    )
                 })?;
                 if !v.trim().is_empty() {
                     form_model = Some(v.trim().to_string());
@@ -806,7 +867,11 @@ pub(crate) async fn create_file(
                 let file_name = field.file_name().unwrap_or("file").to_string();
                 let content_type = field.content_type().map(str::to_string);
                 let bytes = field.bytes().await.map_err(|e| {
-                    ProxyError::InvalidRequest(format!("failed to read file field: {e}"))
+                    crate::error::proxy_error_from_multipart(
+                        e,
+                        state.request_body_limit_bytes,
+                        "failed to read file field",
+                    )
                 })?;
                 let mut part = reqwest::multipart::Part::bytes(bytes.to_vec()).file_name(file_name);
                 if let Some(ct) = content_type {
@@ -819,7 +884,11 @@ pub(crate) async fn create_file(
                 continue;
             }
             let v = field.text().await.map_err(|e| {
-                ProxyError::InvalidRequest(format!("malformed multipart field: {e}"))
+                crate::error::proxy_error_from_multipart(
+                    e,
+                    state.request_body_limit_bytes,
+                    "malformed multipart field",
+                )
             })?;
             form = form.text(name, v);
         }
@@ -829,13 +898,15 @@ pub(crate) async fn create_file(
         })?;
 
         let wanted = form_model.or_else(|| explicit_model(&params, &headers));
-        let target = resolve_target(&state, &auth, wanted.as_deref(), &client)?;
+        let snapshot = &**snapshot.insert(state.snapshot.load());
+        let target = resolve_target(snapshot, &auth, wanted.as_deref(), &client)?;
 
         // Batch/fine-tune input files carry end-user content — scan them
         // like any other inbound payload.
         scan_input_blob(&state, &auth, &target, &file_bytes, &mut monitor_hits).await?;
         let _reservation = crate::quota::enforce(
             &state,
+            snapshot,
             &auth,
             Some(&crate::quota::ModelRateLimit::from_model(
                 target.display_name(),
@@ -866,6 +937,9 @@ pub(crate) async fn create_file(
 
     finish(
         &state,
+        // A form that failed before the model field was read never loaded
+        // one.
+        &snapshot.unwrap_or_else(|| state.snapshot.load()),
         "files",
         Method::POST,
         "/v1/files".into(),
@@ -911,7 +985,7 @@ pub(crate) async fn get_file(
     State(state): State<ProxyState>,
     auth: AuthenticatedKey,
     client: ClientContext,
-    Path(id): Path<String>,
+    AisixPath(id): AisixPath<String>,
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Response {
@@ -941,7 +1015,7 @@ pub(crate) async fn delete_file(
     State(state): State<ProxyState>,
     auth: AuthenticatedKey,
     client: ClientContext,
-    Path(id): Path<String>,
+    AisixPath(id): AisixPath<String>,
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Response {
@@ -971,7 +1045,7 @@ pub(crate) async fn file_content(
     State(state): State<ProxyState>,
     auth: AuthenticatedKey,
     client: ClientContext,
-    Path(id): Path<String>,
+    AisixPath(id): AisixPath<String>,
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Response {
@@ -1005,11 +1079,33 @@ pub(crate) async fn create_batch(
     client: ClientContext,
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
-    body: Bytes,
+    // Result-wrapped so an extractor-layer 413 (chunked body over the
+    // cap) maps to the OpenAI envelope instead of axum's stock
+    // text/plain rejection — see completions.rs.
+    body: Result<Bytes, axum::extract::rejection::BytesRejection>,
 ) -> Response {
     let started = Instant::now();
+    let body = match body {
+        Ok(bytes) => bytes,
+        // Answer through `reject` — see completions.rs.
+        Err(rej) => {
+            return crate::reject::reject_before_dispatch(
+                &state,
+                "POST",
+                "/v1/batches",
+                &client.request_id,
+                Some(&auth.entry.id),
+                started,
+                crate::reject::Envelope::OpenAi,
+                crate::error::proxy_error_from_bytes_rejection(rej, state.request_body_limit_bytes),
+            );
+        }
+    };
     let request_id = client.request_id.clone();
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
+
+    // One snapshot for the whole request (#941) — see `embeddings`.
+    let snapshot = state.snapshot.load();
 
     let result = async {
         let mut req_json: Value = serde_json::from_slice(&body)
@@ -1039,7 +1135,7 @@ pub(crate) async fn create_batch(
         let wanted = embedded
             .or(body_model)
             .or_else(|| explicit_model(&params, &headers));
-        let target = resolve_target(&state, &auth, wanted.as_deref(), &client)?;
+        let target = resolve_target(&snapshot, &auth, wanted.as_deref(), &client)?;
 
         // Forward the provider wire shape: raw file id, no gateway-only
         // routing fields.
@@ -1053,6 +1149,7 @@ pub(crate) async fn create_batch(
         scan_input_blob(&state, &auth, &target, &out_body, &mut monitor_hits).await?;
         let _reservation = crate::quota::enforce(
             &state,
+            &snapshot,
             &auth,
             Some(&crate::quota::ModelRateLimit::from_model(
                 target.display_name(),
@@ -1083,6 +1180,7 @@ pub(crate) async fn create_batch(
 
     finish(
         &state,
+        &snapshot,
         "batches",
         Method::POST,
         "/v1/batches".into(),
@@ -1099,7 +1197,7 @@ pub(crate) async fn get_batch(
     State(state): State<ProxyState>,
     auth: AuthenticatedKey,
     client: ClientContext,
-    Path(id): Path<String>,
+    AisixPath(id): AisixPath<String>,
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Response {
@@ -1108,12 +1206,16 @@ pub(crate) async fn get_batch(
     let (raw, embedded) = routed_model_hint(&id, &params, &headers);
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
 
+    // One snapshot for the whole request (#941) — see `embeddings`.
+    let snapshot = state.snapshot.load();
+
     let result = async {
         require_safe_upstream_id(&raw)?;
         let wanted = embedded.or_else(|| explicit_model(&params, &headers));
-        let target = resolve_target(&state, &auth, wanted.as_deref(), &client)?;
+        let target = resolve_target(&snapshot, &auth, wanted.as_deref(), &client)?;
         let _reservation = crate::quota::enforce(
             &state,
+            &snapshot,
             &auth,
             Some(&crate::quota::ModelRateLimit::from_model(
                 target.display_name(),
@@ -1153,6 +1255,7 @@ pub(crate) async fn get_batch(
 
     finish(
         &state,
+        &snapshot,
         "batches",
         Method::GET,
         format!("/v1/batches/{id}"),
@@ -1169,7 +1272,7 @@ pub(crate) async fn cancel_batch(
     State(state): State<ProxyState>,
     auth: AuthenticatedKey,
     client: ClientContext,
-    Path(id): Path<String>,
+    AisixPath(id): AisixPath<String>,
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Response {
@@ -1232,11 +1335,33 @@ pub(crate) async fn create_ft_job(
     client: ClientContext,
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
-    body: Bytes,
+    // Result-wrapped so an extractor-layer 413 (chunked body over the
+    // cap) maps to the OpenAI envelope instead of axum's stock
+    // text/plain rejection — see completions.rs.
+    body: Result<Bytes, axum::extract::rejection::BytesRejection>,
 ) -> Response {
     let started = Instant::now();
+    let body = match body {
+        Ok(bytes) => bytes,
+        // Answer through `reject` — see completions.rs.
+        Err(rej) => {
+            return crate::reject::reject_before_dispatch(
+                &state,
+                "POST",
+                "/v1/fine_tuning/jobs",
+                &client.request_id,
+                Some(&auth.entry.id),
+                started,
+                crate::reject::Envelope::OpenAi,
+                crate::error::proxy_error_from_bytes_rejection(rej, state.request_body_limit_bytes),
+            );
+        }
+    };
     let request_id = client.request_id.clone();
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
+
+    // One snapshot for the whole request (#941) — see `embeddings`.
+    let snapshot = state.snapshot.load();
 
     let result = async {
         let mut req_json: Value = serde_json::from_slice(&body)
@@ -1260,7 +1385,7 @@ pub(crate) async fn create_ft_job(
             .unwrap_or((training_file.clone(), None));
         require_safe_upstream_id(&raw_training)?;
         let wanted = embedded.or_else(|| explicit_model(&params, &headers));
-        let target = resolve_target(&state, &auth, wanted.as_deref(), &client)?;
+        let target = resolve_target(&snapshot, &auth, wanted.as_deref(), &client)?;
 
         if let Some(obj) = req_json.as_object_mut() {
             obj.insert("training_file".into(), Value::String(raw_training));
@@ -1277,6 +1402,7 @@ pub(crate) async fn create_ft_job(
         scan_input_blob(&state, &auth, &target, &out_body, &mut monitor_hits).await?;
         let _reservation = crate::quota::enforce(
             &state,
+            &snapshot,
             &auth,
             Some(&crate::quota::ModelRateLimit::from_model(
                 target.display_name(),
@@ -1307,6 +1433,7 @@ pub(crate) async fn create_ft_job(
 
     finish(
         &state,
+        &snapshot,
         "fine_tuning",
         Method::POST,
         "/v1/fine_tuning/jobs".into(),
@@ -1323,7 +1450,7 @@ pub(crate) async fn get_ft_job(
     State(state): State<ProxyState>,
     auth: AuthenticatedKey,
     client: ClientContext,
-    Path(id): Path<String>,
+    AisixPath(id): AisixPath<String>,
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Response {
@@ -1353,7 +1480,7 @@ pub(crate) async fn cancel_ft_job(
     State(state): State<ProxyState>,
     auth: AuthenticatedKey,
     client: ClientContext,
-    Path(id): Path<String>,
+    AisixPath(id): AisixPath<String>,
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Response {
@@ -1441,6 +1568,9 @@ async fn forward_simple(
     let label = spec.label;
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
 
+    // One snapshot for the whole request (#941) — see `embeddings`.
+    let snapshot = state.snapshot.load();
+
     let result = async {
         let embedded = match &spec.id {
             Some((raw, embedded)) => {
@@ -1450,13 +1580,14 @@ async fn forward_simple(
             None => None,
         };
         let wanted = embedded.or_else(|| explicit_model(&params, &headers));
-        let target = resolve_target(&state, &auth, wanted.as_deref(), &client)?;
+        let target = resolve_target(&snapshot, &auth, wanted.as_deref(), &client)?;
 
         if let Some(body) = &spec.body {
             scan_input_blob(&state, &auth, &target, body, &mut monitor_hits).await?;
         }
         let _reservation = crate::quota::enforce(
             &state,
+            &snapshot,
             &auth,
             Some(&crate::quota::ModelRateLimit::from_model(
                 target.display_name(),
@@ -1495,6 +1626,7 @@ async fn forward_simple(
 
     finish(
         &state,
+        &snapshot,
         label,
         method,
         log_path,
@@ -1558,6 +1690,7 @@ fn maybe_attribute_batch(
 
     let state = state.clone();
     let api_key_id = auth.entry.id.clone();
+    let jwt = auth.jwt.clone();
     let model_id = target.model_entry.id.clone();
     let display_name = target.display_name().to_string();
     let cost = target.model_entry.value.cost.clone();
@@ -1565,12 +1698,14 @@ fn maybe_attribute_batch(
     let secret = target.secret.clone();
     let adapter = target.adapter;
     let api_base = target.pk_entry.value.api_base.clone();
+    let pk_tls = target.pk_entry.value.tls.clone();
     let raw_batch_id = raw_batch_id.to_string();
 
     tokio::spawn(async move {
         if let Err(e) = attribute_batch_usage(
             &state,
             &api_key_id,
+            jwt.as_ref(),
             &model_id,
             &display_name,
             cost.as_ref(),
@@ -1578,6 +1713,7 @@ fn maybe_attribute_batch(
             &secret,
             adapter,
             api_base.as_deref(),
+            pk_tls.as_ref(),
             &raw_batch_id,
             &output_file_id,
         )
@@ -1601,6 +1737,7 @@ fn maybe_attribute_batch(
 async fn attribute_batch_usage(
     state: &ProxyState,
     api_key_id: &str,
+    jwt: Option<&std::sync::Arc<crate::auth::JwtIdentity>>,
     model_id: &str,
     display_name: &str,
     cost: Option<&aisix_core::models::model::ModelCost>,
@@ -1608,6 +1745,7 @@ async fn attribute_batch_usage(
     secret: &str,
     adapter: Adapter,
     api_base: Option<&str>,
+    tls: Option<&aisix_core::models::provider_key::ProviderKeyTls>,
     raw_batch_id: &str,
     output_file_id: &str,
 ) -> Result<(), String> {
@@ -1627,14 +1765,14 @@ async fn attribute_batch_usage(
                 .map(str::trim)
                 .filter(|b| !b.is_empty())
                 .ok_or("provider_key has no api_base")?;
-            crate::dispatch::build_v1_url(
+            crate::dispatch::build_openai_url(
                 base.trim_end_matches('/'),
                 &format!("/files/{output_file_id}/content"),
             )
         }
     };
 
-    let client = crate::http_client::client();
+    let client = crate::http_client::client_for(tls);
     let mut builder = client.get(&url).timeout(BATCH_ATTRIBUTION_TIMEOUT);
     builder = match adapter {
         Adapter::AzureOpenai => builder.header("api-key", secret),
@@ -1686,6 +1824,9 @@ async fn attribute_batch_usage(
     }
 
     let snap = state.snapshot.load();
+    let pk = crate::usage_attr::ResolvedPk::resolve(&snap, pk_id);
+    // Same exporter set for every model slice of one batch.
+    let exporters = crate::usage_attr::live_exporters(state, &snap);
     let multi = per_model.len() > 1;
     for (idx, (provider_model, agg)) in per_model.iter().enumerate() {
         let request_id = batch_attribution_request_id(raw_batch_id, idx, multi);
@@ -1706,9 +1847,16 @@ async fn attribute_batch_usage(
             inbound_protocol: "batch".to_string(),
             ..Default::default()
         };
-        crate::usage_attr::apply_pk_telemetry(&mut event, &snap, pk_id);
-        state.usage_sink.try_emit("batch", event.clone());
-        let exporters = snap.observability_exporters.entries();
+        crate::usage_attr::apply_pk_telemetry(&mut event, &pk);
+        // Attribution names the identity that observed completion — the
+        // same caller the event's api_key_id already reflects.
+        crate::usage_attr::apply_jwt_identity(&mut event, jwt);
+        let usage_model = crate::usage_attr::usage_event_model_label(&snap, &event.requested_model);
+        state.usage_sink.try_emit(
+            "batch",
+            event.clone(),
+            crate::usage_attr::usage_event_labels(&usage_model, &pk),
+        );
         state
             .otlp_fan_out
             .fan_out(&event, None, exporters.iter().map(|e| &e.value));
@@ -1744,7 +1892,11 @@ mod tests {
             addr: "127.0.0.1:0".into(),
             request_body_limit_bytes: 1_048_576,
             real_ip: Default::default(),
+            request_id: Default::default(),
+            url_rewrites: Vec::new(),
             tls: None,
+            thread_per_core: None,
+            workers: None,
         }
     }
 
@@ -2141,9 +2293,11 @@ mod tests {
         }
         assert_eq!(mgmt, 1);
         let agg = agg.expect("aggregated batch event must be emitted");
-        // The telemetry contract requires a UUID request_id (a non-UUID
-        // event 400s the whole flush on cp-api, dropping co-flushed
-        // events), and the id must stay deterministic for re-emission.
+        // cp-api accepts any visible-ASCII request_id since
+        // AISIX-Cloud#1288, so this is no longer a wire constraint — but a
+        // synthesised batch id has no caller behind it to correlate with,
+        // and minting a UUID keeps it distinguishable from a caller's own
+        // id in /logs. It must also stay deterministic for re-emission.
         uuid::Uuid::parse_str(&agg.request_id)
             .expect("batch attribution request_id must be a UUID");
         assert_eq!(

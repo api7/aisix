@@ -258,10 +258,16 @@ pub struct ManagedConfig {
     /// so the proxy can serve traffic from cached config across CP
     /// outages and full container restarts.
     ///
-    /// Empty string disables persistence — useful for ephemeral test
-    /// runs where you don't want a stale cache to mask a real failure.
-    #[serde(default = "ManagedConfig::default_snapshot_cache_path")]
-    pub snapshot_cache_path: String,
+    /// When the field is omitted, managed mode uses
+    /// `/var/lib/aisix/config_cache.json` and self-hosted etcd mode
+    /// leaves persistence off (unchanged defaults). Setting a path
+    /// enables the cache in either mode — self-hosted etcd deployments
+    /// gain the same offline resilience by opting in. Empty string
+    /// disables persistence everywhere — useful for ephemeral test runs
+    /// where you don't want a stale cache to mask a real failure. A
+    /// bare `snapshot_cache_path:` (YAML null) is treated as omitted.
+    #[serde(default)]
+    pub snapshot_cache_path: Option<String>,
 
     /// Heartbeat interval, in seconds. The DP POSTs a heartbeat to
     /// dp-manager every `heartbeat_interval_secs`; CP surfaces a DP as
@@ -296,14 +302,27 @@ impl ManagedConfig {
         has_pem || has_file
     }
 
+    /// Resolve the snapshot-cache path per the field docs: an explicit
+    /// path wins in any mode, an explicit empty string disables, and an
+    /// omitted field means "the default path in managed mode, disabled
+    /// in self-hosted etcd mode".
+    pub fn effective_snapshot_cache_path(&self) -> Option<&str> {
+        match self.snapshot_cache_path.as_deref() {
+            Some("") => None,
+            Some(path) => Some(path),
+            None if self.is_managed() => Some(Self::DEFAULT_SNAPSHOT_CACHE_PATH),
+            None => None,
+        }
+    }
+
+    /// Default on-disk snapshot cache location for managed mode.
+    pub const DEFAULT_SNAPSHOT_CACHE_PATH: &'static str = "/var/lib/aisix/config_cache.json";
+
     fn default_mtls_dir() -> String {
         "/var/lib/aisix/mtls".into()
     }
     fn default_dp_id_file() -> String {
         "/var/lib/aisix/dp_id".into()
-    }
-    fn default_snapshot_cache_path() -> String {
-        "/var/lib/aisix/config_cache.json".into()
     }
     const fn default_heartbeat_interval_secs() -> u64 {
         15
@@ -375,6 +394,14 @@ impl EtcdConfig {
 #[serde(deny_unknown_fields)]
 pub struct ProxyConfig {
     pub addr: String,
+    /// Cap on inbound request bodies across the whole proxy surface
+    /// (JSON, multipart, passthrough, MCP, A2A). `0` — the default —
+    /// disables the cap, matching the reference LLM proxy's
+    /// out-of-box behaviour: providers accept larger requests than any
+    /// fixed gateway default (Anthropic takes 32 MB), so a gateway-side
+    /// cap rejects requests the upstream would have served. Set a value
+    /// to bound per-request memory; over-limit requests get a 413 in
+    /// the caller's error envelope.
     #[serde(default = "ProxyConfig::default_body_limit")]
     pub request_body_limit_bytes: usize,
     #[serde(default)]
@@ -385,12 +412,215 @@ pub struct ProxyConfig {
     /// an L7 LB / ingress that sets `x-forwarded-for`.
     #[serde(default)]
     pub real_ip: RealIpConfig,
+    /// Which inbound headers a caller may hand the gateway its own
+    /// request id in (AISIX-Cloud#1288).
+    #[serde(default)]
+    pub request_id: RequestIdConfig,
+    /// Serve the proxy from independent worker threads — each with its
+    /// own runtime, its own `SO_REUSEPORT` listener on `addr`, and its
+    /// own upstream connection pool — instead of one shared runtime
+    /// whose threads hand work to each other.
+    ///
+    /// Omitted, the default, enables it on Linux and disables it
+    /// elsewhere: the kernel spreads incoming connections across
+    /// same-port listeners on Linux, and other platforms do not.
+    /// Set `false` to serve from one shared runtime on any platform.
+    ///
+    /// A request is handled end to end on the thread that accepted it,
+    /// which removes a cross-thread handoff per request. On a small
+    /// number of client connections (fewer than about four per worker)
+    /// the kernel's per-connection spreading can leave workers unevenly
+    /// loaded; throughput at that size may be lower than with a shared
+    /// runtime.
+    ///
+    /// Applied at startup. Changing it requires a restart.
+    #[serde(default)]
+    pub thread_per_core: Option<bool>,
+    /// Number of proxy worker threads.
+    ///
+    /// Omitted, the default, uses the parallelism available to the
+    /// process, which follows the CPU limits applied by a container
+    /// runtime, cgroup, or `taskset`. Must be at least 1.
+    ///
+    /// Applied at startup. Changing it requires a restart.
+    #[serde(default)]
+    pub workers: Option<usize>,
+    /// Entry-level URL rewrite rules, applied to every proxy-listener
+    /// request **before** routing (the admin and metrics listeners are
+    /// unaffected). The first rule whose `match` regex matches the request
+    /// path rewrites it — once, no cascading — and the request then flows
+    /// through the normal endpoint (auth, ACL, quota, …) as if the client
+    /// had sent the rewritten path. Lets operators map legacy URL shapes
+    /// onto AISIX endpoints, e.g. per-server MCP paths onto
+    /// `/mcp/{server}`. Empty (the default) = no rewriting.
+    ///
+    /// Env-only deployments (the chart injects config purely through
+    /// `AISIX_*` vars, which cannot express a structured list) set the
+    /// whole list as one JSON array:
+    /// `AISIX_PROXY__URL_REWRITES='[{"match":"^/x$","rewrite":"/y"}]'`.
+    #[serde(default, deserialize_with = "deserialize_url_rewrites")]
+    pub url_rewrites: Vec<UrlRewriteRule>,
 }
 
 impl ProxyConfig {
     const fn default_body_limit() -> usize {
-        10 * 1024 * 1024
+        0
     }
+
+    /// Whether the proxy serves from thread-per-core workers, resolving
+    /// the platform default when unset.
+    pub fn thread_per_core_enabled(&self) -> bool {
+        self.thread_per_core.unwrap_or(cfg!(target_os = "linux"))
+    }
+
+    /// Proxy worker-thread count, resolving the default when unset.
+    ///
+    /// `available_parallelism` reports the CPUs this process may actually
+    /// run on, so a cgroup CPU limit or a `taskset` affinity mask sizes
+    /// the pool correctly without the operator restating it here. Falls
+    /// back to 1 on the platforms that cannot report it.
+    pub fn worker_threads(&self) -> usize {
+        self.workers
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
+    }
+}
+
+/// One entry-level URL rewrite rule (see [`ProxyConfig::url_rewrites`]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UrlRewriteRule {
+    /// Optional name, used in logs when the rule fires.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Regex matched against the **raw, percent-encoded** request path
+    /// (never the query string) — no decoding, no normalization. Anchor
+    /// with `^`/`$` to match the whole path; an unanchored pattern matches
+    /// anywhere in it. Must not match the empty string.
+    #[serde(rename = "match")]
+    pub pattern: String,
+    /// Replacement for the matched portion of the path. Capture groups are
+    /// available as `$1`… / `${name}`; use `${1}x` (braced) when a literal
+    /// character follows a group reference (`$1x` reads as the group named
+    /// `1x`). The query string is preserved as sent, so the template must
+    /// not contain `?`, `#`, whitespace, or control characters.
+    #[serde(rename = "rewrite")]
+    pub replacement: String,
+}
+
+/// Accept a list of structs either as a structured sequence (config file)
+/// or as a JSON array carried in one string — the only shape an env var can
+/// hold, and env vars are the sole config channel in chart-driven
+/// deployments.
+///
+/// `with_list_parse_key` covers the other half of the problem: it splits a
+/// comma-separated env value, which is enough for a `Vec<String>` but cannot
+/// express a list of structs. So every sequence field needs one of the two —
+/// this for `Vec<Struct>`, a `with_list_parse_key` registration for
+/// `Vec<String>` / `Vec<f64>` — or it is unreachable from the environment.
+/// `field` names the setting in the error, so a malformed JSON string says
+/// which one it came from.
+fn deserialize_seq_or_json_string<'de, D, T>(
+    deserializer: D,
+    field: &str,
+) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum SeqOrJsonString<T> {
+        Seq(Vec<T>),
+        JsonString(String),
+    }
+    match SeqOrJsonString::<T>::deserialize(deserializer)? {
+        SeqOrJsonString::Seq(rules) => Ok(rules),
+        SeqOrJsonString::JsonString(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return Ok(Vec::new());
+            }
+            serde_json::from_str(trimmed)
+                .map_err(|e| serde::de::Error::custom(format!("{field} JSON string: {e}")))
+        }
+    }
+}
+
+fn deserialize_url_rewrites<'de, D>(deserializer: D) -> Result<Vec<UrlRewriteRule>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_seq_or_json_string(deserializer, "url_rewrites")
+}
+
+fn deserialize_client_type_rules<'de, D>(deserializer: D) -> Result<Vec<ClientTypeRule>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_seq_or_json_string(deserializer, "client_type_rules")
+}
+
+/// Reject a rewrite template that references capture groups its pattern
+/// does not define — the regex engine expands unknown references to the
+/// empty string, which would silently rewrite traffic to the wrong
+/// endpoint. Mirrors the engine's replacement syntax: `$$` is a literal
+/// `$`, `${name}` is a braced reference, and a bare `$name` reference
+/// spans the longest run of `[0-9A-Za-z_]` (so `$1x` reads as a group
+/// named `1x`, not group 1 followed by `x`).
+fn validate_rewrite_template_refs(regex: &regex::Regex, template: &str) -> Result<(), String> {
+    let names: std::collections::HashSet<&str> = regex.capture_names().flatten().collect();
+    let group_count = regex.captures_len(); // includes group 0 (the whole match)
+    let ref_ok = |name: &str| {
+        if name.chars().all(|c| c.is_ascii_digit()) {
+            name.parse::<usize>().is_ok_and(|idx| idx < group_count)
+        } else {
+            names.contains(name)
+        }
+    };
+    let bytes = template.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'$' {
+            i += 1;
+            continue;
+        }
+        if bytes.get(i + 1) == Some(&b'$') {
+            i += 2;
+            continue;
+        }
+        if bytes.get(i + 1) == Some(&b'{') {
+            let Some(end) = template[i + 2..].find('}') else {
+                return Err("rewrite has an unterminated `${…}` group reference".to_string());
+            };
+            let name = &template[i + 2..i + 2 + end];
+            if name.is_empty() || !ref_ok(name) {
+                return Err(format!(
+                    "rewrite references unknown capture group `${{{name}}}`"
+                ));
+            }
+            i += 2 + end + 1;
+            continue;
+        }
+        let start = i + 1;
+        let mut end = start;
+        while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+            end += 1;
+        }
+        if end == start {
+            // A bare trailing `$`: the engine treats it as a literal.
+            i += 1;
+            continue;
+        }
+        let name = &template[start..end];
+        if !ref_ok(name) {
+            return Err(format!(
+                "rewrite references unknown capture group `${name}` \
+                 (write `${{N}}text` to follow group N with literal text)"
+            ));
+        }
+        i = end;
+    }
+    Ok(())
 }
 
 /// nginx `set_real_ip_from` + `real_ip_recursive` equivalent. Resolves
@@ -437,6 +667,100 @@ impl RealIpConfig {
                 s.parse::<ipnet::IpNet>()
                     .or_else(|_| s.parse::<std::net::IpAddr>().map(ipnet::IpNet::from))
                     .map_err(|_| s.clone())
+            })
+            .collect()
+    }
+}
+
+/// Headers an operator's `default_headers` block may never set, that are
+/// never forwarded from a client, and that a caller-supplied request id may
+/// never be read out of.
+///
+/// The auth entries are the credentials each bridge mints for itself: letting
+/// config override them would swap the gateway's upstream identity for an
+/// attacker-supplied one. The last three are host-routing / session /
+/// proxy-auth headers that no provider auth scheme uses but that are still
+/// dangerous to hand to config.
+///
+/// cp-api rejects these at write time
+/// (`internal/cpapi/resources/provider_key_overrides.go`); this list is the
+/// runtime half of that pair, and the two must stay in sync.
+///
+/// Lives here rather than in `aisix-gateway` (which re-exports it as
+/// `upstream_headers::RESERVED_UPSTREAM_HEADERS`) so that [`Config::validate`]
+/// can enforce it too: naming one of these in
+/// `proxy.request_id.accept_headers` would turn the caller's credential into
+/// the request id, which the gateway then writes to its logs and telemetry,
+/// returns in `x-aisix-request-id`, and sends upstream — routing around this
+/// very guard by a different door.
+pub const RESERVED_UPSTREAM_HEADERS: &[&str] = &[
+    "authorization",        // OpenAI / Anthropic / Vertex Bearer
+    "x-api-key",            // Anthropic raw, also OpenAI legacy proxies
+    "x-goog-api-key",       // Gemini API key
+    "api-key",              // Azure OpenAI key
+    "x-amz-security-token", // AWS SigV4 session header (Bedrock)
+    "x-amz-date",           // AWS SigV4 timestamp (Bedrock)
+    "x-amz-content-sha256", // AWS SigV4 body hash (Bedrock)
+    "proxy-authorization",  // proxy auth — never operator-controllable
+    "cookie",               // session bleed between caller and upstream
+    "host",                 // URL hijack via Host header
+];
+
+/// Where the gateway will accept a caller-supplied request id
+/// (AISIX-Cloud#1288).
+///
+/// The id a caller sends becomes THE id for the request: the
+/// `x-aisix-request-id` response header, every attempt's usage event, the
+/// access log, and the `x-aisix-request-id` the upstream sees. That is what
+/// lets a caller find a gateway request by an id its own business logs
+/// already carry, instead of maintaining a second mapping.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct RequestIdConfig {
+    /// Inbound headers consulted, in order; the first one carrying an
+    /// acceptable value wins. An unacceptable or absent value falls back
+    /// to a freshly minted UUID, which is the pre-#1288 behaviour.
+    ///
+    /// Defaults to the gateway's own `x-aisix-request-id` alone. Add
+    /// `x-request-id` to honour the de-facto standard header — deliberately
+    /// NOT a default, because every reverse proxy and ingress in front of
+    /// the gateway stamps that header automatically, so enabling it makes
+    /// the correlation id come from the infrastructure rather than from the
+    /// caller unless the operator meant it to. Set to `[]` to refuse
+    /// caller-supplied ids entirely and always mint a UUID.
+    pub accept_headers: Vec<String>,
+}
+
+impl Default for RequestIdConfig {
+    fn default() -> Self {
+        Self {
+            accept_headers: vec!["x-aisix-request-id".into()],
+        }
+    }
+}
+
+impl RequestIdConfig {
+    /// Parse `accept_headers` into header names, rejecting malformed entries
+    /// and any name in [`RESERVED_UPSTREAM_HEADERS`]. Header names are
+    /// case-insensitive on the wire, so the parse also lowercases and gives
+    /// the proxy ready-to-use keys.
+    ///
+    /// The reserved check is what stops a request id being read out of a
+    /// credential header: the resolved id is echoed to the caller, written to
+    /// the logs and telemetry, and sent upstream, so accepting one from
+    /// `authorization` would disclose the caller's secret through all three.
+    pub fn parse_accept_headers(&self) -> Result<Vec<http::HeaderName>, String> {
+        self.accept_headers
+            .iter()
+            .map(|s| {
+                let name = s
+                    .trim()
+                    .parse::<http::HeaderName>()
+                    .map_err(|_| s.clone())?;
+                if RESERVED_UPSTREAM_HEADERS.contains(&name.as_str()) {
+                    return Err(s.clone());
+                }
+                Ok(name)
             })
             .collect()
     }
@@ -532,7 +856,44 @@ pub struct MetricsConfig {
     /// go to this DP's own Prometheus scrape surface, so the operator who
     /// owns the scrape owns the label set. Order matters (first match
     /// wins); compiled + validated at boot (fail-fast), never hot-reloaded.
+    ///
+    /// Env-only deployments set the whole list as one JSON array:
+    /// `AISIX_OBSERVABILITY__METRICS__CLIENT_TYPE_RULES='[{"pattern":"^py-bill/","client":"billing"}]'`.
+    #[serde(default, deserialize_with = "deserialize_client_type_rules")]
     pub client_type_rules: Vec<ClientTypeRule>,
+    /// Operator overrides for the histogram bucket edges
+    /// (AISIX-Cloud#1226). Deployment-scoped for the same reason as
+    /// `client_type_rules`: the series these edges mint go to this DP's
+    /// own Prometheus scrape surface. Validated at boot (fail-fast),
+    /// never hot-reloaded.
+    pub buckets: HistogramBucketsConfig,
+}
+
+/// Per-metric bucket-edge overrides, in seconds. An unset field keeps that
+/// metric's built-in default; the defaults deliberately differ per metric
+/// because the three distributions do (see `aisix_obs::metrics`). Edges
+/// must be finite, positive and strictly ascending; the `+Inf` bucket is
+/// appended by the exporter and must not be listed.
+///
+/// Changing these changes the Prometheus metric contract: dashboards and
+/// recording rules that hardcode an `le` value break, and previously
+/// recorded series are not comparable across the change.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct HistogramBucketsConfig {
+    /// `aisix_request_e2e_latency_seconds`
+    pub request_e2e_latency: Option<Vec<f64>>,
+    /// `aisix_request_ttft_seconds`
+    pub request_ttft: Option<Vec<f64>>,
+    /// `aisix_guardrail_latency_seconds`
+    pub guardrail_latency: Option<Vec<f64>>,
+    /// `aisix_a2a_ttfb_seconds`
+    ///
+    /// Separate from `request_ttft` on purpose: an agent's wait for its first
+    /// event and a model's wait for its first token have the same shape but
+    /// not the same range — an A2A task may think for minutes before it says
+    /// anything. Defaults to the same edges as `request_ttft`.
+    pub a2a_ttfb: Option<Vec<f64>>,
 }
 
 /// One `client_type_rules` entry: a regex tried against the raw inbound
@@ -691,6 +1052,14 @@ pub struct RedisConnConfig {
     /// Database index for the Sentinel-discovered master (default 0).
     /// Not applicable to `cluster` (Redis Cluster only has DB 0).
     pub database: Option<i64>,
+    /// Trust settings for a `rediss://` connection. Independent of
+    /// `upstream.tls` because the cache/rate-limit backend sits inside
+    /// the deployment and is usually issued by a different authority
+    /// than the model endpoints.
+    ///
+    /// Only consulted for `rediss://` URLs; a plaintext `redis://`
+    /// connection never negotiates TLS regardless of what is set here.
+    pub tls: OutboundTlsConfig,
 }
 
 impl RedisConnConfig {
@@ -723,6 +1092,19 @@ impl RedisConnConfig {
                     ));
                 }
             }
+        }
+        match (&self.tls.client_cert_file, &self.tls.client_key_file) {
+            (Some(_), None) => {
+                return Err(format!(
+                    "{ctx}.tls.client_cert_file requires {ctx}.tls.client_key_file"
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(format!(
+                    "{ctx}.tls.client_key_file requires {ctx}.tls.client_cert_file"
+                ));
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -781,9 +1163,27 @@ pub enum RateLimitBackend {
 /// here, and the request fails with an opaque transport error.
 ///
 /// Every duration accepts `0` to disable that individual knob.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct UpstreamConfig {
+    /// Deployment-wide default for `Model.timeout`: the end-to-end deadline
+    /// in milliseconds for non-streaming upstream calls (and the fallback
+    /// budget for streaming ones, below). Applies to every model that sets
+    /// neither its own `timeout` nor a group-level one. `0` restores the
+    /// pre-default behaviour: no deadline at all.
+    ///
+    /// The default matches the LiteLLM proxy's `request_timeout` (6000 s).
+    /// It is a backstop against an upstream that accepted the connection
+    /// and then goes silent forever — not a responsiveness target, which
+    /// is what per-model `timeout` is for. Deliberately generous so it can
+    /// never cut down a legitimate long request (deep-reasoning calls run
+    /// past 10 minutes).
+    pub timeout_ms: u64,
+    /// Deployment-wide default for `Model.stream_timeout`: the maximum gap
+    /// in milliseconds between upstream streaming chunks. `0` (the
+    /// default) falls back to `timeout_ms`, mirroring how an unset
+    /// `Model.stream_timeout` falls back to `Model.timeout`.
+    pub stream_timeout_ms: u64,
     /// Max time for DNS + TCP + TLS before an attempt fails. Without it a
     /// black-holed upstream is bounded only by the model's overall timeout.
     pub connect_timeout_ms: u64,
@@ -813,11 +1213,16 @@ pub struct UpstreamConfig {
     /// each retry re-sends the full request body, and stacks on top of any
     /// retry the provider's own edge performs.
     pub retries: u32,
+    /// Trust settings for the TLS handshake with every upstream peer —
+    /// see [`OutboundTlsConfig`].
+    pub tls: OutboundTlsConfig,
 }
 
 impl Default for UpstreamConfig {
     fn default() -> Self {
         Self {
+            timeout_ms: DEFAULT_UPSTREAM_TIMEOUT_MS,
+            stream_timeout_ms: 0,
             connect_timeout_ms: 5_000,
             tcp_keepalive_secs: 60,
             tcp_keepalive_interval_secs: 30,
@@ -825,7 +1230,78 @@ impl Default for UpstreamConfig {
             pool_idle_timeout_secs: 30,
             pool_max_idle_per_host: None,
             retries: DEFAULT_UPSTREAM_RETRIES,
+            tls: OutboundTlsConfig::default(),
         }
+    }
+}
+
+/// Trust settings for a class of TLS connections the gateway *opens*.
+///
+/// Used twice, because the two peer classes are issued certificates by
+/// different authorities and must be configurable apart: `upstream.tls`
+/// covers everything the gateway calls out to on a request path — the
+/// provider bridges, guardrail services, MCP and A2A upstreams, the
+/// OIDC/JWKS fetches, the Realtime WebSocket, Bedrock, and the
+/// log-export object stores — while a `redis.tls` block covers the
+/// shared cache / rate-limit backend.
+///
+/// Scope note: this is the connection the gateway makes as a *client*.
+/// The certificate the gateway *presents* on its own listeners is
+/// `proxy.tls` / `admin.tls`, and the etcd channel keeps its own
+/// [`EtcdTlsConfig`] because it is a control-plane link whose bundle is
+/// issued by the control plane rather than configured by the operator.
+///
+/// Without any of this set, the trust store is the platform's: the
+/// built-in root set plus whatever `SSL_CERT_FILE` / `SSL_CERT_DIR`
+/// point at. Those environment variables keep working and stay
+/// additive, but they are process-wide and cannot be expressed per
+/// peer class, which is what `ca_file` is for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct OutboundTlsConfig {
+    /// Path to a PEM file holding one or more certificates to trust as
+    /// issuers, for upstreams whose certificate is signed by a private
+    /// or enterprise CA.
+    ///
+    /// **Additive**: these are trusted *in addition to* the built-in
+    /// roots, so adding a private CA never stops a public provider from
+    /// being reachable. Every certificate in the file is loaded, so a
+    /// full chain in one bundle works.
+    pub ca_file: Option<String>,
+    /// Path to a PEM client certificate presented to upstreams that
+    /// require mutual TLS. Must be set together with `client_key_file`.
+    pub client_cert_file: Option<String>,
+    /// Path to the PEM private key for `client_cert_file`.
+    pub client_key_file: Option<String>,
+    /// Whether the upstream's certificate is verified at all.
+    ///
+    /// Setting this to `false` accepts any certificate, including an
+    /// expired one, one issued for a different host, and one presented
+    /// by an interceptor — which removes the only protection against a
+    /// machine-in-the-middle reading and rewriting every prompt,
+    /// response, and upstream API key that crosses the connection.
+    /// Intended for a test environment where the alternative is not
+    /// running at all; prefer `ca_file` everywhere else.
+    pub verify: bool,
+}
+
+impl Default for OutboundTlsConfig {
+    fn default() -> Self {
+        Self {
+            ca_file: None,
+            client_cert_file: None,
+            client_key_file: None,
+            verify: true,
+        }
+    }
+}
+
+impl OutboundTlsConfig {
+    /// Whether anything here departs from the platform default trust
+    /// behaviour. Used to keep the "no TLS config" path building exactly
+    /// the client it built before this block existed.
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
     }
 }
 
@@ -833,6 +1309,10 @@ impl Default for UpstreamConfig {
 /// which is also what the LiteLLM router falls back to when neither
 /// `router_settings.num_retries` nor `litellm_settings.num_retries` is set.
 pub const DEFAULT_UPSTREAM_RETRIES: u32 = 2;
+
+/// Deployment-wide request-timeout default: 6000 s, matching the LiteLLM
+/// proxy's `request_timeout`. See [`UpstreamConfig::timeout_ms`].
+pub const DEFAULT_UPSTREAM_TIMEOUT_MS: u64 = 6_000_000;
 
 /// Connection-layer settings for the inbound side — the client (or the
 /// gateway in front of this one) talking to the proxy and admin listeners.
@@ -912,10 +1392,28 @@ impl Config {
                 // which blows up secrets that happen to contain a
                 // comma with a serde "invalid type: sequence, expected
                 // a string" error. Opt in only for fields that are
-                // actually Vec<String>.
+                // actually sequences.
+                //
+                // EVERY sequence field belongs on this list: the deployed
+                // chart injects gateway config purely through AISIX_* env
+                // vars, so an unregistered key is not merely awkward from
+                // the environment — it fails to deserialize, leaving the
+                // field unreachable in Kubernetes.
+                // A `Vec<Struct>` cannot be expressed by comma-splitting;
+                // those fields carry `deserialize_seq_or_json_string`
+                // instead and take one JSON array. Between the two
+                // mechanisms every sequence field must be covered —
+                // `env_only_deployments_can_set_every_sequence_field` is
+                // the guard.
                 .list_separator(",")
                 .with_list_parse_key("etcd.endpoints")
                 .with_list_parse_key("admin.admin_keys")
+                .with_list_parse_key("proxy.real_ip.trusted_proxies")
+                .with_list_parse_key("proxy.request_id.accept_headers")
+                .with_list_parse_key("observability.metrics.buckets.request_e2e_latency")
+                .with_list_parse_key("observability.metrics.buckets.request_ttft")
+                .with_list_parse_key("observability.metrics.buckets.guardrail_latency")
+                .with_list_parse_key("observability.metrics.buckets.a2a_ttfb")
                 .try_parsing(true),
         );
 
@@ -932,6 +1430,54 @@ impl Config {
     }
 
     fn validate(&self) -> Result<(), BootstrapError> {
+        // Fail fast on an unusable rewrite rule: a broken rule would
+        // otherwise surface at runtime as silently mis-routed or 404ing
+        // legacy traffic, which is much harder to trace back to a typo in
+        // one line of config.
+        for (i, rule) in self.proxy.url_rewrites.iter().enumerate() {
+            let ctx = || {
+                rule.name
+                    .clone()
+                    .unwrap_or_else(|| format!("proxy.url_rewrites[{i}]"))
+            };
+            let regex = match regex::Regex::new(&rule.pattern) {
+                Ok(regex) => regex,
+                Err(e) => {
+                    return Err(BootstrapError::Config(format!(
+                        "{}: invalid match regex: {e}",
+                        ctx()
+                    )));
+                }
+            };
+            // A pattern that matches the empty string would fire on every
+            // request (zero-width match at position 0) and prepend the
+            // template to every path.
+            if regex.find("").is_some() {
+                return Err(BootstrapError::Config(format!(
+                    "{}: match must not match the empty string",
+                    ctx()
+                )));
+            }
+            // The template lands inside a URI path; a `?` would absorb the
+            // caller's query into itself and a `#` would truncate the path
+            // as a fragment — both silently. Reject them (and unprintables)
+            // up front; capture-group expansions are safe because a request
+            // path can never contain these characters raw.
+            if let Some(bad) = rule
+                .replacement
+                .chars()
+                .find(|c| matches!(c, '?' | '#') || c.is_whitespace() || c.is_control())
+            {
+                return Err(BootstrapError::Config(format!(
+                    "{}: rewrite must not contain {bad:?} (the template is a path; \
+                     the query string is preserved automatically)",
+                    ctx()
+                )));
+            }
+            if let Err(e) = validate_rewrite_template_refs(&regex, &rule.replacement) {
+                return Err(BootstrapError::Config(format!("{}: {e}", ctx())));
+            }
+        }
         if let Some(path) = self.resources_file.as_deref() {
             // File source selected: exactly one resource source may be
             // active. A configured etcd endpoint list alongside the file
@@ -993,6 +1539,28 @@ impl Config {
                 "proxy.real_ip.trusted_proxies invalid CIDR/IP: {bad}"
             )));
         }
+        // A malformed name here would otherwise just never match any
+        // inbound header, so the operator would see caller-supplied
+        // request ids silently ignored with nothing to point at. A reserved
+        // name is worse than useless: it would copy a caller credential into
+        // the response header, the logs and the upstream request.
+        if let Err(bad) = self.proxy.request_id.parse_accept_headers() {
+            return Err(BootstrapError::Config(format!(
+                "proxy.request_id.accept_headers rejects {bad:?}: not a valid HTTP \
+                 header name, or a reserved header a request id must never be read \
+                 from ({})",
+                RESERVED_UPSTREAM_HEADERS.join(", ")
+            )));
+        }
+        // Zero workers would bind no listener at all: the proxy would
+        // boot, report healthy, and refuse every connection.
+        if self.proxy.workers == Some(0) {
+            return Err(BootstrapError::Config(
+                "proxy.workers must be at least 1 (omit it to use the \
+                 parallelism available to the process)"
+                    .into(),
+            ));
+        }
         // The dedicated metrics listener address must be a bindable
         // socket address — it is always bound when prometheus is enabled.
         let metrics_addr = &self.observability.metrics.prometheus.addr;
@@ -1027,6 +1595,25 @@ impl Config {
                 .validate("cache.redis")
                 .map_err(BootstrapError::Config)?;
         }
+        // A half-configured client identity would otherwise be silently
+        // dropped and surface much later as an upstream 4xx from a peer
+        // that wanted mutual TLS.
+        match (
+            &self.upstream.tls.client_cert_file,
+            &self.upstream.tls.client_key_file,
+        ) {
+            (Some(_), None) => {
+                return Err(BootstrapError::Config(
+                    "upstream.tls.client_cert_file requires upstream.tls.client_key_file".into(),
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(BootstrapError::Config(
+                    "upstream.tls.client_key_file requires upstream.tls.client_cert_file".into(),
+                ));
+            }
+            _ => {}
+        }
         Ok(())
     }
 }
@@ -1058,7 +1645,9 @@ admin:
         );
         let cfg = Config::load_from_path(Some(f.path())).unwrap();
         assert_eq!(cfg.etcd.endpoints, vec!["http://127.0.0.1:2379"]);
-        assert_eq!(cfg.proxy.request_body_limit_bytes, 10 * 1024 * 1024);
+        // `0` = no request-body cap, the out-of-box behaviour of the
+        // reference LLM proxy.
+        assert_eq!(cfg.proxy.request_body_limit_bytes, 0);
         assert!(cfg.observability.metrics.prometheus.enabled);
         // The dedicated metrics listener defaults to 0.0.0.0:9090 in
         // every mode — no admin-listener fallback to fall out of sync with.
@@ -1069,6 +1658,127 @@ admin:
         assert!(!cfg.proxy.real_ip.recursive);
         assert_eq!(cfg.proxy.real_ip.header, "x-forwarded-for");
         assert!(cfg.proxy.real_ip.parse_trusted().unwrap().is_empty());
+    }
+
+    #[test]
+    fn request_id_accept_headers_default_to_the_gateway_header_only() {
+        // The default is the contract from AISIX-Cloud#1288: a caller can
+        // reuse an id through OUR header, and `x-request-id` — which every
+        // ingress in front of the gateway stamps — stays opt-in.
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+  prefix: "/aisix"
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+"#,
+        );
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert_eq!(
+            cfg.proxy.request_id.accept_headers,
+            vec!["x-aisix-request-id"]
+        );
+        assert_eq!(
+            cfg.proxy
+                .request_id
+                .parse_accept_headers()
+                .unwrap()
+                .iter()
+                .map(|h| h.as_str().to_string())
+                .collect::<Vec<_>>(),
+            vec!["x-aisix-request-id"],
+        );
+    }
+
+    #[test]
+    fn request_id_accept_headers_are_configurable_and_validated() {
+        let with = |block: &str| {
+            write_yaml(&format!(
+                r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+  prefix: "/aisix"
+proxy:
+  addr: "0.0.0.0:3000"
+{block}
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+"#
+            ))
+        };
+
+        // Opting `x-request-id` in, and header names normalised to lower
+        // case so the lookup matches however the caller cased it.
+        let f =
+            with("  request_id:\n    accept_headers: [\"X-Aisix-Request-Id\", \"x-request-id\"]\n");
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert_eq!(
+            cfg.proxy
+                .request_id
+                .parse_accept_headers()
+                .unwrap()
+                .iter()
+                .map(|h| h.as_str().to_string())
+                .collect::<Vec<_>>(),
+            vec!["x-aisix-request-id", "x-request-id"],
+        );
+
+        // An empty list refuses caller-supplied ids entirely.
+        let f = with("  request_id:\n    accept_headers: []\n");
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert!(cfg.proxy.request_id.accept_headers.is_empty());
+
+        // A malformed name fails the boot instead of silently never
+        // matching an inbound header.
+        let f = with("  request_id:\n    accept_headers: [\"not a header\"]\n");
+        let err = Config::load_from_path(Some(f.path()))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("proxy.request_id.accept_headers"),
+            "expected the offending key in the error, got: {err}"
+        );
+    }
+
+    // A request id read out of a credential header would be echoed to the
+    // caller, written to the logs and telemetry, and sent upstream as
+    // `x-aisix-request-id` — disclosing the caller's secret through all
+    // three, and walking around the RESERVED_UPSTREAM_HEADERS guard by a
+    // different door. Every reserved name must fail the boot.
+    #[test]
+    fn request_id_accept_headers_rejects_credential_headers() {
+        for reserved in RESERVED_UPSTREAM_HEADERS {
+            for spelling in [reserved.to_string(), reserved.to_uppercase()] {
+                let f = write_yaml(&format!(
+                    r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+  prefix: "/aisix"
+proxy:
+  addr: "0.0.0.0:3000"
+  request_id:
+    accept_headers: ["{spelling}"]
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+"#
+                ));
+                let err = Config::load_from_path(Some(f.path()))
+                    .expect_err(&format!(
+                        "{spelling} must be refused as a request-id source"
+                    ))
+                    .to_string();
+                assert!(
+                    err.contains("proxy.request_id.accept_headers"),
+                    "expected the offending key in the error for {spelling}, got: {err}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1121,6 +1831,255 @@ admin:
         let nets = cfg.proxy.real_ip.parse_trusted().unwrap();
         assert_eq!(nets.len(), 2);
         assert!(nets.iter().any(|n| n.to_string() == "10.0.0.0/8"));
+    }
+
+    #[test]
+    fn loads_url_rewrites_and_rejects_an_invalid_regex() {
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+  prefix: "/aisix"
+proxy:
+  addr: "0.0.0.0:3000"
+  url_rewrites:
+    - name: per-server-mcp-compat
+      match: "^/mcp-servers/([^/]+)/mcp$"
+      rewrite: "/mcp/$1"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+"#,
+        );
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert_eq!(cfg.proxy.url_rewrites.len(), 1);
+        assert_eq!(cfg.proxy.url_rewrites[0].replacement, "/mcp/$1");
+
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+  prefix: "/aisix"
+proxy:
+  addr: "0.0.0.0:3000"
+  url_rewrites:
+    - match: "^/mcp-servers/([^/+/mcp$"
+      rewrite: "/mcp/$1"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+"#,
+        );
+        let err = Config::load_from_path(Some(f.path())).unwrap_err();
+        assert!(
+            format!("{err}").contains("url_rewrites"),
+            "error should name the bad rule: {err}"
+        );
+    }
+
+    #[test]
+    fn url_rewrites_accepts_a_json_string_for_env_only_deployments() {
+        // Chart-driven deployments inject config purely through AISIX_* env
+        // vars, which cannot express a structured list — the whole list
+        // rides in one JSON string. A YAML string scalar takes the same
+        // code path as the env source.
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+  prefix: "/aisix"
+proxy:
+  addr: "0.0.0.0:3000"
+  url_rewrites: '[{"name":"compat","match":"^/mcp-servers/([^/]+)/mcp$","rewrite":"/mcp/$1"}]'
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+"#,
+        );
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert_eq!(cfg.proxy.url_rewrites.len(), 1);
+        assert_eq!(cfg.proxy.url_rewrites[0].name.as_deref(), Some("compat"));
+
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+  prefix: "/aisix"
+proxy:
+  addr: "0.0.0.0:3000"
+  url_rewrites: '[{"match": broken'
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+"#,
+        );
+        let err = Config::load_from_path(Some(f.path())).unwrap_err();
+        assert!(
+            format!("{err}").contains("url_rewrites"),
+            "error should name the field: {err}"
+        );
+    }
+
+    #[test]
+    fn env_only_deployments_can_set_every_sequence_field() {
+        // The chart and the dashboard's `docker run` snippet configure the
+        // gateway purely through AISIX_* env vars, so a sequence field that
+        // the env source cannot express is unreachable in those deployments
+        // — it does not fall back to a default, the whole load fails.
+        //
+        // The YAML-scalar tests above do NOT cover this: they exercise the
+        // deserializer, not the `Environment` source's list-parse
+        // registration. `proxy.real_ip.trusted_proxies` was registered
+        // nowhere and shipped unreachable behind exactly that gap.
+        const CHILD_MARKER: &str = "TEST_ENV_SEQUENCE_FIELDS_CHILD";
+        const ENV: [(&str, &str); 9] = [
+            ("AISIX_ETCD__ENDPOINTS", "http://127.0.0.1:2379"),
+            ("AISIX_ADMIN__ADMIN_KEYS", "k1,k2"),
+            ("AISIX_PROXY__ADDR", "0.0.0.0:3000"),
+            ("AISIX_ADMIN__ADDR", "127.0.0.1:3001"),
+            (
+                "AISIX_PROXY__REAL_IP__TRUSTED_PROXIES",
+                "10.0.0.0/8,127.0.0.1/32",
+            ),
+            (
+                "AISIX_PROXY__REQUEST_ID__ACCEPT_HEADERS",
+                "x-aisix-request-id,x-request-id",
+            ),
+            (
+                "AISIX_PROXY__URL_REWRITES",
+                r#"[{"name":"c","match":"^/a$","rewrite":"/b"}]"#,
+            ),
+            (
+                "AISIX_OBSERVABILITY__METRICS__CLIENT_TYPE_RULES",
+                r#"[{"pattern":"^py-bill/","client":"billing"}]"#,
+            ),
+            (
+                "AISIX_OBSERVABILITY__METRICS__BUCKETS__REQUEST_TTFT",
+                "0.1,0.5,1",
+            ),
+        ];
+
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            // Isolate env-backed loading in a child process so concurrent
+            // tests neither observe nor overwrite these variables.
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .arg("env_only_deployments_can_set_every_sequence_field")
+                .arg("--test-threads=1")
+                .env(CHILD_MARKER, "1");
+            for (key, _) in std::env::vars_os() {
+                if key.to_string_lossy().starts_with("AISIX_") {
+                    child.env_remove(key);
+                }
+            }
+            for (k, v) in ENV {
+                child.env(k, v);
+            }
+            let output = child.output().unwrap();
+            assert!(
+                output.status.success(),
+                "child config test failed: {}",
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        }
+
+        let cfg = Config::load_from_path(None).unwrap();
+        assert_eq!(
+            cfg.proxy.real_ip.trusted_proxies,
+            vec!["10.0.0.0/8".to_string(), "127.0.0.1/32".to_string()],
+        );
+        assert_eq!(
+            cfg.proxy.request_id.accept_headers,
+            vec!["x-aisix-request-id".to_string(), "x-request-id".to_string()],
+        );
+        assert_eq!(cfg.proxy.url_rewrites.len(), 1);
+        assert_eq!(cfg.observability.metrics.client_type_rules.len(), 1);
+        assert_eq!(
+            cfg.observability.metrics.client_type_rules[0].client,
+            "billing"
+        );
+        assert_eq!(
+            cfg.observability.metrics.buckets.request_ttft,
+            Some(vec![0.1, 0.5, 1.0])
+        );
+        assert_eq!(
+            cfg.etcd.endpoints,
+            vec!["http://127.0.0.1:2379".to_string()]
+        );
+        assert_eq!(
+            cfg.admin.admin_keys,
+            vec!["k1".to_string(), "k2".to_string()]
+        );
+    }
+
+    #[test]
+    fn url_rewrites_rejects_silent_template_mistakes() {
+        let case = |rule_yaml: &str, expect: &str| {
+            let f = write_yaml(&format!(
+                r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+  prefix: "/aisix"
+proxy:
+  addr: "0.0.0.0:3000"
+  url_rewrites:
+{rule_yaml}
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+"#
+            ));
+            let err = Config::load_from_path(Some(f.path())).unwrap_err();
+            assert!(
+                format!("{err}").contains(expect),
+                "expected {expect:?} in: {err}"
+            );
+        };
+
+        // An unknown group reference expands to the empty string at runtime
+        // — every legacy request would silently land on the wrong endpoint.
+        case(
+            "    - match: \"^/mcp-servers/([^/]+)/mcp$\"\n      rewrite: \"/mcp/$2\"",
+            "unknown capture group",
+        );
+        case(
+            "    - match: \"^/gw/(?P<server>[^/]+)$\"\n      rewrite: \"/mcp/${srv}\"",
+            "unknown capture group",
+        );
+        // `?` would absorb the caller's query; `#` would truncate the path.
+        case(
+            "    - match: \"^/a$\"\n      rewrite: \"/v1/chat?model=x\"",
+            "must not contain",
+        );
+        case(
+            "    - match: \"^/a$\"\n      rewrite: \"/v1/models#frag\"",
+            "must not contain",
+        );
+        // A pattern matching the empty string fires on every request.
+        case(
+            "    - match: \"(x)?\"\n      rewrite: \"/y\"",
+            "empty string",
+        );
+
+        // The braced form with literal text after a group is the valid way
+        // to write what `$1x` cannot mean.
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+  prefix: "/aisix"
+proxy:
+  addr: "0.0.0.0:3000"
+  url_rewrites:
+    - match: "^/gw/(?P<server>[^/]+)/v(\\d+)$"
+      rewrite: "/mcp/${server}-v${2}"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+"#,
+        );
+        Config::load_from_path(Some(f.path())).expect("braced references are valid");
     }
 
     #[test]
@@ -1372,6 +2331,8 @@ admin:
 "#,
         );
         let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert_eq!(cfg.upstream.timeout_ms, 6_000_000);
+        assert_eq!(cfg.upstream.stream_timeout_ms, 0);
         assert_eq!(cfg.upstream.connect_timeout_ms, 5_000);
         assert_eq!(cfg.upstream.tcp_keepalive_secs, 60);
         assert_eq!(cfg.upstream.tcp_keepalive_interval_secs, 30);
@@ -1395,6 +2356,8 @@ admin:
   addr: "127.0.0.1:3001"
   admin_keys: ["k1"]
 upstream:
+  timeout_ms: 0
+  stream_timeout_ms: 30000
   connect_timeout_ms: 2000
   pool_idle_timeout_secs: 10
   tcp_keepalive_secs: 0
@@ -1402,6 +2365,8 @@ upstream:
 "#,
         );
         let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert_eq!(cfg.upstream.timeout_ms, 0);
+        assert_eq!(cfg.upstream.stream_timeout_ms, 30_000);
         assert_eq!(cfg.upstream.connect_timeout_ms, 2_000);
         assert_eq!(cfg.upstream.pool_idle_timeout_secs, 10);
         assert_eq!(cfg.upstream.tcp_keepalive_secs, 0);
@@ -1688,6 +2653,80 @@ observability:
     }
 
     #[test]
+    fn managed_container_examples_use_supported_bootstrap_env() {
+        const CHILD_MARKER: &str = "TEST_MANAGED_CONFIG_ENV_CHILD";
+        const MANAGED_ENV_VARS: [&str; 5] = [
+            "AISIX_MANAGED__CP_BASE_URL",
+            "AISIX_MANAGED__CP_ETCD_ENDPOINT",
+            "AISIX_MANAGED__CP_CERT_PEM",
+            "AISIX_MANAGED__CP_KEY_PEM",
+            "AISIX_MANAGED__CP_CA_PEM",
+        ];
+
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+            for relative in ["Dockerfile", "docker/entrypoint.sh"] {
+                let example = std::fs::read_to_string(repo_root.join(relative)).unwrap();
+                for variable in MANAGED_ENV_VARS {
+                    assert!(
+                        example.contains(variable),
+                        "{relative} must document {variable}",
+                    );
+                }
+                assert!(
+                    !example.contains("AISIX_MANAGED__REGISTRATION_TOKEN"),
+                    "{relative} must not document the removed registration-token bootstrap",
+                );
+            }
+
+            // Isolate environment-backed loading in a child test process so
+            // concurrent tests cannot observe or overwrite these variables.
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .arg("managed_container_examples_use_supported_bootstrap_env")
+                .arg("--test-threads=1")
+                .env(CHILD_MARKER, "1");
+            for (key, _) in std::env::vars_os() {
+                if key.to_string_lossy().starts_with("AISIX_") {
+                    child.env_remove(key);
+                }
+            }
+            child
+                .env(MANAGED_ENV_VARS[0], "https://cp.example.com/api")
+                .env(MANAGED_ENV_VARS[1], "etcd.example.com:7943")
+                .env(MANAGED_ENV_VARS[2], "test certificate")
+                .env(MANAGED_ENV_VARS[3], "test private key")
+                .env(MANAGED_ENV_VARS[4], "test CA certificate");
+            let output = child.output().unwrap();
+            assert!(
+                output.status.success(),
+                "child config test failed: {}",
+                String::from_utf8_lossy(&output.stderr),
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "child config test did not run exactly one passing test: {}",
+                String::from_utf8_lossy(&output.stdout),
+            );
+            return;
+        }
+
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config.managed.yaml");
+        let cfg = Config::load_from_path(Some(Path::new(path)))
+            .expect("documented managed-mode environment variables must load");
+        assert!(cfg.managed.is_managed());
+        assert_eq!(
+            cfg.managed.cp_base_url.as_deref(),
+            Some("https://cp.example.com/api")
+        );
+        assert_eq!(
+            cfg.managed.cp_etcd_endpoint.as_deref(),
+            Some("etcd.example.com:7943")
+        );
+        assert!(cfg.managed.cert_bundle_provided());
+    }
+
+    #[test]
     fn shipped_example_config_binds_the_metrics_listener() {
         // `config.example.yaml` is the self-hosted reference shape; pin
         // the explicit unified scrape address so standalone and managed
@@ -1697,6 +2736,112 @@ observability:
             Config::load_from_path(Some(Path::new(path))).expect("config.example.yaml must load");
         assert!(cfg.observability.metrics.prometheus.enabled);
         assert_eq!(cfg.observability.metrics.prometheus.addr, "0.0.0.0:9090");
+    }
+
+    /// The block the issue reports as missing. `AISIX_UPSTREAM_SSL_VERIFY`
+    /// used to be rejected at boot with "unknown field", and the error
+    /// listed every section *except* a place to put a CA.
+    #[test]
+    fn loads_the_upstream_tls_block() {
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+upstream:
+  tls:
+    ca_file: "/etc/aisix/tls/private-ca.pem"
+    client_cert_file: "/etc/aisix/tls/client.crt"
+    client_key_file: "/etc/aisix/tls/client.key"
+    verify: false
+"#,
+        );
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert_eq!(
+            cfg.upstream.tls.ca_file.as_deref(),
+            Some("/etc/aisix/tls/private-ca.pem")
+        );
+        assert!(!cfg.upstream.tls.verify);
+    }
+
+    /// Verification must stay on for a deployment that never mentions
+    /// TLS — the block is `#[serde(default)]`, and a derived `Default`
+    /// would have made `verify` false.
+    #[test]
+    fn omitting_the_tls_block_keeps_verification_on() {
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+"#,
+        );
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert!(cfg.upstream.tls.verify);
+        assert!(cfg.upstream.tls.is_default());
+    }
+
+    /// Half an identity is silently dropped by every TLS stack and then
+    /// surfaces much later as a 4xx from a peer that wanted mutual TLS.
+    #[test]
+    fn a_client_certificate_without_its_key_is_rejected_at_boot() {
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+upstream:
+  tls:
+    client_cert_file: "/etc/aisix/tls/client.crt"
+"#,
+        );
+        let err = Config::load_from_path(Some(f.path()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("client_key_file"), "{err}");
+    }
+
+    #[test]
+    fn redis_carries_its_own_tls_block() {
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+ratelimit:
+  backend: redis
+  redis:
+    mode: single
+    url: "rediss://redis.internal:6379"
+    tls:
+      ca_file: "/etc/aisix/tls/redis-ca.pem"
+"#,
+        );
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        let redis = cfg.ratelimit.redis.as_ref().unwrap();
+        assert_eq!(
+            redis.tls.ca_file.as_deref(),
+            Some("/etc/aisix/tls/redis-ca.pem")
+        );
+        // Independent of the upstream block: the two peers are issued by
+        // different authorities in every real deployment.
+        assert!(cfg.upstream.tls.is_default());
     }
 
     #[test]
@@ -1796,13 +2941,49 @@ managed:
         assert_eq!(cfg.managed.mtls_dir, "/var/lib/aisix/mtls");
         assert_eq!(cfg.managed.dp_id_file, "/var/lib/aisix/dp_id");
         // Default snapshot cache path keeps offline-resilience on by
-        // default; operators opt out by setting the field to "".
+        // default in managed mode; operators opt out by setting the
+        // field to "".
         assert_eq!(
-            cfg.managed.snapshot_cache_path,
-            "/var/lib/aisix/config_cache.json",
+            cfg.managed.effective_snapshot_cache_path(),
+            Some("/var/lib/aisix/config_cache.json"),
         );
         // CP URL comes from env at runtime — empty here is fine.
         assert!(cfg.managed.cp_base_url.is_none());
+    }
+
+    /// #871: the snapshot cache resolves per mode — managed defaults on,
+    /// self-hosted etcd defaults off, an explicit path enables either,
+    /// an explicit "" disables either.
+    #[test]
+    fn snapshot_cache_path_resolution_per_mode() {
+        let mut managed = ManagedConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            managed.effective_snapshot_cache_path(),
+            Some(ManagedConfig::DEFAULT_SNAPSHOT_CACHE_PATH),
+        );
+        managed.snapshot_cache_path = Some(String::new());
+        assert_eq!(managed.effective_snapshot_cache_path(), None);
+        managed.snapshot_cache_path = Some("/tmp/cache.json".into());
+        assert_eq!(
+            managed.effective_snapshot_cache_path(),
+            Some("/tmp/cache.json"),
+        );
+
+        let mut self_hosted = ManagedConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        assert_eq!(self_hosted.effective_snapshot_cache_path(), None);
+        self_hosted.snapshot_cache_path = Some("/tmp/cache.json".into());
+        assert_eq!(
+            self_hosted.effective_snapshot_cache_path(),
+            Some("/tmp/cache.json"),
+        );
+        self_hosted.snapshot_cache_path = Some(String::new());
+        assert_eq!(self_hosted.effective_snapshot_cache_path(), None);
     }
 
     #[test]
@@ -1895,5 +3076,82 @@ admin:
         assert_eq!(tls.client_cert_file, "/c.crt");
         assert_eq!(tls.client_key_file, "/c.key");
         assert_eq!(tls.domain_name.as_deref(), Some("etcd.aisix.cloud"));
+    }
+
+    /// Serving topology is a startup decision, so every existing config
+    /// — none of which names it — has to keep loading and resolve to the
+    /// platform's answer.
+    #[test]
+    fn serving_topology_defaults_to_the_platform_answer() {
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://localhost:2379"]
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+"#,
+        );
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert_eq!(cfg.proxy.thread_per_core, None);
+        assert_eq!(cfg.proxy.workers, None);
+        assert_eq!(
+            cfg.proxy.thread_per_core_enabled(),
+            cfg!(target_os = "linux"),
+            "thread-per-core is the default where the kernel spreads \
+             connections across same-port listeners, and only there"
+        );
+        assert_eq!(
+            cfg.proxy.worker_threads(),
+            std::thread::available_parallelism().map_or(1, |n| n.get()),
+        );
+    }
+
+    /// The fallback an operator reaches for when thread-per-core is the
+    /// wrong shape for their traffic. It has to win on every platform,
+    /// including the one where it is also the default.
+    #[test]
+    fn explicit_serving_topology_overrides_the_platform_default() {
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://localhost:2379"]
+proxy:
+  addr: "0.0.0.0:3000"
+  thread_per_core: false
+  workers: 3
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+"#,
+        );
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert_eq!(cfg.proxy.thread_per_core, Some(false));
+        assert!(!cfg.proxy.thread_per_core_enabled());
+        assert_eq!(cfg.proxy.worker_threads(), 3);
+    }
+
+    /// Zero workers would bind no listener and still report a healthy
+    /// boot, so it has to fail at load naming the field to fix.
+    #[test]
+    fn rejects_zero_proxy_workers() {
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://localhost:2379"]
+proxy:
+  addr: "0.0.0.0:3000"
+  workers: 0
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+"#,
+        );
+        let err = Config::load_from_path(Some(f.path()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("proxy.workers"), "unexpected error: {err}");
     }
 }

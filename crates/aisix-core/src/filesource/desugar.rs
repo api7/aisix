@@ -16,6 +16,9 @@
 //! - `rate_limit_policies[].scope_ref` — for `scope: api_key` /
 //!   `scope: model`, a *name* resolved to the referenced entry's derived
 //!   id; other scopes pass through verbatim.
+//! - `rate_limit_policies[].conditions[]` — leaves on the `api_key` /
+//!   `model` dimensions resolve their value name(s) the same way,
+//!   recursively through group nodes; other dimensions pass through.
 //!
 //! Everything this module emits must be exactly a canonical resource
 //! document: the caller then runs the same JSON-Schema validators and
@@ -147,6 +150,92 @@ pub(crate) fn desugar_model(doc: &mut Value, maps: &IdentityMaps) -> Result<(), 
     Ok(())
 }
 
+/// `passthrough_routes[].provider_key` (name) → `provider_key_id` and
+/// `passthrough_routes[].anonymous_key` (name) → `anonymous_key_id`
+/// (derived ids). Name references are the file-mode ergonomic form; an
+/// unknown name is a load error listing the candidates, so a typo can
+/// never become a route that 400s on every request at runtime.
+pub(crate) fn desugar_passthrough_route(
+    doc: &mut Value,
+    maps: &IdentityMaps,
+) -> Result<(), String> {
+    let Some(obj) = doc.as_object_mut() else {
+        return Ok(()); // non-object entries error upstream
+    };
+    for (name_field, id_field, kind, noun) in [
+        (
+            "provider_key",
+            "provider_key_id",
+            "provider_keys",
+            "provider key",
+        ),
+        ("anonymous_key", "anonymous_key_id", "api_keys", "api key"),
+    ] {
+        let Some(name_value) = obj.get(name_field) else {
+            continue;
+        };
+        let Some(name) = name_value.as_str() else {
+            return Err(format!(
+                "`{name_field}` must be a string (a {noun} display_name)"
+            ));
+        };
+        if obj.contains_key(id_field) {
+            return Err(format!(
+                "`{name_field}` (a name reference) and `{id_field}` are mutually \
+                 exclusive — set exactly one"
+            ));
+        }
+        let resolved = maps
+            .get(kind)
+            .and_then(|m| m.get(name))
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "`{name_field}` references unknown {noun} {name:?} ({})",
+                    known_names(maps, kind)
+                )
+            })?;
+        let name_owned = name_field.to_string();
+        obj.remove(&name_owned);
+        obj.insert(id_field.into(), Value::String(resolved));
+    }
+    Ok(())
+}
+
+/// `claim_mappings[].resolve.api_key` (name) → `resolve.api_key_id`
+/// (derived id).
+pub(crate) fn desugar_claim_mapping(doc: &mut Value, maps: &IdentityMaps) -> Result<(), String> {
+    let Some(resolve) = doc.get_mut("resolve").and_then(Value::as_object_mut) else {
+        return Ok(()); // missing / mistyped resolve: canonical validation reports it
+    };
+    let Some(name_value) = resolve.get("api_key") else {
+        return Ok(());
+    };
+    let Some(name) = name_value.as_str() else {
+        return Err("`resolve.api_key` must be a string (an api key display_name)".into());
+    };
+    if resolve.contains_key("api_key_id") {
+        return Err(
+            "`resolve.api_key` (a name reference) and `resolve.api_key_id` are mutually \
+             exclusive — set exactly one"
+                .into(),
+        );
+    }
+    let resolved = maps
+        .get("api_keys")
+        .and_then(|m| m.get(name))
+        .cloned()
+        .ok_or_else(|| {
+            format!(
+                "`resolve.api_key` references unknown api key {name:?} ({})",
+                known_names(maps, "api_keys")
+            )
+        })?;
+    resolve.remove("api_key");
+    resolve.insert("api_key_id".into(), Value::String(resolved));
+    Ok(())
+}
+
 /// `api_keys[]`: strip the identity-only `display_name`, resolve
 /// `key_env` XOR `key_hash`. The plaintext read from the environment is
 /// hashed and dropped — it must never surface in errors, logs, or the
@@ -215,6 +304,12 @@ pub(crate) fn desugar_api_key(doc: &mut Value, env: EnvLookup<'_>) -> Result<(),
 /// it with the derived id (the proxy matches policies by entry id).
 /// Other scopes (`team`, `member`, `team_member`, or anything the schema
 /// will reject later) pass through verbatim.
+///
+/// Conditional-form rows get the same sugar one level down:
+/// `conditions[]` leaves on the `api_key` / `model` dimensions resolve
+/// their `value` name(s) to derived ids, recursively through group
+/// nodes. `team` / `member` values and the string dimensions
+/// (`model_name`, `provider`) pass through verbatim.
 pub(crate) fn desugar_rate_limit_policy(
     doc: &mut Value,
     maps: &IdentityMaps,
@@ -223,31 +318,86 @@ pub(crate) fn desugar_rate_limit_policy(
         Some(o) => o,
         None => return Ok(()),
     };
-    let scope_kind = match obj.get("scope").and_then(Value::as_str) {
-        Some("api_key") => "api_keys",
-        Some("model") => "models",
+    if let Some(conditions) = obj.get_mut("conditions") {
+        desugar_condition_nodes(conditions, maps, 0)?;
+    }
+    let (scope_kind, label) = match obj.get("scope").and_then(Value::as_str) {
+        Some("api_key") => ("api_keys", "api key"),
+        Some("model") => ("models", "model"),
         _ => return Ok(()),
     };
     let Some(name) = obj.get("scope_ref").and_then(Value::as_str) else {
         // Missing / non-string scope_ref: canonical validation reports it.
         return Ok(());
     };
-    let resolved = maps
-        .get(scope_kind)
+    let resolved = resolve_entity_name(maps, scope_kind, label, name, "`scope_ref`")?;
+    obj.insert("scope_ref".into(), Value::String(resolved));
+    Ok(())
+}
+
+fn resolve_entity_name(
+    maps: &IdentityMaps,
+    kind: &str,
+    label: &str,
+    name: &str,
+    field: &str,
+) -> Result<String, String> {
+    maps.get(kind)
         .and_then(|m| m.get(name))
         .cloned()
         .ok_or_else(|| {
             format!(
-                "`scope_ref` references unknown {} {name:?} ({})",
-                if scope_kind == "api_keys" {
-                    "api key"
-                } else {
-                    "model"
-                },
-                known_names(maps, scope_kind)
+                "{field} references unknown {label} {name:?} ({})",
+                known_names(maps, kind)
             )
-        })?;
-    obj.insert("scope_ref".into(), Value::String(resolved));
+        })
+}
+
+/// Walk a `conditions` node list and resolve leaf values on the
+/// `api_key`/`model` dimensions from names to derived ids. Shapes the
+/// schema will reject later (non-array nodes, non-string values) pass
+/// through untouched; the depth guard only stops runaway recursion on
+/// not-yet-validated input — the real cap is enforced by
+/// `validate_semantics`.
+fn desugar_condition_nodes(
+    nodes: &mut Value,
+    maps: &IdentityMaps,
+    depth: usize,
+) -> Result<(), String> {
+    if depth > 8 {
+        return Ok(());
+    }
+    let Some(items) = nodes.as_array_mut() else {
+        return Ok(());
+    };
+    for node in items {
+        let Some(obj) = node.as_object_mut() else {
+            continue;
+        };
+        if let Some(children) = obj.get_mut("children") {
+            desugar_condition_nodes(children, maps, depth + 1)?;
+            continue;
+        }
+        let (kind, label) = match obj.get("dimension").and_then(Value::as_str) {
+            Some("api_key") => ("api_keys", "api key"),
+            Some("model") => ("models", "model"),
+            _ => continue,
+        };
+        let field = format!("`conditions` {label} value");
+        match obj.get_mut("value") {
+            Some(Value::String(name)) => {
+                *name = resolve_entity_name(maps, kind, label, name, &field)?;
+            }
+            Some(Value::Array(values)) => {
+                for value in values {
+                    if let Value::String(name) = value {
+                        *name = resolve_entity_name(maps, kind, label, name, &field)?;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
     Ok(())
 }
 

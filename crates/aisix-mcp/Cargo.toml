@@ -26,12 +26,15 @@ tracing.workspace = true
 http.workspace = true
 reqwest.workspace = true
 # rmcp 1.8.0 builds its transport on the reqwest 0.13 line (the workspace is
-# on 0.12) and does not re-export it. This renamed dep exists ONLY to name
+# on 0.12) and does not re-export it. This renamed dep resolves to the same
+# crate version rmcp links, and is used for two things: naming
 # `StreamableHttpError<reqwest::Error>` when downcasting a connect failure to
-# detect an upstream 401 — it resolves to the same crate version rmcp links,
-# so the downcast sees the identical type. Kept `default-features = false`:
-# only the `Error` type is used, never a client. The 401-invalidation
-# integration test fails loudly if these ever stop unifying.
+# detect an upstream 401 (the downcast sees the identical type), and building
+# `shared_http_client()` — the client handed to every rmcp transport with the
+# deployment's `upstream.*` settings applied. Kept `default-features = false`:
+# TLS comes in through rmcp's own `reqwest?/rustls` feature unification. The
+# 401-invalidation integration test fails loudly if the versions ever stop
+# unifying.
 rmcp-reqwest = { package = "reqwest", version = "0.13", default-features = false }
 # Token-cache keying: the client secret is folded into the cache key as a
 # SHA-256 digest so a rotated secret never reuses the previous secret's token.
@@ -40,21 +43,24 @@ hex.workspace = true
 # Path-parameter encoding for OpenAPI-backed tool calls (`crate::openapi`).
 percent-encoding.workspace = true
 
-# Official MCP Rust SDK. Pinned exactly: rmcp is <16 months old and still
+# Official MCP Rust SDK. Pinned exactly: rmcp is <2 years old and still
 # ships breaking changes on a roughly-monthly cadence, so we hold a fixed
 # version and keep all rmcp types behind this crate's own surface (the
 # `McpBridge` trait and the gateway DTOs) to absorb API drift.
+#
+# The 3.x line implements the MCP 2026-07-28 revision (stateless serving,
+# `resultType`, cache hints, `Mcp-Method`/`Mcp-Name` header validation) and
+# passes the official conformance suite's dated 2026-07-28 core suites.
 #
 # The gateway is dual-role — an MCP client to upstream servers AND an MCP
 # server to downstream agents — so both the `client` and `server` halves are
 # production dependencies.
 [dependencies.rmcp]
-version = "=1.8.0"
+version = "=3.1.2"
 default-features = false
 features = [
     "client",
     "server",
-    "base64",
     "transport-streamable-http-client",
     "transport-streamable-http-client-reqwest",
     # `transport-streamable-http-client-reqwest` only wires `dep:reqwest`
@@ -71,3 +77,6 @@ aisix-core = { path = "../aisix-core" }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 axum.workspace = true
 async-trait.workspace = true
+# Raw-HTTP wire-shape assertions in tests/protocol_generations.rs: real
+# clients hide the headers and envelope details those tests pin.
+reqwest.workspace = true

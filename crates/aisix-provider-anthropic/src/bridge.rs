@@ -14,6 +14,7 @@
 //! Error mapping is identical to OpenAi — the `BridgeError` contract from
 //! PR #6 applies verbatim.
 
+use aisix_gateway::url_cache::cached_endpoint_url;
 use aisix_gateway::{
     Bridge, BridgeContext, BridgeError, ChatChunk, ChatChunkStream, ChatFormat, ChatResponse,
     SseDecoder, SseEvent,
@@ -53,6 +54,15 @@ impl AnthropicBridge {
             client,
             api_version: ANTHROPIC_VERSION,
         }
+    }
+
+    /// The client this dispatch runs on: the bridge's shared one, unless
+    /// the resolved Provider Key carries its own TLS settings.
+    fn client_for(&self, ctx: &BridgeContext) -> Client {
+        aisix_gateway::upstream_tls::client_for_provider_key(
+            &self.client,
+            ctx.provider_key.tls.as_ref(),
+        )
     }
 
     pub fn with_api_version(mut self, v: &'static str) -> Self {
@@ -262,7 +272,6 @@ impl Bridge for AnthropicBridge {
         req: &ChatFormat,
         ctx: &BridgeContext,
     ) -> Result<ChatResponse, BridgeError> {
-        let base = resolve_base(ctx)?;
         let key = api_key(ctx)?;
         let upstream = upstream_model(ctx)?;
 
@@ -270,15 +279,23 @@ impl Bridge for AnthropicBridge {
             split_system(req).map_err(|e| BridgeError::InvalidUpstreamConfig(e.to_string()))?;
         let mut body = build_request(req, upstream, system, messages, false);
         maybe_inject_cache_breakpoints(&mut body, ctx);
-        let url = format!("{base}/v1/messages");
-        let client = self.client.clone();
+        let url = cached_endpoint_url(
+            &ctx.provider_key_id,
+            "anthropic/messages",
+            &[
+                ctx.provider_key.api_base.as_deref().unwrap_or(""),
+                &ctx.provider_key.provider,
+            ],
+            || Ok(format!("{}/v1/messages", resolve_base(ctx)?)),
+        )?;
+        let client = self.client_for(ctx);
         let api_version = self.api_version;
         let started = Instant::now();
         let request_id = ctx.request_id.clone();
 
         with_deadline(ctx.deadline, started, async move {
-            let resp = client
-                .post(&url)
+            let resp = url
+                .post_on(&client)
                 .header("x-api-key", key)
                 .header("anthropic-version", api_version)
                 .header(header::CONTENT_TYPE, "application/json")
@@ -286,7 +303,7 @@ impl Bridge for AnthropicBridge {
                 .json(&body)
                 .send()
                 .await
-                .map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
+                .map_err(aisix_gateway::send_error)?;
 
             let status = resp.status();
             if !status.is_success() {
@@ -307,7 +324,6 @@ impl Bridge for AnthropicBridge {
         req: &ChatFormat,
         ctx: &BridgeContext,
     ) -> Result<ChatChunkStream, BridgeError> {
-        let base = resolve_base(ctx)?;
         let key = api_key(ctx)?;
         let upstream = upstream_model(ctx)?;
 
@@ -315,15 +331,22 @@ impl Bridge for AnthropicBridge {
             split_system(req).map_err(|e| BridgeError::InvalidUpstreamConfig(e.to_string()))?;
         let mut body = build_request(req, upstream, system, messages, true);
         maybe_inject_cache_breakpoints(&mut body, ctx);
-        let url = format!("{base}/v1/messages");
-        let client = self.client.clone();
+        let url = cached_endpoint_url(
+            &ctx.provider_key_id,
+            "anthropic/messages",
+            &[
+                ctx.provider_key.api_base.as_deref().unwrap_or(""),
+                &ctx.provider_key.provider,
+            ],
+            || Ok(format!("{}/v1/messages", resolve_base(ctx)?)),
+        )?;
+        let client = self.client_for(ctx);
         let api_version = self.api_version;
         let started = Instant::now();
         let request_id = ctx.request_id.clone();
 
         let resp = with_deadline(ctx.deadline, started, async move {
-            client
-                .post(&url)
+            url.post_on(&client)
                 .header("x-api-key", key)
                 .header("anthropic-version", api_version)
                 .header(header::CONTENT_TYPE, "application/json")
@@ -332,7 +355,7 @@ impl Bridge for AnthropicBridge {
                 .json(&body)
                 .send()
                 .await
-                .map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))
+                .map_err(aisix_gateway::send_error)
         })
         .await?;
 
@@ -364,6 +387,9 @@ where
                 let SseEvent::Data(payload) = event else { continue };
                 let parsed: AnthropicStreamEvent = serde_json::from_str(&payload)
                     .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?;
+                if let AnthropicStreamEvent::Error { error } = &parsed {
+                    Err(crate::wire::stream_error_into_bridge_error(error))?;
+                }
                 state.update(&parsed);
                 if let Some(c) = state.to_chunk(&parsed) {
                     yield c;
@@ -859,6 +885,63 @@ data: {\"type\":\"message_stop\"}\n\n";
             Err(BridgeError::UpstreamStatus { status: 500, .. }) => {}
             Err(other) => panic!("unexpected: {other:?}"),
         }
+    }
+
+    /// AISIX-Cloud#1222 scenario 3: Anthropic reports mid-stream
+    /// failures as an in-band `event: error` frame inside the 200
+    /// stream. Pre-fix the frame deserialized into the `Other`
+    /// catch-all and was silently swallowed — the truncated stream
+    /// then looked like a clean completion.
+    #[tokio::test]
+    async fn streaming_in_band_error_event_surfaces_as_typed_error() {
+        let server = MockServer::start().await;
+        let sse = "\
+event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_stream\",\"model\":\"claude-sonnet-4-5\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":1}}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hel\"}}\n\n\
+event: error\n\
+data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n";
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&server)
+            .await;
+
+        let bridge = AnthropicBridge::new();
+        let ctx = sample_ctx(&server.uri());
+        let mut stream = bridge.chat_stream(&req(), &ctx).await.unwrap();
+
+        let first = stream.next().await.expect("delta before the error");
+        assert_eq!(first.unwrap().delta.content.as_deref(), Some("hel"));
+        let err = stream
+            .next()
+            .await
+            .expect("error event must surface, not be swallowed")
+            .unwrap_err();
+        match err {
+            BridgeError::UpstreamInBand {
+                status,
+                message,
+                parsed,
+                wire,
+            } => {
+                // 529 is the documented HTTP status for overloaded_error.
+                assert_eq!(status, Some(529));
+                assert_eq!(message, "Overloaded");
+                assert_eq!(
+                    parsed.expect("view").kind.as_deref(),
+                    Some("overloaded_error")
+                );
+                assert!(matches!(wire, aisix_gateway::UpstreamWire::Anthropic));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert!(stream.next().await.is_none(), "stream ends after the error");
     }
 
     #[test]

@@ -121,6 +121,18 @@ impl VertexBridge {
         }
     }
 
+    /// The client this dispatch runs on: the bridge's shared one, unless
+    /// the resolved Provider Key carries its own TLS settings. The token
+    /// minter deliberately keeps the shared client — it talks to the
+    /// identity provider, not to the key's `api_base`, and a private CA
+    /// declared for the model endpoint says nothing about that host.
+    fn client_for(&self, ctx: &BridgeContext) -> Client {
+        aisix_gateway::upstream_tls::client_for_provider_key(
+            &self.client,
+            ctx.provider_key.tls.as_ref(),
+        )
+    }
+
     /// Test-only seam: replace the canonical Vertex host with this
     /// URL (e.g. a wiremock URI). Credentials, project, region,
     /// SDK-equivalent URL stitching all run normally; only the
@@ -174,6 +186,23 @@ impl VertexBridge {
     /// operator sees an actionable message instead of a silent
     /// fall-through-to-canonical (which is what the original #390 bug
     /// was — exactly what we don't want to bring back).
+    /// The id this request's endpoint URLs are cached under, or `""` to
+    /// bypass the cache.
+    ///
+    /// The test-only `api_base_override` shadows `provider_key.api_base`
+    /// inside [`Self::resolve_api_base`] without being one of the
+    /// fingerprint inputs, so a row built under one override could answer
+    /// under another — a wiremock port belonging to a server an earlier
+    /// test already dropped. Bypassing keeps the seam invisible to the
+    /// cache, the way the Azure bridge's URL override does.
+    fn url_cache_key<'a>(&self, ctx: &'a BridgeContext) -> &'a str {
+        #[cfg(test)]
+        if self.api_base_override.is_some() {
+            return "";
+        }
+        &ctx.provider_key_id
+    }
+
     fn resolve_api_base(
         &self,
         region: &str,
@@ -589,6 +618,43 @@ fn parse_vertex_error_status(body: &[u8]) -> Option<String> {
     outer.error.status
 }
 
+/// Parse one OpenAI-shaped SSE `data:` payload from a Vertex shim /
+/// partner stream, surfacing an in-band `{"error":...}` frame as the
+/// typed [`BridgeError::UpstreamInBand`] instead of a decode failure.
+/// `context` prefixes the decode-error message exactly as before.
+fn parse_vertex_openai_stream_payload(
+    data: &str,
+    context: &str,
+) -> Result<OpenAiStreamChunk, BridgeError> {
+    serde_json::from_str(data).map_err(|e| {
+        aisix_gateway::capture_in_band_error(data, aisix_gateway::UpstreamWire::Vertex)
+            .unwrap_or_else(|| BridgeError::UpstreamDecode(format!("{context}: {e}")))
+    })
+}
+
+/// Same probe for a Gemini `streamGenerateContent?alt=sse` payload —
+/// Google reports mid-stream failures as a `{"error":{code,message,
+/// status}}` frame inside the committed 200 stream.
+///
+/// Unlike the OpenAI chunk shape, [`GeminiGenerateContentResponse`] is
+/// fully defaultable, so an error frame would *successfully* parse as
+/// an empty response and be silently swallowed — the probe must run
+/// before the chunk parse, not on its failure. The `contains` guard
+/// keeps the extra parse off the hot path.
+fn parse_vertex_gemini_stream_payload(
+    data: &str,
+    context: &str,
+) -> Result<GeminiGenerateContentResponse, BridgeError> {
+    if data.contains("\"error\"") {
+        if let Some(e) =
+            aisix_gateway::capture_in_band_error(data, aisix_gateway::UpstreamWire::Vertex)
+        {
+            return Err(e);
+        }
+    }
+    serde_json::from_str(data).map_err(|e| BridgeError::UpstreamDecode(format!("{context}: {e}")))
+}
+
 #[async_trait]
 impl Bridge for VertexBridge {
     fn name(&self) -> &'static str {
@@ -664,13 +730,26 @@ impl Bridge for VertexBridge {
         validate_url_token("region", &creds.region)?;
         validate_url_token("upstream_id", upstream_id)?;
 
-        let base = self.resolve_api_base(&creds.region, ctx.provider_key.api_base.as_deref())?;
-        let url = format!(
-            "{base}/v1/projects/{project}/locations/{region}/publishers/google/models/{model}:predict",
-            project = creds.project,
-            region = creds.region,
-            model = upstream_id,
-        );
+        let url = aisix_gateway::url_cache::cached_model_endpoint_url(
+            self.url_cache_key(ctx),
+            "vertex/google-predict",
+            upstream_id,
+            &[
+                ctx.provider_key.api_base.as_deref().unwrap_or(""),
+                &creds.project,
+                &creds.region,
+            ],
+            || {
+                let base =
+                    self.resolve_api_base(&creds.region, ctx.provider_key.api_base.as_deref())?;
+                Ok::<_, BridgeError>(format!(
+                    "{base}/v1/projects/{project}/locations/{region}/publishers/google/models/{model}:predict",
+                    project = creds.project,
+                    region = creds.region,
+                    model = upstream_id,
+                ))
+            },
+        )?;
 
         let instances: Vec<serde_json::Value> = req
             .input
@@ -685,18 +764,18 @@ impl Bridge for VertexBridge {
 
         let access_token = creds.resolve_access_token(&self.token_minter).await?;
         let headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
-        let client = self.client.clone();
+        let client = self.client_for(ctx);
         let started = Instant::now();
         let model_echo = req.model.clone();
 
         with_deadline(ctx.deadline, started, async move {
-            let resp = client
-                .post(&url)
+            let resp = url
+                .post_on(&client)
                 .headers(headers)
                 .json(&body)
                 .send()
                 .await
-                .map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
+                .map_err(aisix_gateway::send_error)?;
             let status = resp.status();
             if !status.is_success() {
                 return Err(map_http_error(status, resp).await);
@@ -776,13 +855,26 @@ impl VertexBridge {
         validate_url_token("region", &creds.region)?;
         validate_url_token("upstream_id", upstream_id)?;
 
-        let base = self.resolve_api_base(&creds.region, ctx.provider_key.api_base.as_deref())?;
-        let url = format!(
-            "{base}/v1/projects/{project}/locations/{region}/publishers/google/models/{model}:generateContent",
-            project = creds.project,
-            region = creds.region,
-            model = upstream_id,
-        );
+        let url = aisix_gateway::url_cache::cached_model_endpoint_url(
+            self.url_cache_key(ctx),
+            "vertex/gemini-generate",
+            upstream_id,
+            &[
+                ctx.provider_key.api_base.as_deref().unwrap_or(""),
+                &creds.project,
+                &creds.region,
+            ],
+            || {
+                let base =
+                    self.resolve_api_base(&creds.region, ctx.provider_key.api_base.as_deref())?;
+                Ok::<_, BridgeError>(format!(
+                    "{base}/v1/projects/{project}/locations/{region}/publishers/google/models/{model}:generateContent",
+                    project = creds.project,
+                    region = creds.region,
+                    model = upstream_id,
+                ))
+            },
+        )?;
 
         let typed = build_gemini_request(req);
         // Audit LOW-4: Gemini requires `contents` to be a non-empty
@@ -810,17 +902,17 @@ impl VertexBridge {
         // surfaces as a Config error (operator-actionable).
         let access_token = creds.resolve_access_token(&self.token_minter).await?;
         let headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
-        let client = self.client.clone();
+        let client = self.client_for(ctx);
         let started = Instant::now();
 
         with_deadline(ctx.deadline, started, async move {
-            let resp = client
-                .post(&url)
+            let resp = url
+                .post_on(&client)
                 .headers(headers)
                 .json(&body)
                 .send()
                 .await
-                .map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
+                .map_err(aisix_gateway::send_error)?;
 
             let status = resp.status();
             if !status.is_success() {
@@ -869,13 +961,26 @@ impl VertexBridge {
         validate_url_token("region", &creds.region)?;
         validate_url_token("upstream_id", upstream_id)?;
 
-        let base = self.resolve_api_base(&creds.region, ctx.provider_key.api_base.as_deref())?;
-        let url = format!(
-            "{base}/v1/projects/{project}/locations/{region}/publishers/anthropic/models/{model}:rawPredict",
-            project = creds.project,
-            region = creds.region,
-            model = upstream_id,
-        );
+        let url = aisix_gateway::url_cache::cached_model_endpoint_url(
+            self.url_cache_key(ctx),
+            "vertex/anthropic-rawpredict",
+            upstream_id,
+            &[
+                ctx.provider_key.api_base.as_deref().unwrap_or(""),
+                &creds.project,
+                &creds.region,
+            ],
+            || {
+                let base =
+                    self.resolve_api_base(&creds.region, ctx.provider_key.api_base.as_deref())?;
+                Ok::<_, BridgeError>(format!(
+                    "{base}/v1/projects/{project}/locations/{region}/publishers/anthropic/models/{model}:rawPredict",
+                    project = creds.project,
+                    region = creds.region,
+                    model = upstream_id,
+                ))
+            },
+        )?;
 
         // Build the Anthropic Messages body via the shared serializer,
         // then shape it for Vertex (strip model + stream, add the
@@ -902,17 +1007,17 @@ impl VertexBridge {
 
         let access_token = creds.resolve_access_token(&self.token_minter).await?;
         let headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
-        let client = self.client.clone();
+        let client = self.client_for(ctx);
         let started = Instant::now();
 
         with_deadline(ctx.deadline, started, async move {
-            let resp = client
-                .post(&url)
+            let resp = url
+                .post_on(&client)
                 .headers(headers)
                 .json(&body_value)
                 .send()
                 .await
-                .map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
+                .map_err(aisix_gateway::send_error)?;
 
             let status = resp.status();
             if !status.is_success() {
@@ -953,13 +1058,26 @@ impl VertexBridge {
         validate_url_token("region", &creds.region)?;
         validate_url_token("upstream_id", upstream_id)?;
 
-        let base = self.resolve_api_base(&creds.region, ctx.provider_key.api_base.as_deref())?;
-        let url = format!(
-            "{base}/v1/projects/{project}/locations/{region}/publishers/anthropic/models/{model}:streamRawPredict",
-            project = creds.project,
-            region = creds.region,
-            model = upstream_id,
-        );
+        let url = aisix_gateway::url_cache::cached_model_endpoint_url(
+            self.url_cache_key(ctx),
+            "vertex/anthropic-stream-rawpredict",
+            upstream_id,
+            &[
+                ctx.provider_key.api_base.as_deref().unwrap_or(""),
+                &creds.project,
+                &creds.region,
+            ],
+            || {
+                let base =
+                    self.resolve_api_base(&creds.region, ctx.provider_key.api_base.as_deref())?;
+                Ok::<_, BridgeError>(format!(
+                    "{base}/v1/projects/{project}/locations/{region}/publishers/anthropic/models/{model}:streamRawPredict",
+                    project = creds.project,
+                    region = creds.region,
+                    model = upstream_id,
+                ))
+            },
+        )?;
 
         // Same Anthropic Messages body as the non-stream path, but built
         // with stream=true and — unlike `:rawPredict` — `stream` is KEPT
@@ -986,17 +1104,16 @@ impl VertexBridge {
         // token-mint error surfaces as a direct Err, not mid-stream.
         let access_token = creds.resolve_access_token(&self.token_minter).await?;
         let headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
-        let client = self.client.clone();
+        let client = self.client_for(ctx);
         let started = Instant::now();
 
         let resp = with_deadline(ctx.deadline, started, async move {
-            client
-                .post(&url)
+            url.post_on(&client)
                 .headers(headers)
                 .json(&body_value)
                 .send()
                 .await
-                .map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))
+                .map_err(aisix_gateway::send_error)
         })
         .await?;
 
@@ -1027,6 +1144,9 @@ impl VertexBridge {
                                 "vertex anthropic stream chunk parse: {e}"
                             ))
                         })?;
+                    if let AnthropicStreamEvent::Error { error } = &parsed {
+                        Err(aisix_provider_anthropic::wire::stream_error_into_bridge_error(error))?;
+                    }
                     state.update(&parsed);
                     if let Some(chunk) = state.to_chunk(&parsed) {
                         yield chunk;
@@ -1081,7 +1201,16 @@ impl VertexBridge {
         validate_url_token("project", &creds.project)?;
         validate_url_token("region", &creds.region)?;
 
-        let url = self.openai_shim_url(&creds, ctx.provider_key.api_base.as_deref())?;
+        let url = aisix_gateway::url_cache::cached_endpoint_url(
+            self.url_cache_key(ctx),
+            "vertex/openai-shim",
+            &[
+                ctx.provider_key.api_base.as_deref().unwrap_or(""),
+                &creds.project,
+                &creds.region,
+            ],
+            || self.openai_shim_url(&creds, ctx.provider_key.api_base.as_deref()),
+        )?;
 
         let messages = openai_messages_from(req);
         let typed = build_openai_request(req, upstream_id, &messages, false);
@@ -1094,17 +1223,17 @@ impl VertexBridge {
 
         let access_token = creds.resolve_access_token(&self.token_minter).await?;
         let headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
-        let client = self.client.clone();
+        let client = self.client_for(ctx);
         let started = Instant::now();
 
         with_deadline(ctx.deadline, started, async move {
-            let resp = client
-                .post(&url)
+            let resp = url
+                .post_on(&client)
                 .headers(headers)
                 .json(&body)
                 .send()
                 .await
-                .map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
+                .map_err(aisix_gateway::send_error)?;
             let status = resp.status();
             if !status.is_success() {
                 return Err(map_http_error(status, resp).await);
@@ -1133,7 +1262,16 @@ impl VertexBridge {
         validate_url_token("project", &creds.project)?;
         validate_url_token("region", &creds.region)?;
 
-        let url = self.openai_shim_url(&creds, ctx.provider_key.api_base.as_deref())?;
+        let url = aisix_gateway::url_cache::cached_endpoint_url(
+            self.url_cache_key(ctx),
+            "vertex/openai-shim",
+            &[
+                ctx.provider_key.api_base.as_deref().unwrap_or(""),
+                &creds.project,
+                &creds.region,
+            ],
+            || self.openai_shim_url(&creds, ctx.provider_key.api_base.as_deref()),
+        )?;
 
         let messages = openai_messages_from(req);
         let typed = build_openai_request(req, upstream_id, &messages, true);
@@ -1147,17 +1285,16 @@ impl VertexBridge {
         // token-mint error surfaces as a direct Err, not mid-stream.
         let access_token = creds.resolve_access_token(&self.token_minter).await?;
         let headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
-        let client = self.client.clone();
+        let client = self.client_for(ctx);
         let started = Instant::now();
 
         let resp = with_deadline(ctx.deadline, started, async move {
-            client
-                .post(&url)
+            url.post_on(&client)
                 .headers(headers)
                 .json(&body)
                 .send()
                 .await
-                .map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))
+                .map_err(aisix_gateway::send_error)
         })
         .await?;
 
@@ -1176,12 +1313,10 @@ impl VertexBridge {
                 for event in decoder.feed(bytes.as_ref()) {
                     match event {
                         SseEvent::Data(data) => {
-                            let parsed: OpenAiStreamChunk =
-                                serde_json::from_str(&data).map_err(|e| {
-                                    BridgeError::UpstreamDecode(format!(
-                                        "vertex openai-shim stream chunk parse: {e}"
-                                    ))
-                                })?;
+                            let parsed = parse_vertex_openai_stream_payload(
+                                &data,
+                                "vertex openai-shim stream chunk parse",
+                            )?;
                             yield openai_stream_chunk_into_chat_chunk(parsed);
                         }
                         // OpenAI shim terminates with `data: [DONE]`;
@@ -1193,11 +1328,10 @@ impl VertexBridge {
             // Flush a partial trailing chunk if the connection drops
             // without a final blank line.
             if let Some(SseEvent::Data(data)) = decoder.finish() {
-                let parsed: OpenAiStreamChunk = serde_json::from_str(&data).map_err(|e| {
-                    BridgeError::UpstreamDecode(format!(
-                        "vertex openai-shim stream tail parse: {e}"
-                    ))
-                })?;
+                let parsed = parse_vertex_openai_stream_payload(
+                    &data,
+                    "vertex openai-shim stream tail parse",
+                )?;
                 yield openai_stream_chunk_into_chat_chunk(parsed);
             }
         };
@@ -1259,12 +1393,25 @@ impl VertexBridge {
                 "vertex publisher {publisher:?} has no URL segment for the :rawPredict rail"
             ))
         })?;
-        let url = self.partner_rawpredict_url(
-            &creds,
-            ctx.provider_key.api_base.as_deref(),
-            segment,
+        let url = aisix_gateway::url_cache::cached_model_endpoint_url(
+            self.url_cache_key(ctx),
+            "vertex/partner-rawpredict",
             upstream_id,
-            "rawPredict",
+            &[
+                ctx.provider_key.api_base.as_deref().unwrap_or(""),
+                &creds.project,
+                &creds.region,
+                segment,
+            ],
+            || {
+                self.partner_rawpredict_url(
+                    &creds,
+                    ctx.provider_key.api_base.as_deref(),
+                    segment,
+                    upstream_id,
+                    "rawPredict",
+                )
+            },
         )?;
 
         // OpenAI chat-completions body — same serializer the OpenAI-shim
@@ -1280,17 +1427,17 @@ impl VertexBridge {
 
         let access_token = creds.resolve_access_token(&self.token_minter).await?;
         let headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
-        let client = self.client.clone();
+        let client = self.client_for(ctx);
         let started = Instant::now();
 
         with_deadline(ctx.deadline, started, async move {
-            let resp = client
-                .post(&url)
+            let resp = url
+                .post_on(&client)
                 .headers(headers)
                 .json(&body)
                 .send()
                 .await
-                .map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
+                .map_err(aisix_gateway::send_error)?;
             let status = resp.status();
             if !status.is_success() {
                 return Err(map_http_error(status, resp).await);
@@ -1326,12 +1473,25 @@ impl VertexBridge {
                 "vertex publisher {publisher:?} has no URL segment for the :streamRawPredict rail"
             ))
         })?;
-        let url = self.partner_rawpredict_url(
-            &creds,
-            ctx.provider_key.api_base.as_deref(),
-            segment,
+        let url = aisix_gateway::url_cache::cached_model_endpoint_url(
+            self.url_cache_key(ctx),
+            "vertex/partner-stream-rawpredict",
             upstream_id,
-            "streamRawPredict",
+            &[
+                ctx.provider_key.api_base.as_deref().unwrap_or(""),
+                &creds.project,
+                &creds.region,
+                segment,
+            ],
+            || {
+                self.partner_rawpredict_url(
+                    &creds,
+                    ctx.provider_key.api_base.as_deref(),
+                    segment,
+                    upstream_id,
+                    "streamRawPredict",
+                )
+            },
         )?;
 
         let messages = openai_messages_from(req);
@@ -1346,17 +1506,16 @@ impl VertexBridge {
         // token-mint error surfaces as a direct Err, not mid-stream.
         let access_token = creds.resolve_access_token(&self.token_minter).await?;
         let headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
-        let client = self.client.clone();
+        let client = self.client_for(ctx);
         let started = Instant::now();
 
         let resp = with_deadline(ctx.deadline, started, async move {
-            client
-                .post(&url)
+            url.post_on(&client)
                 .headers(headers)
                 .json(&body)
                 .send()
                 .await
-                .map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))
+                .map_err(aisix_gateway::send_error)
         })
         .await?;
 
@@ -1375,12 +1534,10 @@ impl VertexBridge {
                 for event in decoder.feed(bytes.as_ref()) {
                     match event {
                         SseEvent::Data(data) => {
-                            let parsed: OpenAiStreamChunk =
-                                serde_json::from_str(&data).map_err(|e| {
-                                    BridgeError::UpstreamDecode(format!(
-                                        "vertex partner :streamRawPredict chunk parse: {e}"
-                                    ))
-                                })?;
+                            let parsed = parse_vertex_openai_stream_payload(
+                                &data,
+                                "vertex partner :streamRawPredict chunk parse",
+                            )?;
                             yield openai_stream_chunk_into_chat_chunk(parsed);
                         }
                         // OpenAI-compatible upstreams (Mistral / AI21)
@@ -1390,11 +1547,10 @@ impl VertexBridge {
                 }
             }
             if let Some(SseEvent::Data(data)) = decoder.finish() {
-                let parsed: OpenAiStreamChunk = serde_json::from_str(&data).map_err(|e| {
-                    BridgeError::UpstreamDecode(format!(
-                        "vertex partner :streamRawPredict tail parse: {e}"
-                    ))
-                })?;
+                let parsed = parse_vertex_openai_stream_payload(
+                    &data,
+                    "vertex partner :streamRawPredict tail parse",
+                )?;
                 yield openai_stream_chunk_into_chat_chunk(parsed);
             }
         };
@@ -1431,13 +1587,26 @@ impl VertexBridge {
         validate_url_token("region", &creds.region)?;
         validate_url_token("upstream_id", upstream_id)?;
 
-        let base = self.resolve_api_base(&creds.region, ctx.provider_key.api_base.as_deref())?;
-        let url = format!(
-            "{base}/v1/projects/{project}/locations/{region}/publishers/google/models/{model}:streamGenerateContent?alt=sse",
-            project = creds.project,
-            region = creds.region,
-            model = upstream_id,
-        );
+        let url = aisix_gateway::url_cache::cached_model_endpoint_url(
+            self.url_cache_key(ctx),
+            "vertex/gemini-stream-generate",
+            upstream_id,
+            &[
+                ctx.provider_key.api_base.as_deref().unwrap_or(""),
+                &creds.project,
+                &creds.region,
+            ],
+            || {
+                let base =
+                    self.resolve_api_base(&creds.region, ctx.provider_key.api_base.as_deref())?;
+                Ok::<_, BridgeError>(format!(
+                    "{base}/v1/projects/{project}/locations/{region}/publishers/google/models/{model}:streamGenerateContent?alt=sse",
+                    project = creds.project,
+                    region = creds.region,
+                    model = upstream_id,
+                ))
+            },
+        )?;
 
         let typed = build_gemini_request(req);
         if typed.contents.is_empty() {
@@ -1457,17 +1626,16 @@ impl VertexBridge {
         // as a direct Err return rather than being yielded mid-stream.
         let access_token = creds.resolve_access_token(&self.token_minter).await?;
         let headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
-        let client = self.client.clone();
+        let client = self.client_for(ctx);
         let started = Instant::now();
 
         let resp = with_deadline(ctx.deadline, started, async move {
-            client
-                .post(&url)
+            url.post_on(&client)
                 .headers(headers)
                 .json(&body)
                 .send()
                 .await
-                .map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))
+                .map_err(aisix_gateway::send_error)
         })
         .await?;
 
@@ -1492,12 +1660,10 @@ impl VertexBridge {
                 let bytes: Bytes = item.map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
                 for event in decoder.feed(bytes.as_ref()) {
                     if let SseEvent::Data(data) = event {
-                        let parsed: GeminiGenerateContentResponse =
-                            serde_json::from_str(&data).map_err(|e| {
-                                BridgeError::UpstreamDecode(format!(
-                                    "vertex stream chunk parse: {e}"
-                                ))
-                            })?;
+                        let parsed = parse_vertex_gemini_stream_payload(
+                            &data,
+                            "vertex stream chunk parse",
+                        )?;
                         for chunk in
                             gemini_chunk_into_chat_chunks(parsed, &upstream_id_owned, &mut emitted_role)
                         {
@@ -1515,12 +1681,10 @@ impl VertexBridge {
             // last chunk if the upstream connection drops without a
             // final `\n\n`.
             if let Some(SseEvent::Data(data)) = decoder.finish() {
-                let parsed: GeminiGenerateContentResponse =
-                    serde_json::from_str(&data).map_err(|e| {
-                        BridgeError::UpstreamDecode(format!(
-                            "vertex stream tail parse: {e}"
-                        ))
-                    })?;
+                let parsed = parse_vertex_gemini_stream_payload(
+                    &data,
+                    "vertex stream tail parse",
+                )?;
                 for chunk in
                     gemini_chunk_into_chat_chunks(parsed, &upstream_id_owned, &mut emitted_role)
                 {
@@ -3496,6 +3660,79 @@ mod tests {
         assert_eq!(chat.message.content_str(), "hello from gemini");
     }
 
+    /// The Vertex URL carries the upstream model in its path, so the
+    /// endpoint URL cache has to hold a row per model. Keying it by
+    /// Provider Key alone would make each model invalidate the previous
+    /// one's row — every request a miss, and a window in which a stale
+    /// row answers for the wrong model.
+    ///
+    /// Two models on one key id, alternating, three rounds: each must
+    /// land on its own path every time.
+    #[tokio::test]
+    async fn url_cache_holds_a_row_per_upstream_model() {
+        let server = MockServer::start().await;
+        for model in ["gemini-1.5-pro", "gemini-2.0-flash"] {
+            Mock::given(method("POST"))
+                .and(path(format!(
+                    "/v1/projects/my-proj/locations/us-central1/publishers/google/models/{model}:generateContent"
+                )))
+                .respond_with(CapturingResponder::default())
+                .expect(3)
+                .mount(&server)
+                .await;
+        }
+
+        let bridge = VertexBridge::new();
+        let req = ChatFormat::new("my-gemini", vec![ChatMessage::user("hi")]);
+        for _ in 0..3 {
+            for model in ["gemini-1.5-pro", "gemini-2.0-flash"] {
+                let ctx = BridgeContext::new(
+                    "req-1",
+                    sample_model_with(model),
+                    sample_pk_with_secret_and_api_base(valid_secret_json(), &server.uri()),
+                )
+                .with_resource_ids("m-1", "pk-vertex-rows");
+                bridge.chat(&req, &ctx).await.unwrap();
+            }
+        }
+        // Each `.expect(3)` is verified when the server drops.
+    }
+
+    /// An edited `api_base` has to reach the model-keyed rows too: a
+    /// cached URL that outlives the edit keeps dispatching to the host
+    /// the operator just re-pointed away from.
+    #[tokio::test]
+    async fn url_cache_follows_an_api_base_edit_for_the_same_key_id() {
+        async fn mount(server: &MockServer) {
+            Mock::given(method("POST"))
+                .and(path(
+                    "/v1/projects/my-proj/locations/us-central1/publishers/google/models/gemini-1.5-pro:generateContent",
+                ))
+                .respond_with(CapturingResponder::default())
+                .expect(1)
+                .mount(server)
+                .await;
+        }
+        let first = MockServer::start().await;
+        let second = MockServer::start().await;
+        mount(&first).await;
+        mount(&second).await;
+
+        let bridge = VertexBridge::new();
+        let req = ChatFormat::new("my-gemini", vec![ChatMessage::user("hi")]);
+        for host in [&first, &second] {
+            let ctx = BridgeContext::new(
+                "req-1",
+                sample_model_with("gemini-1.5-pro"),
+                sample_pk_with_secret_and_api_base(valid_secret_json(), &host.uri()),
+            )
+            .with_resource_ids("m-1", "pk-vertex-repoint");
+            bridge.chat(&req, &ctx).await.unwrap();
+        }
+        // Each `.expect(1)` fails on drop if the second request stayed
+        // on the first host.
+    }
+
     /// Same as above but exercises the trailing-slash trim — a
     /// realistic operator paste (`http://corp-proxy/vertex/`) must
     /// still produce a single-slash URL after concatenation.
@@ -4314,6 +4551,125 @@ mod tests {
             saw_decode_err,
             "expected UpstreamDecode error on invalid JSON chunk"
         );
+    }
+
+    /// AISIX-Cloud#1222 scenario 3: Google reports a mid-stream failure
+    /// as a `{"error":{code,message,status}}` frame inside the
+    /// committed 200 stream. Pre-fix it surfaced as UpstreamDecode and
+    /// the numeric code / gRPC status were lost.
+    #[tokio::test]
+    async fn chat_gemini_stream_in_band_error_frame_surfaces_typed() {
+        let body = "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"hel\"}]}}]}\n\n\
+data: {\"error\":{\"code\":503,\"message\":\"The service is currently unavailable.\",\"status\":\"UNAVAILABLE\"}}\n\n"
+            .to_string();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(body),
+            )
+            .mount(&server)
+            .await;
+
+        let bridge = VertexBridge::new().with_api_base_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("gemini-1.5-pro"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let req = ChatFormat::new("my-gemini", vec![ChatMessage::user("hi")]);
+        let mut stream = bridge.chat_stream(&req, &ctx).await.unwrap();
+        let mut saw_in_band = false;
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(_) => continue,
+                Err(BridgeError::UpstreamInBand {
+                    status,
+                    parsed,
+                    wire,
+                    ..
+                }) => {
+                    assert_eq!(status, Some(503));
+                    assert_eq!(parsed.expect("view").kind.as_deref(), Some("UNAVAILABLE"));
+                    assert!(matches!(wire, aisix_gateway::UpstreamWire::Vertex));
+                    saw_in_band = true;
+                    break;
+                }
+                Err(other) => panic!("unexpected: {other:?}"),
+            }
+        }
+        assert!(saw_in_band, "expected typed in-band error");
+    }
+
+    /// Claude-on-Vertex speaks the Anthropic Messages wire — an
+    /// in-band `event: error` frame must surface typed instead of
+    /// being swallowed by the `Other` catch-all (same fix as the
+    /// native Anthropic bridge, AISIX-Cloud#1222).
+    #[tokio::test]
+    async fn chat_anthropic_stream_in_band_error_event_surfaces_typed() {
+        let body = "event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hel\"}}\n\n\
+event: error\n\
+data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n"
+            .to_string();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(body),
+            )
+            .mount(&server)
+            .await;
+
+        let bridge = VertexBridge::new().with_api_base_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("claude-3-5-sonnet-v2@20241022"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let req = ChatFormat::new("my-claude", vec![ChatMessage::user("hi")]);
+        let mut stream = bridge.chat_stream(&req, &ctx).await.unwrap();
+        let mut saw_in_band = false;
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(_) => continue,
+                Err(BridgeError::UpstreamInBand { status, wire, .. }) => {
+                    assert_eq!(status, Some(529), "documented overloaded_error status");
+                    assert!(
+                        matches!(wire, aisix_gateway::UpstreamWire::Anthropic),
+                        "Anthropic taxonomy applies to Claude-on-Vertex in-band errors"
+                    );
+                    saw_in_band = true;
+                    break;
+                }
+                Err(other) => panic!("unexpected: {other:?}"),
+            }
+        }
+        assert!(saw_in_band, "expected typed in-band error");
+    }
+
+    /// The OpenAI-shim rail probes the same envelope shape.
+    #[test]
+    fn parse_vertex_openai_stream_payload_captures_error_frame() {
+        let err = parse_vertex_openai_stream_payload(
+            r#"{"error":{"message":"upstream broke","code":"500"}}"#,
+            "vertex openai-shim stream chunk parse",
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            BridgeError::UpstreamInBand {
+                status: Some(500),
+                ..
+            }
+        ));
+        // Garbage keeps the decode classification + context prefix.
+        match parse_vertex_openai_stream_payload("{not-json", "ctx-prefix").unwrap_err() {
+            BridgeError::UpstreamDecode(msg) => assert!(msg.starts_with("ctx-prefix")),
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 
     #[tokio::test]

@@ -16,7 +16,7 @@
 
 use aisix_core::AppliedGuardrail;
 use aisix_gateway::{BridgeError, ChatFormat, ChatMessage, EmbeddingRequest};
-use aisix_obs::{content_capture_cap, AccessLog, CapturedContent, RequestOutcome, UsageEvent};
+use aisix_obs::{content_capture_cap, AccessLog, CapturedContent, UsageEvent};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -98,37 +98,38 @@ pub async fn embeddings(
     let api_key_id = auth.entry.id.clone();
     let body = match body {
         Ok(Json(b)) => b,
+        // Classification stays in the shared helper so this route can't
+        // drift from its siblings on the 413-vs-400 rules; `reject` gives
+        // the refusal the same access log + metrics a served request gets.
         Err(rej) => {
-            use axum::extract::rejection::JsonRejection;
-            // BytesRejection → distinguish 413 (PAYLOAD_TOO_LARGE,
-            // real per-extractor cap exceeded) from 400 (transport-
-            // side read failure). `JsonRejection` is `#[non_exhaustive]`
-            // so the fallback `_` arm catches today's JsonDataError
-            // (the #401 case) / JsonSyntaxError / MissingJsonContentType
-            // AND any future variant axum adds, defaulting to 400
-            // until each new variant gets an explicit policy decision.
-            return match rej {
-                JsonRejection::BytesRejection(inner)
-                    if inner.status() == StatusCode::PAYLOAD_TOO_LARGE =>
-                {
-                    ProxyError::RequestTooLarge {
-                        limit_bytes: state.request_body_limit_bytes,
-                    }
-                }
-                JsonRejection::BytesRejection(_) => {
-                    ProxyError::InvalidRequest("failed to read request body".into())
-                }
-                _ => ProxyError::InvalidRequest("invalid JSON request body".into()),
-            }
-            .into_response();
+            return crate::reject::reject_before_dispatch(
+                &state,
+                "POST",
+                "/v1/embeddings",
+                &request_id,
+                Some(&api_key_id),
+                started,
+                crate::reject::Envelope::OpenAi,
+                crate::error::proxy_error_from_json_rejection(rej, state.request_body_limit_bytes),
+            );
         }
     };
     let model_name = body.model.clone();
+    // One snapshot for the whole request (#941): dispatch, the terminal
+    // metric emit and the usage event all read this handle instead of
+    // loading their own. The request's view of config is therefore frozen
+    // at entry — see the module note on `ProxyState::snapshot`.
+    let snapshot = state.snapshot.load();
 
-    match dispatch(&state, &auth, body, &request_id, &client).await {
+    match dispatch(&state, &snapshot, &auth, body, &request_id, &client).await {
         Ok(success) => {
             let elapsed = started.elapsed();
-            let status = 200u16;
+            // The actual response status, not a hardcoded 200: the 501
+            // NotImplemented branch also returns `Ok(success)`, and calling
+            // it a 200 both mislabels the access log and books it as
+            // `outcome="success"` on the request metrics. Same fix #426 made
+            // for completions / responses / rerank.
+            let status = success.response.status().as_u16();
             emit_access_log(
                 &model_name,
                 &success.provider,
@@ -138,11 +139,21 @@ pub async fn embeddings(
                 &request_id,
                 None,
             );
-            state.metrics.record_request(
-                &success.provider,
-                &model_name,
+            // One ProviderKey lookup for the metric emit + the usage event
+            // below (#941).
+            let pk = crate::usage_attr::ResolvedPk::resolve(&snapshot, &success.provider_key_id);
+            crate::request_metrics::record(
+                &state,
+                "/v1/embeddings",
+                crate::request_metrics::Caller::new(&auth),
+                crate::request_metrics::Upstream {
+                    provider: &success.provider,
+                    model: &model_name,
+                    upstream_model: &success.upstream_model,
+                    pk: pk.labels(),
+                    ..Default::default()
+                },
                 status,
-                RequestOutcome::Success,
                 elapsed,
             );
             // Issue #226: emit UsageEvent so cp-api's budget ledger
@@ -162,11 +173,14 @@ pub async fn embeddings(
             if success.upstream_called {
                 emit_usage_event(
                     &state,
+                    &snapshot,
+                    &pk,
                     &request_id,
                     &success.model_id,
                     &model_name,
                     &api_key_id,
-                    &success.provider_key_id,
+                    &success.provider,
+                    &success.upstream_model,
                     &success.applied_guardrails,
                     status,
                     elapsed,
@@ -192,19 +206,26 @@ pub async fn embeddings(
                 &request_id,
                 Some(&err),
             );
-            let snap = state.snapshot.load();
-            let metric_model = crate::usage_attr::metric_model_label(&snap, &model_name);
-            state.metrics.record_request(
-                "unknown",
-                metric_model,
+            let metric_model = crate::usage_attr::metric_model_label(&snapshot, &model_name);
+            // AISIX-Cloud#1325: name the target the request died on. This
+            // branch used to emit `Upstream::default()`, so a 502 from a
+            // real provider landed on `provider="unknown"` while the same
+            // key's successes landed on the real one.
+            let attributed = crate::attribution::current().unwrap_or_default();
+            let last_target = crate::request_metrics::LastTarget::new(&snapshot, &attributed);
+            crate::request_metrics::record(
+                &state,
+                "/v1/embeddings",
+                crate::request_metrics::Caller::new(&auth),
+                last_target.upstream(metric_model.as_ref(), false, false),
                 status,
-                RequestOutcome::from_status(status),
                 elapsed,
             );
             // Per #655 parity: surface the failed request in Logs with a
             // zero-token event (status + error class), instead of dropping it.
             crate::usage_attr::emit_error_usage_event(
                 &state,
+                &snapshot,
                 "embeddings",
                 "openai",
                 &request_id,
@@ -232,6 +253,9 @@ struct EmbedDispatchSuccess {
     /// Resolved ProviderKey UUID — feeds the per-PK telemetry attribution
     /// tags on the emitted UsageEvent (AISIX-Cloud#867 parity).
     provider_key_id: String,
+    /// Provider-side model name, for the `upstream_model` metric label
+    /// (AISIX-Cloud#1234 parity with chat / messages / responses).
+    upstream_model: String,
     /// The `{kind, hook}` set of guardrails that governed this request (#379
     /// parity) — surfaced on the emitted UsageEvent.
     applied_guardrails: Vec<AppliedGuardrail>,
@@ -262,14 +286,13 @@ struct EmbedDispatchSuccess {
 
 async fn dispatch(
     state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
     auth: &AuthenticatedKey,
     mut body: EmbeddingRequestBody,
     request_id: &str,
     client_ctx: &ClientContext,
 ) -> Result<EmbedDispatchSuccess, ProxyError> {
-    let snapshot = state.snapshot.load();
-
-    let model_entry = crate::model_resolve::resolve_model(&snapshot, &body.model)
+    let model_entry = crate::model_resolve::resolve_model(snapshot, &body.model)
         .ok_or_else(|| ProxyError::ModelNotFound(body.model.clone()))?;
 
     if !auth.key().can_access(&body.model) {
@@ -281,7 +304,7 @@ async fn dispatch(
 
     let model = &model_entry.value;
     let provider = crate::dispatch::require_provider(model)?;
-    let pk_entry = crate::dispatch::resolve_provider_key(&snapshot, model)?;
+    let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
 
     let bridge = crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value)
         .ok_or(ProxyError::ProviderUnavailable)?;
@@ -298,7 +321,9 @@ async fn dispatch(
     // #542: run this BEFORE the rate-limit reservation so a content-policy
     // block doesn't burn an RPM slot (matching /v1/chat/completions).
     let guardrail_ctx = aisix_guardrails::RequestContext {
+        passthrough_route_id: "",
         model_id: &model_entry.id,
+        mcp_server_id: "",
         api_key_id: &auth.entry.id,
         team_id: auth.key().team_id.as_deref(),
     };
@@ -373,7 +398,7 @@ async fn dispatch(
 
     let model_rl =
         crate::quota::ModelRateLimit::from_model(&body.model, &model_entry.id, &model_entry.value);
-    let reservation = crate::quota::enforce(state, auth, Some(&model_rl)).await?;
+    let reservation = crate::quota::enforce(state, snapshot, auth, Some(&model_rl)).await?;
 
     let upstream_model_id = crate::dispatch::require_upstream_model(model)?.to_string();
 
@@ -402,7 +427,8 @@ async fn dispatch(
         Arc::new(pk_entry.value.clone()),
         Some(client_ctx),
     );
-    if let Some(d) = model.request_timeout() {
+    if let Some(d) = crate::routing::effective_timeouts(model, None, state.default_timeouts).request
+    {
         ctx = ctx.with_deadline(d);
     }
 
@@ -421,7 +447,7 @@ async fn dispatch(
         Ok(embed_resp) => {
             // #701: clear any cooldown/unhealthy mark now the upstream
             // answered — same recovery signal as rerank/audio/chat.
-            state.health.record_success(&body.model);
+            state.health.record_success(&model_entry.value.display_name);
             state.runtime_status.mark_healthy(&model_entry.id);
             // Token accounting (#226 / AISIX-Cloud#1074). Embeddings are
             // input-only, so `prompt_tokens == total_tokens` on the OpenAI
@@ -470,6 +496,7 @@ async fn dispatch(
                 provider: provider_label,
                 model_id: model_entry.id.to_string(),
                 provider_key_id: pk_entry.id.to_string(),
+                upstream_model: model.upstream_model().unwrap_or("unknown").to_string(),
                 applied_guardrails: applied_guardrails.clone(),
                 redactions: redactions.clone(),
                 monitor_hits: monitor_hits.clone(),
@@ -493,6 +520,7 @@ async fn dispatch(
                 provider: provider.to_ascii_lowercase(),
                 model_id: model_entry.id.to_string(),
                 provider_key_id: pk_entry.id.to_string(),
+                upstream_model: model.upstream_model().unwrap_or("unknown").to_string(),
                 applied_guardrails: applied_guardrails.clone(),
                 redactions: redactions.clone(),
                 monitor_hits: monitor_hits.clone(),
@@ -547,6 +575,9 @@ fn emit_access_log(
         completion_tokens: None,
         total_tokens: None,
         request_id,
+        // No provider response id: the OpenAI embeddings response shape
+        // carries none (AISIX-Cloud#1289).
+        provider_request_id: None,
         served_by_model: None,
         routing_attempt_count: None,
         routing_fallback_count: None,
@@ -579,11 +610,20 @@ fn emit_access_log(
 #[allow(clippy::too_many_arguments)]
 fn emit_usage_event(
     state: &ProxyState,
+    // The request's snapshot + its one ProviderKey observation, resolved
+    // by the handler (#941) — this emitter used to load and look up both
+    // itself, on top of the metric emit that had already done the same.
+    snap: &aisix_core::AisixSnapshot,
+    pk: &crate::usage_attr::ResolvedPk<'_>,
     request_id: &str,
     model_id: &str,
     requested_model: &str,
     api_key_id: &str,
-    provider_key_id: &str,
+    // Metric labels the UsageEvent has no field for (AISIX-Cloud#1234
+    // follow-up): the wire struct is the CP contract, so they ride
+    // alongside rather than in it.
+    provider: &str,
+    upstream_model: &str,
     applied_guardrails: &[AppliedGuardrail],
     status_code: u16,
     elapsed: Duration,
@@ -622,7 +662,6 @@ fn emit_usage_event(
     // branded_provider / pk_label / byo_label) ARE populated — same lookup as
     // chat / messages / responses (AISIX-Cloud#867 parity) via
     // `usage_attr::apply_pk_telemetry` below.
-    let snap = state.snapshot.load();
     let mut event = UsageEvent {
         request_id: request_id.to_string(),
         // RFC 3339 UTC. cp-api parses with time.Parse(time.RFC3339, ...);
@@ -646,18 +685,43 @@ fn emit_usage_event(
         client_user_agent: client.user_agent.clone(),
         ..Default::default()
     };
-    crate::usage_attr::apply_pk_telemetry(&mut event, &snap, provider_key_id);
+    crate::usage_attr::apply_pk_telemetry(&mut event, pk);
     // Handler label "embeddings" — bucketed prometheus counter (#408).
-    state.usage_sink.try_emit("embeddings", event.clone());
+    crate::usage_attr::apply_jwt_identity(&mut event, client.jwt.as_ref());
+    let usage_model = crate::usage_attr::usage_event_model_label(snap, &event.requested_model);
+    state.usage_sink.try_emit(
+        "embeddings",
+        event.clone(),
+        crate::usage_attr::usage_event_labels(&usage_model, pk),
+    );
     // Per-env OTLP/HTTP fan-out — same shape as chat.rs:1334. The
     // snapshot's exporter table is empty for envs that haven't
     // configured any, so this is a cheap no-op on the common path.
-    let exporters = snap.observability_exporters.entries();
+    let exporters = crate::usage_attr::live_exporters(state, snap);
     state
         .otlp_fan_out
         .fan_out(&event, content, exporters.iter().map(|e| &e.value));
+    let owned_caller = crate::request_metrics::Caller::from_api_key_id(snap, api_key_id);
+    crate::request_metrics::record_usage(
+        state,
+        "/v1/embeddings",
+        owned_caller.as_caller(),
+        crate::request_metrics::Upstream {
+            provider,
+            model: requested_model,
+            upstream_model,
+            pk: pk.labels(),
+            ..Default::default()
+        },
+        crate::request_metrics::Tokens {
+            input: prompt_tokens,
+            output: 0,
+            total: prompt_tokens,
+            spend_usd: 0.0,
+            client_type: state.client_classifier.classify(&client.user_agent),
+        },
+    );
 }
-
 #[cfg(test)]
 mod tests {
 
@@ -677,7 +741,11 @@ mod tests {
             addr: "127.0.0.1:0".into(),
             request_body_limit_bytes: 1_048_576,
             real_ip: Default::default(),
+            request_id: Default::default(),
+            url_rewrites: Vec::new(),
             tls: None,
+            thread_per_core: None,
+            workers: None,
         }
     }
 

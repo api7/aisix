@@ -5,6 +5,13 @@
 //! matches the OpenAI `/v1/models` contract so any client that uses
 //! `client.models.list()` sees the models available to it.
 //!
+//! The listing is defined as *the names a caller may put in a request's
+//! `model` field*, so every dispatch shape qualifies: direct models and
+//! the virtual aliases (routing / semantic / ensemble) alike. A Model
+//! Group is the stable public entry point its operator intends callers
+//! to use, and the same `allowed_models` ACL that authorizes the request
+//! decides whether it appears here.
+//!
 //! Each Model surfaces as:
 //! ```json
 //! {
@@ -56,16 +63,14 @@ pub async fn list_models(
 
     let snapshot = state.snapshot.load();
 
-    // Collect the names of all non-routing models (routing aliases are
-    // implementation detail, not something callers PUT into requests).
-    // Wildcard aliases (`provider/*`) are patterns, not concrete ids a caller
-    // can request by name, so they're excluded too.
-    // Then filter to what the authenticated key may access.
+    // Collect every model name a caller can request. Wildcard aliases
+    // (`provider/*`) are patterns rather than concrete ids, so they're the one
+    // exclusion. Then filter to what the authenticated key may access.
     let all_names: Vec<String> = snapshot
         .models
         .entries()
         .into_iter()
-        .filter(|e| !e.value.is_routing() && !e.value.display_name.contains('*'))
+        .filter(|e| !e.value.display_name.contains('*'))
         .map(|e| e.value.display_name.clone())
         .collect();
 
@@ -119,7 +124,11 @@ mod tests {
             addr: "127.0.0.1:0".into(),
             request_body_limit_bytes: 1_048_576,
             real_ip: Default::default(),
+            request_id: Default::default(),
+            url_rewrites: Vec::new(),
             tls: None,
+            thread_per_core: None,
+            workers: None,
         }
     }
 
@@ -186,7 +195,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wildcard_key_sees_all_non_routing_models() {
+    async fn wildcard_key_sees_all_concrete_models() {
         let snap = new_snap();
         snap.models.insert(model_entry("m1", "gpt4"));
         snap.models.insert(model_entry("m2", "claude"));
@@ -258,20 +267,46 @@ mod tests {
         assert_eq!(data.len(), 0);
     }
 
+    /// Every virtual dispatch shape — routing, semantic, ensemble — is a name
+    /// a caller may request, so all three list alongside direct models.
     #[tokio::test]
-    async fn routing_models_are_excluded_from_list() {
+    async fn virtual_aliases_are_listed_alongside_direct_models() {
         let snap = new_snap();
         snap.models.insert(model_entry("m1", "gpt4"));
-        // Insert a routing model.
-        let routing_cfg = serde_json::json!({
+        snap.models.insert(model_entry("m2", "embed"));
+
+        let routing: Model = serde_json::from_value(serde_json::json!({
             "display_name": "smart-router",
             "routing": {
                 "strategy": "failover",
                 "targets": [{"model": "gpt4"}]
             }
-        });
-        let routing: Model = serde_json::from_value(routing_cfg).unwrap();
+        }))
+        .unwrap();
         snap.models.insert(ResourceEntry::new("r1", routing, 1));
+
+        let semantic: Model = serde_json::from_value(serde_json::json!({
+            "display_name": "topic-router",
+            "semantic": {
+                "embedding_model": "embed",
+                "routes": [{"name": "legal", "target": "gpt4", "examples": ["contract review"]}],
+                "default": "gpt4",
+                "match": {"threshold": 0.8}
+            }
+        }))
+        .unwrap();
+        snap.models.insert(ResourceEntry::new("s1", semantic, 1));
+
+        let ensemble: Model = serde_json::from_value(serde_json::json!({
+            "display_name": "panel",
+            "ensemble": {
+                "panel": [{"model": "gpt4"}],
+                "judge": {"model": "gpt4"}
+            }
+        }))
+        .unwrap();
+        snap.models.insert(ResourceEntry::new("e1", ensemble, 1));
+
         snap.apikeys.insert(apikey_entry("sk-caller", &["*"]));
 
         let app = build_app(snap);
@@ -286,10 +321,87 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let ids: Vec<&str> = v["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            ["embed", "gpt4", "panel", "smart-router", "topic-router"]
+        );
+    }
+
+    /// A Model Group carries no `provider` of its own, so it falls back to the
+    /// gateway as owner rather than leaking a target's provider.
+    #[tokio::test]
+    async fn routing_model_is_owned_by_the_gateway() {
+        let snap = new_snap();
+        snap.models.insert(model_entry("m1", "gpt4"));
+        let routing: Model = serde_json::from_value(serde_json::json!({
+            "display_name": "smart-router",
+            "routing": {
+                "strategy": "failover",
+                "targets": [{"model": "gpt4"}]
+            }
+        }))
+        .unwrap();
+        snap.models.insert(ResourceEntry::new("r1", routing, 1));
+        snap.apikeys
+            .insert(apikey_entry("sk-caller", &["smart-router"]));
+
+        let app = build_app(snap);
+        let req = Request::builder()
+            .method("GET")
+            .uri("/v1/models")
+            .header("authorization", "Bearer sk-caller")
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let item = &v["data"][0];
+        assert_eq!(item["id"], "smart-router");
+        assert_eq!(item["object"], "model");
+        assert_eq!(item["owned_by"], "aisix");
+    }
+
+    /// The Model-Group-only deployment: the key is authorized for the group
+    /// alone, so the group is the whole listing and its targets stay hidden.
+    #[tokio::test]
+    async fn key_scoped_to_a_group_sees_the_group_and_not_its_targets() {
+        let snap = new_snap();
+        snap.models.insert(model_entry("m1", "gpt4"));
+        snap.models.insert(model_entry("m2", "claude"));
+        let routing: Model = serde_json::from_value(serde_json::json!({
+            "display_name": "my-gpt-group",
+            "routing": {
+                "strategy": "failover",
+                "targets": [{"model": "gpt4"}, {"model": "claude"}]
+            }
+        }))
+        .unwrap();
+        snap.models.insert(ResourceEntry::new("r1", routing, 1));
+        snap.apikeys
+            .insert(apikey_entry("sk-caller", &["my-gpt-group"]));
+
+        let app = build_app(snap);
+        let req = Request::builder()
+            .method("GET")
+            .uri("/v1/models")
+            .header("authorization", "Bearer sk-caller")
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let data = v["data"].as_array().unwrap();
-        // Only gpt4, not smart-router.
         assert_eq!(data.len(), 1);
-        assert_eq!(data[0]["id"], "gpt4");
+        assert_eq!(data[0]["id"], "my-gpt-group");
     }
 
     #[tokio::test]

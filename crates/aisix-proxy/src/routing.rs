@@ -64,6 +64,23 @@ pub fn is_retryable(err: &BridgeError, retry_on_429: bool, fallback_on_statuses:
             }
             !(400..500).contains(status)
         }
+        // An in-band stream error with an embedded status follows the
+        // same status rules as an HTTP status error (LiteLLM applies
+        // its non-429-4xx filter to in-body stream errors identically).
+        // Without a status the provider reported an unspecified stream
+        // fault — transient by assumption, like Transport.
+        BridgeError::UpstreamInBand { status, .. } => match status {
+            Some(s) => {
+                if fallback_on_statuses.contains(s) {
+                    return true;
+                }
+                if *s == 429 {
+                    return retry_on_429;
+                }
+                !(400..500).contains(s)
+            }
+            None => true,
+        },
         // Customer-fixable config / credentials (#367) is the caller's
         // mistake — retrying or failing over won't help, same as a
         // non-429 4xx.
@@ -171,11 +188,11 @@ pub fn retry_after_hint(err: &BridgeError) -> Option<Duration> {
 /// keeps the default for.
 pub fn effective_retries(
     target: &aisix_core::Model,
-    group: Option<&aisix_core::models::routing::Routing>,
+    group_retries: Option<u32>,
     deployment_default: u32,
     has_fallback_targets: bool,
 ) -> RetryBudget {
-    if let Some(explicit) = target.retries.or_else(|| group.and_then(|r| r.retries)) {
+    if let Some(explicit) = target.retries.or(group_retries) {
         return RetryBudget {
             attempts: explicit as usize,
             configured: true,
@@ -188,6 +205,22 @@ pub fn effective_retries(
             deployment_default as usize
         },
         configured: false,
+    }
+}
+
+/// The group-level slot of the member → group → deployment-default
+/// retries chain, resolved from the caller-addressed parent entry:
+/// `routing.retries` for a Model Group, the parent's own top-level
+/// `retries` otherwise — a semantic router has no `routing` block, so
+/// its group level lives on the Model itself (the same place a routing
+/// group keeps its group-level `timeout`).
+pub fn group_retries_of(parent: &aisix_core::Model) -> Option<u32> {
+    match parent.routing.as_ref() {
+        // A Model Group's group slot is `routing.retries` alone — a
+        // stray top-level `retries` on the group Model stays inert
+        // (the schema-convergence work forbids that shape outright).
+        Some(routing) => routing.retries,
+        None => parent.retries,
     }
 }
 
@@ -220,6 +253,99 @@ impl RetryBudget {
     /// (`is_retryable`); this only governs re-hitting the same target.
     pub fn covers(&self, err: &BridgeError) -> bool {
         self.configured || !matches!(err, BridgeError::Timeout { .. })
+    }
+}
+
+/// Request/stream deadlines for one dispatch target, resolved across the
+/// same levels as [`effective_retries`]: the target model, then its group,
+/// then the deployment-wide `upstream.timeout_ms` /
+/// `upstream.stream_timeout_ms` defaults from the DP config.
+#[derive(Debug, Clone, Copy)]
+pub struct TimeoutBudget {
+    /// End-to-end deadline for a non-streaming call. `None` = unbounded.
+    pub request: Option<std::time::Duration>,
+    /// Streaming budget: bounds the connect phase and the gap between
+    /// chunks. `None` = unbounded.
+    pub stream: Option<std::time::Duration>,
+    /// True when `stream` came from the target/group resources rather than
+    /// the deployment defaults. Gates the pre-200 first-chunk peek: an
+    /// operator who configured a streaming budget on the resource asked
+    /// for slow-first-token FAILOVER (#554), which requires withholding
+    /// the 200 until the first chunk arrives. The deployment default must
+    /// NOT do that — it is a backstop, and withholding headers for its
+    /// (long) duration would also silence the SSE heartbeats that exist
+    /// precisely to cover a slow first token (AISIX-Cloud#1126). With the
+    /// default budget, a first-chunk stall surfaces as an in-band timeout
+    /// after the 200 instead of failing over. Same shape as
+    /// [`RetryBudget::covers`]: explicit config opts into the sharper
+    /// behaviour, the deployment default stays conservative.
+    pub stream_configured: bool,
+}
+
+/// Deployment-wide timeout defaults (`upstream.timeout_ms` /
+/// `upstream.stream_timeout_ms`) with the `0` = "no default" sentinel
+/// already folded to `None`.
+#[derive(Debug, Clone, Copy)]
+pub struct TimeoutDefaults {
+    pub request: Option<std::time::Duration>,
+    pub stream: Option<std::time::Duration>,
+}
+
+impl Default for TimeoutDefaults {
+    /// Mirrors `UpstreamConfig::default()` so an embedded ProxyState built
+    /// without config wiring behaves like a default deployment.
+    fn default() -> Self {
+        Self {
+            request: Some(std::time::Duration::from_millis(
+                aisix_core::config::DEFAULT_UPSTREAM_TIMEOUT_MS,
+            )),
+            stream: None,
+        }
+    }
+}
+
+/// Resolve the request/stream deadlines for one dispatch target.
+///
+/// `timeout` resolves model → group → deployment default, first level that
+/// says anything wins. An explicit `0` at model or group level resolves to
+/// "no deadline" and STOPS the chain — that is how an operator opts a
+/// long-running model out of the deployment backstop.
+///
+/// The streaming budget resolves the RESOURCE levels first — the model /
+/// group `stream_timeout` (`0` defers, its historical semantics), then the
+/// resource-resolved `timeout` — and only then the deployment defaults,
+/// `stream_timeout_ms` falling back to `timeout_ms`. Within that, the
+/// dedicated stream knob outranks the generic one at EVERY level: a
+/// group's `stream_timeout` beats a member's `timeout` for streams, and
+/// supplies a budget even to a member whose `timeout: 0` opted out of the
+/// request deadline. (A model with only `timeout` still gets that value
+/// as its streaming budget, and its `timeout: 0` still opts the stream
+/// out, whenever no resource-level `stream_timeout` exists.) This is the
+/// LiteLLM router's shape: the `stream_timeout` chain is exhausted before
+/// the non-stream `timeout` chain is consulted at all.
+pub fn effective_timeouts(
+    target: &Model,
+    group: Option<&Model>,
+    defaults: TimeoutDefaults,
+) -> TimeoutBudget {
+    let request_level = target
+        .request_timeout_level()
+        .or_else(|| group.and_then(|g| g.request_timeout_level()));
+    let request = request_level.unwrap_or(defaults.request);
+    let resource_stream = target
+        .stream_read_timeout()
+        .or_else(|| group.and_then(|g| g.stream_read_timeout()));
+    let (stream, stream_configured) = if let Some(d) = resource_stream {
+        (Some(d), true)
+    } else if let Some(r) = request_level {
+        (r, r.is_some())
+    } else {
+        (defaults.stream.or(defaults.request), false)
+    };
+    TimeoutBudget {
+        request,
+        stream,
+        stream_configured,
     }
 }
 
@@ -1311,6 +1437,28 @@ mod tests {
         ));
     }
 
+    /// AISIX-Cloud#1222: in-band stream errors follow the same status
+    /// rules as HTTP status errors; a status-less one is treated as a
+    /// transient fault (retryable).
+    #[test]
+    fn is_retryable_classifies_in_band_errors_by_embedded_status() {
+        let in_band = |status: Option<u16>| BridgeError::UpstreamInBand {
+            status,
+            message: "m".into(),
+            parsed: None,
+            wire: aisix_gateway::UpstreamWire::OpenAI,
+        };
+        assert!(is_retryable(&in_band(Some(500)), false, &[]));
+        assert!(is_retryable(&in_band(Some(529)), false, &[]));
+        assert!(!is_retryable(&in_band(Some(400)), false, &[]));
+        assert!(!is_retryable(&in_band(Some(429)), false, &[]));
+        assert!(is_retryable(&in_band(Some(429)), true, &[]));
+        // fallback_on_statuses admits listed in-band codes too.
+        assert!(is_retryable(&in_band(Some(408)), false, &[408]));
+        assert!(!is_retryable(&in_band(Some(408)), false, &[]));
+        assert!(is_retryable(&in_band(None), false, &[]));
+    }
+
     /// AISIX-Cloud#1012: `fallback_on_statuses` opts specific upstream
     /// status codes into retry/failover. The list is additive — codes not
     /// listed keep the default classification — and it never resurrects
@@ -1449,9 +1597,51 @@ mod tests {
     ) -> RetryBudget {
         let m = model_with_retries(target);
         match group {
-            Some(g) => effective_retries(&m, Some(&group_with_retries(g)), default, has_fallback),
+            Some(g) => effective_retries(
+                &m,
+                group_retries_of(&{
+                    let mut parent = model_with_retries(None);
+                    parent.routing = Some(group_with_retries(g));
+                    parent
+                }),
+                default,
+                has_fallback,
+            ),
             None => effective_retries(&m, None, default, has_fallback),
         }
+    }
+
+    #[test]
+    fn group_retries_reads_the_routing_block_then_the_parent_model() {
+        // Model Group: the group slot is `routing.retries`; a stray
+        // top-level value on the parent stays shadowed by it.
+        let mut group_parent = model_with_retries(Some(7));
+        group_parent.routing = Some(group_with_retries(Some(3)));
+        assert_eq!(group_retries_of(&group_parent), Some(3));
+        // …and stays INERT even when `routing.retries` is unset — the
+        // routing block's presence pins the group slot, so the target →
+        // routing.retries → deployment-default chain is unchanged for
+        // every Model Group shape.
+        let mut sparse_group = model_with_retries(Some(7));
+        sparse_group.routing = Some(group_with_retries(None));
+        assert_eq!(group_retries_of(&sparse_group), None);
+        // Semantic router (no routing block): the parent's own top-level
+        // `retries` IS the group slot — the member → group → default
+        // chain unified across virtual parents.
+        let semantic_parent = model_with_retries(Some(2));
+        assert_eq!(group_retries_of(&semantic_parent), Some(2));
+        assert_eq!(
+            effective_retries(
+                &model_with_retries(None),
+                group_retries_of(&semantic_parent),
+                9,
+                false
+            )
+            .attempts,
+            2
+        );
+        // Neither configured → no group level.
+        assert_eq!(group_retries_of(&model_with_retries(None)), None);
     }
 
     #[test]
@@ -1496,6 +1686,201 @@ mod tests {
         // same-target retries gets them even with fallbacks queued up.
         assert_eq!(budget(Some(3), None, 2, true).attempts, 3);
         assert_eq!(budget(None, Some(Some(3)), 2, true).attempts, 3);
+    }
+
+    // ── effective_timeouts ────────────────────────────────────────
+    fn model_with_timeouts(timeout: Option<u64>, stream_timeout: Option<u64>) -> Model {
+        let mut m: Model = serde_json::from_str(
+            r#"{"display_name":"m","provider":"openai","model_name":"gpt-4o","provider_key_id":"pk"}"#,
+        )
+        .unwrap();
+        m.timeout = timeout;
+        m.stream_timeout = stream_timeout;
+        m
+    }
+
+    fn defaults_ms(request: Option<u64>, stream: Option<u64>) -> TimeoutDefaults {
+        TimeoutDefaults {
+            request: request.map(std::time::Duration::from_millis),
+            stream: stream.map(std::time::Duration::from_millis),
+        }
+    }
+
+    fn ms(v: u64) -> Option<std::time::Duration> {
+        Some(std::time::Duration::from_millis(v))
+    }
+
+    #[test]
+    fn effective_timeouts_prefers_the_target_then_the_group_then_the_default() {
+        let group = model_with_timeouts(Some(2_000), Some(1_500));
+        // Target wins over group and default.
+        let t = effective_timeouts(
+            &model_with_timeouts(Some(1_000), Some(500)),
+            Some(&group),
+            defaults_ms(Some(9_000), Some(8_000)),
+        );
+        assert_eq!(t.request, ms(1_000));
+        assert_eq!(t.stream, ms(500));
+        // Group applies when the target is silent.
+        let t = effective_timeouts(
+            &model_with_timeouts(None, None),
+            Some(&group),
+            defaults_ms(Some(9_000), Some(8_000)),
+        );
+        assert_eq!(t.request, ms(2_000));
+        assert_eq!(t.stream, ms(1_500));
+        // Deployment default applies when both are silent — the case that
+        // used to mean "no deadline at all".
+        let silent_group = model_with_timeouts(None, None);
+        let t = effective_timeouts(
+            &model_with_timeouts(None, None),
+            Some(&silent_group),
+            defaults_ms(Some(9_000), Some(8_000)),
+        );
+        assert_eq!(t.request, ms(9_000));
+        assert_eq!(t.stream, ms(8_000));
+        // A direct model has no group at all.
+        let t = effective_timeouts(
+            &model_with_timeouts(None, None),
+            None,
+            defaults_ms(Some(9_000), None),
+        );
+        assert_eq!(t.request, ms(9_000));
+    }
+
+    #[test]
+    fn effective_timeouts_explicit_zero_disables_and_stops_the_chain() {
+        // `timeout: 0` on the model is an opt-out of the deployment
+        // backstop, not "unset" — a long-running model must be able to
+        // escape the default.
+        let t = effective_timeouts(
+            &model_with_timeouts(Some(0), None),
+            None,
+            defaults_ms(Some(9_000), None),
+        );
+        assert_eq!(t.request, None);
+        assert_eq!(t.stream, None);
+        // Same at group level.
+        let group_zero = model_with_timeouts(Some(0), None);
+        let t = effective_timeouts(
+            &model_with_timeouts(None, None),
+            Some(&group_zero),
+            defaults_ms(Some(9_000), None),
+        );
+        assert_eq!(t.request, None);
+        // `upstream.timeout_ms: 0` restores the pre-default behaviour.
+        let t = effective_timeouts(
+            &model_with_timeouts(None, None),
+            None,
+            defaults_ms(None, None),
+        );
+        assert_eq!(t.request, None);
+        assert_eq!(t.stream, None);
+    }
+
+    #[test]
+    fn effective_timeouts_stream_zero_defers_and_falls_back_to_request() {
+        // `stream_timeout: 0`/absent defers (its historical semantics),
+        // ending at the resource-resolved request timeout.
+        let t = effective_timeouts(
+            &model_with_timeouts(Some(5_000), Some(0)),
+            None,
+            defaults_ms(Some(9_000), None),
+        );
+        assert_eq!(t.stream, ms(5_000));
+        // Resource config beats deployment config: a model `timeout` wins
+        // over the deployment stream default.
+        let t = effective_timeouts(
+            &model_with_timeouts(Some(5_000), None),
+            None,
+            defaults_ms(Some(9_000), Some(700)),
+        );
+        assert_eq!(t.stream, ms(5_000));
+        // With no resource-level timeouts, the deployment stream default
+        // applies, falling back to the deployment request default.
+        let t = effective_timeouts(
+            &model_with_timeouts(None, None),
+            None,
+            defaults_ms(Some(9_000), Some(700)),
+        );
+        assert_eq!(t.stream, ms(700));
+        let t = effective_timeouts(
+            &model_with_timeouts(None, None),
+            None,
+            defaults_ms(Some(9_000), None),
+        );
+        assert_eq!(t.stream, ms(9_000));
+    }
+
+    #[test]
+    fn effective_timeouts_only_resource_config_arms_the_first_chunk_peek() {
+        // Deployment-default budgets must not withhold the 200 waiting for
+        // the first chunk — that would silence the SSE heartbeats that
+        // cover a slow first token (AISIX-Cloud#1126).
+        let t = effective_timeouts(
+            &model_with_timeouts(None, None),
+            None,
+            defaults_ms(Some(9_000), Some(700)),
+        );
+        assert!(!t.stream_configured);
+        // A model/group streaming budget — or a model `timeout` acting as
+        // one — is an explicit ask for slow-first-token failover (#554).
+        let t = effective_timeouts(
+            &model_with_timeouts(None, Some(700)),
+            None,
+            defaults_ms(Some(9_000), None),
+        );
+        assert!(t.stream_configured);
+        let t = effective_timeouts(
+            &model_with_timeouts(Some(5_000), None),
+            None,
+            defaults_ms(None, None),
+        );
+        assert!(t.stream_configured);
+        let group = model_with_timeouts(None, Some(700));
+        let t = effective_timeouts(
+            &model_with_timeouts(None, None),
+            Some(&group),
+            defaults_ms(Some(9_000), None),
+        );
+        assert!(t.stream_configured);
+        // `timeout: 0` disarms everything.
+        let t = effective_timeouts(
+            &model_with_timeouts(Some(0), None),
+            None,
+            defaults_ms(Some(9_000), None),
+        );
+        assert!(!t.stream_configured);
+        assert_eq!(t.stream, None);
+    }
+
+    #[test]
+    fn effective_timeouts_stream_knob_outranks_the_timeout_knob_across_levels() {
+        // The dedicated stream knob wins at every level: a group
+        // `stream_timeout` beats a member's own `timeout` for the
+        // streaming budget (the member's `timeout` still governs its
+        // non-streaming deadline). LiteLLM resolves the same way — the
+        // stream chain is exhausted before the non-stream chain starts.
+        let group = model_with_timeouts(None, Some(700));
+        let t = effective_timeouts(
+            &model_with_timeouts(Some(5_000), None),
+            Some(&group),
+            defaults_ms(Some(9_000), None),
+        );
+        assert_eq!(t.request, ms(5_000));
+        assert_eq!(t.stream, ms(700));
+        assert!(t.stream_configured);
+        // ...including a member that opted OUT of the request deadline:
+        // `timeout: 0` cannot cancel a group's explicit stream budget —
+        // only the dedicated knob governs the dedicated budget.
+        let t = effective_timeouts(
+            &model_with_timeouts(Some(0), None),
+            Some(&group),
+            defaults_ms(Some(9_000), None),
+        );
+        assert_eq!(t.request, None);
+        assert_eq!(t.stream, ms(700));
+        assert!(t.stream_configured);
     }
 
     #[test]

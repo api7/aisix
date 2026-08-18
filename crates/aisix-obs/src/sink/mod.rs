@@ -91,6 +91,30 @@ impl SinkError {
     }
 }
 
+/// Render an error together with its full `source()` chain.
+///
+/// `Display` on a transport error usually names only the outermost layer
+/// ("error sending request", "Error performing PUT <url>") while the
+/// actionable cause — a DNS failure, a TLS verification error — sits levels
+/// deeper. The nightly objstore smoke burned five weeks on a detail that
+/// ended at the request URL before anyone saw the underlying
+/// "failed to lookup address information". Layers whose text the outer
+/// message already embeds are skipped, so wrappers that interpolate their
+/// source don't repeat it.
+pub(crate) fn error_chain(e: &dyn std::error::Error) -> String {
+    let mut out = e.to_string();
+    let mut cur = e.source();
+    while let Some(src) = cur {
+        let text = src.to_string();
+        if !out.contains(&text) {
+            out.push_str(": ");
+            out.push_str(&text);
+        }
+        cur = src.source();
+    }
+    out
+}
+
 /// Result of one [`ObservabilitySink::append_batch`] call.
 pub type SinkResult = Result<SinkAck, SinkError>;
 
@@ -214,5 +238,60 @@ mod tests {
         let bad = SinkHealth::unhealthy("endpoint unreachable");
         assert!(!bad.healthy);
         assert_eq!(bad.detail.as_deref(), Some("endpoint unreachable"));
+    }
+
+    #[derive(Debug)]
+    struct Layered {
+        text: &'static str,
+        source: Option<Box<dyn std::error::Error + Send + Sync>>,
+    }
+
+    impl std::fmt::Display for Layered {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.text)
+        }
+    }
+
+    impl std::error::Error for Layered {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.source
+                .as_deref()
+                .map(|s| s as &(dyn std::error::Error + 'static))
+        }
+    }
+
+    #[test]
+    fn error_chain_appends_hidden_sources() {
+        // The wrapper's Display names only itself — the shape reqwest and
+        // object_store's retry error have, which is what buried the DNS
+        // cause of the nightly objstore failure.
+        let e = Layered {
+            text: "error sending request",
+            source: Some(Box::new(Layered {
+                text: "dns error: failed to lookup address information",
+                source: None,
+            })),
+        };
+        assert_eq!(
+            error_chain(&e),
+            "error sending request: dns error: failed to lookup address information"
+        );
+    }
+
+    #[test]
+    fn error_chain_skips_sources_already_interpolated() {
+        // Wrappers that embed their source's Display (thiserror's
+        // `#[error("outer: {0}")]` pattern) must not repeat it.
+        let e = Layered {
+            text: "outer: inner detail",
+            source: Some(Box::new(Layered {
+                text: "inner detail",
+                source: Some(Box::new(Layered {
+                    text: "root cause",
+                    source: None,
+                })),
+            })),
+        };
+        assert_eq!(error_chain(&e), "outer: inner detail: root cause");
     }
 }

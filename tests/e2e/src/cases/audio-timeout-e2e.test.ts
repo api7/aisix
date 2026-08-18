@@ -150,10 +150,13 @@ describe("audio request timeout (#911 [22])", () => {
     });
     const elapsed = Date.now() - started;
 
-    // The upstream stalls for SLOW_MS; the model timeout must abandon it well
+    // The upstream stalls for SLOW_MS; the model timeout must abandon it
     // before that. Before the fix no timeout was applied and this waited the
-    // full SLOW_MS, so the elapsed-time bound is what fails pre-fix.
+    // full SLOW_MS, so the elapsed-time bound is what fails pre-fix — any
+    // bound under SLOW_MS discriminates, since the stall is a hard floor.
+    // Keep the margin over TIMEOUT_MS wide: a loaded CI runner has been
+    // seen adding ~1.8s of overhead on top of the 400ms timeout.
     expect(res.ok).toBe(false);
-    expect(elapsed).toBeLessThan(SLOW_MS - 800);
+    expect(elapsed).toBeLessThan(SLOW_MS - 200);
   }, 30_000);
 });

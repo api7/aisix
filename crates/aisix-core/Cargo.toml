@@ -17,10 +17,12 @@ thiserror.workspace = true
 anyhow.workspace = true
 config.workspace = true
 jsonschema.workspace = true
+regex.workspace = true
 schemars = { workspace = true, features = ["chrono"] }
 # ApiKey::expires_at parses RFC 3339 timestamps for key-expiry
 # enforcement in the proxy auth path (#933).
 chrono.workspace = true
+chrono-tz.workspace = true
 once_cell.workspace = true
 # ApiKey::hash_bearer (prd-09a §9A.7B.4) is the canonical SHA-256 the
 # proxy uses to compare an incoming Authorization: Bearer <plaintext>
@@ -29,6 +31,9 @@ sha2.workspace = true
 hex.workspace = true
 # Trusted-proxy CIDR parsing/validation for proxy.real_ip (#492)
 ipnet.workspace = true
+# Header-name parsing/validation for proxy.request_id.accept_headers
+# (AISIX-Cloud#1288) — same role ipnet plays for real_ip.
+http.workspace = true
 # filesource: resources.yaml parsing + deterministic UUIDv5 resource ids
 yaml-rust2.workspace = true
 uuid.workspace = true

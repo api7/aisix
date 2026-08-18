@@ -16,13 +16,14 @@
 //!    line. Errors surface via [`ProxyError`] which carries the right
 //!    status, error type, and (for rate-limits) Retry-After.
 
-use aisix_cache::{Cache, CacheKey};
-use aisix_core::AppliedGuardrail;
-use aisix_gateway::{BridgeError, ChatFormat};
+use aisix_cache::{semantic_prompt_text, Cache, CacheKey, SemanticCacheStore};
+use aisix_core::models::{CacheScope, SemanticCacheConfig};
+use aisix_core::{AisixSnapshot, AppliedGuardrail};
+use aisix_gateway::{BridgeError, ChatFormat, ChatResponse};
 use aisix_guardrails::GuardrailVerdict;
 use aisix_obs::{
-    content_capture_cap, AccessLog, CapturedContent, LatencyLabels, LlmUsage, Metrics,
-    RequestLabels, RequestOutcome, UsageEvent, UsageLabels,
+    content_capture_cap, AccessLog, CapturedContent, LatencyLabels, Metrics, UsageEvent,
+    UsageLabels,
 };
 use axum::extract::State;
 use axum::http::HeaderValue;
@@ -44,8 +45,17 @@ use crate::routing::{is_retryable, resolve_attempt_models, AttemptModel, Routing
 use crate::state::ProxyState;
 
 /// Header set on every non-streaming response indicating whether the
-/// response came from the cache (`hit`) or the upstream (`miss`).
+/// response came from the cache (`hit`), the upstream (`miss`), or the
+/// upstream because the caller sent `Cache-Control: no-cache` (`bypass`).
 pub const CACHE_HEADER: &str = "x-aisix-cache";
+
+/// On a cache hit, which matching layer served it: `exact` or
+/// `semantic`. Absent on miss/bypass.
+pub const CACHE_LAYER_HEADER: &str = "x-aisix-cache-layer";
+
+/// On a semantic cache hit, the cosine similarity between the request
+/// and the stored entry (4 decimal places). Absent otherwise.
+pub const CACHE_SIMILARITY_HEADER: &str = "x-aisix-cache-similarity";
 
 struct DispatchFailure {
     model_id: Option<String>,
@@ -94,30 +104,21 @@ pub async fn chat_completions(
     let path = "/v1/chat/completions";
     let mut req = match body {
         Ok(Json(r)) => r,
+        // Classify the body-extractor failure (malformed JSON vs 413 cap
+        // vs transport read error) via the shared helper, then answer
+        // through `reject` so the rejection lands in the access log and
+        // the request metrics like every other terminal path here.
         Err(rej) => {
-            use axum::extract::rejection::JsonRejection;
-            use axum::http::StatusCode;
-            // BytesRejection → distinguish 413 (PAYLOAD_TOO_LARGE,
-            // real per-extractor cap exceeded) from 400 (transport-
-            // side read failure). `JsonRejection` is `#[non_exhaustive]`
-            // so the fallback `_` arm catches today's JsonDataError
-            // (the #324 case) / JsonSyntaxError / MissingJsonContentType
-            // AND any future variant axum adds, defaulting to 400
-            // until each new variant gets an explicit policy decision.
-            return match rej {
-                JsonRejection::BytesRejection(inner)
-                    if inner.status() == StatusCode::PAYLOAD_TOO_LARGE =>
-                {
-                    ProxyError::RequestTooLarge {
-                        limit_bytes: state.request_body_limit_bytes,
-                    }
-                }
-                JsonRejection::BytesRejection(_) => {
-                    ProxyError::InvalidRequest("failed to read request body".into())
-                }
-                _ => ProxyError::InvalidRequest("invalid JSON request body".into()),
-            }
-            .into_response();
+            return crate::reject::reject_before_dispatch(
+                &state,
+                method,
+                path,
+                &client.request_id,
+                Some(&auth.entry.id),
+                started,
+                crate::reject::Envelope::OpenAi,
+                crate::error::proxy_error_from_json_rejection(rej, state.request_body_limit_bytes),
+            );
         }
     };
     let request_id = client.request_id.clone();
@@ -134,8 +135,14 @@ pub async fn chat_completions(
     // Filled by `dispatch` with monitor-mode guardrail observations
     // (AISIX-Cloud#562), same dual-path lifecycle as `applied_guardrails`.
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
+    // One snapshot for the whole request (#941). Dispatch, the quota gate,
+    // the terminal metric emits and the usage events all read this handle
+    // instead of loading their own, so a request sees ONE config generation
+    // rather than one per emit.
+    let snapshot = state.snapshot.load();
     let outcome = dispatch(
         &state,
+        &snapshot,
         &auth,
         &mut req,
         &request_id,
@@ -151,22 +158,17 @@ pub async fn chat_completions(
         Ok(mut success) => {
             let status = 200;
             let elapsed = started.elapsed();
-            // #890 req-3/req-4: resolve the readable provider-key name from the
-            // snapshot and normalise the inbound client type once.
-            let provider_key_name = {
-                let snap = state.snapshot.load();
-                crate::usage_attr::provider_key_metric_name(&snap, &success.provider_key_id)
-            };
+            // #890 req-4: normalise the inbound client type once.
             let client_type = state.client_classifier.classify(&client.user_agent);
+            // One ProviderKey lookup for both terminal metric emits and the
+            // winner's usage event below (#941).
+            let pk = crate::usage_attr::ResolvedPk::resolve(&snapshot, &success.provider_key_id);
             record_success(
-                &state.metrics,
+                &state,
+                &pk,
+                &auth,
                 &success.provider,
                 &model_name,
-                &api_key_id,
-                auth.key().team_id.as_deref(),
-                auth.key().user_id.as_deref(),
-                auth.key().user_name.as_deref(),
-                &provider_key_name,
                 client_type,
                 req.is_streaming(),
                 success.routing.fallback_count() > 0,
@@ -186,6 +188,11 @@ pub async fn chat_completions(
                 success.completion_tokens,
                 success.total_tokens,
                 &request_id,
+                // Empty on the streaming path — the id rides the first
+                // upstream frame, which has not arrived yet. That case is
+                // covered by the per-attempt `provider call completed` line
+                // the usage sink emits (AISIX-Cloud#1289).
+                Some(success.provider_request_id.as_str()),
                 &success.routing,
                 None,
             );
@@ -195,6 +202,7 @@ pub async fn chat_completions(
             // streaming path.
             emit_failed_attempts(
                 &state,
+                &snapshot,
                 &request_id,
                 &model_name,
                 &api_key_id,
@@ -229,6 +237,8 @@ pub async fn chat_completions(
                     .unwrap_or(&success.model_id);
                 emit_usage_event(
                     &state,
+                    &snapshot,
+                    &pk,
                     &request_id,
                     event_model_id,
                     &model_name,
@@ -248,6 +258,11 @@ pub async fn chat_completions(
                         finish_reason: success.finish_reason.clone(),
                         bypass_reason: success.bypass_reason.clone().unwrap_or_default(),
                         cache_status: success.cache_status.as_str().to_string(),
+                        cache_hit_layer: success
+                            .cache_hit_layer
+                            .map(|l| l.as_str().to_string())
+                            .unwrap_or_default(),
+                        cache_similarity: success.cache_similarity,
                         cache_hit_saved_input_tokens: success.cache_hit_saved_input_tokens,
                         cache_hit_saved_output_tokens: success.cache_hit_saved_output_tokens,
                         // Non-streaming: nothing was streamed, so there is no
@@ -261,7 +276,6 @@ pub async fn chat_completions(
                         error_class: String::new(),
                         error_message: String::new(),
                         applied_guardrails: applied_guardrails.clone(),
-                        provider_key_id: success.provider_key_id.clone(),
                         redacted_entity_counts: redaction_counts.clone(),
                         guardrail_monitor_hits: monitor_hits.clone(),
                     },
@@ -356,9 +370,7 @@ pub async fn chat_completions(
             // label (unbounded cardinality). The raw name still flows to the
             // per-request access log + usage events below (bounded by request
             // volume, not label cardinality).
-            let snap = state.snapshot.load();
-            let metric_model = crate::usage_attr::metric_model_label(&snap, &model_name);
-            record_error(&state.metrics, &err, metric_model, status, elapsed);
+            let metric_model = crate::usage_attr::metric_model_label(&snapshot, &model_name);
             // Access log: surface the upstream-billed counts when the
             // error fired AFTER the upstream call (output-content-filter
             // block). Pre-upstream errors (input filter, budget,
@@ -384,33 +396,29 @@ pub async fn chat_completions(
             // metrics successes use, so a success rate is computable
             // (numerator outcome="success" over a denominator that includes
             // failures — previously these series were success-path-only).
-            // Provider / upstream_model / provider_key are unknown on the
-            // failure path; identity + status + outcome + stream + is_fallback
-            // are what the success-rate query needs.
-            let fail_labels = RequestLabels {
-                endpoint: "/v1/chat/completions",
-                inbound_protocol: "openai",
-                provider: "unknown",
-                model: metric_model,
-                upstream_model: "unknown",
-                provider_key_id: "unknown",
-                provider_key_name: "unknown",
-                api_key_id: &api_key_id,
-                team_id: auth.key().team_id.as_deref().unwrap_or("unknown"),
-                user_id: auth.key().user_id.as_deref().unwrap_or("unknown"),
-                user_name: auth.key().user_name.as_deref().unwrap_or("unknown"),
-                stream: req.is_streaming(),
-                is_fallback: routing.fallback_count() > 0,
+            // AISIX-Cloud#1325: name the target the request died on. This
+            // branch used to emit `Upstream::default()`, so a 502 from a
+            // real provider landed on `provider="unknown"` while the same
+            // key's successes landed on the real one.
+            let attributed = crate::attribution::current().unwrap_or_default();
+            let last_target = crate::request_metrics::LastTarget::new(&snapshot, &attributed);
+            crate::request_metrics::record(
+                &state,
+                "/v1/chat/completions",
+                crate::request_metrics::Caller::new(&auth),
+                last_target.upstream(
+                    metric_model.as_ref(),
+                    req.is_streaming(),
+                    routing.fallback_count() > 0,
+                ),
                 status,
-                outcome: RequestOutcome::from_status(status),
-            };
-            state.metrics.record_proxy_request(fail_labels, elapsed);
-            state.metrics.record_llm_request(fail_labels, elapsed);
+                elapsed,
+            );
             state.metrics.record_request_e2e_latency(
                 LatencyLabels {
                     endpoint: "/v1/chat/completions",
-                    model: metric_model,
-                    provider: "unknown",
+                    model: metric_model.as_ref(),
+                    provider: last_target.provider(),
                     status,
                     streaming: req.is_streaming(),
                 },
@@ -428,6 +436,7 @@ pub async fn chat_completions(
                 al_completion,
                 al_total,
                 &request_id,
+                None,
                 &routing,
                 Some(&err),
             );
@@ -450,7 +459,8 @@ pub async fn chat_completions(
                 None
             } else {
                 content_capture_cap(
-                    snap.observability_exporters
+                    snapshot
+                        .observability_exporters
                         .entries()
                         .iter()
                         .map(|e| &e.value),
@@ -476,6 +486,7 @@ pub async fn chat_completions(
             // reports which guardrails governed it.
             emit_failed_attempts(
                 &state,
+                &snapshot,
                 &request_id,
                 &model_name,
                 &api_key_id,
@@ -506,8 +517,11 @@ pub async fn chat_completions(
                     let winner_latency = winner
                         .map(|w| Duration::from_millis(u64::from(w.latency_ms)))
                         .unwrap_or(elapsed);
+                    let pk = crate::usage_attr::ResolvedPk::resolve(&snapshot, &c.provider_key_id);
                     emit_usage_event(
                         &state,
+                        &snapshot,
+                        &pk,
                         &request_id,
                         event_model_id,
                         &model_name,
@@ -527,6 +541,10 @@ pub async fn chat_completions(
                             finish_reason: c.finish_reason,
                             bypass_reason: c.bypass_reason,
                             cache_status: c.cache_status.as_str().to_string(),
+                            // Output-blocked responses were upstream-served,
+                            // never cache hits — no layer / similarity.
+                            cache_hit_layer: String::new(),
+                            cache_similarity: None,
                             cache_hit_saved_input_tokens: 0,
                             cache_hit_saved_output_tokens: 0,
                             upstream_ttft_ms: 0,
@@ -541,7 +559,6 @@ pub async fn chat_completions(
                             // The chain governed the request even though it
                             // ultimately blocked on the output filter.
                             applied_guardrails: applied_guardrails.clone(),
-                            provider_key_id: c.provider_key_id,
                             // Input-side masking happened before the output
                             // block — the audit trail keeps it.
                             redacted_entity_counts: redaction_counts.clone(),
@@ -556,6 +573,8 @@ pub async fn chat_completions(
                 None if routing.attempts.is_empty() => {
                     emit_usage_event(
                         &state,
+                        &snapshot,
+                        &crate::usage_attr::ResolvedPk::unresolved(),
                         &request_id,
                         model_id_str,
                         &model_name,
@@ -645,6 +664,12 @@ struct Success {
     /// the dashboard's /logs column. See `aisix-core::CachePolicy`
     /// (Stage 2) and `aisix-cache::Cache` for the source of truth.
     cache_status: CacheStatus,
+    /// On a cache hit, the matching layer that served it. `None` on
+    /// every other outcome. Lands on `usage_events.cache_hit_layer`.
+    cache_hit_layer: Option<CacheHitLayer>,
+    /// On a semantic cache hit, the request↔entry cosine similarity.
+    /// `None` otherwise. Lands on `usage_events.cache_similarity`.
+    cache_similarity: Option<f32>,
     /// True when telemetry emission is wired into the SSE stream's
     /// on_complete callback (streaming path). The top-level handler
     /// must NOT call `emit_usage_event` again — that would emit one
@@ -705,6 +730,10 @@ pub(crate) enum CacheStatus {
     /// Cache consulted, entry returned without an upstream call. Maps
     /// to `x-aisix-cache: hit` on the response header.
     Hit,
+    /// The gate was open but the caller sent `Cache-Control: no-cache`,
+    /// so the read path was skipped and the upstream served the
+    /// request. Maps to `x-aisix-cache: bypass` on the response header.
+    Bypass,
 }
 
 impl CacheStatus {
@@ -714,6 +743,216 @@ impl CacheStatus {
             CacheStatus::Disabled => "disabled",
             CacheStatus::Miss => "miss",
             CacheStatus::Hit => "hit",
+            CacheStatus::Bypass => "bypass",
+        }
+    }
+}
+
+/// Which matching layer served a cache hit. Surfaced on the
+/// [`CACHE_LAYER_HEADER`] response header and the usage event's
+/// `cache_hit_layer` field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CacheHitLayer {
+    /// The exact-fingerprint (L1) layer: a byte-identical request.
+    Exact,
+    /// The embedding-similarity (L2) layer: a semantically similar
+    /// request cleared the policy's threshold.
+    Semantic,
+}
+
+impl CacheHitLayer {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            CacheHitLayer::Exact => "exact",
+            CacheHitLayer::Semantic => "semantic",
+        }
+    }
+}
+
+/// Request-side `Cache-Control` directives the gate honors (per-request
+/// bypass): `no-cache` skips the read path but still stores the fresh
+/// response; `no-store` suppresses the write. Anything else in the
+/// header is ignored.
+#[derive(Debug, Clone, Copy, Default)]
+struct CacheControlDirectives {
+    no_cache: bool,
+    no_store: bool,
+}
+
+fn cache_control_directives(headers: &axum::http::HeaderMap) -> CacheControlDirectives {
+    let mut out = CacheControlDirectives::default();
+    for value in headers.get_all(axum::http::header::CACHE_CONTROL) {
+        let Ok(s) = value.to_str() else { continue };
+        for token in s.split(',') {
+            // Token match only — RFC 9111 request directives we honor
+            // carry no arguments, and an argument form (`no-cache=...`)
+            // deliberately does NOT match rather than over-matching.
+            let token = token.trim();
+            if token.eq_ignore_ascii_case("no-cache") {
+                out.no_cache = true;
+            } else if token.eq_ignore_ascii_case("no-store") {
+                out.no_store = true;
+            }
+        }
+    }
+    out
+}
+
+/// Everything the semantic (L2) layer needs for this request, resolved
+/// once at the gate: the store for the policy's backend, the policy's
+/// semantic config, the resolved embedding model, the candidate
+/// partition, and the canonical request text to embed. Built only when
+/// the matched policy configures semantic matching, the embedding model
+/// resolves, AND the request is embeddable — `None` runs the policy
+/// exact-only.
+struct SemanticGateCtx {
+    store: Arc<dyn SemanticCacheStore>,
+    cfg: SemanticCacheConfig,
+    /// Resolved at gate time so the partition can carry the embedding
+    /// model's identity, and so a dangling reference is one metric'd
+    /// warn instead of a per-lookup surprise.
+    embed_entry: Arc<aisix_core::ResourceEntry<aisix_core::Model>>,
+    policy_id: String,
+    policy_name: String,
+    generation: u32,
+    /// Candidate partition: the request scope fingerprint PLUS the
+    /// embedding model's resource id + dimensions. Vectors from two
+    /// different embedding models live in unrelated spaces — cosine
+    /// across them is meaningless — so swapping a policy's
+    /// `embedding_model` (even at equal dimensions) must orphan the old
+    /// entries rather than compare against them.
+    scope_fp: String,
+    text: String,
+}
+
+/// Embed the request text for the cache's semantic layer. `None` on any
+/// failure — the cache is an optimization layer, so a broken embedding
+/// path degrades to an ordinary miss instead of failing the request.
+async fn cache_semantic_embed(
+    state: &ProxyState,
+    snapshot: &AisixSnapshot,
+    sem: &SemanticGateCtx,
+    request_id: &str,
+) -> Option<Vec<f32>> {
+    let started = Instant::now();
+    let texts = [sem.text.clone()];
+    // Same deadline chain as the semantic router's embed call: the
+    // policy knob wins, then the embedding model's own `timeout`, then
+    // the deployment default — a hung embedding upstream must not stall
+    // the cache gate unbounded either.
+    let embed_deadline = sem.cfg.embedding_timeout().or_else(|| {
+        crate::routing::effective_timeouts(&sem.embed_entry.value, None, state.default_timeouts)
+            .request
+    });
+    match crate::semantic::embed_texts(
+        state,
+        snapshot,
+        &sem.embed_entry,
+        embed_deadline,
+        request_id,
+        &texts,
+    )
+    .await
+    {
+        Ok(vectors) => {
+            state
+                .metrics
+                .record_cache_semantic_embed(&sem.policy_name, started.elapsed());
+            vectors.into_iter().next()
+        }
+        Err(err) => {
+            tracing::warn!(
+                target: "aisix::cache",
+                policy_name = %sem.policy_name,
+                error = %err,
+                "cache semantic embedding call failed; request proceeds uncached",
+            );
+            state
+                .metrics
+                .record_cache_semantic_embed_failure(&sem.policy_name, "embed");
+            None
+        }
+    }
+}
+
+/// Read path of the cache gate: exact (L1) lookup first, then — on an
+/// exact miss, when the policy configures it — the semantic (L2)
+/// similarity lookup. A semantic hit backfills the exact layer so the
+/// same wording takes the cheap L1 path next time.
+///
+/// `semantic_embedding` hands the L2 request embedding back to the
+/// caller on a miss, so the post-upstream write reuses it instead of
+/// paying a second embedding call.
+#[allow(clippy::too_many_arguments)]
+async fn resolve_cache_hit(
+    state: &ProxyState,
+    snapshot: &AisixSnapshot,
+    cache: &Arc<dyn Cache>,
+    key: &str,
+    ttl: Option<Duration>,
+    semantic_gate: Option<&SemanticGateCtx>,
+    request_id: &str,
+    semantic_embedding: &mut Option<Vec<f32>>,
+) -> Option<(ChatResponse, CacheHitLayer, Option<f32>)> {
+    match cache.get(key).await {
+        Ok(Some(cached)) => return Some((cached, CacheHitLayer::Exact, None)),
+        Ok(None) => {}
+        Err(err) => {
+            tracing::warn!(error = %err, key = %key, "cache lookup failed");
+        }
+    }
+    let sem = semantic_gate?;
+    let vector = cache_semantic_embed(state, snapshot, sem, request_id).await?;
+    match sem
+        .store
+        .lookup(
+            &sem.policy_id,
+            sem.generation,
+            &sem.scope_fp,
+            &vector,
+            sem.cfg.threshold,
+        )
+        .await
+    {
+        Ok(Some(hit)) => {
+            // Backfill TTL is capped at the matched entry's own
+            // remaining lifetime: a paraphrase near expiry must not
+            // grant the stored response a fresh full TTL, or repeated
+            // paraphrases could keep stale data alive indefinitely.
+            let remaining = hit
+                .expires_at
+                .saturating_duration_since(std::time::Instant::now());
+            let backfill_ttl = ttl.map(|t| t.min(remaining)).unwrap_or(remaining);
+            if !backfill_ttl.is_zero() {
+                if let Err(err) = cache
+                    .put_with_ttl(key, hit.response.clone(), backfill_ttl)
+                    .await
+                {
+                    tracing::warn!(error = %err, key = %key, "cache backfill write failed");
+                }
+            }
+            // 4-dp similarity everywhere it surfaces (header, usage
+            // event) so the stored value matches what callers see.
+            let similarity = (hit.similarity * 10_000.0).round() / 10_000.0;
+            Some((hit.response, CacheHitLayer::Semantic, Some(similarity)))
+        }
+        Ok(None) => {
+            *semantic_embedding = Some(vector);
+            None
+        }
+        Err(err) => {
+            tracing::warn!(
+                target: "aisix::cache",
+                policy_name = %sem.policy_name,
+                error = %err,
+                "semantic cache lookup failed",
+            );
+            state
+                .metrics
+                .record_cache_semantic_store_failure(&sem.policy_name, "lookup");
+            // The embedding is still good — keep it for the write path.
+            *semantic_embedding = Some(vector);
+            None
         }
     }
 }
@@ -922,6 +1161,7 @@ struct UpstreamCharge {
 #[allow(clippy::too_many_arguments)]
 async fn dispatch(
     state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
     auth: &AuthenticatedKey,
     // `&mut` so mask-action PII guardrails (#932) can rewrite the request
     // text in place before it reaches semantic routing, the cache key, or
@@ -954,7 +1194,6 @@ async fn dispatch(
         ));
     }
 
-    let snapshot = state.snapshot.load();
     // Largest content cap any enabled content-capturing exporter wants, or
     // `None` when none do — computed once so each response path (cache hit /
     // upstream) only captures when an exporter actually consumes it.
@@ -966,7 +1205,7 @@ async fn dispatch(
             .map(|e| &e.value),
     );
     let virtual_entry =
-        crate::model_resolve::resolve_model(&snapshot, &req.model).ok_or_else(|| {
+        crate::model_resolve::resolve_model(snapshot, &req.model).ok_or_else(|| {
             DispatchFailure::new(None, None, ProxyError::ModelNotFound(req.model.clone()))
         })?;
     let model_id = virtual_entry.id.clone();
@@ -994,7 +1233,9 @@ async fn dispatch(
     // check below, the output check later, and the streaming output
     // guardrail context.
     let guardrail_ctx = aisix_guardrails::RequestContext {
+        passthrough_route_id: "",
         model_id: &model_id,
+        mcp_server_id: "",
         api_key_id: &auth.entry.id,
         team_id: auth.key().team_id.as_deref(),
     };
@@ -1105,14 +1346,21 @@ async fn dispatch(
     let (attempt_models, semantic_route): (Vec<AttemptModel>, Option<String>) =
         if virtual_entry.value.is_semantic() {
             let prompt = last_user_message_text(req).unwrap_or_default();
-            crate::semantic::resolve(state, &snapshot, &virtual_entry, &prompt, request_id)
-                .await
-                .map_err(&with_model)?
+            crate::semantic::resolve(
+                state,
+                snapshot,
+                &virtual_entry,
+                &prompt,
+                &client.source_ip,
+                request_id,
+            )
+            .await
+            .map_err(&with_model)?
         } else {
             let attempts = resolve_attempt_models(
                 &state.routing,
                 &state.runtime_status,
-                &snapshot,
+                snapshot,
                 &req.model,
                 &virtual_entry.id,
                 &virtual_entry.value,
@@ -1146,8 +1394,7 @@ async fn dispatch(
         // Pre-flight the PK-based two-tier dispatch so a missing
         // family/specialized bridge surfaces as 503 here, before
         // we commit to a long upstream call.
-        let pk_entry =
-            crate::dispatch::resolve_provider_key(&snapshot, only).map_err(with_model)?;
+        let pk_entry = crate::dispatch::resolve_provider_key(snapshot, only).map_err(with_model)?;
         if crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value).is_none() {
             return Err(with_model(ProxyError::ProviderUnavailable));
         }
@@ -1161,7 +1408,7 @@ async fn dispatch(
         &virtual_entry.id,
         &virtual_entry.value,
     );
-    let mut reservation = crate::quota::enforce_rate_limit(state, auth, Some(&model_rl))
+    let mut reservation = crate::quota::enforce_rate_limit(state, snapshot, auth, Some(&model_rl))
         .await
         .map_err(&with_model)?;
 
@@ -1177,7 +1424,8 @@ async fn dispatch(
     if virtual_entry.value.is_ensemble() {
         return dispatch_ensemble(
             state,
-            &snapshot,
+            auth,
+            snapshot,
             &virtual_entry,
             req,
             request_id,
@@ -1220,8 +1468,13 @@ async fn dispatch(
             .unwrap_or(&[]);
         let is_routing_request =
             virtual_entry.value.routing.is_some() || virtual_entry.value.is_semantic();
-        let mut stream_routing = RoutingTelemetry::default();
+        let mut stream_routing = RoutingTelemetry::for_request(&virtual_entry.value.display_name);
         let mut last_err: Option<BridgeError> = None;
+        // The un-flattened per-target quota rejection, kept only while it
+        // is the loop's LATEST failure: on exhaustion it is surfaced
+        // instead of its flattened BridgeError twin so the 429 keeps the
+        // structured `error.policy` attribution (AISIX-Cloud#892).
+        let mut last_reserve_reject: Option<ProxyError> = None;
 
         struct StreamWin {
             model: aisix_core::Model,
@@ -1250,16 +1503,19 @@ async fn dispatch(
         'targets: for (target_idx, attempt) in attempt_models.iter().enumerate() {
             let model = &attempt.model;
             let Ok(provider) = crate::dispatch::require_provider(model) else {
+                last_reserve_reject = None;
                 last_err = Some(BridgeError::Config("model has no provider".into()));
                 continue 'targets;
             };
-            let Ok(pk_entry) = crate::dispatch::resolve_provider_key(&snapshot, model) else {
+            let Ok(pk_entry) = crate::dispatch::resolve_provider_key(snapshot, model) else {
+                last_reserve_reject = None;
                 last_err = Some(BridgeError::Config(
                     "model references unknown provider_key_id".into(),
                 ));
                 continue 'targets;
             };
             let Some(bridge) = crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value) else {
+                last_reserve_reject = None;
                 last_err = Some(BridgeError::Config(
                     "no bridge registered for provider_key".into(),
                 ));
@@ -1277,14 +1533,20 @@ async fn dispatch(
                 Arc::new(pk_entry.value.clone()),
                 Some(client),
             );
-            if let Some(d) = model.stream_timeout_effective() {
+            // Effective streaming budget, resolved target → group →
+            // `upstream.stream_timeout_ms`/`timeout_ms`. Used for the
+            // connect deadline (above) AND the per-chunk read timeout +
+            // first-chunk peek below, so the budget is applied
+            // consistently.
+            let timeouts = crate::routing::effective_timeouts(
+                model,
+                Some(&virtual_entry.value),
+                state.default_timeouts,
+            );
+            let stream_budget = timeouts.stream;
+            if let Some(d) = stream_budget {
                 ctx = ctx.with_deadline(d);
             }
-            // Effective streaming budget: `stream_timeout`, falling back to
-            // `timeout`. Used for the connect deadline (above) AND the
-            // per-chunk read timeout + first-chunk peek below, so the budget
-            // is applied consistently.
-            let stream_budget = model.stream_timeout_effective();
 
             // How many times to re-hit the SAME target (with backoff) on a
             // retryable failure before failing over to the next one.
@@ -1296,7 +1558,7 @@ async fn dispatch(
             // existed on the group.
             let budget = crate::routing::effective_retries(
                 model,
-                virtual_entry.value.routing.as_ref(),
+                crate::routing::group_retries_of(&virtual_entry.value),
                 state.default_retries,
                 target_idx + 1 < attempt_models.len(),
             );
@@ -1315,27 +1577,39 @@ async fn dispatch(
                 // reset mid-loop).
                 let member_reservation = match crate::quota::reserve_routing_target(
                     state,
-                    is_routing_request,
+                    snapshot,
+                    auth,
+                    is_routing_request.then_some(crate::quota::RoutingParent {
+                        name: &virtual_entry.value.display_name,
+                        entry_id: &virtual_entry.id,
+                    }),
                     &model.display_name,
                     &attempt.id,
                     model,
                 )
                 .await
                 {
-                    Ok(r) => r,
+                    Ok(r) => {
+                        last_reserve_reject = None;
+                        r
+                    }
                     Err(e) => {
-                        stream_routing.attempts.push(AttemptRecord {
-                            index: idx,
-                            kind,
-                            target_model,
-                            target_model_id: attempt.id.clone(),
-                            provider_key_id: pk_entry.id.clone(),
-                            status: 429,
-                            success: false,
-                            error_class: "rate_limit_exceeded".to_string(),
-                            error_message: e.to_string(),
-                            latency_ms: 0,
-                        });
+                        stream_routing.record(
+                            state,
+                            AttemptRecord {
+                                index: idx,
+                                kind,
+                                target_model,
+                                target_model_id: attempt.id.clone(),
+                                provider_key_id: pk_entry.id.clone(),
+                                status: 429,
+                                success: false,
+                                error_class: "rate_limit_exceeded".to_string(),
+                                error_message: e.to_string(),
+                                latency_ms: 0,
+                                dispatched: false,
+                            },
+                        );
                         // Keep the limiter's own Retry-After hint on the wire:
                         // when every target is exhausted this error becomes the
                         // client's 429, and SDKs back off on that header.
@@ -1347,23 +1621,30 @@ async fn dispatch(
                             ),
                             crate::quota::retry_after_of(&e).map(Duration::from_secs),
                         ));
+                        // Only the policy-layer rejection is worth
+                        // surfacing un-flattened (it carries the
+                        // `error.policy` attribution); the inline model
+                        // layer keeps the established flattened shape.
+                        last_reserve_reject =
+                            matches!(e, ProxyError::PolicyRateLimit { .. }).then_some(e);
                         continue 'targets;
                     }
                 };
                 let attempt_started = Instant::now();
-                // Connect, then — only when a streaming budget is configured —
-                // peek the first chunk so a slow or erroring first token fails
-                // over before the 200 is committed. Without a budget there is
-                // nothing to gate on, so the stream is committed directly (a
-                // first-chunk error then surfaces in-band, exactly like the
-                // pre-#554 behavior). The read-timeout wrapper is a no-op when
-                // the budget is None.
+                // Connect, then — only when a streaming budget is configured
+                // ON THE RESOURCES — peek the first chunk so a slow or
+                // erroring first token fails over before the 200 is
+                // committed. The deployment-default budget does not peek
+                // (see `TimeoutBudget::stream_configured`): it stays a read
+                // timeout, so the 200 commits directly and the SSE
+                // heartbeats cover the wait for the first token. The
+                // read-timeout wrapper is a no-op when the budget is None.
                 let attempt_stream: Result<aisix_gateway::ChatChunkStream, BridgeError> =
                     match bridge.chat_stream(req, &ctx).await {
                         Err(e) => Err(e),
                         Ok(up) => {
                             let up = crate::stream_timeout::with_read_timeout(up, stream_budget);
-                            if stream_budget.is_some() {
+                            if timeouts.stream_configured {
                                 let mut up = up;
                                 match up.next().await {
                                     // Re-prepend the peeked chunk so the SSE pump
@@ -1397,18 +1678,22 @@ async fn dispatch(
                         // time-to-first-response (upstream stream established) —
                         // the routing-relevant latency signal.
                         state.runtime_status.record_latency(&attempt.id, latency_ms);
-                        stream_routing.attempts.push(AttemptRecord {
-                            index: idx,
-                            kind,
-                            target_model,
-                            target_model_id: attempt.id.clone(),
-                            provider_key_id: pk_entry.id.clone(),
-                            status: 200,
-                            success: true,
-                            error_class: String::new(),
-                            error_message: String::new(),
-                            latency_ms,
-                        });
+                        stream_routing.record(
+                            state,
+                            AttemptRecord {
+                                index: idx,
+                                kind,
+                                target_model,
+                                target_model_id: attempt.id.clone(),
+                                provider_key_id: pk_entry.id.clone(),
+                                status: 200,
+                                success: true,
+                                error_class: String::new(),
+                                error_message: String::new(),
+                                latency_ms,
+                                dispatched: true,
+                            },
+                        );
                         won = Some(StreamWin {
                             model: model.clone(),
                             target_id: attempt.id.clone(),
@@ -1423,18 +1708,22 @@ async fn dispatch(
                         break 'targets;
                     }
                     Err(err) => {
-                        stream_routing.attempts.push(AttemptRecord {
-                            index: idx,
-                            kind,
-                            target_model,
-                            target_model_id: attempt.id.clone(),
-                            provider_key_id: pk_entry.id.clone(),
-                            status: err.http_status(),
-                            success: false,
-                            error_class: routing_error_class(&err).to_string(),
-                            error_message: attempt_error_message(&err),
-                            latency_ms,
-                        });
+                        stream_routing.record(
+                            state,
+                            AttemptRecord {
+                                index: idx,
+                                kind,
+                                target_model,
+                                target_model_id: attempt.id.clone(),
+                                provider_key_id: pk_entry.id.clone(),
+                                status: err.http_status(),
+                                success: false,
+                                error_class: routing_error_class(&err).to_string(),
+                                error_message: attempt_error_message(&err),
+                                latency_ms,
+                                dispatched: err.reached_upstream(),
+                            },
+                        );
                         let retryable = is_retryable(&err, retry_on_429, fallback_statuses);
                         tracing::warn!(
                             target_model = %model.display_name,
@@ -1456,6 +1745,7 @@ async fn dispatch(
                         // timeout — see `RetryBudget::covers`. Fail-over is
                         // unaffected: the outer loop still moves on.
                         let budget_covers = budget.covers(&err);
+                        last_reserve_reject = None;
                         last_err = Some(err);
                         if !retryable {
                             break 'targets;
@@ -1482,6 +1772,13 @@ async fn dispatch(
         }
 
         let Some(won) = won else {
+            // When the loop's LAST failure was a per-target quota
+            // rejection, surface the un-flattened ProxyError: same 429 +
+            // Retry-After as the BridgeError twin, plus the structured
+            // `error.policy` attribution (AISIX-Cloud#892).
+            if let Some(e) = last_reserve_reject {
+                return Err(with_model(e).with_routing(stream_routing));
+            }
             let err = last_err.unwrap_or_else(|| {
                 BridgeError::Config("streaming routing exhausted with no targets".into())
             });
@@ -1542,14 +1839,19 @@ async fn dispatch(
         let user_id_for_metrics = auth.key().user_id.clone();
         let provider_for_metrics = provider.to_ascii_lowercase();
         let model_for_metrics = req.model.clone();
-        let provider_key_id_for_metrics = pk_id.clone();
-        // #890 req-3/req-4: readable provider-key name + normalised inbound
-        // client type, captured for the streaming on_complete metric emission
-        // (mirrors the non-streaming `record_success` path).
-        let provider_key_name_for_metrics = {
-            let snap = state.snapshot.load();
-            crate::usage_attr::provider_key_metric_name(&snap, &pk_id)
+        // Latency histograms label with the BOUNDED model (emit-chokepoint
+        // rule): a wildcard-served alias must not mint per-suffix series.
+        let (bounded_model_for_metrics, bounded_upstream_for_metrics) = {
+            let (m, u) = crate::usage_attr::metric_model_label_pair(
+                snapshot,
+                &req.model,
+                model.upstream_model().unwrap_or("unknown"),
+            );
+            (m.into_owned(), u.into_owned())
         };
+        // #890 req-4: normalised inbound client type, captured for the
+        // streaming on_complete metric emission (mirrors the non-streaming
+        // `record_success` path).
         let user_name_for_metrics = auth.key().user_name.clone();
         let client_type_for_metrics = state
             .client_classifier
@@ -1643,17 +1945,35 @@ async fn dispatch(
                 for key in &post_stream_keys {
                     limiter.add_tokens_post_stream(key, comp.total_tokens);
                 }
+                // A stream can outlive several config generations, so the
+                // terminal emits read a FRESH snapshot rather than the one
+                // the request started on (#941) — one load and one
+                // ProviderKey lookup for the usage event, `record_usage`
+                // and the TTFT labels below, which each used to do their
+                // own.
+                let snap = state_for_telem.snapshot.load();
+                let pk = crate::usage_attr::ResolvedPk::resolve(&snap, &provider_key_id_for_telem);
                 // Telemetry: emit with the actual upstream-reported counts.
                 // cost_usd stays 0.0; cp-api recomputes server-side from
                 // its model_pricing catalog (same pattern as the non-
                 // streaming path's cost_usd handling).
                 emit_usage_event(
                     &state_for_telem,
+                    &snap,
+                    &pk,
                     &request_id_for_telem,
                     &model_id_for_telem,
                     &model_for_metrics,
                     &api_key_id_for_telem,
-                    /* status_code */ 200,
+                    // A stream the consumer abandoned mid-flight is reported
+                    // as 499, matching what LiteLLM records for the same
+                    // event. The upstream work still happened, so the event
+                    // is emitted either way — only its outcome differs.
+                    if comp.reached_end {
+                        200
+                    } else {
+                        crate::CLIENT_CLOSED_REQUEST
+                    },
                     // Scoped to the winning attempt, not the request: the
                     // failed attempts before it emit their own events and
                     // `started` would double-count them (plus the pre-dispatch
@@ -1689,6 +2009,8 @@ async fn dispatch(
                         // local at that point. Tracking issue to be filed
                         // alongside the streaming-cache implementation.
                         cache_status: CacheStatus::Disabled.as_str().to_string(),
+                        cache_hit_layer: String::new(),
+                        cache_similarity: None,
                         cache_hit_saved_input_tokens: 0,
                         cache_hit_saved_output_tokens: 0,
                         upstream_ttft_ms: comp.upstream_ttft_ms,
@@ -1701,7 +2023,6 @@ async fn dispatch(
                         error_class: String::new(),
                         error_message: String::new(),
                         applied_guardrails: applied_guardrails_for_telem.clone(),
-                        provider_key_id: provider_key_id_for_telem.clone(),
                         redacted_entity_counts: {
                             let mut merged = input_redactions_for_telem.clone();
                             crate::redact::merge_counts(&mut merged, comp.redacted_entity_counts);
@@ -1727,44 +2048,41 @@ async fn dispatch(
                         _ => None,
                     },
                 );
-                metrics_for_stream.record_llm_usage(
-                    UsageLabels {
-                        endpoint: "/v1/chat/completions",
-                        inbound_protocol: "openai",
-                        provider: &provider_for_metrics,
-                        model: &model_for_metrics,
-                        upstream_model: &upstream_model_for_metrics,
-                        provider_key_id: &provider_key_id_for_metrics,
-                        provider_key_name: &provider_key_name_for_metrics,
+                // #1002: comp.total_tokens is the cache-inclusive total (an
+                // Anthropic upstream bridged to an OpenAI-shape client folds
+                // cache tokens into total_tokens per #679).
+                crate::request_metrics::record_usage(
+                    &state_for_telem,
+                    "/v1/chat/completions",
+                    crate::request_metrics::Caller {
                         api_key_id: &api_key_id_for_telem,
                         team_id: team_id_for_metrics.as_deref().unwrap_or("unknown"),
                         user_id: user_id_for_metrics.as_deref().unwrap_or("unknown"),
                         user_name: user_name_for_metrics.as_deref().unwrap_or("unknown"),
                     },
-                    LlmUsage {
-                        input_tokens: comp.prompt_tokens,
-                        output_tokens: comp.completion_tokens,
-                        total_tokens: comp.total_tokens.min(u64::from(u32::MAX)) as u32,
-                        spend_usd: 0.0,
+                    crate::request_metrics::Upstream {
+                        provider: &provider_for_metrics,
+                        model: &model_for_metrics,
+                        upstream_model: &bounded_upstream_for_metrics,
+                        pk: pk.labels(),
+                        stream: true,
+                        // The serving target is fixed once the stream
+                        // commits, so fallback attribution is the
+                        // pre-stream winner's attempt kind.
+                        is_fallback: winner_kind == "fallback",
                     },
-                );
-                // #890 req-4: streaming token volume by inbound client type.
-                // #1002: comp.total_tokens is the cache-inclusive total (an
-                // Anthropic upstream bridged to an OpenAI-shape client folds
-                // cache tokens into total_tokens per #679).
-                // AISIX-Cloud#1044: same requested logical model as the
-                // UsageLabels above.
-                metrics_for_stream.record_llm_tokens_by_client(
-                    &client_type_for_metrics,
-                    &model_for_metrics,
-                    u64::from(comp.prompt_tokens),
-                    u64::from(comp.completion_tokens),
-                    comp.total_tokens,
+                    crate::request_metrics::Tokens {
+                        input: comp.prompt_tokens,
+                        output: comp.completion_tokens,
+                        total: comp.total_tokens.min(u64::from(u32::MAX)) as u32,
+                        spend_usd: 0.0,
+                        client_type: &client_type_for_metrics,
+                    },
                 );
                 metrics_for_stream.record_request_e2e_latency(
                     LatencyLabels {
                         endpoint: "/v1/chat/completions",
-                        model: &model_for_metrics,
+                        model: &bounded_model_for_metrics,
                         provider: &provider_for_metrics,
                         status: 200,
                         streaming: true,
@@ -1774,7 +2092,7 @@ async fn dispatch(
                 metrics_for_stream.record_request_ttft(
                     LatencyLabels {
                         endpoint: "/v1/chat/completions",
-                        model: &model_for_metrics,
+                        model: &bounded_model_for_metrics,
                         provider: &provider_for_metrics,
                         status: 200,
                         streaming: true,
@@ -1786,10 +2104,10 @@ async fn dispatch(
                         endpoint: "/v1/chat/completions",
                         inbound_protocol: "openai",
                         provider: &provider_for_metrics,
-                        model: &model_for_metrics,
-                        upstream_model: &upstream_model_for_metrics,
-                        provider_key_id: &provider_key_id_for_metrics,
-                        provider_key_name: &provider_key_name_for_metrics,
+                        model: &bounded_model_for_metrics,
+                        upstream_model: &bounded_upstream_for_metrics,
+                        provider_key_id: pk.labels().id(),
+                        provider_key_name: pk.labels().name(),
                         api_key_id: &api_key_id_for_telem,
                         team_id: team_id_for_metrics.as_deref().unwrap_or("unknown"),
                         user_id: user_id_for_metrics.as_deref().unwrap_or("unknown"),
@@ -1837,6 +2155,8 @@ async fn dispatch(
             // crates/aisix-cache/src/lib.rs. Always surface as
             // `disabled` on the streaming path.
             cache_status: CacheStatus::Disabled,
+            cache_hit_layer: None,
+            cache_similarity: None,
             cache_hit_saved_input_tokens: 0,
             cache_hit_saved_output_tokens: 0,
             telemetry_handled_by_stream: true,
@@ -1904,21 +2224,135 @@ async fn dispatch(
         .and(matched_policy.as_ref())
         .map(|entry| Duration::from_secs(u64::from(entry.value.ttl_seconds)));
 
+    // Per-request bypass: standard `Cache-Control` request directives.
+    // `no-cache` skips the read path (both layers) but still refreshes
+    // the stored entry on success; `no-store` suppresses the writes.
+    let cc = cache_control_directives(client.headers.as_ref());
+
     // Cache lookup keyed on the *virtual* model name so a re-request
-    // hits the cache regardless of which target served the original.
-    let cache_key = policy_cache
-        .as_ref()
-        .map(|_| CacheKey::from_request(req).fingerprint());
+    // hits the cache regardless of which target served the original,
+    // scoped by the matched policy (id + purge generation) and — under
+    // `scope: api_key` — by the caller, so entries never leak across
+    // policies, purges, or callers.
+    let cache_key_full = match (policy_cache.as_ref(), matched_policy.as_ref()) {
+        (Some(_), Some(entry)) => {
+            let scope_api_key = match entry.value.scope {
+                CacheScope::ApiKey => Some(auth.entry.id.as_str()),
+                CacheScope::Env => None,
+            };
+            Some(CacheKey::from_request(req).with_scope(
+                &entry.id,
+                entry.value.purge_generation,
+                scope_api_key,
+            ))
+        }
+        _ => None,
+    };
+    let cache_key = cache_key_full.as_ref().map(|k| k.fingerprint());
 
     let cache_status = if policy_cache.is_some() {
-        CacheStatus::Miss
+        if cc.no_cache {
+            CacheStatus::Bypass
+        } else {
+            CacheStatus::Miss
+        }
     } else {
         CacheStatus::Disabled
     };
 
+    // Semantic (L2) context — present only when the matched policy
+    // carries a `semantic` block, its backend has a semantic store, and
+    // this request is embeddable (all-text messages). Absent, the
+    // policy runs exact-only.
+    let semantic_gate: Option<SemanticGateCtx> =
+        match (matched_policy.as_ref(), cache_key_full.as_ref()) {
+            (Some(entry), Some(key_full)) => entry.value.semantic.as_ref().and_then(|cfg| {
+                let store = state
+                    .cache
+                    .as_ref()?
+                    .semantic_for_policy_backend(entry.value.backend, &entry.id, &entry.value.name)?
+                    .clone();
+                let text = semantic_prompt_text(req)?;
+                let embed_entry = match snapshot.models.get_by_name(&cfg.embedding_model) {
+                    Some(e) if e.value.is_embedding() => e.clone(),
+                    other => {
+                        // A stable config error, not a per-request one:
+                        // log once per policy, count every request.
+                        if state
+                            .cache
+                            .as_ref()
+                            .is_some_and(|c| c.semantic_resolve_warn_once(&entry.id))
+                        {
+                            tracing::warn!(
+                                target: "aisix::cache",
+                                policy_name = %entry.value.name,
+                                embedding_model = %cfg.embedding_model,
+                                found = other.is_some(),
+                                "cache policy references a missing or non-embedding \
+                                 embedding_model; semantic matching is skipped until \
+                                 the reference resolves",
+                            );
+                        }
+                        state
+                            .metrics
+                            .record_cache_semantic_embed_failure(&entry.value.name, "resolve");
+                        return None;
+                    }
+                };
+                let dims = embed_entry
+                    .value
+                    .embedding
+                    .as_ref()
+                    .map(|e| e.dimensions)
+                    .unwrap_or(0);
+                // Partition = scope fingerprint + embedding model
+                // identity (resource id, upstream model name, and
+                // dimensions — the upstream name catches an in-place
+                // `model_name` edit that keeps id + dims): see the
+                // `SemanticGateCtx::scope_fp` docs.
+                let scope_fp = format!(
+                    "{}:{}:{}:{}",
+                    key_full.scope_fingerprint(),
+                    embed_entry.id,
+                    embed_entry.value.model_name.as_deref().unwrap_or(""),
+                    dims
+                );
+                Some(SemanticGateCtx {
+                    store,
+                    cfg: cfg.clone(),
+                    embed_entry,
+                    policy_id: entry.id.clone(),
+                    policy_name: entry.value.name.clone(),
+                    generation: entry.value.purge_generation,
+                    scope_fp,
+                    text,
+                })
+            }),
+            _ => None,
+        };
+
+    // Handed from the read path (L2 miss) to the write path so a full
+    // miss costs exactly one embedding call.
+    let mut semantic_embedding: Option<Vec<f32>> = None;
+
     if let (Some(cache), Some(key)) = (policy_cache.as_ref(), cache_key.as_ref()) {
-        match cache.get(key).await {
-            Ok(Some(mut cached)) => {
+        let resolved = if cc.no_cache {
+            None
+        } else {
+            resolve_cache_hit(
+                state,
+                snapshot,
+                cache,
+                key,
+                matched_policy_ttl,
+                semantic_gate.as_ref(),
+                request_id,
+                &mut semantic_embedding,
+            )
+            .await
+        };
+        match resolved {
+            Some((mut cached, hit_layer, hit_similarity)) => {
                 reservation.commit_tokens(0).await;
                 // #448: a cache hit is client-visible output just like a
                 // fresh upstream response, so it must run output guardrails
@@ -2047,10 +2481,29 @@ async fn dispatch(
                         cap as usize,
                     )
                 });
+                state.metrics.record_cache_event(
+                    matched_policy
+                        .as_ref()
+                        .map(|e| e.value.name.as_str())
+                        .unwrap_or_default(),
+                    match hit_layer {
+                        CacheHitLayer::Exact => "hit_exact",
+                        CacheHitLayer::Semantic => "hit_semantic",
+                    },
+                );
                 let mut response = Json(render_response(now, cached, &req.model)).into_response();
                 response
                     .headers_mut()
                     .insert(CACHE_HEADER, HeaderValue::from_static("hit"));
+                response.headers_mut().insert(
+                    CACHE_LAYER_HEADER,
+                    HeaderValue::from_static(hit_layer.as_str()),
+                );
+                if let Some(similarity) = hit_similarity {
+                    if let Ok(v) = HeaderValue::try_from(format!("{similarity:.4}")) {
+                        response.headers_mut().insert(CACHE_SIMILARITY_HEADER, v);
+                    }
+                }
                 return Ok(Success {
                     response,
                     provider: provider_label,
@@ -2077,6 +2530,8 @@ async fn dispatch(
                     cost_usd: 0.0,
                     bypass_reason: bypass_reason.clone(),
                     cache_status: CacheStatus::Hit,
+                    cache_hit_layer: Some(hit_layer),
+                    cache_similarity: hit_similarity,
                     // The whole point of #88: cache hit replays the
                     // upstream's prompt + completion tokens. Surfacing
                     // them as a dedicated counter (rather than relying
@@ -2096,9 +2551,17 @@ async fn dispatch(
                     captured_content,
                 });
             }
-            Ok(None) => {}
-            Err(err) => {
-                tracing::warn!(error = %err, key = %key, "cache lookup failed");
+            None => {
+                // Consulted-but-not-served: count the outcome now
+                // (`miss` or `bypass`) so the metric reflects every gate
+                // decision, including requests that later fail upstream.
+                state.metrics.record_cache_event(
+                    matched_policy
+                        .as_ref()
+                        .map(|e| e.value.name.as_str())
+                        .unwrap_or_default(),
+                    cache_status.as_str(),
+                );
             }
         }
     }
@@ -2107,6 +2570,9 @@ async fn dispatch(
     // to later targets only after retries are exhausted. Non-retryable
     // (non-429 4xx) errors stop immediately.
     let mut last_err: Option<BridgeError> = None;
+    // See the streaming loop: latest per-target quota rejection, surfaced
+    // un-flattened on exhaustion for `error.policy` attribution (#892).
+    let mut last_reserve_reject: Option<ProxyError> = None;
     let mut chosen_provider: Option<String> = None;
     let mut chosen_provider_key_id: Option<String> = None;
     let mut chosen_upstream_model: Option<String> = None;
@@ -2129,7 +2595,7 @@ async fn dispatch(
         .unwrap_or(&[]);
     let is_routing_request =
         virtual_entry.value.routing.is_some() || virtual_entry.value.is_semantic();
-    let mut routing = RoutingTelemetry::default();
+    let mut routing = RoutingTelemetry::for_request(&virtual_entry.value.display_name);
     // The winning target's own model-layer reservation (routing dispatch
     // only) — folded into `reservation` at the commit point below so the
     // member's TPM/TPD bills with the request-level layers
@@ -2139,12 +2605,14 @@ async fn dispatch(
     'targets: for (target_idx, attempt) in attempt_models.iter().enumerate() {
         let model = &attempt.model;
         let Some(provider) = model.provider.as_deref() else {
+            last_reserve_reject = None;
             last_err = Some(BridgeError::Config("model has no provider".into()));
             continue;
         };
-        let pk_entry = match crate::dispatch::resolve_provider_key(&snapshot, model) {
+        let pk_entry = match crate::dispatch::resolve_provider_key(snapshot, model) {
             Ok(pk) => pk,
             Err(_) => {
+                last_reserve_reject = None;
                 last_err = Some(BridgeError::Config(
                     "model references unknown provider_key_id".into(),
                 ));
@@ -2157,6 +2625,7 @@ async fn dispatch(
         // is gone after #302 Phase A; a PK that matches neither tier is
         // a misconfiguration and surfaces as 503.
         let Some(bridge) = crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value) else {
+            last_reserve_reject = None;
             last_err = Some(BridgeError::Config(format!(
                 "no bridge registered for provider_key provider={:?} adapter={:?}",
                 pk_entry.value.provider, pk_entry.value.adapter
@@ -2175,13 +2644,19 @@ async fn dispatch(
             Arc::new(pk_entry.value.clone()),
             Some(client),
         );
-        if let Some(d) = model.request_timeout() {
+        if let Some(d) = crate::routing::effective_timeouts(
+            model,
+            Some(&virtual_entry.value),
+            state.default_timeouts,
+        )
+        .request
+        {
             ctx = ctx.with_deadline(d);
         }
         // Per-target retry budget — see the streaming loop above.
         let budget = crate::routing::effective_retries(
             model,
-            virtual_entry.value.routing.as_ref(),
+            crate::routing::group_retries_of(&virtual_entry.value),
             state.default_retries,
             target_idx + 1 < attempt_models.len(),
         );
@@ -2206,27 +2681,39 @@ async fn dispatch(
             // reset mid-loop).
             let member_reservation = match crate::quota::reserve_routing_target(
                 state,
-                is_routing_request,
+                snapshot,
+                auth,
+                is_routing_request.then_some(crate::quota::RoutingParent {
+                    name: &virtual_entry.value.display_name,
+                    entry_id: &virtual_entry.id,
+                }),
                 &model.display_name,
                 &attempt.id,
                 model,
             )
             .await
             {
-                Ok(r) => r,
+                Ok(r) => {
+                    last_reserve_reject = None;
+                    r
+                }
                 Err(e) => {
-                    routing.attempts.push(AttemptRecord {
-                        index: attempt_index,
-                        kind,
-                        target_model,
-                        target_model_id: attempt.id.clone(),
-                        provider_key_id: pk_entry.id.clone(),
-                        status: 429,
-                        success: false,
-                        error_class: "rate_limit_exceeded".to_string(),
-                        error_message: e.to_string(),
-                        latency_ms: 0,
-                    });
+                    routing.record(
+                        state,
+                        AttemptRecord {
+                            index: attempt_index,
+                            kind,
+                            target_model,
+                            target_model_id: attempt.id.clone(),
+                            provider_key_id: pk_entry.id.clone(),
+                            status: 429,
+                            success: false,
+                            error_class: "rate_limit_exceeded".to_string(),
+                            error_message: e.to_string(),
+                            latency_ms: 0,
+                            dispatched: false,
+                        },
+                    );
                     // Keep the limiter's own Retry-After hint on the wire:
                     // when every target is exhausted this error becomes the
                     // client's 429, and SDKs back off on that header.
@@ -2238,6 +2725,12 @@ async fn dispatch(
                         ),
                         crate::quota::retry_after_of(&e).map(Duration::from_secs),
                     ));
+                    // Only the policy-layer rejection is worth surfacing
+                    // un-flattened (it carries the `error.policy`
+                    // attribution); the inline model layer keeps the
+                    // established flattened shape.
+                    last_reserve_reject =
+                        matches!(e, ProxyError::PolicyRateLimit { .. }).then_some(e);
                     continue 'targets;
                 }
             };
@@ -2265,35 +2758,43 @@ async fn dispatch(
                     chosen_upstream_model =
                         Some(model.upstream_model().unwrap_or("unknown").to_string());
                     chosen_target_display_name = Some(model.display_name.clone());
-                    routing.attempts.push(AttemptRecord {
-                        index: attempt_index,
-                        kind,
-                        target_model,
-                        target_model_id: attempt.id.clone(),
-                        provider_key_id: pk_entry.id.clone(),
-                        status: 200,
-                        success: true,
-                        error_class: String::new(),
-                        error_message: String::new(),
-                        latency_ms: attempt_latency_ms,
-                    });
+                    routing.record(
+                        state,
+                        AttemptRecord {
+                            index: attempt_index,
+                            kind,
+                            target_model,
+                            target_model_id: attempt.id.clone(),
+                            provider_key_id: pk_entry.id.clone(),
+                            status: 200,
+                            success: true,
+                            error_class: String::new(),
+                            error_message: String::new(),
+                            latency_ms: attempt_latency_ms,
+                            dispatched: true,
+                        },
+                    );
                     won_member_reservation = member_reservation;
                     upstream = Some(resp);
                     break;
                 }
                 Err(err) => {
-                    routing.attempts.push(AttemptRecord {
-                        index: attempt_index,
-                        kind,
-                        target_model,
-                        target_model_id: attempt.id.clone(),
-                        provider_key_id: pk_entry.id.clone(),
-                        status: err.http_status(),
-                        success: false,
-                        error_class: routing_error_class(&err).to_string(),
-                        error_message: attempt_error_message(&err),
-                        latency_ms: attempt_latency_ms,
-                    });
+                    routing.record(
+                        state,
+                        AttemptRecord {
+                            index: attempt_index,
+                            kind,
+                            target_model,
+                            target_model_id: attempt.id.clone(),
+                            provider_key_id: pk_entry.id.clone(),
+                            status: err.http_status(),
+                            success: false,
+                            error_class: routing_error_class(&err).to_string(),
+                            error_message: attempt_error_message(&err),
+                            latency_ms: attempt_latency_ms,
+                            dispatched: err.reached_upstream(),
+                        },
+                    );
                     let retryable = is_retryable(&err, retry_on_429, fallback_statuses);
                     tracing::warn!(
                         target_model = %model.display_name,
@@ -2320,6 +2821,7 @@ async fn dispatch(
                     // same-target retries for timeouts. Fail-over is
                     // unaffected.
                     let budget_covers = budget.covers(&err);
+                    last_reserve_reject = None;
                     last_err = Some(err);
                     if !retryable {
                         break;
@@ -2355,6 +2857,11 @@ async fn dispatch(
     }
 
     let Some(mut upstream) = upstream else {
+        // Prefer the un-flattened quota rejection when it was the last
+        // failure — keeps `error.policy` attribution (AISIX-Cloud#892).
+        if let Some(e) = last_reserve_reject {
+            return Err(with_model(e).with_routing(routing));
+        }
         // Bubble the most recent BridgeError through ProxyError::Bridge.
         let err = last_err.unwrap_or_else(|| {
             BridgeError::Config("routing exhausted with no targets attempted".into())
@@ -2419,7 +2926,7 @@ async fn dispatch(
     let reasoning_tokens = upstream.usage.reasoning_tokens;
     let cache_creation_tokens = upstream.usage.cache_creation_tokens;
     let cache_read_tokens = upstream.usage.cache_read_tokens;
-    let provider_request_id = upstream.id.clone();
+    let provider_request_id = crate::usage_attr::sanitize_provider_response_id(&upstream.id);
     let provider_model_version = upstream.model.clone();
     let finish_reason = finish_reason_label(&upstream.finish_reason);
     // Fold the winning target's model-layer reservation in so one commit
@@ -2534,13 +3041,53 @@ async fn dispatch(
     // not the cache backend's global fallback. Backends without
     // per-entry support (defined via `Cache::put_with_ttl`'s default
     // impl) silently fall back to `put`.
-    if let (Some(ttl), Some(cache), Some(key)) = (
+    if let (Some(ttl), Some(cache), Some(key), false) = (
         matched_policy_ttl,
         policy_cache.as_ref(),
         cache_key.as_ref(),
+        // `Cache-Control: no-store` suppresses both layers' writes.
+        cc.no_store,
     ) {
         if let Err(err) = cache.put_with_ttl(key, upstream.clone(), ttl).await {
             tracing::warn!(error = %err, key = %key, "cache write failed");
+        }
+        // Semantic (L2) write. Reuses the read path's embedding; when
+        // the read path was bypassed (`no-cache`) compute one now so
+        // the refreshed entry is findable by similarity too. A `None`
+        // without `no-cache` means the read path already tried and
+        // failed to embed this request — don't pay a second doomed call.
+        if let Some(sem) = semantic_gate.as_ref() {
+            let vector = match semantic_embedding.take() {
+                Some(v) => Some(v),
+                None if cc.no_cache => cache_semantic_embed(state, snapshot, sem, request_id).await,
+                None => None,
+            };
+            if let Some(vector) = vector {
+                if let Err(err) = sem
+                    .store
+                    .store(
+                        &sem.policy_id,
+                        sem.generation,
+                        &sem.scope_fp,
+                        key,
+                        vector,
+                        upstream.clone(),
+                        ttl,
+                        sem.cfg.max_entries,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        target: "aisix::cache",
+                        policy_name = %sem.policy_name,
+                        error = %err,
+                        "semantic cache write failed",
+                    );
+                    state
+                        .metrics
+                        .record_cache_semantic_store_failure(&sem.policy_name, "store");
+                }
+            }
         }
     }
 
@@ -2557,13 +3104,22 @@ async fn dispatch(
     });
 
     let mut response = Json(render_response(now, upstream, &req.model)).into_response();
-    if matches!(cache_status, CacheStatus::Miss) {
-        // Miss header only when the cache was actually consulted —
-        // policy-disabled requests have no cache header at all so a
-        // user can tell at a glance whether the gate was open.
-        response
-            .headers_mut()
-            .insert(CACHE_HEADER, HeaderValue::from_static("miss"));
+    // Header only when the gate was open — policy-disabled requests have
+    // no cache header at all so a user can tell at a glance whether the
+    // gate ran. `bypass` = the caller's `Cache-Control: no-cache`
+    // skipped the read path.
+    match cache_status {
+        CacheStatus::Miss => {
+            response
+                .headers_mut()
+                .insert(CACHE_HEADER, HeaderValue::from_static("miss"));
+        }
+        CacheStatus::Bypass => {
+            response
+                .headers_mut()
+                .insert(CACHE_HEADER, HeaderValue::from_static("bypass"));
+        }
+        _ => {}
     }
 
     // Header presence is the wire signal for "routing happened" —
@@ -2595,6 +3151,8 @@ async fn dispatch(
         cost_usd,
         bypass_reason,
         cache_status,
+        cache_hit_layer: None,
+        cache_similarity: None,
         // Cache-saved counters are zero on the upstream-served path —
         // the request *did* hit the upstream, no work was saved.
         cache_hit_saved_input_tokens: 0,
@@ -2624,6 +3182,7 @@ async fn dispatch(
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_ensemble(
     state: &ProxyState,
+    auth: &AuthenticatedKey,
     snapshot: &aisix_core::AisixSnapshot,
     virtual_entry: &aisix_core::ResourceEntry<aisix_core::Model>,
     req: &ChatFormat,
@@ -2720,8 +3279,11 @@ async fn dispatch_ensemble(
                 &member.usage,
                 &member.est_output_text,
             );
+            let pk = crate::usage_attr::ResolvedPk::resolve(snapshot, &sub_provider_key_id);
             emit_usage_event(
                 state,
+                snapshot,
+                &pk,
                 request_id,
                 &sub_model_id,
                 &req.model,
@@ -2742,7 +3304,6 @@ async fn dispatch_ensemble(
                     attempt_kind: "panel".to_string(),
                     attempt_model: member.model.clone(),
                     applied_guardrails: applied_guardrails.to_vec(),
-                    provider_key_id: sub_provider_key_id,
                     ..UsageExtras::default()
                 },
                 /* cost_usd */ 0.0,
@@ -2754,9 +3315,14 @@ async fn dispatch_ensemble(
 
     let caller = crate::ensemble::ProxyModelCaller {
         state,
+        auth,
         snapshot,
         request_id,
         client,
+        routing_parent: crate::quota::RoutingParent {
+            name: &virtual_entry.value.display_name,
+            entry_id: &virtual_entry.id,
+        },
     };
 
     // Streaming ensemble (OPTION A): the panel must be buffered to synthesize,
@@ -2870,7 +3436,9 @@ async fn dispatch_ensemble(
             Arc::new(judge_pk.value.clone()),
             Some(client),
         );
-        if let Some(deadline) = judge_model.request_timeout() {
+        if let Some(deadline) =
+            crate::routing::effective_timeouts(judge_model, None, state.default_timeouts).request
+        {
             judge_ctx = judge_ctx.with_deadline(deadline);
         }
 
@@ -2884,9 +3452,15 @@ async fn dispatch_ensemble(
         // tokens are added post-stream, mirroring the entry reservation below.
         let judge_reservation = match crate::quota::reserve_model_only(
             state,
+            snapshot,
+            auth,
             &ensemble_cfg.judge.model,
             &judge_entry.id,
             judge_model,
+            Some(crate::quota::RoutingParent {
+                name: &virtual_entry.value.display_name,
+                entry_id: &virtual_entry.id,
+            }),
         )
         .await
         {
@@ -2999,6 +3573,8 @@ async fn dispatch_ensemble(
         let state_for_telem = state.clone();
         let request_id_for_telem = request_id.to_string();
         let client_model_for_telem = req.model.clone();
+        let bounded_model_for_telem =
+            crate::usage_attr::metric_model_label(snapshot, &req.model).into_owned();
         let api_key_id_for_telem = api_key_id.to_string();
         let applied_guardrails_for_telem = applied_guardrails.to_vec();
         let client_for_telem = client.clone();
@@ -3052,6 +3628,9 @@ async fn dispatch_ensemble(
                 for key in &judge_post_stream_keys {
                     limiter.add_tokens_post_stream(key, comp.total_tokens);
                 }
+                // Fresh snapshot at stream end, shared by every emit in this
+                // closure (#941) — see the single-model streaming path.
+                let snap = state_for_telem.snapshot.load();
                 // Telemetry: one event per panel member (attempt_kind "panel",
                 // index 0..N) carrying that member's own buffered usage, then
                 // one judge event (attempt_kind "judge", index N) from the
@@ -3071,8 +3650,11 @@ async fn dispatch_ensemble(
                             &member.usage,
                             &member.est_output_text,
                         );
+                    let pk = crate::usage_attr::ResolvedPk::resolve(&snap, &member.provider_key_id);
                     emit_usage_event(
                         &state_for_telem,
+                        &snap,
+                        &pk,
                         &request_id_for_telem,
                         &member.model_id,
                         &client_model_for_telem,
@@ -3093,7 +3675,6 @@ async fn dispatch_ensemble(
                             attempt_kind: "panel".to_string(),
                             attempt_model: member.attempt_model.clone(),
                             applied_guardrails: applied_guardrails_for_telem.clone(),
-                            provider_key_id: member.provider_key_id.clone(),
                             ..UsageExtras::default()
                         },
                         /* cost_usd */ 0.0,
@@ -3102,8 +3683,12 @@ async fn dispatch_ensemble(
                         /* content */ None,
                     );
                 }
+                let judge_pk =
+                    crate::usage_attr::ResolvedPk::resolve(&snap, &judge_provider_key_id);
                 emit_usage_event(
                     &state_for_telem,
+                    &snap,
+                    &judge_pk,
                     &request_id_for_telem,
                     &judge_model_id,
                     &client_model_for_telem,
@@ -3136,7 +3721,6 @@ async fn dispatch_ensemble(
                         attempt_kind: "judge".to_string(),
                         attempt_model: judge_attempt_model.clone(),
                         applied_guardrails: applied_guardrails_for_telem.clone(),
-                        provider_key_id: judge_provider_key_id.clone(),
                         redacted_entity_counts: {
                             let mut merged = input_redactions_for_telem.clone();
                             crate::redact::merge_counts(&mut merged, comp.redacted_entity_counts);
@@ -3160,7 +3744,7 @@ async fn dispatch_ensemble(
                 state_for_telem.metrics.record_request_e2e_latency(
                     LatencyLabels {
                         endpoint: "/v1/chat/completions",
-                        model: &client_model_for_telem,
+                        model: &bounded_model_for_telem,
                         // Matches the legacy series: no single provider
                         // governs an ensemble response.
                         provider: "ensemble",
@@ -3172,7 +3756,7 @@ async fn dispatch_ensemble(
                 state_for_telem.metrics.record_request_ttft(
                     LatencyLabels {
                         endpoint: "/v1/chat/completions",
-                        model: &client_model_for_telem,
+                        model: &bounded_model_for_telem,
                         provider: "ensemble",
                         status: 200,
                         streaming: true,
@@ -3213,6 +3797,8 @@ async fn dispatch_ensemble(
             finish_reason: String::new(),
             bypass_reason,
             cache_status: CacheStatus::Disabled,
+            cache_hit_layer: None,
+            cache_similarity: None,
             cache_hit_saved_input_tokens: 0,
             cache_hit_saved_output_tokens: 0,
             // Per-sub-call usage is emitted from on_complete; suppress the
@@ -3319,8 +3905,11 @@ async fn dispatch_ensemble(
             &judge_usage,
             &estimation_output_text(&outcome.response),
         );
+        let judge_pk = crate::usage_attr::ResolvedPk::resolve(snapshot, &judge_provider_key_id);
         emit_usage_event(
             state,
+            snapshot,
+            &judge_pk,
             request_id,
             &judge_model_id,
             &req.model,
@@ -3335,7 +3924,9 @@ async fn dispatch_ensemble(
                 cache_creation_tokens: judge_usage.cache_creation_tokens,
                 cache_read_tokens: judge_usage.cache_read_tokens,
                 usage_estimated: judge_estimated,
-                provider_request_id: outcome.response.id.clone(),
+                provider_request_id: crate::usage_attr::sanitize_provider_response_id(
+                    &outcome.response.id,
+                ),
                 provider_model_version: outcome.response.model.clone(),
                 finish_reason: finish_reason_label(&outcome.response.finish_reason),
                 bypass_reason: bypass.to_string(),
@@ -3344,7 +3935,6 @@ async fn dispatch_ensemble(
                 attempt_kind: "judge".to_string(),
                 attempt_model: outcome.judge_model.clone(),
                 applied_guardrails: applied_guardrails.to_vec(),
-                provider_key_id: judge_provider_key_id,
                 redacted_entity_counts: redactions.clone(),
                 guardrail_monitor_hits: hits.to_vec(),
                 ..UsageExtras::default()
@@ -3470,6 +4060,8 @@ async fn dispatch_ensemble(
         cost_usd: 0.0,
         bypass_reason,
         cache_status: CacheStatus::Disabled,
+        cache_hit_layer: None,
+        cache_similarity: None,
         cache_hit_saved_input_tokens: 0,
         cache_hit_saved_output_tokens: 0,
         // Telemetry already emitted per-sub-call above; suppress the
@@ -3499,15 +4091,14 @@ fn finish_reason_label(reason: &aisix_gateway::FinishReason) -> String {
 
 #[allow(clippy::too_many_arguments)]
 fn record_success(
-    metrics: &Metrics,
+    state: &ProxyState,
+    // Resolved once by the caller and shared by `record` + `record_usage`
+    // below, which each used to look the same row up (#941).
+    pk: &crate::usage_attr::ResolvedPk<'_>,
+    auth: &AuthenticatedKey,
     provider: &str,
     model: &str,
-    api_key_id: &str,
-    team_id: Option<&str>,
-    user_id: Option<&str>,
-    // #890 req-3 readable name + req-4 client type + req-1/req-2 dimensions.
-    user_name: Option<&str>,
-    provider_key_name: &str,
+    // #890 req-4 client type + req-1/req-2 dimensions.
     client_type: &str,
     stream: bool,
     is_fallback: bool,
@@ -3515,35 +4106,32 @@ fn record_success(
     s: &Success,
     elapsed: Duration,
 ) {
-    let outcome = RequestOutcome::from_status(status);
-    metrics.record_request(provider, model, status, outcome, elapsed);
-    let request_labels = RequestLabels {
-        endpoint: "/v1/chat/completions",
-        inbound_protocol: "openai",
-        provider,
-        model,
-        upstream_model: &s.upstream_model,
-        provider_key_id: &s.provider_key_id,
-        provider_key_name,
-        api_key_id,
-        team_id: team_id.unwrap_or("unknown"),
-        user_id: user_id.unwrap_or("unknown"),
-        user_name: user_name.unwrap_or("unknown"),
-        stream,
-        is_fallback,
+    let metrics = &state.metrics;
+    let caller = crate::request_metrics::Caller::new(auth);
+    crate::request_metrics::record(
+        state,
+        "/v1/chat/completions",
+        caller,
+        crate::request_metrics::Upstream {
+            provider,
+            model,
+            upstream_model: &s.upstream_model,
+            pk: pk.labels(),
+            stream,
+            is_fallback,
+        },
         status,
-        outcome,
-    };
-    metrics.record_proxy_request(request_labels, elapsed);
-    metrics.record_llm_request(request_labels, elapsed);
+        elapsed,
+    );
     // SLO e2e histogram (AISIX-Cloud#1011): non-streaming only here —
     // `elapsed` for a stream is time-to-response-start; the stream's
     // on_complete records the full duration instead.
     if !stream {
+        let bounded_model = crate::usage_attr::metric_model_label(&state.snapshot.load(), model);
         metrics.record_request_e2e_latency(
             LatencyLabels {
                 endpoint: "/v1/chat/completions",
-                model,
+                model: bounded_model.as_ref(),
                 provider,
                 status,
                 streaming: false,
@@ -3551,42 +4139,29 @@ fn record_success(
             elapsed,
         );
     }
-    if let Some(total) = s.total_tokens {
-        metrics.record_tokens(provider, model, total);
-    }
-    metrics.record_llm_usage(
-        UsageLabels {
-            endpoint: "/v1/chat/completions",
-            inbound_protocol: "openai",
+    // Non-streaming path only; streaming tokens arrive in the SSE
+    // on_complete and are recorded there. All-zero is a no-op, which is what
+    // the streaming branch reaching here produces.
+    // #1002: `s.total_tokens` is the cache-inclusive canonical total.
+    crate::request_metrics::record_usage(
+        state,
+        "/v1/chat/completions",
+        caller,
+        crate::request_metrics::Upstream {
             provider,
             model,
             upstream_model: &s.upstream_model,
-            provider_key_id: &s.provider_key_id,
-            provider_key_name,
-            api_key_id,
-            team_id: team_id.unwrap_or("unknown"),
-            user_id: user_id.unwrap_or("unknown"),
-            user_name: user_name.unwrap_or("unknown"),
+            pk: pk.labels(),
+            stream,
+            is_fallback,
         },
-        LlmUsage {
-            input_tokens: s.prompt_tokens.unwrap_or(0).min(u64::from(u32::MAX)) as u32,
-            output_tokens: s.completion_tokens.unwrap_or(0).min(u64::from(u32::MAX)) as u32,
-            total_tokens: s.total_tokens.unwrap_or(0).min(u64::from(u32::MAX)) as u32,
+        crate::request_metrics::Tokens {
+            input: s.prompt_tokens.unwrap_or(0).min(u64::from(u32::MAX)) as u32,
+            output: s.completion_tokens.unwrap_or(0).min(u64::from(u32::MAX)) as u32,
+            total: s.total_tokens.unwrap_or(0).min(u64::from(u32::MAX)) as u32,
             spend_usd: s.cost_usd,
+            client_type,
         },
-    );
-    // #890 req-4: token volume by inbound client type (non-streaming path;
-    // streaming tokens arrive in the SSE on_complete and are recorded there).
-    // No-op when all counts are zero (e.g. the streaming branch here).
-    // #1002: s.total_tokens is the cache-inclusive canonical total.
-    // AISIX-Cloud#1044: `model` is the same requested logical model recorded
-    // on the UsageLabels above.
-    metrics.record_llm_tokens_by_client(
-        client_type,
-        model,
-        s.prompt_tokens.unwrap_or(0),
-        s.completion_tokens.unwrap_or(0),
-        s.total_tokens.unwrap_or(0),
     );
 }
 
@@ -3624,6 +4199,12 @@ fn record_budget_gauges(
 #[allow(clippy::too_many_arguments)]
 fn emit_usage_event(
     state: &ProxyState,
+    // The request's snapshot and the attempt's ProviderKey, both resolved
+    // by the caller (#941). Each event names its OWN attempt's key — a
+    // panel member, a judge, a failed fallback — so the resolution belongs
+    // at the call site, not here.
+    snap: &aisix_core::AisixSnapshot,
+    pk: &crate::usage_attr::ResolvedPk<'_>,
     request_id: &str,
     model_id: &str,
     requested_model: &str,
@@ -3638,20 +4219,12 @@ fn emit_usage_event(
     client: &ClientContext,
     content: Option<CapturedContent>,
 ) {
-    // Look up per-PK telemetry attribution tags from the live snapshot.
-    // Empty `provider_key_id` (pre-dispatch error paths) → default
-    // tags (all empty / false) → wire fields skip-serialize → cp-api
-    // stores NULL. See AISIX-Cloud#436.
-    let snap = state.snapshot.load();
-    let tags = if !extras.provider_key_id.is_empty() {
-        snap.provider_keys
-            .get_by_id(&extras.provider_key_id)
-            .map(|e| e.value.telemetry_tags.clone())
-            .unwrap_or_default()
-    } else {
-        Default::default()
-    };
-    let event = UsageEvent {
+    // Per-PK telemetry attribution tags. An unresolved key (the
+    // pre-dispatch error paths) yields default (all empty / false) tags →
+    // wire fields skip-serialize → cp-api stores NULL. See
+    // AISIX-Cloud#436.
+    let tags = pk.telemetry_tags();
+    let mut event = UsageEvent {
         request_id: request_id.to_string(),
         // RFC 3339 UTC. cp-api parses with time.Parse(time.RFC3339, ...);
         // chrono's `to_rfc3339_opts(Secs, true)` emits the trailing Z.
@@ -3679,6 +4252,8 @@ fn emit_usage_event(
         redacted_entity_counts: extras.redacted_entity_counts,
         guardrail_monitor_hits: extras.guardrail_monitor_hits,
         cache_status: extras.cache_status,
+        cache_hit_layer: extras.cache_hit_layer,
+        cache_similarity: extras.cache_similarity,
         cache_hit_saved_input_tokens: extras.cache_hit_saved_input_tokens,
         cache_hit_saved_output_tokens: extras.cache_hit_saved_output_tokens,
         upstream_ttft_ms: extras.upstream_ttft_ms,
@@ -3712,10 +4287,16 @@ fn emit_usage_event(
         // MCP attribution does not apply to the chat path.
         ..Default::default()
     };
+    crate::usage_attr::apply_jwt_identity(&mut event, client.jwt.as_ref());
     // Handler label "chat" matches the documented enumeration for
     // `aisix_usage_events_emitted_total` (#408). Keep `&'static str`
     // so prometheus cardinality stays bounded.
-    state.usage_sink.try_emit("chat", event.clone());
+    let usage_model = crate::usage_attr::usage_event_model_label(snap, &event.requested_model);
+    state.usage_sink.try_emit(
+        "chat",
+        event.clone(),
+        crate::usage_attr::usage_event_labels(&usage_model, pk),
+    );
     // Guardrail outcome counters (#379). Recorded here — the one place every
     // chat path (success / error / streaming / cache-hit) funnels through —
     // from the same guardrail fields the UsageEvent carries.
@@ -3726,7 +4307,7 @@ fn emit_usage_event(
     // empty for envs that haven't configured any, so this is a cheap
     // no-op on the common path. Spawned tasks own the POST work and
     // never block the request return.
-    let exporters = snap.observability_exporters.entries();
+    let exporters = crate::usage_attr::live_exporters(state, snap);
     state
         .otlp_fan_out
         .fan_out(&event, content.as_ref(), exporters.iter().map(|e| &e.value));
@@ -3759,6 +4340,13 @@ pub(crate) fn sanitize_tag(s: String) -> String {
     if s.is_empty() {
         return s;
     }
+    // Clean-input fast path: within the cap (≤256 bytes ⇒ ≤256 chars)
+    // and no control characters means the filtered copy would be
+    // byte-identical — return the input without re-collecting. This
+    // runs several times per request (tags, user-agent, PK names).
+    if s.len() <= 256 && !s.chars().any(|c| c.is_control()) {
+        return s;
+    }
     s.chars().filter(|c| !c.is_control()).take(256).collect()
 }
 
@@ -3787,10 +4375,16 @@ struct UsageExtras {
     /// `dpmgr_usage_events.guardrail_bypassed_reason`. Default empty
     /// string = no bypass; cp-api stores NULL in that case.
     bypass_reason: String,
-    /// Lowercased `CacheStatus` (`"hit"` / `"miss"` / `"disabled"`).
-    /// Empty default for the error path where the cache lookup never
-    /// fired. Goes onto `dpmgr_usage_events.cache_status`.
+    /// Lowercased `CacheStatus` (`"hit"` / `"miss"` / `"disabled"` /
+    /// `"bypass"`). Empty default for the error path where the cache
+    /// lookup never fired. Goes onto `dpmgr_usage_events.cache_status`.
     cache_status: String,
+    /// On a cache hit, the matching layer (`"exact"` / `"semantic"`).
+    /// Empty otherwise. Goes onto `usage_events.cache_hit_layer`.
+    cache_hit_layer: String,
+    /// On a semantic cache hit, the request↔entry cosine similarity.
+    /// `None` otherwise. Goes onto `usage_events.cache_similarity`.
+    cache_similarity: Option<f32>,
     /// On a cache HIT, the cached response's prompt + completion
     /// tokens. Zero otherwise. cp-api derives `cost_saved_usd` on
     /// ingest from these + its pricing catalog (see #88).
@@ -3820,15 +4414,6 @@ struct UsageExtras {
     /// which guardrails ran (#379). Empty for the guardrail-free path and
     /// for requests rejected before resolution.
     applied_guardrails: Vec<AppliedGuardrail>,
-    /// UUID of the resolved ProviderKey. Used at emit time to look up
-    /// `telemetry_tags` from the snapshot and populate UsageEvent's
-    /// per-PK attribution fields (`provider_kind` / `provider_featured`
-    /// / `branded_provider` / `pk_label` / `byo_label`).
-    /// Empty for pre-dispatch error paths (auth fail, guardrail block
-    /// before dispatch) where no ProviderKey was resolved — those
-    /// emit events land in cp-api with the tag columns NULL.
-    /// See AISIX-Cloud#436 / #302 M17.
-    provider_key_id: String,
     /// Per-detector PII mask counts for this request, input + output
     /// merged (#932). Lands on `usage_events.redacted_entity_counts`.
     /// Detector names only, never matched values. Empty = no redaction.
@@ -3848,6 +4433,7 @@ struct UsageExtras {
 #[allow(clippy::too_many_arguments)]
 fn emit_failed_attempts(
     state: &ProxyState,
+    snap: &aisix_core::AisixSnapshot,
     request_id: &str,
     requested_model: &str,
     api_key_id: &str,
@@ -3873,8 +4459,12 @@ fn emit_failed_attempts(
         } else {
             None
         };
+        // Each failed attempt hit its own target, hence its own key.
+        let pk = crate::usage_attr::ResolvedPk::resolve(snap, &rec.provider_key_id);
         emit_usage_event(
             state,
+            snap,
+            &pk,
             request_id,
             // Each failed attempt records the TARGET it actually hit
             // (AISIX-Cloud#790), not the group it was resolved from.
@@ -3892,7 +4482,6 @@ fn emit_failed_attempts(
                 error_class: rec.error_class.clone(),
                 error_message: rec.error_message.clone(),
                 applied_guardrails: applied_guardrails.to_vec(),
-                provider_key_id: rec.provider_key_id.clone(),
                 ..UsageExtras::default()
             },
             /* cost_usd */ 0.0,
@@ -3900,15 +4489,6 @@ fn emit_failed_attempts(
             client,
             content,
         );
-    }
-}
-
-fn record_error(metrics: &Metrics, err: &ProxyError, model: &str, status: u16, elapsed: Duration) {
-    let outcome = RequestOutcome::from_status(status);
-    // Provider is unknown for pre-dispatch errors (auth, 404, etc.).
-    metrics.record_request("unknown", model, status, outcome, elapsed);
-    if let ProxyError::RateLimit(rl) = err {
-        metrics.record_ratelimit_rejection(&rl.scope().to_string());
     }
 }
 
@@ -3925,6 +4505,9 @@ fn emit_access_log(
     completion_tokens: Option<u64>,
     total_tokens: Option<u64>,
     request_id: &str,
+    // Winning attempt's provider response id; empty when unknown at this
+    // point (streaming, cache hit, guardrail block, pre-dispatch error).
+    provider_request_id: Option<&str>,
     routing: &RoutingTelemetry,
     error: Option<&ProxyError>,
 ) {
@@ -3951,6 +4534,7 @@ fn emit_access_log(
         completion_tokens,
         total_tokens,
         request_id,
+        provider_request_id: provider_request_id.filter(|s| !s.is_empty()),
         served_by_model: served_by.filter(|s| !s.is_empty()),
         routing_attempt_count: match routing.attempt_count() {
             0 => None,
@@ -4076,6 +4660,18 @@ struct StreamCompletion {
     /// output checks (AISIX-Cloud#562). Merged with the input-side hits
     /// by the on_complete telemetry closure.
     monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
+    /// `true` once the generator reached its own end — upstream EOF, an
+    /// error frame, or an output-guardrail block. It stays `false` only
+    /// when the consumer went away first, because `async_stream::stream!`
+    /// then simply stops resuming the body and the tail never runs. That
+    /// makes it the one signal at the Drop site that distinguishes a
+    /// delivered response from an abandoned one, which the telemetry
+    /// closure turns into `499` (see `CLIENT_CLOSED_REQUEST`).
+    ///
+    /// Distinct from `chunks_delivered`: a stream can deliver chunks and
+    /// still be abandoned midway, and a zero-chunk stream can still
+    /// legitimately reach its end (an immediate error frame).
+    reached_end: bool,
 }
 
 /// Parameters needed to run output-guardrail evaluation at
@@ -4346,19 +4942,19 @@ where
         while let Some(item) = upstream.next().await {
             let maybe_chunk = match item {
                 Ok(mut chunk) => {
-                    // Record TTFT on the first chunk carrying generated
-                    // output (content or tool calls). Skip role-only
-                    // chunks that OpenAI emits before actual tokens.
-                    if !first_chunk_seen
-                        && (chunk.delta.content.is_some() || chunk.delta.tool_calls.is_some())
-                    {
+                    // Record TTFT on the first upstream chunk of ANY type,
+                    // role-only preambles included — the industry convention
+                    // (LiteLLM, caller-side gateways), so the figure matches
+                    // what external observers report (AISIX-Cloud#1225).
+                    if !first_chunk_seen {
                         first_chunk_seen = true;
                         guard.comp().upstream_ttft_ms =
                             attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
                     }
                     let comp = guard.comp();
                     if !chunk.id.is_empty() {
-                        comp.provider_request_id = chunk.id.clone();
+                        comp.provider_request_id =
+                            crate::usage_attr::sanitize_provider_response_id(&chunk.id);
                     }
                     if !chunk.model.is_empty() {
                         comp.provider_model_version = chunk.model.clone();
@@ -4659,6 +5255,15 @@ where
             // a post-yield increment under-counts by 1 on every
             // abort path (#419, audit follow-up).
         }
+        // Upstream EOF — the response was delivered in full. Record it here,
+        // BEFORE the end-of-stream guardrail work below, which awaits remote
+        // provider calls and is a routine drop point: SDK clients close on
+        // the terminal frame, and a flag set after the scan would report a
+        // fully-delivered response as abandoned. This also keeps it ahead of
+        // the final `[DONE]` yield, since `async_stream::stream!` resumes the
+        // body only when the consumer pulls again. Same placement as the
+        // sibling streams in messages.rs and responses_bridge.rs.
+        guard.comp().reached_end = true;
         // Per #204: run the output guardrail on the accumulated
         // assistant content BEFORE emitting `[DONE]`. Buffer-then-
         // check is the right cadence for a blocking guardrail:
@@ -4906,7 +5511,7 @@ where
         // `guard` drops here. On client disconnect, the generator
         // drops at the suspension point inside the loop; Drop fires
         // there with whatever StreamCompletion has been captured up
-        // to that point.
+        // to that point — `reached_end` still false.
     };
     // Hyper polls this generator after the request-id middleware has
     // returned, so re-attach the request span here — while we're still

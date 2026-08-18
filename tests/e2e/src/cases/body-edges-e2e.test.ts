@@ -46,6 +46,15 @@ const CALLER_KEY_HASH = createHash("sha256")
   .update(CALLER_PLAINTEXT)
   .digest("hex");
 
+/** An access-log line for a `/v1/completions` request the gateway refused. */
+const isRefusal = (line: string): boolean =>
+  line.includes("proxy request completed") &&
+  line.includes('path="/v1/completions"') &&
+  line.includes("status=413");
+
+const countRefusals = (output: string): number =>
+  output.split("\n").filter(isRefusal).length;
+
 describe("body edges e2e: multi-turn, oversize body, empty messages", () => {
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
@@ -58,7 +67,9 @@ describe("body edges e2e: multi-turn, oversize body, empty messages", () => {
     if (!etcdReachable) return;
 
     upstream = await startOpenAiUpstream();
-    app = await spawnApp();
+    // `info` so the oversize case can assert on the access-log line the
+    // gateway emits for the request it refuses.
+    app = await spawnApp({ logLevel: "info" });
     seed = new SeedClient(etcd, app.etcdPrefix);
 
     const pk = await seed.createProviderKey({
@@ -220,6 +231,145 @@ describe("body edges e2e: multi-turn, oversize body, empty messages", () => {
     expect(upstream.receivedRequests.length).toBe(upstreamHitsBefore);
   });
 
+  test("oversize body: the gateway records the request it refused", async (ctx) => {
+    if (!etcdReachable || !app) {
+      ctx.skip();
+      return;
+    }
+
+    // The 413 above is answered by the body-cap middleware, which
+    // short-circuits BEFORE any handler runs — and the access log is
+    // emitted BY the handlers. That left an operator with nothing to
+    // look at: a caller reporting a 413 the gateway had no record of is
+    // indistinguishable from the request never arriving.
+    //
+    // (`observability.access_log` in the harness config is the reserved
+    // field nothing reads today — the access log is gated by the log
+    // level alone, which is why this suite raises it to `info`.)
+    const filler = "x".repeat(10 * 1024 * 1024 + 512 * 1024);
+    const res = await fetch(`${app.proxyUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${CALLER_PLAINTEXT}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "body-edges",
+        messages: [{ role: "user", content: filler }],
+      }),
+    });
+    expect(res.status).toBe(413);
+
+    // Join the log line to THIS request instead of grepping for a bare
+    // `413` any other case in the suite could also have produced.
+    const requestId = res.headers.get("x-aisix-request-id");
+    expect(requestId).toBeTruthy();
+
+    let line: string | undefined;
+    await waitConfigPropagation(async () => {
+      line = app!
+        .output()
+        .split("\n")
+        .find(
+          (l) =>
+            l.includes(requestId!) && l.includes("proxy request completed"),
+        );
+      return line !== undefined;
+    });
+    expect(line).toMatch(/status=413/);
+    expect(line).toContain("/v1/chat/completions");
+    // The reason, not just the status: `error_kind` carries the OpenAI
+    // envelope's coarse `invalid_request_error`, so a cap hit is only
+    // nameable through the message.
+    expect(line).toMatch(/request body exceeds/);
+
+    // Same blindness on the metrics plane — no handler ran, so nothing
+    // counted the refusal either.
+    const scrape = await fetch(`${app.metricsUrl}/metrics`).then((r) =>
+      r.text(),
+    );
+    expect(scrape).toMatch(/aisix_requests_total\{[^}]*status="413"/);
+
+    // The access log says the request was refused; it cannot say what
+    // the gateway did with the body it refused. That second question is
+    // what an operator has when the caller reports a connection reset
+    // rather than a 413 — so the same request also carries a diagnostic
+    // naming the declared size, the cap, how much was absorbed and how
+    // the drain ended, joined by the same request id.
+    const detail = app
+      .output()
+      .split("\n")
+      .find(
+        (l) =>
+          l.includes(requestId!) &&
+          l.includes("request body exceeded the configured limit"),
+      );
+    expect(detail).toBeDefined();
+    expect(detail).toMatch(/declared_content_length=\d+/);
+    expect(detail).toMatch(/configured_limit_bytes=10485760/);
+    expect(detail).toMatch(/drained_bytes=\d+/);
+    // This caller sent everything it declared, so the connection stayed
+    // usable and it got to read the 413 above.
+    expect(detail).toMatch(/drain_outcome="completed"/);
+    expect(detail).toMatch(/endpoint="\/v1\/chat\/completions"/);
+
+    const sample = scrape
+      .split("\n")
+      .find((l) =>
+        l.startsWith("aisix_proxy_request_body_limit_rejections_total{"),
+      );
+    expect(sample).toBeDefined();
+    expect(sample).toContain('endpoint="/v1/chat/completions"');
+    expect(sample).toContain('outcome="completed"');
+  });
+
+  test("chunked oversize body: the handler that rejected it records the refusal", async (ctx) => {
+    if (!etcdReachable || !app) {
+      ctx.skip();
+      return;
+    }
+
+    // No Content-Length, so the middleware can't judge the request up
+    // front: it reaches the handler, whose body extractor rejects once
+    // the cap is crossed. Same blindness one layer further in, so it
+    // needs its own coverage. `/v1/completions` isolates the count —
+    // nothing else in this suite calls it.
+    const before = countRefusals(app.output());
+
+    const chunk = "x".repeat(512 * 1024);
+    const body = new ReadableStream({
+      start(controller) {
+        for (let i = 0; i < 22; i++) controller.enqueue(new TextEncoder().encode(chunk));
+        controller.close();
+      },
+    });
+    // A client streaming into a cap can legitimately lose the connection
+    // mid-write instead of reading the 413 — the failure mode the
+    // Content-Length path exists to avoid and this one cannot. The
+    // gateway's record is the subject here, so tolerate either outcome.
+    await fetch(`${app.proxyUrl}/v1/completions`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${CALLER_PLAINTEXT}`,
+        "content-type": "application/json",
+      },
+      body,
+      duplex: "half",
+    } as RequestInit & { duplex: "half" }).catch(() => undefined);
+
+    await waitConfigPropagation(async () => countRefusals(app!.output()) > before);
+    const line = app
+      .output()
+      .split("\n")
+      .filter((l) => isRefusal(l))
+      .at(-1)!;
+    expect(line).toMatch(/status=413/);
+    expect(line).toMatch(/request body exceeds/);
+    // Auth ran before the body extractor here, so unlike the
+    // middleware's short-circuit the refusal is attributable to a caller.
+    expect(line).toMatch(/api_key_id/);
+  });
+
   test("empty messages array: 4xx with OpenAI-shape error envelope, upstream untouched", async (ctx) => {
     if (!etcdReachable || !app || !upstream) {
       ctx.skip();
@@ -277,4 +427,97 @@ describe("body edges e2e: multi-turn, oversize body, empty messages", () => {
     ).length;
     expect(upstreamChatHitsAfter).toBe(upstreamChatHitsBefore);
   });
+});
+
+// The shipped default is `request_body_limit_bytes: 0` — NO cap, matching
+// the reference LLM proxy's out-of-box behaviour (its request-size guard
+// defaults to off): providers accept larger requests than any fixed
+// gateway default, so a gateway-side cap rejects requests the upstream
+// would have served. The suite above pins the behaviour WITH a cap (the
+// harness sets 10 MiB); this suite pins the default.
+describe("body edges e2e: unlimited default (request_body_limit_bytes: 0)", () => {
+  let app: SpawnedApp | undefined;
+  let upstream: OpenAiUpstream | undefined;
+  let etcdReachable = false;
+
+  beforeAll(async () => {
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
+    if (!etcdReachable) return;
+
+    upstream = await startOpenAiUpstream();
+    app = await spawnApp({ requestBodyLimitBytes: 0 });
+    const seed = new SeedClient(etcd, app.etcdPrefix);
+
+    const pk = await seed.createProviderKey({
+      display_name: "body-unlimited-pk",
+      secret: "sk-mock",
+      api_base: `${upstream.baseUrl}/v1`,
+    });
+    await seed.createModel({
+      display_name: "body-unlimited",
+      provider: "openai",
+      model_name: "gpt-4o-mini",
+      provider_key_id: pk.id,
+    });
+    await seed.createApiKey({
+      key_hash: CALLER_KEY_HASH,
+      allowed_models: ["body-unlimited"],
+    });
+
+    const client = new OpenAI({
+      apiKey: CALLER_PLAINTEXT,
+      baseURL: `${app.proxyUrl}/v1`,
+      maxRetries: 0,
+    });
+    await waitConfigPropagation(async () => {
+      try {
+        const r = await client.chat.completions.create({
+          model: "body-unlimited",
+          messages: [{ role: "user", content: "ready-probe" }],
+        });
+        return r.choices[0]?.message.role === "assistant";
+      } catch {
+        return false;
+      }
+    });
+  });
+
+  afterAll(async () => {
+    await app?.exit();
+    await upstream?.close();
+  });
+
+  test("a 12 MiB body sails through to the upstream", async (ctx) => {
+    if (!etcdReachable || !app || !upstream) {
+      ctx.skip();
+      return;
+    }
+
+    // Comfortably above both the old 10 MiB default and axum's
+    // built-in 2 MiB extractor fallback — proving the cap is OFF,
+    // not merely raised.
+    const filler = "x".repeat(12 * 1024 * 1024);
+    const upstreamHitsBefore = upstream.receivedRequests.length;
+    const res = await fetch(`${app.proxyUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${CALLER_PLAINTEXT}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "body-unlimited",
+        messages: [{ role: "user", content: filler }],
+      }),
+    });
+
+    expect(res.status).toBe(200);
+    await res.json();
+    expect(upstream.receivedRequests.length).toBe(upstreamHitsBefore + 1);
+    const sent = upstream.receivedRequests[upstreamHitsBefore]!;
+    const sentBody = JSON.parse(sent.body) as {
+      messages?: Array<{ content?: string }>;
+    };
+    expect(sentBody.messages?.[0]?.content?.length).toBe(filler.length);
+  }, 60_000);
 });

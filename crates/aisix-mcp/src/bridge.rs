@@ -17,13 +17,14 @@ use std::time::Duration;
 use aisix_core::{McpAuthType, McpServer};
 use async_trait::async_trait;
 use http::{HeaderName, HeaderValue};
-use rmcp::model::CallToolRequestParams;
+use rmcp::model::{CallToolRequestParams, CallToolResponse, ClientInfo, ProtocolVersion};
 use rmcp::service::{ClientInitializeError, RoleClient, RunningService};
 use rmcp::transport::streamable_http_client::{
     StreamableHttpClientTransportConfig, StreamableHttpError,
 };
 use rmcp::transport::StreamableHttpClientTransport;
-use rmcp::ServiceExt;
+use rmcp::ClientCacheConfig;
+use rmcp::{ClientLifecycleMode, ClientServiceExt};
 
 use crate::error::McpError;
 
@@ -32,6 +33,90 @@ use crate::error::McpError;
 /// one, so without this a hung or slow upstream pins the gateway request task
 /// indefinitely. Overridable per upstream via [`McpUpstream::with_timeout`].
 pub const DEFAULT_UPSTREAM_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Shared HTTP client for every rmcp streamable-http transport, with the
+/// deployment's `upstream.*` connection settings applied.
+///
+/// rmcp pins its own reqwest line (0.13 — see Cargo.toml), so the shared
+/// `aisix_gateway::client_builder()` (workspace reqwest) cannot be handed
+/// to it directly; this is the sanctioned second construction site that
+/// applies the SAME `upstream_http::config()` values to rmcp's reqwest.
+///
+/// What this changes vs rmcp's `default_http_client()`:
+/// - a connect timeout exists at all (rmcp sets none, so a black-holed
+///   upstream was bounded only by the coarse per-operation deadline —
+///   the actual bug this fixes);
+/// - connection POOLING turns ON. rmcp deliberately disables idle
+///   pooling (`pool_max_idle_per_host(0)`) to dodge ~40 ms delayed-ACK
+///   stalls on reused connections; here reuse wins — every other
+///   outbound path pools under `upstream.*` management, and per-call
+///   TCP+TLS handshakes to a remote MCP server cost far more than the
+///   stall rmcp avoids. An operator can restore rmcp's behaviour with
+///   `upstream.pool_max_idle_per_host: 0`;
+/// - the TCP keepalive triple moves from reqwest's default 15 s/15 s/3
+///   to the deployment's 60 s/30 s/5;
+/// - the deployment's `upstream.tls` trust decision applies here too. An
+///   MCP server behind an enterprise CA is exactly as common as a model
+///   endpoint behind one, and the PEM has to be re-parsed rather than
+///   reused because rmcp's `Certificate` is a different crate version's
+///   type than the one `upstream_tls` caches for the workspace line.
+///
+/// One client for all MCP upstreams = one shared pool, matching how the
+/// provider bridges share theirs (auth is injected per-request by the
+/// transport, never client-wide).
+fn shared_http_client() -> rmcp_reqwest::Client {
+    static CLIENT: std::sync::OnceLock<rmcp_reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            let cfg = aisix_gateway::upstream_http::config();
+            let mut b = rmcp_reqwest::Client::builder()
+                .pool_idle_timeout(cfg.pool_idle_timeout)
+                .tcp_keepalive(cfg.tcp_keepalive);
+            if let Some(d) = cfg.connect_timeout {
+                b = b.connect_timeout(d);
+            }
+            if let Some(d) = cfg.tcp_keepalive_interval {
+                b = b.tcp_keepalive_interval(d);
+            }
+            if let Some(n) = cfg.tcp_keepalive_retries {
+                b = b.tcp_keepalive_retries(n);
+            }
+            if let Some(n) = cfg.pool_max_idle_per_host {
+                b = b.pool_max_idle_per_host(n);
+            }
+            if let Some(pem) = &cfg.tls.extra_ca_pem {
+                // Already validated at boot by `TlsSettings::load`; a
+                // failure here would mean rmcp's reqwest disagrees with
+                // ours about the same bytes, which is worth a loud line
+                // rather than a silently untrusting client.
+                match rmcp_reqwest::Certificate::from_pem_bundle(pem) {
+                    Ok(roots) => {
+                        for root in roots {
+                            b = b.add_root_certificate(root);
+                        }
+                    }
+                    Err(e) => tracing::error!(
+                        error = %e,
+                        "upstream.tls.ca_file not applied to MCP upstream connections"
+                    ),
+                }
+            }
+            if let Some(configured) = &cfg.tls.client_identity {
+                match rmcp_reqwest::Identity::from_pem(&configured.joined()) {
+                    Ok(identity) => b = b.identity(identity),
+                    Err(e) => tracing::error!(
+                        error = %e,
+                        "upstream.tls client identity not applied to MCP upstream connections"
+                    ),
+                }
+            }
+            if !cfg.tls.verify {
+                b = b.danger_accept_invalid_certs(true);
+            }
+            b.build().unwrap_or_else(|_| rmcp_reqwest::Client::new())
+        })
+        .clone()
+}
 
 /// Header carrying the gateway-held key for `api_key` upstream auth.
 const API_KEY_HEADER: &str = "x-api-key";
@@ -102,6 +187,26 @@ impl std::fmt::Debug for McpAuth {
     }
 }
 
+/// The MCP protocol revision the bridge opens an upstream session with.
+///
+/// Explicit, never probed: a server that does not speak the configured
+/// revision produces a visible connect failure instead of a silent
+/// cross-generation downgrade. (Automatic fallback is how version and
+/// session context ends up crossing the protocol boundary — the bug class
+/// sibling gateways are currently working through.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum McpProtocol {
+    /// Open with the `initialize` handshake and negotiate among the
+    /// pre-2026 protocol revisions. Works with every legacy server and with
+    /// `2026-07-28` servers that keep backward compatibility.
+    #[default]
+    LegacyHandshake,
+    /// The stateless MCP `2026-07-28` revision: handshake-free
+    /// `server/discover` startup, self-contained per-request metadata.
+    /// Required for servers that no longer answer `initialize`.
+    V20260728,
+}
+
 /// Connection parameters for a single upstream MCP server.
 #[derive(Clone)]
 pub struct McpUpstream {
@@ -112,6 +217,9 @@ pub struct McpUpstream {
     pub auth: McpAuth,
     /// Per-operation deadline. Defaults to [`DEFAULT_UPSTREAM_TIMEOUT`].
     pub timeout: Duration,
+    /// Protocol revision the session is opened with. Defaults to the
+    /// legacy `initialize` handshake.
+    pub protocol: McpProtocol,
 }
 
 // Manual so a `Bearer` token cannot leak through `McpUpstream`'s `Debug`
@@ -122,6 +230,7 @@ impl std::fmt::Debug for McpUpstream {
             .field("url", &self.url)
             .field("auth", &self.auth)
             .field("timeout", &self.timeout)
+            .field("protocol", &self.protocol)
             .finish()
     }
 }
@@ -133,7 +242,14 @@ impl McpUpstream {
             url: url.into(),
             auth: McpAuth::None,
             timeout: DEFAULT_UPSTREAM_TIMEOUT,
+            protocol: McpProtocol::default(),
         }
+    }
+
+    /// Select the protocol revision the session is opened with.
+    pub fn with_protocol(mut self, protocol: McpProtocol) -> Self {
+        self.protocol = protocol;
+        self
     }
 
     /// Set Bearer auth (raw token, no `Bearer ` prefix).
@@ -211,23 +327,56 @@ pub trait McpBridge: Send + Sync {
 /// `rmcp`-backed [`McpBridge`]: holds one running client session to the
 /// upstream. Dropping it tears the session down.
 pub struct RmcpBridge {
-    running: RunningService<RoleClient, ()>,
+    running: RunningService<RoleClient, ClientInfo>,
     timeout: Duration,
+}
+
+/// Base transport configuration for one upstream connection. Two rmcp
+/// defaults are deliberately overridden, both to keep "one inbound call =
+/// one upstream execution" true and the 1.8-era transport behavior stable:
+///
+/// - `reinit_on_expired_session = false`. On a session-expired 404 the SDK
+///   default transparently re-runs `initialize` and RE-SENDS the in-flight
+///   request — for `tools/call` that is a silent second execution of a
+///   possibly side-effectful tool, outside quota and budget accounting
+///   (the session-layer sibling of the MRTR auto-retry disabled in
+///   [`McpBridge::call_tool`]). The gateway surfaces the failure instead;
+///   [`EphemeralBridge`] opens a fresh session on the next operation anyway.
+/// - `max_sse_event_size = usize::MAX`. 3.x introduced a 16 MiB per-event
+///   cap on upstream SSE frames that 1.8 never had — a large image/audio
+///   tool result delivered over SSE would fail while the identical JSON
+///   response succeeds. Unbounded preserves the shipped behavior; the
+///   per-operation deadline still bounds the read.
+fn transport_config(url: &str) -> StreamableHttpClientTransportConfig {
+    let mut config = StreamableHttpClientTransportConfig::with_uri(url.to_string());
+    config.reinit_on_expired_session = false;
+    config.max_sse_event_size = usize::MAX;
+    config
 }
 
 impl RmcpBridge {
     /// Open a session to `upstream`: build the Streamable HTTP transport
     /// (injecting gateway-held auth — for `oauth2` this mints or reuses a
-    /// cached access token first) and run the `initialize` handshake. The
+    /// cached access token first) and run the startup lifecycle selected by
+    /// [`McpUpstream::protocol`] — the `initialize` handshake by default,
+    /// or handshake-free `server/discover` for `2026-07-28` upstreams. The
     /// whole sequence, token minting included, is bounded by the upstream's
     /// timeout.
     pub async fn connect(upstream: &McpUpstream) -> Result<Self, McpError> {
         let establish = async {
+            // Every arm goes through `with_client(shared_http_client(), ..)`
+            // so the transport inherits the deployment's `upstream.*`
+            // connection settings — `from_uri`/`from_config` would build
+            // rmcp's own default client with none of them — and through
+            // `transport_config` for the pinned transport defaults.
             let transport = match &upstream.auth {
-                McpAuth::None => StreamableHttpClientTransport::from_uri(upstream.url.clone()),
-                McpAuth::Bearer(token) => StreamableHttpClientTransport::from_config(
-                    StreamableHttpClientTransportConfig::with_uri(upstream.url.clone())
-                        .auth_header(token.clone()),
+                McpAuth::None => StreamableHttpClientTransport::with_client(
+                    shared_http_client(),
+                    transport_config(&upstream.url),
+                ),
+                McpAuth::Bearer(token) => StreamableHttpClientTransport::with_client(
+                    shared_http_client(),
+                    transport_config(&upstream.url).auth_header(token.clone()),
                 ),
                 McpAuth::ApiKey(key) => {
                     // A key with non-header-safe bytes is a clean config error,
@@ -241,39 +390,74 @@ impl RmcpBridge {
                     // header map, mirroring this module's redaction posture.
                     value.set_sensitive(true);
                     let headers = HashMap::from([(HeaderName::from_static(API_KEY_HEADER), value)]);
-                    StreamableHttpClientTransport::from_config(
-                        StreamableHttpClientTransportConfig::with_uri(upstream.url.clone())
-                            .custom_headers(headers),
+                    StreamableHttpClientTransport::with_client(
+                        shared_http_client(),
+                        transport_config(&upstream.url).custom_headers(headers),
                     )
                 }
                 McpAuth::OAuth2(cfg) => {
                     let token = crate::oauth::get_or_fetch(cfg).await?;
-                    StreamableHttpClientTransport::from_config(
-                        StreamableHttpClientTransportConfig::with_uri(upstream.url.clone())
-                            .auth_header(token),
+                    StreamableHttpClientTransport::with_client(
+                        shared_http_client(),
+                        transport_config(&upstream.url).auth_header(token),
                     )
                 }
             };
-            ().serve(transport).await.map_err(|e| {
-                // An upstream 401 against a minted token means the token was
-                // revoked or expired earlier than promised: drop the cache
-                // entry so the next attempt re-mints instead of replaying it.
-                if let McpAuth::OAuth2(cfg) = &upstream.auth {
-                    if init_error_is_unauthorized(&e) {
-                        crate::oauth::invalidate(cfg);
+            // Lifecycle follows the configured protocol revision. The
+            // handler is `ClientInfo::default()` on BOTH paths — identical
+            // handshake bytes to the previous unit handler (whose default
+            // `get_info()` returns exactly `ClientInfo::default()`), plus
+            // the per-request metadata the Discover lifecycle needs.
+            let lifecycle = match upstream.protocol {
+                McpProtocol::LegacyHandshake => ClientLifecycleMode::Initialize,
+                // Discover, NOT Auto: a server that answers `server/discover`
+                // with an error must fail the connect visibly. `Auto` would
+                // silently retry the legacy handshake, hiding real
+                // misconfiguration and version drift.
+                McpProtocol::V20260728 => ClientLifecycleMode::Discover {
+                    preferred_versions: vec![ProtocolVersion::V_2026_07_28],
+                },
+            };
+            ClientInfo::default()
+                .serve_with_lifecycle(transport, lifecycle)
+                .await
+                .map_err(|e| {
+                    // An upstream 401 against a minted token means the token was
+                    // revoked or expired earlier than promised: drop the cache
+                    // entry so the next attempt re-mints instead of replaying it.
+                    if let McpAuth::OAuth2(cfg) = &upstream.auth {
+                        if init_error_is_unauthorized(&e) {
+                            crate::oauth::invalidate(cfg);
+                        }
                     }
-                }
-                // Bound + sanitize: a bare-401 shape embeds the upstream's
-                // response body in the error text, which lands in gateway
-                // logs. An upstream that reflects request headers into its
-                // error body (or emits control characters for log injection)
-                // must not get either past this point verbatim.
-                McpError::Connect(sanitize_error_message(&e.to_string()))
-            })
+                    // Bound + sanitize: a bare-401 shape embeds the upstream's
+                    // response body in the error text, which lands in gateway
+                    // logs. An upstream that reflects request headers into its
+                    // error body (or emits control characters for log injection)
+                    // must not get either past this point verbatim.
+                    McpError::Connect(sanitize_error_message(&e.to_string()))
+                })
         };
         let running = tokio::time::timeout(upstream.timeout, establish)
             .await
             .map_err(|_| McpError::Connect("upstream MCP connect timed out".to_string()))??;
+        // rmcp 3.x ships a client response cache that is ENABLED by default
+        // (`ClientCacheConfig::default()`), keyed per peer and honoring the
+        // server's `ttlMs`/`cacheScope` hints. A pooled or persistent bridge
+        // is shared across every AISIX caller that reaches the same
+        // upstream, so a cached upstream response would be served across
+        // principals — a cross-tenant leak the SDK's own migration guide
+        // warns about (`private_partition`). Today's production path
+        // (`EphemeralBridge`) reconnects per operation, so this pins the
+        // posture BEFORE the "connection pooling is a later optimization"
+        // note above ever lands. The gateway's caching story is a wire-level
+        // hint only (no cache engine), so the cache is disabled outright
+        // rather than partitioned. Do not re-enable without keying the
+        // partition to the calling principal.
+        running
+            .peer()
+            .set_response_cache_config(ClientCacheConfig::disabled())
+            .await;
         Ok(Self {
             running,
             timeout: upstream.timeout,
@@ -360,10 +544,43 @@ impl McpBridge for RmcpBridge {
                 ))
             }
         };
-        let result = tokio::time::timeout(self.timeout, self.running.call_tool(params))
+        // `call_tool_once`, NOT `call_tool`: the 3.x high-level helper drives
+        // MRTR (SEP-2322) automatically — on an `input_required` result it
+        // re-sends the request with client-fulfilled inputs, up to
+        // `DEFAULT_MRTR_MAX_ROUNDS` (10) upstream round trips for ONE inbound
+        // call. That would silently multiply upstream cost and defeat every
+        // per-call quota, budget, and timeout assumption in the gateway. The
+        // `_once` variant sends exactly one request; a non-final response is
+        // surfaced as a clean tool failure instead of a hidden retry loop.
+        let response = tokio::time::timeout(self.timeout, self.running.call_tool_once(params))
             .await
             .map_err(|_| McpError::Request("upstream tools/call timed out".to_string()))?
             .map_err(|e| McpError::Request(e.to_string()))?;
+        let result = match response {
+            CallToolResponse::Complete(result) => result,
+            CallToolResponse::InputRequired(_) => {
+                return Err(McpError::Request(
+                    "upstream tool requires additional interactive input (MRTR), which the \
+                     gateway does not relay"
+                        .to_string(),
+                ))
+            }
+            CallToolResponse::Task(_) => {
+                return Err(McpError::Request(
+                    "upstream tool deferred to an asynchronous task, which the gateway does \
+                     not support"
+                        .to_string(),
+                ))
+            }
+            // `CallToolResponse` is #[non_exhaustive]; treat future variants
+            // as unsupported rather than mis-mapping them to a result. Kept
+            // payload-free: the message lands in gateway logs verbatim.
+            _ => {
+                return Err(McpError::Request(
+                    "upstream returned an unsupported tools/call response kind".to_string(),
+                ))
+            }
+        };
         let content = serde_json::to_value(&result.content)
             .map_err(|e| McpError::Request(format!("failed to encode tool result: {e}")))?;
         Ok(McpToolResult {
@@ -392,6 +609,65 @@ fn into_mcp_tool(tool: rmcp::model::Tool) -> McpTool {
 /// then fails cleanly at connect time and that server degrades like any
 /// unreachable upstream (its tools drop out of `tools/list`, the failure is
 /// logged), instead of one bad row poisoning snapshot loading.
+/// Whether a URL sends its traffic over cleartext HTTP. Matches how the
+/// HTTP stack will actually treat it (the URL parser lowercases the scheme
+/// and strips leading whitespace), so `HTTP://` and `" http://"` are
+/// flagged too; `https://` never is.
+fn is_cleartext(url: &str) -> bool {
+    let trimmed = url.trim_start();
+    trimmed
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
+}
+
+/// The cleartext-credential findings for a registered server: which
+/// gateway-held secret travels over plain HTTP, and to which URL. Applies
+/// to every credentialed auth type against an `http://` server URL —
+/// `type: mcp` and `type: openapi` rows share these fields — plus, for
+/// `oauth2`, a cleartext `token_url` (it carries the client secret; a
+/// distinct finding even when `token_url` equals `url`). Pure, so tests
+/// pin the selection.
+pub(crate) fn cleartext_findings(server: &McpServer) -> Vec<(&'static str, String)> {
+    let mut findings = Vec::new();
+    if server.auth_type != McpAuthType::None && is_cleartext(&server.url) {
+        findings.push(("the gateway-held upstream credential", server.url.clone()));
+    }
+    if server.auth_type == McpAuthType::OAuth2 {
+        let token_url = server.token_url.as_deref().unwrap_or_default();
+        if is_cleartext(token_url) {
+            findings.push(("the OAuth client secret", token_url.to_string()));
+        }
+    }
+    findings
+}
+
+/// Warn — once per distinct finding per process — that a credential travels
+/// unencrypted. Deliberately a warning, not a rejection: plain-HTTP
+/// upstreams inside a private network are a lawful, common deployment, and
+/// request behavior (including redirect handling) stays aligned with the
+/// reference SDK baseline (#879). Deduped on the (server, finding, url)
+/// tuple because the gateway is rebuilt from the snapshot on every request
+/// — an undeduped warn would log per call.
+pub(crate) fn warn_cleartext_credential(server: &McpServer) {
+    use std::sync::{Mutex, OnceLock};
+    type Warned = std::collections::HashSet<(String, &'static str, String)>;
+    static WARNED: OnceLock<Mutex<Warned>> = OnceLock::new();
+    for (what, url) in cleartext_findings(server) {
+        let mut warned = WARNED
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if warned.insert((server.name.clone(), what, url.clone())) {
+            tracing::warn!(
+                server = %server.name,
+                url = %url,
+                "{what} is sent over cleartext http; anyone on the network path can read \
+                 it — serve this upstream over https"
+            );
+        }
+    }
+}
+
 pub fn upstream_from_mcp_server(server: &McpServer) -> McpUpstream {
     let auth = match server.auth_type {
         McpAuthType::None => McpAuth::None,
@@ -408,10 +684,18 @@ pub fn upstream_from_mcp_server(server: &McpServer) -> McpUpstream {
         .timeout_ms
         .map(Duration::from_millis)
         .unwrap_or(DEFAULT_UPSTREAM_TIMEOUT);
+    // Dated spec revisions map one-to-one onto session lifecycles; absent
+    // means the legacy handshake (which negotiates among the pre-2026
+    // revisions on its own).
+    let protocol = match server.protocol_version {
+        None => McpProtocol::LegacyHandshake,
+        Some(aisix_core::McpProtocolVersion::V20260728) => McpProtocol::V20260728,
+    };
     McpUpstream {
         url: server.url.clone(),
         auth,
         timeout,
+        protocol,
     }
 }
 
@@ -458,6 +742,81 @@ impl McpBridge for EphemeralBridge {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cleartext_credential_detection() {
+        let server = |auth_type: &str, url: &str, token_url: Option<&str>| -> McpServer {
+            serde_json::from_value(serde_json::json!({
+                "display_name": "s",
+                "url": url,
+                "auth_type": auth_type,
+                "secret": "k",
+                "client_id": "c",
+                "token_url": token_url,
+            }))
+            .expect("valid server")
+        };
+
+        // A credentialed http:// URL is flagged; https and credential-less
+        // http are not (https also starts with "http", so the scheme match
+        // must include the separator). The URL parser lowercases the scheme
+        // and strips leading whitespace, so those shapes flag too.
+        for auth in ["bearer", "api_key"] {
+            assert_eq!(
+                cleartext_findings(&server(auth, "http://mcp.internal/mcp", None)).len(),
+                1,
+                "{auth} over http must be flagged"
+            );
+        }
+        assert!(cleartext_findings(&server("bearer", "https://mcp.internal/mcp", None)).is_empty());
+        assert!(cleartext_findings(&server("none", "http://mcp.internal/mcp", None)).is_empty());
+        assert!(cleartext_findings(&server("bearer", "", None)).is_empty());
+        assert_eq!(
+            cleartext_findings(&server("bearer", "HTTP://mcp.internal/mcp", None)).len(),
+            1
+        );
+        assert_eq!(
+            cleartext_findings(&server("bearer", " http://mcp.internal/mcp", None)).len(),
+            1
+        );
+
+        // oauth2: the server URL carries the minted token, the token URL the
+        // client secret — two distinct findings, even at the same URL.
+        let both = cleartext_findings(&server("oauth2", "http://x/mcp", Some("http://x/mcp")));
+        assert_eq!(both.len(), 2, "token_url == url must still flag twice");
+        let token_only = cleartext_findings(&server(
+            "oauth2",
+            "https://x/mcp",
+            Some("http://idp.internal/token"),
+        ));
+        assert_eq!(token_only.len(), 1);
+        assert_eq!(token_only[0].0, "the OAuth client secret");
+    }
+
+    /// The dial to an upstream that swallows SYNs must be cut by the
+    /// shared client's `upstream.connect_timeout_ms` (default 5 s) —
+    /// before the transport ran on rmcp's default reqwest, which has no
+    /// connect timeout, so the dial hung until the OUTER
+    /// `upstream.timeout` (12 s here; kernel SYN retries run ≈127 s).
+    /// 203.0.113.1 (TEST-NET-3) is reserved and unrouted, the standard
+    /// black-hole address; on networks that answer with an immediate
+    /// "unreachable" the call fails fast either way — the assertion is
+    /// the upper bound, which only the connect timeout guarantees.
+    #[tokio::test]
+    async fn connect_timeout_bounds_an_unreachable_upstream() {
+        let mut upstream = McpUpstream::new("http://203.0.113.1:81/mcp");
+        upstream.timeout = Duration::from_secs(12);
+        let started = std::time::Instant::now();
+        let err = RmcpBridge::connect(&upstream)
+            .await
+            .err()
+            .expect("dial to a black-holed upstream must fail");
+        assert!(
+            started.elapsed() < Duration::from_secs(8),
+            "dial was not bounded by connect_timeout: took {:?} ({err})",
+            started.elapsed()
+        );
+    }
 
     /// The hand-written Debug impls are the only guard between a credential
     /// and the logs; pin them so a `#[derive(Debug)]` regression fails loudly

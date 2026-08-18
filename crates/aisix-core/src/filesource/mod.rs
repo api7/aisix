@@ -45,12 +45,12 @@ use std::path::Path;
 use yaml_rust2::{Yaml, YamlLoader};
 
 use crate::models::{
-    validate_a2a_agent, validate_apikey, validate_cache_policy, validate_guardrail,
-    validate_mcp_auth_settings, validate_mcp_server, validate_model,
-    validate_observability_exporter, validate_oidc_provider, validate_provider_key,
-    validate_rate_limit_policy, A2aAgent, ApiKey, CachePolicy, Guardrail, McpAuthSettings,
-    McpServer, Model, ObservabilityExporter, OidcProvider, ProviderKey, RateLimitPolicy,
-    SchemaError,
+    validate_a2a_agent, validate_apikey, validate_cache_policy, validate_claim_mapping,
+    validate_guardrail, validate_mcp_auth_settings, validate_mcp_server, validate_model,
+    validate_observability_exporter, validate_oidc_provider, validate_passthrough_route,
+    validate_provider_key, validate_rate_limit_policy, A2aAgent, ApiKey, CachePolicy, ClaimMapping,
+    Guardrail, McpAuthSettings, McpServer, Model, ObservabilityExporter, OidcProvider,
+    PassthroughRoute, ProviderKey, RateLimitPolicy, SchemaError,
 };
 use crate::resource::ResourceEntry;
 use crate::AisixSnapshot;
@@ -131,8 +131,8 @@ pub(crate) fn url_has_credentials(url: &str) -> bool {
     false
 }
 
-/// Fixed processing order for the eleven resource collections.
-const KINDS: [(&str, IdentityField); 11] = [
+/// Fixed processing order for the thirteen resource collections.
+const KINDS: [(&str, IdentityField); 13] = [
     ("provider_keys", IdentityField::DisplayName),
     ("models", IdentityField::DisplayName),
     ("api_keys", IdentityField::DisplayName),
@@ -143,6 +143,8 @@ const KINDS: [(&str, IdentityField); 11] = [
     ("observability_exporters", IdentityField::Name),
     ("rate_limit_policies", IdentityField::Name),
     ("oidc_providers", IdentityField::Name),
+    ("claim_mappings", IdentityField::Name),
+    ("passthrough_routes", IdentityField::NameOrDisplayName),
     // Singleton: the fixed identity makes a second entry a duplicate
     // at pass 1, enforcing at-most-one row per file.
     (
@@ -353,6 +355,8 @@ pub fn load_from_str(
     let mut observability_exporters: Vec<(String, String, ObservabilityExporter)> = Vec::new();
     let mut rate_limit_policies: Vec<(String, String, RateLimitPolicy)> = Vec::new();
     let mut oidc_providers: Vec<(String, String, OidcProvider)> = Vec::new();
+    let mut claim_mappings: Vec<(String, String, ClaimMapping)> = Vec::new();
+    let mut passthrough_routes: Vec<(String, String, PassthroughRoute)> = Vec::new();
     let mut mcp_auth_settings: Vec<(String, String, McpAuthSettings)> = Vec::new();
 
     for mut entry in prepared {
@@ -379,6 +383,10 @@ pub fn load_from_str(
             "api_keys" => desugar::desugar_api_key(&mut entry.doc, env),
             "rate_limit_policies" => {
                 desugar::desugar_rate_limit_policy(&mut entry.doc, &identity_maps)
+            }
+            "claim_mappings" => desugar::desugar_claim_mapping(&mut entry.doc, &identity_maps),
+            "passthrough_routes" => {
+                desugar::desugar_passthrough_route(&mut entry.doc, &identity_maps)
             }
             _ => Ok(()),
         };
@@ -418,6 +426,12 @@ pub fn load_from_str(
                     a2a_agents.push((id, scope, t));
                 }
             }
+            "passthrough_routes" => {
+                if let Some(t) = finish(&scope, &entry.doc, validate_passthrough_route, &mut errors)
+                {
+                    passthrough_routes.push((id, scope, t));
+                }
+            }
             "cache_policies" => {
                 if let Some(t) = finish(&scope, &entry.doc, validate_cache_policy, &mut errors) {
                     cache_policies.push((id, scope, t));
@@ -434,14 +448,31 @@ pub fn load_from_str(
                 }
             }
             "rate_limit_policies" => {
-                if let Some(t) = finish(&scope, &entry.doc, validate_rate_limit_policy, &mut errors)
-                {
-                    rate_limit_policies.push((id, scope, t));
+                if let Some(t) = finish::<RateLimitPolicy>(
+                    &scope,
+                    &entry.doc,
+                    validate_rate_limit_policy,
+                    &mut errors,
+                ) {
+                    // Semantic caps the schema can't express (condition-tree
+                    // depth/leaf counts, operator×dimension admission, regex
+                    // compilability) — a failing entry is a load error like
+                    // any schema failure.
+                    if let Err(message) = t.validate_semantics() {
+                        errors.push(LoadError { scope, message });
+                    } else {
+                        rate_limit_policies.push((id, scope, t));
+                    }
                 }
             }
             "oidc_providers" => {
                 if let Some(t) = finish(&scope, &entry.doc, validate_oidc_provider, &mut errors) {
                     oidc_providers.push((id, scope, t));
+                }
+            }
+            "claim_mappings" => {
+                if let Some(t) = finish(&scope, &entry.doc, validate_claim_mapping, &mut errors) {
+                    claim_mappings.push((id, scope, t));
                 }
             }
             "mcp_auth_settings" => {
@@ -514,6 +545,32 @@ pub fn load_from_str(
         }
     }
 
+    // Same load-time protection for route grants: an `allowed_routes`
+    // entry naming no defined route (globs exempt) is a typo that would
+    // otherwise surface as a silent runtime 403.
+    let route_names = identity_maps.get("passthrough_routes").unwrap_or(&empty);
+    for (_, scope, key) in &apikeys {
+        for entry in key.allowed_routes.iter().flatten() {
+            if entry.contains('*') || route_names.contains_key(entry) {
+                continue;
+            }
+            let mut known: Vec<&str> = route_names.keys().map(String::as_str).collect();
+            known.sort_unstable();
+            errors.push(LoadError {
+                scope: scope.to_string(),
+                message: format!(
+                    "allowed_routes entry references unknown passthrough route {entry:?} \
+                     (defined routes: {})",
+                    if known.is_empty() {
+                        "none".to_string()
+                    } else {
+                        known.join(", ")
+                    }
+                ),
+            });
+        }
+    }
+
     // The runtime credential index is keyed by key_hash, so two api_keys
     // entries with distinct display_names but the same plaintext would
     // silently last-wins at auth time (the Admin API rejects exactly
@@ -582,6 +639,50 @@ pub fn load_from_str(
                     "duplicate enabled OIDC issuer {:?}: already used by {first} — every \
                      enabled provider must have a distinct issuer",
                     provider.issuer
+                ),
+            });
+        }
+    }
+
+    // A claim mapping only ever evaluates against tokens verified by the
+    // provider it names, so a typo'd `jwt_provider` would make the rule
+    // silently dead. Resolve the reference at load like any other
+    // cross-reference. (API keys deliberately allow a dangling
+    // `jwt_provider`: the binding goes inert but the key still
+    // authenticates by plaintext. A mapping has no such fallback role.)
+    let provider_names = identity_maps.get("oidc_providers").unwrap_or(&empty);
+    let api_key_ids = identity_maps.get("api_keys").unwrap_or(&empty);
+    for (_, scope, mapping) in &claim_mappings {
+        if !provider_names.contains_key(&mapping.jwt_provider) {
+            let mut known: Vec<&str> = provider_names.keys().map(String::as_str).collect();
+            known.sort_unstable();
+            errors.push(LoadError {
+                scope: scope.clone(),
+                message: format!(
+                    "jwt_provider references unknown OIDC provider {:?} (defined providers: {})",
+                    mapping.jwt_provider,
+                    if known.is_empty() {
+                        "none".to_string()
+                    } else {
+                        known.join(", ")
+                    }
+                ),
+            });
+        }
+        // The `resolve.api_key` name sugar resolves (or errors) in
+        // desugar; a canonical `resolve.api_key_id` written directly must
+        // equally land on a key defined in this file, or the mapping
+        // would silently resolve nothing at runtime.
+        if !api_key_ids
+            .values()
+            .any(|derived| derived == &mapping.resolve.api_key_id)
+        {
+            errors.push(LoadError {
+                scope: scope.clone(),
+                message: format!(
+                    "resolve.api_key_id {:?} does not match any api key defined in this file — \
+                     reference the key by name via `resolve.api_key` instead",
+                    mapping.resolve.api_key_id
                 ),
             });
         }
@@ -698,6 +799,16 @@ pub fn load_from_str(
     for (id, _, v) in oidc_providers {
         snapshot
             .oidc_providers
+            .insert(ResourceEntry::new(id, v, revision));
+    }
+    for (id, _, v) in claim_mappings {
+        snapshot
+            .claim_mappings
+            .insert(ResourceEntry::new(id, v, revision));
+    }
+    for (id, _, v) in passthrough_routes {
+        snapshot
+            .passthrough_routes
             .insert(ResourceEntry::new(id, v, revision));
     }
     for (id, _, v) in mcp_auth_settings {

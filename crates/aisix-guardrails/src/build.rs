@@ -995,8 +995,10 @@ pub fn build_index_from_snapshot(
         let scope_kind = match attachment.scope_type {
             GuardrailScopeType::Env => ScopeKind::Env,
             GuardrailScopeType::Model => ScopeKind::Model,
+            GuardrailScopeType::McpServer => ScopeKind::McpServer,
             GuardrailScopeType::ApiKey => ScopeKind::ApiKey,
             GuardrailScopeType::Team => ScopeKind::Team,
+            GuardrailScopeType::PassthroughRoute => ScopeKind::PassthroughRoute,
         };
 
         entries.push(GuardrailIndex::push_entry(
@@ -1174,8 +1176,19 @@ impl LiveGuardrailIndex {
     /// Cheap on the cache-hit path (one lock acquire + version compare +
     /// arc clone + `O(n)` linear walk over attachment rows). Rebuilds only
     /// on snapshot version change.
+    ///
+    /// An empty index (no guardrails configured — the default) resolves
+    /// to the same empty chain for every request, so that case returns
+    /// early: no resolve walk, no applied-set copy, no sink attach (a
+    /// chain with no members never reports to the sink). This is the one
+    /// chokepoint every endpoint family resolves through, so the fast
+    /// path covers them all.
     pub fn resolve(&self, ctx: &RequestContext<'_>) -> GuardrailChain {
-        self.current()
+        let index = self.current();
+        if index.is_empty() {
+            return GuardrailChain::empty();
+        }
+        index
             .resolve(ctx)
             .with_metrics_sink(self.metrics_sink.clone())
     }
@@ -1875,7 +1888,9 @@ mod tests {
         let attachments: ResourceTable<GuardrailAttachment> = ResourceTable::default();
         let index = build_index_from_snapshot(&shuffled_table(), &attachments, None);
         let chain = index.resolve(&RequestContext {
+            passthrough_route_id: "",
             model_id: "m",
+            mcp_server_id: "",
             api_key_id: "k",
             team_id: None,
         });
@@ -1925,7 +1940,9 @@ mod tests {
         assert_eq!(index.len(), 1);
 
         let ctx = RequestContext {
+            passthrough_route_id: "",
             model_id: "m1",
+            mcp_server_id: "",
             api_key_id: "k1",
             team_id: None,
         };
@@ -1965,7 +1982,9 @@ mod tests {
         assert_eq!(index.len(), 0);
         // Verify the guardrail does not fire (not just that the index is empty).
         let ctx = RequestContext {
+            passthrough_route_id: "",
             model_id: "m",
+            mcp_server_id: "",
             api_key_id: "k",
             team_id: None,
         };
@@ -2013,7 +2032,9 @@ mod tests {
             "enabled+disabled attachments: exactly 1 entry expected",
         );
         let ctx = RequestContext {
+            passthrough_route_id: "",
             model_id: "any",
+            mcp_server_id: "",
             api_key_id: "any",
             team_id: None,
         };
@@ -2054,7 +2075,9 @@ mod tests {
         );
 
         let ctx = RequestContext {
+            passthrough_route_id: "",
             model_id: "any-model",
+            mcp_server_id: "",
             api_key_id: "any-key",
             team_id: None,
         };
@@ -2128,7 +2151,9 @@ mod tests {
         let live = LiveGuardrailIndex::new(handle.clone(), None);
 
         let ctx = RequestContext {
+            passthrough_route_id: "",
             model_id: "m1",
+            mcp_server_id: "",
             api_key_id: "k1",
             team_id: None,
         };
@@ -2172,6 +2197,24 @@ mod tests {
             .await
             .is_block());
         assert!(!live.is_empty());
+    }
+
+    #[tokio::test]
+    async fn live_index_empty_fast_path_resolves_empty_chain() {
+        // Zero-config fast path: an empty index resolves to an empty
+        // chain with an empty applied set — the same observable shape
+        // the full resolve walk produces on an empty index.
+        let live = LiveGuardrailIndex::new(SnapshotHandle::new(AisixSnapshot::new()), None);
+        let chain = live.resolve(&RequestContext {
+            passthrough_route_id: "",
+            model_id: "m",
+            mcp_server_id: "",
+            api_key_id: "k",
+            team_id: None,
+        });
+        assert!(chain.is_empty());
+        assert!(chain.applied().is_empty());
+        assert!(!chain.check_input(&req("anything")).await.is_block());
     }
 
     // -----------------------------------------------------------------------
@@ -2231,7 +2274,9 @@ mod tests {
         let live =
             LiveGuardrailIndex::new_with_sink(SnapshotHandle::new(snap), None, Some(sink.clone()));
         let ctx = RequestContext {
+            passthrough_route_id: "",
             model_id: "m1",
+            mcp_server_id: "",
             api_key_id: "k1",
             team_id: None,
         };
@@ -2453,7 +2498,9 @@ mod tests {
 
         let index = build_index_from_snapshot(&guardrails, &attachments, None);
         let chain = index.resolve(&RequestContext {
+            passthrough_route_id: "",
             model_id: "m-A",
+            mcp_server_id: "",
             api_key_id: "k",
             team_id: None,
         });
@@ -2466,6 +2513,62 @@ mod tests {
             }],
             "applied mirrors the deduplicated chain, not the raw entry count",
         );
+    }
+
+    #[tokio::test]
+    async fn mcp_server_attachment_builds_into_the_index() {
+        // The wire `scope_type: "mcp_server"` survives the snapshot build and
+        // selects on the called server, leaving model traffic alone.
+        let guardrails: ResourceTable<DomainGuardrail> = ResourceTable::default();
+        guardrails.insert(entry(
+            "kw",
+            "g-1",
+            parse(
+                r#"{
+                    "name": "kw",
+                    "kind": "keyword",
+                    "hook_point": "input",
+                    "patterns": [{ "kind": "literal", "value": "AKIA" }]
+                }"#,
+            ),
+        ));
+        let attachments: ResourceTable<GuardrailAttachment> = ResourceTable::default();
+        attachments.insert(attachment_entry(
+            "a-mcp",
+            parse_attachment(
+                r#"{ "guardrail_id": "g-1", "scope_type": "mcp_server", "scope_id": "mcp-A", "priority": 50 }"#,
+            ),
+        ));
+
+        let index = build_index_from_snapshot(&guardrails, &attachments, None);
+        assert_eq!(index.len(), 1, "the attachment must not be skipped");
+
+        let matched = index.resolve(&RequestContext {
+            passthrough_route_id: "",
+            model_id: "",
+            mcp_server_id: "mcp-A",
+            api_key_id: "k",
+            team_id: None,
+        });
+        assert_eq!(matched.len(), 1);
+
+        let other_server = index.resolve(&RequestContext {
+            passthrough_route_id: "",
+            model_id: "",
+            mcp_server_id: "mcp-B",
+            api_key_id: "k",
+            team_id: None,
+        });
+        assert!(other_server.is_empty());
+
+        let llm = index.resolve(&RequestContext {
+            passthrough_route_id: "",
+            model_id: "m-A",
+            mcp_server_id: "",
+            api_key_id: "k",
+            team_id: None,
+        });
+        assert!(llm.is_empty(), "model traffic carries no MCP server");
     }
 
     #[tokio::test]
@@ -2496,7 +2599,9 @@ mod tests {
 
         let index = build_index_from_snapshot(&guardrails, &attachments, None);
         let chain = index.resolve(&RequestContext {
+            passthrough_route_id: "",
             model_id: "m-OTHER",
+            mcp_server_id: "",
             api_key_id: "k",
             team_id: None,
         });

@@ -18,6 +18,9 @@
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use crate::bridge::BridgeError;
+use crate::upstream_tls::TlsSettings;
+
 /// Suffixes marking a query parameter whose value is a credential and must
 /// be redacted out of logged URLs. Vertex/Gemini accept `?key=` and
 /// `?access_token=`, and an operator can put either directly in a
@@ -85,6 +88,11 @@ pub struct UpstreamHttpConfig {
     /// Cap on idle connections kept per upstream host. `None` leaves
     /// reqwest's default (unbounded).
     pub pool_max_idle_per_host: Option<usize>,
+    /// Trust material for the TLS handshake — see [`TlsSettings`]. Lives
+    /// here rather than beside each client so the private-CA / mTLS /
+    /// verification decision is made once and reaches every outbound
+    /// stack, not just the ones someone remembered to wire.
+    pub tls: TlsSettings,
 }
 
 impl Default for UpstreamHttpConfig {
@@ -96,6 +104,7 @@ impl Default for UpstreamHttpConfig {
             tcp_keepalive_retries: Some(5),
             pool_idle_timeout: Some(Duration::from_secs(30)),
             pool_max_idle_per_host: None,
+            tls: TlsSettings::default(),
         }
     }
 }
@@ -106,8 +115,14 @@ static CONFIG: OnceLock<UpstreamHttpConfig> = OnceLock::new();
 /// during boot, before any bridge builds its client. Later calls are
 /// ignored — the pools are already built, so a second set would silently
 /// not apply.
-pub fn init(cfg: UpstreamHttpConfig) {
+///
+/// Fails when the configured TLS material does not parse, which is the
+/// point at which a wrong `upstream.tls.ca_file` should stop the boot
+/// rather than become a transport error on the first upstream call.
+pub fn init(cfg: UpstreamHttpConfig) -> Result<(), String> {
+    crate::upstream_tls::init_reqwest_material(&cfg.tls)?;
     let _ = CONFIG.set(cfg);
+    Ok(())
 }
 
 /// The active settings, defaulting when [`init`] was never called (tests,
@@ -116,8 +131,9 @@ pub fn config() -> &'static UpstreamHttpConfig {
     CONFIG.get_or_init(UpstreamHttpConfig::default)
 }
 
-/// A `reqwest::ClientBuilder` with the connection settings applied. Callers
-/// add their own `user_agent` / TLS options and `build()`.
+/// A `reqwest::ClientBuilder` with the connection settings **and the
+/// deployment's outbound TLS trust** applied. Callers add their own
+/// `user_agent` and `build()`.
 pub fn client_builder() -> reqwest::ClientBuilder {
     let cfg = config();
     let mut b = reqwest::Client::builder()
@@ -134,6 +150,26 @@ pub fn client_builder() -> reqwest::ClientBuilder {
     }
     if let Some(n) = cfg.pool_max_idle_per_host {
         b = b.pool_max_idle_per_host(n);
+    }
+    apply_tls(b, &cfg.tls)
+}
+
+/// Layer the outbound trust decision onto a builder. Split out so the
+/// per-ProviderKey clients get byte-for-byte the same treatment as the
+/// shared one.
+pub(crate) fn apply_tls(
+    mut b: reqwest::ClientBuilder,
+    tls: &TlsSettings,
+) -> reqwest::ClientBuilder {
+    let material = crate::upstream_tls::reqwest_material();
+    for root in &material.roots {
+        b = b.add_root_certificate(root.clone());
+    }
+    if let Some(identity) = &material.identity {
+        b = b.identity(identity.clone());
+    }
+    if !tls.verify {
+        b = b.danger_accept_invalid_certs(true);
     }
     b
 }
@@ -157,6 +193,33 @@ pub fn transport_error_message(err: &reqwest::Error) -> String {
     }
     append_source_chain(&mut msg, err);
     msg
+}
+
+/// Classify a `reqwest` **send** failure into its [`BridgeError`].
+///
+/// reqwest reports a *builder* error when the request could not even be
+/// constructed. In practice that is an `api_base` that does not parse as a
+/// URL: [`crate::url_cache::EndpointUrl::Unparsed`] deliberately hands the
+/// raw string to the request builder so the message stays exactly what it
+/// always was, and the parse failure then surfaces here at `send()` with
+/// `is_builder()` set and no URL attached.
+///
+/// Nothing was sent, so this is customer-fixable upstream config — the same
+/// class as a *missing* `api_base`, which already maps to
+/// [`BridgeError::InvalidUpstreamConfig`] — rather than a transport failure.
+/// Calling it `Transport` would report a 502 for an operator's typo, retry
+/// a URL that can never parse, and (via
+/// [`BridgeError::reached_upstream`]) count it against the target's
+/// `aisix_deployment_*` health even though no provider was contacted.
+///
+/// Use at `send()` sites only. A failure reading an already-open response
+/// body or stream is never a builder error and stays [`BridgeError::Transport`].
+pub fn send_error(err: reqwest::Error) -> BridgeError {
+    if err.is_builder() {
+        BridgeError::InvalidUpstreamConfig(transport_error_message(&err))
+    } else {
+        BridgeError::Transport(transport_error_message(&err))
+    }
 }
 
 /// Same as [`transport_error_message`] for error types that aren't
@@ -255,11 +318,18 @@ mod tests {
             let src = std::fs::read_to_string(&file).expect("read source");
             // Tests build throwaway clients on purpose; only the
             // production half of each file is in scope.
-            let production = match src.find("#[cfg(test)]") {
-                Some(i) => &src[..i],
-                None => &src[..],
-            };
+            let production = production_half(&src);
+            // `shared_http_client()` in aisix-mcp is the sanctioned
+            // counterpart of `client_builder()` for rmcp's own reqwest
+            // line (rmcp pins 0.13; it gets the same
+            // `upstream_http::config()` values applied). The exemption is
+            // scoped to that one file so a bare rmcp client anywhere else
+            // still gets flagged.
+            let sanctioned_rmcp_site = file.ends_with("aisix-mcp/src/bridge.rs");
             for (n, line) in production.lines().enumerate() {
+                if sanctioned_rmcp_site && line.contains("rmcp_reqwest::Client::") {
+                    continue;
+                }
                 if line.contains("reqwest::Client::builder()")
                     || line.contains("reqwest::Client::new()")
                 {
@@ -273,6 +343,147 @@ mod tests {
             offenders.is_empty(),
             "these build a reqwest client directly instead of \
              `aisix_gateway::client_builder()`:\n{}",
+            offenders.join("\n"),
+        );
+    }
+
+    /// The outbound stacks that are *not* reqwest each have exactly one
+    /// sanctioned construction site, and each of those sites is the only
+    /// thing standing between `upstream.tls` and a client that quietly
+    /// trusts the wrong set of roots.
+    ///
+    /// Nothing else catches a regression here: a client built without the
+    /// shared trust material works perfectly against every public
+    /// provider and fails only against the private CA the setting exists
+    /// for — which is to say, only in the customer's environment.
+    ///
+    /// Each entry is (probe, what the file must also mention, why).
+    #[test]
+    fn every_non_reqwest_outbound_stack_applies_the_shared_tls_settings() {
+        const RULES: &[(&str, &str, &str)] = &[
+            (
+                // Catches a *new* WebSocket call site: `connect_async`
+                // builds its own connector over webpki roots only.
+                "tokio_tungstenite::connect_async(",
+                "rustls_client_config",
+                "the Realtime WebSocket must dial through the shared rustls config \
+                 (`connect_async` builds its own connector over webpki roots only)",
+            ),
+            (
+                // Catches the existing call site being weakened — passing
+                // `Connector::Plain` or `None` still compiles and still
+                // connects, just to a different set of roots.
+                "connect_async_tls_with_config",
+                "rustls_client_config",
+                "the Realtime WebSocket connector must come from \
+                 `upstream_tls::rustls_client_config()`",
+            ),
+            (
+                "aws_config::SdkConfig::builder()",
+                "aws_http_client",
+                "Bedrock SDK clients must be built on `upstream_tls::aws_http_client()`",
+            ),
+            (
+                "AmazonS3Builder::",
+                "tls_client_options",
+                "object-store exporters must pass `tls_client_options()` as client options",
+            ),
+            (
+                "MicrosoftAzureBuilder::",
+                "tls_client_options",
+                "object-store exporters must pass `tls_client_options()` as client options",
+            ),
+            (
+                "GoogleCloudStorageBuilder::",
+                "tls_client_options",
+                "object-store exporters must pass `tls_client_options()` as client options",
+            ),
+        ];
+
+        let crates_dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/.."));
+        let mut offenders = Vec::new();
+        for file in rust_sources(crates_dir) {
+            let src = std::fs::read_to_string(&file).expect("read source");
+            let production = production_half(&src);
+            for (probe, required, why) in RULES {
+                if production.contains(probe) && !production.contains(required) {
+                    offenders.push(format!("{}: {}", file.display(), why));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "these reach an external service without the deployment's outbound TLS \
+             trust:\n{}",
+            offenders.join("\n"),
+        );
+    }
+
+    /// The part of a source file that is not the test module.
+    ///
+    /// Cuts at the top-level `#[cfg(test)] mod …` specifically, not at
+    /// the first `#[cfg(test)]` anywhere: that attribute is also used on
+    /// struct fields and match arms, several of which appear near the
+    /// top of a file, and cutting there silently excused everything
+    /// below from every scan in this module.
+    fn production_half(src: &str) -> &str {
+        const MARKER: &str = "\n#[cfg(test)]\nmod ";
+        match src.find(MARKER) {
+            Some(i) => &src[..i],
+            None => src,
+        }
+    }
+
+    /// The scans above are only worth their runtime if they actually see
+    /// the whole file — an early `#[cfg(test)]` field attribute used to
+    /// hide every call site under it.
+    #[test]
+    fn production_half_cuts_at_the_test_module_not_a_field_attribute() {
+        let src = "struct S {\n    #[cfg(test)]\n    probe: bool,\n}\nfn f() {}\n\
+                   #[cfg(test)]\nmod tests {\n    fn t() {}\n}\n";
+        let production = production_half(src);
+        assert!(production.contains("fn f()"), "{production}");
+        assert!(!production.contains("fn t()"), "{production}");
+    }
+
+    /// On a thread-per-core worker every dispatch runs on that worker's
+    /// own pool, and that one pool stands in for all of the clients
+    /// below — so it is built with a single user agent
+    /// (`upstream_tls::DISPATCH_USER_AGENT`).
+    ///
+    /// That substitution is only invisible while the clients it replaces
+    /// agree on the user agent. Give one bridge its own and the header
+    /// it sends changes depending on which serving mode the deployment
+    /// runs, which is not something an upstream-facing identity is
+    /// allowed to do. Whoever wants a distinct user agent has to give
+    /// that client a distinct pool as well.
+    #[test]
+    fn every_dispatch_client_presents_the_same_user_agent() {
+        let crates_dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/.."));
+        // Only literals: the telemetry, heartbeat, and OTLP clients build
+        // theirs from a version string or a named constant, and none of
+        // them talks to a model provider or reaches the per-worker pool.
+        const NEEDLE: &str = ".user_agent(\"";
+        let mut offenders = Vec::new();
+        for file in rust_sources(crates_dir) {
+            let src = std::fs::read_to_string(&file).expect("read source");
+            for (n, line) in production_half(&src).lines().enumerate() {
+                let Some(rest) = line.split_once(NEEDLE).map(|(_, r)| r) else {
+                    continue;
+                };
+                let Some((agent, _)) = rest.split_once('"') else {
+                    continue;
+                };
+                if agent != crate::upstream_tls::DISPATCH_USER_AGENT {
+                    offenders.push(format!("{}:{}: {agent}", file.display(), n + 1));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "these dispatch clients present a user agent the per-worker \
+             pool would replace with `{}`:\n{}",
+            crate::upstream_tls::DISPATCH_USER_AGENT,
             offenders.join("\n"),
         );
     }
@@ -451,5 +662,36 @@ mod tests {
             with_causes.len() > top_level.len(),
             "causes must add information"
         );
+    }
+
+    /// The distinction `send_error` exists to make. `EndpointUrl::Unparsed`
+    /// hands a malformed `api_base` to the request builder verbatim, and
+    /// reqwest reports the parse failure only here, at `send()`, as a
+    /// builder error with no URL attached. Classifying it as `Transport`
+    /// would 502 an operator's typo, retry a URL that can never parse, and
+    /// count it against the target's upstream health.
+    #[tokio::test]
+    async fn builder_errors_are_upstream_config_not_transport() {
+        let client = reqwest::Client::new();
+        let builder_err = crate::url_cache::EndpointUrl::Unparsed("ht tp://not a url".to_string())
+            .post_on(&client)
+            .send()
+            .await
+            .expect_err("a malformed api_base cannot produce a response");
+        assert!(builder_err.is_builder());
+        assert!(matches!(
+            send_error(builder_err),
+            BridgeError::InvalidUpstreamConfig(_)
+        ));
+
+        // A real connection attempt to a closed port stays transport: we
+        // did try to reach the provider, and that is upstream health.
+        let io_err = client
+            .post("http://127.0.0.1:1/v1/chat/completions")
+            .send()
+            .await
+            .expect_err("nothing listens on port 1");
+        assert!(!io_err.is_builder());
+        assert!(matches!(send_error(io_err), BridgeError::Transport(_)));
     }
 }

@@ -15,10 +15,6 @@ import {
 // no propagation wait anywhere in this suite: the first request must
 // already serve.
 //
-// The Admin API write path stays deliberately covered during its
-// deprecation window by the seed-vs-admin characterization case and
-// the cases marked "Deliberately seeds via the Admin API".
-//
 // v3 self-hosted CP wire (§9A.7B.4): the resources file stores SHA-256
 // of the plaintext bearer, never the plaintext itself. The gateway
 // hashes incoming `Bearer <plaintext>` and looks the key up by hash.

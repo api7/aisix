@@ -10,7 +10,7 @@
 //! The gateway appends `/v1/rerank`.
 
 use aisix_core::AppliedGuardrail;
-use aisix_obs::{content_capture_cap, AccessLog, CapturedContent, RequestOutcome, UsageEvent};
+use aisix_obs::{content_capture_cap, AccessLog, CapturedContent, UsageEvent};
 use axum::extract::State;
 use axum::http::HeaderValue;
 use axum::response::{IntoResponse, Response};
@@ -35,6 +35,12 @@ struct RerankDispatchSuccess {
     /// Resolved ProviderKey UUID — feeds per-PK telemetry attribution
     /// (AISIX-Cloud#867 parity).
     provider_key_id: String,
+    /// Provider-side model name, for the `upstream_model` metric label
+    /// (AISIX-Cloud#1234 parity with chat / messages / responses).
+    upstream_model: String,
+    /// Rerank response object `id` (Cohere sends one; Jina-style upstreams
+    /// do not). Empty when the upstream omitted it (AISIX-Cloud#1289).
+    provider_request_id: String,
     /// The `{kind, hook}` set of guardrails that governed this request (#379
     /// parity) — surfaced on the emitted UsageEvent.
     applied_guardrails: Vec<AppliedGuardrail>,
@@ -72,9 +78,27 @@ pub async fn rerank(
     State(state): State<ProxyState>,
     auth: AuthenticatedKey,
     client: ClientContext,
-    Json(mut body): Json<Value>,
+    // Result-wrapped so an extractor-layer 413 maps to the OpenAI
+    // envelope — see completions.rs.
+    body: Result<Json<Value>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     let started = Instant::now();
+    let Json(mut body) = match body {
+        Ok(json) => json,
+        // Answer through `reject` — see completions.rs.
+        Err(rej) => {
+            return crate::reject::reject_before_dispatch(
+                &state,
+                "POST",
+                "/v1/rerank",
+                &client.request_id,
+                Some(&auth.entry.id),
+                started,
+                crate::reject::Envelope::OpenAi,
+                crate::error::proxy_error_from_json_rejection(rej, state.request_body_limit_bytes),
+            );
+        }
+    };
     let request_id = client.request_id.clone();
     let api_key_id = auth.entry.id.clone();
 
@@ -84,7 +108,10 @@ pub async fn rerank(
         .unwrap_or("")
         .to_string();
 
-    match dispatch(&state, &auth, &mut body, &request_id, &client).await {
+    // One snapshot for the whole request (#941) — see `embeddings`.
+    let snapshot = state.snapshot.load();
+
+    match dispatch(&state, &snapshot, &auth, &mut body, &request_id, &client).await {
         Ok(success) => {
             let elapsed = started.elapsed();
             let status = success.response.status().as_u16();
@@ -95,13 +122,24 @@ pub async fn rerank(
                 status,
                 elapsed,
                 &request_id,
+                Some(success.provider_request_id.as_str()),
                 None,
             );
-            state.metrics.record_request(
-                &success.provider,
-                &model_name,
+            // One ProviderKey lookup for the metric emit + the usage event
+            // below (#941).
+            let pk = crate::usage_attr::ResolvedPk::resolve(&snapshot, &success.provider_key_id);
+            crate::request_metrics::record(
+                &state,
+                "/v1/rerank",
+                crate::request_metrics::Caller::new(&auth),
+                crate::request_metrics::Upstream {
+                    provider: &success.provider,
+                    model: &model_name,
+                    upstream_model: &success.upstream_model,
+                    pk: pk.labels(),
+                    ..Default::default()
+                },
                 status,
-                RequestOutcome::from_status(status),
                 elapsed,
             );
             // Issue #405: emit UsageEvent so cp-api's budget ledger
@@ -113,15 +151,19 @@ pub async fn rerank(
             if let Some(usage) = success.usage {
                 emit_usage_event(
                     &state,
+                    &snapshot,
+                    &pk,
                     &request_id,
                     &success.model_id,
                     &model_name,
                     &api_key_id,
-                    &success.provider_key_id,
+                    &success.provider,
+                    &success.upstream_model,
                     &success.applied_guardrails,
                     status,
                     elapsed,
                     &usage,
+                    &success.provider_request_id,
                     &client,
                     success.redactions.clone(),
                     success.monitor_hits.clone(),
@@ -140,21 +182,29 @@ pub async fn rerank(
                 status,
                 elapsed,
                 &request_id,
+                None,
                 Some(&err),
             );
-            let snap = state.snapshot.load();
-            let metric_model = crate::usage_attr::metric_model_label(&snap, &model_name);
-            state.metrics.record_request(
-                "unknown",
-                metric_model,
+            let metric_model = crate::usage_attr::metric_model_label(&snapshot, &model_name);
+            // AISIX-Cloud#1325: name the target the request died on. This
+            // branch used to emit `Upstream::default()`, so a 502 from a
+            // real provider landed on `provider="unknown"` while the same
+            // key's successes landed on the real one.
+            let attributed = crate::attribution::current().unwrap_or_default();
+            let last_target = crate::request_metrics::LastTarget::new(&snapshot, &attributed);
+            crate::request_metrics::record(
+                &state,
+                "/v1/rerank",
+                crate::request_metrics::Caller::new(&auth),
+                last_target.upstream(metric_model.as_ref(), false, false),
                 status,
-                RequestOutcome::from_status(status),
                 elapsed,
             );
             // Per #655 parity: surface the failed request in Logs with a
             // zero-token event (status + error class), instead of dropping it.
             crate::usage_attr::emit_error_usage_event(
                 &state,
+                &snapshot,
                 "rerank",
                 "openai",
                 &request_id,
@@ -196,20 +246,19 @@ fn rerank_input_to_chat(model: &str, body: &Value) -> aisix_gateway::ChatFormat 
 
 async fn dispatch(
     state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
     auth: &AuthenticatedKey,
     body: &mut Value,
     request_id: &str,
     client_ctx: &ClientContext,
 ) -> Result<RerankDispatchSuccess, ProxyError> {
-    let snapshot = state.snapshot.load();
-
     let model_name = body
         .get("model")
         .and_then(|v| v.as_str())
         .ok_or_else(|| ProxyError::InvalidRequest("`model` field missing".into()))?
         .to_string();
 
-    let model_entry = crate::model_resolve::resolve_model(&snapshot, &model_name)
+    let model_entry = crate::model_resolve::resolve_model(snapshot, &model_name)
         .ok_or_else(|| ProxyError::ModelNotFound(model_name.clone()))?;
 
     if !auth.key().can_access(&model_name) {
@@ -226,7 +275,9 @@ async fn dispatch(
     // content-policy refusal doesn't burn an RPM slot. (Output is reranked
     // indices/scores, not generated text, so there is no output hook.)
     let guardrail_ctx = aisix_guardrails::RequestContext {
+        passthrough_route_id: "",
         model_id: &model_entry.id,
+        mcp_server_id: "",
         api_key_id: &auth.entry.id,
         team_id: auth.key().team_id.as_deref(),
     };
@@ -278,7 +329,7 @@ async fn dispatch(
 
     let model_rl =
         crate::quota::ModelRateLimit::from_model(&model_name, &model_entry.id, &model_entry.value);
-    let reservation = crate::quota::enforce(state, auth, Some(&model_rl)).await?;
+    let reservation = crate::quota::enforce(state, snapshot, auth, Some(&model_rl)).await?;
 
     let model = &model_entry.value;
 
@@ -322,7 +373,7 @@ async fn dispatch(
         )));
     }
 
-    let pk_entry = crate::dispatch::resolve_provider_key(&snapshot, model)?;
+    let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
     let api_key = crate::dispatch::require_api_key(&pk_entry.value, model)?.to_string();
     let upstream_model = crate::dispatch::require_upstream_model(model)?.to_string();
 
@@ -343,11 +394,6 @@ async fn dispatch(
         aisix_provider_openai::overrides::apply_default_body_fields(body, &r.default_body_fields);
     }
 
-    // Build upstream URL. build_v1_url tolerates either base form —
-    // `https://api.cohere.com` (bare host) and `https://api.openai.com/v1`
-    // (OpenAI-SDK convention, with /v1) both end up at `…/v1/rerank`
-    // instead of `…/v1/v1/rerank`.
-    //
     // The provider arm of `default_base_for_provider` is guaranteed to
     // return `Some` here because the gate above already rejected any
     // provider label outside `{"openai", "cohere", "jina"}` — all three
@@ -356,12 +402,22 @@ async fn dispatch(
     // gate without an arm in the helper; the audit-trail-friendly
     // default is OpenAI's host (it's a 4xx-from-OpenAI rather than
     // dispatching to a stale legacy domain).
-    let base = match pk_entry.value.api_base.as_deref() {
-        Some(b) if !b.trim().is_empty() => b.trim_end_matches('/').to_string(),
-        _ => default_base_for_provider(&provider_label)
-            .unwrap_or_else(|| "https://api.openai.com".to_string()),
-    };
-    let url = crate::dispatch::build_v1_url(&base, "/rerank");
+    let url = aisix_gateway::url_cache::cached_endpoint_url(
+        &pk_entry.id,
+        "proxy/rerank",
+        &[
+            pk_entry.value.api_base.as_deref().unwrap_or(""),
+            &provider_label,
+        ],
+        || {
+            let base = match pk_entry.value.api_base.as_deref() {
+                Some(b) if !b.trim().is_empty() => b.trim_end_matches('/').to_string(),
+                _ => default_base_for_provider(&provider_label)
+                    .unwrap_or_else(|| "https://api.openai.com".to_string()),
+            };
+            Ok::<_, crate::error::ProxyError>(crate::dispatch::build_openai_url(&base, "/rerank"))
+        },
+    )?;
 
     // Build headers explicitly so the PK's `request.default_headers` and
     // `request.forward_client_headers` can inject operator/client headers
@@ -397,7 +453,7 @@ async fn dispatch(
         ),
     );
 
-    let client = crate::http_client::client();
+    let client = crate::http_client::client_for(pk_entry.value.tls.as_ref());
     // Send, check the status, and read the body as one retryable unit, so a
     // transient fault anywhere in that sequence is retried rather than
     // surfacing to the caller. `note_failure` runs per attempt, matching
@@ -409,9 +465,15 @@ async fn dispatch(
     let cooldown_cfg = model.cooldown.as_ref();
     let (upstream_headers, body_bytes) =
         match crate::routing::retrying_dispatch(state, model, "/v1/rerank", || {
-            let mut req = client.post(&url).headers(headers.clone()).json(body);
+            let mut req = url
+                .clone()
+                .post_on(&client)
+                .headers(headers.clone())
+                .json(body);
             // #554: rerank is non-streaming; apply the E2E request timeout.
-            if let Some(d) = model.request_timeout() {
+            if let Some(d) =
+                crate::routing::effective_timeouts(model, None, state.default_timeouts).request
+            {
                 req = req.timeout(d);
             }
             async move {
@@ -460,7 +522,7 @@ async fn dispatch(
             Err(err) => return Err(ProxyError::Bridge(err)),
         };
 
-    state.health.record_success(&model_name);
+    state.health.record_success(&model_entry.value.display_name);
     state.runtime_status.mark_healthy(&model_entry.id);
 
     // Extract usage from the upstream body BEFORE handing the bytes
@@ -474,8 +536,11 @@ async fn dispatch(
     // upstream returned 200 + claimed JSON but the body was
     // unparseable — this is upstream-malformed, not gateway-bug,
     // but operators need to see it).
-    let usage = match serde_json::from_slice::<Value>(&body_bytes) {
-        Ok(v) => extract_rerank_usage(&v),
+    let (usage, provider_request_id) = match serde_json::from_slice::<Value>(&body_bytes) {
+        Ok(v) => (
+            extract_rerank_usage(&v),
+            crate::usage_attr::provider_response_id(&v),
+        ),
         Err(e) => {
             tracing::warn!(
                 request_id = %request_id,
@@ -483,7 +548,7 @@ async fn dispatch(
                 error = %e,
                 "rerank: upstream body parse failed; skipping UsageEvent emission"
             );
-            None
+            (None, String::new())
         }
     };
 
@@ -526,8 +591,10 @@ async fn dispatch(
         provider: provider_label,
         model_id: model_entry.id.to_string(),
         provider_key_id: pk_entry.id.to_string(),
+        upstream_model,
         applied_guardrails: applied_guardrails.clone(),
         usage,
+        provider_request_id,
         redactions,
         monitor_hits,
         captured_content,
@@ -581,15 +648,24 @@ fn extract_rerank_usage(body: &Value) -> Option<RerankUsage> {
 #[allow(clippy::too_many_arguments)]
 fn emit_usage_event(
     state: &ProxyState,
+    // The request's snapshot + its one ProviderKey observation, resolved
+    // by the handler (#941).
+    snap: &aisix_core::AisixSnapshot,
+    pk: &crate::usage_attr::ResolvedPk<'_>,
     request_id: &str,
     model_id: &str,
     requested_model: &str,
     api_key_id: &str,
-    provider_key_id: &str,
+    // Metric labels the UsageEvent has no field for (AISIX-Cloud#1234
+    // follow-up): the wire struct is the CP contract, so they ride
+    // alongside rather than in it.
+    provider: &str,
+    upstream_model: &str,
     applied_guardrails: &[AppliedGuardrail],
     status_code: u16,
     elapsed: Duration,
     usage: &RerankUsage,
+    provider_request_id: &str,
     client: &ClientContext,
     // Per-detector PII mask counts (#932/#696). Empty = no redaction.
     redacted_entity_counts: crate::redact::RedactionCounts,
@@ -599,7 +675,6 @@ fn emit_usage_event(
     // never to the CP sink.
     content: Option<&CapturedContent>,
 ) {
-    let snap = state.snapshot.load();
     let mut event = UsageEvent {
         request_id: request_id.to_string(),
         occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
@@ -612,6 +687,7 @@ fn emit_usage_event(
         upstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
         downstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
         status_code,
+        provider_request_id: provider_request_id.to_string(),
         inbound_protocol: "openai".to_string(),
         applied_guardrails: applied_guardrails.to_vec(),
         client_source_ip: client.source_ip.clone(),
@@ -623,14 +699,39 @@ fn emit_usage_event(
     // Per-PK attribution tags (provider_kind / provider_featured /
     // branded_provider / pk_label / byo_label) ARE populated — same lookup as
     // chat / messages / responses / embeddings (AISIX-Cloud#867 parity).
-    crate::usage_attr::apply_pk_telemetry(&mut event, &snap, provider_key_id);
-    state.usage_sink.try_emit("rerank", event.clone());
-    let exporters = snap.observability_exporters.entries();
+    crate::usage_attr::apply_pk_telemetry(&mut event, pk);
+    crate::usage_attr::apply_jwt_identity(&mut event, client.jwt.as_ref());
+    let usage_model = crate::usage_attr::usage_event_model_label(snap, &event.requested_model);
+    state.usage_sink.try_emit(
+        "rerank",
+        event.clone(),
+        crate::usage_attr::usage_event_labels(&usage_model, pk),
+    );
+    let exporters = crate::usage_attr::live_exporters(state, snap);
     state
         .otlp_fan_out
         .fan_out(&event, content, exporters.iter().map(|e| &e.value));
+    let owned_caller = crate::request_metrics::Caller::from_api_key_id(snap, api_key_id);
+    crate::request_metrics::record_usage(
+        state,
+        "/v1/rerank",
+        owned_caller.as_caller(),
+        crate::request_metrics::Upstream {
+            provider,
+            model: requested_model,
+            upstream_model,
+            pk: pk.labels(),
+            ..Default::default()
+        },
+        crate::request_metrics::Tokens {
+            input: usage.prompt_tokens,
+            output: 0,
+            total: usage.prompt_tokens,
+            spend_usd: 0.0,
+            client_type: state.client_classifier.classify(&client.user_agent),
+        },
+    );
 }
-
 /// Default upstream host for the rerank-supporting providers,
 /// keyed by the lowercase `Model.provider` string. Per #302 Phase A
 /// this is a string-keyed match: the `Provider` enum has been
@@ -646,7 +747,7 @@ fn default_base_for_provider(provider: &str) -> Option<String> {
     match provider {
         "openai" => Some("https://api.openai.com".to_string()),
         // Cohere v1 path (deprecated by Cohere but still functional)
-        // is what the gateway's `build_v1_url` produces from this
+        // is what the gateway's `build_openai_url` produces from this
         // base. Operators who want the Cohere v2 path can override
         // `api_base` to `https://api.cohere.com/v2` — see #213's v2
         // follow-up for the version-routing extension if needed.
@@ -659,6 +760,7 @@ fn default_base_for_provider(provider: &str) -> Option<String> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_access_log(
     model: &str,
     provider: &str,
@@ -666,6 +768,8 @@ fn emit_access_log(
     status: u16,
     elapsed: Duration,
     request_id: &str,
+    // Provider response id; `None`/empty when the call produced none.
+    provider_request_id: Option<&str>,
     error: Option<&ProxyError>,
 ) {
     let (error_kind, error) = match error {
@@ -687,6 +791,7 @@ fn emit_access_log(
         completion_tokens: None,
         total_tokens: None,
         request_id,
+        provider_request_id: provider_request_id.filter(|s| !s.is_empty()),
         served_by_model: None,
         routing_attempt_count: None,
         routing_fallback_count: None,
@@ -715,7 +820,11 @@ mod tests {
             addr: "127.0.0.1:0".into(),
             request_body_limit_bytes: 1_048_576,
             real_ip: Default::default(),
+            request_id: Default::default(),
+            url_rewrites: Vec::new(),
             tls: None,
+            thread_per_core: None,
+            workers: None,
         }
     }
 
@@ -1072,7 +1181,7 @@ mod tests {
 
         let snap = AisixSnapshot::new();
         // Operator-style configuration: bare host, no /v1 suffix.
-        // The gateway's `build_v1_url` produces `/v1/rerank` correctly
+        // The gateway's `build_openai_url` produces `/v1/rerank` correctly
         // for both `https://api.jina.ai` and `https://api.jina.ai/v1`.
         let pk_json = format!(
             r#"{{"display_name":"jina-up","secret":"jina_mock_secret","api_base":"{}","provider":"jina"}}"#,
@@ -1148,7 +1257,7 @@ mod tests {
 
         let snap = AisixSnapshot::new();
         // Cohere's API base form: bare host, no /v1 suffix. The
-        // gateway's `build_v1_url` appends /v1/rerank correctly for
+        // gateway's `build_openai_url` appends /v1/rerank correctly for
         // both `https://api.cohere.com` and `https://api.cohere.com/v1`.
         let pk_json = format!(
             r#"{{"display_name":"cohere-up","secret":"sk-cohere-mock","api_base":"{}","provider":"cohere","adapter":"openai"}}"#,
@@ -1244,6 +1353,56 @@ mod tests {
 
         assert_eq!(resp.status(), StatusCode::OK);
         upstream.verify().await;
+    }
+
+    /// AISIX-Cloud#1289: a rerank response object carries an `id` (Cohere
+    /// sends one) and it must reach the UsageEvent — the handler recorded
+    /// none before. Fails before the fix (empty), passes after.
+    #[tokio::test]
+    async fn records_the_provider_response_id_1289() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/rerank"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "rerank_1289",
+                "results": [{"index": 0, "relevance_score": 0.9}],
+                "model": "rerank-multilingual-v3.0",
+                "usage": {"prompt_tokens": 12, "total_tokens": 12}
+            })))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(openai_model("rerank-openai"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let state = crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+
+        let resp = tower::ServiceExt::oneshot(
+            crate::build_router(state),
+            make_req(serde_json::json!({
+                "model": "rerank-openai",
+                "query": "q",
+                "documents": ["a", "b"]
+            })),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted")
+            .expect("usage_sink sender dropped");
+        assert_eq!(event.provider_request_id, "rerank_1289");
+        assert_ne!(event.request_id, event.provider_request_id);
     }
 
     /// Issue #405: a successful /v1/rerank call must emit a

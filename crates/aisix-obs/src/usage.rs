@@ -27,6 +27,7 @@
 //! batch contract (5s interval / 100-event ceiling) lives in the worker
 //! (aisix-server), not here.
 
+use crate::metrics::UsageEventLabels;
 use aisix_core::{AppliedGuardrail, GuardrailMonitorHit};
 use serde::Serialize;
 
@@ -112,6 +113,17 @@ pub struct UsageEvent {
     #[serde(default, skip_serializing_if = "is_false")]
     pub usage_estimated: bool,
 
+    /// Audio length in seconds — the cost basis for models billed by
+    /// duration rather than tokens (AISIX-Cloud#1138, api7/aisix#457).
+    /// `whisper-1` reports `usage: {type: "duration", seconds: N}` and no
+    /// token counts at all, so without this field its spend is
+    /// unpriceable; cp-api multiplies it by the model's per-second rate.
+    /// Populated on `/v1/audio/transcriptions` + `/translations`; 0
+    /// elsewhere and omitted from the wire, so token-only events are
+    /// unchanged and older cp-api builds ignore it.
+    #[serde(default, skip_serializing_if = "is_zero_f64")]
+    pub audio_duration_seconds: f64,
+
     /// How long THIS attempt spent on the upstream, in milliseconds:
     /// from the moment the attempt began to the moment it settled —
     /// end-of-stream for a streamed attempt, not first-chunk.
@@ -122,12 +134,22 @@ pub struct UsageEvent {
     /// is `downstream_latency_ms`.
     pub upstream_latency_ms: u32,
 
-    /// Time to the upstream's first token, in milliseconds — measured
-    /// from the start of THIS attempt to the first upstream SSE chunk
-    /// carrying generated output (role-only preamble chunks don't
-    /// count). Same attempt scope as `upstream_latency_ms`, so the two
+    /// Time to the upstream's first streamed frame, in milliseconds —
+    /// measured from the start of THIS attempt to the first SSE frame
+    /// the upstream delivered, whatever its type (metadata preambles
+    /// like `response.created` / `message_start` / a role-only chat
+    /// chunk included). This is the industry TTFT convention — LiteLLM
+    /// and front-side gateways stamp the same event — so the figure is
+    /// directly comparable with what a caller-side proxy reports. A
+    /// hidden-reasoning model that streams nothing while it thinks
+    /// (AISIX-Cloud#1225) shows the wait in `upstream_latency_ms`, not
+    /// here. Same attempt scope as `upstream_latency_ms`, so the two
     /// are directly comparable. 0 on non-streaming, error, and
-    /// cache-hit paths (omitted from the wire via skip_serializing_if).
+    /// cache-hit paths (omitted from the wire via skip_serializing_if)
+    /// — and, since the field is whole milliseconds, also on a stream
+    /// whose first frame arrived in under one. Absent therefore means
+    /// "no streamed first frame was measured", not "there was no
+    /// stream".
     ///
     /// This is what the UPSTREAM delivered on this attempt. What the
     /// caller actually waited for is `downstream_latency_ms`, which also
@@ -161,15 +183,36 @@ pub struct UsageEvent {
     ///
     /// Absent (0) on the non-terminal attempts of a request, and on any
     /// path that never reached response delivery.
+    ///
+    /// `/a2a` is the one exception to the streaming rule above: it records
+    /// the WHOLE stream, because an agent's stream of task updates is the
+    /// call's product rather than a delivery mechanism for one. The
+    /// subtraction against `upstream_ttft_ms` therefore does not describe
+    /// gateway overhead there — it is the rest of the agent's own work.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub downstream_latency_ms: u32,
 
     /// HTTP status code the proxy returned to the downstream caller.
     pub status_code: u16,
 
-    /// Provider response `id` — OpenAI's `chat.completion.id` or
-    /// Anthropic's message `id`. Empty when the request never reached
-    /// the upstream (guardrail block / pre-dispatch error).
+    /// Provider response `id` — OpenAI's `chat.completion.id`, Anthropic's
+    /// message `id`, a Responses-API `resp_…`.
+    ///
+    /// Empty does NOT mean the request never reached an upstream. It means
+    /// no id was recorded, which happens on all of:
+    ///
+    /// - the request never reached an upstream (guardrail block,
+    ///   pre-dispatch error), or was served from cache;
+    /// - the attempt failed, so there was no response body to read one from;
+    /// - the endpoint's provider response carries no id at all — embeddings,
+    ///   audio, images, `count_tokens` — or the id it returns is a resource
+    ///   handle rather than a per-call response id (video jobs,
+    ///   files/batches/fine-tuning, the passthrough tunnel), which is
+    ///   deliberately not recorded here (AISIX-Cloud#1289);
+    /// - the upstream simply omitted it.
+    ///
+    /// So a consumer may not infer "reached an upstream" from a non-empty
+    /// value's absence: a successful `/v1/embeddings` call has none.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub provider_request_id: String,
 
@@ -249,6 +292,9 @@ pub struct UsageEvent {
     ///   upstream response was just stored
     /// - `"disabled"` — no enabled `cache_policy` in snapshot for
     ///   this env, the cache gate was closed
+    /// - `"bypass"` — the gate was open but the caller sent
+    ///   `Cache-Control: no-cache`, so the read path was skipped and
+    ///   the upstream served the request (the entry was refreshed)
     ///
     /// Empty string = cache state unknown / not applicable (error
     /// paths that fail before the cache lookup). cp-api persists
@@ -275,6 +321,19 @@ pub struct UsageEvent {
     /// for the full pricing-derivation story.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub cache_hit_saved_output_tokens: u32,
+
+    /// On a cache hit, which matching layer served it: `"exact"` (a
+    /// byte-identical request) or `"semantic"` (an
+    /// embedding-similarity match above the policy's threshold).
+    /// Empty on every other outcome — `/dp/telemetry` binds JSON
+    /// leniently, so older CP images ignore the unknown field.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub cache_hit_layer: String,
+
+    /// On a semantic cache hit, the cosine similarity between the
+    /// request and the stored entry, in `[0, 1]`. `None` otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_similarity: Option<f32>,
 
     /// Which client-facing protocol the request used:
     ///
@@ -422,10 +481,108 @@ pub struct UsageEvent {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub a2a_agent_name: String,
 
-    /// The JSON-RPC method invoked on the A2A agent (such as `message/send`).
+    /// The JSON-RPC method invoked on the A2A agent, exactly as the caller
+    /// wrote it (such as `message/send`, or its 1.0 spelling `SendMessage`).
     /// Empty for non-A2A events; cp-api stores empty as NULL.
+    ///
+    /// Unbounded by nature — a caller picks the string — so this is the
+    /// forensic value only. Aggregate on `a2a_operation`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub a2a_method: String,
+
+    /// The canonical operation `a2a_method` names, collapsing the two wire
+    /// vocabularies onto one bounded set (`message/send`, `message/stream`,
+    /// `tasks/get`, …) and everything unrecognised onto `unknown`.
+    ///
+    /// A gateway may front a 0.3 agent and a 1.0 agent at once, and those call
+    /// the same operation `message/stream` and `SendStreamingMessage`. This is
+    /// the field to group or label by; `a2a_method` keeps the raw value.
+    /// Empty for non-A2A events.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub a2a_operation: String,
+
+    /// The A2A wire version this agent is pinned to (`0.3` / `1.0`) — what the
+    /// gateway announced to it in the `A2A-Version` header. Empty for non-A2A
+    /// events.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub a2a_protocol_version: String,
+
+    /// The A2A task this call created or acted on. Empty when the call names
+    /// no task — a first `message/send` whose agent answers with a bare
+    /// message never has one.
+    ///
+    /// High-cardinality by design: it joins a request to a task across the
+    /// `message/send` → `tasks/get` → `tasks/resubscribe` sequence, so it
+    /// belongs in logs and traces and never in a metric label.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub a2a_task_id: String,
+
+    /// The A2A context (conversation) the call belongs to — the id that ties
+    /// a multi-turn interaction's tasks together. Empty when the exchange
+    /// carried none. High-cardinality, same as `a2a_task_id`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub a2a_context_id: String,
+
+    /// The last task state the upstream reported on this call, normalized to
+    /// the specification's set (`submitted`, `working`, `input-required`,
+    /// `completed`, `canceled`, `failed`, `rejected`, `auth-required`) or
+    /// `unknown` for anything else.
+    ///
+    /// For a streamed call this is the state the task was in when the stream
+    /// ended — including when the caller walked away mid-task, where no
+    /// terminal state is invented. Empty when no response carried a state at
+    /// all (the call failed before the upstream answered).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub a2a_task_state: String,
+
+    /// Events the gateway relayed downstream on a streamed A2A call.
+    ///
+    /// Read together with `upstream_ttft_ms` and `upstream_latency_ms` it
+    /// separates the two ways a stream disappoints: nothing arrived for a long
+    /// time (high TTFT), or plenty arrived and none of it advanced the task
+    /// (high count, no terminal state). 0 for a unary call, and for a stream
+    /// whose upstream produced nothing at all.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub a2a_stream_event_count: u32,
+
+    // ─── Passthrough-route attribution (AISIX-Cloud#1312) ───
+    /// Registered name of the passthrough route that served the request.
+    /// Empty for non-passthrough events; cp-api stores empty as NULL.
+    /// Older cp-api images that predate this field ignore it (DP-first
+    /// rollout).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub passthrough_route_name: String,
+
+    /// End-user identity injected by the upstream network device via the
+    /// route's `identity_header` (forward-proxy deployments, where the
+    /// caller carries no gateway credential of its own). Empty when the
+    /// route configures no identity header or the client sent none;
+    /// cp-api stores empty as NULL.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub client_identity: String,
+
+    // ─── JWT identity attribution (AISIX-Cloud#564) ───
+    /// Value of the OIDC trust provider's identity claim (`sub` by
+    /// default) when the request authenticated with a JWT. Claim
+    /// mappings let many external identities share one API key, so
+    /// `api_key_id` alone can no longer name the caller — this field
+    /// restores per-identity attribution. Empty for requests
+    /// authenticated with the key's plaintext; cp-api stores empty as
+    /// NULL. Older cp-api images ignore it (DP-first rollout).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub jwt_subject: String,
+
+    /// Name of the OIDC trust provider that verified the token.
+    /// Subjects are only unique per provider, so attribution carries
+    /// both. Empty for non-JWT events; cp-api stores empty as NULL.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub jwt_provider: String,
+
+    /// Name of the claim mapping that selected the API key. Empty for
+    /// non-JWT events and for identities bound to their key directly
+    /// via `jwt_subject`; cp-api stores empty as NULL.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub jwt_claim_mapping: String,
 }
 
 #[inline]
@@ -436,6 +593,11 @@ fn is_zero_u32(n: &u32) -> bool {
 #[inline]
 fn is_false(b: &bool) -> bool {
     !*b
+}
+
+#[inline]
+fn is_zero_f64(n: &f64) -> bool {
+    *n == 0.0
 }
 
 /// Cheap clonable handle the proxy hands to request handlers. Backed
@@ -464,6 +626,48 @@ fn is_false(b: &bool) -> bool {
 pub struct UsageSink {
     tx: Option<tokio::sync::mpsc::Sender<UsageEvent>>,
     metrics: Option<crate::metrics::Metrics>,
+}
+
+/// Log one line per provider call that came back with a response id
+/// (AISIX-Cloud#1289), so `provider_request_id` is greppable in the plain
+/// application log and not only in telemetry.
+///
+/// This lives on the usage-sink path on purpose: per #655 **every** upstream
+/// attempt — the winner, an abandoned mid-stream fallover, a retried target —
+/// becomes its own `UsageEvent`, and every handler funnels those through
+/// [`UsageSink::try_emit`]. That makes this the single point that sees each
+/// attempt's id, so no handler can be added later that records an id in
+/// telemetry while staying silent in the log. It also covers the two cases the
+/// one-line-per-request access log structurally cannot: a **streamed**
+/// response (the id arrives in the first frame, after the access-log line is
+/// written) and a **mid-stream failover** (two provider calls, two ids, one
+/// access-log line).
+///
+/// `request_id` + `attempt_index` identify the individual call; the line is
+/// skipped entirely when there is no id (guardrail block, pre-dispatch error,
+/// cache hit, a failed attempt that never got a response body, and the
+/// endpoints whose provider response carries no id).
+fn log_provider_call(handler: &'static str, event: &UsageEvent) {
+    if event.provider_request_id.is_empty() {
+        return;
+    }
+    // Field rendering matches `AccessLog::emit` (plain `&str`, so the fmt
+    // layer quotes it) — an operator greps the two lines the same way.
+    tracing::info!(
+        request_id = event.request_id.as_str(),
+        provider_request_id = event.provider_request_id.as_str(),
+        attempt_index = event.attempt_index,
+        attempt_kind = if event.attempt_kind.is_empty() {
+            "initial"
+        } else {
+            event.attempt_kind.as_str()
+        },
+        handler,
+        status = event.status_code,
+        requested_model = event.requested_model.as_str(),
+        provider_model_version = event.provider_model_version.as_str(),
+        "provider call completed",
+    );
 }
 
 impl UsageSink {
@@ -509,7 +713,16 @@ impl UsageSink {
     /// `aisix_usage_events_emitted_total` counter (#408): `"chat"`,
     /// `"embeddings"`, `"messages"`, `"responses"`, etc. Keep it
     /// `&'static str` so cardinality stays bounded.
-    pub fn try_emit(&self, handler: &'static str, event: UsageEvent) {
+    ///
+    /// `labels` carries the model and ProviderKey the event is attributed
+    /// to (AISIX-Cloud#1317). Both counters below take the SAME set, so
+    /// `emitted == delivered + dropped` still holds per model and per key
+    /// rather than only in aggregate — which is what makes "whose usage
+    /// records did we lose" answerable. The event itself cannot supply
+    /// them: its `requested_model` is caller-controlled text (#451) and it
+    /// carries no ProviderKey id at all.
+    pub fn try_emit(&self, handler: &'static str, event: UsageEvent, labels: UsageEventLabels<'_>) {
+        log_provider_call(handler, &event);
         // Normalise inbound_protocol to a fixed `&'static str` set at
         // the boundary (audit MEDIUM-3). This both kills the heap
         // alloc per call AND pins prometheus cardinality at the type
@@ -527,7 +740,7 @@ impl UsageSink {
         // failure path (including `sink_disabled`) so the invariant
         // `emitted == delivered + dropped` holds strictly.
         if let Some(m) = &self.metrics {
-            m.record_usage_event_emit(handler, event.status_code, bounded_protocol);
+            m.record_usage_event_emit(handler, event.status_code, bounded_protocol, labels);
         }
 
         let Some(tx) = &self.tx else {
@@ -536,7 +749,7 @@ impl UsageSink {
             // intended to emit but no sink was wired" — silent
             // zeros would otherwise hide the misconfiguration.
             if let Some(m) = &self.metrics {
-                m.record_usage_event_drop("sink_disabled");
+                m.record_usage_event_drop("sink_disabled", labels);
             }
             return;
         };
@@ -550,7 +763,7 @@ impl UsageSink {
                 tokio::sync::mpsc::error::TrySendError::Closed(_) => "sink_closed",
             };
             if let Some(m) = &self.metrics {
-                m.record_usage_event_drop(reason);
+                m.record_usage_event_drop(reason, labels);
             }
             tracing::warn!(reason = reason, "usage event dropped");
         }
@@ -566,16 +779,136 @@ mod tests {
         let sink = UsageSink::disabled();
         // Doesn't panic; doesn't allocate a worker. Two emits in a
         // row also fine.
-        sink.try_emit("test", sample_event("req-1"));
-        sink.try_emit("test", sample_event("req-2"));
+        sink.try_emit("test", sample_event("req-1"), UsageEventLabels::default());
+        sink.try_emit("test", sample_event("req-2"), UsageEventLabels::default());
+    }
+
+    /// Keep every callsite emittable for the whole test binary.
+    ///
+    /// A callsite's `Interest` is cached process-wide the first time it is
+    /// hit, from whichever dispatcher the hitting thread has; with no global
+    /// default that is `NoSubscriber`, and a sibling test reaching
+    /// `log_provider_call` on another thread would cache `Interest::never()`,
+    /// leaving the capture below empty. A permissive global default removes
+    /// the outcome (api7/aisix#909).
+    fn keep_callsites_enabled() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry());
+        });
+    }
+
+    /// Run `emit` with a capturing subscriber installed; return what it wrote.
+    fn capture_logs(emit: impl FnOnce()) -> String {
+        #[derive(Clone)]
+        struct BufWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for BufWriter {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl tracing_subscriber::fmt::MakeWriter<'_> for BufWriter {
+            type Writer = BufWriter;
+            fn make_writer(&self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        keep_callsites_enabled();
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(BufWriter(buf.clone()))
+            .finish();
+        {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            emit();
+        }
+        let bytes = buf.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    /// AISIX-Cloud#1289: a provider call that came back with a response id
+    /// must be greppable in the plain application log, keyed by the gateway
+    /// `request_id` + `attempt_index` so a retried/failed-over request can be
+    /// walked call by call. Emitting from `try_emit` is what makes this hold
+    /// for a *streamed* response too — its id only exists long after the
+    /// one-line-per-request access log was written.
+    #[test]
+    fn try_emit_logs_the_provider_call_with_its_ids() {
+        let mut ev = sample_event("req-1289");
+        ev.provider_request_id = "chatcmpl-abc".into();
+        ev.provider_model_version = "gpt-4o-2024-08-06".into();
+        ev.attempt_index = 2;
+        ev.attempt_kind = "fallback".into();
+        ev.status_code = 200;
+
+        let out = capture_logs(|| {
+            UsageSink::disabled().try_emit("chat", ev, UsageEventLabels::default())
+        });
+
+        assert!(out.contains("provider call completed"), "{out}");
+        assert!(
+            out.contains("provider_request_id=\"chatcmpl-abc\"")
+                || out.contains("provider_request_id=chatcmpl-abc"),
+            "{out}"
+        );
+        // The two ids coexist — neither may overwrite the other.
+        assert!(
+            out.contains("request_id=\"req-1289\"") || out.contains("request_id=req-1289"),
+            "{out}"
+        );
+        assert!(out.contains("attempt_index=2"), "{out}");
+        assert!(
+            out.contains("attempt_kind=\"fallback\"") || out.contains("attempt_kind=fallback"),
+            "{out}"
+        );
+    }
+
+    /// The line is skipped entirely when the call produced no provider id
+    /// (guardrail block, pre-dispatch error, cache hit, an attempt that never
+    /// got a response body) — a `provider_request_id=""` on every request
+    /// would defeat filtering on the field, and inventing a value would be
+    /// worse still.
+    #[test]
+    fn try_emit_is_silent_when_there_is_no_provider_id() {
+        let out = capture_logs(|| {
+            UsageSink::disabled().try_emit(
+                "chat",
+                sample_event("req-none"),
+                UsageEventLabels::default(),
+            )
+        });
+        assert!(!out.contains("provider call completed"), "{out}");
+    }
+
+    /// An event that predates `attempt_kind` (or a single-shot endpoint that
+    /// never sets it) must still read as a real attempt rather than an empty
+    /// string — the wire default is `initial`.
+    #[test]
+    fn provider_call_log_defaults_a_blank_attempt_kind() {
+        let mut ev = sample_event("req-blank");
+        ev.provider_request_id = "cmpl-1".into();
+        let out = capture_logs(|| {
+            UsageSink::disabled().try_emit("completions", ev, UsageEventLabels::default())
+        });
+        assert!(
+            out.contains("attempt_kind=\"initial\"") || out.contains("attempt_kind=initial"),
+            "{out}"
+        );
     }
 
     #[tokio::test]
     async fn emit_into_real_channel_arrives_in_order() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let sink = UsageSink::new(tx);
-        sink.try_emit("test", sample_event("req-a"));
-        sink.try_emit("test", sample_event("req-b"));
+        sink.try_emit("test", sample_event("req-a"), UsageEventLabels::default());
+        sink.try_emit("test", sample_event("req-b"), UsageEventLabels::default());
         let a = rx.recv().await.unwrap();
         let b = rx.recv().await.unwrap();
         assert_eq!(a.request_id, "req-a");
@@ -589,8 +922,9 @@ mod tests {
         // hot path.
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         let sink = UsageSink::new(tx);
-        sink.try_emit("test", sample_event("req-1"));
-        sink.try_emit("test", sample_event("req-2")); // dropped, logged
+        sink.try_emit("test", sample_event("req-1"), UsageEventLabels::default());
+        sink.try_emit("test", sample_event("req-2"), UsageEventLabels::default());
+        // dropped, logged
     }
 
     /// Issue #408: a `try_emit` call with a Metrics handle attached
@@ -610,6 +944,7 @@ mod tests {
                 inbound_protocol: "openai".into(),
                 ..Default::default()
             },
+            UsageEventLabels::default(),
         );
         sink.try_emit(
             "embeddings",
@@ -618,6 +953,7 @@ mod tests {
                 inbound_protocol: "openai".into(),
                 ..Default::default()
             },
+            UsageEventLabels::default(),
         );
 
         let rendered = metrics.render();
@@ -662,8 +998,8 @@ mod tests {
             ..Default::default()
         };
 
-        sink.try_emit("chat", event()); // delivered
-        sink.try_emit("chat", event()); // dropped (channel full)
+        sink.try_emit("chat", event(), UsageEventLabels::default()); // delivered
+        sink.try_emit("chat", event(), UsageEventLabels::default()); // dropped (channel full)
 
         let rendered = metrics.render();
         // Numeric assertions (audit HIGH-2): name-only checks let a
@@ -704,6 +1040,7 @@ mod tests {
                 inbound_protocol: "openai".into(),
                 ..Default::default()
             },
+            UsageEventLabels::default(),
         );
 
         let rendered = metrics.render();
@@ -735,6 +1072,7 @@ mod tests {
                 inbound_protocol: "openai".into(),
                 ..Default::default()
             },
+            UsageEventLabels::default(),
         );
         sink.try_emit(
             "chat",
@@ -743,6 +1081,7 @@ mod tests {
                 inbound_protocol: "openai".into(),
                 ..Default::default()
             },
+            UsageEventLabels::default(),
         );
 
         let rendered = metrics.render();
@@ -769,6 +1108,58 @@ mod tests {
         );
     }
 
+    /// AISIX-Cloud#1317: the attribution handed to `try_emit` has to reach
+    /// BOTH counters. Asserted here rather than on `Metrics` directly
+    /// because the wiring is the part that can silently rot: an emit that
+    /// carries the model and a drop that does not looks, once you group by
+    /// model, exactly like a request whose usage record was delivered.
+    #[tokio::test]
+    async fn a_dropped_event_is_attributed_like_the_emit_it_came_from() {
+        let metrics = crate::metrics::Metrics::new(false);
+        let sink = UsageSink::disabled().with_metrics(metrics.clone());
+
+        sink.try_emit(
+            "chat",
+            UsageEvent {
+                status_code: 200,
+                inbound_protocol: "openai".into(),
+                ..Default::default()
+            },
+            UsageEventLabels {
+                model: "customer-chat",
+                provider_key_id: "pk-1",
+                provider_key_name: "openai-prod",
+            },
+        );
+
+        let rendered = metrics.render();
+        let emitted = parse_counter_value(
+            &rendered,
+            "aisix_usage_events_emitted_total",
+            &[
+                ("handler", "chat"),
+                ("model", "customer-chat"),
+                ("provider_key_id", "pk-1"),
+                ("provider_key_name", "openai-prod"),
+            ],
+        );
+        let dropped = parse_counter_value(
+            &rendered,
+            "aisix_usage_event_drops_total",
+            &[
+                ("reason", "sink_disabled"),
+                ("model", "customer-chat"),
+                ("provider_key_id", "pk-1"),
+                ("provider_key_name", "openai-prod"),
+            ],
+        );
+        assert_eq!(
+            (emitted, dropped),
+            (1, 1),
+            "emit and drop must both carry the request's attribution:\n{rendered}"
+        );
+    }
+
     /// Issue #408 audit MEDIUM-3: a wire-level `inbound_protocol`
     /// outside the documented set must be normalised to `"other"`
     /// rather than landing on the metric as a user-controlled
@@ -789,6 +1180,7 @@ mod tests {
                 inbound_protocol: "evil-cardinality-bomb".into(),
                 ..Default::default()
             },
+            UsageEventLabels::default(),
         );
 
         let rendered = metrics.render();

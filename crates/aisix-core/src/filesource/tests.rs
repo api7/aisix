@@ -103,12 +103,42 @@ rate_limit_policies:
     scope_ref: team-uuid-1
     window: hour
     max_requests: 1000
+  - name: premium-family
+    conditions:
+      - dimension: team
+        operator: in
+        value: ["team-uuid-1"]
+      - logic: or
+        children:
+          - dimension: model
+            operator: in
+            value: ["gpt-4o"]
+          - dimension: provider
+            operator: "=="
+            value: anthropic
+    group_by: [member]
+    limits:
+      rpm: 20
 
 oidc_providers:
   - name: corp-keycloak
     issuer: https://sso.example.com/realms/agents
     audiences: ["aisix-gateway"]
     required_scopes: ["ai.access"]
+
+claim_mappings:
+  - name: finance-dept
+    jwt_provider: corp-keycloak
+    priority: 100
+    match:
+      - claim: department
+        op: exact
+        values: ["finance"]
+      - claim: groups
+        op: contains
+        values: ["ai-users"]
+    resolve:
+      api_key: ops
 "#;
 
 fn full_env() -> HashMap<String, String> {
@@ -130,8 +160,9 @@ fn full_valid_file_loads_every_kind() {
     assert_eq!(snap.a2a_agents.len(), 1);
     assert_eq!(snap.cache_policies.len(), 1);
     assert_eq!(snap.observability_exporters.len(), 1);
-    assert_eq!(snap.rate_limit_policies.len(), 3);
+    assert_eq!(snap.rate_limit_policies.len(), 4);
     assert_eq!(snap.oidc_providers.len(), 1);
+    assert_eq!(snap.claim_mappings.len(), 1);
 
     // The OIDC provider loads with serde defaults filled.
     let idp = snap.oidc_providers.get_by_name("corp-keycloak").unwrap();
@@ -144,6 +175,14 @@ fn full_valid_file_loads_every_kind() {
     let ci_bot = snap.apikeys.get_by_name(&ci_bot_hash).unwrap();
     assert_eq!(ci_bot.value.jwt_subject.as_deref(), Some("agent-ci-bot"));
     assert_eq!(ci_bot.value.jwt_provider.as_deref(), Some("corp-keycloak"));
+
+    // The claim mapping loads and its `resolve.api_key` name sugar
+    // resolved to the ops key's derived id.
+    let cm = snap.claim_mappings.get_by_name("finance-dept").unwrap();
+    assert_eq!(cm.value.jwt_provider, "corp-keycloak");
+    assert_eq!(cm.value.priority, 100);
+    assert_eq!(cm.value.match_.len(), 2);
+    assert_eq!(cm.value.resolve.api_key_id, derive_id("api_keys", "ops"));
 
     // Interpolation landed in the provider key (full + partial).
     let pk = snap.provider_keys.get_by_name("openai-prod").unwrap();
@@ -181,13 +220,93 @@ fn full_valid_file_loads_every_kind() {
     };
     assert_eq!(
         by_policy_name("cap-gpt4o").value.scope_ref,
-        derive_id("models", "gpt-4o"),
+        Some(derive_id("models", "gpt-4o")),
     );
     assert_eq!(
         by_policy_name("cap-ci-bot").value.scope_ref,
-        derive_id("api_keys", "ci-bot"),
+        Some(derive_id("api_keys", "ci-bot")),
     );
-    assert_eq!(by_policy_name("cap-team").value.scope_ref, "team-uuid-1");
+    assert_eq!(
+        by_policy_name("cap-team").value.scope_ref.as_deref(),
+        Some("team-uuid-1")
+    );
+
+    // The conditional form loads with the same name sugar one level
+    // down: a `model` leaf's values resolve to derived ids; `team` and
+    // string-dimension values pass through verbatim (AISIX-Cloud#892).
+    let premium = by_policy_name("premium-family");
+    assert!(premium.value.is_conditional());
+    let conditions = serde_json::to_value(premium.value.conditions.as_ref().unwrap()).unwrap();
+    assert_eq!(conditions[0]["value"][0], "team-uuid-1");
+    assert_eq!(
+        conditions[1]["children"][0]["value"][0],
+        derive_id("models", "gpt-4o")
+    );
+    assert_eq!(conditions[1]["children"][1]["value"], "anthropic");
+}
+
+#[test]
+fn conditional_policy_with_unknown_model_name_is_a_load_error() {
+    // Same contract as scope_ref: a typo in a conditions model
+    // reference must fail the load, never become a silently-dead leaf.
+    let file = r#"
+_format_version: "1"
+
+provider_keys:
+  - display_name: pk
+    provider: openai
+    api_key: sk-x
+models:
+  - display_name: gpt-4o
+    provider: openai
+    model_name: gpt-4o
+    provider_key: pk
+rate_limit_policies:
+  - name: bad-ref
+    conditions:
+      - dimension: model
+        operator: in
+        value: ["no-such-model"]
+    limits:
+      rpm: 5
+"#;
+    let errors = errors_of(load(file, &env_of(&[])));
+    // Exactly one error: the dangling reference itself, so the test
+    // proves the unknown-model leaf alone fails the load.
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].contains("no-such-model"), "{errors:?}");
+}
+
+#[test]
+fn dead_knob_on_a_group_is_a_declarative_load_error() {
+    // The strict write path (declarative resources file) rejects a knob
+    // the kind never resolves — a silently-dead `cost` on a Model Group
+    // was the #962 class. Stored etcd rows load leniently instead (the
+    // loader strips + reports); a file the operator edits fails fast
+    // with the field named.
+    let file = r#"
+_format_version: "1"
+
+provider_keys:
+  - display_name: pk
+    provider: openai
+    api_key: sk-x
+models:
+  - display_name: gpt-4o
+    provider: openai
+    model_name: gpt-4o
+    provider_key: pk
+  - display_name: balanced
+    routing:
+      targets:
+        - model: gpt-4o
+    cost:
+      input_per_1k: 0.5
+      output_per_1k: 1.5
+"#;
+    let errors = errors_of(load(file, &env_of(&[])));
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].contains("balanced"), "{errors:?}");
 }
 
 #[test]
@@ -741,4 +860,136 @@ fn report_formats_file_and_all_errors() {
         text.contains("  - (file): missing mandatory _format_version"),
         "{text}"
     );
+}
+
+/// Minimal valid prelude for claim-mapping error tests: one provider
+/// key, one model, one api key, one OIDC provider.
+const CLAIM_MAPPING_PRELUDE: &str = r#"
+_format_version: "1"
+
+provider_keys:
+  - display_name: pk
+    provider: openai
+    api_key: sk-x
+
+models:
+  - display_name: gpt-4o
+    provider: openai
+    model_name: gpt-4o
+    provider_key: pk
+
+api_keys:
+  - display_name: policy-key
+    key_hash: 91ed2dbc407561556f3e7be98ba0bd2a57986d6a868c482d867d19c6d40d201c
+    allowed_models: ["gpt-4o"]
+
+oidc_providers:
+  - name: corp
+    issuer: https://sso.example.com/realms/agents
+    audiences: ["aisix"]
+"#;
+
+#[test]
+fn claim_mapping_with_unknown_provider_is_a_load_error() {
+    let file = format!(
+        "{CLAIM_MAPPING_PRELUDE}
+claim_mappings:
+  - name: bad-provider
+    jwt_provider: no-such-idp
+    match:
+      - claim: department
+        op: exact
+        values: [\"finance\"]
+    resolve:
+      api_key: policy-key
+"
+    );
+    let errors = errors_of(load(&file, &env_of(&[])));
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].contains("no-such-idp"), "{errors:?}");
+    assert!(errors[0].contains("corp"), "{errors:?}");
+}
+
+#[test]
+fn claim_mapping_with_unknown_api_key_name_is_a_load_error() {
+    let file = format!(
+        "{CLAIM_MAPPING_PRELUDE}
+claim_mappings:
+  - name: bad-target
+    jwt_provider: corp
+    match:
+      - claim: department
+        op: exact
+        values: [\"finance\"]
+    resolve:
+      api_key: no-such-key
+"
+    );
+    let errors = errors_of(load(&file, &env_of(&[])));
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].contains("no-such-key"), "{errors:?}");
+}
+
+#[test]
+fn claim_mapping_with_raw_unmatched_api_key_id_is_a_load_error() {
+    // A canonical api_key_id written directly (e.g. copied from a
+    // managed environment) must still land on a key defined in this
+    // file — otherwise the mapping would silently resolve nothing.
+    let file = format!(
+        "{CLAIM_MAPPING_PRELUDE}
+claim_mappings:
+  - name: raw-id
+    jwt_provider: corp
+    match:
+      - claim: department
+        op: exact
+        values: [\"finance\"]
+    resolve:
+      api_key_id: 99999999-9999-9999-9999-999999999999
+"
+    );
+    let errors = errors_of(load(&file, &env_of(&[])));
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].contains("resolve.api_key_id"), "{errors:?}");
+}
+
+#[test]
+fn claim_mapping_name_and_id_reference_are_mutually_exclusive() {
+    let file = format!(
+        "{CLAIM_MAPPING_PRELUDE}
+claim_mappings:
+  - name: both-refs
+    jwt_provider: corp
+    match:
+      - claim: department
+        op: exact
+        values: [\"finance\"]
+    resolve:
+      api_key: policy-key
+      api_key_id: 99999999-9999-9999-9999-999999999999
+"
+    );
+    let errors = errors_of(load(&file, &env_of(&[])));
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].contains("mutually"), "{errors:?}");
+}
+
+#[test]
+fn claim_mapping_without_conditions_is_a_load_error() {
+    // An empty `match` list would make the rule match every verified
+    // token — the schema requires at least one condition so a mapping
+    // is always an explicit selection.
+    let file = format!(
+        "{CLAIM_MAPPING_PRELUDE}
+claim_mappings:
+  - name: match-all
+    jwt_provider: corp
+    match: []
+    resolve:
+      api_key: policy-key
+"
+    );
+    let errors = errors_of(load(&file, &env_of(&[])));
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].contains("match"), "{errors:?}");
 }

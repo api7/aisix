@@ -1,5 +1,9 @@
 # Rust
 /target
+# PGO phase target dirs (native runs of the three-phase release recipe)
+/target-pgo-gen
+/target-pgo
+/bench/pgo-training/trainer/target
 Cargo.lock.bak
 **/*.rs.bk
 *.profraw
@@ -35,3 +39,6 @@ coverage/
 
 # Filled-in real-cloud objstore credentials (template: real-cloud.env.example)
 /crates/aisix-obs/tests/real-cloud.env
+
+# Local benchmark results collected by bench/onthebench/bench.sh
+/bench-results/

@@ -4,19 +4,18 @@
 //!
 //! Reads are served from the live snapshot (the same one the proxy
 //! reads), so `GET` lists / gets reflect the loaded file — including
-//! SIGHUP reloads — without a second storage backend. Every write
-//! returns [`StoreError::ReadOnly`], which the HTTP layer maps to a
-//! 409 telling the operator to edit the file and reload. A router-level
-//! guard in `build_router` rejects write requests before handler logic
-//! runs; these store errors are the defense-in-depth backstop for any
-//! non-HTTP caller.
+//! SIGHUP reloads — without a second storage backend. The admin surface
+//! is read-only by construction: the resource write endpoints were
+//! removed together with the Admin API write path, so this store only
+//! ever answers gets and lists. Resources change by editing the file
+//! and sending SIGHUP.
 
 use aisix_core::resource::Resource;
 use aisix_core::resource::ResourceEntry;
 use aisix_core::snapshot::{ResourceTable, SnapshotHandle};
 use aisix_core::{
     A2aAgent, AisixSnapshot, ApiKey, CachePolicy, Guardrail, McpServer, Model,
-    ObservabilityExporter, ProviderKey,
+    ObservabilityExporter, PassthroughRoute, ProviderKey,
 };
 
 use crate::store::{ConfigStore, StoreError};
@@ -24,29 +23,11 @@ use crate::store::{ConfigStore, StoreError};
 /// Read-only [`ConfigStore`] over the file-loaded snapshot.
 pub struct FileManagedStore {
     snapshot: SnapshotHandle<AisixSnapshot>,
-    resources_path: String,
 }
 
 impl FileManagedStore {
-    pub fn new(snapshot: SnapshotHandle<AisixSnapshot>, resources_path: impl Into<String>) -> Self {
-        Self {
-            snapshot,
-            resources_path: resources_path.into(),
-        }
-    }
-
-    /// The message every write path returns. Includes the file path so
-    /// the operator knows exactly what to edit.
-    pub fn read_only_message(resources_path: &str) -> String {
-        format!(
-            "resources are file-managed: this gateway loads its resources from \
-             {resources_path}; edit that file and send SIGHUP to reload instead of \
-             using the resource write API"
-        )
-    }
-
-    fn read_only(&self) -> StoreError {
-        StoreError::ReadOnly(Self::read_only_message(&self.resources_path))
+    pub fn new(snapshot: SnapshotHandle<AisixSnapshot>) -> Self {
+        Self { snapshot }
     }
 
     fn get_from<T: Resource + Clone>(
@@ -72,14 +53,10 @@ impl FileManagedStore {
 }
 
 macro_rules! impl_file_managed_store {
-    ($( { $ty:ty, $table:ident, $put:ident, $get:ident, $list:ident, $delete:ident } )+) => {
+    ($( { $ty:ty, $table:ident, $get:ident, $list:ident } )+) => {
         #[async_trait::async_trait]
         impl ConfigStore for FileManagedStore {
             $(
-                async fn $put(&self, _entry: ResourceEntry<$ty>) -> Result<(), StoreError> {
-                    Err(self.read_only())
-                }
-
                 async fn $get(&self, id: &str) -> Result<Option<ResourceEntry<$ty>>, StoreError> {
                     Ok(self.get_from(|s| &s.$table, id))
                 }
@@ -87,24 +64,21 @@ macro_rules! impl_file_managed_store {
                 async fn $list(&self) -> Result<Vec<ResourceEntry<$ty>>, StoreError> {
                     Ok(self.list_from(|s| &s.$table))
                 }
-
-                async fn $delete(&self, _id: &str) -> Result<bool, StoreError> {
-                    Err(self.read_only())
-                }
             )+
         }
     };
 }
 
 impl_file_managed_store! {
-    { Model, models, put_model, get_model, list_models, delete_model }
-    { ApiKey, apikeys, put_apikey, get_apikey, list_apikeys, delete_apikey }
-    { ProviderKey, provider_keys, put_provider_key, get_provider_key, list_provider_keys, delete_provider_key }
-    { Guardrail, guardrails, put_guardrail, get_guardrail, list_guardrails, delete_guardrail }
-    { CachePolicy, cache_policies, put_cache_policy, get_cache_policy, list_cache_policies, delete_cache_policy }
-    { ObservabilityExporter, observability_exporters, put_observability_exporter, get_observability_exporter, list_observability_exporters, delete_observability_exporter }
-    { McpServer, mcp_servers, put_mcp_server, get_mcp_server, list_mcp_servers, delete_mcp_server }
-    { A2aAgent, a2a_agents, put_a2a_agent, get_a2a_agent, list_a2a_agents, delete_a2a_agent }
+    { Model, models, get_model, list_models }
+    { ApiKey, apikeys, get_apikey, list_apikeys }
+    { ProviderKey, provider_keys, get_provider_key, list_provider_keys }
+    { Guardrail, guardrails, get_guardrail, list_guardrails }
+    { CachePolicy, cache_policies, get_cache_policy, list_cache_policies }
+    { ObservabilityExporter, observability_exporters, get_observability_exporter, list_observability_exporters }
+    { McpServer, mcp_servers, get_mcp_server, list_mcp_servers }
+    { A2aAgent, a2a_agents, get_a2a_agent, list_a2a_agents }
+    { PassthroughRoute, passthrough_routes, get_passthrough_route, list_passthrough_routes }
 }
 
 #[cfg(test)]
@@ -129,7 +103,7 @@ mod tests {
     #[tokio::test]
     async fn reads_serve_the_live_snapshot() {
         let handle = snapshot_with_model();
-        let store = FileManagedStore::new(handle.clone(), "/etc/aisix/resources.yaml");
+        let store = FileManagedStore::new(handle.clone());
 
         let listed = store.list_models().await.unwrap();
         assert_eq!(listed.len(), 1);
@@ -142,30 +116,5 @@ mod tests {
         // A snapshot swap (SIGHUP reload) is immediately visible.
         handle.store(AisixSnapshot::new());
         assert!(store.list_models().await.unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn writes_and_deletes_are_read_only_errors_naming_the_file() {
-        let store = FileManagedStore::new(snapshot_with_model(), "/etc/aisix/resources.yaml");
-        let entry = store.get_model("m-1").await.unwrap().unwrap();
-
-        let err = store.put_model(entry).await.unwrap_err();
-        match &err {
-            StoreError::ReadOnly(msg) => {
-                assert!(msg.contains("file-managed"), "{msg}");
-                assert!(msg.contains("/etc/aisix/resources.yaml"), "{msg}");
-                assert!(msg.contains("SIGHUP"), "{msg}");
-            }
-            other => panic!("expected ReadOnly, got {other:?}"),
-        }
-        assert!(matches!(
-            store.delete_model("m-1").await.unwrap_err(),
-            StoreError::ReadOnly(_)
-        ));
-        // Spot-check a second kind so the macro expansion is covered.
-        assert!(matches!(
-            store.delete_guardrail("g-1").await.unwrap_err(),
-            StoreError::ReadOnly(_)
-        ));
     }
 }

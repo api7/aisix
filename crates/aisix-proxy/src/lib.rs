@@ -26,6 +26,7 @@
 
 mod a2a;
 mod attempt;
+mod attribution;
 mod audio;
 mod auth;
 pub mod background;
@@ -36,6 +37,7 @@ mod completions;
 pub(crate) mod cooldown;
 mod count_tokens;
 mod dispatch;
+mod ebml;
 mod embeddings;
 mod ensemble;
 mod error;
@@ -50,15 +52,18 @@ mod mcp_auth;
 mod messages;
 mod model_resolve;
 mod models;
-mod passthrough;
+mod passthrough_route;
 mod quota;
 mod realtime;
 mod redact;
+mod reject;
 mod render;
 mod request_id;
+mod request_metrics;
 mod rerank;
 mod responses;
 mod responses_bridge;
+mod rewrite;
 mod routing;
 mod semantic;
 pub mod sse_keepalive;
@@ -76,10 +81,11 @@ pub use health::{
 };
 pub use state::{CacheBackends, ProxyState};
 
+use aisix_obs::{AccessLog, CancelledLabels};
 use axum::extract::State;
 use axum::http::{header, HeaderValue, Request};
 use axum::middleware::{self, Next};
-use axum::response::{IntoResponse, Response};
+use axum::response::Response;
 use axum::routing::{any, get, post};
 use axum::Router;
 use tower_http::set_header::SetResponseHeaderLayer;
@@ -98,7 +104,7 @@ static SERVER_HEADER_VALUE: std::sync::LazyLock<HeaderValue> = std::sync::LazyLo
 /// OpenAI-compatible proxy surface.
 pub fn build_router(state: ProxyState) -> Router {
     let body_limit = state.request_body_limit_bytes;
-    Router::new()
+    let router = Router::new()
         .route("/livez", get(livez))
         .route("/readyz", get(readyz))
         .route("/v1/models", get(models::list_models))
@@ -152,10 +158,6 @@ pub fn build_router(state: ProxyState) -> Router {
             "/v1/fine_tuning/jobs/:id/cancel",
             post(jobs::cancel_ft_job),
         )
-        .route(
-            "/passthrough/:provider/*rest",
-            any(passthrough::passthrough),
-        )
         // RFC 9728 Protected Resource Metadata for the /mcp OAuth surface
         // (AISIX-Cloud#1143). Unauthenticated by design — discovery must
         // precede auth; 404 while the surface is dormant. Both the root
@@ -175,13 +177,18 @@ pub fn build_router(state: ProxyState) -> Router {
         )
         // Downstream-facing MCP gateway. Authentication (AISIX API key or,
         // with trust providers configured, an IdP-issued JWT) is enforced
-        // inside the handler via the `AuthenticatedKey` extractor. The
-        // nested router scopes the OAuth challenge middleware to the /mcp
-        // surface only (AISIX-Cloud#1143).
+        // inside the handler via the `AuthenticatedKey` extractor.
+        // `/mcp/{server}` is the single-server variant (original tool names);
+        // the static `/mcp/` route wins over the param route for that path.
+        // The nested router scopes the OAuth challenge middleware to the
+        // whole /mcp surface — scoped endpoint included, since a standard
+        // client may connect straight to `/mcp/{server}` and needs the same
+        // `WWW-Authenticate` discovery hint from its 401 (AISIX-Cloud#1143).
         .merge(
             Router::new()
                 .route("/mcp", any(mcp::mcp_endpoint))
                 .route("/mcp/", any(mcp::mcp_endpoint))
+                .route("/mcp/:server", any(mcp::mcp_scoped_endpoint))
                 .route_layer(middleware::from_fn_with_state(
                     state.clone(),
                     mcp_auth::challenge_middleware,
@@ -196,63 +203,126 @@ pub fn build_router(state: ProxyState) -> Router {
             "/a2a/:agent/.well-known/agent-card.json",
             get(a2a::a2a_agent_card),
         )
-        // Wire the configured cap into axum's request-body extractor
-        // chain (`Json<T>` defers to `Bytes` which honors this layer).
-        // Without this, axum 0.7's `DefaultBodyLimit` falls back to
-        // its built-in 2 MiB default, which silently rejects bodies
-        // in the 2 MiB-to-cap band with a stock `BytesRejection`
-        // response (NOT the OpenAI envelope). The middleware below
-        // catches the Content-Length-known case ahead of the
-        // extractor; this layer catches chunked / size-mismatched
-        // bodies once their actual byte count exceeds the cap.
-        .layer(axum::extract::DefaultBodyLimit::max(body_limit))
+        // Path-prefix passthrough routes match here, AFTER every typed
+        // route has had its chance — a route can never shadow the
+        // gateway's own API. No-match requests keep the plain 404 (or the
+        // `/passthrough/*` 410 migration tombstone) inside the handler.
+        // Registered before the layers so fallback traffic gets the same
+        // body-limit / telemetry / Server-header treatment as the routes.
+        .fallback(passthrough_route::entry);
+    let router = apply_shared_proxy_layers(router, &state, body_limit).with_state(state.clone());
+
+    // The host-dispatch target: the same fallback handler behind the SAME
+    // shared layer stack, so a foreign-host request keeps the body-limit
+    // fast path, the in-flight/cancel telemetry, and the Server-header
+    // override — dispatching to the bare handler would silently shed all
+    // three (and let an upstream Server header leak through).
+    let host_entry_stack = apply_shared_proxy_layers(
+        Router::new().fallback(passthrough_route::entry),
+        &state,
+        body_limit,
+    )
+    .with_state(state.clone());
+
+    // Pre-routing URL rewriting (`proxy.url_rewrites`). `Router::layer`
+    // middleware runs AFTER route matching, so a URI rewritten there could
+    // never change which route matches. Wrapping the whole router as the
+    // fallback of an outer router — whose "routing" trivially resolves to
+    // that fallback — gives the rewrite layer a genuine pre-routing seat:
+    // it mutates the URI, then the inner router matches on the rewritten
+    // path. Built only when rules are configured, so the default path pays
+    // nothing. See rewrite.rs.
+    let router = if state.url_rewrites.is_empty() {
+        router
+    } else {
+        Router::new()
+            .fallback_service(router)
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                rewrite::rewrite_request_uri,
+            ))
+    };
+
+    // Host-based passthrough-route dispatch. A request whose `Host`
+    // matches an enabled route's `hosts` was never addressed to this
+    // gateway's own API (forward-proxy traffic delivered with the
+    // original host), so it must not fall into a typed route that
+    // happens to share the path — this seat is pre-routing AND outside
+    // the rewrite layer, so `url_rewrites` never touches foreign-host
+    // paths. Wrapped unconditionally: routes arrive dynamically via the
+    // snapshot, and the per-request probe is one arc-swap load plus a
+    // scan of the (typically tiny) route table. Matched requests go to
+    // `host_entry_stack`, which carries the same shared layers as the
+    // main stack (see above).
+    let router = Router::new()
+        .fallback_service(router)
+        .layer(middleware::from_fn_with_state(
+            (state.clone(), host_entry_stack),
+            passthrough_route::host_dispatch,
+        ));
+
+    // Outermost: mint the request id into the request extensions
+    // before any handler/extractor runs — including the rewrite layer,
+    // whose fired/failed log lines must carry the request span — and
+    // stamp it onto every response (including the short-circuited 4xx
+    // from the layers above) so the whole proxy family carries
+    // `x-aisix-request-id` and it equals the telemetry request_id. See
+    // request_id.rs.
+    router.layer(middleware::from_fn_with_state(
+        state,
+        request_id::ensure_request_id,
+    ))
+}
+
+/// The per-request layers every proxy-listener path shares, applied to the
+/// main route stack AND the host-dispatch entry stack so the two cannot
+/// drift (a layer added to one but not the other silently exempts
+/// foreign-host traffic from it). Innermost→outermost:
+///
+/// - `DefaultBodyLimit`: wire the configured cap into axum's request-body
+///   extractor chain (`Json<T>` defers to `Bytes`, which honors this
+///   layer). Without it, axum 0.7 falls back to its built-in 2 MiB
+///   default, which silently rejects bodies in the 2 MiB-to-cap band with
+///   a stock `BytesRejection` (NOT the OpenAI envelope). `0` = no cap —
+///   `disable()` rather than omitting the layer, because omitting it
+///   would fall back to axum's 2 MiB, not to "unlimited".
+/// - `enforce_request_body_limit`: short-circuits the Content-Length-known
+///   oversize case ahead of the extractors; the extractor-chain layer
+///   above catches chunked / size-mismatched bodies.
+/// - `record_request_telemetry`: one layer for both per-request telemetry
+///   guards — the in-flight gauge and the client-cancel recorder. Sits
+///   outside the body-limit layers so a hang-up during body upload is
+///   captured too, and inside `ensure_request_id` so the emitted line
+///   carries the same request id the caller was handed.
+/// - `SetResponseHeaderLayer(Server)`: identify the data plane on every
+///   response, including error envelopes and short-circuited responses.
+///   `overriding` (vs `if_not_present`) ensures the gateway's identity is
+///   authoritative — any Server header set by inner handlers or proxied
+///   from an upstream is replaced, so client-visible Server never leaks
+///   provider identity.
+fn apply_shared_proxy_layers(
+    router: Router<ProxyState>,
+    state: &ProxyState,
+    body_limit: usize,
+) -> Router<ProxyState> {
+    router
+        .layer(if body_limit > 0 {
+            axum::extract::DefaultBodyLimit::max(body_limit)
+        } else {
+            axum::extract::DefaultBodyLimit::disable()
+        })
         .layer(middleware::from_fn_with_state(
             state.clone(),
             enforce_request_body_limit,
         ))
         .layer(middleware::from_fn_with_state(
             state.clone(),
-            record_in_flight_request,
+            record_request_telemetry,
         ))
-        // Identify the data plane on every response, including error
-        // envelopes and short-circuited responses from the layers
-        // above. `overriding` (vs `if_not_present`) ensures the
-        // gateway's identity is authoritative — any Server header set
-        // by inner handlers or accidentally proxied from upstream is
-        // replaced, so client-visible Server never leaks provider
-        // identity.
         .layer(SetResponseHeaderLayer::overriding(
             header::SERVER,
             SERVER_HEADER_VALUE.clone(),
         ))
-        // Outermost: mint the request id into the request extensions
-        // before any handler/extractor runs, and stamp it onto every
-        // response (including the short-circuited 4xx from the layers
-        // above) so the whole proxy family carries `x-aisix-request-id`
-        // and it equals the telemetry request_id. See request_id.rs.
-        .layer(middleware::from_fn(request_id::ensure_request_id))
-        .with_state(state)
-}
-
-async fn record_in_flight_request(
-    State(state): State<ProxyState>,
-    request: Request<axum::body::Body>,
-    next: Next,
-) -> Response {
-    // Normalize to a bounded route template BEFORE using the path as a
-    // metric label. This middleware runs before authentication and before
-    // route matching, so the raw `request.uri().path()` is fully
-    // attacker-controlled — the `/passthrough/:provider/*rest` wildcard
-    // suffix (or any 404 path) would otherwise let an unauthenticated
-    // caller mint unbounded Prometheus time series (#451).
-    let endpoint = normalize_endpoint_label(request.uri().path());
-    let inbound_protocol = inbound_protocol_for_endpoint(endpoint).to_string();
-    let _guard = InFlightGuard::new(
-        state.metrics.clone(),
-        endpoint.to_string(),
-        inbound_protocol,
-    );
-    next.run(request).await
 }
 
 /// Collapse a raw request path to a fixed route template so metric labels
@@ -275,24 +345,36 @@ fn normalize_endpoint_label(path: &str) -> &'static str {
         "/v1/audio/transcriptions" => "/v1/audio/transcriptions",
         "/v1/audio/translations" => "/v1/audio/translations",
         "/v1/audio/speech" => "/v1/audio/speech",
+        "/v1/videos" => "/v1/videos",
         "/mcp" | "/mcp/" => "/mcp",
         "/v1/realtime" => "/v1/realtime",
         "/v1/files" => "/v1/files",
         "/v1/batches" => "/v1/batches",
         "/v1/fine_tuning/jobs" => "/v1/fine_tuning/jobs",
+        // `/v1/videos/:id` and `/v1/videos/:id/content` collapse together:
+        // the id is the only thing that varies and neither is worth its own
+        // series.
+        _ if path.starts_with("/v1/videos/") => "/v1/videos/:id",
         _ if path.starts_with("/v1/files/") => "/v1/files/:id",
         _ if path.starts_with("/v1/batches/") => "/v1/batches/:id",
         _ if path.starts_with("/v1/fine_tuning/jobs/") => "/v1/fine_tuning/jobs/:id",
+        _ if path.starts_with("/mcp/") => "/mcp/{server}",
         _ if path.starts_with("/a2a/") => "/a2a",
-        _ if path.starts_with("/passthrough/") => "/passthrough/:provider/*rest",
+        // The removed implicit tunnel: 410-tombstoned requests and any
+        // path-prefix route an operator claims under the old namespace
+        // both label as the passthrough_route family.
+        _ if path.starts_with("/passthrough/") => "/passthrough_route",
         _ => "other",
     }
 }
 
+/// Protocol family a route speaks, keyed off the normalized endpoint label.
+/// Shared by the in-flight gauge and the detailed request families
+/// (`request_metrics`) so the two can't disagree.
 fn inbound_protocol_for_endpoint(endpoint: &str) -> &'static str {
     if endpoint == "/v1/messages" || endpoint == "/v1/messages/count_tokens" {
         "anthropic"
-    } else if endpoint == "/mcp" {
+    } else if endpoint == "/mcp" || endpoint == "/mcp/{server}" {
         "mcp"
     } else if endpoint == "/a2a" {
         "a2a"
@@ -305,17 +387,21 @@ fn inbound_protocol_for_endpoint(endpoint: &str) -> &'static str {
 
 struct InFlightGuard {
     metrics: std::sync::Arc<aisix_obs::Metrics>,
-    endpoint: String,
-    inbound_protocol: String,
+    /// Bounded route template + protocol family — both `'static` by
+    /// construction (`normalize_endpoint_label` /
+    /// `inbound_protocol_for_endpoint`), so the guard owns no
+    /// allocations.
+    endpoint: &'static str,
+    inbound_protocol: &'static str,
 }
 
 impl InFlightGuard {
     fn new(
         metrics: std::sync::Arc<aisix_obs::Metrics>,
-        endpoint: String,
-        inbound_protocol: String,
+        endpoint: &'static str,
+        inbound_protocol: &'static str,
     ) -> Self {
-        metrics.increment_proxy_in_flight(&endpoint, &inbound_protocol);
+        metrics.increment_proxy_in_flight(endpoint, inbound_protocol);
         Self {
             metrics,
             endpoint,
@@ -327,7 +413,175 @@ impl InFlightGuard {
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
         self.metrics
-            .decrement_proxy_in_flight(&self.endpoint, &self.inbound_protocol);
+            .decrement_proxy_in_flight(self.endpoint, self.inbound_protocol);
+    }
+}
+
+/// nginx's non-standard "client closed request" status, used here purely
+/// as a recorded outcome — nothing is ever sent to a caller that already
+/// hung up. LiteLLM reports the same event as 499, so an operator running
+/// both reads one number.
+pub(crate) const CLIENT_CLOSED_REQUEST: u16 = 499;
+
+/// `error_kind` for an abandoned request, mirroring LiteLLM's
+/// `ClientDisconnected` error class.
+const CLIENT_DISCONNECTED_KIND: &str = "client_disconnected";
+
+/// One middleware for both per-request telemetry guards: the in-flight
+/// gauge and the client-cancel recorder. The two used to be separate
+/// layers; they sit at the same position in the stack with nothing
+/// between them, so a single layer arms both and the per-request boxed
+/// service hop (and one of two route-normalize calls) disappears.
+///
+/// In-flight gauge: incremented before the inner service runs,
+/// decremented on guard drop — including cancellation.
+///
+/// Client-cancel: records a request whose caller hung up before the
+/// response head was written. Every endpoint logs and meters itself at
+/// the end of its own handler — 29 `emit_access_log` call sites across
+/// 12 modules. When the client disconnects first, axum drops the
+/// handler future and *none* of that code runs: the request leaves no
+/// access-log line, no usage event and no metric. It is invisible
+/// exactly where an operator most needs it, because the usual reason a
+/// caller gives up is a long time-to-first-token.
+///
+/// A cancelled future is only observable from `Drop`, so arm a guard,
+/// disarm it once the inner service yields a response, and emit from
+/// `Drop` when it is still armed. Doing it in one layer rather than in
+/// each handler also keeps the endpoint family from drifting the way the
+/// request-id header did before `ensure_request_id` (see request_id.rs).
+/// On cancellation the in-flight guard (declared later) drops first,
+/// then the cancel guard emits — the same order the nested layers
+/// produced.
+///
+/// This is NOT the streaming-disconnect path: once SSE bytes flow the
+/// response head is already committed, so the handler has logged and the
+/// per-stream `Drop` guard emits the usage event (see
+/// `chat::build_sse_stream`). Response bodies are polled after this
+/// middleware has returned, so a mid-stream hang-up leaves the guard
+/// disarmed and is not double-counted here.
+async fn record_request_telemetry(
+    State(state): State<ProxyState>,
+    request: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    // Normalize to a bounded route template BEFORE using the path as a
+    // metric label. This middleware runs before authentication and before
+    // route matching, so the raw `request.uri().path()` is fully
+    // attacker-controlled — the `/passthrough/:provider/*rest` wildcard
+    // suffix (or any 404 path) would otherwise let an unauthenticated
+    // caller mint unbounded Prometheus time series (#451).
+    let endpoint = normalize_endpoint_label(request.uri().path());
+    // The cell the handler fills in as it resolves the model and picks a
+    // target, so this layer can attribute a cancelled request to them
+    // (AISIX-Cloud#1317). Installed here because a cancelled handler
+    // future never gets to hand anything back.
+    let attribution = std::sync::Arc::new(attribution::RequestAttribution::default());
+    let mut guard = ClientCancelGuard {
+        armed: true,
+        state: state.clone(),
+        attribution: attribution.clone(),
+        endpoint,
+        method: request.method().clone(),
+        uri: request.uri().clone(),
+        request_id: request
+            .extensions()
+            .get::<request_id::RequestId>()
+            .map(|id| id.0.clone())
+            .unwrap_or_default(),
+        started: std::time::Instant::now(),
+    };
+    let _in_flight = InFlightGuard::new(
+        state.metrics.clone(),
+        endpoint,
+        inbound_protocol_for_endpoint(endpoint),
+    );
+    let response = attribution::scope(attribution, next.run(request)).await;
+    guard.armed = false;
+    response
+}
+
+struct ClientCancelGuard {
+    /// Cleared when the inner service returns. Still set at drop time
+    /// means the future was cancelled rather than completed.
+    armed: bool,
+    /// Held for the metrics sink AND the snapshot the attribution labels
+    /// are resolved against at drop time.
+    state: ProxyState,
+    /// What the cancelled request had resolved before the caller hung up.
+    attribution: std::sync::Arc<attribution::RequestAttribution>,
+    /// Bounded route template — safe as a metric label (#451).
+    endpoint: &'static str,
+    method: axum::http::Method,
+    /// `Uri` clones are reference-counted internally; the path is only
+    /// read on the cancel path, so the happy path pays no formatting.
+    uri: axum::http::Uri,
+    request_id: String,
+    started: std::time::Instant,
+}
+
+impl Drop for ClientCancelGuard {
+    fn drop(&mut self) {
+        // A panicking handler also leaves the guard armed — its future is
+        // dropped mid-unwind exactly like a cancelled one. Attributing that
+        // to the caller would be wrong twice over: it fabricates a client
+        // disconnect that never happened, and it buries the panic under a
+        // benign-looking 499. A panic has its own signal (tokio surfaces the
+        // task failure and hyper drops the connection), so stay silent and
+        // let that stand. Emitting here would also risk a double panic,
+        // which aborts the process.
+        if !self.armed || std::thread::panicking() {
+            return;
+        }
+        let latency = self.started.elapsed();
+        let resolved = self.attribution.get();
+        AccessLog {
+            method: self.method.as_str(),
+            path: self.uri.path(),
+            status: CLIENT_CLOSED_REQUEST,
+            latency,
+            // The log line takes the RAW names: it is bounded by request
+            // volume, not by label cardinality, so it can say exactly
+            // which target the abandoned request was waiting on.
+            provider: (!resolved.provider.is_empty()).then_some(resolved.provider.as_str()),
+            model: (!resolved.requested_model.is_empty())
+                .then_some(resolved.requested_model.as_str()),
+            api_key_id: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            total_tokens: None,
+            request_id: &self.request_id,
+            provider_request_id: None,
+            served_by_model: None,
+            routing_attempt_count: None,
+            routing_fallback_count: None,
+            error_kind: Some(CLIENT_DISCONNECTED_KIND),
+            error: Some("client closed the request before the response head was written"),
+        }
+        .emit();
+        // Bound the labels the same way every other emit does: the model
+        // through the configured set, the ProviderKey name off the row its
+        // id names — a cancelled request must not be able to mint series
+        // (#451), and its samples must land on the SAME label values the
+        // request families use for the same target.
+        let snap = self.state.snapshot.load();
+        let model = if resolved.requested_model.is_empty() {
+            std::borrow::Cow::Borrowed("unknown")
+        } else {
+            usage_attr::metric_model_label(&snap, &resolved.requested_model)
+        };
+        let resolved_pk = usage_attr::ResolvedPk::resolve(&snap, &resolved.provider_key_id);
+        let pk = if resolved.provider_key_id.is_empty() {
+            usage_attr::PkLabels::default()
+        } else {
+            resolved_pk.labels()
+        };
+        self.state.metrics.record_client_cancelled(CancelledLabels {
+            endpoint: self.endpoint,
+            model: model.as_ref(),
+            provider_key_id: pk.id(),
+            provider_key_name: pk.name(),
+        });
     }
 }
 
@@ -347,11 +601,18 @@ impl Drop for InFlightGuard {
 /// `fetch` both set Content-Length for non-streamed POSTs, and
 /// without this middleware they see ECONNRESET (indistinguishable
 /// from a network failure or a gateway crash) instead of 413.
+///
+/// Both short-circuits answer through [`crate::reject`], so a request
+/// refused here still produces the access-log line and request metrics
+/// every other terminal path emits — the handler it never reached can't
+/// do it. The logged latency spans the body drain below, which is what
+/// an oversize request actually costs the gateway.
 async fn enforce_request_body_limit(
     State(state): State<ProxyState>,
     request: Request<axum::body::Body>,
     next: Next,
 ) -> Response {
+    let started = std::time::Instant::now();
     // /v1/messages must emit the Anthropic-shape error envelope
     // (closes #336). The middleware runs BEFORE the handler so the
     // handler's `into_anthropic_response()` would never see the
@@ -370,12 +631,10 @@ async fn enforce_request_body_limit(
     let path = request.uri().path();
     let is_anthropic_path =
         path == "/v1/messages" || path == "/v1/messages/" || path == "/v1/messages/count_tokens";
-    let render = |e: ProxyError| -> Response {
-        if is_anthropic_path {
-            e.into_anthropic_response()
-        } else {
-            e.into_response()
-        }
+    let envelope = if is_anthropic_path {
+        reject::Envelope::Anthropic
+    } else {
+        reject::Envelope::OpenAi
     };
     // RFC 9110 §8.6 — a server SHOULD reject a request that carries
     // duplicate or conflicting `Content-Length` values rather than
@@ -384,28 +643,114 @@ async fn enforce_request_body_limit(
         .headers()
         .get_all(axum::http::header::CONTENT_LENGTH)
         .iter();
+    // The access log takes the bounded route template, not the raw path.
+    // This is the one logging site that runs before authentication AND
+    // before route matching, so the raw path is unvalidated
+    // caller-controlled text — the same reason the metric labels are
+    // collapsed (#451).
+    let endpoint = normalize_endpoint_label(path);
     let first = content_lengths.next();
     if content_lengths.next().is_some() {
-        return render(ProxyError::InvalidRequest(
-            "conflicting Content-Length headers".into(),
-        ));
+        return reject::reject_before_dispatch(
+            &state,
+            request.method().as_str(),
+            endpoint,
+            &request_id_of(&request),
+            None,
+            started,
+            envelope,
+            ProxyError::InvalidRequest("conflicting Content-Length headers".into()),
+        );
     }
+    // `0` = the cap is disabled; the duplicate-Content-Length rejection
+    // above still applies — that one is request-smuggling hygiene, not a
+    // size limit.
     if let Some(declared) = first
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<usize>().ok())
     {
-        if declared > state.request_body_limit_bytes {
+        if state.request_body_limit_bytes > 0 && declared > state.request_body_limit_bytes {
+            // Capture what the logs need before the body move below
+            // consumes the request.
+            let method = request.method().clone();
+            let request_id = request_id_of(&request);
             // Drain the inbound body so hyper can flush the 413 response
             // on the same HTTP/1.1 connection. Without this, hyper closes
             // the socket while the client is still writing, and the client
             // sees EPIPE/ECONNRESET instead of the 413.
-            drain_body(request.into_body()).await;
-            return render(ProxyError::RequestTooLarge {
-                limit_bytes: state.request_body_limit_bytes,
-            });
+            let drain = drain_body(request.into_body()).await;
+            record_body_limit_rejection(
+                &state,
+                endpoint,
+                method.as_str(),
+                &request_id,
+                declared,
+                &drain,
+                started,
+            );
+            return reject::reject_before_dispatch(
+                &state,
+                method.as_str(),
+                endpoint,
+                &request_id,
+                None,
+                started,
+                envelope,
+                ProxyError::RequestTooLarge {
+                    limit_bytes: state.request_body_limit_bytes,
+                },
+            );
         }
     }
     next.run(request).await
+}
+
+/// The id `ensure_request_id` (the outermost layer) minted for this
+/// request, so a rejection logged here joins the `x-aisix-request-id` the
+/// caller was handed. The fallback only covers a router assembled without
+/// that layer — every shipped path has it.
+fn request_id_of(request: &Request<axum::body::Body>) -> String {
+    request
+        .extensions()
+        .get::<request_id::RequestId>()
+        .map(|r| r.0.clone())
+        .unwrap_or_else(request_id::new_request_id)
+}
+
+/// How the drain of a refused body ended. A fixed vocabulary: it is both
+/// a metric label and a log field, and `completed` vs the rest is what
+/// tells an operator whether the caller could still read the 413.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DrainOutcome {
+    /// The caller finished sending. The connection is clean, so the 413
+    /// reaches it.
+    Completed,
+    /// The byte cap was hit first. The rest of the body is never read, so
+    /// the caller may see a reset instead of the 413.
+    CapReached,
+    /// The time budget expired with the caller still sending — same
+    /// visible result as `CapReached`, different cause (a slow or
+    /// dribbling client rather than a huge one).
+    Timeout,
+    /// The caller's stream errored mid-drain: it went away on its own.
+    ClientReadError,
+}
+
+impl DrainOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            DrainOutcome::Completed => "completed",
+            DrainOutcome::CapReached => "cap_reached",
+            DrainOutcome::Timeout => "timeout",
+            DrainOutcome::ClientReadError => "client_read_error",
+        }
+    }
+}
+
+/// What a drain cost and how it ended.
+struct Drain {
+    bytes: usize,
+    outcome: DrainOutcome,
 }
 
 /// Read and discard the inbound body, bounded by both bytes and time.
@@ -413,25 +758,134 @@ async fn enforce_request_body_limit(
 /// Byte cap (32 MiB) prevents a huge `Content-Length` from consuming
 /// unbounded memory.  Time cap (5 s) prevents a slowloris-style
 /// client from holding the task indefinitely by dribbling data.
-async fn drain_body(body: axum::body::Body) {
+///
+/// Returns how it ended, because those two bounds are exactly the cases
+/// where the caller gets a connection reset instead of the 413 the drain
+/// exists to deliver — and a discarded result made a reset caused here
+/// indistinguishable from one caused anywhere else.
+async fn drain_body(body: axum::body::Body) -> Drain {
     use http_body_util::BodyExt;
 
     const DRAIN_CAP: usize = 32 * 1024 * 1024;
     const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-    let _ = tokio::time::timeout(DRAIN_TIMEOUT, async {
-        let mut drained = 0usize;
+    let mut drained = 0usize;
+    // Bound the future to its own statement: holding it in the `match`
+    // scrutinee would keep `drained` mutably borrowed through the arms.
+    let ended = tokio::time::timeout(DRAIN_TIMEOUT, async {
         let mut body = body;
-        while let Some(Ok(frame)) = body.frame().await {
-            if let Some(data) = frame.data_ref() {
-                drained += data.len();
-                if drained >= DRAIN_CAP {
-                    break;
+        loop {
+            match body.frame().await {
+                Some(Ok(frame)) => {
+                    if let Some(data) = frame.data_ref() {
+                        drained += data.len();
+                        if drained >= DRAIN_CAP {
+                            return DrainOutcome::CapReached;
+                        }
+                    }
                 }
+                // Distinguishing this from the clean end below is the
+                // point: `while let Some(Ok(_))` folded a client that
+                // vanished mid-body into "drained fine".
+                Some(Err(_)) => return DrainOutcome::ClientReadError,
+                None => return DrainOutcome::Completed,
             }
         }
     })
     .await;
+    Drain {
+        // On timeout the inner future is dropped mid-poll, so this is
+        // what had been absorbed by then — the useful number.
+        bytes: drained,
+        outcome: ended.unwrap_or(DrainOutcome::Timeout),
+    }
+}
+
+/// Emit the body-limit diagnostic for a refused request: what the caller
+/// declared, what the cap was, how much of the body the gateway absorbed
+/// and how that drain ended. Joined to the access log by `request_id`.
+///
+/// Level follows the outcome. A clean drain is routine and stays `info`;
+/// a cap hit, a timeout or a mid-drain read error all mean the gateway
+/// stopped reading while the caller was still writing — the case where
+/// the caller sees a reset rather than the 413 — so those warn. The warn
+/// is rate limited per outcome so a flood of oversize requests can't
+/// amplify into a log flood; the counter above it is unconditional and
+/// keeps the true volume regardless of what the limiter drops.
+fn record_body_limit_rejection(
+    state: &ProxyState,
+    endpoint: &'static str,
+    method: &str,
+    request_id: &str,
+    declared_content_length: usize,
+    drain: &Drain,
+    started: std::time::Instant,
+) {
+    let inbound_protocol = inbound_protocol_for_endpoint(endpoint);
+    state
+        .metrics
+        .record_body_limit_rejection(endpoint, inbound_protocol, drain.outcome.as_str());
+
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    if drain.outcome == DrainOutcome::Completed {
+        tracing::info!(
+            target: "aisix::body_limit",
+            request_id,
+            endpoint,
+            method,
+            status = 413,
+            declared_content_length,
+            configured_limit_bytes = state.request_body_limit_bytes,
+            drained_bytes = drain.bytes,
+            drain_outcome = drain.outcome.as_str(),
+            elapsed_ms,
+            "request body exceeded the configured limit",
+        );
+    } else if warn_allowed(drain.outcome) {
+        tracing::warn!(
+            target: "aisix::body_limit",
+            request_id,
+            endpoint,
+            method,
+            status = 413,
+            declared_content_length,
+            configured_limit_bytes = state.request_body_limit_bytes,
+            drained_bytes = drain.bytes,
+            drain_outcome = drain.outcome.as_str(),
+            elapsed_ms,
+            "request body exceeded the configured limit and the drain did not finish",
+        );
+    }
+}
+
+/// At most one warn per abnormal outcome per second. Per outcome rather
+/// than global so a steady stream of one kind can't mask the first of
+/// another. Races between threads at the boundary can let a second line
+/// through; that is cheaper than the synchronisation to prevent it, and
+/// the counter is the source of truth for volume anyway.
+fn warn_allowed(outcome: DrainOutcome) -> bool {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    const WARN_INTERVAL_MS: u64 = 1_000;
+    // `0` = never warned. Elapsed millis are clamped to >= 1 on store so
+    // the sentinel can't collide with a warn in the first millisecond.
+    static LAST_WARN_MS: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+    static PROCESS_START: std::sync::LazyLock<std::time::Instant> =
+        std::sync::LazyLock::new(std::time::Instant::now);
+
+    let slot = match outcome {
+        DrainOutcome::CapReached => 0,
+        DrainOutcome::Timeout => 1,
+        DrainOutcome::ClientReadError => 2,
+        DrainOutcome::Completed => return false,
+    };
+    let now = (PROCESS_START.elapsed().as_millis() as u64).max(1);
+    let last = LAST_WARN_MS[slot].load(Ordering::Relaxed);
+    if last != 0 && now.saturating_sub(last) < WARN_INTERVAL_MS {
+        return false;
+    }
+    LAST_WARN_MS[slot].store(now, Ordering::Relaxed);
+    true
 }
 
 async fn livez(
@@ -468,15 +922,23 @@ mod tests {
         // unbounded-cardinality vector from #451.
         assert_eq!(
             normalize_endpoint_label("/passthrough/openai/anything/unique-123"),
-            "/passthrough/:provider/*rest"
+            "/passthrough_route"
         );
         assert_eq!(
             normalize_endpoint_label("/passthrough/openai/other-unique-456"),
-            "/passthrough/:provider/*rest"
+            "/passthrough_route"
         );
         // Arbitrary unauthenticated paths bucket to a single label.
         assert_eq!(normalize_endpoint_label("/random/x"), "other");
         assert_eq!(normalize_endpoint_label("/random/y"), "other");
+        // The scoped MCP endpoint collapses to one label regardless of the
+        // server segment; the aggregated endpoint (with and without the
+        // trailing slash) keeps its own — the exact `"/mcp/"` arm must stay
+        // ahead of the `/mcp/` prefix arm.
+        assert_eq!(normalize_endpoint_label("/mcp/alpha"), "/mcp/{server}");
+        assert_eq!(normalize_endpoint_label("/mcp/unique-xyz"), "/mcp/{server}");
+        assert_eq!(normalize_endpoint_label("/mcp"), "/mcp");
+        assert_eq!(normalize_endpoint_label("/mcp/"), "/mcp");
     }
 
     use aisix_core::resource::ResourceEntry;
@@ -498,7 +960,11 @@ mod tests {
             addr: "127.0.0.1:0".into(),
             request_body_limit_bytes: 1_048_576,
             real_ip: Default::default(),
+            request_id: Default::default(),
+            url_rewrites: Vec::new(),
             tls: None,
+            thread_per_core: None,
+            workers: None,
         }
     }
 
@@ -554,6 +1020,23 @@ mod tests {
         snap
     }
 
+    /// An enabled inject-mode PassthroughRoute at `/passthrough/openai`,
+    /// carrying the shared PK — the explicit-route successor of the
+    /// removed implicit tunnel, so the ported #1116 semantics tests keep
+    /// their original request shapes.
+    fn passthrough_route_entry(target_url: &str) -> ResourceEntry<aisix_core::PassthroughRoute> {
+        let cfg = format!(
+            r#"{{
+                "name": "openai-tunnel",
+                "path_prefix": "/passthrough/openai",
+                "target_url": "{target_url}",
+                "provider_key_id": "{PK_ID}"
+            }}"#
+        );
+        let route: aisix_core::PassthroughRoute = serde_json::from_str(&cfg).unwrap();
+        ResourceEntry::new("route-id-1", route, 1)
+    }
+
     fn apikey_entry(key: &str, allowed: &[&str]) -> ResourceEntry<ApiKey> {
         apikey_entry_with_limits(key, allowed, None)
     }
@@ -571,10 +1054,13 @@ mod tests {
         // Tests pass the plaintext bearer here (e.g. "sk-caller"); the
         // wire schema stores its SHA-256 (§9A.7B.4). Hash via the
         // canonical helper so request-side `Bearer <plaintext>` lookups
-        // line up.
+        // line up. `allowed_routes: ["*"]` keeps the passthrough-route
+        // tests on the same shared key fixture (typed endpoints never
+        // read it).
         let key_hash = ApiKey::hash_bearer(key);
-        let cfg =
-            format!(r#"{{"key_hash": "{key_hash}", "allowed_models": {allowed_json}{rl_tail}}}"#);
+        let cfg = format!(
+            r#"{{"key_hash": "{key_hash}", "allowed_models": {allowed_json}, "allowed_routes": ["*"]{rl_tail}}}"#
+        );
         let apikey: ApiKey = serde_json::from_str(&cfg).unwrap();
         ResourceEntry::new("key-id-1", apikey, 1)
     }
@@ -1653,6 +2139,455 @@ mod tests {
         assert!(
             message.contains("Content-Length"),
             "smuggling-rejection message should mention Content-Length; got {message:?}"
+        );
+    }
+
+    fn build_state_with_limit(snapshot: AisixSnapshot, hub: Arc<Hub>, limit: usize) -> ProxyState {
+        let handle = SnapshotHandle::new(snapshot);
+        let cfg = ProxyConfig {
+            addr: "127.0.0.1:0".into(),
+            request_body_limit_bytes: limit,
+            real_ip: Default::default(),
+            request_id: Default::default(),
+            url_rewrites: Vec::new(),
+            tls: None,
+            thread_per_core: None,
+            workers: None,
+        };
+        ProxyState::new(handle, hub, &cfg).without_cache()
+    }
+
+    /// `request_body_limit_bytes: 0` (the default) disables the cap
+    /// entirely. The load-bearing detail is axum's BUILT-IN 2 MiB
+    /// `DefaultBodyLimit`: merely skipping our `max(limit)` layer would
+    /// still reject bodies over 2 MiB with a stock rejection, so the
+    /// router must install `DefaultBodyLimit::disable()`. A 2.5 MiB body
+    /// — over axum's built-in cap — must reach the handler on both the
+    /// declared-Content-Length path and the chunked path.
+    #[tokio::test]
+    async fn zero_limit_admits_bodies_over_axums_builtin_cap() {
+        let hub = Arc::new(Hub::new());
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
+        let app = build_router(build_state_with_limit(snap, hub, 0));
+
+        let filler = "x".repeat(2 * 1024 * 1024 + 512 * 1024); // 2.5 MiB
+        let body =
+            format!(r#"{{"model":"my-gpt4","messages":[{{"role":"user","content":"{filler}"}}]}}"#);
+
+        // Declared Content-Length path (the middleware's early check).
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .header("content-length", body.len().to_string())
+            .body(Body::from(body.clone()))
+            .unwrap();
+        let resp = run(app.clone(), req).await;
+        assert_ne!(
+            resp.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "limit 0 must not reject on declared size"
+        );
+        // The body parsed and dispatch ran (and failed on the unusable
+        // upstream) — proving the request got PAST the extractor.
+        assert!(
+            resp.status().is_server_error(),
+            "expected an upstream dispatch failure, got {}",
+            resp.status()
+        );
+
+        // Chunked path (no Content-Length): this is the one axum's
+        // built-in 2 MiB default would kill without `disable()`.
+        let chunks: Vec<_> = body
+            .into_bytes()
+            .chunks(200 * 1024)
+            .map(|c| c.to_vec())
+            .collect();
+        let stream = futures::stream::iter(chunks.into_iter().map(Ok::<_, std::io::Error>));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from_stream(stream))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_ne!(
+            resp.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "limit 0 must not cap a chunked body at axum's 2 MiB default"
+        );
+        assert!(resp.status().is_server_error());
+    }
+
+    /// A caller that sends everything it declared leaves the connection
+    /// clean, so it can actually read the 413 the drain exists to
+    /// deliver. This is the only outcome that is not a warning.
+    #[tokio::test]
+    async fn drain_reports_a_body_the_client_finished_sending() {
+        let drain = drain_body(Body::from(vec![b'x'; 4096])).await;
+        assert_eq!(drain.outcome, DrainOutcome::Completed);
+        assert_eq!(drain.bytes, 4096);
+    }
+
+    /// Past the byte cap the rest of the body is never read, so the
+    /// caller is likely to see a reset instead of the 413 — an operator
+    /// has to be able to tell that apart from a clean drain.
+    #[tokio::test]
+    async fn drain_reports_hitting_the_byte_cap() {
+        // One MiB over the 32 MiB cap, in chunks so nothing holds the
+        // whole body at once.
+        let chunk = vec![b'x'; 1024 * 1024];
+        let stream =
+            futures::stream::iter((0..33).map(move |_| Ok::<_, std::io::Error>(chunk.clone())));
+        let drain = drain_body(Body::from_stream(stream)).await;
+        assert_eq!(drain.outcome, DrainOutcome::CapReached);
+        assert_eq!(drain.bytes, 32 * 1024 * 1024);
+    }
+
+    /// A client that dribbles (or stops) holds the drain until the time
+    /// budget expires. `start_paused` advances the clock as soon as the
+    /// runtime idles, so this costs no wall-clock time.
+    #[tokio::test(start_paused = true)]
+    async fn drain_reports_the_time_budget_expiring() {
+        let head = futures::stream::iter([Ok::<_, std::io::Error>(vec![b'x'; 512])]);
+        let never_ends = head.chain(futures::stream::pending());
+        let drain = drain_body(Body::from_stream(never_ends)).await;
+        assert_eq!(drain.outcome, DrainOutcome::Timeout);
+        // What had been absorbed when the budget ran out, not zero.
+        assert_eq!(drain.bytes, 512);
+    }
+
+    /// The client going away mid-body used to be folded into "drained
+    /// fine" by a `while let Some(Ok(_))` loop, which is exactly the case
+    /// an operator is trying to explain when a caller reports a reset.
+    #[tokio::test]
+    async fn drain_reports_the_client_vanishing_mid_body() {
+        let stream = futures::stream::iter([
+            Ok(vec![b'x'; 256]),
+            Err(std::io::Error::other("connection reset")),
+        ]);
+        let drain = drain_body(Body::from_stream(stream)).await;
+        assert_eq!(drain.outcome, DrainOutcome::ClientReadError);
+        assert_eq!(drain.bytes, 256);
+    }
+
+    /// The rate limiter must never swallow the FIRST warning of a kind —
+    /// that is the one an operator needs — and must not let one noisy
+    /// outcome mask another's first occurrence.
+    #[test]
+    fn the_first_warning_of_each_abnormal_outcome_survives_the_rate_limit() {
+        assert!(warn_allowed(DrainOutcome::Timeout));
+        assert!(!warn_allowed(DrainOutcome::Timeout), "second within 1s");
+        assert!(
+            warn_allowed(DrainOutcome::ClientReadError),
+            "a different outcome keeps its own budget"
+        );
+        assert!(
+            !warn_allowed(DrainOutcome::Completed),
+            "a clean drain is not a warning"
+        );
+    }
+
+    /// A body-cap rejection short-circuits BEFORE any handler runs, and
+    /// both the access log and the request metrics are emitted BY the
+    /// handlers — so pre-fix a caller got a 413 the gateway kept no
+    /// record of: nothing in the log, no `aisix_requests_total` sample.
+    /// "Client reports 413, gateway shows nothing" was indistinguishable
+    /// from the request never arriving.
+    ///
+    /// The metric is what this asserts, because it is per-`ProxyState`
+    /// and so unaffected by whatever else the suite is doing; the log
+    /// line — process-global tracing state, not safely assertable from a
+    /// parallel unit test — is pinned end-to-end in the `body-edges` E2E.
+    #[tokio::test]
+    async fn body_cap_short_circuit_is_counted_like_any_other_terminal_path() {
+        let hub = Arc::new(Hub::new());
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
+        let state = build_state(snap, hub); // 1 MiB cap from cfg()
+        let app = build_router(state.clone());
+
+        let oversized = 2 * 1024 * 1024;
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .header("content-length", oversized.to_string())
+            .body(Body::from(
+                r#"{"model":"my-gpt4","messages":[{"role":"user","content":"hi"}]}"#,
+            ))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        let scrape = state.metrics.render();
+        assert!(
+            scrape.contains("aisix_requests_total") && scrape.contains(r#"status="413""#),
+            "the 413 must be counted, got: {scrape}"
+        );
+    }
+
+    /// The refusal is counted with the outcome of its drain, and both
+    /// labels stay bounded: `endpoint` collapses to a route template even
+    /// when the caller invents the path. This surface answers before
+    /// authentication, so an unbounded label here would let anyone mint
+    /// series at will (#451).
+    #[tokio::test]
+    async fn body_cap_rejection_is_counted_with_a_bounded_endpoint_and_its_outcome() {
+        let hub = Arc::new(Hub::new());
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
+        let state = build_state(snap, hub); // 1 MiB cap from cfg()
+        let app = build_router(state.clone());
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/passthrough/openai/caller-invented-path-9d3f")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .header("content-length", (2 * 1024 * 1024).to_string())
+            .body(Body::from("{}"))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        let scrape = state.metrics.render();
+        let sample = scrape
+            .lines()
+            .find(|l| l.starts_with("aisix_proxy_request_body_limit_rejections_total{"))
+            .unwrap_or_else(|| panic!("the refusal must be counted, got: {scrape}"));
+        assert!(
+            sample.contains(r#"endpoint="/passthrough_route""#),
+            "the caller's path must not reach the label: {sample}"
+        );
+        assert!(sample.contains(r#"outcome="completed""#), "{sample}");
+        assert!(sample.contains(r#"inbound_protocol="openai""#), "{sample}");
+    }
+
+    /// The chunked path reaches the handler, which rejects at its body
+    /// extractor and returns before the dispatch tail — silent for the
+    /// same reason, one layer further in. Locks the handler-side half.
+    #[tokio::test]
+    async fn chunked_oversize_rejection_is_counted_like_any_other_terminal_path() {
+        let hub = Arc::new(Hub::new());
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
+        let state = build_state(snap, hub);
+        let app = build_router(state.clone());
+
+        let chunk = vec![b'x'; 200 * 1024];
+        let stream =
+            futures::stream::iter((0..10).map(move |_| Ok::<_, std::io::Error>(chunk.clone())));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from_stream(stream))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        let scrape = state.metrics.render();
+        assert!(
+            scrape.contains(r#"status="413""#),
+            "the 413 must be counted, got: {scrape}"
+        );
+    }
+
+    /// The duplicate-Content-Length rejection is smuggling hygiene, not
+    /// a size limit — it must keep firing when the cap is disabled.
+    #[tokio::test]
+    async fn zero_limit_still_rejects_duplicate_content_length() {
+        let hub = Arc::new(Hub::new());
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
+        let app = build_router(build_state_with_limit(snap, hub, 0));
+
+        let body = r#"{"model":"my-gpt4","messages":[{"role":"user","content":"hi"}]}"#;
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        req.headers_mut().append(
+            axum::http::header::CONTENT_LENGTH,
+            axum::http::HeaderValue::from(body.len()),
+        );
+        req.headers_mut().append(
+            axum::http::header::CONTENT_LENGTH,
+            axum::http::HeaderValue::from(body.len() + 1),
+        );
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Chunked oversize on a handler that used to take a bare
+    /// `Json<Value>` extractor: the rejection must be the OpenAI
+    /// envelope, not axum's stock `text/plain` 413. (The
+    /// Content-Length path was already correct via the middleware;
+    /// the chunked path leaked the stock rejection.)
+    #[tokio::test]
+    async fn chunked_oversize_on_v1_completions_returns_openai_envelope() {
+        let hub = Arc::new(Hub::new());
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
+        let app = build_router(build_state(snap, hub));
+
+        let chunk = vec![b'x'; 200 * 1024];
+        let stream =
+            futures::stream::iter((0..10).map(move |_| Ok::<_, std::io::Error>(chunk.clone())));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from_stream(stream))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes)
+            .expect("413 must carry the JSON envelope, not axum's text/plain rejection");
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+    }
+
+    /// Same contract for the raw-`Bytes` handlers (batches /
+    /// fine-tuning).
+    #[tokio::test]
+    async fn chunked_oversize_on_v1_batches_returns_openai_envelope() {
+        let hub = Arc::new(Hub::new());
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
+        let app = build_router(build_state(snap, hub));
+
+        let chunk = vec![b'x'; 200 * 1024];
+        let stream =
+            futures::stream::iter((0..10).map(move |_| Ok::<_, std::io::Error>(chunk.clone())));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/batches")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from_stream(stream))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes)
+            .expect("413 must carry the JSON envelope, not axum's text/plain rejection");
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+    }
+
+    /// Chunked oversize multipart upload: axum's `MultipartError`
+    /// classifies the cap hit as 413, and the handlers must preserve
+    /// that instead of folding every multipart error into 400.
+    #[tokio::test]
+    async fn chunked_oversize_multipart_returns_413_envelope() {
+        let hub = Arc::new(Hub::new());
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
+        let app = build_router(build_state(snap, hub));
+
+        let boundary = "aisix-test-boundary-413";
+        let mut body = Vec::new();
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; \
+                 filename=\"a.wav\"\r\nContent-Type: audio/wav\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend(vec![b'x'; 2 * 1024 * 1024]); // over the 1 MiB test cap
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let chunks: Vec<_> = body.chunks(200 * 1024).map(|c| c.to_vec()).collect();
+        let stream = futures::stream::iter(chunks.into_iter().map(Ok::<_, std::io::Error>));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/audio/transcriptions")
+            .header("authorization", "Bearer sk-caller")
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from_stream(stream))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        let message = v["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("limit"),
+            "413 message should reference the limit; got {message:?}"
+        );
+    }
+
+    /// The passthrough tunnel reads its body manually (`to_bytes`), so
+    /// the `0` sentinel has to be widened there too — this is the site
+    /// the first audit round caught unconverted, where every POST got
+    /// `413 request body exceeds 0-byte limit` on the new default.
+    #[tokio::test]
+    async fn zero_limit_passthrough_post_is_not_rejected() {
+        let hub = Arc::new(Hub::new());
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
+        snap.passthrough_routes
+            .insert(passthrough_route_entry("http://unused"));
+        let app = build_router(build_state_with_limit(snap, hub, 0));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/passthrough/openai/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"model":"gpt-4o","input":"hi"}"#))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_ne!(
+            resp.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "limit 0 must not reject the passthrough body"
+        );
+        // Past the body read; the dispatch then failed on the unusable
+        // upstream.
+        assert!(
+            resp.status().is_server_error(),
+            "expected an upstream dispatch failure, got {}",
+            resp.status()
+        );
+    }
+
+    /// With a configured cap, a chunked over-limit passthrough body is
+    /// a 413 in the envelope — and a transport fault stays a 400, no
+    /// longer mislabelled as `RequestTooLarge`.
+    #[tokio::test]
+    async fn chunked_oversize_on_passthrough_returns_openai_envelope() {
+        let hub = Arc::new(Hub::new());
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
+        snap.passthrough_routes
+            .insert(passthrough_route_entry("http://unused"));
+        let app = build_router(build_state(snap, hub));
+
+        let chunk = vec![b'x'; 200 * 1024];
+        let stream =
+            futures::stream::iter((0..10).map(move |_| Ok::<_, std::io::Error>(chunk.clone())));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/passthrough/openai/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from_stream(stream))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let v: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("413 must carry the JSON envelope");
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        let message = v["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("limit"),
+            "413 message should reference the limit; got {message:?}"
         );
     }
 
@@ -2871,6 +3806,8 @@ data: [DONE]\n\n"
         let hub = Arc::new(Hub::new());
         hub.register_specialized("openai", Arc::new(openai_test_bridge()));
         let snap = new_snap(&upstream.uri());
+        snap.passthrough_routes
+            .insert(passthrough_route_entry(&upstream.uri()));
         snap.models.insert(model_entry_with_rate_limit(
             "my-video-model",
             serde_json::json!({"rpm": 1}),
@@ -2927,6 +3864,8 @@ data: [DONE]\n\n"
         // must stay untouched. The API key carries rpm=2 to pin that the
         // key layer still gates the tunnel (and 429s on the 3rd call).
         let snap = new_snap(&upstream.uri());
+        snap.passthrough_routes
+            .insert(passthrough_route_entry(&upstream.uri()));
         snap.models.insert(model_entry_with_rate_limit(
             "my-video-model",
             serde_json::json!({"rpm": 1}),
@@ -2990,6 +3929,8 @@ data: [DONE]\n\n"
         let hub = Arc::new(Hub::new());
         hub.register_specialized("openai", Arc::new(openai_test_bridge()));
         let snap = new_snap(&upstream.uri());
+        snap.passthrough_routes
+            .insert(passthrough_route_entry(&upstream.uri()));
         snap.models.insert(model_entry("my-video-model"));
         snap.rate_limit_policies.insert(ResourceEntry::new(
             "pol-1",
@@ -3028,6 +3969,199 @@ data: [DONE]\n\n"
         );
     }
 
+    /// A schedule window that always matches "now" (every weekday, all
+    /// day) so suspension is deterministic under the system clock.
+    fn always_on_schedule() -> serde_json::Value {
+        serde_json::json!([{
+            "timezone": "UTC",
+            "days_of_week": ["mon", "tue", "wed", "thu", "fri", "sat", "sun"],
+            "start_time": "00:00",
+            "end_time": "24:00"
+        }])
+    }
+
+    /// A schedule window that can never match (a fixed past date).
+    fn never_on_schedule() -> serde_json::Value {
+        serde_json::json!([{
+            "timezone": "UTC",
+            "dates": ["2000-01-01"],
+            "start_time": "00:00",
+            "end_time": "24:00"
+        }])
+    }
+
+    /// While inside a scheduled suspension window the policy reserves
+    /// nothing; once the schedule no longer matches, enforcement resumes
+    /// on the unchanged bucket (AISIX-Cloud#1104).
+    #[tokio::test]
+    async fn scheduled_suspension_pauses_policy_until_window_closes() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/anything"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = new_snap(&upstream.uri());
+        snap.passthrough_routes
+            .insert(passthrough_route_entry(&upstream.uri()));
+        snap.models.insert(model_entry("my-video-model"));
+        let policy_json = |schedules: serde_json::Value| {
+            serde_json::json!({
+                "name": "video-cap",
+                "scope": "model",
+                "scope_ref": "model-id-1",
+                "window": "minute",
+                "max_requests": 1,
+                "schedules": schedules
+            })
+        };
+        snap.rate_limit_policies.insert(ResourceEntry::new(
+            "pol-1",
+            serde_json::from_value(policy_json(always_on_schedule())).unwrap(),
+            1,
+        ));
+        snap.apikeys
+            .insert(apikey_entry("sk-caller", &["my-video-model"]));
+        let state = build_state(snap, hub);
+
+        let make_req = || {
+            Request::builder()
+                .method("POST")
+                .uri("/passthrough/openai/anything")
+                .header("authorization", "Bearer sk-caller")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"model":"my-video-model","input":"x"}"#))
+                .unwrap()
+        };
+
+        // Suspended: max_requests=1 would reject the second call — both pass.
+        for _ in 0..2 {
+            let resp = run(build_router(state.clone()), make_req()).await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "suspended policy must not gate requests",
+            );
+        }
+
+        // Swap in a schedule that no longer matches (as the loader does
+        // when the window closes relative to a fresh evaluation).
+        state
+            .snapshot
+            .load()
+            .rate_limit_policies
+            .insert(ResourceEntry::new(
+                "pol-1",
+                serde_json::from_value(policy_json(never_on_schedule())).unwrap(),
+                2,
+            ));
+
+        let resp = run(build_router(state.clone()), make_req()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = run(build_router(state.clone()), make_req()).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "policy must enforce again outside its suspension windows",
+        );
+    }
+
+    /// The routing/ensemble per-target path (`reserve_model_only`)
+    /// iterates the policy table independently of `reserve_layers`, so
+    /// it must honor scheduled suspensions too (AISIX-Cloud#1104).
+    #[tokio::test]
+    async fn reserve_model_only_honors_scheduled_suspension() {
+        let hub = Arc::new(Hub::new());
+        let snap = new_snap("http://127.0.0.1:1");
+        let model = model_entry("mg-member");
+        let target = model.value.clone();
+        snap.models.insert(model);
+        let policy_json = |schedules: serde_json::Value| {
+            serde_json::json!({
+                "name": "member-cap",
+                "scope": "model",
+                "scope_ref": "model-id-1",
+                "window": "minute",
+                "max_requests": 1,
+                "schedules": schedules
+            })
+        };
+        snap.rate_limit_policies.insert(ResourceEntry::new(
+            "pol-1",
+            serde_json::from_value(policy_json(always_on_schedule())).unwrap(),
+            1,
+        ));
+        let state = build_state(snap, hub);
+        let auth = AuthenticatedKey {
+            entry: Arc::new(ResourceEntry::new(
+                "key-entry-1",
+                serde_json::from_value::<aisix_core::ApiKey>(serde_json::json!({
+                    "key_hash": "h",
+                    "allowed_models": [],
+                }))
+                .unwrap(),
+                1,
+            )),
+            jwt: None,
+        };
+
+        // Suspended: max_requests=1 would deny the second reservation
+        // (pre_commit counts stick even when the reservation drops
+        // uncommitted) — both succeed because nothing is reserved.
+        for _ in 0..2 {
+            let r = quota::reserve_model_only(
+                &state,
+                &state.snapshot.load(),
+                &auth,
+                "mg-member",
+                "model-id-1",
+                &target,
+                None,
+            )
+            .await;
+            assert!(r.is_ok(), "suspended policy must reserve nothing");
+        }
+
+        state
+            .snapshot
+            .load()
+            .rate_limit_policies
+            .insert(ResourceEntry::new(
+                "pol-1",
+                serde_json::from_value(policy_json(never_on_schedule())).unwrap(),
+                2,
+            ));
+
+        assert!(quota::reserve_model_only(
+            &state,
+            &state.snapshot.load(),
+            &auth,
+            "mg-member",
+            "model-id-1",
+            &target,
+            None,
+        )
+        .await
+        .is_ok());
+        assert!(
+            quota::reserve_model_only(
+                &state,
+                &state.snapshot.load(),
+                &auth,
+                "mg-member",
+                "model-id-1",
+                &target,
+                None,
+            )
+            .await
+            .is_err(),
+            "policy outside its windows must throttle the second reservation",
+        );
+    }
+
     /// The tunnel forwards bodies verbatim, so callers typically name the
     /// provider-native id (`model_name`), not the gateway alias
     /// (`display_name`). The limit must bind either way, and the bucket is
@@ -3044,6 +4178,8 @@ data: [DONE]\n\n"
         let hub = Arc::new(Hub::new());
         hub.register_specialized("openai", Arc::new(openai_test_bridge()));
         let snap = new_snap(&upstream.uri());
+        snap.passthrough_routes
+            .insert(passthrough_route_entry(&upstream.uri()));
         snap.models.insert(model_entry_named(
             "ali-video-alias",
             "happyhorse-1.1-t2v",
@@ -3091,6 +4227,8 @@ data: [DONE]\n\n"
         let hub = Arc::new(Hub::new());
         hub.register_specialized("openai", Arc::new(openai_test_bridge()));
         let snap = new_snap(&upstream.uri());
+        snap.passthrough_routes
+            .insert(passthrough_route_entry(&upstream.uri()));
         // Credential-lending model for the addressed provider — unlimited.
         snap.models.insert(model_entry("openai-lender"));
         // Same body-name model under another provider, rpm=1. Its bucket
@@ -4056,8 +5194,12 @@ data: [DONE]\n\n";
         // The entry must live in the redis instance and ONLY there —
         // a dispatch bug that wrote to the memory instance would
         // still produce a "hit" above, so pin the instance directly.
+        // The stored key carries the gate's scope: policy id, purge
+        // generation 0, and (scope defaults to `api_key`) the caller.
         let req: aisix_gateway::ChatFormat = serde_json::from_value(body).unwrap();
-        let key = CacheKey::from_request(&req).fingerprint();
+        let key = CacheKey::from_request(&req)
+            .with_scope("cp-id-redis-cache", 0, Some("key-id-1"))
+            .fingerprint();
         assert!(
             redis_standin.get(&key).await.unwrap().is_some(),
             "cache entry must be written to the policy's redis backend",
@@ -6146,8 +7288,352 @@ data: [DONE]\n\n";
         // simply that an event fires; counts are best-effort. Pin
         // the structural fields to confirm we didn't grab some
         // unrelated event.
-        assert_eq!(event.status_code, 200);
+        assert_eq!(
+            event.status_code, CLIENT_CLOSED_REQUEST,
+            "an abandoned stream must be recorded as a client cancel, not as a success"
+        );
         assert!(!event.guardrail_blocked);
+    }
+
+    /// The counterpart to the test above: a stream the consumer reads to
+    /// completion must stay `200`. Without this, the `reached_end` flag
+    /// could be wired to something that is never set and every streamed
+    /// request would silently be reported as abandoned.
+    #[tokio::test]
+    async fn streaming_chat_telemetry_reports_200_when_fully_consumed() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        let sse = "\
+data: {\"id\":\"cmpl-full\",\"model\":\"gpt-4o-2024-08-06\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"cmpl-full\",\"model\":\"gpt-4o-2024-08-06\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"cmpl-full\",\"model\":\"gpt-4o-2024-08-06\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+data: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&upstream)
+            .await;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
+        let state = build_state(snap, hub).with_usage_sink(UsageSink::new(tx));
+        let app = build_router(state);
+
+        let body = serde_json::json!({
+            "model": "my-gpt4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Drain to the end, the way a client that wants the whole answer does.
+        let mut body_stream = resp.into_body().into_data_stream();
+        while body_stream.next().await.is_some() {}
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("usage event was never emitted")
+            .expect("sender dropped without sending");
+        assert_eq!(
+            event.status_code, 200,
+            "a fully consumed stream must not be reported as a client cancel"
+        );
+    }
+
+    /// Same contract, but with an output guardrail attached — the shape that
+    /// puts an awaiting end-of-stream scan between the upstream's last chunk
+    /// and `[DONE]`. `reached_end` must be set before that scan, so pin the
+    /// outcome with one configured.
+    ///
+    /// This fixes the placement contract; it cannot reproduce the race
+    /// itself. A keyword guardrail scans locally, so its await completes
+    /// immediately and a consumer cannot realistically be dropped inside it.
+    /// The actual protection is that all five stream paths mark the flag at
+    /// upstream EOF, ahead of any scan.
+    #[tokio::test]
+    async fn streaming_chat_with_output_guardrail_reports_200_when_fully_consumed() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        let sse = "\
+data: {\"id\":\"cmpl-guard\",\"model\":\"gpt-4o-2024-08-06\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"cmpl-guard\",\"model\":\"gpt-4o-2024-08-06\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"all clear\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"cmpl-guard\",\"model\":\"gpt-4o-2024-08-06\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+data: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&upstream)
+            .await;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
+        let state = build_state(snap, hub).with_usage_sink(UsageSink::new(tx));
+        // The literal never appears in the response above, so the scan runs
+        // to completion and allows — the stream is delivered in full.
+        seed_guardrail(
+            &state.snapshot,
+            "g-eos-scan",
+            r#"{"name":"eos-scan-guard","kind":"keyword","hook_point":"output","patterns":[{"kind":"literal","value":"never-present-literal"}]}"#,
+        );
+        let app = build_router(state);
+
+        let body = serde_json::json!({
+            "model": "my-gpt4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let mut body_stream = resp.into_body().into_data_stream();
+        while body_stream.next().await.is_some() {}
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("usage event was never emitted")
+            .expect("sender dropped without sending");
+        assert_eq!(
+            event.status_code, 200,
+            "a fully consumed stream with an output guardrail must not be reported as a cancel"
+        );
+    }
+
+    const CANCEL_METRIC: &str = "aisix_proxy_client_cancelled_requests_total";
+
+    /// A caller that hangs up before the response head exists must still
+    /// leave a trace. Every endpoint logs and meters from the tail of its
+    /// own handler, which a cancelled future never reaches — so such a
+    /// request used to be absent from the access log, the usage events
+    /// AND the metrics simultaneously. That made "the client says it sent
+    /// N requests but the gateway only logged M" unaccountable, and it
+    /// hid exactly the case operators care about: a caller giving up
+    /// during a long time-to-first-token.
+    #[tokio::test]
+    async fn client_cancel_before_response_head_is_recorded() {
+        let upstream = MockServer::start().await;
+        // Outlives the patience window below, so the handler is still
+        // awaiting the upstream when its future is dropped.
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_secs(30))
+                    .set_body_json(serde_json::json!({
+                        "id": "cmpl-never",
+                        "model": "gpt-4o",
+                        "choices": []
+                    })),
+            )
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
+        let state = build_state(snap, hub);
+        let metrics = state.metrics.clone();
+        let app = build_router(state);
+
+        assert!(!metrics.render().contains(CANCEL_METRIC));
+
+        let body = serde_json::json!({
+            "model": "my-gpt4",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+
+        // Dropping the in-flight future is precisely what axum does when
+        // the client's connection goes away before the handler produced a
+        // response head.
+        let outcome =
+            tokio::time::timeout(std::time::Duration::from_millis(300), app.oneshot(req)).await;
+        assert!(
+            outcome.is_err(),
+            "upstream answered too fast to model a cancel"
+        );
+
+        let rendered = metrics.render();
+        assert!(
+            rendered.contains(CANCEL_METRIC),
+            "cancelled request left no metric: {rendered}"
+        );
+        assert!(
+            rendered.contains("endpoint=\"/v1/chat/completions\""),
+            "cancel metric lost its endpoint label: {rendered}"
+        );
+    }
+
+    /// The guard must stay silent on the happy path. A completed request
+    /// is already logged and metered by its own handler; counting it as a
+    /// client cancel too would make the new series useless for alerting.
+    #[tokio::test]
+    async fn completed_request_is_not_counted_as_client_cancel() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-ok",
+                "model": "gpt-4o",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })))
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
+        let state = build_state(snap, hub);
+        let metrics = state.metrics.clone();
+        let app = build_router(state);
+
+        let body = serde_json::json!({
+            "model": "my-gpt4",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let rendered = metrics.render();
+        assert!(
+            !rendered.contains(CANCEL_METRIC),
+            "a completed request was miscounted as a client cancel: {rendered}"
+        );
+    }
+
+    /// A panicking handler drops the guard mid-unwind with `armed` still
+    /// set, which looks identical to a cancel from `Drop`'s point of view.
+    /// Recording it would invent a client disconnect that never happened and
+    /// bury the panic under a benign 499, so the guard must stay silent and
+    /// let the panic's own signal stand.
+    #[test]
+    fn cancel_guard_stays_silent_during_unwind() {
+        let state = build_state(AisixSnapshot::new(), Arc::new(Hub::new()));
+        let probe = state.metrics.clone();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = ClientCancelGuard {
+                armed: true,
+                state: state.clone(),
+                attribution: std::sync::Arc::new(attribution::RequestAttribution::default()),
+                endpoint: "/v1/chat/completions",
+                method: axum::http::Method::POST,
+                uri: "/v1/chat/completions".parse().unwrap(),
+                request_id: "req-unwind".to_string(),
+                started: std::time::Instant::now(),
+            };
+            panic!("handler blew up");
+        }));
+
+        assert!(result.is_err(), "the test's own panic must have unwound");
+        assert!(
+            !probe.render().contains(CANCEL_METRIC),
+            "a panicking handler was miscounted as a client cancel: {}",
+            probe.render()
+        );
+    }
+
+    /// A mid-stream hang-up is NOT a head-phase cancel. By the time SSE
+    /// bytes flow the response head is committed, the handler has already
+    /// written its access log, and the per-stream Drop guard emits the
+    /// usage event (see `streaming_chat_telemetry_fires_on_client_disconnect`).
+    /// Counting it here as well would report one disconnect twice under
+    /// two different outcomes.
+    #[tokio::test]
+    async fn mid_stream_disconnect_is_not_counted_as_head_phase_cancel() {
+        let upstream = MockServer::start().await;
+        let sse = "\
+data: {\"id\":\"cmpl-mid\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"cmpl-mid\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n\
+data: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
+        let state = build_state(snap, hub);
+        let metrics = state.metrics.clone();
+        let app = build_router(state);
+
+        let body = serde_json::json!({
+            "model": "my-gpt4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Read one chunk, then hang up mid-stream.
+        let mut body_stream = resp.into_body().into_data_stream();
+        let _first = body_stream.next().await;
+        drop(body_stream);
+
+        let rendered = metrics.render();
+        assert!(
+            !rendered.contains(CANCEL_METRIC),
+            "mid-stream disconnect was double-counted as a head-phase cancel: {rendered}"
+        );
     }
 
     /// Regression for #225: streaming chat must read the terminal SSE

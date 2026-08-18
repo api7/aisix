@@ -33,12 +33,23 @@ pub fn wildcard_capture(pattern: &str, candidate: &str) -> Option<String> {
 
 /// Whether `pattern` matches `candidate`. A pattern with a single `*` is
 /// glob-matched; any other pattern matches only an exactly-equal candidate.
+///
+/// Same decision as `wildcard_capture(..).is_some()` but without
+/// materialising the capture — this runs on the per-request authz path,
+/// where a bare `"*"` allowlist entry would otherwise copy the whole
+/// candidate just to discard it.
 pub fn wildcard_matches(pattern: &str, candidate: &str) -> bool {
-    if pattern.contains('*') {
-        wildcard_capture(pattern, candidate).is_some()
-    } else {
-        pattern == candidate
+    let Some(star) = pattern.find('*') else {
+        return pattern == candidate;
+    };
+    if pattern[star + 1..].contains('*') {
+        return false; // only a single '*' is supported
     }
+    let prefix = &pattern[..star];
+    let suffix = &pattern[star + 1..];
+    candidate.len() >= prefix.len() + suffix.len()
+        && candidate.starts_with(prefix)
+        && candidate.ends_with(suffix)
 }
 
 #[cfg(test)]
@@ -80,6 +91,48 @@ mod tests {
     #[test]
     fn multiple_stars_unsupported() {
         assert_eq!(wildcard_capture("a/*/*", "a/b/c"), None);
+    }
+
+    /// Differential oracle: `wildcard_matches` must agree with
+    /// `wildcard_capture(..).is_some()` for every pattern shape — the
+    /// two are duplicate decision procedures guarding the authz
+    /// allowlists, and a future edit to either must not let them
+    /// diverge silently.
+    #[test]
+    fn matches_agrees_with_capture_oracle() {
+        let pats = [
+            "*",
+            "openai/*",
+            "*-sfx",
+            "gpt-*-preview",
+            "aa*aa",
+            "a/*/*",
+            "**",
+            "lit",
+            "",
+        ];
+        let cands = [
+            "",
+            "openai/",
+            "openai/gpt-4o",
+            "aaa",
+            "aaaa",
+            "gpt-4o-preview",
+            "gpt-4o-final",
+            "a/b/c",
+            "-sfx",
+            "lit",
+        ];
+        for p in pats {
+            for c in cands {
+                let expected = if p.contains('*') {
+                    wildcard_capture(p, c).is_some()
+                } else {
+                    p == c
+                };
+                assert_eq!(wildcard_matches(p, c), expected, "p={p:?} c={c:?}");
+            }
+        }
     }
 
     #[test]

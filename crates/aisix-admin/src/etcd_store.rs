@@ -1,17 +1,18 @@
-//! etcd-backed [`ConfigStore`].
+//! etcd-backed [`ConfigStore`] — read-only.
 //!
-//! Writes serialise just the entity value (not the full
-//! `ResourceEntry`) to `{prefix}/{kind}/{id}` so the read path in
-//! `aisix-etcd::loader` — which already parses value-only JSON — works
-//! unchanged. The ResourceEntry wrapper is reconstructed on read from
-//! etcd's own `mod_revision`.
+//! Resources reach etcd through the declarative paths (the control
+//! plane or direct etcd writes); this store only reads them back for
+//! the admin GET surface. Values are entity-value JSON (not the full
+//! `ResourceEntry`) at `{prefix}/{kind}/{id}` — the same layout
+//! `aisix-etcd::loader` parses. The ResourceEntry wrapper is
+//! reconstructed on read from etcd's own `mod_revision`.
 //!
 //! Data layout:
 //! ```text
 //! /aisix/
 //!   models/
 //!     <uuid>  → { "name": "...", "model": "...", "provider_config": {...}, ... }
-//!   apikeys/
+//!   api_keys/
 //!     <uuid>  → { "key_hash": "...", "allowed_models": [...], ... }
 //! ```
 //!
@@ -20,11 +21,11 @@
 
 use aisix_core::resource::ResourceEntry;
 use aisix_core::{
-    A2aAgent, ApiKey, CachePolicy, Guardrail, McpServer, Model, ObservabilityExporter, ProviderKey,
+    A2aAgent, ApiKey, CachePolicy, Guardrail, McpServer, Model, ObservabilityExporter,
+    PassthroughRoute, ProviderKey,
 };
-use etcd_client::{Client, DeleteOptions, GetOptions};
+use etcd_client::{Client, GetOptions};
 use serde::de::DeserializeOwned;
-use serde::Serialize;
 use tokio::sync::Mutex;
 
 use crate::store::{ConfigStore, StoreError};
@@ -39,6 +40,7 @@ pub const CACHE_POLICIES_SUBKEY: &str = "cache_policies";
 pub const OBSERVABILITY_EXPORTERS_SUBKEY: &str = "observability_exporters";
 pub const MCP_SERVERS_SUBKEY: &str = "mcp_servers";
 pub const A2A_AGENTS_SUBKEY: &str = "a2a_agents";
+pub const PASSTHROUGH_ROUTES_SUBKEY: &str = "passthrough_routes";
 
 pub struct EtcdConfigStore {
     client: Mutex<Client>,
@@ -80,17 +82,6 @@ impl EtcdConfigStore {
     pub(crate) fn id_from_key<'a>(&self, full_key: &'a str, kind: &str) -> Option<&'a str> {
         let needle = format!("{}/{}/", self.prefix, kind);
         full_key.strip_prefix(&needle)
-    }
-
-    async fn put_json<T: Serialize>(&self, key: &str, value: &T) -> Result<(), StoreError> {
-        let bytes = serde_json::to_vec(value).map_err(|e| StoreError::Backend(e.to_string()))?;
-        self.client
-            .lock()
-            .await
-            .put(key.as_bytes().to_vec(), bytes, None)
-            .await
-            .map_err(|e| StoreError::Backend(e.to_string()))?;
-        Ok(())
     }
 
     async fn get_one<T: DeserializeOwned>(
@@ -147,26 +138,10 @@ impl EtcdConfigStore {
         }
         Ok(out)
     }
-
-    async fn delete_one(&self, key: &str) -> Result<bool, StoreError> {
-        let resp = self
-            .client
-            .lock()
-            .await
-            .delete(key.as_bytes().to_vec(), Some(DeleteOptions::new()))
-            .await
-            .map_err(|e| StoreError::Backend(e.to_string()))?;
-        Ok(resp.deleted() > 0)
-    }
 }
 
 #[async_trait::async_trait]
 impl ConfigStore for EtcdConfigStore {
-    async fn put_model(&self, entry: ResourceEntry<Model>) -> Result<(), StoreError> {
-        let key = self.key_for(MODELS_SUBKEY, &entry.id);
-        self.put_json(&key, &entry.value).await
-    }
-
     async fn get_model(&self, id: &str) -> Result<Option<ResourceEntry<Model>>, StoreError> {
         let key = self.key_for(MODELS_SUBKEY, id);
         Ok(self
@@ -184,15 +159,6 @@ impl ConfigStore for EtcdConfigStore {
             .collect())
     }
 
-    async fn delete_model(&self, id: &str) -> Result<bool, StoreError> {
-        self.delete_one(&self.key_for(MODELS_SUBKEY, id)).await
-    }
-
-    async fn put_apikey(&self, entry: ResourceEntry<ApiKey>) -> Result<(), StoreError> {
-        let key = self.key_for(APIKEYS_SUBKEY, &entry.id);
-        self.put_json(&key, &entry.value).await
-    }
-
     async fn get_apikey(&self, id: &str) -> Result<Option<ResourceEntry<ApiKey>>, StoreError> {
         let key = self.key_for(APIKEYS_SUBKEY, id);
         Ok(self
@@ -208,15 +174,6 @@ impl ConfigStore for EtcdConfigStore {
             .into_iter()
             .map(|(id, v, rev)| ResourceEntry::new(id, v, rev))
             .collect())
-    }
-
-    async fn delete_apikey(&self, id: &str) -> Result<bool, StoreError> {
-        self.delete_one(&self.key_for(APIKEYS_SUBKEY, id)).await
-    }
-
-    async fn put_provider_key(&self, entry: ResourceEntry<ProviderKey>) -> Result<(), StoreError> {
-        let key = self.key_for(PROVIDER_KEYS_SUBKEY, &entry.id);
-        self.put_json(&key, &entry.value).await
     }
 
     async fn get_provider_key(
@@ -239,16 +196,6 @@ impl ConfigStore for EtcdConfigStore {
             .collect())
     }
 
-    async fn delete_provider_key(&self, id: &str) -> Result<bool, StoreError> {
-        self.delete_one(&self.key_for(PROVIDER_KEYS_SUBKEY, id))
-            .await
-    }
-
-    async fn put_guardrail(&self, entry: ResourceEntry<Guardrail>) -> Result<(), StoreError> {
-        let key = self.key_for(GUARDRAILS_SUBKEY, &entry.id);
-        self.put_json(&key, &entry.value).await
-    }
-
     async fn get_guardrail(
         &self,
         id: &str,
@@ -269,15 +216,6 @@ impl ConfigStore for EtcdConfigStore {
             .collect())
     }
 
-    async fn delete_guardrail(&self, id: &str) -> Result<bool, StoreError> {
-        self.delete_one(&self.key_for(GUARDRAILS_SUBKEY, id)).await
-    }
-
-    async fn put_cache_policy(&self, entry: ResourceEntry<CachePolicy>) -> Result<(), StoreError> {
-        let key = self.key_for(CACHE_POLICIES_SUBKEY, &entry.id);
-        self.put_json(&key, &entry.value).await
-    }
-
     async fn get_cache_policy(
         &self,
         id: &str,
@@ -296,19 +234,6 @@ impl ConfigStore for EtcdConfigStore {
             .into_iter()
             .map(|(id, v, rev)| ResourceEntry::new(id, v, rev))
             .collect())
-    }
-
-    async fn delete_cache_policy(&self, id: &str) -> Result<bool, StoreError> {
-        self.delete_one(&self.key_for(CACHE_POLICIES_SUBKEY, id))
-            .await
-    }
-
-    async fn put_observability_exporter(
-        &self,
-        entry: ResourceEntry<ObservabilityExporter>,
-    ) -> Result<(), StoreError> {
-        let key = self.key_for(OBSERVABILITY_EXPORTERS_SUBKEY, &entry.id);
-        self.put_json(&key, &entry.value).await
     }
 
     async fn get_observability_exporter(
@@ -333,16 +258,6 @@ impl ConfigStore for EtcdConfigStore {
             .collect())
     }
 
-    async fn delete_observability_exporter(&self, id: &str) -> Result<bool, StoreError> {
-        self.delete_one(&self.key_for(OBSERVABILITY_EXPORTERS_SUBKEY, id))
-            .await
-    }
-
-    async fn put_mcp_server(&self, entry: ResourceEntry<McpServer>) -> Result<(), StoreError> {
-        let key = self.key_for(MCP_SERVERS_SUBKEY, &entry.id);
-        self.put_json(&key, &entry.value).await
-    }
-
     async fn get_mcp_server(
         &self,
         id: &str,
@@ -363,15 +278,6 @@ impl ConfigStore for EtcdConfigStore {
             .collect())
     }
 
-    async fn delete_mcp_server(&self, id: &str) -> Result<bool, StoreError> {
-        self.delete_one(&self.key_for(MCP_SERVERS_SUBKEY, id)).await
-    }
-
-    async fn put_a2a_agent(&self, entry: ResourceEntry<A2aAgent>) -> Result<(), StoreError> {
-        let key = self.key_for(A2A_AGENTS_SUBKEY, &entry.id);
-        self.put_json(&key, &entry.value).await
-    }
-
     async fn get_a2a_agent(&self, id: &str) -> Result<Option<ResourceEntry<A2aAgent>>, StoreError> {
         let key = self.key_for(A2A_AGENTS_SUBKEY, id);
         Ok(self
@@ -389,8 +295,26 @@ impl ConfigStore for EtcdConfigStore {
             .collect())
     }
 
-    async fn delete_a2a_agent(&self, id: &str) -> Result<bool, StoreError> {
-        self.delete_one(&self.key_for(A2A_AGENTS_SUBKEY, id)).await
+    async fn get_passthrough_route(
+        &self,
+        id: &str,
+    ) -> Result<Option<ResourceEntry<PassthroughRoute>>, StoreError> {
+        let key = self.key_for(PASSTHROUGH_ROUTES_SUBKEY, id);
+        Ok(self
+            .get_one::<PassthroughRoute>(&key)
+            .await?
+            .map(|(v, rev)| ResourceEntry::new(id, v, rev)))
+    }
+
+    async fn list_passthrough_routes(
+        &self,
+    ) -> Result<Vec<ResourceEntry<PassthroughRoute>>, StoreError> {
+        Ok(self
+            .list_range::<PassthroughRoute>(PASSTHROUGH_ROUTES_SUBKEY)
+            .await?
+            .into_iter()
+            .map(|(id, v, rev)| ResourceEntry::new(id, v, rev))
+            .collect())
     }
 }
 
@@ -461,7 +385,7 @@ mod tests {
     //   cargo test -p aisix-admin -- --ignored --test-threads=1
     #[tokio::test]
     #[ignore = "requires a running etcd container via testcontainers"]
-    async fn put_get_list_delete_roundtrip_against_real_etcd() {
+    async fn reads_serve_directly_written_etcd_keys() {
         use testcontainers::runners::AsyncRunner;
         use testcontainers::{GenericImage, ImageExt};
 
@@ -478,22 +402,25 @@ mod tests {
             .expect("container port");
         let endpoint = format!("http://127.0.0.1:{port}");
 
-        let client = etcd_client::Client::connect([endpoint], None)
+        let mut client = etcd_client::Client::connect([endpoint], None)
             .await
             .expect("etcd client");
-        let store = EtcdConfigStore::new(client, "/aisix-it");
+        let store = EtcdConfigStore::new(client.clone(), "/aisix-it");
 
-        let model: Model = serde_json::from_str(
-            r#"{
+        // Resources reach etcd by direct writes (the declarative path);
+        // the store is the read side. Seed a model the way an operator
+        // or the control plane would: a raw JSON value at
+        // `{prefix}/{kind}/{id}`.
+        let model_json = r#"{
                 "display_name": "it-gpt4",
                 "provider": "openai",
                 "model_name": "gpt-4o",
                 "provider_key_id": "11111111-1111-1111-1111-111111111111"
-            }"#,
-        )
-        .unwrap();
-        let entry = ResourceEntry::new("m-it-1", model, 0);
-        store.put_model(entry.clone()).await.unwrap();
+            }"#;
+        client
+            .put("/aisix-it/models/m-it-1", model_json, None)
+            .await
+            .expect("direct etcd put");
 
         let got = store.get_model("m-it-1").await.unwrap().unwrap();
         assert_eq!(got.id, "m-it-1");
@@ -503,8 +430,11 @@ mod tests {
         let listed = store.list_models().await.unwrap();
         assert_eq!(listed.len(), 1);
 
-        assert!(store.delete_model("m-it-1").await.unwrap());
+        client
+            .delete("/aisix-it/models/m-it-1", None)
+            .await
+            .expect("direct etcd delete");
         assert!(store.get_model("m-it-1").await.unwrap().is_none());
-        assert!(!store.delete_model("m-it-1").await.unwrap());
+        assert!(store.list_models().await.unwrap().is_empty());
     }
 }

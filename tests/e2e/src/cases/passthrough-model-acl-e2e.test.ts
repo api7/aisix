@@ -10,19 +10,18 @@ import {
   type SpawnedApp,
 } from "../harness/index.js";
 
-// E2E: generic passthrough enforces the caller's model ACL (#449).
-// Pre-fix, /passthrough/{provider}/* picked the first Model matching the
-// provider and lent its credentials to ANY valid API key, regardless of
-// the key's allowed_models — so a low-privilege key could reach a
-// provider's upstream credentials it was never granted. The gateway now
-// requires the key to be allowed to access a model of that provider
-// before injecting the provider credential.
+// E2E: passthrough routes are an explicit grant on the API key
+// (`allowed_routes`, mirroring `allowed_tools`/`allowed_agents`). The
+// removed implicit tunnel derived authorization from the key's model ACL
+// (#449); routes carry their own dimension: a key with no grant for the
+// route's name must not reach the route's upstream credential, whatever
+// its model ACL says.
 
 const sha = (s: string) => createHash("sha256").update(s).digest("hex");
-const ALLOWED = "sk-pt-acl-allowed";
-const DENIED = "sk-pt-acl-denied";
+const ALLOWED = "sk-ptr-acl-allowed";
+const DENIED = "sk-ptr-acl-denied";
 
-describe("passthrough model ACL (#449)", () => {
+describe("passthrough route ACL (allowed_routes)", () => {
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
   let etcdReachable = false;
@@ -35,20 +34,28 @@ describe("passthrough model ACL (#449)", () => {
     app = await spawnApp();
     const seed = new SeedClient(etcd, app.etcdPrefix);
     const pk = await seed.createProviderKey({
-      display_name: "pt-acl-pk",
+      display_name: "ptr-acl-pk",
       secret: "sk-openai-mock",
-      api_base: upstream.baseUrl,
+      api_base: "http://unused-on-routes",
     });
-    await seed.createModel({
-      display_name: "pt-acl-model",
-      provider: "openai",
-      model_name: "gpt-x",
+    await seed.createPassthroughRoute({
+      name: "ptr-acl-tunnel",
+      path_prefix: "/passthrough/openai",
+      target_url: upstream.baseUrl,
       provider_key_id: pk.id,
     });
-    // ALLOWED key may use the openai model; DENIED key may only use an
-    // unrelated model name (no openai model in its ACL).
-    await seed.createApiKey({ key_hash: sha(ALLOWED), allowed_models: ["pt-acl-model"] });
-    await seed.createApiKey({ key_hash: sha(DENIED), allowed_models: ["unrelated-model"] });
+    // ALLOWED names the route; DENIED has every model but no route grant —
+    // model ACL must not leak into route authorization.
+    await seed.createApiKey({
+      key_hash: sha(ALLOWED),
+      allowed_models: [],
+      allowed_routes: ["ptr-acl-tunnel"],
+    });
+    await seed.createApiKey({
+      key_hash: sha(DENIED),
+      allowed_models: ["*"],
+      allowed_routes: ["unrelated-route"],
+    });
   });
 
   afterAll(async () => {
@@ -56,26 +63,28 @@ describe("passthrough model ACL (#449)", () => {
     await upstream?.close();
   });
 
-  const callPassthrough = (key: string) =>
+  const callRoute = (key: string) =>
     fetch(`${app!.proxyUrl}/passthrough/openai/v1/files`, {
       method: "GET",
       headers: { authorization: `Bearer ${key}` },
     });
 
-  test("key without access to a provider model is rejected (#449)", async (ctx) => {
+  test("key without the route grant is rejected; granted key passes", async (ctx) => {
     if (!etcdReachable || !app || !upstream) {
       ctx.skip();
       return;
     }
-    await waitConfigPropagation(async () => (await callPassthrough(ALLOWED)).ok);
+    await waitConfigPropagation(async () => (await callRoute(ALLOWED)).ok);
 
-    const denied = await callPassthrough(DENIED);
+    const denied = await callRoute(DENIED);
     expect(
       denied.status,
-      "key with no openai model in its ACL must not reach openai passthrough creds",
+      "a key whose allowed_routes does not name the route must not reach its upstream credential",
     ).toBe(403);
+    const body = (await denied.json()) as { error?: { type?: unknown } };
+    expect(body.error?.type).toBe("permission_denied");
 
-    const allowed = await callPassthrough(ALLOWED);
-    expect(allowed.status, "key allowed for an openai model may use openai passthrough").toBe(200);
+    const allowed = await callRoute(ALLOWED);
+    expect(allowed.status, "the granted key may use the route").toBe(200);
   });
 });

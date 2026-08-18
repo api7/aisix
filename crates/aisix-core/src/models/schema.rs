@@ -10,9 +10,33 @@
 //! 5. etcd txn commit
 //! ```
 //!
+//! Two validator sets exist since issue #871 (strict write / lenient read):
+//!
+//! - **Strict** ([`SCHEMAS`], the plain `validate_*` functions): unknown
+//!   fields are rejected (where a resource closes them). Used by the
+//!   in-repo declarative writers — `aisix validate` and the file
+//!   source — so typos keep failing loud, and published as the
+//!   resource schema files in `schemas/resources/` — the write
+//!   contract. (The control plane validates against its own API
+//!   schema; raw direct etcd puts are only checked on read.)
+//! - **Lenient** ([`LENIENT_SCHEMAS`], the `validate_*_lenient` functions):
+//!   unknown fields pass; every other constraint (types, required, ranges,
+//!   closed enums) still applies. Used only by the etcd snapshot loader so a
+//!   document written by a newer control plane loads with its extra fields
+//!   ignored — and reported — instead of whole-row rejected.
+//!
+//! Both sets build from the same per-resource producers; strictness is a
+//! mechanical [`close_unknown_fields`] pass over the produced value, so the
+//! two can never drift field-wise. Deliberately closed subschemas (the
+//! `observability_exporter` branches and the guardrail tagged sub-enums,
+//! injected inside the producers) stay closed in BOTH sets: serde silently
+//! ignores unknown fields inside those tagged shapes, so an open schema
+//! there would be an unreportable — silent — tolerance.
+//!
 //! The watch path reuses step 2 on incoming events — malformed payloads are
 //! skipped with a warning and do not take down the gateway.
 
+use crate::models::model::Model;
 use jsonschema::Validator;
 use once_cell::sync::Lazy;
 use serde_json::{json, Value};
@@ -20,7 +44,8 @@ use std::sync::Arc;
 use thiserror::Error;
 
 /// Cached compiled schemas. Compiling on every write would be wasteful; the
-/// schemas are static, so we build them once.
+/// schemas are static, so we build them once. This is the **strict** set:
+/// unknown fields fail validation wherever the resource model closes them.
 pub struct Schemas {
     pub model: Validator,
     pub apikey: Validator,
@@ -34,53 +59,116 @@ pub struct Schemas {
     pub mcp_policy: Validator,
     pub a2a_agent: Validator,
     pub oidc_provider: Validator,
+    pub claim_mapping: Validator,
+    pub passthrough_route: Validator,
     pub mcp_auth_settings: Validator,
 }
 
-pub static SCHEMAS: Lazy<Arc<Schemas>> = Lazy::new(|| Arc::new(Schemas::compile()));
+pub static SCHEMAS: Lazy<Arc<Schemas>> = Lazy::new(|| Arc::new(Schemas::compile(true)));
+
+/// The **lenient** twin of [`SCHEMAS`]: same producers, without the
+/// [`close_unknown_fields`] pass. Only the etcd snapshot loader validates
+/// against this set (issue #871); every write path stays on [`SCHEMAS`].
+pub static LENIENT_SCHEMAS: Lazy<Arc<Schemas>> = Lazy::new(|| Arc::new(Schemas::compile(false)));
+
+/// Whether a resource's write contract closes unknown top-level fields.
+/// `cache_policy`, `guardrail`, `guardrail_attachment` and
+/// `observability_exporter` historically ship open root schemas (documented
+/// on their producers), so the strict closing pass skips them. Shared by
+/// [`Schemas::compile`] and the resource schema published by `dump-schema`,
+/// so the enforced write contract and the published one cannot drift.
+fn closes_on_write(resource: &str) -> bool {
+    !matches!(
+        resource,
+        "cache_policy" | "guardrail" | "guardrail_attachment" | "observability_exporter"
+    )
+}
+
+/// The canonical schema of one resource, as enforced on the given path.
+/// `strict` selects the write contract (unknown fields rejected wherever the
+/// resource closes them); `!strict` the etcd read contract (unknown fields
+/// tolerated). This is the single producer both validator sets and the
+/// `dump-schema` binary build from.
+pub fn resource_root_schema(resource: &str, strict: bool) -> Value {
+    let mut schema = match resource {
+        "model" => model_root_schema(strict),
+        "api_key" => apikey_root_schema(),
+        "provider_key" => provider_key_root_schema(),
+        "guardrail" => guardrail_root_schema(),
+        "guardrail_attachment" => guardrail_attachment_root_schema(),
+        "cache_policy" => cache_policy_root_schema(),
+        "observability_exporter" => observability_exporter_root_schema(),
+        "rate_limit_policy" => rate_limit_policy_root_schema(),
+        "mcp_server" => mcp_server_root_schema(),
+        "mcp_policy" => mcp_policy_root_schema(),
+        "a2a_agent" => a2a_agent_root_schema(),
+        "oidc_provider" => oidc_provider_root_schema(),
+        "claim_mapping" => claim_mapping_root_schema(),
+        "passthrough_route" => passthrough_route_root_schema(),
+        "mcp_auth_settings" => mcp_auth_settings_root_schema(),
+        other => panic!("unknown resource {other:?}"),
+    };
+    if strict && closes_on_write(resource) {
+        close_unknown_fields(&mut schema);
+    }
+    schema
+}
 
 impl Schemas {
-    fn compile() -> Self {
+    fn compile(strict: bool) -> Self {
+        let build = |resource: &str| {
+            jsonschema::options()
+                .build(&resource_root_schema(resource, strict))
+                .unwrap_or_else(|e| panic!("{resource} schema is well-formed: {e}"))
+        };
         Self {
-            model: jsonschema::options()
-                .build(&model_root_schema())
-                .expect("model schema is well-formed"),
-            apikey: jsonschema::options()
-                .build(&apikey_root_schema())
-                .expect("apikey schema is well-formed"),
-            provider_key: jsonschema::options()
-                .build(&provider_key_root_schema())
-                .expect("provider_key schema is well-formed"),
-            guardrail: jsonschema::options()
-                .build(&guardrail_root_schema())
-                .expect("guardrail schema is well-formed"),
-            guardrail_attachment: jsonschema::options()
-                .build(&guardrail_attachment_root_schema())
-                .expect("guardrail_attachment schema is well-formed"),
-            cache_policy: jsonschema::options()
-                .build(&cache_policy_root_schema())
-                .expect("cache_policy schema is well-formed"),
-            observability_exporter: jsonschema::options()
-                .build(&observability_exporter_root_schema())
-                .expect("observability_exporter schema is well-formed"),
-            rate_limit_policy: jsonschema::options()
-                .build(&rate_limit_policy_root_schema())
-                .expect("rate_limit_policy schema is well-formed"),
-            mcp_server: jsonschema::options()
-                .build(&mcp_server_root_schema())
-                .expect("mcp_server schema is well-formed"),
-            mcp_policy: jsonschema::options()
-                .build(&mcp_policy_root_schema())
-                .expect("mcp_policy schema is well-formed"),
-            a2a_agent: jsonschema::options()
-                .build(&a2a_agent_root_schema())
-                .expect("a2a_agent schema is well-formed"),
-            oidc_provider: jsonschema::options()
-                .build(&oidc_provider_root_schema())
-                .expect("oidc_provider schema is well-formed"),
-            mcp_auth_settings: jsonschema::options()
-                .build(&mcp_auth_settings_root_schema())
-                .expect("mcp_auth_settings schema is well-formed"),
+            model: build("model"),
+            apikey: build("api_key"),
+            provider_key: build("provider_key"),
+            guardrail: build("guardrail"),
+            guardrail_attachment: build("guardrail_attachment"),
+            cache_policy: build("cache_policy"),
+            observability_exporter: build("observability_exporter"),
+            rate_limit_policy: build("rate_limit_policy"),
+            mcp_server: build("mcp_server"),
+            mcp_policy: build("mcp_policy"),
+            a2a_agent: build("a2a_agent"),
+            oidc_provider: build("oidc_provider"),
+            claim_mapping: build("claim_mapping"),
+            passthrough_route: build("passthrough_route"),
+            mcp_auth_settings: build("mcp_auth_settings"),
+        }
+    }
+}
+
+/// Close a produced resource schema against unknown fields: insert
+/// `additionalProperties: false` on the root object and on every
+/// `definitions` entry that is a plain object schema (has `properties`).
+///
+/// This reproduces exactly what `#[serde(deny_unknown_fields)]` made
+/// `schemars` emit before issue #871 moved strictness out of the structs:
+///
+/// - conditional/overlay subschemas (`oneOf`/`anyOf`/`allOf`/`if` branches)
+///   are never touched — closing an `if`/`then` overlay would reject every
+///   field the overlay does not list;
+/// - an existing `additionalProperties` value is preserved, whether the
+///   deliberate `false` on hand-closed branches or the value schema of a
+///   map-typed field;
+/// - enum-shaped definitions (no `properties`) are skipped.
+pub fn close_unknown_fields(schema: &mut Value) {
+    fn close_object(node: &mut Value) {
+        let Some(obj) = node.as_object_mut() else {
+            return;
+        };
+        if obj.contains_key("properties") && !obj.contains_key("additionalProperties") {
+            obj.insert("additionalProperties".to_string(), json!(false));
+        }
+    }
+
+    close_object(schema);
+    if let Some(Value::Object(defs)) = schema.get_mut("definitions") {
+        for def in defs.values_mut() {
+            close_object(def);
         }
     }
 }
@@ -111,8 +199,78 @@ pub fn validate(validator: &Validator, value: &Value) -> Result<(), SchemaError>
     Ok(())
 }
 
+/// Strict model validation, with the per-kind dead-knob case named.
+///
+/// The model schema is a five-branch `oneOf` (one per kind), so when a
+/// document carries a knob its kind never resolves, EVERY branch fails
+/// and the first error `jsonschema` reports is the root-level "not valid
+/// under any of the schemas" — true, but it does not say which field is
+/// at fault. That is the one failure mode the strict path exists to
+/// produce (`model_one_of_strict`), so it is worth naming.
+///
+/// The field list comes from [`Model::strip_kind_inapplicable`], the same
+/// function the lenient loader uses to strip and report these knobs, so
+/// the two paths cannot disagree about which knob is dead on which kind.
+///
+/// Best-effort by construction: a document that fails for any other
+/// reason — an unknown field, a wrong type, a missing requirement — may
+/// not deserialise at all, and keeps the generic message. Only the field
+/// NAMES are added, never instance values, so this respects the masking
+/// contract in [`validate`].
+///
+/// A dead knob is only reported when it is the WHOLE story: the document
+/// is re-validated with exactly those fields removed, and the message is
+/// replaced only if it then passes. A document that carries a dead knob
+/// AND an independent violation keeps the original error, which points
+/// at the other problem and is the more useful of the two — replacing it
+/// would leave `path` and `message` describing different fields.
 pub fn validate_model(value: &Value) -> Result<(), SchemaError> {
-    validate(&SCHEMAS.model, value)
+    let err = match validate(&SCHEMAS.model, value) {
+        Ok(()) => return Ok(()),
+        Err(err) => err,
+    };
+    let Ok(mut model) = serde_json::from_value::<Model>(value.clone()) else {
+        return Err(err);
+    };
+    let dead = model.strip_kind_inapplicable();
+    if dead.is_empty() {
+        return Err(err);
+    }
+    // Probe the ORIGINAL document minus the dead fields rather than
+    // re-serialising `model`: a serde round-trip drops unknown fields
+    // and materialises defaults, either of which could make the probe
+    // pass while the real document still fails. Every dead knob is a
+    // top-level field.
+    let mut probe = value.clone();
+    match probe.as_object_mut() {
+        Some(obj) => {
+            for field in &dead {
+                obj.remove(*field);
+            }
+        }
+        None => return Err(err),
+    }
+    if validate(&SCHEMAS.model, &probe).is_err() {
+        return Err(err);
+    }
+    // strip_kind_inapplicable only reports on these three kinds.
+    let kind = if model.is_routing() {
+        "model group"
+    } else if model.is_ensemble() {
+        "ensemble"
+    } else {
+        "semantic router"
+    };
+    Err(SchemaError {
+        path: err.path,
+        message: format!(
+            "{} not accepted on a {kind}",
+            dead.iter()
+                .map(|f| format!("`{f}`"))
+                .collect::<Vec<_>>()
+                .join(", "),
+        ),
+    })
 }
 
 pub fn validate_apikey(value: &Value) -> Result<(), SchemaError> {
@@ -159,8 +317,82 @@ pub fn validate_oidc_provider(value: &Value) -> Result<(), SchemaError> {
     validate(&SCHEMAS.oidc_provider, value)
 }
 
+pub fn validate_claim_mapping(value: &Value) -> Result<(), SchemaError> {
+    validate(&SCHEMAS.claim_mapping, value)
+}
+
+pub fn validate_passthrough_route(value: &Value) -> Result<(), SchemaError> {
+    validate(&SCHEMAS.passthrough_route, value)
+}
+
+// ---- lenient variants (etcd snapshot loader only, issue #871) ----
+//
+// Unknown fields pass; every other constraint still applies. The loader
+// pairs these with `serde_ignored` so tolerated fields are collected and
+// reported as partially compatible rather than silently dropped.
+
+pub fn validate_model_lenient(value: &Value) -> Result<(), SchemaError> {
+    validate(&LENIENT_SCHEMAS.model, value)
+}
+
+pub fn validate_apikey_lenient(value: &Value) -> Result<(), SchemaError> {
+    validate(&LENIENT_SCHEMAS.apikey, value)
+}
+
+pub fn validate_provider_key_lenient(value: &Value) -> Result<(), SchemaError> {
+    validate(&LENIENT_SCHEMAS.provider_key, value)
+}
+
+pub fn validate_guardrail_lenient(value: &Value) -> Result<(), SchemaError> {
+    validate(&LENIENT_SCHEMAS.guardrail, value)
+}
+
+pub fn validate_cache_policy_lenient(value: &Value) -> Result<(), SchemaError> {
+    validate(&LENIENT_SCHEMAS.cache_policy, value)
+}
+
+pub fn validate_observability_exporter_lenient(value: &Value) -> Result<(), SchemaError> {
+    validate(&LENIENT_SCHEMAS.observability_exporter, value)
+}
+
+pub fn validate_rate_limit_policy_lenient(value: &Value) -> Result<(), SchemaError> {
+    validate(&LENIENT_SCHEMAS.rate_limit_policy, value)
+}
+
+pub fn validate_guardrail_attachment_lenient(value: &Value) -> Result<(), SchemaError> {
+    validate(&LENIENT_SCHEMAS.guardrail_attachment, value)
+}
+
+pub fn validate_mcp_server_lenient(value: &Value) -> Result<(), SchemaError> {
+    validate(&LENIENT_SCHEMAS.mcp_server, value)
+}
+
+pub fn validate_a2a_agent_lenient(value: &Value) -> Result<(), SchemaError> {
+    validate(&LENIENT_SCHEMAS.a2a_agent, value)
+}
+
+pub fn validate_mcp_policy_lenient(value: &Value) -> Result<(), SchemaError> {
+    validate(&LENIENT_SCHEMAS.mcp_policy, value)
+}
+
+pub fn validate_oidc_provider_lenient(value: &Value) -> Result<(), SchemaError> {
+    validate(&LENIENT_SCHEMAS.oidc_provider, value)
+}
+
+pub fn validate_claim_mapping_lenient(value: &Value) -> Result<(), SchemaError> {
+    validate(&LENIENT_SCHEMAS.claim_mapping, value)
+}
+
+pub fn validate_passthrough_route_lenient(value: &Value) -> Result<(), SchemaError> {
+    validate(&LENIENT_SCHEMAS.passthrough_route, value)
+}
+
 pub fn validate_mcp_auth_settings(value: &Value) -> Result<(), SchemaError> {
     validate(&SCHEMAS.mcp_auth_settings, value)
+}
+
+pub fn validate_mcp_auth_settings_lenient(value: &Value) -> Result<(), SchemaError> {
+    validate(&LENIENT_SCHEMAS.mcp_auth_settings, value)
 }
 
 /// Build a resource's canonical JSON Schema from its struct via `schemars`,
@@ -190,14 +422,44 @@ fn struct_root_schema<T: schemars::JsonSchema>(nullable_options: bool) -> Value 
 /// Canonical JSON Schema for the `model` resource: the [`Model`] struct plus
 /// the one cross-field invariant `schemars` cannot express
 /// ([`super::model::model_one_of`] — the direct/routing/ensemble XOR).
+/// `strict` picks the write-path variant that additionally forbids the
+/// per-kind dead knobs ([`super::model::model_one_of_strict`]); the
+/// lenient read path keeps the base XOR so stored rows load (and strip)
+/// rather than drop.
 ///
 /// [`Model`]: crate::models::Model
-pub fn model_root_schema() -> Value {
+pub fn model_root_schema(strict: bool) -> Value {
     let mut schema = struct_root_schema::<crate::models::Model>(false);
+    let one_of = if strict {
+        super::model::model_one_of_strict()
+    } else {
+        super::model::model_one_of()
+    };
     schema
         .as_object_mut()
         .expect("model root schema is a JSON object")
-        .insert("oneOf".to_string(), super::model::model_one_of());
+        .insert("oneOf".to_string(), one_of);
+    // `OnEmbeddingFailure` is `#[serde(untagged)]` with an object variant
+    // (`{ "target": … }`): serde buffers untagged content and silently
+    // swallows unknown fields inside it, invisible to both the write
+    // path's serde step and the loader's `serde_ignored` reporting. The
+    // schema closure is therefore the only non-silent guard — same
+    // reasoning as the tagged-enum branch closures below, applied to
+    // both validator sets.
+    if let Some(any_of) = schema
+        .get_mut("definitions")
+        .and_then(|d| d.get_mut("OnEmbeddingFailure"))
+        .and_then(|b| b.get_mut("anyOf"))
+        .and_then(Value::as_array_mut)
+    {
+        for branch in any_of.iter_mut() {
+            if branch.get("type").and_then(Value::as_str) == Some("object") {
+                if let Some(obj) = branch.as_object_mut() {
+                    obj.insert("additionalProperties".to_string(), json!(false));
+                }
+            }
+        }
+    }
     schema
 }
 
@@ -292,12 +554,21 @@ fn accept_renamed_field(schema: &mut Value, canonical: &str, former: &str, note:
 /// `auth_type` closed sets come from the
 /// [`McpTransport`](crate::models::McpTransport) /
 /// [`McpAuthType`](crate::models::McpAuthType) enums. The per-`auth_type`
-/// credential coupling is intentionally not encoded here (see the note on the
-/// struct); the schema stays permissive and write paths enforce it. The label
+/// credential coupling, and the openapi-only `spec`/`api_key_header` fields, are
+/// injected here as an `allOf` of `if`/`then` subschemas (see
+/// [`super::mcp_server::mcp_server_credential_coupling`]) so every configuration
+/// path enforces them. The label
 /// is accepted under both its canonical name `name` and its former name
 /// `display_name` (see [`accept_renamed_field`]).
 pub fn mcp_server_root_schema() -> Value {
     let mut schema = struct_root_schema::<crate::models::McpServer>(true);
+    schema
+        .as_object_mut()
+        .expect("mcp server root schema is a JSON object")
+        .insert(
+            "allOf".to_string(),
+            super::mcp_server::mcp_server_credential_coupling(),
+        );
     accept_renamed_field(
         &mut schema,
         "name",
@@ -339,6 +610,13 @@ pub fn mcp_server_root_schema() -> Value {
 /// [`accept_renamed_field`]).
 pub fn a2a_agent_root_schema() -> Value {
     let mut schema = struct_root_schema::<crate::models::A2aAgent>(true);
+    schema
+        .as_object_mut()
+        .expect("a2a agent root schema is a JSON object")
+        .insert(
+            "allOf".to_string(),
+            super::a2a_agent::a2a_agent_credential_coupling(),
+        );
     accept_renamed_field(
         &mut schema,
         "name",
@@ -423,12 +701,81 @@ pub fn oidc_provider_root_schema() -> Value {
     schema
 }
 
+/// Canonical JSON Schema for the `claim_mapping` resource, derived from
+/// the [`ClaimMapping`](crate::models::ClaimMapping) struct. Uses the
+/// plain-but-absent `Option` representation (`false`): the resource has
+/// no nullable fields, only defaults omitted when unset.
+pub fn claim_mapping_root_schema() -> Value {
+    let mut schema = struct_root_schema::<crate::models::ClaimMapping>(false);
+    // `priority` has a stable runtime default of 0, but schemars drops
+    // the `default` keyword for fields whose default value is skipped
+    // on serialization (`skip_serializing_if = "is_zero"`). Re-assert
+    // it so API consumers can discover the behavior from the contract,
+    // matching the `enabled: true` default the derive does emit.
+    if let Some(priority) = schema
+        .get_mut("properties")
+        .and_then(|p| p.get_mut("priority"))
+        .and_then(Value::as_object_mut)
+    {
+        priority.insert("default".to_string(), json!(0));
+    }
+    schema
+}
+
+/// Canonical JSON Schema for the `passthrough_route` resource, derived from
+/// the [`PassthroughRoute`](crate::models::PassthroughRoute) struct. Uses the
+/// nullable `Option` representation (`true`) so unset optional fields accept
+/// an explicit `null` as well as being absent. The `auth_mode` /
+/// `credential_mode` closed sets come from their enums; every
+/// cross-field invariant (match dimensions, target shape, per-mode required
+/// companions) is injected as an `allOf` (see
+/// [`super::passthrough_route::passthrough_route_coupling`]) so the strict
+/// write path and the lenient etcd read path enforce the same coupling. The
+/// label is accepted under both `name` and its `display_name` alias.
+pub fn passthrough_route_root_schema() -> Value {
+    let mut schema = struct_root_schema::<crate::models::PassthroughRoute>(true);
+    schema
+        .as_object_mut()
+        .expect("passthrough route root schema is a JSON object")
+        .insert(
+            "allOf".to_string(),
+            super::passthrough_route::passthrough_route_coupling(),
+        );
+    accept_renamed_field(
+        &mut schema,
+        "name",
+        "display_name",
+        "Accepted as an alternative spelling of `name`. \
+         Provide the label under exactly one of the two names.",
+    );
+    if let Some(Value::Object(defs)) = schema.get_mut("definitions") {
+        title_single_value_enum_variants(
+            defs,
+            "PassthroughAuthMode",
+            &[
+                ("gateway_key", "Standard gateway credential"),
+                ("header_key", "Gateway credential in a dedicated header"),
+                ("anonymous", "Anonymous (bound principal)"),
+            ],
+        );
+        title_single_value_enum_variants(
+            defs,
+            "PassthroughCredentialMode",
+            &[
+                ("inject", "Inject the ProviderKey secret"),
+                ("forward_client", "Forward the caller's own credential"),
+            ],
+        );
+    }
+    schema
+}
+
 /// Canonical JSON Schema for the `mcp_auth_settings` resource, derived
 /// from the [`McpAuthSettings`](crate::models::McpAuthSettings) struct.
-/// One required field (`resource_url`); the singleton-per-environment
-/// invariant is enforced by the writers (cp-api keys the row by the
-/// environment id; the resources file rejects duplicates at load), not
-/// by the document schema.
+/// The singleton-per-environment invariant is enforced by the writers
+/// (cp-api keys the row by the environment id; the resources file
+/// rejects duplicates at load) and, at read time, by the resolver
+/// failing closed — not by the document schema.
 pub fn mcp_auth_settings_root_schema() -> Value {
     struct_root_schema::<crate::models::McpAuthSettings>(false)
 }
@@ -895,19 +1242,54 @@ fn branch_kind(branch: &serde_json::Map<String, Value>) -> Option<&str> {
 
 /// Canonical JSON Schema for the `rate_limit_policy` resource, derived from the
 /// [`RateLimitPolicy`](crate::models::RateLimitPolicy) struct (the `scope`/
-/// `window` closed sets come from the `PolicyScope`/`PolicyWindow` enums) plus
-/// the one cross-field invariant `schemars` can't express: at least one of
-/// `max_requests`/`max_tokens` must be set
-/// ([`super::rate_limit_policy::rate_limit_policy_any_of`]).
+/// `window`/dimension/operator closed sets come from their enums) plus the
+/// cross-field invariants `schemars` can't express:
+///
+/// - the classic/conditional form XOR
+///   ([`super::rate_limit_policy::rate_limit_policy_form_one_of`]), which also
+///   carries the classic form's "at least one of `max_requests`/`max_tokens`";
+/// - the `PolicySchedule` day-selector XOR;
+/// - closing the `ConditionNode` object variants in **both** validator sets:
+///   the node is `#[serde(untagged)]`, so serde buffers its content and
+///   silently swallows unknown fields inside it, invisible to the write
+///   path's serde step and the loader's `serde_ignored` reporting alike — the
+///   schema closure is the only non-silent guard (same reasoning as
+///   `OnEmbeddingFailure` in [`model_root_schema`]).
+///
+/// The tree caps (depth/leaf counts), the operator×dimension admission
+/// matrix and regex compilability are beyond draft-07 — those live in
+/// [`RateLimitPolicy::validate_semantics`], applied by the loader and the
+/// file source after parse.
+///
+/// [`RateLimitPolicy::validate_semantics`]: crate::models::RateLimitPolicy::validate_semantics
 pub fn rate_limit_policy_root_schema() -> Value {
     let mut schema = struct_root_schema::<crate::models::RateLimitPolicy>(false);
-    schema
+    let obj = schema
         .as_object_mut()
-        .expect("rate_limit_policy root schema is a JSON object")
+        .expect("rate_limit_policy root schema is a JSON object");
+    obj.insert(
+        "oneOf".to_string(),
+        super::rate_limit_policy::rate_limit_policy_form_one_of(),
+    );
+    let defs = obj
+        .get_mut("definitions")
+        .and_then(Value::as_object_mut)
+        .expect("rate_limit_policy schema has definitions");
+    // The schedule day-selector XOR is the same kind of cross-field
+    // invariant, one level down in the definitions.
+    defs.get_mut("PolicySchedule")
+        .and_then(Value::as_object_mut)
+        .expect("rate_limit_policy schema defines PolicySchedule")
         .insert(
-            "anyOf".to_string(),
-            super::rate_limit_policy::rate_limit_policy_any_of(),
+            "oneOf".to_string(),
+            super::rate_limit_policy::policy_schedule_one_of(),
         );
+    for def in ["PolicyCondition", "ConditionGroup"] {
+        defs.get_mut(def)
+            .and_then(Value::as_object_mut)
+            .unwrap_or_else(|| panic!("rate_limit_policy schema defines {def}"))
+            .insert("additionalProperties".to_string(), json!(false));
+    }
     schema
 }
 
@@ -2591,11 +2973,12 @@ mod tests {
 
     #[test]
     fn rate_limit_policy_rejects_unknown_window() {
+        // "day" graduated into the enum (#771); "week" stays out.
         let v = json!({
             "name": "bad",
             "scope": "team",
             "scope_ref": "x",
-            "window": "day",
+            "window": "week",
             "max_requests": 10
         });
         assert!(validate_rate_limit_policy(&v).is_err());
@@ -2635,6 +3018,103 @@ mod tests {
             "window": "minute"
         });
         assert!(validate_rate_limit_policy(&v).is_err());
+    }
+
+    // ---- rate_limit_policy conditional form (AISIX-Cloud#892) ----
+
+    #[test]
+    fn rate_limit_policy_conditional_form_passes_both_validator_sets() {
+        let v = json!({
+            "name": "algo-team-premium",
+            "conditions": [
+                { "dimension": "team", "operator": "in", "value": ["t-1"] },
+                { "logic": "or", "children": [
+                    { "dimension": "model_name", "operator": "~~", "value": "^gpt-4\\.1" },
+                    { "dimension": "provider", "operator": "==", "value": "anthropic" }
+                ]}
+            ],
+            "group_by": ["team"],
+            "limits": { "rpm": 1000, "tpm": 1000000 },
+            "action": "reject"
+        });
+        validate_rate_limit_policy(&v).unwrap();
+        validate_rate_limit_policy_lenient(&v).unwrap();
+    }
+
+    #[test]
+    fn rate_limit_policy_conditional_minimal_is_just_limits() {
+        // conditions/group_by/action are all optional — `limits` alone
+        // is a valid "cap every request in the env" policy.
+        let v = json!({
+            "name": "env-wide",
+            "limits": { "concurrency": 10 }
+        });
+        validate_rate_limit_policy(&v).unwrap();
+    }
+
+    #[test]
+    fn rate_limit_policy_rejects_mixed_forms() {
+        // A row carrying both a classic field and a conditional field
+        // fails the injected oneOf in BOTH validator sets — an old DP
+        // must never half-enforce such a row.
+        let v = json!({
+            "name": "mixed",
+            "scope": "team",
+            "scope_ref": "x",
+            "window": "minute",
+            "max_requests": 10,
+            "limits": { "rpm": 5 }
+        });
+        assert!(validate_rate_limit_policy(&v).is_err());
+        assert!(validate_rate_limit_policy_lenient(&v).is_err());
+    }
+
+    #[test]
+    fn rate_limit_policy_rejects_unknown_field_inside_condition_node() {
+        // ConditionNode is #[serde(untagged)]: serde silently swallows
+        // unknown fields inside untagged content, so the schema closure
+        // on the node definitions is the only guard — in both sets.
+        let v = json!({
+            "name": "sneaky",
+            "conditions": [
+                { "dimension": "team", "operator": "==", "value": "t-1", "extra": 1 }
+            ],
+            "limits": { "rpm": 5 }
+        });
+        assert!(validate_rate_limit_policy(&v).is_err());
+        assert!(validate_rate_limit_policy_lenient(&v).is_err());
+    }
+
+    #[test]
+    fn rate_limit_policy_rejects_unknown_dimension_and_operator() {
+        let bad_dim = json!({
+            "name": "bad",
+            "conditions": [ { "dimension": "region", "operator": "==", "value": "us" } ],
+            "limits": { "rpm": 5 }
+        });
+        assert!(validate_rate_limit_policy(&bad_dim).is_err());
+        let bad_op = json!({
+            "name": "bad",
+            "conditions": [ { "dimension": "team", "operator": "matches", "value": "t" } ],
+            "limits": { "rpm": 5 }
+        });
+        assert!(validate_rate_limit_policy(&bad_op).is_err());
+    }
+
+    #[test]
+    fn rate_limit_policy_classic_rows_unchanged_by_892() {
+        // The exact pre-#892 shape keeps validating — stored rows are
+        // never rewritten, so the classic branch must stay byte-stable.
+        let v = json!({
+            "name": "team-acme-tpm",
+            "scope": "team",
+            "scope_ref": "11111111-1111-1111-1111-111111111111",
+            "window": "minute",
+            "max_requests": 1000,
+            "max_tokens": 1000000
+        });
+        validate_rate_limit_policy(&v).unwrap();
+        validate_rate_limit_policy_lenient(&v).unwrap();
     }
 
     // ---- provider_key schema (issue #302 Phase A skeleton) ----
@@ -2984,17 +3464,124 @@ mod tests {
     }
 
     #[test]
-    fn mcp_server_schema_stays_permissive_on_credential_coupling() {
-        // The per-`auth_type` credential coupling (oauth2 ⇒ client_id +
-        // secret + token_url) is enforced by write paths, not this schema —
-        // an incomplete oauth2 row must still validate so the snapshot loader
-        // keeps it (the runtime degrades that server gracefully instead).
+    fn mcp_server_schema_enforces_credential_coupling() {
+        // This assertion is the inverse of what it used to be, deliberately.
+        // The coupling (oauth2 ⇒ client_id + secret + token_url) used to be
+        // left to write paths, on the reasoning that an incomplete row should
+        // still load and degrade at runtime. That reasoning depended on a write
+        // path existing to catch it; with resource writes removed from this
+        // gateway, leaving the schema permissive means nothing checks the
+        // coupling at all on the declarative and etcd paths.
+        //
+        // Rejecting at load is also the more diagnosable of the two failures: a
+        // rejected row is named in `GET /status/config`'s `rejected` array,
+        // whereas a loaded-but-degraded server silently serves no tools.
         let v = json!({
             "display_name": "x",
             "url": "https://x/mcp",
             "auth_type": "oauth2"
         });
+        assert!(validate_mcp_server(&v).is_err());
+
+        // The complete set still validates.
+        let v = json!({
+            "display_name": "x",
+            "url": "https://x/mcp",
+            "auth_type": "oauth2",
+            "secret": "cs",
+            "client_id": "cid",
+            "token_url": "https://auth/token"
+        });
         validate_mcp_server(&v).unwrap();
+    }
+
+    // ---- strict-write / lenient-read split (issue #871) ----
+
+    #[test]
+    fn lenient_set_tolerates_unknown_fields_strict_set_rejects() {
+        let v = json!({
+            "key_hash": "9df37f5e7cbc3c391d872742b5f286c242e733a09add9eeaa4d26a599bd90b20",
+            "allowed_models": ["a"],
+            "future_field": true
+        });
+        assert!(validate_apikey(&v).is_err(), "write contract stays strict");
+        validate_apikey_lenient(&v).expect("read contract tolerates unknown fields");
+    }
+
+    #[test]
+    fn lenient_set_still_enforces_every_other_constraint() {
+        // Missing required field.
+        assert!(validate_apikey_lenient(&json!({"allowed_models": []})).is_err());
+        // Unknown enum value.
+        let v = json!({
+            "display_name": "r",
+            "routing": {"strategy": "quantum", "targets": [{"model": "a"}]}
+        });
+        assert!(validate_model_lenient(&v).is_err());
+        // Range violation.
+        let v = json!({
+            "display_name": "", "provider": "openai",
+            "model_name": "g", "provider_key_id": "pk"
+        });
+        assert!(validate_model_lenient(&v).is_err());
+    }
+
+    #[test]
+    fn lenient_set_keeps_deliberate_closures_closed() {
+        // The observability-exporter branches guard the credential_ref
+        // indirection against a smuggled plaintext secret, and serde
+        // cannot report ignored fields inside tagged-enum content — so
+        // these closures must hold on the READ path too, or the
+        // tolerance would be silent.
+        let exporter = json!({
+            "name": "o", "kind": "otlp_http",
+            "endpoint": "https://otel.example/v1/traces",
+            "smuggled_secret": "sk-x"
+        });
+        assert!(validate_observability_exporter_lenient(&exporter).is_err());
+
+        // Same for the guardrail tagged sub-enums: serde silently
+        // swallows unknown fields inside inline-tagged variants.
+        let guardrail = json!({
+            "name": "kw", "kind": "keyword",
+            "patterns": [{"kind": "literal", "value": "x", "extra": 1}]
+        });
+        assert!(validate_guardrail_lenient(&guardrail).is_err());
+    }
+
+    #[test]
+    fn on_embedding_failure_object_variant_is_closed_on_both_paths() {
+        // `OnEmbeddingFailure` is untagged with an object variant: serde
+        // buffers untagged content and silently swallows unknown fields
+        // inside it — invisible to serde_ignored too. The producer closes
+        // the object branch so the typo is caught on write AND stays a
+        // loud (RED) rejection on read instead of a silent tolerance.
+        let v = json!({
+            "display_name": "prod-chat",
+            "semantic": {
+                "embedding_model": "e",
+                "routes": [{"name": "a", "target": "m", "examples": ["x"]}],
+                "default": "d",
+                "match": {"threshold": 0.5},
+                "on_embedding_failure": {"target": "t", "sneaky": 1}
+            }
+        });
+        assert!(validate_model(&v).is_err());
+        assert!(validate_model_lenient(&v).is_err());
+
+        // The legitimate shapes keep validating on both paths.
+        let ok = json!({
+            "display_name": "prod-chat",
+            "semantic": {
+                "embedding_model": "e",
+                "routes": [{"name": "a", "target": "m", "examples": ["x"]}],
+                "default": "d",
+                "match": {"threshold": 0.5},
+                "on_embedding_failure": {"target": "t"}
+            }
+        });
+        validate_model(&ok).unwrap();
+        validate_model_lenient(&ok).unwrap();
     }
 
     #[test]
@@ -3008,5 +3595,127 @@ mod tests {
             "timeout_ms": 0
         });
         assert!(validate_mcp_server(&v).is_err());
+    }
+
+    #[test]
+    fn model_dead_knob_error_names_the_field_and_kind() {
+        // The five-branch `oneOf` makes every branch fail, so the raw
+        // jsonschema error is the root-level "not valid under any of the
+        // schemas". The dead knob is the case the strict path exists to
+        // catch, so it must be named.
+        let group = json!({
+            "display_name": "g",
+            "routing": {"strategy": "failover", "targets": [{"model": "m"}]},
+            "retries": 3,
+            "cost": {"input_per_1k": 0.5, "output_per_1k": 1.5}
+        });
+        let msg = validate_model(&group).unwrap_err().message;
+        assert!(msg.contains("`cost`"), "{msg}");
+        assert!(msg.contains("`retries`"), "{msg}");
+        assert!(msg.contains("model group"), "{msg}");
+        assert!(
+            !msg.contains("oneOf"),
+            "generic message should be replaced: {msg}"
+        );
+
+        let ensemble = json!({
+            "display_name": "e",
+            "ensemble": {"panel": [{"model": "m"}], "judge": {"model": "m"}},
+            "timeout": 1000
+        });
+        let msg = validate_model(&ensemble).unwrap_err().message;
+        assert!(msg.contains("`timeout`"), "{msg}");
+        assert!(msg.contains("ensemble"), "{msg}");
+
+        let semantic = json!({
+            "display_name": "s",
+            "semantic": {
+                "embedding_model": "e",
+                "routes": [{"name": "a", "target": "m", "examples": ["x"]}],
+                "default": "d",
+                "match": {"threshold": 0.5},
+                "on_embedding_failure": {"target": "t"}
+            },
+            "auto_prompt_caching": {"enabled": true}
+        });
+        let msg = validate_model(&semantic).unwrap_err().message;
+        assert!(msg.contains("`auto_prompt_caching`"), "{msg}");
+        assert!(msg.contains("semantic router"), "{msg}");
+    }
+
+    #[test]
+    fn model_non_dead_knob_failures_keep_the_generic_message() {
+        // A failure that is NOT a dead knob must not be relabelled: the
+        // enrichment is best-effort and only speaks for the case it can
+        // prove. An unknown field on a direct model is rejected by
+        // `additionalProperties: false`, and strip_kind_inapplicable has
+        // nothing to say about it.
+        let unknown = json!({
+            "display_name": "d",
+            "provider": "openai",
+            "model_name": "gpt-4o-mini",
+            "provider_key_id": "pk",
+            "definitely_not_a_field": 1
+        });
+        let msg = validate_model(&unknown).unwrap_err().message;
+        assert!(!msg.contains("not accepted on a"), "{msg}");
+
+        // A dead knob on a DIRECT model is not dead at all — it resolves
+        // there — so a direct model carrying `retries` must still VALIDATE.
+        let direct = json!({
+            "display_name": "d",
+            "provider": "openai",
+            "model_name": "gpt-4o-mini",
+            "provider_key_id": "pk",
+            "retries": 3
+        });
+        validate_model(&direct).unwrap();
+    }
+
+    #[test]
+    fn model_dead_knob_error_carries_no_instance_values() {
+        // The masking contract: validation errors reach logs, the
+        // rejection buffer and admin 400 bodies, and model documents can
+        // carry credentials. Only field NAMES may be added.
+        let group = json!({
+            "display_name": "g",
+            "routing": {"strategy": "failover", "targets": [{"model": "m"}]},
+            "cost": {"input_per_1k": 12345.678, "output_per_1k": 99999.111}
+        });
+        let msg = validate_model(&group).unwrap_err().message;
+        assert!(msg.contains("`cost`"), "{msg}");
+        assert!(!msg.contains("12345"), "instance value leaked: {msg}");
+        assert!(!msg.contains("99999"), "instance value leaked: {msg}");
+    }
+
+    #[test]
+    fn model_dead_knob_with_an_independent_failure_keeps_the_original_error() {
+        // A dead knob is only named when it is the WHOLE story. Here the
+        // group also has an empty display_name (minLength 1) — which
+        // `Model` deserialises fine, so the enrichment is reachable.
+        // Replacing the message would report `retries` while `path` still
+        // points at /display_name: two different fields in one error.
+        let v = json!({
+            "display_name": "",
+            "routing": {"strategy": "failover", "targets": [{"model": "m"}]},
+            "retries": 3
+        });
+        let err = validate_model(&v).unwrap_err();
+        assert_eq!(err.path, "/display_name", "{err:?}");
+        assert!(
+            !err.message.contains("`retries`"),
+            "the independent failure must win: {err:?}"
+        );
+        assert!(err.message.contains("shorter than 1 character"), "{err:?}");
+
+        // With the independent violation fixed, the dead knob is the whole
+        // story again and gets named.
+        let v = json!({
+            "display_name": "g",
+            "routing": {"strategy": "failover", "targets": [{"model": "m"}]},
+            "retries": 3
+        });
+        let err = validate_model(&v).unwrap_err();
+        assert!(err.message.contains("`retries`"), "{err:?}");
     }
 }

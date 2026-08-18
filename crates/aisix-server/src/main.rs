@@ -16,6 +16,50 @@ use std::error::Error as StdError;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+// jemalloc as the global allocator on the shipped/benched targets
+// (Linux glibc): under the thread-per-core saturation load, allocator
+// time drops from ~15% of request CPU (glibc malloc) to ~6%. Other
+// targets keep the system allocator. One deploy caveat: jemalloc bakes
+// the build host's page size into the binary, so an aarch64 binary
+// built on a 4K-page host aborts at startup on a 64K-page kernel —
+// cross-building for such kernels needs JEMALLOC_SYS_WITH_LG_PAGE=16,
+// which runs on both page sizes.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+// jemalloc parks freed pages as "dirty" and only advances their decay clock
+// on later allocator activity in the same arena, so after a burst of
+// large-payload traffic an idle gateway keeps its peak RSS indefinitely
+// (#968: a 60s burst of ~120KiB bodies left +38MB resident, flat, on an
+// otherwise idle process). The background purge thread decouples purging
+// from traffic. Enabled via runtime mallctl on purpose: the equivalent
+// `opt.background_thread` startup path carries an upstream warning that it
+// "may cause crash or deadlock during initialization". Failure is never
+// fatal — foreground decay still bounds RSS under load; only idle-time
+// reclamation is lost, which the warning makes visible.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn enable_jemalloc_background_thread() -> Result<bool, tikv_jemalloc_ctl::Error> {
+    use tikv_jemalloc_ctl::background_thread;
+    // Write-then-read-back: the write is a request, the read is the fact.
+    // The outcome is returned so the unit test exercises this function
+    // itself — a broken body must fail the test, not stay silently green.
+    let outcome = background_thread::write(true).and_then(|()| background_thread::read());
+    match &outcome {
+        Ok(true) => tracing::info!("jemalloc background purge thread enabled"),
+        Ok(false) => tracing::warn!(
+            "jemalloc background purge thread did not enable on this target; \
+             freed memory will not return to the OS while the process is idle"
+        ),
+        Err(e) => tracing::warn!(
+            error = %e,
+            "failed to enable jemalloc background purge thread; freed memory \
+             will not return to the OS while the process is idle"
+        ),
+    }
+    outcome
+}
+
 mod cert_bundle;
 mod export;
 mod heartbeat;
@@ -101,8 +145,17 @@ enum CliCommand {
     },
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+/// Threads left to the control surfaces when the proxy serves from
+/// thread-per-core workers.
+///
+/// The proxy's own runtimes belong to its workers in that mode, so this
+/// runtime is only running the etcd watch, the admin and metrics
+/// listeners, signal handling, and the background exporters. Two threads
+/// keep a config reload from stalling behind a telemetry flush without
+/// taking a core back from the workers.
+const CONTROL_RUNTIME_THREADS: usize = 2;
+
+fn main() -> anyhow::Result<()> {
     // Install the process-level rustls CryptoProvider before anything
     // else touches TLS. rustls 0.23 dropped implicit provider selection
     // and panics at first use when both `aws-lc-rs` and `ring` features
@@ -127,13 +180,15 @@ async fn main() -> anyhow::Result<()> {
             reveal_secrets,
             output,
         }) => {
-            return export::run(export::ExportArgs {
-                endpoints: etcd,
-                prefix,
-                reveal_secrets,
-                output,
-            })
-            .await;
+            return tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?
+                .block_on(export::run(export::ExportArgs {
+                    endpoints: etcd,
+                    prefix,
+                    reveal_secrets,
+                    output,
+                }));
         }
         None => {}
     }
@@ -142,18 +197,38 @@ async fn main() -> anyhow::Result<()> {
         .config
         .expect("clap enforces --config unless a subcommand is given");
 
-    // Steps 1-2: config.
+    // Steps 1-2: config. Read before the runtime exists because
+    // `proxy.thread_per_core` and `proxy.workers` decide how many threads
+    // this runtime gets — and, in thread-per-core mode, that it is not
+    // the runtime serving proxy traffic at all.
     let cfg = Config::load_from_path(Some(&config_path))
         .map_err(|e| anyhow::anyhow!("config load failed: {e}"))?;
 
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder.enable_all();
+    builder.worker_threads(if cfg.proxy.thread_per_core_enabled() {
+        CONTROL_RUNTIME_THREADS
+    } else {
+        cfg.proxy.worker_threads()
+    });
+    builder.build()?.block_on(async_main(cfg))
+}
+
+async fn async_main(cfg: Config) -> anyhow::Result<()> {
     // Step 3: tracing + optional OTLP export.
     init_tracing(&cfg.observability).map_err(|e| anyhow::anyhow!("tracing init failed: {e}"))?;
     let _otlp = install_otlp_tracer(&cfg.observability)
         .map_err(|e| anyhow::anyhow!("otlp init failed: {e}"))?;
 
+    // After tracing so the enable outcome is observable in the logs; the
+    // returned outcome is already logged inside.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    let _ = enable_jemalloc_background_thread();
+
     // Before any bridge builds its `reqwest::Client` — the connection
     // pools are constructed once and can't be reconfigured afterwards.
-    aisix_gateway::upstream_http::init(upstream_http_config(&cfg.upstream));
+    aisix_gateway::upstream_http::init(upstream_http_config(&cfg.upstream)?)
+        .map_err(|e| anyhow::anyhow!("upstream TLS init failed: {e}"))?;
 
     run(cfg).await
 }
@@ -304,6 +379,27 @@ fn select_managed_boot_path(bundle_on_disk: bool, bundle_provided: bool) -> Mana
         ManagedBootPath::ReusePersisted
     } else {
         ManagedBootPath::MissingBundle
+    }
+}
+
+async fn run_metrics_upkeep<F>(mut cancel: watch::Receiver<bool>, period: Duration, upkeep: F)
+where
+    F: Fn(),
+{
+    let mut interval = tokio::time::interval(period);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        if *cancel.borrow() {
+            break;
+        }
+        tokio::select! {
+            _ = interval.tick() => upkeep(),
+            changed = cancel.changed() => {
+                if changed.is_err() || *cancel.borrow() {
+                    break;
+                }
+            }
+        }
     }
 }
 
@@ -535,10 +631,10 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
                 .await
                 .map_err(|e| anyhow::anyhow!("etcd connect failed: {e}"))?,
             );
-            // Separate client for the admin write path — only needed when the
-            // admin surface is bound. We could share a single underlying
+            // Separate client for the admin read surface — only needed when
+            // the admin listener is bound. We could share a single underlying
             // connection via `Client::clone()` but keeping two is cleaner:
-            // writes and the watch stream don't contend on the same mutex.
+            // admin reads and the watch stream don't contend on the same mutex.
             // Skipped whenever the admin listener is not bound — managed mode,
             // or `admin.enabled = false` — so admin-off doesn't pay for (or
             // fail boot on) a connection it immediately drops; `/status/models`
@@ -553,17 +649,15 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
                     etcd_prefix.clone(),
                 ))
             };
-            // Snapshot cache: in managed mode persist to disk (default
-            // /var/lib/aisix/config_cache.json) so the DP can serve traffic
+            // Snapshot cache: persist to disk so the DP can serve traffic
             // from the last-known config across CP outages and restarts.
-            // Disabled outside managed mode and when the operator clears the
-            // path explicitly.
-            let snapshot_cache =
-                if cfg.managed.is_managed() && !cfg.managed.snapshot_cache_path.is_empty() {
-                    SnapshotCache::new(&cfg.managed.snapshot_cache_path)
-                } else {
-                    SnapshotCache::disabled()
-                };
+            // Managed mode defaults to /var/lib/aisix/config_cache.json;
+            // self-hosted etcd mode enables it only when the operator sets
+            // a path explicitly; "" disables it in either mode.
+            let snapshot_cache = match cfg.managed.effective_snapshot_cache_path() {
+                Some(path) => SnapshotCache::new(path),
+                None => SnapshotCache::disabled(),
+            };
             let supervisor = Arc::new(Supervisor::with_cache(
                 provider,
                 etcd_prefix,
@@ -661,7 +755,24 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     // env_id is resolved by now (managed provisioning / sidecar restore
     // above); it becomes the constant `env_id` label on the SLO latency
     // histograms. Standalone DPs leave it empty → "unknown".
-    let metrics = Arc::new(Metrics::new_with_env_id(&cfg.etcd.env_id));
+    // AISIX-Cloud#1226: operator bucket overrides. Validation errors are
+    // boot-fatal — a silently ignored override would leave the deployment
+    // reading quantiles off bucket edges it did not choose.
+    let histogram_buckets =
+        aisix_obs::HistogramBuckets::from_config(&cfg.observability.metrics.buckets)
+            .map_err(|e| anyhow::anyhow!(e))?;
+    let metrics = Arc::new(Metrics::new_with_buckets(
+        &cfg.etcd.env_id,
+        &histogram_buckets,
+    ));
+    let metrics_upkeep_task = {
+        let metrics = metrics.clone();
+        tokio::spawn(run_metrics_upkeep(
+            cancel_rx.clone(),
+            Duration::from_secs(5),
+            move || metrics.run_upkeep(),
+        ))
+    };
     // Cache backends (#519 B.8). The memory cache is always built
     // (in-process, cheap); the redis cache is built iff `cache.redis`
     // is configured. Which instance serves a request is selected by
@@ -689,10 +800,84 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
         }
         None => None,
     };
-    let cache = Some(CacheBackends::new(
-        Arc::new(MemoryCache::with_defaults()),
-        redis_cache,
-    ));
+    // Shared semantic (L2) store for `backend: redis` policies. Wired
+    // only when the server passes the vector-search probe — a plain
+    // Redis 6/7 (or cluster mode, unsupported yet) degrades those
+    // policies to exact-only, loudly, HERE at boot rather than
+    // silently per request.
+    let semantic_redis: Option<Arc<dyn aisix_cache::SemanticCacheStore>> =
+        match cfg.cache.redis.as_ref() {
+            Some(redis_cfg) if redis_cfg.mode == aisix_core::RedisMode::Cluster => {
+                tracing::warn!(
+                    target: "aisix::cache",
+                    "cache.redis is in cluster mode; semantic matching on backend=redis \
+                     policies is not supported yet and stays exact-only"
+                );
+                None
+            }
+            Some(redis_cfg) => {
+                // Degrade (never abort) on any failure here: the exact
+                // redis cache above is the load-bearing connection; the
+                // semantic store is an optimization layer.
+                match aisix_cache::RedisSemanticCache::connect(redis_cfg).await {
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "aisix::cache",
+                            error = %e,
+                            "redis semantic cache connect failed; semantic matching \
+                             on backend=redis policies stays exact-only"
+                        );
+                        None
+                    }
+                    Ok(store) => {
+                        let store = store.with_env_namespace(&cfg.etcd.env_id);
+                        match store.probe().await {
+                            Ok(()) => {
+                                match store.sweep_empty_indexes().await {
+                                    Ok(dropped) if dropped > 0 => {
+                                        tracing::info!(
+                                            target: "aisix::cache",
+                                            dropped,
+                                            "reclaimed empty semantic-cache indexes"
+                                        );
+                                    }
+                                    Ok(_) => {}
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            target: "aisix::cache",
+                                            error = %e,
+                                            "semantic-cache index sweep failed; continuing"
+                                        );
+                                    }
+                                }
+                                tracing::info!(
+                                    target: "aisix::cache",
+                                    "cache.redis supports vector search; semantic matching \
+                                     enabled for backend=redis policies"
+                                );
+                                Some(Arc::new(store) as Arc<dyn aisix_cache::SemanticCacheStore>)
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    target: "aisix::cache",
+                                    error = %e,
+                                    "cache.redis has no vector-search support; semantic matching \
+                                     on backend=redis policies stays exact-only"
+                                );
+                                None
+                            }
+                        }
+                    }
+                }
+            }
+            None => None,
+        };
+    let mut cache_backends =
+        CacheBackends::new(Arc::new(MemoryCache::with_defaults()), redis_cache);
+    if let Some(store) = semantic_redis {
+        cache_backends = cache_backends.with_semantic_redis(store);
+    }
+    let cache = Some(cache_backends);
 
     let mut proxy_state = ProxyState::with_components(
         snapshot_handle.clone(),
@@ -713,6 +898,8 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!(e))?;
     proxy_state = proxy_state.with_client_classifier(Arc::new(client_classifier));
     proxy_state = proxy_state.with_default_retries(cfg.upstream.retries);
+    proxy_state =
+        proxy_state.with_default_timeouts(cfg.upstream.timeout_ms, cfg.upstream.stream_timeout_ms);
     if let Some(client) = budget_client {
         proxy_state = proxy_state.with_budget_client(client);
     }
@@ -762,6 +949,10 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
         let config_status_for_heartbeat = supervisor.config_status();
         h = h.with_config_hash_fetcher(Arc::new(move || {
             config_status_for_heartbeat.applied_config_hash()
+        }));
+        let supervisor_for_partial = Arc::clone(supervisor);
+        h = h.with_partial_compat_fetcher(Arc::new(move || {
+            supervisor_for_partial.recent_partial_compat()
         }));
         let fan_out = proxy_state.otlp_fan_out.clone();
         h = h.with_exporter_health_fetcher(Arc::new(move || fan_out.exporter_stats()));
@@ -820,19 +1011,18 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
 
     // Admin router + listener are only built in standalone mode.
     // In managed mode (`cfg.managed.enabled = true`) the DP reads
-    // configuration exclusively from etcd; exposing admin writes or
-    // the Playground would bypass the aisix.cloud control plane.
+    // configuration exclusively from etcd; exposing the admin surface
+    // or the Playground would bypass the AISIX Cloud control plane.
     //
     // Which store backs the admin surface depends on the resource
-    // source: etcd standalone gets the writable etcd store; file mode
-    // gets a read-only view of the file-loaded snapshot (writes return
-    // 409 pointing at the file).
+    // source: etcd standalone reads the etcd store; file mode reads a
+    // view of the file-loaded snapshot. The admin resource surface is
+    // read-only — writes were removed with the Admin API write path.
     let admin_store: Option<Arc<dyn ConfigStore>> = match (admin_client, &file_source_path) {
         (Some((client, prefix)), _) => Some(Arc::new(EtcdConfigStore::new(client, prefix))),
-        (None, Some(path)) if !cfg.managed.is_managed() => Some(Arc::new(FileManagedStore::new(
-            snapshot_handle.clone(),
-            path.display().to_string(),
-        ))),
+        (None, Some(_)) if !cfg.managed.is_managed() => {
+            Some(Arc::new(FileManagedStore::new(snapshot_handle.clone())))
+        }
         _ => None,
     };
     // Per-model runtime health as an operational read on the metrics/status
@@ -840,15 +1030,11 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     // surface's store handle, so the status-listener view and
     // `GET /admin/v1/models/status` read the very same source; managed mode
     // has no admin store and serves the applied snapshot through the same
-    // read-only view file mode uses (the path only appears in write
-    // rejections, which the read-only status listener never issues).
+    // read-only view file mode uses.
     let status_models_state = aisix_admin::ModelsStatusState {
         store: match &admin_store {
             Some(store) => Arc::clone(store),
-            None => Arc::new(FileManagedStore::new(
-                snapshot_handle.clone(),
-                "the control plane",
-            )),
+            None => Arc::new(FileManagedStore::new(snapshot_handle.clone())),
         },
         runtime_status_tracker: Some(runtime_status_tracker.clone()),
     };
@@ -871,11 +1057,6 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
             // while reporting healthy. See issue #114.
             admin_state = admin_state.with_watch_status(supervisor.watch_status());
         }
-        if let Some(path) = &file_source_path {
-            // Arm the router-level write guard: every mutating
-            // /admin/v1/* request answers 409 naming the file.
-            admin_state = admin_state.with_file_managed_path(path.display().to_string());
-        }
         let admin_router = aisix_admin::build_router(admin_state);
 
         let admin_addr: std::net::SocketAddr = cfg.admin.addr.parse()?;
@@ -887,6 +1068,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
             downstream_idle_timeout,
             cancel_rx.clone(),
             "admin",
+            None,
         )))
     } else {
         // Drop unused shared components so the compiler can see they
@@ -932,6 +1114,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
                 downstream_idle_timeout,
                 cancel_rx.clone(),
                 "metrics",
+                None,
             )))
         } else {
             None
@@ -941,6 +1124,10 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     // Step 9: bind + serve the proxy (always). Admin is handled above.
     let proxy_addr: std::net::SocketAddr = cfg.proxy.addr.parse()?;
     let proxy_tls = cfg.proxy.tls.clone();
+    let proxy_workers = cfg
+        .proxy
+        .thread_per_core_enabled()
+        .then(|| cfg.proxy.worker_threads());
     let proxy_serve = serve_http(
         proxy_addr,
         proxy_router,
@@ -948,6 +1135,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
         downstream_idle_timeout,
         cancel_rx.clone(),
         "proxy",
+        proxy_workers,
     );
 
     // Step 10: shutdown coordinator. Whichever of (signal, proxy, admin)
@@ -982,6 +1170,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     if let Some(task) = telemetry_task {
         let _ = task.await;
     }
+    let _ = metrics_upkeep_task.await;
     let _ = background_check_task.await;
     tracing::info!("aisix shut down cleanly");
     Ok(())
@@ -1243,21 +1432,39 @@ fn load_heartbeat_config_from_disk(
 /// `crates/aisix-proxy/src/rerank.rs` and bypasses the Bridge.
 /// Translate the `upstream:` config block into the gateway's client
 /// settings. Every duration treats `0` as "leave this knob off".
-fn upstream_http_config(cfg: &aisix_core::config::UpstreamConfig) -> UpstreamHttpConfig {
+///
+/// Fails when `upstream.tls` names a file that cannot be read or does
+/// not hold the PEM it claims to — the boot is where an operator can
+/// still act on that, and it is a far better signal than the generic
+/// `UnknownIssuer` transport error the misconfiguration otherwise
+/// produces on every upstream call.
+fn upstream_http_config(
+    cfg: &aisix_core::config::UpstreamConfig,
+) -> anyhow::Result<UpstreamHttpConfig> {
     fn ms(v: u64) -> Option<Duration> {
         (v > 0).then(|| Duration::from_millis(v))
     }
     fn secs(v: u64) -> Option<Duration> {
         (v > 0).then(|| Duration::from_secs(v))
     }
-    UpstreamHttpConfig {
+    let tls = aisix_gateway::TlsSettings::load("upstream.tls", &cfg.tls)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    if !tls.verify {
+        tracing::warn!(
+            "upstream.tls.verify is false: upstream certificates are NOT checked, so any \
+             peer able to intercept the connection can read and rewrite prompts, responses, \
+             and upstream API keys"
+        );
+    }
+    Ok(UpstreamHttpConfig {
         connect_timeout: ms(cfg.connect_timeout_ms),
         tcp_keepalive: secs(cfg.tcp_keepalive_secs),
         tcp_keepalive_interval: secs(cfg.tcp_keepalive_interval_secs),
         tcp_keepalive_retries: (cfg.tcp_keepalive_retries > 0).then_some(cfg.tcp_keepalive_retries),
         pool_idle_timeout: secs(cfg.pool_idle_timeout_secs),
         pool_max_idle_per_host: cfg.pool_max_idle_per_host,
-    }
+        tls,
+    })
 }
 
 fn build_hub() -> Hub {
@@ -1307,6 +1514,27 @@ fn background_check_interval(snapshot: &aisix_core::AisixSnapshot) -> std::time:
     std::time::Duration::from_secs(min_interval.max(1))
 }
 
+/// Set on every connection the gateway accepts from a client.
+///
+/// Nagle's algorithm holds a small segment back until the previous one
+/// has been acknowledged. A short buffered answer leaves in a single
+/// segment and never notices — which is why this is invisible in the
+/// throughput benchmark — but a streamed one writes a frame at a time,
+/// and a frame that lands while an earlier one is still unacknowledged
+/// waits out the client's delayed ACK (up to 40ms on Linux) before it
+/// leaves the box. HTTP/2 control frames and the WebSocket surfaces run
+/// on the same accepted socket and inherit the option.
+///
+/// `axum_server` accepts with the option off, and the gateway had never
+/// turned it on. reqwest already sets it on the upstream side.
+///
+/// A `set_nodelay` failure fails that connection: on Linux the option
+/// carries no socket-state precondition and cannot fail, and elsewhere
+/// it reports a peer that has already gone away — a connection that was
+/// not answerable regardless.
+const DOWNSTREAM_NODELAY: axum_server::accept::NoDelayAcceptor =
+    axum_server::accept::NoDelayAcceptor;
+
 /// Completes when the process receives SIGINT or SIGTERM (best-effort on
 /// Windows — Ctrl+C only) OR when another part of the system has already
 /// flipped the cancel channel.
@@ -1327,6 +1555,7 @@ async fn serve_http(
     idle_timeout: Option<Duration>,
     cancel: watch::Receiver<bool>,
     label: &'static str,
+    workers: Option<usize>,
 ) -> anyhow::Result<()> {
     // Resolved before binding so a bad cert path still fails with the
     // same error it always did, before a port is taken.
@@ -1344,6 +1573,21 @@ async fn serve_http(
         ),
         None => None,
     };
+
+    // Thread-per-core serving is the proxy's; the admin and metrics
+    // surfaces are control traffic and keep their single listener.
+    if let Some(workers) = workers {
+        return serve_http_tpc(
+            addr,
+            router,
+            tls_config,
+            idle_timeout,
+            cancel,
+            label,
+            workers,
+        )
+        .await;
+    }
 
     let listener = std::net::TcpListener::bind(addr)
         .map_err(|e| anyhow::anyhow!("{label} listener bind {addr} failed: {e}"))?;
@@ -1370,18 +1614,241 @@ async fn serve_http(
     match tls_config {
         None => {
             tracing::info!(%addr, label, "aisix listening (http)");
-            let mut server = axum_server::from_tcp(listener).handle(handle);
+            let mut server = axum_server::from_tcp(listener)
+                .acceptor(DOWNSTREAM_NODELAY)
+                .handle(handle);
             apply_idle_timeout(server.http_builder(), idle_timeout);
             server.serve(make_service).await?;
         }
         Some(tls_config) => {
             tracing::info!(%addr, label, "aisix listening (https)");
-            let mut server = axum_server::from_tcp_rustls(listener, tls_config).handle(handle);
+            let mut server = axum_server::from_tcp_rustls(listener, tls_config)
+                .map(|tls| tls.acceptor(DOWNSTREAM_NODELAY))
+                .handle(handle);
             apply_idle_timeout(server.http_builder(), idle_timeout);
             server.serve(make_service).await?;
         }
     }
     Ok(())
+}
+
+/// Serve from `workers` independent threads, each with its own runtime
+/// and its own `SO_REUSEPORT` listener on the same address.
+///
+/// A connection is accepted, read, dispatched, and answered on one
+/// thread, and the upstream call it makes runs on that thread's own
+/// connection pool (see `upstream_tls::mark_worker_thread`). That is the
+/// point of the mode: the shared runtime hands a request between threads
+/// roughly once per request — first when a worker steals the task, again
+/// when the upstream response lands on whichever thread happens to own
+/// that connection — and each handoff costs a wakeup and a context
+/// switch. Here there are none.
+///
+/// The kernel decides which listener gets each connection, hashing the
+/// 4-tuple. That spreads evenly across many client connections and
+/// unevenly across few, which is why the mode is documented as a
+/// throughput setting rather than a latency one.
+async fn serve_http_tpc(
+    addr: std::net::SocketAddr,
+    router: axum::Router,
+    tls_config: Option<axum_server::tls_rustls::RustlsConfig>,
+    idle_timeout: Option<Duration>,
+    cancel: watch::Receiver<bool>,
+    label: &'static str,
+    workers: usize,
+) -> anyhow::Result<()> {
+    // An address someone else already holds has to stay a loud boot
+    // failure. Every socket on a `SO_REUSEPORT` address has to set the
+    // option, so a socket that does not set it fails to bind exactly
+    // when something else is there — which is the check the worker
+    // sockets below deliberately give up, since they must co-bind with
+    // each other. Without this a second gateway would start silently
+    // and split traffic with the first.
+    drop(
+        std::net::TcpListener::bind(addr)
+            .map_err(|e| anyhow::anyhow!("{label} listener bind {addr} failed: {e}"))?,
+    );
+
+    // Every listener is bound before any worker spawns, so a bind
+    // failure — fd exhaustion on the last socket included — aborts
+    // startup before a single connection is accepted, exactly as the
+    // single listener does.
+    let mut listeners = Vec::with_capacity(workers);
+    for _ in 0..workers {
+        let listener = bind_reuseport_listener(addr)
+            .map_err(|e| anyhow::anyhow!("{label} listener bind {addr} failed: {e}"))?;
+        listener.set_nonblocking(true)?;
+        listeners.push(listener);
+    }
+
+    // One slot per worker so no worker blocks reporting its exit.
+    let (exit_tx, exit_rx) = std::sync::mpsc::sync_channel::<anyhow::Result<()>>(workers);
+    for (worker, listener) in listeners.into_iter().enumerate() {
+        let router = router.clone();
+        let cancel = cancel.clone();
+        let tls_config = tls_config.clone();
+        let exit_tx = exit_tx.clone();
+        std::thread::Builder::new()
+            // Names the mode in `ps -T` / `top -H`: `tpc-N` here,
+            // tokio's own `tokio-rt-worker` on the shared runtime.
+            .name(format!("tpc-{worker}"))
+            .spawn(move || {
+                let mut exit = WorkerExit {
+                    tx: exit_tx,
+                    worker,
+                    outcome: None,
+                };
+                exit.outcome = Some(run_tpc_worker(
+                    addr,
+                    listener,
+                    router,
+                    tls_config,
+                    idle_timeout,
+                    cancel,
+                    label,
+                    worker,
+                ));
+            })?;
+    }
+    // Only the workers hold senders from here, so a `RecvError` means
+    // every worker is gone.
+    drop(exit_tx);
+
+    // A graceful shutdown ends the workers together, but each drains its
+    // own connections on its own clock — an idle worker returns at once
+    // while a sibling may hold an in-flight stream for minutes. Wait for
+    // every worker, so the fastest drain cannot end the process under
+    // the slowest. Everything else stays immediately fatal: an accept
+    // loop failing, a panic unwinding, or a worker stopping without a
+    // shutdown signal has to bring the process down rather than leave it
+    // serving on fewer listeners than it reported binding.
+    let shutdown_seen = cancel;
+    tokio::task::spawn_blocking(move || {
+        for _ in 0..workers {
+            match exit_rx.recv() {
+                Ok(Ok(())) if *shutdown_seen.borrow() => {}
+                Ok(Ok(())) => {
+                    return Err(anyhow::anyhow!(
+                        "a proxy worker stopped serving without a shutdown signal"
+                    ));
+                }
+                Ok(Err(e)) => return Err(e),
+                Err(_) => {
+                    return Err(anyhow::anyhow!("a proxy worker exited without reporting"));
+                }
+            }
+        }
+        Ok(())
+    })
+    .await?
+}
+
+/// Reports a worker's exit exactly once, including when a panic unwinds
+/// out of it and there is no return value to send.
+struct WorkerExit {
+    tx: std::sync::mpsc::SyncSender<anyhow::Result<()>>,
+    worker: usize,
+    outcome: Option<anyhow::Result<()>>,
+}
+
+impl Drop for WorkerExit {
+    fn drop(&mut self) {
+        let outcome = self.outcome.take().unwrap_or_else(|| {
+            Err(anyhow::anyhow!(
+                "proxy worker {} panicked; see the panic above",
+                self.worker
+            ))
+        });
+        let _ = self.tx.send(outcome);
+    }
+}
+
+/// One thread-per-core worker: its own current-thread runtime, its own
+/// listener, its own upstream connection pool.
+#[allow(clippy::too_many_arguments)]
+fn run_tpc_worker(
+    addr: std::net::SocketAddr,
+    listener: std::net::TcpListener,
+    router: axum::Router,
+    tls_config: Option<axum_server::tls_rustls::RustlsConfig>,
+    idle_timeout: Option<Duration>,
+    cancel: watch::Receiver<bool>,
+    label: &'static str,
+    worker: usize,
+) -> anyhow::Result<()> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    // Every dispatch from this thread now uses this thread's pool, so an
+    // upstream response is read by the same runtime that is waiting for
+    // it. Marked inside the worker because the marker is per thread.
+    aisix_gateway::upstream_tls::mark_worker_thread();
+    rt.block_on(async move {
+        let handle = axum_server::Handle::new();
+        tokio::spawn({
+            let handle = handle.clone();
+            async move {
+                shutdown_signal(cancel, label).await;
+                // `None` = drain without a deadline, as on the shared
+                // runtime: an in-flight LLM stream can run for minutes.
+                handle.graceful_shutdown(None);
+            }
+        });
+
+        let make_service = router.into_make_service_with_connect_info::<std::net::SocketAddr>();
+        match tls_config {
+            None => {
+                tracing::info!(%addr, label, worker, "aisix listening (http, thread-per-core)");
+                let mut server = axum_server::from_tcp(listener)
+                    .acceptor(DOWNSTREAM_NODELAY)
+                    .handle(handle);
+                apply_idle_timeout(server.http_builder(), idle_timeout);
+                server.serve(make_service).await?;
+            }
+            Some(tls_config) => {
+                tracing::info!(%addr, label, worker, "aisix listening (https, thread-per-core)");
+                let mut server = axum_server::from_tcp_rustls(listener, tls_config)
+                    .map(|tls| tls.acceptor(DOWNSTREAM_NODELAY))
+                    .handle(handle);
+                apply_idle_timeout(server.http_builder(), idle_timeout);
+                server.serve(make_service).await?;
+            }
+        }
+        Ok(())
+    })
+}
+
+/// A listener that shares `addr` with the other workers' listeners.
+///
+/// `SO_REUSEPORT` has to be set before the bind, and every socket on the
+/// address has to set it, which is why this cannot go through
+/// `TcpListener::bind`.
+fn bind_reuseport_listener(addr: std::net::SocketAddr) -> std::io::Result<std::net::TcpListener> {
+    #[cfg(not(unix))]
+    return Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "thread-per-core serving needs SO_REUSEPORT, which this platform \
+         does not have; set proxy.thread_per_core: false",
+    ));
+
+    #[cfg(unix)]
+    {
+        let domain = if addr.is_ipv4() {
+            socket2::Domain::IPV4
+        } else {
+            socket2::Domain::IPV6
+        };
+        let socket =
+            socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+        socket.set_reuse_address(true)?;
+        socket.set_reuse_port(true)?;
+        socket.bind(&addr.into())?;
+        // Matches the backlog `std::net::TcpListener::bind` requests, so
+        // the two modes queue the same number of pending connections per
+        // socket.
+        socket.listen(128)?;
+        Ok(socket.into())
+    }
 }
 
 /// Close an accepted HTTP/1.1 connection that sits idle for `idle_timeout`.
@@ -1457,6 +1924,47 @@ async fn wait_for_signal(
 mod tests {
     use super::*;
     use clap::Parser;
+
+    // The shipped-target contract: the runtime mallctl enable must actually
+    // take effect here — an Ok(false) read-back would mean the #968 fix
+    // silently does nothing. Drives the delivered function, not an inline
+    // re-implementation of the mallctl pair; the test binary links the same
+    // #[global_allocator] as the shipped one.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn jemalloc_background_thread_enables_at_runtime() {
+        assert!(
+            matches!(enable_jemalloc_background_thread(), Ok(true)),
+            "background_thread did not enable on a linux-gnu target"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn metrics_upkeep_runs_periodically_and_stops_on_cancel() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let task = tokio::spawn(run_metrics_upkeep(
+            cancel_rx,
+            Duration::from_secs(5),
+            move || {
+                observed.fetch_add(1, Ordering::SeqCst);
+            },
+        ));
+
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        cancel_tx.send(true).unwrap();
+        task.await.unwrap();
+        tokio::time::advance(Duration::from_secs(10)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
 
     #[test]
     fn supplied_certs_take_precedence_over_persisted_bundle() {
@@ -1846,6 +2354,98 @@ models:
             bridge.name(),
             "anthropic",
             "specialized 'anthropic' MUST be `AnthropicBridge::new()` (bridge name 'anthropic')",
+        );
+    }
+
+    /// The acceptor has to leave `TCP_NODELAY` set on the socket the
+    /// gateway will write responses to. Asserted against a real accepted
+    /// connection, including that the option is off beforehand — the
+    /// default this exists to change.
+    #[tokio::test]
+    async fn the_downstream_acceptor_sets_tcp_nodelay() {
+        use axum_server::accept::Accept;
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let _client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let (accepted, _peer) = listener.accept().await.expect("accept");
+
+        assert!(
+            !accepted.nodelay().expect("read nodelay"),
+            "a plain accepted socket is expected to have Nagle on; if the \
+             platform default changed, this test no longer proves anything",
+        );
+        let (accepted, ()) = DOWNSTREAM_NODELAY
+            .accept(accepted, ())
+            .await
+            .expect("accept");
+        assert!(accepted.nodelay().expect("read nodelay"));
+    }
+
+    /// Four listeners are served — HTTP and HTTPS, on the shared runtime
+    /// and on each thread-per-core worker — and a fifth is one config
+    /// surface away. A listener wired without the acceptor fails in the
+    /// way nothing catches: it serves correctly, benchmarks identically,
+    /// and only pays the delayed-ACK tax on streamed responses.
+    ///
+    /// The TLS sites also have to wire it with `map`, not `acceptor`:
+    /// `Server::acceptor` *replaces* the acceptor, so
+    /// `from_tcp_rustls(..).acceptor(DOWNSTREAM_NODELAY)` compiles, drops
+    /// the rustls acceptor, and serves plaintext on the TLS port — while
+    /// satisfying a check that only looks for the constant's name.
+    #[test]
+    fn every_listener_sets_tcp_nodelay() {
+        let src = include_str!("main.rs");
+        let production = src
+            .split("\n#[cfg(test)]\nmod ")
+            .next()
+            .expect("production half");
+        // Spelled out at the call site rather than imported, so this
+        // probe sees every listener. (`use axum_server::…` in production
+        // would hide one from it.)
+        assert!(
+            !production.contains("use axum_server::"),
+            "importing the listener constructor hides the site from this \
+             check; call it as `axum_server::from_tcp…` instead",
+        );
+        let lines: Vec<&str> = production.lines().collect();
+
+        let mut sites = 0;
+        let mut offenders = Vec::new();
+        for (n, line) in lines.iter().enumerate() {
+            if !(line.contains("axum_server::from_tcp") || line.contains("axum_server::bind")) {
+                continue;
+            }
+            sites += 1;
+            // The acceptor is wired in the same statement, which the
+            // formatter keeps within the next two lines.
+            let statement = lines[n..(n + 3).min(lines.len())].join(" ");
+            if !statement.contains("DOWNSTREAM_NODELAY") {
+                offenders.push(format!("main.rs:{}: no TCP_NODELAY acceptor", n + 1));
+            } else if line.contains("_rustls") && !statement.contains(".map(") {
+                offenders.push(format!(
+                    "main.rs:{}: TLS listener must slot the acceptor under rustls with \
+                     `.map(|tls| tls.acceptor(DOWNSTREAM_NODELAY))`; `.acceptor(..)` \
+                     replaces the rustls acceptor and serves plaintext",
+                    n + 1
+                ));
+            }
+        }
+
+        assert!(
+            sites >= 4,
+            "found {sites} listener construction sites, expected at least 4 — \
+             the probe no longer matches the code and this test proves nothing. \
+             If the listeners were deliberately consolidated, lower this count \
+             on purpose",
+        );
+        assert!(
+            offenders.is_empty(),
+            "these listeners accept connections with Nagle left on, which \
+             delays streamed response frames; wire `DOWNSTREAM_NODELAY`:\n{}",
+            offenders.join("\n"),
         );
     }
 }

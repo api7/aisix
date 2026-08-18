@@ -18,10 +18,9 @@ export interface AppOverrides {
    * still returned but point at an unbound port. Resources are seeded
    * through `SeedClient`/`EtcdClient`, never the Admin API.
    *
-   * Only tests whose subject IS the Admin API surface (the held-back set —
-   * admin auth, write-rejection, deprecation headers, status-equivalence,
-   * key rotation) opt back in with `admin: true`; they stay admin-on until
-   * the Admin API is removed, then get deleted.
+   * Only tests whose subject IS the Admin API read surface (admin
+   * auth, the removed-write 405/404 contract, health, OpenAPI,
+   * status-equivalence) opt back in with `admin: true`.
    */
   admin?: boolean;
   /** Inserted into `admin.admin_keys`. Defaults to a fresh random key. */
@@ -43,6 +42,28 @@ export interface AppOverrides {
     header?: string;
   };
   /**
+   * `proxy.request_id` block (AISIX-Cloud#1288). Merged into the base
+   * proxy config like `realIp`. Names the inbound headers a caller may
+   * supply its own request id in; omitted, the binary's default
+   * (`["x-aisix-request-id"]`) applies.
+   */
+  requestId?: { accept_headers?: string[] };
+  /**
+   * `proxy.url_rewrites` block. Merged into the base proxy config (like
+   * `realIp`) so the listener addr is preserved. Entry-level path
+   * rewriting: first matching rule wins, `rewrite` replaces the matched
+   * portion of the path.
+   */
+  urlRewrites?: Array<{ name?: string; match: string; rewrite: string }>;
+  /**
+   * `proxy.request_body_limit_bytes`. A dedicated override (like
+   * `realIp`) because `extra` replaces whole top-level blocks and the
+   * proxy block carries the harness-picked listener addr. `0` disables
+   * the cap — the shipped default; the harness pins 10 MiB unless a
+   * test overrides it so the existing 413 suite keeps its subject.
+   */
+  requestBodyLimitBytes?: number;
+  /**
    * Extra environment variables for the spawned binary, applied AFTER the
    * `AISIX_*` strip. Use for non-config secrets the DP reads from its own
    * environment rather than from the kine config — e.g.
@@ -50,6 +71,29 @@ export interface AppOverrides {
    * AccessKey deliberately never travels on the config path.
    */
   extraEnv?: Record<string, string>;
+  /**
+   * `proxy.thread_per_core`. Omitted, the binary picks its platform
+   * default, which is what the suite should normally exercise.
+   *
+   * Pin it to `false` in a test whose subject is per-connection or
+   * per-pool state: with thread-per-core serving the kernel picks which
+   * worker accepts each connection, and each worker keeps its own
+   * upstream pool, so a count taken across two calls depends on that
+   * choice. Pinning keeps such an assertion measuring its own subject.
+   */
+  threadPerCore?: boolean;
+  /**
+   * Log level for the spawned binary. Defaults to `warn` — quiet enough
+   * that the suite's output stays readable. Tests that assert on a line
+   * the gateway emits at `info` (the access log) raise it here.
+   *
+   * Applied to BOTH `observability.log_level` and `RUST_LOG`: the DP's
+   * `init_tracing` tries `EnvFilter::try_from_default_env()` first, so
+   * the env var wins and setting the config key alone would silently do
+   * nothing. It also outranks an ambient `RUST_LOG`, so a developer
+   * debugging with `RUST_LOG=error` can't turn a test's subject off.
+   */
+  logLevel?: string;
   /**
    * `observability.metrics.client_type_rules` (AISIX-Cloud#1045): operator
    * UA→client_type regex rules, tried before the built-in allowlist.
@@ -66,6 +110,21 @@ export interface AppOverrides {
    * and send SIGHUP to exercise reloads.
    */
   resourcesFile?: string;
+  /**
+   * Reuse a fixed etcd prefix instead of generating a fresh one. For
+   * restart scenarios: `stop()` the first app (keeps etcd data), then
+   * spawn a second one with the same prefix so it loads the survivor
+   * state. The LAST app spawned on the prefix should `exit()` to clean
+   * it up.
+   */
+  etcdPrefix?: string;
+  /**
+   * `managed.snapshot_cache_path` — enables the on-disk snapshot cache
+   * (#871) without managed mode. Point two sequential apps (same
+   * `etcdPrefix`) at one path to exercise cache-restored restarts.
+   * The caller owns the file's lifecycle.
+   */
+  snapshotCachePath?: string;
 }
 
 export interface SpawnedApp {
@@ -91,13 +150,41 @@ export interface SpawnedApp {
    */
   output(): string;
   signal(signal: NodeJS.Signals): void;
+  /**
+   * Resolves when the process exits on its own — no signal is sent, no
+   * SIGKILL escalation. Rejects after `timeoutMs`. For asserting that a
+   * shutdown initiated via `signal()` actually terminates the process.
+   */
+  waitForExit(timeoutMs?: number): Promise<void>;
   exit(): Promise<void>;
+  /**
+   * Terminate the binary WITHOUT cleaning up: the etcd prefix, the tmp
+   * config dir, and any snapshot cache file survive. For restart
+   * scenarios — spawn a successor with the same `etcdPrefix` /
+   * `snapshotCachePath`, and let the successor's `exit()` clean up.
+   */
+  stop(): Promise<void>;
 }
 
 const BIN_PATH =
   process.env.AISIX_BIN ?? join(process.cwd(), "..", "..", "target", "debug", "aisix");
 const READY_TIMEOUT_MS = 10_000;
 const SHUTDOWN_GRACE_MS = 3_000;
+
+/**
+ * Suite-wide `proxy.thread_per_core`, from `E2E_THREAD_PER_CORE`, so CI
+ * can run the whole suite in each serving mode. Unset leaves the binary
+ * on its platform default; a per-test `threadPerCore` still wins over
+ * both.
+ *
+ * Every site that spawns the binary has to read this — a spawn site that
+ * ignores it silently stays on one mode forever, and the leg that was
+ * supposed to cover the other one goes green without ever running it.
+ */
+export const suiteThreadPerCore: boolean | undefined =
+  process.env.E2E_THREAD_PER_CORE === undefined
+    ? undefined
+    : process.env.E2E_THREAD_PER_CORE !== "false";
 
 /**
  * Per-test handle to a spawned `aisix` binary. Each call writes a fresh
@@ -166,7 +253,7 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
   }
   const [proxyPort, adminPort, metricsPort] = await pickFreePorts(3);
   const adminKey = overrides.adminKey ?? `admin-${randomUUID()}`;
-  const etcdPrefix = `/aisix-e2e-${randomUUID()}`;
+  const etcdPrefix = overrides.etcdPrefix ?? `/aisix-e2e-${randomUUID()}`;
 
   const dir = await mkdtemp(join(tmpdir(), "aisix-e2e-"));
   let resourcesPath: string | undefined;
@@ -189,15 +276,20 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
         }),
     proxy: {
       addr: `127.0.0.1:${proxyPort}`,
-      request_body_limit_bytes: 10485760,
+      request_body_limit_bytes: overrides.requestBodyLimitBytes ?? 10485760,
       ...(overrides.realIp ? { real_ip: overrides.realIp } : {}),
+      ...(overrides.requestId ? { request_id: overrides.requestId } : {}),
+      ...((overrides.threadPerCore ?? suiteThreadPerCore) !== undefined
+        ? { thread_per_core: overrides.threadPerCore ?? suiteThreadPerCore }
+        : {}),
+      ...(overrides.urlRewrites ? { url_rewrites: overrides.urlRewrites } : {}),
     },
     admin: adminEnabled
       ? { addr: `127.0.0.1:${adminPort}`, admin_keys: [adminKey] }
       : { addr: `127.0.0.1:${adminPort}`, enabled: false },
     observability: {
       service_name: "aisix-e2e",
-      log_level: "warn",
+      log_level: overrides.logLevel ?? "warn",
       access_log: false,
       metrics: {
         prometheus: {
@@ -213,6 +305,9 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
       tracing: { otlp: { enabled: false, endpoint: "http://127.0.0.1:4317", sample_ratio: 1 } },
     },
     cache: { backend: "memory" },
+    ...(overrides.snapshotCachePath
+      ? { managed: { snapshot_cache_path: overrides.snapshotCachePath } }
+      : {}),
     ...(overrides.extra ?? {}),
   };
 
@@ -225,7 +320,7 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
   for (const [k, v] of Object.entries(process.env)) {
     if (v !== undefined && !k.startsWith("AISIX_")) childEnv[k] = v;
   }
-  childEnv.RUST_LOG = process.env.RUST_LOG ?? "warn";
+  childEnv.RUST_LOG = overrides.logLevel ?? process.env.RUST_LOG ?? "warn";
   childEnv.HTTP_PROXY = "";
   childEnv.HTTPS_PROXY = "";
   childEnv.ALL_PROXY = "";
@@ -326,9 +421,29 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
     signal(signal: NodeJS.Signals) {
       if (child.exitCode === null) child.kill(signal);
     },
+    waitForExit(timeoutMs = 10_000) {
+      // A signal-terminated child has exitCode === null and signalCode
+      // set — both mean "already exited", and the exit event will not
+      // fire again for a late listener.
+      if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+      return new Promise<void>((resolve, reject) => {
+        const onExit = () => {
+          clearTimeout(timer);
+          resolve();
+        };
+        const timer = setTimeout(() => {
+          child.off("exit", onExit);
+          reject(new Error(`aisix did not exit within ${timeoutMs}ms`));
+        }, timeoutMs);
+        child.once("exit", onExit);
+      });
+    },
     async exit() {
       await terminate(child);
       await cleanup(fileMode ? undefined : etcd, etcdPrefix, dir);
+    },
+    async stop() {
+      await terminate(child);
     },
   };
 }

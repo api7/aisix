@@ -88,12 +88,17 @@ After every `gh pr create` or force-push, spawn a fresh `general-purpose` Agent 
 
 Output HIGH/MEDIUM/LOW per finding with **concrete suggested code**, not vague "consider". **Merge gate:** every HIGH and MEDIUM is either fixed in code or explicitly justified in the PR (e.g. "feature gap, filed as #N, agreed not to block"); silent merge is not enough. For findings that surface gateway/product-behavior gaps, file separate issues and link them. Self-review misses the author's blind spots — an independent agent catches them.
 
+## PR Batching — One PR per Session by Default
+
+This repo is developed end-to-end by agents — no human reviewer needs small review units — and CodeRabbit bills and rate-limits **per PR**. Fanning one effort into many small PRs burns review quota and stalls the session on throttled bot reviews. Keep ONE open PR per session and push follow-up and related work to it as additional commits (rule and doc riders included) instead of opening another. Split only when a fix must merge independently ahead of the batch, or when the user asks for separate delivery.
+
 ## Handler Families Stay in Lockstep — Fix the Whole Class
 
 **The client-facing endpoint handlers come in families that share dispatch, auth, routing, telemetry, and guardrail logic — `/v1/chat/completions`, `/v1/messages` (+`count_tokens`), `/v1/responses`, plus embeddings/rerank/audio/images and the jobs surface (files/batches/fine-tuning). A bug or feature landed on one almost always applies to the others, and a gap on the unfixed siblings is SILENT: nothing errors, the behavior just quietly degrades.**
 
 - When you touch a per-request mechanism (a runtime metric, a limit, an auth check, a usage emission, header threading), grep the offending call/pattern across the whole crate and wire **every** sibling path in the same PR — both streaming and non-streaming branches — or state explicitly in the PR which sibling is deferred and why, and file the follow-up issue immediately.
 - "Documented follow-up" without an issue is how gaps rot: it lives in one PR description and no one ever comes back.
+- **An emit function on `Metrics` with no caller is invisible to every check we run.** Its methods are `pub`, so dead-code analysis never fires; unit tests call it directly and pass; the only symptom is a series that never appears in a scrape, which is indistinguishable from "no traffic yet". A metric family is shipped when an **e2e asserts it in `GET /metrics`** after driving real traffic — not when `Metrics` can emit it. (Twice now: `record_proxy_request` until #888, then `record_deployment_request` + `record_routing_fallback` until #972.)
 - Test coverage must include each wired endpoint, not just chat: an e2e that only drives `/v1/chat/completions` will stay green forever while Anthropic-SDK (`/v1/messages`) and Codex (`/v1/responses`) traffic silently misbehaves.
 - Prefer hoisting the shared logic into one chokepoint (e.g. `resolve_attempt_models`) so the family can't drift again.
 
@@ -120,6 +125,41 @@ This repo reads its config from etcd, but users never write etcd directly — th
 - Renames converge with `#[serde(alias = "…")]` so stored documents and existing callers keep loading through the deprecation window; never hard-rename a shipped field in one step (an unreleased field with no consumers may rename outright, as #657 did). Regenerate `schemas/resources/` afterwards (`cargo run -p aisix-core --bin dump-schema`).
 - Exactly four divergence axes are registered as intentional and allowed: reference style (names here vs UUIDs in the CP), tenancy scoping (flat here vs org/environment there), credential custody (`key_hash` in documents here vs server-generated plaintext-once there), and CP-derived fields (`cost`, `telemetry_tags`). Anything else that diverges from cp-admin.yaml is drift — the planned cross-plane contract check will fail it.
 - Why the CP spec and not this repo's schemas: the CP is spec-first behind a closed validator (its spec already is the authoritative field shape on that side), the spec renders into the customer-facing API reference, and this repo's schemas are generated from the implementation — a schema that follows the implementation cannot lead it. Naming drift has already cost real churn: #644 (the generated schema advertised `rps`/`rph` the validator rejected) and #657 (a wire-breaking rename because the field was named DP-first).
+
+## Model Kinds Stay in Lockstep — Two Identities, and the Sub-Dispatch Bypasses
+
+**A Model is one table but five kinds (`direct` / `routing` / `ensemble` / `semantic` / `embedding`, plus wildcard display-name aliases), and every request carries TWO model identities: the caller-addressed entry (may be a virtual parent) and the dispatched target. For direct models they coincide, so a mechanism built and tested against direct models silently never decides the composite case — the most-repeated silent-bug class here (#962, #1087, #1237, #1267, #786).**
+
+The five kinds are the cross-plane taxonomy (cp-admin.yaml `kind`); this repo's `model_one_of` implements four dispatch shapes, with `embedding` carried as the `embedding` block on the direct shape (`models/model.rs`). For a wildcard-served request three names are in play — the caller-minted alias, the wildcard row's `display_name`, and the concrete upstream model — and "caller-addressed entry" means the **resolved row** for the gate/metric family: inline rate-limit buckets, Prometheus metric labels, and health keys use the row's `display_name`, not the caller-minted string (#959). The `upstream_model` half is caller-minted too — `resolve_model` hands dispatch a synthetic Model whose `model_name` is the caller's substituted suffix — so a metric label taken off a resolved Model must go through `usage_attr::metric_model_label_pair`, which collapses BOTH halves to the row's configured identity. Usage-event attribution (`requested_model`) and `model_name` policy conditions intentionally keep the caller-supplied name.
+
+- When you touch a model-keyed mechanism (a limit, a guard, an ACL, a config knob, usage/metric attribution, cache keying), answer in the doc comment: does it key on the **requested** entry, the **dispatched** target, or **both**, and what is the behavior for each of the six shapes.
+- The per-target invariant (`crates/aisix-proxy/AGENTS.md`: "a per-model gate binds each target") is written around `resolve_attempt_models` — the routing-group trunk. **Ensemble panel/judge (`ProxyModelCaller::call`, the streaming judge) and semantic targets (`semantic::resolve`) bypass that trunk**, so a gate wired only into the trunk is silently absent there (the 2026-08 audit found member IP allowlist, health consumption, and retries all missing on the semantic path for exactly this reason — #958). A new per-target gate must be wired into the sub-dispatch paths too, or explicitly deferred with a filed issue. Prefer routing every dispatch through one shared chokepoint so the family can't drift.
+- **Strict writes, lenient loads.** `model_one_of` has two variants: the **strict** schema (declarative resources file, the published `schemas/resources/model.schema.json`, every strict validator consumer) forbids a knob a kind never resolves — accepted-but-unread config is the #962 class; the **lenient** loader keeps the base XOR so stored rows written by an older build still load, with `Model::strip_kind_inapplicable` dropping the dead knob and reporting it as `inapplicable:<field>` through the partial-compat channel. The two lists MUST mirror each other exactly (strict-forbidden ⇔ lenient-stripped) — a field forbidden-but-not-stripped half-honors; stripped-but-not-forbidden vanishes on load while the write path accepts it. A knob is enforced exactly as written or rejected, never half-honored (#963).
+- **`ensemble` is an experimental surface.** Its known parity gaps — member `allowed_cidrs`/guardrail/cooldown/health consumption, Prometheus token+spend attribution, response caching, parent-level generic knobs — are deliberate TODOs under a single future design pass. Do NOT piecemeal-fix one gap ahead of that pass, and do NOT re-audit them as fresh findings. (The one exception is a marshal-family or shared-chokepoint change where covering ensemble is a one-line parallel edit, e.g. projecting an entry-level field the DP already enforces.)
+- Adding a NEW kind = sweeping every existing model-keyed mechanism against it (grep the kind predicates in `models/model.rs`; every hit re-answers the questions above).
+
+## AISIX Product Terminology
+
+Use the following terms in public prose, generated API descriptions, release
+notes, and configuration comments:
+
+- **AISIX AI Gateway** is the open-source product. Use **open-source AISIX
+  gateway** when the distinction from AISIX Cloud matters; after establishing
+  the product, use **AISIX gateway** or **gateway**.
+- **AISIX Cloud** is the commercial product umbrella. **Hybrid Cloud** is its
+  API7-hosted control-plane option, and **On-Premises** is its customer-hosted
+  control-plane option. Do not present **AISIX Hybrid Cloud** or **AISIX
+  On-Premises** as separate products.
+- An AISIX gateway is a **data plane** only within AISIX Cloud architecture. Do
+  not call an independently operated open-source gateway a data plane.
+- Do not use **standalone gateway** as a product label. `standalone mode` and
+  `managed mode` remain valid when describing runtime behavior.
+- Avoid unqualified **self-hosted**. Name the component being operated, such as
+  the open-source AISIX gateway, the On-Premises control plane, or a self-hosted
+  upstream service.
+- The Dashboard is the control plane's user interface, not the whole control
+  plane. Live AI requests pass through the gateway directly and do not pass
+  through the AISIX Cloud control plane or API7.
 
 ## Documentation Lives in api7/docs
 

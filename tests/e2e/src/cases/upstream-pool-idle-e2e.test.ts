@@ -131,9 +131,20 @@ describe("upstream pool idle timeout", () => {
     expiringUpstream = await startCountingUpstream();
     holdingUpstream = await startCountingUpstream();
 
-    expiring = await spawnApp({ extra: { upstream: { pool_idle_timeout_secs: POOL_IDLE_S } } });
+    // One pool, so the connection counts below measure the idle deadline
+    // and nothing else. Under thread-per-core serving each worker keeps
+    // its own pool and the kernel decides which worker takes each
+    // connection, which would make "the second call reused the first
+    // call's connection" a question about that choice instead.
+    expiring = await spawnApp({
+      threadPerCore: false,
+      extra: { upstream: { pool_idle_timeout_secs: POOL_IDLE_S } },
+    });
     // 0 switches the knob off, leaving reqwest's own 90s pool lifetime.
-    holding = await spawnApp({ extra: { upstream: { pool_idle_timeout_secs: 0 } } });
+    holding = await spawnApp({
+      threadPerCore: false,
+      extra: { upstream: { pool_idle_timeout_secs: 0 } },
+    });
 
     await seedInto(expiring, etcd, expiringUpstream.baseUrl);
     await seedInto(holding, etcd, holdingUpstream.baseUrl);

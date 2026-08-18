@@ -11,10 +11,20 @@
 //! The type lives in its own module so `/v1/chat/completions`,
 //! `/v1/messages`, and `/v1/responses` cannot drift apart on how they
 //! classify and emit attempts.
+//!
+//! [`RoutingTelemetry::record`] is the single place an attempt is
+//! recorded, and therefore the single place the per-attempt METRICS are
+//! emitted — the `aisix_deployment_*` and `aisix_routing_*_fallbacks_total`
+//! families. Read them together with the request families rather than
+//! against them: `aisix_proxy_requests_total` samples once per client
+//! request with the status the caller saw, so a request whose first
+//! target 502'd and whose fallback succeeded is one `status="200"` sample
+//! there, one failure here, and two rows in the usage log.
 
 use std::time::Instant;
 
 use aisix_gateway::BridgeError;
+use aisix_obs::RequestOutcome;
 
 use crate::error::ProxyError;
 
@@ -49,6 +59,21 @@ pub(crate) struct AttemptRecord {
     pub error_message: String,
     /// This attempt's own wall-clock duration in ms.
     pub latency_ms: u32,
+    /// Whether this attempt actually reached the upstream.
+    ///
+    /// False for an attempt the target's own rate-limit layers refused
+    /// before dispatch, and equally for one the bridge rejected while still
+    /// assembling the request — an unusable `api_key`, a missing
+    /// `model_name`/`api_base`, a body that would not serialize (see
+    /// [`BridgeError::reached_upstream`] and `attempt_reached_upstream`,
+    /// which decide this per error variant). Neither produced an upstream
+    /// response, so both stay out of the `aisix_deployment_*_responses_total`
+    /// families an operator reads as upstream health; counting them there
+    /// reports our own misconfiguration as provider degradation. Such an
+    /// attempt is still real everywhere else — the per-attempt usage event,
+    /// and the initial/retry/fallback classification the next attempt is
+    /// measured against.
+    pub dispatched: bool,
 }
 
 /// Per-attempt telemetry accumulated while serving one request. Direct
@@ -60,9 +85,51 @@ pub(crate) struct RoutingTelemetry {
     /// Display name of the most recently attempted target — drives the
     /// initial/retry/fallback classification in [`Self::begin_attempt`].
     last_target: Option<String>,
+    /// What the CALLER asked for — the Model-Group name for a routed
+    /// request. Labels the fallback counters, which answer "how often did
+    /// THIS group have to fall back", so the group is the useful key and
+    /// the target it moved to is the second label.
+    requested_model: String,
 }
 
 impl RoutingTelemetry {
+    /// Start a request's telemetry knowing what the caller asked for.
+    /// Use in place of `default()` on the dispatch loops so the fallback
+    /// counters have a group to file under.
+    pub fn for_request(requested_model: &str) -> Self {
+        Self {
+            requested_model: requested_model.to_string(),
+            ..Self::default()
+        }
+    }
+
+    /// Record one resolved attempt: emit its per-attempt metrics, then
+    /// keep the record for the per-attempt usage events.
+    ///
+    /// THE chokepoint for everything counted per attempt. Handlers call
+    /// this instead of pushing onto `attempts` directly, so a new dispatch
+    /// path cannot land recording usage events but no metrics — which is
+    /// exactly how `aisix_deployment_*` and `aisix_routing_*_fallbacks_total`
+    /// shipped as never-emitted series (AISIX-Cloud#1299): the emit
+    /// functions existed on `Metrics` from the start and simply had no
+    /// caller.
+    pub fn record(&mut self, state: &crate::state::ProxyState, rec: AttemptRecord) {
+        if rec.dispatched {
+            state.runtime_status.record_deployment_attempt(
+                &rec.target_model_id,
+                RequestOutcome::from_status(rec.status),
+            );
+        }
+        if rec.kind == "fallback" {
+            state.metrics.record_routing_fallback(
+                rec.success,
+                &self.requested_model,
+                &rec.target_model,
+            );
+        }
+        self.attempts.push(rec);
+    }
+
     /// Classify the next attempt against `display_name` and advance the
     /// last-target tracker. Returns `(index, kind)` to stamp onto the
     /// `AttemptRecord` the caller pushes once the attempt resolves. Call
@@ -137,6 +204,7 @@ pub(crate) fn routing_error_class(err: &BridgeError) -> &'static str {
         BridgeError::Timeout { .. } => "timeout",
         BridgeError::UpstreamStatus { .. } => "upstream_status",
         BridgeError::UpstreamDecode(_) => "upstream_decode",
+        BridgeError::UpstreamInBand { .. } => "upstream_in_band",
         BridgeError::Config(_) => "config",
         BridgeError::InvalidUpstreamConfig(_) => "invalid_config",
         BridgeError::InvalidUpstreamCredentials(_) => "invalid_credentials",
@@ -203,6 +271,54 @@ pub(crate) fn attempt_error_from_proxy(err: &ProxyError) -> (String, String) {
     }
 }
 
+/// Whether a failed attempt actually reached its upstream — the
+/// `AttemptRecord::dispatched` value for the `ProxyError`-typed dispatch
+/// loops (`/v1/messages`, `/v1/responses`), mirroring
+/// [`BridgeError::reached_upstream`] for the `BridgeError`-typed one.
+///
+/// `ContentFiltered` is `true` because only the **output** hook can fire
+/// inside a dispatch call — the input hook runs once, before the loop — so
+/// the provider had already answered when we blocked it. (That attempt is
+/// therefore counted as a deployment *failure* by
+/// `RequestOutcome::from_status`, even though the upstream was healthy;
+/// that is a defect in the outcome mapping, not in this predicate, and
+/// fixing it needs the error to carry which hook fired.) Every remaining
+/// variant is a gateway-side decision — auth, ACL, budget, rate limit,
+/// unknown model — taken without contacting any provider. Exhaustive so a
+/// new variant has to declare its side of the network boundary.
+pub(crate) fn attempt_reached_upstream(err: &ProxyError) -> bool {
+    match err {
+        ProxyError::Bridge(be) => be.reached_upstream(),
+        ProxyError::ContentFiltered(_) => true,
+        ProxyError::MissingAuth
+        | ProxyError::MissingRouteAuthHeader(_)
+        | ProxyError::InvalidApiKey
+        | ProxyError::ApiKeyExpired
+        | ProxyError::ApiKeyDisabled
+        | ProxyError::JwtInvalid
+        | ProxyError::JwtExpired
+        | ProxyError::JwtClaimsRejected
+        | ProxyError::JwtInsufficientScope { .. }
+        | ProxyError::JwtIdentityUnmapped
+        | ProxyError::JwksUnavailable
+        | ProxyError::ModelNotFound(_)
+        | ProxyError::VideoNotFound(_)
+        | ProxyError::ModelForbidden(_)
+        | ProxyError::ModelIpRestricted(_)
+        | ProxyError::RouteIpRestricted(_)
+        | ProxyError::RouteForbidden(_)
+        | ProxyError::Gone(_)
+        | ProxyError::InvalidRequest(_)
+        | ProxyError::WebSocketUpgradeRequired { .. }
+        | ProxyError::ProviderUnavailable
+        | ProxyError::AllCandidatesUnavailable { .. }
+        | ProxyError::BudgetExceeded(_)
+        | ProxyError::RequestTooLarge { .. }
+        | ProxyError::RateLimit(_)
+        | ProxyError::PolicyRateLimit { .. } => false,
+    }
+}
+
 /// Milliseconds elapsed since `started`, saturating at `u32::MAX`.
 pub(crate) fn ms_since(started: Instant) -> u32 {
     started.elapsed().as_millis().min(u32::MAX as u128) as u32
@@ -212,6 +328,62 @@ pub(crate) fn ms_since(started: Instant) -> u32 {
 mod tests {
     use super::*;
     use aisix_gateway::{UpstreamWire, MAX_UPSTREAM_ERROR_MESSAGE_BYTES};
+
+    /// The `aisix_deployment_*` families read as upstream health, so an
+    /// error raised while the request was still being assembled has to stay
+    /// out of them. Both matches are exhaustive, so a NEW variant is already
+    /// a compile error; this pins the classification of the existing ones,
+    /// which is what a well-meaning refactor would silently flip.
+    #[test]
+    fn only_errors_that_reached_the_provider_count_as_upstream_attempts() {
+        for err in [
+            BridgeError::Config("serialize request body: eof".into()),
+            BridgeError::InvalidUpstreamConfig("model.model_name missing".into()),
+            BridgeError::InvalidUpstreamCredentials("provider_key.api_key is empty".into()),
+        ] {
+            assert!(
+                !err.reached_upstream(),
+                "{err} is raised before the request is sent"
+            );
+            assert!(!attempt_reached_upstream(&ProxyError::Bridge(err)));
+        }
+
+        // A timeout or a refused connection IS upstream health: we tried to
+        // reach the provider and could not. Excluding these would hide the
+        // outage the family exists to show.
+        for err in [
+            BridgeError::Timeout {
+                elapsed_ms: 7167,
+                cause: String::new(),
+            },
+            BridgeError::Transport("connection refused".into()),
+            BridgeError::upstream_status(502, "bad gateway"),
+            BridgeError::UpstreamDecode("unparseable body".into()),
+            BridgeError::UpstreamInBand {
+                status: Some(500),
+                message: "overloaded".into(),
+                parsed: None,
+                wire: UpstreamWire::Unknown,
+            },
+            BridgeError::StreamAborted,
+        ] {
+            assert!(
+                err.reached_upstream(),
+                "{err} means the provider was contacted"
+            );
+            assert!(attempt_reached_upstream(&ProxyError::Bridge(err)));
+        }
+
+        // Only the output hook can fire inside a dispatch call, so the
+        // provider had already answered — the attempt did reach it.
+        assert!(attempt_reached_upstream(&ProxyError::ContentFiltered(
+            "blocked by response guardrail".into()
+        )));
+        // Gateway-side refusals never contacted anyone.
+        assert!(!attempt_reached_upstream(&ProxyError::ModelNotFound(
+            "nope".into()
+        )));
+    }
 
     /// AISIX-Cloud#1093: the access log is the one line an operator gets
     /// per request, so EVERY failure has to name itself there — including

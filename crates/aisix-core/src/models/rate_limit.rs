@@ -14,7 +14,6 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
 pub struct RateLimit {
     /// Tokens per 60-second window.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -65,7 +64,6 @@ impl RateLimit {
 /// consumed — the shape leaves `tpm`/`tpd` out rather than accepting a knob
 /// that is silently inert.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
 pub struct McpRateLimit {
     /// Tool calls per 1-second window.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -134,8 +132,11 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_fields() {
-        let r: Result<RateLimit, _> = serde_json::from_str(r#"{"rpm": 10, "extra": 1}"#);
-        assert!(r.is_err());
+    fn tolerates_unknown_fields_for_forward_compat() {
+        // cp-api may ship new fields ahead of the DP rolling out; serde must
+        // accept them (the write path still rejects them via the strict
+        // schema validators in models/schema.rs).
+        let rl: RateLimit = serde_json::from_str(r#"{"rpm": 10, "extra": 1}"#).unwrap();
+        assert_eq!(rl.rpm, Some(10));
     }
 }

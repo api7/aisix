@@ -33,14 +33,14 @@ use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
-use aisix_core::models::{BoundClaimExpect, OidcProvider};
+use aisix_core::models::{BoundClaimExpect, ClaimMapping, ClaimMatch, ClaimMatchOp, OidcProvider};
 use aisix_core::resource::ResourceEntry;
 use aisix_core::{AisixSnapshot, ApiKey};
 use base64::Engine;
 use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation};
 
-use crate::auth::AuthenticatedKey;
+use crate::auth::{AuthenticatedKey, JwtIdentity};
 use crate::error::ProxyError;
 use crate::state::ProxyState;
 
@@ -96,17 +96,25 @@ pub(crate) fn looks_like_jwt(token: &str) -> bool {
     if token.len() > MAX_JWT_BYTES {
         return false;
     }
-    let parts: Vec<&str> = token.splitn(4, '.').collect();
-    if parts.len() != 3 || parts.iter().any(|p| p.is_empty()) {
+    // Exactly three non-empty segments — checked on the iterator so the
+    // per-request path allocates nothing.
+    let mut parts = token.splitn(4, '.');
+    let (Some(header), Some(payload), Some(sig), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    if header.is_empty() || payload.is_empty() || sig.is_empty() {
         return false;
     }
-    matches!(b64url_json(parts[0]), Some(v) if v.get("alg").is_some())
+    matches!(b64url_json(header), Some(v) if v.get("alg").is_some())
 }
 
 /// True when the snapshot has at least one enabled trust provider — the
-/// gate for entering the JWT path at all.
+/// gate for entering the JWT path at all. O(1) on deployments with no
+/// providers configured (the common case).
 pub(crate) fn any_enabled_provider(snapshot: &AisixSnapshot) -> bool {
-    snapshot.oidc_providers.any(|e| e.value.enabled)
+    !snapshot.oidc_providers.is_empty() && snapshot.oidc_providers.any(|e| e.value.enabled)
 }
 
 fn b64url_json(segment: &str) -> Option<serde_json::Value> {
@@ -152,32 +160,78 @@ fn provider_for_issuer(
     found
 }
 
-/// The API key bound to `subject` **as asserted by `provider_name`**. A
-/// key whose `jwt_provider` names a different trust provider is never a
-/// candidate: subjects are namespaced by the provider that vouched for
-/// them, so a second trusted provider cannot mint a token impersonating
-/// the first provider's identity of the same name. Fails closed on
-/// ambiguity for the same reason as [`provider_for_issuer`] — the CP
-/// enforces `(jwt_provider, jwt_subject)` uniqueness and the file loader
-/// rejects duplicates, so this only guards a transient race.
+/// The API key bound to `subject` **as asserted by `provider_name`**,
+/// plus whether the binding was ambiguous. A key whose `jwt_provider`
+/// names a different trust provider is never a candidate: subjects are
+/// namespaced by the provider that vouched for them, so a second
+/// trusted provider cannot mint a token impersonating the first
+/// provider's identity of the same name. Ambiguity (two keys sharing
+/// one binding) is surfaced to the caller so it can fail closed rather
+/// than fall through to the claim mappings — the CP enforces
+/// `(jwt_provider, jwt_subject)` uniqueness and the file loader rejects
+/// duplicates, so this only guards a transient race.
 fn key_for_subject(
     snapshot: &AisixSnapshot,
     provider_name: &str,
     subject: &str,
-) -> Option<Arc<ResourceEntry<ApiKey>>> {
+) -> (Option<Arc<ResourceEntry<ApiKey>>>, bool) {
     let (found, ambiguous) = snapshot.apikeys.find_unique_by(|e| {
         e.value.jwt_subject.as_deref() == Some(subject)
             && e.value.jwt_provider.as_deref() == Some(provider_name)
     });
-    if ambiguous {
-        tracing::warn!(
-            target: "aisix::auth",
-            provider = %clip(provider_name),
-            "two API keys share one jwt binding; failing closed — the identity \
-             is ambiguous and neither key's limits can be applied",
-        );
+    // Ambiguity is not logged here: the caller's `deny` site carries the
+    // full request context (issuer, subject, route, source ip) in one line.
+    (found, ambiguous)
+}
+
+/// The highest-priority enabled claim mapping for `provider_name` whose
+/// conditions all hold against the verified claims. Candidates are
+/// ordered by `(priority, name, id)` — a total order, so evaluation is
+/// deterministic across replicas and across snapshot updates even if a
+/// control-plane bug ever produced duplicate names — and the same token
+/// always resolves the same mapping.
+fn matching_claim_mapping(
+    snapshot: &AisixSnapshot,
+    provider_name: &str,
+    claims: &serde_json::Value,
+) -> Option<Arc<ResourceEntry<ClaimMapping>>> {
+    let mut candidates: Vec<_> = snapshot
+        .claim_mappings
+        .entries()
+        .into_iter()
+        .filter(|e| e.value.enabled && e.value.jwt_provider == provider_name)
+        .collect();
+    candidates.sort_by(|a, b| {
+        (a.value.priority, a.value.name.as_str(), a.id.as_str()).cmp(&(
+            b.value.priority,
+            b.value.name.as_str(),
+            b.id.as_str(),
+        ))
+    });
+    candidates
+        .into_iter()
+        .find(|e| e.value.match_.iter().all(|m| claim_match_holds(claims, m)))
+}
+
+/// Whether one claim condition holds. A missing claim, or a claim whose
+/// JSON type does not fit the operator, never matches (default deny):
+/// `exact` requires a string claim equal to one of the accepted values,
+/// `contains` an array of strings containing one of them.
+fn claim_match_holds(claims: &serde_json::Value, m: &ClaimMatch) -> bool {
+    let Some(actual) = nested_claim(claims, &m.claim) else {
+        return false;
+    };
+    match m.op {
+        ClaimMatchOp::Exact => actual
+            .as_str()
+            .is_some_and(|s| m.values.iter().any(|v| v == s)),
+        ClaimMatchOp::Contains => actual.as_array().is_some_and(|items| {
+            items
+                .iter()
+                .filter_map(|v| v.as_str())
+                .any(|s| m.values.iter().any(|v| v == s))
+        }),
     }
-    found
 }
 
 /// Authenticate a JWT-shaped bearer. Called from the auth choke point
@@ -188,14 +242,18 @@ pub(crate) async fn authenticate_jwt(
     state: &ProxyState,
     snapshot: &AisixSnapshot,
     token: &str,
+    ctx: crate::auth::DenialContext<'_>,
 ) -> Result<AuthenticatedKey, ProxyError> {
+    let d = Denier { state, ctx };
     let header = match jsonwebtoken::decode_header(token) {
         Ok(h) => h,
         Err(_) => {
             return Err(deny(
-                state,
+                d,
                 "jwt_malformed",
                 "",
+                None,
+                None,
                 None,
                 ProxyError::JwtInvalid,
             ))
@@ -205,20 +263,24 @@ pub(crate) async fn authenticate_jwt(
 
     let Some(iss) = unverified_issuer(token) else {
         return Err(deny(
-            state,
+            d,
             "jwt_missing_issuer",
             "",
             kid.as_deref(),
+            None,
+            None,
             ProxyError::JwtInvalid,
         ));
     };
 
     let Some(provider) = provider_for_issuer(snapshot, &iss) else {
         return Err(deny(
-            state,
+            d,
             "jwt_untrusted_issuer",
             &iss,
             kid.as_deref(),
+            None,
+            None,
             ProxyError::JwtInvalid,
         ));
     };
@@ -226,10 +288,12 @@ pub(crate) async fn authenticate_jwt(
 
     if !ALLOWED_ALGS.contains(&header.alg) {
         return Err(deny(
-            state,
+            d,
             "jwt_alg_not_allowed",
             &iss,
             kid.as_deref(),
+            None,
+            None,
             ProxyError::JwtInvalid,
         ));
     }
@@ -246,10 +310,12 @@ pub(crate) async fn authenticate_jwt(
                 "cannot resolve the trust provider's JWKS endpoint",
             );
             return Err(deny(
-                state,
+                d,
                 "jwks_unavailable",
                 &iss,
                 kid.as_deref(),
+                None,
+                None,
                 ProxyError::JwksUnavailable,
             ));
         }
@@ -265,10 +331,12 @@ pub(crate) async fn authenticate_jwt(
                 "cannot fetch the trust provider's JWKS",
             );
             return Err(deny(
-                state,
+                d,
                 "jwks_unavailable",
                 &iss,
                 kid.as_deref(),
+                None,
+                None,
                 ProxyError::JwksUnavailable,
             ));
         }
@@ -284,10 +352,12 @@ pub(crate) async fn authenticate_jwt(
     }
     if candidates.is_empty() {
         return Err(deny(
-            state,
+            d,
             "jwt_unknown_kid",
             &iss,
             kid.as_deref(),
+            None,
+            None,
             ProxyError::JwtInvalid,
         ));
     }
@@ -295,7 +365,7 @@ pub(crate) async fn authenticate_jwt(
     // ── Signature + registered claims ────────────────────────────────
     let claims = match validate_with_keys(token, header.alg, prov, &candidates) {
         Ok(c) => c,
-        Err((reason, err)) => return Err(deny(state, reason, &iss, kid.as_deref(), err)),
+        Err((reason, err)) => return Err(deny(d, reason, &iss, kid.as_deref(), None, None, err)),
     };
 
     // ── Provider claim requirements ──────────────────────────────────
@@ -305,52 +375,97 @@ pub(crate) async fn authenticate_jwt(
     // same 403 on the wire.
     if let Err(rejection) = check_provider_claims(&claims, prov) {
         let (reason, err) = claims_rejection_error(rejection, prov);
-        return Err(deny(state, reason, &iss, kid.as_deref(), err));
+        return Err(deny(d, reason, &iss, kid.as_deref(), None, None, err));
     }
 
     // ── Identity mapping ─────────────────────────────────────────────
     let Some(subject) = nested_claim(&claims, &prov.identity_claim).and_then(|v| v.as_str()) else {
         return Err(deny(
-            state,
+            d,
             "jwt_identity_claim_missing",
             &iss,
             kid.as_deref(),
+            None,
+            None,
             ProxyError::JwtIdentityUnmapped,
         ));
     };
 
-    let Some(entry) = key_for_subject(snapshot, &prov.name, subject) else {
-        tracing::warn!(
-            target: "aisix::auth",
-            method = "jwt",
-            reason = "jwt_identity_unmapped",
-            provider = %clip(&prov.name),
-            issuer = %clip(&iss),
-            subject = ?clip(subject),
-            "rejected inbound JWT: no API key binds this identity to this provider",
-        );
-        state
-            .metrics
-            .record_auth_decision("jwt", false, "jwt_identity_unmapped");
-        return Err(ProxyError::JwtIdentityUnmapped);
+    // The direct `(jwt_provider, jwt_subject)` key binding is
+    // authoritative for its subject — including its disabled/expired
+    // lifecycle. Claim mappings only admit identities no key binds
+    // explicitly, so adding a mapping can never reroute (or re-enable)
+    // an identity an operator pinned to a specific key. An AMBIGUOUS
+    // binding fails closed here for the same reason: the subject *is*
+    // bound, just not resolvably, and letting it fall through to the
+    // mappings would hand a mis-provisioned identity whatever a rule
+    // grants.
+    let (bound, ambiguous) = key_for_subject(snapshot, &prov.name, subject);
+    if ambiguous {
+        return Err(deny(
+            d,
+            "jwt_binding_ambiguous",
+            &iss,
+            kid.as_deref(),
+            Some(subject),
+            None,
+            ProxyError::JwtIdentityUnmapped,
+        ));
+    }
+    let (entry, claim_mapping) = match bound {
+        Some(entry) => (entry, None),
+        None => match matching_claim_mapping(snapshot, &prov.name, &claims) {
+            Some(mapping) => {
+                let Some(entry) = snapshot
+                    .apikeys
+                    .get_by_id(&mapping.value.resolve.api_key_id)
+                else {
+                    return Err(deny(
+                        d,
+                        "claim_mapping_target_missing",
+                        &iss,
+                        kid.as_deref(),
+                        Some(subject),
+                        Some(&mapping.value.name),
+                        ProxyError::JwtIdentityUnmapped,
+                    ));
+                };
+                (entry, Some(mapping.value.name.clone()))
+            }
+            None => {
+                return Err(deny(
+                    d,
+                    "jwt_identity_unmapped",
+                    &iss,
+                    kid.as_deref(),
+                    Some(subject),
+                    None,
+                    ProxyError::JwtIdentityUnmapped,
+                ));
+            }
+        },
     };
 
     // Same lifecycle enforcement as the API-key path (#933).
     if entry.value.disabled {
         return Err(deny(
-            state,
+            d,
             "key_disabled",
             &iss,
             kid.as_deref(),
+            None,
+            None,
             ProxyError::ApiKeyDisabled,
         ));
     }
     if entry.value.is_expired_at(chrono::Utc::now()) {
         return Err(deny(
-            state,
+            d,
             "key_expired",
             &iss,
             kid.as_deref(),
+            None,
+            None,
             ProxyError::ApiKeyExpired,
         ));
     }
@@ -363,9 +478,17 @@ pub(crate) async fn authenticate_jwt(
         issuer = %iss,
         subject = %subject,
         api_key_id = %entry.id,
+        claim_mapping = ?claim_mapping,
         "jwt authentication succeeded",
     );
-    Ok(AuthenticatedKey { entry })
+    Ok(AuthenticatedKey {
+        entry,
+        jwt: Some(Arc::new(JwtIdentity {
+            subject: subject.to_string(),
+            provider: prov.name.clone(),
+            claim_mapping,
+        })),
+    })
 }
 
 /// Cap on attacker-controlled token metadata reproduced in the decision
@@ -392,12 +515,15 @@ fn clip(s: &str) -> &str {
 /// provider has matched, a denial names a real configured issuer and is
 /// worth a `warn`.
 fn deny(
-    state: &ProxyState,
+    d: Denier<'_>,
     reason: &'static str,
     issuer: &str,
     kid: Option<&str>,
+    subject: Option<&str>,
+    claim_mapping: Option<&str>,
     err: ProxyError,
 ) -> ProxyError {
+    let Denier { state, ctx } = d;
     state.metrics.record_auth_decision("jwt", false, reason);
     let pre_match = matches!(
         reason,
@@ -410,6 +536,10 @@ fn deny(
             reason = %reason,
             issuer = ?clip(issuer),
             kid = ?clip(kid.unwrap_or("")),
+            http_method = %ctx.method,
+            path = %ctx.path,
+            request_id = %ctx.request_id,
+            source_ip = %ctx.source_ip.resolve(),
             "rejected inbound JWT (pre-verification)",
         );
     } else {
@@ -419,10 +549,24 @@ fn deny(
             reason = %reason,
             issuer = ?clip(issuer),
             kid = ?clip(kid.unwrap_or("")),
+            subject = ?subject.map(clip),
+            claim_mapping = ?claim_mapping.map(clip),
+            http_method = %ctx.method,
+            path = %ctx.path,
+            request_id = %ctx.request_id,
+            source_ip = %ctx.source_ip.resolve(),
             "rejected inbound JWT",
         );
     }
     err
+}
+
+/// `state` + the request context every JWT denial line carries, bundled so
+/// the twelve `deny` sites stay one argument wide.
+#[derive(Clone, Copy)]
+struct Denier<'a> {
+    state: &'a ProxyState,
+    ctx: crate::auth::DenialContext<'a>,
 }
 
 /// Verify signature + registered claims against each candidate key.
@@ -1326,24 +1470,39 @@ jyxumGxNpoIV8LlzsMsaWQ==
         // the cross-provider impersonation guard (audit H1).
         mk_key("k-5", Some("agent-1"), Some("partner"));
         assert_eq!(
-            key_for_subject(&snapshot, "corp", "agent-1").unwrap().id,
+            key_for_subject(&snapshot, "corp", "agent-1").0.unwrap().id,
             "k-1"
         );
         assert_eq!(
-            key_for_subject(&snapshot, "corp", "agent-2").unwrap().id,
+            key_for_subject(&snapshot, "corp", "agent-2").0.unwrap().id,
             "k-3"
         );
         assert_eq!(
-            key_for_subject(&snapshot, "partner", "agent-1").unwrap().id,
+            key_for_subject(&snapshot, "partner", "agent-1")
+                .0
+                .unwrap()
+                .id,
             "k-5"
         );
-        // No provider match -> no key, even though the subject exists.
-        assert!(key_for_subject(&snapshot, "unknown", "agent-1").is_none());
-        assert!(key_for_subject(&snapshot, "corp", "agent-9").is_none());
+        // No provider match -> no key, even though the subject exists —
+        // and no ambiguity signal either.
+        assert!(matches!(
+            key_for_subject(&snapshot, "unknown", "agent-1"),
+            (None, false)
+        ));
+        assert!(matches!(
+            key_for_subject(&snapshot, "corp", "agent-9"),
+            (None, false)
+        ));
 
-        // A duplicate (provider, subject) pair -> fail closed.
+        // A duplicate (provider, subject) pair -> fail closed, and the
+        // ambiguity is REPORTED so the auth path can reject instead of
+        // falling through to the claim mappings.
         mk_key("k-1-dup", Some("agent-1"), Some("corp"));
-        assert!(key_for_subject(&snapshot, "corp", "agent-1").is_none());
+        assert!(matches!(
+            key_for_subject(&snapshot, "corp", "agent-1"),
+            (None, true)
+        ));
     }
 
     #[test]
@@ -1394,5 +1553,169 @@ jyxumGxNpoIV8LlzsMsaWQ==
             Some("https://idp.test/realms/agents")
         );
         assert!(unverified_issuer("sk-abc").is_none());
+    }
+
+    fn mapping(json: serde_json::Value) -> ClaimMapping {
+        serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn claim_match_ops_are_strictly_typed() {
+        let claims = serde_json::json!({
+            "department": "finance",
+            "groups": ["dev", "mcp-admin", 42],
+            "realm_access": {"roles": ["agent"]},
+            "count": 7,
+        });
+        let m = |claim: &str, op: &str, values: serde_json::Value| -> ClaimMatch {
+            serde_json::from_value(serde_json::json!({
+                "claim": claim, "op": op, "values": values
+            }))
+            .unwrap()
+        };
+
+        // exact: string equality against any accepted value.
+        assert!(claim_match_holds(
+            &claims,
+            &m("department", "exact", serde_json::json!(["hr", "finance"]))
+        ));
+        assert!(!claim_match_holds(
+            &claims,
+            &m("department", "exact", serde_json::json!(["hr"]))
+        ));
+        // exact never matches an array claim, even one containing the value.
+        assert!(!claim_match_holds(
+            &claims,
+            &m("groups", "exact", serde_json::json!(["mcp-admin"]))
+        ));
+
+        // contains: array membership; non-string items are ignored.
+        assert!(claim_match_holds(
+            &claims,
+            &m("groups", "contains", serde_json::json!(["mcp-admin"]))
+        ));
+        assert!(!claim_match_holds(
+            &claims,
+            &m("groups", "contains", serde_json::json!(["ops"]))
+        ));
+        // contains never matches a string claim.
+        assert!(!claim_match_holds(
+            &claims,
+            &m("department", "contains", serde_json::json!(["finance"]))
+        ));
+
+        // Dots traverse nested objects, as everywhere else in JWT config.
+        assert!(claim_match_holds(
+            &claims,
+            &m(
+                "realm_access.roles",
+                "contains",
+                serde_json::json!(["agent"])
+            )
+        ));
+
+        // Missing claims and non-string/array shapes never match.
+        assert!(!claim_match_holds(
+            &claims,
+            &m("missing", "exact", serde_json::json!(["x"]))
+        ));
+        assert!(!claim_match_holds(
+            &claims,
+            &m("count", "exact", serde_json::json!(["7"]))
+        ));
+    }
+
+    #[test]
+    fn mapping_selection_is_priority_ordered_and_provider_scoped() {
+        let snapshot = AisixSnapshot::new();
+        let mk = |id: &str, m: serde_json::Value| {
+            snapshot
+                .claim_mappings
+                .insert(ResourceEntry::new(id, mapping(m), 1));
+        };
+        // Both match `department=finance`; the lower priority value wins.
+        mk(
+            "cm-broad",
+            serde_json::json!({
+                "name": "broad", "jwt_provider": "corp", "priority": 200,
+                "match": [{"claim": "department", "op": "exact", "values": ["finance"]}],
+                "resolve": {"api_key_id": "k-broad"},
+            }),
+        );
+        mk(
+            "cm-narrow",
+            serde_json::json!({
+                "name": "narrow", "jwt_provider": "corp", "priority": 100,
+                "match": [{"claim": "department", "op": "exact", "values": ["finance"]}],
+                "resolve": {"api_key_id": "k-narrow"},
+            }),
+        );
+        // Same priority as `narrow` but later in name order — the tie
+        // break is deterministic, never insertion order.
+        mk(
+            "cm-tie",
+            serde_json::json!({
+                "name": "zz-tie", "jwt_provider": "corp", "priority": 100,
+                "match": [{"claim": "department", "op": "exact", "values": ["finance"]}],
+                "resolve": {"api_key_id": "k-tie"},
+            }),
+        );
+        // Would win on priority, but is disabled.
+        mk(
+            "cm-off",
+            serde_json::json!({
+                "name": "off", "jwt_provider": "corp", "priority": 1, "enabled": false,
+                "match": [{"claim": "department", "op": "exact", "values": ["finance"]}],
+                "resolve": {"api_key_id": "k-off"},
+            }),
+        );
+        // Would win on priority, but belongs to another provider.
+        mk(
+            "cm-partner",
+            serde_json::json!({
+                "name": "partner-rule", "jwt_provider": "partner", "priority": 1,
+                "match": [{"claim": "department", "op": "exact", "values": ["finance"]}],
+                "resolve": {"api_key_id": "k-partner"},
+            }),
+        );
+
+        let claims = serde_json::json!({"department": "finance"});
+        assert_eq!(
+            matching_claim_mapping(&snapshot, "corp", &claims)
+                .unwrap()
+                .id,
+            "cm-narrow"
+        );
+        assert_eq!(
+            matching_claim_mapping(&snapshot, "partner", &claims)
+                .unwrap()
+                .id,
+            "cm-partner"
+        );
+        // Every condition must hold: a rule with one unmet condition is
+        // skipped even at the best priority.
+        let missing = serde_json::json!({"department": "hr"});
+        assert!(matching_claim_mapping(&snapshot, "corp", &missing).is_none());
+    }
+
+    #[test]
+    fn mapping_conditions_are_conjunctive() {
+        let snapshot = AisixSnapshot::new();
+        snapshot.claim_mappings.insert(ResourceEntry::new(
+            "cm-and",
+            mapping(serde_json::json!({
+                "name": "and-rule", "jwt_provider": "corp",
+                "match": [
+                    {"claim": "department", "op": "exact", "values": ["finance"]},
+                    {"claim": "groups", "op": "contains", "values": ["mcp-admin"]},
+                ],
+                "resolve": {"api_key_id": "k-and"},
+            })),
+            1,
+        ));
+        let both = serde_json::json!({"department": "finance", "groups": ["mcp-admin"]});
+        let one = serde_json::json!({"department": "finance", "groups": ["dev"]});
+        assert!(matching_claim_mapping(&snapshot, "corp", &both).is_some());
+        assert!(matching_claim_mapping(&snapshot, "corp", &one).is_none());
     }
 }

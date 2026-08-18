@@ -50,6 +50,25 @@
       },
       "type": "object"
     },
+    "ProviderKeyTls": {
+      "additionalProperties": false,
+      "description": "TLS settings for connections to one Provider Key's `api_base`.\n\nUse this when a single upstream endpoint needs trust settings that differ from the gateway's deployment-wide ones — typically a self-hosted model endpoint whose certificate is signed by a private certificate authority.\n\nThe certificate is supplied inline rather than as a file path, because the endpoint is declared here rather than in the gateway's own configuration file. For a certificate authority that applies to every upstream, prefer the gateway's `upstream.tls.ca_file` setting.",
+      "properties": {
+        "ca_cert": {
+          "description": "PEM-encoded certificate authority certificates trusted as issuers for this endpoint, in addition to the gateway's default trust store. A bundle containing several certificates is accepted.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "verify": {
+          "default": true,
+          "description": "Whether the endpoint's certificate is verified. Setting this to `false` accepts any certificate, including one presented by an intercepting party, and is intended only for test environments.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
     "RequestOverrides": {
       "additionalProperties": false,
       "description": "Per-`ProviderKey` request-shape overrides. Use these fields to rename request body parameters, clamp supported numeric parameters, add fallback outbound headers, or add fallback outbound body fields.",
@@ -230,7 +249,7 @@
       ]
     },
     "api_key": {
-      "description": "Upstream provider's API key. The data plane receives plaintext so it can authenticate to the upstream provider. Protect the configuration store and transport accordingly.",
+      "description": "Upstream provider's API key. The gateway receives plaintext so it can authenticate to the upstream provider. Protect the configuration store and transport accordingly.",
       "minLength": 1,
       "type": "string"
     },
@@ -294,6 +313,17 @@
         "featured": false
       },
       "description": "Telemetry tags carried alongside the key for metric and log emission."
+    },
+    "tls": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ProviderKeyTls"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "TLS settings for connections to this key's `api_base`. Omit to use the gateway's deployment-wide trust settings."
     }
   },
   "required": [

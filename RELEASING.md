@@ -1,8 +1,9 @@
 # Releasing
 
-How an AISIX data-plane release is cut. Order matters: downstream packaging
-(AISIX Cloud and the self-hosted bundle) pins the exact data-plane image
-version, so the data plane is always tagged and published **first**.
+How an AISIX AI Gateway release is cut. Order matters: downstream packaging
+(AISIX Cloud and the On-Premises package, whose artifact name is
+`aisix-self-hosted`) pins the exact gateway image version, so the gateway is
+always tagged and published **first**.
 
 ## 1. Tag
 
@@ -22,9 +23,30 @@ Pushing the tag triggers two workflows:
 - **`release-draft.yml`** creates a **draft** GitHub Release for the tag. The
   draft already leads with a version-stamped **Get started + Download** header
   (from [`.github/release-notes-header.md`](.github/release-notes-header.md):
-  docs, self-hosted quickstart, and the `docker pull` command), then a commented
+  docs, gateway quickstart, and the `docker pull` command), then a commented
   curated-notes scaffold to fill in, then GitHub's auto-generated **What's
   Changed** list as a starting skeleton.
+
+### PGO is mandatory and fail-closed
+
+Published images are profile-guided-optimized (#967): the Docker build
+compiles an instrumented gateway, drives the committed training matrix
+(`bench/pgo-training/`) against it, and rebuilds with the merged profile.
+Any phase failing — instrumented build, training, profile merge, optimized
+build — fails the image build; there is no fallback to a plain build. After
+the push, the workflow asserts the `pgo-verified.json` proof marker inside
+the image (shape count, profile size) before signing. If a release build
+fails in a PGO phase, fix the cause; never ship around it. To inspect a
+shipped image's marker:
+
+```bash
+docker run --rm --entrypoint cat ghcr.io/api7/aisix:X.Y.Z \
+  /usr/local/share/aisix/pgo-verified.json
+```
+
+Local note: each retrained profile is content-addressed, so repeated local
+PGO builds accumulate build artifacts in the persistent BuildKit cache
+mounts; reclaim with `docker builder prune`.
 
 ## 2. Polish the release notes
 
@@ -59,5 +81,6 @@ version for patch releases.
 ## 4. Downstream
 
 Only after the images are published, downstream release flows (AISIX Cloud /
-the self-hosted package) may tag the same `vX.Y.Z` — their packaging pulls
+the On-Premises package named `aisix-self-hosted`) may tag the same `vX.Y.Z` —
+their packaging pulls
 `docker.io/api7/aisix:X.Y.Z` and fails if it does not exist yet.

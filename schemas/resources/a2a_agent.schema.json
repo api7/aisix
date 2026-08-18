@@ -1,6 +1,54 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "auth_type": {
+            "const": "bearer"
+          }
+        },
+        "required": [
+          "auth_type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "secret": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "secret"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "auth_type": {
+            "const": "api_key"
+          }
+        },
+        "required": [
+          "auth_type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "secret": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "secret"
+        ]
+      }
+    }
+  ],
   "anyOf": [
     {
       "required": [
@@ -80,6 +128,7 @@
     "display_name": {
       "description": "Accepted as an alternative spelling of `name`. Provide the label under exactly one of the two names.",
       "minLength": 1,
+      "pattern": "^[^/?#%\\s\\x00-\\x1f\\x7f-]+$",
       "type": "string"
     },
     "enabled": {
@@ -88,8 +137,9 @@
       "type": "boolean"
     },
     "name": {
-      "description": "Operator-facing label, unique within the gateway. It is the path segment under which the agent is exposed to callers as `/a2a/<name>`, so it must be a single non-empty URL path segment.",
+      "description": "Operator-facing label, unique within the gateway. It is the path segment under which the agent is exposed to callers as `/a2a/<name>`, so it must be a single non-empty URL path segment. The name is interpolated into the advertised agent-card URL without percent-encoding, so `/`, `?`, `#`, `%` and whitespace are rejected: `a?b` would advertise a URL whose path is just `/a2a/a`, and the lookup is an exact match on the stored name.",
       "minLength": 1,
+      "pattern": "^[^/?#%\\s\\x00-\\x1f\\x7f-]+$",
       "type": "string"
     },
     "protocol_version": {
@@ -99,7 +149,7 @@
         }
       ],
       "default": "1.0",
-      "description": "The A2A wire-format version AISIX uses for this agent. AISIX pins the version explicitly so the served agent card and accepted requests stay consistent."
+      "description": "The A2A wire-format version this agent speaks. AISIX announces it to the agent in the `A2A-Version` header on every request, so it must match what the agent actually serves: an agent reads an absent or mismatched version as a protocol error and rejects the call."
     },
     "secret": {
       "description": "Credential AISIX uses to authenticate to the upstream agent. For `bearer`, AISIX sends it as `Authorization: Bearer <secret>`; for `api_key`, AISIX sends it as `x-api-key: <secret>`. Leave unset for `none`.",
@@ -118,7 +168,7 @@
       ]
     },
     "url": {
-      "description": "The upstream agent's base URL, such as `https://agents.example.com/a2a`. AISIX reaches this URL over HTTP with the A2A JSON-RPC 2.0 protocol and discovers the agent card relative to it.",
+      "description": "The upstream agent's A2A service endpoint, such as `https://agents.example.com/a2a`, where AISIX sends JSON-RPC 2.0 requests over HTTP. AISIX looks for the agent card at the well-known path under this URL's own path first, then under its origin, so both an agent that owns its domain and one published under a path prefix are reachable without extra configuration.",
       "minLength": 1,
       "type": "string"
     }

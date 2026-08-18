@@ -10,7 +10,7 @@ etcd:
   dial_timeout_ms: 5000
   request_timeout_ms: 5000
   # Optional TLS / mTLS bundle. Required when connecting to an
-  # aisix.cloud DP Manager (endpoint is https:// and the CP issues
+  # AISIX Cloud Data Plane Manager (endpoint is https:// and the control plane issues
   # a client cert via IssueAIDataplaneCertificate). Uncomment and
   # point to your mTLS bundle.
   # tls:
@@ -33,7 +33,13 @@ etcd:
 
 proxy:
   addr: "0.0.0.0:3000"
-  request_body_limit_bytes: 10485760   # 10 MiB
+  # Cap on inbound request bodies (JSON, multipart, passthrough, MCP,
+  # A2A). 0 — the default — disables the cap: providers accept larger
+  # requests than any fixed gateway default (Anthropic takes 32 MB), so
+  # a gateway-side cap rejects requests the upstream would have served.
+  # Set a value to bound per-request memory; over-limit requests get a
+  # 413 in the caller's error envelope.
+  # request_body_limit_bytes: 0
   # tls:
   #   cert_file: "/etc/aisix/tls/proxy.crt"
   #   key_file:  "/etc/aisix/tls/proxy.key"
@@ -41,11 +47,61 @@ proxy:
   # set_real_ip_from + real_ip_recursive parity. Default trusts nothing
   # and logs the immediate TCP peer; configure trusted_proxies when the
   # gateway sits behind an L7 LB / ingress that sets x-forwarded-for.
+  # Env-only deployments set the CIDR list comma-separated:
+  # AISIX_PROXY__REAL_IP__TRUSTED_PROXIES=10.0.0.0/8,127.0.0.1/32
   # real_ip:
   #   trusted_proxies: ["10.0.0.0/8", "127.0.0.1/32"]
   #   recursive: true
   #   header: x-forwarded-for
+  # Which inbound headers a caller may hand the gateway its own request
+  # id in. The id it sends becomes THE id for the request: the
+  # x-aisix-request-id response header, every retry/failover attempt's
+  # usage event, the access log, and the x-aisix-request-id the upstream
+  # sees — so a caller can find a gateway request by an id its own logs
+  # already carry. Headers are consulted in order, first acceptable value
+  # wins; an absent or unusable value (empty, longer than 256 bytes, or
+  # containing anything outside visible ASCII) falls back to a generated
+  # UUID rather than failing the request.
+  # Defaults to ["x-aisix-request-id"]. Add x-request-id to honour the
+  # de-facto standard header — off by default because every reverse proxy
+  # and ingress in front of the gateway stamps it automatically, which
+  # would make the correlation id come from the infrastructure rather
+  # than from the caller. Set to [] to always mint a UUID.
+  # Env-only deployments set the list comma-separated:
+  # AISIX_PROXY__REQUEST_ID__ACCEPT_HEADERS=x-aisix-request-id,x-request-id
+  # request_id:
+  #   accept_headers: ["x-aisix-request-id", "x-request-id"]
+  # Serve from independent worker threads, each with its own runtime,
+  # its own SO_REUSEPORT listener on addr, and its own upstream
+  # connection pool, so a request is handled end to end on the thread
+  # that accepted it. Omitted, it is on for Linux and off elsewhere.
+  # Set false to serve from one shared runtime. Applied at startup.
+  # thread_per_core: true
+  # Number of proxy worker threads. Omitted, it follows the parallelism
+  # available to the process, so a container CPU limit or a taskset
+  # affinity mask sizes it. Applied at startup.
+  # workers: 4
+  # Entry-level URL rewriting: map legacy URL shapes onto AISIX endpoints
+  # before routing. The first rule whose `match` regex matches the request
+  # path rewrites it (once, no cascading); the request then flows through
+  # the normal endpoint — auth, ACL, quota — as if the client had sent the
+  # rewritten path. `match` runs against the RAW, percent-encoded path (no
+  # decoding or normalization); `rewrite` replaces the matched portion
+  # ($1/${name} expand capture groups; use ${1}text to follow a group with
+  # literal text); the query string is preserved. Invalid regexes, unknown
+  # group references, and `?`/`#`/whitespace in the template fail startup.
+  # In env-only deployments set the whole list as one JSON array:
+  # AISIX_PROXY__URL_REWRITES='[{"match":"...","rewrite":"..."}]'
+  # Example: serve per-server MCP URLs like /mcp-servers/github/mcp on
+  # the /mcp/{server} endpoint.
+  # url_rewrites:
+  #   - name: per-server-mcp-compat
+  #     match: "^/mcp-servers/([^/]+)/mcp$"
+  #     rewrite: "/mcp/$1"
 
+# Admin listener — read-only resource surface, OpenAPI reference, and
+# playground. Resources are managed declaratively (resources_file or
+# direct etcd writes), not through this listener.
 admin:
   addr: "127.0.0.1:3001"
   admin_keys:
@@ -82,28 +138,48 @@ observability:
     # boot; changes require a restart. The metric label set stays bounded:
     # only these fixed values (plus built-ins / "other" / "unknown") are
     # ever emitted — never the raw User-Agent.
+    # Env-only deployments set the whole list as one JSON array:
+    # AISIX_OBSERVABILITY__METRICS__CLIENT_TYPE_RULES='[{"pattern":"^py-billing-batcher/","client":"billing-batcher"}]'
     # client_type_rules:
     #   - pattern: "^py-billing-batcher/"
     #     client: billing-batcher
     #   - pattern: "internal-eval-harness"
     #     client: eval-harness
+    # Optional per-metric histogram bucket edges, in seconds. Each metric
+    # keeps its own default when unset — they differ on purpose, because
+    # the three distributions do: end-to-end latency starts in the
+    # milliseconds (cache hits, requests refused before dispatch) while
+    # time-to-first-token cannot be faster than the upstream, and guardrail
+    # checks run an order of magnitude below both. Edges must be finite,
+    # positive and strictly ascending; do not list `+Inf` (it is added for
+    # you). Validated at boot; changes require a restart.
+    #
+    # Every edge costs one `_bucket` series PER label combination, so
+    # lengthening a list multiplies time series. Changing a list also
+    # changes the metric contract: dashboards and recording rules that
+    # hardcode an `le` value break, and series recorded before the change
+    # are not comparable with those after it.
+    # buckets:
+    #   request_e2e_latency: [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60, 120, 300, 420, 600]
+    #   request_ttft: [0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60, 120, 300]
+    #   guardrail_latency: [0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30]
   tracing:
     otlp:
       enabled: false
       endpoint: "http://127.0.0.1:4317"
       sample_ratio: 1.0
 
-# Managed-mode switch. Uncomment when running as an aisix.cloud
-# tenant: the admin API and Playground will NOT be bound — all
+# Managed-mode switch. Uncomment when connecting the gateway to
+# AISIX Cloud: the admin API and Playground will NOT be bound — all
 # configuration flows from etcd via the mTLS channel above, driven
-# by the aisix.cloud control plane.
+# by the AISIX Cloud control plane.
 # managed:
 #   enabled: true
 
 # Cache backend availability. The in-process memory cache is always
 # built; the shared redis cache is built iff `redis` is configured.
 # Which backend serves a request is chosen per matched CachePolicy
-# (its `backend` field, managed via the Admin API / control plane) —
+# (its `backend` field, set in the resources file / etcd / control plane) —
 # a policy asking for redis on a DP without `cache.redis` gets NO
 # caching for its requests (cache_status = disabled), never a silent
 # fallback to node-local memory.
@@ -111,10 +187,16 @@ cache:
   # Legacy knob — no longer selects a single global cache. Kept for
   # config compatibility; `backend: "redis"` still requires the
   # `redis` block below (validated at boot).
+  #
+  # Cache policies with a `semantic` block additionally need vector
+  # search on this Redis (Redis 8+, or the search module) in `single`
+  # or `sentinel` mode; without it, `backend: redis` policies serve
+  # exact matches only (probed and logged at boot).
   backend: "memory"   # memory | redis
   # redis:
-  #   # mode picks the topology. Credentials and TLS (rediss://) travel
-  #   # inside the URLs, as in single mode.
+  #   # mode picks the topology. Credentials travel inside the URLs, as
+  #   # in single mode; a `rediss://` URL turns TLS on and the `tls` block
+  #   # below configures what it trusts.
   #   mode: "single"   # single | cluster | sentinel
   #   # mode: single  → one endpoint:
   #   url: "redis://127.0.0.1:6379"
@@ -130,6 +212,19 @@ cache:
   #   # username: "default"      # Redis ACL user (cluster nodes / sentinel master)
   #   # password: "s3cret"
   #   # database: 0              # DB index for the sentinel master (not used by cluster)
+  #   # Trust settings for a `rediss://` URL, ignored on plaintext
+  #   # `redis://`. Separate from `upstream.tls` because an in-cluster
+  #   # Redis is normally issued by a different authority than the model
+  #   # endpoints. Same fields and same meanings.
+  #   # tls:
+  #   #   ca_file: "/etc/aisix/tls/redis-ca.pem"
+  #   #   client_cert_file: "/etc/aisix/tls/redis-client.crt"
+  #   #   client_key_file:  "/etc/aisix/tls/redis-client.key"
+  #   #   verify: true
+  #   # NOTE: in sentinel mode the client library accepts no custom trust
+  #   # roots for the master it discovers, so ca_file does not apply there
+  #   # (it is logged at startup). Use SSL_CERT_FILE or the system trust
+  #   # store for that one case; `verify` does apply.
 
 # Rate-limit counter backend (api7/AISIX-Cloud#798).
 #
@@ -149,6 +244,7 @@ ratelimit:
   #   # nodes: ["redis://10.0.0.1:6379"]        # mode: cluster
   #   # sentinels: ["redis://10.0.0.1:26379"]   # mode: sentinel
   #   # master_name: "mymaster"                  # mode: sentinel
+  #   # tls: { ca_file: "/etc/aisix/tls/redis-ca.pem" }   # for rediss://
   # Seconds before an unreleased concurrency slot (crashed replica /
   # hung upstream) is reclaimed. Redis backend only.
   # concurrency_ttl_secs: 300
@@ -160,6 +256,21 @@ ratelimit:
 # The values below are the defaults; uncomment to override. Every
 # duration accepts 0 to switch that knob off.
 upstream:
+  # Deployment-wide default for `Model.timeout`: the end-to-end deadline
+  # for non-streaming calls, and the fallback streaming budget (below),
+  # for every model that does not set its own. A backstop against an
+  # upstream that accepted the connection and then goes silent forever —
+  # not a responsiveness target (set per-model `timeout` for that), so it
+  # is deliberately generous: deep-reasoning calls can run past 10
+  # minutes. A model opts out with `timeout: 0`; setting 0 here restores
+  # the old "no deadline unless configured" behaviour.
+  # timeout_ms: 6000000
+
+  # Deployment-wide default for `Model.stream_timeout`: the maximum gap
+  # between streaming chunks. 0 falls back to `timeout_ms`, mirroring how
+  # an unset `Model.stream_timeout` falls back to `Model.timeout`.
+  # stream_timeout_ms: 0
+
   # Max time for DNS + TCP + TLS before an attempt fails. Without it a
   # black-holed upstream is bounded only by the model's own timeout.
   # connect_timeout_ms: 5000
@@ -194,6 +305,38 @@ upstream:
   # struggling upstream sees.
   # retries: 2
 
+  # Trust settings for the TLS handshake with every upstream: the provider
+  # bridges, guardrail services, MCP and A2A upstreams, OIDC/JWKS fetches,
+  # the Realtime WebSocket, Bedrock, and the log-export object stores.
+  #
+  # Unset, the trust store is the platform's — the built-in root set plus
+  # whatever SSL_CERT_FILE / SSL_CERT_DIR point at. Those environment
+  # variables keep working and stay additive; ca_file is the same idea
+  # expressed in config instead of in the process environment.
+  # tls:
+  #   # PEM file of one or more certificates to trust as issuers, for an
+  #   # upstream whose certificate is signed by a private or enterprise CA.
+  #   # ADDITIVE: public providers stay reachable. A full chain in one
+  #   # bundle works — every certificate in the file is loaded.
+  #   ca_file: "/etc/aisix/tls/private-ca.pem"
+  #
+  #   # Client certificate for upstreams that require mutual TLS. Both
+  #   # fields are required together.
+  #   # client_cert_file: "/etc/aisix/tls/client.crt"
+  #   # client_key_file:  "/etc/aisix/tls/client.key"
+  #
+  #   # false accepts ANY certificate — expired, issued for another host,
+  #   # or presented by an interceptor — which removes the only thing
+  #   # stopping a machine-in-the-middle from reading and rewriting every
+  #   # prompt, response, and upstream API key on the connection. For a
+  #   # test environment where the alternative is not running at all;
+  #   # prefer ca_file everywhere else.
+  #   #
+  #   # Two paths cannot honour it and log so at startup: Bedrock (the AWS
+  #   # SDK's HTTP stack cannot disable verification, and cannot present a
+  #   # client certificate either), and Redis in sentinel mode.
+  #   # verify: true
+
 # Connection-layer settings for the inbound side — the clients, or the
 # gateway in front of this one, talking to the listeners above. The
 # mirror image of `upstream:`.
@@ -218,6 +361,7 @@ downstream:
   # sse_keepalive_interval_secs: 15
 
 # Models, API keys, provider keys, guardrails, cache policies, and
-# observability exporters are NOT defined in this file. They are stored
-# in etcd and managed via the Admin API (see docs/api-admin.md). This
-# file only bootstraps the gateway.
+# observability exporters are NOT defined in this file. They come from
+# the configured resource source: the `resources_file` above, direct
+# etcd writes, or the AISIX Cloud control plane. This file only
+# bootstraps the gateway.

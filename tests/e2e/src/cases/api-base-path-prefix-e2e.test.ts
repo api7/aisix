@@ -1,0 +1,380 @@
+import { WebSocket } from "undici";
+import { WebSocketServer, type WebSocket as WsSocket } from "ws";
+import { afterAll, beforeAll, describe, expect, test } from "vitest";
+import {
+  spawnApp,
+  startOpenAiUpstream,
+  type OpenAiUpstream,
+  type SpawnedApp,
+} from "../harness/index.js";
+
+// E2E: `api_base` is the upstream root — whatever path it carries is
+// preserved, and every endpoint is appended to it (AISIX-Cloud#1244).
+//
+// Before the fix the gateway used two different conventions on one
+// provider key: the OpenAI-family bridge appended `/chat/completions` to
+// the configured base verbatim, while the proxy-side handlers injected a
+// `/v1` segment unless the base already ended in `/v1`. A key pointing at
+// a non-`/v1` root — Baidu Qianfan's `…/v2`, Zhipu's `…/api/paas/v4`,
+// Volcengine Ark's `…/api/v3`, Gemini's `…/v1beta/openai` — therefore
+// served chat correctly while responses, rerank, audio, realtime, videos
+// and the batch/files routes all dispatched to `…/v2/v1/<endpoint>` and
+// 404'd.
+//
+// Each case asserts BOTH that the gateway answered 200 and the exact path
+// it dialled: the mock accepts any path, so a status-only assertion would
+// not catch a wrong path, and a path-only assertion would not catch the
+// gateway failing after a correct dispatch.
+
+const CALLER_PLAINTEXT = "sk-apibase-e2e-caller";
+const CALLER_KEY_ENV = "APIBASE_E2E_CALLER_KEY";
+
+/** `/v2` — the reported Qianfan shape; also stands in for every other
+ *  vendor whose OpenAI-compatible root is not `/v1`. */
+function resources(
+  upstreamBase: string,
+  realtimeBase: string,
+  videosBase: string,
+): string {
+  return `
+_format_version: "1"
+provider_keys:
+  - display_name: pk-v2-root
+    provider: openai
+    adapter: openai
+    api_key: sk-mock
+    api_base: ${upstreamBase}/v2
+  - display_name: pk-bare-host
+    provider: openai
+    adapter: openai
+    api_key: sk-mock
+    api_base: ${upstreamBase}
+  - display_name: pk-anthropic-mounted
+    provider: anthropic
+    adapter: anthropic
+    api_key: sk-mock
+    api_base: ${upstreamBase}/anthropic
+  - display_name: pk-realtime-v2-root
+    provider: openai
+    adapter: openai
+    api_key: sk-upstream-realtime
+    api_base: ${realtimeBase}/v2
+  - display_name: pk-videos-v2-root
+    provider: openai
+    adapter: openai
+    api_key: sk-mock
+    api_base: ${videosBase}/v2
+models:
+  - display_name: m-v2-root
+    provider: openai
+    model_name: gpt-4o-mini
+    provider_key: pk-v2-root
+  - display_name: m-bare-host
+    provider: openai
+    model_name: gpt-4o-mini
+    provider_key: pk-bare-host
+  - display_name: m-anthropic-mounted
+    provider: anthropic
+    model_name: claude-3-5-sonnet
+    provider_key: pk-anthropic-mounted
+  - display_name: m-realtime-v2-root
+    provider: openai
+    model_name: gpt-realtime-mock
+    provider_key: pk-realtime-v2-root
+  - display_name: m-videos-v2-root
+    provider: openai
+    model_name: sora-2
+    provider_key: pk-videos-v2-root
+api_keys:
+  - display_name: apibase-caller
+    key_env: ${CALLER_KEY_ENV}
+    allowed_models:
+      [
+        "m-v2-root",
+        "m-bare-host",
+        "m-anthropic-mounted",
+        "m-realtime-v2-root",
+        "m-videos-v2-root",
+      ]
+`;
+}
+
+interface RealtimeUpstream {
+  baseUrl: string;
+  handshakes: string[];
+  close(): Promise<void>;
+}
+
+/** Records the upgrade path of every realtime handshake, then holds the
+ *  socket open so a successful relay handshake is observable as `open`
+ *  rather than being indistinguishable from a rejected one. */
+async function startRealtimeUpstream(): Promise<RealtimeUpstream> {
+  const handshakes: string[] = [];
+  const wss = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+  wss.on("connection", (_socket: WsSocket, req) => {
+    handshakes.push(req.url ?? "");
+  });
+  await new Promise<void>((resolve) => wss.on("listening", resolve));
+  const addr = wss.address();
+  if (addr === null || typeof addr === "string") throw new Error("no port");
+  return {
+    baseUrl: `http://127.0.0.1:${addr.port}`,
+    handshakes,
+    close: () =>
+      new Promise<void>((resolve, reject) =>
+        wss.close((e) => (e ? reject(e) : resolve())),
+      ),
+  };
+}
+
+describe("api_base path prefix is preserved on every endpoint", () => {
+  let app: SpawnedApp | undefined;
+  let upstream: OpenAiUpstream | undefined;
+  let videosUpstream: OpenAiUpstream | undefined;
+  let realtime: RealtimeUpstream | undefined;
+
+  const auth = { authorization: `Bearer ${CALLER_PLAINTEXT}` };
+
+  /**
+   * Run one proxied request and return the path the gateway dialled.
+   * Asserts a 200 so a correctly-routed request that the gateway then
+   * mishandles still fails the case.
+   */
+  async function dialledPath(
+    mock: () => OpenAiUpstream | undefined,
+    run: () => Promise<Response>,
+  ): Promise<string> {
+    const up = mock();
+    if (!up) throw new Error("setup failed");
+    const before = up.receivedRequests.length;
+    const res = await run();
+    const body = await res.text();
+    expect(
+      res.status,
+      `gateway answered ${res.status}: ${body.slice(0, 300)}`,
+    ).toBe(200);
+    expect(body.length).toBeGreaterThan(0);
+    const seen = up.receivedRequests.slice(before);
+    expect(seen.length).toBe(1);
+    return seen[0].path;
+  }
+
+  /** The shared OpenAI/Anthropic mock (canned chat-shaped body). */
+  const onShared = (run: () => Promise<Response>) =>
+    dialledPath(() => upstream, run);
+
+  beforeAll(async () => {
+    upstream = await startOpenAiUpstream();
+    // The videos route decodes `{id, status}` from the submit response,
+    // so it needs its own mock body rather than the shared chat one.
+    videosUpstream = await startOpenAiUpstream({
+      nonStreamBody: { id: "video-mock-1", status: "queued" },
+    });
+    realtime = await startRealtimeUpstream();
+    // File mode: resources load synchronously at boot, no etcd needed.
+    app = await spawnApp({
+      resourcesFile: resources(
+        upstream.baseUrl,
+        realtime.baseUrl,
+        videosUpstream.baseUrl,
+      ),
+      extraEnv: { [CALLER_KEY_ENV]: CALLER_PLAINTEXT },
+    });
+  });
+
+  afterAll(async () => {
+    await app?.exit();
+    await upstream?.close();
+    await videosUpstream?.close();
+    await realtime?.close();
+  });
+
+  test("chat completions keeps the /v2 root (the leg that always worked)", async () => {
+    if (!app) throw new Error("setup failed");
+    const path = await onShared(() =>
+      fetch(`${app!.proxyUrl}/v1/chat/completions`, {
+        method: "POST",
+        headers: { ...auth, "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "m-v2-root",
+          messages: [{ role: "user", content: "hi" }],
+        }),
+      }),
+    );
+    expect(path).toBe("/v2/chat/completions");
+  });
+
+  test("responses keeps the /v2 root instead of building /v2/v1/responses", async () => {
+    if (!app) throw new Error("setup failed");
+    const path = await onShared(() =>
+      fetch(`${app!.proxyUrl}/v1/responses`, {
+        method: "POST",
+        headers: { ...auth, "content-type": "application/json" },
+        body: JSON.stringify({ model: "m-v2-root", input: "hello" }),
+      }),
+    );
+    expect(path).toBe("/v2/responses");
+  });
+
+  test("rerank keeps the /v2 root", async () => {
+    if (!app) throw new Error("setup failed");
+    const path = await onShared(() =>
+      fetch(`${app!.proxyUrl}/v1/rerank`, {
+        method: "POST",
+        headers: { ...auth, "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "m-v2-root",
+          query: "q",
+          documents: ["a", "b"],
+        }),
+      }),
+    );
+    expect(path).toBe("/v2/rerank");
+  });
+
+  test("audio speech keeps the /v2 root", async () => {
+    if (!app) throw new Error("setup failed");
+    const path = await onShared(() =>
+      fetch(`${app!.proxyUrl}/v1/audio/speech`, {
+        method: "POST",
+        headers: { ...auth, "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "m-v2-root",
+          input: "hi",
+          voice: "alloy",
+        }),
+      }),
+    );
+    expect(path).toBe("/v2/audio/speech");
+  });
+
+  test("audio transcriptions keeps the /v2 root", async () => {
+    if (!app) throw new Error("setup failed");
+    const form = new FormData();
+    form.set("model", "m-v2-root");
+    form.set("file", new Blob(["fake audio"]), "clip.mp3");
+    const path = await onShared(() =>
+      fetch(`${app!.proxyUrl}/v1/audio/transcriptions`, {
+        method: "POST",
+        headers: auth,
+        body: form,
+      }),
+    );
+    expect(path).toBe("/v2/audio/transcriptions");
+  });
+
+  test("the batch/files family keeps the /v2 root", async () => {
+    if (!app) throw new Error("setup failed");
+
+    const listPath = await onShared(() =>
+      fetch(`${app!.proxyUrl}/v1/files?model=m-v2-root`, { headers: auth }),
+    );
+    expect(listPath).toBe("/v2/files");
+
+    const batchPath = await onShared(() =>
+      fetch(`${app!.proxyUrl}/v1/batches`, {
+        method: "POST",
+        headers: { ...auth, "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "m-v2-root",
+          input_file_id: "file-1",
+          endpoint: "/v1/chat/completions",
+          completion_window: "24h",
+        }),
+      }),
+    );
+    expect(batchPath).toBe("/v2/batches");
+  });
+
+  test("videos submit keeps the /v2 root", async () => {
+    if (!app) throw new Error("setup failed");
+    const path = await dialledPath(
+      () => videosUpstream,
+      () =>
+        fetch(`${app!.proxyUrl}/v1/videos`, {
+          method: "POST",
+          headers: { ...auth, "content-type": "application/json" },
+          body: JSON.stringify({
+            model: "m-videos-v2-root",
+            prompt: "a cat wearing a hat",
+          }),
+        }),
+    );
+    expect(path).toBe("/v2/videos");
+  });
+
+  test("realtime keeps the /v2 root on the upstream upgrade", async () => {
+    if (!app || !realtime) throw new Error("setup failed");
+    const ws = new WebSocket(
+      `${app.proxyUrl.replace("http://", "ws://")}/v1/realtime?model=m-realtime-v2-root`,
+      ["realtime", `openai-insecure-api-key.${CALLER_PLAINTEXT}`],
+    );
+    // A relay that fails to reach the upstream must fail the case, not be
+    // swallowed — the upstream holds the socket open on success.
+    await new Promise<void>((resolve, reject) => {
+      ws.addEventListener("open", () => resolve(), { once: true });
+      ws.addEventListener(
+        "error",
+        () => reject(new Error("realtime relay handshake failed")),
+        { once: true },
+      );
+    });
+    // The gateway answers the client upgrade first and dials upstream
+    // right after, so the recorded handshake trails the client `open`.
+    for (let i = 0; i < 100 && realtime.handshakes.length === 0; i++) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    ws.close();
+    expect(
+      realtime.handshakes.length,
+      "gateway never dialled the realtime upstream",
+    ).toBe(1);
+    expect(realtime.handshakes[0]).toBe("/v2/realtime?model=gpt-realtime-mock");
+  });
+
+  test("a bare host still gets the canonical /v1 synthesized", async () => {
+    if (!app) throw new Error("setup failed");
+    // Several vendor defaults ship the bare host (deepseek, cohere,
+    // runwayml) — dropping the synthesis would break all of them.
+    const path = await onShared(() =>
+      fetch(`${app!.proxyUrl}/v1/responses`, {
+        method: "POST",
+        headers: { ...auth, "content-type": "application/json" },
+        body: JSON.stringify({ model: "m-bare-host", input: "hello" }),
+      }),
+    );
+    expect(path).toBe("/v1/responses");
+  });
+
+  test("anthropic keeps /v1 in the endpoint even under a mounted path", async () => {
+    if (!app) throw new Error("setup failed");
+    // Mirror image of the OpenAI family: Anthropic documents the bare
+    // host and owns `/v1` in the endpoint, so a gateway mounted at
+    // `/anthropic` serves `/anthropic/v1/messages` — the path must NOT
+    // suppress the version segment here.
+    const messagesPath = await onShared(() =>
+      fetch(`${app!.proxyUrl}/v1/messages`, {
+        method: "POST",
+        headers: { ...auth, "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "m-anthropic-mounted",
+          max_tokens: 16,
+          messages: [{ role: "user", content: "hi" }],
+        }),
+      }),
+    );
+    expect(messagesPath).toBe("/anthropic/v1/messages");
+
+    const countPath = await onShared(() =>
+      fetch(`${app!.proxyUrl}/v1/messages/count_tokens`, {
+        method: "POST",
+        headers: { ...auth, "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "m-anthropic-mounted",
+          messages: [{ role: "user", content: "hi" }],
+        }),
+      }),
+    );
+    expect(countPath).toBe("/anthropic/v1/messages/count_tokens");
+  });
+});

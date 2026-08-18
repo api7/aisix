@@ -17,31 +17,42 @@
 
 use serde::{Deserialize, Serialize};
 
+use serde_json::{json, Value};
+
 use crate::resource::Resource;
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct A2aAgent {
     /// Operator-facing label, unique within the gateway. It is the path segment
     /// under which the agent is exposed to callers as `/a2a/<name>`, so it must
-    /// be a single non-empty URL path segment.
+    /// be a single non-empty URL path segment. The name is interpolated into the
+    /// advertised agent-card URL without percent-encoding, so `/`, `?`, `#`, `%`
+    /// and whitespace are rejected: `a?b` would advertise a URL whose path is
+    /// just `/a2a/a`, and the lookup is an exact match on the stored name.
     // `display_name` is the field's former name; stored documents and
     // callers that still use it keep deserializing (schema-side acceptance
     // lives in `schema::a2a_agent_root_schema`). Re-serialization always
     // emits `name`.
     #[serde(alias = "display_name")]
-    #[schemars(length(min = 1))]
+    #[schemars(
+        regex(pattern = "^[^/?#%\\s\\x00-\\x1f\\x7f\u{0080}-\u{009f}]+$"),
+        length(min = 1)
+    )]
     pub name: String,
 
-    /// The upstream agent's base URL, such as `https://agents.example.com/a2a`.
-    /// AISIX reaches this URL over HTTP with the A2A JSON-RPC 2.0 protocol and
-    /// discovers the agent card relative to it.
+    /// The upstream agent's A2A service endpoint, such as
+    /// `https://agents.example.com/a2a`, where AISIX sends JSON-RPC 2.0 requests
+    /// over HTTP. AISIX looks for the agent card at the well-known path under
+    /// this URL's own path first, then under its origin, so both an agent that
+    /// owns its domain and one published under a path prefix are reachable
+    /// without extra configuration.
     #[schemars(length(min = 1))]
     pub url: String,
 
-    /// The A2A wire-format version AISIX uses for this agent. AISIX pins the
-    /// version explicitly so the served agent card and accepted requests stay
-    /// consistent.
+    /// The A2A wire-format version this agent speaks. AISIX announces it to the
+    /// agent in the `A2A-Version` header on every request, so it must match what
+    /// the agent actually serves: an agent reads an absent or mismatched version
+    /// as a protocol error and rejects the call.
     #[serde(default)]
     pub protocol_version: A2aProtocolVersion,
 
@@ -58,12 +69,12 @@ pub struct A2aAgent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret: Option<String>,
 
-    // Cross-field coupling (`bearer`/`api_key` require `secret`) is
-    // deliberately NOT expressed in this flat schema — that would force
-    // restructuring the resource into a oneOf. The control plane enforces the
-    // coupling strictly at write time, this gateway's own Admin API re-checks
-    // it on write, and the runtime degrades gracefully when a snapshot-loaded
-    // agent is misconfigured.
+    // Cross-field coupling (`bearer`/`api_key` require a non-empty `secret`) is
+    // expressed as an injected `allOf` of `if`/`then` subschemas rather than in
+    // this flat struct — see `a2a_agent_credential_coupling`. That keeps the
+    // resource flat (no oneOf restructuring) while giving the published schema
+    // and every runtime validator one shared definition, so a declarative
+    // `resources.yaml` and the control plane reject the same documents.
     /// Maximum time, in milliseconds, to wait for a single upstream operation,
     /// including fetching the agent card or invoking the agent. When omitted,
     /// AISIX applies a built-in default.
@@ -99,6 +110,18 @@ pub enum A2aProtocolVersion {
     V0_3,
 }
 
+impl A2aProtocolVersion {
+    /// The value this version carries on the wire, in the `A2A-Version` header
+    /// and in the `protocolVersion` field of an agent card. Kept in lockstep
+    /// with the `serde` renames above, which are the same strings.
+    pub fn as_wire_str(self) -> &'static str {
+        match self {
+            Self::V1_0 => "1.0",
+            Self::V0_3 => "0.3",
+        }
+    }
+}
+
 /// How the gateway authenticates to an upstream A2A agent.
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
@@ -130,9 +153,97 @@ impl Resource for A2aAgent {
     }
 }
 
+/// The `auth_type` → credential coupling, as a JSON Schema `allOf` that
+/// [`crate::models::schema::a2a_agent_root_schema`] injects into the generated
+/// schema. `schemars` cannot express a cross-field conditional, so this is the
+/// single definition the published schema and every runtime validator share:
+/// declaring `bearer` or `api_key` without a non-empty `secret` leaves the
+/// gateway sending an empty credential upstream, so it is rejected at load.
+pub fn a2a_agent_credential_coupling() -> Value {
+    json!([
+        {
+            "if": { "properties": { "auth_type": { "const": "bearer" } }, "required": ["auth_type"] },
+            "then": {
+                "required": ["secret"],
+                "properties": { "secret": { "type": "string", "minLength": 1 } }
+            }
+        },
+        {
+            "if": { "properties": { "auth_type": { "const": "api_key" } }, "required": ["auth_type"] },
+            "then": {
+                "required": ["secret"],
+                "properties": { "secret": { "type": "string", "minLength": 1 } }
+            }
+        }
+    ])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn schema_pins_each_a2a_obligation_individually() {
+        // Every excluded character is pinned, under both accepted spellings, so
+        // narrowing the pattern back to `^[^/]+$` fails here.
+        for bad in [
+            "a/b", "a?b", "a#b", "a%2Fb", "a b", "a\tb", "a\nb", "a\x7fb", "a\u{80}b", "a\u{9f}b",
+        ] {
+            for key in ["name", "display_name"] {
+                let doc = json!({key: bad, "url": "https://x/a2a"});
+                crate::models::schema::validate_a2a_agent(&doc)
+                    .expect_err(&format!("{key}={bad:?} must be rejected"));
+            }
+        }
+        // A plain name is still fine under both spellings.
+        for key in ["name", "display_name"] {
+            let doc = json!({key: "invoice-processor", "url": "https://x/a2a"});
+            crate::models::schema::validate_a2a_agent(&doc).expect("plain name is valid");
+        }
+        // Credential obligations: missing, empty and null all fail.
+        for bad in [None, Some(json!("")), Some(json!(null))] {
+            let mut doc = json!({"name": "a", "url": "https://x/a2a", "auth_type": "bearer"});
+            if let Some(v) = bad {
+                doc["secret"] = v;
+            }
+            crate::models::schema::validate_a2a_agent(&doc)
+                .expect_err("bearer needs a non-empty string secret");
+        }
+    }
+
+    #[test]
+    fn schema_rejects_slash_in_name() {
+        // The name is the `/a2a/<name>` path segment, so a slash would split
+        // into two segments and route somewhere else entirely.
+        let doc = json!({"name": "a/b", "url": "https://x/a2a"});
+        let err = crate::models::schema::validate_a2a_agent(&doc)
+            .expect_err("a name containing `/` must be rejected");
+        assert!(err.path.contains("name"), "unexpected path: {}", err.path);
+    }
+
+    #[test]
+    fn schema_requires_secret_for_bearer_and_api_key() {
+        for auth in ["bearer", "api_key"] {
+            let doc = json!({"name": "agent", "url": "https://x/a2a", "auth_type": auth});
+            crate::models::schema::validate_a2a_agent(&doc)
+                .expect_err(&format!("{auth} without a secret must be rejected"));
+
+            let empty =
+                json!({"name": "agent", "url": "https://x/a2a", "auth_type": auth, "secret": ""});
+            crate::models::schema::validate_a2a_agent(&empty)
+                .expect_err(&format!("{auth} with an empty secret must be rejected"));
+
+            let ok = json!({"name": "agent", "url": "https://x/a2a", "auth_type": auth, "secret": "tok"});
+            crate::models::schema::validate_a2a_agent(&ok)
+                .expect("a complete credential set must be accepted");
+        }
+    }
+
+    #[test]
+    fn schema_accepts_none_auth_without_secret() {
+        let doc = json!({"name": "agent", "url": "https://x/a2a"});
+        crate::models::schema::validate_a2a_agent(&doc).expect("auth_type none needs no secret");
+    }
 
     #[test]
     fn deserialises_minimal_a2a_agent() {
@@ -164,25 +275,26 @@ mod tests {
     }
 
     #[test]
-    fn rejects_oauth2_auth_type_and_oauth_fields() {
+    fn rejects_oauth2_auth_type_but_tolerates_removed_oauth_fields() {
         // `auth_type` accepts only `none` / `bearer` / `api_key` — the same
         // closed set as the control plane's a2a_agent resource.
         assert!(serde_json::from_str::<A2aAgent>(
             r#"{"display_name":"a","url":"https://x/a2a","auth_type":"oauth2","secret":"cs-1"}"#,
         )
         .is_err());
-        // The OAuth-specific fields were removed with the `oauth2` arm, so a
-        // document carrying one is rejected as an unknown field.
+        // The OAuth-specific fields were removed with the `oauth2` arm; serde
+        // now tolerates them as unknown fields for forward compatibility (the
+        // write path still rejects them via `validate_a2a_agent` in
+        // `models/schema.rs`).
         for field in [
             r#""client_id":"cid""#,
             r#""token_url":"https://auth/x/token""#,
             r#""scopes":["read","write"]"#,
         ] {
             let doc = format!(r#"{{"display_name":"a","url":"https://x/a2a",{field}}}"#);
-            assert!(
-                serde_json::from_str::<A2aAgent>(&doc).is_err(),
-                "field must be rejected as unknown: {doc}"
-            );
+            let a: A2aAgent = serde_json::from_str(&doc)
+                .unwrap_or_else(|e| panic!("field must be tolerated as unknown: {doc}: {e}"));
+            assert_eq!(a.name, "a");
         }
     }
 
@@ -213,10 +325,13 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_fields() {
-        let r: Result<A2aAgent, _> =
-            serde_json::from_str(r#"{"display_name":"x","url":"u","extra":1}"#);
-        assert!(r.is_err());
+    fn tolerates_unknown_fields_for_forward_compat() {
+        // A newer control plane may ship fields ahead of this DP; serde must
+        // accept them (the write path still rejects them via
+        // `validate_a2a_agent` in `models/schema.rs`).
+        let a: A2aAgent =
+            serde_json::from_str(r#"{"display_name":"x","url":"u","extra":1}"#).unwrap();
+        assert_eq!(a.name, "x");
     }
 
     // ---- `display_name` → `name` rename ----

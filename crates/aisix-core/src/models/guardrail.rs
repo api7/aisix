@@ -93,9 +93,8 @@ pub enum BedrockAWSCredentials {
         /// AWS access key ID for static Bedrock guardrail credentials.
         #[schemars(length(min = 1))]
         access_key_id: String,
-        /// Decrypted before projection. Plaintext is held in memory only
-        /// and is not logged. The data plane passes it to the
-        /// AWS SDK's static credentials provider.
+        /// AWS secret access key used to authenticate requests to Amazon
+        /// Bedrock. The gateway does not log the plaintext value.
         #[schemars(length(min = 1))]
         secret_access_key: String,
     },
@@ -127,7 +126,7 @@ pub enum BedrockLatencyMode {
 pub struct AzureContentSafetyConfig {
     /// Azure Cognitive Services resource endpoint, e.g.
     /// `https://my-resource.cognitiveservices.azure.com`.
-    /// The data plane appends `/contentsafety/text:shieldPrompt?api-version=2024-09-01`.
+    /// The gateway appends `/contentsafety/text:shieldPrompt?api-version=2024-09-01`.
     #[schemars(length(min = 1))]
     pub endpoint: String,
     /// Azure subscription key sent with the `Ocp-Apim-Subscription-Key` header. Decrypted before
@@ -161,7 +160,7 @@ fn default_acs_timeout_ms() -> u32 {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AzureContentSafetyTextModerationConfig {
-    /// Azure Cognitive Services resource endpoint. The data plane appends
+    /// Azure Cognitive Services resource endpoint. The gateway appends
     /// `/contentsafety/text:analyze?api-version=2024-09-01`.
     #[schemars(length(min = 1))]
     pub endpoint: String,
@@ -285,7 +284,7 @@ fn default_acs_on_buffer_exceeded() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AliyunTextModerationConfig {
-    /// Aliyun region the guardrail lives in, e.g. `cn-shanghai`. The data plane
+    /// Aliyun region the guardrail lives in, e.g. `cn-shanghai`. The gateway
     /// builds the endpoint `https://green-cip.<region>.aliyuncs.com`.
     #[schemars(length(min = 1))]
     pub region: String,
@@ -364,7 +363,7 @@ fn default_aliyun_risk_level_threshold() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AliyunAiGuardrailConfig {
-    /// Aliyun region the guardrail lives in, e.g. `cn-shanghai`. The data plane
+    /// Aliyun region the guardrail lives in, e.g. `cn-shanghai`. The gateway
     /// builds the endpoint `https://green-cip.<region>.aliyuncs.com`.
     #[schemars(length(min = 1))]
     pub region: String,
@@ -547,7 +546,7 @@ pub struct LakeraConfig {
     #[schemars(length(min = 1))]
     pub api_key: String,
     /// Endpoint override, e.g. a regional or self-hosted Lakera deployment.
-    /// The data plane appends `/v2/guard`. Defaults to `https://api.lakera.ai`.
+    /// The gateway appends `/v2/guard`. Defaults to `https://api.lakera.ai`.
     #[serde(default)]
     #[schemars(length(min = 1))]
     pub endpoint: Option<String>,
@@ -661,11 +660,11 @@ pub struct PresidioEntityConfig {
 #[serde(deny_unknown_fields)]
 pub struct PresidioConfig {
     /// Presidio analyzer base URL, e.g. `http://presidio-analyzer:3000`.
-    /// The data plane appends `/analyze`.
+    /// The gateway appends `/analyze`.
     #[schemars(length(min = 1))]
     pub analyzer_url: String,
     /// Presidio anonymizer base URL, e.g. `http://presidio-anonymizer:3000`.
-    /// The data plane appends `/anonymize`. Only called when a detected
+    /// The gateway appends `/anonymize`. Only called when a detected
     /// entity's effective action is `mask`.
     #[schemars(length(min = 1))]
     pub anonymizer_url: String,
@@ -963,20 +962,29 @@ impl Resource for Guardrail {
 /// Which dimension of the request a guardrail attachment is scoped to.
 ///
 /// `Env` applies to every request in the environment. The narrower scopes let
-/// operators attach a guardrail to only the models, API keys, or teams that
-/// need it.
+/// operators attach a guardrail to only the models, MCP servers, API keys, or
+/// teams that need it.
+///
+/// `Model`, `McpServer` and `PassthroughRoute` select dimensions a request
+/// carries only one of: an MCP tool call resolves no model, an LLM request
+/// routes to no MCP server, and a passthrough-route request resolves neither.
+/// A `Model`-scoped guardrail therefore never inspects MCP or passthrough
+/// traffic, an `McpServer`-scoped one never inspects model traffic, and a
+/// `PassthroughRoute`-scoped one inspects only the traffic of that route.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum GuardrailScopeType {
     Env,
     Model,
+    McpServer,
     ApiKey,
     Team,
+    PassthroughRoute,
 }
 
 /// Guardrail attachment that scopes one guardrail to an environment, model,
-/// caller API key, or team. AISIX loads attachments with the guardrail
-/// definitions and uses `scope_type` plus `scope_id` to decide which
+/// MCP server, caller API key, or team. AISIX loads attachments with the
+/// guardrail definitions and uses `scope_type` plus `scope_id` to decide which
 /// guardrails apply to each request.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 pub struct GuardrailAttachment {
@@ -987,8 +995,9 @@ pub struct GuardrailAttachment {
     /// What dimension of the request this attachment is scoped to.
     pub scope_type: GuardrailScopeType,
 
-    /// The UUID of the specific resource (model / api_key / team).
-    /// `None` when `scope_type` is `Env` (applies to all requests).
+    /// The UUID of the specific resource (model / mcp_server / api_key /
+    /// team / passthrough_route). `None` when `scope_type` is `Env`
+    /// (applies to all requests).
     pub scope_id: Option<String>,
 
     /// Higher number = higher precedence. When the same guardrail appears
@@ -999,6 +1008,17 @@ pub struct GuardrailAttachment {
     /// When `false`, AISIX ignores this attachment.
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+
+    /// Environment the attachment belongs to. Written by the managed
+    /// control plane for its own scoping; the gateway does not read it.
+    //
+    // Declared so the field counts as known instead of being reported
+    // as partially compatible on every managed deployment (the CP
+    // writes it unconditionally): every attachment in a gateway's
+    // snapshot already belongs to its environment, so there is nothing
+    // to consume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env_id: Option<String>,
 
     #[serde(skip)]
     pub(crate) runtime_id: String,

@@ -80,6 +80,19 @@ pub struct ErrorBody {
     /// {message,type,param,code} shape is preserved everywhere else.
     #[serde(flatten, skip_serializing_if = "Option::is_none")]
     pub budget: Option<BudgetErrorFields>,
+    /// Identity of the rate-limit policy that rejected the request —
+    /// present on policy-layer 429s only (AISIX-Cloud#892: with several
+    /// policies live, an unattributed 429 is undebuggable). Same
+    /// additive convention as `budget`: absent everywhere else.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy: Option<PolicyErrorRef>,
+}
+
+/// The `error.policy` block on a policy-layer 429.
+#[derive(Debug, Serialize, Clone)]
+pub struct PolicyErrorRef {
+    pub id: String,
+    pub name: String,
 }
 
 /// The structured budget fields that `budget_exceeded` 429s lift from
@@ -113,12 +126,23 @@ impl ErrorEnvelope {
                 param: None,
                 code: None,
                 budget: None,
+                policy: None,
             },
         }
     }
 
     pub fn with_code(mut self, code: impl Into<String>) -> Self {
         self.error.code = Some(code.into());
+        self
+    }
+
+    /// Attach the offending policy's identity to the error block. Only
+    /// the policy-layer 429 path calls this.
+    pub fn with_policy(mut self, id: impl Into<String>, name: impl Into<String>) -> Self {
+        self.error.policy = Some(PolicyErrorRef {
+            id: id.into(),
+            name: name.into(),
+        });
         self
     }
 
@@ -142,6 +166,13 @@ impl ErrorEnvelope {
 pub enum ProxyError {
     #[error("missing or malformed Authorization header")]
     MissingAuth,
+    /// A `header_key` passthrough route saw no gateway key in its configured
+    /// header. Named separately from [`ProxyError::MissingAuth`] because on
+    /// these routes `Authorization` deliberately carries the caller's own
+    /// upstream credential — telling the integrator to fix `Authorization`
+    /// points at exactly the wrong header.
+    #[error("missing or malformed {0} header (this route's gateway API key header)")]
+    MissingRouteAuthHeader(String),
     #[error("invalid API key")]
     InvalidApiKey,
     /// The presented key exists but its `expires_at` deadline has
@@ -219,8 +250,32 @@ pub enum ProxyError {
     /// The model name rides along for operator logs only.
     #[error("Access denied: your client IP is not allowed to access this model")]
     ModelIpRestricted(String),
+    /// The resolved client IP is outside the passthrough route's
+    /// `source_cidrs` allowlist. Same generic-message rule as
+    /// [`Self::ModelIpRestricted`] — never echo the configured ranges; the
+    /// route name rides along for operator logs only.
+    #[error("Access denied: your client IP is not allowed to access this route")]
+    RouteIpRestricted(String),
+    /// The caller's API key does not carry the passthrough route in its
+    /// `allowed_routes` grants.
+    #[error("API key is not allowed to use passthrough route {0:?}")]
+    RouteForbidden(String),
+    /// A removed endpoint whose replacement exists: 410 with a fixed
+    /// migration message (the implicit `/passthrough/:provider/*rest`
+    /// tunnel, superseded by explicit passthrough routes).
+    #[error("{0}")]
+    Gone(String),
     #[error("request payload is invalid: {0}")]
     InvalidRequest(String),
+    /// A non-WebSocket request reached the WebSocket-only realtime
+    /// endpoint. Carries the upgrade layer's own classification — 400 for
+    /// malformed upgrade headers, 426 for a connection that cannot
+    /// upgrade, 405 for a HEAD request (axum's `get()` also serves HEAD,
+    /// so the extractor's method check is reachable) — plus its
+    /// per-variant reason, so the refusal keeps both the status and the
+    /// diagnostic the bare rejection used to carry.
+    #[error("this endpoint requires a WebSocket upgrade: {detail}")]
+    WebSocketUpgradeRequired { status: StatusCode, detail: String },
     #[error("no bridge registered for provider")]
     ProviderUnavailable,
     /// Every routing candidate was excluded by the runtime status layer
@@ -263,6 +318,19 @@ pub enum ProxyError {
     RequestTooLarge { limit_bytes: usize },
     #[error(transparent)]
     RateLimit(#[from] RateLimitError),
+    /// A policy-layer rate-limit rejection carrying the offending
+    /// policy's identity (AISIX-Cloud#892). Same status/type/headers as
+    /// [`Self::RateLimit`]; the envelope adds `error.policy` so a
+    /// caller hitting one of several live policies can tell which. The
+    /// Display form names the policy too, so every path that flattens
+    /// this error into a message (routing attempt records, mid-stream
+    /// failover, ensemble logs) keeps the attribution.
+    #[error("{source} (policy '{policy_name}')")]
+    PolicyRateLimit {
+        source: RateLimitError,
+        policy_id: String,
+        policy_name: String,
+    },
     #[error(transparent)]
     Bridge(#[from] BridgeError),
 }
@@ -273,9 +341,11 @@ pub enum ProxyError {
 /// metadata, safe to surface (#519 B.4b) — but never the matched-pattern
 /// detail (per #153 that detail stays in `tracing` only; echoing it lets
 /// callers enumerate the blocklist or extract the blocked output).
-/// `side` is `"request"` (input hook) or `"response"` (output hook).
-/// Every proxy endpoint family builds its 422 / SSE-error message through
-/// this helper so the envelope shape can't drift between siblings.
+/// `side` is `"request"` (input hook) or `"response"` (output hook) — the MCP
+/// endpoints pass `"tool call"` / `"tool result"` instead. Every endpoint
+/// family builds its rejection text through this helper so the wording can't
+/// drift between siblings, even where the envelope differs (422 or an SSE
+/// error event on the LLM routes; an `isError` tool result on `/mcp`).
 pub(crate) fn guardrail_block_message(side: &str, guardrail_name: Option<&str>) -> String {
     match guardrail_name {
         Some(name) => format!("{side} blocked by content policy (guardrail '{name}')"),
@@ -286,7 +356,8 @@ pub(crate) fn guardrail_block_message(side: &str, guardrail_name: Option<&str>) 
 impl ProxyError {
     pub fn status(&self) -> StatusCode {
         match self {
-            ProxyError::MissingAuth
+            ProxyError::MissingRouteAuthHeader(_)
+            | ProxyError::MissingAuth
             | ProxyError::InvalidApiKey
             | ProxyError::ApiKeyExpired
             | ProxyError::ApiKeyDisabled
@@ -299,15 +370,20 @@ impl ProxyError {
             ProxyError::JwksUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             ProxyError::ModelForbidden(_) => StatusCode::FORBIDDEN,
             ProxyError::ModelIpRestricted(_) => StatusCode::FORBIDDEN,
+            ProxyError::RouteIpRestricted(_) => StatusCode::FORBIDDEN,
+            ProxyError::RouteForbidden(_) => StatusCode::FORBIDDEN,
+            ProxyError::Gone(_) => StatusCode::GONE,
             ProxyError::ModelNotFound(_) => StatusCode::NOT_FOUND,
             ProxyError::VideoNotFound(_) => StatusCode::NOT_FOUND,
             ProxyError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
+            ProxyError::WebSocketUpgradeRequired { status, .. } => *status,
             ProxyError::ProviderUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             ProxyError::AllCandidatesUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
             ProxyError::ContentFiltered(_) => StatusCode::UNPROCESSABLE_ENTITY,
             ProxyError::BudgetExceeded(_) => StatusCode::TOO_MANY_REQUESTS,
             ProxyError::RequestTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
             ProxyError::RateLimit(_) => StatusCode::TOO_MANY_REQUESTS,
+            ProxyError::PolicyRateLimit { .. } => StatusCode::TOO_MANY_REQUESTS,
             ProxyError::Bridge(b) => {
                 StatusCode::from_u16(b.http_status()).unwrap_or(StatusCode::BAD_GATEWAY)
             }
@@ -316,7 +392,8 @@ impl ProxyError {
 
     pub fn kind(&self) -> &'static str {
         match self {
-            ProxyError::MissingAuth
+            ProxyError::MissingRouteAuthHeader(_)
+            | ProxyError::MissingAuth
             | ProxyError::InvalidApiKey
             | ProxyError::ApiKeyExpired
             | ProxyError::ApiKeyDisabled
@@ -331,15 +408,20 @@ impl ProxyError {
             ProxyError::JwksUnavailable => "api_error",
             ProxyError::ModelForbidden(_) => "permission_denied",
             ProxyError::ModelIpRestricted(_) => "permission_denied",
+            ProxyError::RouteIpRestricted(_) => "permission_denied",
+            ProxyError::RouteForbidden(_) => "permission_denied",
+            ProxyError::Gone(_) => "invalid_request_error",
             ProxyError::ModelNotFound(_) => "model_not_found",
             ProxyError::VideoNotFound(_) => "video_not_found",
             ProxyError::InvalidRequest(_) => "invalid_request_error",
+            ProxyError::WebSocketUpgradeRequired { .. } => "websocket_upgrade_required",
             ProxyError::RequestTooLarge { .. } => "invalid_request_error",
             ProxyError::ProviderUnavailable => "provider_unavailable",
             ProxyError::AllCandidatesUnavailable { .. } => "all_candidates_unavailable",
             ProxyError::ContentFiltered(_) => "content_filter",
             ProxyError::BudgetExceeded(_) => "billing_error",
             ProxyError::RateLimit(_) => "rate_limit_exceeded",
+            ProxyError::PolicyRateLimit { .. } => "rate_limit_exceeded",
             ProxyError::Bridge(b) => b.error_type(),
         }
     }
@@ -350,6 +432,7 @@ impl ProxyError {
     pub fn retry_after_secs(&self) -> Option<u64> {
         match self {
             ProxyError::RateLimit(e) => e.retry_after_secs(),
+            ProxyError::PolicyRateLimit { source, .. } => source.retry_after_secs(),
             ProxyError::AllCandidatesUnavailable { retry_after_secs } => *retry_after_secs,
             // Source the Retry-After header from the same value the 429
             // body carries (prd-09b §5.8 retry_after_seconds), so the
@@ -391,6 +474,25 @@ impl ProxyError {
         {
             return render_bridge_upstream_envelope(*status, message, parsed.as_deref(), *wire);
         }
+        // An in-band stream error (provider error inside a 2xx stream,
+        // caught pre-first-chunk) carries the same parsed view — render
+        // it with the embedded status so a provider's in-band 429 /
+        // overloaded gets the same translated envelope its HTTP twin
+        // would. No embedded status → the generic 502 family.
+        if let ProxyError::Bridge(aisix_gateway::BridgeError::UpstreamInBand {
+            status,
+            message,
+            parsed,
+            wire,
+        }) = self
+        {
+            return render_bridge_upstream_envelope(
+                status.unwrap_or(502),
+                message,
+                parsed.as_deref(),
+                *wire,
+            );
+        }
         // A timeout's transport cause names the upstream host and the
         // connection-layer fault it hit. Same rule as the 5xx body below:
         // that is operator diagnostics, so it reaches the logs and the
@@ -406,10 +508,22 @@ impl ProxyError {
         let env = ErrorEnvelope::new(self.to_string(), self.kind());
         match self {
             ProxyError::BudgetExceeded(r) => env.with_code("budget_exceeded").with_budget(r),
+            // Attribution for policy-layer 429s (AISIX-Cloud#892): the
+            // OpenAI envelope names the offending policy. The Anthropic
+            // envelope keeps its strict {type,message} shape.
+            ProxyError::PolicyRateLimit {
+                policy_id,
+                policy_name,
+                ..
+            } => env.with_policy(policy_id, policy_name),
             // Stable machine-readable code for SDKs to branch on, distinct
             // from the generic `permission_denied` type shared with
             // ModelForbidden (#557 AC-1).
             ProxyError::ModelIpRestricted(_) => env.with_code("ip_restricted"),
+            ProxyError::RouteIpRestricted(_) => env.with_code("ip_restricted"),
+            // Stable code so migration tooling can detect the removed
+            // tunnel without matching on the message text.
+            ProxyError::Gone(_) => env.with_code("endpoint_removed"),
             // Stable machine-readable codes so SDKs can branch on the
             // lifecycle reason without parsing the message, while the
             // `error.type` stays the family-wide `invalid_api_key`.
@@ -523,6 +637,7 @@ impl IntoResponse for ProxyError {
         let challenge = self.auth_challenge();
         let status = self.status();
         let retry_after = self.retry_after_secs();
+        let upgrade_reject = matches!(self, ProxyError::WebSocketUpgradeRequired { .. });
         let body = self.envelope();
         let mut response = (status, Json(body)).into_response();
         if let Some(secs) = retry_after {
@@ -532,6 +647,25 @@ impl IntoResponse for ProxyError {
         }
         if let Some(challenge) = challenge {
             response.extensions_mut().insert(challenge);
+        }
+        // RFC 9110: a 426 must name the protocol to switch to (§15.5.22)
+        // and a 405 must list the allowed methods (§15.5.6; GET implies
+        // HEAD on this route). axum's bare rejection omitted both, but the
+        // response is the gateway's own now.
+        if upgrade_reject {
+            match status {
+                StatusCode::UPGRADE_REQUIRED => {
+                    response
+                        .headers_mut()
+                        .insert("upgrade", HeaderValue::from_static("websocket"));
+                }
+                StatusCode::METHOD_NOT_ALLOWED => {
+                    response
+                        .headers_mut()
+                        .insert("allow", HeaderValue::from_static("GET, HEAD"));
+                }
+                _ => {}
+            }
         }
         response
     }
@@ -682,6 +816,65 @@ pub(crate) fn proxy_error_from_json_rejection(
         }
         _ => ProxyError::InvalidRequest("invalid JSON request body".into()),
     }
+}
+
+/// [`proxy_error_from_json_rejection`]'s sibling for handlers that take
+/// the raw `Bytes` extractor (batches / fine-tuning): same 413-vs-400
+/// discrimination, no JSON layer.
+pub(crate) fn proxy_error_from_bytes_rejection(
+    rej: axum::extract::rejection::BytesRejection,
+    limit_bytes: usize,
+) -> ProxyError {
+    if rej.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        ProxyError::RequestTooLarge { limit_bytes }
+    } else {
+        ProxyError::InvalidRequest("failed to read request body".into())
+    }
+}
+
+/// Map a multipart read failure, preserving axum's 413 discrimination:
+/// an over-cap stream or part is a real `RequestTooLarge` (axum's
+/// `MultipartError::status()` already classifies it 413); everything
+/// else stays the 400 the call site describes via `context`. Without
+/// this, an over-limit chunked upload surfaced as a generic 400
+/// `invalid_request_error` instead of `request_too_large`.
+pub(crate) fn proxy_error_from_multipart(
+    err: axum::extract::multipart::MultipartError,
+    limit_bytes: usize,
+    context: &str,
+) -> ProxyError {
+    if err.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        ProxyError::RequestTooLarge { limit_bytes }
+    } else {
+        ProxyError::InvalidRequest(format!("{context}: {err}"))
+    }
+}
+
+/// Cap for manual `axum::body::to_bytes` reads: the configured
+/// `request_body_limit_bytes` with the `0` = "no cap" sentinel widened to
+/// `usize::MAX`, mirroring what `DefaultBodyLimit::disable()` does on the
+/// extractor path.
+pub(crate) fn body_read_cap(limit_bytes: usize) -> usize {
+    if limit_bytes == 0 {
+        usize::MAX
+    } else {
+        limit_bytes
+    }
+}
+
+/// Whether a manual body read failed because it hit the length cap
+/// (→ 413) rather than a transport fault (→ 400). `axum::body::to_bytes`
+/// folds both into one opaque `axum::Error`; the cap case carries
+/// `http_body_util::LengthLimitError` in its source chain.
+pub(crate) fn is_length_limit_error(err: &axum::Error) -> bool {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = source {
+        if e.is::<http_body_util::LengthLimitError>() {
+            return true;
+        }
+        source = e.source();
+    }
+    false
 }
 
 #[cfg(test)]

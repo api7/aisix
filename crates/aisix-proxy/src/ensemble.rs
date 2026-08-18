@@ -84,12 +84,18 @@ pub trait ModelCaller: Send + Sync {
 /// ensemble run, so it holds no owned state of its own.
 pub(crate) struct ProxyModelCaller<'a> {
     pub state: &'a ProxyState,
+    /// Caller identity — the per-member quota gate needs the identity
+    /// dimensions for conditional policy rows (AISIX-Cloud#892).
+    pub auth: &'a crate::auth::AuthenticatedKey,
     pub snapshot: &'a AisixSnapshot,
     pub request_id: &'a str,
     /// The originating request's context. Member calls are dispatched on
     /// the caller's behalf, so they carry the same caller identity and
     /// forwardable client headers as a single-upstream dispatch would.
     pub client: &'a crate::client_ip::ClientContext,
+    /// The ensemble entry the caller addressed, so per-member policy
+    /// matching sees the {member, parent} pair (AISIX-Cloud#1267).
+    pub routing_parent: crate::quota::RoutingParent<'a>,
 }
 
 #[async_trait]
@@ -136,7 +142,9 @@ impl ModelCaller for ProxyModelCaller<'_> {
             Arc::new(pk_entry.value.clone()),
             Some(self.client),
         );
-        if let Some(deadline) = model.request_timeout() {
+        if let Some(deadline) =
+            crate::routing::effective_timeouts(model, None, self.state.default_timeouts).request
+        {
             ctx = ctx.with_deadline(deadline);
         }
 
@@ -147,11 +155,24 @@ impl ModelCaller for ProxyModelCaller<'_> {
         // that exceeds its own limit becomes a failed sub-call: the panel drops
         // it toward `min_responses`, and the judge surfaces it as a 429 judge
         // failure. An unlimited member reserves nothing (zero overhead).
-        let reservation = crate::quota::reserve_model_only(self.state, target, &entry.id, model)
-            .await
-            .map_err(|_| {
-                BridgeError::upstream_status(429, "rate limit exceeded for an ensemble sub-call")
-            })?;
+        let reservation = crate::quota::reserve_model_only(
+            self.state,
+            self.snapshot,
+            self.auth,
+            target,
+            &entry.id,
+            model,
+            Some(self.routing_parent),
+        )
+        .await
+        .map_err(|e| {
+            // Client-visible message stays generic; the cause
+            // (which layer / which policy fired) goes to the
+            // logs so an operator can attribute the throttled
+            // member.
+            tracing::warn!(member = %target, error = %e, "ensemble sub-call rate limited");
+            BridgeError::upstream_status(429, "rate limit exceeded for an ensemble sub-call")
+        })?;
 
         // On a bridge error the reservation drops here → concurrency slots
         // release and no tokens are counted. On success we commit the member's

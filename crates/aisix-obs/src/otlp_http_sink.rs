@@ -306,15 +306,39 @@ fn fingerprint_otlp(cfg: &OtlpHttpConfig) -> u64 {
 /// (0.01%) resolution, plenty for an operator-facing percentage knob.
 const SAMPLE_PRECISION: u64 = 10_000;
 
+/// Salt mixed into the sampling hash, drawn once per process.
+///
+/// Without it the bucket is a pure function of `request_id` — and since
+/// AISIX-Cloud#1288 the caller may choose that id. A caller could then grind
+/// FNV-1a (which is trivially cheap) for ids that land outside the configured
+/// bucket and make its own traffic invisible to a sampled exporter, or inside
+/// it to force itself into every trace. The salt is not caller-observable, so
+/// the bucket is no longer predictable off the wire.
+static SAMPLE_SALT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+fn sample_salt() -> u64 {
+    *SAMPLE_SALT.get_or_init(|| uuid::Uuid::new_v4().as_u128() as u64)
+}
+
 /// Per-request sampling decision for an `otlp_http` exporter. `rate` is the
 /// exporter's `sample_rate` (`None` = 1.0, the pre-knob default).
 ///
-/// Deterministic — no clock, no RNG: the request's `request_id` is hashed
-/// (FNV-1a 64, stable across processes and versions) into a bucket in
-/// `0..SAMPLE_PRECISION`, and the request is sampled when the bucket falls
-/// below `rate × SAMPLE_PRECISION`. Same id → same decision, so the
-/// per-attempt events of one request (#655, which share `request_id`) are
-/// exported all-or-nothing, and every DP replica samples the same set.
+/// No clock: the request's `request_id` is hashed (FNV-1a 64) together with a
+/// per-process salt into a bucket in `0..SAMPLE_PRECISION`, and the request is
+/// sampled when the bucket falls below `rate × SAMPLE_PRECISION`. Within a
+/// process the same id always gets the same decision, so the per-attempt
+/// events of one request (#655, which share `request_id`) are exported
+/// all-or-nothing — they are emitted by the process that served the request,
+/// which is the only place that guarantee is needed.
+///
+/// Replicas therefore sample different subsets, and a restart reshuffles.
+/// That is the deliberate cost of the salt (see [`SAMPLE_SALT`]); the property
+/// it replaces — every replica choosing the identical set — only had meaning
+/// when ids were gateway-minted UUIDs that could not repeat across replicas.
+///
+/// Note this samples per REQUEST, not per caller: a caller that reuses one id
+/// across many requests still gets one decision for all of them, so a heavily
+/// id-reusing client can skew what fraction of total traffic an exporter sees.
 fn otlp_should_sample(rate: Option<f64>, request_id: &str) -> bool {
     let rate = rate.unwrap_or(1.0);
     if rate >= 1.0 {
@@ -324,7 +348,10 @@ fn otlp_should_sample(rate: Option<f64>, request_id: &str) -> bool {
         return false;
     }
     let threshold = (rate * SAMPLE_PRECISION as f64).round() as u64;
-    fnv1a_64(request_id.as_bytes()) % SAMPLE_PRECISION < threshold
+    let mut salted = [0u8; 8].to_vec();
+    salted.copy_from_slice(&sample_salt().to_le_bytes());
+    salted.extend_from_slice(request_id.as_bytes());
+    fnv1a_64(&salted) % SAMPLE_PRECISION < threshold
 }
 
 /// FNV-1a 64-bit — implemented inline (a fold over two constants) so the
@@ -551,8 +578,13 @@ impl ObservabilitySink for OtlpSink {
                     Err(SinkError::Permanent(detail))
                 }
             }
-            // Connect / DNS / timeout — transient by nature.
-            Err(e) => Err(SinkError::Transient(format!("POST {}: {e}", self.endpoint))),
+            // Connect / DNS / timeout — transient by nature. reqwest's
+            // Display hides the cause in `source()` — chain it.
+            Err(e) => Err(SinkError::Transient(format!(
+                "POST {}: {}",
+                self.endpoint,
+                crate::sink::error_chain(&e)
+            ))),
         }
     }
 
@@ -608,7 +640,7 @@ fn build_otlp_span(record: &SinkRecord, exporter_name: &str) -> Value {
 
     let mut attributes = vec![
         attr_string("gen_ai.system", "aisix"),
-        attr_string("gen_ai.operation.name", "chat"),
+        attr_string("gen_ai.operation.name", operation_name(event)),
     ];
     // The model alias the client sent (`model` field) — a Model-Group
     // name for routed requests (AISIX-Cloud#790). Semconv key for the
@@ -653,6 +685,14 @@ fn build_otlp_span(record: &SinkRecord, exporter_name: &str) -> Value {
     }
     if !event.model_id.is_empty() {
         attributes.push(attr_string("aisix.model_id", &event.model_id));
+    }
+    // Duration cost basis (#457): only the duration-billed audio models
+    // carry it, so it stays off every other span.
+    if event.audio_duration_seconds > 0.0 {
+        attributes.push(attr_double(
+            "aisix.audio.duration_seconds",
+            event.audio_duration_seconds,
+        ));
     }
     attributes.push(attr_string("aisix.exporter_name", exporter_name));
     attributes.push(attr_string("aisix.request_id", &event.request_id));
@@ -703,6 +743,85 @@ fn build_otlp_span(record: &SinkRecord, exporter_name: &str) -> Value {
             &event.client_user_agent,
         ));
     }
+    // End-user identity a passthrough route's `identity_header` extracted —
+    // the per-employee attribution of the forward-proxy scenario. Not gated
+    // on the protocol so a future handler that learns to populate it exports
+    // it without touching this sink.
+    if !event.client_identity.is_empty() {
+        attributes.push(attr_string_capped(
+            "aisix.client_identity",
+            &event.client_identity,
+        ));
+    }
+    // JWT identity attribution (AISIX-Cloud#564): who the request ran as
+    // when it authenticated with a JWT — the identity behind the (possibly
+    // shared) api_key_id.
+    if !event.jwt_subject.is_empty() {
+        attributes.push(attr_string("aisix.jwt_subject", &event.jwt_subject));
+    }
+    if !event.jwt_provider.is_empty() {
+        attributes.push(attr_string("aisix.jwt_provider", &event.jwt_provider));
+    }
+    if !event.jwt_claim_mapping.is_empty() {
+        attributes.push(attr_string(
+            "aisix.jwt_claim_mapping",
+            &event.jwt_claim_mapping,
+        ));
+    }
+    // Gateway-protocol attribution. An A2A or MCP call is not a model
+    // inference, and encoding one as a bare `chat` span left every agent and
+    // tool call in a trace backend indistinguishable from an LLM request —
+    // with the agent, the method and the task it touched recorded nowhere at
+    // all (AISIX-Cloud#1215).
+    match event.inbound_protocol.as_str() {
+        "a2a" => {
+            if !event.a2a_agent_name.is_empty() {
+                attributes.push(attr_string("gen_ai.agent.name", &event.a2a_agent_name));
+            }
+            // An A2A context ties a multi-turn exchange's tasks together —
+            // exactly what semconv means by a conversation id.
+            if !event.a2a_context_id.is_empty() {
+                attributes.push(attr_string_capped(
+                    "gen_ai.conversation.id",
+                    &event.a2a_context_id,
+                ));
+            }
+            for (key, value) in [
+                ("aisix.a2a.method", &event.a2a_method),
+                ("aisix.a2a.operation", &event.a2a_operation),
+                ("aisix.a2a.protocol_version", &event.a2a_protocol_version),
+                ("aisix.a2a.task_id", &event.a2a_task_id),
+                ("aisix.a2a.task_state", &event.a2a_task_state),
+            ] {
+                if !value.is_empty() {
+                    attributes.push(attr_string_capped(key, value));
+                }
+            }
+            if event.a2a_stream_event_count > 0 {
+                attributes.push(attr_int(
+                    "aisix.a2a.stream_event_count",
+                    i64::from(event.a2a_stream_event_count),
+                ));
+            }
+        }
+        "mcp" => {
+            if !event.mcp_tool_name.is_empty() {
+                attributes.push(attr_string_capped("gen_ai.tool.name", &event.mcp_tool_name));
+            }
+            if !event.mcp_server_name.is_empty() {
+                attributes.push(attr_string("aisix.mcp.server_name", &event.mcp_server_name));
+            }
+        }
+        "passthrough" => {
+            if !event.passthrough_route_name.is_empty() {
+                attributes.push(attr_string(
+                    "aisix.passthrough.route_name",
+                    &event.passthrough_route_name,
+                ));
+            }
+        }
+        _ => {}
+    }
     // Opt-in captured content (#519 B.2) — present ONLY on a record built by
     // [`content_record`] for a `content_mode = full` exporter. Keys match the
     // Datadog sink's flattened content fields, so one query vocabulary works
@@ -718,13 +837,65 @@ fn build_otlp_span(record: &SinkRecord, exporter_name: &str) -> Value {
     json!({
         "traceId": trace_id,
         "spanId":  span_id,
-        "name":    "chat.completions",
-        "kind":    3, // SPAN_KIND_CLIENT (DP → upstream LLM)
+        "name":    span_name(event),
+        // SPAN_KIND_CLIENT for all three: the gateway is the client of a
+        // remote LLM, agent or MCP server. The conventions name INTERNAL for
+        // a tool executed in-process, which is not what this span describes.
+        "kind":    3,
         "startTimeUnixNano": start_unix_nano.to_string(),
         "endTimeUnixNano":   end_unix_nano.to_string(),
         "attributes": attributes,
         "status": { "code": status_code },
     })
+}
+
+/// The OpenTelemetry GenAI operation this event describes.
+///
+/// The gateway fronts three kinds of upstream, and only one of them is a model
+/// inference. `invoke_agent` and `execute_tool` are the semconv's own
+/// well-known values for the other two, so an A2A or MCP span lands in the
+/// same bucket a trace backend already understands.
+fn operation_name(event: &UsageEvent) -> &'static str {
+    match event.inbound_protocol.as_str() {
+        "a2a" => "invoke_agent",
+        "mcp" => "execute_tool",
+        "passthrough" => "passthrough",
+        _ => "chat",
+    }
+}
+
+/// Longest target this will append to a span name.
+///
+/// An A2A agent name is a registered resource, but an MCP tool name is the
+/// caller's own `tools/call` `params.name` and is recorded before the tool is
+/// known to exist — including on the quota-rejection path, which emits without
+/// ever contacting an upstream. A trace backend indexes span names and most
+/// derive RED metrics from them, so the one field a caller picks freely is
+/// bounded before it gets there.
+const MAX_SPAN_NAME_TARGET: usize = 64;
+
+/// The span's name: `{operation} {target}` where the target is low-cardinality
+/// and known, per the semconv's naming rule for agent and tool spans. LLM
+/// traffic keeps the name it has always had.
+///
+/// A target that is absent or outside [`MAX_SPAN_NAME_TARGET`] leaves the bare
+/// operation, which the conventions name as the fallback for exactly this
+/// case. The raw value is still on the span as an attribute either way.
+fn span_name(event: &UsageEvent) -> String {
+    let operation = operation_name(event);
+    let target = match event.inbound_protocol.as_str() {
+        "a2a" => &event.a2a_agent_name,
+        "mcp" => &event.mcp_tool_name,
+        // A route name is a registered resource like an agent name, so it is
+        // operator-bounded — but it still passes the length cap below.
+        "passthrough" => &event.passthrough_route_name,
+        _ => return "chat.completions".to_string(),
+    };
+    if target.is_empty() || target.len() > MAX_SPAN_NAME_TARGET {
+        operation.to_string()
+    } else {
+        format!("{operation} {target}")
+    }
 }
 
 /// Wrap one or more spans into an OTLP/HTTP-JSON `ExportTraceServiceRequest`.
@@ -761,11 +932,37 @@ fn attr_string(key: &str, value: &str) -> Value {
     })
 }
 
+/// Longest caller-supplied attribute value carried on a span.
+///
+/// The gateway-protocol attributes below are copied from the caller's own
+/// JSON-RPC envelope (the method it invoked, the ids it named), and the
+/// request body limit defaults to unlimited, so their length is the caller's
+/// choice. Every span rides in a batched export, so an unbounded value is a
+/// delivery problem as much as a storage one.
+const MAX_PROTOCOL_ATTR_BYTES: usize = 256;
+
+/// [`attr_string`] for a value a caller controls, cut to
+/// [`MAX_PROTOCOL_ATTR_BYTES`] on a UTF-8 boundary.
+fn attr_string_capped(key: &str, value: &str) -> Value {
+    let mut end = MAX_PROTOCOL_ATTR_BYTES.min(value.len());
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    attr_string(key, &value[..end])
+}
+
 fn attr_int(key: &str, value: i64) -> Value {
     json!({
         "key": key,
         // OTLP/JSON encodes int as a string to avoid JS Number precision loss.
         "value": { "intValue": value.to_string() },
+    })
+}
+
+fn attr_double(key: &str, value: f64) -> Value {
+    json!({
+        "key": key,
+        "value": { "doubleValue": value },
     })
 }
 
@@ -1153,14 +1350,40 @@ mod tests {
             }
         }
 
-        // Across many distinct ids the kept fraction tracks the rate. The id
-        // set is fixed, so the count is exact and the test cannot flake.
+        // Across many distinct ids the kept fraction tracks the rate. The
+        // per-process salt makes the exact count vary between runs, so the
+        // band is wide: at n=1000, p=0.5 the standard deviation is ~16, and
+        // ±150 is over nine of them.
         let kept = (0..1000)
             .filter(|i| otlp_should_sample(Some(0.5), &format!("req-{i}")))
             .count();
         assert!(
             (350..=650).contains(&kept),
             "rate 0.5 kept {kept}/1000 — hash badly skewed"
+        );
+    }
+
+    // AISIX-Cloud#1288: the request id is caller-supplied, so the sampling
+    // bucket must not be a pure function of it. Without the salt a caller can
+    // grind ids offline until one falls outside a sampled exporter's bucket
+    // and never appear in a trace again.
+    #[test]
+    fn sampling_bucket_is_not_predictable_from_the_request_id_alone() {
+        // The unsalted hash is what an attacker can compute off the wire.
+        // Over many ids it must disagree with the real decision often enough
+        // that precomputing an evasive id is not possible.
+        let disagreements = (0..1000)
+            .filter(|i| {
+                let id = format!("req-{i}");
+                let unsalted = fnv1a_64(id.as_bytes()) % SAMPLE_PRECISION
+                    < (0.5 * SAMPLE_PRECISION as f64) as u64;
+                unsalted != otlp_should_sample(Some(0.5), &id)
+            })
+            .count();
+        assert!(
+            disagreements > 100,
+            "only {disagreements}/1000 ids differ from the unsalted bucket — \
+             the salt is not reaching the hash"
         );
     }
 
@@ -1298,6 +1521,219 @@ mod tests {
         assert!(keys.contains(&"aisix.model_id"));
         assert!(keys.contains(&"aisix.exporter_name"));
         assert!(keys.contains(&"aisix.request_id"));
+    }
+
+    #[test]
+    fn an_a2a_call_exports_as_an_agent_span_not_a_chat_one() {
+        // Every gateway-protocol event used to be encoded as `chat` /
+        // `chat.completions`, so an agent call was indistinguishable from a
+        // model inference in a trace backend and the agent, method and task it
+        // touched appeared nowhere (AISIX-Cloud#1215).
+        let mut ev = sample_event();
+        ev.inbound_protocol = "a2a".into();
+        ev.a2a_agent_name = "invoice-processor".into();
+        ev.a2a_method = "SendStreamingMessage".into();
+        ev.a2a_operation = "message/stream".into();
+        ev.a2a_protocol_version = "1.0".into();
+        ev.a2a_task_id = "task-9".into();
+        ev.a2a_context_id = "ctx-4".into();
+        ev.a2a_task_state = "working".into();
+
+        let body = build_otlp_traces_payload(&ev, "test-exp");
+        let span = &body["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
+        assert_eq!(span["name"], "invoke_agent invoice-processor");
+        let attrs = span["attributes"].as_array().unwrap();
+        let find = |k: &str| attrs.iter().find(|a| a["key"] == k);
+        let string_at = |k: &str| find(k).unwrap()["value"]["stringValue"].clone();
+        assert_eq!(string_at("gen_ai.operation.name"), "invoke_agent");
+        assert_eq!(string_at("gen_ai.agent.name"), "invoice-processor");
+        // A2A's context id is semconv's conversation id — the thread a
+        // multi-turn exchange's tasks hang off.
+        assert_eq!(string_at("gen_ai.conversation.id"), "ctx-4");
+        assert_eq!(string_at("aisix.a2a.method"), "SendStreamingMessage");
+        assert_eq!(string_at("aisix.a2a.operation"), "message/stream");
+        assert_eq!(string_at("aisix.a2a.protocol_version"), "1.0");
+        assert_eq!(string_at("aisix.a2a.task_id"), "task-9");
+        assert_eq!(string_at("aisix.a2a.task_state"), "working");
+    }
+
+    #[test]
+    fn a_passthrough_relay_exports_route_and_identity_not_a_chat_span() {
+        // The passthrough handler emits usage events with
+        // `inbound_protocol = "passthrough"`; without the explicit branch a
+        // Copilot relay exported as a bare `chat.completions` span with the
+        // route and the device-injected end-user identity recorded nowhere.
+        let mut ev = sample_event();
+        ev.inbound_protocol = "passthrough".into();
+        ev.passthrough_route_name = "copilot-chat".into();
+        ev.client_identity = "alice@example.com".into();
+
+        let body = build_otlp_traces_payload(&ev, "test-exp");
+        let span = &body["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
+        assert_eq!(span["name"], "passthrough copilot-chat");
+        let attrs = span["attributes"].as_array().unwrap();
+        let find = |k: &str| attrs.iter().find(|a| a["key"] == k);
+        let string_at = |k: &str| find(k).unwrap()["value"]["stringValue"].clone();
+        assert_eq!(string_at("gen_ai.operation.name"), "passthrough");
+        assert_eq!(string_at("aisix.passthrough.route_name"), "copilot-chat");
+        assert_eq!(string_at("aisix.client_identity"), "alice@example.com");
+    }
+
+    #[test]
+    fn client_identity_exports_without_a_protocol_gate() {
+        // The identity attribute must not depend on the passthrough branch:
+        // any handler that populates the field gets it exported.
+        let mut ev = sample_event();
+        ev.client_identity = "bob@example.com".into();
+        let body = build_otlp_traces_payload(&ev, "test-exp");
+        let span = &body["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
+        let attrs = span["attributes"].as_array().unwrap();
+        let id = attrs
+            .iter()
+            .find(|a| a["key"] == "aisix.client_identity")
+            .unwrap();
+        assert_eq!(id["value"]["stringValue"], "bob@example.com");
+    }
+
+    #[test]
+    fn a_streamed_a2a_call_carries_its_event_count() {
+        // A unary call has no count, and exporting a zero would read as "the
+        // stream carried nothing" rather than "there was no stream".
+        let mut streamed = sample_event();
+        streamed.inbound_protocol = "a2a".into();
+        streamed.a2a_agent_name = "invoice-processor".into();
+        streamed.a2a_stream_event_count = 17;
+        let body = build_otlp_traces_payload(&streamed, "test-exp");
+        let attrs = body["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["attributes"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(
+            attrs
+                .iter()
+                .find(|a| a["key"] == "aisix.a2a.stream_event_count")
+                .unwrap()["value"]["intValue"],
+            "17"
+        );
+
+        let mut unary = sample_event();
+        unary.inbound_protocol = "a2a".into();
+        let body = build_otlp_traces_payload(&unary, "test-exp");
+        let attrs = body["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["attributes"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert!(attrs
+            .iter()
+            .all(|a| a["key"] != "aisix.a2a.stream_event_count"));
+    }
+
+    #[test]
+    fn an_mcp_call_exports_as_a_tool_span() {
+        let mut ev = sample_event();
+        ev.inbound_protocol = "mcp".into();
+        ev.mcp_server_name = "github".into();
+        ev.mcp_tool_name = "create_issue".into();
+
+        let body = build_otlp_traces_payload(&ev, "test-exp");
+        let span = &body["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
+        assert_eq!(span["name"], "execute_tool create_issue");
+        let attrs = span["attributes"].as_array().unwrap();
+        let find = |k: &str| attrs.iter().find(|a| a["key"] == k);
+        assert_eq!(
+            find("gen_ai.operation.name").unwrap()["value"]["stringValue"],
+            "execute_tool"
+        );
+        assert_eq!(
+            find("gen_ai.tool.name").unwrap()["value"]["stringValue"],
+            "create_issue"
+        );
+        assert_eq!(
+            find("aisix.mcp.server_name").unwrap()["value"]["stringValue"],
+            "github"
+        );
+    }
+
+    #[test]
+    fn a_caller_chosen_target_cannot_grow_the_span_name() {
+        // An MCP tool name is the caller's own `tools/call` `params.name`,
+        // recorded before the tool is known to exist, and the request body
+        // limit defaults to unlimited. A trace backend indexes span names, so
+        // an oversized one falls back to the bare operation and travels as an
+        // attribute instead — itself cut to a fixed cap.
+        let mut ev = sample_event();
+        ev.inbound_protocol = "mcp".into();
+        ev.mcp_tool_name = "t".repeat(4096);
+
+        let body = build_otlp_traces_payload(&ev, "test-exp");
+        let span = &body["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
+        assert_eq!(span["name"], "execute_tool");
+        let attrs = span["attributes"].as_array().unwrap();
+        let tool = attrs
+            .iter()
+            .find(|a| a["key"] == "gen_ai.tool.name")
+            .unwrap()["value"]["stringValue"]
+            .as_str()
+            .unwrap();
+        assert_eq!(tool.len(), MAX_PROTOCOL_ATTR_BYTES);
+    }
+
+    #[test]
+    fn a_capped_attribute_is_cut_on_a_char_boundary() {
+        // A multi-byte character straddling the cap must not produce invalid
+        // UTF-8 in the export body.
+        let mut ev = sample_event();
+        ev.inbound_protocol = "a2a".into();
+        ev.a2a_method = "情".repeat(200);
+
+        let body = build_otlp_traces_payload(&ev, "test-exp");
+        let attrs = body["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["attributes"]
+            .as_array()
+            .unwrap()
+            .clone();
+        let method = attrs
+            .iter()
+            .find(|a| a["key"] == "aisix.a2a.method")
+            .unwrap()["value"]["stringValue"]
+            .as_str()
+            .unwrap();
+        assert!(method.len() <= MAX_PROTOCOL_ATTR_BYTES);
+        assert!(method.chars().all(|c| c == '情'));
+    }
+
+    #[test]
+    fn a_gateway_protocol_span_without_a_target_keeps_a_bare_name() {
+        // A pre-dispatch rejection resolves no agent, so there is no
+        // low-cardinality target to append — semconv says name the span after
+        // the operation alone rather than inventing one.
+        let mut ev = sample_event();
+        ev.inbound_protocol = "a2a".into();
+        let body = build_otlp_traces_payload(&ev, "test-exp");
+        assert_eq!(
+            body["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["name"],
+            "invoke_agent"
+        );
+    }
+
+    #[test]
+    fn llm_traffic_keeps_its_chat_span_shape() {
+        // The protocol switch must not move LLM spans: dashboards and saved
+        // trace queries are written against these two values.
+        for protocol in ["", "openai", "anthropic"] {
+            let mut ev = sample_event();
+            ev.inbound_protocol = protocol.into();
+            let body = build_otlp_traces_payload(&ev, "test-exp");
+            let span = &body["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
+            assert_eq!(span["name"], "chat.completions", "protocol={protocol:?}");
+            let attrs = span["attributes"].as_array().unwrap();
+            assert_eq!(
+                attrs
+                    .iter()
+                    .find(|a| a["key"] == "gen_ai.operation.name")
+                    .unwrap()["value"]["stringValue"],
+                "chat"
+            );
+        }
     }
 
     #[test]

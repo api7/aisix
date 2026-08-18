@@ -37,8 +37,7 @@
 
 use aisix_core::AppliedGuardrail;
 use aisix_obs::{
-    content_capture_cap, AccessLog, CapturedContent, LatencyLabels, LlmUsage, RequestLabels,
-    RequestOutcome, UsageEvent, UsageLabels,
+    content_capture_cap, AccessLog, CapturedContent, LatencyLabels, UsageEvent, UsageLabels,
 };
 use axum::extract::State;
 use axum::http::{HeaderName, HeaderValue};
@@ -55,7 +54,8 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use crate::attempt::{
-    attempt_error_from_proxy, ms_since, AttemptInfo, AttemptRecord, RoutingTelemetry,
+    attempt_error_from_proxy, attempt_reached_upstream, ms_since, AttemptInfo, AttemptRecord,
+    RoutingTelemetry,
 };
 use crate::auth::AuthenticatedKey;
 use crate::chat::sanitize_tag;
@@ -84,22 +84,28 @@ pub async fn messages(
         Ok(a) => a,
         Err(e) => return e.into_anthropic_response(),
     };
+    let started = Instant::now();
     let Json(mut body) = match body {
         Ok(j) => j,
         Err(rej) => {
             // Classify the body-extractor failure (malformed JSON vs
             // 413 cap vs transport read error) via the shared helper so
             // /v1/messages and /v1/messages/count_tokens stay in lockstep
-            // on the discrimination rules, then render the Anthropic-
-            // shape envelope the Claude SDK can parse (#336).
-            return crate::error::proxy_error_from_json_rejection(
-                rej,
-                state.request_body_limit_bytes,
-            )
-            .into_anthropic_response();
+            // on the discrimination rules, then answer through `reject`,
+            // which renders the Anthropic-shape envelope the Claude SDK
+            // can parse (#336) and emits the access log + metrics.
+            return crate::reject::reject_before_dispatch(
+                &state,
+                "POST",
+                "/v1/messages",
+                &client.request_id,
+                Some(&auth.entry.id),
+                started,
+                crate::reject::Envelope::Anthropic,
+                crate::error::proxy_error_from_json_rejection(rej, state.request_body_limit_bytes),
+            );
         }
     };
-    let started = Instant::now();
     let request_id = client.request_id.clone();
     let api_key_id = auth.entry.id.clone();
 
@@ -109,11 +115,13 @@ pub async fn messages(
         .unwrap_or("")
         .to_string();
 
+    // One snapshot for the whole request (#941): the handle this already
+    // loaded to resolve the model now also serves dispatch, the terminal
+    // metric emits and the usage events, instead of each loading its own.
     let snapshot = state.snapshot.load();
     let model_id = crate::model_resolve::resolve_model(&snapshot, &model_name)
         .map(|e| e.id.clone())
         .unwrap_or_default();
-    drop(snapshot);
 
     // Filled by `dispatch` once the per-request guardrail chain resolves;
     // read below to attach `applied_guardrails` to the telemetry event on both
@@ -134,6 +142,7 @@ pub async fn messages(
         .unwrap_or(false);
     match dispatch(
         &state,
+        &snapshot,
         &auth,
         &mut body,
         &request_id,
@@ -170,48 +179,41 @@ pub async fn messages(
                 status,
                 elapsed,
                 &request_id,
+                // Empty on the streaming path — the id rides the
+                // `message_start` frame, which has not arrived yet. That case
+                // is covered by the per-attempt `provider call completed`
+                // line the usage sink emits (AISIX-Cloud#1289).
+                Some(metrics.provider_request_id.as_str()),
                 &routing,
                 None,
             );
-            state.metrics.record_request(
-                &provider_label,
-                &model_name,
+            // ONE ProviderKey lookup for both the metric emit and the
+            // winner's usage event below (#941).
+            let pk = crate::usage_attr::ResolvedPk::resolve(&snapshot, &provider_key_id);
+            crate::request_metrics::record(
+                &state,
+                "/v1/messages",
+                crate::request_metrics::Caller::new(&auth),
+                crate::request_metrics::Upstream {
+                    provider: &provider_label,
+                    model: &model_name,
+                    upstream_model: &upstream_model,
+                    pk: pk.labels(),
+                    stream: stream_requested,
+                    is_fallback: routing.fallback_count() > 0,
+                },
                 status,
-                RequestOutcome::from_status(status),
                 elapsed,
             );
-            let outcome = RequestOutcome::from_status(status);
-            // #890 req-3: readable provider-key name resolved from the snapshot.
-            let provider_key_name = {
-                let snap = state.snapshot.load();
-                crate::usage_attr::provider_key_metric_name(&snap, &provider_key_id)
-            };
-            let labels = RequestLabels {
-                endpoint: "/v1/messages",
-                inbound_protocol: "anthropic",
-                provider: &provider_label,
-                model: &model_name,
-                upstream_model: &upstream_model,
-                provider_key_id: &provider_key_id,
-                provider_key_name: &provider_key_name,
-                api_key_id: &api_key_id,
-                team_id: auth.key().team_id.as_deref().unwrap_or("unknown"),
-                user_id: auth.key().user_id.as_deref().unwrap_or("unknown"),
-                user_name: auth.key().user_name.as_deref().unwrap_or("unknown"),
-                stream: stream_requested,
-                is_fallback: routing.fallback_count() > 0,
-                status,
-                outcome,
-            };
-            state.metrics.record_proxy_request(labels, elapsed);
-            state.metrics.record_llm_request(labels, elapsed);
             // SLO e2e histogram (AISIX-Cloud#1011): non-streaming only —
             // a stream records its full duration at completion instead.
             if !stream_requested {
+                let bounded_model =
+                    crate::usage_attr::metric_model_label(&state.snapshot.load(), &model_name);
                 state.metrics.record_request_e2e_latency(
                     LatencyLabels {
                         endpoint: "/v1/messages",
-                        model: &model_name,
+                        model: bounded_model.as_ref(),
                         provider: &provider_label,
                         status,
                         streaming: false,
@@ -224,6 +226,7 @@ pub async fn messages(
             // first-try success and for the single-attempt streaming path.
             emit_failed_attempts_anthropic(
                 &state,
+                &snapshot,
                 &request_id,
                 &api_key_id,
                 &provider_label,
@@ -265,12 +268,13 @@ pub async fn messages(
                 metrics.downstream_latency_ms = elapsed.as_millis().min(u32::MAX as u128) as u32;
                 emit_anthropic_usage_event(
                     &state,
+                    &snapshot,
+                    &pk,
                     &request_id,
                     event_model_id,
                     &api_key_id,
                     &provider_label,
                     &model_name,
-                    &provider_key_id,
                     &upstream_model,
                     auth.key().team_id.as_deref(),
                     auth.key().user_id.as_deref(),
@@ -298,45 +302,36 @@ pub async fn messages(
                 status,
                 elapsed,
                 &request_id,
+                None,
                 &routing,
                 Some(&err),
             );
-            let snap = state.snapshot.load();
-            let metric_model = crate::usage_attr::metric_model_label(&snap, &model_name);
-            state.metrics.record_request(
-                "unknown",
-                metric_model,
-                status,
-                RequestOutcome::from_status(status),
-                elapsed,
-            );
+            let metric_model = crate::usage_attr::metric_model_label(&snapshot, &model_name);
             // #890 req-2: count the FAILED request on the rich request metrics
             // so a success rate is computable (denominator incl. failures).
-            // Provider/upstream/provider_key are unknown on the failure path.
-            let fail_labels = RequestLabels {
-                endpoint: "/v1/messages",
-                inbound_protocol: "anthropic",
-                provider: "unknown",
-                model: metric_model,
-                upstream_model: "unknown",
-                provider_key_id: "unknown",
-                provider_key_name: "unknown",
-                api_key_id: &api_key_id,
-                team_id: auth.key().team_id.as_deref().unwrap_or("unknown"),
-                user_id: auth.key().user_id.as_deref().unwrap_or("unknown"),
-                user_name: auth.key().user_name.as_deref().unwrap_or("unknown"),
-                stream: stream_requested,
-                is_fallback: routing.fallback_count() > 0,
+            // AISIX-Cloud#1325: name the target the request died on. This
+            // branch used to emit `Upstream::default()`, so a 502 from a
+            // real provider landed on `provider="unknown"` while the same
+            // key's successes landed on the real one.
+            let attributed = crate::attribution::current().unwrap_or_default();
+            let last_target = crate::request_metrics::LastTarget::new(&snapshot, &attributed);
+            crate::request_metrics::record(
+                &state,
+                "/v1/messages",
+                crate::request_metrics::Caller::new(&auth),
+                last_target.upstream(
+                    metric_model.as_ref(),
+                    stream_requested,
+                    routing.fallback_count() > 0,
+                ),
                 status,
-                outcome: RequestOutcome::from_status(status),
-            };
-            state.metrics.record_proxy_request(fail_labels, elapsed);
-            state.metrics.record_llm_request(fail_labels, elapsed);
+                elapsed,
+            );
             state.metrics.record_request_e2e_latency(
                 LatencyLabels {
                     endpoint: "/v1/messages",
-                    model: metric_model,
-                    provider: "unknown",
+                    model: metric_model.as_ref(),
+                    provider: last_target.provider(),
                     status,
                     streaming: stream_requested,
                 },
@@ -352,7 +347,8 @@ pub async fn messages(
                 None
             } else {
                 content_capture_cap(
-                    snap.observability_exporters
+                    snapshot
+                        .observability_exporters
                         .entries()
                         .iter()
                         .map(|e| &e.value),
@@ -376,6 +372,7 @@ pub async fn messages(
             // the dashboard's Logs tab surfaces each failed upstream try.
             emit_failed_attempts_anthropic(
                 &state,
+                &snapshot,
                 &request_id,
                 &api_key_id,
                 "unknown",
@@ -396,12 +393,13 @@ pub async fn messages(
             if routing.attempts.is_empty() {
                 emit_anthropic_usage_event(
                     &state,
+                    &snapshot,
+                    &crate::usage_attr::ResolvedPk::unresolved(),
                     &request_id,
                     &model_id,
                     &api_key_id,
                     "unknown",
                     &model_name,
-                    "unknown",
                     "unknown",
                     auth.key().team_id.as_deref(),
                     auth.key().user_id.as_deref(),
@@ -438,6 +436,7 @@ pub async fn messages(
 #[allow(clippy::too_many_arguments)]
 fn emit_failed_attempts_anthropic(
     state: &ProxyState,
+    snap: &aisix_core::AisixSnapshot,
     request_id: &str,
     api_key_id: &str,
     provider: &str,
@@ -467,8 +466,11 @@ fn emit_failed_attempts_anthropic(
         } else {
             None
         };
+        let pk = crate::usage_attr::ResolvedPk::resolve(snap, &rec.provider_key_id);
         emit_anthropic_usage_event(
             state,
+            snap,
+            &pk,
             request_id,
             // Each failed attempt records the TARGET it actually hit
             // (AISIX-Cloud#790), not the group it was resolved from.
@@ -476,7 +478,6 @@ fn emit_failed_attempts_anthropic(
             api_key_id,
             provider,
             model,
-            &rec.provider_key_id,
             upstream_model,
             team_id,
             user_id,
@@ -499,6 +500,7 @@ fn emit_failed_attempts_anthropic(
 #[allow(clippy::too_many_arguments)]
 async fn dispatch(
     state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
     auth: &AuthenticatedKey,
     body: &mut Value,
     request_id: &str,
@@ -518,8 +520,6 @@ async fn dispatch(
     // same lifecycle as `redactions_out`.
     monitor_hits_out: &mut Vec<aisix_core::GuardrailMonitorHit>,
 ) -> Result<DispatchOutcome, MessagesDispatchError> {
-    let snapshot = state.snapshot.load();
-
     // Extract and resolve model.
     let model_name = body
         .get("model")
@@ -527,7 +527,7 @@ async fn dispatch(
         .ok_or_else(|| ProxyError::InvalidRequest("`model` field missing".into()))?
         .to_string();
 
-    let model_entry = crate::model_resolve::resolve_model(&snapshot, &model_name)
+    let model_entry = crate::model_resolve::resolve_model(snapshot, &model_name)
         .ok_or_else(|| ProxyError::ModelNotFound(model_name.clone()))?;
 
     if !auth.key().can_access(&model_name) {
@@ -548,7 +548,9 @@ async fn dispatch(
     // #542: run this BEFORE the rate-limit reservation so a content-policy
     // block doesn't burn an RPM slot (matching /v1/chat/completions).
     let guardrail_ctx = aisix_guardrails::RequestContext {
+        passthrough_route_id: "",
         model_id: &model_entry.id,
+        mcp_server_id: "",
         api_key_id: &auth.entry.id,
         team_id: auth.key().team_id.as_deref(),
     };
@@ -620,7 +622,8 @@ async fn dispatch(
     // `Option` so the winning streaming attempt can `take()` the reservation
     // and carry it into the end-of-stream guard (#688); non-streaming / failed
     // attempts leave it in place for the post-dispatch commit or a retry.
-    let mut reservation = Some(crate::quota::enforce(state, auth, Some(&model_rl)).await?);
+    let mut reservation =
+        Some(crate::quota::enforce(state, snapshot, auth, Some(&model_rl)).await?);
 
     // Budget pre-check via cp-api (mirrors /v1/chat/completions).
     let budget_decision = state.budgets.check(&auth.entry.id).await;
@@ -640,7 +643,7 @@ async fn dispatch(
     let attempt_models = crate::routing::resolve_attempt_models(
         &state.routing,
         &state.runtime_status,
-        &snapshot,
+        snapshot,
         &model_name,
         &model_entry.id,
         &model_entry.value,
@@ -671,8 +674,16 @@ async fn dispatch(
     // Routing target names only matter on the telemetry for a real Model
     // Group; a direct model leaves `attempt_model` empty (its `model_id`
     // already identifies it), matching chat.rs.
+    // NOTE: deliberately narrower than chat's `routing.is_some() ||
+    // is_semantic()`. The quota gate defers model-property policies on any
+    // routing/ensemble/semantic PARENT (`ModelRateLimit::routing_parent`),
+    // expecting the per-target pass to reserve them — which only runs when
+    // this flag is true. Safe today because semantic/ensemble parents
+    // cannot successfully dispatch on this endpoint (no provider →
+    // pre-dispatch 4xx); if this endpoint ever grows semantic support,
+    // widen this flag or the deferred policies are silently skipped.
     let is_routing_request = model_entry.value.routing.is_some();
-    let mut routing = RoutingTelemetry::default();
+    let mut routing = RoutingTelemetry::for_request(&model_entry.value.display_name);
 
     // Walk targets, failing over to the next only on a retryable upstream
     // failure. A 4xx / config error is returned as-is — retrying other
@@ -686,7 +697,7 @@ async fn dispatch(
     let n = attempt_models.len();
     let mut last_err: Option<ProxyError> = None;
     'targets: for (i, target) in attempt_models.iter().enumerate() {
-        let pk_id = crate::dispatch::resolve_provider_key(&snapshot, &target.model)
+        let pk_id = crate::dispatch::resolve_provider_key(snapshot, &target.model)
             .map(|e| e.id.clone())
             .unwrap_or_default();
         // How many times to re-hit the SAME target (with backoff) on a
@@ -696,9 +707,16 @@ async fn dispatch(
         // because the knob only existed on the group.
         let budget = crate::routing::effective_retries(
             &target.model,
-            model_entry.value.routing.as_ref(),
+            crate::routing::group_retries_of(&model_entry.value),
             state.default_retries,
             i + 1 < n,
+        );
+        // Deadlines resolved target → group → deployment default, next to
+        // the retry budget so the two knobs stay in lockstep.
+        let timeouts = crate::routing::effective_timeouts(
+            &target.model,
+            Some(&model_entry.value),
+            state.default_timeouts,
         );
         for attempt_idx in 0..=budget.attempts {
             // Upstream `Retry-After` when the last failure carried one, else
@@ -724,7 +742,12 @@ async fn dispatch(
             // reset mid-loop).
             let mut member_reservation = match crate::quota::reserve_routing_target(
                 state,
-                is_routing_request,
+                snapshot,
+                auth,
+                is_routing_request.then_some(crate::quota::RoutingParent {
+                    name: &model_entry.value.display_name,
+                    entry_id: &model_entry.id,
+                }),
                 &target.model.display_name,
                 &target.id,
                 &target.model,
@@ -733,18 +756,22 @@ async fn dispatch(
             {
                 Ok(r) => r,
                 Err(e) => {
-                    routing.attempts.push(AttemptRecord {
-                        index: idx,
-                        kind,
-                        target_model,
-                        target_model_id: target.id.clone(),
-                        provider_key_id: pk_id.clone(),
-                        status: 429,
-                        success: false,
-                        error_class: "rate_limit_exceeded".to_string(),
-                        error_message: e.to_string(),
-                        latency_ms: 0,
-                    });
+                    routing.record(
+                        state,
+                        AttemptRecord {
+                            index: idx,
+                            kind,
+                            target_model,
+                            target_model_id: target.id.clone(),
+                            provider_key_id: pk_id.clone(),
+                            status: 429,
+                            success: false,
+                            error_class: "rate_limit_exceeded".to_string(),
+                            error_message: e.to_string(),
+                            latency_ms: 0,
+                            dispatched: false,
+                        },
+                    );
                     last_err = Some(e);
                     continue 'targets;
                 }
@@ -752,9 +779,10 @@ async fn dispatch(
             let attempt_started = Instant::now();
             match dispatch_to_target(
                 state,
-                &snapshot,
+                snapshot,
                 body,
                 target,
+                timeouts,
                 &model_name,
                 request_id,
                 started,
@@ -782,18 +810,22 @@ async fn dispatch(
                     let latency_ms = ms_since(attempt_started);
                     // Feed the least_latency EWMA for this target.
                     state.runtime_status.record_latency(&target.id, latency_ms);
-                    routing.attempts.push(AttemptRecord {
-                        index: idx,
-                        kind,
-                        target_model,
-                        target_model_id: target.id.clone(),
-                        provider_key_id: outcome.provider_key_id.clone(),
-                        status: 200,
-                        success: true,
-                        error_class: String::new(),
-                        error_message: String::new(),
-                        latency_ms,
-                    });
+                    routing.record(
+                        state,
+                        AttemptRecord {
+                            index: idx,
+                            kind,
+                            target_model,
+                            target_model_id: target.id.clone(),
+                            provider_key_id: outcome.provider_key_id.clone(),
+                            status: 200,
+                            success: true,
+                            error_class: String::new(),
+                            error_message: String::new(),
+                            latency_ms,
+                            dispatched: true,
+                        },
+                    );
                     outcome.routing = routing;
                     // #911 [21]: commit the reserved layers with the actual
                     // token cost so TPM/TPD is enforced for /v1/messages like
@@ -828,18 +860,22 @@ async fn dispatch(
                         ProxyError::Bridge(be) if crate::routing::is_retryable(be, retry_on_429, fallback_statuses)
                     );
                     let (error_class, error_message) = attempt_error_from_proxy(&e);
-                    routing.attempts.push(AttemptRecord {
-                        index: idx,
-                        kind,
-                        target_model,
-                        target_model_id: target.id.clone(),
-                        provider_key_id: pk_id.clone(),
-                        status: e.status().as_u16(),
-                        success: false,
-                        error_class,
-                        error_message,
-                        latency_ms: ms_since(attempt_started),
-                    });
+                    routing.record(
+                        state,
+                        AttemptRecord {
+                            index: idx,
+                            kind,
+                            target_model,
+                            target_model_id: target.id.clone(),
+                            provider_key_id: pk_id.clone(),
+                            status: e.status().as_u16(),
+                            success: false,
+                            error_class,
+                            error_message,
+                            latency_ms: ms_since(attempt_started),
+                            dispatched: attempt_reached_upstream(&e),
+                        },
+                    );
                     // See `RetryBudget::covers`: a default budget skips
                     // same-target retries for timeouts; fail-over is unaffected.
                     let budget_covers = match &e {
@@ -870,15 +906,19 @@ async fn dispatch(
     })
 }
 
-/// Dispatch one concrete (non-routing) target Model. Branches on the
-/// target's provider: Anthropic upstreams go through the byte-for-byte
-/// passthrough, everything else through the cross-provider translation.
+/// Dispatch one concrete (non-routing) target Model. Branches on the wire
+/// protocol the target's upstream speaks (`dispatch::speaks_anthropic`):
+/// Anthropic-protocol upstreams go through the byte-for-byte passthrough,
+/// everything else through the cross-provider translation.
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_to_target(
     state: &ProxyState,
     snapshot: &aisix_core::AisixSnapshot,
     body: &Value,
     target: &crate::routing::AttemptModel,
+    // Deadlines resolved by the caller across target → group → deployment
+    // default (`routing::effective_timeouts`); this fn only applies them.
+    timeouts: crate::routing::TimeoutBudget,
     model_name: &str,
     request_id: &str,
     started: Instant,
@@ -918,12 +958,14 @@ async fn dispatch_to_target(
     let model = &target.model;
     let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
 
-    if model.provider.as_deref() != Some("anthropic") {
+    if !crate::dispatch::speaks_anthropic(snapshot, model) {
         return cross_provider_dispatch(
             state,
+            snapshot,
             body,
             model,
             &target.id,
+            timeouts,
             &pk_entry.value,
             &pk_entry.id,
             model_name,
@@ -947,9 +989,11 @@ async fn dispatch_to_target(
 
     anthropic_passthrough_dispatch(
         state,
+        snapshot,
         body,
         model,
         &target.id,
+        timeouts,
         &pk_entry.value,
         &pk_entry.id,
         model_name,
@@ -978,9 +1022,11 @@ async fn dispatch_to_target(
 #[allow(clippy::too_many_arguments)]
 async fn anthropic_passthrough_dispatch(
     state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
     body: &Value,
     model: &aisix_core::Model,
     model_id: &str,
+    timeouts: crate::routing::TimeoutBudget,
     pk_value: &aisix_core::ProviderKey,
     pk_id: &str,
     model_name: &str,
@@ -1035,12 +1081,22 @@ async fn anthropic_passthrough_dispatch(
         );
     }
 
-    // Build the target URL. build_v1_url tolerates the rare case
+    // Build the target URL. build_anthropic_url tolerates the rare case
     // where the customer mistakenly puts `/v1` in the Anthropic
     // api_base (the dashboard placeholder uses the OpenAI form, so
     // this is a copy-paste hazard).
-    let base = crate::dispatch::resolve_base_url(pk_value)?;
-    let url = crate::dispatch::build_v1_url(&base, "/messages");
+    let url = aisix_gateway::url_cache::cached_endpoint_url(
+        pk_id,
+        "proxy/messages",
+        &[pk_value.api_base.as_deref().unwrap_or("")],
+        || {
+            let base = crate::dispatch::resolve_base_url(pk_value)?;
+            Ok::<_, crate::error::ProxyError>(crate::dispatch::build_anthropic_url(
+                &base,
+                "/messages",
+            ))
+        },
+    )?;
 
     // Check if the request wants streaming.
     let is_stream = body
@@ -1083,14 +1139,14 @@ async fn anthropic_passthrough_dispatch(
         &crate::dispatch::upstream_header_ctx(pk_value, pk_id, model, model_id, client_ctx),
     );
 
-    let client = crate::http_client::client();
-    let mut req_builder = client.post(&url).headers(headers).json(&body);
+    let client = crate::http_client::client_for(pk_value.tls.as_ref());
+    let mut req_builder = url.post_on(&client).headers(headers).json(&body);
     // #554: non-streaming gets the E2E request timeout via reqwest's
     // request-level timeout. Streaming must NOT use it (it would cap the
     // whole stream); the streaming branch below enforces the per-chunk
     // read timeout instead.
     if !is_stream {
-        if let Some(d) = model.request_timeout() {
+        if let Some(d) = timeouts.request {
             req_builder = req_builder.timeout(d);
         }
     }
@@ -1104,11 +1160,7 @@ async fn anthropic_passthrough_dispatch(
     // Streaming bounds the connect by the stream deadline (reqwest's
     // request-level timeout can't be used — it would cap the whole stream);
     // non-streaming relies on the request-level timeout set above.
-    let connect_deadline = if is_stream {
-        model.stream_timeout_effective()
-    } else {
-        None
-    };
+    let connect_deadline = if is_stream { timeouts.stream } else { None };
     let upstream_resp =
         crate::stream_timeout::send_with_deadline(req_builder, connect_deadline, send_started)
             .await
@@ -1167,14 +1219,14 @@ async fn anthropic_passthrough_dispatch(
         // target) before the 200 is committed; without one, forward directly
         // (pre-#554 behavior). A mid-stream stall truncates the forwarded
         // stream — there is no in-band error frame for an opaque passthrough.
-        let stream_budget = model.stream_timeout_effective();
+        let stream_budget = timeouts.stream;
         let wrapped: std::pin::Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>> =
             Box::pin(crate::stream_timeout::with_read_timeout_bytes(
                 upstream_resp.bytes_stream(),
                 stream_budget,
             ));
         let body_stream: std::pin::Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>> =
-            if stream_budget.is_some() {
+            if timeouts.stream_configured {
                 let mut wrapped = wrapped;
                 let first_bytes = match wrapped.next().await {
                     Some(Ok(b)) => b,
@@ -1227,6 +1279,10 @@ async fn anthropic_passthrough_dispatch(
         let api_key_id_c = api_key_id.to_string();
         let provider_c = provider_label.clone();
         let model_name_c = model_name.to_string();
+        // Bounded twin for the latency-histogram label (emit-chokepoint
+        // rule) — usage events keep the raw requested string.
+        let bounded_model_c =
+            crate::usage_attr::metric_model_label(&state.snapshot.load(), model_name).into_owned();
         let provider_key_id_c = pk_id.to_string();
         let upstream_model_c = upstream_model.clone();
         let team_id_c = team_id.clone();
@@ -1249,9 +1305,7 @@ async fn anthropic_passthrough_dispatch(
         // into `usage.response_text` by the frame parser and preserved (not
         // taken) when `content_cap` is set. Both gated.
         let content_cap = content_capture_cap(
-            state
-                .snapshot
-                .load()
+            snapshot
                 .observability_exporters
                 .entries()
                 .iter()
@@ -1332,26 +1386,40 @@ async fn anthropic_passthrough_dispatch(
                 state_c.metrics.record_request_e2e_latency(
                     LatencyLabels {
                         endpoint: "/v1/messages",
-                        model: &model_name_c,
+                        model: &bounded_model_c,
                         provider: &provider_c,
                         status: 200,
                         streaming: true,
                     },
                     started.elapsed(),
                 );
+                // A stream can outlive several config generations, so the
+                // end-of-stream emit reads a FRESH snapshot rather than the
+                // one the request started on (#941).
+                let snap_c = state_c.snapshot.load();
+                let pk_c = crate::usage_attr::ResolvedPk::resolve(&snap_c, &provider_key_id_c);
                 emit_anthropic_usage_event(
                     &state_c,
+                    &snap_c,
+                    &pk_c,
                     &request_id_c,
                     &model_id_c,
                     &api_key_id_c,
                     &provider_c,
                     &model_name_c,
-                    &provider_key_id_c,
                     &upstream_model_c,
                     team_id_c.as_deref(),
                     user_id_c.as_deref(),
                     user_name_c.as_deref(),
-                    200,
+                    // A stream the consumer abandoned mid-flight is reported
+                    // as 499, matching LiteLLM. The upstream work still
+                    // happened, so the event is emitted either way — only
+                    // its outcome differs.
+                    if usage.reached_end {
+                        200
+                    } else {
+                        crate::CLIENT_CLOSED_REQUEST
+                    },
                     // Attempt-scoped, unlike the e2e histogram above: any
                     // failed attempt before this one emitted its own event.
                     attempt_started.elapsed(),
@@ -1678,11 +1746,7 @@ fn anthropic_metrics_from_response_json(body: &Value) -> AnthropicUsageMetrics {
             .and_then(|u| u.get("cache_read_input_tokens"))
             .and_then(Value::as_u64)
             .unwrap_or(0) as u32,
-        provider_request_id: body
-            .get("id")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string(),
+        provider_request_id: crate::usage_attr::provider_response_id(body),
         provider_model_version: body
             .get("model")
             .and_then(Value::as_str)
@@ -1714,9 +1778,11 @@ fn anthropic_metrics_from_response_json(body: &Value) -> AnthropicUsageMetrics {
 #[allow(clippy::too_many_arguments)]
 async fn cross_provider_dispatch(
     state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
     body: &Value,
     model: &aisix_core::Model,
     model_id: &str,
+    timeouts: crate::routing::TimeoutBudget,
     provider_key: &aisix_core::ProviderKey,
     provider_key_id: &str,
     model_name: &str,
@@ -1789,9 +1855,9 @@ async fn cross_provider_dispatch(
         Some(client),
     );
     let connect_deadline = if is_stream {
-        model.stream_timeout_effective()
+        timeouts.stream
     } else {
-        model.request_timeout()
+        timeouts.request
     };
     if let Some(d) = connect_deadline {
         ctx = ctx.with_deadline(d);
@@ -1823,9 +1889,9 @@ async fn cross_provider_dispatch(
         // (pre-#554 behavior; a first-chunk error then surfaces in-band). The
         // wrapper keeps enforcing the read timeout on the remaining chunks
         // either way (no-op when unset).
-        let stream_budget = model.stream_timeout_effective();
+        let stream_budget = timeouts.stream;
         let upstream = crate::stream_timeout::with_read_timeout(upstream, stream_budget);
-        let upstream: aisix_gateway::ChatChunkStream = if stream_budget.is_some() {
+        let upstream: aisix_gateway::ChatChunkStream = if timeouts.stream_configured {
             let mut upstream = upstream;
             let first_chunk = match upstream.next().await {
                 Some(Ok(chunk)) => chunk,
@@ -1848,7 +1914,7 @@ async fn cross_provider_dispatch(
                 }
             };
             // Re-prepend the peeked chunk so the SSE encoder sees the whole
-            // stream (and records TTFT on the first content chunk).
+            // stream (and records TTFT on the first chunk).
             Box::pin(
                 futures::stream::once(std::future::ready(Ok::<_, aisix_gateway::BridgeError>(
                     first_chunk,
@@ -1858,7 +1924,7 @@ async fn cross_provider_dispatch(
         } else {
             upstream
         };
-        state.health.record_success(model_name);
+        state.health.record_success(&model.display_name);
         state.runtime_status.mark_healthy(model_id);
 
         let message_id = format!("msg_{}", Uuid::new_v4().simple());
@@ -1869,6 +1935,8 @@ async fn cross_provider_dispatch(
         let api_key_id_for_telem = api_key_id.to_string();
         let provider_for_telem = provider_label.clone();
         let model_for_telem = model_name.to_string();
+        let bounded_model_for_telem =
+            crate::usage_attr::metric_model_label(&state.snapshot.load(), model_name).into_owned();
         let provider_key_id_for_telem = provider_key_id.to_string();
         let upstream_model_for_telem = upstream_model.clone();
         let team_id_for_telem = team_id;
@@ -1891,9 +1959,7 @@ async fn cross_provider_dispatch(
         // Content capture: prompt up front, response assembled in the stream
         // into `comp.response_text`. Both gated on `content_cap`.
         let content_cap = content_capture_cap(
-            state
-                .snapshot
-                .load()
+            snapshot
                 .observability_exporters
                 .entries()
                 .iter()
@@ -1968,26 +2034,37 @@ async fn cross_provider_dispatch(
                 state_for_telem.metrics.record_request_e2e_latency(
                     LatencyLabels {
                         endpoint: "/v1/messages",
-                        model: &model_for_telem,
+                        model: &bounded_model_for_telem,
                         provider: &provider_for_telem,
                         status: 200,
                         streaming: true,
                     },
                     started_for_telem.elapsed(),
                 );
+                // Fresh snapshot at stream end — see the passthrough path.
+                let snap_telem = state_for_telem.snapshot.load();
+                let pk_telem =
+                    crate::usage_attr::ResolvedPk::resolve(&snap_telem, &provider_key_id_for_telem);
                 emit_anthropic_usage_event(
                     &state_for_telem,
+                    &snap_telem,
+                    &pk_telem,
                     &request_id_for_telem,
                     &model_id_for_telem,
                     &api_key_id_for_telem,
                     &provider_for_telem,
                     &model_for_telem,
-                    &provider_key_id_for_telem,
                     &upstream_model_for_telem,
                     team_id_for_telem.as_deref(),
                     user_id_for_telem.as_deref(),
                     user_name_for_telem.as_deref(),
-                    200,
+                    // See the sibling passthrough path: an abandoned stream
+                    // is reported as 499, matching LiteLLM.
+                    if comp.reached_end {
+                        200
+                    } else {
+                        crate::CLIENT_CLOSED_REQUEST
+                    },
                     // Attempt-scoped — see the sibling passthrough path.
                     attempt_started_for_telem.elapsed(),
                     metrics,
@@ -2111,7 +2188,7 @@ async fn cross_provider_dispatch(
         cache_creation_tokens: resp.usage.cache_creation_tokens,
         cache_read_tokens: resp.usage.cache_read_tokens,
         usage_estimated: false,
-        provider_request_id: resp.id.clone(),
+        provider_request_id: crate::usage_attr::sanitize_provider_response_id(&resp.id),
         provider_model_version: resp.model.clone(),
         finish_reason: finish_reason_label(&resp.finish_reason),
         upstream_ttft_ms: 0,
@@ -2128,9 +2205,7 @@ async fn cross_provider_dispatch(
     // text for content-capturing exporters (gated); threaded to `fan_out` via
     // `DispatchOutcome`, never to the CP sink.
     let captured_content = content_capture_cap(
-        state
-            .snapshot
-            .load()
+        snapshot
             .observability_exporters
             .entries()
             .iter()
@@ -2238,16 +2313,19 @@ fn build_anthropic_sse_stream(
         while let Some(item) = upstream.next().await {
             match item {
                 Ok(chunk) => {
-                    if !first_chunk_seen
-                        && (chunk.delta.content.is_some() || chunk.delta.tool_calls.is_some())
-                    {
+                    // First upstream chunk of ANY type stops the TTFT clock —
+                    // the industry convention (LiteLLM, caller-side gateways),
+                    // so the figure matches external observers
+                    // (AISIX-Cloud#1225).
+                    if !first_chunk_seen {
                         first_chunk_seen = true;
                         guard.comp().upstream_ttft_ms =
                             attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
                     }
                     let comp = guard.comp();
                     if !chunk.id.is_empty() {
-                        comp.provider_request_id = chunk.id.clone();
+                        comp.provider_request_id =
+                        crate::usage_attr::sanitize_provider_response_id(&chunk.id);
                     }
                     if !chunk.model.is_empty() {
                         comp.provider_model_version = chunk.model.clone();
@@ -2342,6 +2420,10 @@ fn build_anthropic_sse_stream(
                 }
             }
         }
+        // Upstream stream over — the response was received in full. Record
+        // it before the scan below, which awaits a remote provider and is a
+        // routine drop point for clients that close on the terminal event.
+        guard.comp().reached_end = true;
         // End-of-stream output guardrail (#448): scan the accumulated
         // assistant text and, on a block, emit a terminal Anthropic
         // `error` event instead of completing the stream cleanly.
@@ -2500,6 +2582,11 @@ fn finish_reason_label(reason: &aisix_gateway::FinishReason) -> String {
 
 #[derive(Default)]
 struct AnthropicStreamCompletion {
+    /// `true` once the upstream stream reached its end, i.e. the response
+    /// was received in full. Stays `false` when the consumer went away
+    /// first — the generator is dropped at a suspension point and the tail
+    /// never runs — which the telemetry closure reports as `499`.
+    reached_end: bool,
     prompt_tokens: u32,
     completion_tokens: u32,
     cache_creation_tokens: u32,
@@ -2664,12 +2751,20 @@ struct AnthropicUsageMetrics {
 #[allow(clippy::too_many_arguments)]
 fn emit_anthropic_usage_event(
     state: &ProxyState,
+    // The request's snapshot, resolved by the caller (#941). Every event
+    // names its OWN attempt's ProviderKey, so the row lookup stays here —
+    // but it is now ONE lookup feeding both the wire attribution tags and
+    // the `provider_key_name` metric label, which used to look it up twice.
+    snap: &aisix_core::AisixSnapshot,
+    // Resolved by the caller so the winning attempt's row is read ONCE for
+    // both this event and the handler's `record` (#941 audit L2). The
+    // failed-attempt and stream-end callers resolve their own.
+    pk: &crate::usage_attr::ResolvedPk<'_>,
     request_id: &str,
     model_id: &str,
     api_key_id: &str,
     provider: &str,
     model: &str,
-    provider_key_id: &str,
     upstream_model: &str,
     team_id: Option<&str>,
     user_id: Option<&str>,
@@ -2696,19 +2791,8 @@ fn emit_anthropic_usage_event(
     // resolved ProviderKey from the live snapshot and copy its
     // `telemetry_tags` into wire fields. Empty `provider_key_id`
     // (pre-dispatch error path) bypasses the lookup → wire NULL.
-    let snap = state.snapshot.load();
-    let tags = if !provider_key_id.is_empty() {
-        snap.provider_keys
-            .get_by_id(provider_key_id)
-            .map(|e| e.value.telemetry_tags.clone())
-            .unwrap_or_default()
-    } else {
-        Default::default()
-    };
-    // #890 req-3: readable provider-key name for the metric label (shared
-    // resolver so chat + messages can't drift).
-    let provider_key_name = crate::usage_attr::provider_key_metric_name(&snap, provider_key_id);
-    let event = UsageEvent {
+    let tags = pk.telemetry_tags();
+    let mut event = UsageEvent {
         request_id: request_id.to_string(),
         occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         model_id: model_id.to_string(),
@@ -2748,8 +2832,14 @@ fn emit_anthropic_usage_event(
     };
     // Handler label "messages" — Anthropic /v1/messages inbound
     // path. Bucketed prometheus counter (#408).
-    state.usage_sink.try_emit("messages", event.clone());
-    let exporters = snap.observability_exporters.entries();
+    crate::usage_attr::apply_jwt_identity(&mut event, client.jwt.as_ref());
+    let usage_model = crate::usage_attr::usage_event_model_label(snap, &event.requested_model);
+    state.usage_sink.try_emit(
+        "messages",
+        event.clone(),
+        crate::usage_attr::usage_event_labels(&usage_model, pk),
+    );
+    let exporters = crate::usage_attr::live_exporters(state, snap);
     state
         .otlp_fan_out
         .fan_out(&event, content.as_ref(), exporters.iter().map(|e| &e.value));
@@ -2763,43 +2853,40 @@ fn emit_anthropic_usage_event(
         metrics.cache_creation_tokens,
         metrics.cache_read_tokens,
     );
-    state.metrics.record_llm_usage(
-        UsageLabels {
-            endpoint: "/v1/messages",
-            inbound_protocol: "anthropic",
-            provider,
-            model,
-            upstream_model,
-            provider_key_id,
-            provider_key_name: &provider_key_name,
+    // Covers streaming and non-streaming — every /v1/messages usage event
+    // flows through here.
+    crate::request_metrics::record_usage(
+        state,
+        "/v1/messages",
+        crate::request_metrics::Caller {
             api_key_id,
             team_id: team_id.unwrap_or("unknown"),
             user_id: user_id.unwrap_or("unknown"),
             user_name: user_name.unwrap_or("unknown"),
         },
-        LlmUsage {
-            input_tokens: metrics.prompt_tokens,
-            output_tokens: metrics.completion_tokens,
-            total_tokens: total_tokens_all.min(u64::from(u32::MAX)) as u32,
+        crate::request_metrics::Upstream {
+            provider,
+            model,
+            upstream_model,
+            pk: pk.labels(),
+            ..Default::default()
+        },
+        crate::request_metrics::Tokens {
+            input: metrics.prompt_tokens,
+            output: metrics.completion_tokens,
+            total: total_tokens_all.min(u64::from(u32::MAX)) as u32,
             spend_usd: 0.0,
+            client_type: state.client_classifier.classify(&client.user_agent),
         },
     );
-    // #890 req-4: token volume by inbound client type (covers streaming and
-    // non-streaming — every /v1/messages usage event flows through here).
-    // #1002: total_tokens_all folds in the Anthropic cache counters.
-    // AISIX-Cloud#1044: same requested logical model as the UsageLabels above.
-    state.metrics.record_llm_tokens_by_client(
-        state.client_classifier.classify(&client.user_agent),
-        model,
-        u64::from(metrics.prompt_tokens),
-        u64::from(metrics.completion_tokens),
-        total_tokens_all,
-    );
     if metrics.upstream_ttft_ms > 0 {
+        let snap_for_labels = state.snapshot.load();
+        let (bounded_model, bounded_upstream) =
+            crate::usage_attr::metric_model_label_pair(&snap_for_labels, model, upstream_model);
         state.metrics.record_request_ttft(
             LatencyLabels {
                 endpoint: "/v1/messages",
-                model,
+                model: bounded_model.as_ref(),
                 provider,
                 status: status_code,
                 streaming: true,
@@ -2811,10 +2898,10 @@ fn emit_anthropic_usage_event(
                 endpoint: "/v1/messages",
                 inbound_protocol: "anthropic",
                 provider,
-                model,
-                upstream_model,
-                provider_key_id,
-                provider_key_name: &provider_key_name,
+                model: bounded_model.as_ref(),
+                upstream_model: bounded_upstream.as_ref(),
+                provider_key_id: pk.labels().id(),
+                provider_key_name: pk.labels().name(),
                 api_key_id,
                 team_id: team_id.unwrap_or("unknown"),
                 user_id: user_id.unwrap_or("unknown"),
@@ -2851,6 +2938,11 @@ pub(crate) const MAX_SSE_FRAME_BUF_BYTES: usize = 1 << 20; // 1 MiB
 /// corresponding frame.
 #[derive(Default)]
 struct AnthropicStreamUsage {
+    /// `true` once the upstream stream reached its end, i.e. the response
+    /// was forwarded in full. Stays `false` when the consumer went away
+    /// first — the generator is dropped at a suspension point and the tail
+    /// never runs — which the telemetry closure reports as `499`.
+    reached_end: bool,
     prompt_tokens: u32,
     completion_tokens: u32,
     cache_creation_tokens: u32,
@@ -2867,7 +2959,8 @@ struct AnthropicStreamUsage {
     provider_request_id: String,
     provider_model_version: String,
     finish_reason: String,
-    /// Attempt-scoped time to the upstream's first content frame.
+    /// Attempt-scoped time to the upstream's first streamed frame,
+    /// whatever its type — see `UsageEvent::upstream_ttft_ms`.
     upstream_ttft_ms: u32,
     /// Request-scoped time until the caller got its first response
     /// bytes. Trails `upstream_ttft_ms` by whatever the gateway did
@@ -2898,15 +2991,21 @@ struct AnthropicStreamUsage {
 
 /// Update the accumulator from one parsed SSE `data:` JSON object.
 /// Best-effort: unrecognised `type` values are ignored. The TTFT
-/// measurement (first content frame) is driven by `attempt_started` and
-/// `first_token_seen`, and is attempt-scoped — see
-/// `UsageEvent::upstream_ttft_ms`.
+/// measurement is driven by `attempt_started` and `first_token_seen`,
+/// and is attempt-scoped — see `UsageEvent::upstream_ttft_ms`.
 fn update_anthropic_usage(
     acc: &mut AnthropicStreamUsage,
     json: &Value,
     attempt_started: Instant,
     first_token_seen: &mut bool,
 ) {
+    // First parsed frame of ANY type (`message_start` included) stops the
+    // TTFT clock — the industry convention (LiteLLM, caller-side gateways),
+    // so the figure matches external observers (AISIX-Cloud#1225).
+    if !*first_token_seen {
+        *first_token_seen = true;
+        acc.upstream_ttft_ms = attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+    }
     match json.get("type").and_then(Value::as_str) {
         Some("message_start") => {
             let msg = json.get("message");
@@ -2932,19 +3031,13 @@ fn update_anthropic_usage(
                 }
             }
             if let Some(id) = msg.and_then(|m| m.get("id")).and_then(Value::as_str) {
-                acc.provider_request_id = id.to_string();
+                acc.provider_request_id = crate::usage_attr::sanitize_provider_response_id(id);
             }
             if let Some(m) = msg.and_then(|m| m.get("model")).and_then(Value::as_str) {
                 acc.provider_model_version = m.to_string();
             }
         }
         Some("content_block_start") | Some("content_block_delta") => {
-            // First content frame → record time-to-first-token.
-            if !*first_token_seen {
-                *first_token_seen = true;
-                acc.upstream_ttft_ms =
-                    attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
-            }
             // Accumulate assistant output for the end-of-stream output
             // guardrail (#448). text streams as `delta.text`; tool_use
             // streams its name in `content_block.{name,input}` on
@@ -3316,6 +3409,10 @@ where
                 return;
             }
         }
+        // Upstream stream over — the response was forwarded in full. Record
+        // it before the scan below, which awaits a remote provider and is a
+        // routine drop point for clients that close on the terminal event.
+        guard.usage().reached_end = true;
         // End-of-stream output guardrail (#448): scan the accumulated
         // assistant text. On a block, emit a terminal Anthropic `error`
         // event. On the hold-back path (BufferFull) nothing has been
@@ -3462,6 +3559,9 @@ fn emit_access_log(
     status: u16,
     latency: Duration,
     request_id: &str,
+    // Winning attempt's provider response id; empty when unknown at this
+    // point (streaming, guardrail block, pre-dispatch error).
+    provider_request_id: Option<&str>,
     routing: &RoutingTelemetry,
     error: Option<&ProxyError>,
 ) {
@@ -3491,6 +3591,7 @@ fn emit_access_log(
         completion_tokens: None,
         total_tokens: None,
         request_id,
+        provider_request_id: provider_request_id.filter(|s| !s.is_empty()),
         served_by_model: served_by,
         routing_attempt_count: match routing.attempt_count() {
             0 => None,
@@ -3531,7 +3632,11 @@ mod tests {
             addr: "127.0.0.1:0".into(),
             request_body_limit_bytes: 1_048_576,
             real_ip: Default::default(),
+            request_id: Default::default(),
+            url_rewrites: Vec::new(),
             tls: None,
+            thread_per_core: None,
+            workers: None,
         }
     }
 
@@ -3650,6 +3755,67 @@ mod tests {
             "stop_reason": "end_turn",
             "usage": {"input_tokens": 10, "output_tokens": 3}
         })
+    }
+
+    /// A `provider: "byo"` model whose ProviderKey carries
+    /// `adapter: anthropic` fronts an Anthropic-protocol upstream, so
+    /// `/v1/messages` must forward the caller's body verbatim just like it
+    /// does for the catalog vendor. Branching on the vendor id instead sent
+    /// it through the cross-provider bridge, which re-encodes the body from
+    /// the normalized form and silently drops caller-owned fields — here
+    /// `cache_control`, whose loss changes both prompt-cache behavior and
+    /// what the upstream bills.
+    #[tokio::test]
+    async fn byo_model_on_the_anthropic_adapter_passes_the_body_through() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(header("x-api-key", "sk-byo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(anthropic_response()))
+            .mount(&upstream)
+            .await;
+
+        let snap = AisixSnapshot::new();
+        let pk_json = format!(
+            r#"{{"display_name":"byo-anthropic","secret":"sk-byo","api_base":"{}","provider":"byo","adapter":"anthropic"}}"#,
+            upstream.uri()
+        );
+        let pk: aisix_core::ProviderKey = serde_json::from_str(&pk_json).unwrap();
+        snap.provider_keys
+            .insert(ResourceEntry::new(ANTHROPIC_PK_ID, pk, 1));
+        let model_json = format!(
+            r#"{{"display_name":"byo-claude","provider":"byo","model_name":"claude-sonnet-4-5","provider_key_id":"{ANTHROPIC_PK_ID}"}}"#
+        );
+        let m: Model = serde_json::from_str(&model_json).unwrap();
+        snap.models.insert(ResourceEntry::new("m-1", m, 1));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let app = build_app(snap);
+        let resp = app
+            .oneshot(make_req(serde_json::json!({
+                "model": "byo-claude",
+                "max_tokens": 100,
+                "system": [{
+                    "type": "text",
+                    "text": "long shared preamble",
+                    "cache_control": {"type": "ephemeral", "ttl": "5m"}
+                }],
+                "messages": [{"role": "user", "content": "Hello"}]
+            })))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let received = upstream.received_requests().await.unwrap();
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].url.path(), "/v1/messages");
+        let sent: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
+        assert_eq!(sent["model"], "claude-sonnet-4-5");
+        assert_eq!(
+            sent["system"][0]["cache_control"],
+            serde_json::json!({"type": "ephemeral", "ttl": "5m"}),
+            "the caller's cache_control must reach the upstream unchanged"
+        );
     }
 
     #[tokio::test]

@@ -41,7 +41,6 @@ pub enum Adapter {
 
 /// Per-token cost for budget tracking. Both values are in USD per 1,000 tokens.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
-#[serde(deny_unknown_fields)]
 pub struct ModelCost {
     /// Prompt token cost in USD per 1,000 tokens.
     #[schemars(range(min = 0.0))]
@@ -61,7 +60,6 @@ impl ModelCost {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct BackgroundModelCheck {
     /// Whether background health checks are enabled for this model.
     pub enabled: bool,
@@ -88,7 +86,6 @@ pub struct BackgroundModelCheck {
 
 /// Request-path cooldown settings for a direct model after retryable upstream failures.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq, Default)]
-#[serde(deny_unknown_fields)]
 pub struct CooldownConfig {
     /// Whether cooldown is active for this model. Set to `false` to keep the model in rotation regardless of upstream failures.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -183,7 +180,6 @@ impl CacheTtl {
 /// prompt-cache discounts without changing their requests. Requests that
 /// already set their own cache-control markers are forwarded unchanged.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct AutoPromptCaching {
     /// Whether automatic prompt-cache injection is active for this model.
     pub enabled: bool,
@@ -200,7 +196,6 @@ impl AutoPromptCaching {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
 pub struct Model {
     /// Operator-facing unique label. Surfaces on `/v1/models`,
     /// `req.model` on chat completions, `ApiKey.allowed_models`, and
@@ -228,11 +223,11 @@ pub struct Model {
     #[schemars(length(min = 1))]
     pub provider_key_id: Option<String>,
 
-    /// End-to-end timeout in milliseconds for non-streaming upstream calls. `0` or absent disables the non-streaming timeout.
+    /// End-to-end timeout in milliseconds for non-streaming upstream calls. Absent falls back to the group's `timeout`, then to the deployment-wide `upstream.timeout_ms` default. `0` disables the non-streaming timeout for this model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<u64>,
 
-    /// Maximum gap in milliseconds between upstream streaming chunks. `0` or absent falls back to `timeout`.
+    /// Maximum gap in milliseconds between upstream streaming chunks. `0` or absent falls back to the group's `stream_timeout`, then to the model's (or group's) `timeout`, then to the deployment-wide `upstream.stream_timeout_ms` / `timeout_ms` defaults.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_timeout: Option<u64>,
 
@@ -325,35 +320,59 @@ impl Model {
         self.model_name.as_deref()
     }
 
-    /// Non-streaming request deadline derived from `timeout`. Folds the
-    /// `0`/absent "no timeout" sentinel into `None` so callers can apply
-    /// it unconditionally with `if let Some(d) = ...`.
-    pub fn request_timeout(&self) -> Option<std::time::Duration> {
-        self.timeout
-            .filter(|&ms| ms > 0)
-            .map(std::time::Duration::from_millis)
+    /// Strip the per-kind DEAD knobs from a loaded document, returning
+    /// the stripped field names for the loader's partially-compatible
+    /// report. The strict write path rejects these shapes outright
+    /// ([`model_one_of_strict`]); rows stored before that keep loading —
+    /// minus the field, so no code path can half-honor a knob the shape
+    /// never resolved.
+    pub fn strip_kind_inapplicable(&mut self) -> Vec<&'static str> {
+        let mut stripped = Vec::new();
+        if !(self.is_routing() || self.is_ensemble() || self.is_semantic()) {
+            return stripped;
+        }
+        if self.auto_prompt_caching.take().is_some() {
+            stripped.push("auto_prompt_caching");
+        }
+        if self.cost.take().is_some() {
+            stripped.push("cost");
+        }
+        if (self.is_routing() || self.is_ensemble()) && self.retries.take().is_some() {
+            stripped.push("retries");
+        }
+        // Pushed in lexicographic order so a pure-strip row's field list
+        // is already sorted (the loader's merge path re-sorts a combined
+        // unknown+inapplicable list, but a strip-only row bypasses that).
+        if self.is_ensemble() {
+            if self.stream_timeout.take().is_some() {
+                stripped.push("stream_timeout");
+            }
+            if self.timeout.take().is_some() {
+                stripped.push("timeout");
+            }
+        }
+        stripped
     }
 
-    /// Streaming per-chunk read deadline derived from `stream_timeout`.
-    /// Same `0`/absent → `None` folding as [`Model::request_timeout`].
+    /// This resource's own non-streaming deadline, as one level of the
+    /// model → group → `upstream.timeout_ms` resolution performed by the
+    /// proxy's `effective_timeouts`. Tri-state: `None` defers to the next
+    /// level, `Some(None)` is an explicit `0` ("no deadline, stop
+    /// resolving"), `Some(Some(d))` is a configured deadline.
+    pub fn request_timeout_level(&self) -> Option<Option<std::time::Duration>> {
+        self.timeout
+            .map(|ms| (ms > 0).then(|| std::time::Duration::from_millis(ms)))
+    }
+
+    /// This resource's own streaming per-chunk deadline, as one level of
+    /// the model → group → `upstream.stream_timeout_ms` → resolved
+    /// `timeout` chain. Unlike [`Model::request_timeout_level`], `0` and
+    /// absent both defer — `stream_timeout` has always used `0` as "fall
+    /// back", not "disable".
     pub fn stream_read_timeout(&self) -> Option<std::time::Duration> {
         self.stream_timeout
             .filter(|&ms| ms > 0)
             .map(std::time::Duration::from_millis)
-    }
-
-    /// Effective deadline for a streaming request: a positive
-    /// `stream_timeout`, otherwise the non-streaming `timeout`. Applied to the
-    /// connect phase, the per-chunk read timeout, and the first-chunk
-    /// failover gate. Because `stream_read_timeout()` folds `0` to `None`,
-    /// `stream_timeout: 0` is treated the same as absent — it falls back to
-    /// `timeout` rather than disabling the streaming timeout. `None` (both
-    /// unset or `0`) = no streaming timeout. Note: a model that sets only a
-    /// small `timeout` therefore also gets that value as its streaming
-    /// budget.
-    pub fn stream_timeout_effective(&self) -> Option<std::time::Duration> {
-        self.stream_read_timeout()
-            .or_else(|| self.request_timeout())
     }
 
     /// Whether a client at `source_ip` may access this model (#557).
@@ -391,6 +410,57 @@ impl Model {
 /// `oneOf` into the generated schema, so the published schema and the
 /// runtime validator share this single definition.
 pub fn model_one_of() -> Value {
+    model_one_of_variant(false)
+}
+
+/// The write-path variant of [`model_one_of`]: additionally forbids the
+/// per-kind DEAD knobs — fields the runtime never reads on that shape,
+/// which the lenient read path keeps tolerating (loaded rows strip them
+/// with a partially-compatible warning instead of dropping the row; see
+/// [`Model::strip_kind_inapplicable`]). Kind policy (project decision):
+/// generic call knobs (`timeout`/`stream_timeout`/`retries`) resolve
+/// member → group → deployment default wherever a group slot exists;
+/// model-specific knobs (`auto_prompt_caching`, `cost`) are direct-only.
+pub fn model_one_of_strict() -> Value {
+    model_one_of_variant(true)
+}
+
+fn model_one_of_variant(strict: bool) -> Value {
+    let extend = |base: &mut Value, extra: &[&str]| {
+        let list = base["not"]["anyOf"].as_array_mut().expect("anyOf array");
+        for field in extra {
+            list.push(json!({ "required": [field] }));
+        }
+    };
+    let mut variants = model_one_of_base();
+    if strict {
+        let arr = variants.as_array_mut().expect("oneOf array");
+        // routing: the group slot for timeouts is the top-level pair
+        // (api7/aisix#844); retries' group slot is `routing.retries`, so a
+        // top-level value is dead — as are the model-specific knobs.
+        extend(&mut arr[0], &["retries", "auto_prompt_caching", "cost"]);
+        // direct (arr[1]): every knob is live.
+        // ensemble: sub-calls resolve member-level knobs only; the
+        // parent-level deadline is `ensemble.timeout_ms`.
+        extend(
+            &mut arr[2],
+            &[
+                "timeout",
+                "stream_timeout",
+                "retries",
+                "auto_prompt_caching",
+                "cost",
+            ],
+        );
+        // semantic: top-level timeout/stream_timeout/retries ARE the group
+        // slots (no routing block to carry them); the model-specific knobs
+        // stay direct-only.
+        extend(&mut arr[3], &["auto_prompt_caching", "cost"]);
+    }
+    variants
+}
+
+fn model_one_of_base() -> Value {
     json!([
         {
             "required": ["routing"],
@@ -500,71 +570,111 @@ mod tests {
         .unwrap();
         assert_eq!(m.stream_timeout, Some(2_500));
         assert_eq!(
-            m.request_timeout(),
-            Some(std::time::Duration::from_millis(30_000))
+            m.request_timeout_level(),
+            Some(Some(std::time::Duration::from_millis(30_000)))
         );
         assert_eq!(
             m.stream_read_timeout(),
             Some(std::time::Duration::from_millis(2_500))
         );
 
-        // Absent → None.
+        // Absent → defer to the next resolution level.
         let none: Model = serde_json::from_str(
             r#"{"display_name":"x","provider":"openai","model_name":"g","provider_key_id":"pk-1"}"#,
         )
         .unwrap();
-        assert_eq!(none.request_timeout(), None);
+        assert_eq!(none.request_timeout_level(), None);
         assert_eq!(none.stream_read_timeout(), None);
 
-        // Explicit 0 is the "no timeout" sentinel → None.
+        // Explicit `timeout: 0` resolves to "no deadline" and stops the
+        // chain; explicit `stream_timeout: 0` defers like absent.
         let zero: Model = serde_json::from_str(
             r#"{"display_name":"x","provider":"openai","model_name":"g","provider_key_id":"pk-1","timeout":0,"stream_timeout":0}"#,
         )
         .unwrap();
-        assert_eq!(zero.request_timeout(), None);
+        assert_eq!(zero.request_timeout_level(), Some(None));
         assert_eq!(zero.stream_read_timeout(), None);
-
-        // stream_timeout_effective cascade: prefer stream_timeout when set.
-        assert_eq!(
-            m.stream_timeout_effective(),
-            Some(std::time::Duration::from_millis(2_500))
-        );
-        // Falls back to `timeout` when stream_timeout is absent.
-        let timeout_only: Model = serde_json::from_str(
-            r#"{"display_name":"x","provider":"openai","model_name":"g","provider_key_id":"pk-1","timeout":5000}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            timeout_only.stream_timeout_effective(),
-            Some(std::time::Duration::from_millis(5_000))
-        );
-        // None when neither is set, and when both are the 0 sentinel.
-        assert_eq!(none.stream_timeout_effective(), None);
-        assert_eq!(zero.stream_timeout_effective(), None);
-
-        // Explicit `stream_timeout: 0` folds to absent → falls back to
-        // `timeout`, not "disable streaming".
-        let stream_zero_timeout_set: Model = serde_json::from_str(
-            r#"{"display_name":"x","provider":"openai","model_name":"g","provider_key_id":"pk-1","timeout":5000,"stream_timeout":0}"#,
-        )
-        .unwrap();
-        assert_eq!(stream_zero_timeout_set.stream_read_timeout(), None);
-        assert_eq!(
-            stream_zero_timeout_set.stream_timeout_effective(),
-            Some(std::time::Duration::from_millis(5_000))
-        );
     }
 
     #[test]
-    fn rejects_unknown_top_level_fields() {
-        let r: Result<Model, _> = serde_json::from_str(
+    fn tolerates_unknown_top_level_fields_for_forward_compat() {
+        // cp-api may ship new fields ahead of the DP rolling out; serde must
+        // accept them. The write path still rejects them via `validate_model`
+        // in models/schema.rs.
+        let m: Model = serde_json::from_str(
             r#"{
               "display_name":"x","provider":"openai","model_name":"g",
               "provider_key_id":"pk-1",
               "foo": 1
             }"#,
+        )
+        .unwrap();
+        assert_eq!(m.display_name, "x");
+    }
+
+    #[test]
+    fn strip_kind_inapplicable_per_kind() {
+        let load = |v: serde_json::Value| -> Model { serde_json::from_value(v).unwrap() };
+        // Routing parent: model-specific knobs + top-level retries strip;
+        // the group-level timeout pair stays (it IS the group slot).
+        let mut group = load(serde_json::json!({
+            "display_name": "g",
+            "routing": {"targets": [{"model": "m"}]},
+            "retries": 2,
+            "timeout": 1000,
+            "cost": {"input_per_1k": 0.0, "output_per_1k": 0.0},
+            "auto_prompt_caching": {"enabled": true}
+        }));
+        let mut stripped = group.strip_kind_inapplicable();
+        stripped.sort_unstable();
+        assert_eq!(stripped, ["auto_prompt_caching", "cost", "retries"]);
+        assert!(group.retries.is_none() && group.cost.is_none());
+        assert_eq!(group.timeout, Some(1000));
+        // Semantic parent: timeout/retries are the group slots and stay.
+        let mut sem = load(serde_json::json!({
+            "display_name": "s",
+            "semantic": {
+                "embedding_model": "e",
+                "routes": [{"name": "r", "target": "t", "examples": ["x"]}],
+                "default": "d",
+                "match": {"threshold": 0.5}
+            },
+            "retries": 2,
+            "timeout": 1000,
+            "cost": {"input_per_1k": 0.0, "output_per_1k": 0.0}
+        }));
+        assert_eq!(sem.strip_kind_inapplicable(), ["cost"]);
+        assert_eq!(sem.retries, Some(2));
+        assert_eq!(sem.timeout, Some(1000));
+        // Direct: nothing strips.
+        let mut direct = load(serde_json::json!({
+            "display_name": "m",
+            "provider": "openai",
+            "model_name": "gpt-4o",
+            "provider_key_id": "pk-1",
+            "retries": 2,
+            "cost": {"input_per_1k": 0.0, "output_per_1k": 0.0}
+        }));
+        assert!(direct.strip_kind_inapplicable().is_empty());
+        assert_eq!(direct.retries, Some(2));
+        // Ensemble parent: the whole generic set strips (its own
+        // deadline knob is `ensemble.timeout_ms`).
+        let mut ens = load(serde_json::json!({
+            "display_name": "e",
+            "ensemble": {"panel": [{"model": "m"}], "judge": {"model": "j"}},
+            "timeout": 1000,
+            "stream_timeout": 500,
+            "retries": 1,
+            "cost": {"input_per_1k": 0.0, "output_per_1k": 0.0}
+        }));
+        // Asserted WITHOUT a pre-sort: the strip output is already
+        // lexicographic (a pure-strip loader row keeps the fields
+        // "sorted" per PartialCompatRow's contract).
+        let ens_stripped = ens.strip_kind_inapplicable();
+        assert_eq!(
+            ens_stripped,
+            ["cost", "retries", "stream_timeout", "timeout"]
         );
-        assert!(r.is_err());
     }
 
     #[test]

@@ -1,9 +1,10 @@
-# aisix — managed-mode bootstrap config (aisix.cloud tenant).
+# AISIX gateway — managed-mode bootstrap configuration for AISIX Cloud.
 #
-# Used by the official Docker image as `/etc/aisix/config.yaml`.
+# Baked into the official Docker image as `/etc/aisix/config.managed.yaml`.
+# Select it by setting `AISIX_CONFIG_PATH` to that path.
 # Only the bare minimum is set here:
 #
-#   - `managed.enabled: true`           always on for this image
+#   - `managed.enabled: true`           always on in this bootstrap configuration
 #   - `etcd.endpoints: [placeholder]`   overridden at boot from managed
 #                                       CP endpoint config
 #   - `admin.admin_keys: [placeholder]` validation requires the slot,
@@ -41,7 +42,32 @@ etcd:
 
 proxy:
   addr: "0.0.0.0:3000"
-  request_body_limit_bytes: 10485760
+  # 0 = no request-body cap (the default); set a value to bound
+  # per-request memory.
+  # request_body_limit_bytes: 0
+  # Serving topology; on for Linux by default. A managed deployment
+  # reaches these through the environment rather than by editing this
+  # file: AISIX_PROXY__THREAD_PER_CORE, AISIX_PROXY__WORKERS.
+  # thread_per_core: true
+  # workers: 4
+  # Headers a caller may hand the gateway its own request id in; that id
+  # then becomes the x-aisix-request-id response header, the request_id on
+  # every attempt's usage event, and what the upstream sees. Defaults to
+  # ["x-aisix-request-id"]. Add x-request-id only if the gateway is NOT
+  # behind a proxy that stamps it. Comma-separated from the environment:
+  # AISIX_PROXY__REQUEST_ID__ACCEPT_HEADERS=x-aisix-request-id,x-request-id
+  # request_id:
+  #   accept_headers: ["x-aisix-request-id"]
+  # Entry-level URL rewriting (first matching rule wins; `match` runs on
+  # the raw, percent-encoded path; `rewrite` replaces the matched portion,
+  # $1 = capture group; the query string is preserved). Lets clients keep
+  # legacy URL shapes, e.g. per-server MCP paths served on the
+  # /mcp/{server} endpoint. When configuring through env vars only, set
+  # one JSON array: AISIX_PROXY__URL_REWRITES='[{"match":"...","rewrite":"..."}]'
+  # url_rewrites:
+  #   - name: per-server-mcp-compat
+  #     match: "^/mcp-servers/([^/]+)/mcp$"
+  #     rewrite: "/mcp/$1"
 
 admin:
   # Bind to an unbindable port so even if managed mode somehow
@@ -73,6 +99,13 @@ observability:
     # client_type_rules:
     #   - pattern: "^py-billing-batcher/"
     #     client: billing-batcher
+    # Optional per-metric histogram bucket edges, in seconds; each metric
+    # keeps its own default when unset. See config.example.yaml for the
+    # full annotation and the cardinality/contract caveats. Override with
+    # a comma-separated list, e.g.
+    # AISIX_OBSERVABILITY__METRICS__BUCKETS__REQUEST_TTFT=0.1,0.5,1,5,30,300
+    # buckets:
+    #   request_ttft: [0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60, 120, 300]
   tracing:
     otlp:
       enabled: false
@@ -107,12 +140,23 @@ cache:
 # the gateway expires them — the symptom is intermittent transport
 # errors against an otherwise healthy upstream.
 upstream:
+  # timeout_ms: 6000000
+  # stream_timeout_ms: 0
   # connect_timeout_ms: 5000
   # tcp_keepalive_secs: 60
   # tcp_keepalive_interval_secs: 30
   # tcp_keepalive_retries: 5
   pool_idle_timeout_secs: 30
   # pool_max_idle_per_host: 32
+  # Trust settings for every upstream TLS handshake — model endpoints,
+  # guardrail services, MCP / A2A upstreams, OIDC discovery, Realtime,
+  # Bedrock, log-export object stores. `ca_file` is additive to the
+  # platform trust store, so trusting a private CA leaves the public
+  # providers reachable. See config.example.yaml for the full block.
+  # tls:
+  #   ca_file: "/etc/aisix/tls/private-ca.pem"
+  #   # client_cert_file / client_key_file for mutual TLS
+  #   # verify: true   # false accepts ANY certificate — test use only
 
 # Connection-layer settings for the inbound side. `idle_timeout_secs: 0`
 # (the default) never closes an idle client connection, leaving that to

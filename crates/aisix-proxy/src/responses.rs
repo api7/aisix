@@ -13,9 +13,7 @@
 //! 400 with an explanatory message.
 
 use aisix_gateway::{ChatFormat, ChatMessage, ChatResponse, FinishReason, UsageStats};
-use aisix_obs::{
-    content_capture_cap, AccessLog, CapturedContent, LatencyLabels, RequestOutcome, UsageEvent,
-};
+use aisix_obs::{content_capture_cap, AccessLog, CapturedContent, LatencyLabels, UsageEvent};
 use axum::extract::State;
 use axum::http::{HeaderName, HeaderValue};
 use axum::response::{IntoResponse, Response};
@@ -27,14 +25,15 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use crate::attempt::{
-    attempt_error_from_proxy, ms_since, AttemptInfo, AttemptRecord, RoutingTelemetry,
+    attempt_error_from_proxy, attempt_reached_upstream, ms_since, AttemptInfo, AttemptRecord,
+    RoutingTelemetry,
 };
 use crate::auth::AuthenticatedKey;
 use crate::chat::sanitize_tag;
 use crate::client_ip::ClientContext;
 use crate::error::ProxyError;
 use crate::state::ProxyState;
-use crate::usage_attr::{provider_telemetry_tags, total_tokens_with_cache};
+use crate::usage_attr::{total_tokens_with_cache, ResolvedPk};
 
 /// Per-request payload from a successful dispatch — carries the
 /// response + provider label + the bits of usage data needed for
@@ -58,6 +57,11 @@ struct ResponseDispatchSuccess {
     /// pk_label / …) on the emitted UsageEvent (AISIX-Cloud#867). Empty when
     /// the target carried no provider_key_id.
     provider_key_id: String,
+    /// The provider-side model name the winning attempt actually called,
+    /// for the `upstream_model` metric label (AISIX-Cloud#1234). Same value
+    /// chat + messages report, so a query can group all three endpoints by
+    /// the model the provider was billed for rather than the alias.
+    upstream_model: String,
     /// Per-attempt routing telemetry (#655): the failed attempts that
     /// preceded the winner plus the winning attempt itself.
     routing: RoutingTelemetry,
@@ -114,6 +118,15 @@ impl From<ProxyError> for ResponsesDispatchError {
 /// the ones below.
 #[derive(Default, Clone)]
 struct ResponseUsage {
+    /// `true` once the upstream stream reached EOF, i.e. the response was
+    /// delivered in full. Stays `false` when the consumer went away first,
+    /// which is what the telemetry closure turns into `499`.
+    ///
+    /// Set at upstream EOF rather than after the end-of-stream guardrail
+    /// scan: SDK clients routinely close right after the terminal frame and
+    /// drop this generator at that await, and such a request was delivered
+    /// in full — marking it later would report it as abandoned.
+    reached_end: bool,
     prompt_tokens: u32,
     completion_tokens: u32,
     /// True when any token counter was filled by the local estimator
@@ -136,23 +149,47 @@ struct ResponseUsage {
     /// verbatim OpenAI path (OpenAI surfaces cache hits via
     /// `cached_prompt_tokens` instead).
     cache_read_tokens: u32,
-    /// Attempt-scoped time to the upstream's first content delta. 0 on the
-    /// non-streaming paths. Before this existed `/v1/responses` reported no
-    /// TTFT at all, so codex-class clients showed blank.
+    /// Attempt-scoped time to the upstream's first streamed frame, whatever
+    /// its type (`response.created` included) — see
+    /// `UsageEvent::upstream_ttft_ms`. 0 on the non-streaming paths. Before
+    /// this existed `/v1/responses` reported no TTFT at all, so codex-class
+    /// clients showed blank.
     upstream_ttft_ms: u32,
     /// Request-scoped time until the caller got its first response bytes.
     /// 0 until the stream forwards something (or the handler stamps it on
     /// the non-streaming paths).
     downstream_latency_ms: u32,
+    /// Responses-API response object `id` (`resp_…`), or the bridged
+    /// upstream's own id on the #825 cross-provider path. Empty when the
+    /// upstream returned no id (AISIX-Cloud#1289).
+    provider_request_id: String,
 }
 
 pub async fn responses(
     State(state): State<ProxyState>,
     auth: AuthenticatedKey,
     client: ClientContext,
-    Json(mut body): Json<Value>,
+    // Result-wrapped so an extractor-layer 413 maps to the OpenAI
+    // envelope — see completions.rs.
+    body: Result<Json<Value>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     let started = Instant::now();
+    let Json(mut body) = match body {
+        Ok(json) => json,
+        // Answer through `reject` — see completions.rs.
+        Err(rej) => {
+            return crate::reject::reject_before_dispatch(
+                &state,
+                "POST",
+                "/v1/responses",
+                &client.request_id,
+                Some(&auth.entry.id),
+                started,
+                crate::reject::Envelope::OpenAi,
+                crate::error::proxy_error_from_json_rejection(rej, state.request_body_limit_bytes),
+            );
+        }
+    };
     let request_id = client.request_id.clone();
     let api_key_id = auth.entry.id.clone();
 
@@ -161,6 +198,13 @@ pub async fn responses(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+    // Read once here rather than off `body` at each terminal emit: dispatch
+    // never rewrites the field, and the failure paths must label the request
+    // with what the caller asked for.
+    let stream_requested = body
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     // Filled by `dispatch` with per-detector PII mask counts (#932); attached
     // to the terminal usage event on both the success and failure paths.
@@ -168,8 +212,11 @@ pub async fn responses(
     // Filled by `dispatch` with monitor-mode guardrail observations
     // (AISIX-Cloud#562), same lifecycle as `redaction_counts`.
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
+    // One snapshot for the whole request (#941) — see `embeddings`.
+    let snapshot = state.snapshot.load();
     match dispatch(
         &state,
+        &snapshot,
         &auth,
         &mut body,
         &request_id,
@@ -194,20 +241,40 @@ pub async fn responses(
                 status,
                 elapsed,
                 &request_id,
+                // `None` on the streaming path — `usage` is filled by the
+                // stream's completion callback, long after this line. That
+                // case is covered by the per-attempt `provider call
+                // completed` line the usage sink emits (AISIX-Cloud#1289).
+                success
+                    .usage
+                    .as_ref()
+                    .map(|u| u.provider_request_id.as_str()),
                 &success.routing,
                 None,
             );
-            state.metrics.record_request(
-                &success.provider,
-                &model_name,
+            // ONE ProviderKey lookup for both the metric emit and the
+            // winner's usage event below (#941).
+            let pk = ResolvedPk::resolve(&snapshot, &success.provider_key_id);
+            crate::request_metrics::record(
+                &state,
+                "/v1/responses",
+                crate::request_metrics::Caller::new(&auth),
+                crate::request_metrics::Upstream {
+                    provider: &success.provider,
+                    model: &model_name,
+                    upstream_model: &success.upstream_model,
+                    pk: pk.labels(),
+                    stream: stream_requested,
+                    is_fallback: success.routing.fallback_count() > 0,
+                },
                 status,
-                RequestOutcome::from_status(status),
                 elapsed,
             );
             // Per #655: one zero-token UsageEvent per failed attempt that
             // preceded the winner (non-streaming failover).
             emit_failed_attempts(
                 &state,
+                &snapshot,
                 &request_id,
                 &model_name,
                 &api_key_id,
@@ -234,16 +301,15 @@ pub async fn responses(
                 // SLO e2e histogram (AISIX-Cloud#1011): recorded even when
                 // the upstream response carried no parseable usage block —
                 // latency observation must not depend on token accounting.
+                let bounded_model =
+                    crate::usage_attr::metric_model_label(&state.snapshot.load(), &model_name);
                 state.metrics.record_request_e2e_latency(
                     LatencyLabels {
                         endpoint: "/v1/responses",
-                        model: &model_name,
+                        model: bounded_model.as_ref(),
                         provider: &success.provider,
                         status,
-                        streaming: body
-                            .get("stream")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false),
+                        streaming: stream_requested,
                     },
                     elapsed,
                 );
@@ -266,11 +332,14 @@ pub async fn responses(
                         .unwrap_or(elapsed);
                     emit_usage_event(
                         &state,
+                        &snapshot,
+                        &pk,
                         &request_id,
                         &success.model_id,
                         &model_name,
                         &api_key_id,
-                        &success.provider_key_id,
+                        &success.provider,
+                        &success.upstream_model,
                         status,
                         winner_latency,
                         &usage,
@@ -295,28 +364,39 @@ pub async fn responses(
                 status,
                 elapsed,
                 &request_id,
+                None,
                 &routing,
                 Some(&err),
             );
-            let snap = state.snapshot.load();
-            let metric_model = crate::usage_attr::metric_model_label(&snap, &model_name);
-            state.metrics.record_request(
-                "unknown",
-                metric_model,
+            let metric_model = crate::usage_attr::metric_model_label(&snapshot, &model_name);
+            // The failed request counts on the detailed families too, so a
+            // success rate over /v1/responses has the failures in its
+            // denominator.
+            // AISIX-Cloud#1325: name the target the request died on. This
+            // branch used to emit `Upstream::default()`, so a 502 from a
+            // real provider landed on `provider="unknown"` while the same
+            // key's successes landed on the real one.
+            let attributed = crate::attribution::current().unwrap_or_default();
+            let last_target = crate::request_metrics::LastTarget::new(&snapshot, &attributed);
+            crate::request_metrics::record(
+                &state,
+                "/v1/responses",
+                crate::request_metrics::Caller::new(&auth),
+                last_target.upstream(
+                    metric_model.as_ref(),
+                    stream_requested,
+                    routing.fallback_count() > 0,
+                ),
                 status,
-                RequestOutcome::from_status(status),
                 elapsed,
             );
             state.metrics.record_request_e2e_latency(
                 LatencyLabels {
                     endpoint: "/v1/responses",
-                    model: metric_model,
-                    provider: "unknown",
+                    model: metric_model.as_ref(),
+                    provider: last_target.provider(),
                     status,
-                    streaming: body
-                        .get("stream")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false),
+                    streaming: stream_requested,
                 },
                 elapsed,
             );
@@ -330,7 +410,8 @@ pub async fn responses(
                 None
             } else {
                 content_capture_cap(
-                    snap.observability_exporters
+                    snapshot
+                        .observability_exporters
                         .entries()
                         .iter()
                         .map(|e| &e.value),
@@ -354,6 +435,7 @@ pub async fn responses(
             // the dashboard's Logs tab surfaces each failed upstream try.
             emit_failed_attempts(
                 &state,
+                &snapshot,
                 &request_id,
                 &model_name,
                 &api_key_id,
@@ -368,6 +450,7 @@ pub async fn responses(
             if routing.attempts.is_empty() {
                 emit_zero_token_event(
                     &state,
+                    &snapshot,
                     &request_id,
                     "",
                     &model_name,
@@ -396,6 +479,7 @@ pub async fn responses(
 #[allow(clippy::too_many_arguments)]
 async fn dispatch(
     state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
     auth: &AuthenticatedKey,
     // `&mut` so mask-action PII guardrails (#932) can rewrite the request
     // text in place before it reaches the upstream.
@@ -415,15 +499,13 @@ async fn dispatch(
     // same lifecycle as `redactions_out`.
     monitor_hits_out: &mut Vec<aisix_core::GuardrailMonitorHit>,
 ) -> Result<ResponseDispatchSuccess, ResponsesDispatchError> {
-    let snapshot = state.snapshot.load();
-
     let model_name = body
         .get("model")
         .and_then(|v| v.as_str())
         .ok_or_else(|| ProxyError::InvalidRequest("`model` field missing".into()))?
         .to_string();
 
-    let model_entry = crate::model_resolve::resolve_model(&snapshot, &model_name)
+    let model_entry = crate::model_resolve::resolve_model(snapshot, &model_name)
         .ok_or_else(|| ProxyError::ModelNotFound(model_name.clone()))?;
 
     if !auth.key().can_access(&model_name) {
@@ -446,7 +528,9 @@ async fn dispatch(
     // #542: run this BEFORE the rate-limit reservation so a content-policy
     // block doesn't burn an RPM slot (matching /v1/chat/completions).
     let guardrail_ctx = aisix_guardrails::RequestContext {
+        passthrough_route_id: "",
         model_id: &model_entry.id,
+        mcp_server_id: "",
         api_key_id: &auth.entry.id,
         team_id: auth.key().team_id.as_deref(),
     };
@@ -517,7 +601,8 @@ async fn dispatch(
     // `Option` so the winning streaming attempt can `take()` the reservation
     // and carry it into the end-of-stream guard (#688); non-streaming / failed
     // attempts leave it in place for the post-dispatch commit or a retry.
-    let mut reservation = Some(crate::quota::enforce(state, auth, Some(&model_rl)).await?);
+    let mut reservation =
+        Some(crate::quota::enforce(state, snapshot, auth, Some(&model_rl)).await?);
 
     // Resolve the attempt list (routing-aware). A Model Group walks its
     // targets in order; a direct model resolves to itself (#471). OpenAI
@@ -527,7 +612,7 @@ async fn dispatch(
     let attempt_models = crate::routing::resolve_attempt_models(
         &state.routing,
         &state.runtime_status,
-        &snapshot,
+        snapshot,
         &model_name,
         &model_entry.id,
         &model_entry.value,
@@ -554,8 +639,16 @@ async fn dispatch(
         .as_ref()
         .map(|r| r.fallback_on_statuses_or_default())
         .unwrap_or(&[]);
+    // NOTE: deliberately narrower than chat's `routing.is_some() ||
+    // is_semantic()`. The quota gate defers model-property policies on any
+    // routing/ensemble/semantic PARENT (`ModelRateLimit::routing_parent`),
+    // expecting the per-target pass to reserve them — which only runs when
+    // this flag is true. Safe today because semantic/ensemble parents
+    // cannot successfully dispatch on this endpoint (no provider →
+    // pre-dispatch 4xx); if this endpoint ever grows semantic support,
+    // widen this flag or the deferred policies are silently skipped.
     let is_routing_request = model_entry.value.routing.is_some();
-    let mut routing = RoutingTelemetry::default();
+    let mut routing = RoutingTelemetry::for_request(&model_entry.value.display_name);
     // Walk the targets, failing over on a retryable failure. Streaming and
     // non-streaming share this loop: the per-target dispatch branches
     // internally and, for streaming, only returns Ok once the first chunk
@@ -573,9 +666,16 @@ async fn dispatch(
         // model gets a budget too.
         let budget = crate::routing::effective_retries(
             &target.model,
-            model_entry.value.routing.as_ref(),
+            crate::routing::group_retries_of(&model_entry.value),
             state.default_retries,
             target_idx + 1 < attempt_models.len(),
+        );
+        // Deadlines resolved target → group → deployment default, next to
+        // the retry budget so the two knobs stay in lockstep.
+        let timeouts = crate::routing::effective_timeouts(
+            &target.model,
+            Some(&model_entry.value),
+            state.default_timeouts,
         );
         for attempt_idx in 0..=budget.attempts {
             // Upstream `Retry-After` when the last failure carried one, else
@@ -611,7 +711,12 @@ async fn dispatch(
             // reset mid-loop).
             let mut member_reservation = match crate::quota::reserve_routing_target(
                 state,
-                is_routing_request,
+                snapshot,
+                auth,
+                is_routing_request.then_some(crate::quota::RoutingParent {
+                    name: &model_entry.value.display_name,
+                    entry_id: &model_entry.id,
+                }),
                 &target.model.display_name,
                 &target.id,
                 &target.model,
@@ -620,18 +725,22 @@ async fn dispatch(
             {
                 Ok(r) => r,
                 Err(e) => {
-                    routing.attempts.push(AttemptRecord {
-                        index: idx,
-                        kind,
-                        target_model,
-                        target_model_id: target.id.clone(),
-                        provider_key_id: pk_id.clone(),
-                        status: 429,
-                        success: false,
-                        error_class: "rate_limit_exceeded".to_string(),
-                        error_message: e.to_string(),
-                        latency_ms: 0,
-                    });
+                    routing.record(
+                        state,
+                        AttemptRecord {
+                            index: idx,
+                            kind,
+                            target_model,
+                            target_model_id: target.id.clone(),
+                            provider_key_id: pk_id.clone(),
+                            status: 429,
+                            success: false,
+                            error_class: "rate_limit_exceeded".to_string(),
+                            error_message: e.to_string(),
+                            latency_ms: 0,
+                            dispatched: false,
+                        },
+                    );
                     last_err = Some(e);
                     continue 'targets;
                 }
@@ -639,10 +748,11 @@ async fn dispatch(
             let result = if target.model.provider.as_deref() == Some("openai") {
                 responses_to_target(
                     state,
-                    &snapshot,
+                    snapshot,
                     body,
                     &target.model,
                     &target.id,
+                    timeouts,
                     request_id,
                     resolved_chain.clone(),
                     started,
@@ -660,10 +770,11 @@ async fn dispatch(
             } else {
                 responses_cross_provider_to_target(
                     state,
-                    &snapshot,
+                    snapshot,
                     body,
                     &target.model,
                     &target.id,
+                    timeouts,
                     request_id,
                     resolved_chain.clone(),
                     started,
@@ -684,18 +795,22 @@ async fn dispatch(
                     let latency_ms = ms_since(attempt_started);
                     // Feed the least_latency EWMA for this target.
                     state.runtime_status.record_latency(&target.id, latency_ms);
-                    routing.attempts.push(AttemptRecord {
-                        index: idx,
-                        kind,
-                        target_model,
-                        target_model_id: target.id.clone(),
-                        provider_key_id: pk_id.clone(),
-                        status: success.response.status().as_u16(),
-                        success: true,
-                        error_class: String::new(),
-                        error_message: String::new(),
-                        latency_ms,
-                    });
+                    routing.record(
+                        state,
+                        AttemptRecord {
+                            index: idx,
+                            kind,
+                            target_model,
+                            target_model_id: target.id.clone(),
+                            provider_key_id: pk_id.clone(),
+                            status: success.response.status().as_u16(),
+                            success: true,
+                            error_class: String::new(),
+                            error_message: String::new(),
+                            latency_ms,
+                            dispatched: true,
+                        },
+                    );
                     success.routing = routing;
                     // #911 [21]: commit the reserved layers with the actual
                     // token cost so TPM/TPD is enforced for /v1/responses like
@@ -736,18 +851,22 @@ async fn dispatch(
                         ProxyError::Bridge(be) if crate::routing::is_retryable(be, retry_on_429, fallback_statuses)
                     );
                     let (error_class, error_message) = attempt_error_from_proxy(&e);
-                    routing.attempts.push(AttemptRecord {
-                        index: idx,
-                        kind,
-                        target_model,
-                        target_model_id: target.id.clone(),
-                        provider_key_id: pk_id.clone(),
-                        status: e.status().as_u16(),
-                        success: false,
-                        error_class,
-                        error_message,
-                        latency_ms: ms_since(attempt_started),
-                    });
+                    routing.record(
+                        state,
+                        AttemptRecord {
+                            index: idx,
+                            kind,
+                            target_model,
+                            target_model_id: target.id.clone(),
+                            provider_key_id: pk_id.clone(),
+                            status: e.status().as_u16(),
+                            success: false,
+                            error_class,
+                            error_message,
+                            latency_ms: ms_since(attempt_started),
+                            dispatched: attempt_reached_upstream(&e),
+                        },
+                    );
                     // See `RetryBudget::covers`: a default budget skips
                     // same-target retries for timeouts; fail-over is unaffected.
                     let budget_covers = match &e {
@@ -883,6 +1002,9 @@ async fn responses_to_target(
     body: &Value,
     model: &aisix_core::Model,
     model_id: &str,
+    // Deadlines resolved by the caller across target → group → deployment
+    // default (`routing::effective_timeouts`); this fn only applies them.
+    timeouts: crate::routing::TimeoutBudget,
     request_id: &str,
     // Arc so the live-forward streaming path can carry the chain into its
     // end-of-stream observation (AISIX-Cloud#1010).
@@ -957,13 +1079,18 @@ async fn responses_to_target(
         );
     }
 
-    let base = crate::dispatch::resolve_base_url(&pk_entry.value)?;
-    // build_v1_url tolerates both `https://api.openai.com` (provider
-    // default) and `https://api.openai.com/v1` (the OpenAI-SDK form
-    // the dashboard's provider-keys placeholder pre-fills). Without
-    // it, the SDK convention double-prefixes to `/v1/v1/responses`
-    // and 404s.
-    let url = crate::dispatch::build_v1_url(&base, "/responses");
+    let url = aisix_gateway::url_cache::cached_endpoint_url(
+        &pk_entry.id,
+        "proxy/responses",
+        &[pk_entry.value.api_base.as_deref().unwrap_or("")],
+        || {
+            let base = crate::dispatch::resolve_base_url(&pk_entry.value)?;
+            Ok::<_, crate::error::ProxyError>(crate::dispatch::build_openai_url(
+                &base,
+                "/responses",
+            ))
+        },
+    )?;
 
     let is_stream = body
         .get("stream")
@@ -1003,14 +1130,14 @@ async fn responses_to_target(
         ),
     );
 
-    let client = crate::http_client::client();
-    let mut req = client.post(&url).headers(headers).json(&body);
+    let client = crate::http_client::client_for(pk_entry.value.tls.as_ref());
+    let mut req = url.post_on(&client).headers(headers).json(&body);
     // #554: non-streaming gets the E2E request timeout via reqwest's
     // request-level timeout. Streaming must NOT use it (it would cap the
     // whole stream); the streaming branch below enforces the per-chunk
     // read timeout instead.
     if !is_stream {
-        if let Some(d) = model.request_timeout() {
+        if let Some(d) = timeouts.request {
             req = req.timeout(d);
         }
     }
@@ -1024,11 +1151,7 @@ async fn responses_to_target(
     // Streaming bounds the connect by the stream deadline (reqwest's
     // request-level timeout can't be used — it would cap the whole stream);
     // non-streaming relies on the request-level timeout set above.
-    let connect_deadline = if is_stream {
-        model.stream_timeout_effective()
-    } else {
-        None
-    };
+    let connect_deadline = if is_stream { timeouts.stream } else { None };
     let upstream_resp =
         crate::stream_timeout::send_with_deadline(req, connect_deadline, send_started)
             .await
@@ -1098,10 +1221,9 @@ async fn responses_to_target(
             };
             let stream = upstream_resp.bytes_stream();
             futures::pin_mut!(stream);
-            // Effective streaming budget: `stream_timeout`, falling back to
-            // `timeout` — applied to every buffered read, consistent with the
-            // verbatim branch and the connect deadline.
-            let read_to = model.stream_timeout_effective();
+            // Effective streaming budget — applied to every buffered read,
+            // consistent with the verbatim branch and the connect deadline.
+            let read_to = timeouts.stream;
             let mut buf: Vec<u8> = Vec::new();
             let mut saw_chunk = false;
             loop {
@@ -1230,6 +1352,12 @@ async fn responses_to_target(
             // telemetry only, the buffered bytes forward untouched.
             let usage = {
                 let mut u = responses_sse_usage(&buf).unwrap_or_default();
+                // The usage gate is independent of the id: a stream whose
+                // terminal frame reported no usage still names the upstream
+                // call it was (AISIX-Cloud#1289).
+                if u.provider_request_id.is_empty() {
+                    u.provider_request_id = responses_sse_provider_request_id(&buf);
+                }
                 if u.prompt_tokens == 0 || u.completion_tokens == 0 {
                     let est = crate::token_estimate::Estimator::new(
                         &upstream_model,
@@ -1268,6 +1396,7 @@ async fn responses_to_target(
                 usage,
                 model_id: model_id.to_string(),
                 provider_key_id: provider_key_id.clone(),
+                upstream_model: upstream_model.clone(),
                 routing: RoutingTelemetry::default(),
                 guardrail_blocked: false,
                 usage_handled_by_stream: false,
@@ -1283,7 +1412,7 @@ async fn responses_to_target(
         // without one, forward directly (pre-#554 behavior). A mid-stream
         // stall truncates the forwarded stream (no in-band error frame for
         // an opaque byte passthrough).
-        let stream_budget = model.stream_timeout_effective();
+        let stream_budget = timeouts.stream;
         let wrapped: std::pin::Pin<
             Box<dyn futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>,
         > = Box::pin(crate::stream_timeout::with_read_timeout_bytes(
@@ -1292,7 +1421,7 @@ async fn responses_to_target(
         ));
         let body_stream: std::pin::Pin<
             Box<dyn futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>,
-        > = if stream_budget.is_some() {
+        > = if timeouts.stream_configured {
             let mut wrapped = wrapped;
             let first_bytes = match wrapped.next().await {
                 Some(Ok(b)) => b,
@@ -1336,9 +1465,13 @@ async fn responses_to_target(
         let request_id_c = request_id.to_string();
         let model_id_c = model_id.to_string();
         let requested_model_c = requested_model.to_string();
+        let bounded_model_c =
+            crate::usage_attr::metric_model_label(&state.snapshot.load(), requested_model)
+                .into_owned();
         let api_key_id_c = api_key_id.to_string();
         let provider_key_id_c = provider_key_id.clone();
         let provider_c = provider_label.clone();
+        let upstream_model_c = upstream_model.clone();
         let client_c = client_ctx.clone();
         // #688: carry the reservation into the end-of-stream guard — keys drive
         // post-stream TPM/TPD accounting, the hold keeps the concurrency slot(s)
@@ -1429,7 +1562,7 @@ async fn responses_to_target(
                 state_c.metrics.record_request_e2e_latency(
                     LatencyLabels {
                         endpoint: "/v1/responses",
-                        model: &requested_model_c,
+                        model: &bounded_model_c,
                         provider: &provider_c,
                         status: 200,
                         streaming: true,
@@ -1443,14 +1576,30 @@ async fn responses_to_target(
                 // with the input-side hits (AISIX-Cloud#1010).
                 let mut monitor_hits = input_monitor_hits.clone();
                 monitor_hits.extend(output_hits);
+                // A stream can outlive several config generations, so the
+                // end-of-stream emit reads a FRESH snapshot rather than the
+                // one the request started on (#941).
+                let snap_c = state_c.snapshot.load();
+                let pk_c = ResolvedPk::resolve(&snap_c, &provider_key_id_c);
                 emit_usage_event(
                     &state_c,
+                    &snap_c,
+                    &pk_c,
                     &request_id_c,
                     &model_id_c,
                     &requested_model_c,
                     &api_key_id_c,
-                    &provider_key_id_c,
-                    200,
+                    &provider_c,
+                    &upstream_model_c,
+                    // A stream the consumer abandoned mid-flight is reported
+                    // as 499, matching LiteLLM. The upstream work still
+                    // happened, so the event is emitted either way — only
+                    // its outcome differs.
+                    if usage.reached_end {
+                        200
+                    } else {
+                        crate::CLIENT_CLOSED_REQUEST
+                    },
                     // Attempt-scoped, unlike the e2e histogram above: any
                     // failed attempt before this one emitted its own event.
                     attempt_started.elapsed(),
@@ -1479,6 +1628,7 @@ async fn responses_to_target(
             usage: None,
             model_id: model_id.to_string(),
             provider_key_id,
+            upstream_model: upstream_model.clone(),
             routing: RoutingTelemetry::default(),
             guardrail_blocked: false,
             usage_handled_by_stream: true,
@@ -1512,6 +1662,13 @@ async fn responses_to_target(
         // object at all becomes a wholly-estimated record instead of None.
         let usage = {
             let mut u = extract_response_usage(&json_body).unwrap_or_default();
+            // `extract_response_usage` returns None on a body with no usable
+            // `usage` block, and the estimation fallback below then works off
+            // a default — which would drop a perfectly good top-level `id`
+            // (AISIX-Cloud#1289).
+            if u.provider_request_id.is_empty() {
+                u.provider_request_id = crate::usage_attr::provider_response_id(&json_body);
+            }
             if u.prompt_tokens == 0 || u.completion_tokens == 0 {
                 let est = crate::token_estimate::Estimator::new(
                     &upstream_model,
@@ -1580,6 +1737,7 @@ async fn responses_to_target(
                     usage,
                     model_id: model_id.to_string(),
                     provider_key_id: provider_key_id.clone(),
+                    upstream_model: upstream_model.clone(),
                     routing: RoutingTelemetry::default(),
                     guardrail_blocked: true,
                     usage_handled_by_stream: false,
@@ -1621,6 +1779,7 @@ async fn responses_to_target(
             usage,
             model_id: model_id.to_string(),
             provider_key_id,
+            upstream_model,
             routing: RoutingTelemetry::default(),
             guardrail_blocked: false,
             usage_handled_by_stream: false,
@@ -1644,6 +1803,9 @@ async fn responses_cross_provider_to_target(
     body: &Value,
     model: &aisix_core::Model,
     model_id: &str,
+    // Deadlines resolved by the caller across target → group → deployment
+    // default (`routing::effective_timeouts`); this fn only applies them.
+    timeouts: crate::routing::TimeoutBudget,
     request_id: &str,
     chain: Arc<aisix_guardrails::GuardrailChain>,
     started: Instant,
@@ -1709,9 +1871,9 @@ async fn responses_cross_provider_to_target(
         Some(client_ctx),
     );
     let connect_deadline = if is_stream {
-        model.stream_timeout_effective()
+        timeouts.stream
     } else {
-        model.request_timeout()
+        timeouts.request
     };
     if let Some(d) = connect_deadline {
         ctx = ctx.with_deadline(d);
@@ -1737,9 +1899,9 @@ async fn responses_cross_provider_to_target(
         // #554: peek the first chunk so a slow/erroring first token fails
         // over before the 200 is committed (when a stream budget is set);
         // the wrapper keeps enforcing the per-chunk read timeout either way.
-        let stream_budget = model.stream_timeout_effective();
+        let stream_budget = timeouts.stream;
         let upstream = crate::stream_timeout::with_read_timeout(upstream, stream_budget);
-        let upstream: aisix_gateway::ChatChunkStream = if stream_budget.is_some() {
+        let upstream: aisix_gateway::ChatChunkStream = if timeouts.stream_configured {
             let mut upstream = upstream;
             let first_chunk = match upstream.next().await {
                 Some(Ok(chunk)) => chunk,
@@ -1806,9 +1968,13 @@ async fn responses_cross_provider_to_target(
         let request_id_c = request_id.to_string();
         let model_id_c = model_id.to_string();
         let requested_model_c = requested_model.to_string();
+        let bounded_model_c =
+            crate::usage_attr::metric_model_label(&state.snapshot.load(), requested_model)
+                .into_owned();
         let api_key_id_c = api_key_id.to_string();
         let provider_key_id_c = provider_key_id.clone();
         let provider_c = provider_label.clone();
+        let upstream_model_c = model.upstream_model().unwrap_or("unknown").to_string();
         let client_c = client_ctx.clone();
         let attempt_c = attempt.clone();
         // #688: carry the reservation into the end-of-stream guard — keys drive
@@ -1865,6 +2031,7 @@ async fn responses_cross_provider_to_target(
                 // in-flight.
                 drop(in_flight);
                 let usage = ResponseUsage {
+                    reached_end: comp.reached_end,
                     prompt_tokens: comp.prompt_tokens,
                     completion_tokens: comp.completion_tokens,
                     reasoning_tokens: comp.reasoning_tokens,
@@ -1874,6 +2041,7 @@ async fn responses_cross_provider_to_target(
                     usage_estimated: comp.usage_estimated,
                     upstream_ttft_ms: comp.upstream_ttft_ms,
                     downstream_latency_ms: comp.downstream_latency_ms,
+                    provider_request_id: comp.provider_request_id,
                 };
                 // A clean stream is a committed 200; an output-guardrail block
                 // (or fail-closed overflow) bills the upstream tokens but is
@@ -1895,20 +2063,28 @@ async fn responses_cross_provider_to_target(
                 state_c.metrics.record_request_e2e_latency(
                     LatencyLabels {
                         endpoint: "/v1/responses",
-                        model: &requested_model_c,
+                        model: &bounded_model_c,
                         provider: &provider_c,
                         status,
                         streaming: true,
                     },
                     started.elapsed(),
                 );
+                // A stream can outlive several config generations, so the
+                // end-of-stream emit reads a FRESH snapshot rather than the
+                // one the request started on (#941).
+                let snap_c = state_c.snapshot.load();
+                let pk_c = ResolvedPk::resolve(&snap_c, &provider_key_id_c);
                 emit_usage_event(
                     &state_c,
+                    &snap_c,
+                    &pk_c,
                     &request_id_c,
                     &model_id_c,
                     &requested_model_c,
                     &api_key_id_c,
-                    &provider_key_id_c,
+                    &provider_c,
+                    &upstream_model_c,
                     status,
                     // Attempt-scoped — see the sibling verbatim path.
                     attempt_started.elapsed(),
@@ -1952,6 +2128,7 @@ async fn responses_cross_provider_to_target(
             usage: None,
             model_id: model_id.to_string(),
             provider_key_id,
+            upstream_model: model.upstream_model().unwrap_or("unknown").to_string(),
             routing: RoutingTelemetry::default(),
             guardrail_blocked: false,
             usage_handled_by_stream: true,
@@ -1976,6 +2153,9 @@ async fn responses_cross_provider_to_target(
 
     let usage = {
         let mut u = ResponseUsage {
+            // Non-streaming: the response was received in full or this code
+            // would not run.
+            reached_end: true,
             prompt_tokens: resp.usage.prompt_tokens,
             completion_tokens: resp.usage.completion_tokens,
             reasoning_tokens: resp.usage.reasoning_tokens,
@@ -1985,6 +2165,10 @@ async fn responses_cross_provider_to_target(
             usage_estimated: false,
             upstream_ttft_ms: 0,
             downstream_latency_ms: 0,
+            // The bridged upstream's own id, not the `resp_…` re-encoded
+            // below — that one is minted here and means nothing to the
+            // provider (AISIX-Cloud#1289).
+            provider_request_id: crate::usage_attr::sanitize_provider_response_id(&resp.id),
         };
         // Token-estimation fallback (AISIX-Cloud#1074): fill counters the
         // bridged upstream never reported. Telemetry only — the re-encoded
@@ -2052,6 +2236,7 @@ async fn responses_cross_provider_to_target(
                 usage: Some(usage),
                 model_id: model_id.to_string(),
                 provider_key_id: provider_key_id.clone(),
+                upstream_model: model.upstream_model().unwrap_or("unknown").to_string(),
                 routing: RoutingTelemetry::default(),
                 guardrail_blocked: true,
                 usage_handled_by_stream: false,
@@ -2104,6 +2289,7 @@ async fn responses_cross_provider_to_target(
         usage: Some(usage),
         model_id: model_id.to_string(),
         provider_key_id,
+        upstream_model: model.upstream_model().unwrap_or("unknown").to_string(),
         routing: RoutingTelemetry::default(),
         guardrail_blocked: false,
         usage_handled_by_stream: false,
@@ -2147,6 +2333,9 @@ fn extract_response_usage(body: &Value) -> Option<ResponseUsage> {
         .and_then(|v| v.as_u64())
         .unwrap_or(0) as u32;
     Some(ResponseUsage {
+        // Parsed from a fully buffered response body, so by definition the
+        // response was delivered in full.
+        reached_end: true,
         prompt_tokens,
         completion_tokens,
         usage_estimated: false,
@@ -2159,6 +2348,11 @@ fn extract_response_usage(body: &Value) -> Option<ResponseUsage> {
         // measured these before this terminal frame arrived.
         upstream_ttft_ms: 0,
         downstream_latency_ms: 0,
+        // `resp_…` straight off the upstream's own response object
+        // (AISIX-Cloud#1289). On the streaming path the caller carries the
+        // id it saw on an earlier frame across this replacement, so an
+        // upstream that only stamps it on `response.created` still records.
+        provider_request_id: crate::usage_attr::provider_response_id(body),
     })
 }
 
@@ -2204,33 +2398,43 @@ fn responses_sse_usage(bytes: &[u8]) -> Option<ResponseUsage> {
     usage
 }
 
+/// The `resp_…` carried by any frame of a fully-buffered Responses-API SSE
+/// body — `response.created` is the first, so this survives a stream whose
+/// terminal frame reported no usage and therefore produced no
+/// [`ResponseUsage`] (AISIX-Cloud#1289).
+fn responses_sse_provider_request_id(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    for line in text.lines() {
+        let Some(data) = line.strip_prefix("data:").map(str::trim) else {
+            continue;
+        };
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        if let Ok(json) = serde_json::from_str::<Value>(data) {
+            if let Some(r) = json.get("response") {
+                let id = crate::usage_attr::provider_response_id(r);
+                if !id.is_empty() {
+                    return id;
+                }
+            }
+        }
+    }
+    String::new()
+}
+
 /// Drain every complete SSE frame from `buf`, updating `acc` with the latest
 /// terminal-event usage (#808) and feeding each parsed event to the optional
 /// content capture (AISIX-Cloud#947). A frame ends at the first blank line;
 /// an incomplete trailing frame is left in `buf` for the next chunk. Reuses
 /// the shared SSE framing helpers from the `/v1/messages` passthrough so the
 /// two surfaces parse identically.
-/// Whether this SSE event carries generated output. Mirrors the set
-/// `SseTextCapture::observe` accumulates, so TTFT lands on the same frame
-/// the capture considers the first real token.
-fn is_responses_content_delta(json: &Value) -> bool {
-    matches!(
-        json.get("type").and_then(Value::as_str),
-        Some(
-            "response.output_text.delta"
-                | "response.function_call_arguments.delta"
-                | "response.mcp_call_arguments.delta"
-                | "response.custom_tool_call_input.delta"
-        )
-    )
-}
-
 fn drain_responses_sse_frames(
     buf: &mut Vec<u8>,
     acc: &mut Option<ResponseUsage>,
     mut capture: Option<&mut SseTextCapture>,
     attempt_started: Instant,
-    first_token_seen: &mut bool,
+    first_frame_seen: &mut bool,
 ) {
     while let Some(end) = crate::messages::find_frame_end(buf) {
         let frame: Vec<u8> = buf.drain(..end).collect();
@@ -2239,24 +2443,54 @@ fn drain_responses_sse_frames(
                 continue;
             }
             if let Ok(json) = serde_json::from_slice::<Value>(data) {
-                // First content delta → upstream TTFT. `/v1/responses`
-                // reported none at all before this, so codex-class clients
-                // showed a blank figure.
-                if !*first_token_seen && is_responses_content_delta(&json) {
-                    *first_token_seen = true;
+                // First parsed frame of ANY type (`response.created`
+                // included) → upstream TTFT. The industry convention
+                // (LiteLLM, caller-side gateways) stamps the same event, so
+                // the figure matches external observers. A generated-output
+                // whitelist here reported the END of a silent thinking
+                // phase on hidden-reasoning upstreams — AISIX-Cloud#1225.
+                if !*first_frame_seen {
+                    *first_frame_seen = true;
                     acc.get_or_insert_with(Default::default).upstream_ttft_ms =
                         attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
                 }
+                // `resp_…` off any frame that carries the response object —
+                // `response.created` is the first, so a stream that dies
+                // before its terminal frame still records which upstream call
+                // it was (AISIX-Cloud#1289).
+                if let Some(id) = json
+                    .get("response")
+                    .and_then(|r| r.get("id"))
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                {
+                    acc.get_or_insert_with(Default::default).provider_request_id =
+                        crate::usage_attr::sanitize_provider_response_id(id);
+                }
                 if let Some(u) = parse_responses_terminal_usage(&json) {
                     // The terminal frame replaces the token counters; carry
-                    // the two latency figures measured before it across.
-                    let (ttft, down) = acc
+                    // the latency figures and the id observed before it
+                    // across — an upstream that stamps the id only on
+                    // `response.created` would otherwise lose it here.
+                    let (ttft, down, prev_id) = acc
                         .as_ref()
-                        .map(|a| (a.upstream_ttft_ms, a.downstream_latency_ms))
+                        .map(|a| {
+                            (
+                                a.upstream_ttft_ms,
+                                a.downstream_latency_ms,
+                                a.provider_request_id.clone(),
+                            )
+                        })
                         .unwrap_or_default();
+                    let provider_request_id = if u.provider_request_id.is_empty() {
+                        prev_id
+                    } else {
+                        u.provider_request_id.clone()
+                    };
                     *acc = Some(ResponseUsage {
                         upstream_ttft_ms: ttft,
                         downstream_latency_ms: down,
+                        provider_request_id,
                         ..u
                     });
                 }
@@ -2490,7 +2724,7 @@ where
         };
         futures::pin_mut!(upstream);
         let mut buf: Vec<u8> = Vec::new();
-        let mut first_token_seen = false;
+        let mut first_frame_seen = false;
         while let Some(item) = upstream.next().await {
             if let Ok(bytes) = &item {
                 // Side-channel parse: copy into the frame buffer (the original
@@ -2502,7 +2736,7 @@ where
                     usage_acc,
                     capture,
                     attempt_started,
-                    &mut first_token_seen,
+                    &mut first_frame_seen,
                 );
                 // Bound the frame buffer: the happy path drains complete frames
                 // above so `buf` only holds a partial trailing frame. A
@@ -2530,6 +2764,13 @@ where
                 }
             }
             yield item;
+        }
+        // Upstream EOF — the response was delivered in full. Record that
+        // before the scan below, which awaits a remote provider and is a
+        // routine drop point for clients that close on the terminal frame.
+        {
+            let (usage_acc, _) = guard.parts();
+            usage_acc.get_or_insert_with(Default::default).reached_end = true;
         }
         // Clean end-of-stream: run the monitor observation (needs async, so
         // it can't live in the Drop guard), then complete explicitly. The
@@ -2711,8 +2952,8 @@ fn apply_passthrough_headers(
 /// Other fields left at `UsageEvent::default()`:
 ///   - cache_creation_tokens / cache_read_tokens — populated only on the
 ///     #825 cross-provider bridge path (Anthropic backends); 0 otherwise
-///   - provider_request_id / provider_model_version / finish_reason
-///     — not yet plumbed for non-chat handlers (follow-up)
+///   - provider_model_version / finish_reason — not yet plumbed for
+///     non-chat handlers (follow-up)
 ///   - cost_usd — cp-api computes server-side from pricing catalog
 ///   - cache_status / cache_hit_* / ttft_ms — no caching/streaming
 ///     surface on Responses API non-streaming
@@ -2727,11 +2968,24 @@ fn apply_passthrough_headers(
 #[allow(clippy::too_many_arguments)]
 fn emit_usage_event(
     state: &ProxyState,
+    // The request's snapshot, resolved by the caller (#941). The row
+    // lookup stays here because each event names its OWN attempt's key,
+    // but it is now ONE lookup feeding both the wire attribution tags and
+    // the `provider_key_name` metric label.
+    snap: &aisix_core::AisixSnapshot,
+    // Resolved by the caller so the winning attempt's row is read ONCE for
+    // both this event and the handler's `record` (#941 audit L2). The
+    // stream-end callers resolve their own against a fresh snapshot.
+    pk: &ResolvedPk<'_>,
     request_id: &str,
     model_id: &str,
     requested_model: &str,
     api_key_id: &str,
-    provider_key_id: &str,
+    // Metric labels the UsageEvent has no field for (AISIX-Cloud#1234
+    // follow-up): the wire struct is the CP contract, so they ride
+    // alongside rather than in it.
+    provider: &str,
+    upstream_model: &str,
     status_code: u16,
     elapsed: Duration,
     usage: &ResponseUsage,
@@ -2748,9 +3002,8 @@ fn emit_usage_event(
     // (AISIX-Cloud#947). Forwarded only to `fan_out`, never to the CP sink.
     content: Option<&CapturedContent>,
 ) {
-    let snap = state.snapshot.load();
-    let tags = provider_telemetry_tags(&snap, provider_key_id);
-    let event = UsageEvent {
+    let tags = pk.telemetry_tags();
+    let mut event = UsageEvent {
         request_id: request_id.to_string(),
         occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         model_id: model_id.to_string(),
@@ -2769,6 +3022,7 @@ fn emit_usage_event(
         upstream_ttft_ms: usage.upstream_ttft_ms,
         downstream_latency_ms: usage.downstream_latency_ms,
         status_code,
+        provider_request_id: usage.provider_request_id.clone(),
         inbound_protocol: "openai".to_string(),
         attempt_index: attempt.index,
         attempt_kind: attempt.kind,
@@ -2787,8 +3041,14 @@ fn emit_usage_event(
         guardrail_monitor_hits,
         ..Default::default()
     };
-    state.usage_sink.try_emit("responses", event.clone());
-    let exporters = snap.observability_exporters.entries();
+    crate::usage_attr::apply_jwt_identity(&mut event, client.jwt.as_ref());
+    let usage_model = crate::usage_attr::usage_event_model_label(snap, &event.requested_model);
+    state.usage_sink.try_emit(
+        "responses",
+        event.clone(),
+        crate::usage_attr::usage_event_labels(&usage_model, pk),
+    );
+    let exporters = crate::usage_attr::live_exporters(state, snap);
     state
         .otlp_fan_out
         .fan_out(&event, content, exporters.iter().map(|e| &e.value));
@@ -2802,17 +3062,31 @@ fn emit_usage_event(
     // intentionally stays chat/messages-scoped (cross-API audit #646-652).
     // #1002: cache-inclusive total via the shared helper — cache counters are
     // non-zero only on the #825 Anthropic bridge path.
-    state.metrics.record_llm_tokens_by_client(
-        state.client_classifier.classify(&client.user_agent),
-        requested_model,
-        u64::from(usage.prompt_tokens),
-        u64::from(usage.completion_tokens),
-        total_tokens_with_cache(
-            usage.prompt_tokens,
-            usage.completion_tokens,
-            usage.cache_creation_tokens,
-            usage.cache_read_tokens,
-        ),
+    let total_all = total_tokens_with_cache(
+        usage.prompt_tokens,
+        usage.completion_tokens,
+        usage.cache_creation_tokens,
+        usage.cache_read_tokens,
+    );
+    let owned_caller = crate::request_metrics::Caller::from_api_key_id(snap, api_key_id);
+    crate::request_metrics::record_usage(
+        state,
+        "/v1/responses",
+        owned_caller.as_caller(),
+        crate::request_metrics::Upstream {
+            provider,
+            model: requested_model,
+            upstream_model,
+            pk: pk.labels(),
+            ..Default::default()
+        },
+        crate::request_metrics::Tokens {
+            input: usage.prompt_tokens,
+            output: usage.completion_tokens,
+            total: total_all.min(u64::from(u32::MAX)) as u32,
+            spend_usd: 0.0,
+            client_type: state.client_classifier.classify(&client.user_agent),
+        },
     );
 }
 
@@ -2821,6 +3095,7 @@ fn emit_usage_event(
 #[allow(clippy::too_many_arguments)]
 fn emit_zero_token_event(
     state: &ProxyState,
+    snap: &aisix_core::AisixSnapshot,
     request_id: &str,
     model_id: &str,
     requested_model: &str,
@@ -2840,9 +3115,9 @@ fn emit_zero_token_event(
     // requests. Forwarded only to `fan_out`, never to the CP sink.
     content: Option<CapturedContent>,
 ) {
-    let snap = state.snapshot.load();
-    let tags = provider_telemetry_tags(&snap, provider_key_id);
-    let event = UsageEvent {
+    let pk = ResolvedPk::resolve(snap, provider_key_id);
+    let tags = pk.telemetry_tags();
+    let mut event = UsageEvent {
         request_id: request_id.to_string(),
         occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         model_id: model_id.to_string(),
@@ -2867,8 +3142,14 @@ fn emit_zero_token_event(
         client_user_agent: client.user_agent.clone(),
         ..Default::default()
     };
-    state.usage_sink.try_emit("responses", event.clone());
-    let exporters = snap.observability_exporters.entries();
+    crate::usage_attr::apply_jwt_identity(&mut event, client.jwt.as_ref());
+    let usage_model = crate::usage_attr::usage_event_model_label(snap, &event.requested_model);
+    state.usage_sink.try_emit(
+        "responses",
+        event.clone(),
+        crate::usage_attr::usage_event_labels(&usage_model, &pk),
+    );
+    let exporters = crate::usage_attr::live_exporters(state, snap);
     state
         .otlp_fan_out
         .fan_out(&event, content.as_ref(), exporters.iter().map(|e| &e.value));
@@ -2879,6 +3160,7 @@ fn emit_zero_token_event(
 #[allow(clippy::too_many_arguments)]
 fn emit_failed_attempts(
     state: &ProxyState,
+    snap: &aisix_core::AisixSnapshot,
     request_id: &str,
     requested_model: &str,
     api_key_id: &str,
@@ -2904,6 +3186,7 @@ fn emit_failed_attempts(
         };
         emit_zero_token_event(
             state,
+            snap,
             request_id,
             // Each failed attempt records the TARGET it actually hit
             // (AISIX-Cloud#790), not the group it was resolved from.
@@ -2932,6 +3215,9 @@ fn emit_access_log(
     status: u16,
     elapsed: Duration,
     request_id: &str,
+    // Winning attempt's provider response id; `None` when unknown at this
+    // point (streaming, guardrail block, pre-dispatch error).
+    provider_request_id: Option<&str>,
     routing: &RoutingTelemetry,
     error: Option<&ProxyError>,
 ) {
@@ -2960,6 +3246,7 @@ fn emit_access_log(
         completion_tokens: None,
         total_tokens: None,
         request_id,
+        provider_request_id: provider_request_id.filter(|s| !s.is_empty()),
         served_by_model: served_by,
         routing_attempt_count: match routing.attempt_count() {
             0 => None,
@@ -2996,7 +3283,11 @@ mod tests {
             addr: "127.0.0.1:0".into(),
             request_body_limit_bytes: 1_048_576,
             real_ip: Default::default(),
+            request_id: Default::default(),
+            url_rewrites: Vec::new(),
             tls: None,
+            thread_per_core: None,
+            workers: None,
         }
     }
 
@@ -4597,6 +4888,196 @@ mod tests {
         assert_eq!(event.inbound_protocol, "openai");
         assert!(!event.request_id.is_empty());
         assert!(!event.occurred_at.is_empty());
+    }
+
+    /// AISIX-Cloud#1289: `/v1/responses` must record the upstream's own
+    /// response object id. Before this it was one of the fields the handler
+    /// left at `UsageEvent::default()` ("not yet plumbed for non-chat
+    /// handlers"), so a Codex-class call had no id an operator could take to
+    /// the provider's console. Fails before the fix (empty), passes after.
+    #[tokio::test]
+    async fn records_the_provider_response_id_non_streaming_1289() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "resp_1289_nonstream",
+                "object": "response",
+                "model": "gpt-4o-2024-08-06",
+                "output": [],
+                "usage": {"input_tokens": 4, "output_tokens": 2}
+            })))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_openai(&upstream.uri());
+        snap.models.insert(openai_model("gpt-4o-resp"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let state = crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+
+        let resp = crate::build_router(state)
+            .oneshot(make_req(serde_json::json!({
+                "model": "gpt-4o-resp",
+                "input": "hello"
+            })))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted")
+            .expect("usage_sink sender dropped");
+        assert_eq!(ev.provider_request_id, "resp_1289_nonstream");
+        // The gateway's own id must survive alongside it, not be replaced.
+        assert!(!ev.request_id.is_empty());
+        assert_ne!(ev.request_id, ev.provider_request_id);
+    }
+
+    /// AISIX-Cloud#1289 follow-up: `extract_response_usage` gates on a usable
+    /// `usage.input_tokens` and returns `None` without one, so the estimation
+    /// fallback (AISIX-Cloud#1074) works off a defaulted `ResponseUsage` — and
+    /// used to drop a perfectly good top-level `id` with it. The estimated
+    /// record must still name the upstream call it came from. Fails before the
+    /// follow-up (empty), passes after.
+    #[tokio::test]
+    async fn records_the_provider_response_id_when_usage_is_estimated_1289() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "resp_1289_estimated",
+                "object": "response",
+                "model": "gpt-4o-2024-08-06",
+                "output": [{
+                    "type": "message",
+                    "id": "msg_e",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "hello there"}]
+                }]
+                // No `usage` block at all — the estimator fills the counters.
+            })))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_openai(&upstream.uri());
+        snap.models.insert(openai_model("gpt-4o-resp"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let state = crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+
+        let resp = crate::build_router(state)
+            .oneshot(make_req(serde_json::json!({
+                "model": "gpt-4o-resp",
+                "input": "hello"
+            })))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted")
+            .expect("usage_sink sender dropped");
+        assert!(
+            ev.usage_estimated,
+            "fixture has no usage block, so this must be the estimated path",
+        );
+        assert_eq!(ev.provider_request_id, "resp_1289_estimated");
+    }
+
+    /// The buffered-SSE reader (the output-guardrail path holds the whole
+    /// response) must find the id on `response.created` even when no terminal
+    /// frame carried usage — that combination produces no `ResponseUsage` at
+    /// all, which is exactly where the id used to vanish.
+    #[test]
+    fn buffered_sse_id_survives_a_stream_with_no_terminal_usage_1289() {
+        let body = b"\
+data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1289_buffered\"}}\n\n\
+data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n\
+data: [DONE]\n\n";
+        assert!(
+            super::responses_sse_usage(body).is_none(),
+            "no terminal usage frame — the precondition for the lost-id case",
+        );
+        assert_eq!(
+            super::responses_sse_provider_request_id(body),
+            "resp_1289_buffered"
+        );
+    }
+
+    /// AISIX-Cloud#1289, streaming: the id arrives on `response.created` and
+    /// the terminal `response.completed` need not repeat it — this upstream
+    /// deliberately omits it there. A reader that only looked at the terminal
+    /// frame, or one that let the terminal frame overwrite what earlier
+    /// frames established, records nothing; both are the failure this pins.
+    #[tokio::test]
+    async fn streaming_records_the_provider_response_id_from_response_created_1289() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        let sse_body = "\
+data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1289_stream\"}}\n\n\
+data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n\
+data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":9,\"output_tokens\":3}}}\n\n\
+data: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse_body),
+            )
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_openai(&upstream.uri());
+        snap.models.insert(openai_model("gpt-4o-resp"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let state = crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+
+        let resp = crate::build_router(state)
+            .oneshot(make_req(serde_json::json!({
+                "model": "gpt-4o-resp",
+                "input": "hi",
+                "stream": true
+            })))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // Draining runs the stream to completion → the end-of-stream emit.
+        let _ = to_bytes(resp.into_body(), 65536).await.unwrap();
+
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted for a streaming 200")
+            .expect("usage event sender dropped");
+        assert_eq!(ev.prompt_tokens, 9, "terminal-frame usage must still win");
+        assert_eq!(
+            ev.provider_request_id, "resp_1289_stream",
+            "the id seen on response.created must survive the terminal frame",
+        );
     }
 
     /// AISIX-Cloud#867: the verbatim-OpenAI /v1/responses path must apply the

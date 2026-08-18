@@ -7,6 +7,7 @@
 use super::a2a_agent::A2aAgent;
 use super::apikey::ApiKey;
 use super::cache_policy::CachePolicy;
+use super::claim_mapping::ClaimMapping;
 use super::guardrail::{Guardrail, GuardrailAttachment};
 use super::mcp_auth_settings::McpAuthSettings;
 use super::mcp_policy::McpPolicy;
@@ -14,6 +15,7 @@ use super::mcp_server::McpServer;
 use super::model::Model;
 use super::observability_exporter::ObservabilityExporter;
 use super::oidc_provider::OidcProvider;
+use super::passthrough_route::PassthroughRoute;
 use super::provider_key::ProviderKey;
 use super::rate_limit_policy::RateLimitPolicy;
 use crate::snapshot::ResourceTable;
@@ -28,7 +30,7 @@ pub struct AisixSnapshot {
     pub guardrails: ResourceTable<Guardrail>,
     /// Attachment rows: `/aisix/<env>/guardrail_attachments/<uuid>`.
     /// Each row binds a guardrail definition to a scope (env / model /
-    /// api_key / team). `GuardrailIndex::build_from_snapshot` consumes
+    /// mcp_server / api_key / team). `GuardrailIndex::build_from_snapshot` consumes
     /// both this table and `guardrails` to build the per-request resolver.
     pub guardrail_attachments: ResourceTable<GuardrailAttachment>,
     /// Per-env cache policies. Stage 2 honors only the existence of an
@@ -57,6 +59,17 @@ pub struct AisixSnapshot {
     /// request to the API key whose `jwt_subject` equals the token's
     /// identity claim.
     pub oidc_providers: ResourceTable<OidcProvider>,
+    /// Claim-mapping rules: `/aisix/<env>/claim_mappings/<uuid>`. When a
+    /// verified JWT's subject binds to no API key directly, the enabled
+    /// rules for the matched trust provider are evaluated in priority
+    /// order and the first match selects the key the request runs as.
+    pub claim_mappings: ResourceTable<ClaimMapping>,
+    /// Explicit passthrough bindings: `/aisix/<env>/passthrough_routes/<uuid>`.
+    /// Each row maps a gateway entry (path prefix and/or inbound `Host`) to
+    /// one upstream target with its own auth and credential handling; the
+    /// proxy matches them after the typed routes (path) or before them
+    /// (foreign `Host`).
+    pub passthrough_routes: ResourceTable<PassthroughRoute>,
     /// The environment's inbound MCP OAuth discovery identity:
     /// `/aisix/<env>/mcp_auth_settings/<env-uuid>` — a singleton row
     /// (cp-api keys it by the environment id). Together with at least
@@ -85,6 +98,8 @@ impl AisixSnapshot {
             + self.mcp_policies.len()
             + self.a2a_agents.len()
             + self.oidc_providers.len()
+            + self.claim_mappings.len()
+            + self.passthrough_routes.len()
             + self.mcp_auth_settings.len()
     }
 }

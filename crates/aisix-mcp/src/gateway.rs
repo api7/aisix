@@ -14,6 +14,11 @@
 //! - `tools/call` strips the namespace prefix and routes to the owning
 //!   upstream.
 //!
+//! A gateway may instead be **scoped** to a single upstream
+//! ([`McpGateway::from_snapshot_scoped`], mounted at `/mcp/{server}`): it then
+//! serves that server's tools under their original, un-namespaced names while
+//! ACL decisions keep evaluating the namespaced form.
+//!
 //! The aggregator holds no per-request or per-session state, so governance
 //! never depends on a transport session — which keeps it aligned with the
 //! stateless direction of the MCP 2026-07-28 revision.
@@ -27,8 +32,8 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, Content, ErrorData, ListToolsResult,
-    PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
+    CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorData,
+    ListToolsResult, PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerInfo, Tool,
 };
 use rmcp::service::RequestContext;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
@@ -48,10 +53,39 @@ use crate::openapi::OpenApiBridge;
 /// not contain it; tool names may (we split on the first occurrence).
 pub const TOOL_NAMESPACE_SEPARATOR: &str = "__";
 
+/// Every protocol version `/mcp` serves, oldest first: the Streamable HTTP
+/// generations (`2025-03-26` onward) plus the stateless `2026-07-28`
+/// revision. The single source of truth for `initialize` negotiation,
+/// `server/discover`, and the proxy layer's `MCP-Protocol-Version` header
+/// gate — one list so the three can never drift.
+pub const SUPPORTED_PROTOCOL_VERSIONS: &[ProtocolVersion] = &[
+    ProtocolVersion::V_2025_03_26,
+    ProtocolVersion::V_2025_06_18,
+    ProtocolVersion::V_2025_11_25,
+    ProtocolVersion::V_2026_07_28,
+];
+
+/// [`SUPPORTED_PROTOCOL_VERSIONS`] as plain strings, for callers that gate on
+/// the `MCP-Protocol-Version` HTTP header without depending on rmcp types
+/// (the proxy layer). Kept in lockstep by `supported_version_lists_agree`.
+pub const SUPPORTED_PROTOCOL_VERSION_NAMES: &[&str] =
+    &["2025-03-26", "2025-06-18", "2025-11-25", "2026-07-28"];
+
 /// One registered upstream: its gateway-facing name and the live bridge to it.
 struct NamedUpstream {
     name: String,
     bridge: Arc<dyn McpBridge>,
+}
+
+/// Strip `server`'s namespace prefix from `name`: `Some(bare)` when `name`
+/// is `<server>__<bare>`, `None` otherwise. The one primitive both the
+/// scoped gateway and the proxy's attribution peek use to interpret a tool
+/// name on `/mcp/{server}`, so the two can never drift. Prefix matching is
+/// by whole-string prefix (not first-separator split), so a server name
+/// that itself ends in `_` still namespaces cleanly.
+pub fn strip_server_prefix<'a>(server: &str, name: &'a str) -> Option<&'a str> {
+    name.strip_prefix(server)
+        .and_then(|rest| rest.strip_prefix(TOOL_NAMESPACE_SEPARATOR))
 }
 
 /// Which tools a gateway instance may expose and call, in the namespaced
@@ -229,6 +263,26 @@ impl ToolAcl {
 pub struct McpGateway {
     upstreams: Arc<[NamedUpstream]>,
     tool_acl: ToolAcl,
+    /// When set, this gateway serves exactly one upstream under its **original**
+    /// tool names: `tools/list` strips the `<server>__` namespace prefix and
+    /// `tools/call` accepts both the bare and the prefixed form. ACL decisions
+    /// still evaluate the namespaced form, so per-tool grants keep one meaning
+    /// across the aggregated and the scoped endpoint.
+    scoped: Option<Arc<ScopedServer>>,
+}
+
+/// The single-server scope of a gateway built by
+/// [`McpGateway::from_snapshot_scoped`].
+struct ScopedServer {
+    /// The scoped upstream's registered name — the namespace every ACL check
+    /// re-applies and the name `initialize` reports.
+    name: String,
+    /// Every **other** registered server name, enabled or not. A `tools/call`
+    /// whose name is prefixed with one of these is a cross-server mistake and
+    /// fails closed rather than being silently served as a bare name.
+    /// Disabled servers stay reserved so this scope's callable name surface
+    /// does not shift when another server's `enabled` flag is toggled.
+    foreign: std::collections::HashSet<String>,
 }
 
 impl McpGateway {
@@ -265,6 +319,7 @@ impl McpGateway {
         Self {
             upstreams: deduped.into(),
             tool_acl: ToolAcl::allow_all(),
+            scoped: None,
         }
     }
 
@@ -290,6 +345,10 @@ impl McpGateway {
             .into_iter()
             .filter(|entry| entry.value.enabled)
             .map(|entry| {
+                // Here, not inside one bridge constructor: `type: mcp` and
+                // `type: openapi` rows share the credential fields, so the
+                // cleartext warning covers both.
+                crate::bridge::warn_cleartext_credential(&entry.value);
                 let name = entry.value.name.clone();
                 let bridge: Arc<dyn McpBridge> = match entry.value.server_type {
                     McpServerType::Mcp => {
@@ -301,6 +360,37 @@ impl McpGateway {
                 (name, bridge)
             });
         McpGateway::new(upstreams)
+    }
+
+    /// Build a gateway scoped to the single **enabled** `mcp_servers` entry
+    /// named `server`, serving its tools under their original names (see
+    /// [`McpGateway::scoped`]). Returns `None` when the server is not
+    /// registered or is disabled — a disabled server is treated as absent,
+    /// same as the aggregated endpoint skipping it.
+    pub fn from_snapshot_scoped(snapshot: &AisixSnapshot, server: &str) -> Option<Self> {
+        let entry = snapshot.mcp_servers.get_by_name(server)?;
+        if !entry.value.enabled {
+            return None;
+        }
+        crate::bridge::warn_cleartext_credential(&entry.value);
+        let name = entry.value.name.clone();
+        let bridge: Arc<dyn McpBridge> = match entry.value.server_type {
+            McpServerType::Mcp => {
+                let upstream = upstream_from_mcp_server(&entry.value);
+                Arc::new(EphemeralBridge::new(upstream))
+            }
+            McpServerType::Openapi => Arc::new(OpenApiBridge::new(entry)),
+        };
+        let foreign = snapshot
+            .mcp_servers
+            .entries()
+            .into_iter()
+            .filter(|e| e.value.name != name)
+            .map(|e| e.value.name.clone())
+            .collect();
+        let mut gateway = McpGateway::new([(name.clone(), bridge)]);
+        gateway.scoped = Some(Arc::new(ScopedServer { name, foreign }));
+        Some(gateway)
     }
 
     fn find(&self, server: &str) -> Option<&Arc<dyn McpBridge>> {
@@ -315,7 +405,7 @@ impl ServerHandler for McpGateway {
     async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
         // Fan out concurrently; each upstream call is already deadline-bounded
         // by its bridge, so a slow upstream cannot stall the aggregate.
@@ -345,34 +435,119 @@ impl ServerHandler for McpGateway {
         }
         // Per-tool ACL: expose only the tools this caller's key permits.
         tools.retain(|tool| self.tool_acl.permits(tool.name.as_ref()));
-        Ok(ListToolsResult::with_all_items(tools))
+        // A scoped gateway serves its single upstream's tools under their
+        // original names — the namespace prefix exists to disambiguate the
+        // aggregate, and a single-server endpoint has nothing to disambiguate.
+        // ACL filtering above ran on the namespaced form. Strip only when the
+        // bare name round-trips through `call_tool`'s parsing: a literal
+        // upstream name that itself starts with a registered server's prefix
+        // would be re-stripped (or fail closed) if advertised bare, so those
+        // stay namespaced — that spelling is the one `call_tool` accepts.
+        if let Some(scoped) = &self.scoped {
+            for tool in &mut tools {
+                if let Some(bare) = strip_server_prefix(&scoped.name, tool.name.as_ref()) {
+                    let round_trips = strip_server_prefix(&scoped.name, bare).is_none()
+                        && !scoped
+                            .foreign
+                            .iter()
+                            .any(|f| strip_server_prefix(f, bare).is_some());
+                    if round_trips {
+                        tool.name = Cow::Owned(bare.to_string());
+                    }
+                }
+            }
+        }
+        // Cache hints (SEP-2549, required on 2026-07-28 list results) are a
+        // wire-level statement only — the gateway runs no cache engine. The
+        // honest values here are "do not cache": the list is filtered by the
+        // CALLER's per-key ACL (so it is `private` to that authorization
+        // context), and upstream tool sets can change between requests (so
+        // its freshness window is zero).
+        //
+        // Version-gated because rmcp only strips `resultType` for legacy
+        // peers, not these fields — setting them unconditionally would add
+        // two fields legacy clients have never seen. Modern requests carry
+        // the version in `_meta`; legacy sessions fall back to the
+        // handshake's negotiated version. (ISO `YYYY-MM-DD` versions compare
+        // lexically the same as chronologically.)
+        let result = ListToolsResult::with_all_items(tools);
+        let modern = context
+            .protocol_version()
+            .is_some_and(|v| v.as_str() >= ProtocolVersion::V_2026_07_28.as_str());
+        Ok(if modern {
+            result.with_ttl_ms(0).with_cache_scope(CacheScope::Private)
+        } else {
+            result
+        })
     }
 
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, ErrorData> {
-        let (server, tool) = request
-            .name
-            .split_once(TOOL_NAMESPACE_SEPARATOR)
-            .ok_or_else(|| {
-                ErrorData::invalid_params(
-                    format!(
-                        "tool name '{}' is missing a 'server__tool' prefix",
-                        request.name
-                    ),
-                    None,
+    ) -> Result<CallToolResponse, ErrorData> {
+        // Resolve `(server, tool, namespaced)` from the caller's tool name.
+        // Scoped: the name is the upstream's original one, but a caller that
+        // sends the namespaced form anyway (an aggregated-endpoint client
+        // pointed at the scoped URL) keeps working — `<scope>__x` reduces to
+        // `x`. (An upstream tool literally named `<scope>__x` is therefore
+        // only callable as `<scope>__<scope>__x` — one strip, own prefix
+        // first; `tools/list` advertises exactly that spelling.) A name
+        // prefixed with a *different* registered server's name fails closed:
+        // the scoped endpoint never cross-routes, and silently serving it as
+        // a bare name would mask the caller's mistake. An unregistered
+        // prefix stays a bare name, since tool names may legitimately
+        // contain the separator.
+        let request_name = request.name.as_ref();
+        let (server, tool, namespaced): (&str, &str, Cow<'_, str>) = match &self.scoped {
+            Some(scoped) => {
+                let scope = scoped.name.as_str();
+                let bare = match strip_server_prefix(scope, request_name) {
+                    Some(rest) => rest,
+                    None if scoped
+                        .foreign
+                        .iter()
+                        .any(|f| strip_server_prefix(f, request_name).is_some()) =>
+                    {
+                        // Same neutral wording as the ACL reject: don't
+                        // confirm what the other server serves.
+                        return Err(ErrorData::invalid_params(
+                            format!("tool '{request_name}' is not available"),
+                            None,
+                        ));
+                    }
+                    None => request_name,
+                };
+                (
+                    scope,
+                    bare,
+                    Cow::Owned(format!("{scope}{TOOL_NAMESPACE_SEPARATOR}{bare}")),
                 )
-            })?;
+            }
+            None => {
+                let (server, tool) = request_name
+                    .split_once(TOOL_NAMESPACE_SEPARATOR)
+                    .ok_or_else(|| {
+                        ErrorData::invalid_params(
+                            format!(
+                                "tool name '{request_name}' is missing a 'server__tool' prefix"
+                            ),
+                            None,
+                        )
+                    })?;
+                (server, tool, Cow::Borrowed(request_name))
+            }
+        };
 
         // Per-tool ACL: reject a call the caller's key doesn't permit. A
         // disallowed tool is also absent from `tools/list`, so this is
         // defense-in-depth; the message stays neutral and does not reveal
-        // whether the tool exists upstream.
-        if !self.tool_acl.permits(request.name.as_ref()) {
+        // whether the tool exists upstream. The check runs on the namespaced
+        // form so grants mean the same thing on every endpoint; the message
+        // echoes the caller's own spelling.
+        if !self.tool_acl.permits(&namespaced) {
             return Err(ErrorData::invalid_params(
-                format!("tool '{}' is not available", request.name),
+                format!("tool '{request_name}' is not available"),
                 None,
             ));
         }
@@ -401,17 +576,54 @@ impl ServerHandler for McpGateway {
             )
         })?;
 
-        into_call_tool_result(result)
+        // Always a final (`Complete`) response: the gateway never asks the
+        // downstream agent for more input (MRTR stays un-relayed — see
+        // `RmcpBridge::call_tool`), so `InputRequired` is never produced here.
+        into_call_tool_result(result).map(CallToolResponse::from)
+    }
+
+    /// The protocol versions this endpoint implements, replacing the SDK
+    /// default (`ProtocolVersion::KNOWN_VERSIONS`, which would advertise
+    /// every version rmcp has ever heard of — including ones this endpoint
+    /// does not serve). Consulted by rmcp for `initialize` negotiation (an
+    /// exact match is echoed; anything else falls back to
+    /// `get_info().protocol_version`) and advertised verbatim in
+    /// `server/discover`.
+    ///
+    /// `2024-11-05` is deliberately absent: that generation's transport is
+    /// HTTP+SSE, which this Streamable-HTTP-only endpoint has never served.
+    fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
+        Cow::Borrowed(SUPPORTED_PROTOCOL_VERSIONS)
     }
 
     fn get_info(&self) -> ServerInfo {
         let mut info = ServerInfo::default();
+        // Pinned, not `ProtocolVersion::default()`: this is the version a
+        // legacy `initialize` falls back to when the client requests one we
+        // don't list in `supported_protocol_versions` — the same answer the
+        // endpoint has always given. Riding the SDK's `LATEST` alias would
+        // silently move this fallback whenever rmcp bumps it.
+        info.protocol_version = ProtocolVersion::V_2025_11_25;
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
-        info.instructions = Some(
-            "AISIX MCP gateway: aggregates tools from registered upstream MCP \
-             servers, namespaced as `server__tool`."
-                .to_string(),
-        );
+        match &self.scoped {
+            // The scoped endpoint presents as the upstream server itself, so
+            // `initialize` reports that server's registered name.
+            Some(scoped) => {
+                info.server_info.name = scoped.name.clone();
+                info.instructions = Some(format!(
+                    "AISIX MCP gateway: serves the tools of MCP server `{}` \
+                     under their original names.",
+                    scoped.name
+                ));
+            }
+            None => {
+                info.instructions = Some(
+                    "AISIX MCP gateway: aggregates tools from registered upstream MCP \
+                     servers, namespaced as `server__tool`."
+                        .to_string(),
+                );
+            }
+        }
         info
     }
 }
@@ -422,11 +634,29 @@ impl ServerHandler for McpGateway {
 /// Configured stateless (no sticky session, JSON responses): the aggregator
 /// keeps no per-session state, so the endpoint can sit behind a plain load
 /// balancer — matching the MCP 2026-07-28 transport direction.
+///
+/// `request_body_limit_bytes` is the deployment's request-body cap
+/// (`0` = unlimited, the same convention as everywhere else in the data
+/// plane). It must be threaded in because rmcp 3.x added its OWN inbound
+/// cap (4 MiB default) inside this service — beneath the gateway's limit
+/// middleware — which would silently override any configured limit above
+/// 4 MiB (and the documented unlimited mode) with a plain-text 413.
 pub fn streamable_http_service(
     gateway: McpGateway,
+    request_body_limit_bytes: usize,
 ) -> StreamableHttpService<McpGateway, LocalSessionManager> {
     let mut config = StreamableHttpServerConfig::default();
-    config.stateful_mode = false;
+    config.max_request_body_bytes = if request_body_limit_bytes == 0 {
+        usize::MAX
+    } else {
+        request_body_limit_bytes
+    };
+    // rmcp 3.x rename of `stateful_mode` (same semantics for legacy
+    // protocol versions; 2026-07-28 requests are stateless regardless, per
+    // SEP-2567). Kept `false`: the aggregator holds no session state, so
+    // legacy clients get sessionless serving too and the endpoint stays
+    // safe behind a plain load balancer.
+    config.legacy_session_mode = false;
     config.json_response = true;
     // Disable rmcp's `Host`-header allowlist. Its default
     // (`localhost`/`127.0.0.1`/`::1`) is a DNS-rebinding guard for
@@ -464,7 +694,7 @@ fn prefixed_tool(server: &str, tool: crate::McpTool) -> Tool {
 /// preserving the upstream's tool-level error flag (a tool-level error is
 /// propagated as `Ok(error_result)`, not turned into a protocol error).
 fn into_call_tool_result(result: crate::McpToolResult) -> Result<CallToolResult, ErrorData> {
-    let content: Vec<Content> = serde_json::from_value(result.content).map_err(|e| {
+    let content: Vec<ContentBlock> = serde_json::from_value(result.content).map_err(|e| {
         ErrorData::internal_error(format!("malformed tool content from upstream: {e}"), None)
     })?;
     let mut call_result = if result.is_error {
@@ -474,4 +704,45 @@ fn into_call_tool_result(result: crate::McpToolResult) -> Result<CallToolResult,
     };
     call_result.structured_content = result.structured_content;
     Ok(call_result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The rmcp-typed list (initialize negotiation, `server/discover`) and
+    /// the string list (the proxy's `MCP-Protocol-Version` header gate) are
+    /// two spellings of ONE decision; a version added to either alone is a
+    /// drift bug.
+    #[test]
+    fn supported_version_lists_agree() {
+        let typed: Vec<&str> = SUPPORTED_PROTOCOL_VERSIONS
+            .iter()
+            .map(|v| v.as_str())
+            .collect();
+        assert_eq!(typed, SUPPORTED_PROTOCOL_VERSION_NAMES);
+    }
+
+    /// `2024-11-05` (the HTTP+SSE generation) must stay excluded: this
+    /// endpoint serves Streamable HTTP only.
+    #[test]
+    fn http_sse_generation_stays_unsupported() {
+        assert!(!SUPPORTED_PROTOCOL_VERSION_NAMES.contains(&"2024-11-05"));
+        assert!(!SUPPORTED_PROTOCOL_VERSIONS.contains(&ProtocolVersion::V_2024_11_05));
+    }
+
+    /// The exact served set, as literals: growing or shrinking it is a
+    /// deliberate protocol-surface decision that must show up as a failing
+    /// test, not ride along inside a refactor that edits the constants.
+    /// (The lockstep test above only proves the two constants AGREE — it
+    /// would pass if a fifth version were added to both.)
+    #[test]
+    fn supported_version_set_is_pinned() {
+        assert_eq!(
+            SUPPORTED_PROTOCOL_VERSION_NAMES,
+            &["2025-03-26", "2025-06-18", "2025-11-25", "2026-07-28"],
+            "update this pin together with the negotiation/discover/header-gate \
+             docs and the tracking issue when the served set changes"
+        );
+    }
 }

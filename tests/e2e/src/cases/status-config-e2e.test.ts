@@ -12,6 +12,7 @@ import {
   pickFreePorts,
   spawnApp,
   startOpenAiUpstream,
+  suiteThreadPerCore,
   waitConfigPropagation,
   type OpenAiUpstream,
   type SpawnedApp,
@@ -345,7 +346,13 @@ async function spawnPointedAtDeadEtcd(): Promise<MinimalApp> {
       dial_timeout_ms: 2000,
       request_timeout_ms: 2000,
     },
-    proxy: { addr: `127.0.0.1:${proxyPort}`, request_body_limit_bytes: 10485760 },
+    proxy: {
+      addr: `127.0.0.1:${proxyPort}`,
+      request_body_limit_bytes: 10485760,
+      // This file spawns the binary itself, so it has to honour the
+      // suite-wide serving mode the shared harness applies.
+      ...(suiteThreadPerCore !== undefined ? { thread_per_core: suiteThreadPerCore } : {}),
+    },
     admin: { addr: `127.0.0.1:${adminPort}`, admin_keys: [`admin-${randomUUID()}`] },
     observability: {
       service_name: "aisix-status-nl",

@@ -36,7 +36,9 @@ use super::{
 };
 
 /// Cap on a masked error-detail string surfaced to logs / health.
-const DETAIL_MAX_CHARS: usize = 200;
+// Wide enough that a bucket URL (~180 chars for a partitioned object key)
+// leaves room for the error source chain behind it.
+const DETAIL_MAX_CHARS: usize = 500;
 
 /// A delivery target for one object-storage bucket (any provider).
 pub struct ObjectStoreSink {
@@ -184,6 +186,37 @@ pub enum ObjectStoreCredentials {
     },
 }
 
+/// HTTP client options carrying the deployment's outbound TLS trust, so
+/// an on-prem object store — a MinIO or an internal S3-compatible host
+/// behind an enterprise CA — is reachable on the same `upstream.tls`
+/// setting the provider bridges use.
+///
+/// Applied first in every builder chain: `with_client_options` replaces
+/// the whole options value, so a later `with_allow_http` layers onto
+/// this rather than the other way round.
+fn tls_client_options() -> object_store::ClientOptions {
+    let tls = &aisix_gateway::upstream_http::config().tls;
+    let mut options = object_store::ClientOptions::new();
+    if let Some(pem) = &tls.extra_ca_pem {
+        // Validated at boot by `TlsSettings::load`.
+        match object_store::Certificate::from_pem_bundle(pem) {
+            Ok(roots) => {
+                for root in roots {
+                    options = options.with_root_certificate(root);
+                }
+            }
+            Err(e) => tracing::error!(
+                error = %e,
+                "upstream.tls.ca_file not applied to object-store exports"
+            ),
+        }
+    }
+    if !tls.verify {
+        options = options.with_allow_invalid_certificates(true);
+    }
+    options
+}
+
 /// Build the provider-agnostic [`ObjectStore`] handle for a configured
 /// exporter. **This is the only provider-specific code** — each arm picks the
 /// matching `object_store` builder, which owns that cloud's signing. An
@@ -206,6 +239,7 @@ pub fn build_object_store(
             },
         ) => {
             let mut b = object_store::aws::AmazonS3Builder::new()
+                .with_client_options(tls_client_options())
                 .with_bucket_name(bucket)
                 .with_access_key_id(access_key_id)
                 .with_secret_access_key(secret_access_key);
@@ -241,6 +275,7 @@ pub fn build_object_store(
             // the service-account JSON's `gcs_base_url` field instead, so the
             // `endpoint` config is intentionally not applied for GCS.
             let b = object_store::gcp::GoogleCloudStorageBuilder::new()
+                .with_client_options(tls_client_options())
                 .with_bucket_name(bucket)
                 .with_service_account_key(service_account_key);
             let store = b
@@ -256,6 +291,7 @@ pub fn build_object_store(
             },
         ) => {
             let mut b = object_store::azure::MicrosoftAzureBuilder::new()
+                .with_client_options(tls_client_options())
                 .with_container_name(bucket)
                 .with_account(account)
                 .with_access_key(access_key);
@@ -310,7 +346,9 @@ pub fn build_object_store_ambient(
                         .to_string(),
                 ));
             }
-            let mut b = object_store::aws::AmazonS3Builder::from_env().with_bucket_name(bucket);
+            let mut b = object_store::aws::AmazonS3Builder::from_env()
+                .with_client_options(tls_client_options())
+                .with_bucket_name(bucket);
             if let Some(r) = region {
                 b = b.with_region(r);
             }
@@ -323,6 +361,7 @@ pub fn build_object_store_ambient(
             // No service-account key set → `object_store` sources Application
             // Default Credentials (GKE Workload Identity / GCE metadata).
             let store = object_store::gcp::GoogleCloudStorageBuilder::new()
+                .with_client_options(tls_client_options())
                 .with_bucket_name(bucket)
                 .build()
                 .map_err(|e| {
@@ -522,7 +561,10 @@ fn partition(occurred_at: &str) -> (String, String) {
 /// does not echo secrets in error text.
 fn map_object_store_err(e: object_store::Error) -> SinkError {
     use object_store::Error as E;
-    let detail = truncate(&e.to_string());
+    // The full source chain, not just the outer Display: object_store's
+    // retry error stops at "Error performing PUT <url>" and keeps the
+    // connect/DNS/TLS cause in `source()`.
+    let detail = truncate(&super::error_chain(&e));
     match e {
         E::PermissionDenied { .. }
         | E::Unauthenticated { .. }
@@ -1020,6 +1062,39 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn mapped_detail_carries_the_error_source_chain() {
+        // A Generic transport error's Display stops at the outer layer
+        // ("Error performing PUT <url>"); the connect/DNS cause lives in
+        // `source()`. The nightly real-cloud smoke failed for five weeks
+        // with a detail that never named the cause — the mapped detail
+        // must include the chain.
+        #[derive(Debug)]
+        struct Outer(std::io::Error);
+        impl std::fmt::Display for Outer {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("error performing PUT https://acct.example.net/container/key")
+            }
+        }
+        impl std::error::Error for Outer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+
+        let e = object_store::Error::Generic {
+            store: "MicrosoftAzure",
+            source: Box::new(Outer(std::io::Error::other(
+                "failed to lookup address information: Name or service not known",
+            ))),
+        };
+        let (SinkError::Transient(detail) | SinkError::Permanent(detail)) = map_object_store_err(e);
+        assert!(
+            detail.contains("failed to lookup address information"),
+            "detail must surface the underlying cause, got: {detail}"
+        );
+    }
 }
 
 /// Real-emulator smoke tests — the one-off validation that the sink's real
@@ -1085,7 +1160,7 @@ mod smoke {
 
         sink.append_batch(&batch, &IdempotencyMarker::None)
             .await
-            .expect("real put accepted by the emulator");
+            .expect("real put accepted by the object store");
 
         let keys = list_under(&store, &prefix).await;
         assert_eq!(keys.len(), 1, "exactly one object written");

@@ -157,6 +157,27 @@ pub struct ClientContext {
     /// arranges by declaring `auth` before `client`. Default (empty) on
     /// the unauthenticated paths; those resolve no `api_key` variable.
     pub caller: aisix_gateway::CallerIdentity,
+    /// The verified JWT identity behind the request, for usage
+    /// attribution (AISIX-Cloud#564). Published by the same auth
+    /// extractor; `None` when the request authenticated with the key's
+    /// plaintext.
+    pub jwt: Option<Arc<crate::auth::JwtIdentity>>,
+}
+
+/// Resolve the caller's address from the peer plus the trusted-proxy
+/// configuration. Shared with the auth extractor, which needs it before
+/// `ClientContext` runs so a rejected credential can still name its source.
+/// Empty when the request carries no `ConnectInfo` (oneshot tests).
+pub(crate) fn source_ip_from_parts(parts: &Parts, cfg: &ResolvedRealIp) -> String {
+    parts
+        .extensions
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ci| ci.0.ip())
+        .map(|peer| {
+            let forwarded = parse_forwarded(&parts.headers, &cfg.header);
+            resolve_client_ip(peer, &forwarded, &cfg.trusted, cfg.recursive).to_string()
+        })
+        .unwrap_or_default()
 }
 
 #[axum::async_trait]
@@ -174,15 +195,7 @@ where
         let proxy_state = ProxyState::from_ref(state);
         let cfg = &proxy_state.real_ip;
 
-        let source_ip = parts
-            .extensions
-            .get::<ConnectInfo<SocketAddr>>()
-            .map(|ci| ci.0.ip())
-            .map(|peer| {
-                let forwarded = parse_forwarded(&parts.headers, &cfg.header);
-                resolve_client_ip(peer, &forwarded, &cfg.trusted, cfg.recursive).to_string()
-            })
-            .unwrap_or_default();
+        let source_ip = source_ip_from_parts(parts, cfg);
 
         let user_agent = parts
             .headers
@@ -224,6 +237,10 @@ where
                 .get::<Arc<aisix_core::ResourceEntry<aisix_core::ApiKey>>>()
                 .map(|e| aisix_gateway::CallerIdentity::from_entry(e))
                 .unwrap_or_default(),
+            jwt: parts
+                .extensions
+                .get::<Arc<crate::auth::JwtIdentity>>()
+                .cloned(),
         })
     }
 }

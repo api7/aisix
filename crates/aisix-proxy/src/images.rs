@@ -12,7 +12,7 @@
 
 use aisix_core::AppliedGuardrail;
 use aisix_gateway::BridgeError;
-use aisix_obs::{content_capture_cap, AccessLog, CapturedContent, RequestOutcome, UsageEvent};
+use aisix_obs::{content_capture_cap, AccessLog, CapturedContent, UsageEvent};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -37,6 +37,9 @@ struct ImageDispatchSuccess {
     /// Resolved ProviderKey UUID — feeds per-PK telemetry attribution
     /// (AISIX-Cloud#867 parity).
     provider_key_id: String,
+    /// Provider-side model name, for the `upstream_model` metric label
+    /// (AISIX-Cloud#1234 parity with chat / messages / responses).
+    upstream_model: String,
     /// The `{kind, hook}` set of guardrails that governed this request (#379
     /// parity) — surfaced on the emitted UsageEvent.
     applied_guardrails: Vec<AppliedGuardrail>,
@@ -66,9 +69,27 @@ pub async fn image_generations(
     State(state): State<ProxyState>,
     auth: AuthenticatedKey,
     client: ClientContext,
-    Json(body): Json<Value>,
+    // Result-wrapped so an extractor-layer 413 maps to the OpenAI
+    // envelope — see completions.rs.
+    body: Result<Json<Value>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     let started = Instant::now();
+    let Json(body) = match body {
+        Ok(json) => json,
+        // Answer through `reject` — see completions.rs.
+        Err(rej) => {
+            return crate::reject::reject_before_dispatch(
+                &state,
+                "POST",
+                "/v1/images/generations",
+                &client.request_id,
+                Some(&auth.entry.id),
+                started,
+                crate::reject::Envelope::OpenAi,
+                crate::error::proxy_error_from_json_rejection(rej, state.request_body_limit_bytes),
+            );
+        }
+    };
     let request_id = client.request_id.clone();
     let api_key_id = auth.entry.id.clone();
     let model_name = body
@@ -77,23 +98,42 @@ pub async fn image_generations(
         .unwrap_or("unknown")
         .to_string();
 
-    match dispatch(&state, &auth, body, &request_id, &client).await {
+    // One snapshot for the whole request (#941) — see `embeddings`.
+    let snapshot = state.snapshot.load();
+
+    match dispatch(&state, &snapshot, &auth, body, &request_id, &client).await {
         Ok(success) => {
             let elapsed = started.elapsed();
+            // The actual response status, not a hardcoded 200: the 501
+            // NotImplemented branch also returns `Ok(success)`, and calling
+            // it a 200 both mislabels the access log and books it as
+            // `outcome="success"` on the request metrics. Same fix #426 made
+            // for completions / responses / rerank.
+            let status = success.response.status().as_u16();
             emit_access_log(
                 &model_name,
                 &success.provider,
                 &api_key_id,
-                200,
+                status,
                 elapsed,
                 &request_id,
                 None,
             );
-            state.metrics.record_request(
-                &success.provider,
-                &model_name,
-                200,
-                RequestOutcome::Success,
+            // One ProviderKey lookup for the metric emit + the usage event
+            // below (#941).
+            let pk = crate::usage_attr::ResolvedPk::resolve(&snapshot, &success.provider_key_id);
+            crate::request_metrics::record(
+                &state,
+                "/v1/images/generations",
+                crate::request_metrics::Caller::new(&auth),
+                crate::request_metrics::Upstream {
+                    provider: &success.provider,
+                    model: &model_name,
+                    upstream_model: &success.upstream_model,
+                    pk: pk.labels(),
+                    ..Default::default()
+                },
+                status,
                 elapsed,
             );
             // Issue #407: emit UsageEvent so cp-api's budget ledger +
@@ -109,11 +149,14 @@ pub async fn image_generations(
                 let (prompt_tokens, completion_tokens) = success.usage.unwrap_or((0, 0));
                 emit_usage_event(
                     &state,
+                    &snapshot,
+                    &pk,
                     &request_id,
                     &success.model_id,
                     &model_name,
                     &api_key_id,
-                    &success.provider_key_id,
+                    &success.provider,
+                    &success.upstream_model,
                     &success.applied_guardrails,
                     200,
                     elapsed,
@@ -139,19 +182,26 @@ pub async fn image_generations(
                 &request_id,
                 Some(&err),
             );
-            let snap = state.snapshot.load();
-            let metric_model = crate::usage_attr::metric_model_label(&snap, &model_name);
-            state.metrics.record_request(
-                "unknown",
-                metric_model,
+            let metric_model = crate::usage_attr::metric_model_label(&snapshot, &model_name);
+            // AISIX-Cloud#1325: name the target the request died on. This
+            // branch used to emit `Upstream::default()`, so a 502 from a
+            // real provider landed on `provider="unknown"` while the same
+            // key's successes landed on the real one.
+            let attributed = crate::attribution::current().unwrap_or_default();
+            let last_target = crate::request_metrics::LastTarget::new(&snapshot, &attributed);
+            crate::request_metrics::record(
+                &state,
+                "/v1/images/generations",
+                crate::request_metrics::Caller::new(&auth),
+                last_target.upstream(metric_model.as_ref(), false, false),
                 status,
-                RequestOutcome::from_status(status),
                 elapsed,
             );
             // Per #655 parity: surface the failed request in Logs with a
             // zero-token event (status + error class), instead of dropping it.
             crate::usage_attr::emit_error_usage_event(
                 &state,
+                &snapshot,
                 "images",
                 "openai",
                 &request_id,
@@ -179,6 +229,7 @@ fn images_input_to_chat(model: &str, body: &Value) -> aisix_gateway::ChatFormat 
 
 async fn dispatch(
     state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
     auth: &AuthenticatedKey,
     mut body: Value,
     request_id: &str,
@@ -193,9 +244,7 @@ async fn dispatch(
         .to_string();
     let model_name = model_name.as_str();
 
-    let snapshot = state.snapshot.load();
-
-    let model_entry = crate::model_resolve::resolve_model(&snapshot, model_name)
+    let model_entry = crate::model_resolve::resolve_model(snapshot, model_name)
         .ok_or_else(|| ProxyError::ModelNotFound(model_name.to_string()))?;
 
     if !auth.key().can_access(model_name) {
@@ -212,7 +261,9 @@ async fn dispatch(
     // refusal doesn't burn an RPM slot. (Output is an image, not scannable
     // text, so there is no output hook.)
     let guardrail_ctx = aisix_guardrails::RequestContext {
+        passthrough_route_id: "",
         model_id: &model_entry.id,
+        mcp_server_id: "",
         api_key_id: &auth.entry.id,
         team_id: auth.key().team_id.as_deref(),
     };
@@ -265,7 +316,7 @@ async fn dispatch(
 
     let model_rl =
         crate::quota::ModelRateLimit::from_model(model_name, &model_entry.id, &model_entry.value);
-    let reservation = crate::quota::enforce(state, auth, Some(&model_rl)).await?;
+    let reservation = crate::quota::enforce(state, snapshot, auth, Some(&model_rl)).await?;
 
     let model = &model_entry.value;
 
@@ -288,7 +339,7 @@ async fn dispatch(
     }
 
     let provider = crate::dispatch::require_provider(model)?.to_string();
-    let pk_entry = crate::dispatch::resolve_provider_key(&snapshot, model)?;
+    let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
 
     let bridge = crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value)
         .ok_or(ProxyError::ProviderUnavailable)?;
@@ -302,7 +353,8 @@ async fn dispatch(
         Arc::new(pk_entry.value.clone()),
         Some(client_ctx),
     );
-    if let Some(d) = model.request_timeout() {
+    if let Some(d) = crate::routing::effective_timeouts(model, None, state.default_timeouts).request
+    {
         ctx = ctx.with_deadline(d);
     }
 
@@ -323,7 +375,7 @@ async fn dispatch(
         Ok(resp_json) => {
             // #701: clear any cooldown/unhealthy mark now the upstream
             // answered — same recovery signal as rerank/audio/chat.
-            state.health.record_success(model_name);
+            state.health.record_success(&model_entry.value.display_name);
             state.runtime_status.mark_healthy(&model_entry.id);
             // Extract usage tokens (gpt-image-1 returns a `usage` block;
             // dall-e-3 doesn't) BEFORE moving resp_json into the
@@ -351,6 +403,7 @@ async fn dispatch(
                 provider: provider_label,
                 model_id: model_entry.id.to_string(),
                 provider_key_id: pk_entry.id.to_string(),
+                upstream_model: model.upstream_model().unwrap_or("unknown").to_string(),
                 applied_guardrails: applied_guardrails.clone(),
                 usage,
                 upstream_called: true,
@@ -368,6 +421,7 @@ async fn dispatch(
                 provider: provider_label,
                 model_id: model_entry.id.to_string(),
                 provider_key_id: pk_entry.id.to_string(),
+                upstream_model: model.upstream_model().unwrap_or("unknown").to_string(),
                 applied_guardrails: applied_guardrails.clone(),
                 usage: None,
                 // No upstream call happened → handler skips emit.
@@ -415,11 +469,19 @@ fn extract_token_usage(body: &Value) -> Option<(u32, u32)> {
 #[allow(clippy::too_many_arguments)]
 fn emit_usage_event(
     state: &ProxyState,
+    // The request's snapshot + its one ProviderKey observation, resolved
+    // by the handler (#941).
+    snap: &aisix_core::AisixSnapshot,
+    pk: &crate::usage_attr::ResolvedPk<'_>,
     request_id: &str,
     model_id: &str,
     requested_model: &str,
     api_key_id: &str,
-    provider_key_id: &str,
+    // Metric labels the UsageEvent has no field for (AISIX-Cloud#1234
+    // follow-up): the wire struct is the CP contract, so they ride
+    // alongside rather than in it.
+    provider: &str,
+    upstream_model: &str,
     applied_guardrails: &[AppliedGuardrail],
     status_code: u16,
     elapsed: Duration,
@@ -434,7 +496,6 @@ fn emit_usage_event(
     // never to the CP sink.
     content: Option<&CapturedContent>,
 ) {
-    let snap = state.snapshot.load();
     let mut event = UsageEvent {
         request_id: request_id.to_string(),
         occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
@@ -456,15 +517,40 @@ fn emit_usage_event(
         guardrail_monitor_hits,
         ..Default::default()
     };
-    crate::usage_attr::apply_pk_telemetry(&mut event, &snap, provider_key_id);
+    crate::usage_attr::apply_pk_telemetry(&mut event, pk);
     // Handler label "images" — bucketed prometheus counter (#408).
-    state.usage_sink.try_emit("images", event.clone());
-    let exporters = snap.observability_exporters.entries();
+    crate::usage_attr::apply_jwt_identity(&mut event, client.jwt.as_ref());
+    let usage_model = crate::usage_attr::usage_event_model_label(snap, &event.requested_model);
+    state.usage_sink.try_emit(
+        "images",
+        event.clone(),
+        crate::usage_attr::usage_event_labels(&usage_model, pk),
+    );
+    let exporters = crate::usage_attr::live_exporters(state, snap);
     state
         .otlp_fan_out
         .fan_out(&event, content, exporters.iter().map(|e| &e.value));
+    let owned_caller = crate::request_metrics::Caller::from_api_key_id(snap, api_key_id);
+    crate::request_metrics::record_usage(
+        state,
+        "/v1/images/generations",
+        owned_caller.as_caller(),
+        crate::request_metrics::Upstream {
+            provider,
+            model: requested_model,
+            upstream_model,
+            pk: pk.labels(),
+            ..Default::default()
+        },
+        crate::request_metrics::Tokens {
+            input: prompt_tokens,
+            output: completion_tokens,
+            total: prompt_tokens.saturating_add(completion_tokens),
+            spend_usd: 0.0,
+            client_type: state.client_classifier.classify(&client.user_agent),
+        },
+    );
 }
-
 fn emit_access_log(
     model: &str,
     provider: &str,
@@ -493,6 +579,9 @@ fn emit_access_log(
         completion_tokens: None,
         total_tokens: None,
         request_id,
+        // No provider response id: the images response is
+        // `{created, data, usage}` — no id on the wire (AISIX-Cloud#1289).
+        provider_request_id: None,
         served_by_model: None,
         routing_attempt_count: None,
         routing_fallback_count: None,
@@ -522,7 +611,11 @@ mod tests {
             addr: "127.0.0.1:0".into(),
             request_body_limit_bytes: 1_048_576,
             real_ip: Default::default(),
+            request_id: Default::default(),
+            url_rewrites: Vec::new(),
             tls: None,
+            thread_per_core: None,
+            workers: None,
         }
     }
 

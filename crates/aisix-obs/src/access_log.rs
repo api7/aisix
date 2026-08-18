@@ -1,12 +1,43 @@
-//! Structured one-line access log. Called by the proxy handler once per
-//! completed request (success or error). Keeping the call explicit rather
-//! than inside a tower layer means the handler can attach `provider`,
-//! `model`, `api_key_id`, and `tokens` — fields the layer couldn't see.
+//! Structured one-line access log — one line per request, success or error.
+//! Keeping the call explicit rather than inside a tower layer means the
+//! caller can attach `provider`, `model`, `api_key_id`, and `tokens` —
+//! fields the layer couldn't see.
+//!
+//! # When the line is written, and what that costs
+//!
+//! WHEN differs by path, and it decides which fields can be filled at all.
+//! Four cases, and only the first is "at the end of the request":
+//!
+//! - **Non-streamed response** — from the handler, on its way out, with
+//!   everything it resolved available.
+//! - **Streamed response** — from the handler too, but when the SSE body is
+//!   handed to the server, BEFORE a single frame is polled. The upstream has
+//!   produced nothing yet, so the token counts and `provider_request_id` are
+//!   necessarily absent, and `status` is the response-OPEN status: a stream
+//!   that later aborts, or whose consumer walks away, still logged `200`.
+//! - **`/v1/realtime`** — the opposite extreme. The handler returns the
+//!   WebSocket upgrade immediately; the line is written by `run_session` on
+//!   a detached task once the session closes, so it carries the close status
+//!   and the session's real token totals.
+//! - **Caller hung up before the response head** — written from
+//!   `ClientCancelGuard::drop`, with no handler involved. Status is `499`
+//!   and every resolved field is `None`, because the handler future was
+//!   dropped before it could fill any of them.
+//!
+//! So do not add a field whose value only exists once the upstream has
+//! responded and expect it on every line: it is silently empty on the
+//! streamed and cancelled ones. A streamed request's completion-time figures
+//! live on the per-attempt `UsageEvent` (and, for the provider response id,
+//! on the `provider call completed` line `UsageSink::try_emit` writes),
+//! keyed by the same `request_id`.
 
 use std::time::Duration;
 
-/// Canonical access-log fields. Constructed by the handler at the end of
-/// a request and passed to [`log_access`].
+/// Canonical access-log fields, passed to [`log_access`].
+///
+/// Constructed at the point a request's outcome becomes known — which is not
+/// the same moment, nor even the same caller, on every path. See the module
+/// docs before assuming a field is available here.
 #[derive(Debug, Clone)]
 pub struct AccessLog<'a> {
     pub method: &'a str,
@@ -20,6 +51,22 @@ pub struct AccessLog<'a> {
     pub completion_tokens: Option<u64>,
     pub total_tokens: Option<u64>,
     pub request_id: &'a str,
+    /// Provider response object `id` of the attempt that served the request
+    /// — OpenAI's `chat.completion.id`, Anthropic's message `id`,
+    /// `/v1/responses`' `resp_…`. Distinct from `request_id` (this
+    /// gateway's own id) and from the provider's HTTP transport header id;
+    /// none of the three may overwrite another (AISIX-Cloud#1289).
+    ///
+    /// `None` whenever no id exists by the time this line is written:
+    /// the request never reached an upstream (guardrail block,
+    /// pre-dispatch error), it was served from cache, the endpoint's
+    /// provider response carries no id at all (embeddings / audio /
+    /// images / count_tokens), or the response is **streamed** — there the
+    /// id arrives in the first frame, after this line. Streamed and
+    /// mid-stream-failed-over calls are covered instead by the per-attempt
+    /// `provider call completed` line (see `UsageSink::try_emit`), which
+    /// shares this `request_id`.
+    pub provider_request_id: Option<&'a str>,
     /// Routing target that ultimately served the request (the winning
     /// attempt's display name). `None` for direct models / cache hits.
     pub served_by_model: Option<&'a str>,
@@ -58,6 +105,7 @@ impl AccessLog<'_> {
             completion_tokens = self.completion_tokens,
             total_tokens = self.total_tokens,
             request_id = self.request_id,
+            provider_request_id = self.provider_request_id,
             served_by_model = self.served_by_model,
             routing_attempt_count = self.routing_attempt_count,
             routing_fallback_count = self.routing_fallback_count,
@@ -124,6 +172,7 @@ mod tests {
                 completion_tokens: Some(1),
                 total_tokens: Some(3),
                 request_id: "req-abc",
+                provider_request_id: Some("chatcmpl-abc"),
                 served_by_model: Some("fallback-target"),
                 routing_attempt_count: Some(2),
                 routing_fallback_count: Some(1),
@@ -141,6 +190,13 @@ mod tests {
         assert!(out.contains("provider=\"openai\"") || out.contains("provider=openai"));
         assert!(out.contains("total_tokens=3"));
         assert!(out.contains("request_id=\"req-abc\"") || out.contains("request_id=req-abc"));
+        // AISIX-Cloud#1289: the provider's own response id, next to — never
+        // instead of — the gateway's `request_id`.
+        assert!(
+            out.contains("provider_request_id=\"chatcmpl-abc\"")
+                || out.contains("provider_request_id=chatcmpl-abc"),
+            "{out}"
+        );
         assert!(
             out.contains("served_by_model=\"fallback-target\"")
                 || out.contains("served_by_model=fallback-target")
@@ -178,6 +234,7 @@ mod tests {
                 completion_tokens: None,
                 total_tokens: None,
                 request_id: "req-fail",
+                provider_request_id: None,
                 served_by_model: None,
                 routing_attempt_count: Some(1),
                 routing_fallback_count: None,
@@ -189,6 +246,10 @@ mod tests {
 
         let out = writer.contents();
         assert!(out.contains("status=504"));
+        // A call that never got a provider response must not carry an empty
+        // `provider_request_id=""` — an always-present field defeats
+        // filtering on it, same rule as `error_kind` above.
+        assert!(!out.contains("provider_request_id"), "{out}");
         assert!(
             out.contains("error_kind=\"timeout\"") || out.contains("error_kind=timeout"),
             "{out}"
@@ -222,6 +283,7 @@ mod tests {
                 completion_tokens: None,
                 total_tokens: None,
                 request_id: "req-xyz",
+                provider_request_id: None,
                 served_by_model: None,
                 routing_attempt_count: None,
                 routing_fallback_count: None,

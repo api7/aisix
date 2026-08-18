@@ -70,8 +70,8 @@
 //! design (poll traffic would flood /logs with no billing signal).
 
 use aisix_core::AppliedGuardrail;
-use aisix_obs::{AccessLog, RequestOutcome, UsageEvent};
-use axum::extract::{Path, State};
+use aisix_obs::{AccessLog, UsageEvent};
+use axum::extract::State;
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -83,6 +83,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::auth::AuthenticatedKey;
 use crate::client_ip::ClientContext;
 use crate::error::{ErrorEnvelope, ProxyError};
+use crate::reject::AisixPath;
 use crate::state::ProxyState;
 
 /// DashScope video-synthesis submit path (relative to the ProviderKey's
@@ -117,8 +118,8 @@ const RUNWAY_TASK_PATH: &str = "/v1/tasks";
 /// and <https://docs.dev.runwayml.com/api-details/versions/2024-11-06/>.
 const RUNWAY_VERSION_HEADER: &str = "X-Runway-Version";
 const RUNWAY_VERSION_VALUE: &str = "2024-11-06";
-/// OpenAI Sora videos base path (version-independent — `build_v1_url` owns
-/// the `/v1` prefix). Submit POSTs it, poll GETs `{path}/{id}`, content
+/// OpenAI Sora videos base path (version-independent — `build_openai_url`
+/// joins it onto the api_base). Submit POSTs it, poll GETs `{path}/{id}`, content
 /// GETs `{path}/{id}/content`. Source: official `openai-python` SDK,
 /// `resources/videos.py` (`self._post("/videos", …)`,
 /// `self._get("/videos/{video_id}", …)`,
@@ -623,9 +624,9 @@ impl VideoProvider {
             // endpoint paths, not the base — so there is no version suffix
             // to strip (no stripper invented per the PR brief).
             Self::Runway => &[],
-            // OpenAI composes its URLs via `build_v1_url` (which owns the
-            // `/v1` prefix and tolerates both the bare-host and `…/v1`
-            // conventions), so `root` is never consulted for it.
+            // OpenAI composes its URLs via `build_openai_url`, which
+            // preserves whatever root the api_base carries, so `root`
+            // is never consulted for it.
             Self::Openai => &[],
         };
         for suffix in suffixes {
@@ -638,10 +639,10 @@ impl VideoProvider {
 
     fn submit_url(self, base: &str) -> String {
         // OpenAI uses the version-independent `/videos` path under the
-        // shared `build_v1_url` normalizer; the other four compose the
+        // shared `build_openai_url` joiner; the other four compose the
         // vendor's versioned path onto the stripped host root.
         if self == Self::Openai {
-            return crate::dispatch::build_v1_url(base, OPENAI_VIDEOS_PATH);
+            return crate::dispatch::build_openai_url(base, OPENAI_VIDEOS_PATH);
         }
         let root = self.root(base);
         match self {
@@ -655,7 +656,10 @@ impl VideoProvider {
 
     fn poll_url(self, base: &str, task_id: &str) -> String {
         if self == Self::Openai {
-            return crate::dispatch::build_v1_url(base, &format!("{OPENAI_VIDEOS_PATH}/{task_id}"));
+            return crate::dispatch::build_openai_url(
+                base,
+                &format!("{OPENAI_VIDEOS_PATH}/{task_id}"),
+            );
         }
         let root = self.root(base);
         match self {
@@ -953,7 +957,7 @@ impl VideoProvider {
             Self::Openai => {
                 crate::jobs::require_safe_upstream_id(task_id)?;
                 Ok(ContentDelivery::Proxy {
-                    url: crate::dispatch::build_v1_url(
+                    url: crate::dispatch::build_openai_url(
                         base,
                         &format!("{OPENAI_VIDEOS_PATH}/{task_id}/content"),
                     ),
@@ -1025,6 +1029,10 @@ struct VideoTarget {
     provider_label: String,
     base_url: String,
     secret: String,
+    /// The ProviderKey's TLS override, resolved with the target so every
+    /// round-trip on this surface (submit, poll, content fetch) dials the
+    /// endpoint under the same trust settings.
+    tls: Option<aisix_core::models::provider_key::ProviderKeyTls>,
     /// The ProviderKey's rendered `default_headers` plus the client headers
     /// its `forward_client_headers` allowlist admits, resolved once when the
     /// target is resolved so every round-trip on this surface (submit, poll,
@@ -1043,14 +1051,12 @@ impl VideoTarget {
 /// against (the requested alias on submit, the stored display name on the
 /// GET routes).
 fn resolve_video_target(
-    state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
     auth: &AuthenticatedKey,
     model_entry: std::sync::Arc<aisix_core::ResourceEntry<aisix_core::Model>>,
     acl_name: &str,
     client_ctx: &ClientContext,
 ) -> Result<Result<VideoTarget, Response>, ProxyError> {
-    let snapshot = state.snapshot.load();
-
     if !auth.key().can_access(acl_name) {
         return Err(ProxyError::ModelForbidden(acl_name.to_string()));
     }
@@ -1069,7 +1075,7 @@ fn resolve_video_target(
         return Ok(Err((StatusCode::NOT_IMPLEMENTED, Json(env)).into_response()));
     };
 
-    let pk_entry = crate::dispatch::resolve_provider_key(&snapshot, &model_entry.value)?;
+    let pk_entry = crate::dispatch::resolve_provider_key(snapshot, &model_entry.value)?;
     // Of the mapped vendors only OpenAI has a built-in default api_base (the
     // same one the chat path uses) — an openai video Model with no `api_base`
     // falls back to it. The other four express regional endpoints, so their
@@ -1094,6 +1100,7 @@ fn resolve_video_target(
         ));
     Ok(Ok(VideoTarget {
         pk_id: pk_entry.id.to_string(),
+        tls: pk_entry.value.tls.clone(),
         provider: video_provider,
         provider_label: provider.to_ascii_lowercase(),
         base_url,
@@ -1120,7 +1127,7 @@ async fn provider_call(
     body: Option<&serde_json::Value>,
     request_id: &str,
 ) -> Result<serde_json::Value, ProxyError> {
-    let client = crate::http_client::client();
+    let client = crate::http_client::client_for(target.tls.as_ref());
     let note = |e: aisix_gateway::BridgeError| {
         crate::cooldown::note_failure(
             &state.runtime_status,
@@ -1194,7 +1201,13 @@ async fn provider_call(
                     .header(header::CONTENT_TYPE, "application/json")
                     .json(b);
             }
-            if let Some(d) = target.model_entry.value.request_timeout() {
+            if let Some(d) = crate::routing::effective_timeouts(
+                &target.model_entry.value,
+                None,
+                state.default_timeouts,
+            )
+            .request
+            {
                 builder = builder.timeout(d);
             }
             async move {
@@ -1269,7 +1282,7 @@ async fn proxy_content(
     url: &str,
     request_id: &str,
 ) -> Result<Response, ProxyError> {
-    let client = crate::http_client::client();
+    let client = crate::http_client::client_for(target.tls.as_ref());
     // Same map-then-merge shape as `provider_call` — see the comment there
     // on why the gateway-owned names cannot be appended to.
     let mut headers = axum::http::HeaderMap::new();
@@ -1296,7 +1309,9 @@ async fn proxy_content(
     }
     let builder = client.get(url).headers(headers);
 
-    let stream_budget = target.model_entry.value.stream_timeout_effective();
+    let stream_budget =
+        crate::routing::effective_timeouts(&target.model_entry.value, None, state.default_timeouts)
+            .stream;
     let started = Instant::now();
     let note = |e: aisix_gateway::BridgeError| {
         crate::cooldown::note_failure(
@@ -1410,7 +1425,12 @@ struct Telemetry<'a> {
     state: &'a ProxyState,
     method: &'static str,
     path: String,
-    api_key_id: String,
+    /// The `endpoint` metric label — the same collapsed route template
+    /// `normalize_endpoint_label` produces, so the request families agree
+    /// with `aisix_proxy_in_flight_requests`. Coarser than `path`, which
+    /// keeps `/content` distinct for the access log.
+    endpoint: &'static str,
+    auth: &'a AuthenticatedKey,
     request_id: String,
     started: Instant,
 }
@@ -1432,11 +1452,17 @@ impl Telemetry<'_> {
             latency: elapsed,
             provider: Some(provider).filter(|p| !p.is_empty()),
             model: Some(model_label),
-            api_key_id: Some(&self.api_key_id),
+            api_key_id: Some(&self.auth.entry.id),
             prompt_tokens: None,
             completion_tokens: None,
             total_tokens: None,
             request_id: &self.request_id,
+            // The provider's video-job id is a handle to a resource the
+            // caller keeps polling, not this call's response-object id;
+            // recording it here would repeat one id across every poll of the
+            // same job (AISIX-Cloud#1289). It already reaches the caller as
+            // the job's own `id`.
+            provider_request_id: None,
             served_by_model: None,
             routing_attempt_count: None,
             routing_fallback_count: None,
@@ -1444,11 +1470,28 @@ impl Telemetry<'_> {
             error: error.as_deref(),
         }
         .emit();
-        self.state.metrics.record_request(
-            provider,
-            model_label,
+        // AISIX-Cloud#1325: this tail never took `upstream_model` or the
+        // ProviderKey pair, and its error sites pass `provider: "unknown"`.
+        // All three come off the request's attribution cell, which the
+        // dispatch filled when it selected the target — so a failed video
+        // job is attributable to the same key its successes are.
+        let snap = self.state.snapshot.load();
+        let attributed = crate::attribution::current().unwrap_or_default();
+        let last_target = crate::request_metrics::LastTarget::new(&snap, &attributed);
+        let provider = if provider == "unknown" {
+            last_target.provider()
+        } else {
+            provider
+        };
+        crate::request_metrics::record(
+            self.state,
+            self.endpoint,
+            crate::request_metrics::Caller::new(self.auth),
+            crate::request_metrics::Upstream {
+                provider,
+                ..last_target.upstream(model_label, false, false)
+            },
             status,
-            RequestOutcome::from_status(status),
             elapsed,
         );
     }
@@ -1467,7 +1510,8 @@ pub async fn create_video(
         state: &state,
         method: "POST",
         path: "/v1/videos".to_string(),
-        api_key_id: auth.entry.id.clone(),
+        endpoint: "/v1/videos",
+        auth: &auth,
         request_id: client.request_id.clone(),
         started,
     };
@@ -1490,7 +1534,10 @@ pub async fn create_video(
     };
     let model_name = body.model.clone();
 
-    match dispatch_create(&state, &auth, body, &client).await {
+    // One snapshot for the whole request (#941) — see `embeddings`.
+    let snapshot = state.snapshot.load();
+
+    match dispatch_create(&state, &snapshot, &auth, body, &client).await {
         Ok(success) => {
             let status = success.response.status().as_u16();
             // Label by the RESOLVED entry's display_name, not the requested
@@ -1499,8 +1546,7 @@ pub async fn create_video(
             // #451 cardinality failure. Exact-match requests are unchanged
             // (alias == display_name); wildcard traffic aggregates under
             // the pattern itself.
-            let snap = state.snapshot.load();
-            let model_label = snap
+            let model_label = snapshot
                 .models
                 .get_by_id(&success.model_id)
                 .map(|e| e.value.display_name.clone())
@@ -1515,6 +1561,7 @@ pub async fn create_video(
             if success.upstream_called {
                 emit_submit_usage_event(
                     &state,
+                    &snapshot,
                     &client,
                     &auth.entry.id,
                     &success.model_id,
@@ -1530,13 +1577,13 @@ pub async fn create_video(
         }
         Err(err) => {
             let status = err.status().as_u16();
-            let snap = state.snapshot.load();
-            let metric_model = crate::usage_attr::metric_model_label(&snap, &model_name);
-            telemetry.finish(status, "unknown", metric_model, Some(&err));
+            let metric_model = crate::usage_attr::metric_model_label(&snapshot, &model_name);
+            telemetry.finish(status, "unknown", metric_model.as_ref(), Some(&err));
             // #655 parity: failed submits surface in Logs as zero-token
             // events instead of vanishing.
             crate::usage_attr::emit_error_usage_event(
                 &state,
+                &snapshot,
                 "videos",
                 "openai",
                 &client.request_id,
@@ -1565,12 +1612,12 @@ struct CreateSuccess {
 
 async fn dispatch_create(
     state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
     auth: &AuthenticatedKey,
     body: VideoCreateBody,
     client: &ClientContext,
 ) -> Result<CreateSuccess, ProxyError> {
-    let snapshot = state.snapshot.load();
-    let model_entry = crate::model_resolve::resolve_model(&snapshot, &body.model)
+    let model_entry = crate::model_resolve::resolve_model(snapshot, &body.model)
         .ok_or_else(|| ProxyError::ModelNotFound(body.model.clone()))?;
     let model_id = model_entry.id.to_string();
 
@@ -1586,7 +1633,7 @@ async fn dispatch_create(
         ));
     }
 
-    let target = match resolve_video_target(state, auth, model_entry, &body.model, client)? {
+    let target = match resolve_video_target(snapshot, auth, model_entry, &body.model, client)? {
         Ok(t) => t,
         Err(resp) => {
             return Ok(CreateSuccess {
@@ -1605,7 +1652,9 @@ async fn dispatch_create(
     // embeddings, run BEFORE the rate-limit reservation so a policy
     // block doesn't burn an RPM slot (#542).
     let guardrail_ctx = aisix_guardrails::RequestContext {
+        passthrough_route_id: "",
         model_id: &target.model_entry.id,
+        mcp_server_id: "",
         api_key_id: &auth.entry.id,
         team_id: auth.key().team_id.as_deref(),
     };
@@ -1645,7 +1694,7 @@ async fn dispatch_create(
         &target.model_entry.id,
         &target.model_entry.value,
     );
-    let reservation = crate::quota::enforce(state, auth, Some(&model_rl)).await?;
+    let reservation = crate::quota::enforce(state, snapshot, auth, Some(&model_rl)).await?;
 
     let upstream_model =
         crate::dispatch::require_upstream_model(&target.model_entry.value)?.to_string();
@@ -1671,7 +1720,9 @@ async fn dispatch_create(
     reservation.commit_tokens(0).await;
     let resp = result?;
 
-    state.health.record_success(&body.model);
+    state
+        .health
+        .record_success(&target.model_entry.value.display_name);
     state.runtime_status.mark_healthy(&target.model_entry.id);
 
     let submit = target.provider.parse_submit(&resp)?;
@@ -1723,19 +1774,18 @@ async fn dispatch_create(
 /// caller already knows the model name they asked for, so there is
 /// nothing to disclose.
 fn resolve_get_target(
-    state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
     auth: &AuthenticatedKey,
     video_id: &str,
     client_ctx: &ClientContext,
 ) -> Result<(VideoTarget, String), ProxyError> {
     let (entry_id, alias, task_id) =
         decode_video_id(video_id).ok_or_else(|| ProxyError::VideoNotFound(video_id.to_string()))?;
-    let snapshot = state.snapshot.load();
     let model_entry = snapshot
         .models
         .get_by_id(&entry_id)
         .ok_or_else(|| ProxyError::VideoNotFound(video_id.to_string()))?;
-    match resolve_video_target(state, auth, model_entry, &alias, client_ctx) {
+    match resolve_video_target(snapshot, auth, model_entry, &alias, client_ctx) {
         Ok(Ok(target)) => Ok((target, task_id)),
         // Unsupported provider → uniform 404 (oracle fold, see above).
         Ok(Err(_)) => Err(ProxyError::VideoNotFound(video_id.to_string())),
@@ -1749,24 +1799,27 @@ pub async fn get_video(
     State(state): State<ProxyState>,
     auth: AuthenticatedKey,
     client: ClientContext,
-    Path(video_id): Path<String>,
+    AisixPath(video_id): AisixPath<String>,
 ) -> Response {
     let telemetry = Telemetry {
         state: &state,
         method: "GET",
         path: "/v1/videos/:id".to_string(),
-        api_key_id: auth.entry.id.clone(),
+        endpoint: "/v1/videos/:id",
+        auth: &auth,
         request_id: client.request_id.clone(),
         started: Instant::now(),
     };
+    // One snapshot for the whole request (#941) — see `embeddings`.
+    let snapshot = state.snapshot.load();
 
     let result: Result<(Response, String, String), ProxyError> = async {
-        let (target, task_id) = resolve_get_target(&state, &auth, &video_id, &client)?;
+        let (target, task_id) = resolve_get_target(&snapshot, &auth, &video_id, &client)?;
         // Poll traffic is exempt from model-level limits BY DESIGN
         // (AISIX-Cloud#1118 decision 3): a client polling a task it
         // already paid an RPM slot to submit must not starve itself.
         // Key-level layers still apply.
-        let reservation = crate::quota::enforce(&state, &auth, None).await?;
+        let reservation = crate::quota::enforce(&state, &snapshot, &auth, None).await?;
         let result = poll_task(&state, &target, &task_id, &client.request_id).await;
         reservation.commit_tokens(0).await;
         let poll = result?;
@@ -1800,21 +1853,26 @@ pub async fn video_content(
     State(state): State<ProxyState>,
     auth: AuthenticatedKey,
     client: ClientContext,
-    Path(video_id): Path<String>,
+    AisixPath(video_id): AisixPath<String>,
 ) -> Response {
     let telemetry = Telemetry {
         state: &state,
         method: "GET",
         path: "/v1/videos/:id/content".to_string(),
-        api_key_id: auth.entry.id.clone(),
+        // Collapsed with the metadata route, matching how
+        // `normalize_endpoint_label` treats `/v1/files/:id/content`.
+        endpoint: "/v1/videos/:id",
+        auth: &auth,
         request_id: client.request_id.clone(),
         started: Instant::now(),
     };
+    // One snapshot for the whole request (#941) — see `embeddings`.
+    let snapshot = state.snapshot.load();
 
     let result: Result<(Response, String, String), ProxyError> = async {
-        let (target, task_id) = resolve_get_target(&state, &auth, &video_id, &client)?;
+        let (target, task_id) = resolve_get_target(&snapshot, &auth, &video_id, &client)?;
         // Same model-layer exemption as the poll route (see get_video).
-        let reservation = crate::quota::enforce(&state, &auth, None).await?;
+        let reservation = crate::quota::enforce(&state, &snapshot, &auth, None).await?;
         let result = poll_task(&state, &target, &task_id, &client.request_id).await;
         reservation.commit_tokens(0).await;
         let poll = result?;
@@ -1920,6 +1978,8 @@ pub async fn video_content(
 #[allow(clippy::too_many_arguments)]
 fn emit_submit_usage_event(
     state: &ProxyState,
+    // The request's snapshot, loaded once by the handler (#941).
+    snap: &aisix_core::AisixSnapshot,
     client: &ClientContext,
     api_key_id: &str,
     model_id: &str,
@@ -1930,7 +1990,6 @@ fn emit_submit_usage_event(
     status_code: u16,
     elapsed: Duration,
 ) {
-    let snap = state.snapshot.load();
     let mut event = UsageEvent {
         request_id: client.request_id.clone(),
         occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
@@ -1949,9 +2008,16 @@ fn emit_submit_usage_event(
         client_user_agent: client.user_agent.clone(),
         ..Default::default()
     };
-    crate::usage_attr::apply_pk_telemetry(&mut event, &snap, provider_key_id);
-    state.usage_sink.try_emit("videos", event.clone());
-    let exporters = snap.observability_exporters.entries();
+    let pk = crate::usage_attr::ResolvedPk::resolve(snap, provider_key_id);
+    crate::usage_attr::apply_pk_telemetry(&mut event, &pk);
+    crate::usage_attr::apply_jwt_identity(&mut event, client.jwt.as_ref());
+    let usage_model = crate::usage_attr::usage_event_model_label(snap, &event.requested_model);
+    state.usage_sink.try_emit(
+        "videos",
+        event.clone(),
+        crate::usage_attr::usage_event_labels(&usage_model, &pk),
+    );
+    let exporters = crate::usage_attr::live_exporters(state, snap);
     state
         .otlp_fan_out
         .fan_out(&event, None, exporters.iter().map(|e| &e.value));
@@ -2314,7 +2380,11 @@ mod tests {
             addr: "127.0.0.1:0".into(),
             request_body_limit_bytes: 1_048_576,
             real_ip: Default::default(),
+            request_id: Default::default(),
+            url_rewrites: Vec::new(),
             tls: None,
+            thread_per_core: None,
+            workers: None,
         }
     }
 

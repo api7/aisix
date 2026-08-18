@@ -14,8 +14,8 @@ use std::sync::Arc;
 
 use aisix_mcp::{EphemeralBridge, McpBridge, McpUpstream, OAuthClientConfig, RmcpBridge};
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, Content, ListToolsResult, PaginatedRequestParams,
-    ServerCapabilities, ServerInfo, Tool,
+    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ListToolsResult,
+    PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
 };
 use rmcp::service::RequestContext;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
@@ -47,7 +47,7 @@ impl ServerHandler for EchoServer {
         &self,
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, ErrorData> {
+    ) -> Result<CallToolResponse, ErrorData> {
         if request.name != "echo" {
             return Err(ErrorData::invalid_params(
                 format!("unknown tool: {}", request.name),
@@ -64,7 +64,7 @@ impl ServerHandler for EchoServer {
         if text == "sleep" {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         }
-        Ok(CallToolResult::success(vec![Content::text(text)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(text)]).into())
     }
 
     fn get_info(&self) -> ServerInfo {

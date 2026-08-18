@@ -8,8 +8,15 @@ name: docker-image
 #   - push to poc               → :poc + :sha-<shortsha>
 #   - push tag vX.Y.Z           → :X.Y.Z + :X.Y + :X + :latest
 #                                 + :sha-<shortsha>
+#   - push tag vX.Y.Z-rc.N      → :X.Y.Z-rc.N + :sha-<shortsha>  (NO rolling tags)
 #   - pull request              → build-only (no push), sanity check
 #   - workflow_dispatch         → :sha-<shortsha> + optional tag input
+#
+# Pre-release tags exist so a release candidate can be QA'd on the exact
+# artifacts customers receive before anything points at it. They must move
+# no rolling pointer: docker/metadata-action already skips :X.Y and :X for
+# pre-release semver, and the guards below keep :latest and the published
+# `openapi-latest.json` on the last stable release.
 
 on:
   push:
@@ -26,6 +33,7 @@ on:
       - rust-toolchain.toml
       - "crates/**"
       - "schemas/**"
+      - "bench/pgo-training/**"
   workflow_dispatch:
     inputs:
       tag:
@@ -48,9 +56,44 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # PGO builds (#967) compile the workspace twice (instrumented + optimized)
+    # with a training run in between — roughly 2.5x the plain fat-LTO build
+    # that used to fit in 45 minutes.
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v6
+
+      # PGO build mode (#967). Push builds (dev/poc/tags/dispatch) are always
+      # PGO=on: shipped artifacts are PGO'd, fail-closed, no fallback. PR
+      # builds default to PGO=off so review latency stays at one compile —
+      # EXCEPT when the PR touches the build pipeline or the training assets,
+      # in which case the full three-phase build must prove itself pre-merge.
+      - name: Decide PGO build mode
+        id: pgomode
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || '' }}
+        run: |
+          set -eu
+          mode=on
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            mode=off
+            git fetch --no-tags --depth=1 origin "$BASE_SHA"
+            # Capture the diff as a CHECKED command before matching: inside
+            # an `if` condition a git failure is exempt from `set -e` and
+            # would silently leave mode=off (fail-open). As an assignment,
+            # a diff failure kills the step instead. Captured text also
+            # avoids grep -q closing the pipe under git (SIGPIPE).
+            changed="$(git diff --name-only "$BASE_SHA" HEAD)"
+            # Root build inputs (workspace manifest with [profile.release],
+            # lockfile, toolchain pin) are PGO inputs too: a bump can break
+            # the instrumented/profile-use build or the training run while
+            # the plain PGO=off compile stays green.
+            if printf '%s\n' "$changed" \
+                | grep -qE '^(Dockerfile|\.dockerignore|Cargo\.(toml|lock)|rust-toolchain\.toml|bench/pgo-training/|\.github/workflows/docker-image\.ya?ml)'; then
+              mode=on
+            fi
+          fi
+          echo "value=$mode" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
@@ -83,6 +126,9 @@ jobs:
           images: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
             ${{ startsWith(github.ref, 'refs/tags/v') && format('{0}/{1}', secrets.DOCKER_REGISTRY, env.IMAGE_NAME) || '' }}
+          # `latest` is guarded on `!contains(ref_name, '-')` so a `-rc.N` tag
+          # cannot move it; metadata-action already skips {{major}}.{{minor}}
+          # and {{major}} for pre-release semver.
           tags: |
             type=raw,value=dev,enable=${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
             type=raw,value=poc,enable=${{ github.event_name == 'push' && github.ref == 'refs/heads/poc' }}
@@ -91,7 +137,7 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-') }}
             type=raw,value=${{ github.event.inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag != '' }}
           labels: |
             org.opencontainers.image.title=aisix
@@ -135,6 +181,7 @@ jobs:
           build-args: |
             BUILD_SHA=${{ steps.shortsha.outputs.value }}
             BUILD_VERSION=${{ steps.relver.outputs.value }}
+            PGO=${{ steps.pgomode.outputs.value }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: false   # keep manifest format compatible with older clients
@@ -152,6 +199,35 @@ jobs:
           IMG="${REGISTRY}/${IMAGE_NAME}@${{ steps.build.outputs.digest }}"
           docker run --rm --entrypoint /usr/local/bin/aisix "$IMG" --version | tee /tmp/aisix-version
           grep -qx "aisix ${VER}" /tmp/aisix-version
+
+      # Fail-closed release gate (#967): every image built with PGO=on must
+      # carry the proof marker the Dockerfile writes only after the
+      # profile-optimized build succeeds. An absent marker, a short shape
+      # list, or an undersized merged profile fails the workflow here —
+      # before signing, and before any human treats the artifact as good.
+      # The `if` is deliberately NOT just `pgomode == 'on'`: every push build
+      # asserts unconditionally, so a future bug in the pgomode step itself
+      # (empty output, renamed id) cannot skip both the PGO build AND its
+      # guard in the same breath.
+      - name: Assert PGO proof marker (#967)
+        if: github.event_name != 'pull_request' || steps.pgomode.outputs.value == 'on'
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -eux
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            IMG="$(printf '%s\n' "$TAGS" | head -n1)"
+          else
+            IMG="${REGISTRY}/${IMAGE_NAME}@${DIGEST}"
+            docker pull "$IMG"
+          fi
+          docker run --rm --entrypoint cat "$IMG" /usr/local/share/aisix/pgo-verified.json \
+            | tee /tmp/pgo-verified.json
+          shapes="$(jq -r '.shapes | length' /tmp/pgo-verified.json)"
+          test "$shapes" -ge 12
+          test "$(jq -r '.profraw_count' /tmp/pgo-verified.json)" -ge "$shapes"
+          test "$(jq -r '.profdata_bytes' /tmp/pgo-verified.json)" -ge 524288
 
       # The image contract customers rely on for hostNetwork/:80
       # deployments: the default non-root user (uid 10001) must be able
@@ -191,6 +267,39 @@ jobs:
           done
           docker logs smoke-aisix
           test -n "$ok"
+
+      # The profiling contract from #847: the shipped binary must stay
+      # profileable in the field, meaning the symbol table survives into
+      # the image (function-level flame graphs). A future strip step,
+      # RUSTFLAGS change, or base-image swap would break flame graphs
+      # silently, so pin it here — and print the size so every PR
+      # records the real Linux artifact cost.
+      # Also enforced on tag builds since #967: the PGO'd binary that ships
+      # must provably keep the profiling contract, not just the PR variant.
+      - name: Verify shipped binary keeps its symbol table (#847)
+        if: github.event_name == 'pull_request' || startsWith(github.ref, 'refs/tags/v')
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -eux
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            IMAGE="$(printf '%s\n' "$TAGS" | head -n1)"
+          else
+            IMAGE="${REGISTRY}/${IMAGE_NAME}@${DIGEST}"
+            docker pull "$IMAGE"
+          fi
+          cid="$(docker create "$IMAGE")"
+          docker cp "$cid:/usr/local/bin/aisix" /tmp/aisix-shipped
+          docker rm "$cid"
+          ls -l /tmp/aisix-shipped
+          test "$(nm /tmp/aisix-shipped | grep -c ' [tT] ')" -gt 1000
+          readelf -S /tmp/aisix-shipped | grep -E '\.symtab|\.eh_frame'
+          # jemalloc must actually be linked (prefixed _rjem_ symbols):
+          # if the cfg gates in aisix-server drift, the binary silently
+          # falls back to glibc malloc with no other signal.
+          nm /tmp/aisix-shipped | grep -q ' [tT] _rjem_' \
+            || { echo "::error::jemalloc symbols missing from shipped binary"; exit 1; }
 
       - name: Install cosign
         if: github.event_name != 'pull_request'
@@ -275,8 +384,17 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           jq --arg version "$VERSION" '.info.version = $version' ./openapi.json > "openapi-${VERSION}.json"
           aws s3 cp "./openapi-${VERSION}.json" "s3://${S3_BUCKET}/ai-gateway/openapi-${VERSION}.json"
-          aws s3 cp "./openapi-${VERSION}.json" "s3://${S3_BUCKET}/ai-gateway/openapi-latest.json"
-          echo "/ai-gateway/openapi-${VERSION}.json /ai-gateway/openapi-latest.json" > .updated_openapi_files
+          PATHS="/ai-gateway/openapi-${VERSION}.json"
+          # A release candidate publishes its own version-pinned spec (QA reads
+          # it) but must leave `openapi-latest.json` on the last stable release.
+          case "$VERSION" in
+            *-*) echo "::notice::pre-release ${VERSION}: openapi-latest.json left untouched" ;;
+            *)
+              aws s3 cp "./openapi-${VERSION}.json" "s3://${S3_BUCKET}/ai-gateway/openapi-latest.json"
+              PATHS="$PATHS /ai-gateway/openapi-latest.json"
+              ;;
+          esac
+          echo "$PATHS" > .updated_openapi_files
 
       - name: Invalidate OpenAPI CloudFront paths
         if: steps.openapi-secrets.outputs.enabled == 'true'

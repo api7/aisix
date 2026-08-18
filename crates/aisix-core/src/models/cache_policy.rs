@@ -3,10 +3,10 @@
 //! `/aisix/<env>/cache_policies/<uuid>`; the DP loads them on watch
 //! and `aisix-proxy::cache_gate` consults them on every chat request.
 //!
-//! Backends supported: `memory` + `redis`. Semantic backends were
-//! removed pending DP-side wiring of the embedding client +
-//! chat-dispatch integration — see ai-gateway issue #116 and the
-//! TODO issue tracking re-introduction.
+//! Backends supported: `memory` + `redis` — the *storage* dimension.
+//! Matching is layered: every policy does exact-fingerprint matching,
+//! and a policy that carries a [`SemanticCacheConfig`] additionally
+//! matches by embedding similarity when the exact layer misses.
 //!
 //! See `crates/aisix-cache` for the cache backend itself; this module
 //! is the wire shape only.
@@ -26,7 +26,86 @@ pub enum CacheBackend {
     Redis,
 }
 
-/// Semantic cache policy for chat requests.
+/// Sharing boundary for cache entries created under a policy. Applies to
+/// both matching layers: an entry written in one scope bucket is never
+/// served to a request in another.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheScope {
+    /// Entries are private to the API key that created them. The safe
+    /// default: one caller's answers are never replayed to another.
+    #[default]
+    ApiKey,
+    /// Entries are shared by every API key in the environment. Pick this
+    /// for shared-knowledge traffic (FAQ, documentation Q&A) where
+    /// cross-caller reuse is the point.
+    Env,
+}
+
+/// Embedding-similarity matching for a cache policy. When present, a
+/// request that misses the exact layer is embedded and compared against
+/// stored entries; the nearest entry at or above `threshold` cosine
+/// similarity is served. Only requests whose messages are entirely text
+/// participate — requests containing images or audio never match by
+/// similarity.
+///
+/// On `backend: redis`, similarity matching requires a Redis server
+/// with vector search (Redis 8 or later, or the search module) in
+/// `single` or `sentinel` mode; without it — or in `cluster` mode —
+/// the policy keeps serving exact matches only and a warning is
+/// logged.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
+pub struct SemanticCacheConfig {
+    /// Name of the `embedding` model used to embed requests. The model
+    /// must exist in the same environment and carry an `embedding`
+    /// block; its `dimensions` value fixes the vector size for this
+    /// policy's entries.
+    #[schemars(length(min = 1))]
+    pub embedding_model: String,
+
+    /// Minimum cosine similarity for a stored entry to be served, in
+    /// `[0, 1]`. Higher is stricter. Values below `0.9` noticeably
+    /// increase wrong-answer risk for most embedding models.
+    #[schemars(range(min = 0.0, max = 1.0))]
+    pub threshold: f32,
+
+    /// Upper bound on stored entries for this policy on the `memory`
+    /// backend; the oldest entry is evicted first. Shared backends
+    /// bound growth by TTL instead and ignore this value. The ceiling
+    /// keeps the per-request similarity scan and the per-policy vector
+    /// memory bounded; workloads needing more entries belong on a
+    /// shared backend.
+    #[serde(default = "default_semantic_max_entries")]
+    #[schemars(range(min = 1, max = 10000))]
+    pub max_entries: u32,
+
+    /// Per-call deadline for the embedding request in milliseconds.
+    /// `0` or absent disables the embedding-specific deadline. On
+    /// timeout the request proceeds to the upstream uncached.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_timeout_ms: Option<u64>,
+}
+
+impl SemanticCacheConfig {
+    /// Per-call embedding deadline. Folds the `0`/absent sentinel into
+    /// `None` so callers can apply it unconditionally.
+    pub fn embedding_timeout(&self) -> Option<std::time::Duration> {
+        self.embedding_timeout_ms
+            .filter(|&ms| ms > 0)
+            .map(std::time::Duration::from_millis)
+    }
+}
+
+fn default_semantic_max_entries() -> u32 {
+    1000
+}
+
+/// A prompt-response cache rule. Requests covered by an enabled policy
+/// are served from cache when an identical request was answered before
+/// (exact matching), and — when `semantic` is configured — when a
+/// sufficiently similar request was.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
 pub struct CachePolicy {
     /// Operator-facing name that surfaces in metric labels and cache headers.
@@ -52,6 +131,27 @@ pub struct CachePolicy {
     #[serde(default = "default_applies_to")]
     #[schemars(length(min = 1, max = 255))]
     pub applies_to: String,
+
+    /// Sharing boundary for entries created under this policy:
+    /// `api_key` (default) keeps entries private to the caller that
+    /// created them; `env` shares them across the environment.
+    #[serde(default)]
+    pub scope: CacheScope,
+
+    /// Invalidation counter. Entries are readable only while their
+    /// stored generation matches; a purge bumps this value, making
+    /// every earlier entry unreachable at once. Managed by the purge
+    /// operation — not set directly. Full-document updates must carry
+    /// the current value forward: writing a lower (or omitted, i.e.
+    /// `0`) value re-exposes entries stored under that earlier
+    /// generation until their TTL passes.
+    #[serde(default)]
+    pub purge_generation: u32,
+
+    /// Embedding-similarity matching. Absent: the policy matches
+    /// exactly-identical requests only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic: Option<SemanticCacheConfig>,
 
     /// Set by the loader from the kine path's UUID segment. The DP
     /// uses this for metric labels and log correlation. Not part of
@@ -248,5 +348,78 @@ mod tests {
         });
         let p: CachePolicy = serde_json::from_value(v).unwrap();
         assert_eq!(p.name, "future");
+    }
+
+    #[test]
+    fn scope_and_generation_default_for_legacy_rows() {
+        // Rows written before the semantic-cache release carry neither
+        // field; they must parse with the documented defaults.
+        let p: CachePolicy =
+            serde_json::from_value(json!({"name": "old", "backend": "memory"})).unwrap();
+        assert_eq!(p.scope, CacheScope::ApiKey);
+        assert_eq!(p.purge_generation, 0);
+        assert!(p.semantic.is_none());
+    }
+
+    #[test]
+    fn deserialises_full_semantic_policy() {
+        let v = json!({
+            "name": "faq",
+            "backend": "memory",
+            "scope": "env",
+            "purge_generation": 3,
+            "semantic": {
+                "embedding_model": "text-embedding-3-small",
+                "threshold": 0.92,
+                "embedding_timeout_ms": 2000
+            }
+        });
+        let p: CachePolicy = serde_json::from_value(v).unwrap();
+        assert_eq!(p.scope, CacheScope::Env);
+        assert_eq!(p.purge_generation, 3);
+        let sem = p.semantic.as_ref().unwrap();
+        assert_eq!(sem.embedding_model, "text-embedding-3-small");
+        assert!((sem.threshold - 0.92).abs() < 1e-6);
+        assert_eq!(sem.max_entries, 1000, "max_entries defaults to 1000");
+        assert_eq!(
+            sem.embedding_timeout(),
+            Some(std::time::Duration::from_millis(2000))
+        );
+    }
+
+    #[test]
+    fn semantic_block_tolerates_unknown_fields_for_forward_compat() {
+        // Same forward-compat contract as the policy root: a future
+        // knob inside `semantic` must not make this DP drop the row.
+        let v = json!({
+            "name": "faq",
+            "semantic": {
+                "embedding_model": "e",
+                "threshold": 0.9,
+                "future_knob": true
+            }
+        });
+        let p: CachePolicy = serde_json::from_value(v).unwrap();
+        assert!(p.semantic.is_some());
+    }
+
+    #[test]
+    fn semantic_zero_timeout_means_no_deadline() {
+        let sem: SemanticCacheConfig = serde_json::from_value(json!({
+            "embedding_model": "e",
+            "threshold": 0.9,
+            "embedding_timeout_ms": 0
+        }))
+        .unwrap();
+        assert_eq!(sem.embedding_timeout(), None);
+    }
+
+    #[test]
+    fn semantic_threshold_is_required() {
+        let v = json!({
+            "name": "faq",
+            "semantic": {"embedding_model": "e"}
+        });
+        assert!(serde_json::from_value::<CachePolicy>(v).is_err());
     }
 }

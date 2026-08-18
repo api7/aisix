@@ -200,6 +200,16 @@
       },
       "type": "array"
     },
+    "allowed_routes": {
+      "description": "Passthrough routes this key may use, named by their registered names. Entries are matched as single-`*` globs, mirroring `allowed_tools`: `\"*\"` grants every route and an entry without a `*` matches one route exactly. When omitted, set to `null`, or set to an empty list, the key may use no passthrough route — access is granted explicitly.",
+      "items": {
+        "type": "string"
+      },
+      "type": [
+        "array",
+        "null"
+      ]
+    },
     "allowed_tools": {
       "description": "MCP tools this key may call, as namespaced `<server>__<tool>` names (the form the gateway exposes). Entries are matched as single-`*` globs, mirroring `allowed_models`: `\"*\"` grants every tool and `\"<server>__*\"` grants every tool on one server (e.g. `\"github__*\"`); an entry without a `*` matches one tool exactly. When omitted, set to `null`, or set to an empty list, the key has no MCP tool access — access is granted explicitly.",
       "items": {

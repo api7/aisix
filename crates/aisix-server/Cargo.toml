@@ -46,11 +46,29 @@ rcgen.workspace = true
 uuid.workspace = true
 hostname.workspace = true
 x509-parser = "0.16"
+# `SO_REUSEPORT` for the thread-per-core proxy listeners. `all` is
+# explicit because `set_reuse_port` lives behind it — it resolves
+# without the feature today only because other dependencies happen to
+# enable it on the same socket2, which a version bump would end.
+socket2 = { version = "0.5", features = ["all"] }
 # Only for the hyper connection builder `axum_server::Server::http_builder()`
 # hands back — where `downstream.idle_timeout_secs` is applied. Same 0.1.x
 # axum-server itself depends on, so the builder types unify.
 hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
 
+# jemalloc as the global allocator, only on the targets we ship and
+# bench (Linux glibc — the Docker image and both supported production
+# arches). Other targets (macOS dev builds, musl) keep the system
+# allocator rather than carry an allocator we never run in production.
+# The ctl crate exists for one runtime mallctl at startup (enable the
+# background purge thread, #968); it drags in the unmaintained `paste`
+# proc-macro (RUSTSEC-2024-0436, build-time only) — accepted until
+# jemalloc-ctl drops it upstream.
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+tikv-jemallocator = "0.6"
+tikv-jemalloc-ctl = "0.6"
+
 [dev-dependencies]
 tempfile = "3"
 wiremock = "0.6"
+tokio = { workspace = true, features = ["test-util"] }

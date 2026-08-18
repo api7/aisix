@@ -20,6 +20,7 @@
 //! - elapsed deadline → `BridgeError::Timeout { elapsed_ms }`
 
 use aisix_core::{RequestOverrides, ResponseOverrides, StreamDoneMarker};
+use aisix_gateway::url_cache::cached_endpoint_url;
 use aisix_gateway::{
     apply_request_headers, Bridge, BridgeContext, BridgeError, ChatChunk, ChatChunkStream,
     ChatFormat, ChatResponse, EmbeddingRequest, EmbeddingResponse, SseDecoder, SseEvent,
@@ -78,6 +79,15 @@ impl OpenAiBridge {
 
     pub fn with_client(client: Client) -> Self {
         Self { client }
+    }
+
+    /// The client this dispatch runs on: the bridge's shared one, unless
+    /// the resolved Provider Key carries its own TLS settings.
+    fn client_for(&self, ctx: &BridgeContext) -> Client {
+        aisix_gateway::upstream_tls::client_for_provider_key(
+            &self.client,
+            ctx.provider_key.tls.as_ref(),
+        )
     }
 
     /// Resolve `ProviderKey.api_base` into the canonical base URL the
@@ -378,7 +388,6 @@ impl Bridge for OpenAiBridge {
         req: &ChatFormat,
         ctx: &BridgeContext,
     ) -> Result<ChatResponse, BridgeError> {
-        let base = self.resolve_base(ctx)?;
         let key = api_key(ctx)?;
         let upstream = upstream_model(ctx)?;
 
@@ -390,18 +399,26 @@ impl Bridge for OpenAiBridge {
             ctx.provider_key.response.as_ref(),
         )?;
         let headers = build_request_headers(key, &ctx.request_id, false, &ctx.header_ctx())?;
-        let url = format!("{base}/chat/completions");
-        let client = self.client.clone();
+        let url = cached_endpoint_url(
+            &ctx.provider_key_id,
+            "openai/chat",
+            &[
+                ctx.provider_key.api_base.as_deref().unwrap_or(""),
+                &ctx.provider_key.provider,
+            ],
+            || Ok(format!("{}/chat/completions", self.resolve_base(ctx)?)),
+        )?;
+        let client = self.client_for(ctx);
         let started = Instant::now();
 
         with_deadline(ctx.deadline, started, async move {
-            let resp = client
-                .post(&url)
+            let resp = url
+                .post_on(&client)
                 .headers(headers)
                 .json(&body)
                 .send()
                 .await
-                .map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
+                .map_err(aisix_gateway::send_error)?;
 
             let status = resp.status();
             if !status.is_success() {
@@ -422,7 +439,6 @@ impl Bridge for OpenAiBridge {
         req: &EmbeddingRequest,
         ctx: &BridgeContext,
     ) -> Result<EmbeddingResponse, BridgeError> {
-        let base = self.resolve_base(ctx)?;
         let key = api_key(ctx)?;
         let upstream = upstream_model(ctx)?;
 
@@ -436,17 +452,25 @@ impl Bridge for OpenAiBridge {
             ctx.provider_key.response.as_ref(),
         )?;
         let headers = build_request_headers(key, &ctx.request_id, false, &ctx.header_ctx())?;
-        let url = format!("{base}/embeddings");
-        let client = self.client.clone();
+        let url = cached_endpoint_url(
+            &ctx.provider_key_id,
+            "openai/embeddings",
+            &[
+                ctx.provider_key.api_base.as_deref().unwrap_or(""),
+                &ctx.provider_key.provider,
+            ],
+            || Ok(format!("{}/embeddings", self.resolve_base(ctx)?)),
+        )?;
+        let client = self.client_for(ctx);
         let started = Instant::now();
         with_deadline(ctx.deadline, started, async move {
-            let resp = client
-                .post(&url)
+            let resp = url
+                .post_on(&client)
                 .headers(headers)
                 .json(&body)
                 .send()
                 .await
-                .map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
+                .map_err(aisix_gateway::send_error)?;
 
             let status = resp.status();
             if !status.is_success() {
@@ -467,7 +491,6 @@ impl Bridge for OpenAiBridge {
         body: &serde_json::Value,
         ctx: &BridgeContext,
     ) -> Result<serde_json::Value, BridgeError> {
-        let base = self.resolve_base(ctx)?;
         let key = api_key(ctx)?;
         let upstream = upstream_model(ctx)?;
 
@@ -488,17 +511,25 @@ impl Bridge for OpenAiBridge {
         )?;
         let headers = build_request_headers(key, &ctx.request_id, false, &ctx.header_ctx())?;
 
-        let url = format!("{base}/completions");
-        let client = self.client.clone();
+        let url = cached_endpoint_url(
+            &ctx.provider_key_id,
+            "openai/completions",
+            &[
+                ctx.provider_key.api_base.as_deref().unwrap_or(""),
+                &ctx.provider_key.provider,
+            ],
+            || Ok(format!("{}/completions", self.resolve_base(ctx)?)),
+        )?;
+        let client = self.client_for(ctx);
         let started = Instant::now();
         with_deadline(ctx.deadline, started, async move {
-            let resp = client
-                .post(&url)
+            let resp = url
+                .post_on(&client)
                 .headers(headers)
                 .json(&outbound)
                 .send()
                 .await
-                .map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
+                .map_err(aisix_gateway::send_error)?;
 
             let status = resp.status();
             if !status.is_success() {
@@ -517,7 +548,6 @@ impl Bridge for OpenAiBridge {
         body: &serde_json::Value,
         ctx: &BridgeContext,
     ) -> Result<serde_json::Value, BridgeError> {
-        let base = self.resolve_base(ctx)?;
         let key = api_key(ctx)?;
         let upstream = upstream_model(ctx)?;
 
@@ -538,17 +568,25 @@ impl Bridge for OpenAiBridge {
         )?;
         let headers = build_request_headers(key, &ctx.request_id, false, &ctx.header_ctx())?;
 
-        let url = format!("{base}/images/generations");
-        let client = self.client.clone();
+        let url = cached_endpoint_url(
+            &ctx.provider_key_id,
+            "openai/images",
+            &[
+                ctx.provider_key.api_base.as_deref().unwrap_or(""),
+                &ctx.provider_key.provider,
+            ],
+            || Ok(format!("{}/images/generations", self.resolve_base(ctx)?)),
+        )?;
+        let client = self.client_for(ctx);
         let started = Instant::now();
         with_deadline(ctx.deadline, started, async move {
-            let resp = client
-                .post(&url)
+            let resp = url
+                .post_on(&client)
                 .headers(headers)
                 .json(&outbound)
                 .send()
                 .await
-                .map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
+                .map_err(aisix_gateway::send_error)?;
 
             let status = resp.status();
             if !status.is_success() {
@@ -567,7 +605,6 @@ impl Bridge for OpenAiBridge {
         req: &ChatFormat,
         ctx: &BridgeContext,
     ) -> Result<ChatChunkStream, BridgeError> {
-        let base = self.resolve_base(ctx)?;
         let key = api_key(ctx)?;
         let upstream = upstream_model(ctx)?;
 
@@ -579,18 +616,25 @@ impl Bridge for OpenAiBridge {
             ctx.provider_key.response.as_ref(),
         )?;
         let headers = build_request_headers(key, &ctx.request_id, true, &ctx.header_ctx())?;
-        let url = format!("{base}/chat/completions");
-        let client = self.client.clone();
+        let url = cached_endpoint_url(
+            &ctx.provider_key_id,
+            "openai/chat",
+            &[
+                ctx.provider_key.api_base.as_deref().unwrap_or(""),
+                &ctx.provider_key.provider,
+            ],
+            || Ok(format!("{}/chat/completions", self.resolve_base(ctx)?)),
+        )?;
+        let client = self.client_for(ctx);
         let started = Instant::now();
 
         let resp = with_deadline(ctx.deadline, started, async move {
-            client
-                .post(&url)
+            url.post_on(&client)
                 .headers(headers)
                 .json(&body)
                 .send()
                 .await
-                .map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))
+                .map_err(aisix_gateway::send_error)
         })
         .await?;
 
@@ -710,17 +754,22 @@ fn parse_stream_chunk(
     payload: &str,
     reasoning_path: Option<&str>,
 ) -> Result<OpenAiStreamChunk, BridgeError> {
-    match reasoning_path {
-        Some(path) => {
-            let mut value: Value = serde_json::from_str(payload)
-                .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?;
-            extract_reasoning_field(&mut value, path);
-            serde_json::from_value(value).map_err(|e| BridgeError::UpstreamDecode(e.to_string()))
-        }
-        None => {
-            serde_json::from_str(payload).map_err(|e| BridgeError::UpstreamDecode(e.to_string()))
-        }
-    }
+    let parsed = match reasoning_path {
+        Some(path) => serde_json::from_str::<Value>(payload)
+            .map_err(|e| e.to_string())
+            .and_then(|mut value| {
+                extract_reasoning_field(&mut value, path);
+                serde_json::from_value(value).map_err(|e| e.to_string())
+            }),
+        None => serde_json::from_str(payload).map_err(|e| e.to_string()),
+    };
+    parsed.map_err(|serde_err| {
+        // A frame that isn't a chunk may be the provider reporting an
+        // error inside the 200 stream (`{"error":{...}}`) — surface the
+        // provider's own error instead of the serde failure.
+        aisix_gateway::capture_in_band_error(payload, aisix_gateway::UpstreamWire::OpenAI)
+            .unwrap_or(BridgeError::UpstreamDecode(serde_err))
+    })
 }
 
 #[cfg(test)]
@@ -759,6 +808,56 @@ mod tests {
 
     fn req() -> ChatFormat {
         ChatFormat::new("my-gpt4", vec![ChatMessage::user("hi")])
+    }
+
+    async fn mount_ok(server: &MockServer) {
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-1",
+                "model": "gpt-4o",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })))
+            .mount(server)
+            .await;
+    }
+
+    /// The URL cache keys on the ProviderKey's resource id; an edited
+    /// `api_base` must take effect on the next request (fingerprint
+    /// revalidation), never serve the previously cached host.
+    #[tokio::test]
+    async fn url_cache_follows_api_base_edit_for_same_key_id() {
+        let s1 = MockServer::start().await;
+        let s2 = MockServer::start().await;
+        mount_ok(&s1).await;
+        mount_ok(&s2).await;
+
+        let bridge = OpenAiBridge::new();
+        let ctx1 = BridgeContext::new("r1", sample_model(), sample_provider_key(&s1.uri()))
+            .with_resource_ids("m-1", "pk-rewire-test");
+        bridge.chat(&req(), &ctx1).await.unwrap();
+
+        // Same resource id, api_base re-pointed at a different host.
+        let ctx2 = BridgeContext::new("r2", sample_model(), sample_provider_key(&s2.uri()))
+            .with_resource_ids("m-1", "pk-rewire-test");
+        bridge.chat(&req(), &ctx2).await.unwrap();
+
+        assert_eq!(
+            s1.received_requests().await.unwrap().len(),
+            1,
+            "first request hits the original host"
+        );
+        assert_eq!(
+            s2.received_requests().await.unwrap().len(),
+            1,
+            "after the edit the request follows the new host — a stale \
+             cached URL would have hit the original again"
+        );
     }
 
     #[tokio::test]
@@ -1146,6 +1245,61 @@ data: [DONE]\n\n";
             Err(BridgeError::UpstreamStatus { status: 500, .. }) => {}
             Err(other) => panic!("unexpected: {other:?}"),
         }
+    }
+
+    /// AISIX-Cloud#1222 scenario 3: an OpenAI-compatible upstream that
+    /// commits a 200 stream and then reports failure as a
+    /// `data: {"error":{...}}` frame. Pre-fix the frame surfaced as an
+    /// `UpstreamDecode` serde failure and the provider's own error
+    /// type/message were lost.
+    #[tokio::test]
+    async fn streaming_in_band_error_frame_surfaces_as_typed_error() {
+        let server = MockServer::start().await;
+        let sse = "\
+data: {\"id\":\"cmpl-s\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hel\"},\"finish_reason\":null}]}\n\n\
+data: {\"error\":{\"message\":\"The server had an error processing your request\",\"type\":\"server_error\",\"code\":\"server_error\"}}\n\n";
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&server)
+            .await;
+
+        let bridge = OpenAiBridge::new();
+        let ctx = sample_ctx(&server.uri());
+        let mut stream = bridge.chat_stream(&req(), &ctx).await.unwrap();
+
+        let first = stream.next().await.expect("delta before the error");
+        assert_eq!(first.unwrap().delta.content.as_deref(), Some("hel"));
+        let err = stream.next().await.expect("error frame").unwrap_err();
+        match err {
+            BridgeError::UpstreamInBand {
+                status,
+                message,
+                parsed,
+                wire,
+            } => {
+                assert_eq!(status, None);
+                assert_eq!(message, "The server had an error processing your request");
+                assert_eq!(parsed.expect("view").kind.as_deref(), Some("server_error"));
+                assert!(matches!(wire, aisix_gateway::UpstreamWire::OpenAI));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert!(stream.next().await.is_none());
+    }
+
+    /// Garbage that is not an error envelope keeps the historical
+    /// `UpstreamDecode` classification.
+    #[test]
+    fn parse_stream_chunk_garbage_still_decodes_error() {
+        let err = parse_stream_chunk("{not-json", None).unwrap_err();
+        assert!(matches!(err, BridgeError::UpstreamDecode(_)));
+        let err = parse_stream_chunk(r#"{"unexpected":"shape"}"#, None).unwrap_err();
+        assert!(matches!(err, BridgeError::UpstreamDecode(_)));
     }
 
     #[test]

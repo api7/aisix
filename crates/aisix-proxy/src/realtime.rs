@@ -43,7 +43,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use aisix_core::models::model::Adapter;
-use aisix_obs::{AccessLog, RequestOutcome, UsageEvent};
+use aisix_obs::{AccessLog, UsageEvent};
 use axum::extract::ws::{CloseFrame, Message as AxMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, Method};
@@ -65,18 +65,85 @@ const AZURE_REALTIME_API_VERSION: &str = "2024-10-01-preview";
 /// Subprotocol item carrying the caller's API key in the browser flow.
 const SUBPROTOCOL_KEY_PREFIX: &str = "openai-insecure-api-key.";
 
+/// Dial the upstream Realtime endpoint under the deployment's outbound
+/// TLS trust.
+///
+/// `connect_async` would build its own connector over the compiled-in
+/// root set only, which leaves this the one upstream path that ignores
+/// `upstream.tls` *and* `SSL_CERT_FILE` — a self-hosted Realtime
+/// endpoint behind an enterprise CA would fail here while the same
+/// provider's `/v1/chat/completions` worked.
+async fn connect_upstream(
+    request: tokio_tungstenite::tungstenite::handshake::client::Request,
+) -> Result<
+    (
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        tokio_tungstenite::tungstenite::handshake::client::Response,
+    ),
+    tokio_tungstenite::tungstenite::Error,
+> {
+    let connector =
+        tokio_tungstenite::Connector::Rustls(aisix_gateway::upstream_tls::rustls_client_config());
+    tokio_tungstenite::connect_async_tls_with_config(request, None, false, Some(connector)).await
+}
+
 pub(crate) async fn realtime(
     State(state): State<ProxyState>,
+    method: Method,
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
-    client: ClientContext,
-    ws: WebSocketUpgrade,
+    mut client: ClientContext,
+    ws: Result<WebSocketUpgrade, axum::extract::ws::rejection::WebSocketUpgradeRejection>,
 ) -> Response {
     let request_id = client.request_id.clone();
     let started = Instant::now();
 
-    match prepare(&state, &params, &headers, &client).await {
-        Ok(prep) => {
+    // A non-WebSocket request (plain GET, malformed upgrade headers, a
+    // connection that cannot upgrade, or a HEAD — `get()` serves HEAD
+    // too) used to get axum's bare rejection — no access log, no metrics,
+    // no usage event, no envelope; the same silent class #863/#880/#884
+    // collected (#885). Map it into this endpoint's normal error arm,
+    // keeping axum's own status classification (400 / 426 / 405) and its
+    // per-variant diagnostic.
+    //
+    // Auth runs here rather than through the extractor (the browser flow
+    // carries the credential in a subprotocol item), so a failure between
+    // auth and dispatch must hand the resolved key back for attribution —
+    // pre-#932 those errors were emitted as if anonymous.
+    //
+    // One snapshot for the whole pre-upgrade phase (#941): `prepare`
+    // resolves the model against it and the rejection arm below reports
+    // through it, so a refused upgrade cannot straddle two config
+    // generations. The detached session's terminal emit deliberately reads
+    // a fresh one — it can run for minutes.
+    let snapshot = state.snapshot.load();
+    let outcome = match ws {
+        Ok(ws) => match authenticate(&state, &headers, &client).await {
+            Ok(auth) => {
+                // Every other family gets `client.jwt` published by the
+                // auth extractor; do the same here so the session clone
+                // and the error emits below attribute the JWT identity.
+                client.jwt = auth.jwt.clone();
+                prepare(&state, &snapshot, &params, &client, auth.clone())
+                    .await
+                    .map(|prep| (ws, prep))
+                    .map_err(|err| (Some(auth), err))
+            }
+            Err(err) => Err((None, err)),
+        },
+        Err(rejection) => Err((
+            None,
+            crate::error::ProxyError::WebSocketUpgradeRequired {
+                status: rejection.status(),
+                detail: rejection.body_text(),
+            },
+        )),
+    };
+
+    match outcome {
+        Ok((ws, prep)) => {
             let state2 = state.clone();
             let client2 = client.clone();
             // `on_upgrade` runs the session on a detached task, so the
@@ -92,23 +159,45 @@ pub(crate) async fn realtime(
                 .instrument(span)
             })
         }
-        Err(err) => {
+        Err((auth, err)) => {
             let status = err.status().as_u16();
+            let api_key_id = auth.as_ref().map(|a| a.entry.id.as_str());
             emit_access_log(
-                &Method::GET,
+                &method,
                 status,
                 started.elapsed(),
                 &request_id,
+                api_key_id,
                 None,
                 Some(&err),
             );
+            // Count the refusal like every other pre-dispatch rejection
+            // (unresolved labels, same as `reject_before_dispatch`) — logs
+            // and the request-rate metrics must not disagree about whether
+            // these requests exist. Authentication may not have run, so the
+            // caller is attributed only when a key was resolved (#932).
+            crate::request_metrics::record(
+                &state,
+                "/v1/realtime",
+                match auth.as_ref() {
+                    Some(a) => crate::request_metrics::Caller::new(a),
+                    None => crate::request_metrics::Caller::unattributed(None),
+                },
+                crate::request_metrics::Upstream {
+                    model: crate::usage_attr::UNRESOLVED_MODEL_LABEL,
+                    ..Default::default()
+                },
+                status,
+                started.elapsed(),
+            );
             crate::usage_attr::emit_error_usage_event(
                 &state,
+                &snapshot,
                 "realtime",
                 "realtime",
                 &request_id,
                 params.get("model").map(String::as_str).unwrap_or(""),
-                "",
+                api_key_id.unwrap_or(""),
                 status,
                 err.kind(),
                 &client,
@@ -131,12 +220,11 @@ struct Prepared {
 
 async fn prepare(
     state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
     params: &HashMap<String, String>,
-    headers: &HeaderMap,
     client: &ClientContext,
+    auth: AuthenticatedKey,
 ) -> Result<Prepared, ProxyError> {
-    let auth = authenticate(state, headers).await?;
-
     let requested_model = params
         .get("model")
         .map(String::as_str)
@@ -149,8 +237,7 @@ async fn prepare(
         ));
     }
 
-    let snapshot = state.snapshot.load();
-    let model_entry = crate::model_resolve::resolve_model(&snapshot, &requested_model)
+    let model_entry = crate::model_resolve::resolve_model(snapshot, &requested_model)
         .ok_or_else(|| ProxyError::ModelNotFound(format!("model {requested_model:?} not found")))?;
     if !auth.key().can_access(&requested_model) {
         return Err(ProxyError::ModelForbidden(format!(
@@ -165,14 +252,14 @@ async fn prepare(
     }
     crate::dispatch::check_ip_access(model, &client.source_ip)?;
 
-    let pk_entry = crate::dispatch::resolve_provider_key(&snapshot, model)?;
+    let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
     let secret = crate::dispatch::require_api_key(&pk_entry.value, model)?.to_string();
     let upstream_model = crate::dispatch::require_upstream_model(model)?.to_string();
 
     let upstream_request = match pk_entry.value.adapter {
         Some(Adapter::Openai) => {
             let base = crate::dispatch::resolve_base_url(&pk_entry.value)?;
-            let url = crate::dispatch::build_v1_url(&base, "/realtime");
+            let url = crate::dispatch::build_openai_url(&base, "/realtime");
             let url = format!(
                 "{}?model={}",
                 to_ws_scheme(&url)?,
@@ -235,6 +322,7 @@ async fn prepare(
     };
     let reservation = crate::quota::enforce(
         state,
+        snapshot,
         &auth,
         Some(&crate::quota::ModelRateLimit::from_model(
             &model_entry.value.display_name,
@@ -261,28 +349,38 @@ async fn prepare(
 async fn authenticate(
     state: &ProxyState,
     headers: &HeaderMap,
+    client: &ClientContext,
 ) -> Result<AuthenticatedKey, ProxyError> {
+    // `/v1/realtime` is a WebSocket upgrade, so there are no request parts
+    // to read here — the resolved client context carries the same two
+    // identifying fields the HTTP extractor puts on a denial.
+    let ctx = crate::auth::DenialContext {
+        method: "GET",
+        path: "/v1/realtime",
+        request_id: &client.request_id,
+        source_ip: crate::auth::LazySourceIp::Ready(&client.source_ip),
+    };
     if let Some(auth) = headers.get(axum::http::header::AUTHORIZATION) {
         let s = auth.to_str().map_err(|_| ProxyError::MissingAuth)?;
         let token = s.strip_prefix("Bearer ").map(str::trim).unwrap_or("");
         if token.is_empty() {
             return Err(ProxyError::MissingAuth);
         }
-        return crate::auth::authenticate_token(state, token).await;
+        return crate::auth::authenticate_token(state, token, ctx).await;
     }
     if let Some(raw) = headers.get("x-api-key") {
         let token = raw.to_str().map_err(|_| ProxyError::MissingAuth)?.trim();
         if token.is_empty() {
             return Err(ProxyError::MissingAuth);
         }
-        return crate::auth::authenticate_token(state, token).await;
+        return crate::auth::authenticate_token(state, token, ctx).await;
     }
     if let Some(proto) = headers.get("sec-websocket-protocol") {
         let s = proto.to_str().map_err(|_| ProxyError::MissingAuth)?;
         for item in s.split(',') {
             if let Some(token) = item.trim().strip_prefix(SUBPROTOCOL_KEY_PREFIX) {
                 if !token.is_empty() {
-                    return crate::auth::authenticate_token(state, token).await;
+                    return crate::auth::authenticate_token(state, token, ctx).await;
                 }
             }
         }
@@ -382,7 +480,9 @@ async fn run_session(
     } = prep;
 
     let guardrail_ctx = aisix_guardrails::RequestContext {
+        passthrough_route_id: "",
         model_id: &model_entry.id,
+        mcp_server_id: "",
         api_key_id: &auth.entry.id,
         team_id: auth.key().team_id.as_deref(),
     };
@@ -390,7 +490,7 @@ async fn run_session(
 
     let (mut client_tx, mut client_rx) = client_ws.split();
 
-    let upstream = match tokio_tungstenite::connect_async(upstream_request).await {
+    let upstream = match connect_upstream(upstream_request).await {
         Ok((ws, _resp)) => ws,
         Err(e) => {
             tracing::warn!(error = %e, model = %requested_model, "realtime upstream connect failed");
@@ -426,11 +526,13 @@ async fn run_session(
                 502,
                 started.elapsed(),
                 &request_id,
+                Some(&auth.entry.id),
                 Some((&provider_label, &requested_model)),
                 Some(&connect_err),
             );
             crate::usage_attr::emit_error_usage_event(
                 &state,
+                &state.snapshot.load(),
                 "realtime",
                 "realtime",
                 &request_id,
@@ -461,10 +563,12 @@ async fn run_session(
     // (`downstream_remote_disconnect` and friends) the issue asks for
     // separately, which needs its own status decision.
     let mut session_error: Option<ProxyError> = None;
-    // Operator-configured stream idle deadline (stream_timeout on the
-    // Model). Absent → no idle cap; realtime sessions are long-lived by
-    // design.
-    let idle_cap = model_entry.value.stream_timeout_effective();
+    // Stream idle deadline, resolved model → `upstream.stream_timeout_ms`
+    // / `timeout_ms`. Realtime sessions are long-lived by design, so the
+    // deployment default (6000 s) only reaps sessions with no traffic in
+    // either direction for that long; `timeout: 0` on the model lifts it.
+    let idle_cap =
+        crate::routing::effective_timeouts(&model_entry.value, None, state.default_timeouts).stream;
 
     loop {
         let next = async {
@@ -617,18 +721,33 @@ async fn run_session(
         close_status,
         elapsed,
         &request_id,
+        Some(&auth.entry.id),
         Some((&provider_label, &requested_model)),
         session_error.as_ref(),
     );
-    state.metrics.record_request(
-        &provider_label,
-        &model_entry.value.display_name,
+    // A realtime session can run for minutes, so its terminal emits read a
+    // FRESH snapshot rather than the one `prepare` resolved against (#941) —
+    // one load and one ProviderKey lookup shared by the request metric, the
+    // usage event and `record_usage` below, where each used to do its own.
+    let snap = state.snapshot.load();
+    let pk = crate::usage_attr::ResolvedPk::resolve(&snap, &pk_id);
+    crate::request_metrics::record(
+        &state,
+        "/v1/realtime",
+        crate::request_metrics::Caller::new(&auth),
+        crate::request_metrics::Upstream {
+            provider: &provider_label,
+            model: &model_entry.value.display_name,
+            // AISIX-Cloud#1325: a session that ends on an upstream error
+            // still names the key it was talking to — these two used to be
+            // `unknown` on every realtime sample, success included.
+            upstream_model: model_entry.value.upstream_model().unwrap_or("unknown"),
+            pk: pk.labels(),
+            ..Default::default()
+        },
         close_status,
-        RequestOutcome::from_status(close_status),
         elapsed,
     );
-
-    let snap = state.snapshot.load();
     let mut event = UsageEvent {
         request_id: request_id.clone(),
         occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
@@ -655,12 +774,44 @@ async fn run_session(
         guardrail_monitor_hits: monitor_hits,
         ..Default::default()
     };
-    crate::usage_attr::apply_pk_telemetry(&mut event, &snap, &pk_id);
-    state.usage_sink.try_emit("realtime", event.clone());
-    let exporters = snap.observability_exporters.entries();
+    crate::usage_attr::apply_pk_telemetry(&mut event, &pk);
+    crate::usage_attr::apply_jwt_identity(&mut event, auth.jwt.as_ref());
+    let usage_model = crate::usage_attr::usage_event_model_label(&snap, &event.requested_model);
+    state.usage_sink.try_emit(
+        "realtime",
+        event.clone(),
+        crate::usage_attr::usage_event_labels(&usage_model, &pk),
+    );
+    let exporters = crate::usage_attr::live_exporters(&state, &snap);
     state
         .otlp_fan_out
         .fan_out(&event, None, exporters.iter().map(|e| &e.value));
+    // A realtime session bills real tokens against a real model, and this is
+    // the only place that knows the session's totals. Its cost is resolved
+    // here too, unlike the other endpoints, so it is the one non-chat surface
+    // that also feeds `aisix_llm_spend_micro_usd_total`.
+    crate::request_metrics::record_usage(
+        &state,
+        "/v1/realtime",
+        crate::request_metrics::Caller::new(&auth),
+        crate::request_metrics::Upstream {
+            provider: &provider_label,
+            // The requested string so the emit chokepoint folds a
+            // wildcard-served alias's pair to the row's identities
+            // (non-wildcard: requested == display_name, unchanged).
+            model: &requested_model,
+            upstream_model: model_entry.value.upstream_model().unwrap_or("unknown"),
+            pk: pk.labels(),
+            ..Default::default()
+        },
+        crate::request_metrics::Tokens {
+            input: usage.input_tokens.min(u32::MAX as u64) as u32,
+            output: usage.output_tokens.min(u32::MAX as u64) as u32,
+            total: total_tokens.min(u32::MAX as u64) as u32,
+            spend_usd: event.cost_usd,
+            client_type: state.client_classifier.classify(&client.user_agent),
+        },
+    );
 }
 
 enum Dir {
@@ -725,6 +876,7 @@ fn emit_access_log(
     status: u16,
     elapsed: Duration,
     request_id: &str,
+    api_key_id: Option<&str>,
     target: Option<(&str, &str)>,
     error: Option<&ProxyError>,
 ) {
@@ -742,11 +894,12 @@ fn emit_access_log(
         latency: elapsed,
         provider: target.map(|(p, _)| p).filter(|p| !p.is_empty()),
         model: target.map(|(_, m)| m),
-        api_key_id: None,
+        api_key_id,
         prompt_tokens: None,
         completion_tokens: None,
         total_tokens: None,
         request_id,
+        provider_request_id: None,
         served_by_model: None,
         routing_attempt_count: None,
         routing_fallback_count: None,
@@ -773,7 +926,11 @@ mod tests {
             addr: "127.0.0.1:0".into(),
             request_body_limit_bytes: 1_048_576,
             real_ip: Default::default(),
+            request_id: Default::default(),
+            url_rewrites: Vec::new(),
             tls: None,
+            thread_per_core: None,
+            workers: None,
         }
     }
 
@@ -805,6 +962,7 @@ mod tests {
         snap: AisixSnapshot,
     ) -> (
         std::net::SocketAddr,
+        crate::ProxyState,
         tokio::sync::mpsc::Receiver<ObsUsageEvent>,
     ) {
         let (tx, rx) = tokio::sync::mpsc::channel::<ObsUsageEvent>(16);
@@ -813,7 +971,7 @@ mod tests {
         let state = crate::ProxyState::new(handle, hub, &cfg())
             .without_cache()
             .with_usage_sink(UsageSink::new(tx));
-        let app = crate::build_router(state);
+        let app = crate::build_router(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -821,7 +979,7 @@ mod tests {
                 .await
                 .unwrap();
         });
-        (addr, rx)
+        (addr, state, rx)
     }
 
     /// Scripted mock upstream: accepts ONE WebSocket, records the request
@@ -886,7 +1044,7 @@ mod tests {
     async fn relays_frames_and_emits_aggregated_usage_event() {
         let (up_addr, handshake, frames) = spawn_upstream().await;
         let snap = snapshot(&format!("http://{up_addr}/v1"), "openai", "openai");
-        let (addr, mut rx) = serve(snap).await;
+        let (addr, _state, mut rx) = serve(snap).await;
 
         let mut req = format!("ws://{addr}/v1/realtime?model=rt-model")
             .into_client_request()
@@ -949,7 +1107,7 @@ mod tests {
     async fn subprotocol_key_authenticates_and_realtime_is_echoed() {
         let (up_addr, _handshake, _frames) = spawn_upstream().await;
         let snap = snapshot(&format!("http://{up_addr}/v1"), "openai", "openai");
-        let (addr, _rx) = serve(snap).await;
+        let (addr, _state, _rx) = serve(snap).await;
 
         let mut req = format!("ws://{addr}/v1/realtime?model=rt-model")
             .into_client_request()
@@ -977,7 +1135,7 @@ mod tests {
     #[tokio::test]
     async fn missing_auth_rejects_the_handshake() {
         let snap = snapshot("http://127.0.0.1:9/v1", "openai", "openai");
-        let (addr, _rx) = serve(snap).await;
+        let (addr, _state, _rx) = serve(snap).await;
 
         let req = format!("ws://{addr}/v1/realtime?model=rt-model")
             .into_client_request()
@@ -992,7 +1150,7 @@ mod tests {
     #[tokio::test]
     async fn missing_model_param_rejects_with_400() {
         let snap = snapshot("http://127.0.0.1:9/v1", "openai", "openai");
-        let (addr, mut rx) = serve(snap).await;
+        let (addr, _state, mut rx) = serve(snap).await;
 
         let mut req = format!("ws://{addr}/v1/realtime")
             .into_client_request()
@@ -1020,7 +1178,7 @@ mod tests {
     #[tokio::test]
     async fn non_realtime_capable_adapter_is_rejected() {
         let snap = snapshot("http://127.0.0.1:9", "anthropic", "anthropic");
-        let (addr, _rx) = serve(snap).await;
+        let (addr, _state, _rx) = serve(snap).await;
 
         let mut req = format!("ws://{addr}/v1/realtime?model=rt-model")
             .into_client_request()
@@ -1041,7 +1199,7 @@ mod tests {
         let k_json = format!(r#"{{"key_hash":"{CALLER_HASH}","allowed_models":["other-model"]}}"#);
         let k: ApiKey = serde_json::from_str(&k_json).unwrap();
         snap.apikeys.insert(ResourceEntry::new("k-1", k, 2));
-        let (addr, _rx) = serve(snap).await;
+        let (addr, state, mut rx) = serve(snap).await;
 
         let mut req = format!("ws://{addr}/v1/realtime?model=rt-model")
             .into_client_request()
@@ -1052,5 +1210,158 @@ mod tests {
             .await
             .expect_err("handshake must fail on model ACL");
         assert!(err.to_string().contains("403"), "got: {err}");
+
+        // Auth succeeded before the ACL refused, so the error event must
+        // name the caller — pre-#932 it was emitted as if anonymous.
+        let ev = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("the refusal must emit an error UsageEvent")
+            .expect("sink closed");
+        assert_eq!(ev.status_code, 403);
+        assert_eq!(
+            ev.api_key_id, "k-1",
+            "a post-auth refusal must attribute the resolved key"
+        );
+
+        // Second surface of the same fix: the request-rate metric label
+        // set names the caller instead of `unknown`.
+        let scrape = state.metrics.render();
+        assert!(
+            scrape.contains(r#"api_key_id="k-1""#),
+            "the refusal metric must carry the caller label, got: {scrape}"
+        );
+    }
+
+    /// State + router + usage receiver for driving the endpoint's
+    /// REJECTION paths with `oneshot` (no live connection needed — the
+    /// point is that no upgrade happens).
+    fn oneshot_router() -> (
+        axum::Router,
+        crate::ProxyState,
+        tokio::sync::mpsc::Receiver<ObsUsageEvent>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::channel::<ObsUsageEvent>(4);
+        let state = crate::ProxyState::new(
+            SnapshotHandle::new(AisixSnapshot::new()),
+            Arc::new(Hub::new()),
+            &cfg(),
+        )
+        .without_cache()
+        .with_usage_sink(UsageSink::new(tx));
+        (crate::build_router(state.clone()), state, rx)
+    }
+
+    async fn body_json(response: axum::response::Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 16)
+            .await
+            .unwrap_or_default();
+        serde_json::from_slice(&bytes).expect("an error envelope, not a bare rejection body")
+    }
+
+    #[tokio::test]
+    async fn non_websocket_request_is_recorded_and_enveloped() {
+        use tower::ServiceExt as _;
+        // Pre-#885 a plain GET (no upgrade headers) got axum's bare
+        // rejection: nothing in the access log, metrics, or the usage
+        // pipeline. It now takes this endpoint's normal error arm —
+        // envelope + usage event + request metrics — keeping axum's 400
+        // classification for bad/missing upgrade headers.
+        let (router, state, mut rx) = oneshot_router();
+        let response = router
+            .oneshot(
+                axum::http::Request::get("/v1/realtime?model=probe-model")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("router responds");
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+        let json = body_json(response).await;
+        assert_eq!(json["error"]["type"], "websocket_upgrade_required");
+
+        let event = rx.try_recv().expect("the refusal is recorded");
+        assert_eq!(event.status_code, 400);
+        assert_eq!(event.inbound_protocol, "realtime");
+        // The handler authenticates only after the upgrade is accepted
+        // as upgradable, so a rejected upgrade never reaches auth — no
+        // key is attributed; the requested model rides along.
+        assert_eq!(event.api_key_id, "");
+        assert_eq!(event.requested_model, "probe-model");
+
+        // Logs and the request-rate metrics must not disagree about
+        // whether these requests exist.
+        let scrape = state.metrics.render();
+        assert!(
+            scrape.contains(r#"status="400""#) && scrape.contains(r#"model="unresolved""#),
+            "the refusal must be counted, got: {scrape}"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_upgradable_connection_keeps_its_426() {
+        use tower::ServiceExt as _;
+        // Correct WebSocket headers over a connection that cannot upgrade
+        // (a `oneshot` request carries no hyper upgrade extension) is
+        // axum's ConnectionNotUpgradable — 426 Upgrade Required. The
+        // status must survive the envelope mapping rather than being
+        // flattened to 400, and the response must name the protocol to
+        // switch to (RFC 9110 §15.5.22).
+        let (router, _state, mut rx) = oneshot_router();
+        let response = router
+            .oneshot(
+                axum::http::Request::get("/v1/realtime")
+                    .header("connection", "upgrade")
+                    .header("upgrade", "websocket")
+                    .header("sec-websocket-version", "13")
+                    .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("router responds");
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::UPGRADE_REQUIRED,
+            "axum's 426 classification must survive"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("upgrade")
+                .and_then(|v| v.to_str().ok()),
+            Some("websocket")
+        );
+        let json = body_json(response).await;
+        assert_eq!(json["error"]["type"], "websocket_upgrade_required");
+        assert_eq!(rx.try_recv().expect("recorded").status_code, 426);
+    }
+
+    #[tokio::test]
+    async fn head_request_keeps_its_405_and_allow_header() {
+        use tower::ServiceExt as _;
+        // axum's `get()` also serves HEAD, so a HEAD request reaches the
+        // extractor's method check — 405, with the Allow header RFC 9110
+        // §15.5.6 requires, and recorded like every other refusal.
+        let (router, _state, mut rx) = oneshot_router();
+        let response = router
+            .oneshot(
+                axum::http::Request::head("/v1/realtime")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("router responds");
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::METHOD_NOT_ALLOWED
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("allow")
+                .and_then(|v| v.to_str().ok()),
+            Some("GET, HEAD")
+        );
+        assert_eq!(rx.try_recv().expect("recorded").status_code, 405);
     }
 }

@@ -20,9 +20,12 @@ mod oauth;
 pub mod openapi;
 
 pub use bridge::{
-    upstream_from_mcp_server, EphemeralBridge, McpAuth, McpBridge, McpTool, McpToolResult,
-    McpUpstream, OAuthClientConfig, RmcpBridge,
+    upstream_from_mcp_server, EphemeralBridge, McpAuth, McpBridge, McpProtocol, McpTool,
+    McpToolResult, McpUpstream, OAuthClientConfig, RmcpBridge,
 };
 pub use error::McpError;
-pub use gateway::{streamable_http_service, McpGateway, ToolAcl, TOOL_NAMESPACE_SEPARATOR};
+pub use gateway::{
+    streamable_http_service, strip_server_prefix, McpGateway, ToolAcl,
+    SUPPORTED_PROTOCOL_VERSION_NAMES, TOOL_NAMESPACE_SEPARATOR,
+};
 pub use openapi::{validate_spec, OpenApiBridge};

@@ -36,12 +36,16 @@ tokio.workspace = true
 axum.workspace = true
 reqwest.workspace = true
 # Inbound OIDC/JWT verification on the proxy auth path (jwt.rs). Same
-# major as the vertex provider's service-account signer.
-jsonwebtoken = "9"
+# major as the vertex provider's service-account signer. `aws_lc_rs`
+# resolves to the same aws-lc-rs version already installed as the
+# process-wide rustls provider — version-unified, not a parallel
+# crypto backend.
+jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
 tower.workspace = true
 tower-http.workspace = true
 http-body-util.workspace = true
 bytes.workspace = true
+regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 # Token-estimation fallback for usage telemetry (token_estimate.rs).
@@ -69,6 +73,11 @@ tracing.workspace = true
 uuid.workspace = true
 # Real-ip resolver: trusted-proxy CIDR matching for x-forwarded-for (#492)
 ipnet.workspace = true
+# Audio duration for the transcription cost basis: an upstream that
+# answers `text`/`srt`/`vtt` reports no `usage`, so the duration is read
+# off the uploaded file instead. Metadata-only (no decoding), and
+# default-features-off drops the id3v2 zlib path we never need.
+lofty.workspace = true
 
 [dev-dependencies]
 # `test-util` drives the SSE-heartbeat tests on a paused clock.
@@ -77,3 +86,5 @@ tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
 # [dependencies] so the /v1/messages handler can use their primitives
 # in non-test builds too.
 wiremock.workspace = true
+# Captures the auth-denial log lines so their per-request fields are pinned.
+tracing-subscriber.workspace = true

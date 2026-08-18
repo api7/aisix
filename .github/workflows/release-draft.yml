@@ -67,8 +67,26 @@ jobs:
           # GitHub's auto-generated "What's Changed" skeleton, appended below the
           # header. Fall back to a bare heading so a transient API failure still
           # produces a draft (with the header) instead of no release at all.
+          #
+          # Pin the range start to the last published STABLE release instead of
+          # letting GitHub pick it. A release is now preceded by its own
+          # `-rc.N` candidate tags, and auto-detection choosing one of those
+          # would collapse the changelog to the (usually empty) rc → final
+          # delta. Omitted for the first-ever release, where there is no
+          # previous stable one and auto-detection is correct.
+          # /releases/latest is defined as the newest published release that is
+          # neither a draft nor a prerelease — exactly the range start we want.
+          # 404s when there is none yet.
+          PREV=$(gh api "repos/$REPO/releases/latest" --jq .tag_name 2>/dev/null || true)
+          if [ -n "$PREV" ] && [ "$PREV" != "null" ] && [ "$PREV" != "$TAG" ]; then
+            set -- -f previous_tag_name="$PREV"
+            echo "changelog range: $PREV..$TAG"
+          else
+            set --
+            echo "changelog range: auto-detected (no previous stable release)"
+          fi
           gh api "repos/$REPO/releases/generate-notes" \
-            -f tag_name="$TAG" --jq .body >> release-body.md \
+            -f tag_name="$TAG" "$@" --jq .body >> release-body.md \
             || printf '## What'"'"'s Changed\n' >> release-body.md
 
           # Pre-release tags (v0.4.0-rc.1) get the prerelease flag.

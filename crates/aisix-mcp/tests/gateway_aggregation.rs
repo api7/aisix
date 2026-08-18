@@ -16,11 +16,11 @@ use std::sync::Arc;
 use aisix_core::{AisixSnapshot, McpServer, ResourceEntry};
 use aisix_mcp::{
     streamable_http_service, upstream_from_mcp_server, McpAuth, McpBridge, McpError, McpGateway,
-    McpTool, McpToolResult, McpUpstream, RmcpBridge, ToolAcl,
+    McpProtocol, McpTool, McpToolResult, McpUpstream, RmcpBridge, ToolAcl,
 };
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, Content, ErrorData, ListToolsResult,
-    PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
+    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorData,
+    ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
 };
 use rmcp::service::RequestContext;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
@@ -58,7 +58,7 @@ impl ServerHandler for LabeledEcho {
         &self,
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, ErrorData> {
+    ) -> Result<CallToolResponse, ErrorData> {
         if request.name != "echo" {
             return Err(ErrorData::invalid_params(
                 format!("unknown tool: {}", request.name),
@@ -74,12 +74,12 @@ impl ServerHandler for LabeledEcho {
         // `fail` drives the tool-level-error path: a valid call whose tool
         // reports failure, returned as `Ok(CallToolResult::error(..))`.
         if text == "fail" {
-            return Ok(CallToolResult::error(vec![Content::text("boom")]));
+            return Ok(CallToolResult::error(vec![ContentBlock::text("boom")]).into());
         }
-        Ok(CallToolResult::success(vec![Content::text(format!(
-            "{}:{text}",
-            self.label
-        ))]))
+        Ok(
+            CallToolResult::success(vec![ContentBlock::text(format!("{}:{text}", self.label))])
+                .into(),
+        )
     }
 
     fn get_info(&self) -> ServerInfo {
@@ -101,7 +101,7 @@ async fn spawn_upstream(label: &'static str) -> SocketAddr {
 
 /// Serve the gateway itself; return its bound address.
 async fn spawn_gateway(gateway: McpGateway) -> SocketAddr {
-    serve(axum::Router::new().nest_service("/mcp", streamable_http_service(gateway))).await
+    serve(axum::Router::new().nest_service("/mcp", streamable_http_service(gateway, 0))).await
 }
 
 async fn serve(app: axum::Router) -> SocketAddr {
@@ -313,6 +313,42 @@ fn upstream_from_mcp_server_maps_auth_and_timeout() {
         upstream_from_mcp_server(&plain).auth,
         McpAuth::None
     ));
+}
+
+/// The configured `protocol_version` — the wire value a control plane
+/// writes — selects the bridge lifecycle, and its absence keeps the legacy
+/// handshake. Pins the deserialize → upstream mapping itself, so reverting
+/// the mapping (not just the lifecycle switch) fails a test.
+#[test]
+fn upstream_from_mcp_server_maps_protocol_version() {
+    let modern: McpServer = serde_json::from_value(serde_json::json!({
+        "display_name": "m",
+        "url": "https://api.example.com/mcp",
+        "protocol_version": "2026-07-28"
+    }))
+    .unwrap();
+    assert_eq!(
+        upstream_from_mcp_server(&modern).protocol,
+        McpProtocol::V20260728
+    );
+
+    let dflt: McpServer = serde_json::from_value(serde_json::json!({
+        "display_name": "d", "url": "https://api.example.com/mcp"
+    }))
+    .unwrap();
+    assert_eq!(
+        upstream_from_mcp_server(&dflt).protocol,
+        McpProtocol::LegacyHandshake
+    );
+
+    // An unknown revision is a hard deserialization error, not a silent
+    // fallback to some default lifecycle.
+    let unknown = serde_json::from_value::<McpServer>(serde_json::json!({
+        "display_name": "u",
+        "url": "https://api.example.com/mcp",
+        "protocol_version": "2099-01-01"
+    }));
+    assert!(unknown.is_err(), "unknown revisions must be rejected");
 }
 
 #[test]
