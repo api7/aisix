@@ -134,8 +134,14 @@ describe("metric label cardinality for unresolved model (#911 [27])", () => {
       .split("\n")
       .filter((l) => l.startsWith("aisix_requests_total{"));
 
-    // No raw unknown model name may appear in any label.
-    const leaked = requestLines.filter((l) => l.includes(BOGUS_PREFIX));
+    // No raw unknown model name may appear in any label — scanned across the
+    // WHOLE scrape, not just the request families. Any counter that grows a
+    // `model` label inherits this exposure (AISIX-Cloud#1317 added one to the
+    // usage-event and client-cancel counters), and a guard scoped to one
+    // family would not have covered them.
+    const leaked = scrape
+      .split("\n")
+      .filter((l) => !l.startsWith("#") && l.includes(BOGUS_PREFIX));
     expect(
       leaked,
       `raw model names leaked into metric labels:\n${leaked.join("\n")}`,
