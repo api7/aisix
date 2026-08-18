@@ -113,17 +113,6 @@ pub struct PassthroughRoute {
     #[schemars(length(min = 1))]
     pub provider_key_id: Option<String>,
 
-    /// Body-shape hint for auditing, guardrails and usage extraction.
-    /// Parsing is best-effort: a body that does not match the declared
-    /// shape degrades to `raw` handling, it is never rejected for shape.
-    #[serde(default)]
-    pub protocol: PassthroughProtocol,
-
-    /// Relay `text/event-stream` upstream responses incrementally. When
-    /// `false` streaming responses are fully buffered like any other body.
-    #[serde(default = "default_true")]
-    pub streaming: bool,
-
     /// Optional header carrying the end-user identity injected by the
     /// upstream network device (e.g. `x-aisix-user`). Its value is recorded
     /// on the usage event for per-employee audit attribution and stripped
@@ -135,12 +124,11 @@ pub struct PassthroughRoute {
     #[schemars(regex(pattern = "^[!#$%&'*+.^_`|~0-9a-z-]+$"), length(min = 1))]
     pub identity_header: Option<String>,
 
-    /// Maximum time, in milliseconds, for a non-streaming upstream
-    /// exchange. On a streaming route it bounds the response-header phase
-    /// and any non-SSE body read, but never a healthy SSE relay (which
-    /// ends with the upstream stream or the client hanging up). When
-    /// omitted, the gateway default request timeout applies to
-    /// non-streaming exchanges only.
+    /// Maximum time, in milliseconds, for the upstream exchange. Bounds
+    /// the response-header phase and any non-SSE body read, but never a
+    /// healthy SSE relay (which ends with the upstream stream or the
+    /// client hanging up). When omitted, the gateway default request
+    /// timeout applies the same way.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1))]
     pub timeout_ms: Option<u64>,
@@ -191,30 +179,6 @@ pub enum PassthroughCredentialMode {
     /// headers are still stripped so the gateway credential never leaks
     /// upstream.
     ForwardClient,
-}
-
-/// Body-shape hint for a passthrough route.
-#[derive(
-    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum PassthroughProtocol {
-    /// No parsing: bodies are opaque byte blobs (guardrails scan them as
-    /// one lossy-UTF-8 text).
-    #[default]
-    Raw,
-    /// OpenAI-compatible chat envelope (`messages`, streamed
-    /// `choices[].delta.content`, final-chunk / response `usage`).
-    OpenaiChat,
-    /// OpenAI-compatible legacy completions / FIM envelope (`prompt` [+
-    /// `suffix`], streamed `choices[].text`, `usage`).
-    OpenaiCompletions,
-    /// OpenAI Responses API envelope: `input` items on the request,
-    /// `output` items on the response, `response.output_text.delta`
-    /// events while streaming, and `usage` in the
-    /// `input_tokens`/`output_tokens` spelling — carried on the terminal
-    /// `response.completed` event when the response streams.
-    OpenaiResponses,
 }
 
 impl Resource for PassthroughRoute {
@@ -476,8 +440,6 @@ mod tests {
         let r = minimal();
         assert_eq!(r.auth_mode, PassthroughAuthMode::GatewayKey);
         assert_eq!(r.credential_mode, PassthroughCredentialMode::Inject);
-        assert_eq!(r.protocol, PassthroughProtocol::Raw);
-        assert!(r.streaming);
         assert!(r.enabled);
         assert!(!r.preserve_host);
     }
@@ -606,6 +568,30 @@ mod coupling_tests {
             validate_passthrough_route(&doc)
         );
         assert!(validate_passthrough_route_lenient(&doc).is_ok());
+    }
+
+    #[test]
+    fn removed_protocol_and_streaming_fields_are_unknown() {
+        // The pre-0.10.0 dev cycle carried `protocol` / `streaming` route
+        // fields; both were removed before the kind ever shipped (the
+        // envelope is now detected per request, SSE always relays
+        // incrementally). The strict write path rejects them like any
+        // unknown field; the lenient etcd path tolerates-and-strips.
+        for (field, value) in [
+            ("protocol", json!("openai_responses")),
+            ("streaming", json!(false)),
+        ] {
+            let mut doc = base();
+            doc[field] = value;
+            assert!(
+                validate_passthrough_route(&doc).is_err(),
+                "strict must reject unknown field {field}"
+            );
+            assert!(
+                validate_passthrough_route_lenient(&doc).is_ok(),
+                "lenient must tolerate unknown field {field}"
+            );
+        }
     }
 
     #[test]
