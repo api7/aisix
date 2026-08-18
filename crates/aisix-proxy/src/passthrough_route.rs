@@ -1623,9 +1623,17 @@ fn stream_response(
         telemetry.emit();
     };
 
+    // Re-attach the request span (the body is polled after the request-id
+    // middleware returns, so end-of-stream telemetry would otherwise log
+    // without a request_id) and heartbeat silence gaps — this branch is
+    // SSE-only, where a comment frame is protocol-legal and identical to
+    // what the typed endpoints emit; relayed frames are untouched.
     let mut response = Response::builder()
         .status(status)
-        .body(Body::from_stream(stream))
+        .body(Body::from_stream(crate::sse_keepalive::with_heartbeat(
+            crate::request_id::in_request_span(stream),
+            crate::sse_keepalive::interval(),
+        )))
         .unwrap();
     copy_safe_headers(&resp_headers, response.headers_mut());
     // The relay re-chunks the body; a stale upstream length must not ride

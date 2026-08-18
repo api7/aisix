@@ -567,6 +567,17 @@ describe("passthrough-route e2e: explicit routes, BYO credentials, 410 tombstone
       });
     }
 
+    // Readiness sentinel, seeded LAST: the snapshot watch applies etcd
+    // revisions in order, so this route serving proves every resource
+    // seeded before it (exporter, the three routes under test) is live —
+    // without the probe exercising any exchange the test asserts on.
+    await seed.createPassthroughRoute({
+      name: "ptr-auto-ready",
+      path_prefix: "/auto-ready",
+      target_url: rpcUpstream.baseUrl,
+      provider_key_id: pk.id,
+    });
+
     const headers = {
       authorization: `Bearer ${CALLER_PLAINTEXT}`,
       "content-type": "application/json",
@@ -580,10 +591,7 @@ describe("passthrough-route e2e: explicit routes, BYO credentials, 410 tombstone
 
     await waitConfigPropagation(async () => {
       try {
-        const r = await post("/auto-chat/chat/completions", {
-          model: "m",
-          messages: [{ role: "user", content: "probe" }],
-        });
+        const r = await post("/auto-ready/ping", {});
         await r.text();
         return r.status === 200;
       } catch {
@@ -591,6 +599,12 @@ describe("passthrough-route e2e: explicit routes, BYO credentials, 410 tombstone
       }
     });
 
+    const chatRes = await post("/auto-chat/chat/completions", {
+      model: "m",
+      messages: [{ role: "user", content: "hi" }],
+    });
+    expect(chatRes.status).toBe(200);
+    await chatRes.text();
     const responsesRes = await post("/auto-resp/responses", {
       model: "m",
       input: [{ role: "user", content: "hi" }],
