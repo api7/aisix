@@ -2180,6 +2180,7 @@ impl RouteTelemetry {
             // The Drop emit is the request's end — body EOF or client drop.
             /* terminal */
             true,
+            /* dispatched */ true,
         );
     }
 }

@@ -287,6 +287,10 @@ pub async fn chat_completions(
                     &client,
                     success.captured_content.take(),
                     /* terminal */ true,
+                    // A cache hit records no attempt AND contacted no
+                    // upstream; any other no-attempt success did.
+                    /* dispatched */
+                    winner.is_some() || success.cache_hit_layer.is_none(),
                 );
             }
             // Inject x-ratelimit-* headers so OpenAI SDK clients see the
@@ -578,6 +582,9 @@ pub async fn chat_completions(
                         &client,
                         failure_content.take(),
                         /* terminal */ true,
+                        // Billed-then-blocked: the upstream answered.
+                        /* dispatched */
+                        true,
                     );
                 }
                 None if routing.attempts.is_empty() => {
@@ -612,6 +619,10 @@ pub async fn chat_completions(
                         &client,
                         failure_content.take(),
                         /* terminal */ true,
+                        // Pre-dispatch failure: no upstream was contacted;
+                        // `elapsed` is handler time, not an upstream call.
+                        /* dispatched */
+                        false,
                     );
                 }
                 None => {
@@ -2064,6 +2075,7 @@ async fn dispatch(
                     // body EOF or client drop.
                     /* terminal */
                     true,
+                    /* dispatched */ true,
                 );
                 // #1002: comp.total_tokens is the cache-inclusive total (an
                 // Anthropic upstream bridged to an OpenAI-shape client folds
@@ -3329,6 +3341,7 @@ async fn dispatch_ensemble(
                 client,
                 /* content */ None,
                 /* terminal */ false,
+                /* dispatched */ true,
             );
         };
 
@@ -3701,6 +3714,7 @@ async fn dispatch_ensemble(
                         &client_for_telem,
                         /* content */ None,
                         /* terminal */ false,
+                        /* dispatched */ true,
                     );
                 }
                 let judge_pk =
@@ -3757,7 +3771,12 @@ async fn dispatch_ensemble(
                     comp.guardrail_blocked,
                     &client_for_telem,
                     /* content */ None,
-                    /* terminal */ false,
+                    // The streaming ensemble emits nothing after the judge
+                    // — this IS the request's terminal emission, same as
+                    // the single-model stream guard (AISIX-Cloud#1279).
+                    /* terminal */
+                    true,
+                    /* dispatched */ true,
                 );
                 // SLO histograms (AISIX-Cloud#1011): the handler's
                 // record_success is stream-gated, so the ensemble stream
@@ -3909,7 +3928,8 @@ async fn dispatch_ensemble(
                          blocked: bool,
                          bypass: &str,
                          redactions: &crate::redact::RedactionCounts,
-                         hits: &[aisix_core::GuardrailMonitorHit]| {
+                         hits: &[aisix_core::GuardrailMonitorHit],
+                         terminal_judge: bool| {
         for (index, member) in outcome.panel.iter().enumerate() {
             emit_panel_member(member, index, blocked, bypass);
         }
@@ -3964,7 +3984,15 @@ async fn dispatch_ensemble(
             blocked,
             client,
             /* content */ None,
-            /* terminal */ false,
+            // The judge event is the ensemble's final emission. On the
+            // success path it is the request's terminal event (nothing
+            // else emits — `telemetry_handled_by_stream` suppresses the
+            // handler's own emit); on the blocked path the outer error
+            // arm emits the real terminal carrying the caller's status,
+            // so the judge stays non-terminal there (AISIX-Cloud#1279).
+            /* terminal */
+            terminal_judge,
+            /* dispatched */ true,
         );
     };
 
@@ -4009,6 +4037,7 @@ async fn dispatch_ensemble(
                 &bypass_reason.clone().unwrap_or_default(),
                 &input_redactions,
                 &ensemble_monitor_hits,
+                /* terminal_judge */ false,
             );
             return Err(DispatchFailure::new(
                 Some(model_id.to_string()),
@@ -4040,6 +4069,7 @@ async fn dispatch_ensemble(
         &bypass_reason.clone().unwrap_or_default(),
         &ensemble_redactions,
         &ensemble_monitor_hits,
+        /* terminal_judge */ true,
     );
 
     // The synthesized answer is the client-facing response, rendered with
@@ -4245,6 +4275,11 @@ fn emit_usage_event(
     // (a failed attempt, an ensemble panel member / judge sub-call) carries
     // its own attempt span alone.
     terminal: bool,
+    // Whether the work this event describes actually reached an upstream.
+    // A cache hit and a pre-dispatch error pass false: their events carry
+    // the HANDLER's elapsed time, which must not fabricate an upstream
+    // CLIENT span.
+    dispatched: bool,
 ) {
     // Per-PK telemetry attribution tags. An unresolved key (the
     // pre-dispatch error paths) yields default (all empty / false) tags →
@@ -4337,6 +4372,7 @@ fn emit_usage_event(
         content.as_ref(),
         client.trace.as_ref(),
         terminal,
+        dispatched,
     );
 }
 
@@ -4521,6 +4557,9 @@ fn emit_failed_attempts(
             client,
             content,
             /* terminal */ terminal_last && Some(i) == last_failed,
+            // A recorded attempt is real dispatch work by definition.
+            /* dispatched */
+            true,
         );
     }
 }

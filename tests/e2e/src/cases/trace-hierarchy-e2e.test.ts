@@ -375,8 +375,12 @@ describe("trace hierarchy e2e (AISIX-Cloud#1279)", () => {
       traceparent: VALID_TRACEPARENT, // flags 01 = sampled
     });
 
-    // The control exporter proves the export pipeline ran end-to-end...
-    await waitForSpans(controlRecv, requestId, 3);
+    // The control exporter proves the export pipeline ran end-to-end AND
+    // that the inbound traceparent was accepted (otherwise this test says
+    // nothing about the sampled flag) — the SERVER span continues it.
+    const control = await waitForSpans(controlRecv, requestId, 3);
+    const controlServer = control.find((s) => s.kind === KIND_SERVER)!;
+    expect(controlServer.parentSpanId).toBe(REMOTE_PARENT_ID);
     // ...so the zero-rate exporter's silence is a sampling decision, not
     // slowness: the caller's sampled=1 did not force its way in.
     expect(
@@ -466,6 +470,327 @@ describe("trace hierarchy e2e (AISIX-Cloud#1279)", () => {
     expect(seen["tracestate"]).toBeUndefined();
   });
 
+  test("a streamed request exports the same three-span hierarchy from the drop-guard emit", async (ctx) => {
+    if (!etcdReachable || !app || !seed) {
+      ctx.skip();
+      return;
+    }
+    const otlp = await startMockOtlp();
+    receivers.push(otlp);
+    await seed.createObservabilityExporter({
+      name: "trace-stream-otlp",
+      enabled: true,
+      kind: "otlp_http",
+      endpoint: otlp.url,
+    });
+    const upstream = await startOpenAiUpstream({
+      streamEvents: [
+        JSON.stringify({
+          id: "chatcmpl-trace-stream",
+          object: "chat.completion.chunk",
+          created: Math.floor(Date.now() / 1000),
+          model: "gpt-4o-mini",
+          choices: [{ index: 0, delta: { content: "hi" }, finish_reason: null }],
+        }),
+        JSON.stringify({
+          id: "chatcmpl-trace-stream",
+          object: "chat.completion.chunk",
+          created: Math.floor(Date.now() / 1000),
+          model: "gpt-4o-mini",
+          choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+          usage: { prompt_tokens: 3, completion_tokens: 4, total_tokens: 7 },
+        }),
+        "[DONE]",
+      ],
+    });
+    upstreams.push(upstream);
+    await createOpenAiModel("trace-stream-direct", upstream);
+    await propagate();
+
+    const res = await fetch(`${app.proxyUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${CALLER_PLAINTEXT}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "trace-stream-direct",
+        messages: [{ role: "user", content: "stream me" }],
+        stream: true,
+      }),
+    });
+    expect(res.status).toBe(200);
+    const requestId = res.headers.get("x-aisix-request-id");
+    expect(requestId).toBeTruthy();
+    // Drain — the terminal emit fires from the stream's drop guard.
+    await res.text();
+
+    const spans = await waitForSpans(otlp, requestId!, 3);
+    expect(spans).toHaveLength(3);
+    const server = spans.find((s) => s.kind === KIND_SERVER)!;
+    const logical = spans.find(
+      (s) => s.kind === KIND_CLIENT && s.parentSpanId === server.spanId,
+    )!;
+    const attempt = spans.find((s) => s.parentSpanId === logical.spanId)!;
+    expect(attempt.attributes["gen_ai.usage.output_tokens"]).toBe(4);
+    expect(nanos(attempt.endTimeUnixNano)).toBeLessThanOrEqual(
+      nanos(server.endTimeUnixNano),
+    );
+  });
+
+  test("an all-failed failover exports one SERVER span with the failed attempts under it", async (ctx) => {
+    if (!etcdReachable || !app || !seed) {
+      ctx.skip();
+      return;
+    }
+    const otlp = await startMockOtlp();
+    receivers.push(otlp);
+    await seed.createObservabilityExporter({
+      name: "trace-allfail-otlp",
+      enabled: true,
+      kind: "otlp_http",
+      endpoint: otlp.url,
+    });
+    const first = await startOpenAiUpstream({
+      status: 502,
+      errorBody: { error: { message: "down 1", type: "server_error" } },
+    });
+    const second = await startOpenAiUpstream({
+      status: 502,
+      errorBody: { error: { message: "down 2", type: "server_error" } },
+    });
+    upstreams.push(first, second);
+    await createOpenAiModel("trace-allfail-a", first);
+    await createOpenAiModel("trace-allfail-b", second);
+    await seed.createModel({
+      display_name: "trace-allfail-virtual",
+      routing: {
+        strategy: "failover",
+        targets: [{ model: "trace-allfail-a" }, { model: "trace-allfail-b" }],
+        retries: 0,
+        max_fallbacks: 1,
+      },
+    });
+    await propagate();
+
+    const res = await fetch(`${app.proxyUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${CALLER_PLAINTEXT}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "trace-allfail-virtual",
+        messages: [{ role: "user", content: "everything is down" }],
+      }),
+    });
+    expect(res.status).toBeGreaterThanOrEqual(500);
+    const requestId = res.headers.get("x-aisix-request-id");
+    expect(requestId).toBeTruthy();
+    await res.text();
+
+    // Exactly SERVER + logical + two failed attempts: no terminal event
+    // exists on this shape, so the LAST failed attempt's emission must
+    // carry the structural spans — and only once.
+    const spans = await waitForSpans(otlp, requestId!, 4);
+    expect(spans).toHaveLength(4);
+    expect(spans.filter((s) => s.kind === KIND_SERVER)).toHaveLength(1);
+    const server = spans.find((s) => s.kind === KIND_SERVER)!;
+    const logical = spans.find(
+      (s) => s.kind === KIND_CLIENT && s.parentSpanId === server.spanId,
+    )!;
+    const attempts = spans.filter((s) => s.parentSpanId === logical.spanId);
+    expect(attempts).toHaveLength(2);
+    for (const attempt of attempts) {
+      expect(attempt.attributes["aisix.error_class"]).toBe("upstream_status");
+    }
+  });
+
+  test("/v1/messages and /v1/responses export the same hierarchy shape", async (ctx) => {
+    if (!etcdReachable || !app || !seed) {
+      ctx.skip();
+      return;
+    }
+    const otlp = await startMockOtlp();
+    receivers.push(otlp);
+    await seed.createObservabilityExporter({
+      name: "trace-family-otlp",
+      enabled: true,
+      kind: "otlp_http",
+      endpoint: otlp.url,
+    });
+    const upstream = await startOpenAiUpstream({
+      nonStreamBody: okUpstreamBody("cmpl-trace-family"),
+    });
+    upstreams.push(upstream);
+    await createOpenAiModel("trace-family-direct", upstream);
+    await propagate();
+
+    const drive = async (path: string, body: unknown) => {
+      const res = await fetch(`${app!.proxyUrl}${path}`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${CALLER_PLAINTEXT}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(body),
+      });
+      expect(res.status, path).toBe(200);
+      const requestId = res.headers.get("x-aisix-request-id");
+      expect(requestId, path).toBeTruthy();
+      await res.text();
+      return requestId!;
+    };
+
+    for (const [path, body] of [
+      [
+        "/v1/messages",
+        {
+          model: "trace-family-direct",
+          max_tokens: 32,
+          messages: [{ role: "user", content: "trace me" }],
+        },
+      ],
+      ["/v1/responses", { model: "trace-family-direct", input: "trace me" }],
+    ] as const) {
+      const requestId = await drive(path, body);
+      const spans = await waitForSpans(otlp, requestId, 3);
+      expect(spans, path).toHaveLength(3);
+      const server = spans.find((s) => s.kind === KIND_SERVER)!;
+      expect(server, path).toBeTruthy();
+      const logical = spans.find(
+        (s) => s.kind === KIND_CLIENT && s.parentSpanId === server.spanId,
+      )!;
+      expect(logical, path).toBeTruthy();
+      const attempt = spans.find((s) => s.parentSpanId === logical.spanId)!;
+      expect(attempt, path).toBeTruthy();
+      expect(new Set(spans.map((s) => s.traceId)).size, path).toBe(1);
+    }
+  });
+
+  test("an ensemble request exports one SERVER span and no dangling parents", async (ctx) => {
+    if (!etcdReachable || !app || !seed) {
+      ctx.skip();
+      return;
+    }
+    const otlp = await startMockOtlp();
+    receivers.push(otlp);
+    await seed.createObservabilityExporter({
+      name: "trace-ens-otlp",
+      enabled: true,
+      kind: "otlp_http",
+      endpoint: otlp.url,
+    });
+    const member = await startOpenAiUpstream({
+      nonStreamBody: okUpstreamBody("cmpl-trace-ens-member"),
+    });
+    const judge = await startOpenAiUpstream({
+      nonStreamBody: okUpstreamBody("cmpl-trace-ens-judge"),
+    });
+    upstreams.push(member, judge);
+    await createOpenAiModel("trace-ens-member-a", member);
+    await createOpenAiModel("trace-ens-member-b", member);
+    await createOpenAiModel("trace-ens-judge", judge);
+    await seed.createModel({
+      display_name: "trace-ens-virtual",
+      ensemble: {
+        panel: [{ model: "trace-ens-member-a" }, { model: "trace-ens-member-b" }],
+        judge: { model: "trace-ens-judge" },
+        min_responses: 2,
+      },
+    });
+    await propagate();
+
+    const requestId = await driveChat("trace-ens-virtual");
+
+    // Two panel sub-calls + the judge's terminal emission (SERVER +
+    // logical carrier) = four spans.
+    const spans = await waitForSpans(otlp, requestId, 4);
+    expect(spans).toHaveLength(4);
+    expect(spans.filter((s) => s.kind === KIND_SERVER)).toHaveLength(1);
+
+    // Every parent resolves within the exported trace — the orphan-span
+    // regression this test exists to prevent.
+    const ids = new Set(spans.map((s) => s.spanId));
+    for (const span of spans) {
+      if (span.parentSpanId !== "") {
+        expect(
+          ids.has(span.parentSpanId),
+          `dangling parent ${span.parentSpanId} on ${span.name}`,
+        ).toBe(true);
+      }
+    }
+    const panel = spans.filter(
+      (s) => s.attributes["aisix.attempt_kind"] === "panel",
+    );
+    expect(panel).toHaveLength(2);
+  });
+
+  test("a cache hit exports the SERVER span alone — no fictitious upstream span", async (ctx) => {
+    if (!etcdReachable || !app || !seed) {
+      ctx.skip();
+      return;
+    }
+    const otlp = await startMockOtlp();
+    receivers.push(otlp);
+    await seed.createObservabilityExporter({
+      name: "trace-cache-otlp",
+      enabled: true,
+      kind: "otlp_http",
+      endpoint: otlp.url,
+    });
+    const upstream = await startOpenAiUpstream({
+      nonStreamBody: okUpstreamBody("cmpl-trace-cache"),
+    });
+    upstreams.push(upstream);
+    await createOpenAiModel("trace-cache-direct", upstream);
+    await seed.createCachePolicy({
+      name: "trace-cache-policy",
+      enabled: true,
+      applies_to: "all",
+    });
+    await propagate();
+
+    const driveOnce = async () => {
+      const res = await fetch(`${app!.proxyUrl}/v1/chat/completions`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${CALLER_PLAINTEXT}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "trace-cache-direct",
+          messages: [{ role: "user", content: "cache me exactly" }],
+        }),
+      });
+      expect(res.status).toBe(200);
+      const outcome = res.headers.get("x-aisix-cache");
+      const requestId = res.headers.get("x-aisix-request-id");
+      await res.text();
+      return { outcome, requestId: requestId! };
+    };
+
+    // First call misses and populates; poll until a call reports a hit
+    // (the write is asynchronous).
+    await driveOnce();
+    let hit: { outcome: string | null; requestId: string } | undefined;
+    const deadline = Date.now() + 10_000;
+    while (Date.now() < deadline) {
+      const attempt = await driveOnce();
+      if (attempt.outcome === "hit") {
+        hit = attempt;
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    expect(hit, "no cache hit within 10s").toBeTruthy();
+
+    const spans = await waitForSpans(otlp, hit!.requestId, 1);
+    expect(spans).toHaveLength(1);
+    expect(spans[0].kind).toBe(KIND_SERVER);
+    expect(spans[0].parentSpanId).toBe("");
+  });
+
   test("a transient receiver failure re-delivers byte-identical span ids", async (ctx) => {
     if (!etcdReachable || !app || !seed) {
       ctx.skip();
@@ -509,7 +834,11 @@ describe("trace hierarchy e2e (AISIX-Cloud#1279)", () => {
 
     const idSet = (spans: CapturedSpan[]) =>
       spans
-        .map((s) => `${s.traceId}/${s.spanId}/${s.startTimeUnixNano}`)
+        .map(
+          (s) =>
+            `${s.traceId}/${s.spanId}/${s.parentSpanId}/${s.kind}/` +
+            `${s.startTimeUnixNano}/${s.endTimeUnixNano}`,
+        )
         .sort()
         .join("|");
     // The 503'd delivery and its retry carry byte-identical ids and

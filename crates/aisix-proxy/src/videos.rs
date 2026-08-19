@@ -2022,6 +2022,7 @@ fn emit_submit_usage_event(
         None,
         client.trace.as_ref(),
         /* terminal */ true,
+        /* dispatched */ true,
     );
 }
 

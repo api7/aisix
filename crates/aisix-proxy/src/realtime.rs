@@ -787,6 +787,7 @@ async fn run_session(
         None,
         client.trace.as_ref(),
         /* terminal */ true,
+        /* dispatched */ true,
     );
     // A realtime session bills real tokens against a real model, and this is
     // the only place that knows the session's totals. Its cost is resolved

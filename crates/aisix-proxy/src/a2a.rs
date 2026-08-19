@@ -812,6 +812,7 @@ fn emit_a2a_usage(
         captured.as_ref(),
         trace,
         /* terminal */ true,
+        /* dispatched */ true,
     );
 }
 

@@ -473,8 +473,11 @@ pub(crate) fn emit_prepared_usage_event(
     labels: UsageEventLabels<'_>,
     trace: Option<&std::sync::Arc<aisix_obs::RequestTraceBundle>>,
 ) {
-    // An error event is the request's terminal (and only) emission.
-    emit_usage(state, snap, label, event, labels, None, trace, true);
+    // An error event is the request's terminal (and only) emission. Its
+    // builder leaves `upstream_latency_ms` at 0, so no upstream span is
+    // derivable either way — `dispatched: false` states the common case
+    // (most error events never reached a provider).
+    emit_usage(state, snap, label, event, labels, None, trace, true, false);
 }
 
 /// THE emission chokepoint (AISIX-Cloud#1279): every usage event leaves
@@ -485,8 +488,12 @@ pub(crate) fn emit_prepared_usage_event(
 /// says whether this event ends the request — the terminal event carries
 /// the SERVER + logical spans (ending the SERVER span at NOW, the real
 /// body EOF/drop), a non-terminal one carries its own attempt span alone.
-/// The event's public `trace_id` is stamped here so the CP row and the
-/// exported spans always agree.
+/// `dispatched` is the caller's statement that this event describes work
+/// that actually reached an upstream — a cache hit and a pre-dispatch
+/// error pass `false` so no fictitious upstream CLIENT span is fabricated
+/// from the handler-elapsed time their events carry. The event's public
+/// `trace_id` is stamped here so the CP row and the exported spans always
+/// agree.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_usage(
     state: &ProxyState,
@@ -497,10 +504,16 @@ pub(crate) fn emit_usage(
     content: Option<&aisix_obs::CapturedContent>,
     trace: Option<&std::sync::Arc<aisix_obs::RequestTraceBundle>>,
     terminal: bool,
+    dispatched: bool,
 ) {
     let emission = trace.map(|bundle| {
         event.trace_id = bundle.trace_id_hex();
-        bundle.emission(terminal, event.attempt_index, event.upstream_latency_ms)
+        bundle.emission(
+            terminal,
+            event.attempt_index,
+            event.upstream_latency_ms,
+            dispatched,
+        )
     });
     state.usage_sink.try_emit(label, event.clone(), labels);
     let exporters = live_exporters(state, snap);

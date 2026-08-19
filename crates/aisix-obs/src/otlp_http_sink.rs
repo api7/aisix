@@ -723,17 +723,27 @@ fn build_otlp_spans(record: &SinkRecord, exporter_name: &str) -> Vec<Value> {
 }
 
 /// OTLP span `flags` (uint32): the low byte is the span's W3C trace-flags
-/// — always `sampled`, since encoding IS the export decision — plus
-/// `HAS_IS_REMOTE` (bit 8) on every span, and `IS_REMOTE` (bit 9) on a
-/// SERVER span whose parent arrived over the wire in `traceparent`.
+/// — always `sampled`, since encoding IS the export decision, plus the
+/// inbound octet's `random` bit (0x02) on a SERVER span continuing a
+/// remote trace — and `HAS_IS_REMOTE` (bit 8) on every span, with
+/// `IS_REMOTE` (bit 9) on a SERVER span whose parent arrived over the
+/// wire in `traceparent`.
 fn span_flags(span: &crate::trace::SpanEmit, trace: &crate::trace::TraceEmission) -> u32 {
     const SAMPLED: u32 = 0x01;
+    const W3C_RANDOM: u32 = 0x02;
     const HAS_IS_REMOTE: u32 = 0x100;
     const IS_REMOTE: u32 = 0x200;
-    let remote_parent = span.role == crate::trace::SpanRole::Server
-        && trace.remote_flags.is_some()
-        && span.parent_span_id.is_some();
-    SAMPLED | HAS_IS_REMOTE | if remote_parent { IS_REMOTE } else { 0 }
+    let remote = span.role == crate::trace::SpanRole::Server
+        && span.parent_span_id.is_some()
+        && trace.remote_flags.is_some();
+    let mut flags = SAMPLED | HAS_IS_REMOTE;
+    if remote {
+        flags |= IS_REMOTE;
+        // The random bit describes the trace id, which the remote parent
+        // minted — preserve its claim; never invent it for local roots.
+        flags |= u32::from(trace.remote_flags.unwrap_or(0)) & W3C_RANDOM;
+    }
+    flags
 }
 
 /// The joining attributes a structural (non-carrier) span carries: enough
@@ -1277,7 +1287,7 @@ mod tests {
         bundle.end_attempt(1);
         let mut event = sample_event();
         event.attempt_index = 1;
-        SinkRecord::metadata_only(event).with_trace(Some(bundle.emission(true, 1, 250)))
+        SinkRecord::metadata_only(event).with_trace(Some(bundle.emission(true, 1, 250, true)))
     }
 
     /// The hierarchy contract (AISIX-Cloud#1279): a terminal record with a

@@ -353,6 +353,7 @@ pub async fn responses(
                         monitor_hits.clone(),
                         success.captured_content.as_ref(),
                         /* terminal */ true,
+                        /* dispatched */ true,
                     );
                 }
             }
@@ -478,6 +479,9 @@ pub async fn responses(
                     monitor_hits.clone(),
                     failure_content.take(),
                     /* terminal */ true,
+                    // Pre-dispatch failure: no upstream contacted.
+                    /* dispatched */
+                    false,
                 );
             }
             err.into_response()
@@ -1621,6 +1625,7 @@ async fn responses_to_target(
                     monitor_hits,
                     captured_content.as_ref(),
                     /* terminal */ true,
+                    /* dispatched */ true,
                 );
             },
         );
@@ -2117,6 +2122,7 @@ async fn responses_cross_provider_to_target(
                     },
                     captured_content.as_ref(),
                     /* terminal */ true,
+                    /* dispatched */ true,
                 );
             },
         );
@@ -3015,6 +3021,9 @@ fn emit_usage_event(
     content: Option<&CapturedContent>,
     // Whether this event ends the request (AISIX-Cloud#1279).
     terminal: bool,
+    // Whether the work this event describes actually reached an upstream —
+    // false for a pre-dispatch failure, whose `elapsed` is handler time.
+    dispatched: bool,
 ) {
     let tags = pk.telemetry_tags();
     let mut event = UsageEvent {
@@ -3066,6 +3075,7 @@ fn emit_usage_event(
         content,
         client.trace.as_ref(),
         terminal,
+        dispatched,
     );
     // AISIX-Cloud#1044: token volume by inbound client type × model. Codex
     // traffic arrives on /v1/responses, so leaving this endpoint out of the
@@ -3132,6 +3142,9 @@ fn emit_zero_token_event(
     // Whether this event ends the request (AISIX-Cloud#1279): true for a
     // pre-dispatch / all-failed terminal, false for a superseded attempt.
     terminal: bool,
+    // Whether this attempt actually reached an upstream — false on the
+    // pre-dispatch path, true for a recorded failed attempt.
+    dispatched: bool,
 ) {
     let pk = ResolvedPk::resolve(snap, provider_key_id);
     let tags = pk.telemetry_tags();
@@ -3171,6 +3184,7 @@ fn emit_zero_token_event(
         content.as_ref(),
         client.trace.as_ref(),
         terminal,
+        dispatched,
     );
 }
 
@@ -3227,6 +3241,9 @@ fn emit_failed_attempts(
             Vec::new(),
             content,
             /* terminal */ terminal_last && Some(i) == last_failed,
+            // A recorded attempt is real dispatch work by definition.
+            /* dispatched */
+            true,
         );
     }
 }

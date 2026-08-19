@@ -712,6 +712,7 @@ fn emit_usage_event(
         content,
         client.trace.as_ref(),
         /* terminal */ true,
+        /* dispatched */ true,
     );
     let owned_caller = crate::request_metrics::Caller::from_api_key_id(snap, api_key_id);
     crate::request_metrics::record_usage(

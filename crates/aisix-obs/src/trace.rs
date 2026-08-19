@@ -92,10 +92,12 @@ fn hex_lower(bytes: &[u8]) -> String {
 pub struct RemoteTraceContext {
     pub trace_id: TraceId,
     pub parent_span_id: SpanId,
-    /// The verbatim `trace-flags` octet. Carried onto the exported SERVER
-    /// span; deliberately NOT consulted by the exporter's own sampling —
-    /// the operator's `sample_rate` stays authoritative, so an inbound
-    /// `sampled=1` cannot force export past `sample_rate=0`.
+    /// The verbatim `trace-flags` octet. The encoder ORs its W3C-defined
+    /// non-sampled bits (today only `random`, 0x02) into the SERVER span's
+    /// exported flags; the `sampled` bit is deliberately NOT consulted by
+    /// the exporter's own sampling — the operator's `sample_rate` stays
+    /// authoritative, so an inbound `sampled=1` cannot force export past
+    /// `sample_rate=0`.
     pub flags: u8,
     /// The caller's `tracestate`, kept only when the `traceparent` it
     /// travelled with was valid (spec: state is meaningless without its
@@ -318,17 +320,24 @@ impl RequestTraceBundle {
     /// the upstream keeps streaming.
     ///
     /// A request that never dispatched an attempt (`attempts` empty):
-    /// - `upstream_latency_ms > 0` — a family that dispatches without
-    ///   per-attempt tracking (MCP / A2A / jobs / realtime): one CLIENT
-    ///   span under SERVER, placed by the handler's own measured duration
-    ///   ending now.
+    /// - `dispatched_upstream` — a family that dispatches without
+    ///   per-attempt tracking (MCP / A2A / jobs / realtime, the ensemble
+    ///   trunk bypass): one CLIENT span under SERVER, placed by the
+    ///   handler's own measured duration ending now.
     /// - otherwise — a cache hit, a guardrail block, a pre-dispatch error:
     ///   the SERVER span alone. No fictitious upstream CLIENT span.
+    ///
+    /// `dispatched_upstream` is the CALLER's statement of fact, never
+    /// inferred from the event's latency: a cache hit and a pre-dispatch
+    /// error legitimately carry the handler's elapsed time in
+    /// `upstream_latency_ms`, which an inference would misread as an
+    /// upstream call.
     pub fn emission(
         &self,
         terminal: bool,
         attempt_index: u32,
         upstream_latency_ms: u32,
+        dispatched_upstream: bool,
     ) -> TraceEmission {
         let now = self.clock.now_unix_nanos();
         let latency_nanos = u64::from(upstream_latency_ms).saturating_mul(1_000_000);
@@ -367,7 +376,7 @@ impl RequestTraceBundle {
         // trace. The id is minted once per emission snapshot, so delivery
         // retries and every exporter still agree on it.
         let attempt_span = attempt_span.or_else(|| {
-            (!terminal && upstream_latency_ms > 0).then(|| SpanEmit {
+            (!terminal && dispatched_upstream && upstream_latency_ms > 0).then(|| SpanEmit {
                 role: SpanRole::Attempt,
                 span_id: SpanId::random(),
                 parent_span_id: Some(self.logical_span_id),
@@ -403,7 +412,7 @@ impl RequestTraceBundle {
                     start_unix_nano: first.start_unix_nano,
                     end_unix_nano: last_end,
                 });
-            } else if upstream_latency_ms > 0 {
+            } else if dispatched_upstream && upstream_latency_ms > 0 {
                 // Dispatched upstream without per-attempt tracking: one
                 // CLIENT span placed by the handler's measured duration,
                 // clamped inside the SERVER span.
@@ -589,7 +598,7 @@ mod tests {
     fn remote_parent_decides_trace_id_and_server_parent() {
         let bundle = bundle_with_remote();
         assert_eq!(bundle.trace_id_hex(), "4bf92f3577b34da6a3ce929d0e0e4736");
-        let em = bundle.emission(true, 0, 0);
+        let em = bundle.emission(true, 0, 0, false);
         let server = em
             .spans
             .iter()
@@ -606,7 +615,7 @@ mod tests {
     #[test]
     fn local_root_has_no_parent_and_a_random_trace() {
         let bundle = RequestTraceBundle::new(None);
-        let em = bundle.emission(true, 0, 0);
+        let em = bundle.emission(true, 0, 0, false);
         let server = em
             .spans
             .iter()
@@ -629,13 +638,13 @@ mod tests {
         bundle.end_attempt(1);
 
         // The failed attempt's event (non-terminal).
-        let failed = bundle.emission(false, 0, 40);
+        let failed = bundle.emission(false, 0, 40, true);
         assert_eq!(failed.spans.len(), 1, "attempt span only");
         let failed_span = failed.spans[0];
         assert_eq!(failed_span.role, SpanRole::Attempt);
 
         // The winner's terminal event.
-        let terminal = bundle.emission(true, 1, 60);
+        let terminal = bundle.emission(true, 1, 60, true);
         let server = terminal
             .spans
             .iter()
@@ -673,8 +682,8 @@ mod tests {
         let bundle = RequestTraceBundle::new(None);
         bundle.start_attempt(0);
         bundle.end_attempt(0);
-        let a = bundle.emission(false, 0, 10);
-        let b = bundle.emission(false, 0, 10);
+        let a = bundle.emission(false, 0, 10, true);
+        let b = bundle.emission(false, 0, 10, true);
         assert_eq!(a.trace_id, b.trace_id);
         assert_eq!(a.spans[0].span_id.to_hex(), b.spans[0].span_id.to_hex());
         assert_eq!(a.spans[0].start_unix_nano, b.spans[0].start_unix_nano);
@@ -692,7 +701,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(15));
         // Terminal emission happens at real stream end; the handler
         // measured 10ms of streaming after the commit stamp.
-        let em = bundle.emission(true, 0, 10);
+        let em = bundle.emission(true, 0, 10, true);
         let attempt = em
             .spans
             .iter()
@@ -719,10 +728,22 @@ mod tests {
     #[test]
     fn no_attempts_and_no_latency_emits_server_only() {
         let bundle = RequestTraceBundle::new(None);
-        let em = bundle.emission(true, 0, 0);
+        let em = bundle.emission(true, 0, 0, false);
         assert_eq!(em.spans.len(), 1);
         assert_eq!(em.spans[0].role, SpanRole::Server);
         assert_eq!(em.carrier_role(), Some(SpanRole::Server));
+    }
+
+    /// The finding the `dispatched_upstream` parameter exists for: a cache
+    /// hit and a pre-dispatch block carry the HANDLER's elapsed time in
+    /// `upstream_latency_ms`, so a latency-based inference would fabricate
+    /// an upstream CLIENT span for a request that contacted no provider.
+    #[test]
+    fn undispatched_terminal_with_nonzero_latency_still_emits_server_only() {
+        let bundle = RequestTraceBundle::new(None);
+        let em = bundle.emission(true, 0, 40, false);
+        assert_eq!(em.spans.len(), 1);
+        assert_eq!(em.spans[0].role, SpanRole::Server);
     }
 
     /// Families that dispatch without per-attempt tracking (MCP / A2A /
@@ -730,7 +751,7 @@ mod tests {
     #[test]
     fn no_attempts_with_latency_emits_one_client_child() {
         let bundle = RequestTraceBundle::new(None);
-        let em = bundle.emission(true, 0, 25);
+        let em = bundle.emission(true, 0, 25, true);
         let server = em
             .spans
             .iter()
@@ -755,9 +776,9 @@ mod tests {
         let bundle = RequestTraceBundle::new(None);
         bundle.start_attempt(0);
         bundle.end_attempt(0);
-        let first = bundle.emission(true, 0, 10);
+        let first = bundle.emission(true, 0, 10, true);
         assert!(first.spans.iter().any(|s| s.role == SpanRole::Server));
-        let second = bundle.emission(true, 0, 10);
+        let second = bundle.emission(true, 0, 10, true);
         assert!(
             !second.spans.iter().any(|s| s.role == SpanRole::Server),
             "duplicate SERVER span"

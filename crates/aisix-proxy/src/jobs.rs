@@ -612,6 +612,7 @@ fn emit_job_usage_event(
         None,
         client.trace.as_ref(),
         /* terminal */ true,
+        /* dispatched */ true,
     );
 }
 

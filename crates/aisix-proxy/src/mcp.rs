@@ -685,6 +685,7 @@ fn emit_tool_call_usage(
         None,
         trace,
         /* terminal */ true,
+        /* dispatched */ true,
     );
 }
 

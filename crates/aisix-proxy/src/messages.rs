@@ -292,6 +292,7 @@ pub async fn messages(
                     monitor_hits.clone(),
                     captured_content,
                     /* terminal */ true,
+                    /* dispatched */ true,
                 );
             }
             response
@@ -427,6 +428,9 @@ pub async fn messages(
                     monitor_hits.clone(),
                     failure_content.take(),
                     /* terminal */ true,
+                    // Pre-dispatch failure: no upstream was contacted.
+                    /* dispatched */
+                    false,
                 );
             }
             // /v1/messages must return Anthropic-shape error envelope
@@ -507,6 +511,9 @@ fn emit_failed_attempts_anthropic(
             Vec::new(),
             content,
             /* terminal */ terminal_last && Some(i) == last_failed,
+            // A recorded attempt is real dispatch work by definition.
+            /* dispatched */
+            true,
         );
     }
 }
@@ -1467,6 +1474,7 @@ async fn anthropic_passthrough_dispatch(
                     // Drop-guard emit at stream end = the request's end.
                     /* terminal */
                     true,
+                    /* dispatched */ true,
                 );
             },
         );
@@ -2114,6 +2122,7 @@ async fn cross_provider_dispatch(
                     // Drop-guard emit at stream end = the request's end.
                     /* terminal */
                     true,
+                    /* dispatched */ true,
                 );
             },
         );
@@ -2810,6 +2819,9 @@ fn emit_anthropic_usage_event(
     // event carries the trace's SERVER + logical spans; a failed attempt's
     // event carries its own attempt span alone.
     terminal: bool,
+    // Whether the work this event describes actually reached an upstream —
+    // false for a pre-dispatch failure, whose `elapsed` is handler time.
+    dispatched: bool,
 ) {
     // Per-PK telemetry attribution (#302 M17 / AISIX-Cloud#436).
     // Same shape as chat.rs's emit_usage_event — look up the
@@ -2870,6 +2882,7 @@ fn emit_anthropic_usage_event(
         content.as_ref(),
         client.trace.as_ref(),
         terminal,
+        dispatched,
     );
     // Cache-inclusive canonical total: Anthropic reports cache tokens as
     // counters separate from prompt_tokens, so prompt+completion undercounts

@@ -1581,6 +1581,7 @@ fn emit_usage_event(
         content,
         client.trace.as_ref(),
         /* terminal */ true,
+        /* dispatched */ true,
     );
     // Speech (TTS) reports no tokens at all, so this is a no-op there; the
     // transcription routes report them when the model supplies a usage block.
