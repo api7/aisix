@@ -575,14 +575,36 @@ struct StreamedTranscript {
     /// `None` when the stream ended before one arrived (a client that
     /// disconnected, an upstream that reports no tokens).
     usage: Option<(u32, u32)>,
-    /// The transcript assembled from the `transcript.text.delta` events,
-    /// capped at the exporter's content-capture limit. Empty when no
-    /// exporter asked for content and no output chain needs a scan.
-    text: String,
+    /// The transcript assembled from the `transcript.text.delta` events.
+    deltas: String,
+    /// The whole transcript as the terminal `transcript.text.done` event
+    /// reports it. Preferred over the assembled deltas — same precedence
+    /// the `/v1/responses` capture uses — so a provider that answers with
+    /// the terminal event alone still yields a scannable transcript.
+    terminal: Option<String>,
     /// False when the caller disconnected before the upstream ended.
     reached_end: bool,
     /// End-of-stream monitor observations (AISIX-Cloud#1010).
     output_hits: Vec<aisix_core::GuardrailMonitorHit>,
+}
+
+impl StreamedTranscript {
+    /// The transcript the caller received, for the end-of-stream scan and
+    /// the content capture. Both are capped at their own limits on top of
+    /// this one.
+    fn text(&self) -> &str {
+        self.terminal.as_deref().unwrap_or(&self.deltas)
+    }
+}
+
+/// The longest prefix of `text` that fits in `cap` bytes without splitting
+/// a codepoint.
+fn truncate_on_char_boundary(text: &str, cap: usize) -> &str {
+    let mut end = text.len().min(cap);
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
 /// Fires `on_complete` exactly once with what the relay saw — at
@@ -698,7 +720,7 @@ where
             // The guard stays armed across the await: an SDK that closes
             // on the terminal frame drops this generator here, and the
             // Drop emit must still carry the usage it already parsed.
-            let text = guard.observed().text.clone();
+            let text = guard.observed().text().to_string();
             let hits = scan.observe(&text).await;
             guard.observed().output_hits = hits;
         }
@@ -708,11 +730,15 @@ where
     })
 }
 
-/// Fold one batch of decoded SSE events into the running observation:
-/// `transcript.text.delta` appends to the transcript (bounded by `cap`),
-/// and any event carrying a `usage` block updates the counts — the last
-/// one wins, so a provider that reports usage on a later event than
-/// `transcript.text.done` is read the same way.
+/// Fold one batch of decoded SSE events into the running observation, all
+/// of it bounded by `cap`.
+///
+/// Read by field rather than by event type, so a provider that names its
+/// events differently is still observed: a `usage` block updates the
+/// counts (last one wins, so usage reported after
+/// `transcript.text.done` is read the same way), a whole-transcript
+/// `text` becomes the terminal text, and a `delta` appends to the
+/// assembled one.
 fn observe_transcript_events(
     observed: &mut StreamedTranscript,
     events: &[aisix_gateway::SseEvent],
@@ -728,16 +754,18 @@ fn observe_transcript_events(
         if let Some(usage) = extract_token_usage(&value) {
             observed.usage = Some(usage);
         }
-        if observed.text.len() >= cap {
+        if let Some(full) = value.get("text").and_then(Value::as_str) {
+            observed.terminal = Some(truncate_on_char_boundary(full, cap).to_string());
+            continue;
+        }
+        if observed.deltas.len() >= cap {
             continue;
         }
         if let Some(delta) = value.get("delta").and_then(Value::as_str) {
-            let room = cap - observed.text.len();
-            let mut end = delta.len().min(room);
-            while end > 0 && !delta.is_char_boundary(end) {
-                end -= 1;
-            }
-            observed.text.push_str(&delta[..end]);
+            let room = cap - observed.deltas.len();
+            observed
+                .deltas
+                .push_str(truncate_on_char_boundary(delta, room));
         }
     }
 }
@@ -1222,14 +1250,14 @@ async fn multipart_dispatch(
                     // than the one the request started on (#941).
                     let snap = state_c.snapshot.load();
                     let pk = crate::usage_attr::ResolvedPk::resolve(&snap, &pk_id_c);
-                    let mut monitor_hits = input_monitor_hits;
-                    monitor_hits.extend(outcome.output_hits);
                     let captured_content = match (&captured_prompt_c, content_cap) {
                         (Some(prompt), Some(cap)) => {
-                            Some(CapturedContent::new(prompt, &outcome.text, cap as usize))
+                            Some(CapturedContent::new(prompt, outcome.text(), cap as usize))
                         }
                         _ => None,
                     };
+                    let mut monitor_hits = input_monitor_hits;
+                    monitor_hits.extend(outcome.output_hits);
                     emit_usage_event(
                         &state_c,
                         &snap,
@@ -2896,6 +2924,62 @@ mod tests {
             .expect("UsageEvent must be emitted")
             .expect("usage_sink sender dropped");
         assert_eq!((event.prompt_tokens, event.completion_tokens), (14, 4));
+    }
+
+    /// The relay's side-channel observation reads by FIELD, not by event
+    /// name: a provider that answers with the terminal event alone —
+    /// whole transcript in `text`, no incremental deltas — must still
+    /// leave a scannable, capturable transcript behind, or the
+    /// end-of-stream guardrail scan and the content capture both see
+    /// nothing (#998).
+    #[test]
+    fn terminal_text_stands_in_for_missing_deltas() {
+        let decode = |payloads: &[&str]| {
+            let mut observed = super::StreamedTranscript::default();
+            let events: Vec<aisix_gateway::SseEvent> = payloads
+                .iter()
+                .map(|p| aisix_gateway::SseEvent::Data((*p).to_string()))
+                .collect();
+            super::observe_transcript_events(&mut observed, &events, 1024);
+            observed
+        };
+
+        let terminal_only = decode(&[r#"{"type":"transcript.text.done","text":"hello world",
+                "usage":{"type":"tokens","input_tokens":26,"output_tokens":12}}"#]);
+        assert_eq!(terminal_only.text(), "hello world");
+        assert_eq!(terminal_only.usage, Some((26, 12)));
+
+        let deltas_only = decode(&[
+            r#"{"type":"transcript.text.delta","delta":"hello"}"#,
+            r#"{"type":"transcript.text.delta","delta":" world"}"#,
+        ]);
+        assert_eq!(
+            deltas_only.text(),
+            "hello world",
+            "without a terminal event the assembled deltas are the transcript"
+        );
+
+        // The terminal event wins over the deltas — the two say the same
+        // thing, and counting both would double the captured transcript.
+        let both = decode(&[
+            r#"{"type":"transcript.text.delta","delta":"hello"}"#,
+            r#"{"type":"transcript.text.delta","delta":" world"}"#,
+            r#"{"type":"transcript.text.done","text":"hello world"}"#,
+        ]);
+        assert_eq!(both.text(), "hello world");
+    }
+
+    /// The observation is bounded, and the bound never splits a codepoint
+    /// — the captured text is handed to `CapturedContent` as a `&str`.
+    #[test]
+    fn observation_is_capped_on_a_char_boundary() {
+        let mut observed = super::StreamedTranscript::default();
+        let events: Vec<aisix_gateway::SseEvent> = (0..4)
+            .map(|_| aisix_gateway::SseEvent::Data(r#"{"delta":"日本語"}"#.to_string()))
+            .collect();
+        // 3 bytes per char: a 7-byte cap must stop after two chars.
+        super::observe_transcript_events(&mut observed, &events, 7);
+        assert_eq!(observed.text(), "日本");
     }
 
     /// The SSE read is content-type gated: a `srt`/`vtt` transcript is

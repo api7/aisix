@@ -32,8 +32,9 @@ opaque binary passthrough (audio, images) corrupts it.
 
 Swapping `resp.bytes()` for `resp.bytes_stream()` is the visible part of the
 change and the least of it. The handler now returns while the response is still
-being delivered, and three request-scoped things that used to be finished by then
-are not — none of which errors when missed:
+being delivered, so three request-scoped things that used to be finished by then
+are not — and a fourth rule decides whether the path may stream at all. None of
+the four errors when missed:
 
 - **The reqwest request-level timeout has to go.** `RequestBuilder::timeout`
   bounds the body read too, so it cuts a long stream off mid-response. Bound the
