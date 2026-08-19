@@ -295,8 +295,12 @@ describe("realtime e2e: /v1/realtime WebSocket relay (#721)", () => {
     let span;
     const deadline = Date.now() + 10_000;
     while (Date.now() < deadline) {
+      // Attempt carrier only — the AISIX-Cloud#1279 hierarchy also ships
+      // structural spans sharing the request id without usage attributes.
       span = otlp.spans.find(
-        (s) => s.attributes["aisix.request_id"] === refusal.requestId,
+        (s) =>
+          s.attributes["aisix.request_id"] === refusal.requestId &&
+          s.attributes["aisix.attempt_index"] !== undefined,
       );
       if (span) break;
       await new Promise((r) => setTimeout(r, 100));

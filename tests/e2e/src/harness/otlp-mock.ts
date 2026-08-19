@@ -11,11 +11,39 @@ import { createServer, type Server } from "node:http";
 export interface CapturedSpan {
   name: string;
   attributes: Record<string, string | number | boolean>;
+  /** 32-hex W3C trace id; empty when the body omitted it. */
+  traceId: string;
+  /** 16-hex span id; empty when the body omitted it. */
+  spanId: string;
+  /** 16-hex parent span id; empty for a root span. */
+  parentSpanId: string;
+  /** OTLP SpanKind (2 = SERVER, 3 = CLIENT); 0 when omitted. */
+  kind: number;
+  /** OTLP span flags (uint32); 0 when omitted. */
+  flags: number;
+  /** W3C tracestate carried on the span; empty when absent. */
+  traceState: string;
+  /** Nanosecond boundaries, as strings (OTLP/JSON int64 encoding). */
+  startTimeUnixNano: string;
+  endTimeUnixNano: string;
+  /** 0-based index of the POST this span arrived in (delivery-retry tests). */
+  postIndex: number;
+}
+
+export interface MockOtlpOptions {
+  /**
+   * Respond to the first N POSTs with 503 (their spans are still recorded),
+   * then accept. Models a transiently failing receiver so a test can assert
+   * the sink's delivery retry re-sends byte-identical spans.
+   */
+  failFirst?: number;
 }
 
 export interface MockOtlp {
   url: string;
   spans: CapturedSpan[];
+  /** Number of POSTs received so far (including ones answered 503). */
+  posts: number;
   /**
    * Bodies this receiver could not parse, empty on a healthy run. Without it a
    * malformed export and a never-sent one look identical: both end as "no
@@ -40,19 +68,32 @@ function anyValue(value: Record<string, unknown>): string | number | boolean {
   return "";
 }
 
-export async function startMockOtlp(): Promise<MockOtlp> {
+export async function startMockOtlp(
+  options: MockOtlpOptions = {},
+): Promise<MockOtlp> {
   const spans: CapturedSpan[] = [];
   const parseFailures: string[] = [];
+  const state = { posts: 0, failuresLeft: options.failFirst ?? 0 };
   const server: Server = createServer((req, res) => {
     const chunks: Buffer[] = [];
     req.on("data", (chunk: Buffer) => chunks.push(chunk));
     req.on("end", () => {
+      const postIndex = state.posts;
+      state.posts += 1;
       try {
         const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as {
           resourceSpans?: {
             scopeSpans?: {
               spans?: {
                 name: string;
+                traceId?: string;
+                spanId?: string;
+                parentSpanId?: string;
+                kind?: number;
+                flags?: number;
+                traceState?: string;
+                startTimeUnixNano?: string;
+                endTimeUnixNano?: string;
                 attributes?: { key: string; value: Record<string, unknown> }[];
               }[];
             }[];
@@ -65,7 +106,19 @@ export async function startMockOtlp(): Promise<MockOtlp> {
               for (const attr of span.attributes ?? []) {
                 attributes[attr.key] = anyValue(attr.value);
               }
-              spans.push({ name: span.name, attributes });
+              spans.push({
+                name: span.name,
+                attributes,
+                traceId: span.traceId ?? "",
+                spanId: span.spanId ?? "",
+                parentSpanId: span.parentSpanId ?? "",
+                kind: span.kind ?? 0,
+                flags: span.flags ?? 0,
+                traceState: span.traceState ?? "",
+                startTimeUnixNano: span.startTimeUnixNano ?? "0",
+                endTimeUnixNano: span.endTimeUnixNano ?? "0",
+                postIndex,
+              });
             }
           }
         }
@@ -74,6 +127,12 @@ export async function startMockOtlp(): Promise<MockOtlp> {
         // test, so it is kept rather than swallowed — otherwise it reaches the
         // test as an indistinguishable "no span arrived".
         parseFailures.push(String(err));
+      }
+      if (state.failuresLeft > 0) {
+        state.failuresLeft -= 1;
+        res.writeHead(503, { "content-type": "application/json" });
+        res.end("{}");
+        return;
       }
       res.writeHead(200, { "content-type": "application/json" });
       res.end("{}");
@@ -87,6 +146,9 @@ export async function startMockOtlp(): Promise<MockOtlp> {
   return {
     url: `http://127.0.0.1:${address.port}/v1/traces`,
     spans,
+    get posts() {
+      return state.posts;
+    },
     parseFailures,
     close: () => new Promise((resolve) => server.close(() => resolve())),
   };
