@@ -416,6 +416,33 @@ impl InFlightGuard {
     }
 }
 
+/// Holds the process-wide drain count up for one request.
+///
+/// Deliberately separate from [`InFlightGuard`]: that one feeds
+/// `aisix_proxy_in_flight_requests` and keeps its established semantics of
+/// ending when the handler returns, so the published gauge does not shift
+/// meaning. The drain gate has to span the **response body** instead — a
+/// streaming body is polled after the middleware returns, so a guard
+/// released there would read zero while SSE bytes are still flowing and
+/// let the shutdown coordinator close the listener under exactly the
+/// traffic the drain window exists to protect.
+struct DrainGuard {
+    livez: std::sync::Arc<health::LivezState>,
+}
+
+impl DrainGuard {
+    fn new(livez: std::sync::Arc<health::LivezState>) -> Self {
+        livez.enter();
+        Self { livez }
+    }
+}
+
+impl Drop for DrainGuard {
+    fn drop(&mut self) {
+        self.livez.leave();
+    }
+}
+
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
         self.metrics
@@ -478,6 +505,7 @@ async fn record_request_telemetry(
     // suffix (or any 404 path) would otherwise let an unauthenticated
     // caller mint unbounded Prometheus time series (#451).
     let endpoint = normalize_endpoint_label(request.uri().path());
+    let version = request.version();
     // The cell the handler fills in as it resolves the model and picks a
     // target, so this layer can attribute a cancelled request to them
     // (AISIX-Cloud#1317). Installed here because a cancelled handler
@@ -502,9 +530,51 @@ async fn record_request_telemetry(
         endpoint,
         inbound_protocol_for_endpoint(endpoint),
     );
-    let response = attribution::scope(attribution, next.run(request)).await;
+    let drain = DrainGuard::new(state.livez.clone());
+    let mut response = attribution::scope(attribution, next.run(request)).await;
     guard.armed = false;
+    // Sampled AFTER the handler, not before: a request that arrived just
+    // ahead of the signal and finished inside the window is riding one of
+    // the pooled connections that most needs retiring.
+    if state.livez.is_shutting_down() {
+        retire_connection(&version, &mut response);
+    }
+    hold_until_body_done(response, drain)
+}
+
+/// Move `drain` into the response body so the count stays raised until the
+/// body is fully written — or dropped, when the client hangs up mid-stream.
+fn hold_until_body_done(response: Response, drain: DrainGuard) -> Response {
+    use http_body_util::BodyExt;
+    let (parts, body) = response.into_parts();
+    let body = axum::body::Body::new(body.map_frame(move |frame| {
+        // The closure owns the guard; the mapped body owns the closure.
+        let _hold = &drain;
+        frame
+    }));
+    Response::from_parts(parts, body)
+}
+
+/// Ask an HTTP/1.1 client to retire this connection once the response is
+/// read, by answering `Connection: close`.
+///
+/// The gateway keeps accepting through the drain window, so a client that
+/// pools connections would otherwise hold idle ones open right up to the
+/// moment the listener closes — and a request dispatched onto one of those
+/// in that instant dies with no response, which is how a graceful shutdown
+/// still surfaces as a 502/503 upstream-reset at the caller. Retiring them
+/// as they are used means there is nothing idle left to lose.
+///
+/// HTTP/2 has no such header (it is a connection-specific field, forbidden
+/// by RFC 9113 §8.2.2); its drain signal is the GOAWAY that hyper emits
+/// when the listener does shut down.
+fn retire_connection(version: &axum::http::Version, response: &mut Response) {
+    if *version == axum::http::Version::HTTP_2 || *version == axum::http::Version::HTTP_3 {
+        return;
+    }
     response
+        .headers_mut()
+        .insert(header::CONNECTION, HeaderValue::from_static("close"));
 }
 
 struct ClientCancelGuard {
