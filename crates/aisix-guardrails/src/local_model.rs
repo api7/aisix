@@ -248,6 +248,12 @@ struct Embedder {
 
 impl Embedder {
     fn load(dir: &std::path::Path, lanes: usize) -> Result<Self, LocalModelError> {
+        // `parse_lanes` never yields 0, but `LocalModelConfig`'s fields
+        // are `pub` and a future programmatic constructor (the
+        // control-plane integration) could hand-build one; an empty
+        // pool would panic at the prototype embed with a confusing
+        // boot error instead of just working.
+        let lanes = lanes.max(1);
         let tokenizer_path = dir.join("tokenizer.json");
         let mut tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path).map_err(|e| {
             LocalModelError::Tokenizer(format!("{}: {e}", tokenizer_path.display()))
