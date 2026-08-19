@@ -1140,7 +1140,11 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
 
     // Step 10: shutdown coordinator. Whichever of (signal, proxy, admin)
     // completes first triggers the rest.
-    let signal_task = tokio::spawn(wait_for_signal(cancel_tx.clone(), livez_state));
+    let signal_task = tokio::spawn(wait_for_signal(
+        cancel_tx.clone(),
+        livez_state,
+        Duration::from_secs(cfg.shutdown.min_drain_secs),
+    ));
 
     proxy_serve
         .await
@@ -1889,9 +1893,19 @@ async fn shutdown_signal(mut cancel: watch::Receiver<bool>, label: &'static str)
     }
 }
 
+/// How often the drain loop re-reads the in-flight count once the
+/// minimum window has elapsed.
+const DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// How often the drain loop reports that it is still waiting, so a drain
+/// that never finishes is visible in the logs rather than looking like a
+/// hung process.
+const DRAIN_LOG_INTERVAL: Duration = Duration::from_secs(5);
+
 async fn wait_for_signal(
     cancel_tx: watch::Sender<bool>,
     livez_state: std::sync::Arc<aisix_proxy::LivezState>,
+    min_drain: Duration,
 ) {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
@@ -1915,8 +1929,44 @@ async fn wait_for_signal(
         _ = term => tracing::info!("received SIGTERM"),
     }
 
+    // `/readyz` answers 503 from here on. Everything below decides when
+    // it is safe to stop accepting, which is deliberately NOT the same
+    // moment: a balancer only learns about the 503 on its next health
+    // check, and closing the listener before then refuses every
+    // connection it routes in between.
     livez_state.mark_shutting_down();
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    tracing::info!(
+        min_drain_secs = min_drain.as_secs(),
+        in_flight = livez_state.in_flight(),
+        "draining — /readyz now reports 503, still accepting new connections"
+    );
+
+    if !min_drain.is_zero() {
+        tokio::time::sleep(min_drain).await;
+    }
+
+    // The window is a minimum, not a deadline. A balancer slower than
+    // configured is still routing traffic here, and that traffic is
+    // exactly what the in-flight count shows — so keep serving until it
+    // reaches zero, at which point closing the listener cannot interrupt
+    // anything. Unbounded on purpose: an inference call or an SSE stream
+    // may run for minutes, and the platform (Kubernetes
+    // `terminationGracePeriodSeconds`, systemd `TimeoutStopSec`) is the
+    // one hard bound.
+    let mut last_log = std::time::Instant::now();
+    loop {
+        let in_flight = livez_state.in_flight();
+        if in_flight == 0 {
+            break;
+        }
+        if last_log.elapsed() >= DRAIN_LOG_INTERVAL {
+            tracing::info!(in_flight, "still draining in-flight requests");
+            last_log = std::time::Instant::now();
+        }
+        tokio::time::sleep(DRAIN_POLL_INTERVAL).await;
+    }
+
+    tracing::info!("drain complete — closing listeners");
     let _ = cancel_tx.send(true);
 }
 

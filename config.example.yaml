@@ -360,6 +360,38 @@ downstream:
   # connection. 0 disables the heartbeat.
   # sse_keepalive_interval_secs: 15
 
+# ---------------------------------------------------------------------------
+# Shutdown
+# ---------------------------------------------------------------------------
+# What happens between SIGINT/SIGTERM and the process exiting.
+#
+# The signal makes /readyz answer 503 straight away, but a load balancer
+# only learns that on its next health check and keeps routing new
+# connections until then. So the gateway keeps accepting after the signal
+# and only stops once the balancer has had time to withdraw it AND nothing
+# is left in flight. In-flight requests then drain with no deadline — an
+# inference call or an SSE stream may run for minutes — so the platform
+# (Kubernetes terminationGracePeriodSeconds, systemd TimeoutStopSec) is
+# the only hard bound. Make sure that bound is generous enough for your
+# longest request.
+shutdown:
+  # Minimum seconds to keep accepting new connections after the signal,
+  # while /readyz already reports 503.
+  #
+  # Size it ABOVE the detection latency of whatever load-balances this
+  # instance: a Kubernetes readiness probe needs periodSeconds x
+  # failureThreshold, an external balancer its own check interval times
+  # its retry count. Too low and the listener closes while traffic is
+  # still being routed here; too high only delays the exit.
+  #
+  # It is a minimum, not a deadline — after it elapses the gateway still
+  # waits for the in-flight count to reach zero, so a balancer slower than
+  # configured cannot make it close under live traffic.
+  #
+  # 0 drops the window entirely and is only correct when nothing routes
+  # here by health check.
+  min_drain_secs: 30
+
 # Models, API keys, provider keys, guardrails, cache policies, and
 # observability exporters are NOT defined in this file. They come from
 # the configured resource source: the `resources_file` above, direct

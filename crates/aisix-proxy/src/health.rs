@@ -33,6 +33,12 @@ static TEXT_PLAIN_UTF8: HeaderValue = HeaderValue::from_static("text/plain; char
 #[derive(Debug, Default)]
 pub struct LivezState {
     shutting_down: AtomicBool,
+    /// Requests currently being served on the proxy listener, raised and
+    /// lowered by the telemetry middleware's RAII guard. Read by the
+    /// shutdown coordinator to decide when closing the listener can no
+    /// longer interrupt anything; a streaming response keeps its slot for
+    /// as long as bytes may still flow.
+    in_flight: AtomicUsize,
 }
 
 impl LivezState {
@@ -42,6 +48,28 @@ impl LivezState {
 
     pub fn mark_shutting_down(&self) {
         self.shutting_down.store(true, Ordering::Relaxed);
+    }
+
+    /// Raise the in-flight count. Pair with [`Self::leave`]; the proxy
+    /// does that through a `Drop` guard so a cancelled request still
+    /// lowers the count it raised.
+    pub fn enter(&self) {
+        self.in_flight.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Lower the in-flight count, saturating at zero so an unpaired
+    /// decrement cannot wrap the counter and wedge the drain.
+    pub fn leave(&self) {
+        let _ = self
+            .in_flight
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(1))
+            });
+    }
+
+    /// Requests in flight right now.
+    pub fn in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::Relaxed)
     }
 
     fn shutdown_check(&self) -> Result<(), &'static str> {

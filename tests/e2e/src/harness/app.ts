@@ -305,6 +305,14 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
       tracing: { otlp: { enabled: false, endpoint: "http://127.0.0.1:4317", sample_ratio: 1 } },
     },
     cache: { backend: "memory" },
+    // The gateway ships a 30s drain window so a load balancer can
+    // withdraw a terminating replica before its listener closes. No
+    // balancer fronts a spawned test binary, and paying that window on
+    // every teardown would add 30s per app — the harness would SIGKILL
+    // at SHUTDOWN_GRACE_MS instead, losing the clean-exit path these
+    // specs rely on. Drain immediately here; the drain spec sets its own
+    // window through `extra`.
+    shutdown: { min_drain_secs: 0 },
     ...(overrides.snapshotCachePath
       ? { managed: { snapshot_cache_path: overrides.snapshotCachePath } }
       : {}),

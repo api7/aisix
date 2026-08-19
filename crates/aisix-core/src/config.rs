@@ -72,6 +72,10 @@ pub struct Config {
     /// emits a heartbeat — see [`DownstreamConfig`].
     #[serde(default)]
     pub downstream: DownstreamConfig,
+    /// How the process behaves between the shutdown signal and exit —
+    /// see [`ShutdownConfig`].
+    #[serde(default)]
+    pub shutdown: ShutdownConfig,
     /// Optional managed-mode configuration. When `managed.enabled = true`
     /// the admin API and Playground endpoints are **not** bound — the DP
     /// is a pure etcd reader driven by the aisix.cloud control plane.
@@ -1353,6 +1357,50 @@ impl Default for DownstreamConfig {
             idle_timeout_secs: 0,
             sse_keepalive_interval_secs: 15,
         }
+    }
+}
+
+/// What the gateway does between receiving SIGINT/SIGTERM and exiting.
+///
+/// The shutdown signal makes `/readyz` answer 503 immediately, but a load
+/// balancer only learns that on its next health check — and keeps sending
+/// new connections until then. Closing the listener at signal time would
+/// therefore refuse every connection routed inside that blind window. So
+/// the gateway keeps serving after the signal, and only stops accepting
+/// once the balancer has had time to withdraw it AND nothing is left in
+/// flight.
+///
+/// Once it does stop accepting, in-flight requests drain without a
+/// deadline — an inference call or an SSE stream may run for minutes.
+/// The platform caps the whole sequence (Kubernetes
+/// `terminationGracePeriodSeconds`, systemd `TimeoutStopSec`), which is
+/// the only hard bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ShutdownConfig {
+    /// Minimum seconds to keep accepting new connections after the
+    /// shutdown signal, while `/readyz` already answers 503.
+    ///
+    /// Size it above the detection latency of whatever load-balances this
+    /// instance — a Kubernetes readiness probe needs `periodSeconds x
+    /// failureThreshold`, an external balancer its own check interval
+    /// times its retry count. Too low and the listener closes while the
+    /// balancer is still routing to it; too high only delays the exit.
+    ///
+    /// The window is a *minimum*, not a deadline: after it elapses the
+    /// gateway still waits for the in-flight count to reach zero before it
+    /// stops accepting, so a balancer that is slower than configured
+    /// cannot make it close under live traffic.
+    ///
+    /// `0` drops the window entirely: the gateway stops accepting as soon
+    /// as nothing is in flight. Only correct when nothing routes to this
+    /// instance by health check.
+    pub min_drain_secs: u64,
+}
+
+impl Default for ShutdownConfig {
+    fn default() -> Self {
+        Self { min_drain_secs: 30 }
     }
 }
 
