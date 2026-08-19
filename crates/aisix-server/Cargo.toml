@@ -68,6 +68,12 @@ hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
 tikv-jemallocator = "0.6"
 tikv-jemalloc-ctl = "0.6"
 
+[features]
+# Local CPU embedding-model guardrail MVP (AISIX-Cloud#1331). Off by
+# default (statically links ONNX Runtime); the guardrail additionally
+# activates only when AISIX_LOCAL_GUARDRAIL_MODEL_DIR is set.
+local-model-guardrail = ["aisix-guardrails/local-model"]
+
 [dev-dependencies]
 tempfile = "3"
 wiremock = "0.6"
