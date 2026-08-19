@@ -1,19 +1,19 @@
-//! `McpPolicy` entity — environment-default and team-level MCP tool access
+//! `McpPolicy` entity — environment-level and team-level MCP tool access
 //! policies stored in etcd under `mcp_policies/<uuid>`.
 //!
-//! Policies lift MCP tool access from per-key `allowed_tools` configuration
-//! to a layered grant: an `env`-scoped policy sets the environment-wide
-//! default, a `team`-scoped policy replaces that default for the keys that
-//! belong to the team, and each key narrows (never widens) the inherited
-//! grant through its `mcp_access` block. `deny` patterns from every
-//! applicable level are always subtracted, so a tool denied at the
-//! environment level stays unavailable regardless of team or key
-//! configuration.
+//! MCP tool access is resolved from up to three layers of the same shape,
+//! each an `allow`/`deny` pattern pair: the `env`-scoped policy, the
+//! `team`-scoped policy of the key's team, and the key's own `mcp_access`
+//! block. A tool is permitted when **every present layer** allows it and
+//! **no** layer denies it — allow intersects, deny unions. A layer that is
+//! absent (no policy row, a disabled one, or no `mcp_access` block) imposes
+//! no constraint; with no layer present at all the grant is empty, so MCP
+//! access is always granted explicitly.
 //!
-//! Keys without an `mcp_access` block keep the pre-policy behavior: their
-//! `allowed_tools` list is the entire allow side (no inheritance), with
-//! policy `deny` patterns still subtracted. The effective-ACL computation
-//! lives with the MCP gateway endpoint, which resolves it per request.
+//! Because `allow` is required on every layer, a layer that only wants to
+//! subtract tools spells its allow side `["*"]`. The effective-ACL
+//! computation lives with the MCP gateway endpoint, which resolves it per
+//! request.
 
 use serde::{Deserialize, Serialize};
 
@@ -23,26 +23,11 @@ use crate::resource::Resource;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum McpPolicyScope {
-    /// The environment-wide default, applied to keys whose team has no
-    /// enabled policy of its own.
+    /// Applied to every key in the environment.
     Env,
-    /// A team-level policy, applied to the keys that belong to the team
-    /// named by `scope_ref`. It replaces the environment default for those
-    /// keys.
+    /// Applied to the keys belonging to the team named by `scope_ref`, on
+    /// top of the environment policy rather than in place of it.
     Team,
-}
-
-/// What an MCP access policy grants before `deny` patterns are subtracted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum McpPolicyMode {
-    /// Grants no MCP tools.
-    None,
-    /// Grants exactly the tools matched by the `allow` patterns.
-    Selected,
-    /// Grants every tool on every registered MCP server, including servers
-    /// and tools added after the policy is created.
-    All,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -52,33 +37,29 @@ pub struct McpPolicy {
     pub scope: McpPolicyScope,
 
     /// Team identifier the policy targets. Required when `scope` is `team`;
-    /// omitted for an environment-default policy.
+    /// omitted for an environment policy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(min = 1))]
     pub scope_ref: Option<String>,
 
-    /// What the policy grants: `none`, `selected` (the `allow` patterns), or
-    /// `all` current and future tools.
-    pub mode: McpPolicyMode,
-
-    /// Namespaced `<server>__<tool>` patterns granted when `mode` is
-    /// `selected`. Entries are matched as single-`*` globs, the same form as
-    /// an API key's `allowed_tools`: `"<server>__*"` grants every tool on one
-    /// server and an entry without a `*` matches one tool exactly. Ignored
-    /// for the other modes.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Namespaced `<server>__<tool>` patterns this layer allows. Entries are
+    /// matched as single-`*` globs: `"*"` allows every tool, `"<server>__*"`
+    /// every tool on one server, and an entry without a `*` matches one tool
+    /// exactly. An empty list allows nothing, which is how a policy blocks
+    /// all MCP access; a policy that only means to subtract tools writes
+    /// `["*"]` here and lists them under `deny`.
     pub allow: Vec<String>,
 
     /// Namespaced `<server>__<tool>` patterns subtracted from the effective
     /// grant of every key the policy applies to, using the same single-`*`
     /// glob matching as `allow`. Deny always wins: a tool matched here stays
-    /// unavailable even when a team policy or a key's own configuration
-    /// would otherwise grant it.
+    /// unavailable however the other layers allow it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deny: Vec<String>,
 
     /// Whether the policy is applied. A disabled policy is kept but
-    /// ignored. Treated as `true` when omitted.
+    /// contributes neither its allow nor its deny side. Treated as `true`
+    /// when omitted.
     #[serde(default = "default_enabled")]
     pub enabled: bool,
 
@@ -92,39 +73,19 @@ fn default_enabled() -> bool {
     true
 }
 
-/// How an API key combines with the applicable MCP access policies:
-/// `inherit`, `restrict`, or `deny`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum McpAccessMode {
-    /// The key uses the inherited grant unchanged: its team's enabled policy
-    /// when one exists, otherwise the environment-default policy.
-    Inherit,
-    /// The key uses the intersection of the inherited grant and its own
-    /// `allow` patterns — a restriction can only narrow what the policies
-    /// grant, never widen it.
-    Restrict,
-    /// The key has no MCP tool access at all.
-    Deny,
-}
-
-/// Policy-driven MCP access configuration on an API key. When present, this
-/// block supersedes the key's `allowed_tools` list: the allow side of the
-/// key's effective grant is computed from the applicable MCP access policies
-/// and `mode`, and `allowed_tools` is not consulted.
+/// The API key's own layer of the MCP tool ACL, the same `allow`/`deny`
+/// shape an MCP access policy carries. Present means the key constrains its
+/// grant; omitted means the key adds no constraint of its own and takes
+/// whatever the environment and team layers leave.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct McpAccess {
-    /// How the key combines with the applicable policies: `inherit`,
-    /// `restrict`, or `deny`.
-    pub mode: McpAccessMode,
-
-    /// Namespaced `<server>__<tool>` patterns intersected with the inherited
-    /// grant when `mode` is `restrict`, using the same single-`*` glob
-    /// matching as `allowed_tools`. Ignored for the other modes.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Namespaced `<server>__<tool>` patterns this key allows, intersected
+    /// with the environment and team layers. Same single-`*` glob matching a
+    /// policy's `allow` uses; an empty list leaves the key no MCP access,
+    /// and `["*"]` narrows nothing (useful with `deny` alone).
     pub allow: Vec<String>,
 
-    /// Namespaced `<server>__<tool>` patterns subtracted from the key's
+    /// Namespaced `<server>__<tool>` patterns subtracted from this key's
     /// effective grant, using the same single-`*` glob matching as `allow`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deny: Vec<String>,
@@ -136,9 +97,9 @@ impl Resource for McpPolicy {
     }
 
     /// The by-name index key: the targeted team id, or `"env"` for the
-    /// environment-default policy. Lookups during effective-ACL resolution
-    /// iterate and filter on `(scope, scope_ref)` rather than relying on
-    /// this index, so a malformed row can never shadow the default.
+    /// environment policy. Lookups during effective-ACL resolution iterate
+    /// and filter on `(scope, scope_ref)` rather than relying on this index,
+    /// so a malformed row can never shadow the environment layer.
     #[allow(clippy::misnamed_getters)]
     fn name(&self) -> &str {
         self.scope_ref.as_deref().unwrap_or("env")
@@ -154,11 +115,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn deserialises_env_default_policy() {
+    fn deserialises_env_policy() {
         let p: McpPolicy = serde_json::from_str(
             r#"{
               "scope": "env",
-              "mode": "selected",
               "allow": ["github__*", "postgres__query"],
               "deny": ["github__delete_repository"]
             }"#,
@@ -166,7 +126,6 @@ mod tests {
         .unwrap();
         assert_eq!(p.scope, McpPolicyScope::Env);
         assert!(p.scope_ref.is_none());
-        assert_eq!(p.mode, McpPolicyMode::Selected);
         assert_eq!(p.allow, vec!["github__*", "postgres__query"]);
         assert_eq!(p.deny, vec!["github__delete_repository"]);
         assert!(p.enabled);
@@ -175,18 +134,19 @@ mod tests {
     #[test]
     fn deserialises_team_policy() {
         let p: McpPolicy = serde_json::from_str(
-            r#"{
-              "scope": "team",
-              "scope_ref": "team-uuid-1",
-              "mode": "all"
-            }"#,
+            r#"{"scope": "team", "scope_ref": "team-uuid-1", "allow": ["*"]}"#,
         )
         .unwrap();
         assert_eq!(p.scope, McpPolicyScope::Team);
         assert_eq!(p.scope_ref.as_deref(), Some("team-uuid-1"));
-        assert_eq!(p.mode, McpPolicyMode::All);
-        assert!(p.allow.is_empty());
+        assert_eq!(p.allow, vec!["*"]);
         assert!(p.deny.is_empty());
+    }
+
+    #[test]
+    fn allow_is_required_on_both_layers() {
+        assert!(serde_json::from_str::<McpPolicy>(r#"{"scope":"env"}"#).is_err());
+        assert!(serde_json::from_str::<McpAccess>(r#"{"deny":["github__*"]}"#).is_err());
     }
 
     #[test]
@@ -195,23 +155,23 @@ mod tests {
         // accept them. The write path still rejects them via the strict
         // schema validators (validate_mcp_policy in models/schema.rs).
         let p: McpPolicy =
-            serde_json::from_str(r#"{"scope":"env","mode":"all","extra":1}"#).unwrap();
-        assert_eq!(p.mode, McpPolicyMode::All);
+            serde_json::from_str(r#"{"scope":"env","allow":["*"],"extra":1}"#).unwrap();
+        assert_eq!(p.allow, vec!["*"]);
     }
 
     #[test]
-    fn rejects_unknown_mode_and_scope() {
-        assert!(serde_json::from_str::<McpPolicy>(r#"{"scope":"org","mode":"all"}"#).is_err());
-        assert!(serde_json::from_str::<McpPolicy>(r#"{"scope":"env","mode":"open"}"#).is_err());
+    fn rejects_unknown_scope() {
+        assert!(serde_json::from_str::<McpPolicy>(r#"{"scope":"org","allow":["*"]}"#).is_err());
     }
 
     #[test]
     fn enabled_defaults_true_and_roundtrips_false() {
-        let active: McpPolicy = serde_json::from_str(r#"{"scope":"env","mode":"all"}"#).unwrap();
+        let active: McpPolicy =
+            serde_json::from_str(r#"{"scope":"env","allow":["*"]}"#).unwrap();
         assert!(active.enabled);
 
         let disabled: McpPolicy =
-            serde_json::from_str(r#"{"scope":"env","mode":"all","enabled":false}"#).unwrap();
+            serde_json::from_str(r#"{"scope":"env","allow":["*"],"enabled":false}"#).unwrap();
         assert!(!disabled.enabled);
     }
 
@@ -219,59 +179,45 @@ mod tests {
     fn resource_trait_points_at_scope_ref_and_kind() {
         assert_eq!(McpPolicy::kind(), "mcp_policies");
 
-        let mut env: McpPolicy = serde_json::from_str(r#"{"scope":"env","mode":"all"}"#).unwrap();
+        let mut env: McpPolicy =
+            serde_json::from_str(r#"{"scope":"env","allow":["*"]}"#).unwrap();
         env.runtime_id = "p-env".into();
         assert_eq!(env.id(), "p-env");
         assert_eq!(env.name(), "env");
 
-        let mut team: McpPolicy =
-            serde_json::from_str(r#"{"scope":"team","scope_ref":"team-uuid-1","mode":"none"}"#)
-                .unwrap();
+        let mut team: McpPolicy = serde_json::from_str(
+            r#"{"scope":"team","scope_ref":"team-uuid-1","allow":[]}"#,
+        )
+        .unwrap();
         team.runtime_id = "p-team".into();
         assert_eq!(team.name(), "team-uuid-1");
     }
 
     #[test]
-    fn mcp_access_deserialises_all_modes() {
-        let inherit: McpAccess = serde_json::from_str(r#"{"mode":"inherit"}"#).unwrap();
-        assert_eq!(inherit.mode, McpAccessMode::Inherit);
-        assert!(inherit.allow.is_empty());
-        assert!(inherit.deny.is_empty());
-
-        let restrict: McpAccess = serde_json::from_str(
-            r#"{"mode":"restrict","allow":["github__*"],"deny":["github__delete_repository"]}"#,
+    fn mcp_access_deserialises_allow_and_deny() {
+        let narrow: McpAccess = serde_json::from_str(
+            r#"{"allow":["github__*"],"deny":["github__delete_repository"]}"#,
         )
         .unwrap();
-        assert_eq!(restrict.mode, McpAccessMode::Restrict);
-        assert_eq!(restrict.allow, vec!["github__*"]);
-        assert_eq!(restrict.deny, vec!["github__delete_repository"]);
+        assert_eq!(narrow.allow, vec!["github__*"]);
+        assert_eq!(narrow.deny, vec!["github__delete_repository"]);
 
-        let deny: McpAccess = serde_json::from_str(r#"{"mode":"deny"}"#).unwrap();
-        assert_eq!(deny.mode, McpAccessMode::Deny);
+        // The old `mode: deny` is now an empty allow list.
+        let blocked: McpAccess = serde_json::from_str(r#"{"allow":[]}"#).unwrap();
+        assert!(blocked.allow.is_empty());
+        assert!(blocked.deny.is_empty());
     }
 
     #[test]
-    fn mcp_access_tolerates_unknown_fields_for_forward_compat_but_rejects_unknown_modes() {
-        // cp-api may ship new fields ahead of the DP rolling out; serde must
-        // accept them (the write path still rejects them via the strict
-        // schema validators in models/schema.rs). Unknown enum values stay
-        // hard errors.
-        let a: McpAccess = serde_json::from_str(r#"{"mode":"inherit","extra":1}"#).unwrap();
-        assert_eq!(a.mode, McpAccessMode::Inherit);
-        assert!(serde_json::from_str::<McpAccess>(r#"{"mode":"legacy"}"#).is_err());
-    }
-
-    #[test]
-    fn empty_lists_stay_off_the_wire() {
-        let p: McpPolicy = serde_json::from_str(r#"{"scope":"env","mode":"all"}"#).unwrap();
+    fn empty_deny_stays_off_the_wire() {
+        let p: McpPolicy = serde_json::from_str(r#"{"scope":"env","allow":["*"]}"#).unwrap();
         let v = serde_json::to_value(&p).unwrap();
-        assert!(v.get("allow").is_none());
         assert!(v.get("deny").is_none());
         assert!(v.get("scope_ref").is_none());
+        assert_eq!(v["allow"], serde_json::json!(["*"]));
 
-        let a: McpAccess = serde_json::from_str(r#"{"mode":"inherit"}"#).unwrap();
+        let a: McpAccess = serde_json::from_str(r#"{"allow":["*"]}"#).unwrap();
         let v = serde_json::to_value(&a).unwrap();
-        assert!(v.get("allow").is_none());
         assert!(v.get("deny").is_none());
     }
 }

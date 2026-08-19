@@ -1191,7 +1191,7 @@ mod tests {
         // Non-default optional fields, so the PublicApiKey projection is
         // pinned field-by-field — a projection that dropped one of these
         // would still pass an id-only check.
-        payload["allowed_tools"] = json!(["github__create_issue"]);
+        payload["mcp_access"] = json!({"allow": ["github__create_issue"]});
         payload["allowed_agents"] = json!(["invoice-agent"]);
         payload["rate_limit"] = json!({"rpm": 60});
         payload["disabled"] = json!(true);
@@ -1214,8 +1214,8 @@ mod tests {
             assert_eq!(v["value"]["key_hash"], expected_hash.as_str(), "{base}");
             assert_eq!(v["value"]["allowed_models"], json!(["my-model"]), "{base}");
             assert_eq!(
-                v["value"]["allowed_tools"],
-                json!(["github__create_issue"]),
+                v["value"]["mcp_access"],
+                json!({"allow": ["github__create_issue"]}),
                 "{base}"
             );
             assert_eq!(

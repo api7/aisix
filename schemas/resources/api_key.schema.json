@@ -4,61 +4,27 @@
   "definitions": {
     "McpAccess": {
       "additionalProperties": false,
-      "description": "Policy-driven MCP access configuration on an API key. When present, this block supersedes the key's `allowed_tools` list: the allow side of the key's effective grant is computed from the applicable MCP access policies and `mode`, and `allowed_tools` is not consulted.",
+      "description": "The API key's own layer of the MCP tool ACL, the same `allow`/`deny` shape an MCP access policy carries. Present means the key constrains its grant; omitted means the key adds no constraint of its own and takes whatever the environment and team layers leave.",
       "properties": {
         "allow": {
-          "description": "Namespaced `<server>__<tool>` patterns intersected with the inherited grant when `mode` is `restrict`, using the same single-`*` glob matching as `allowed_tools`. Ignored for the other modes.",
+          "description": "Namespaced `<server>__<tool>` patterns this key allows, intersected with the environment and team layers. Same single-`*` glob matching a policy's `allow` uses; an empty list leaves the key no MCP access, and `[\"*\"]` narrows nothing (useful with `deny` alone).",
           "items": {
             "type": "string"
           },
           "type": "array"
         },
         "deny": {
-          "description": "Namespaced `<server>__<tool>` patterns subtracted from the key's effective grant, using the same single-`*` glob matching as `allow`.",
+          "description": "Namespaced `<server>__<tool>` patterns subtracted from this key's effective grant, using the same single-`*` glob matching as `allow`.",
           "items": {
             "type": "string"
           },
           "type": "array"
-        },
-        "mode": {
-          "allOf": [
-            {
-              "$ref": "#/definitions/McpAccessMode"
-            }
-          ],
-          "description": "How the key combines with the applicable policies: `inherit`, `restrict`, or `deny`."
         }
       },
       "required": [
-        "mode"
+        "allow"
       ],
       "type": "object"
-    },
-    "McpAccessMode": {
-      "description": "How an API key combines with the applicable MCP access policies: `inherit`, `restrict`, or `deny`.",
-      "oneOf": [
-        {
-          "description": "The key uses the inherited grant unchanged: its team's enabled policy when one exists, otherwise the environment-default policy.",
-          "enum": [
-            "inherit"
-          ],
-          "type": "string"
-        },
-        {
-          "description": "The key uses the intersection of the inherited grant and its own `allow` patterns — a restriction can only narrow what the policies grant, never widen it.",
-          "enum": [
-            "restrict"
-          ],
-          "type": "string"
-        },
-        {
-          "description": "The key has no MCP tool access at all.",
-          "enum": [
-            "deny"
-          ],
-          "type": "string"
-        }
-      ]
     },
     "McpRateLimit": {
       "additionalProperties": false,
@@ -184,7 +150,7 @@
   },
   "properties": {
     "allowed_agents": {
-      "description": "A2A agents this key may reach, named by their registered names. Entries are matched as single-`*` globs, mirroring `allowed_tools`: `\"*\"` grants every agent and an entry without a `*` matches one agent exactly. When omitted, set to `null`, or set to an empty list, the key has no A2A agent access — access is granted explicitly.",
+      "description": "A2A agents this key may reach, named by their registered names. Entries are matched as single-`*` globs, mirroring `allowed_models`: `\"*\"` grants every agent and an entry without a `*` matches one agent exactly. When omitted, set to `null`, or set to an empty list, the key has no A2A agent access — access is granted explicitly.",
       "items": {
         "type": "string"
       },
@@ -201,17 +167,7 @@
       "type": "array"
     },
     "allowed_routes": {
-      "description": "Passthrough routes this key may use, named by their registered names. Entries are matched as single-`*` globs, mirroring `allowed_tools`: `\"*\"` grants every route and an entry without a `*` matches one route exactly. When omitted, set to `null`, or set to an empty list, the key may use no passthrough route — access is granted explicitly.",
-      "items": {
-        "type": "string"
-      },
-      "type": [
-        "array",
-        "null"
-      ]
-    },
-    "allowed_tools": {
-      "description": "MCP tools this key may call, as namespaced `<server>__<tool>` names (the form the gateway exposes). Entries are matched as single-`*` globs, mirroring `allowed_models`: `\"*\"` grants every tool and `\"<server>__*\"` grants every tool on one server (e.g. `\"github__*\"`); an entry without a `*` matches one tool exactly. When omitted, set to `null`, or set to an empty list, the key has no MCP tool access — access is granted explicitly.",
+      "description": "Passthrough routes this key may use, named by their registered names. Entries are matched as single-`*` globs, mirroring `allowed_models`: `\"*\"` grants every route and an entry without a `*` matches one route exactly. When omitted, set to `null`, or set to an empty list, the key may use no passthrough route — access is granted explicitly.",
       "items": {
         "type": "string"
       },
@@ -269,7 +225,7 @@
           "type": "null"
         }
       ],
-      "description": "Policy-driven MCP access for this key. When present, it supersedes `allowed_tools`: the key's grant is computed from the environment's and its team's MCP access policies according to `mode` (`inherit`, `restrict`, or `deny`), and `allowed_tools` is not consulted. When omitted, the key keeps the explicit `allowed_tools` behavior — with policy `deny` patterns still subtracted, since deny applies to every key the policy covers."
+      "description": "This key's own layer of the MCP tool ACL, as namespaced `<server>__<tool>` glob patterns. It is intersected with the environment and team MCP access policies: every present layer must allow a tool and no layer may deny it. When omitted the key adds no constraint of its own — but with no layer present anywhere the grant is empty, so MCP access is always granted explicitly."
     },
     "mcp_rate_limits": {
       "additionalProperties": {

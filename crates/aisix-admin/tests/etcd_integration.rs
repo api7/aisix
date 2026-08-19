@@ -195,7 +195,7 @@ async fn apikeys_round_trip_through_real_etcd() {
         json!({
             "key_hash": key_hash,
             "allowed_models": ["it-gpt4"],
-            "allowed_tools": ["github__create_issue", "*"]
+            "mcp_access": {"allow": ["github__create_issue", "*"]}
         }),
     )
     .await;

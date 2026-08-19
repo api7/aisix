@@ -54,7 +54,7 @@ pub use guardrail::{
     PiiConfig, PiiCustomPattern, PiiDetectorConfig, PresidioConfig, PresidioEntityConfig,
 };
 pub use mcp_auth_settings::McpAuthSettings;
-pub use mcp_policy::{McpAccess, McpAccessMode, McpPolicy, McpPolicyMode, McpPolicyScope};
+pub use mcp_policy::{McpAccess, McpPolicy, McpPolicyScope};
 pub use mcp_server::{McpAuthType, McpProtocolVersion, McpServer, McpServerType, McpTransport};
 pub use model::{
     Adapter, BackgroundModelCheck, CooldownConfig, Model, DEFAULT_COOLDOWN_TRIGGER_STATUSES,

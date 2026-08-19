@@ -786,12 +786,11 @@ pub fn mcp_auth_settings_root_schema() -> Value {
 /// Canonical JSON Schema for the `mcp_policy` resource, derived from the
 /// [`McpPolicy`](crate::models::McpPolicy) struct. Uses the nullable `Option`
 /// representation (`true`) so `scope_ref` accepts an explicit `null` as
-/// well as being absent. The `scope`/`mode` closed sets come from
-/// the [`McpPolicyScope`](crate::models::McpPolicyScope) /
-/// [`McpPolicyMode`](crate::models::McpPolicyMode) enums, plus the one
+/// well as being absent. The closed `scope` set comes from the
+/// [`McpPolicyScope`](crate::models::McpPolicyScope) enum, plus the one
 /// cross-field invariant `schemars` cannot express: a `team`-scoped policy
 /// must name its team in `scope_ref` (otherwise the row could shadow the
-/// environment default).
+/// environment layer).
 pub fn mcp_policy_root_schema() -> Value {
     let mut schema = struct_root_schema::<crate::models::McpPolicy>(true);
     schema
@@ -1908,23 +1907,45 @@ mod tests {
         let v = json!({
             "key_hash":"9df37f5e7cbc3c391d872742b5f286c242e733a09add9eeaa4d26a599bd90b20",
             "allowed_models":["gpt-4o"],
-            "mcp_access": {"mode": "inherit"}
+            "mcp_access": {"allow": ["*"]}
         });
         validate_apikey(&v).unwrap();
         let v = json!({
             "key_hash":"9df37f5e7cbc3c391d872742b5f286c242e733a09add9eeaa4d26a599bd90b20",
             "allowed_models":["gpt-4o"],
-            "mcp_access": {"mode": "restrict", "allow": ["github__*"], "deny": ["github__delete_repo"]}
+            "mcp_access": {"allow": ["github__*"], "deny": ["github__delete_repo"]}
         });
         validate_apikey(&v).unwrap();
     }
 
     #[test]
-    fn apikey_mcp_access_rejects_unknown_mode() {
+    fn apikey_mcp_access_requires_an_explicit_allow_side() {
+        // A block carrying only `deny` would silently grant nothing; the
+        // schema forces the author to say what the key allows.
         let v = json!({
             "key_hash":"9df37f5e7cbc3c391d872742b5f286c242e733a09add9eeaa4d26a599bd90b20",
             "allowed_models":[],
-            "mcp_access": {"mode": "legacy"}
+            "mcp_access": {"deny": ["github__*"]}
+        });
+        assert!(validate_apikey(&v).is_err());
+    }
+
+    #[test]
+    fn apikey_mcp_access_rejects_the_removed_mode_field() {
+        let v = json!({
+            "key_hash":"9df37f5e7cbc3c391d872742b5f286c242e733a09add9eeaa4d26a599bd90b20",
+            "allowed_models":[],
+            "mcp_access": {"mode": "inherit", "allow": ["*"]}
+        });
+        assert!(validate_apikey(&v).is_err());
+    }
+
+    #[test]
+    fn apikey_rejects_the_removed_allowed_tools_field() {
+        let v = json!({
+            "key_hash":"9df37f5e7cbc3c391d872742b5f286c242e733a09add9eeaa4d26a599bd90b20",
+            "allowed_models":[],
+            "allowed_tools": ["github__*"]
         });
         assert!(validate_apikey(&v).is_err());
     }
@@ -1933,7 +1954,6 @@ mod tests {
     fn mcp_policy_env_and_team_forms_pass() {
         validate_mcp_policy(&json!({
             "scope": "env",
-            "mode": "selected",
             "allow": ["github__*"],
             "deny": ["github__delete_repo"]
         }))
@@ -1941,7 +1961,7 @@ mod tests {
         validate_mcp_policy(&json!({
             "scope": "team",
             "scope_ref": "team-uuid-1",
-            "mode": "all",
+            "allow": ["*"],
             "enabled": true
         }))
         .unwrap();
@@ -1950,21 +1970,29 @@ mod tests {
     #[test]
     fn mcp_policy_team_scope_requires_scope_ref() {
         // A team row without its team id could shadow the environment
-        // default; the cross-field guard rejects it at the schema gate.
-        assert!(validate_mcp_policy(&json!({"scope": "team", "mode": "all"})).is_err());
+        // layer; the cross-field guard rejects it at the schema gate.
+        assert!(validate_mcp_policy(&json!({"scope": "team", "allow": ["*"]})).is_err());
         assert!(
-            validate_mcp_policy(&json!({"scope": "team", "scope_ref": null, "mode": "all"}))
+            validate_mcp_policy(&json!({"scope": "team", "scope_ref": null, "allow": ["*"]}))
                 .is_err()
         );
-        // The environment default carries no scope_ref.
-        validate_mcp_policy(&json!({"scope": "env", "mode": "none"})).unwrap();
+        // The environment layer carries no scope_ref.
+        validate_mcp_policy(&json!({"scope": "env", "allow": []})).unwrap();
+    }
+
+    #[test]
+    fn mcp_policy_requires_an_explicit_allow_side() {
+        assert!(validate_mcp_policy(&json!({"scope": "env"})).is_err());
+        assert!(validate_mcp_policy(&json!({"scope": "env", "deny": ["github__*"]})).is_err());
     }
 
     #[test]
     fn mcp_policy_rejects_unknown_fields_and_values() {
-        assert!(validate_mcp_policy(&json!({"scope": "org", "mode": "all"})).is_err());
-        assert!(validate_mcp_policy(&json!({"scope": "env", "mode": "open"})).is_err());
-        assert!(validate_mcp_policy(&json!({"scope": "env", "mode": "all", "rogue": 1})).is_err());
+        assert!(validate_mcp_policy(&json!({"scope": "org", "allow": ["*"]})).is_err());
+        assert!(validate_mcp_policy(&json!({"scope": "env", "allow": ["*"], "rogue": 1})).is_err());
+        // `mode` is gone; a payload still carrying it is a write from a
+        // control plane that has not caught up.
+        assert!(validate_mcp_policy(&json!({"scope": "env", "mode": "all", "allow": ["*"]})).is_err());
     }
 
     #[test]
