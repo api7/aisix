@@ -55,14 +55,44 @@ pub enum ObsError {
     AlreadyInitialised,
 }
 
-/// Install a process-wide tracing subscriber.
-pub fn init_tracing(cfg: &ObservabilityConfig) -> Result<(), ObsError> {
-    let filter = EnvFilter::try_from_default_env()
+/// Third-party log targets pinned below WARN. Applied after the
+/// configured level and after `RUST_LOG`, so they hold for these targets
+/// either way — a `log`-crate record's level is fixed at its callsite and
+/// a subscriber can only filter it, never re-level it, so keeping these
+/// out of the log is the available form of "not a warning".
+///
+/// `lofty` is the audio-metadata reader behind the transcription duration
+/// probe (`aisix-proxy::audio`). Every real mp3 upload logs one or more
+/// parse observations at WARN — `Chunk exceeds reader size, stopping`,
+/// `MPEG: Using bitrate to estimate duration` — that describe the
+/// uploaded container, not a gateway fault, and that no operator can act
+/// on: the probe already treats an unreadable file as a zero cost basis
+/// rather than an error. Left at WARN they turn every transcription into
+/// a warning line and fail the e2e log scan (#998).
+const QUIET_TARGETS: &[&str] = &["lofty=error"];
+
+/// The subscriber's level filter: `RUST_LOG` when set, else the
+/// configured level, with [`QUIET_TARGETS`] applied on top.
+fn build_filter(cfg: &ObservabilityConfig) -> Result<EnvFilter, ObsError> {
+    let mut filter = EnvFilter::try_from_default_env()
         .or_else(|_| EnvFilter::try_new(&cfg.log_level))
         .map_err(|source| ObsError::Filter {
             directive: cfg.log_level.clone(),
             source,
         })?;
+    for directive in QUIET_TARGETS {
+        filter = filter.add_directive(
+            directive
+                .parse()
+                .expect("QUIET_TARGETS holds valid filter directives"),
+        );
+    }
+    Ok(filter)
+}
+
+/// Install a process-wide tracing subscriber.
+pub fn init_tracing(cfg: &ObservabilityConfig) -> Result<(), ObsError> {
+    let filter = build_filter(cfg)?;
 
     // Colorize only for a human at a terminal. When stderr is a pipe or a
     // file — every real deployment, where logs go to a container runtime and
@@ -93,6 +123,60 @@ pub fn init_tracing(cfg: &ObservabilityConfig) -> Result<(), ObsError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tracing_subscriber::fmt::MakeWriter;
+
+    /// Collect emitted log bytes into an in-memory buffer.
+    #[derive(Clone, Default)]
+    struct VecWriter {
+        buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+    impl std::io::Write for VecWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.buf.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> MakeWriter<'a> for VecWriter {
+        type Writer = VecWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// #998: the audio-metadata reader's parse chatter must not reach the
+    /// log as a WARN, while the gateway's own WARNs still do.
+    #[test]
+    fn quiet_targets_drop_lofty_warnings_only() {
+        let writer = VecWriter::default();
+        let cfg = ObservabilityConfig {
+            log_level: "info".into(),
+            ..Default::default()
+        };
+        let subscriber = tracing_subscriber::registry()
+            .with(build_filter(&cfg).expect("filter builds"))
+            .with(fmt::layer().with_ansi(false).with_writer(writer.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!(target: "lofty::mpeg::properties", "MPEG: Using bitrate to estimate duration");
+            tracing::error!(target: "lofty::iff::chunk", "unreadable");
+            tracing::warn!(target: "aisix_proxy::audio", "transcription failed");
+        });
+        let logged = String::from_utf8_lossy(&writer.buf.lock().unwrap()).into_owned();
+        assert!(
+            !logged.contains("Using bitrate"),
+            "lofty WARN chatter must be filtered out, got: {logged}"
+        );
+        assert!(
+            logged.contains("unreadable"),
+            "a lofty ERROR must still surface, got: {logged}"
+        );
+        assert!(
+            logged.contains("transcription failed"),
+            "the gateway's own WARNs must be unaffected, got: {logged}"
+        );
+    }
 
     #[test]
     fn already_initialised_variant_is_displayable() {
