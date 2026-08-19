@@ -12,7 +12,7 @@
 //! Only OpenAI models support this endpoint. Non-OpenAI models receive a
 //! 400 with an explanatory message.
 
-use aisix_gateway::{ChatFormat, ChatMessage, ChatResponse, FinishReason, UsageStats};
+use aisix_gateway::{ChatFormat, ChatMessage};
 use aisix_obs::{content_capture_cap, AccessLog, CapturedContent, LatencyLabels, UsageEvent};
 use axum::extract::State;
 use axum::http::{HeaderName, HeaderValue};
@@ -32,6 +32,7 @@ use crate::auth::AuthenticatedKey;
 use crate::chat::sanitize_tag;
 use crate::client_ip::ClientContext;
 use crate::error::ProxyError;
+use crate::guardrail_stream::{synth_chat_response, EosOutputScan};
 use crate::state::ProxyState;
 use crate::usage_attr::{total_tokens_with_cache, ResolvedPk};
 
@@ -1490,10 +1491,8 @@ async fn responses_to_target(
         // the only way an output-hook chain reaches this live-forward branch)
         // still gets its end-of-stream scan, so would-block / would-mask
         // observations reach telemetry. `None` without an output hook.
-        let eos_scan = aisix_guardrails::Guardrail::runs_on_output(chain).then(|| EosOutputScan {
-            chain: Arc::clone(&chain_arc),
-            upstream_model: upstream_model.clone(),
-        });
+        let eos_scan = aisix_guardrails::Guardrail::runs_on_output(chain)
+            .then(|| EosOutputScan::new(Arc::clone(&chain_arc), upstream_model.clone()));
         // Token-estimation fallback context (AISIX-Cloud#1074): the request
         // body is cloned because the closure runs at end-of-stream Drop.
         // Tokenized only if the upstream never reports usage.
@@ -2602,68 +2601,6 @@ impl<F: FnOnce(ResponseUsage, String, Vec<aisix_core::GuardrailMonitorHit>)> Dro
     }
 }
 
-/// End-of-stream output observation for the live-forward verbatim path
-/// (AISIX-Cloud#1010). Reachable only when the output-hook chain's resolved
-/// streaming policy is `EndOfStreamCheck` — today that is exactly the
-/// monitor-only chains, which can never block. Runs the same two-phase scan
-/// as the buffered branch (blob check + segment pass) so would-block /
-/// would-mask hits reach telemetry; the bytes are already on the wire, so a
-/// `Block` verdict (unreachable for monitor members) is logged, not enforced.
-struct EosOutputScan {
-    chain: Arc<aisix_guardrails::GuardrailChain>,
-    upstream_model: String,
-}
-
-impl EosOutputScan {
-    async fn observe(self, text: &str) -> Vec<aisix_core::GuardrailMonitorHit> {
-        // Bound the provider calls the same way the buffered branch's byte
-        // cap does — scan at most the cap's worth of text.
-        let mut end = text
-            .len()
-            .min(aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES);
-        while end > 0 && !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        let scan_text = &text[..end];
-        if scan_text.is_empty() {
-            return Vec::new();
-        }
-        let synth = synth_chat_response(&self.upstream_model, scan_text.to_string());
-        let (verdict, mut hits) = aisix_guardrails::Guardrail::check_output_non_segment_observed(
-            self.chain.as_ref(),
-            &synth,
-        )
-        .await;
-        // Segment pass (bedrock/lakera/presidio members): offer the flattened
-        // text as one segment so monitor-mode segment moderators record their
-        // observations too. Masks are suppressed in monitor mode, and nothing
-        // could be rewritten anyway — the counts are discarded.
-        let mut seg_counts = crate::redact::RedactionCounts::new();
-        let verdict = crate::redact::moderate_body(
-            self.chain.as_ref(),
-            crate::redact::Direction::Output,
-            verdict,
-            &mut seg_counts,
-            &mut hits,
-            |g| {
-                let _ = g.redact_output_text(scan_text);
-                crate::redact::RedactionCounts::new()
-            },
-        )
-        .await;
-        if let aisix_guardrails::GuardrailVerdict::Block { reason, .. } = verdict {
-            tracing::warn!(
-                guardrail_hook = "output",
-                model = %self.upstream_model,
-                reason = %reason,
-                "output guardrail returned a block after live forward; \
-                 response already sent (EndOfStreamCheck policy)",
-            );
-        }
-        hits
-    }
-}
-
 /// Wrap a Responses-API upstream byte stream so the terminal event's usage is
 /// parsed in-flight and `on_complete` fires once at end-of-stream (or
 /// client-disconnect) with the accumulated counts (#808) plus the captured
@@ -2899,20 +2836,6 @@ fn responses_sse_output_text(bytes: &[u8]) -> String {
         }
     }
     deltas
-}
-
-/// Build the minimal internal `ChatResponse` an output guardrail needs to
-/// scan: the assistant text in `message.content`. Only the text is read by
-/// `check_output` (via `guardrail_output_text`); the other fields are
-/// placeholders and never reach the client.
-fn synth_chat_response(model: &str, text: String) -> ChatResponse {
-    ChatResponse {
-        id: String::new(),
-        model: model.to_string(),
-        message: ChatMessage::assistant(text),
-        finish_reason: FinishReason::Stop,
-        usage: UsageStats::default(),
-    }
 }
 
 /// Copy the upstream `content-type` onto the client response and stamp the

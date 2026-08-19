@@ -42,6 +42,7 @@ mod embeddings;
 mod ensemble;
 mod error;
 mod error_translate;
+mod guardrail_stream;
 pub mod health;
 mod http_client;
 mod images;
