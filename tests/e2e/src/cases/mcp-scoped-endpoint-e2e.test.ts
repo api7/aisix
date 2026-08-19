@@ -184,7 +184,7 @@ describe("mcp scoped endpoint e2e: /mcp/{server}", () => {
     ): Record<string, unknown> => ({
       key_hash: sha256(plaintext),
       allowed_models: [],
-      allowed_tools: allowedTools,
+      mcp_access: { allow: allowedTools },
     });
     await seed.createApiKey(keyDoc(KEY_WILD, ["*"]));
     await seed.createApiKey(keyDoc(KEY_ALPHA_ECHO, ["alpha__echo"]));

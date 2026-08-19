@@ -602,8 +602,7 @@ fn resolve_env_layer_alone_governs_a_key_with_no_block() {
 fn resolve_empty_allow_list_on_any_layer_grants_nothing() {
     // The explicit "block everything" spelling, replacing the removed
     // `mode: none` / `mode: deny`.
-    let wide_env =
-        policy_snapshot(&[("p-env", serde_json::json!({"scope":"env","allow":["*"]}))]);
+    let wide_env = policy_snapshot(&[("p-env", serde_json::json!({"scope":"env","allow":["*"]}))]);
     let blocked_key = acl_key(serde_json::json!({
         "key_hash":"h","allowed_models":[],"mcp_access":{"allow":[]}
     }));

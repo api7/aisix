@@ -195,12 +195,12 @@ describe("mcp openapi e2e: REST API exposed as MCP tools", () => {
     await seed.createApiKey({
       key_hash: sha256(KEY_FULL),
       allowed_models: [],
-      allowed_tools: ["*"],
+      mcp_access: { allow: ["*"] },
     });
     await seed.createApiKey({
       key_hash: sha256(KEY_SCOPED),
       allowed_models: [],
-      allowed_tools: ["erp__getitem"],
+      mcp_access: { allow: ["erp__getitem"] },
     });
 
     // Tolerant probe (no assertions): both the key and the server must have

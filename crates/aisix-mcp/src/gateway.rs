@@ -40,9 +40,7 @@ use rmcp::transport::streamable_http_server::session::local::LocalSessionManager
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{RoleServer, ServerHandler};
 
-use aisix_core::models::{
-    ApiKey, McpPolicy, McpPolicyScope, McpServerType,
-};
+use aisix_core::models::{ApiKey, McpPolicy, McpPolicyScope, McpServerType};
 use aisix_core::{AisixSnapshot, ResourceEntry};
 
 use crate::bridge::{upstream_from_mcp_server, EphemeralBridge, McpBridge};
@@ -233,7 +231,10 @@ impl ToolAcl {
         }
 
         let mut allow: Vec<AllowLayer> = Vec::new();
-        for policy in [env_policy.as_ref(), team_policy.as_ref()].into_iter().flatten() {
+        for policy in [env_policy.as_ref(), team_policy.as_ref()]
+            .into_iter()
+            .flatten()
+        {
             allow.push(AllowLayer::from_patterns(&policy.value.allow));
         }
         if let Some(access) = &key.mcp_access {

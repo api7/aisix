@@ -159,7 +159,7 @@ describe("mcp server rate limit e2e: per api key × mcp server", () => {
     ): Record<string, unknown> => ({
       key_hash: sha256(plaintext),
       allowed_models: [],
-      allowed_tools: ["*"],
+      mcp_access: { allow: ["*"] },
       ...extra,
     });
     // Both capped keys carry the SAME alpha cap, so a shared counter would

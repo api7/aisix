@@ -166,8 +166,7 @@ mod tests {
 
     #[test]
     fn enabled_defaults_true_and_roundtrips_false() {
-        let active: McpPolicy =
-            serde_json::from_str(r#"{"scope":"env","allow":["*"]}"#).unwrap();
+        let active: McpPolicy = serde_json::from_str(r#"{"scope":"env","allow":["*"]}"#).unwrap();
         assert!(active.enabled);
 
         let disabled: McpPolicy =
@@ -179,26 +178,23 @@ mod tests {
     fn resource_trait_points_at_scope_ref_and_kind() {
         assert_eq!(McpPolicy::kind(), "mcp_policies");
 
-        let mut env: McpPolicy =
-            serde_json::from_str(r#"{"scope":"env","allow":["*"]}"#).unwrap();
+        let mut env: McpPolicy = serde_json::from_str(r#"{"scope":"env","allow":["*"]}"#).unwrap();
         env.runtime_id = "p-env".into();
         assert_eq!(env.id(), "p-env");
         assert_eq!(env.name(), "env");
 
-        let mut team: McpPolicy = serde_json::from_str(
-            r#"{"scope":"team","scope_ref":"team-uuid-1","allow":[]}"#,
-        )
-        .unwrap();
+        let mut team: McpPolicy =
+            serde_json::from_str(r#"{"scope":"team","scope_ref":"team-uuid-1","allow":[]}"#)
+                .unwrap();
         team.runtime_id = "p-team".into();
         assert_eq!(team.name(), "team-uuid-1");
     }
 
     #[test]
     fn mcp_access_deserialises_allow_and_deny() {
-        let narrow: McpAccess = serde_json::from_str(
-            r#"{"allow":["github__*"],"deny":["github__delete_repository"]}"#,
-        )
-        .unwrap();
+        let narrow: McpAccess =
+            serde_json::from_str(r#"{"allow":["github__*"],"deny":["github__delete_repository"]}"#)
+                .unwrap();
         assert_eq!(narrow.allow, vec!["github__*"]);
         assert_eq!(narrow.deny, vec!["github__delete_repository"]);
 

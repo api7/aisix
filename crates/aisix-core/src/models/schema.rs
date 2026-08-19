@@ -1992,7 +1992,9 @@ mod tests {
         assert!(validate_mcp_policy(&json!({"scope": "env", "allow": ["*"], "rogue": 1})).is_err());
         // `mode` is gone; a payload still carrying it is a write from a
         // control plane that has not caught up.
-        assert!(validate_mcp_policy(&json!({"scope": "env", "mode": "all", "allow": ["*"]})).is_err());
+        assert!(
+            validate_mcp_policy(&json!({"scope": "env", "mode": "all", "allow": ["*"]})).is_err()
+        );
     }
 
     #[test]
