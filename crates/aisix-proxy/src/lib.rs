@@ -393,12 +393,6 @@ fn inbound_protocol_for_endpoint(endpoint: &str) -> &'static str {
 
 struct InFlightGuard {
     metrics: std::sync::Arc<aisix_obs::Metrics>,
-    /// Same edges as the metric, but as one process-wide count the
-    /// shutdown coordinator can read. The gauge next to it is sliced by
-    /// endpoint and protocol and lives behind the metrics registry's
-    /// lock — the right shape for a dashboard, the wrong one for a
-    /// hot-path drain gate.
-    livez: std::sync::Arc<health::LivezState>,
     /// Bounded route template + protocol family — both `'static` by
     /// construction (`normalize_endpoint_label` /
     /// `inbound_protocol_for_endpoint`), so the guard owns no
@@ -410,18 +404,42 @@ struct InFlightGuard {
 impl InFlightGuard {
     fn new(
         metrics: std::sync::Arc<aisix_obs::Metrics>,
-        livez: std::sync::Arc<health::LivezState>,
         endpoint: &'static str,
         inbound_protocol: &'static str,
     ) -> Self {
         metrics.increment_proxy_in_flight(endpoint, inbound_protocol);
-        livez.enter();
         Self {
             metrics,
-            livez,
             endpoint,
             inbound_protocol,
         }
+    }
+}
+
+/// Holds the process-wide drain count up for one request.
+///
+/// Deliberately separate from [`InFlightGuard`]: that one feeds
+/// `aisix_proxy_in_flight_requests` and keeps its established semantics of
+/// ending when the handler returns, so the published gauge does not shift
+/// meaning. The drain gate has to span the **response body** instead — a
+/// streaming body is polled after the middleware returns, so a guard
+/// released there would read zero while SSE bytes are still flowing and
+/// let the shutdown coordinator close the listener under exactly the
+/// traffic the drain window exists to protect.
+struct DrainGuard {
+    livez: std::sync::Arc<health::LivezState>,
+}
+
+impl DrainGuard {
+    fn new(livez: std::sync::Arc<health::LivezState>) -> Self {
+        livez.enter();
+        Self { livez }
+    }
+}
+
+impl Drop for DrainGuard {
+    fn drop(&mut self) {
+        self.livez.leave();
     }
 }
 
@@ -429,7 +447,6 @@ impl Drop for InFlightGuard {
     fn drop(&mut self) {
         self.metrics
             .decrement_proxy_in_flight(self.endpoint, self.inbound_protocol);
-        self.livez.leave();
     }
 }
 
@@ -510,17 +527,32 @@ async fn record_request_telemetry(
     };
     let _in_flight = InFlightGuard::new(
         state.metrics.clone(),
-        state.livez.clone(),
         endpoint,
         inbound_protocol_for_endpoint(endpoint),
     );
-    let draining = state.livez.is_shutting_down();
+    let drain = DrainGuard::new(state.livez.clone());
     let mut response = attribution::scope(attribution, next.run(request)).await;
     guard.armed = false;
-    if draining {
+    // Sampled AFTER the handler, not before: a request that arrived just
+    // ahead of the signal and finished inside the window is riding one of
+    // the pooled connections that most needs retiring.
+    if state.livez.is_shutting_down() {
         retire_connection(&version, &mut response);
     }
-    response
+    hold_until_body_done(response, drain)
+}
+
+/// Move `drain` into the response body so the count stays raised until the
+/// body is fully written — or dropped, when the client hangs up mid-stream.
+fn hold_until_body_done(response: Response, drain: DrainGuard) -> Response {
+    use http_body_util::BodyExt;
+    let (parts, body) = response.into_parts();
+    let body = axum::body::Body::new(body.map_frame(move |frame| {
+        // The closure owns the guard; the mapped body owns the closure.
+        let _hold = &drain;
+        frame
+    }));
+    Response::from_parts(parts, body)
 }
 
 /// Ask an HTTP/1.1 client to retire this connection once the response is

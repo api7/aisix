@@ -61,6 +61,20 @@ async function readyzStatus(proxyUrl: string): Promise<number | "refused"> {
   }
 }
 
+/** Poll until `check` holds, or fail with `what`. */
+async function waitUntil(
+  check: () => boolean,
+  what: string,
+  timeoutMs = 10_000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (check()) return;
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  throw new Error(`timed out waiting for ${what}`);
+}
+
 /** Poll until `/readyz` reports the expected status, or time out. */
 async function waitReadyz(
   proxyUrl: string,
@@ -134,9 +148,12 @@ describe("graceful drain e2e: SIGTERM stops readiness, not service", () => {
 
   test(
     "keeps serving through the drain window, then exits once nothing is in flight",
-    async () => {
-      if (!etcdReachable) return;
-      const proxyUrl = app!.proxyUrl;
+    async (ctx) => {
+      if (!etcdReachable || !app) {
+        ctx.skip();
+        return;
+      }
+      const proxyUrl = app.proxyUrl;
 
       expect(await readyzStatus(proxyUrl)).toBe(200);
 
@@ -144,11 +161,16 @@ describe("graceful drain e2e: SIGTERM stops readiness, not service", () => {
       // signal. It must complete rather than be cut off, and it must
       // hold the listener open past the window.
       const inFlight = chat(proxyUrl);
-      // Let it reach the gateway before the signal lands.
-      await new Promise((r) => setTimeout(r, 300));
+      // Gate on the upstream having actually received it, so the signal
+      // below lands with the request genuinely in flight rather than after
+      // a sleep that only usually wins the race.
+      await waitUntil(
+        () => upstream!.receivedRequests.length > 0,
+        "the slow request never reached the upstream",
+      );
 
       const signalledAt = Date.now();
-      app!.signal("SIGTERM");
+      app.signal("SIGTERM");
 
       // Readiness withdraws immediately — this is what the balancer polls.
       await waitReadyz(proxyUrl, 503, 3_000);
@@ -176,9 +198,9 @@ describe("graceful drain e2e: SIGTERM stops readiness, not service", () => {
 
       // Nothing in flight now — the process closes the listener and exits
       // on its own. No SIGKILL, so the clean-shutdown path runs.
-      await app!.waitForExit(15_000);
+      await app.waitForExit(15_000);
       expect(await readyzStatus(proxyUrl)).toBe("refused");
-      expect(app!.output()).toContain("drain complete");
+      expect(app.output()).toContain("drain complete");
     },
     60_000,
   );
