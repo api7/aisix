@@ -115,8 +115,12 @@ fn accept_routing_full() {
         json!({
             "display_name": "r",
             "routing": {
-                "strategy": "weighted",
-                "targets": [{"model": "a", "weight": 3}, {"model": "b", "weight": 1}],
+                "strategy": "consistent_hash",
+                "hash_on": [{"type": "header", "name": "x-session-id"}, {"type": "api_key"}],
+                "targets": [
+                    {"model": "a", "weight": 3},
+                    {"model": "b", "weight": 1, "priority": -1}
+                ],
                 "retries": 2,
                 "max_fallbacks": 1,
                 "retry_on_429": true,

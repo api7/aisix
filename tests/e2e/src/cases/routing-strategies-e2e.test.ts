@@ -350,15 +350,38 @@ describe("routing strategies and retry behavior e2e", () => {
     expect(second.receivedRequests.length - secondBaseline).toBe(2);
   });
 
-  test("weighted picks the positive-weight target first and falls forward from there", async (ctx) => {
+  test("priority tiers: the active tier is tried first, the backup tier absorbs its failure", async (ctx) => {
     if (!etcdReachable || !app || !seed) {
       ctx.skip();
       return;
     }
 
-    const zeroWeightBefore = await startOpenAiUpstream({
+    // Active tier (priority 0) is down; first backup tier (priority -1)
+    // serves; a second backup (priority -2) exists but max_fallbacks: 1
+    // caps the walk before it — pinning both the tier order and the cap.
+    const primaryDown = await startOpenAiUpstream({
+      status: 503,
+      errorBody: { error: { message: "active tier down", type: "server_error" } },
+    });
+    const backup = await startOpenAiUpstream({
       nonStreamBody: {
-        id: "cmpl-routing-weighted-before",
+        id: "cmpl-routing-priority-backup",
+        object: "chat.completion",
+        created: Math.floor(Date.now() / 1000),
+        model: "gpt-4o-mini",
+        choices: [
+          {
+            index: 0,
+            message: { role: "assistant", content: "backup tier served" },
+            finish_reason: "stop",
+          },
+        ],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      },
+    });
+    const lastResort = await startOpenAiUpstream({
+      nonStreamBody: {
+        id: "cmpl-routing-priority-last",
         object: "chat.completion",
         created: Math.floor(Date.now() / 1000),
         model: "gpt-4o-mini",
@@ -372,41 +395,21 @@ describe("routing strategies and retry behavior e2e", () => {
         usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
       },
     });
-    const weightedPrimary = await startOpenAiUpstream({
-      status: 503,
-      errorBody: { error: { message: "weighted primary down", type: "server_error" } },
-    });
-    const forwardFallback = await startOpenAiUpstream({
-      nonStreamBody: {
-        id: "cmpl-routing-weighted-fallback",
-        object: "chat.completion",
-        created: Math.floor(Date.now() / 1000),
-        model: "gpt-4o-mini",
-        choices: [
-          {
-            index: 0,
-            message: { role: "assistant", content: "weighted fallback worked" },
-            finish_reason: "stop",
-          },
-        ],
-        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
-      },
-    });
-    upstreams.push(zeroWeightBefore, weightedPrimary, forwardFallback);
+    upstreams.push(primaryDown, backup, lastResort);
 
-    await createOpenAiModel("routing-weighted-before", zeroWeightBefore);
-    await createOpenAiModel("routing-weighted-primary", weightedPrimary);
-    await createOpenAiModel("routing-weighted-fallback", forwardFallback);
-    await waitUntilModelResponds("routing-weighted-before", "should-not-run");
-    await waitUntilModelResponds("routing-weighted-fallback", "weighted fallback worked");
+    await createOpenAiModel("routing-priority-primary", primaryDown);
+    await createOpenAiModel("routing-priority-backup", backup);
+    await createOpenAiModel("routing-priority-last", lastResort);
+    await waitUntilModelResponds("routing-priority-backup", "backup tier served");
+    await waitUntilModelResponds("routing-priority-last", "should-not-run");
     await seed.createModel({
-      display_name: "routing-weighted-virtual",
+      display_name: "routing-priority-virtual",
       routing: {
-        strategy: "weighted",
+        strategy: "failover",
         targets: [
-          { model: "routing-weighted-before", weight: 0 },
-          { model: "routing-weighted-primary", weight: 1 },
-          { model: "routing-weighted-fallback", weight: 0 },
+          { model: "routing-priority-last", priority: -2 },
+          { model: "routing-priority-primary" },
+          { model: "routing-priority-backup", priority: -1 },
         ],
         max_fallbacks: 1,
       },
@@ -418,25 +421,26 @@ describe("routing strategies and retry behavior e2e", () => {
       maxRetries: 0,
     });
 
-    // Gate on DP-snapshot presence rather than probing the
-    // virtual — probe would warm the weighted primary's 502 cooldown
-    // and skew per-target hit counts. Both direct models' readiness
-    // was already established above; this confirms the routing record
-    // has reached the DP snapshot.
-    await waitSeedApplied("routing-weighted");
+    // Gate on DP-snapshot presence rather than probing the virtual —
+    // a probe would warm the primary's cooldown and skew per-target
+    // hit counts. Both healthy models' readiness was established
+    // above; this confirms the routing record reached the DP snapshot.
+    await waitSeedApplied("routing-priority");
 
-    const beforeBaseline = zeroWeightBefore.receivedRequests.length;
-    const primaryBaseline = weightedPrimary.receivedRequests.length;
-    const fallbackBaseline = forwardFallback.receivedRequests.length;
+    const lastBaseline = lastResort.receivedRequests.length;
+    const primaryBaseline = primaryDown.receivedRequests.length;
+    const backupBaseline = backup.receivedRequests.length;
 
     const completion = await client.chat.completions.create({
-      model: "routing-weighted-virtual",
-      messages: [{ role: "user", content: "weighted routing request" }],
+      model: "routing-priority-virtual",
+      messages: [{ role: "user", content: "priority routing request" }],
     });
 
-    expect(completion.choices[0]?.message.content).toBe("weighted fallback worked");
-    expect(zeroWeightBefore.receivedRequests.length - beforeBaseline).toBe(0);
-    expect(weightedPrimary.receivedRequests.length - primaryBaseline).toBe(1);
-    expect(forwardFallback.receivedRequests.length - fallbackBaseline).toBe(1);
+    // Declaration order puts the priority -2 target FIRST — tier order
+    // must out-rank declaration order for this to pass.
+    expect(completion.choices[0]?.message.content).toBe("backup tier served");
+    expect(primaryDown.receivedRequests.length - primaryBaseline).toBe(1);
+    expect(backup.receivedRequests.length - backupBaseline).toBe(1);
+    expect(lastResort.receivedRequests.length - lastBaseline).toBe(0);
   });
 });

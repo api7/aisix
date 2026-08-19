@@ -154,10 +154,11 @@ Covered by 183 end-to-end scenario files (496 cases) that run against real gatew
 - **Anthropic Messages API** — `POST /v1/messages` as a first-class route, working against
   **any** configured upstream: requests and responses (including streaming) are translated
   both ways when a model points at a non-Anthropic provider.
-- **Routing & failover** — virtual/routing models with six strategies: `round_robin`,
-  `weighted` (with sticky/canary hashing), `failover`, plus metric-based `least_cost`,
-  `least_latency`, and `least_busy`. Retry budgets, cooldowns, tag-conditional targets,
-  and per-attempt timeouts.
+- **Routing & failover** — virtual/routing models with six strategies: `round_robin`
+  (smooth weighted round-robin), `consistent_hash` (session affinity keyed by header /
+  cookie / API key / client IP), `failover`, plus metric-based `least_cost`,
+  `least_latency`, and `least_busy`. Per-target `priority` tiers (active/backup pools),
+  retry budgets, cooldowns, tag-conditional targets, and per-attempt timeouts.
 - **Ensemble models** — fan one request out to a panel of models concurrently, then have a
   judge model synthesize a single answer, with a minimum-successful-responses threshold.
 - **Semantic routing** — one virtual model that dispatches by the *meaning* of each

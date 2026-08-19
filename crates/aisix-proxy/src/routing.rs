@@ -3,35 +3,46 @@
 //! When a request lands on a Model with `routing` configured, the proxy
 //! asks the [`RoutingRegistry`] for an iterator of underlying target
 //! Model names in attempt-order. The registry owns the per-virtual-
-//! model state (round-robin counter, weighted PRNG seed); selection
+//! model state (smooth-WRR counters, consistent-hash rings); selection
 //! itself is pure given that state.
 //!
-//! Positional strategies (spec §3.5) pick a starting target, then walk
-//! forward on failure:
-//! - **failover**: always start at `targets[0]`, walk forward on failure.
-//! - **round_robin**: each *new* request advances a per-model counter
-//!   so callers spread evenly across targets.
-//! - **weighted**: pick a starting target with probability proportional
-//!   to `weight`, then walk forward on failure (weights only affect the
-//!   *first* target choice — once we're falling back, order is positional).
+//! Targets partition into **priority tiers** first (`priority`, higher
+//! value preferred, APISIX-style — each tier gets its own balancing
+//! state, mirroring APISIX's per-priority pickers): the strategy orders
+//! targets within each tier, tiers concatenate best-first, and a lower
+//! tier is only reached after every higher-tier target failed or was
+//! filtered as unavailable.
 //!
-//! Metric-ordered strategies rank the whole target set by a runtime signal
-//! (attempted best-first, then falling forward). They can't be ordered from
-//! `pick_targets` because the ranking key lives on the resolved target
+//! Positional strategies pick a starting target per tier, then walk
+//! forward on failure:
+//! - **failover**: always start at the tier's first target, walk forward.
+//! - **round_robin**: smooth weighted round-robin over target `weight`s
+//!   (equal weights degrade to a plain cycle).
+//! - **consistent_hash**: ketama-style hashing of the request's hash key
+//!   (the `hash_on` chain) over the tier's ring; the walk follows the
+//!   ring, so a failed target's keys spread to their ring successors and
+//!   every other key keeps its mapping.
+//!
+//! Metric-ordered strategies rank targets by a runtime signal within each
+//! tier (attempted best-first, then falling forward). They can't be ordered
+//! from `pick_targets` because the ranking key lives on the resolved target
 //! Models / runtime state, so `resolve_attempt_models` ranks them instead:
 //! - **least_cost**: cheapest target first, by combined input+output per-1K
 //!   price; targets without a `cost` rank last.
 //! - **least_latency**: fastest target first, by an EWMA of observed upstream
 //!   latency; targets with no samples yet rank first (probe, then exploit).
-//! - **least_busy**: least-loaded target first, by in-flight request count.
+//! - **least_busy**: least-loaded target first, by in-flight requests
+//!   divided by target `weight` (the APISIX least_conn score).
 
 use aisix_core::{
-    AisixSnapshot, Model, Routing, RoutingStrategy, RoutingTarget, WhenAllUnavailablePolicy,
+    AisixSnapshot, HashOnType, Model, Routing, RoutingStrategy, RoutingTarget,
+    WhenAllUnavailablePolicy,
 };
 use aisix_gateway::BridgeError;
+use axum::http::HeaderMap;
 use dashmap::DashMap;
 use rand::Rng;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use crate::error::ProxyError;
@@ -441,10 +452,111 @@ where
     Err(last_err.unwrap_or_else(|| BridgeError::Config("retry loop produced no error".into())))
 }
 
+/// Balancing state is keyed per (virtual model, tier priority). Priority is
+/// part of the identity — the APISIX convention: tiers hold disjoint target
+/// sets and must not share rotation state.
+type TierKey = (String, i32);
+
+/// Smooth weighted round-robin state for one (virtual model, tier).
+struct WrrState {
+    /// Fingerprint of the (model, weight) list this state was built for. A
+    /// config change — or a different tag/IP-filtered subset — resets the
+    /// rotation rather than letting stale counters index a different list.
+    fingerprint: u64,
+    current: Vec<i64>,
+}
+
+const RING_POINTS_PER_UNIT: usize = 160;
+/// Weights are reduced (gcd, then proportional scaling) to at most this many
+/// total units before being multiplied by [`RING_POINTS_PER_UNIT`], bounding
+/// ring memory per tier regardless of the configured weight magnitudes.
+const RING_MAX_UNITS: u64 = 64;
+
+/// One tier's ketama-style consistent-hash ring. Every target owns
+/// `160 × weight-units` pseudo-random points on the u64 hash circle; a key
+/// maps to the first point at or after its own hash. Removing a target
+/// (health filtering) moves only that target's keys — each lands on its
+/// ring successor — and every other key keeps its mapping.
+struct HashRing {
+    fingerprint: u64,
+    /// (hash point, index into the tier's target list), sorted by point.
+    points: Vec<(u64, u32)>,
+}
+
+impl HashRing {
+    fn build(fingerprint: u64, targets: &[RoutingTarget]) -> Self {
+        fn gcd(mut a: u64, mut b: u64) -> u64 {
+            while b != 0 {
+                (a, b) = (b, a % b);
+            }
+            a
+        }
+        // An explicit weight of 0 still gets one unit: a target with no ring
+        // points would be silently unreachable in its tier, turning a weight
+        // typo into a dropped target.
+        let weights: Vec<u64> = targets
+            .iter()
+            .map(|t| u64::from(t.weight_or_default().max(1)))
+            .collect();
+        let g = weights.iter().fold(0, |acc, w| gcd(acc, *w)).max(1);
+        let mut units: Vec<u64> = weights.iter().map(|w| w / g).collect();
+        let sum: u64 = units.iter().sum();
+        if sum > RING_MAX_UNITS {
+            units = units
+                .iter()
+                .map(|u| ((u * RING_MAX_UNITS) / sum).max(1))
+                .collect();
+        }
+        let total_points = units.iter().sum::<u64>() as usize * RING_POINTS_PER_UNIT;
+        let mut points = Vec::with_capacity(total_points);
+        for (idx, (target, units)) in targets.iter().zip(&units).enumerate() {
+            for i in 0..(*units as usize) * RING_POINTS_PER_UNIT {
+                let mut h = fnv1a_extend(FNV_OFFSET_BASIS, target.model.as_bytes());
+                h = fnv1a_extend(h, &[0]);
+                h = fnv1a_extend(h, &(i as u32).to_le_bytes());
+                points.push((mix64(h), idx as u32));
+            }
+        }
+        points.sort_unstable();
+        Self {
+            fingerprint,
+            points,
+        }
+    }
+
+    /// The tier's targets in this key's deterministic preference order:
+    /// the key's own point first, then successive ring positions. This
+    /// doubles as the failover order within the tier.
+    fn preference_order(&self, key_hash: u64, n_targets: usize) -> Vec<u32> {
+        let mut order = Vec::with_capacity(n_targets);
+        let mut seen = vec![false; n_targets];
+        if !self.points.is_empty() {
+            let start = self.points.partition_point(|(p, _)| *p < key_hash);
+            for off in 0..self.points.len() {
+                let (_, idx) = self.points[(start + off) % self.points.len()];
+                if !seen[idx as usize] {
+                    seen[idx as usize] = true;
+                    order.push(idx);
+                    if order.len() == n_targets {
+                        return order;
+                    }
+                }
+            }
+        }
+        // Degenerate rings (no points) still yield every target.
+        for (i, present) in seen.iter().enumerate() {
+            if !present {
+                order.push(i as u32);
+            }
+        }
+        order
+    }
+}
+
 #[derive(Default)]
 pub struct RoutingRegistry {
-    // virtual model name → atomic round-robin cursor
-    cursors: DashMap<String, AtomicUsize>,
+    wrr: DashMap<TierKey, Mutex<WrrState>>,
+    rings: DashMap<TierKey, std::sync::Arc<HashRing>>,
 }
 
 impl RoutingRegistry {
@@ -453,14 +565,17 @@ impl RoutingRegistry {
     }
 
     /// Pick the target order for one request. The first element is the
-    /// initial target; subsequent elements are later fallback targets (in
-    /// declaration order, wrapping if needed). Length is bounded by the
-    /// initial target plus `routing.max_fallbacks_or_default()`.
+    /// initial target; subsequent elements are later fallback targets.
+    /// Targets partition into priority tiers (higher value first); the
+    /// strategy orders each tier independently and tiers concatenate, so a
+    /// lower tier is reached only after every higher-tier target failed or
+    /// was filtered. Length is bounded by the initial target plus
+    /// `routing.max_fallbacks_or_default()`.
     pub fn pick_targets(
         &self,
         virtual_name: &str,
         routing: &Routing,
-        stability_key: Option<&str>,
+        hash_key: &str,
     ) -> Vec<String> {
         if routing.targets.is_empty() {
             return Vec::new();
@@ -468,59 +583,143 @@ impl RoutingRegistry {
         // Metric-ordered strategies (least_cost, …) can't be ranked here:
         // the ranking key lives on the resolved target Models / runtime
         // state, which `resolve_attempt_models` has and this does not. Hand
-        // back the full declaration-order list; ranking and `max_fallbacks`
-        // truncation happen there instead.
+        // back the full declaration-order list; tier-aware ranking and
+        // `max_fallbacks` truncation happen there instead.
         if routing.strategy.is_metric_based() {
             return routing.targets.iter().map(|t| t.model.clone()).collect();
         }
-        let start = self.starting_index(virtual_name, routing, stability_key);
-        attempt_order(
-            &routing.targets,
-            start,
-            routing.max_fallbacks_or_default() + 1,
-        )
+        let mut order = Vec::with_capacity(routing.targets.len());
+        for tier in partition_by_priority(&routing.targets) {
+            let priority = tier[0].priority_or_default();
+            match routing.strategy {
+                RoutingStrategy::Failover => {
+                    order.extend(tier.iter().map(|t| t.model.clone()));
+                }
+                RoutingStrategy::RoundRobin => {
+                    let start = self.wrr_pick(virtual_name, priority, &tier);
+                    order.extend(attempt_order(&tier, start, tier.len()));
+                }
+                RoutingStrategy::ConsistentHash => {
+                    let ring = self.ring_for(virtual_name, priority, &tier);
+                    for idx in ring.preference_order(stable_hash(hash_key), tier.len()) {
+                        order.push(tier[idx as usize].model.clone());
+                    }
+                }
+                RoutingStrategy::LeastCost
+                | RoutingStrategy::LeastLatency
+                | RoutingStrategy::LeastBusy => {
+                    unreachable!("metric strategies short-circuit above")
+                }
+            }
+        }
+        order.truncate(routing.max_fallbacks_or_default() + 1);
+        order
     }
 
-    fn starting_index(
+    /// Smooth weighted round-robin (the nginx algorithm): every pick adds
+    /// each target's weight to its running counter, takes the max, and
+    /// subtracts the weight total from the winner. Proportional AND
+    /// interleaved; equal weights degrade to a declaration-order cycle.
+    fn wrr_pick(&self, virtual_name: &str, priority: i32, tier: &[RoutingTarget]) -> usize {
+        let weights: Vec<i64> = tier
+            .iter()
+            .map(|t| i64::from(t.weight_or_default().max(1)))
+            .collect();
+        let total: i64 = weights.iter().sum();
+        let fingerprint = tier_fingerprint(tier);
+        let entry = self
+            .wrr
+            .entry((virtual_name.to_string(), priority))
+            .or_insert_with(|| {
+                Mutex::new(WrrState {
+                    fingerprint,
+                    current: vec![0; weights.len()],
+                })
+            });
+        let mut state = entry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.fingerprint != fingerprint || state.current.len() != weights.len() {
+            *state = WrrState {
+                fingerprint,
+                current: vec![0; weights.len()],
+            };
+        }
+        let mut best = 0;
+        for (i, w) in weights.iter().enumerate() {
+            state.current[i] += w;
+            if state.current[i] > state.current[best] {
+                best = i;
+            }
+        }
+        state.current[best] -= total;
+        best
+    }
+
+    /// The cached ring for one (virtual model, tier), rebuilt when the
+    /// tier's (model, weight) fingerprint changes — a config edit, or a
+    /// different tag/IP-filtered subset. One entry per key: alternating
+    /// subsets rebuild rather than accumulate, keeping the map bounded by
+    /// the number of configured (group, tier) pairs.
+    fn ring_for(
         &self,
         virtual_name: &str,
-        routing: &Routing,
-        stability_key: Option<&str>,
-    ) -> usize {
-        match routing.strategy {
-            RoutingStrategy::Failover => 0,
-            RoutingStrategy::RoundRobin => self.advance_cursor(virtual_name, routing.targets.len()),
-            RoutingStrategy::Weighted => {
-                // Sticky (A/B / canary) routing makes the weighted pick
-                // deterministic in the request's stability key; otherwise each
-                // request samples the weight distribution independently.
-                let sticky_key = routing
-                    .sticky_or_default()
-                    .then_some(stability_key)
-                    .flatten();
-                weighted_pick(&routing.targets, sticky_key)
+        priority: i32,
+        tier: &[RoutingTarget],
+    ) -> std::sync::Arc<HashRing> {
+        let fingerprint = tier_fingerprint(tier);
+        let key = (virtual_name.to_string(), priority);
+        if let Some(ring) = self.rings.get(&key) {
+            if ring.fingerprint == fingerprint {
+                return ring.clone();
             }
-            // Metric-ordered strategies never reach here — `pick_targets`
-            // short-circuits them before computing a start index.
-            RoutingStrategy::LeastCost
-            | RoutingStrategy::LeastLatency
-            | RoutingStrategy::LeastBusy => 0,
         }
-    }
-
-    fn advance_cursor(&self, virtual_name: &str, modulo: usize) -> usize {
-        let entry = self.cursors.entry(virtual_name.to_string()).or_default();
-        let prev = entry.fetch_add(1, Ordering::Relaxed);
-        prev % modulo
+        let ring = std::sync::Arc::new(HashRing::build(fingerprint, tier));
+        self.rings.insert(key, ring.clone());
+        ring
     }
 }
 
 impl std::fmt::Debug for RoutingRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RoutingRegistry")
-            .field("virtual_models_seen", &self.cursors.len())
+            .field("wrr_tiers", &self.wrr.len())
+            .field("rings", &self.rings.len())
             .finish()
     }
+}
+
+/// Split targets into priority tiers, highest priority first, declaration
+/// order preserved within each tier. Every target defaults to priority 0,
+/// so an unconfigured group is a single tier and this is a no-op shape.
+fn partition_by_priority(targets: &[RoutingTarget]) -> Vec<Vec<RoutingTarget>> {
+    let mut priorities: Vec<i32> = targets.iter().map(|t| t.priority_or_default()).collect();
+    priorities.sort_unstable_by(|a, b| b.cmp(a));
+    priorities.dedup();
+    priorities
+        .into_iter()
+        .map(|p| {
+            targets
+                .iter()
+                .filter(|t| t.priority_or_default() == p)
+                .cloned()
+                .collect()
+        })
+        .collect()
+}
+
+/// Fingerprint of a tier's identity for balancing-state reuse: the ordered
+/// (model, weight) pairs. Priorities are already part of the state key and
+/// tags do not affect selection within a surviving subset.
+fn tier_fingerprint(tier: &[RoutingTarget]) -> u64 {
+    let mut h = FNV_OFFSET_BASIS;
+    for t in tier {
+        h = fnv1a_extend(h, t.model.as_bytes());
+        h = fnv1a_extend(h, &[0]);
+        h = fnv1a_extend(h, &t.weight_or_default().to_le_bytes());
+        h = fnv1a_extend(h, &[1]);
+    }
+    h
 }
 
 /// Narrow a routing model's targets to those eligible for this request's
@@ -572,59 +771,95 @@ fn attempt_order(targets: &[RoutingTarget], start_idx: usize, limit: usize) -> V
     order
 }
 
-/// Pick an index by weighted-random. Ignores zero weights; a fully-zero
-/// list falls back to index 0 deterministically.
-///
-/// Per #197: each call must draw an INDEPENDENT sample from the weight
-/// distribution. The prior implementation used
-/// `SystemTime::now().subsec_nanos() + Instant::now().elapsed().as_nanos()`
-/// as entropy, which has two correctness bugs that compound:
-///   1. `Instant::now().elapsed()` always returns ~0 (the Instant was
-///      just created), so the mix is effectively just subsec_nanos.
-///   2. Under rapid-fire requests (e2e fires N=100 in tight loop),
-///      consecutive subsec_nanos values differ by a near-constant
-///      step (≈1 µs of wall-clock per request). Modular reduction
-///      `entropy() % total_weight` against that step pattern aliases
-///      to a single bin — every request lands on the same target.
-///      Empirical observation: 200/0 split on a configured 70/30.
-///
-/// Use `rand::thread_rng()` instead. The thread-local PRNG is seeded
-/// from OS entropy on first use and is independent across calls; the
-/// distribution converges to the configured weights over a finite
-/// sample (per the spec the e2e pins).
-///
-/// With a `sticky_key` (A/B / canary routing) the pick is instead a
-/// deterministic function of that key, so the same key always resolves to the
-/// same target while the aggregate split still honors the weights.
-fn weighted_pick(targets: &[RoutingTarget], sticky_key: Option<&str>) -> usize {
-    let total: u64 = targets.iter().map(|t| t.weight_or_default() as u64).sum();
-    if total == 0 {
-        return 0;
-    }
-    let pick = match sticky_key {
-        Some(key) => stable_hash(key) % total,
-        None => rand::thread_rng().gen_range(0..total),
-    };
-    let mut acc: u64 = 0;
-    for (i, t) in targets.iter().enumerate() {
-        acc += t.weight_or_default() as u64;
-        if pick < acc {
-            return i;
-        }
-    }
-    targets.len() - 1
-}
+const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
-/// Stable 64-bit FNV-1a hash used to map a sticky-routing key into the weight
-/// distribution. Deterministic across processes and toolchains by design (the
-/// std hasher is not), so a given key always resolves to the same target.
-fn stable_hash(s: &str) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a offset basis
-    for b in s.as_bytes() {
-        h ^= *b as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3); // FNV-1a prime
+/// Fold `bytes` into a running 64-bit FNV-1a hash. Deterministic across
+/// processes, replicas, and toolchains by design (the std hasher is not) —
+/// every consistent-hash artifact (ring points, key hashes, fingerprints)
+/// must agree everywhere, and MUST NOT change across DP versions: changing
+/// this function remaps every session's target.
+fn fnv1a_extend(mut h: u64, bytes: &[u8]) -> u64 {
+    for b in bytes {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(FNV_PRIME);
     }
     h
+}
+
+/// The splitmix64 finalizer. FNV-1a alone has weak avalanche on short,
+/// structured inputs — ring points hashed from `name\0index` cluster into
+/// narrow bands, handing one target most of the circle (observed: 32
+/// distinct keys all mapping to one of two equal-weight targets). Ketama
+/// implementations use MD5/CRC32 for exactly this reason; a strong final
+/// mix restores uniform dispersion while keeping the pipeline dependency-
+/// free and deterministic. Same stability contract as `fnv1a_extend`.
+fn mix64(mut x: u64) -> u64 {
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^= x >> 31;
+    x
+}
+
+/// Stable, well-dispersed 64-bit hash of a consistent-hash key.
+fn stable_hash(s: &str) -> u64 {
+    mix64(fnv1a_extend(FNV_OFFSET_BASIS, s.as_bytes()))
+}
+
+/// Resolve the `consistent_hash` key for one request by walking the
+/// routing model's `hash_on` chain (default: the `x-aisix-routing-key`
+/// header, then the caller's API key id). The first source yielding a
+/// non-empty value wins; when nothing yields, the empty string keeps the
+/// pick deterministic rather than random.
+fn resolve_hash_key(routing: &Routing, req: &RoutingRequest<'_>) -> String {
+    for source in routing.hash_on_or_default() {
+        let value = match source.source_type {
+            HashOnType::Header => source.name.as_deref().and_then(|name| {
+                req.headers
+                    .and_then(|h| h.get(name))
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+            }),
+            HashOnType::Cookie => source
+                .name
+                .as_deref()
+                .and_then(|name| req.headers.and_then(|h| cookie_value(h, name))),
+            HashOnType::ApiKey => Some(req.api_key_id.trim())
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned),
+            HashOnType::ClientIp => Some(req.source_ip.trim())
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned),
+        };
+        if let Some(value) = value {
+            return value;
+        }
+    }
+    String::new()
+}
+
+/// Extract a cookie's value from the request's `Cookie` header(s):
+/// `name=value` pairs separated by `;`, first match wins. Values are taken
+/// verbatim (no unquoting) — the key only needs to be stable, not parsed.
+fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    for header in headers.get_all(axum::http::header::COOKIE) {
+        let Ok(raw) = header.to_str() else { continue };
+        for pair in raw.split(';') {
+            let mut it = pair.splitn(2, '=');
+            let key = it.next().unwrap_or("").trim();
+            if key == name {
+                let value = it.next().unwrap_or("").trim();
+                if !value.is_empty() {
+                    return Some(value.to_owned());
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Combined per-1K unit price used to rank `least_cost` targets. A target
@@ -666,18 +901,30 @@ fn order_attempts_by_metric(
             });
         }
         RoutingStrategy::LeastBusy => {
-            attempts.sort_by_key(|a| runtime_status.in_flight(&a.id));
+            // The APISIX least_conn score: in-flight scaled by 1/weight, so a
+            // heavier target absorbs proportionally more concurrency. `+1`
+            // keeps idle targets ranked by weight instead of tying at 0.
+            let score = |a: &AttemptModel| {
+                (runtime_status.in_flight(&a.id) as f64 + 1.0) / f64::from(a.weight.max(1))
+            };
+            attempts.sort_by(|a, b| score(a).total_cmp(&score(b)));
         }
-        RoutingStrategy::Failover | RoutingStrategy::RoundRobin | RoutingStrategy::Weighted => {}
+        RoutingStrategy::Failover
+        | RoutingStrategy::RoundRobin
+        | RoutingStrategy::ConsistentHash => {}
     }
 }
 
 /// One concrete (non-routing) Model the dispatch loop will attempt, paired
-/// with its snapshot id so health/cooldown tracking can key on it.
+/// with its snapshot id so health/cooldown tracking can key on it, and the
+/// routing-target attributes selection still needs after resolution
+/// (priority for tier-aware metric ranking, weight for `least_busy`).
 #[derive(Clone)]
 pub(crate) struct AttemptModel {
     pub id: String,
     pub model: Model,
+    pub priority: i32,
+    pub weight: u32,
 }
 
 /// Outcome of routing-candidate filtering. Lifts the "all candidates
@@ -757,11 +1004,11 @@ pub(crate) fn filter_attempt_models(
 }
 
 /// Per-request routing inputs threaded into [`resolve_attempt_models`]: the
-/// tags that gate tag/metadata routing, the stability key for sticky
-/// (A/B / canary) weighted selection, and the caller's resolved source IP
-/// for the per-target client-IP allowlist. Tags come from request headers;
-/// the stability key is the routing-key header when present, otherwise the
-/// caller's API key id.
+/// tags that gate tag/metadata routing, the raw material for the
+/// `consistent_hash` hash key (the inbound headers plus the caller's API key
+/// id — the configured `hash_on` chain is evaluated against them at
+/// resolution time), and the caller's resolved source IP, used both for the
+/// per-target client-IP allowlist and as the `client_ip` hash source.
 ///
 /// `source_ip` defaults to the empty string, which
 /// [`aisix_core::Model::ip_allowed`] treats as "not in range" — so a caller
@@ -770,7 +1017,8 @@ pub(crate) fn filter_attempt_models(
 #[derive(Clone, Copy, Default)]
 pub(crate) struct RoutingRequest<'a> {
     pub tags: &'a [String],
-    pub stability_key: Option<&'a str>,
+    pub headers: Option<&'a HeaderMap>,
+    pub api_key_id: &'a str,
     pub source_ip: &'a str,
 }
 
@@ -821,6 +1069,8 @@ pub(crate) fn resolve_attempt_models(
         return Ok(vec![AttemptModel {
             id: virtual_id.to_string(),
             model: virtual_model.clone(),
+            priority: 0,
+            weight: 1,
         }]);
     };
 
@@ -853,7 +1103,12 @@ pub(crate) fn resolve_attempt_models(
     };
     let routing = &filtered_routing;
 
-    let names = routing_registry.pick_targets(virtual_name, routing, req.stability_key);
+    let hash_key = if routing.strategy == RoutingStrategy::ConsistentHash {
+        resolve_hash_key(routing, &req)
+    } else {
+        String::new()
+    };
+    let names = routing_registry.pick_targets(virtual_name, routing, &hash_key);
     if names.is_empty() {
         return Err(ProxyError::InvalidRequest(
             "routing model has no targets".into(),
@@ -866,16 +1121,28 @@ pub(crate) fn resolve_attempt_models(
                 "routing target {name:?} does not resolve to a Model"
             ))
         })?;
+        // Duplicate target models are rejected at the write path, so the
+        // first match is the only match.
+        let target = routing
+            .targets
+            .iter()
+            .find(|t| t.model == *name)
+            .expect("picked name comes from routing.targets");
         resolved.push(AttemptModel {
             id: target_entry.id.clone(),
             model: target_entry.value.clone(),
+            priority: target.priority_or_default(),
+            weight: target.weight_or_default(),
         });
     }
     // Metric-ordered strategies get the full target set from `pick_targets`;
     // rank it best-first here (target Models are now resolved) and cap it to
-    // the same attempt budget the positional strategies apply upstream.
+    // the same attempt budget the positional strategies apply upstream. The
+    // metric sort runs first, then a stable sort on priority — so tiers
+    // concatenate highest-first with the metric order preserved inside each.
     if routing.strategy.is_metric_based() {
         order_attempts_by_metric(routing.strategy, &mut resolved, runtime_status);
+        resolved.sort_by_key(|a| std::cmp::Reverse(a.priority));
         resolved.truncate(routing.max_fallbacks_or_default() + 1);
     }
     match filter_attempt_models(
@@ -913,7 +1180,7 @@ mod tests {
             retry_on_429: None,
             fallback_on_statuses: None,
             when_all_unavailable: None,
-            sticky: None,
+            hash_on: None,
         }
     }
 
@@ -932,59 +1199,96 @@ mod tests {
     }
 
     #[test]
-    fn sticky_weighted_pick_is_deterministic_per_key() {
+    fn chash_preference_order_is_deterministic_per_key() {
         let targets = vec![
             RoutingTarget::new("a").with_weight(50),
             RoutingTarget::new("b").with_weight(50),
         ];
-        let first = weighted_pick(&targets, Some("session-1"));
+        let ring = HashRing::build(tier_fingerprint(&targets), &targets);
+        let first = ring.preference_order(stable_hash("session-1"), targets.len());
+        assert_eq!(first.len(), 2);
         for _ in 0..50 {
-            assert_eq!(weighted_pick(&targets, Some("session-1")), first);
+            assert_eq!(
+                ring.preference_order(stable_hash("session-1"), targets.len()),
+                first
+            );
         }
     }
 
     #[test]
-    fn sticky_weighted_pick_spreads_distinct_keys() {
+    fn chash_spreads_distinct_keys() {
         // Distinct keys shouldn't all funnel to one target.
         let targets = vec![
             RoutingTarget::new("a").with_weight(50),
             RoutingTarget::new("b").with_weight(50),
         ];
+        let ring = HashRing::build(tier_fingerprint(&targets), &targets);
         let mut seen = [false; 2];
         for i in 0..200 {
-            seen[weighted_pick(&targets, Some(&format!("k{i}")))] = true;
+            seen[ring.preference_order(stable_hash(&format!("k{i}")), 2)[0] as usize] = true;
         }
         assert!(seen[0] && seen[1]);
     }
 
     #[test]
-    fn sticky_weighted_pick_honors_extreme_weights() {
-        // A 100/0 canary split lands every key on the weighted target.
+    fn chash_weight_scales_a_targets_share_of_keys() {
         let targets = vec![
-            RoutingTarget::new("stable").with_weight(100),
-            RoutingTarget::new("canary").with_weight(0),
+            RoutingTarget::new("heavy").with_weight(90),
+            RoutingTarget::new("light").with_weight(10),
         ];
-        for i in 0..50 {
-            assert_eq!(weighted_pick(&targets, Some(&format!("k{i}"))), 0);
+        let ring = HashRing::build(tier_fingerprint(&targets), &targets);
+        let mut heavy = 0;
+        for i in 0..1000 {
+            if ring.preference_order(stable_hash(&format!("k{i}")), 2)[0] == 0 {
+                heavy += 1;
+            }
+        }
+        // 90/10 configured; allow generous slack for hash variance.
+        assert!(
+            (800..=980).contains(&heavy),
+            "expected ~900/1000 keys on the heavy target, got {heavy}"
+        );
+    }
+
+    #[test]
+    fn chash_removing_a_target_only_moves_its_own_keys() {
+        // The consistent-hash property the whole feature hangs on: dropping
+        // one target must not remap keys whose first choice survives.
+        let full = vec![
+            RoutingTarget::new("a"),
+            RoutingTarget::new("b"),
+            RoutingTarget::new("c"),
+        ];
+        let ring = HashRing::build(tier_fingerprint(&full), &full);
+        let shrunk: Vec<RoutingTarget> = vec![full[0].clone(), full[2].clone()]; // drop "b"
+        let shrunk_ring = HashRing::build(tier_fingerprint(&shrunk), &shrunk);
+        for i in 0..500 {
+            let h = stable_hash(&format!("k{i}"));
+            let before = full[ring.preference_order(h, 3)[0] as usize].model.clone();
+            let after = shrunk[shrunk_ring.preference_order(h, 2)[0] as usize]
+                .model
+                .clone();
+            if before != "b" {
+                assert_eq!(before, after, "key k{i} moved although its target survived");
+            }
         }
     }
 
     #[test]
-    fn sticky_routing_pins_a_key_to_one_target() {
+    fn chash_pick_targets_pins_a_key_and_walks_the_ring() {
         let reg = RoutingRegistry::new();
-        let mut routing = r(
-            RoutingStrategy::Weighted,
+        let routing = r(
+            RoutingStrategy::ConsistentHash,
             vec![
                 RoutingTarget::new("stable").with_weight(90),
                 RoutingTarget::new("canary").with_weight(10),
             ],
-            Some(0), // only the chosen start target
+            None,
         );
-        routing.sticky = Some(true);
-        let first = reg.pick_targets("v", &routing, Some("user-42"));
-        assert_eq!(first.len(), 1);
+        let first = reg.pick_targets("v", &routing, "user-42");
+        assert_eq!(first.len(), 2, "walk covers the whole tier");
         for _ in 0..20 {
-            assert_eq!(reg.pick_targets("v", &routing, Some("user-42")), first);
+            assert_eq!(reg.pick_targets("v", &routing, "user-42"), first);
         }
     }
 
@@ -1136,7 +1440,7 @@ mod tests {
             None,
         );
         for _ in 0..5 {
-            let order = reg.pick_targets("v", &routing, None);
+            let order = reg.pick_targets("v", &routing, "");
             assert_eq!(order, vec!["primary", "secondary", "tertiary"]);
         }
     }
@@ -1155,7 +1459,7 @@ mod tests {
         );
         let mut firsts = Vec::new();
         for _ in 0..6 {
-            let order = reg.pick_targets("v", &routing, None);
+            let order = reg.pick_targets("v", &routing, "");
             firsts.push(order[0].clone());
         }
         // Two full cycles of a→b→c.
@@ -1171,10 +1475,10 @@ mod tests {
             Some(1),
         );
         // Two distinct virtual models advance independently.
-        assert_eq!(reg.pick_targets("v1", &routing, None)[0], "a");
-        assert_eq!(reg.pick_targets("v2", &routing, None)[0], "a");
-        assert_eq!(reg.pick_targets("v1", &routing, None)[0], "b");
-        assert_eq!(reg.pick_targets("v2", &routing, None)[0], "b");
+        assert_eq!(reg.pick_targets("v1", &routing, "")[0], "a");
+        assert_eq!(reg.pick_targets("v2", &routing, "")[0], "a");
+        assert_eq!(reg.pick_targets("v1", &routing, "")[0], "b");
+        assert_eq!(reg.pick_targets("v2", &routing, "")[0], "b");
     }
 
     #[test]
@@ -1190,178 +1494,200 @@ mod tests {
             Some(2),
         );
         // First call starts at a → a, b, c
-        assert_eq!(reg.pick_targets("v", &routing, None), vec!["a", "b", "c"]);
+        assert_eq!(reg.pick_targets("v", &routing, ""), vec!["a", "b", "c"]);
         // Second call starts at b → b, c, a
-        assert_eq!(reg.pick_targets("v", &routing, None), vec!["b", "c", "a"]);
+        assert_eq!(reg.pick_targets("v", &routing, ""), vec!["b", "c", "a"]);
     }
 
     #[test]
-    fn weighted_picks_from_targets_and_falls_back_in_order() {
+    fn wrr_first_pick_prefers_the_heavier_weight_and_walks_forward() {
         let reg = RoutingRegistry::new();
         let routing = r(
-            RoutingStrategy::Weighted,
+            RoutingStrategy::RoundRobin,
             vec![
                 RoutingTarget::new("a").with_weight(99),
                 RoutingTarget::new("b").with_weight(1),
             ],
             Some(1),
         );
-        // We just assert correctness of the *order* shape:
-        // exactly two attempts, distinct targets, both targets covered.
-        // (Aggregate distribution is pinned by the dedicated tests
-        // below.)
-        let order = reg.pick_targets("v", &routing, None);
-        assert_eq!(order.len(), 2);
-        assert!(order.iter().any(|t| t == "a"));
-        assert!(order.iter().any(|t| t == "b"));
+        // Smooth WRR is deterministic: the first pick is the heavy target,
+        // the walk continues in declaration order.
+        assert_eq!(reg.pick_targets("v", &routing, ""), vec!["a", "b"]);
     }
 
     #[test]
-    fn weighted_with_all_zero_weights_picks_index_zero_deterministically() {
-        let targets = vec![
-            RoutingTarget::new("a").with_weight(0),
-            RoutingTarget::new("b").with_weight(0),
-        ];
-        assert_eq!(weighted_pick(&targets, None), 0);
-    }
-
-    /// Aggregate-distribution property: across many trials, a 100/1
-    /// weight bias must converge to ~99% on the heavy target. Pre-#197
-    /// the threshold sat at ≥ 60% to absorb the weak nanos-clock entropy
-    /// — that gate would also pass a weight-half-sensitivity regression
-    /// (~75% would slip through). With proper PRNG entropy in
-    /// `weighted_pick`, the empirical bin should land within ~1% of
-    /// the analytic 100/(100+1) = 99.0% expectation; we assert ≥ 95%
-    /// (≈4σ band for n=5000, rejects half-sensitivity AND weight-blind).
-    #[test]
-    fn weighted_pick_aggregate_distribution_favors_heavier_weight() {
-        let targets = vec![
-            RoutingTarget::new("a").with_weight(100),
-            RoutingTarget::new("b").with_weight(1),
-        ];
-        let n = 5_000;
-        let a_count = (0..n)
-            .filter(|_| weighted_pick(&targets, None) == 0)
-            .count();
-        // Uniform 50/50 → ~2500. Weighted 100/1 → ~4950 in theory.
-        // 95% threshold (4750) rejects both a weight-blind impl
-        // (~50%) AND a half-sensitivity regression (~75% would also
-        // fail). With proper PRNG entropy this gate has ~5σ margin;
-        // CI-flake risk is negligible.
-        assert!(
-            a_count * 100 / n >= 95,
-            "weight=100 target should dominate aggregate picks; got {a_count}/{n}",
+    fn wrr_distribution_matches_weights_exactly() {
+        // Smooth WRR is exact, not stochastic: over one full cycle of
+        // total-weight picks, each target is chosen exactly `weight` times.
+        let reg = RoutingRegistry::new();
+        let routing = r(
+            RoutingStrategy::RoundRobin,
+            vec![
+                RoutingTarget::new("a").with_weight(70),
+                RoutingTarget::new("b").with_weight(30),
+            ],
+            Some(0),
         );
-    }
-
-    /// Companion to the above: that test passes both for a correctly
-    /// weighted impl AND for an "always pick index 0" regression (since
-    /// the heavy weight is at index 0). Swap the weights so the heavy
-    /// target sits at index 1 — a weight-blind impl that always picks
-    /// the first target would now fail this test, while a correct
-    /// weighted impl still favors index 1.
-    #[test]
-    fn weighted_pick_aggregate_distribution_respects_index_swap() {
-        let targets = vec![
-            RoutingTarget::new("a").with_weight(1),
-            RoutingTarget::new("b").with_weight(100),
-        ];
-        let n = 5_000;
-        let b_count = (0..n)
-            .filter(|_| weighted_pick(&targets, None) == 1)
-            .count();
-        assert!(
-            b_count * 100 / n >= 95,
-            "weight=100 target at index 1 should dominate aggregate picks; got {b_count}/{n}",
-        );
-    }
-
-    /// Issue #197 regression: a 70/30 weighted split must land near
-    /// 70/30 over a finite sample. The pre-fix nanos-clock entropy
-    /// collapsed to a single bin under rapid-fire calls (observed
-    /// 200/0 in e2e on a configured 70/30); a proper PRNG converges
-    /// to the analytic distribution.
-    ///
-    /// Tolerance: n=1000 with p=0.7 has σ=√(np(1-p))=√210≈14.49. A ±50
-    /// absolute window is ~3.45σ → P(false positive) ≈ 0.056%. The
-    /// pre-fix collapse-to-one-bin failure produces 1000/0 which is
-    /// ~33σ outside the window — caught with overwhelming margin.
-    #[test]
-    fn weighted_pick_70_30_split_converges_to_configured_ratio() {
-        let targets = vec![
-            RoutingTarget::new("a").with_weight(70),
-            RoutingTarget::new("b").with_weight(30),
-        ];
-        let n = 1_000;
-        let a_count = (0..n)
-            .filter(|_| weighted_pick(&targets, None) == 0)
-            .count();
-        // Expected ~700; tolerance window [650, 750] (≈±3.45σ).
-        assert!(
-            (650..=750).contains(&a_count),
-            "70/30 weighted split must land near 700/1000; got {a_count}/{n} on heavy target",
-        );
-    }
-
-    /// 3-target coverage: a weight-blind impl that only ever picks
-    /// `targets[0]` if `pick < sum/n` (and `targets[1]` otherwise)
-    /// would pass every 2-target test in this module but fail with
-    /// 3+ targets — the third bin would starve. Pin a 50/30/20 split
-    /// and assert each bin lands within a generous tolerance window.
-    ///
-    /// n=2000 chosen so the smallest bin (20% → ~400) has σ ≈ 17.9;
-    /// ±100 window ≈ 5.6σ for that bin, larger margins for the other
-    /// two.
-    #[test]
-    fn weighted_pick_50_30_20_split_distributes_to_all_three_bins() {
-        let targets = vec![
-            RoutingTarget::new("a").with_weight(50),
-            RoutingTarget::new("b").with_weight(30),
-            RoutingTarget::new("c").with_weight(20),
-        ];
-        let n = 2_000;
-        let mut counts = [0_usize; 3];
-        for _ in 0..n {
-            counts[weighted_pick(&targets, None)] += 1;
+        let mut counts = [0usize; 2];
+        for _ in 0..100 {
+            match reg.pick_targets("v", &routing, "")[0].as_str() {
+                "a" => counts[0] += 1,
+                _ => counts[1] += 1,
+            }
         }
-        // Expected 1000/600/400. ±100 window catches a weight-blind
-        // 2-target collapse (where the 3rd bin would be 0) AND
-        // sample noise.
-        assert!(
-            (900..=1100).contains(&counts[0]),
-            "50%-weighted bin should land near 1000/2000; got {counts:?}",
+        assert_eq!(counts, [70, 30]);
+    }
+
+    #[test]
+    fn wrr_interleaves_rather_than_bursting() {
+        // The nginx smooth-WRR property: 2/1 yields a,b,a per cycle, not
+        // a,a,b — heavier targets spread across the cycle.
+        let reg = RoutingRegistry::new();
+        let routing = r(
+            RoutingStrategy::RoundRobin,
+            vec![
+                RoutingTarget::new("a").with_weight(2),
+                RoutingTarget::new("b").with_weight(1),
+            ],
+            Some(0),
         );
-        assert!(
-            (500..=700).contains(&counts[1]),
-            "30%-weighted bin should land near 600/2000; got {counts:?}",
+        let picks: Vec<String> = (0..6)
+            .map(|_| reg.pick_targets("v", &routing, "").remove(0))
+            .collect();
+        assert_eq!(picks, vec!["a", "b", "a", "a", "b", "a"]);
+    }
+
+    #[test]
+    fn wrr_zero_weights_clamp_to_one() {
+        // weight: 0 clamps to 1 (the write path forbids 0; clamping keeps a
+        // hand-written 0 reachable instead of silently dropping the target).
+        let reg = RoutingRegistry::new();
+        let routing = r(
+            RoutingStrategy::RoundRobin,
+            vec![
+                RoutingTarget::new("a").with_weight(0),
+                RoutingTarget::new("b").with_weight(0),
+            ],
+            Some(0),
         );
-        assert!(
-            (300..=500).contains(&counts[2]),
-            "20%-weighted bin should land near 400/2000; got {counts:?}",
+        let picks: Vec<String> = (0..4)
+            .map(|_| reg.pick_targets("v", &routing, "").remove(0))
+            .collect();
+        assert_eq!(picks, vec!["a", "b", "a", "b"]);
+    }
+
+    #[test]
+    fn wrr_state_resets_when_the_tier_config_changes() {
+        let reg = RoutingRegistry::new();
+        let before = r(
+            RoutingStrategy::RoundRobin,
+            vec![RoutingTarget::new("a"), RoutingTarget::new("b")],
+            Some(0),
+        );
+        assert_eq!(reg.pick_targets("v", &before, "")[0], "a");
+        assert_eq!(reg.pick_targets("v", &before, "")[0], "b");
+        // New target list → fingerprint mismatch → rotation restarts.
+        let after = r(
+            RoutingStrategy::RoundRobin,
+            vec![RoutingTarget::new("x"), RoutingTarget::new("y")],
+            Some(0),
+        );
+        assert_eq!(reg.pick_targets("v", &after, "")[0], "x");
+    }
+
+    #[test]
+    fn priority_tiers_concatenate_highest_first() {
+        // The A/B two-pool shape from AISIX-Cloud#1206: priority 0 is the
+        // active pool, priority -1 the backup; the walk exhausts the whole
+        // active tier before any backup target.
+        let reg = RoutingRegistry::new();
+        let routing = r(
+            RoutingStrategy::Failover,
+            vec![
+                RoutingTarget::new("b1").with_priority(-1),
+                RoutingTarget::new("a1"),
+                RoutingTarget::new("a2"),
+                RoutingTarget::new("b2").with_priority(-1),
+            ],
+            None,
+        );
+        assert_eq!(
+            reg.pick_targets("v", &routing, ""),
+            vec!["a1", "a2", "b1", "b2"]
         );
     }
 
-    /// Zero-weight-in-the-middle: a weight=0 target between two
-    /// non-zero targets must NEVER be picked. The CDF predicate
-    /// `pick < acc` (strict less-than) is what enforces this — a
-    /// weight-0 segment doesn't widen `acc` so the predicate skips
-    /// past it. A regression that used `<=` would incidentally pick
-    /// the zero-weight bin on the boundary value of `pick`.
     #[test]
-    fn weighted_pick_zero_weight_target_in_middle_is_never_picked() {
-        let targets = vec![
-            RoutingTarget::new("a").with_weight(10),
-            RoutingTarget::new("b").with_weight(0),
-            RoutingTarget::new("c").with_weight(10),
-        ];
-        let n = 2_000;
-        let b_count = (0..n)
-            .filter(|_| weighted_pick(&targets, None) == 1)
-            .count();
-        assert_eq!(
-            b_count, 0,
-            "weight=0 target must never be picked; got {b_count}/{n}",
+    fn priority_tiers_run_the_strategy_per_tier() {
+        // Each tier owns its own WRR rotation (the APISIX per-priority
+        // picker rule): the backup tier's order is its own strategy pick,
+        // not a continuation of the active tier's.
+        let reg = RoutingRegistry::new();
+        let routing = r(
+            RoutingStrategy::RoundRobin,
+            vec![
+                RoutingTarget::new("a1"),
+                RoutingTarget::new("a2"),
+                RoutingTarget::new("b1").with_priority(-1),
+                RoutingTarget::new("b2").with_priority(-1),
+            ],
+            None,
         );
+        assert_eq!(
+            reg.pick_targets("v", &routing, ""),
+            vec!["a1", "a2", "b1", "b2"]
+        );
+        // Second call: both tiers advanced their own rotation.
+        assert_eq!(
+            reg.pick_targets("v", &routing, ""),
+            vec!["a2", "a1", "b2", "b1"]
+        );
+    }
+
+    #[test]
+    fn priority_tiers_chash_hashes_within_each_tier() {
+        let reg = RoutingRegistry::new();
+        let routing = r(
+            RoutingStrategy::ConsistentHash,
+            vec![
+                RoutingTarget::new("a1"),
+                RoutingTarget::new("a2"),
+                RoutingTarget::new("a3"),
+                RoutingTarget::new("b1").with_priority(-1),
+                RoutingTarget::new("b2").with_priority(-1),
+            ],
+            None,
+        );
+        let order = reg.pick_targets("v", &routing, "session-7");
+        assert_eq!(order.len(), 5);
+        // Every active-tier target precedes every backup target.
+        let a_positions: Vec<usize> = order
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.starts_with('a'))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(a_positions, vec![0, 1, 2]);
+        // Deterministic per key.
+        assert_eq!(reg.pick_targets("v", &routing, "session-7"), order);
+        // A different key may start elsewhere but keeps the tier boundary.
+        let other = reg.pick_targets("v", &routing, "session-8");
+        assert!(other[..3].iter().all(|t| t.starts_with('a')));
+    }
+
+    #[test]
+    fn max_fallbacks_caps_across_tiers() {
+        let reg = RoutingRegistry::new();
+        let routing = r(
+            RoutingStrategy::Failover,
+            vec![
+                RoutingTarget::new("a1"),
+                RoutingTarget::new("a2"),
+                RoutingTarget::new("b1").with_priority(-1),
+            ],
+            Some(1),
+        );
+        assert_eq!(reg.pick_targets("v", &routing, ""), vec!["a1", "a2"]);
     }
 
     #[test]
@@ -1372,7 +1698,7 @@ mod tests {
             vec![RoutingTarget::new("a"), RoutingTarget::new("b")],
             Some(0),
         );
-        let order = reg.pick_targets("v", &routing, None);
+        let order = reg.pick_targets("v", &routing, "");
         assert_eq!(order, vec!["a"]);
     }
 
@@ -1380,7 +1706,7 @@ mod tests {
     fn empty_targets_yields_empty_order() {
         let reg = RoutingRegistry::new();
         let routing = r(RoutingStrategy::Failover, vec![], None);
-        assert!(reg.pick_targets("v", &routing, None).is_empty());
+        assert!(reg.pick_targets("v", &routing, "").is_empty());
     }
 
     #[test]
@@ -1921,6 +2247,8 @@ mod tests {
         AttemptModel {
             id: id.to_string(),
             model,
+            priority: 0,
+            weight: 1,
         }
     }
 
@@ -1939,6 +2267,8 @@ mod tests {
         AttemptModel {
             id: id.to_string(),
             model,
+            priority: 0,
+            weight: 1,
         }
     }
 
@@ -2067,7 +2397,7 @@ mod tests {
         );
         // Ranking needs resolved Models, so pick_targets hands back every
         // target untouched regardless of max_fallbacks.
-        assert_eq!(reg.pick_targets("v", &routing, None), vec!["a", "b", "c"]);
+        assert_eq!(reg.pick_targets("v", &routing, ""), vec!["a", "b", "c"]);
     }
 
     #[test]
