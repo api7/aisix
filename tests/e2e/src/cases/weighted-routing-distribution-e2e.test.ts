@@ -11,35 +11,24 @@ import {
   type SpawnedApp,
 } from "../harness/index.js";
 
-// E2E: weighted routing distribution. A virtual Model carries a
-// Routing block with `strategy: "weighted"` and two targets — `wr-a`
-// (weight 70) and `wr-b` (weight 30). Per docs `api-admin.md` §4.1
-// (direct vs routing two-mode split) and the routing schema enum
-// `["round_robin", "weighted", "failover"]`, the gateway is expected
-// to dispatch incoming traffic in a 70:30 ratio across the two
-// targets.
+// E2E: weighted round-robin distribution. A virtual Model carries a
+// Routing block with `strategy: "round_robin"` and two targets — `wr-a`
+// (weight 70) and `wr-b` (weight 30). round_robin is smooth WEIGHTED
+// round-robin (the nginx algorithm; AISIX-Cloud#1206 merged the former
+// `weighted` strategy into it), so the gateway must dispatch traffic in
+// an exact 70:30 ratio across the two targets.
 //
 // One contract pinned here:
 //
-//   - Weighted strategy honours the integer `weight` field per
-//     target. After N requests the observed split lands inside a
-//     statistically reasonable tolerance window around the declared
-//     ratio. A regression that ignored `weight` and round-robined
-//     instead would fail (each side would land ~50%, well outside
-//     [55, 85] / [15, 45]).
+//   - round_robin honours the integer `weight` field per target, and is
+//     deterministic: smooth WRR is periodic with period = total weight
+//     (100 here), and ANY window of one full period contains each
+//     target exactly `weight` times — so 100 sequential requests land
+//     at exactly 70/30 regardless of how many warm-up probes ran
+//     before the counted batch.
 //
 // Reference: OpenAI Chat Completions API spec for the shape the
 // caller sees (https://platform.openai.com/docs/api-reference/chat).
-//
-// The 100-request count and the [55, 85] / [15, 45] tolerance are
-// chosen so a scheduler that completely ignores weight (e.g.
-// round-robins or pins to one target) cannot pass — round-robin
-// lands at 50/50, well outside [55, 85] for the heavy side — while
-// the legitimate 70/30 path stays comfortably inside. Two
-// independent binomial windows: 70±15 over n=100 with σ≈4.58 puts
-// the gate at ~3.3σ, P(false positive) ≈ 0.1%. The previous ±10
-// gate sat at ~2.2σ (≈2.8%) and tripped roughly once per ~36 CI
-// runs — wide enough to be a steady CI flake.
 
 const CALLER_PLAINTEXT = "sk-wr-e2e-caller";
 const CALLER_KEY_HASH = createHash("sha256")
@@ -49,14 +38,8 @@ const CALLER_KEY_HASH = createHash("sha256")
 const TOTAL_REQUESTS = 100;
 const HEAVY_WEIGHT = 70;
 const LIGHT_WEIGHT = 30;
-// Tolerance: weight ±15 absolute on a 100-sample window. See header
-// comment for the statistical-power tradeoff vs the previous ±10.
-const HEAVY_LO = 55;
-const HEAVY_HI = 85;
-const LIGHT_LO = 15;
-const LIGHT_HI = 45;
 
-describe("weighted routing distribution e2e: 70/30 split lands inside [55,85] / [15,45]", () => {
+describe("weighted round-robin distribution e2e: 70/30 split is exact over one WRR period", () => {
   let app: SpawnedApp | undefined;
   let upstreamA: OpenAiUpstream | undefined;
   let upstreamB: OpenAiUpstream | undefined;
@@ -129,13 +112,12 @@ describe("weighted routing distribution e2e: 70/30 split lands inside [55,85] / 
       model_name: "gpt-4o-mini",
       provider_key_id: pkB.id,
     });
-    // Virtual Model: routing-only, weighted strategy. Per the schema
-    // enum the gateway publishes (round_robin / weighted / failover),
-    // `weighted` should honour each target's `weight` integer.
+    // Virtual Model: routing-only, weighted round-robin. round_robin
+    // honours each target's `weight` integer exactly (smooth WRR).
     await seed.createModel({
       display_name: "wr-virtual",
       routing: {
-        strategy: "weighted",
+        strategy: "round_robin",
         targets: [
           { model: "wr-a", weight: HEAVY_WEIGHT },
           { model: "wr-b", weight: LIGHT_WEIGHT },
@@ -143,7 +125,7 @@ describe("weighted routing distribution e2e: 70/30 split lands inside [55,85] / 
       },
     });
     // Caller is allowed all three Models so the readiness probes can
-    // hit the leaves directly without firing the weighted dispatcher.
+    // hit the leaves directly without firing the WRR dispatcher.
     await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["wr-virtual", "wr-a", "wr-b"],
@@ -171,7 +153,7 @@ describe("weighted routing distribution e2e: 70/30 split lands inside [55,85] / 
     // Two-stage readiness gate: probe each leaf Model directly so
     // both ProviderKey registrations are observed by the proxy
     // before we exercise the virtual router. Probing through
-    // `wr-virtual` here would fire the weighted dispatcher and
+    // `wr-virtual` here would fire the WRR dispatcher and
     // pollute the count baseline.
     await waitConfigPropagation(async () => {
       try {
@@ -195,10 +177,9 @@ describe("weighted routing distribution e2e: 70/30 split lands inside [55,85] / 
         return false;
       }
     });
-    // One probe through the virtual Model so the weighted
-    // dispatcher's lazy state (if any — schedulers often build the
-    // weight wheel on first dispatch) is constructed before we start
-    // counting.
+    // One probe through the virtual Model so the WRR dispatcher's
+    // lazy state is constructed before we start counting. Periodicity
+    // makes the exact assertion below offset-independent.
     await waitConfigPropagation(async () => {
       try {
         const probe = await client.chat.completions.create({
@@ -237,13 +218,13 @@ describe("weighted routing distribution e2e: 70/30 split lands inside [55,85] / 
     // upstreams could still appear "balanced" by ratio.
     expect(aDelta + bDelta).toBe(TOTAL_REQUESTS);
 
-    // Distribution assertion: heavy side ~70, light side ~30, both
-    // inside ±15. A round-robin regression (50/50) fails both gates;
-    // a pin-to-one regression (100/0) fails both gates.
-    expect(aDelta).toBeGreaterThanOrEqual(HEAVY_LO);
-    expect(aDelta).toBeLessThanOrEqual(HEAVY_HI);
-    expect(bDelta).toBeGreaterThanOrEqual(LIGHT_LO);
-    expect(bDelta).toBeLessThanOrEqual(LIGHT_HI);
+    // Distribution assertion: smooth WRR is exact over one full period
+    // (total weight = 100 = TOTAL_REQUESTS), at any starting offset. An
+    // equal-rotation regression lands 50/50; a pin-to-one regression
+    // lands 100/0; a random-sampling regression flakes around 70 — all
+    // fail an exact gate.
+    expect(aDelta).toBe(HEAVY_WEIGHT);
+    expect(bDelta).toBe(LIGHT_WEIGHT);
     // Per-test timeout lifted to 90s. The default suite timeout
     // (60s, vitest.config.ts) is tight for 100 sequential round-trips
     // when upstream latency drifts above ~50ms/call; 90s leaves

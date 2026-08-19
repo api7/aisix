@@ -2234,12 +2234,16 @@ fn add_variant_titles(doc: &mut Value) {
             "/components/schemas/RoutingStrategy/oneOf",
             &[
                 "Round robin",
-                "Weighted",
+                "Consistent hash",
                 "Failover",
                 "Least cost",
                 "Least latency",
                 "Least busy",
             ],
+        ),
+        (
+            "/components/schemas/HashOnType/oneOf",
+            &["Header", "Cookie", "API key", "Client IP"],
         ),
         (
             "/components/schemas/SlsContentMode/oneOf",

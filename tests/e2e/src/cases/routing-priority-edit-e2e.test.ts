@@ -11,24 +11,25 @@ import {
   type SpawnedApp,
 } from "../harness/index.js";
 
-// E2E: a LIVE edit to a weighted routing model's weights re-takes
+// E2E: a LIVE edit to a routing model's target priorities re-takes
 // effect on the dispatch path (#196 L1, ai-gateway #127 L1).
 //
 // The sibling weighted-routing-distribution-e2e pins that the INITIAL
 // weights are honored. The gap this closes: after the model is live
-// and serving, an operator rewrites the weights on the stored model, and
-// the change must propagate through the etcd watch and the weighted
-// scheduler must REBUILD — a scheduler that cached its weight wheel on
-// first dispatch and never rebuilt on config update would keep serving
-// the old split, silently ignoring the operator's change.
+// and serving, an operator rewrites the target priorities on the stored
+// model, and the change must propagate through the etcd watch and the
+// scheduler must REBUILD — a scheduler that cached its tier partition
+// (or WRR wheel) on first dispatch and never rebuilt on config update
+// would keep serving the old layout, silently ignoring the operator's
+// change.
 //
-// Design is deterministic (no statistics): weight 0 = excluded (see
-// routing-strategies-e2e "weighted picks the positive-weight target").
-//   - Start [wr-edit-a: 100, wr-edit-b: 0]  → every dispatch hits A.
-//   - Edit to [wr-edit-a: 0, wr-edit-b: 100] → every dispatch hits B.
+// Design is deterministic (no statistics): the active tier takes ALL
+// traffic while it is healthy, the backup tier none (AISIX-Cloud#1206).
+//   - Start [wr-edit-a: priority 0, wr-edit-b: priority -1] → all A.
+//   - Edit to [wr-edit-a: priority -1, wr-edit-b: priority 0] → all B.
 // The propagation signal is unambiguous: a probe through the virtual
-// model returning "served by B" is IMPOSSIBLE under the old [100,0]
-// config, so it proves the edit is live before we count.
+// model returning "served by B" is IMPOSSIBLE under the old layout, so
+// it proves the edit is live before we count.
 //
 // Reference: OpenAI Chat Completions shape the caller sees
 // (https://platform.openai.com/docs/api-reference/chat).
@@ -53,7 +54,7 @@ function upstreamBody(content: string, id: string): Record<string, unknown> {
   };
 }
 
-describe("weighted routing live-edit: changing weights shifts real traffic (#196 L1)", () => {
+describe("routing live-edit: swapping target priorities shifts real traffic (#196 L1)", () => {
   let app: SpawnedApp | undefined;
   let upstreamA: OpenAiUpstream | undefined;
   let upstreamB: OpenAiUpstream | undefined;
@@ -98,15 +99,15 @@ describe("weighted routing live-edit: changing weights shifts real traffic (#196
       model_name: "gpt-4o-mini",
       provider_key_id: pkB.id,
     });
-    // Virtual model: weighted, ALL traffic to A initially (B excluded
-    // via weight 0). Capture the generated id so we can PUT it below.
+    // Virtual model: round_robin with B parked in a backup tier — ALL
+    // traffic to A initially. Capture the generated id for the PUT below.
     const virtual = await seed.createModel({
       display_name: "wr-edit-virtual",
       routing: {
-        strategy: "weighted",
+        strategy: "round_robin",
         targets: [
-          { model: "wr-edit-a", weight: 100 },
-          { model: "wr-edit-b", weight: 0 },
+          { model: "wr-edit-a" },
+          { model: "wr-edit-b", priority: -1 },
         ],
       },
     });
@@ -124,7 +125,7 @@ describe("weighted routing live-edit: changing weights shifts real traffic (#196
     await upstreamB?.close();
   });
 
-  test("editing weights [100,0] → [0,100] flips the served upstream", async (ctx) => {
+  test("swapping tier priorities flips the served upstream", async (ctx) => {
     if (!etcdReachable || !app || !upstreamA || !upstreamB || !seed || !virtualId) {
       ctx.skip();
       return;
@@ -149,7 +150,7 @@ describe("weighted routing live-edit: changing weights shifts real traffic (#196
     };
 
     // Readiness: both leaves registered, then the virtual model serving
-    // A under the initial [100,0] weights.
+    // A under the initial tier layout (A active, B backup).
     await waitConfigPropagation(async () => {
       try {
         const a = await client.chat.completions.create({
@@ -174,7 +175,7 @@ describe("weighted routing live-edit: changing weights shifts real traffic (#196
     });
     await waitConfigPropagation(async () => (await callVirtual("ready-virtual")) === "served by A");
 
-    // --- Phase 1: under [100,0], every dispatch must hit A. ---
+    // --- Phase 1: A is the active tier — every dispatch must hit A. ---
     const aBase1 = upstreamA.receivedRequests.length;
     const bBase1 = upstreamB.receivedRequests.length;
     for (let i = 0; i < BATCH; i++) {
@@ -183,25 +184,26 @@ describe("weighted routing live-edit: changing weights shifts real traffic (#196
     expect(upstreamA.receivedRequests.length - aBase1).toBe(BATCH);
     expect(upstreamB.receivedRequests.length - bBase1).toBe(0);
 
-    // --- Edit: invert the weights to [0,100] by rewriting the document. ---
+    // --- Edit: swap the tiers by rewriting the document. ---
     await seed.update("models", virtualId, {
       display_name: "wr-edit-virtual",
       routing: {
-        strategy: "weighted",
+        strategy: "round_robin",
         targets: [
-          { model: "wr-edit-a", weight: 0 },
-          { model: "wr-edit-b", weight: 100 },
+          { model: "wr-edit-a", priority: -1 },
+          { model: "wr-edit-b" },
         ],
       },
     });
 
     // Propagation signal: a virtual dispatch returning "served by B" is
-    // impossible under the old [100,0] config, so it proves the edit is
-    // live + the scheduler rebuilt. If the scheduler never rebuilds on a
-    // config edit (the regression this test targets), this times out.
+    // impossible under the old tier layout (B was backup behind a healthy
+    // A), so it proves the edit is live + the scheduler rebuilt. If the
+    // scheduler never rebuilds on a config edit (the regression this test
+    // targets), this times out.
     await waitConfigPropagation(async () => (await callVirtual("post-edit-probe")) === "served by B");
 
-    // --- Phase 2: under [0,100], every dispatch must hit B. ---
+    // --- Phase 2: after the swap B is the active tier — every dispatch must hit B. ---
     const aBase2 = upstreamA.receivedRequests.length;
     const bBase2 = upstreamB.receivedRequests.length;
     for (let i = 0; i < BATCH; i++) {

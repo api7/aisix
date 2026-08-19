@@ -76,7 +76,10 @@ pub use provider_key::{
 };
 pub use rate_limit::{McpRateLimit, RateLimit};
 pub use rate_limit_policy::{PolicyScope, PolicyWindow, RateLimitPolicy};
-pub use routing::{Routing, RoutingStrategy, RoutingTarget, WhenAllUnavailablePolicy};
+pub use routing::{
+    default_hash_on, HashOnSource, HashOnType, Routing, RoutingStrategy, RoutingTarget,
+    WhenAllUnavailablePolicy,
+};
 pub use schema::{
     validate_a2a_agent, validate_a2a_agent_lenient, validate_apikey, validate_apikey_lenient,
     validate_cache_policy, validate_cache_policy_lenient, validate_claim_mapping,

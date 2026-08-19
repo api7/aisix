@@ -1010,7 +1010,7 @@ mod tests {
         for (model, expect) in [
             (None, false),
             (Some(model_json(Some("round_robin"), false)), false),
-            (Some(model_json(Some("weighted"), false)), false),
+            (Some(model_json(Some("consistent_hash"), false)), false),
             (Some(model_json(Some("failover"), false)), false),
             // least_cost ranks by static configured cost, not runtime
             // bookkeeping — it must NOT activate the write paths.

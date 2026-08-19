@@ -1366,12 +1366,8 @@ async fn dispatch(
                 &virtual_entry.value,
                 RoutingRequest {
                     tags: &client.routing_tags,
-                    stability_key: Some(
-                        client
-                            .routing_key
-                            .as_deref()
-                            .unwrap_or(auth.entry.id.as_str()),
-                    ),
+                    headers: Some(&client.headers),
+                    api_key_id: auth.entry.id.as_str(),
                     source_ip: &client.source_ip,
                 },
             )
