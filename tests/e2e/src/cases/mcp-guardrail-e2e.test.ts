@@ -151,7 +151,7 @@ describe("mcp guardrails e2e: /mcp", () => {
     await seed.createApiKey({
       key_hash: sha256(KEY),
       allowed_models: [],
-      allowed_tools: ["*"],
+      mcp_access: { allow: ["*"] },
     });
     const proxy = new ProxyClient(app.proxyUrl, KEY);
     await waitConfigPropagation(async () => (await proxy.listModels()).status === 200);

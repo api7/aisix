@@ -77,23 +77,12 @@ pub struct ApiKey {
     #[schemars(length(min = 1))]
     pub jwt_provider: Option<String>,
 
-    /// MCP tools this key may call, as namespaced `<server>__<tool>` names
-    /// (the form the gateway exposes). Entries are matched as single-`*`
-    /// globs, mirroring `allowed_models`: `"*"` grants every tool and
-    /// `"<server>__*"` grants every tool on one server (e.g. `"github__*"`);
-    /// an entry without a `*` matches one tool exactly. When omitted, set to
-    /// `null`, or set to an empty list, the key has no MCP tool access —
-    /// access is granted explicitly.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub allowed_tools: Option<Vec<String>>,
-
-    /// Policy-driven MCP access for this key. When present, it supersedes
-    /// `allowed_tools`: the key's grant is computed from the environment's
-    /// and its team's MCP access policies according to `mode` (`inherit`,
-    /// `restrict`, or `deny`), and `allowed_tools` is not consulted. When
-    /// omitted, the key keeps the explicit `allowed_tools` behavior — with
-    /// policy `deny` patterns still subtracted, since deny applies to every
-    /// key the policy covers.
+    /// This key's own layer of the MCP tool ACL, as namespaced
+    /// `<server>__<tool>` glob patterns. It is intersected with the
+    /// environment and team MCP access policies: every present layer must
+    /// allow a tool and no layer may deny it. When omitted the key adds no
+    /// constraint of its own — but with no layer present anywhere the grant
+    /// is empty, so MCP access is always granted explicitly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_access: Option<McpAccess>,
 
@@ -108,7 +97,7 @@ pub struct ApiKey {
     pub mcp_rate_limits: Option<BTreeMap<String, McpRateLimit>>,
 
     /// A2A agents this key may reach, named by their registered names. Entries
-    /// are matched as single-`*` globs, mirroring `allowed_tools`: `"*"` grants
+    /// are matched as single-`*` globs, mirroring `allowed_models`: `"*"` grants
     /// every agent and an entry without a `*` matches one agent exactly. When
     /// omitted, set to `null`, or set to an empty list, the key has no A2A
     /// agent access — access is granted explicitly.
@@ -116,7 +105,7 @@ pub struct ApiKey {
     pub allowed_agents: Option<Vec<String>>,
 
     /// Passthrough routes this key may use, named by their registered names.
-    /// Entries are matched as single-`*` globs, mirroring `allowed_tools`:
+    /// Entries are matched as single-`*` globs, mirroring `allowed_models`:
     /// `"*"` grants every route and an entry without a `*` matches one route
     /// exactly. When omitted, set to `null`, or set to an empty list, the key
     /// may use no passthrough route — access is granted explicitly.
@@ -174,30 +163,6 @@ impl ApiKey {
             .any(|n| crate::wildcard::wildcard_matches(n, model_name))
     }
 
-    /// True if this key may call the given MCP tool, named in the gateway's
-    /// namespaced `<server>__<tool>` form.
-    ///
-    /// Entries are matched as single-`*` globs, so `"*"` grants every tool and
-    /// `"<server>__*"` grants every tool on that server (e.g. `"github__*"`
-    /// permits `github__create_issue`); entries without a `*` match exactly.
-    /// A key with no `allowed_tools` (or an empty list) may call no MCP tools —
-    /// access is granted explicitly, matching [`ApiKey::can_access`].
-    ///
-    /// This mirrors only the legacy allow side (a key without an `mcp_access`
-    /// block and ignoring policy `deny` overlays). Currently exercised only by
-    /// tests: the live MCP enforcement path builds an `aisix_mcp::ToolAcl`
-    /// resolved against the key **and** the environment/team MCP policies,
-    /// using the identical matcher; this method is kept in lockstep as the
-    /// documented mirror of its legacy component.
-    pub fn can_access_tool(&self, tool: &str) -> bool {
-        match &self.allowed_tools {
-            None => false,
-            Some(allowed) => allowed
-                .iter()
-                .any(|t| crate::wildcard::wildcard_matches(t, tool)),
-        }
-    }
-
     /// The limits this key carries for one MCP server, named as it is
     /// registered (the `<server>` namespace of a `<server>__<tool>` call).
     /// `None` when the key sets no limit for that server.
@@ -208,7 +173,7 @@ impl ApiKey {
     /// True if this key may reach the given A2A agent, named by its registered
     /// name.
     ///
-    /// Semantics mirror [`ApiKey::can_access_tool`]: entries are single-`*`
+    /// Semantics mirror [`ApiKey::can_access`]: entries are single-`*`
     /// globs, so `"*"` grants every agent; entries without a `*` match exactly.
     /// A key with no `allowed_agents` (or an empty list) may reach no A2A agent
     /// — access is granted explicitly.
@@ -321,7 +286,6 @@ mod tests {
             user_name: None,
             jwt_subject: None,
             jwt_provider: None,
-            allowed_tools: None,
             mcp_access: None,
             allowed_routes: None,
             mcp_rate_limits: None,
@@ -335,87 +299,27 @@ mod tests {
     }
 
     #[test]
-    fn can_access_tool_enforces_namespaced_allowlist() {
-        // No `allowed_tools` configured → no MCP tool access.
-        let none: ApiKey =
-            serde_json::from_str(r#"{"key_hash":"h","allowed_models":["*"]}"#).unwrap();
-        assert!(!none.can_access_tool("github__create_issue"));
-
-        // Explicit null has the same no-access behavior as omission.
-        let null: ApiKey =
-            serde_json::from_str(r#"{"key_hash":"h","allowed_models":["*"],"allowed_tools":null}"#)
-                .unwrap();
-        assert!(!null.can_access_tool("github__create_issue"));
-
-        // Empty list also denies everything.
-        let empty: ApiKey =
-            serde_json::from_str(r#"{"key_hash":"h","allowed_models":[],"allowed_tools":[]}"#)
-                .unwrap();
-        assert!(!empty.can_access_tool("github__create_issue"));
-
-        // Exact namespaced names.
-        let specific: ApiKey = serde_json::from_str(
-            r#"{"key_hash":"h","allowed_models":[],"allowed_tools":["github__create_issue"]}"#,
-        )
-        .unwrap();
-        assert!(specific.can_access_tool("github__create_issue"));
-        assert!(!specific.can_access_tool("github__delete_repo"));
-
-        // Wildcard grants every tool.
-        let wildcard: ApiKey =
-            serde_json::from_str(r#"{"key_hash":"h","allowed_models":[],"allowed_tools":["*"]}"#)
-                .unwrap();
-        assert!(wildcard.can_access_tool("anything__at_all"));
-
-        // Per-server wildcard grants every tool on that server only.
-        let per_server: ApiKey = serde_json::from_str(
-            r#"{"key_hash":"h","allowed_models":[],"allowed_tools":["github__*"]}"#,
-        )
-        .unwrap();
-        assert!(per_server.can_access_tool("github__create_issue"));
-        assert!(per_server.can_access_tool("github__delete_repo"));
-        // It must not leak across the server boundary: a different server,
-        // and a server whose name merely shares the prefix, are both denied.
-        assert!(!per_server.can_access_tool("slack__post_message"));
-        assert!(!per_server.can_access_tool("githubenterprise__create_issue"));
-
-        // The glob is a single `*` anywhere, not only trailing (same as
-        // `allowed_models`): `"*__readonly"` is a genuine any-server grant of
-        // a same-named tool. Pinned so the breadth stays intentional.
-        let any_server: ApiKey = serde_json::from_str(
-            r#"{"key_hash":"h","allowed_models":[],"allowed_tools":["*__readonly"]}"#,
-        )
-        .unwrap();
-        assert!(any_server.can_access_tool("github__readonly"));
-        assert!(any_server.can_access_tool("slack__readonly"));
-        // The suffix still anchors — a longer tool name doesn't match.
-        assert!(!any_server.can_access_tool("github__readonly_admin"));
-    }
-
-    #[test]
     fn mcp_access_block_roundtrips_and_defaults_absent() {
-        // Every pre-existing key payload lacks `mcp_access`; it must load
-        // as None so the legacy allowed_tools behavior keeps applying.
-        let legacy = sample();
-        assert!(legacy.mcp_access.is_none());
-        let v = serde_json::to_value(&legacy).unwrap();
+        // A key with no block of its own adds no layer to the ACL.
+        let unconstrained = sample();
+        assert!(unconstrained.mcp_access.is_none());
+        let v = serde_json::to_value(&unconstrained).unwrap();
         assert!(v.get("mcp_access").is_none());
 
         let k: ApiKey = serde_json::from_str(
             r#"{
               "key_hash": "h",
               "allowed_models": [],
-              "mcp_access": {"mode": "restrict", "allow": ["github__*"], "deny": ["github__delete_repo"]}
+              "mcp_access": {"allow": ["github__*"], "deny": ["github__delete_repo"]}
             }"#,
         )
         .unwrap();
         let access = k.mcp_access.as_ref().unwrap();
-        assert_eq!(access.mode, crate::models::McpAccessMode::Restrict);
         assert_eq!(access.allow, vec!["github__*"]);
         assert_eq!(access.deny, vec!["github__delete_repo"]);
         // Round-trip preserves the block.
         let v = serde_json::to_value(&k).unwrap();
-        assert_eq!(v["mcp_access"]["mode"], "restrict");
+        assert_eq!(v["mcp_access"]["allow"], serde_json::json!(["github__*"]));
     }
 
     #[test]
@@ -424,13 +328,10 @@ mod tests {
         // out; serde must accept them (the write path still rejects them
         // via `validate_apikey` in models/schema.rs).
         let k: ApiKey = serde_json::from_str(
-            r#"{"key_hash":"h","allowed_models":[],"mcp_access":{"mode":"inherit","widen":["*"]}}"#,
+            r#"{"key_hash":"h","allowed_models":[],"mcp_access":{"allow":["*"],"widen":["*"]}}"#,
         )
         .unwrap();
-        assert_eq!(
-            k.mcp_access.unwrap().mode,
-            crate::models::McpAccessMode::Inherit
-        );
+        assert_eq!(k.mcp_access.unwrap().allow, vec!["*"]);
     }
 
     #[test]

@@ -171,12 +171,12 @@ describe("mcp anonymous access e2e", () => {
     const principal = await seed.createApiKey({
       key_hash: sha256(ANON_PRINCIPAL_SECRET),
       allowed_models: [],
-      allowed_tools: ["*"],
+      mcp_access: { allow: ["*"] },
     });
     await seed.createApiKey({
       key_hash: sha256(KEY_WILD),
       allowed_models: [],
-      allowed_tools: ["*"],
+      mcp_access: { allow: ["*"] },
     });
 
     await seed.update("mcp_auth_settings", settingsId, {
