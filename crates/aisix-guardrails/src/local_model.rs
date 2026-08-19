@@ -95,7 +95,10 @@ use ort::session::Session;
 use ort::value::Tensor;
 use regex::Regex;
 
-use crate::{Guardrail, GuardrailVerdict, SegmentsOutcome};
+use crate::{
+    Guardrail, GuardrailVerdict, SegmentsOutcome, StreamOutputPolicy,
+    DEFAULT_STREAM_OUTPUT_BUFFER_BYTES,
+};
 
 /// Environment variable holding the model directory (`model.onnx` +
 /// `tokenizer.json`). Set → the server bootstrap loads and injects the
@@ -178,13 +181,17 @@ pub struct LocalModelConfig {
 
 impl LocalModelConfig {
     /// `None` when [`MODEL_DIR_ENV`] is unset (guardrail disabled). A
-    /// malformed threshold falls back to the default rather than
-    /// failing boot — the gate is a tuning knob, not a correctness one.
+    /// malformed or out-of-range threshold falls back to the default
+    /// rather than failing boot — the gate is a tuning knob, not a
+    /// correctness one. The range check matters: `"NaN"` parses as a
+    /// valid f32 and would make `score >= threshold` always false — a
+    /// configured-looking guardrail that silently never masks.
     pub fn from_env() -> Option<Self> {
         let model_dir = PathBuf::from(std::env::var_os(MODEL_DIR_ENV)?);
         let threshold = std::env::var(THRESHOLD_ENV)
             .ok()
             .and_then(|s| s.parse::<f32>().ok())
+            .filter(|t| t.is_finite() && (0.0..=1.0).contains(t))
             .unwrap_or(DEFAULT_THRESHOLD);
         Some(Self {
             model_dir,
@@ -204,9 +211,18 @@ struct Embedder {
 impl Embedder {
     fn load(dir: &std::path::Path) -> Result<Self, LocalModelError> {
         let tokenizer_path = dir.join("tokenizer.json");
-        let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path).map_err(|e| {
+        let mut tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path).map_err(|e| {
             LocalModelError::Tokenizer(format!("{}: {e}", tokenizer_path.display()))
         })?;
+        // Enforce truncation here instead of trusting the operator's
+        // tokenizer.json (the reference export allows 32K tokens): a
+        // window is ~100 chars by construction, so 512 tokens
+        // (`TruncationParams` default) is pure headroom — this is the
+        // second bound, after the candidate-span byte cap, that keeps a
+        // single inference's cost fixed no matter what the caller sends.
+        tokenizer
+            .with_truncation(Some(tokenizers::TruncationParams::default()))
+            .map_err(|e| LocalModelError::Tokenizer(format!("truncation config: {e}")))?;
         let model_path = dir.join("model.onnx");
         // One intra-op thread and NO spin-wait: the guardrail must not
         // tax a gateway that isn't sending it traffic (see module doc).
@@ -245,7 +261,15 @@ impl Embedder {
         let len = ids.len() as i64;
 
         let started = Instant::now();
-        let mut session = self.session.lock().expect("embedder session poisoned");
+        // A panic in a previous run poisons the mutex; recover instead of
+        // panicking forever after — `Session::run` is stateless, so the
+        // session itself is unharmed, and turning every later inference
+        // into a panic would silently disable the operator's masking
+        // until restart (the exact state load treats as boot-fatal).
+        let mut session = self
+            .session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let outputs = session.run(ort::inputs! {
             "input_ids" => Tensor::from_array((vec![1, len], ids))?,
             "attention_mask" => Tensor::from_array((vec![1, len], mask))?,
@@ -287,20 +311,36 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
 
-/// Candidate spans (byte ranges) in `text`, in order.
+/// Hard byte cap on a single candidate span. A real version number is
+/// short by definition; without this cap `\d+(?:\.\d+)+` matches an
+/// arbitrarily long `1.1.1...` run as ONE span, and since the window is
+/// span + context, a crafted request would turn each model call into a
+/// max-truncation inference and stall the single lane for everyone
+/// (audit finding on PR #999). Over-cap spans are dropped BEFORE the
+/// per-pass budget so they cannot starve legitimate candidates either.
+const MAX_CANDIDATE_SPAN_BYTES: usize = 64;
+
+/// Candidate spans (byte ranges) in `text`, in order. Spans longer than
+/// [`MAX_CANDIDATE_SPAN_BYTES`] are not candidates (see the constant).
 fn candidate_spans(re: &Regex, text: &str) -> Vec<Range<usize>> {
-    re.find_iter(text).map(|m| m.range()).collect()
+    re.find_iter(text)
+        .map(|m| m.range())
+        .filter(|s| s.len() <= MAX_CANDIDATE_SPAN_BYTES)
+        .collect()
 }
 
 /// The context window around `span`: `ctx` chars on each side, snapped
 /// to char boundaries, clamped to the text.
 fn window_bounds(text: &str, span: &Range<usize>, ctx: usize) -> Range<usize> {
+    if ctx == 0 {
+        return span.clone();
+    }
     let before = &text[..span.start];
     let start = before
         .char_indices()
         .rev()
-        .nth(ctx.saturating_sub(1))
-        .map_or_else(|| if ctx == 0 { span.start } else { 0 }, |(i, _)| i);
+        .nth(ctx - 1)
+        .map_or(0, |(i, _)| i);
     let after = &text[span.end..];
     let end = span.end
         + after
@@ -358,16 +398,27 @@ impl LocalModelGuardrail {
     }
 
     /// Embed one window off the async runtime: bounded by the
-    /// semaphore, executed in `spawn_blocking`.
+    /// semaphore, executed in `spawn_blocking`. The permit MOVES INTO
+    /// the blocking closure: a `spawn_blocking` task keeps running when
+    /// its awaiter is dropped (client disconnect), so a permit held in
+    /// this async scope would release while the session is still busy —
+    /// letting the next request park a second blocking-pool thread on
+    /// the session mutex, and repeated cancellations pile threads up
+    /// toward the pool cap (audit finding on PR #999). Held by the
+    /// closure, the permit releases only when the inference actually
+    /// finishes.
     async fn embed_window(&self, window: String) -> Result<Vec<f32>, LocalModelError> {
-        let _permit = Arc::clone(&self.permits)
+        let permit = Arc::clone(&self.permits)
             .acquire_owned()
             .await
             .expect("inference semaphore never closed");
         let embedder = Arc::clone(&self.embedder);
-        tokio::task::spawn_blocking(move || embedder.embed(&window))
-            .await
-            .map_err(|e| LocalModelError::Model(format!("inference task join: {e}")))?
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            embedder.embed(&window)
+        })
+        .await
+        .map_err(|e| LocalModelError::Model(format!("inference task join: {e}")))?
     }
 
     /// Mask one segment. Returns the rewritten text and how many spans
@@ -447,6 +498,22 @@ impl Guardrail for LocalModelGuardrail {
         true
     }
 
+    /// Masking a streamed response needs the whole response held back (a
+    /// span can cross any chunk boundary) — but past the buffer cap this
+    /// guardrail must release UNMASKED, not block: the trait default's
+    /// fail-closed overflow would turn a >cap streamed response into a
+    /// `content_filter` error from a guardrail whose contract is
+    /// "rewrite, never block" (audit finding on PR #999). Past-cap
+    /// content degrades to fewer masks, the same fail-open arm as
+    /// inference failure and the per-pass call cap. A chain member with
+    /// a stricter policy (e.g. fail-closed pii) still wins the fold.
+    fn stream_output_policy(&self) -> StreamOutputPolicy {
+        StreamOutputPolicy::BufferFull {
+            max_buffer_bytes: DEFAULT_STREAM_OUTPUT_BUFFER_BYTES,
+            on_exceeded_fail_open: true,
+        }
+    }
+
     async fn moderate_input_segments(&self, texts: &[String]) -> SegmentsOutcome {
         self.moderate(texts).await
     }
@@ -470,6 +537,18 @@ mod tests {
         let spans = candidate_spans(&re(), text);
         let values: Vec<&str> = spans.iter().map(|s| &text[s.clone()]).collect();
         assert_eq!(values, vec!["12.1", "2022.4.1"]);
+    }
+
+    #[test]
+    fn candidate_spans_drop_oversized_runs() {
+        // A crafted `1.1.1...` run over the byte cap is one regex match
+        // but NOT a candidate — it must vanish before budget accounting
+        // so it can neither stall the lane nor starve real candidates.
+        let bomb = "1.1".repeat(60); // 180 bytes, single match
+        let text = format!("前缀 {bomb} 中缀 12.1 后缀");
+        let spans = candidate_spans(&re(), &text);
+        let values: Vec<&str> = spans.iter().map(|s| &text[s.clone()]).collect();
+        assert_eq!(values, vec!["12.1"]);
     }
 
     #[test]

@@ -71,7 +71,9 @@ tikv-jemalloc-ctl = "0.6"
 [features]
 # Local CPU embedding-model guardrail MVP (AISIX-Cloud#1331). Off by
 # default (statically links ONNX Runtime); the guardrail additionally
-# activates only when AISIX_LOCAL_GUARDRAIL_MODEL_DIR is set.
+# activates only when GUARDRAIL_LOCAL_MODEL_DIR is set (non-AISIX_
+# prefix on purpose: the config loader claims the AISIX_* env namespace
+# and strictly rejects unknown fields).
 local-model-guardrail = ["aisix-guardrails/local-model"]
 
 [dev-dependencies]
