@@ -36,7 +36,37 @@
 //! session serializes anyway), with ONE intra-op thread and intra/inter-op
 //! **spinning disabled** — ONNX Runtime's default spin-wait burns ~9.4%
 //! of a core while completely idle, taxing deployments that never send
-//! guardrail traffic.
+//! guardrail traffic. The request's async worker never blocks: it awaits
+//! the JoinHandle and keeps serving its other connections; only the
+//! blocking-pool thread computes. That thread is NOT core-pinned — on a
+//! saturated host it competes with the serving workers for scheduling;
+//! hard business/model core partitioning needs a dedicated pinned
+//! inference pool.
+//!
+//! Scaling notes (MVP review, measured on a 12-core avx2+vnni host):
+//! - One lane sustains ~50 inferences/s (p50 ≈ 19 ms per ~35-token
+//!   window; roughly linear in tokens). The acceptance shape spends TWO
+//!   inferences per request (input + output pass).
+//! - Throughput scales by adding lanes: N sessions behind
+//!   `Semaphore::new(N)`. `run(&mut self)` forbids concurrent runs on
+//!   one session even though the ONNX Runtime C API documents `Run` as
+//!   thread-safe with shared read-only weights; this crate forbids
+//!   `unsafe`, so the shared-weights form waits on an upstream `&self`
+//!   run, a thin unsafe shim crate, or the sidecar deployment form.
+//!   Until then each lane pays its own weight copy (~190 MiB int8).
+//!   ONE ORT `Session` is a loaded model instance, not a conversation:
+//!   every `run` is stateless, so lanes are freely interchangeable.
+//! - Per-audit cost ≈ (#candidate windows × inference) + (#prototypes ×
+//!   384-dim dot ≈ 1 µs). A window embedding is category-agnostic: a
+//!   span matched by several categories embeds ONCE and compares
+//!   against the whole prototype library, so prototype count stays
+//!   latency-noise up to ~1e5 vectors (then: ANN index).
+//! - The candidate-regex layer is the all-traffic cost. At many
+//!   categories the per-category patterns must merge into one
+//!   multi-pattern automaton (`RegexSet` / aho-corasick), compiled at
+//!   prototype-library build time and atomically swapped — never per
+//!   request. The rust regex engine is non-backtracking, so
+//!   operator-supplied patterns cannot ReDoS the data plane.
 //!
 //! Model contract (upstream docs): the model directory holds the two
 //! deliverables `model.onnx` + `tokenizer.json`. The MVP target is
@@ -130,6 +160,17 @@ pub enum LocalModelError {
 /// NO control-plane resource; see the design issue for what the real
 /// config object must eventually carry (model id + dimension + prefix
 /// convention + threshold table + prototype-library version).
+///
+/// Target form (not built): the category data becomes a prototype
+/// LIBRARY resource — etcd stores category TEXT only (name, action,
+/// replacement, candidate patterns, description/sample sentences); the
+/// DP encodes vectors with its own loaded model off the hot path
+/// (cached by model id + text hash) and atomically swaps the compiled
+/// library on a watch tick, the same propagation the guardrail index
+/// already uses — so category updates land without a restart. Vectors
+/// never travel through config, which removes the "encoded by which
+/// model" mismatch for text-sourced prototypes; swapping the MODEL
+/// itself stays a cold operation (all vectors rebuilt).
 pub struct LocalModelConfig {
     pub model_dir: PathBuf,
     pub threshold: f32,

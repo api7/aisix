@@ -24,6 +24,14 @@ import {
 // - response side: the (fixed) upstream reply carrying the same sentence
 //   reaches the caller masked.
 //
+// SCOPE PINS (deliberate, per the MVP brief — not accidental gaps):
+// - one happy path only; no negative/threshold/degrade cases;
+// - non-streaming only: streamed output rides the guardrail's default
+//   BufferFull hold-back + the same segment pass, but is not pinned here;
+// - /v1/chat/completions only: the sibling families (/v1/messages,
+//   /v1/responses, legacy completions, MCP) are explicitly unwired —
+//   tracked on the design issue, not silently missing.
+//
 // OPT-IN SPEC: skipped unless AISIX_LOCAL_GUARDRAIL_MODEL_DIR points at
 // the model directory (model.onnx + tokenizer.json). Setting it implies
 // the binary under test was built with `--features local-model-guardrail`
