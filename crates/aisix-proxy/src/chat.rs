@@ -212,6 +212,9 @@ pub async fn chat_completions(
                 // The winner's success event carries the content.
                 /* content_for_last */
                 None,
+                // ...and the terminal trace spans.
+                /* terminal_last */
+                false,
             );
             // The streaming path wires the WINNER's telemetry into the SSE
             // stream's on_complete callback (it has to wait for the
@@ -283,6 +286,7 @@ pub async fn chat_completions(
                     /* guardrail_blocked */ false,
                     &client,
                     success.captured_content.take(),
+                    /* terminal */ true,
                 );
             }
             // Inject x-ratelimit-* headers so OpenAI SDK clients see the
@@ -494,6 +498,11 @@ pub async fn chat_completions(
                 &applied_guardrails,
                 &routing,
                 content_for_last,
+                // All-failed (no charge): the last failed attempt is the
+                // request's terminal emission. With a charge, the
+                // billed-then-blocked event below is terminal instead.
+                /* terminal_last */
+                charge.is_none(),
             );
             // Terminal event:
             //  - output-blocked (charge present): the WINNING attempt was
@@ -568,6 +577,7 @@ pub async fn chat_completions(
                         guardrail_blocked,
                         &client,
                         failure_content.take(),
+                        /* terminal */ true,
                     );
                 }
                 None if routing.attempts.is_empty() => {
@@ -601,11 +611,13 @@ pub async fn chat_completions(
                         guardrail_blocked,
                         &client,
                         failure_content.take(),
+                        /* terminal */ true,
                     );
                 }
                 None => {
                     // All attempts failed; each was emitted above (the last
-                    // one carrying the captured request body).
+                    // one carrying the captured request body — and, per
+                    // AISIX-Cloud#1279, the trace's terminal spans).
                 }
             }
             err.into_response()
@@ -1468,7 +1480,8 @@ async fn dispatch(
             .unwrap_or(&[]);
         let is_routing_request =
             virtual_entry.value.routing.is_some() || virtual_entry.value.is_semantic();
-        let mut stream_routing = RoutingTelemetry::for_request(&virtual_entry.value.display_name);
+        let mut stream_routing = RoutingTelemetry::for_request(&virtual_entry.value.display_name)
+            .with_trace(client.trace.clone());
         let mut last_err: Option<BridgeError> = None;
         // The un-flattened per-target quota rejection, kept only while it
         // is the loop's LATEST failure: on exhaustion it is surfaced
@@ -2047,6 +2060,10 @@ async fn dispatch(
                         )),
                         _ => None,
                     },
+                    // The stream's Drop-guard emit IS the request's end —
+                    // body EOF or client drop.
+                    /* terminal */
+                    true,
                 );
                 // #1002: comp.total_tokens is the cache-inclusive total (an
                 // Anthropic upstream bridged to an OpenAI-shape client folds
@@ -2595,7 +2612,8 @@ async fn dispatch(
         .unwrap_or(&[]);
     let is_routing_request =
         virtual_entry.value.routing.is_some() || virtual_entry.value.is_semantic();
-    let mut routing = RoutingTelemetry::for_request(&virtual_entry.value.display_name);
+    let mut routing = RoutingTelemetry::for_request(&virtual_entry.value.display_name)
+        .with_trace(client.trace.clone());
     // The winning target's own model-layer reservation (routing dispatch
     // only) — folded into `reservation` at the commit point below so the
     // member's TPM/TPD bills with the request-level layers
@@ -3310,6 +3328,7 @@ async fn dispatch_ensemble(
                 blocked,
                 client,
                 /* content */ None,
+                /* terminal */ false,
             );
         };
 
@@ -3681,6 +3700,7 @@ async fn dispatch_ensemble(
                         comp.guardrail_blocked,
                         &client_for_telem,
                         /* content */ None,
+                        /* terminal */ false,
                     );
                 }
                 let judge_pk =
@@ -3737,6 +3757,7 @@ async fn dispatch_ensemble(
                     comp.guardrail_blocked,
                     &client_for_telem,
                     /* content */ None,
+                    /* terminal */ false,
                 );
                 // SLO histograms (AISIX-Cloud#1011): the handler's
                 // record_success is stream-gated, so the ensemble stream
@@ -3943,6 +3964,7 @@ async fn dispatch_ensemble(
             blocked,
             client,
             /* content */ None,
+            /* terminal */ false,
         );
     };
 
@@ -4218,6 +4240,11 @@ fn emit_usage_event(
     guardrail_blocked: bool,
     client: &ClientContext,
     content: Option<CapturedContent>,
+    // Whether this event ends the request (AISIX-Cloud#1279): the terminal
+    // event carries the trace's SERVER + logical spans; a non-terminal one
+    // (a failed attempt, an ensemble panel member / judge sub-call) carries
+    // its own attempt span alone.
+    terminal: bool,
 ) {
     // Per-PK telemetry attribution tags. An unresolved key (the
     // pre-dispatch error paths) yields default (all empty / false) tags →
@@ -4288,29 +4315,29 @@ fn emit_usage_event(
         ..Default::default()
     };
     crate::usage_attr::apply_jwt_identity(&mut event, client.jwt.as_ref());
-    // Handler label "chat" matches the documented enumeration for
-    // `aisix_usage_events_emitted_total` (#408). Keep `&'static str`
-    // so prometheus cardinality stays bounded.
-    let usage_model = crate::usage_attr::usage_event_model_label(snap, &event.requested_model);
-    state.usage_sink.try_emit(
-        "chat",
-        event.clone(),
-        crate::usage_attr::usage_event_labels(&usage_model, pk),
-    );
     // Guardrail outcome counters (#379). Recorded here — the one place every
     // chat path (success / error / streaming / cache-hit) funnels through —
     // from the same guardrail fields the UsageEvent carries.
     state
         .metrics
         .record_guardrail_outcome(guardrail_blocked, &event.guardrail_bypassed_reason);
-    // Per-env OTLP/HTTP fan-out. The snapshot's exporter table is
-    // empty for envs that haven't configured any, so this is a cheap
-    // no-op on the common path. Spawned tasks own the POST work and
-    // never block the request return.
-    let exporters = crate::usage_attr::live_exporters(state, snap);
-    state
-        .otlp_fan_out
-        .fan_out(&event, content.as_ref(), exporters.iter().map(|e| &e.value));
+    // Handler label "chat" matches the documented enumeration for
+    // `aisix_usage_events_emitted_total` (#408). Keep `&'static str`
+    // so prometheus cardinality stays bounded. Both emit legs (CP sink +
+    // per-env exporter fan-out) go through the shared chokepoint, which
+    // also snapshots the trace spans (AISIX-Cloud#1279).
+    let usage_model =
+        crate::usage_attr::usage_event_model_label(snap, &event.requested_model).into_owned();
+    crate::usage_attr::emit_usage(
+        state,
+        snap,
+        "chat",
+        event,
+        crate::usage_attr::usage_event_labels(&usage_model, pk),
+        content.as_ref(),
+        client.trace.as_ref(),
+        terminal,
+    );
 }
 
 /// Defence-in-depth sanitiser for operator-defined `ProviderKey
@@ -4446,6 +4473,11 @@ fn emit_failed_attempts(
     // success-path caller) stay content-less to avoid duplicating a large
     // prompt across N events.
     mut content_for_last: Option<CapturedContent>,
+    // AISIX-Cloud#1279: on the all-failed path the LAST failed attempt's
+    // event is the request's terminal emission (there is no other), so it
+    // carries the trace's SERVER + logical spans. False on the success
+    // path, where the winner's event is the terminal one.
+    terminal_last: bool,
 ) {
     let last_failed = routing.attempts.iter().rposition(|a| !a.success);
     for (i, rec) in routing
@@ -4488,6 +4520,7 @@ fn emit_failed_attempts(
             /* guardrail_blocked */ false,
             client,
             content,
+            /* terminal */ terminal_last && Some(i) == last_failed,
         );
     }
 }

@@ -162,6 +162,13 @@ pub struct ClientContext {
     /// extractor; `None` when the request authenticated with the key's
     /// plaintext.
     pub jwt: Option<Arc<crate::auth::JwtIdentity>>,
+    /// The request's trace identity (AISIX-Cloud#1279), minted by
+    /// `ensure_request_id` beside the [`RequestId`]. Handlers thread it
+    /// into their attempt telemetry and usage-event emission so every
+    /// exported span of the request shares one trace. `None` only when
+    /// the middleware isn't in the chain (a handler unit test with a
+    /// bare router) — emission then falls back to the legacy flat span.
+    pub trace: Option<Arc<aisix_obs::RequestTraceBundle>>,
 }
 
 /// Resolve the caller's address from the peer plus the trusted-proxy
@@ -240,6 +247,10 @@ where
             jwt: parts
                 .extensions
                 .get::<Arc<crate::auth::JwtIdentity>>()
+                .cloned(),
+            trace: parts
+                .extensions
+                .get::<Arc<aisix_obs::RequestTraceBundle>>()
                 .cloned(),
         })
     }

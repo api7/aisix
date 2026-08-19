@@ -52,6 +52,17 @@ pub struct UsageEvent {
     /// `x-aisix-call-id` response header carries so logs join.
     pub request_id: String,
 
+    /// The W3C trace id every OTLP span of this request shares, as 32
+    /// lowercase-hex chars (AISIX-Cloud#1279). The public correlation key
+    /// between a usage row and a trace backend: the dashboard's
+    /// `trace_ui_url_template` can substitute it as `{trace_id}` to link a
+    /// log row straight to the trace. Deliberately the ONLY trace field on
+    /// this wire contract — span ids and boundaries stay on the exporter
+    /// path (`SinkRecord::trace`). Empty when the emitting path predates
+    /// the trace bundle.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub trace_id: String,
+
     /// Wall-clock time the upstream call completed, RFC 3339 (UTC).
     pub occurred_at: String,
 

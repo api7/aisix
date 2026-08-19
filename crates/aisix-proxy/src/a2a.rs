@@ -136,13 +136,18 @@ pub async fn a2a_endpoint(
         .get::<crate::request_id::RequestId>()
         .map(|r| r.0.clone())
         .unwrap_or_else(new_request_id);
+    // The request's trace bundle (AISIX-Cloud#1279), minted beside the id.
+    let trace = request
+        .extensions()
+        .get::<std::sync::Arc<aisix_obs::RequestTraceBundle>>()
+        .cloned();
     let api_key_id = auth.entry.id.clone();
     let http_method = request.method().clone();
     // `dispatch` takes the key by value; the terminal emit below still needs
     // the caller's team / user labels (the handle is an `Arc` clone).
     let caller_auth = auth.clone();
 
-    let response = dispatch(auth, &agent, &state, request, &request_id).await;
+    let response = dispatch(auth, &agent, &state, request, &request_id, trace).await;
 
     let elapsed = started.elapsed();
     let status = response.status().as_u16();
@@ -192,6 +197,7 @@ async fn dispatch(
     state: &ProxyState,
     request: Request,
     request_id: &str,
+    trace: Option<std::sync::Arc<aisix_obs::RequestTraceBundle>>,
 ) -> Response {
     // Resolve the agent from the live snapshot. A disabled agent is treated as
     // absent — not served, same as a missing one.
@@ -287,6 +293,7 @@ async fn dispatch(
                 &call,
                 response.status().as_u16(),
                 Duration::ZERO,
+                trace.as_ref(),
             );
             return response;
         }
@@ -299,6 +306,7 @@ async fn dispatch(
             state,
             &snapshot,
             request_id,
+            trace.clone(),
             upstream,
             value,
             call,
@@ -331,6 +339,7 @@ async fn dispatch(
                 &call,
                 StatusCode::OK.as_u16(),
                 latency,
+                trace.as_ref(),
             );
             axum::Json(response_value).into_response()
         }
@@ -346,6 +355,7 @@ async fn dispatch(
                 &call,
                 status.as_u16(),
                 latency,
+                trace.as_ref(),
             );
             a2a_error_response(rpc_id, status, &err.to_string())
         }
@@ -380,6 +390,9 @@ struct StreamUsageOnDrop {
     /// caller and is downgraded if the stream later faults — once the headers
     /// are out, the usage event is the only place that can say so.
     status: u16,
+    /// The request's trace bundle (AISIX-Cloud#1279) — the Drop emit is
+    /// the request's terminal emission, so it carries the terminal spans.
+    trace: Option<std::sync::Arc<aisix_obs::RequestTraceBundle>>,
     _concurrency: aisix_ratelimit::StreamConcurrencyGuard,
 }
 
@@ -411,6 +424,7 @@ impl Drop for StreamUsageOnDrop {
             &self.call,
             status,
             self.started.elapsed(),
+            self.trace.as_ref(),
         );
     }
 }
@@ -427,6 +441,7 @@ async fn dispatch_stream(
     state: &ProxyState,
     snapshot: &aisix_core::AisixSnapshot,
     request_id: &str,
+    trace: Option<std::sync::Arc<aisix_obs::RequestTraceBundle>>,
     upstream: aisix_a2a::A2aUpstream,
     request: serde_json::Value,
     call: A2aCall,
@@ -452,6 +467,7 @@ async fn dispatch_stream(
                 &call,
                 status.as_u16(),
                 started.elapsed(),
+                trace.as_ref(),
             );
             return a2a_error_response(rpc_id, status, &err.to_string());
         }
@@ -465,6 +481,7 @@ async fn dispatch_stream(
         call,
         started,
         status: StatusCode::OK.as_u16(),
+        trace,
         _concurrency: reservation.into_stream_hold(),
     };
     let agent_label = agent.to_string();
@@ -701,6 +718,7 @@ fn emit_a2a_usage(
     call: &A2aCall,
     status_code: u16,
     latency: Duration,
+    trace: Option<&std::sync::Arc<aisix_obs::RequestTraceBundle>>,
 ) {
     // No model resolves on this endpoint, so the estimator falls back to its
     // default encoding — the same thing it does for any non-OpenAI model.
@@ -777,22 +795,23 @@ fn emit_a2a_usage(
     );
     // As with MCP: an agent call has no model and no ProviderKey, so the
     // attribution labels are the placeholder (AISIX-Cloud#1317).
-    state
-        .usage_sink
-        .try_emit("a2a", event.clone(), aisix_obs::UsageEventLabels::default());
-    let exporters = crate::usage_attr::live_exporters(state, snap);
     // Opt-in content capture, on the same terms as every other endpoint: only
     // an exporter configured for full content sees the words, and they never
-    // travel to the control plane — the usage event above carries counts
-    // only. The captured text is the message parts, not the JSON-RPC
-    // envelopes, so it reads as a prompt and a completion rather than as
-    // protocol scaffolding.
+    // travel to the control plane — the usage event carries counts only. The
+    // captured text is the message parts, not the JSON-RPC envelopes, so it
+    // reads as a prompt and a completion rather than as protocol scaffolding.
+    let exporters = crate::usage_attr::live_exporters(state, snap);
     let captured = content_capture_cap(exporters.iter().map(|e| &e.value))
         .map(|cap| CapturedContent::new(&call.text.request, &response_text, cap as usize));
-    state.otlp_fan_out.fan_out(
-        &event,
+    crate::usage_attr::emit_usage(
+        state,
+        snap,
+        "a2a",
+        event,
+        aisix_obs::UsageEventLabels::default(),
         captured.as_ref(),
-        exporters.iter().map(|e| &e.value),
+        trace,
+        /* terminal */ true,
     );
 }
 

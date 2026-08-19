@@ -97,6 +97,15 @@ pub struct SinkRecord {
     /// Opt-in captured content; omitted entirely under `metadata_only`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<SinkContent>,
+    /// The event's span snapshot (AISIX-Cloud#1279): ids + boundaries
+    /// frozen at emission time, so the encoder — which runs inside the
+    /// delivery retry loop — reproduces byte-identical ids on every retry.
+    /// `serde(skip)`: this is OTLP structure, not record data; the
+    /// Datadog/SLS/object-store wire shapes are unchanged. (The public
+    /// `UsageEvent::trace_id` correlation key rides the flattened usage
+    /// fields instead.)
+    #[serde(skip)]
+    pub trace: Option<crate::trace::TraceEmission>,
 }
 
 impl SinkRecord {
@@ -106,12 +115,19 @@ impl SinkRecord {
             schema_version: SCHEMA_VERSION,
             usage,
             content: None,
+            trace: None,
         }
     }
 
     /// Attach captured content (`content_mode = full`).
     pub fn with_content(mut self, content: SinkContent) -> Self {
         self.content = Some(content);
+        self
+    }
+
+    /// Attach the request's span snapshot (AISIX-Cloud#1279).
+    pub fn with_trace(mut self, trace: Option<crate::trace::TraceEmission>) -> Self {
+        self.trace = trace;
         self
     }
 }

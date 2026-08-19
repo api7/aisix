@@ -90,6 +90,11 @@ pub(crate) struct RoutingTelemetry {
     /// THIS group have to fall back", so the group is the useful key and
     /// the target it moved to is the second label.
     requested_model: String,
+    /// The request's trace bundle (AISIX-Cloud#1279). [`Self::begin_attempt`]
+    /// and [`Self::record`] stamp each attempt's span start/end into it —
+    /// the same chokepoints the per-attempt metrics use, so a dispatch
+    /// path cannot record an attempt without its span boundaries.
+    trace: Option<std::sync::Arc<aisix_obs::RequestTraceBundle>>,
 }
 
 impl RoutingTelemetry {
@@ -101,6 +106,15 @@ impl RoutingTelemetry {
             requested_model: requested_model.to_string(),
             ..Self::default()
         }
+    }
+
+    /// Attach the request's trace bundle so attempt boundaries land on it.
+    pub fn with_trace(
+        mut self,
+        trace: Option<std::sync::Arc<aisix_obs::RequestTraceBundle>>,
+    ) -> Self {
+        self.trace = trace;
+        self
     }
 
     /// Record one resolved attempt: emit its per-attempt metrics, then
@@ -127,6 +141,12 @@ impl RoutingTelemetry {
                 &rec.target_model,
             );
         }
+        // The attempt settled — stamp its span end (AISIX-Cloud#1279). For
+        // a streaming winner this is commit time; the terminal emission
+        // extends it to the measured stream end.
+        if let Some(trace) = &self.trace {
+            trace.end_attempt(rec.index);
+        }
         self.attempts.push(rec);
     }
 
@@ -144,6 +164,11 @@ impl RoutingTelemetry {
             "retry"
         };
         self.last_target = Some(display_name.to_string());
+        // Mint the attempt's span id and stamp its start at the real
+        // dispatch boundary (AISIX-Cloud#1279).
+        if let Some(trace) = &self.trace {
+            trace.start_attempt(index);
+        }
         (index, kind)
     }
 

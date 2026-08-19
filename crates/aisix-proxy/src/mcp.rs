@@ -165,6 +165,11 @@ async fn serve(state: ProxyState, request: Request, scope: Option<String>) -> Re
         .get::<crate::request_id::RequestId>()
         .map(|r| r.0.clone())
         .unwrap_or_else(new_request_id);
+    // The request's trace bundle (AISIX-Cloud#1279), minted beside the id.
+    let trace = request
+        .extensions()
+        .get::<std::sync::Arc<aisix_obs::RequestTraceBundle>>()
+        .cloned();
     let api_key_id = auth.entry.id.clone();
     let method = request.method().clone();
     // `dispatch` takes the key by value; the terminal emit below still needs
@@ -178,6 +183,7 @@ async fn serve(state: ProxyState, request: Request, scope: Option<String>) -> Re
         &state,
         request,
         &request_id,
+        trace.as_ref(),
     )
     .await;
 
@@ -235,6 +241,7 @@ async fn dispatch(
     state: &ProxyState,
     request: Request,
     request_id: &str,
+    trace: Option<&std::sync::Arc<aisix_obs::RequestTraceBundle>>,
 ) -> Response {
     // One snapshot for the whole request: the scoped-server resolution below
     // and the gateway construction further down must see the same resource
@@ -347,6 +354,7 @@ async fn dispatch(
                     Duration::ZERO,
                     false,
                     Vec::new(),
+                    trace,
                 );
                 return response;
             }
@@ -418,6 +426,7 @@ async fn dispatch(
                 Duration::ZERO,
                 true,
                 monitor_hits,
+                trace,
             );
             return jsonrpc_guardrail_block(rpc_id, "tool call", guardrail_name.as_deref());
         }
@@ -497,6 +506,7 @@ async fn dispatch(
                 latency,
                 true,
                 monitor_hits,
+                trace,
             );
             return jsonrpc_guardrail_block(rpc_id, "tool result", guardrail_name.as_deref());
         }
@@ -517,6 +527,7 @@ async fn dispatch(
             latency,
             false,
             monitor_hits,
+            trace,
         );
     }
     response
@@ -638,6 +649,7 @@ fn emit_tool_call_usage(
     latency: Duration,
     guardrail_blocked: bool,
     guardrail_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
+    trace: Option<&std::sync::Arc<aisix_obs::RequestTraceBundle>>,
 ) {
     let mut event = UsageEvent {
         request_id: request_id.to_string(),
@@ -660,17 +672,20 @@ fn emit_tool_call_usage(
     // A tool call resolves neither a model nor a ProviderKey, so the
     // attribution labels are the placeholder — present so this family has
     // ONE label set across every handler (AISIX-Cloud#1317).
-    state
-        .usage_sink
-        .try_emit("mcp", event.clone(), aisix_obs::UsageEventLabels::default());
-    // #698: fan the event out to the per-env OTLP/SLS/Datadog exporters like
-    // every other emitter — pre-fix MCP usage reached only the CP sink, so
+    // #698: both emit legs (CP sink + per-env exporter fan-out) go through
+    // the shared chokepoint — pre-fix MCP usage reached only the CP sink, so
     // exporters never saw /mcp traffic. No content capture (tool args/results
     // are a separate surface from prompt/response).
-    let exporters = crate::usage_attr::live_exporters(state, snap);
-    state
-        .otlp_fan_out
-        .fan_out(&event, None, exporters.iter().map(|e| &e.value));
+    crate::usage_attr::emit_usage(
+        state,
+        snap,
+        "mcp",
+        event,
+        aisix_obs::UsageEventLabels::default(),
+        None,
+        trace,
+        /* terminal */ true,
+    );
 }
 
 /// Reject a request whose `MCP-Protocol-Version` header names a version
