@@ -54,7 +54,9 @@
 //!   thread-safe with shared read-only weights; this crate forbids
 //!   `unsafe`, so the shared-weights form waits on an upstream `&self`
 //!   run, a thin unsafe shim crate, or the sidecar deployment form.
-//!   Until then each lane pays its own weight copy (~190 MiB int8).
+//!   Until then each lane pays its own weight copy — measured: the
+//!   first lane costs ~192 MiB resident (weights + tokenizer + arena),
+//!   each additional lane ~102 MiB (its weight copy + arena).
 //!   Lane dispatch is a centralized free-list — deliberately NO
 //!   worker↔session binding (sessions are interchangeable; the central
 //!   queue load-balances the uneven per-worker accept distribution).
@@ -113,7 +115,7 @@ pub const MODEL_DIR_ENV: &str = "GUARDRAIL_LOCAL_MODEL_DIR";
 pub const THRESHOLD_ENV: &str = "GUARDRAIL_LOCAL_MODEL_THRESHOLD";
 /// Optional inference-lane count (default 1, clamped to
 /// [`MAX_LANES`]). Each lane is one ONNX session — one more core the
-/// guardrail may use and one more ~190 MiB weight copy resident; see
+/// guardrail may use and roughly one more ~100 MiB weight copy resident (measured); see
 /// the module scaling notes and api7/aisix#1001.
 pub const LANES_ENV: &str = "GUARDRAIL_LOCAL_MODEL_LANES";
 
