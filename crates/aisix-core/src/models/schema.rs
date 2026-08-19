@@ -1964,12 +1964,23 @@ mod tests {
 
     #[test]
     fn apikey_mcp_access_rejects_the_removed_mode_field() {
+        // Write path: `mode` is gone from the authored shape. Read path:
+        // the CP projects `"mode": "deny"` as a tombstone so 0.9.x DPs
+        // load the row fail-closed, and this generation's loader must
+        // keep accepting the hybrid document.
         let v = json!({
             "key_hash":"9df37f5e7cbc3c391d872742b5f286c242e733a09add9eeaa4d26a599bd90b20",
             "allowed_models":[],
             "mcp_access": {"mode": "inherit", "allow": ["*"]}
         });
         assert!(validate_apikey(&v).is_err());
+        validate_apikey_lenient(&v).unwrap();
+        validate_apikey_lenient(&json!({
+            "key_hash":"9df37f5e7cbc3c391d872742b5f286c242e733a09add9eeaa4d26a599bd90b20",
+            "allowed_models":[],
+            "mcp_access": {"mode": "deny", "allow": ["github__*"], "deny": ["x__y"]}
+        }))
+        .unwrap();
     }
 
     #[test]

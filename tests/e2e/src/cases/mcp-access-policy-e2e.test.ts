@@ -43,6 +43,7 @@ const KEY_T1_WIDE = "sk-mcp-t1-wide";
 const KEY_T2 = "sk-mcp-t2";
 const KEY_NARROW = "sk-mcp-t2-narrow";
 const KEY_BLOCKED = "sk-mcp-blocked";
+const KEY_TOMBSTONE = "sk-mcp-tombstone";
 
 const sha256 = (s: string) => createHash("sha256").update(s).digest("hex");
 
@@ -166,6 +167,7 @@ describe("mcp access policy e2e: env, team and key layers intersect", () => {
     [KEY_T2, ENV_GRANT],
     [KEY_NARROW, ["alpha__echo"]],
     [KEY_BLOCKED, []],
+    [KEY_TOMBSTONE, ["alpha__echo", "alpha__reverse"]],
   ];
 
   beforeAll(async () => {
@@ -231,6 +233,15 @@ describe("mcp access policy e2e: env, team and key layers intersect", () => {
       }),
     );
     await seed.createApiKey(keyDoc(KEY_BLOCKED, { mcp_access: { allow: [] } }));
+    // The exact hybrid document the control plane projects: the layered
+    // shape plus the `"mode": "deny"` tombstone that keeps a 0.9.x DP
+    // loading the row fail-closed. This generation must consume the
+    // tombstone — authenticate the key and enforce the allow/deny half.
+    await seed.createApiKey(
+      keyDoc(KEY_TOMBSTONE, {
+        mcp_access: { mode: "deny", allow: ["alpha__*"] },
+      }),
+    );
 
     // Probe EVERY key to its expected steady state: keys are written at
     // higher revisions than servers/policies, but each key's list also
@@ -248,6 +259,18 @@ describe("mcp access policy e2e: env, team and key layers intersect", () => {
     await app?.exit();
     await alpha?.close();
     await beta?.close();
+  });
+
+  test("a CP-projected legacy-mode tombstone is consumed, not enforced", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+
+    // `mode` would mean "no MCP access" one release back; here it must
+    // be inert — the key's own allow intersects the env layer as usual.
+    await expectList(KEY_TOMBSTONE, ["alpha__echo", "alpha__reverse"]);
+    const ok = await callTool(KEY_TOMBSTONE, "alpha__echo", "hi");
+    expect(ok).toEqual({ ok: true, text: "alpha:hi" });
+    const denied = await callTool(KEY_TOMBSTONE, "beta__echo", "hi");
+    expect(denied.ok).toBe(false);
   });
 
   test("a key with no block of its own takes the env layer unchanged", async (ctx) => {
