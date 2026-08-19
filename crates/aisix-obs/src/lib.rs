@@ -55,8 +55,11 @@ pub enum ObsError {
     AlreadyInitialised,
 }
 
-/// Third-party log targets pinned below WARN, applied last so they hold
-/// whatever the operator asked for otherwise.
+/// Third-party log targets pinned below WARN. Applied after the
+/// configured level and after `RUST_LOG`, so they hold for these targets
+/// either way — a `log`-crate record's level is fixed at its callsite and
+/// a subscriber can only filter it, never re-level it, so keeping these
+/// out of the log is the available form of "not a warning".
 ///
 /// `lofty` is the audio-metadata reader behind the transcription duration
 /// probe (`aisix-proxy::audio`). Every real mp3 upload logs one or more
