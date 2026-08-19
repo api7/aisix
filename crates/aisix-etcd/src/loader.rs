@@ -958,6 +958,31 @@ mod tests {
     }
 
     #[test]
+    fn api_key_legacy_mcp_access_mode_tombstone_is_not_partial_compat() {
+        // The CP projects `"mode": "deny"` inside `mcp_access` so a 0.9.x
+        // DP — where `mode` is required — loads the row fail-closed
+        // instead of skipping it. This generation consumes the tombstone
+        // (`McpAccess::legacy_mode`); it must not surface as a
+        // partial-compat field on every key that carries a block.
+        let entries = vec![raw(
+            "/aisix/api_keys/k-tombstone",
+            br#"{
+                "key_hash": "1460db1b6902f8b1fc2a40d9381a24d0fd22c3bc1b2c6f999c521da73776fbe0",
+                "allowed_models": ["m"],
+                "mcp_access": {"mode": "deny", "allow": ["github__*"], "deny": ["x__y"]}
+            }"#,
+            1,
+        )];
+        let (snap, stats) = build_snapshot("/aisix", &entries);
+        assert_eq!(stats.accepted, 1, "rejections: {:?}", stats.rejections);
+        assert!(stats.partially_compatible.is_empty());
+        let entry = snap.apikeys.get_by_id("k-tombstone").unwrap();
+        let access = entry.value.mcp_access.as_ref().unwrap();
+        assert_eq!(access.allow, vec!["github__*"]);
+        assert_eq!(access.deny, vec!["x__y"]);
+    }
+
+    #[test]
     fn nested_unknown_field_reports_dotted_path() {
         let entries = vec![raw(
             "/aisix/api_keys/k-nested",
