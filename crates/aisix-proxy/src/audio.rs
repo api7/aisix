@@ -3386,4 +3386,61 @@ mod tests {
         assert_eq!(event.prompt_tokens, 21, "billed tokens must be kept");
         assert_eq!(event.completion_tokens, 7);
     }
+
+    /// #998: `stream=true` must not become a way around the output
+    /// guardrail the same transcript gets when it is not streamed. A
+    /// block-capable chain keeps the buffered relay — the whole
+    /// transcript is scanned before any of it reaches the caller — so the
+    /// streamed request is blocked exactly like the non-streamed one.
+    #[tokio::test]
+    async fn streamed_transcription_is_not_an_output_guardrail_bypass() {
+        let upstream = MockServer::start().await;
+        let sse = concat!(
+            "data: {\"type\":\"transcript.text.delta\",\"delta\":\"the secret word is \"}\n\n",
+            "data: {\"type\":\"transcript.text.delta\",\"delta\":\"BLOCKME\"}\n\n",
+            "data: {\"type\":\"transcript.text.done\",\"text\":\"the secret word is BLOCKME\",",
+            "\"usage\":{\"type\":\"tokens\",\"input_tokens\":21,\"output_tokens\":7}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/transcriptions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(whisper_model("my-whisper"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        snap.guardrails.insert(keyword_output_guardrail("BLOCKME"));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = build_app_with_sink(snap, tx);
+        let (ct, body) = streaming_transcription_multipart("my-whisper");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/audio/transcriptions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", ct)
+            .body(body)
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a blocked transcript must not be released just because it streamed"
+        );
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        assert!(
+            !String::from_utf8_lossy(&bytes).contains("BLOCKME"),
+            "the blocked transcript must not reach the caller"
+        );
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted for the billed-then-blocked transcript")
+            .expect("usage_sink sender dropped");
+        assert_eq!(event.status_code, 422);
+        assert!(event.guardrail_blocked, "event must be marked blocked");
+        assert_eq!((event.prompt_tokens, event.completion_tokens), (21, 7));
+    }
 }

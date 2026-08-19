@@ -48,6 +48,14 @@ export interface OpenAiUpstreamOptions {
    * the content GET.
    */
   rawBody?: string;
+  /**
+   * `rawBody` split into chunks written one at a time, `eventDelayMs`
+   * apart, so a spec can tell a relayed body from a buffered one: an
+   * upstream that trickles its bytes is only visibly trickling
+   * downstream if the gateway forwards them as they arrive. Takes
+   * precedence over `rawBody`; no Content-Length is sent.
+   */
+  rawBodyChunks?: string[];
   /** Content-Type for `rawBody` (default `application/octet-stream`). */
   rawContentType?: string;
   /** Per-request response script; used in order before static opts. */
@@ -85,6 +93,8 @@ export interface OpenAiUpstreamStep {
   responseHeaders?: Record<string, string>;
   /** Raw (non-JSON) 200 body — see `OpenAiUpstreamOptions.rawBody`. */
   rawBody?: string;
+  /** See `OpenAiUpstreamOptions.rawBodyChunks`. */
+  rawBodyChunks?: string[];
   /** Content-Type for `rawBody` (default `application/octet-stream`). */
   rawContentType?: string;
 }
@@ -163,6 +173,22 @@ export async function startOpenAiUpstream(
             step.errorBody ?? { error: { message: "mock error" } },
           ),
         );
+        return;
+      }
+
+      if (step.rawBodyChunks !== undefined) {
+        res.statusCode = 200;
+        res.setHeader(
+          "content-type",
+          step.rawContentType ?? "application/octet-stream",
+        );
+        res.flushHeaders();
+        for (const chunk of step.rawBodyChunks) {
+          if (res.writableEnded || res.destroyed) return;
+          res.write(Buffer.from(chunk));
+          if (step.eventDelayMs) await sleep(step.eventDelayMs);
+        }
+        if (!res.writableEnded && !res.destroyed) res.end();
         return;
       }
 
