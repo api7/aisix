@@ -92,7 +92,7 @@ fn closes_on_write(resource: &str) -> bool {
 pub fn resource_root_schema(resource: &str, strict: bool) -> Value {
     let mut schema = match resource {
         "model" => model_root_schema(strict),
-        "api_key" => apikey_root_schema(),
+        "api_key" => apikey_root_schema(strict),
         "provider_key" => provider_key_root_schema(),
         "guardrail" => guardrail_root_schema(),
         "guardrail_attachment" => guardrail_attachment_root_schema(),
@@ -100,7 +100,7 @@ pub fn resource_root_schema(resource: &str, strict: bool) -> Value {
         "observability_exporter" => observability_exporter_root_schema(),
         "rate_limit_policy" => rate_limit_policy_root_schema(),
         "mcp_server" => mcp_server_root_schema(),
-        "mcp_policy" => mcp_policy_root_schema(),
+        "mcp_policy" => mcp_policy_root_schema(strict),
         "a2a_agent" => a2a_agent_root_schema(),
         "oidc_provider" => oidc_provider_root_schema(),
         "claim_mapping" => claim_mapping_root_schema(),
@@ -468,8 +468,37 @@ pub fn model_root_schema(strict: bool) -> Value {
 /// `Option` representation so `team_id`/`user_id` keep accepting an explicit
 /// `null` (cp-api sends `null` to clear team/owner), matching the resource's
 /// wire contract.
-pub fn apikey_root_schema() -> Value {
-    struct_root_schema::<crate::models::ApiKey>(true)
+pub fn apikey_root_schema(strict: bool) -> Value {
+    let mut schema = struct_root_schema::<crate::models::ApiKey>(true);
+    if strict {
+        require_property(
+            schema
+                .pointer_mut("/definitions/McpAccess")
+                .expect("api_key schema defines McpAccess"),
+            "allow",
+        );
+    }
+    schema
+}
+
+/// Add `name` to a schema object's `required` list, creating the list
+/// when absent. Used for fields the WRITE path must see spelled out
+/// while the runtime loader defaults them — a stale row has to keep
+/// loading, but a new one must not acquire its meaning by omission.
+fn require_property(schema: &mut Value, name: &str) {
+    let obj = schema
+        .as_object_mut()
+        .expect("schema fragment is a JSON object");
+    match obj.get_mut("required").and_then(Value::as_array_mut) {
+        Some(list) => {
+            if !list.iter().any(|v| v.as_str() == Some(name)) {
+                list.push(json!(name));
+            }
+        }
+        None => {
+            obj.insert("required".to_string(), json!([name]));
+        }
+    }
 }
 
 /// Canonical JSON Schema for the `provider_key` resource, derived from the
@@ -791,8 +820,11 @@ pub fn mcp_auth_settings_root_schema() -> Value {
 /// cross-field invariant `schemars` cannot express: a `team`-scoped policy
 /// must name its team in `scope_ref` (otherwise the row could shadow the
 /// environment layer).
-pub fn mcp_policy_root_schema() -> Value {
+pub fn mcp_policy_root_schema(strict: bool) -> Value {
     let mut schema = struct_root_schema::<crate::models::McpPolicy>(true);
+    if strict {
+        require_property(&mut schema, "allow");
+    }
     schema
         .as_object_mut()
         .expect("mcp_policy root schema is a JSON object")
@@ -1978,6 +2010,27 @@ mod tests {
         );
         // The environment layer carries no scope_ref.
         validate_mcp_policy(&json!({"scope": "env", "allow": []})).unwrap();
+    }
+
+    #[test]
+    fn the_lenient_schema_still_loads_a_pre_layer_row() {
+        // Documents projected before the layered shape carry a `mode`
+        // and no `allow`. The strict write path rejects them, but the
+        // runtime loader must still accept them: a rejected `api_key`
+        // row is skipped entirely, so the key would stop authenticating
+        // for ALL traffic rather than merely losing MCP access.
+        let key = json!({
+            "key_hash":"9df37f5e7cbc3c391d872742b5f286c242e733a09add9eeaa4d26a599bd90b20",
+            "allowed_models":[],
+            "allowed_tools":["github__*"],
+            "mcp_access": {"mode": "inherit"}
+        });
+        validate_apikey_lenient(&key).unwrap();
+        assert!(validate_apikey(&key).is_err());
+
+        let policy = json!({"scope": "env", "mode": "all"});
+        validate_mcp_policy_lenient(&policy).unwrap();
+        assert!(validate_mcp_policy(&policy).is_err());
     }
 
     #[test]

@@ -7,7 +7,8 @@
       "description": "The API key's own layer of the MCP tool ACL, the same `allow`/`deny` shape an MCP access policy carries. Present means the key constrains its grant; omitted means the key adds no constraint of its own and takes whatever the environment and team layers leave.",
       "properties": {
         "allow": {
-          "description": "Namespaced `<server>__<tool>` patterns this key allows, intersected with the environment and team layers. Same single-`*` glob matching a policy's `allow` uses; an empty list leaves the key no MCP access, and `[\"*\"]` narrows nothing (useful with `deny` alone).",
+          "default": [],
+          "description": "Namespaced `<server>__<tool>` patterns this key allows, intersected with the environment and team layers. Same single-`*` glob matching a policy's `allow` uses; an empty list leaves the key no MCP access, and `[\"*\"]` narrows nothing (useful with `deny` alone).\n\nRequired on the write path and defaulted by the runtime loader, for the reason given on [`McpPolicy::allow`].",
           "items": {
             "type": "string"
           },

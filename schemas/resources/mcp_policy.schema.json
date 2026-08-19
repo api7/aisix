@@ -46,7 +46,8 @@
   },
   "properties": {
     "allow": {
-      "description": "Namespaced `<server>__<tool>` patterns this layer allows. Entries are matched as single-`*` globs: `\"*\"` allows every tool, `\"<server>__*\"` every tool on one server, and an entry without a `*` matches one tool exactly. An empty list allows nothing, which is how a policy blocks all MCP access; a policy that only means to subtract tools writes `[\"*\"]` here and lists them under `deny`.",
+      "default": [],
+      "description": "Namespaced `<server>__<tool>` patterns this layer allows. Entries are matched as single-`*` globs: `\"*\"` allows every tool, `\"<server>__*\"` every tool on one server, and an entry without a `*` matches one tool exactly. An empty list allows nothing, which is how a policy blocks all MCP access; a policy that only means to subtract tools writes `[\"*\"]` here and lists them under `deny`.\n\nThe write path requires the field (the strict schema adds it to `required`), so a layer never allows something by omission. The runtime loader defaults it to empty instead of rejecting the row: a document written before the layered shape would otherwise fail to deserialize, and a skipped `api_key` row stops authenticating altogether rather than merely losing MCP access.",
       "items": {
         "type": "string"
       },
@@ -82,8 +83,8 @@
     }
   },
   "required": [
-    "allow",
-    "scope"
+    "scope",
+    "allow"
   ],
   "title": "McpPolicy",
   "type": "object"

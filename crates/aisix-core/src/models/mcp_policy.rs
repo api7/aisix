@@ -48,6 +48,14 @@ pub struct McpPolicy {
     /// exactly. An empty list allows nothing, which is how a policy blocks
     /// all MCP access; a policy that only means to subtract tools writes
     /// `["*"]` here and lists them under `deny`.
+    ///
+    /// The write path requires the field (the strict schema adds it to
+    /// `required`), so a layer never allows something by omission. The
+    /// runtime loader defaults it to empty instead of rejecting the row:
+    /// a document written before the layered shape would otherwise fail
+    /// to deserialize, and a skipped `api_key` row stops authenticating
+    /// altogether rather than merely losing MCP access.
+    #[serde(default)]
     pub allow: Vec<String>,
 
     /// Namespaced `<server>__<tool>` patterns subtracted from the effective
@@ -83,6 +91,10 @@ pub struct McpAccess {
     /// with the environment and team layers. Same single-`*` glob matching a
     /// policy's `allow` uses; an empty list leaves the key no MCP access,
     /// and `["*"]` narrows nothing (useful with `deny` alone).
+    ///
+    /// Required on the write path and defaulted by the runtime loader,
+    /// for the reason given on [`McpPolicy::allow`].
+    #[serde(default)]
     pub allow: Vec<String>,
 
     /// Namespaced `<server>__<tool>` patterns subtracted from this key's
@@ -144,9 +156,18 @@ mod tests {
     }
 
     #[test]
-    fn allow_is_required_on_both_layers() {
-        assert!(serde_json::from_str::<McpPolicy>(r#"{"scope":"env"}"#).is_err());
-        assert!(serde_json::from_str::<McpAccess>(r#"{"deny":["github__*"]}"#).is_err());
+    fn the_loader_defaults_a_missing_allow_to_empty() {
+        // A row written before the layered shape — e.g. the old
+        // `{"mode":"inherit"}` key block — must still deserialize. It
+        // resolves to a layer allowing nothing (fail-closed) rather than
+        // being skipped, which for an api_key would drop the whole key.
+        // The write path still rejects it; see
+        // `mcp_policy_requires_an_explicit_allow_side` in schema.rs.
+        let p: McpPolicy = serde_json::from_str(r#"{"scope":"env"}"#).unwrap();
+        assert!(p.allow.is_empty());
+
+        let a: McpAccess = serde_json::from_str(r#"{"mode":"inherit"}"#).unwrap();
+        assert!(a.allow.is_empty());
     }
 
     #[test]
