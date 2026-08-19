@@ -650,18 +650,46 @@ where
     // its `request_id` correlation (AISIX-Cloud#1060).
     crate::request_id::in_request_span(async_stream::stream! {
         let mut guard = TranscriptGuard { slot: Some((on_complete, StreamedTranscript::default())) };
-        let mut decoder = aisix_gateway::SseDecoder::new();
+        // `None` once the side-channel parse has been abandoned; the
+        // relay itself carries on either way.
+        let mut decoder = Some(aisix_gateway::SseDecoder::new());
+        // Bytes fed since the decoder last unlocked a frame. The decoder
+        // holds an unterminated frame indefinitely, so an upstream that
+        // streams without a `\n\n` terminator would grow it without
+        // bound; drop the parse at the cap (losing telemetry for that
+        // pathological case) rather than OOM. Same bound and same trade
+        // as the `/v1/responses` passthrough.
+        let mut unterminated: usize = 0;
         futures::pin_mut!(upstream);
         while let Some(item) = upstream.next().await {
-            if let Ok(bytes) = &item {
+            if let (Ok(bytes), Some(d)) = (&item, decoder.as_mut()) {
                 // Side-channel parse over a copy of the frames; `item` is
                 // yielded below untouched.
-                let events = decoder.feed(bytes.as_ref());
+                let events = d.feed(bytes.as_ref());
+                unterminated = if events.is_empty() {
+                    unterminated + bytes.len()
+                } else {
+                    0
+                };
                 observe_transcript_events(guard.observed(), &events, text_cap);
+                if unterminated > crate::messages::MAX_SSE_FRAME_BUF_BYTES {
+                    tracing::warn!(
+                        buffered = unterminated,
+                        "transcription stream: no SSE frame terminator within the buffer cap; \
+                         dropping the parse (usage and capture skipped)"
+                    );
+                    decoder = None;
+                }
             }
             yield item;
         }
-        observe_transcript_events(guard.observed(), &decoder.finish().into_iter().collect::<Vec<_>>(), text_cap);
+        if let Some(mut d) = decoder.take() {
+            observe_transcript_events(
+                guard.observed(),
+                &d.finish().into_iter().collect::<Vec<_>>(),
+                text_cap,
+            );
+        }
         // Upstream EOF — the response was delivered in full. Recorded
         // before the scan below, which awaits a remote provider and is a
         // routine drop point for clients that close on the terminal frame.
@@ -1021,8 +1049,11 @@ async fn multipart_dispatch(
     let tracker = &state.runtime_status;
     let model_id: &str = &model_entry.id;
     let cooldown_cfg = model.cooldown.as_ref();
-    // Send, check the status, and read the body as one retryable unit. See
-    // the same shape in rerank.rs for why `note_failure` stays per attempt.
+    // Send, check the status, and — unless the answer is a stream being
+    // relayed — read the body as one retryable unit. See the same shape in
+    // rerank.rs for why `note_failure` stays per attempt. A relayed stream
+    // leaves the retryable unit at the status check: once its first frame
+    // is on the wire there is no failing over left to do.
     let timeouts = crate::routing::effective_timeouts(model, None, state.default_timeouts);
     let request_budget = timeouts.request;
     let stream_budget = timeouts.stream;
