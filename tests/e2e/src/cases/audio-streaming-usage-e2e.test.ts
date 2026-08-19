@@ -36,6 +36,11 @@ const INPUT_TOKENS = 26;
 const OUTPUT_TOKENS = 12;
 
 // Real streaming-transcription wire shape.
+// CRLF, not LF: that is how OpenAI frames this stream, and a decoder
+// that only knows `\n\n` unlocks no event at all on it — which is how a
+// streamed transcription came to bill zero tokens against the real
+// provider while this spec passed against an LF mock (#998 follow-up).
+const FRAME_END = "\r\n\r\n";
 const TRANSCRIPT_SSE = [
   `data: ${JSON.stringify({ type: "transcript.text.delta", delta: "hello" })}`,
   `data: ${JSON.stringify({ type: "transcript.text.delta", delta: " world" })}`,
@@ -51,7 +56,7 @@ const TRANSCRIPT_SSE = [
     },
   })}`,
   "data: [DONE]",
-].join("\n\n").concat("\n\n");
+].join(FRAME_END).concat(FRAME_END);
 
 interface OtlpReceiver {
   url: string;
