@@ -271,6 +271,7 @@ describe("mcp access policy e2e: env, team and key layers intersect", () => {
     expect(ok).toEqual({ ok: true, text: "alpha:hi" });
     const denied = await callTool(KEY_TOMBSTONE, "beta__echo", "hi");
     expect(denied.ok).toBe(false);
+    expect(denied.error).toContain("not available");
   });
 
   test("a key with no block of its own takes the env layer unchanged", async (ctx) => {
