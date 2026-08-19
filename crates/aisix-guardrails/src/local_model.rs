@@ -54,6 +54,10 @@
 //!   `unsafe`, so the shared-weights form waits on an upstream `&self`
 //!   run, a thin unsafe shim crate, or the sidecar deployment form.
 //!   Until then each lane pays its own weight copy (~190 MiB int8).
+//!   Lane dispatch is a centralized free-list — deliberately NO
+//!   worker↔session binding (sessions are interchangeable; the central
+//!   queue load-balances the uneven per-worker accept distribution).
+//!   Tracked with acceptance criteria in api7/aisix#1001.
 //!   ONE ORT `Session` is a loaded model instance, not a conversation:
 //!   every `run` is stateless, so lanes are freely interchangeable.
 //! - Per-audit cost ≈ (#candidate windows × inference) + (#prototypes ×
