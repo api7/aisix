@@ -76,10 +76,14 @@ async function measure(res: Response): Promise<Delivery> {
   return out;
 }
 
+/** A whole-file speech answer, served with a Content-Length. */
+const WHOLE_SPEECH_BODY = "ID3whole-file-audio-body";
+
 describe("the audio endpoints relay their response as it arrives (#998)", () => {
   let app: SpawnedApp | undefined;
   let transcribeUpstream: OpenAiUpstream | undefined;
   let speechUpstream: OpenAiUpstream | undefined;
+  let wholeSpeechUpstream: OpenAiUpstream | undefined;
   let etcdReachable = false;
 
   beforeAll(async () => {
@@ -98,6 +102,11 @@ describe("the audio endpoints relay their response as it arrives (#998)", () => 
       rawBodyChunks: SPEECH_CHUNKS,
       rawContentType: "audio/mpeg",
       eventDelayMs: CHUNK_DELAY_MS,
+    });
+
+    wholeSpeechUpstream = await startOpenAiUpstream({
+      rawBody: WHOLE_SPEECH_BODY,
+      rawContentType: "audio/mpeg",
     });
 
     app = await spawnApp();
@@ -124,9 +133,20 @@ describe("the audio endpoints relay their response as it arrives (#998)", () => 
       model_name: "tts-1",
       provider_key_id: speechPk.id,
     });
+    const wholeSpeechPk = await seed.createProviderKey({
+      display_name: "issue998-whole-speech-pk",
+      secret: "sk-openai-mock",
+      api_base: `${wholeSpeechUpstream.baseUrl}/v1`,
+    });
+    await seed.createModel({
+      display_name: "whole-tts",
+      provider: "openai",
+      model_name: "tts-1",
+      provider_key_id: wholeSpeechPk.id,
+    });
     await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
-      allowed_models: ["relay-transcribe", "relay-tts"],
+      allowed_models: ["relay-transcribe", "relay-tts", "whole-tts"],
     });
   });
 
@@ -134,6 +154,7 @@ describe("the audio endpoints relay their response as it arrives (#998)", () => 
     await app?.exit();
     await transcribeUpstream?.close();
     await speechUpstream?.close();
+    await wholeSpeechUpstream?.close();
   });
 
   test("a streamed transcription arrives frame by frame", async (ctx) => {
@@ -233,5 +254,47 @@ describe("the audio endpoints relay their response as it arrives (#998)", () => 
       delivery.lastByteMs - delivery.firstByteMs,
       "a player must be able to start before the whole file exists",
     ).toBeGreaterThan(CHUNK_DELAY_MS);
+  });
+
+  // Relaying the body must not cost the caller the size of the download:
+  // an upstream that declares a Content-Length still has it declared
+  // downstream, which is what a client needs to show progress.
+  test("an upstream Content-Length survives the relay", async (ctx) => {
+    if (!etcdReachable || !app) {
+      ctx.skip();
+      return;
+    }
+    const call = () =>
+      fetch(`${app!.proxyUrl}/v1/audio/speech`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${CALLER_PLAINTEXT}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "whole-tts",
+          input: "Hello from AISIX.",
+          voice: "alloy",
+        }),
+      });
+
+    await waitConfigPropagation(async () => {
+      try {
+        const probe = await call();
+        const ok = probe.ok;
+        await probe.text();
+        return ok;
+      } catch {
+        return false;
+      }
+    });
+
+    const res = await call();
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-length")).toBe(
+      String(WHOLE_SPEECH_BODY.length),
+    );
+    expect(res.headers.get("transfer-encoding")).toBeNull();
+    expect(await res.text()).toBe(WHOLE_SPEECH_BODY);
   });
 });
