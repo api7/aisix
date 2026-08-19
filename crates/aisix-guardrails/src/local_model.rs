@@ -31,23 +31,24 @@
 //! inference must not run inline on a tokio worker.
 //!
 //! Threading (inherited from the #1271 assessment): inference runs in
-//! `spawn_blocking`, bounded by a semaphore sized to the session count
-//! (one — `ort` 2.0.0-rc.13's `Session::run` takes `&mut self`, so one
-//! session serializes anyway), with ONE intra-op thread and intra/inter-op
-//! **spinning disabled** — ONNX Runtime's default spin-wait burns ~9.4%
-//! of a core while completely idle, taxing deployments that never send
-//! guardrail traffic. The request's async worker never blocks: it awaits
-//! the JoinHandle and keeps serving its other connections; only the
-//! blocking-pool thread computes. That thread is NOT core-pinned — on a
-//! saturated host it competes with the serving workers for scheduling;
-//! hard business/model core partitioning needs a dedicated pinned
-//! inference pool.
+//! `spawn_blocking`, bounded by a semaphore sized to the session pool —
+//! the configured LANES (`GUARDRAIL_LOCAL_MODEL_LANES`, default 1;
+//! api7/aisix#1001). Each session runs with ONE intra-op thread and
+//! intra/inter-op **spinning disabled** — ONNX Runtime's default
+//! spin-wait burns ~9.4% of a core while completely idle, taxing
+//! deployments that never send guardrail traffic. The request's async
+//! worker never blocks: it awaits the JoinHandle and keeps serving its
+//! other connections; only blocking-pool threads compute. Those threads
+//! are NOT core-pinned — on a saturated host they compete with the
+//! serving workers for scheduling; hard business/model core
+//! partitioning needs a dedicated pinned inference pool.
 //!
 //! Scaling notes (MVP review, measured on a 12-core avx2+vnni host):
 //! - One lane sustains ~50 inferences/s (p50 ≈ 19 ms per ~35-token
 //!   window; roughly linear in tokens). The acceptance shape spends TWO
 //!   inferences per request (input + output pass).
-//! - Throughput scales by adding lanes: N sessions behind
+//! - Throughput scales by adding lanes (api7/aisix#1001, implemented):
+//!   `GUARDRAIL_LOCAL_MODEL_LANES` = N sessions behind
 //!   `Semaphore::new(N)`. `run(&mut self)` forbids concurrent runs on
 //!   one session even though the ONNX Runtime C API documents `Run` as
 //!   thread-safe with shared read-only weights; this crate forbids
@@ -57,7 +58,6 @@
 //!   Lane dispatch is a centralized free-list — deliberately NO
 //!   worker↔session binding (sessions are interchangeable; the central
 //!   queue load-balances the uneven per-worker accept distribution).
-//!   Tracked with acceptance criteria in api7/aisix#1001.
 //!   ONE ORT `Session` is a loaded model instance, not a conversation:
 //!   every `run` is stateless, so lanes are freely interchangeable.
 //! - Per-audit cost ≈ (#candidate windows × inference) + (#prototypes ×
@@ -111,6 +111,15 @@ pub const MODEL_DIR_ENV: &str = "GUARDRAIL_LOCAL_MODEL_DIR";
 /// Optional cosine-similarity gate override (default
 /// [`DEFAULT_THRESHOLD`]).
 pub const THRESHOLD_ENV: &str = "GUARDRAIL_LOCAL_MODEL_THRESHOLD";
+/// Optional inference-lane count (default 1, clamped to
+/// [`MAX_LANES`]). Each lane is one ONNX session — one more core the
+/// guardrail may use and one more ~190 MiB weight copy resident; see
+/// the module scaling notes and api7/aisix#1001.
+pub const LANES_ENV: &str = "GUARDRAIL_LOCAL_MODEL_LANES";
+
+/// Upper clamp for [`LANES_ENV`]: lanes are cores, and no sane host
+/// grants the guardrail more than this.
+const MAX_LANES: usize = 32;
 
 /// Cosine-similarity gate for "this window is about the category".
 /// Calibrated with this module's `#[ignore]` probe against the
@@ -181,6 +190,8 @@ pub enum LocalModelError {
 pub struct LocalModelConfig {
     pub model_dir: PathBuf,
     pub threshold: f32,
+    /// Inference lanes = ONNX sessions = max concurrent inferences.
+    pub lanes: usize,
 }
 
 impl LocalModelConfig {
@@ -189,7 +200,8 @@ impl LocalModelConfig {
     /// rather than failing boot — the gate is a tuning knob, not a
     /// correctness one. The range check matters: `"NaN"` parses as a
     /// valid f32 and would make `score >= threshold` always false — a
-    /// configured-looking guardrail that silently never masks.
+    /// configured-looking guardrail that silently never masks. Lanes
+    /// follow the same lenient rule (malformed → 1).
     pub fn from_env() -> Option<Self> {
         let model_dir = PathBuf::from(std::env::var_os(MODEL_DIR_ENV)?);
         let threshold = std::env::var(THRESHOLD_ENV)
@@ -197,23 +209,43 @@ impl LocalModelConfig {
             .and_then(|s| s.parse::<f32>().ok())
             .filter(|t| t.is_finite() && (0.0..=1.0).contains(t))
             .unwrap_or(DEFAULT_THRESHOLD);
+        let lanes = parse_lanes(std::env::var(LANES_ENV).ok().as_deref());
         Some(Self {
             model_dir,
             threshold,
+            lanes,
         })
     }
 }
 
-/// The blocking inference core: tokenizer + ONNX session. Session
-/// access serializes through the mutex (`Session::run` takes `&mut`);
-/// the guardrail's semaphore keeps queued blocking tasks bounded.
+/// [`LANES_ENV`] parse rule: default 1 when unset or malformed (zero
+/// included — a zero-lane guardrail is a misconfiguration, not a
+/// disable switch; disabling is unsetting [`MODEL_DIR_ENV`]), clamped
+/// to [`MAX_LANES`].
+fn parse_lanes(raw: Option<&str>) -> usize {
+    raw.and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(1)
+        .min(MAX_LANES)
+}
+
+/// The blocking inference core: one shared tokenizer (`encode` takes
+/// `&self` and is thread-safe) + a pool of ONNX sessions — the
+/// inference LANES (api7/aisix#1001). Each session sits behind its own
+/// mutex (`Session::run` takes `&mut`); the guardrail's semaphore
+/// admits at most `sessions.len()` concurrent inferences, so an
+/// admitted task always finds a free session. Dispatch is a
+/// centralized free-list: any request takes whichever session is idle —
+/// deliberately NO worker↔session binding (sessions are stateless and
+/// interchangeable; a central queue load-balances the uneven per-worker
+/// accept distribution).
 struct Embedder {
     tokenizer: tokenizers::Tokenizer,
-    session: Mutex<Session>,
+    sessions: Vec<Mutex<Session>>,
 }
 
 impl Embedder {
-    fn load(dir: &std::path::Path) -> Result<Self, LocalModelError> {
+    fn load(dir: &std::path::Path, lanes: usize) -> Result<Self, LocalModelError> {
         let tokenizer_path = dir.join("tokenizer.json");
         let mut tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path).map_err(|e| {
             LocalModelError::Tokenizer(format!("{}: {e}", tokenizer_path.display()))
@@ -228,24 +260,54 @@ impl Embedder {
             .with_truncation(Some(tokenizers::TruncationParams::default()))
             .map_err(|e| LocalModelError::Tokenizer(format!("truncation config: {e}")))?;
         let model_path = dir.join("model.onnx");
-        // One intra-op thread and NO spin-wait: the guardrail must not
-        // tax a gateway that isn't sending it traffic (see module doc).
-        // Builder-stage errors carry the builder back for recovery
-        // (`ort::Error<SessionBuilder>`); this path never recovers, so
-        // they fold to their message.
+        // One intra-op thread per session and NO spin-wait: throughput
+        // scales by LANES (each lane single-threaded is the best
+        // per-core efficiency for short windows), and the guardrail
+        // must not tax a gateway that isn't sending it traffic (see
+        // module doc). Builder-stage errors carry the builder back for
+        // recovery (`ort::Error<SessionBuilder>`); this path never
+        // recovers, so they fold to their message.
         let build = |b: ort::session::builder::SessionBuilder| {
             b.with_intra_threads(1)?
                 .with_inter_threads(1)?
                 .with_intra_op_spinning(false)?
                 .with_inter_op_spinning(false)
         };
-        let session = build(Session::builder()?)
-            .map_err(|e| LocalModelError::Model(format!("session options: {e}")))?
-            .commit_from_file(&model_path)?;
+        let mut sessions = Vec::with_capacity(lanes);
+        for _ in 0..lanes {
+            let session = build(Session::builder()?)
+                .map_err(|e| LocalModelError::Model(format!("session options: {e}")))?
+                .commit_from_file(&model_path)?;
+            sessions.push(Mutex::new(session));
+        }
         Ok(Self {
             tokenizer,
-            session: Mutex::new(session),
+            sessions,
         })
+    }
+
+    /// Take an idle session from the pool. The caller holds a semaphore
+    /// permit and permits == sessions, so a free lane exists whenever
+    /// this runs; the final blocking `lock()` is a defensive fallback
+    /// that cannot deadlock (some lane always releases). A panic in a
+    /// previous run poisons that lane's mutex; recover instead of
+    /// panicking forever after — `Session::run` is stateless, so the
+    /// session itself is unharmed, and turning every later inference
+    /// into a panic would silently disable the operator's masking until
+    /// restart (the exact state load treats as boot-fatal).
+    fn acquire_free_session(&self) -> std::sync::MutexGuard<'_, Session> {
+        for lane in &self.sessions {
+            match lane.try_lock() {
+                Ok(guard) => return guard,
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                    return poisoned.into_inner();
+                }
+                Err(std::sync::TryLockError::WouldBlock) => continue,
+            }
+        }
+        self.sessions[0]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Embed one text: encode (with the tokenizer's special-token
@@ -265,15 +327,7 @@ impl Embedder {
         let len = ids.len() as i64;
 
         let started = Instant::now();
-        // A panic in a previous run poisons the mutex; recover instead of
-        // panicking forever after — `Session::run` is stateless, so the
-        // session itself is unharmed, and turning every later inference
-        // into a panic would silently disable the operator's masking
-        // until restart (the exact state load treats as boot-fatal).
-        let mut session = self
-            .session
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut session = self.acquire_free_session();
         let outputs = session.run(ort::inputs! {
             "input_ids" => Tensor::from_array((vec![1, len], ids))?,
             "attention_mask" => Tensor::from_array((vec![1, len], mask))?,
@@ -373,22 +427,23 @@ pub struct LocalModelGuardrail {
     threshold: f32,
     candidate_re: Regex,
     /// Bounds in-flight `spawn_blocking` inference tasks. Sized to the
-    /// session count (1): more permits would only queue on the session
-    /// mutex from inside blocking threads.
+    /// session-pool size (the configured lanes): more permits would
+    /// only queue on the session mutexes from inside blocking threads.
     permits: Arc<tokio::sync::Semaphore>,
 }
 
 impl LocalModelGuardrail {
-    /// Load tokenizer + session and encode the category prototype.
-    /// Blocking (model load + one inference) — the server bootstrap
-    /// wraps it in `spawn_blocking`.
+    /// Load tokenizer + the session pool and encode the category
+    /// prototype. Blocking (N model loads + one inference) — the server
+    /// bootstrap wraps it in `spawn_blocking`.
     pub fn load(config: &LocalModelConfig) -> Result<Self, LocalModelError> {
         let started = Instant::now();
-        let embedder = Embedder::load(&config.model_dir)?;
+        let embedder = Embedder::load(&config.model_dir, config.lanes)?;
         let prototype = embedder.embed(PROTOTYPE_DESCRIPTION_ZH)?;
         tracing::info!(
             model_dir = %config.model_dir.display(),
             threshold = config.threshold,
+            lanes = config.lanes,
             load_ms = started.elapsed().as_millis() as u64,
             "local-model guardrail loaded (category: EDA software version)"
         );
@@ -397,7 +452,7 @@ impl LocalModelGuardrail {
             prototype,
             threshold: config.threshold,
             candidate_re: Regex::new(CANDIDATE_PATTERN).expect("candidate pattern must compile"),
-            permits: Arc::new(tokio::sync::Semaphore::new(1)),
+            permits: Arc::new(tokio::sync::Semaphore::new(config.lanes)),
         })
     }
 
@@ -588,8 +643,22 @@ mod tests {
         let cfg = LocalModelConfig {
             model_dir: PathBuf::from("/nonexistent"),
             threshold: DEFAULT_THRESHOLD,
+            lanes: 1,
         };
         assert!(LocalModelGuardrail::load(&cfg).is_err());
+    }
+
+    #[test]
+    fn parse_lanes_defaults_and_clamps() {
+        // Unset / malformed / zero → 1 (zero is a misconfiguration, not
+        // a disable switch); valid values pass; huge values clamp.
+        assert_eq!(parse_lanes(None), 1);
+        assert_eq!(parse_lanes(Some("")), 1);
+        assert_eq!(parse_lanes(Some("abc")), 1);
+        assert_eq!(parse_lanes(Some("-2")), 1);
+        assert_eq!(parse_lanes(Some("0")), 1);
+        assert_eq!(parse_lanes(Some("4")), 4);
+        assert_eq!(parse_lanes(Some("9999")), MAX_LANES);
     }
 
     // ── model-backed tests (need the real model files) ──────────────────
@@ -668,6 +737,73 @@ mod tests {
         let masked = outcome.masked.expect("must mask the version number");
         assert_eq!(masked[0], "这个 EDA 软件的版本是 ***");
         assert_eq!(outcome.counts.get(DETECTOR_NAME), Some(&1));
+    }
+
+    /// Lanes are interchangeable and safe under concurrency: with a
+    /// 2-lane pool, 8 concurrent embeds of the same window all succeed
+    /// and agree (sessions share nothing but identical weights, and a
+    /// single-threaded run is deterministic).
+    #[tokio::test]
+    #[ignore = "needs GUARDRAIL_LOCAL_MODEL_DIR with model.onnx + tokenizer.json"]
+    async fn lanes_run_concurrently_and_agree() {
+        let Some(mut cfg) = LocalModelConfig::from_env() else {
+            return;
+        };
+        cfg.lanes = 2;
+        let g = std::sync::Arc::new(
+            LocalModelGuardrail::load(&cfg).expect("model files present but load failed"),
+        );
+        let window = "这个 EDA 软件的版本是 12.1,请确认兼容性";
+        let tasks: Vec<_> = (0..8)
+            .map(|_| {
+                let g = std::sync::Arc::clone(&g);
+                tokio::spawn(async move { g.embed_window(window.to_owned()).await })
+            })
+            .collect();
+        let mut vectors = Vec::new();
+        for t in tasks {
+            vectors.push(t.await.unwrap().expect("concurrent embed failed"));
+        }
+        let reference = &vectors[0];
+        for v in &vectors[1..] {
+            let agreement = cosine(v, reference);
+            assert!(agreement > 0.9999, "lanes disagree: cosine {agreement}");
+        }
+    }
+
+    /// Throughput calibration for api7/aisix#1001: lanes come from
+    /// GUARDRAIL_LOCAL_MODEL_LANES, so one binary sweeps 1/2/4 lanes.
+    /// Prints inferences/s over a saturating concurrent batch.
+    #[tokio::test]
+    #[ignore = "needs GUARDRAIL_LOCAL_MODEL_DIR with model.onnx + tokenizer.json"]
+    async fn probe_lane_throughput() {
+        let Some(g) = load_from_env().map(std::sync::Arc::new) else {
+            return;
+        };
+        let window = "这个 EDA 软件的版本是 12.1,请确认与工艺库的兼容性之后再安排回归测试";
+        // Warm-up.
+        for _ in 0..3 {
+            g.embed_window(window.to_owned()).await.unwrap();
+        }
+        let total = 64usize;
+        let started = Instant::now();
+        let tasks: Vec<_> = (0..total)
+            .map(|_| {
+                let g = std::sync::Arc::clone(&g);
+                tokio::spawn(async move { g.embed_window(window.to_owned()).await })
+            })
+            .collect();
+        for t in tasks {
+            t.await.unwrap().expect("embed failed");
+        }
+        let secs = started.elapsed().as_secs_f64();
+        println!(
+            "lanes={} total={} wall={:.2}s throughput={:.1} inferences/s",
+            g.embedder.sessions.len(),
+            total,
+            secs,
+            total as f64 / secs
+        );
     }
 
     /// Rough single-inference latency figure for the MVP report.

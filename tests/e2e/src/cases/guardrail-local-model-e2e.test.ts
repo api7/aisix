@@ -85,7 +85,13 @@ describe("local-model guardrail e2e: EDA version number masked on request and re
     });
 
     app = await spawnApp({
-      extraEnv: { GUARDRAIL_LOCAL_MODEL_DIR: MODEL_DIR },
+      // 2 lanes so the acceptance path exercises the session POOL
+      // dispatch (api7/aisix#1001), not just the single-lane degenerate
+      // case; behavior must be identical (lanes are stateless).
+      extraEnv: {
+        GUARDRAIL_LOCAL_MODEL_DIR: MODEL_DIR,
+        GUARDRAIL_LOCAL_MODEL_LANES: "2",
+      },
     });
     const seed = new SeedClient(etcd, app.etcdPrefix);
 
