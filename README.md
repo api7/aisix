@@ -177,15 +177,12 @@ Covered by 183 end-to-end scenario files (496 cases) that run against real gatew
   memory and Redis backends; cost-saved telemetry on every hit. Separately, **automatic
   prompt caching** can be enabled per direct Anthropic model to inject cache breakpoints, so
   callers get provider-side prompt discounts without changing their requests.
-- **MCP gateway** — register upstream MCP servers as first-class resources and front them
-  all behind one endpoint (`/mcp`), with the gateway holding each server's upstream
-  credential, namespacing tools per server, and enforcing per-caller tool access. Serves
-  every current MCP protocol revision — `2025-03-26` through the stateless `2026-07-28` —
-  negotiated per client with no sessions to pin, and connects upstream per server via the
-  `initialize` handshake or, with `protocol_version: "2026-07-28"`, handshake-free
-  `server/discover` for servers that no longer answer `initialize`. The tool surface is
-  validated against the official MCP conformance suite in CI. Also exposes a REST API as
-  MCP tools from its OpenAPI description.
+- **MCP gateway** — front registered upstream MCP servers at `/mcp` with gateway-held
+  credentials, per-server tool namespaces, and per-caller access. It serves every
+  Streamable HTTP revision from `2025-03-26` through stateless `2026-07-28` without
+  downstream sessions. Upstreams use `initialize` by default or `server/discover` with
+  `protocol_version: "2026-07-28"`. CI runs the official MCP suite's applicable tools-only
+  protocol scenarios. Also exposes a REST API as MCP tools from its OpenAPI description.
 - **A2A agent gateway** — front A2A (Agent-to-Agent) agents at `/a2a/:agent`, serving each
   agent's card with URLs rewritten to the gateway, over JSON-RPC 2.0.
 - **Inbound authentication** — caller API keys (SHA-256 hashed, model allowlists, expiry,
