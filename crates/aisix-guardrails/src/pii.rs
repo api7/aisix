@@ -806,10 +806,18 @@ mod tests {
     #[test]
     fn every_builtin_detector_compiles() {
         for (id, _, _) in BUILTIN_DETECTORS {
-            assert!(
-                builtin_rule(id, PiiAction::Mask).is_some(),
-                "builtin {id} must compile",
+            let rule = builtin_rule(id, PiiAction::Mask)
+                .unwrap_or_else(|| panic!("builtin {id} must compile"));
+            // group_scoped is auto-detected from the pattern, so an
+            // accidental capturing `(...)` in a builtin would silently
+            // narrow its replacement to group 1. Builtins must stay
+            // whole-match: use `(?:…)` for grouping.
+            assert_eq!(
+                rule.regex.captures_len(),
+                1,
+                "builtin {id} must not declare capture groups",
             );
+            assert!(!rule.group_scoped);
         }
         assert!(builtin_rule("no_such_detector", PiiAction::Mask).is_none());
     }
