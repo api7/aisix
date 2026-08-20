@@ -126,11 +126,10 @@ pub const THRESHOLD_ENV: &str = "GUARDRAIL_LOCAL_MODEL_THRESHOLD";
 pub const LANES_ENV: &str = "GUARDRAIL_LOCAL_MODEL_LANES";
 /// Optional layer-② hotword proximity window override, in chars each
 /// side of a candidate (default [`rules::DEFAULT_PROXIMITY_CHARS`],
-/// clamped to [`rules::MAX_PROXIMITY_CHARS`]; malformed → default).
-/// `0` collapses the window to the candidate itself — hotword evidence
-/// is disabled and only the negative shape classes still act, i.e. a
-/// "negatives-only" rules mode where every unresolved candidate falls
-/// to the model band.
+/// clamped to [`rules::MAX_PROXIMITY_CHARS`]; malformed or zero →
+/// default). Zero is a misconfiguration, not a mode — the same rule as
+/// [`LANES_ENV`]: a zero window finds no hotword, so layer ② silently
+/// stops masking while looking configured.
 pub const RULE_WINDOW_ENV: &str = "GUARDRAIL_LOCAL_MODEL_RULE_WINDOW";
 /// Optional layer-③ prototype strategy: `description`, `max`, or
 /// `centroid` (default [`PrototypeStrategy::default`]; malformed →
@@ -331,6 +330,7 @@ impl LocalModelConfig {
         let rule_window = std::env::var(RULE_WINDOW_ENV)
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&w| w >= 1)
             .unwrap_or(rules::DEFAULT_PROXIMITY_CHARS)
             .min(rules::MAX_PROXIMITY_CHARS);
         Some(Self {

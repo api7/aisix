@@ -159,7 +159,11 @@ impl RuleScorer {
     pub(super) fn new(proximity_chars: usize) -> Self {
         let compile = |p: &str| Regex::new(p).expect("rule pattern must compile");
         Self {
-            proximity_chars: proximity_chars.min(MAX_PROXIMITY_CHARS),
+            // The env parse already rejects zero (a zero window finds no
+            // hotword — layer ② would silently stop masking), but the
+            // config fields are `pub`; clamp defensively like the lane
+            // pool does.
+            proximity_chars: proximity_chars.clamp(1, MAX_PROXIMITY_CHARS),
             en_trigger: compile(EN_TRIGGER_PATTERN),
             tool: compile(TOOL_PATTERN),
             unit_suffix: compile(UNIT_SUFFIX_PATTERN),
